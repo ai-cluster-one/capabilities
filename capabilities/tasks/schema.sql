@@ -198,8 +198,9 @@ alter table tasks.task_executions add column if not exists metrics jsonb not nul
 
 comment on table tasks.task_executions is
   'One row per raise: opened when the task is claimed, closed when it is released. '
-  'Immutable once closed, so nothing here is ever read-modify-written, and the '
-  'attempt number is the count of these rows rather than a counter to keep in step.';
+  'Immutable once closed, except that a worker''s after hook that fails adds its '
+  'note to metrics, so nothing here is ever read-modify-written, and the attempt '
+  'number is the count of these rows rather than a counter to keep in step.';
 comment on column tasks.task_executions.lease_until is
   'When the claim lapses. A worker that dies stops renewing nothing - the moment '
   'simply passes, the next claim closes the row as abandoned, and the task is free.';

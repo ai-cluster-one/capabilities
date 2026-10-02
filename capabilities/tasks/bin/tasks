@@ -199,6 +199,9 @@ WORKERS
       idle_failure_seconds: 120   # under this, having written nothing, a failed
                                   # turn is one that never started
     park_hint: one sentence added to the handback at the `attempts` ceiling
+    hooks:                        # optional, either or both - see HOOKS
+      before: scripts/gate.py --strict    # asked about each task before a claim
+      after: scripts/follow.sh            # told how each settled raise ended
     ---
 
     What this worker is and how it carries the work: its role, how it works,
@@ -336,6 +339,46 @@ WORKERS
   whenever the store holds work it takes; anything else may run `tasks run
   <worker> --apply` on whatever schedule it keeps, and a worker nothing runs
   never runs.
+
+HOOKS
+  A worker's `hooks` names commands of the project's own that `run` starts
+  around a turn, so a project can gate or follow its work with its own checks.
+  Each is one command line, split as a shell splits it and run without one,
+  from the project root, with the task as `show` prints it under "task" on
+  stdin and these added to the environment: TASKS_TASK_ID, TASKS_TASK_KEY,
+  TASKS_TASK_TYPE, TASKS_TASK_ASSIGNEE, TASKS_WORKER and TASKS_PROJECT_ROOT.
+  `doctor` shows them, and the service fingerprints them with the worker file.
+  Any other key under `hooks` is refused.
+
+  `before` is asked about each task a claim would take for the worker - by
+  `run`, with or without --apply and with --key, and so by the service - before
+  anything is written. It has 30 seconds.
+
+    exit 0                      go: the task is claimed as always
+    exit 75, last stdout line   defer: the task's pickup is set to that moment,
+    a moment                    recorded in its history with actor
+                                `hook:<worker>` and no entry on the trail, and
+                                the next task is asked about
+    anything else               skip: nothing is written, and the next task is
+                                asked about; so is exit 75 without a moment, a
+                                timeout, and a command that cannot be started
+
+  The moment is ISO 8601 with its offset, or a bare date read as `--pickup`
+  reads one. A deferred or skipped task opens no raise, spends no attempt and
+  starts no turn. `run` reports each one under `passed_over` - the task, the
+  verdict, the hook's last stdout line or why it failed - and so does the
+  service's log line; without --apply a deferral is named and not set. A task
+  named with --key that its hook holds back is refused with that reason. When
+  every task is held back, `run --apply` claims nothing and says why, and the
+  service waits for its next poll.
+
+  `after` is told how a raise ended, once it is settled, whatever the outcome:
+  the task as it stands then on stdin, and TASKS_EXECUTION, TASKS_OUTCOME (the
+  raise's outcome) and TASKS_LANDED (the status the task landed in) added to
+  the environment. It has 60 seconds. What it answers changes nothing about
+  the raise; an exit other than 0, a timeout or a command that cannot be
+  started is noted as `after_hook` on the raise's metrics, in the answer and in
+  the service's log line.
 
 SERVICE
   tasks service init [--force]    write capabilities/tasks/service/config.toml
@@ -5864,6 +5907,11 @@ def _selection(opts: dict, project: str, tz) -> tuple[str, list]:
     where, params = _not_types(where, params, opts.get("not_types"))
     where, params = _not_ids(where, params, opts.get("not_ids"))
     clauses: list[str] = []
+    if opts.get("only_id"):
+        # The one task a worker's `before` hook let through: the claim takes it
+        # only while every other condition of the ask still holds.
+        clauses.append("id::text = %s")
+        params = [*params, str(opts["only_id"])]
     if opts.get("assignees"):
         clauses.append("assignee = any(%s)")
         params = [*params, list(opts["assignees"])]
@@ -6215,7 +6263,17 @@ DEFAULT_WORKER = "default"
 # The keys a worker's front matter may carry. Anything else is refused: a key
 # nothing reads is a declaration doing nothing, and it reads as if it did.
 _WORKER_KEYS = ("enabled", "description", "takes", "tags", "assignee", "on_request",
-                "writes", "profile", "routines", "limits", "park_hint")
+                "writes", "profile", "routines", "limits", "park_hint", "hooks")
+
+# A worker's hooks: commands of the project's own that `run` starts around a
+# turn, and the seconds each may take. `before` is asked about each task a claim
+# would take, before anything is written; `after` is told how a settled raise
+# ended. This capability knows nothing of what either checks.
+_HOOK_KEYS = ("before", "after")
+_HOOK_TIMEOUTS = {"before": 30, "after": 60}
+# The exit a `before` hook answers with to hold the task until a moment it names
+# on its last line: EX_TEMPFAIL, "not now, try again later".
+_HOOK_DEFER = 75
 
 # What one filter of `takes` may name, each as a list of the values it allows,
 # and the statuses a worker may take a task in: todo, the queue, and waiting,
@@ -6495,6 +6553,37 @@ def _read_writes(raw, wrong) -> dict | None:
     return writes
 
 
+def _read_hooks(raw, wrong) -> dict:
+    """The worker's hooks, each one command line, or an empty mapping when it
+    declares none. A line is split as a shell would split it and run without
+    one, so a line that does not split is refused here rather than at the turn."""
+    import shlex
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        wrong("its `hooks` is a mapping of before and after, each one command line")
+        return {}
+    for unknown in sorted(set(map(str, raw)) - set(_HOOK_KEYS)):
+        wrong(f"its `hooks` names {unknown!r}, which nothing reads: the hooks are "
+              f"{', '.join(_HOOK_KEYS)}")
+    hooks: dict = {}
+    for which in _HOOK_KEYS:
+        command = raw.get(which)
+        if command is None:
+            continue
+        try:
+            argv = shlex.split(command) if isinstance(command, str) else []
+        except ValueError as exc:
+            wrong(f"its `hooks.{which}` does not split into a command: {exc}")
+            continue
+        if not argv:
+            wrong(f"its `hooks.{which}` is one command line, run without a shell "
+                  "from the project root")
+            continue
+        hooks[which] = command.strip()
+    return hooks
+
+
 def _handler(profile) -> str:
     """What held the task, in the words that would start it again."""
     parts = [profile.harness]
@@ -6609,6 +6698,7 @@ def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
     for twice in sorted(set(takes) & set(on_request)):
         wrong(f"it names {twice!r} in both `takes` and `on_request`")
     writes = _read_writes(settings.get("writes"), wrong)
+    hooks = _read_hooks(settings.get("hooks"), wrong)
     # The shipped worker's whole point is to take what nothing else does, so
     # `default` without `takes` is that. Any other worker without either list
     # would never run.
@@ -6689,7 +6779,7 @@ def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
             "shorthand": shorthand, "description": description, "writes": writes,
             "profile": profile, "knobs": knobs, "profile_source": origin,
             "routines": routines, "limits": limits, "park_hint": hint.strip(),
-            "body": body, "missing": missing,
+            "hooks": hooks, "body": body, "missing": missing,
             "handler": _handler(profile) if profile is not None else None}, []
 
 
@@ -6919,6 +7009,8 @@ def _workers_report() -> tuple[list[dict], list[str]]:
                 row["writes"] = worker["writes"]
             row["routines"] = worker["routines"]
             row["limits"] = worker["limits"]
+            if worker["hooks"]:
+                row["hooks"] = worker["hooks"]
             row["profile_source"] = worker["profile_source"]
             if worker["profile"] is not None:
                 row["harness"] = worker["profile"].harness
@@ -7189,7 +7281,10 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
 
     A worker that declares `writes` has them bound to the raise its claim opens,
     so what the turn may write is fixed at the claim. `run`, the system and the
-    handle the turn will run under, is recorded on the raise by the same claim."""
+    handle the turn will run under, is recorded on the raise by the same claim.
+
+    A worker that declares a `before` hook has each task asked about first, and
+    `_take_past_hooks` takes the first one its hook lets through."""
     base = {"lease": str(worker["limits"]["lease_seconds"]),
             "worker": worker["name"], "handler": worker["handler"]}
     if run is not None:
@@ -7198,9 +7293,30 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
         base["bind"] = worker["writes"]
     if exclude:
         base["not_ids"] = list(exclude)
+    before = (worker.get("hooks") or {}).get("before")
     if key:
-        return _claim(entry, {**base, **_selector_filters(worker), "key": key,
-                              **_key_types(worker)})
+        swept, returned = [], []
+        if before:
+            # The sweeps first, as the claim runs them: a task whose wait ended
+            # or whose lease lapsed becomes claimable only there, and its hook is
+            # asked about it like any other.
+            swept, returned = _sweep(entry)
+            task = _key_candidate(entry, worker, key)
+            # A task the claim would refuse is refused in the claim's own words,
+            # and its hook is never asked about it.
+            passed = _ask_before(entry, worker, task, write=True) if task else None
+            if passed:
+                _die(6, "conflict", f"{key} was not claimed: {_passed_words(passed)}",
+                     f"the before hook of worker {worker['name']!r} decides when "
+                     "it is taken; `tasks show` names any pickup it set")
+        answer = _claim(entry, {**base, **_selector_filters(worker), "key": key,
+                                **_key_types(worker)})
+        if before:
+            answer["swept"] = swept + (answer.get("swept") or [])
+            answer["returned"] = returned + (answer.get("returned") or [])
+        return answer
+    if before:
+        return _take_past_hooks(entry, worker, base, tuple(exclude))
     swept: list = []
     answer: dict = {"claimed": None, "swept": [], "returned": []}
     for ask in _asks(worker):
@@ -7209,6 +7325,83 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
         if answer.get("claimed") is not None:
             break
     answer["swept"] = swept
+    return answer
+
+
+def _next_candidate(cur, worker: dict, project: str, tz,
+                    exclude) -> tuple[dict | None, dict | None]:
+    """The ask that would yield and the task it would take, asked in the order a
+    claim asks in and writing nothing, or two Nones when nothing is there."""
+    for ask in _asks(worker):
+        where, params = _selection({**ask, "not_ids": list(exclude)}, project, tz)
+        cur.execute(f"""select * from {SCHEMA}.tasks{where}
+                        order by pickup_at asc nulls last, created_at asc
+                        limit 1""", params)
+        rows = _rows(cur)
+        if rows:
+            return ask, rows[0]
+    return None, None
+
+
+def _key_candidate(entry, worker: dict, key: str) -> dict | None:
+    """The task named with --key when this worker's claim would take it, or None
+    when the claim would refuse it."""
+    with _connect(entry) as conn, conn.cursor() as cur:
+        tid = _task_id(cur, key, writing=True)
+        cur.execute(f"""select *, (pickup_at is null or pickup_at <= now()) as due
+                          from {SCHEMA}.tasks where id = %s""", (tid,))
+        row = _rows(cur)[0]
+    due = row.pop("due")
+    refused = _key_refusal(row, due, {"key": key, "worker": worker["name"],
+                                      **_key_types(worker)})
+    return row if refused is None else None
+
+
+def _sweep(entry) -> tuple[list, list]:
+    """The two sweeps a claim runs before it selects, on their own: what a hooked
+    worker's candidates are chosen from has to be what its claim would see."""
+    project = _writing_project()
+    with _connect(entry) as conn, conn.cursor() as cur:
+        swept = _sweep_leases(cur, project)
+        returned = _sweep_waiting(cur, project)
+        conn.commit()
+    return [str(r["id"]) for r in swept], [_address(t) for t in returned]
+
+
+def _take_past_hooks(entry, worker: dict, base: dict, exclude: tuple) -> dict:
+    """Take the first task a hooked worker's claim would take that its `before`
+    hook lets through.
+
+    Each candidate is chosen the way the claim chooses, from what is left once
+    the ones already asked about are set aside, and its hook is asked before
+    anything is written, so a task it holds back opens no raise and spends no
+    attempt. A task it lets through is claimed by the same claim as always,
+    narrowed to that one task, so a task somebody else took meanwhile is simply
+    not taken and the next candidate is asked about."""
+    swept, returned = _sweep(entry)
+    project, tz = _writing_project(), _zone(entry)
+    asked = list(exclude)
+    passed: list = []
+    answer: dict = {"claimed": None}
+    while True:
+        with _connect(entry) as conn, conn.cursor() as cur:
+            ask, task = _next_candidate(cur, worker, project, tz, asked)
+        if task is None:
+            answer = {"claimed": None}
+            break
+        tid = str(task["id"])
+        asked.append(tid)
+        held = _ask_before(entry, worker, task, write=True)
+        if held:
+            passed.append(held)
+            continue
+        answer = _claim(entry, {**base, **ask, "only_id": tid})
+        swept += answer.get("swept") or []
+        if answer.get("claimed") is not None:
+            break
+    answer["swept"] = swept
+    answer["returned"] = returned + (answer.get("returned") or [])
+    answer["passed_over"] = passed
     return answer
 
 
@@ -7232,18 +7425,199 @@ def _would_take(entry, worker: dict, key: str | None, exclude: tuple = ()) -> di
                                                    **_key_types(worker)}) is None
                     else None)
         else:
-            for ask in _asks(worker):
-                where, params = _selection({**ask, "not_ids": list(exclude)},
-                                           project, tz)
-                cur.execute(f"""select * from {SCHEMA}.tasks{where}
-                                order by pickup_at asc nulls last, created_at asc
-                                limit 1""", params)
-                rows = _rows(cur)
-                if rows:
-                    take = rows[0]
-                    break
+            _ask, take = _next_candidate(cur, worker, project, tz, exclude)
     return {"worker": worker["name"], "would_claim": _address(take) if take else None,
             "applied": False}
+
+
+def _would_take_past_hooks(entry, worker: dict, key: str | None,
+                           exclude: tuple) -> dict:
+    """What `_would_take` answers, for a worker with a `before` hook: the hook is
+    asked about each candidate as the claim would ask it, and what it holds back
+    is reported rather than written - a moment it defers to is named and not
+    set."""
+    passed: list = []
+    take = None
+    if key:
+        task = _key_candidate(entry, worker, key)
+        held = _ask_before(entry, worker, task, write=False) if task else None
+        if held:
+            passed.append(held)
+        else:
+            take = task
+    else:
+        project, tz = _writing_project(), _zone(entry)
+        asked = list(exclude)
+        while take is None:
+            with _connect(entry) as conn, conn.cursor() as cur:
+                _ask, task = _next_candidate(cur, worker, project, tz, asked)
+            if task is None:
+                break
+            asked.append(str(task["id"]))
+            held = _ask_before(entry, worker, task, write=False)
+            if held:
+                passed.append(held)
+            else:
+                take = task
+    return {"worker": worker["name"], "would_claim": _address(take) if take else None,
+            "applied": False, "passed_over": passed}
+
+
+# --- A worker's hooks --------------------------------------------------------
+
+def _last_line(text: str | None) -> str | None:
+    lines = [one.strip() for one in (text or "").splitlines() if one.strip()]
+    return lines[-1][:500] if lines else None
+
+
+def _run_hook(worker: dict, which: str, task: dict, extra: dict | None = None) -> dict:
+    """Run one of the worker's hooks on one task and say how it ended: its exit,
+    or why it has none, and the last line it printed.
+
+    The command line is split as a shell would split it and run without one, in
+    the project root, with the task as `show` prints it on stdin and the task's
+    handles added to this process's environment. A hook that outlives its
+    seconds is ended with everything it started."""
+    import shlex
+    import signal
+    import subprocess
+    command = worker["hooks"][which]
+    seconds = _HOOK_TIMEOUTS[which]
+    env = {**os.environ,
+           "TASKS_TASK_ID": str(task["id"]),
+           "TASKS_TASK_KEY": task.get("unique_key") or "",
+           "TASKS_TASK_TYPE": task.get("type") or "",
+           "TASKS_TASK_ASSIGNEE": task.get("assignee") or "",
+           "TASKS_WORKER": worker["name"],
+           "TASKS_PROJECT_ROOT": str(_project_here()),
+           **(extra or {})}
+    stdin = json.dumps(task, ensure_ascii=False, indent=2) + "\n"
+    try:
+        child = subprocess.Popen(shlex.split(command), cwd=str(_project_here()), env=env,
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True,
+                                 start_new_session=True)
+    except (OSError, ValueError) as exc:
+        return {"exit": None, "why": f"could not start: {exc}", "said": None}
+    try:
+        out, _err = child.communicate(stdin, timeout=seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            out, _err = child.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            out = None
+        return {"exit": None, "why": f"timed out after {seconds}s", "said": _last_line(out)}
+    code = child.returncode
+    return {"exit": code, "why": None if code == 0 else f"exited {code}",
+            "said": _last_line(out)}
+
+
+def _hook_moment(text: str | None, tz) -> str | None:
+    """The moment a deferring hook named on its last line: an ISO 8601 moment
+    with its offset, or a bare date read as `--pickup` reads one. None when the
+    line is neither."""
+    import datetime
+    text = (text or "").strip()
+    if not text:
+        return None
+    if len(text) == 10:
+        try:
+            day = datetime.date.fromisoformat(text)
+        except ValueError:
+            return None
+        return datetime.datetime(day.year, day.month, day.day, tzinfo=tz).isoformat()
+    try:
+        stamp = datetime.datetime.fromisoformat(text.replace(" ", "T", 1))
+    except ValueError:
+        return None
+    return stamp.isoformat() if stamp.tzinfo is not None else None
+
+
+def _defer(entry, worker: dict, tid: str, moment: str) -> bool:
+    """Hold a task its worker's `before` hook deferred until the moment it named:
+    the pickup alone, recorded in the history as the hook's, with no entry on the
+    trail. A task that left the queue meanwhile, or that a claimer holds, is not
+    written."""
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"""select * from {SCHEMA}.tasks
+                         where id::text = %s and status in ('todo', 'waiting')
+                         for update skip locked""", (tid,))
+        rows = _rows(cur)
+        if not rows:
+            conn.commit()
+            return False
+        cur.execute(f"""update {SCHEMA}.tasks set pickup_at = %s, updated_at = now()
+                         where id::text = %s returning *""", (moment, tid))
+        after = _rows(cur)[0]
+        _record_moves(cur, tid, rows[0], after, actor=f"hook:{worker['name']}")
+        conn.commit()
+    return True
+
+
+def _ask_before(entry, worker: dict, task: dict, *, write: bool) -> dict | None:
+    """Ask the worker's `before` hook about one task a claim would take. None
+    lets the claim go on; otherwise what held the task back: a deferral to the
+    moment the hook named, set when `write` says so, or a skip that writes
+    nothing - any other exit, a deferral naming no moment, a timeout, or a hook
+    that could not be started."""
+    ran = _run_hook(worker, "before", task)
+    if ran["exit"] == 0:
+        return None
+    held = {"task": _address(task), "task_id": str(task["id"])}
+    if ran["exit"] == _HOOK_DEFER:
+        moment = _hook_moment(ran["said"], _zone(entry))
+        if moment:
+            held.update(verdict="defer", until=moment, said=ran["said"])
+            if write:
+                held["pickup_set"] = _defer(entry, worker, held["task_id"], moment)
+            return held
+        held.update(verdict="skip", why=f"exited {_HOOK_DEFER} without a moment on its "
+                    "last line", said=ran["said"])
+        return held
+    held.update(verdict="skip", why=ran["why"], said=ran["said"])
+    return held
+
+
+def _passed_words(held: dict) -> str:
+    """One task a `before` hook held back, in a sentence."""
+    if held["verdict"] == "defer":
+        words = f"its before hook deferred it to {held['until']}"
+        if held.get("pickup_set") is False:
+            words += ", and the pickup was not set because the task left the queue"
+        return words
+    return (f"its before hook skipped it ({held['why']})"
+            + (f": {held['said']}" if held.get("said") else ""))
+
+
+def _after_hook(entry, worker: dict, tid: str, execution: str, report: dict) -> None:
+    """Tell the worker's `after` hook how a settled raise ended. What it answers
+    changes nothing about the raise; a hook that fails, times out or cannot be
+    started is noted on the raise's metrics and in the report."""
+    if not (worker.get("hooks") or {}).get("after"):
+        return
+    with _connect(entry) as conn, conn.cursor() as cur:
+        task = _task_row(cur, tid)
+        cur.execute(f"""select status from {SCHEMA}.task_executions
+                         where id::text = %s""", (execution,))
+        row = cur.fetchone()
+    ran = _run_hook(worker, "after", task,
+                    {"TASKS_EXECUTION": execution,
+                     "TASKS_OUTCOME": (row or {}).get("status") or "",
+                     "TASKS_LANDED": task.get("status") or ""})
+    report["after_hook"] = {k: v for k, v in ran.items() if v is not None}
+    if ran["exit"] == 0:
+        return
+    noted = {"why": ran["why"], **({"said": ran["said"]} if ran["said"] else {})}
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"""update {SCHEMA}.task_executions
+                           set metrics = coalesce(metrics, '{{}}'::jsonb)
+                                         || jsonb_build_object('after_hook', %s::jsonb)
+                         where id::text = %s""", (json.dumps(noted), execution))
+        conn.commit()
 
 
 def _spent(rows: list[dict], from_waiting: bool = False) -> int:
@@ -7536,7 +7910,12 @@ def cmd_run(entry, args: list[str]) -> None:
     if not opts.get("apply"):
         # Nothing is claimed without --apply, so this says which task a claim
         # would find rather than pretending to have taken it.
-        _emit(_would_take(entry, worker, opts.get("key"), *narrowed))
+        # A worker's `before` hook is asked here as the claim would ask it, and
+        # what it holds back is reported rather than written.
+        if (worker.get("hooks") or {}).get("before"):
+            _emit(_would_take_past_hooks(entry, worker, opts.get("key"), exclude))
+        else:
+            _emit(_would_take(entry, worker, opts.get("key"), *narrowed))
         return
 
     # The session is chosen before the claim, so the raise names it from the
@@ -7550,6 +7929,10 @@ def cmd_run(entry, args: list[str]) -> None:
                  run=("claude", pinned) if claude else None)
     report = {"worker": worker["name"], "claimed": None,
               "swept": held.get("swept") or [], "applied": True}
+    # What the worker's `before` hook held back, and why: said whether or not
+    # anything was claimed after it, so a run that claimed nothing says why.
+    if "passed_over" in held:
+        report["passed_over"] = held["passed_over"]
     if held.get("claimed") is None:
         _emit(report)
         return
@@ -7580,6 +7963,7 @@ def cmd_run(entry, args: list[str]) -> None:
               {"missing": True}, park_landing)
         report["parked"] = True
         report["missing"] = worker["missing"]
+        _after_hook(entry, worker, tid, execution, report)
         _emit(report)
         return
 
@@ -7594,6 +7978,7 @@ def cmd_run(entry, args: list[str]) -> None:
             why = f"{why} {worker['park_hint']}"
         _park(entry, tid, execution, why, None, park_landing)
         report["parked"] = True
+        _after_hook(entry, worker, tid, execution, report)
         _emit(report)
         return
 
@@ -7708,6 +8093,7 @@ def cmd_run(entry, args: list[str]) -> None:
     turn["elapsed_ms"] = elapsed_ms
     report["turn"] = turn
     report["trail_grew_by"] = grew_to - grew_from
+    _after_hook(entry, worker, tid, execution, report)
     _emit(report)
 
 
@@ -8121,6 +8507,9 @@ class _ServiceHost:
             return "tasks" in tables and not _notify_behind(cur, SCHEMA, tables)
 
     def lane_has_work(self, worker: dict, exclude: tuple = ()) -> bool:
+        # The store's answer alone: a worker's `before` hook is asked by the turn
+        # this starts, and a turn its hook let take nothing holds the lane until
+        # the poll, as any turn that took nothing does.
         return _would_take(self.entry, worker, None, exclude)["would_claim"] is not None
 
     def sweep_due(self) -> bool:

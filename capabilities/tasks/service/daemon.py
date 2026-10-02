@@ -607,6 +607,24 @@ class Daemon:
                                 else key)
             if answer.get("claimed") is None:
                 said.append("claimed nothing")
+            # What the worker's own hooks said: each task its `before` hook held
+            # back, and an `after` hook that failed.
+            for held in answer.get("passed_over") or []:
+                if not isinstance(held, dict):
+                    continue
+                words = f"passed over {held.get('task')}: {held.get('verdict')}"
+                if held.get("until"):
+                    words += f" until {held['until']}"
+                if held.get("why"):
+                    words += f" ({held['why']})"
+                if held.get("said"):
+                    words += f", said {str(held['said'])[:200]}"
+                said.append(words)
+            after = answer.get("after_hook")
+            if isinstance(after, dict) and after.get("exit") != 0:
+                said.append(f"after hook failed ({after.get('why')})"
+                            + (f", said {str(after['said'])[:200]}" if after.get("said")
+                               else ""))
         if trouble:
             said.append(f"said {trouble.splitlines()[-1][:300]}")
         if turn.claim and turn.claim.get("task_id"):

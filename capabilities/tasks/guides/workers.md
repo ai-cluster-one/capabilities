@@ -23,6 +23,7 @@ A worker file is Markdown. Its YAML front matter is the worker's settings and it
 - `routines` names the project's procedures, each found at `routines/<name>.md`; the first is the procedure for the work and the rest apply at the moments they name. A worker naming none leaves the turn to choose one by the routines' descriptions, or to work from the project's doctrine, and to say on the trail what it chose.
 - `limits` bounds the worker: `attempts` raises that did work before a task is parked, `lease_seconds` how long a claim is held (by default the profile's timeout plus ten minutes), `hold_seconds_on_exhaustion` how long a task rests after a turn that never got to the work, and `idle_failure_seconds`, under which a failed turn that wrote nothing counts as one that never started.
 - `park_hint` is one sentence the project adds to the handback when a task is parked at the `attempts` ceiling, and only then: it is what a person about to read a task the work kept failing on should check first.
+- `hooks` names the project's own commands that run around a turn, described below.
 
 A string in the front matter may carry `${VAR}`, read from the environment and then from the project's `.env` and `.env.local`; a name nothing answers for is refused. Machine-local paths belong there rather than in a versioned file.
 
@@ -41,6 +42,26 @@ What a raise may write is fixed when it is claimed. Editing a worker file change
 The body is the role: what this worker is and how it carries the work, and what done means for it. It is the project's one instruction inside a fixed frame the project cannot edit. The frame already tells the turn which task it holds, that no person is present and nothing in the task is approval, how to write the trail, what the store will let it write, and how to stop - in `waiting`, with a person named. The body therefore says what only this project knows: what the work is, which judgement it needs, and where this role ends.
 
 The task and its trail reach the turn as quoted data, between markers drawn for that prompt alone. Instructions come only from the frame, the body and the routines it names; `tasks help` WORKERS states the frame's order.
+
+### Hooks
+
+A hook lets a project gate or follow a worker's work with a check of its own, without `tasks` knowing what the check is. A worker declares at most two, each one command line run from the project root without a shell, with the task as JSON on stdin and its id, key, type and assignee, the worker's name and the project root in the environment.
+
+`before` is asked about each task a claim would take, before anything is written. Exit 0 lets the claim go on. Exit 75 with a moment on its last stdout line defers the task: its pickup is set to that moment and the next task is asked about. Anything else skips the task this time, writing nothing. Use it for a condition the store cannot see - a shared resource that is busy, a window the work must wait for, a precondition another system answers - so a task that cannot start now never opens a raise, never spends an attempt and never starts a turn only to stop.
+
+`after` is told how a raise ended once it is settled, with the outcome and the status the task landed in. It decides nothing about the raise; use it to follow the work - notify, record, release what `before` checked.
+
+```markdown
+---
+takes: [change]
+profile: implementation
+hooks:
+  before: scripts/resource-free.py
+  after: scripts/notify.sh
+---
+```
+
+Here `scripts/resource-free.py` reads the task from stdin, exits 0 when the resource the work needs is free, and otherwise prints the moment to try again, `2026-01-05T09:00:00+00:00`, and exits 75. `tasks help` HOOKS states the whole contract: the environment, the timeouts and where every held-back task is reported.
 
 ## Shipped workers and project files
 
@@ -68,7 +89,7 @@ A worker that is off still owns the types it names: `default` never takes them, 
 
 Two judgements reach past `doctor` into `run`. A worker naming a missing profile or routine has nothing whole to give a turn, so `run` parks the task it takes, saying what is missing, without starting a turn and without spending an attempt. While any project worker file's types cannot be read at all, `default` takes nothing, because it cannot know which types are someone else's.
 
-When it passes, `doctor` lists each worker with its source, what it shadows, whether it is enabled, its description, what it takes, its `writes`, its profile, its routines and its limits. `tasks run <worker>` without `--apply` says which task a claim would take and writes nothing.
+When it passes, `doctor` lists each worker with its source, what it shadows, whether it is enabled, its description, what it takes, its `writes`, its profile, its routines, its limits and its hooks. `tasks run <worker>` without `--apply` says which task a claim would take and writes nothing; for a worker with a `before` hook it asks the hook, and names what the hook would hold back without setting any pickup.
 
 ## Changing a worker while the service runs
 
