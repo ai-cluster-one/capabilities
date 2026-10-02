@@ -96,6 +96,23 @@ MACHINE VERBS
   update [<name>]
         Re-fetch one capability (or all) from its recorded source; refresh
         snapshots; regenerate the skill.
+  update --check [<name>] [--json]
+        Report, for every installed capability or the one named, whether its
+        recorded source carries a different payload. Writes no registry entry,
+        snapshot or skill; the only thing it may bring forward is a registered
+        source's cache, the tree `search` reads. Payloads are compared by their
+        catalogue hash - the generated catalogue's payload_sha256, recomputed for
+        the installed copy - and versions are the newest heading of each change
+        log, null where none can be read. JSON {checked: [{name, source,
+        installed {catalog_sha256, version, source_commit?},
+        available {catalog_sha256, version} | null, update_available,
+        error? {code, message, hint?}}], update_available}; the top-level
+        update_available is true when any row's is. A source that cannot be
+        reached or read leaves that row's available null and update_available
+        false and names it in error; the other rows are still answered. Exit 0
+        when every row was answered, behind or current alike; 5 when any row
+        carries an error; 3 when the named capability is not installed. Output
+        is always JSON, so --json changes nothing.
   self-update [--from <checkout>]
         Refresh the manager itself and re-point its PATH symlink (install.sh is
         the first-install bootstrap). By default fetch the canonical source;
@@ -104,6 +121,20 @@ MACHINE VERBS
         release is verified and staged before one atomic symlink switch. No-op
         when already current. The manager is not a capability, so it has no
         registry entry or snapshots.
+  self-update --check [--from <checkout>] [--json]
+        Report whether the canonical source (or --from) carries a manager
+        release other than the one the PATH symlink selects. Reads only the
+        incoming release manifest; stages, writes and switches nothing. A
+        release is identified by its release id, the sha256 of its release
+        manifest, which is the name self-update gives its release directory;
+        the version is the newest heading of that release's manager change log,
+        null where none can be read. JSON {installed {release, manager_sha256,
+        version} | null, available {release, manager_sha256, version, source},
+        update_available}; installed is null when the PATH symlink selects no
+        versioned release, which self-update replaces. Exit 0 when the check
+        answered, behind or current alike; 5 when the source cannot be reached
+        or carries no valid release manifest. Output is always JSON, so --json
+        changes nothing.
   skill
         Place the carried global skill and relink every agent host present on
         this machine. The bootstrap and every install/uninstall/update already
@@ -120,7 +151,11 @@ MACHINE VERBS
         catalogue does not carry.
   search [QUERY] [--source ID]
         Search cached catalogues from the official and registered sources.
-        Listing never executes catalogue capability code.
+        Listing never executes catalogue capability code. JSON {matches [{name,
+        source, summary, installed}], unavailable_sources [{source, hint}]}.
+        Every row carries installed: true when a capability of that name is in
+        the machine registry, false when it is a catalogue capability not yet
+        installed here.
   changelog (<name> | --manager | --contract) [--all]
             [--from <path> | --source ID]
         Print the change log of a capability, of the manager, or of the
@@ -382,7 +417,7 @@ import time
 import zlib
 from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
-from typing import NoReturn
+from typing import Callable, NoReturn
 
 SOURCE = os.environ.get("CAPABILITIES_SOURCE") or \
     "https://raw.githubusercontent.com/ai-cluster-one/capabilities/main"
@@ -2027,16 +2062,27 @@ def _activate_payload(name: str, stage: Path) -> Path:
         return activate()
 
 
-def _payload_sha256(reg: Path) -> str:
+def _payload_sha256(reg: Path, script: str | None = None) -> str:
+    """Hash a payload tree.
+
+    With `script`, a top-level script of that name is hashed at bin/<script>,
+    where a source bundle carries it, so an installed copy answers with the
+    payload_sha256 the generated catalogue records for its source.
+    """
     h = hashlib.sha256()
     skip = {"meta.json", "stub", "manifest.json"}
     cache_dirs = {"__pycache__", ".pytest_cache", ".ruff_cache"}
-    for path in sorted(p for p in reg.rglob("*") if p.is_file()):
+    files = []
+    for path in (p for p in reg.rglob("*") if p.is_file()):
         if (path.name in skip or cache_dirs.intersection(path.parts)
                 or path.suffix in {".pyc", ".pyo", ".session"}
                 or path.name.endswith((".session-journal", ".session-wal", ".session-shm"))):
             continue
         rel = path.relative_to(reg).as_posix()
+        if script is not None and rel == script:
+            rel = f"bin/{script}"
+        files.append((reg / rel, rel, path))
+    for _order, rel, path in sorted(files):
         h.update(rel.encode("utf-8") + b"\0")
         h.update(path.read_bytes())
         h.update(b"\0")
@@ -2199,6 +2245,171 @@ def cmd_update(name: str | None) -> None:
         results.append({"name": n, "changed": before != after})
     _sync_skill()
     _emit({"updated": results})
+
+
+def _captured(fn, *args):
+    """Run one step that may `_die`, returning (value, None) or (None, error)."""
+    errors = io.StringIO()
+    try:
+        with redirect_stderr(errors):
+            return fn(*args), None
+    except SystemExit:
+        for line in reversed(errors.getvalue().splitlines()):
+            try:
+                return None, json.loads(line)["error"]
+            except (ValueError, KeyError, TypeError):
+                continue
+        return None, {"code": "check_failed", "message": "the check stopped without a reason"}
+
+
+def _changelog_version(text: str | None) -> str | None:
+    """The version a change log names: its newest entry's heading."""
+    entries = _changelog_entries(text) if text else []
+    return entries[0]["heading"] if entries else None
+
+
+def _changelog_version_at(path: Path) -> str | None:
+    try:
+        return _changelog_version(path.read_text()) if path.is_file() else None
+    except OSError:
+        return None
+
+
+def _changelog_version_from_url(url: str) -> str | None:
+    httpx = _httpx()
+    try:
+        resp = httpx.get(url, follow_redirects=True, timeout=30.0)
+    except httpx.HTTPError:
+        return None
+    return _changelog_version(resp.text) if resp.status_code == 200 else None
+
+
+def _fetch_json(url: str, label: str) -> dict:
+    httpx = _httpx()
+    try:
+        resp = httpx.get(url, follow_redirects=True, timeout=30.0)
+    except httpx.HTTPError as exc:
+        _die(5, "network_error", f"{label} fetch failed: {exc}", url)
+    if resp.status_code != 200:
+        _die(5, "server_error", f"{label} fetch returned {resp.status_code}", url)
+    try:
+        value = json.loads(resp.content)
+    except ValueError as exc:
+        _die(5, "server_error", f"{label} is not JSON: {exc}", url)
+    if not isinstance(value, dict):
+        _die(5, "server_error", f"{label} is not a JSON object", url)
+    return value
+
+
+def _catalogue_entry(catalog: object, name: str, where: str) -> dict:
+    entries = catalog.get("capabilities") if isinstance(catalog, dict) else None
+    if not isinstance(entries, dict):
+        _die(5, "catalog_missing", f"{where} carries no generated capability catalogue")
+    entry = entries.get(name)
+    if not isinstance(entry, dict) or not entry.get("payload_sha256"):
+        _die(3, "not_found", f"{where} carries no capability {name!r}")
+    return entry
+
+
+def _available_payload(name: str, meta: dict, refreshed: dict,
+                       catalogues: dict) -> tuple[str, str, Callable[[], str | None]]:
+    """Where `update` would fetch `name` from, and the payload it would find.
+
+    Returns (source, catalogue hash, version reader). A registered source is
+    brought forward exactly as `update` brings it forward, once per run; a
+    catalogue URL is answered from the catalogue it publishes, fetched once.
+    """
+    source_id = meta.get("source_id")
+    if source_id:
+        if source_id not in refreshed:
+            refreshed[source_id] = _captured(_refresh_source, source_id)
+        _state, error = refreshed[source_id]
+        if error is not None:
+            _die(5, error.get("code", "source_unavailable"), error.get("message", ""),
+                 error.get("hint"))
+        root = _source_root(source_id)
+        capdir = root / "capabilities" / name
+        entry = _catalogue_entry(_read_json(root / ".capability-source" / "catalog.json"),
+                                 name, f"source {source_id!r}")
+        return source_id, entry["payload_sha256"], \
+            lambda: _changelog_version_at(capdir / CHANGELOG_NAME)
+    recorded = meta.get("source") or f"{SOURCE}/capabilities/{name}/bin/{name}"
+    if not re.match(r"^https?://", recorded):
+        p = Path(recorded)
+        if p.is_dir():
+            return recorded, _payload_sha256(p, name), \
+                lambda: _changelog_version_at(p / CHANGELOG_NAME)
+        if p.is_file():
+            return recorded, _single_script_catalogue_sha256(name, p.read_bytes()), \
+                lambda: None
+        _die(3, "not_found", f"{name}'s recorded source no longer exists: {p}")
+    script_rel = f"/capabilities/{name}/bin/{name}"
+    if recorded.endswith(script_rel):
+        base = recorded[:-len(script_rel)]
+        if base not in catalogues:
+            catalogues[base] = _captured(
+                _fetch_json, f"{base}/.capability-source/catalog.json", "catalogue")
+        catalog, error = catalogues[base]
+        if error is not None:
+            _die(5, error.get("code", "network_error"), error.get("message", ""),
+                 error.get("hint"))
+        entry = _catalogue_entry(catalog, name, f"the catalogue at {base}")
+        return recorded, entry["payload_sha256"], lambda: _changelog_version_from_url(
+            f"{base}/capabilities/{name}/{CHANGELOG_NAME}")
+    httpx = _httpx()
+    try:
+        resp = httpx.get(recorded, follow_redirects=True, timeout=30.0)
+    except httpx.HTTPError as exc:
+        _die(5, "network_error", f"fetch failed: {exc}", recorded)
+    if resp.status_code != 200:
+        _die(5, "server_error", f"fetch returned {resp.status_code}", recorded)
+    return recorded, _single_script_catalogue_sha256(name, resp.content), lambda: None
+
+
+def _single_script_catalogue_sha256(name: str, content: bytes) -> str:
+    """The catalogue hash of a payload that is one script and nothing else."""
+    h = hashlib.sha256()
+    h.update(f"bin/{name}".encode("utf-8") + b"\0")
+    h.update(content)
+    h.update(b"\0")
+    return h.hexdigest()
+
+
+def cmd_update_check(name: str | None) -> None:
+    """Answer what `update` would change, changing nothing."""
+    if name:
+        _reject_reserved_capability_name(name)
+    targets = [name] if name else sorted(_installed())
+    if name and not _registry_dir(name).is_dir():
+        _die(3, "not_found", f"{name} is not installed")
+    refreshed: dict = {}
+    catalogues: dict = {}
+    rows = []
+    for n in targets:
+        reg = _registry_dir(n)
+        meta = _read_json(reg / "meta.json") or {}
+        installed = {"catalog_sha256": _payload_sha256(reg, n),
+                     "version": _changelog_version_at(reg / CHANGELOG_NAME)}
+        if meta.get("source_commit"):
+            installed["source_commit"] = meta["source_commit"]
+        row = {"name": n, "source": meta.get("source_id") or meta.get("source"),
+               "installed": installed, "available": None, "update_available": False}
+        found, error = _captured(_available_payload, n, meta, refreshed, catalogues)
+        if error is not None:
+            row["error"] = error
+        else:
+            source, available_sha, version_reader = found
+            behind = available_sha != installed["catalog_sha256"]
+            row["source"] = source
+            row["available"] = {
+                "catalog_sha256": available_sha,
+                "version": version_reader() if behind else installed["version"]}
+            row["update_available"] = behind
+        rows.append(row)
+    _emit({"checked": rows,
+           "update_available": any(row["update_available"] for row in rows)})
+    if any("error" in row for row in rows):
+        sys.exit(5)
 
 
 # ---------------------------------------------------------------- change logs
@@ -2698,6 +2909,65 @@ def cmd_self_update(from_ref: str | None = None) -> None:
         if checkout_result is not None:
             result["official_checkout"] = checkout_result
         _emit(result)
+
+
+def cmd_self_update_check(from_ref: str | None = None) -> None:
+    """Answer whether `self-update` would switch the manager, switching nothing.
+
+    A release is named by the sha256 of its normalised manifest, the name
+    `self-update` stages it under, so two releases are the same release exactly
+    when `self-update` would leave the PATH symlink where it is.
+    """
+    if from_ref:
+        source_root = Path(from_ref).expanduser().resolve()
+        root = source_root if source_root.is_dir() else source_root.parent.parent
+        source = f"local:{source_root}"
+        manifest_path = root / MANAGER_RELEASE_MANIFEST_REL
+        incoming = _read_json(manifest_path)
+        if incoming is None:
+            _die(5, "manager_release_missing",
+                 f"incoming manager release has no {MANAGER_RELEASE_MANIFEST_REL}",
+                 f"{source}: index the release with `capabilities source index official`")
+        manifest, _rel, _assets = _manager_release_parts(incoming, str(manifest_path))
+        read_version = lambda: _changelog_version_at(root / MANAGER_CHANGELOG_REL)
+    else:
+        source = f"{SOURCE.rstrip('/')}/{MANAGER_RELEASE_MANIFEST_REL}"
+        manifest, _rel, _assets = _manager_release_parts(
+            _fetch_json(source, "manager release manifest"), source)
+        read_version = lambda: _changelog_version_from_url(
+            f"{SOURCE.rstrip('/')}/{MANAGER_CHANGELOG_REL}")
+    available_release = hashlib.sha256(
+        _manager_release_manifest_bytes(manifest)).hexdigest()
+
+    installed = None
+    try:
+        executable = (_bin_dir() / "capabilities").resolve(strict=True)
+    except OSError:
+        executable = None
+    if executable is not None:
+        release = executable.parent.parent
+        current = _read_json(release / MANAGER_RELEASE_MANIFEST_REL)
+        if current is not None and not _validate_manager_release_manifest(current):
+            release_id = hashlib.sha256(
+                _manager_release_manifest_bytes(current)).hexdigest()
+            staged = CAP_HOME / ".manager" / "releases" / release_id
+            if executable == (staged / current["manager"]["path"]).resolve():
+                installed = {
+                    "release": release_id,
+                    "manager_sha256": _sha256(executable),
+                    "version": _changelog_version_at(release / MANAGER_CHANGELOG_REL),
+                }
+    behind = installed is None or installed["release"] != available_release
+    _emit({
+        "installed": installed,
+        "available": {
+            "release": available_release,
+            "manager_sha256": manifest["manager"]["sha256"],
+            "version": read_version() if behind else installed["version"],
+            "source": source,
+        },
+        "update_available": behind,
+    })
 
 
 def _capability_tier(name: str) -> str:
@@ -8944,9 +9214,15 @@ def main() -> None:
             _die(6, "input", "uninstall needs a capability name")
         cmd_uninstall(pos[0], flag("--purge-credentials"))
     elif cmd == "update":
-        cmd_update(pos[0] if pos else None)
+        if flag("--check"):
+            cmd_update_check(pos[0] if pos else None)
+        else:
+            cmd_update(pos[0] if pos else None)
     elif cmd == "self-update":
-        cmd_self_update(opt("--from"))
+        if flag("--check"):
+            cmd_self_update_check(opt("--from"))
+        else:
+            cmd_self_update(opt("--from"))
     elif cmd == "list":
         cmd_list()
     elif cmd == "inventory":
