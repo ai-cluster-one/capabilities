@@ -1,51 +1,33 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
+# dependencies = [
+#     "httpx>=0.27",
+# ]
 # ///
-"""calcomc — a credential harness around the official `calcom` CLI (@calcom/cli). It
-resolves a Cal.com API key for the selected connection, injects it, and forwards your
-command verbatim to `calcom`. calcomc owns auth, endpoint pinning, and the write gate;
-the command surface stays calcom's own.
+"""calcomc — Cal.com CLI over the Cal.com API v2: bookings, event types, slots,
+schedules and connected calendars, plus one escape hatch (`api`) for the rest
+of the API. Agent-invoked; every answer is JSON on stdout.
 
 USAGE
-  calcomc <command> [args...]     Forward to `calcom <command> [args...]`, authenticated
-                                  with the selected connection's API key.
-  calcomc connections             Where every connection's values resolve from
-                                  (tier, source, secrets masked). Local only.
-  calcomc doctor [--connection <id>]
-                                  Prove the key resolves and report the account —
-                                  every connection, or one.
+  calcomc <command> [options]     Run one verb against the selected connection.
   calcomc help                    Print this contract.
 
-Contract commands (the same on every capability; calcomc's own, never forwarded):
-  calcomc stub                                  One-line awareness text.
-  calcomc manifest --json                       Machine-readable declaration.
-  calcomc guide [<topic>]                       Guide topics / one guide body.
-  calcomc ids list|get <l>|set <l> <v>|rm <l>   The project identifiers envelope.
-           [--note <text>]
-  calcomc refs                                  Menu of the project's reference files.
-  calcomc inventory [--network]                 What this capability holds in
-                                                this project (--network adds
-                                                remote detail).
-
-Agent-invoked. Run `calcomc help` to reload this contract; run `calcom help` (the real
-CLI) for the full command surface — calcomc does NOT re-document or re-map it.
-
 MODEL
-  calcomc is not a wrapper around calcom's command surface — it never maps, renames, or
-  enumerates calcom commands. It is a thin auth shim: it puts one account's API key in
-  front of `calcom` and execs it. `calcomc bookings list --json` runs `calcom bookings
-  list --json` with CAL_API_KEY set; stdout, stderr, and the exit code are calcom's,
-  passed through untouched, so --json and colors behave exactly as in calcom itself.
-  Only `help`, `doctor`, `login`, `logout`, and the contract commands are calcomc's own;
-  every other word forwards (`calcomc help <cmd>` forwards too, so calcom's own help
-  stays reachable).
+  calcomc talks to the Cal.com API v2 itself (https://api.cal.com/v2, Bearer
+  key); nothing else needs to be installed. Each named verb is one API call,
+  and its answer is Cal.com's own response body, passed through unchanged:
+  {"status": "success", "data": …} and, on `bookings list`, a "pagination"
+  object as well. Field names are Cal.com's (camelCase), never re-mapped.
 
-  It REQUIRES a resolved key and never falls back to this machine's stored `calcom
-  login` session (~/.calcom/config.json) — that refusal is the point: which Cal.com
-  account a command reaches is decided by the selected connection, never by whoever last
-  logged in on this box. For the same reason calcomc always pins the API base in the
-  child environment, so a stored config can never redirect an authenticated call.
+  Every request carries the cal-api-version header its endpoint documents,
+  because Cal.com silently serves a request without one as an older version
+  (2024-04-15) instead of refusing it. `api` sends no version header unless
+  --api-version names one.
+
+  Which Cal.com account a command reaches is decided by the selected
+  connection alone: calcomc requires a resolved key and has no login of its
+  own and no ambient session to fall back to.
 
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one connection.
@@ -66,21 +48,20 @@ CONNECTIONS
                   secret never sits in the registry; the key's VALUE resolves through
                   the cascade below. A second account names its own var
                   (e.g. "CALCOMC_<ID>_API_KEY").
-    api_url       optional — the API base for a self-hosted Cal.com.
-                  Default https://api.cal.com.
-    app_url       optional — the web app base for a self-hosted Cal.com.
+    api_url       optional — the API base for a self-hosted Cal.com, without the
+                  /v2 suffix. Default https://api.cal.com.
     expect_email  optional — `doctor` asserts the key resolves to this account (email or
                   username) and exits 7 on mismatch. The safety net against pasting one
                   account's key under another's connection.
 
   Writability is a grant, not part of the identity: `allow_write` resolves per project
   from the grant, else calcomc's default, which is FALSE — a Cal.com write leaves the
-  system (a booking created, cancelled, or rescheduled emails real attendees; an invite
-  reaches a real person). Writing is granted deliberately, per connection.
+  system (a booking cancelled emails real attendees). Writing is granted deliberately,
+  per connection.
 
-  Selection: --connection <id> (accepted anywhere on the command line; consumed by
-  calcomc, never forwarded). Unflagged, the registry's "default" pointer applies, else
-  the sole entry; several entries without a pointer is refused as ambiguous.
+  Selection: --connection <id> (accepted anywhere on the command line). Unflagged, the
+  registry's "default" pointer applies, else the sole entry; several entries without a
+  pointer is refused as ambiguous.
 
   Secret resolution (first non-empty wins), for the var named by secret_env:
     1. project env   .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
@@ -89,99 +70,139 @@ CONNECTIONS
   There is deliberately no key flag — a secret must not touch argv. A Cal.com API key is
   personal-account-scoped, so its home is the user config; install scaffolds it there.
 
-THE WRITE GATE OVER A FORWARDED SURFACE
-  calcom's surface is `<group> <action> [args]`, sometimes nested
-  (`teams members add`, `org-roles permissions set`). calcomc classifies a forwarded
-  command by its ACTION — the last word of the command path drawn from calcom's known
-  action vocabulary — and refuses on a read-only connection:
+COMMANDS
+  Readiness
+    doctor [--connection <id>]
+        Per connection (every configured one bare; one with --connection): resolve its
+        key and call GET /v2/me. Emits {ok, connections: {<id>: {account: {id, email,
+        username, timeZone}, api_url}}}. Exit 0 all healthy / 2 key missing or
+        rejected / 5 unreachable / 7 key resolved to an account other than the
+        expected one.
+    connections
+        The resolution report — every connection, every value, its winning tier and
+        source, secrets masked. Local only: no network, no key use.
 
-    read     list, list-all, get, get-default, show, available, busy-times, check,
-             attendees, attendee, references, recordings, transcripts, by-seat,
-             calendar-links, video-sessions, all-event-types, user, user-options,
-             assigned, assigned-by-slug, client, redirect, connect-url, agenda,
-             timezones, me, bookings, ooo, schedules
-    write    everything else — including a command whose action calcomc does not
-             recognize, which is refused rather than waved through.
+  Bookings
+    bookings list [--status S] [--after-start ISO] [--before-end ISO]
+                  [--attendee-email ADDR] [--attendee-name NAME]
+                  [--event-type-id ID] [--sort-start asc|desc]
+                  [--limit N] [--skip N] [--json]
+        Bookings of the account; --sort-start orders them by start time.
+        --status: upcoming | recurring | past | cancelled | unconfirmed, or several
+        comma-separated (upcoming,unconfirmed). --after-start / --before-end bound
+        the start and end time, ISO 8601 (2026-10-01 or 2026-10-01T09:00:00Z).
+        --limit is the page size (Cal.com's default 100), --skip the offset. The
+        answer carries Cal.com's "pagination" object (totalItems, remainingItems,
+        hasNextPage, …): read it, a full page is not the whole set.
+    bookings get <uid> [--json]
+        One booking by its uid. A recurring booking's own uid answers every
+        occurrence as an array.
+    bookings cancel <uid> [--reason TEXT] [--json]
+        WRITE. Cancel one booking; Cal.com notifies its attendees. A cancelled
+        booking stays cancelled, so repeating the call cancels nothing twice.
 
-  The gate is applied at dispatch — after connection selection, before the key resolves
-  or `calcom` is execed — so a write on a read-only connection exits 4 regardless of
-  whether the key is present or calcom is installed. No flag and no env var lifts it:
-  granting is `allow_write: true` on that connection. Ask the user; never lift it
-  yourself.
+  Scheduling
+    event-types list [--json]
+        The account's own event types, hidden ones included.
+    event-types get <id> [--json]
+        One event type by its numeric id.
+    slots available --event-type-id ID --start ISO --end ISO
+                    [--timezone TZ] [--duration MIN] [--json]
+        Bookable slots for an event type between --start and --end (ISO 8601; a
+        bare date means the start or end of that day). --timezone is an IANA name
+        (America/New_York), default UTC. data maps each date to its slots; an empty
+        object means nothing is free in the range.
+    schedules list [--json]
+        Availability schedules: name, timeZone, availability, overrides, isDefault.
+    schedules get <id> [--json]
+        One schedule by its numeric id.
+    calendars list [--json]
+        Connected calendars, each with the credentialId and the calendars' externalId
+        values that `calendars busy-times` takes, plus the destination calendar.
+    calendars busy-times --date-from YYYY-MM-DD --date-to YYYY-MM-DD --timezone TZ
+                         --credential-id ID --external-id ID [--json]
+        Busy blocks in one connected calendar, each with its start and end. Take
+        the two ids from `calendars list`.
 
-COMMANDS calcomc owns
-  connections
-      The resolution report — every connection, every value, its winning tier and
-      source, secrets masked. Local only: no network, no key use.
+  Escape hatch
+    api <METHOD> <path> [--query KEY=VALUE ...] [--body JSON|-] [--api-version V]
+        Any Cal.com API v2 call the named verbs do not cover. <path> is relative to
+        /v2 (`/me`, `/event-types/123`; a leading /v2 is accepted too). --query
+        repeats; --body is a JSON object literal or `-` for stdin, sent only on a
+        method that is not GET. --api-version sets the cal-api-version header —
+        look up the value the endpoint documents
+        (https://cal.com/docs/api-reference/v2); without it Cal.com serves the
+        oldest version. METHOD is GET, POST, PUT, PATCH or DELETE. GET is a read;
+        every other method is a WRITE and is refused on a read-only connection.
+        A write is never retried after a timeout or a 5xx: the outcome is reported
+        as unknown (exit 5, outcome_unknown) and is checked with a read.
 
-  doctor [--connection <id>]
-      Per connection (every configured one bare; one with --connection): resolve its key
-      and run `calcom me show --json` with it injected. Emits
-      {ok, connections: {<id>: {account: {id, email, username, timeZone}, api_url}}}.
-      Exit 0 all healthy / 2 key missing or rejected / 5 calcom not installed or
-      unreachable / 7 key resolved to an account other than the expected one.
+  Every verb accepts --json for compatibility with earlier calls; output is JSON
+  with or without it.
 
-  help
-      Print this document. (`calcom help` is the real CLI's surface, a separate thing;
-      calcomc reserves a bare `help` for itself but forwards `help <cmd>`.)
+Contract commands (the same on every capability):
+  calcomc stub                                  One-line awareness text.
+  calcomc manifest --json                       Machine-readable declaration.
+  calcomc guide [<topic>]                       Guide topics / one guide body.
+  calcomc ids list|get <l>|set <l> <v>|rm <l>   The project identifiers envelope.
+           [--note <text>]
+  calcomc refs                                  Menu of the project's reference files.
+  calcomc inventory [--network]                 What this capability holds in
+                                                this project (--network adds
+                                                remote detail).
 
-  login / logout
-      Refused (exit 6). They write this machine's stored calcom session, which calcomc
-      deliberately never reads. Credentials are declared as connections and resolved by
-      the cascade above.
+THE WRITE GATE
+  Writes are `bookings cancel` and `api` with any method but GET. On a connection
+  that does not allow writes they exit 4 before the key resolves or any request is
+  made. No flag and no env var lifts it: granting is `allow_write: true` on that
+  connection. Ask the user; never lift it yourself.
 
-EVERYTHING ELSE — forwarded verbatim to `calcom`, key injected, I/O transparent.
-  Run `calcom <group> --help` for each; calcomc adds nothing to them. Common reaches:
-    agenda [--take N] [--json]           upcoming bookings
-    bookings list [filters] [--json]     bookings by status, attendee, event type, range
-    bookings get <uid> [--json]          one booking
-    slots available [options] [--json]   bookable slots for an event type
-    event-types list [--json]            event types
-    schedules list [--json]              availability schedules
-    calendars busy-times [options]       busy blocks from connected calendars
-    bookings create|cancel|reschedule    write verbs — a read-only connection exits 4
-    api-key-refresh                      rotates the key: the OLD key stops working and
-                                         the new one is printed, never written back
-                                         (a credential file is human-written only), so
-                                         the connection is broken until a human stores it
+QUIRKS WORTH KNOWING
+  Cal.com limits an API key to 120 requests a minute; calcomc backs off and retries
+  a 429 on its own and exits 5 rate_limited when retries run out.
+  Creating, rescheduling and editing (bookings, profile, schedules, event types,
+  selected calendars) have no named verb: use `api` with the endpoint's documented
+  method, path and cal-api-version.
 
-EXIT CODES (calcomc's own layer)
-  0 success · 2 auth (key missing or rejected) · 4 policy refusal — the project gate
-  (capabilities/settings.json) on any verb, or a write action on a read-only connection;
-  ask the user, never lift a gate yourself · 5 environment (calcom not on PATH, or
-  unreachable) · 6 input (bad use of a calcomc-owned command, an unknown or ambiguous
-  connection, or a refused `login`/`logout`) · 7 wrong account (doctor: the key resolves
-  to an account other than the expected one).
-  Forwarded commands return CALCOM's own exit code, not these — calcomc is transparent
-  for everything it forwards (after the gate).
+EXIT CODES
+  0 success · 2 auth (key missing or rejected) · 3 not found (404) · 4 policy refusal
+  — the project gate (capabilities/settings.json) on any verb, or a write on a
+  read-only connection; ask the user, never lift a gate yourself · 5 server/network
+  (timeout, 5xx, 429 after retries, a write whose outcome is unknown) · 6 input (bad
+  arguments, an unknown or ambiguous connection, a request Cal.com refused as
+  invalid) · 7 wrong account (doctor: the key resolves to an account other than the
+  expected one).
 
 EXAMPLES
   calcomc doctor
-  calcomc agenda --json
   calcomc bookings list --status upcoming --json
-  calcomc slots available --event-type-id <ID> --start <ISO> --end <ISO> --json
-  calcomc --connection <id> event-types list --json
+  calcomc bookings list --status past --after-start 2026-09-01 --limit 20
+  calcomc slots available --event-type-id <ID> --start <ISO> --end <ISO> --timezone <TZ>
+  calcomc --connection <id> event-types list
   calcomc bookings cancel <BOOKING_UID> --reason "<text>"
-  CAL_API_KEY=… calcomc me show --json     # one-shot, key supplied through process env
+  calcomc api GET /bookings/<BOOKING_UID>/recordings --api-version 2024-08-13
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
-import shutil
-import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import NoReturn
+
+import httpx
 
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "calcomc"
-SUMMARY = ("Credential harness around the official `calcom` CLI — resolves a "
-           "Cal.com API key per connection, injects it, and forwards your "
-           "command straight to `calcom` (everything but calcomc's own verbs "
-           "passes through untouched); the command surface is `calcom help`.")
+SUMMARY = ("Cal.com CLI over the Cal.com API v2 — list, read and cancel "
+           "bookings, read event types, available slots, schedules, connected "
+           "calendars and their busy times, and reach any other endpoint "
+           "through `api`; writes are refused unless the connection grants "
+           "them, and `doctor` proves the key and the account it resolves to.")
 SCOPE = "user"      # credential scope: a Cal.com API key belongs to one account
 CRED_KEYS = [
     {"key": "CAL_API_KEY", "secret": True, "required": True,
@@ -191,49 +212,30 @@ CRED_KEYS = [
      "note": "API base for a self-hosted Cal.com; a connection's api_url wins"},
 ]
 
-# calcom's surface is `<group> <action> [args]`, sometimes nested. What mutates is
-# the ACTION, so the gate classifies on the action rather than the first word —
-# see deviations.md. An action calcomc does not know is a write.
-READ_ACTIONS = {
-    "agenda", "timezones",
-    "list", "list-all", "get", "get-default", "show",
-    "available", "busy-times", "check",
-    "attendees", "attendee", "references", "recordings", "transcripts",
-    "by-seat", "calendar-links", "video-sessions", "all-event-types",
-    "user", "user-options", "assigned", "assigned-by-slug",
-    "client", "redirect", "connect-url",
-    # leaf actions that share a name with a group: `teams me`, `teams bookings`,
-    # `org-overview ooo`, `org-overview schedules`
-    "me", "bookings", "ooo", "schedules",
-}
-WRITE_ACTIONS = {
-    "create", "update", "delete", "delete-all",
-    "cancel", "reschedule", "confirm", "decline",
-    "reassign", "reassign-to-user", "mark-no-show",
-    "add-attendee", "add-guests", "update-location",
-    "invite", "add", "remove", "set", "set-default",
-    "connect", "disconnect", "save", "sync-credentials",
-    "reserve", "assign", "unassign", "token", "slots",
-    "api-key-refresh",
-}
-WRITE_VERBS = WRITE_ACTIONS     # the contract's constant; the gate reads the action
+# `api` is gated by its HTTP method: GET reads, every other method writes.
+API_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+WRITE_VERBS = {"bookings cancel"} | {f"api {m}" for m in API_METHODS if m != "GET"}
 WRITE_DEFAULT = False   # a Cal.com write leaves the system — it reaches real attendees
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 STATE = False       # calcomc mints nothing; the key is the whole credential
 INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
-POST_INSTALL: list = [
-    {"cmd": "npm install -g @calcom/cli",
-     "note": "install the official `calcom` CLI calcomc forwards to"},
-]
+POST_INSTALL: list = []
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
-# calcom's own auth ceremony, which calcomc replaces rather than forwards.
-REFUSED_VERBS = {"login", "logout"}
 DEFAULT_API_URL = "https://api.cal.com"
-DOCTOR_TIMEOUT = 60.0
+TIMEOUT = httpx.Timeout(60.0)
+MAX_RETRIES = 3
+
+# The cal-api-version each endpoint family documents. Without it Cal.com
+# serves the request as 2024-04-15 rather than refusing it; /me and
+# /calendars accept every version and take none.
+V_BOOKINGS = "2024-08-13"
+V_EVENT_TYPES = "2024-06-14"
+V_SLOTS = "2024-09-04"
+V_SCHEDULES = "2024-06-11"
 
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
@@ -3544,8 +3546,7 @@ def _connections_report() -> dict:
             keys.append(_key_report(secret_env, True, True, value, tier, source))
         else:
             keys.append(_key_report("secret_env", False, True, None, None, None))
-        for field, required in (("api_url", False), ("app_url", False),
-                                ("expect_email", False)):
+        for field, required in (("api_url", False), ("expect_email", False)):
             value = entry.get(field)
             keys.append(_key_report(field, False, required,
                                     str(value) if value is not None else None,
@@ -3579,98 +3580,152 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
             "hint": f"set {secret_env} in {CREDENTIALS_ENV}, the project's "
                     f".env / .env.local, or the environment; mint the key in "
                     f"Cal.com → Settings → Developer → API keys"}
+    api_url = (entry.get("api_url") or DEFAULT_API_URL).rstrip("/")
+    if api_url.endswith("/v2"):
+        api_url = api_url[:-3]
     return {"id": cid, "key": key,
             "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
-            "api_url": entry.get("api_url") or DEFAULT_API_URL,
-            "app_url": entry.get("app_url"),
+            "api_url": api_url,
             "expect": entry.get("expect_email")}, None
 
 
-# ── calcom invocation ───────────────────────────────────────────────────────
+# ── HTTP with 429/5xx backoff ───────────────────────────────────────────────
 
-def _child_env(cfg: dict) -> dict:
-    """The connection's identity, imposed on the child. CAL_API_KEY outranks the
-    machine's stored calcom session, and pinning CAL_API_URL keeps a stored
-    config from redirecting an authenticated call to another endpoint."""
-    env = dict(os.environ)
-    env["CAL_API_KEY"] = cfg["key"]
-    env["CAL_API_URL"] = cfg["api_url"]
-    if cfg.get("app_url"):
-        env["CAL_APP_URL"] = cfg["app_url"]
-    return env
+def _client(cfg: dict) -> httpx.Client:
+    return httpx.Client(base_url=f"{cfg['api_url']}/v2", timeout=TIMEOUT,
+                        headers={"Authorization": f"Bearer {cfg['key']}",
+                                 "Accept": "application/json"})
 
 
-def _command_path(argv: list[str]) -> list[str]:
-    """The leading run of non-option words — calcom's command path plus its
-    positional arguments. Option VALUES are deliberately excluded: free text
-    passed to `--title` or `--reason` must never be read as an action."""
-    path: list[str] = []
-    for token in argv:
-        if token.startswith("-"):
-            break
-        path.append(token)
-    return path
+def _error_message(resp: httpx.Response) -> str:
+    """Cal.com's own words for a refusal: {status, error: {code, message,
+    details}} on the HTTP path, a bare message elsewhere."""
+    text = (resp.text or "").strip()
+    try:
+        body = resp.json()
+    except ValueError:
+        return text[:400] or f"Cal.com returned {resp.status_code}"
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict) and err.get("message"):
+        msg = str(err["message"])
+        details = json.dumps(err.get("details") or "", ensure_ascii=False)
+        if err.get("details") and msg not in details:
+            msg += f" — {details[:300]}"
+        return msg
+    if isinstance(body, dict) and body.get("message"):
+        return str(body["message"])
+    return text[:400] or f"Cal.com returned {resp.status_code}"
 
 
-def _action(argv: list[str]) -> str | None:
-    """The action a forwarded command performs: the last word of its command
-    path drawn from calcom's known action vocabulary. None when the command
-    names no action calcomc recognizes."""
-    found = None
-    for token in _command_path(argv):
-        if token in READ_ACTIONS or token in WRITE_ACTIONS:
-            found = token
-    return found
+def _request(client: httpx.Client, method: str, path: str, *,
+             params=None, body=None, version: str | None = None,
+             idempotent: bool = True):
+    """One API call under the retry loop. A non-idempotent write is never
+    retried once it may have reached Cal.com: a timeout, a dropped connection
+    or a 5xx is reported as an unknown outcome rather than repeated, because
+    a repeat could act twice. A 429 is a refusal before any effect, so it is
+    retried for every method."""
+    headers = {"cal-api-version": version} if version else None
+    kwargs: dict = {"params": params, "headers": headers}
+    if body is not None:
+        kwargs["json"] = body
+    unknown_hint = ("do not retry automatically; check the result with a "
+                    "read before deciding whether to repeat it")
+    last_status: int | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = client.request(method, path, **kwargs)
+        except httpx.TimeoutException:
+            if not idempotent:
+                _die(5, "outcome_unknown",
+                     f"{method} {path} timed out after it was sent; whether "
+                     f"Cal.com applied it is unknown", unknown_hint)
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "timeout", f"request timed out: {method} {path}",
+                 "Cal.com was unresponsive")
+        except httpx.ConnectError as e:
+            _die(5, "network_error", f"network error: {e}",
+                 "check connectivity to the connection's api_url")
+        except httpx.RequestError as e:
+            if not idempotent:
+                _die(5, "outcome_unknown",
+                     f"{method} {path} failed in transit ({e}); whether "
+                     f"Cal.com applied it is unknown", unknown_hint)
+            _die(5, "network_error", f"network error: {e}",
+                 "check connectivity to the connection's api_url")
+
+        last_status = resp.status_code
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", str(attempt * 1.5)))
+            if attempt < MAX_RETRIES:
+                time.sleep(retry_after)
+                continue
+            _die(5, "rate_limited",
+                 "rate-limited by Cal.com (120 requests a minute per key)",
+                 status=429)
+        if resp.status_code >= 500:
+            if not idempotent:
+                _die(5, "outcome_unknown",
+                     f"Cal.com answered {resp.status_code} to {method} {path}; "
+                     f"whether it applied the change is unknown",
+                     unknown_hint, status=resp.status_code)
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            _die(5, "server_error", f"Cal.com returned {resp.status_code}",
+                 _error_message(resp)[:300], status=resp.status_code)
+
+        if resp.status_code >= 400:
+            msg = _error_message(resp)
+            if resp.status_code in (401, 403):
+                _die(2, "unauthorized", msg,
+                     "the key is invalid, revoked, minted on another Cal.com "
+                     "instance, or not allowed this resource",
+                     status=resp.status_code)
+            if resp.status_code == 404:
+                _die(3, "not_found", msg, status=resp.status_code)
+            _die(6, "invalid_request", msg, status=resp.status_code)
+
+        if not resp.content:
+            return {}
+        try:
+            return resp.json()
+        except ValueError:
+            return resp.text
+
+    _die(5, "exhausted_retries",
+         f"exhausted {MAX_RETRIES} attempts on {method} {path}", status=last_status)
 
 
-def _action_gate(cid: str, allow_write: bool, argv: list[str]) -> None:
-    """Refuse a mutating action on a read-only connection. Applied at dispatch,
-    before the key resolves or calcom is execed; nothing in the cascade lifts
-    it. An unrecognized action is a write."""
-    if allow_write:
-        return
-    action = _action(argv)
-    if action in READ_ACTIONS:
-        return
-    named = f"`{' '.join(_command_path(argv))}`".strip()
-    reason = (f"{named} mutates the Cal.com account" if action else
-              f"{named} names no action calcomc recognizes as a read")
-    _read_only_gate(named)
-    _die(4, "read_only",
-         f"connection {cid!r} does not allow writes; {reason}",
-         "Do not lift the gate yourself — ask the user; granting is "
-         "`allow_write: true` on this connection in connections.json.")
-
+# ── doctor ──────────────────────────────────────────────────────────────────
 
 def _check_connection(cfg: dict) -> dict:
-    """One connection's round-trip (`calcom me show --json` under its key),
-    reported rather than died — doctor covers every connection, so a broken one
-    becomes a finding, not a stop."""
+    """One connection's round-trip (GET /v2/me under its key), reported rather
+    than died — doctor covers every connection, so a broken one becomes a
+    finding, not a stop."""
     try:
-        proc = subprocess.run(["calcom", "me", "show", "--json"],
-                              env=_child_env(cfg), capture_output=True,
-                              text=True, timeout=DOCTOR_TIMEOUT)
-    except subprocess.TimeoutExpired:
+        with _client(cfg) as c:
+            resp = c.get("/me")
+    except httpx.TimeoutException:
         return {"ok": False, "category": 5,
-                "error": "calcom was unresponsive (`me show` timed out)"}
-    except OSError as e:
-        return {"ok": False, "category": 5, "error": f"could not run calcom: {e}"}
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        low = err.lower()
-        if any(s in low for s in ("api key", "unauthor", "forbidden", "401",
-                                  "403", "no credentials", "token")):
-            return {"ok": False, "category": 2,
-                    "error": err or "calcom rejected the API key",
-                    "hint": "the key is invalid, revoked, or minted on another "
-                            "Cal.com instance"}
-        return {"ok": False, "category": 5,
-                "error": err or "`calcom me show` failed"}
+                "error": f"{cfg['api_url']} was unresponsive (GET /v2/me timed out)"}
+    except httpx.RequestError as e:
+        return {"ok": False, "category": 5, "error": f"network error: {e}"}
+    if resp.status_code in (401, 403):
+        return {"ok": False, "category": 2, "error": _error_message(resp),
+                "status": resp.status_code,
+                "hint": "the key is invalid, revoked, or minted on another "
+                        "Cal.com instance"}
+    if resp.status_code != 200:
+        return {"ok": False, "category": 5, "error": _error_message(resp),
+                "status": resp.status_code}
     try:
-        profile = json.loads(proc.stdout)
+        profile = resp.json()
     except ValueError:
-        return {"ok": True, "note": "`me show --json` returned non-JSON",
-                "raw": proc.stdout[:500]}
+        return {"ok": False, "category": 5,
+                "error": "GET /v2/me returned non-JSON", "raw": resp.text[:500]}
     if isinstance(profile, dict) and isinstance(profile.get("data"), dict):
         profile = profile["data"]
     account = {field: profile.get(field) for field in
@@ -3715,14 +3770,193 @@ def cmd_doctor(reg: dict, wanted: str | None) -> None:
         sys.exit(fail_exit)
 
 
-def _forward(argv: list[str], cfg: dict) -> NoReturn:
-    # Inherit stdio so prompts, --json, and colors pass straight through;
-    # calcom's own exit code is the result.
+# ── the verb surface ────────────────────────────────────────────────────────
+
+BOOKING_STATUSES = ("upcoming", "recurring", "past", "cancelled", "unconfirmed")
+
+
+class _Parser(argparse.ArgumentParser):
+    """Usage errors leave through the envelope at exit 6, not argparse's 2,
+    which this taxonomy reserves for auth."""
+
+    def error(self, message: str) -> NoReturn:
+        _die(6, "invalid_arguments", f"{self.prog}: {message}",
+             f"run `{NAME} help` for the verb's arguments")
+
+
+def _positive_int(value: str) -> int:
     try:
-        proc = subprocess.run(["calcom", *argv], env=_child_env(cfg))
-    except OSError as e:
-        _die(5, "calcom_exec_failed", f"could not run calcom: {e}")
-    sys.exit(proc.returncode)
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a whole number")
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"{value!r} is negative")
+    return n
+
+
+def _statuses(value: str) -> str:
+    wanted = [s.strip() for s in value.split(",") if s.strip()]
+    bad = [s for s in wanted if s not in BOOKING_STATUSES]
+    if not wanted or bad:
+        raise argparse.ArgumentTypeError(
+            f"{value!r}: each status is one of {', '.join(BOOKING_STATUSES)}")
+    return ",".join(wanted)
+
+
+def _sort(value: str) -> str:
+    if value not in ("asc", "desc"):
+        raise argparse.ArgumentTypeError(f"{value!r} is not asc or desc")
+    return value
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    def leaf(sub, name: str) -> argparse.ArgumentParser:
+        sp = sub.add_parser(name, allow_abbrev=False)
+        sp.add_argument("--json", action="store_true")
+        return sp
+
+    p = _Parser(prog=NAME, allow_abbrev=False, add_help=False)
+    groups = p.add_subparsers(dest="group", required=True,
+                              parser_class=_Parser)
+
+    g = groups.add_parser("bookings", allow_abbrev=False)
+    sub = g.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    sp = leaf(sub, "list")
+    sp.add_argument("--status", type=_statuses)
+    sp.add_argument("--after-start", dest="after_start")
+    sp.add_argument("--before-end", dest="before_end")
+    sp.add_argument("--attendee-email", dest="attendee_email")
+    sp.add_argument("--attendee-name", dest="attendee_name")
+    sp.add_argument("--event-type-id", dest="event_type_id", type=_positive_int)
+    sp.add_argument("--sort-start", dest="sort_start", type=_sort)
+    sp.add_argument("--limit", type=_positive_int)
+    sp.add_argument("--skip", type=_positive_int)
+    leaf(sub, "get").add_argument("uid")
+    sp = leaf(sub, "cancel")
+    sp.add_argument("uid")
+    sp.add_argument("--reason")
+
+    g = groups.add_parser("event-types", allow_abbrev=False)
+    sub = g.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    leaf(sub, "list")
+    leaf(sub, "get").add_argument("id", type=_positive_int)
+
+    g = groups.add_parser("slots", allow_abbrev=False)
+    sub = g.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    sp = leaf(sub, "available")
+    sp.add_argument("--event-type-id", dest="event_type_id", type=_positive_int,
+                    required=True)
+    sp.add_argument("--start", required=True)
+    sp.add_argument("--end", required=True)
+    sp.add_argument("--timezone")
+    sp.add_argument("--duration", type=_positive_int)
+
+    g = groups.add_parser("schedules", allow_abbrev=False)
+    sub = g.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    leaf(sub, "list")
+    leaf(sub, "get").add_argument("id", type=_positive_int)
+
+    g = groups.add_parser("calendars", allow_abbrev=False)
+    sub = g.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    leaf(sub, "list")
+    sp = leaf(sub, "busy-times")
+    sp.add_argument("--date-from", dest="date_from", required=True)
+    sp.add_argument("--date-to", dest="date_to", required=True)
+    sp.add_argument("--timezone", required=True)
+    sp.add_argument("--credential-id", dest="credential_id", required=True)
+    sp.add_argument("--external-id", dest="external_id", required=True)
+
+    sp = groups.add_parser("api", allow_abbrev=False)
+    sp.add_argument("method", type=str.upper, choices=API_METHODS)
+    sp.add_argument("path")
+    sp.add_argument("--query", action="append", default=[])
+    sp.add_argument("--body")
+    sp.add_argument("--api-version", dest="api_version")
+    return p
+
+
+def _verb(args) -> str:
+    """The verb the write gate reads: `<group> <action>`, and `api <METHOD>`
+    for the escape hatch, whose method decides read or write."""
+    if args.group == "api":
+        return f"api {args.method}"
+    return f"{args.group} {args.action}"
+
+
+def _api_request(args) -> tuple[str, list, object]:
+    """Validate the escape hatch's input before any credential resolves."""
+    path = args.path if args.path.startswith("/") else f"/{args.path}"
+    if path == "/v2" or path.startswith("/v2/"):
+        path = path[3:] or "/"
+    params: list = []
+    for item in args.query:
+        if "=" not in item:
+            _die(6, "invalid_arguments",
+                 f"--query {item!r} is not KEY=VALUE",
+                 "e.g. --query take=10 --query 'status=upcoming'")
+        k, v = item.split("=", 1)
+        params.append((k, v))
+    body = None
+    if args.body is not None:
+        if args.method == "GET":
+            _die(6, "invalid_arguments", "--body is not sent on GET",
+                 "pass the values as --query KEY=VALUE, or use the method the "
+                 "endpoint documents")
+        raw = sys.stdin.read() if args.body == "-" else args.body
+        try:
+            body = json.loads(raw)
+        except ValueError as e:
+            _die(6, "invalid_body", f"--body is not valid JSON: {e}")
+    return path, params, body
+
+
+def _dispatch(c: httpx.Client, args, api: tuple | None):
+    g, a = args.group, getattr(args, "action", None)
+    if g == "bookings" and a == "list":
+        params = {"status": args.status, "afterStart": args.after_start,
+                  "beforeEnd": args.before_end,
+                  "attendeeEmail": args.attendee_email,
+                  "attendeeName": args.attendee_name,
+                  "eventTypeId": args.event_type_id,
+                  "sortStart": args.sort_start,
+                  "take": args.limit, "skip": args.skip}
+        return _request(c, "GET", "/bookings", version=V_BOOKINGS,
+                        params={k: v for k, v in params.items() if v is not None})
+    if g == "bookings" and a == "get":
+        return _request(c, "GET", f"/bookings/{args.uid}", version=V_BOOKINGS)
+    if g == "bookings" and a == "cancel":
+        body = {"cancellationReason": args.reason} if args.reason else {}
+        # cancelling is terminal, so a retried cancel cannot act twice
+        return _request(c, "POST", f"/bookings/{args.uid}/cancel",
+                        version=V_BOOKINGS, body=body)
+    if g == "event-types" and a == "list":
+        return _request(c, "GET", "/event-types", version=V_EVENT_TYPES)
+    if g == "event-types" and a == "get":
+        return _request(c, "GET", f"/event-types/{args.id}", version=V_EVENT_TYPES)
+    if g == "slots" and a == "available":
+        params = {"eventTypeId": args.event_type_id, "start": args.start,
+                  "end": args.end, "timeZone": args.timezone,
+                  "duration": args.duration}
+        return _request(c, "GET", "/slots", version=V_SLOTS,
+                        params={k: v for k, v in params.items() if v is not None})
+    if g == "schedules" and a == "list":
+        return _request(c, "GET", "/schedules", version=V_SCHEDULES)
+    if g == "schedules" and a == "get":
+        return _request(c, "GET", f"/schedules/{args.id}", version=V_SCHEDULES)
+    if g == "calendars" and a == "list":
+        return _request(c, "GET", "/calendars")
+    if g == "calendars" and a == "busy-times":
+        params = {"timeZone": args.timezone, "dateFrom": args.date_from,
+                  "dateTo": args.date_to,
+                  "calendarsToLoad[0][credentialId]": args.credential_id,
+                  "calendarsToLoad[0][externalId]": args.external_id}
+        return _request(c, "GET", "/calendars/busy-times", params=params)
+    if g == "api":
+        path, params, body = api
+        return _request(c, args.method, path, params=params or None, body=body,
+                        version=args.api_version,
+                        idempotent=args.method == "GET")
+    _die(6, "unknown_command", f"no handler for {g!r} {a!r}")
 
 
 # ── dispatch ────────────────────────────────────────────────────────────────
@@ -3730,8 +3964,8 @@ def _forward(argv: list[str], cfg: dict) -> NoReturn:
 def main() -> None:
     _gate()                      # every verb passes the effective policy gate first
 
-    # `--connection <id>` is calcomc's own selector, accepted anywhere on the
-    # line, consumed here and never forwarded to `calcom`.
+    # `--connection <id>` is a global selector accepted anywhere on the line,
+    # extracted before argparse so it works after the subcommand too.
     argv = sys.argv[1:]
     wanted_conn: str | None = None
     cleaned: list[str] = []
@@ -3744,44 +3978,35 @@ def main() -> None:
             wanted_conn = a.split("=", 1)[1]; i += 1; continue
         cleaned.append(a); i += 1
 
-    _contract(cleaned)           # contract verbs; everything else forwards
-    if not cleaned or (len(cleaned) == 1 and cleaned[0] in ("help", "-h", "--help")):
-        sys.stdout.write((__doc__ or "").lstrip("\n"))
+    _contract(cleaned)           # contract verbs; domain verbs fall through
+    if not cleaned or cleaned[0] in ("help", "-h", "--help"):
+        _cmd_help()
         return
-
-    verb = cleaned[0]
-    if verb in REFUSED_VERBS:
-        _die(6, "auth_is_calcomcs",
-             f"`{verb}` is calcomc's to own, not calcom's to be asked",
-             "calcomc resolves a key per connection and never reads this "
-             "machine's stored calcom session; declare the account in "
-             "connections.json and run `calcomc doctor`")
 
     reg, _ = _connections_registry()
-    if verb == "doctor":
-        cmd_doctor(reg, wanted_conn)     # calcom-absence is reported per connection
+    if cleaned[0] == "doctor":
+        if len(cleaned) > 1:
+            _die(6, "invalid_arguments",
+                 f"doctor takes only --connection <id>, not {cleaned[1]!r}")
+        cmd_doctor(reg, wanted_conn)
         return
 
-    # Select and gate BEFORE resolving the key or touching `calcom`, so a write
+    args = _build_parser().parse_args(cleaned)
+    api = _api_request(args) if args.group == "api" else None
+
+    # Select and gate BEFORE resolving the key or making a request, so a write
     # on a read-only connection refuses (exit 4) and an unknown id refuses
-    # (exit 6) regardless of whether the key resolves or calcom is installed
-    # (the gate is policy, decided before any credential or exec).
+    # (exit 6) whether or not the key resolves.
     cid, entry = _select_connection(reg, wanted_conn)
     allow_write = bool((entry or {}).get("allow_write", WRITE_DEFAULT))
-    _write_gate(cid, allow_write, verb)
-    _action_gate(cid, allow_write, cleaned)
+    _write_gate(cid, allow_write, _verb(args))
 
     cfg, problem = _build_cfg(cid, entry)
     if problem:
         _die(problem["exit"], problem["code"], problem["message"],
              problem.get("hint"))
-
-    if not shutil.which("calcom"):
-        _die(5, "calcom_not_found", "the `calcom` CLI is not on PATH",
-             "install it: `npm install -g @calcom/cli` "
-             "(https://github.com/calcom/companion)")
-
-    _forward(cleaned, cfg)
+    with _client(cfg) as c:
+        _emit(_dispatch(c, args, api))
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ A reshaped verb surface then costs an instruction reload on the next run and rew
 
 **Recommended** — a convenience verb earns its place by carrying behaviour its flag form cannot. `clickup complete` is not `update --status`: it discovers the list's closed status, refuses on incomplete dependencies, cascades to a parent whose subtasks are now all done, and reports what it unblocked.
 
-**Recommended** — where the system already ships an agent-drivable CLI, forward to it and own only identity, policy, and readiness; where named reads leave gaps, cover them with one escape hatch rather than a verb per endpoint. `calcomc`, `vapic`, and `rclonec` inject one connection's identity and exec the real tool, each saying in a `MODEL` section that it *never maps, renames, or enumerates* the child's commands; `signoz api` and `signoz query <file|->` carry what the named reads do not.
+**Recommended** — where the system already ships an agent-drivable CLI, forward to it and own only identity, policy, and readiness; where named reads leave gaps, cover them with one escape hatch rather than a verb per endpoint. `railwayc`, `vapic`, and `rclonec` inject one connection's identity and exec the real tool, each saying in a `MODEL` section that it *never maps, renames, or enumerates* the child's commands; `signoz api` and `signoz query <file|->` carry what the named reads do not.
 
 ## Parameters
 
@@ -112,7 +112,7 @@ The surface is reached in layers: the stub line, `help` (the entry menu — ever
 
 **Recommended** — open `help <verb>` on verb count, not on body length: once the surface carries more than roughly a dozen callable forms, the per-verb flags move down a layer and the entry menu keeps one line per verb saying what it answers. `clickup` is the instructive case — it has the third layer and still folds every flag of every verb into the second, so the same facts are printed twice.
 
-**Recommended** — `help` takes the whole verb path. Under a nested noun, `help cards create` prints that operation's arguments and `help cards` prints the noun's own verb list; a forwarding capability passes the rest through, as `calcomc help <cmd>` reaches the child's own help.
+**Recommended** — `help` takes the whole verb path. Under a nested noun, `help cards create` prints that operation's arguments and `help cards` prints the noun's own verb list; a forwarding capability passes the rest through, as `railwayc help <cmd>` reaches the child's own help.
 
 ## When the capability is not a plain API wrapper
 
@@ -120,7 +120,7 @@ Skip this section when the capability is a CLI over an HTTP API and nothing else
 
 **A capability wrapping another CLI** — its envelope and exit codes cover its own layer only and it says so, pointing at the wrapped tool's help as the surface: `railwayc` heads the list *EXIT CODES (railwayc's own layer)* and records that *Forwarded commands return RAILWAY's own exit code, not these*, while `rclonec` sends the caller to `rclone help` because it *does NOT re-document or re-map it*.
 
-It refuses rather than fall back to the wrapped tool's ambient login — `calcomc` *REQUIRES a resolved key and never falls back to this machine's stored `calcom login` session*, because a silent success under another account is the worst outcome available; an unrecognised forwarded command is classified as a write, as in `rclonec`'s *a verb in neither set is treated as a write* and `railwayc`'s *a subcommand this tool has not seen is refused rather than waved through*; and a fact that would drift is asked of the installed binary, `rclonec doctor` reporting *the path it resolved and the version it found*.
+It refuses rather than fall back to the wrapped tool's ambient login — `vapic` *REQUIRES a capability connection and never falls back to the official `~/.vapi-cli.yaml` login state*, because a silent success under another account is the worst outcome available; an unrecognised forwarded command is classified as a write, as in `rclonec`'s *a verb in neither set is treated as a write* and `railwayc`'s *a subcommand this tool has not seen is refused rather than waved through*; and a fact that would drift is asked of the installed binary, `rclonec doctor` reporting *the path it resolved and the version it found*.
 
 **A capability with a login ceremony** — not-ready is its own answer rather than a credential failure, and the refusal names the verb that fixes it: `whatsapp` exits 7 *unlinked* beside exit 2 *auth* and hints `whatsapp pair`, and `telegram` opens its help on an *Agent startup protocol (this is a STATEFUL CLI — it holds a login session)* that routes a missing session to `telegram login`.
 

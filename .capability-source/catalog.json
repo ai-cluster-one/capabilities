@@ -17,8 +17,8 @@
     },
     "calcomc": {
       "path": "capabilities/calcomc",
-      "payload_sha256": "5d0a71f6f42ccc0906c39c96b7a9e31f020396d6d49274daf4c1a41c80fa8bea",
-      "summary": "Credential harness around the official `calcom` CLI — resolves a Cal.com API key per connection, injects it, and forwards your command straight to `calcom` (everything but calcomc's own verbs passes through untouched); the command surface is `calcom help`."
+      "payload_sha256": "3e945afee352a3da0521ac1b0010622068260769e8c9fedb65c8c92426b7bf20",
+      "summary": "Cal.com CLI over the Cal.com API v2 — list, read and cancel bookings, read event types, available slots, schedules, connected calendars and their busy times, and reach any other endpoint through `api`; writes are refused unless the connection grants them, and `doctor` proves the key and the account it resolves to."
     },
     "calendar": {
       "path": "capabilities/calendar",
