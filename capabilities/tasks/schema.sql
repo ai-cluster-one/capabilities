@@ -252,3 +252,53 @@ comment on column tasks.task_changes.actor is
 
 create index if not exists task_changes_task_idx
   on tasks.task_changes (task_id, changed_at desc);
+
+-- Tell whoever watches that something a reader of the queue shows has changed:
+-- a task's fields, its trail, or a raise starting or ending. One channel serves
+-- the whole database, so the payload names the schema, the project, the task
+-- and the kind of change, and carries ids only: a watcher reads what it prints
+-- through its own scope. Fired by the store on every write, whichever path made
+-- it, and delivered when the writing transaction commits, so work that rolls
+-- back is never announced; the same payload twice in one transaction arrives
+-- once. Replaced on every apply, like the triggers above, so a store that
+-- predates it gains it.
+create or replace function tasks.notify_watch() returns trigger as $$
+declare
+    task    uuid;
+    project text;
+    kind    text;
+begin
+    if tg_table_name = 'tasks' then
+        task := new.id;
+        project := new.project_id;
+        kind := 'task_changed';
+    else
+        task := new.task_id;
+        execute format('select project_id from %I.tasks where id = $1', tg_table_schema)
+           into project using task;
+        if tg_table_name = 'task_activities' then
+            kind := 'activity_added';
+        elsif tg_op = 'INSERT' then
+            kind := 'run_started';
+        elsif old.ended_at is null and new.ended_at is not null then
+            kind := 'run_ended';
+        else
+            return null;
+        end if;
+    end if;
+    perform pg_notify('tasks_watch', json_build_object(
+        'schema', tg_table_schema, 'project', project,
+        'task', task, 'kind', kind)::text);
+    return null;
+end;
+$$ language plpgsql;
+
+drop trigger if exists tasks_notify_watch on tasks.tasks;
+create trigger tasks_notify_watch after insert or update on tasks.tasks
+    for each row execute function tasks.notify_watch();
+drop trigger if exists task_activities_notify_watch on tasks.task_activities;
+create trigger task_activities_notify_watch after insert on tasks.task_activities
+    for each row execute function tasks.notify_watch();
+drop trigger if exists task_executions_notify_watch on tasks.task_executions;
+create trigger task_executions_notify_watch after insert or update on tasks.task_executions
+    for each row execute function tasks.notify_watch();

@@ -41,6 +41,10 @@ READING
                                   and what came of each
   tasks history <task> [--field F]   how its status, pickup, type and assignee
                                   moved, and what caused each move
+  tasks watch [--project ID | --all-projects]
+                                  stay connected and print one JSON line per
+                                  change to a task that scope reads, as it
+                                  happens, until stopped. See WATCH
 
 WRITING  (needs allow_write on the connection; exit 4 otherwise)
   tasks add --type T --title TEXT [fields]      create one
@@ -629,10 +633,10 @@ PROJECT SCOPE
   `project.json` and from nowhere else, so a row can only ever be attributed to
   a project that declared itself.
 
-  `--project <id>` is a filter on `list`, `ready` and `search`, and unsaid it
-  means the project the command runs in. `--all-projects` removes that filter
-  from `list` and `search`, so one call reads every project in the store; each
-  row still carries its `project_id`. `show`, `runs` and `history` name one task
+  `--project <id>` is a filter on `list`, `ready`, `search` and `watch`, and
+  unsaid it means the project the command runs in. `--all-projects` removes
+  that filter from `list`, `search` and `watch`, so one call reads every
+  project in the store; each row still carries its `project_id`. `show`, `runs` and `history` name one task
   and answer about it whichever project it belongs to when it is named by its
   uuid; a key names a task only in the project the command runs in.
 
@@ -831,6 +835,62 @@ ACTIVITY
   `show` always returns a task together with its whole activity trail, oldest
   first, so what was done is read in the same breath as what is to be done.
 
+WATCH
+  tasks watch [--project ID | --all-projects] [--json]
+
+  A read that does not end. It holds one connection to the store, listens for
+  the store's change notification, and prints one JSON object per line on
+  stdout, flushing each line as it is written, until it is stopped. It writes
+  nothing and needs no allow_write. Its scope is the project scope `list`
+  takes - the project the command runs in, `--project ID`, or `--all-projects`
+  - and a line is printed only for a task that scope reads. Every line is
+  JSON, so `--json` is accepted and changes nothing.
+
+  Each line is an object whose `event` names its shape:
+
+    {"event": "ready", "store": S, "project": P, "all_projects": B}
+        first, once listening. `store` is the digest `list` carries, `project`
+        the project read, null under --all-projects. Read whatever you hold
+        after this line rather than before it, and no change falls between.
+    {"event": K, "task": ROW}
+        K is `task_changed` (the task was created, a field moved, or it was
+        saved), `activity_added` (its trail grew), `run_started` or
+        `run_ended` (a raise opened or closed). ROW is the task as one `list`
+        row prints it, read when the change arrives, so it is the task as it
+        is now. Changes committed together arrive together, one line per kind
+        and task, so a burst that moves one task twice prints it once.
+    {"event": "counts", "counts": {STATUS: N, ...}, "total": N}
+        after each burst of change lines and after each resync: what `counts`
+        answers for the same scope.
+    {"event": "lost", "error": TEXT}
+        the connection dropped - a sleep, a network change, a restart of the
+        store. It is asked for again after 1 second, doubling to 30, for as
+        long as it takes, and nothing is printed while it is away.
+    {"event": "task_changed", "task": ROW, "catch_up": true}
+        once reconnected, every task in scope touched since two minutes
+        before the connection was last proven live, oldest first. The margin
+        covers a change begun before that moment and committed after it, so a
+        task already printed may be printed again.
+    {"event": "resync", "since": MOMENT, "caught_up": N}
+        after the catch-up: re-read the counts and anything you hold, because
+        what happened while the watch was away is known only up to this line.
+
+  Tasks are never deleted, so no line removes one. Notifications come from
+  triggers on the three tables, which `migrate --apply` creates; they fire on
+  every write whichever path made it, and only when it commits, so work that
+  rolls back prints nothing.
+
+  The connection is proven by a round trip every 30 seconds, and one not back
+  within 15 is a connection lost; TCP keepalives are on as well. It shows in
+  the store's activity as application `tasks-watch`.
+
+  It ends with exit 0 on SIGTERM or SIGINT, when its stdin closes, and when
+  whatever reads its stdout goes away. A reader therefore keeps a pipe open on
+  its stdin and closes it to stop the watch; stdin at /dev/null ends it right
+  after `ready`. A store that cannot be reached before `ready` exits 5 and is
+  not asked again, and so does a store without the triggers, before `ready` or
+  on reconnecting. A policy refusal exits 4, as every verb's does.
+
 CONTRACT
   tasks help | doctor | connections | stub | manifest --json
   tasks guide [topic] | ids list|get|set|rm | refs | inventory [--network]
@@ -856,12 +916,14 @@ I/O
   Success is JSON on stdout; errors are JSON on stderr.
 
 EXIT CODES
-  0 success
+  0 success, and a `watch` stopped by a signal, by its stdin closing, or by its
+    reader going away
   3 not found - no task for that uuid or unique key, or no worker of that name
   4 policy - the capability is disabled, the connection does not allow writes,
     the worker is switched off, or worker scope or project scope refuses the
     write; ask the user, never lift the gate yourself
-  5 store - unreachable, or the schema is not present; `tasks doctor` proves both
+  5 store - unreachable, or the schema is not present; `tasks doctor` proves both.
+    For `watch`, also a store that does not announce changes
   6 input - a malformed argument, an unknown flag, a value outside its set, a
     worker file this capability cannot read, or a command run outside a
     project that needs one to know whose tasks it means
@@ -4278,10 +4340,12 @@ def _secret_key(entry: dict | None) -> str:
     return (entry or {}).get("secret_env") or DEFAULT_SECRET_ENV
 
 
-def _connect(entry: dict | None, *, raising: bool = False):
+def _connect(entry: dict | None, *, raising: bool = False, **libpq):
     """A connection to the store, or exit 5 saying why there is none. A caller
     that outlives an unreachable store passes `raising` and is handed the same
-    refusal as a Refusal instead."""
+    refusal as a Refusal instead. `libpq` carries connection parameters a
+    caller holding its connection open needs and every other verb leaves at
+    libpq's own defaults."""
     try:
         import psycopg
         from psycopg.rows import dict_row
@@ -4294,7 +4358,7 @@ def _connect(entry: dict | None, *, raising: bool = False):
             host=_conf(entry, "db_host"), port=int(_conf(entry, "db_port", "5432")),
             user=_conf(entry, "db_user"), dbname=_conf(entry, "db_name"),
             password=password, sslmode=_conf(entry, "db_sslmode", "prefer"),
-            connect_timeout=10, row_factory=dict_row)
+            connect_timeout=10, row_factory=dict_row, **libpq)
     except Exception as exc:
         refusal = Refusal(5, "unreachable", f"cannot reach the store: {exc}",
                           f"`{NAME} connections` shows where every value resolves")
@@ -4934,13 +4998,8 @@ def cmd_counts(entry, args: list[str]) -> None:
         _die(6, "input", "unknown flag --activities",
              f"accepted: {', '.join('--' + n for n in sorted(_COUNT_FLAGS + _COUNT_BOOLS))}")
     where, params = _where(opts, _zone(entry))
-    tallies = ", ".join(f"count(*) filter (where status = '{s}') as \"{s}\""
-                        for s in STATUSES)
     with _connect(entry) as conn, conn.cursor() as cur:
-        cur.execute(f"select {tallies}, count(*) as total from {SCHEMA}.tasks{where}",
-                    params)
-        row = cur.fetchone()
-    _emit({"counts": {s: row[s] for s in STATUSES}, "total": row["total"]})
+        _emit(_tally(cur, where, params))
 
 
 # --- Writing -----------------------------------------------------------------
@@ -8197,6 +8256,315 @@ def cmd_history(entry, args: list[str]) -> None:
         row.setdefault("origin_project", None)
     _emit({"task": tid, "changes": rows})
 
+# --- Watching ----------------------------------------------------------------
+
+# How a watch keeps its one connection. A proxy in front of the store may close
+# a connection that carries no data for minutes and does not pass TCP keepalives
+# on, so the connection is proven end to end by a round trip on this interval,
+# and a round trip that is not back within the bound is a connection lost. TCP
+# keepalives find a dead socket sooner where they reach.
+_WATCH_PING_SECONDS = 30.0
+_WATCH_ROUND_TRIP_SECONDS = 15.0
+_WATCH_LIBPQ = {"application_name": "tasks-watch", "keepalives": 1,
+                "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 3}
+# A lost connection is asked for again after this long, doubling to the longest.
+_WATCH_RETRY_FIRST = 1.0
+_WATCH_RETRY_LONGEST = 30.0
+# How far before the last moment the connection was proven live a catch-up
+# reaches. A transaction stamps its rows with the moment it began, so one that
+# began before that moment and committed after the connection was lost carries
+# an earlier moment than the one it was missed after.
+_WATCH_CATCH_UP_GRACE = "2 minutes"
+_WATCH_KINDS = ("task_changed", "activity_added", "run_started", "run_ended")
+_WATCH_TABLES = ("tasks", "task_activities", "task_executions")
+
+
+class _WatchStop(BaseException):
+    """The watch was told to end: a signal, its stdin closed, or its reader went
+    away. Not an Exception, so nothing that survives a store error survives it."""
+
+
+def _stop_watch(signum, frame) -> NoReturn:
+    raise _WatchStop
+
+
+def _tally(cur, where: str, params: list) -> dict:
+    """How many tasks hold each status under `where`, and how many in all, in one
+    pass, so the numbers can never come from two different moments."""
+    tallies = ", ".join(f"count(*) filter (where status = '{s}') as \"{s}\""
+                        for s in STATUSES)
+    cur.execute(f"select {tallies}, count(*) as total from {SCHEMA}.tasks{where}",
+                params)
+    row = cur.fetchone()
+    return {"counts": {s: row[s] for s in STATUSES}, "total": row["total"]}
+
+
+class _Watch:
+    """One held connection and what it has printed. Everything it prints is read
+    on that connection, through the scope `list` reads, so a line never names a
+    task the scope could not read."""
+
+    def __init__(self, entry, opts: dict):
+        self.entry = entry
+        self.where, self.params = _where(opts)
+        self.project = None if opts.get("all-projects") else self.params[0]
+        self.conn = None
+        self.drops = _watch_drops()
+        # The server's clock when the connection was last proven live, and the
+        # moment a catch-up still owes, kept until its resync is printed.
+        self.live_at = None
+        self.owed = None
+        self.stdin = self._stdin()
+
+    @staticmethod
+    def _stdin() -> int | None:
+        try:
+            fd = sys.stdin.fileno()
+            os.fstat(fd)
+        except (AttributeError, ValueError, OSError):
+            return None
+        return fd
+
+    def line(self, value: dict) -> None:
+        try:
+            sys.stdout.write(json.dumps(value, ensure_ascii=False, default=str) + "\n")
+            sys.stdout.flush()
+        except BrokenPipeError:
+            # Nobody is reading. Pointed at nothing, so the interpreter's own
+            # flush on the way out has nowhere to fail.
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+            raise _WatchStop
+
+    def bounded(self, call):
+        """One round trip on the held connection, severed when it is not back in
+        time, so a peer that vanished is an error now rather than a wait as long
+        as the operating system's."""
+        import socket
+        import threading
+        fd = self.conn.pgconn.socket
+
+        def sever():
+            try:
+                peer = socket.socket(fileno=os.dup(fd))
+            except OSError:
+                return
+            try:
+                peer.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            finally:
+                peer.close()
+
+        timer = threading.Timer(_WATCH_ROUND_TRIP_SECONDS, sever)
+        timer.daemon = True
+        timer.start()
+        try:
+            return call()
+        finally:
+            timer.cancel()
+
+    def open(self) -> str | None:
+        """Connect, check the store announces what a watch reports, and listen.
+        Answers the store's digest."""
+        conn = _connect(self.entry, raising=True, **_WATCH_LIBPQ)
+        try:
+            conn.autocommit = True
+            self.conn = conn
+
+            def check():
+                with conn.cursor() as cur:
+                    tables = _tables_present(cur, SCHEMA)
+                    behind = ([t for t in _WATCH_TABLES if t not in tables]
+                              + _watch_behind(cur, SCHEMA, tables))
+                    return behind, _store_identity(cur)
+
+            behind, store = self.bounded(check)
+            if behind:
+                raise Refusal(5, "schema_behind",
+                              f"schema {SCHEMA} does not announce changes: missing "
+                              f"{', '.join(behind)}",
+                              f"`{NAME} migrate --apply` adds it")
+            self.bounded(lambda: conn.execute(f"listen {WATCH_CHANNEL}"))
+            self.prove()
+        except BaseException:
+            self.close()
+            raise
+        return store
+
+    def close(self) -> None:
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        self.conn = None
+
+    def prove(self) -> None:
+        def now():
+            with self.conn.cursor() as cur:
+                cur.execute("select clock_timestamp() as now")
+                return cur.fetchone()["now"]
+        self.live_at = self.bounded(now)
+
+    def rows(self, sql: str, params: list) -> list[dict]:
+        def read():
+            with self.conn.cursor() as cur:
+                cur.execute(sql, params)
+                return _attach_activities(cur, _rows(cur), {}, embed=False)
+        return self.bounded(read)
+
+    def counts(self) -> None:
+        def read():
+            with self.conn.cursor() as cur:
+                return _tally(cur, self.where, self.params)
+        self.line({"event": "counts", **self.bounded(read)})
+
+    def deliver(self, notes) -> None:
+        """One line per kind and task, in the order they arrived, each carrying
+        the task as it reads now. Notifications for another schema or another
+        project are not this watch's, and are dropped before the store is asked."""
+        wanted: dict = {}
+        for note in notes:
+            if note.channel != WATCH_CHANNEL:
+                continue
+            try:
+                payload = json.loads(note.payload)
+            except ValueError:
+                continue
+            if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
+                continue
+            if self.project is not None and payload.get("project") != self.project:
+                continue
+            kind, task = payload.get("kind"), payload.get("task")
+            if kind in _WATCH_KINDS and task:
+                wanted.setdefault((kind, str(task)), None)
+        if not wanted:
+            return
+        joiner = " and " if self.where else " where "
+        found = {str(row["id"]): row for row in self.rows(
+            f"select {_scan_columns({})} from {SCHEMA}.tasks t{self.where}"
+            f"{joiner}t.id = any(%s::uuid[])",
+            self.params + [sorted({task for _kind, task in wanted})])}
+        printed = False
+        for kind, task in wanted:
+            if task in found:
+                self.line({"event": kind, "task": found[task]})
+                printed = True
+        if printed:
+            self.counts()
+
+    def catch_up(self) -> None:
+        """Every task in scope touched since the moment owed, oldest first, then
+        the line that tells the reader the gap is closed."""
+        since = self.owed
+        rows = self.rows(
+            f"""select * from (select {_scan_columns({})} from {SCHEMA}.tasks t{self.where}) s
+                 where last_touched_at >= %s::timestamptz - interval '{_WATCH_CATCH_UP_GRACE}'
+                 order by last_touched_at asc, id asc""",
+            self.params + [since])
+        for row in rows:
+            self.line({"event": "task_changed", "task": row, "catch_up": True})
+        self.line({"event": "resync", "since": _jsonable(since), "caught_up": len(rows)})
+        self.owed = None
+        self.counts()
+
+    def pause(self, seconds: float) -> None:
+        """Wait, ending the watch if its stdin closes meanwhile."""
+        import select
+        import time
+        if self.stdin is None:
+            time.sleep(seconds)
+            return
+        ready, _w, _x = select.select([self.stdin], [], [], seconds)
+        if ready:
+            self.read_stdin()
+
+    def read_stdin(self) -> None:
+        if not os.read(self.stdin, 65536):
+            raise _WatchStop
+
+    def follow(self) -> None:
+        """Print what the store announces until the connection fails, proving it
+        on the interval while nothing arrives."""
+        import select
+        import time
+        due = time.monotonic() + _WATCH_PING_SECONDS
+        while True:
+            notes = list(self.conn.notifies(timeout=0))
+            if notes:
+                self.deliver(notes)
+                continue
+            waiting = [self.conn.pgconn.socket] + ([self.stdin] if self.stdin is not None else [])
+            ready, _w, _x = select.select(waiting, [], [], max(0.0, due - time.monotonic()))
+            if self.stdin is not None and self.stdin in ready:
+                self.read_stdin()
+            if time.monotonic() >= due:
+                self.prove()
+                due = time.monotonic() + _WATCH_PING_SECONDS
+
+    def reconnect(self, why: str) -> None:
+        """Say the connection is lost, then ask for it again, backing off, for as
+        long as it takes. Only a store that answers and lacks the notifications
+        ends the watch, since asking again cannot change that."""
+        self.close()
+        if self.owed is None:
+            self.owed = self.live_at
+        self.line({"event": "lost", "error": why})
+        delay = _WATCH_RETRY_FIRST
+        while True:
+            self.pause(delay)
+            try:
+                self.open()
+                return
+            except Refusal as refusal:
+                if refusal.code != "unreachable":
+                    _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
+            except self.drops:
+                pass
+            delay = min(delay * 2, _WATCH_RETRY_LONGEST)
+
+    def run(self) -> None:
+        import signal
+        signal.signal(signal.SIGTERM, _stop_watch)
+        signal.signal(signal.SIGINT, _stop_watch)
+        try:
+            try:
+                store = self.open()
+            except Refusal as refusal:
+                _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
+            self.line({"event": "ready", "store": store, "project": self.project,
+                       "all_projects": self.project is None})
+            while True:
+                try:
+                    if self.owed is not None:
+                        self.catch_up()
+                    self.follow()
+                except self.drops as exc:
+                    self.reconnect(str(exc).strip().splitlines()[0] if str(exc).strip()
+                                   else type(exc).__name__)
+        except _WatchStop:
+            pass
+        finally:
+            self.close()
+
+
+def _watch_drops() -> tuple:
+    """What a lost connection raises: the driver's connection failures, and the
+    socket's own."""
+    import psycopg
+    return (psycopg.OperationalError, psycopg.InterfaceError, OSError)
+
+
+def cmd_watch(entry, args: list[str]) -> None:
+    """A read that stays: one held connection, one JSON line per change the
+    scope reads, until a signal or the end of stdin. Every line is JSON, so
+    `--json` is taken and changes nothing."""
+    opts = _flags(args, ("project",), bools=("all-projects", "json"))
+    if "activities" in opts:
+        _die(6, "input", "unknown flag --activities",
+             "accepted: --all-projects, --json, --project")
+    _Watch(entry, opts).run()
+
 
 # --- The service -------------------------------------------------------------
 
@@ -8224,6 +8592,13 @@ _LANE_DEFAULTS = {"max_parallel": 1}
 # project the task belongs to, and a daemon acts only on its own.
 CLAIMABLE_CHANNEL = "tasks_claimable"
 _NOTIFY_TRIGGER = ("tasks", "tasks_notify_claimable")
+
+# The store notifies this channel on every change `watch` reports, one trigger
+# per table a change can land in, and names the kind of change in the payload.
+WATCH_CHANNEL = "tasks_watch"
+_WATCH_TRIGGERS = (("tasks", "tasks_notify_watch"),
+                   ("task_activities", "task_activities_notify_watch"),
+                   ("task_executions", "task_executions_notify_watch"))
 
 # Where `run` writes what it claimed, when the service that started it asks, and
 # the tasks the service tells it not to claim.
@@ -8458,17 +8833,31 @@ def _lane_rows(declaration: dict) -> list[dict]:
             for lane in declaration["lanes"]]
 
 
+def _triggers_absent(cur, schema: str, tables: list[str], triggers) -> list[str]:
+    """Each of `triggers` the store lacks, as table.trigger. A table that is
+    absent is reported as a table, not as its triggers."""
+    absent = []
+    for table, trigger in triggers:
+        if table not in tables:
+            continue
+        cur.execute("""select 1 from pg_trigger g
+                         join pg_class t on t.oid = g.tgrelid
+                         join pg_namespace n on n.oid = t.relnamespace
+                        where n.nspname = %s and t.relname = %s and g.tgname = %s
+                          and not g.tgisinternal""", (schema, table, trigger))
+        if not cur.fetchone():
+            absent.append(f"{table}.{trigger}")
+    return absent
+
+
 def _notify_behind(cur, schema: str, tables: list[str]) -> list[str]:
     """The claimable notification, as table.trigger, when the store lacks it."""
-    table, trigger = _NOTIFY_TRIGGER
-    if table not in tables:
-        return []
-    cur.execute("""select 1 from pg_trigger g
-                     join pg_class t on t.oid = g.tgrelid
-                     join pg_namespace n on n.oid = t.relnamespace
-                    where n.nspname = %s and t.relname = %s and g.tgname = %s
-                      and not g.tgisinternal""", (schema, table, trigger))
-    return [] if cur.fetchone() else [f"{table}.{trigger}"]
+    return _triggers_absent(cur, schema, tables, (_NOTIFY_TRIGGER,))
+
+
+def _watch_behind(cur, schema: str, tables: list[str]) -> list[str]:
+    """The watch notifications, as table.trigger, that the store lacks."""
+    return _triggers_absent(cur, schema, tables, _WATCH_TRIGGERS)
 
 
 def _service_sweep_due(entry) -> bool:
@@ -9212,7 +9601,8 @@ def cmd_migrate(entry, args: list[str]) -> None:
         lacking = (_columns_absent(cur, schema, before)
                    + _constraints_behind(cur, schema, before)
                    + _key_scope_behind(cur, schema, before)
-                   + _notify_behind(cur, schema, before))
+                   + _notify_behind(cur, schema, before)
+                   + _watch_behind(cur, schema, before))
         if not opts.get("apply"):
             _emit({"schema": schema, "project": project, "present": before,
                    "would_create": missing, "would_add": lacking, "applied": False})
@@ -9237,7 +9627,8 @@ def cmd_migrate(entry, args: list[str]) -> None:
                  + _columns_absent(cur, schema, after)
                  + _constraints_behind(cur, schema, after)
                  + _key_scope_behind(cur, schema, after)
-                 + _notify_behind(cur, schema, after))
+                 + _notify_behind(cur, schema, after)
+                 + _watch_behind(cur, schema, after))
     if still:
         _die(5, "schema_incomplete",
              f"schema {schema} is still missing {', '.join(still)} after applying",
@@ -9265,7 +9656,8 @@ def cmd_doctor(wanted: str | None) -> None:
         behind = (_columns_absent(cur, schema, tables)
                   + _constraints_behind(cur, schema, tables)
                   + _key_scope_behind(cur, schema, tables)
-                  + _notify_behind(cur, schema, tables))
+                  + _notify_behind(cur, schema, tables)
+                  + _watch_behind(cur, schema, tables))
     missing = [t for t in _TABLES if t not in tables]
     if missing:
         _die(5, "schema_missing",
@@ -9387,6 +9779,7 @@ def main() -> None:
         "add": cmd_add, "set": cmd_set, "meta": cmd_meta, "activity": cmd_activity,
         "claim": cmd_claim, "release": cmd_release, "run": cmd_run,
         "runs": cmd_runs, "history": cmd_history, "migrate": cmd_migrate,
+        "watch": cmd_watch,
     }
     if verb == "tag":
         cmd_tag(entry, rest); return
