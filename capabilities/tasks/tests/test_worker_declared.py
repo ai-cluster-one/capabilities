@@ -138,9 +138,11 @@ profile: plain
 """)
     worker = mod._worker("probe")
     assert worker["types"] == ["defect"]
+    # An ask that takes a waiting task carries the hold it is read against.
     assert mod._asks(worker) == [
-        {"statuses": ["todo", "waiting"], "type": "defect"},
-        {"tag": ["urgent"], "assignees": ["supervisor"], "statuses": ["waiting"]}]
+        {"statuses": ["todo", "waiting"], "waiting_hold": 1200, "type": "defect"},
+        {"tag": ["urgent"], "assignees": ["supervisor"], "statuses": ["waiting"],
+         "waiting_hold": 1200}]
 
 
 def test_top_level_tags_and_assignee_mean_the_same_inside_every_filter(project):

@@ -1934,6 +1934,48 @@ def test_a_raise_taken_from_waiting_scores_its_release_the_same_way(
 
 
 @needs_store
+def test_a_waiting_task_whose_turn_returned_unspent_is_held_and_stays_waiting(
+        project, store, monkeypatch, capsys):
+    """A pickup would end the wait when it passed, so the hold is read from the
+    raise: the task stays waiting, carries no pickup, and is not taken again
+    until `hold_seconds_on_exhaustion` has passed since that raise ended."""
+    entry, schema, conn = store
+    worker_file(project, "decider").write_text(DECIDER)
+    _todo(entry, capsys, "t-spent")
+    mod.cmd_set(entry, ["t-spent", "--status", "waiting", "--assignee", "decider"])
+    capsys.readouterr()
+
+    class Spent:
+        Profile, Session, FailureKind = (harness_runner.Profile, harness_runner.Session,
+                                         FailureKind)
+        find_profile_file = staticmethod(harness_runner.find_profile_file)
+        ProfileNotFound = harness_runner.ProfileNotFound
+
+        def run(self, prompt, profile, cwd, **kw):
+            return Result(ok=False, harness="claude",
+                          failure=Failure(FailureKind.QUOTA, "hit your limit"))
+
+    monkeypatch.setattr(mod, "_harness_runner", Spent)
+    mod.cmd_run(entry, ["decider", "--apply"])
+    report = _answer(capsys)
+    assert report["returned_unspent"] is True and report["held_until"]
+    mod.cmd_show(entry, ["t-spent"])
+    task = _answer(capsys)["task"]
+    assert task["status"] == "waiting" and task["pickup_at"] is None
+
+    mod.cmd_run(entry, ["decider", "--apply"])
+    assert _answer(capsys)["claimed"] is None
+    assert len(_raises(entry, capsys, "t-spent")) == 1
+
+    conn.execute(f"""update {schema}.task_executions
+                        set ended_at = now() - interval '1201 seconds'""")
+    conn.commit()
+    mod.cmd_run(entry, ["decider", "--apply"])
+    assert _answer(capsys)["claimed"] is not None
+    assert len(_raises(entry, capsys, "t-spent")) == 2
+
+
+@needs_store
 def test_the_session_is_on_the_raise_from_the_claim(project, store, monkeypatch,
                                                     capsys):
     entry, _schema, _conn = store

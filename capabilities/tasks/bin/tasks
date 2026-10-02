@@ -144,11 +144,14 @@ ONE TURN OF THE CONVEYOR
 
   A turn the harness's own report says ran out of quota, and one that fails in
   seconds having written nothing, are not attempts at the work: the raise is
-  marked `exhausted`, the task is held for a while rather than handed straight
-  back into a limit that has not lifted, and the count that parks a task does
-  not spend it. At the ceiling the task is handed back to a person instead of
-  dispatched again. A task parked because its worker names a routine or a
-  profile that is not there is marked `missing` and does not spend it either.
+  marked `exhausted`, the task is held for `hold_seconds_on_exhaustion` rather
+  than handed straight back into a limit that has not lifted, and the count
+  that parks a task does not spend it. A task taken from `waiting` stays there
+  while it is held: its hold is read from that raise rather than set as a
+  pickup, which would end the wait. At the ceiling the task is handed back to a
+  person instead of dispatched again. A task parked because its worker names a
+  routine or a profile that is not there is marked `missing` and does not spend
+  it either.
 
   Every raise leaves exactly one entry. A turn that wrote nothing gets one
   saying so, because a task picked up that left no trace reads exactly like one
@@ -5897,6 +5900,18 @@ _WAITS_ON_ITS_NAME = ("(status <> 'waiting' or case when jsonb_typeof(metadata -
                       "'blocked_by') = 0 else true end)")
 
 
+def _not_held_from_waiting() -> str:
+    """A waiting task whose last raise took it from the wait and returned unspent
+    is held for the worker's `hold_seconds_on_exhaustion` from the moment that
+    raise ended. The hold is read from the raise rather than written as a pickup,
+    because a pickup on a waiting task ends the wait when it passes."""
+    return (f"(status <> 'waiting' or not coalesce((select e.metrics @> "
+            f"jsonb_build_object('{_CLAIMED_FROM}', 'waiting', 'exhausted', true) "
+            f"and e.ended_at > now() - make_interval(secs => %s) "
+            f"from {SCHEMA}.task_executions e where e.task_id = {SCHEMA}.tasks.id "
+            f"order by e.started_at desc limit 1), false))")
+
+
 def _selection(opts: dict, project: str, tz) -> tuple[str, list]:
     """What one ask of a claim selects: the project, the narrowing the ask names,
     the statuses it takes - todo unless it names others - and a pickup that has
@@ -5924,6 +5939,9 @@ def _selection(opts: dict, project: str, tz) -> tuple[str, list]:
         params = [*params, statuses]
         if "waiting" in statuses:
             clauses.append(_WAITS_ON_ITS_NAME)
+            if opts.get("waiting_hold"):
+                clauses.append(_not_held_from_waiting())
+                params = [*params, int(opts["waiting_hold"])]
     clauses.append("(pickup_at is null or pickup_at <= now())")
     joiner = " and " if where else " where "
     return f"{where}{joiner}" + " and ".join(clauses), params
@@ -7264,6 +7282,8 @@ def _asks(worker: dict) -> list[dict]:
             narrowing["assignees"] = list(one["assignee"])
         if one["status"] != ["todo"]:
             narrowing["statuses"] = list(one["status"])
+        if "waiting" in one["status"]:
+            narrowing["waiting_hold"] = worker["limits"]["hold_seconds_on_exhaustion"]
         for kind in one["type"] or [None]:
             asks.append({**narrowing, **({"type": kind} if kind else {})})
     return asks
@@ -7677,6 +7697,16 @@ def _hold_off(entry, tid: str, seconds: int) -> str:
     return after["pickup_at"]
 
 
+def _held_from_waiting_until(entry, execution: str, seconds: int) -> str:
+    """The moment a waiting task this raise returned unspent may be taken again,
+    as the claim will read it from the raise."""
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"""select ended_at + make_interval(secs => %s) as until
+                          from {SCHEMA}.task_executions where id::text = %s""",
+                    (seconds, str(execution)))
+        return _rows(cur)[0]["until"]
+
+
 def _accumulate_cost(entry, tid: str, cost: float) -> float:
     """What the task has cost so far, kept beside what each raise cost rather
     than instead of it: the raise answers what this turn cost, and this answers
@@ -8073,10 +8103,14 @@ def cmd_run(entry, args: list[str]) -> None:
     _close(entry, execution, outcome, landed, said or None,
            result.harness, pointer, metrics, tid, report)
     if unspent and landed != "waiting":
-        # A hold on a task back in `waiting` would end its wait when it passed,
-        # releasing it into the queue, so a task taken from a wait is not held.
         report["held_until"] = _hold_off(entry, tid,
                                          worker["limits"]["hold_seconds_on_exhaustion"])
+    elif unspent:
+        # A pickup on a task back in `waiting` would end its wait when it passed,
+        # releasing it into the queue, so the claim reads this raise instead and
+        # takes the task again only once the same hold has passed.
+        report["held_until"] = _held_from_waiting_until(
+            entry, execution, worker["limits"]["hold_seconds_on_exhaustion"])
     if result.cost_usd is not None:
         report["cost_total"] = _accumulate_cost(entry, tid, result.cost_usd)
     # Every raise leaves exactly one entry, including a raise that did nothing. A
