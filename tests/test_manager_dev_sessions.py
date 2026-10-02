@@ -73,6 +73,7 @@ def _source_repo(tmp_path: Path) -> Path:
                  "ROUTINES.md"):
         shutil.copy2(REPO / name, source / name)
     shutil.copytree(REPO / "contract", source / "contract")
+    shutil.copytree(REPO / "manager", source / "manager")
     shutil.copytree(REPO / "skill", source / "skill")
     shutil.copytree(
         REPO / "capabilities" / "deployment",
@@ -111,6 +112,7 @@ def _release_source_repo(tmp_path: Path) -> tuple[Path, Path]:
                  "ROUTINES.md"):
         shutil.copy2(REPO / name, source / name)
     shutil.copytree(REPO / "contract", source / "contract")
+    shutil.copytree(REPO / "manager", source / "manager")
     shutil.copytree(REPO / "skill", source / "skill")
     shutil.copytree(REPO / "guides", source / "guides")
     shutil.copytree(

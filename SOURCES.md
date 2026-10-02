@@ -116,6 +116,7 @@ capabilities/
     bin/<name>
     guides/          optional
     service/         optional
+    CHANGELOG.md    change log
     deviations.md   optional
 .capability-source/
   catalog.json       generated

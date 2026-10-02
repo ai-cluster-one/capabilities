@@ -60,7 +60,8 @@ curl -fsSL "$REPO/bin/capabilities" -o "$tmp" || err "fetch failed: $REPO/bin/ca
 for asset in SHEBANG.md DOCTRINE.md TEMPLATE.md SOURCES.md ROUTINES.md \
   contract/preamble.py contract/store.py guides/authoring.md guides/conforming.md \
   guides/contract.md guides/dev.md guides/grooming.md guides/publishing.md \
-  guides/repositories.md guides/sanitizing.md skill/SKILL.md; do
+  guides/repositories.md guides/sanitizing.md skill/SKILL.md \
+  manager/CHANGELOG.md contract/CHANGELOG.md; do
     mkdir -p "$assets_tmp/$(dirname "$asset")"
     curl -fsSL "$REPO/$asset" -o "$assets_tmp/$asset" || err "fetch failed: $REPO/$asset"
 done
@@ -117,7 +118,8 @@ with lock_path.open("a+") as lock:
                 "guides/conforming.md", "guides/contract.md", "guides/dev.md",
                 "guides/grooming.md", "guides/publishing.md",
                 "guides/repositories.md", "guides/sanitizing.md",
-                "skill/SKILL.md"):
+                "skill/SKILL.md", "manager/CHANGELOG.md",
+                "contract/CHANGELOG.md"):
         target = manager.parent / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         staged_target = target.with_name(target.name + ".bootstrap-tmp")

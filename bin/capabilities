@@ -121,6 +121,25 @@ MACHINE VERBS
   search [QUERY] [--source ID]
         Search cached catalogues from the official and registered sources.
         Listing never executes catalogue capability code.
+  changelog (<name> | --manager | --contract) [--all]
+            [--from <path> | --source ID]
+        Print the change log of a capability, of the manager, or of the
+        contract: what changed for someone who already has it. By default only
+        the entries newer than the installed version; --all prints the whole
+        log. The installed version is the newest entry in the installed copy's
+        own log - the registry copy for a capability, the manager release on
+        PATH for the manager and the contract. An installed copy without a log
+        predates change logs, so every entry is newer than it; a capability not
+        installed here prints its whole log. The log is read from where the
+        update would come from: a capability's recorded source, else the
+        official catalogue, and the manager's own source for the manager and
+        the contract. --source reads one registered source's local tree, as
+        `search` does (`source refresh` brings it forward); --from reads a
+        local checkout or bundle. Read-only: it installs and writes nothing.
+        JSON {target, kind, log, installed {version, log,
+        registry|release, source_commit?} | null, view, entries [{heading,
+        body}], note?}. Exit 3 when the source carries no log, 5 when it
+        cannot be reached.
   source init ID [--remote GIT_URL]
         Create the canonical editable source workspace at
         ~/.capabilities/sources/ID, initialize git, vendor the authoring contract,
@@ -533,9 +552,15 @@ _MANAGER_GUIDE_TOPICS = (
     "reporting", "repositories", "sanitizing", "surfaces",
 )
 SKILL_ASSET = "skill/SKILL.md"
+# Each thing that ships keeps its own change log in its own home: a capability
+# at its bundle root, the manager and the contract as assets of the manager's
+# release, so the release on PATH carries the log of what it is.
+CHANGELOG_NAME = "CHANGELOG.md"
+MANAGER_CHANGELOG_REL = "manager/CHANGELOG.md"
+CONTRACT_CHANGELOG_REL = "contract/CHANGELOG.md"
 _MANAGER_RUNTIME_ASSETS = tuple(
     f"guides/{topic}.md" for topic in _MANAGER_GUIDE_TOPICS
-) + (SKILL_ASSET,)
+) + (SKILL_ASSET, MANAGER_CHANGELOG_REL, CONTRACT_CHANGELOG_REL)
 _MANAGER_RELEASE_ASSETS = _AUTHORING_ASSETS + _MANAGER_RUNTIME_ASSETS
 MANAGER_RELEASE_SCHEMA = "capabilities.manager-release.v1"
 MANAGER_RELEASE_MANIFEST_REL = ".capability-source/manager-release.json"
@@ -2174,6 +2199,178 @@ def cmd_update(name: str | None) -> None:
         results.append({"name": n, "changed": before != after})
     _sync_skill()
     _emit({"updated": results})
+
+
+# ---------------------------------------------------------------- change logs
+
+def _changelog_entries(text: str) -> list[dict[str, str]]:
+    """Split a change log into its entries, in the log's own newest-first order.
+
+    An entry is a `## ` heading and the body under it, and the heading is the
+    entry's identity. A line inside a fenced block never opens an entry.
+    """
+    entries: list[tuple[str, list[str]]] = []
+    fenced = False
+    for line in text.splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+        if not fenced and line.startswith("## "):
+            entries.append((line[3:].strip(), []))
+        elif entries:
+            entries[-1][1].append(line)
+    return [{"heading": heading, "body": "\n".join(body).strip()}
+            for heading, body in entries]
+
+
+def _changelog_from_path(path: Path, label: str) -> tuple[str, str]:
+    if not path.is_file():
+        _die(3, "changelog_not_found", f"{label} carries no change log at {path}",
+             "the source predates change logs or does not ship this one")
+    try:
+        return path.read_text(), str(path)
+    except OSError as exc:
+        _die(5, "changelog_unreadable", f"cannot read {path}: {exc}")
+
+
+def _changelog_from_url(url: str, label: str) -> tuple[str, str]:
+    httpx = _httpx()
+    try:
+        resp = httpx.get(url, follow_redirects=True, timeout=30.0)
+    except httpx.HTTPError as exc:
+        _die(5, "network_error", f"fetch failed: {exc}", url)
+    if resp.status_code == 404:
+        _die(3, "changelog_not_found", f"{label} carries no change log at its source",
+             f"{url}: the source predates change logs or does not ship this one")
+    if resp.status_code != 200:
+        _die(5, "server_error", f"fetch returned {resp.status_code}", url)
+    return resp.text, url
+
+
+def _capability_changelog_source(name: str, meta: dict, from_ref: str | None,
+                                 source_id: str | None) -> tuple[str, str]:
+    """The capability's log as published where `update` would fetch it.
+
+    A registered source is read from its local tree, as `search` reads it, so
+    this stays a read; `source refresh` is what brings that tree forward.
+    """
+    if from_ref:
+        p = Path(from_ref).expanduser().resolve()
+        if p.is_file():
+            return _changelog_from_path(p, name)
+        if not p.is_dir():
+            _die(3, "not_found", f"--from path does not exist: {p}")
+        repo_bundle = p / "capabilities" / name
+        bundle = repo_bundle if repo_bundle.is_dir() else p
+        return _changelog_from_path(bundle / CHANGELOG_NAME, name)
+    source_id = source_id or meta.get("source_id")
+    if source_id:
+        root = _source_author_root(source_id)
+        if not root.is_dir():
+            _die(5, "source_unavailable", f"source {source_id!r} has no local tree",
+                 f"capabilities source refresh {source_id}")
+        capdir = root / "capabilities" / name
+        if not capdir.is_dir():
+            _die(3, "not_found", f"source {source_id!r} has no capability {name!r}")
+        return _changelog_from_path(capdir / CHANGELOG_NAME, name)
+    recorded = meta.get("source")
+    if recorded and not re.match(r"^https?://", recorded):
+        p = Path(recorded)
+        if p.is_dir():
+            return _changelog_from_path(p / CHANGELOG_NAME, name)
+        if p.is_file():
+            _die(3, "changelog_not_found",
+                 f"{name} was installed from a lone script, which carries no change log",
+                 str(p))
+        _die(3, "not_found", f"{name}'s recorded source no longer exists: {p}")
+    url = recorded or f"{SOURCE}/capabilities/{name}/bin/{name}"
+    script_rel = f"/capabilities/{name}/bin/{name}"
+    if not url.endswith(script_rel):
+        _die(3, "changelog_not_found",
+             f"{name} was installed from a lone script, which carries no change log",
+             url)
+    return _changelog_from_url(url[:-len(f"bin/{name}")] + CHANGELOG_NAME, name)
+
+
+def _active_manager_root() -> Path | None:
+    """The release the manager on PATH runs from, located as it locates its assets."""
+    try:
+        executable = (_bin_dir() / "capabilities").resolve(strict=True)
+    except OSError:
+        return None
+    root = executable.parent.parent
+    return root if (root / "contract" / "preamble.py").is_file() else executable.parent
+
+
+def cmd_changelog(name: str | None, kind: str, show_all: bool,
+                  from_ref: str | None, source_id: str | None) -> None:
+    """Print what changed for someone who already holds the thing.
+
+    One reader for every log. The installed version is the newest entry of the
+    installed copy's own log, so what is new is every published entry above
+    the first one that copy already carries.
+    """
+    if kind == "capability":
+        assert name is not None
+        _reject_reserved_capability_name(name)
+        target = name
+        reg = _registry_dir(name)
+        installed_here = (reg / name).is_file()
+        meta = (_read_json(reg / "meta.json") or {}) if installed_here else {}
+        text, read_from = _capability_changelog_source(
+            name, meta, from_ref, source_id)
+        installed_log = reg / CHANGELOG_NAME
+        installed = {"registry": str(reg)} if installed_here else None
+        if installed is not None and meta.get("source_commit"):
+            installed["source_commit"] = meta["source_commit"]
+    else:
+        target = "capabilities" if kind == "manager" else "contract"
+        rel = MANAGER_CHANGELOG_REL if kind == "manager" else CONTRACT_CHANGELOG_REL
+        if from_ref:
+            p = Path(from_ref).expanduser().resolve()
+            if not p.exists():
+                _die(3, "not_found", f"--from path does not exist: {p}")
+            text, read_from = _changelog_from_path(p if p.is_file() else p / rel, target)
+        else:
+            text, read_from = _changelog_from_url(f"{SOURCE.rstrip('/')}/{rel}", target)
+        release = _active_manager_root()
+        installed_log = release / rel if release is not None else None
+        installed = {"release": str(release)} if release is not None else None
+
+    entries = _changelog_entries(text)
+    note = None
+    if installed is None:
+        note = f"{target} is not installed here; this is its whole log"
+        shown = entries
+    else:
+        carried = []
+        if installed_log is not None and installed_log.is_file():
+            try:
+                carried = _changelog_entries(installed_log.read_text())
+            except OSError:
+                carried = []
+            installed["log"] = str(installed_log)
+        else:
+            installed["log"] = None
+            note = ("the installed copy predates change logs, so every entry "
+                    "is newer than it")
+        installed["version"] = carried[0]["heading"] if carried else None
+        held = {entry["heading"] for entry in carried}
+        since = []
+        for entry in entries:
+            if entry["heading"] in held:
+                break
+            since.append(entry)
+        if held and len(since) == len(entries):
+            note = (f"the installed version {installed['version']!r} is not in "
+                    "the published log, so every entry is shown")
+        shown = entries if show_all else since
+    result = {"target": target, "kind": kind, "log": read_from,
+              "installed": installed,
+              "view": "all" if show_all or installed is None else "since-installed",
+              "entries": shown}
+    if note:
+        result["note"] = note
+    _emit(result)
 
 
 def _manager_release_manifest_bytes(manifest: dict) -> bytes:
@@ -8270,6 +8467,7 @@ def cmd_new_capability(name: str, source_id: str, core_only: bool) -> None:
     script = capdir / "bin" / name
     script.parent.mkdir(parents=True)
     (capdir / "guides").mkdir()
+    (capdir / CHANGELOG_NAME).write_text(f"# {name} — change log\n")
     script.write_text(_capability_skeleton(name, core_only))
     script.chmod(0o755)
     _emit({"created": name, "source": source_id, "path": str(capdir),
@@ -8759,6 +8957,20 @@ def main() -> None:
         cmd_path(flag("--json"), flag("--identity"))
     elif cmd == "search":
         cmd_search(pos[0] if pos else None, opt("--source"))
+    elif cmd == "changelog":
+        selectors = [s for s in ("--manager", "--contract") if flag(s)]
+        if len(pos) + len(selectors) != 1:
+            _die(6, "input",
+                 "changelog needs exactly one of <name>, --manager, or --contract")
+        if selectors and opt("--source"):
+            _die(6, "input",
+                 "--source selects a capability source; the manager and the "
+                 "contract are read from the manager's own source or --from")
+        if opt("--from") and opt("--source"):
+            _die(6, "input", "changelog accepts either --from or --source, not both")
+        kind = selectors[0][2:] if selectors else "capability"
+        cmd_changelog(pos[0] if pos else None, kind, flag("--all"),
+                      opt("--from"), opt("--source"))
     elif cmd == "source":
         if not pos:
             _die(6, "input", "source needs a subcommand")

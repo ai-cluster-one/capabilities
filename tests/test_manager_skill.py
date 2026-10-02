@@ -82,7 +82,7 @@ def test_the_skill_is_carried_whole_so_the_bootstrap_can_place_it() -> None:
     """The skill is an asset, not a composed string: the bootstrap must fetch it."""
     manager = MANAGER.read_text()
     assert 'SKILL_ASSET = "skill/SKILL.md"' in manager, "skill asset is not declared"
-    assert "SKILL_ASSET,)" in manager, "skill asset is not a manager release asset"
+    assert "(SKILL_ASSET," in manager, "skill asset is not a manager release asset"
     installer = (REPO / "install.sh").read_text()
     assert installer.count("skill/SKILL.md") == 2, \
         "install.sh must both fetch and stage the skill"

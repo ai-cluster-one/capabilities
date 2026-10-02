@@ -109,6 +109,7 @@ capabilities/<capability>/
   bin/<name>          the executable — domain verbs + contract verbs (stub, manifest, guide, ids, refs)
   guides/             upstream guide topics, fetched live by `<name> guide`    (optional)
   service/            bundled helper/runtime files, if the manifest declares a service
+  CHANGELOG.md        what changed for those who already have it, read by `capabilities changelog`
   deviations.md       recorded departures from the standard                    (optional)
 ```
 
