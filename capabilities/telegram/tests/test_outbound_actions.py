@@ -778,6 +778,18 @@ class OutboundActionsTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("--session", calls[0][1])
 
+    def test_worker_session_leaves_the_verb_first(self):
+        """The contract's authority gate reads the verb from the first argument,
+        so a verb list granting `read` must still see `read` there."""
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._cross_connection_env(tmpdir)
+            calls = self._run_shim(shim, env, ["telegram", "read", "555"])
+        self.assertEqual(len(calls), 1)
+        _, args = calls[0]
+        self.assertEqual(args[1:3], ["read", "555"])
+        self.assertEqual(args[-2:], ["--session", env["TELEGRAM_WORKER_SESSION"]])
+
     def test_worker_refuses_a_session_path_on_a_daemon_turn(self):
         """A session path names a file, so no grant can make it safe."""
         shim = import_worker_shim()
