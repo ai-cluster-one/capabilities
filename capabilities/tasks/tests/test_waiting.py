@@ -900,10 +900,10 @@ def test_migrate_reports_the_constraint_a_store_is_behind_on(store, capsys, monk
     conn.execute(f"alter table {schema}.tasks add constraint tasks_status_check "
                  f"{OLD_CHECK}")
     with conn.cursor(row_factory=dict_row) as cur:
-        tables = mod._tables_present(cur, schema)
-        assert mod._constraints_behind(cur, schema, tables) == ["tasks.tasks_status_check"]
+        catalog = mod._catalog(cur, schema)
+        assert mod._constraints_behind(catalog) == ["tasks.tasks_status_check"]
         # A table that is absent is reported as a table, not as its constraints.
-        assert mod._constraints_behind(cur, schema, []) == []
+        assert mod._constraints_behind({**catalog, "tables": []}) == []
 
     mod.cmd_migrate(entry, [])
     reported = _answer(capsys)

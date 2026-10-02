@@ -122,15 +122,14 @@ def test_migrate_adds_the_columns_a_store_lacks(store):
     from psycopg.rows import dict_row
     entry, schema, conn = store
     with conn.cursor(row_factory=dict_row) as cur:
-        tables = mod._tables_present(cur, schema)
-        assert tables == sorted(mod._TABLES)
-        assert mod._columns_absent(cur, schema, tables) == []
+        assert mod._catalog(cur, schema)["tables"] == sorted(mod._TABLES)
+        assert mod._columns_absent(mod._catalog(cur, schema)) == []
         conn.execute(f"alter table {schema}.tasks drop column created_by")
         conn.execute(f"alter table {schema}.task_activities drop column actor")
-        assert mod._columns_absent(cur, schema, tables) == ["tasks.created_by",
-                                                           "task_activities.actor"]
+        assert mod._columns_absent(mod._catalog(cur, schema)) == [
+            "tasks.created_by", "task_activities.actor"]
         conn.execute(mod._schema_ddl(schema))
-        assert mod._columns_absent(cur, schema, tables) == []
+        assert mod._columns_absent(mod._catalog(cur, schema)) == []
 
 
 @needs_store

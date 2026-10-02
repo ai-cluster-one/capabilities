@@ -495,6 +495,16 @@ class Daemon:
         self.relisten_delay = min(self.relisten_delay * 2, RELISTEN_LONGEST_SECONDS)
 
     def _check_notification(self) -> None:
+        # The store is brought up to this version first, when all it lacks is
+        # additive, so a store that lacked the notification gains it here. A
+        # store that cannot be asked is said by the check below.
+        try:
+            applied = self.host.catch_up()
+        except (Exception, SystemExit):
+            applied = None
+        if applied:
+            self.log(f"brought schema {applied['schema']} up to this version: "
+                     + ", ".join(applied["created"] + applied["added"]))
         try:
             installed = bool(self.host.notification_installed())
         except (Exception, SystemExit) as exc:

@@ -61,7 +61,9 @@ WRITING  (needs allow_write on the connection; exit 4 otherwise)
   tasks migrate [--apply]                       create what this connection's
                                                 schema is missing; reports and
                                                 touches nothing without --apply,
-                                                and then needs no allow_write
+                                                and then needs no allow_write.
+                                                The only way a change that is not
+                                                additive is applied. See STORE
 
 EXECUTION  (also needs allow_write)
   tasks claim [filters | --key KEY] [--lease 3h] [--worker NAME] [--handler CMD]
@@ -426,10 +428,12 @@ SERVICE
   It wakes when the store notifies that a task of this project became
   claimable - inserted in todo, moved to todo, or its pickup changed while in
   todo; a task handed to a worker in `waiting` is noticed at the poll - at every poll, at the earliest pickup or lease still ahead, and when
-  one of its turns claims or ends. The notification is a trigger `tasks
-  migrate --apply` adds; one channel serves the whole database, and its payload
-  names the schema and the project, so a daemon acts only on its own. A store
-  without it leaves the daemon the poll, and `service doctor` says so. A lapsed
+  one of its turns claims or ends. The notification is a trigger the store
+  gains when it is brought up to this version, which the daemon does itself
+  when it starts listening and at every poll, as STORE describes, and logs; one
+  channel serves the whole database, and its payload names the schema and the
+  project, so a daemon acts only on its own. A store without it leaves the
+  daemon the poll, and `service doctor` says so. A lapsed
   lease and an ended wait are put back by a claim and nothing else, so on the
   poll, with nothing else to start, a daemon that sees one due starts a turn
   whose claim puts it back.
@@ -876,7 +880,8 @@ WATCH
         what happened while the watch was away is known only up to this line.
 
   Tasks are never deleted, so no line removes one. Notifications come from
-  triggers on the three tables, which `migrate --apply` creates; they fire on
+  triggers on the three tables, which the store gains when it is brought up to
+  this version, as STORE describes; they fire on
   every write whichever path made it, and only when it commits, so work that
   rolls back prints nothing.
 
@@ -911,6 +916,33 @@ STORE
 
   A schema is an identifier, not a value, so it is validated as one: anything but
   letters, digits and underscore is refused rather than quoted.
+
+  A store behind this version is brought up to it by the first command that
+  reaches it, read or write, and by the service when it starts listening and at
+  every poll, when everything it lacks is additive: a table, a column that is
+  empty or defaulted, a trigger and the function it runs. It is applied under a
+  lock the store holds for the schema, and the store is read again once the
+  lock is held, so of several clients that find it behind together one applies
+  it and the rest are served as soon as it has. A command reports it as one
+  line on stderr before its answer,
+    {"migrated": {"schema": S, "created": [TABLE...], "added": [TABLE.THING...]}}
+  and the service writes it to its log.
+
+  No backup is taken for that, and none is needed: it writes no row and
+  removes nothing, so dropping what it added puts the store back as it was.
+  A change that is not additive - filling a column into the rows that predate
+  it, replacing a constraint, dropping the store-wide key - is never applied on
+  its own, and nothing else is either while one is pending. Only `migrate
+  --apply` applies it, run deliberately after taking a backup of the schema
+  (`pg_dump --schema S`). Until then the store answers what it can as before,
+  `doctor` and `migrate` name what it lacks, and `watch` on a store without
+  its triggers refuses with exit 5 `schema_behind`.
+
+  A connection without allow_write, a process under the read-only switch, and a
+  role the store does not let create objects are never brought up to date: a
+  command over one is served as it would have been, reading as before, and
+  `doctor` reports the store behind. So is a command that waits 10s for the
+  lock, or for the tables to be free, without getting it.
 
 I/O
   Success is JSON on stdout; errors are JSON on stderr.
@@ -4354,7 +4386,7 @@ def _connect(entry: dict | None, *, raising: bool = False, **libpq):
              "this script runs under `uv run --script`; invoke it through its shebang")
     password, _t, _s = _resolve_env_key(_secret_key(entry))
     try:
-        return psycopg.connect(
+        conn = psycopg.connect(
             host=_conf(entry, "db_host"), port=int(_conf(entry, "db_port", "5432")),
             user=_conf(entry, "db_user"), dbname=_conf(entry, "db_name"),
             password=password, sslmode=_conf(entry, "db_sslmode", "prefer"),
@@ -4365,9 +4397,19 @@ def _connect(entry: dict | None, *, raising: bool = False, **libpq):
         if raising:
             raise refusal from exc
         _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
+    if CATCH_UP:
+        # On the first connection a command opens, so bringing the store up to
+        # this version costs one query on a store that is current and no second
+        # connection on any. Disarmed before it runs: it is asked once per run.
+        globals()["CATCH_UP"] = False
+        applied = _catch_up(conn, SCHEMA, PROJECT)
+        if applied:
+            sys.stderr.write(json.dumps({"migrated": applied}, ensure_ascii=False) + "\n")
+    return conn
 
 
 SCHEMA = "tasks"          # replaced per run from the selected connection
+CATCH_UP = False          # armed per run for a command whose connection may write
 _IDENT = __import__("re").compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -8373,9 +8415,9 @@ class _Watch:
 
             def check():
                 with conn.cursor() as cur:
-                    tables = _tables_present(cur, SCHEMA)
-                    behind = ([t for t in _WATCH_TABLES if t not in tables]
-                              + _watch_behind(cur, SCHEMA, tables))
+                    catalog = _catalog(cur, SCHEMA)
+                    behind = ([t for t in _WATCH_TABLES if t not in catalog["tables"]]
+                              + _watch_behind(catalog))
                     return behind, _store_identity(cur)
 
             behind, store = self.bounded(check)
@@ -8833,31 +8875,21 @@ def _lane_rows(declaration: dict) -> list[dict]:
             for lane in declaration["lanes"]]
 
 
-def _triggers_absent(cur, schema: str, tables: list[str], triggers) -> list[str]:
+def _triggers_absent(catalog: dict, triggers) -> list[str]:
     """Each of `triggers` the store lacks, as table.trigger. A table that is
     absent is reported as a table, not as its triggers."""
-    absent = []
-    for table, trigger in triggers:
-        if table not in tables:
-            continue
-        cur.execute("""select 1 from pg_trigger g
-                         join pg_class t on t.oid = g.tgrelid
-                         join pg_namespace n on n.oid = t.relnamespace
-                        where n.nspname = %s and t.relname = %s and g.tgname = %s
-                          and not g.tgisinternal""", (schema, table, trigger))
-        if not cur.fetchone():
-            absent.append(f"{table}.{trigger}")
-    return absent
+    return [f"{table}.{trigger}" for table, trigger in triggers
+            if table in catalog["tables"] and (table, trigger) not in catalog["triggers"]]
 
 
-def _notify_behind(cur, schema: str, tables: list[str]) -> list[str]:
+def _notify_behind(catalog: dict) -> list[str]:
     """The claimable notification, as table.trigger, when the store lacks it."""
-    return _triggers_absent(cur, schema, tables, (_NOTIFY_TRIGGER,))
+    return _triggers_absent(catalog, (_NOTIFY_TRIGGER,))
 
 
-def _watch_behind(cur, schema: str, tables: list[str]) -> list[str]:
+def _watch_behind(catalog: dict) -> list[str]:
     """The watch notifications, as table.trigger, that the store lacks."""
-    return _triggers_absent(cur, schema, tables, _WATCH_TRIGGERS)
+    return _triggers_absent(catalog, _WATCH_TRIGGERS)
 
 
 def _service_sweep_due(entry) -> bool:
@@ -8955,8 +8987,15 @@ class _ServiceHost:
 
     def notification_installed(self) -> bool:
         with _connect(self.entry) as conn, conn.cursor() as cur:
-            tables = _tables_present(cur, SCHEMA)
-            return "tasks" in tables and not _notify_behind(cur, SCHEMA, tables)
+            catalog = _catalog(cur, SCHEMA)
+            return "tasks" in catalog["tables"] and not _notify_behind(catalog)
+
+    def catch_up(self) -> dict | None:
+        """Bring the store up to this version when it is behind by additive
+        changes only, as a command does before it is served; what was applied,
+        or None."""
+        with _connect(self.entry, raising=True) as conn:
+            return _catch_up(conn, SCHEMA, self.project)
 
     def lane_has_work(self, worker: dict, exclude: tuple = ()) -> bool:
         # The store's answer alone: a worker's `before` hook is asked by the turn
@@ -9114,9 +9153,9 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
     status = _service_status(module)
     try:
         with _connect(entry, raising=True) as conn, conn.cursor() as cur:
-            tables = _tables_present(cur, SCHEMA)
-            missing = [t for t in _TABLES if t not in tables]
-            silent = _notify_behind(cur, SCHEMA, tables)
+            catalog = _catalog(cur, SCHEMA)
+            missing = [t for t in _TABLES if t not in catalog["tables"]]
+            silent = _notify_behind(catalog)
     except Refusal as unreachable:
         # A running daemon outlives the store being away and picks up where it
         # was when the store answers again, so for it this is a warning. With
@@ -9522,55 +9561,160 @@ def _schema_ddl(target: str) -> str:
                        f"create schema if not exists {target};")
 
 
-def _tables_present(cur, schema: str) -> list[str]:
-    cur.execute("""select table_name from information_schema.tables
-                    where table_schema = %s order by table_name""", (schema,))
-    return [r["table_name"] for r in cur.fetchall()]
+def _catalog(cur, schema: str) -> dict:
+    """What the store holds in `schema` that this version checks for, read in
+    one round trip: the tables, their columns, constraints with their
+    definitions, indexes and triggers. Every check of how far a store is behind
+    is asked of this reading, so asking all of them costs one query, which is
+    what lets every command ask before it is served."""
+    cur.execute("""select 'table' as kind, table_name::text as tbl,
+                          null::text as name, null::text as definition
+                     from information_schema.tables where table_schema = %(s)s
+                   union all
+                   select 'column', table_name::text, column_name::text, null
+                     from information_schema.columns where table_schema = %(s)s
+                   union all
+                   select 'constraint', t.relname::text, c.conname::text,
+                          pg_get_constraintdef(c.oid)
+                     from pg_constraint c
+                     join pg_class t on t.oid = c.conrelid
+                     join pg_namespace n on n.oid = t.relnamespace
+                    where n.nspname = %(s)s
+                   union all
+                   select 'index', tablename::text, indexname::text, null
+                     from pg_indexes where schemaname = %(s)s
+                   union all
+                   select 'trigger', t.relname::text, g.tgname::text, null
+                     from pg_trigger g
+                     join pg_class t on t.oid = g.tgrelid
+                     join pg_namespace n on n.oid = t.relnamespace
+                    where n.nspname = %(s)s and not g.tgisinternal""", {"s": schema})
+    catalog: dict = {"tables": [], "columns": set(), "constraints": {},
+                     "indexes": set(), "triggers": set()}
+    for row in cur.fetchall():
+        kind, table, name = row["kind"], row["tbl"], row["name"]
+        if kind == "table":
+            catalog["tables"].append(table)
+        elif kind == "constraint":
+            catalog["constraints"][(table, name)] = row["definition"]
+        else:
+            catalog[{"column": "columns", "index": "indexes",
+                     "trigger": "triggers"}[kind]].add((table, name))
+    catalog["tables"].sort()
+    return catalog
 
 
-def _columns_absent(cur, schema: str, tables: list[str]) -> list[str]:
+def _columns_absent(catalog: dict) -> list[str]:
     """Later columns missing from tables that are present, as table.column. A
     table that is absent is reported as a table, not as each of its columns."""
-    cur.execute("""select table_name, column_name from information_schema.columns
-                    where table_schema = %s""", (schema,))
-    present = {(r["table_name"], r["column_name"]) for r in cur.fetchall()}
-    return [f"{t}.{c}" for t, c in _COLUMNS if t in tables and (t, c) not in present]
+    return [f"{t}.{c}" for t, c in _COLUMNS
+            if t in catalog["tables"] and (t, c) not in catalog["columns"]]
 
 
-def _constraints_behind(cur, schema: str, tables: list[str]) -> list[str]:
+def _constraints_behind(catalog: dict) -> list[str]:
     """Check constraints on tables that are present which do not admit a value a
     later version added, as table.constraint. A table that is absent is reported
     as a table, not as its constraints; a constraint that is absent outright is
     behind too, since applying the schema is what creates it."""
-    cur.execute("""select t.relname as table_name, c.conname as name,
-                          pg_get_constraintdef(c.oid) as definition
-                     from pg_constraint c
-                     join pg_class t on t.oid = c.conrelid
-                     join pg_namespace n on n.oid = t.relnamespace
-                    where n.nspname = %s and c.contype = 'c'""", (schema,))
-    defined = {(r["table_name"], r["name"]): r["definition"] for r in cur.fetchall()}
+    defined = catalog["constraints"]
     return [f"{table}.{name}" for table, name, value in _CONSTRAINTS
-            if table in tables
+            if table in catalog["tables"]
             and f"'{value}'" not in (defined.get((table, name)) or "")]
 
 
-def _key_scope_behind(cur, schema: str, tables: list[str]) -> list[str]:
+def _key_scope_behind(catalog: dict) -> list[str]:
     """The per-project key index, as table.index, when the store still keys
     tasks across the whole store or does not yet key them per project."""
     table, index = _KEY_INDEX
-    if table not in tables:
+    if table not in catalog["tables"]:
         return []
-    cur.execute("""select 1 from pg_indexes
-                    where schemaname = %s and tablename = %s and indexname = %s""",
-                (schema, table, index))
-    has_index = cur.fetchone() is not None
-    cur.execute("""select 1 from pg_constraint c
-                     join pg_class t on t.oid = c.conrelid
-                     join pg_namespace n on n.oid = t.relnamespace
-                    where n.nspname = %s and t.relname = %s and c.conname = %s""",
-                (schema, table, _STORE_WIDE_KEY))
-    store_wide = cur.fetchone() is not None
+    has_index = (table, index) in catalog["indexes"]
+    store_wide = (table, _STORE_WIDE_KEY) in catalog["constraints"]
     return [] if has_index and not store_wide else [f"{table}.{index}"]
+
+
+def _behind(catalog: dict) -> tuple[list[str], list[str]]:
+    """What applying the schema would create - the tables a store lacks - and
+    what it would add to the tables it has, as table.thing."""
+    missing = [t for t in _TABLES if t not in catalog["tables"]]
+    lacking = (_columns_absent(catalog) + _constraints_behind(catalog)
+               + _key_scope_behind(catalog) + _notify_behind(catalog)
+               + _watch_behind(catalog))
+    return missing, lacking
+
+
+# What `migrate` names that nothing applies on its own, because applying it
+# changes what the store already holds rather than adding beside it: the project
+# column is filled into every row that predates it and then required, the status
+# check is replaced, and the store-wide key is dropped. Everything else it names -
+# a table, a column that is empty or defaulted, a trigger and the function it
+# runs - is added beside what is there, writes no row, and is undone by dropping
+# it. A later change that fills, replaces or drops is named here as it lands.
+_NOT_ADDITIVE = frozenset(["tasks.project_id",
+                           *(f"{t}.{n}" for t, n, _value in _CONSTRAINTS),
+                           f"{_KEY_INDEX[0]}.{_KEY_INDEX[1]}"])
+
+# How long a command waits for another to finish bringing the store up to this
+# version, or for the tables it alters to be free, before it leaves the store as
+# it found it and is served as it would have been.
+_CATCH_UP_WAIT = "10s"
+
+
+def _schema_lock(cur, schema: str) -> None:
+    """Hold, until this transaction ends, the lock every change to `schema`'s
+    shape is made under, so two clients never apply it at once."""
+    cur.execute("select pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"tasks.schema:{schema}",))
+
+
+def _catch_up(conn, schema: str, project: str | None) -> dict | None:
+    """Bring a store that is behind this version by additive changes only up to
+    it, on `conn`, and answer what was applied, or None when nothing was.
+
+    Nothing is applied when anything the store lacks is not additive: that is
+    `migrate --apply`'s alone. What is applied is the whole schema, as `migrate
+    --apply` applies it; on a store whose only gaps are additive, every
+    statement in it that fills, replaces or drops finds nothing to change.
+
+    The store is read again once the schema's lock is held, so of clients that
+    found it behind together the first applies it and the rest find it current.
+    A lock not had within `_CATCH_UP_WAIT`, a role that may not create, or any
+    other refusal from the store rolls back whatever was begun, and the store
+    is left exactly as it was found. The connection is handed back with no
+    transaction open either way."""
+    import psycopg
+
+    def gap(cur) -> tuple[list[str], list[str]] | None:
+        missing, lacking = _behind(_catalog(cur, schema))
+        if not (missing or lacking) or _NOT_ADDITIVE.intersection(lacking):
+            return None
+        return missing, lacking
+
+    try:
+        with conn.cursor() as cur:
+            if gap(cur) is None:
+                conn.rollback()
+                return None
+            cur.execute("select set_config('lock_timeout', %s, true)", (_CATCH_UP_WAIT,))
+            _schema_lock(cur, schema)
+            found = gap(cur)
+            if found is None:
+                conn.rollback()
+                return None
+            if project:
+                cur.execute("select set_config('tasks_migration.project_id', %s, true)",
+                            (project,))
+            cur.execute(_schema_ddl(schema))
+            missing, lacking = _behind(_catalog(cur, schema))
+            if missing or lacking:
+                conn.rollback()
+                return None
+        conn.commit()
+    except psycopg.Error:
+        with __import__("contextlib").suppress(psycopg.Error):
+            conn.rollback()
+        return None
+    return {"schema": schema, "created": found[0], "added": found[1]}
 
 
 def cmd_migrate(entry, args: list[str]) -> None:
@@ -9596,13 +9740,9 @@ def cmd_migrate(entry, args: list[str]) -> None:
     # standing to change.
     project = _writing_project()
     with _connect(entry) as conn, conn.cursor() as cur:
-        before = _tables_present(cur, schema)
-        missing = [t for t in _TABLES if t not in before]
-        lacking = (_columns_absent(cur, schema, before)
-                   + _constraints_behind(cur, schema, before)
-                   + _key_scope_behind(cur, schema, before)
-                   + _notify_behind(cur, schema, before)
-                   + _watch_behind(cur, schema, before))
+        catalog = _catalog(cur, schema)
+        before = catalog["tables"]
+        missing, lacking = _behind(catalog)
         if not opts.get("apply"):
             _emit({"schema": schema, "project": project, "present": before,
                    "would_create": missing, "would_add": lacking, "applied": False})
@@ -9620,15 +9760,14 @@ def cmd_migrate(entry, args: list[str]) -> None:
         # version introduced, and a constraint that replaces itself for values a
         # later version admits; running only when a table is missing would leave
         # a store that has all four tables a column or a status behind forever.
+        # Under the lock a command takes to bring the store up to this version
+        # itself, so the two never apply the schema at once.
+        _schema_lock(cur, schema)
         cur.execute(ddl)
         conn.commit()
-        after = _tables_present(cur, schema)
-        still = ([t for t in _TABLES if t not in after]
-                 + _columns_absent(cur, schema, after)
-                 + _constraints_behind(cur, schema, after)
-                 + _key_scope_behind(cur, schema, after)
-                 + _notify_behind(cur, schema, after)
-                 + _watch_behind(cur, schema, after))
+        catalog = _catalog(cur, schema)
+        after = catalog["tables"]
+        still = [item for gap in _behind(catalog) for item in gap]
     if still:
         _die(5, "schema_incomplete",
              f"schema {schema} is still missing {', '.join(still)} after applying",
@@ -9648,21 +9787,24 @@ def cmd_doctor(wanted: str | None) -> None:
     with _connect(entry) as conn, conn.cursor() as cur:
         cur.execute("select version() as v")
         server = cur.fetchone()["v"].split(" (")[0]
-        cur.execute("""select table_name from information_schema.tables
-                        where table_schema = %s order by table_name""", (schema,))
-        tables = [r["table_name"] for r in cur.fetchall()]
         # What `migrate` would add, asked the way `migrate` asks it. A store a
         # column behind still answers, so it is a warning rather than a failure.
-        behind = (_columns_absent(cur, schema, tables)
-                  + _constraints_behind(cur, schema, tables)
-                  + _key_scope_behind(cur, schema, tables)
-                  + _notify_behind(cur, schema, tables)
-                  + _watch_behind(cur, schema, tables))
-    missing = [t for t in _TABLES if t not in tables]
+        # Doctor proves and changes nothing, so it reports a gap the next
+        # command would close rather than closing it.
+        catalog = _catalog(cur, schema)
+        tables = catalog["tables"]
+        missing, behind = _behind(catalog)
+    # Who closes the gap: the next command, when all of it is additive, and
+    # otherwise only `migrate --apply`.
+    closes = (f"`{NAME} migrate --apply` adds it, and nothing else does: it is not "
+              f"additive, so take a backup first (`{NAME} help` STORE)"
+              if _NOT_ADDITIVE.intersection(behind) else
+              f"the next command over a connection that allows writes applies it "
+              f"itself, and `{NAME} migrate --apply` applies it now")
     if missing:
         _die(5, "schema_missing",
              f"schema {schema} is incomplete: missing {', '.join(missing)}",
-             f"`{NAME} migrate --apply` creates them in {schema}")
+             closes)
     # A worker that cannot be read is a turn that will not run, and finding that
     # out here costs nothing while finding it out from a claim costs a task
     # sitting in `in_progress` holding a raise.
@@ -9678,7 +9820,7 @@ def cmd_doctor(wanted: str | None) -> None:
     if behind:
         answer["behind"] = behind
         answer["warning"] = (f"schema {schema} is behind this version: "
-                             f"{', '.join(behind)}; `{NAME} migrate --apply` adds it")
+                             f"{', '.join(behind)}; {closes}")
     _emit(answer)
 
 
@@ -9773,6 +9915,11 @@ def main() -> None:
     globals()["PROJECT"] = _declared_project()
     if verb in WRITE_VERBS and not _reads_only(verb, rest):
         _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), verb)
+    # A store behind this version by additive changes only is brought up to it
+    # before the command is served, read or write alike, over any connection that
+    # allows writes. `migrate` is the explicit path and does its own applying.
+    globals()["CATCH_UP"] = (verb != "migrate" and not read_only_switch()
+                             and bool((entry or {}).get("allow_write", WRITE_DEFAULT)))
     handlers = {
         "list": cmd_list, "ready": cmd_ready, "show": cmd_show, "search": cmd_search,
         "counts": cmd_counts,

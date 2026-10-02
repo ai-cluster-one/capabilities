@@ -839,8 +839,7 @@ def test_the_migration_fills_a_store_that_predates_the_column(
                  f"unique (unique_key)")
 
     with conn.cursor(row_factory=dict_row) as cur:
-        tables = mod._tables_present(cur, schema)
-        assert mod._columns_absent(cur, schema, tables) == ["tasks.project_id"]
+        assert mod._columns_absent(mod._catalog(cur, schema)) == ["tasks.project_id"]
 
     mod.cmd_migrate(entry, [])
     reported = _answer(capsys)

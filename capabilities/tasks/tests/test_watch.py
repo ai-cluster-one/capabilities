@@ -318,17 +318,43 @@ def test_sigterm_ends_it_with_exit_0(lab):
 
 
 @needs_store
-def test_a_store_without_the_triggers_is_refused_before_ready(lab):
+def test_a_store_without_a_trigger_gains_it_before_ready(lab):
+    """The store a release of `watch` left behind: it lacks a trigger, which is
+    additive, so the watch brings the store up to this version and listens."""
     import psycopg
     with psycopg.connect(DSN, autocommit=True) as conn:
         conn.execute(f"drop trigger task_activities_notify_watch "
                      f"on {lab['schema']}.task_activities")
+    watch, ready = _ready(lab)
+    assert ready["event"] == "ready"
+    watch.proc.stdin.close()
+    assert watch.proc.wait(timeout=30) == 0
+    [line] = watch.proc.stderr.read().splitlines()
+    assert json.loads(line) == {"migrated": {
+        "schema": lab["schema"], "created": [],
+        "added": ["task_activities.task_activities_notify_watch"]}}
+    assert _answer(_tasks(lab, "migrate"))["would_add"] == []
+
+
+@needs_store
+def test_a_store_without_the_triggers_is_refused_before_ready(lab):
+    """Behind on something that is not additive as well, the store is brought
+    up to date by nothing but `migrate --apply`, so the watch refuses."""
+    import psycopg
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(f"drop trigger task_activities_notify_watch "
+                     f"on {lab['schema']}.task_activities")
+        conn.execute(f"alter table {lab['schema']}.tasks "
+                     f"drop constraint tasks_status_check")
+        conn.execute(f"alter table {lab['schema']}.tasks add constraint tasks_status_check "
+                     "check (status in ('draft','todo','in_progress','complete','closed'))")
     proc = subprocess.run([str(_cli.CLI_PATH), "watch"], cwd=lab["project"],
                           env=lab["env"], text=True, capture_output=True, timeout=120,
                           stdin=subprocess.DEVNULL)
     assert proc.returncode == 5 and proc.stdout == ""
     error = json.loads(proc.stderr.strip().splitlines()[-1])["error"]
     assert error["code"] == "schema_behind" and "migrate --apply" in error["hint"]
+    assert "migrated" not in proc.stderr
     behind = _answer(_tasks(lab, "migrate"))
     assert "task_activities.task_activities_notify_watch" in behind["would_add"]
 

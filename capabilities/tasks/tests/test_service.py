@@ -464,14 +464,41 @@ def test_a_task_moved_to_todo_or_given_a_new_pickup_is_announced(project, store,
     assert heard() == []
 
 
+# The check a store created before `waiting` existed carries. Behind on it, the
+# store is behind by something that is not additive, so nothing brings it up to
+# this version on its own.
+OLD_CHECK = ("check (status in ('draft','todo','in_progress','complete','closed'))")
+
+
+@needs_store
+def test_the_daemon_brings_a_store_a_trigger_behind_up_to_date_and_logs_it(
+        project, store, capsys):
+    entry, schema, conn = store
+    conn.execute(f"drop trigger tasks_notify_claimable on {schema}.tasks")
+    write_settings(project, "version = 1\npoll_seconds = 3600\n")
+    with Harness(project, entry) as h:
+        h.daemon.step()
+        assert h.daemon.status()["wake_by"] == "notification"
+        log = (h.daemon.state_dir / h.service.LOG_FILE).read_text()
+        assert (f"brought schema {schema} up to this version: "
+                "tasks.tasks_notify_claimable") in log
+        add(entry, capsys, "beta")
+        h.steps(lambda: h.running("beta") == 1, seconds=4)
+        assert "notify" in h.daemon.last_wake["reasons"]
+    mod.cmd_migrate(entry, [])
+    assert json.loads(capsys.readouterr().out)["would_add"] == []
+
+
 @needs_store
 def test_without_the_notification_the_daemon_wakes_by_the_poll(project, store, capsys):
     entry, schema, conn = store
     conn.execute(f"drop trigger tasks_notify_claimable on {schema}.tasks")
+    conn.execute(f"alter table {schema}.tasks drop constraint tasks_status_check")
+    conn.execute(f"alter table {schema}.tasks add constraint tasks_status_check {OLD_CHECK}")
     write_settings(project, "version = 1\npoll_seconds = 1\n")
     from psycopg.rows import dict_row
     with conn.cursor(row_factory=dict_row) as cur:
-        assert mod._notify_behind(cur, schema, mod._tables_present(cur, schema)) == [
+        assert mod._notify_behind(mod._catalog(cur, schema)) == [
             "tasks.tasks_notify_claimable"]
     mod.cmd_migrate(entry, [])
     assert "tasks.tasks_notify_claimable" in json.loads(capsys.readouterr().out)["would_add"]
@@ -483,6 +510,7 @@ def test_without_the_notification_the_daemon_wakes_by_the_poll(project, store, c
         h.steps(lambda: h.running("beta") == 1, seconds=4)
         assert "poll" in h.daemon.last_wake["reasons"]
         assert "notify" not in h.daemon.last_wake["reasons"]
+        assert "brought schema" not in (h.daemon.state_dir / h.service.LOG_FILE).read_text()
     mod.cmd_migrate(entry, ["--apply"])
     assert "tasks.tasks_notify_claimable" in json.loads(capsys.readouterr().out)["added"]
 
