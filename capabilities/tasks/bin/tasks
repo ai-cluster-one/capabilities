@@ -399,7 +399,14 @@ SERVICE
   tasks service stop [--timeout S] [--force]
                                   stop claiming, let running turns finish within
                                   the grace period, end the rest
-  tasks service status            the lanes, the running turns and the next wake
+  tasks service pause [--reason TEXT] [<worker>...]
+                                  start no new turn, on every lane or on the
+                                  named lanes; running turns finish
+  tasks service resume [<worker>...]
+                                  lift the pause, on every lane or on the named
+                                  lanes
+  tasks service status            the lanes, the running turns, the pause and
+                                  the next wake
   tasks service logs [--tail 100] the end of the service log
 
   One daemon per project runs the conveyor on its own. Every enabled worker that
@@ -474,10 +481,29 @@ SERVICE
   closed as abandoned, the task back in todo. `--force` ends the daemon and
   its turns at once and leaves their raises to lapse.
 
+  `service pause` holds the conveyor without stopping the daemon: while it
+  holds, the daemon starts no new turn on the lanes it names, or on every lane
+  when it names none, and goes on polling, listening and ending what finishes.
+  Turns already running are not touched and finish on their own. `service
+  resume` lifts it on the lanes it names, or everywhere; resuming one lane
+  while every lane is paused leaves each other lane paused by name. A name
+  that is not a lane of this service is refused with exit 6, apart from a lane
+  `resume` still finds paused. The pause is runtime state kept beside the pid,
+  not a setting: it moves no fingerprint, needs no reload, outlives the daemon
+  restarting, and both verbs work whether a daemon runs or not. A running
+  daemon takes it up within a second, and `pause` and `resume` wait up to 10s
+  for that. Each records itself in the service log, with who set it - the
+  identity a write is attributed to, TASKS_ACTOR or the account - and its
+  reason. `service status` and `service doctor` show it: the lanes it holds,
+  and for every lane or each lane its reason, when it was set and by whom. A
+  paused service still answers `service doctor` ok, so a supervisor probing it
+  does not restart it. `tasks run <worker> --apply` by hand is not held by the
+  pause. Under the read-only switch both verbs are refused.
+
   `init`, `start` and `run` need tasks enabled for this project itself;
   enabled globally is not asking for a daemon here. `start` and `run` need a
   connection that allows writes. The pid, the fingerprint, the published
-  status and the log live in the project's capability state,
+  status, the pause and the log live in the project's capability state,
   `$XDG_STATE_HOME/capabilities/projects/<project-slug>/tasks/`, and `tasks
   inventory` reports from them whether a daemon runs, its lanes and how many
   turns it is running.
@@ -882,7 +908,8 @@ SERVICE = {
     "name": "conveyor",
     "summary": ("Project-local daemon that runs one turn of the conveyor for each "
                 "worker lane with work, woken by the store."),
-    "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs"],
+    "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs",
+              "pause", "resume"],
     "config": "capabilities/tasks/service/config.toml",
     "state": "$XDG_STATE_HOME/capabilities/projects/<project-slug>/tasks",
     "deploy": {
@@ -8180,7 +8207,8 @@ def cmd_history(entry, args: list[str]) -> None:
 # and what the store holds is answered here, by the same code every other verb
 # uses, so a turn the service starts is the turn a person starts.
 
-_SERVICE_VERBS = ("init", "doctor", "run", "start", "reload", "stop", "status", "logs")
+_SERVICE_VERBS = ("init", "doctor", "run", "start", "reload", "stop", "status", "logs",
+                  "pause", "resume")
 
 # What the settings file may say, and what it leaves to this capability. Any
 # other key is refused: a key nothing reads is a declaration doing nothing.
@@ -8616,15 +8644,45 @@ def _service_status(module) -> dict:
                     "reload_error", "stopping"):
             answer[key] = published.get(key)
         answer["current"] = module.read_fingerprint(state) == _service_fingerprint()
+        answer["pause"] = _pause_block(module, state, _workers_of(answer.get("lanes")),
+                                       published)
         return answer
     try:
         declaration = _service_declaration()
     except Refusal as refused:
         answer["declaration_error"] = refused.message
+        answer["pause"] = _pause_block(module, state, None, None)
         return answer
     answer["lanes"] = [{**row, "running": 0} for row in _lane_rows(declaration)]
     answer["idle"] = declaration["idle"]
+    answer["pause"] = _pause_block(module, state, _workers_of(answer["lanes"]), None)
     return answer
+
+
+def _workers_of(lanes) -> list[str] | None:
+    if not isinstance(lanes, list):
+        return None
+    return [str(row.get("worker")) for row in lanes if isinstance(row, dict)]
+
+
+def _pause_block(module, state: Path, workers: list[str] | None,
+                 published: dict | None) -> dict:
+    """The pause as the state directory holds it: whether anything is paused,
+    the entry pausing every lane, the entries pausing lanes by name, and which
+    of `workers`, the lanes, start no new turn - None when the lanes cannot be
+    read. With a daemon running, whether it has taken the pause up."""
+    pause = module.read_pause(state)
+    block = {"paused": bool(pause["all"] or pause["lanes"]), **pause,
+             "holding": module.holding(pause, workers) if workers is not None else None}
+    if published is not None:
+        block["taken_up"] = _pause_taken_up(pause, published)
+    return block
+
+
+def _pause_taken_up(pause: dict, published: dict | None) -> bool:
+    seen = (published or {}).get("pause")
+    return (isinstance(seen, dict) and seen.get("all") == pause["all"]
+            and seen.get("lanes") == pause["lanes"])
 
 
 def cmd_service_init(args: list[str]) -> None:
@@ -8694,6 +8752,9 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
                                  "so the service wakes by its poll alone; "
                                  f"`{NAME} migrate --apply` adds it")
     answer["service"] = status
+    # A paused service is working as asked: reported, never a problem, so a
+    # supervisor that restarts on a failing probe leaves it paused and running.
+    answer["pause"] = status["pause"]
     if status["running"]:
         loaded = module.read_fingerprint(_service_state_dir())
         current = _service_fingerprint()
@@ -8867,6 +8928,117 @@ def cmd_service_stop(args: list[str]) -> None:
            "turns_killed": turns})
 
 
+def _pause_lanes(names: list[str], pause: dict, resuming: bool) -> list[str] | None:
+    """The lanes the declaration on disk runs, after checking every name given
+    is one of them; None when it does not load and no name needs it. A lane
+    `resume` still finds paused by name may be named even when the declaration
+    no longer runs it, so a pause can always be lifted. Exits 6 on a name that
+    is not a lane."""
+    try:
+        lanes = [lane["worker"] for lane in _service_declaration()["lanes"]]
+    except Refusal as refused:
+        if names and not (resuming and not pause["all"]
+                          and all(name in pause["lanes"] for name in names)):
+            _die(refused.exit_code, refused.code, refused.message,
+                 "a lane is named against the declaration on disk, which does not load")
+        return None
+    unknown = [name for name in names
+               if name not in lanes and not (resuming and name in pause["lanes"])]
+    if unknown:
+        _die(6, "lane_unknown",
+             f"{', '.join(map(repr, unknown))} {'is' if len(unknown) == 1 else 'are'} "
+             "not a lane of this service",
+             f"its lanes are {', '.join(lanes) or 'none'}; `{NAME} service status` "
+             "lists them")
+    return lanes
+
+
+def _pause_wait(module, state: Path, pause: dict) -> bool | None:
+    """Wait up to 10s for a running daemon to publish the pause as written:
+    True once it has, False when it has not, None with no daemon."""
+    import time as _time
+
+    if not module.pid_alive(module.read_pid(state)):
+        return None
+    deadline = _time.monotonic() + 10
+    while True:
+        if _pause_taken_up(pause, module.read_status(state)):
+            return True
+        if _time.monotonic() > deadline or not module.pid_alive(module.read_pid(state)):
+            return False
+        _time.sleep(0.1)
+
+
+def _named_once(names: list[str]) -> list[str]:
+    return list(dict.fromkeys(name.strip() for name in names if name.strip()))
+
+
+def cmd_service_pause(args: list[str]) -> None:
+    """Hold the conveyor: no new turn on the named lanes, or on every lane."""
+    _read_only_gate(f"`{NAME} service pause`")
+    opts = _flags(args, ("reason",), takes=len(args))
+    names = _named_once(opts["_loose"])
+    module = _service_module()
+    state = _service_state_dir()
+    pause = module.read_pause(state)
+    lanes = _pause_lanes(names, pause, resuming=False)
+    reason = (opts.get("reason") or "").strip() or None
+    entry = {"reason": reason, "at": module.now_iso(), "by": _actor()}
+    if names:
+        for name in names:
+            pause["lanes"][name] = entry
+    else:
+        pause["all"] = entry
+    module.write_pause(state, pause)
+    module.log_line(state, f"pause set by {entry['by']} on "
+                    + (f"lane(s) {', '.join(names)}" if names else "every lane")
+                    + (f": {reason}" if reason else ""))
+    answer = {"paused": names or "every lane", **entry}
+    taken = _pause_wait(module, state, pause)
+    answer["running"] = taken is not None
+    answer["pause"] = _pause_block(module, state, lanes,
+                                   module.read_status(state) if taken is not None else None)
+    _emit(answer)
+
+
+def cmd_service_resume(args: list[str]) -> None:
+    """Lift the pause on the named lanes, or everywhere."""
+    _read_only_gate(f"`{NAME} service resume`")
+    opts = _flags(args, (), takes=len(args))
+    names = _named_once(opts["_loose"])
+    module = _service_module()
+    state = _service_state_dir()
+    pause = module.read_pause(state)
+    before = {"all": pause["all"], "lanes": dict(pause["lanes"])}
+    lanes = _pause_lanes(names, pause, resuming=True)
+    kept: list[str] = []
+    if not names:
+        pause = {"all": None, "lanes": {}}
+    else:
+        if pause["all"]:
+            # Every lane was paused and some are let go: each other lane stays
+            # paused, by name, under the entry that paused it.
+            kept = [lane for lane in lanes or []
+                    if lane not in names and lane not in pause["lanes"]]
+            for lane in kept:
+                pause["lanes"][lane] = pause["all"]
+            pause["all"] = None
+        for name in names:
+            pause["lanes"].pop(name, None)
+    changed = pause != before
+    if changed:
+        module.write_pause(state, pause)
+        module.log_line(state, f"pause lifted by {_actor()} on "
+                        + (f"lane(s) {', '.join(names)}" if names else "every lane")
+                        + (f"; {', '.join(kept)} stay paused by name" if kept else ""))
+    answer = {"resumed": names or "every lane", "changed": changed}
+    taken = _pause_wait(module, state, pause)
+    answer["running"] = taken is not None
+    answer["pause"] = _pause_block(module, state, lanes,
+                                   module.read_status(state) if taken is not None else None)
+    _emit(answer)
+
+
 def cmd_service_logs(args: list[str]) -> None:
     opts = _flags(args, ("tail",))
     try:
@@ -8902,6 +9074,10 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
     elif verb == "status":
         _flags(rest, ())
         _emit(_service_status(_service_module()))
+    elif verb == "pause":
+        cmd_service_pause(rest)
+    elif verb == "resume":
+        cmd_service_resume(rest)
     else:
         cmd_service_logs(rest)
 

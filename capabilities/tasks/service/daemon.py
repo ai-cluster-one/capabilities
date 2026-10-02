@@ -24,6 +24,12 @@ It never starts a turn on a task one of its turns holds, or on one a turn of its
 own ended on less than `retry_delay_seconds` ago: its turns are told to claim
 other tasks, and it wakes again when the delay is over. However a turn fails,
 its task comes back no faster than that.
+
+It starts no turn on a lane the pause holds. The pause is a file in its state
+directory, written by `service pause` and `service resume` whether or not a
+daemon runs, and read on every pass of the loop; it is runtime state, not part
+of the declaration, so it moves no fingerprint and outlives a restart. Turns
+already running are not touched by it.
 """
 
 from __future__ import annotations
@@ -45,6 +51,7 @@ PID_FILE = "daemon.pid"
 FINGERPRINT_FILE = "daemon.fingerprint"
 STATUS_FILE = "daemon.json"
 LOG_FILE = "daemon.log"
+PAUSE_FILE = "paused.json"
 TURNS_DIR = "turns"
 RECEIPT_ENV = "TASKS_TURN_RECEIPT"
 EXCLUDE_ENV = "TASKS_TURN_EXCLUDE"
@@ -63,7 +70,7 @@ RELISTEN_LONGEST_SECONDS = 30.0
 # write announces either. Starting one on every wake would spin on a sweep that
 # keeps failing, so it happens on the clock and nowhere else. Listening again
 # after the store was away counts as the clock: a lease may have lapsed meanwhile.
-_SWEEP_WAKES = {"start", "poll", "pickup", "reload", "relisten"}
+_SWEEP_WAKES = {"start", "poll", "pickup", "reload", "relisten", "resume"}
 
 
 def now_iso() -> str:
@@ -114,6 +121,54 @@ def _write_atomic(path: Path, text: str) -> None:
     spare = path.with_name(f".{path.name}.{os.getpid()}")
     spare.write_text(text)
     os.replace(spare, path)
+
+
+def log_line(state_dir: Path, message: str) -> str:
+    """Append one line to the service log, as the daemon writes it, and return
+    it. A verb that changes the daemon's runtime state records it here too,
+    whether or not a daemon runs."""
+    line = f"{now_iso()} tasks service: {message}\n"
+    with contextlib.suppress(OSError):
+        with (Path(state_dir) / LOG_FILE).open("a", encoding="utf-8") as handle:
+            handle.write(line)
+    return line
+
+
+def _pause_entry(found) -> dict | None:
+    if not isinstance(found, dict):
+        return None
+    return {"reason": found.get("reason") if isinstance(found.get("reason"), str) else None,
+            "at": found.get("at"), "by": found.get("by")}
+
+
+def read_pause(state_dir: Path) -> dict:
+    """The pause as written: `all`, the entry holding every lane or None, and
+    `lanes`, an entry per lane held by name. Each entry is its reason, the
+    moment it was set and who set it. No file is no pause."""
+    found = _read_json(Path(state_dir) / PAUSE_FILE) or {}
+    lanes = found.get("lanes") if isinstance(found.get("lanes"), dict) else {}
+    return {"all": _pause_entry(found.get("all")),
+            "lanes": {str(name): entry for name, entry in
+                      ((name, _pause_entry(raw)) for name, raw in sorted(lanes.items()))
+                      if entry is not None}}
+
+
+def write_pause(state_dir: Path, pause: dict) -> None:
+    """Write the pause, or remove the file when it holds nothing."""
+    path = Path(state_dir) / PAUSE_FILE
+    if not pause.get("all") and not pause.get("lanes"):
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_atomic(path, json.dumps({"all": pause.get("all"),
+                                    "lanes": dict(sorted(pause.get("lanes", {}).items()))},
+                                   indent=2) + "\n")
+
+
+def holding(pause: dict, workers) -> list[str]:
+    """The lanes among `workers` that start no new turn under `pause`."""
+    return [worker for worker in workers if pause.get("all") or worker in pause.get("lanes", {})]
 
 
 def _read_json(path: Path) -> dict | None:
@@ -215,6 +270,7 @@ class Daemon:
         self.recent: dict[str, dict] = {}
         self.rotation = 0
         self.reload_error: str | None = None
+        self.pause: dict = {"all": None, "lanes": {}}
         self.started_at = now_iso()
         self._lock = None
         self._published: str | None = None
@@ -224,10 +280,7 @@ class Daemon:
     # --- what it says ----------------------------------------------------------
 
     def log(self, message: str) -> None:
-        line = f"{now_iso()} tasks service: {message}\n"
-        with contextlib.suppress(OSError):
-            with self._log_path.open("a", encoding="utf-8") as handle:
-                handle.write(line)
+        line = log_line(self.state_dir, message)
         if self._log_to_stderr:
             sys.stderr.write(line)
             sys.stderr.flush()
@@ -277,6 +330,7 @@ class Daemon:
                                       if t.worker == lane["worker"]),
                        "held_until_poll": lane["worker"] in self.held}
                       for lane in self.lanes()],
+            "pause": {**self.pause, "holding": self.holding()},
             "idle": self.declaration.get("idle", []),
             "turns": [turn.row() for turn in self.turns.values()],
             "deferred": [{"task": r["task"], "task_id": tid, "until": _at(r["until"] - now)}
@@ -327,10 +381,13 @@ class Daemon:
         for path in left:
             with contextlib.suppress(OSError):
                 path.unlink()
+        self.pause = read_pause(self.state_dir)
+        held = self.holding()
         self.log(f"started, pid {os.getpid()}, project {self.host.project}, "
                  f"lanes {', '.join(self._lane_words()) or 'none'}"
                  + (f"; cleared {len(left)} file(s) a previous daemon left in turns/"
-                    if left else ""))
+                    if left else "")
+                 + (f"; paused, starting no turn on {', '.join(held)}" if held else ""))
         self._connect_listener()
         self.next_poll = time.monotonic() + self.settings()["poll_seconds"]
         self.publish()
@@ -370,6 +427,7 @@ class Daemon:
         if self.reload_requested:
             self.reload_requested = False
             self.reload()
+        self._take_up_pause()
         self.reap()
         now = time.monotonic()
         if now >= self.next_poll:
@@ -498,6 +556,29 @@ class Daemon:
         self.next_moment = (time.monotonic() + max(0.0, float(seconds)) + 0.5
                             if seconds is not None else None)
 
+    # --- the pause -------------------------------------------------------------
+
+    def holding(self) -> list[str]:
+        return holding(self.pause, [lane["worker"] for lane in self.lanes()])
+
+    def _take_up_pause(self) -> None:
+        """Read the pause and act on what moved: a lane newly held starts no
+        turn from now on, and a lane let go is a wake."""
+        found = read_pause(self.state_dir)
+        if found == self.pause:
+            return
+        before = set(self.holding())
+        self.pause = found
+        after = self.holding()
+        lifted = sorted(before - set(after))
+        if after and set(after) != before:
+            running = sum(1 for t in self.turns.values() if t.worker in after)
+            self.log(f"paused: starting no turn on {', '.join(after)}"
+                     + (f"; {running} running turn(s) left to finish" if running else ""))
+        if lifted:
+            self.log(f"resumed: {', '.join(lifted)} start turns again")
+            self.wakes.add("resume")
+
     # --- turns -----------------------------------------------------------------
 
     def _lane_words(self) -> list[str]:
@@ -506,6 +587,7 @@ class Daemon:
     def _room(self, lane: dict) -> bool:
         mine = [t for t in self.turns.values() if t.worker == lane["worker"]]
         return (lane["worker"] not in self.held
+                and lane["worker"] not in self.holding()
                 and len(mine) < lane["max_parallel"]
                 and not any(t.phase == "claiming" for t in mine))
 
