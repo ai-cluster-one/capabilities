@@ -1,6 +1,13 @@
 """The tasks service: a dispatcher that runs the conveyor on its own for a set
 of projects, one slot each. In project mode the set is one project, the one the
-daemon was started in.
+daemon was started in. In machine mode one process serves every project on the
+machine's opt-in list: the set follows the list, a project joining or leaving
+is noticed on the next pass, and a project that cannot be served is reported
+with the reason while the others are served. The machine process owns only
+what is the machine's - its store connections, an optional cap on turns
+running at once across every project and the order projects are served in
+under it - and every turn it starts is the project's, as project mode starts
+it.
 
 Every enabled worker of a project that takes something is a lane. Whenever a
 lane has a free slot and the store holds work it would take, the daemon starts
@@ -83,6 +90,19 @@ END_TURNS_FILE = "end-turns.json"
 TURNS_DIR = "turns"
 RECEIPT_ENV = "TASKS_TURN_RECEIPT"
 EXCLUDE_ENV = "TASKS_TURN_EXCLUDE"
+
+# The tag on every line the machine process writes about itself, its stores or
+# its cap; a line about one project carries that project's slug.
+MACHINE_TAG = "machine"
+
+# The longest the machine process goes without publishing its status, so a
+# probe can tell a process that is alive from one that hangs.
+PUBLISH_SECONDS = 30.0
+
+# How often a project on the list that cannot be served yet is asked again
+# whether it can: its folder, its declaration of itself, its enable, its
+# connection and its lock.
+ADMIT_SECONDS = 1.0
 
 # The longest the loop sleeps between looks at its children and its signals.
 # A stop or a reload is taken within this, and so is a turn that ended.
@@ -194,6 +214,45 @@ def end_turns_age(intent: dict) -> float | None:
     return (datetime.datetime.now(datetime.timezone.utc) - at).total_seconds()
 
 
+def fresh_end_turns(state_dir: Path, default_limit: float, say) -> dict | None:
+    """The end-turns intent in `state_dir` when it is fresh: written no longer
+    ago than the stop that wrote it waits, or `default_limit` when it does not
+    say. One older than that is stale - the stop it came with is long over - so
+    it is said through `say`, removed and ignored, and cannot turn a later
+    restart into an ending."""
+    path = Path(state_dir) / END_TURNS_FILE
+    found = _read_json(path)
+    if found is None:
+        return None
+    age = end_turns_age(found)
+    limit = found.get("timeout_seconds")
+    if not isinstance(limit, (int, float)) or isinstance(limit, bool) or limit <= 0:
+        limit = default_limit
+    if age is None or age > limit:
+        say(f"ignored the end-turns intent {found.get('by')} wrote at "
+            f"{found.get('at')}: older than the {limit:g}s its stop waits; "
+            "running turns are left running")
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return None
+    return found
+
+
+def take_lock(state_dir: Path):
+    """The one-process lock in `state_dir`, taken without waiting: the open
+    file holding it, or None while another process holds it."""
+    import fcntl
+
+    Path(state_dir).mkdir(parents=True, exist_ok=True)
+    handle = (Path(state_dir) / LOCK_FILE).open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
 def _write_atomic(path: Path, text: str) -> None:
     spare = path.with_name(f".{path.name}.{os.getpid()}")
     spare.write_text(text)
@@ -279,6 +338,15 @@ def _why(exc: BaseException) -> str:
     if isinstance(exc, SystemExit):
         return f"exited {exc.code}; the error is on the line above"
     return f"{type(exc).__name__}: {exc}"
+
+
+def _reason(exc: BaseException) -> str:
+    """A refusal as a status reason, `code: sentence`, the way every other
+    reason a slot carries reads; anything else as `_why` says it."""
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and isinstance(getattr(exc, "message", None), str):
+        return f"{code}: {exc.message}"
+    return _why(exc)
 
 
 class StoreAway(Exception):
@@ -474,6 +542,13 @@ class ProjectSlot:
         # until it is asked.
         self.refusal: tuple[str, str] | None = None
         self.checked: bool | None = None
+        # Why the declaration has never loaded, for a machine slot whose first
+        # load failed: it holds its lock and serves nothing until a reload
+        # takes a declaration.
+        self.load_error: str | None = None
+        # Had a wake and room when the machine cap bound: kept until any turn
+        # ends, then offered again.
+        self.waiting_for_cap = False
         self.started_at = now_iso()
         self._lock = None
         self._published: str | None = None
@@ -487,10 +562,7 @@ class ProjectSlot:
         return self.host.scope(self.dispatcher.environment)
 
     def log(self, message: str) -> None:
-        line = log_line(self.state_dir, self.slug, message)
-        if self._log_to_stderr:
-            sys.stderr.write(line)
-            sys.stderr.flush()
+        self.dispatcher.echo(self, log_line(self.state_dir, self.slug, message))
 
     def _stderr_is_log(self) -> bool:
         """`start` hands the daemon the log file as its stderr, so a line written
@@ -518,13 +590,23 @@ class ProjectSlot:
 
     def state(self) -> str:
         """`refused` or `error` while the project may not be served, `paused`
-        while the pause holds every lane, and `served` otherwise."""
+        while the pause holds every lane, and `served` otherwise. A machine
+        slot is also `error` while its declaration has never loaded and while
+        its store is away."""
+        return self._state_and_reason()[0]
+
+    def _state_and_reason(self) -> tuple[str, str | None]:
+        if self.load_error is not None:
+            return "error", self.load_error
         if self.refusal is not None:
-            return self.refusal[0]
+            return self.refusal
+        away = self.store.query_error or self.store.listen_error
+        if self.machine and away:
+            return "error", f"store_away: {away}"
         lanes = [lane["worker"] for lane in self.lanes()]
         if lanes and set(self.holding()) == set(lanes):
-            return "paused"
-        return "served"
+            return "paused", None
+        return "served", None
 
     def status(self) -> dict:
         now = time.monotonic()
@@ -536,13 +618,19 @@ class ProjectSlot:
         reason, due = min(wakes, key=lambda item: item[1])
         listening = self.listener is not None
         listen_error = self.store.listen_error
+        state, why = self._state_and_reason()
+        # A machine slot says so, and whether the machine cap holds it back;
+        # a project-mode status carries neither.
+        machine = ({"mode": "machine", "machine_pid": os.getpid(),
+                    "waiting_for_cap": self.waiting_for_cap} if self.machine else {})
         return {
+            **machine,
             "pid": os.getpid(),
             "started_at": self.started_at,
             "project": self.host.project,
             "schema": self.host.schema,
-            "state": self.state(),
-            "reason": self.refusal[1] if self.refusal else None,
+            "state": state,
+            "reason": why,
             "fingerprint": self.declaration["fingerprint"],
             "wake_by": ("notification" if listening and self.notification_installed
                         else "poll"),
@@ -583,31 +671,41 @@ class ProjectSlot:
 
     # --- lifecycle -------------------------------------------------------------
 
-    def open(self) -> None:
+    def open(self, lock=None) -> None:
         """Take the project's one daemon slot and say which declaration holds it.
 
-        The lock is what makes it one daemon per project; the pid and the
-        fingerprint are written behind it, because they answer for the same
-        process. Then it takes up the turns a daemon before it left running:
-        every turn record in `turns/` whose pid is alive and started at the
-        recorded moment is adopted, and every other is a turn that ended while
-        nothing watched it, said in the log and removed. Files in `turns/` that
-        no record names are cleared."""
+        The lock is what makes it one daemon per project, in either mode; the
+        pid and the fingerprint are written behind it, because they answer for
+        the same process. A machine slot is handed the lock it already took. A
+        slot whose declaration never loaded publishes no fingerprint, so a
+        reload in the project always reaches it. Then it takes up the turns a
+        daemon before it left running: every turn record in `turns/` whose pid
+        is alive and started at the recorded moment is adopted, and every other
+        is a turn that ended while nothing watched it, said in the log and
+        removed. Files in `turns/` that no record names are cleared."""
         import fcntl
 
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._log_to_stderr = not self._stderr_is_log()
         lock_path = self.state_dir / LOCK_FILE
-        self._lock = lock_path.open("a+")
-        try:
-            fcntl.flock(self._lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            self._lock.close()
-            self._lock = None
-            raise RuntimeError(f"another tasks daemon for this project holds {lock_path}") from exc
+        if lock is not None:
+            self._lock = lock
+        else:
+            self._lock = lock_path.open("a+")
+            try:
+                fcntl.flock(self._lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                self._lock.close()
+                self._lock = None
+                raise RuntimeError(
+                    f"another tasks daemon for this project holds {lock_path}") from exc
         (self.state_dir / PID_FILE).write_text(f"{os.getpid()}\n")
-        _write_atomic(self.state_dir / FINGERPRINT_FILE,
-                      self.declaration["fingerprint"] + "\n")
+        if self.declaration["fingerprint"] is None:
+            with contextlib.suppress(OSError):
+                (self.state_dir / FINGERPRINT_FILE).unlink()
+        else:
+            _write_atomic(self.state_dir / FINGERPRINT_FILE,
+                          self.declaration["fingerprint"] + "\n")
         self.turns_dir.mkdir(exist_ok=True)
         adopted, gone = self._read_records()
         named = {path for turn in adopted + gone
@@ -667,11 +765,11 @@ class ProjectSlot:
             with contextlib.suppress(OSError):
                 (self.state_dir / name).unlink()
 
-    def release(self) -> None:
+    def release(self, said: str = "stopped") -> None:
         if self._lock is not None:
             self._lock.close()
             self._lock = None
-        self.log("stopped")
+        self.log(said)
 
     # --- may it be served ------------------------------------------------------
 
@@ -680,11 +778,19 @@ class ProjectSlot:
         project's scope: once per pass at the first wake that would ask the
         store anything, and afresh when `fresh`, which is before every turn.
         A change of answer is said once in the log."""
+        if self.load_error is not None:
+            # Nothing to serve it by until a reload takes a declaration.
+            self.checked = False
+            return False
         if self.checked is not None and not fresh:
             return self.checked
         try:
-            with self.scope():
-                found = self.host.recheck(self.machine)
+            # A machine slot first asks whether its project is still on the
+            # opt-in list; leaving it is the project's own act.
+            found = self.dispatcher.listed(self) if self.machine else None
+            if found is None:
+                with self.scope():
+                    found = self.host.recheck(self.machine)
         except (Exception, SystemExit) as exc:
             found = ("error", _why(exc))
         if found != self.refusal:
@@ -703,12 +809,13 @@ class ProjectSlot:
         """Put one question about this project to its store, inside its scope."""
         return self.dispatcher.ask(self.store, question, scope=self.scope, at_once=at_once)
 
-    def check_notification(self) -> None:
+    def check_notification(self, catch_up: bool = True) -> None:
         # The store is brought up to this version first, when all it lacks is
         # additive, so a store that lacked the notification gains it here. A
-        # store that cannot be asked is said by the check below.
+        # store that cannot be asked is said by the check below. When a
+        # listener opens, a schema several slots share is brought up once.
         try:
-            applied = self.ask(self.host.catch_up)
+            applied = self.ask(self.host.catch_up) if catch_up else None
         except (Exception, SystemExit):
             applied = None
         if applied:
@@ -797,17 +904,21 @@ class ProjectSlot:
                 if t.claim and t.claim.get("task_id")}
         return tuple(sorted(held | set(self.recent)))
 
-    def dispatch(self, wakes: set[str]) -> None:
+    def dispatch(self, wakes: set[str], limit: int | None = None) -> int:
         """Start a turn for every lane with room and work, while the cap across
-        every lane allows. Lanes are asked in a rotating order, so one lane's
-        work cannot keep another's waiting behind the shared cap for ever."""
+        every lane allows, and at most `limit` when the machine cap deals turns
+        one at a time; how many started. Lanes are asked in a rotating order,
+        so one lane's work cannot keep another's waiting behind the shared cap
+        for ever."""
         lanes = self.lanes()
         if not lanes:
-            return
+            return 0
         free = self.settings()["max_parallel"] - len(self.turns)
+        if limit is not None:
+            free = min(free, limit)
         start = self.rotation % len(lanes)
         self.rotation += 1
-        started = False
+        started = 0
         exclude = self.excluded()
         for lane in lanes[start:] + lanes[:start]:
             if free <= 0:
@@ -819,23 +930,24 @@ class ProjectSlot:
                                     self.host.lane_has_work(conn, spec, exclude))
             except (Exception, SystemExit) as exc:
                 self.log(f"cannot ask the store for {lane['worker']}'s work: {_why(exc)}")
-                return
+                return started
             if has_work:
                 if self.spawn(lane["worker"], "work", exclude) is None:
-                    return
+                    return started
                 free -= 1
-                started = True
+                started += 1
         if started or free <= 0 or not (wakes & _SWEEP_WAKES):
-            return
+            return started
         try:
             due = self.ask(self.host.sweep_due)
         except (Exception, SystemExit) as exc:
             self.log(f"cannot ask the store what a claim would put back: {_why(exc)}")
-            return
+            return started
         if due:
             lane = next((lane for lane in lanes if self._room(lane)), None)
-            if lane is not None:
-                self.spawn(lane["worker"], "sweep", exclude)
+            if lane is not None and self.spawn(lane["worker"], "sweep", exclude) is not None:
+                started += 1
+        return started
 
     def spawn(self, worker: str, reason: str, exclude: tuple = ()) -> Turn | None:
         """Start one turn, unless the check taken again just before it refuses
@@ -856,7 +968,7 @@ class ProjectSlot:
             process = subprocess.Popen(
                 self.host.turn_command(worker), cwd=str(self.host.root), env=env,
                 stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                start_new_session=True)
+                start_new_session=True, close_fds=True)
         turn = Turn(turn_id, worker, process, receipt, output, errors, reason, self.slug,
                     lstart=process_started(process.pid),
                     record=self.turns_dir / f"{turn_id}.json")
@@ -869,7 +981,10 @@ class ProjectSlot:
                  + (", to let its claim put back what is due" if reason == "sweep" else ""))
         return turn
 
-    def reap(self) -> None:
+    def reap(self) -> int:
+        """Read what each turn reported and let go of those that ended; how
+        many ended."""
+        ended_now = 0
         for turn in list(self.turns.values()):
             if turn.read_receipt():
                 self.log(f"turn {turn.id} claimed {turn.claim.get('task')} "
@@ -880,6 +995,8 @@ class ProjectSlot:
             if not ended:
                 continue
             self._finish(turn, code)
+            ended_now += 1
+        return ended_now
 
     def _finish(self, turn: Turn, code: int | None) -> None:
         """Say how a turn ended and let go of it. An adopted turn's exit code is
@@ -957,18 +1074,9 @@ class ProjectSlot:
         stop that wrote it waits. One older than that is stale - the stop it
         came with is long over - so it is said, removed and ignored, and cannot
         turn a later restart into an ending."""
-        found = _read_json(self.state_dir / END_TURNS_FILE)
+        found = fresh_end_turns(self.state_dir, self.settings()["shutdown_grace_seconds"] + 30,
+                                self.log)
         if found is None:
-            return False
-        age = end_turns_age(found)
-        limit = found.get("timeout_seconds")
-        if not isinstance(limit, (int, float)) or isinstance(limit, bool) or limit <= 0:
-            limit = self.settings()["shutdown_grace_seconds"] + 30
-        if age is None or age > limit:
-            self.log(f"ignored the end-turns intent {found.get('by')} wrote at "
-                     f"{found.get('at')}: older than the {limit:g}s its stop waits; "
-                     "running turns are left running")
-            self.drop_end_turns()
             return False
         self.log(f"ending running turns, as {found.get('by')} asked at {found.get('at')}")
         return True
@@ -989,9 +1097,19 @@ class ProjectSlot:
             with self.scope():
                 declaration = self.host.load()
         except (Exception, SystemExit) as exc:
+            if self.load_error is not None:
+                # It never had a declaration to keep: still nothing to serve
+                # it by.
+                self.load_error = _reason(exc)
+                self.log(f"reload rejected, still serving nothing: {self.load_error}")
+                return
             self.reload_error = _why(exc)
             self.log(f"reload rejected, keeping the declaration loaded: {self.reload_error}")
             return
+        if self.load_error is not None:
+            self.load_error = None
+            self.checked = None
+            self.log("its declaration loads now; serving it")
         self.declaration = declaration
         self.reload_error = None
         self.held.clear()
@@ -1001,11 +1119,14 @@ class ProjectSlot:
         self.wakes.add("reload")
         self.log(f"reloaded: lanes {', '.join(self._lane_words()) or 'none'}")
 
-    def cut_off(self) -> None:
+    def cut_off(self, grace: float | None = None) -> None:
         """End every turn still running and settle each raise it held the way a
         lapsed lease is settled. An adopted turn is ended only while its pid is
-        still the process recorded, so a pid used again is never ended."""
-        grace = self.settings()["shutdown_grace_seconds"]
+        still the process recorded, so a pid used again is never ended. `grace`
+        is the wait that came before, for the log: the project's own, or the
+        machine's in machine mode."""
+        if grace is None:
+            grace = self.settings()["shutdown_grace_seconds"]
         for turn in list(self.turns.values()):
             turn.read_receipt()
             if turn.process is not None or turn.still_recorded():
@@ -1053,6 +1174,9 @@ class Dispatcher:
         # Turns running at once across every slot; None leaves only each
         # project's own limits, which is what project mode runs by.
         self.machine_cap = machine_cap
+        # Where the next round under the machine cap starts: the project after
+        # the last one that got a turn.
+        self.pointer = 0
         self.slots: list[ProjectSlot] = []
         self.stop_requested = False
         self.reload_requested = False
@@ -1072,6 +1196,30 @@ class Dispatcher:
 
     def on(self, store: Store) -> list[ProjectSlot]:
         return [slot for slot in self.slots if slot.store is store]
+
+    def running(self) -> int:
+        """Turns running across every slot, adopted ones included."""
+        return sum(len(slot.turns) for slot in self.slots)
+
+    # --- what it says ----------------------------------------------------------
+
+    def echo(self, slot: ProjectSlot, line: str) -> None:
+        """Where a slot's log line goes besides its project's own log: the
+        daemon's stderr, unless that is the log already."""
+        if slot._log_to_stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+
+    def store_log(self, store: Store, message: str, per_slot=None) -> None:
+        """Say something about a store: in project mode on the line of the
+        project it serves, `per_slot(slot)` when the words depend on it."""
+        for slot in self.on(store):
+            slot.log(per_slot(slot) if per_slot else message)
+
+    def listed(self, slot: ProjectSlot) -> tuple[str, str] | None:
+        """Whether a machine slot's project is still on the opt-in list; a
+        project-mode dispatcher has no list."""
+        return None
 
     # --- lifecycle -------------------------------------------------------------
 
@@ -1112,19 +1260,42 @@ class Dispatcher:
             self.shutdown()
             self.close()
 
+    def reload(self) -> None:
+        for slot in self.slots:
+            slot.reload()
+
+    def before_pass(self) -> None:
+        """What a pass does before it looks at the slots; nothing in project
+        mode."""
+
+    def after_pass(self) -> None:
+        """What a pass does once every slot has published; nothing in project
+        mode."""
+
+    def cap_freed(self) -> None:
+        """A turn ended somewhere: every slot the machine cap held back is
+        offered a turn again, with the wakes it was holding."""
+        for slot in self.slots:
+            if slot.waiting_for_cap:
+                slot.waiting_for_cap = False
+                slot.wakes.add("cap")
+
     def step(self, wait: bool = True) -> None:
         """One pass: take a reload, look at the children, decide which slots
         have a wake, dispatch each one that may be served, and wait for the
         next reason to look."""
         if self.reload_requested:
             self.reload_requested = False
-            for slot in self.slots:
-                slot.reload()
+            self.reload()
+        self.before_pass()
+        ended = 0
         for slot in self.slots:
             # A slot is checked afresh at this pass's first wake.
             slot.checked = None
             slot._take_up_pause()
-            slot.reap()
+            ended += slot.reap()
+        if ended:
+            self.cap_freed()
         now = time.monotonic()
         polled: dict = {}
         for slot in self.slots:
@@ -1150,6 +1321,7 @@ class Dispatcher:
                     and now >= store.requery_at:
                 self._reconnect(store)
         self._ping(time.monotonic())
+        candidates = []
         for slot in self.slots:
             if slot.next_moment is not None and now >= slot.next_moment:
                 slot.wakes.add("pickup")
@@ -1159,13 +1331,12 @@ class Dispatcher:
                 del slot.recent[tid]
             if over:
                 slot.wakes.add("retry")
-            if slot.wakes and not self.stop_requested:
-                wakes, slot.wakes = slot.wakes, set()
-                slot.last_wake = {"at": now_iso(), "reasons": sorted(wakes)}
-                if slot.served():
-                    slot.dispatch(wakes)
-                    slot._plan_next_moment()
+            if slot.wakes and not self.stop_requested and not slot.waiting_for_cap:
+                candidates.append(slot)
+        self.deal(candidates)
+        for slot in self.slots:
             slot.publish()
+        self.after_pass()
         if wait and not self.stop_requested:
             deadlines = [d for slot in self.slots for d in slot.deadlines()]
             for store in self.stores():
@@ -1173,9 +1344,75 @@ class Dispatcher:
                     + ([store.requery_at] if store.requery_at else [])
             self.wait(max(0.0, min([self.tick] + [d - time.monotonic() for d in deadlines])))
 
+    def deal(self, candidates: list[ProjectSlot]) -> None:
+        """Hand each slot with a wake its turns. With no machine cap every slot
+        that may be served dispatches what its own limits allow.
+
+        Under the cap the slots that may be served are dealt one turn each, in
+        rounds from a rotating project pointer, each slot's turn chosen by its
+        own lane rotation, until the cap is used up or a round starts nothing;
+        the pointer moves to the project after the last one that got a turn.
+        Projects are equal. A slot still in the deal when the cap is used up
+        keeps its wakes and waits for the cap: any turn ending offers it a turn
+        again, so with the cap at one, starts go round the projects with work
+        in turn."""
+        if self.machine_cap is None:
+            for slot in candidates:
+                wakes, slot.wakes = slot.wakes, set()
+                slot.last_wake = {"at": now_iso(), "reasons": sorted(wakes)}
+                if slot.served():
+                    slot.dispatch(wakes)
+                    slot._plan_next_moment()
+            return
+        ready = []
+        for slot in candidates:
+            wakes, slot.wakes = slot.wakes, set()
+            slot.last_wake = {"at": now_iso(), "reasons": sorted(wakes)}
+            if slot.served():
+                ready.append((slot, wakes))
+        if not ready:
+            return
+        count = len(self.slots)
+        dealing = sorted(ready, key=lambda item: (self.slots.index(item[0]) - self.pointer)
+                         % count)
+        free = self.machine_cap - self.running()
+        last = None
+        while dealing:
+            kept, started = [], 0
+            for slot, wakes in dealing:
+                if free <= 0:
+                    kept.append((slot, wakes))
+                    continue
+                got = slot.dispatch(wakes, limit=1)
+                if got:
+                    free -= got
+                    started += got
+                    last = slot
+                    kept.append((slot, wakes))
+            if free <= 0:
+                for slot, wakes in kept:
+                    slot.waiting_for_cap = True
+                    slot.wakes |= wakes
+                break
+            if not started:
+                break
+            dealing = kept
+        for slot, _wakes in ready:
+            slot._plan_next_moment()
+        if last is not None:
+            self.pointer = (self.slots.index(last) + 1) % count
+
+    def ending(self, slot: ProjectSlot) -> tuple[bool, float]:
+        """Whether the stop under way ends this slot's running turns, and the
+        grace they are given first: the project's own intent and grace."""
+        return slot.take_end_turns(), slot.settings()["shutdown_grace_seconds"]
+
+    def drop_intent(self, slot: ProjectSlot) -> None:
+        slot.drop_end_turns()
+
     def shutdown(self) -> None:
-        """Stop claiming. A slot whose project asked for its turns to end gives
-        them its grace period, then ends what is left and settles each raise it
+        """Stop claiming. A slot whose stop asked for its turns to end gives
+        them the grace period, then ends what is left and settles each raise it
         held the way a lapsed lease is settled, and removes the intent; every
         other slot leaves its running turns running, for the next daemon to
         adopt."""
@@ -1183,12 +1420,11 @@ class Dispatcher:
         deadlines = {}
         for slot in self.slots:
             slot.reap()
-            ending = slot.take_end_turns()
-            grace = slot.settings()["shutdown_grace_seconds"]
+            ending, grace = self.ending(slot)
             if ending:
-                deadlines[id(slot)] = time.monotonic() + grace
+                deadlines[id(slot)] = (time.monotonic() + grace, grace)
                 if slot.turns:
-                    slot.log(f"stopping: waiting up to {grace}s for {len(slot.turns)} "
+                    slot.log(f"stopping: waiting up to {grace:g}s for {len(slot.turns)} "
                              "turn(s), then ending the rest")
             elif slot.turns:
                 slot.log(f"stopping: leaving {len(slot.turns)} running turn(s) running; "
@@ -1196,7 +1432,7 @@ class Dispatcher:
             slot.publish()
         while True:
             waiting = [slot for slot in self.slots if id(slot) in deadlines
-                       and slot.turns and time.monotonic() < deadlines[id(slot)]]
+                       and slot.turns and time.monotonic() < deadlines[id(slot)][0]]
             if not waiting:
                 break
             for slot in waiting:
@@ -1205,8 +1441,8 @@ class Dispatcher:
                 time.sleep(0.2)
         for slot in self.slots:
             if id(slot) in deadlines:
-                slot.cut_off()
-                slot.drop_end_turns()
+                slot.cut_off(deadlines[id(slot)][1])
+                self.drop_intent(slot)
                 slot.publish()
 
     # --- waking ----------------------------------------------------------------
@@ -1224,18 +1460,21 @@ class Dispatcher:
             store.listener = None
             why = _why(exc)
             if why != store.listen_error:
-                for slot in self.on(store):
-                    slot.log(f"cannot listen for the store's notification, waking by the "
-                             f"poll every {slot.settings()['poll_seconds']}s and asking "
-                             f"again: {why}")
+                self.store_log(
+                    store, f"cannot listen for the store's notification, waking by the "
+                           f"poll and asking again: {why}",
+                    lambda slot: f"cannot listen for the store's notification, waking by the "
+                                 f"poll every {slot.settings()['poll_seconds']}s and asking "
+                                 f"again: {why}")
             store.listen_error = why
             self._relisten_later(store)
             return
         store.opened()
         store.listener_pinged = time.monotonic()
         if store.listen_error is not None:
+            self.store_log(store, f"listening on {store.host.channel} again; asking the "
+                                  "store for work")
             for slot in self.on(store):
-                slot.log(f"listening on {slot.host.channel} again; asking the store for work")
                 slot.wakes.add("relisten")
         store.listen_error = None
         store.relisten_at = None
@@ -1244,18 +1483,19 @@ class Dispatcher:
             # The store answers, so the questions need not wait out their own
             # interval: the next one asks for its connection at once.
             store.requery_at = None
+        caught_up: set = set()
         for slot in self.on(store):
             if slot.served():
-                slot.check_notification()
+                slot.check_notification(catch_up=slot.host.schema not in caught_up)
+                caught_up.add(slot.host.schema)
 
     def _relisten_later(self, store: Store) -> None:
         store.relisten_at = time.monotonic() + store.relisten_delay
         store.relisten_delay = min(store.relisten_delay * 2, RELISTEN_LONGEST_SECONDS)
 
     def _lose_listener(self, store: Store, exc: BaseException) -> None:
-        for slot in self.on(store):
-            slot.log(f"lost the store's notification, waking by the poll and asking "
-                     f"for it again: {_why(exc)}")
+        self.store_log(store, f"lost the store's notification, waking by the poll and "
+                              f"asking for it again: {_why(exc)}")
         self._drop_listener(store)
         store.listen_error = _why(exc)
         self._relisten_later(store)
@@ -1363,9 +1603,8 @@ class Dispatcher:
             store.query = None
             why = _why(exc)
             if why != store.query_error:
-                for slot in self.on(store):
-                    slot.log(f"cannot connect to the store to ask it for work, asking "
-                             f"again: {why}")
+                self.store_log(store, f"cannot connect to the store to ask it for work, "
+                                      f"asking again: {why}")
             store.query_error = why
             self._requery_later(store)
             raise StoreAway(why) from exc
@@ -1373,8 +1612,7 @@ class Dispatcher:
         store.query_used = time.monotonic()
         store.requery_at = None
         if store.query_error is not None:
-            for slot in self.on(store):
-                slot.log("connected to the store again for its questions")
+            self.store_log(store, "connected to the store again for its questions")
         store.query_error = None
 
     def _reconnect(self, store: Store) -> None:
@@ -1396,9 +1634,8 @@ class Dispatcher:
         why = _why(exc)
         self._drop_query(store)
         if why != store.query_error:
-            for slot in self.on(store):
-                slot.log(f"lost the store connection its questions go on, asking for it "
-                         f"again in {store.requery_delay:g}s: {why}")
+            self.store_log(store, f"lost the store connection its questions go on, asking "
+                                  f"for it again in {store.requery_delay:g}s: {why}")
         store.query_error = why
         self._requery_later(store)
 
@@ -1422,3 +1659,389 @@ class Dispatcher:
             if store.query is not None and now - store.query_used >= PING_SECONDS:
                 with contextlib.suppress(Exception, SystemExit):
                     self.ask(store, store.host.ping)
+
+
+class MachineDispatcher(Dispatcher):
+    """The dispatcher in machine mode: one per machine, by the lock in its
+    machine state root, whose slots follow the opt-in list.
+
+    Everything it knows about the machine arrives through `machine`, the host
+    the executable hands it: the list, the machine settings and their
+    fingerprint, and for each project on the list either a host for it or why
+    it cannot be served yet. On every pass it reads the list again when the
+    file moved; a project that left is let go at once, its running turns left
+    running, and a project that joined is served from the first pass at which
+    it can be. A project that cannot be served yet - its folder gone, not
+    explicitly enabling tasks, a connection the machine process may not use, or
+    its lock held by a project-mode daemon - is reported with the reason and
+    asked again every `ADMIT_SECONDS`. A slot whose declaration does not load
+    holds its lock, is `error` with the reason and serves nothing until a
+    reload takes one; the others are untouched.
+
+    It loads no project's environment or secret. Its connections are opened
+    outside every scope, from its own environment and the machine's tiers, and
+    its turns start from the environment it was started with."""
+
+    def __init__(self, machine, *, tick: float = TICK_SECONDS, pool: StorePool | None = None,
+                 environment=None):
+        super().__init__(tick=tick, pool=pool, environment=environment)
+        self.machine = machine
+        self.state_dir = Path(machine.state_dir)
+        # Every project on the list by its id: what the list says of it, why
+        # it is not served while it is not, and its slot once it is.
+        self.entries: dict[str, dict] = {}
+        self.list_witness = None
+        self.list_error: str | None = None
+        self.settings: dict = {}
+        self.settings_error: str | None = None
+        self.reloads = 0
+        self.started_at = now_iso()
+        self._lock = None
+        self._log_path = self.state_dir / LOG_FILE
+        self._log_to_stderr = True
+        self._published: str | None = None
+        self._published_at = 0.0
+        self._intent: dict | None = None
+        self._intent_read = False
+
+    # --- what it says ----------------------------------------------------------
+
+    def log(self, message: str) -> None:
+        """A line about the process, its stores or its cap, tagged `[machine]`."""
+        line = log_line(self.state_dir, MACHINE_TAG, message)
+        if self._log_to_stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+
+    def echo(self, slot: ProjectSlot, line: str) -> None:
+        """A project's line, already in its own log, goes to the machine log too."""
+        with contextlib.suppress(OSError):
+            with self._log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+        if self._log_to_stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+
+    def project_log(self, entry: dict, message: str) -> None:
+        """A line about a project the machine process holds no slot for yet: in
+        the machine log and in the project's own, under its slug."""
+        state = Path(self.machine.project_state_dir(entry["slug"]))
+        line = (log_line(state, entry["slug"], message) if state.is_dir()
+                else f"{now_iso()} tasks service [{entry['slug']}]: "
+                     + " ".join(part.strip() for part in message.splitlines()
+                                if part.strip()) + "\n")
+        with contextlib.suppress(OSError):
+            with self._log_path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+        if self._log_to_stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+
+    def store_log(self, store: Store, message: str, per_slot=None) -> None:
+        """A store is the machine's: said once under `[machine]`, and in the
+        own log of every project on it."""
+        self.log(f"store {store.name}: {message}")
+        for slot in self.on(store):
+            log_line(slot.state_dir, slot.slug, per_slot(slot) if per_slot else message)
+
+    def _stderr_is_log(self) -> bool:
+        try:
+            mine, log = os.fstat(sys.stderr.fileno()), os.stat(self._log_path)
+        except (OSError, ValueError, AttributeError):
+            return False
+        return (mine.st_dev, mine.st_ino) == (log.st_dev, log.st_ino)
+
+    def status(self) -> dict:
+        """The machine status file: the process, its settings, its cap, its
+        stores and an entry for every project on the list, served or not."""
+        running = self.running()
+        cap = self.machine_cap
+        return {
+            "mode": "machine",
+            "pid": os.getpid(),
+            "started_at": self.started_at,
+            "fingerprint": self.settings.get("fingerprint"),
+            "reload_error": self.settings_error,
+            "reloads": self.reloads,
+            "publish_seconds": PUBLISH_SECONDS,
+            "projects_file": {"path": str(self.machine.projects_file),
+                              "joined": len(self.entries), "error": self.list_error},
+            "cap": {"max_parallel": cap, "running": running,
+                    "binding": bool(cap is not None and running >= cap
+                                    and any(slot.waiting_for_cap for slot in self.slots))},
+            "shutdown_grace_seconds": self.settings.get("shutdown_grace_seconds"),
+            "stores": [{**store.row(), "identity": store.host.store_identity(),
+                        "projects": [slot.slug for slot in self.on(store)],
+                        "retrying": store.relisten_at is not None or store.requery_at is not None}
+                       for store in self.stores()],
+            "projects": [self._entry_row(entry) for entry in
+                         sorted(self.entries.values(), key=lambda e: (e["slug"], e["id"]))],
+            "stopping": self.stopping,
+        }
+
+    def _entry_row(self, entry: dict) -> dict:
+        row = {"project": entry["slug"], "project_id": entry["id"], "root": entry["root"],
+               "joined_at": entry.get("joined_at"), "joined_by": entry.get("joined_by")}
+        slot = entry.get("slot")
+        if slot is None:
+            row.update(state=entry["state"], reason=entry["reason"])
+            return row
+        found = slot.status()
+        row.update({key: found[key] for key in (
+            "state", "reason", "fingerprint", "reload_error", "wake_by", "lanes", "idle",
+            "turns", "deferred", "next_wake", "last_wake", "waiting_for_cap")})
+        row["pause"] = found["pause"]
+        row["store"] = slot.store.name
+        return row
+
+    def publish(self) -> None:
+        """Write the machine status when anything in it moved, and at least
+        every `PUBLISH_SECONDS`, so its age tells a live process from a hung
+        one."""
+        text = json.dumps(self.status(), indent=2)
+        now = time.monotonic()
+        if text == self._published and now - self._published_at < PUBLISH_SECONDS:
+            return
+        found = json.loads(text)
+        found["published_at"] = now_iso()
+        with contextlib.suppress(OSError):
+            _write_atomic(self.state_dir / STATUS_FILE, json.dumps(found, indent=2) + "\n")
+        self._published, self._published_at = text, now
+
+    # --- lifecycle -------------------------------------------------------------
+
+    def open(self) -> None:
+        """Take the machine's one-process lock, say which settings hold it, and
+        take up every project on the list that can be served."""
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._log_to_stderr = not self._stderr_is_log()
+        self._lock = take_lock(self.state_dir)
+        if self._lock is None:
+            raise RuntimeError(f"another machine tasks service holds "
+                               f"{self.state_dir / LOCK_FILE}")
+        self.settings = self.machine.load_settings()
+        self.machine_cap = self.settings["max_parallel"]
+        (self.state_dir / PID_FILE).write_text(f"{os.getpid()}\n")
+        _write_atomic(self.state_dir / FINGERPRINT_FILE, self.settings["fingerprint"] + "\n")
+        self.log(f"started, pid {os.getpid()}, serving the projects on "
+                 f"{self.machine.projects_file}; {self._settings_words()}")
+        self.before_pass()
+        self.publish()
+
+    def _settings_words(self) -> str:
+        cap = self.settings.get("max_parallel")
+        return (f"machine cap {cap} turn(s)" if cap is not None
+                else "no machine cap, each project's own limits apply") + \
+            f", stop --end-turns grace {self.settings.get('shutdown_grace_seconds')}s"
+
+    def close(self) -> None:
+        super().close()
+        for entry in self.entries.values():
+            entry["slot"] = None
+        for name in (PID_FILE, FINGERPRINT_FILE, STATUS_FILE):
+            with contextlib.suppress(OSError):
+                (self.state_dir / name).unlink()
+        self.log("stopped")
+        if self._lock is not None:
+            self._lock.close()
+            self._lock = None
+
+    def reload(self) -> None:
+        """SIGHUP: the machine settings, then every slot on its own. Settings
+        that do not load leave the ones running, said in the log and the
+        status; a slot whose fingerprint did not move is not touched."""
+        try:
+            settings = self.machine.load_settings()
+        except (Exception, SystemExit) as exc:
+            self.settings_error = _why(exc)
+            self.log(f"reload rejected, keeping the machine settings loaded: "
+                     f"{self.settings_error}")
+        else:
+            self.settings, self.settings_error = settings, None
+            self.machine_cap = settings["max_parallel"]
+            _write_atomic(self.state_dir / FINGERPRINT_FILE, settings["fingerprint"] + "\n")
+            self.log(f"reloaded the machine settings: {self._settings_words()}")
+        for slot in self.slots:
+            try:
+                with slot.scope():
+                    current = slot.host.fingerprint()
+            except (Exception, SystemExit):
+                current = None
+            if slot.load_error is not None or current != slot.declaration["fingerprint"]:
+                slot.reload()
+        self.reloads += 1
+        # A cap that grew lets the slots it held back go now.
+        self.cap_freed()
+
+    def before_pass(self) -> None:
+        """Follow the opt-in list, and ask every project on it not yet served
+        whether it can be."""
+        self._take_list()
+        now = time.monotonic()
+        for entry in list(self.entries.values()):
+            if entry.get("slot") is None and now >= entry.get("next_try", 0.0) \
+                    and not self.stop_requested:
+                entry["next_try"] = now + ADMIT_SECONDS
+                self._admit(entry)
+
+    def after_pass(self) -> None:
+        self.publish()
+
+    # --- the list --------------------------------------------------------------
+
+    def _take_list(self) -> None:
+        witness = self.machine.list_witness()
+        if witness == self.list_witness:
+            return
+        self.list_witness = witness
+        try:
+            listed = self.machine.read_list()
+        except (Exception, SystemExit) as exc:
+            why = _why(exc)
+            if why != self.list_error:
+                self.log(f"error: the opt-in list does not load, so the projects already "
+                         f"served stay served and no project joins: {why}")
+            self.list_error = why
+            return
+        if self.list_error is not None:
+            self.log("the opt-in list loads again")
+        self.list_error = None
+        for project in list(self.entries):
+            entry = self.entries[project]
+            found = listed.get(project)
+            if found is None or found["root"] != entry["root"] or found["slug"] != entry["slug"]:
+                self._leave(project)
+        for project, found in listed.items():
+            if project in self.entries:
+                self.entries[project].update(joined_at=found.get("joined_at"),
+                                             joined_by=found.get("joined_by"))
+                continue
+            entry = {**found, "id": project, "state": "refused",
+                     "reason": "not yet checked", "slot": None, "next_try": 0.0,
+                     "said": None}
+            self.entries[project] = entry
+            self.project_log(entry, f"on the machine service's opt-in list, joined "
+                                    f"{found.get('joined_at')} by {found.get('joined_by')}; "
+                                    f"project {project} at {found['root']}")
+
+    def _leave(self, project: str) -> None:
+        """A project no longer on the list: its slot is let go at once - lock,
+        pid and status - and its running turns are left running for whoever
+        serves it next."""
+        entry = self.entries.pop(project)
+        slot = entry.get("slot")
+        if slot is None:
+            self.project_log(entry, "left the machine service's opt-in list")
+            return
+        running = len(slot.turns)
+        self.slots.remove(slot)
+        slot.unpublish()
+        slot.release("left the machine service's opt-in list; let go of its lock"
+                     + (f", leaving {running} running turn(s) running for whoever "
+                        "serves it next" if running else ""))
+        self._drop_unused_stores()
+        if running:
+            self.cap_freed()
+
+    def _drop_unused_stores(self) -> None:
+        used = {slot.store.key for slot in self.slots}
+        for key in [key for key in self.pool.stores if key not in used]:
+            store = self.pool.stores.pop(key)
+            self._drop_listener(store)
+            self._drop_query(store)
+            self.log(f"store {store.name}: no project served on it any more; "
+                     "its connections are closed")
+
+    def listed(self, slot: ProjectSlot) -> tuple[str, str] | None:
+        """Whether the slot's project is on the list as it is on disk now. The
+        list is read again when it moved and nothing is changed here; the next
+        pass takes the change up. A list that does not load leaves the last one
+        that did."""
+        project = slot.host.project
+        known = self.entries.get(project)
+        if self.machine.list_witness() != self.list_witness:
+            try:
+                listed = self.machine.read_list()
+            except (Exception, SystemExit):
+                listed = None
+            if listed is not None:
+                found = listed.get(project)
+                known = (known if found is not None and known is not None
+                         and found["root"] == known["root"] else None)
+        if known is None or known.get("slot") is not slot:
+            return ("refused", "not_joined: the project is no longer on the machine "
+                               f"service's opt-in list {self.machine.projects_file}")
+        return None
+
+    def _admit(self, entry: dict) -> None:
+        """Serve a project on the list if it can be: the checks a slot takes
+        before every action, asked of the machine host; then the project's
+        lock; then its declaration. What stops it is said once."""
+        host, refusal = self.machine.admit(entry, self.environment)
+        if refusal is None:
+            state_dir = Path(host.state_dir)
+            lock = take_lock(state_dir)
+            if lock is None:
+                holder = read_pid(state_dir)
+                refusal = ("refused",
+                           f"a project-mode daemon, pid {holder}, serves this project; "
+                           "stop it there" if pid_alive(holder) else
+                           "another process holds this project's lock "
+                           f"{state_dir / LOCK_FILE}")
+        if refusal is not None:
+            entry["state"], entry["reason"] = refusal
+            if entry.get("said") != refusal:
+                entry["said"] = refusal
+                self.project_log(entry, f"{refusal[0]}: {refusal[1]}; asking again every "
+                                        f"{ADMIT_SECONDS:g}s and starting nothing for it "
+                                        "meanwhile")
+            return
+        load_error = None
+        try:
+            with host.scope(self.environment):
+                declaration = host.load()
+        except (Exception, SystemExit) as exc:
+            load_error = _reason(exc)
+            declaration = host.placeholder()
+        new_store = host.store_key() not in self.pool.stores
+        slot = ProjectSlot(self, host, declaration, machine=True)
+        slot.load_error = load_error
+        self.slots.append(slot)
+        entry["slot"], entry["said"] = slot, None
+        slot.open(lock=lock)
+        if load_error is not None:
+            slot.log(f"error: its declaration does not load, so nothing is asked or "
+                     f"started for it until a reload takes one: {load_error}")
+        slot.next_poll = time.monotonic() + slot.settings()["poll_seconds"]
+        if new_store:
+            self._connect_listener(slot.store)
+        elif slot.store.listener is not None and slot.served():
+            slot.check_notification()
+        slot.publish()
+
+    # --- stopping --------------------------------------------------------------
+
+    def ending(self, slot: ProjectSlot) -> tuple[bool, float]:
+        """`stop --machine --end-turns` writes its intent in the machine state
+        root, and it ends every project's running turns after the machine's
+        grace."""
+        grace = self.settings.get("shutdown_grace_seconds", 60)
+        if not self._intent_read:
+            self._intent_read = True
+            self._intent = fresh_end_turns(self.state_dir, grace + 30, self.log)
+            if self._intent is not None:
+                self.log(f"ending running turns in every project, as "
+                         f"{self._intent.get('by')} asked at {self._intent.get('at')}")
+        return self._intent is not None, grace
+
+    def drop_intent(self, slot: ProjectSlot) -> None:
+        with contextlib.suppress(OSError):
+            (self.state_dir / END_TURNS_FILE).unlink()
+
+    def shutdown(self) -> None:
+        # The intent is the machine's, read once whether or not any slot runs.
+        self.ending(None)
+        super().shutdown()
+        if self._intent is not None:
+            self.drop_intent(None)
+        self.publish()

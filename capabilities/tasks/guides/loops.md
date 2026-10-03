@@ -65,6 +65,18 @@ The capability provides the guard rails under that design:
 
 `tasks help` ONE TURN OF THE CONVEYOR states how a turn's ending scores its raise, and WORKER SCOPE the exact refusals.
 
+## Where the loop runs
+
+A loop runs wherever something starts its workers' turns. The tasks service does that on its own: whenever the store holds work a lane takes, it starts `tasks run <worker> --apply` in the project. It runs in one of two modes, and a turn is the same turn in both.
+
+In project mode one daemon serves the project it was started in, under `tasks service start`, or `tasks service run` under a supervisor. Each project that runs its loops this way has a daemon of its own.
+
+In machine mode one process on the machine serves every project that joined it. A project joins with `tasks service join`, run in the project once it enables tasks for itself, and leaves with `tasks service leave`; joining is an act of its own, apart from enabling the capability, and the machine process takes a project up or lets it go on its next pass without a restart. The process is `tasks service run --machine`, what a supervisor keeps running, and it owns only what is the machine's: one pair of connections per store across every project, an optional cap on the turns running at once across all of them in its settings (`tasks service init --machine` writes them), and the order projects are served in under that cap, equal turns from a rotating pointer. What a turn is stays the project's: its working directory, its environment files, its connection, its workers and their writes, profiles and hooks, and its own `max_parallel` and lane caps. A project with no enabled worker is served and takes nothing.
+
+The blast radius is one project. A project whose worker files do not load, whose folder is gone, that no longer enables tasks for itself, or whose connection the machine process may not use is reported with the reason by `tasks service status --machine` while the others are served; each project pauses on its own with `tasks service pause` there; and every log line names the project it is about. In a joined project `status`, `reload`, `doctor`, `logs`, `pause` and `resume` keep working and speak of the machine process, while `start` and `run` are refused, since the machine process serves it. Before a project joins, whatever supervised its own daemon has to stop doing so, because a project-mode daemon still holding the project keeps it until it exits.
+
+Running turns outlive the process in both modes, and a project moving between the two keeps its running turns: the next process to serve it adopts them. `tasks help` SERVICE states the verbs, the files, the refusals and the status each mode answers.
+
 ## A worked example
 
 A project runs two kinds of work: `defect` and `change`, carried by a `builder` role, and `proposal`, judged by an `evaluator` role. Both stop for decisions at the `supervisor`, which passes what the record does not settle to `<owner>`, the person who decides. The project raises no other types, so the shipped `default` is switched off. The profiles `builder`, `evaluator` and `supervisor` are the project's own files in `capabilities/tasks/profiles/`, and `develop`, `review` and `evaluate` are its routines.

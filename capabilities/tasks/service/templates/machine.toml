@@ -1,0 +1,13 @@
+# The machine tasks service: one process on this machine serving every project
+# that joined it with `tasks service join`. Each project's own settings and
+# lanes still apply; these are the machine's. `tasks help` states every key;
+# any other is refused.
+version = 1
+
+# Turns running at once across every joined project. Absent: only each
+# project's own limits apply.
+max_parallel = 8
+
+# How long `tasks service stop --machine --end-turns` waits for running turns
+# before ending them.
+shutdown_grace_seconds = 60
