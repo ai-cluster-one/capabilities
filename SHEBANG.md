@@ -138,6 +138,7 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 | `post_install[]` | `{ "cmd", "note" }` steps the manager **offers** at install — idempotent, never auto-run. |
 | `service` *(optional)* | Metadata for a bundled service: at minimum `name`, `summary`, and `verbs[]`. The CLI owns its lifecycle contract under `<name> service ...`. |
 | `service.deploy` *(optional)* | Versioned, provider-neutral deploy descriptor. Its v1 contract declares an argv `command`, service-only `environment.required[]` and optional `{key, default?}` entries, named `state`/`shared` mounts, Compose restart policy, optional doctor argv, and `default_policy` (`auto` or `disabled`). Mount targets are absolute or start with `{agent_home}` / `{project_root}` and are resolved by the consuming runtime. Generic CLI credentials do not become service requirements unless the descriptor declares them. |
+| `service.machine` *(optional)* | Declares that the service also runs once per machine for every project that opted in to it (see [machine mode](#machine-mode)). Its v1 contract (`capabilities.service.machine.v1`) names the argv `command` that runs it in the foreground and the argv `doctor` that proves it, each starting with the capability's name and carrying `--machine`; `projects`, the file under the capability's own config home where it lists the projects that opted in; and optionally `config` and `state`, the machine homes of its settings and its runtime files. Any other key is refused. A capability declaring it lists `join` and `leave` among its service verbs. The manager validates it during audit, source check, and install. |
 
 `default_policy: "auto"` makes an explicitly project-enabled capability eligible
 when the deployment runtime's `service_policy.auto_include` is true. `disabled`
@@ -324,6 +325,8 @@ Operational verbs and `doctor` pass an effective two-scope policy gate before di
 
 Database mode keeps both scopes as policy rows in the configured store. An explicit project entry wins. An absent project entry inherits the global entry. Absence at both scopes is disabled by default. Policy mutations require explicit `--project` or `--global`; the agent asks the user which scope they mean rather than guessing.
 
+Above both scopes sits the machine ceiling, `$XDG_CONFIG_HOME/capabilities/machine.json`, which only the manager writes and which is never kept in a store, because it answers for this machine alone. Each installed capability is `allowed` or `quarantined` there; a capability without an entry is allowed. Quarantined is effective-disabled in every project and outside any, whatever the project or global entry says: `_gate()` refuses its operational verbs and `doctor` with exit 4 (`quarantined`) before it resolves a project or a policy row, a `--machine` call included, while safe discovery stays available. Allowed leaves the two scopes deciding exactly as below. `capabilities install` writes `quarantined` for a capability new to the machine and `allowed` when given `--allow`; reinstalling or updating keeps the state, and uninstalling drops it. `capabilities allow` and `capabilities quarantine` change it, and lifting a quarantine is the user's decision, never an agent's.
+
 ```python
 def _project_root() -> Path | None:
     """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
@@ -373,7 +376,7 @@ def _gate() -> None:
 | absent | `true` | enabled by inheritance |
 | absent | `false` or absent | disabled |
 
-The gate is a **guardrail, not a security boundary** — project resolution remains cwd-based. A malformed policy is a configuration error and operational absence is closed. The exit-4 envelope routes the scope decision to the human. Bundled service `init`, `start`, and `run` additionally require explicit project enable: inherited global availability grants CLI use, not ownership of a project daemon. This rule lives once in the preamble: `_gate()` applies it only when the executable declares a `SERVICE` manifest surface, so each service implements its lifecycle without repeating policy logic and domain commands merely named `service` remain ordinary CLI verbs.
+The gate is a **guardrail, not a security boundary** — project resolution remains cwd-based. A malformed policy is a configuration error and operational absence is closed. The exit-4 envelope routes the scope decision to the human. Bundled service `init`, `start`, `run`, and `join` additionally require explicit project enable: inherited global availability grants CLI use, not ownership of a project daemon or consent to a machine one. A service that declares `service.machine` takes `--machine` on its service verbs, and such a call is the one operational use that resolves no project and reads no policy row: the machine service acts for a project only while that project explicitly enables the capability and is on the service's opt-in list, and checks both itself before every action it takes for that project ([machine mode](#machine-mode)). The read-only switch refuses its `init`, `start`, `run`, `reload`, and `leave` as it refuses a project's. This rule lives once in the preamble: `_gate()` applies it only when the executable declares a `SERVICE` manifest surface, so each service implements its lifecycle without repeating policy logic and domain commands merely named `service` remain ordinary CLI verbs.
 
 ## Bundled services
 
@@ -390,6 +393,18 @@ The daemon holds its declaration in memory and read the file once, so the file a
 This is also what lets a service be corrected from inside itself. A job cannot restart the program it runs under - stopping a program stops the process group the job is in, so it dies before the restart lands - but it can reload it, because a reload is the one operation that deliberately leaves the group alone.
 
 What a reload cannot change belongs in the verb's own help rather than in the caller's memory: an identity the process authenticated as, a state root, a records backend. Those need a restart, and saying which is part of shipping the verb.
+
+### Machine mode
+
+A service that declares `service.machine` runs in one of two modes from one implementation. In project mode it serves the project it was started in, as every bundled service does. In machine mode one process on the machine serves every project that opted in to it. Project mode is the case of a set of one: dispatch, its checks and the start of work are the same code in both.
+
+Opting in is explicit and apart from enable. `<name> service join`, run in a project that explicitly enables the capability, adds the project to the service's opt-in list, the file its `service.machine.projects` names; `<name> service leave` removes it. The service alone writes its list, keyed by project id, each entry naming the project's root, slug, and when and by whom it joined. The service notices a project joining, leaving, or whose folder is gone, and reports such a project rather than failing.
+
+Exactly one process serves a project at a time. A lock per project, the same lock in both modes, decides which. A joined project's project-mode `start` and `run` are refused, and a project another process still holds is reported as refused until it is free.
+
+The machine process decides when work starts and nothing about what the work is. It holds what is the machine's - its store connections, held rather than opened per question; an optional machine-wide cap on concurrent work; and the order in which projects are served under that cap - and it loads no project's environment or secrets, so a secret it needs for its own connections resolves from the machine's tiers. The work it starts is the project's: a child process whose working directory is the project, with the project's own environment, connections, grants, and declarations, as project mode starts it. Before every action it takes for a project it checks again that the project is on the list, explicitly enables the capability, and grants the connection the work needs.
+
+The blast radius is one project. Each project's declaration loads and reloads on its own, so a declaration that does not load stops that project only; a project can be paused alone; every log line and every status entry names the project it is about; and the machine status answers for each joined project as `served`, `paused`, `refused`, or `error`, with the reason.
 
 ## The credential cascade
 

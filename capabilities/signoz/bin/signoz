@@ -881,28 +881,87 @@ def _read_only_gate(action: str) -> None:
              f"run in a process without {READ_ONLY_ENV}.")
 
 
+_MACHINE_SCHEMA = "capabilities.machine.v1"
+
+
+def _machine_state() -> str:
+    """This machine's ceiling for this capability: `allowed` or `quarantined`.
+
+    The manager alone writes `$XDG_CONFIG_HOME/capabilities/machine.json`. A
+    capability with no entry, and every capability while the file is absent,
+    is allowed, so the ceiling only ever closes what the two scopes open."""
+    path = _CONFIG_HOME / "capabilities" / "machine.json"
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return "allowed"
+    except (OSError, ValueError) as e:
+        _die(6, "bad_machine_state", f"cannot read the machine ceiling {path}: {e}",
+             "the manager alone writes it; `capabilities list` reports each "
+             "capability's machine state")
+    entries = data.get("capabilities") if isinstance(data, dict) else None
+    if (not isinstance(data, dict) or data.get("schema") != _MACHINE_SCHEMA
+            or not isinstance(entries, dict)):
+        _die(6, "bad_machine_state", f"{path} is not a machine ceiling",
+             f'expected {{"schema": "{_MACHINE_SCHEMA}", "capabilities": {{...}}}}')
+    entry = entries.get(NAME)
+    if entry is None:
+        return "allowed"
+    state = entry.get("state") if isinstance(entry, dict) else None
+    if state not in ("allowed", "quarantined"):
+        _die(6, "bad_machine_state", f"invalid {NAME} entry in {path}",
+             'expected {"state": "allowed"|"quarantined", "at": ..., "by": ...}')
+    return state
+
+
+def _machine_gate() -> None:
+    """The ceiling above both scopes: quarantined is disabled everywhere."""
+    if _machine_state() == "quarantined":
+        _die(4, "quarantined",
+             f"{NAME} is quarantined on this machine, so no project and no "
+             "machine service may use it, whatever project or global policy says",
+             f"ask the user whether to allow {NAME} on this machine; if yes, they "
+             f"run `capabilities allow {NAME}` - an agent never lifts a "
+             "quarantine itself")
+
+
 def _gate() -> None:
     """Project policy overrides global policy; absence inherits, and absence at
     both scopes is default deny. Safe local discovery verbs remain available so
     a disabled capability can be understood and configured before use.
 
     If an ingress supplied CAPABILITIES_AUTH_CONTEXT, that request-scoped gate
-    is stricter and runs first, before credentials or network calls.
+    is stricter and runs first, before credentials or network calls. The
+    machine ceiling runs next: a capability quarantined on this machine is
+    refused before any project or policy row is resolved.
 
     Under the read-only switch a bundled service is neither set up nor started
     nor handed a new declaration.
+
+    A service that declares `machine` takes `--machine` on its service verbs;
+    such a call resolves no project and reads no policy row, because the
+    machine service checks each opted-in project's own policy before every
+    action it takes for that project. `join` is a project act and always takes
+    the ordinary path.
     """
     _auth_gate()
     verb = sys.argv[1] if len(sys.argv) > 1 else "help"
+    safe = verb in {"help", "stub", "manifest", "connections"}
+    if not safe:
+        _machine_gate()
     service_action = sys.argv[2] if len(sys.argv) > 2 else None
     service_contract = globals().get("SERVICE")
-    if isinstance(service_contract, dict) and verb == "service" \
-            and service_action in {"init", "start", "run", "reload"}:
+    service_call = isinstance(service_contract, dict) and verb == "service"
+    machine_service = service_call and isinstance(service_contract.get("machine"), dict)
+    if service_call and (service_action in {"init", "start", "run", "reload"}
+                         or (machine_service and service_action in {"join", "leave"})):
         _read_only_gate(f"`{NAME} service {service_action}`")
-    if isinstance(service_contract, dict) and verb == "service" \
-            and service_action in {"init", "start", "run"}:
+    if machine_service and service_action != "join" and "--machine" in sys.argv[3:]:
+        return
+    if service_call and (service_action in {"init", "start", "run"}
+                         or (machine_service and service_action == "join")):
         _require_project_enabled_for_service()
-    if verb in {"help", "stub", "manifest", "connections"}:
+    if safe:
         return
     row = _policy_row()
     entry = row.get("value") if row else None

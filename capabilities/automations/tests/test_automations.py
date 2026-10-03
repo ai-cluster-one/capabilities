@@ -1372,6 +1372,8 @@ every_seconds = 30
         env.update(
             {
                 "HOME": str(home),
+                # The install writes this machine's ceiling; keep it scratch.
+                "XDG_CONFIG_HOME": str(home / ".config"),
                 "CAPABILITIES_HOME": str(cap_home),
                 "CAPABILITIES_BIN": str(bin_dir),
                 "PATH": str(bin_dir) + os.pathsep + env.get("PATH", ""),

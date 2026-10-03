@@ -50,7 +50,8 @@ ENVIRONMENT
                        it starts under the read-only switch: every capability
                        reads but changes nothing (write verbs, project-record
                        writes and service activation exit 4), and this manager
-                       refuses enable, disable, inherit, init, relabel and set.
+                       refuses allow, disable, enable, inherit, init,
+                       quarantine, relabel and set.
                        doctor reports it. Unset, `0` or `false` leaves it off.
 
 PROJECT PATH VERB
@@ -75,11 +76,14 @@ THE PROJECT ENVELOPE
   absolute in-project path is an error; it never silently selects another tree.
 
 MACHINE VERBS
-  install <name> [--from <path|url> | --source ID] [--yes]
+  install <name> [--from <path|url> | --source ID] [--yes] [--allow]
         Fetch the capability into the registry, symlink its executable onto
         PATH, snapshot `stub` + `manifest --json` (keyed by payload hash),
         scaffold credentials per the declared scope, surface declared
         post-install steps (--yes runs them), regenerate the skill.
+        A capability new to this machine arrives quarantined (see allow);
+        --allow installs it allowed. Reinstalling or updating an installed
+        capability keeps its machine state; uninstall drops it.
         --from accepts: a script file, a bundle directory holding <name> or
         bin/<name>, a repo directory holding capabilities/<name>/bin/<name>, or
         a URL. Source directories, and script paths inside source directories,
@@ -135,6 +139,15 @@ MACHINE VERBS
         answered, behind or current alike; 5 when the source cannot be reached
         or carries no valid release manifest. Output is always JSON, so --json
         changes nothing.
+  allow <name> / quarantine <name>
+        Set this machine's ceiling for an installed capability, kept in
+        $XDG_CONFIG_HOME/capabilities/machine.json, which only the manager
+        writes. Quarantined is effective-disabled in every project and outside
+        any, whatever project or global policy says; allowed leaves the two
+        scopes deciding. A capability with no entry is allowed. JSON
+        {capability, machine: "allowed"|"quarantined", changed}. Exit 3 when
+        not installed. Lifting a quarantine is the user's decision: an agent
+        asks and never runs `allow` on its own initiative.
   skill
         Place the carried global skill and relink every agent host present on
         this machine. The bootstrap and every install/uninstall/update already
@@ -148,7 +161,11 @@ MACHINE VERBS
         CORE_CAPABILITIES in its own executable, and every other capability is
         standard. The tier is a mark to group by; it changes no gate, policy,
         enablement or grant. Source verification refuses a core name the
-        catalogue does not carry.
+        catalogue does not carry. Every row carries `machine` ("allowed" or
+        "quarantined") and `machine_connections`, the connections this
+        machine's global scope declares for it less those whose grant there
+        is disabled; a quarantined row is effective "disabled" with source
+        "machine".
   search [QUERY] [--source ID]
         Search cached catalogues from the official and registered sources.
         Listing never executes catalogue capability code. JSON {matches [{name,
@@ -260,7 +277,9 @@ POLICY VERBS
         Scope is mandatory: ask whether the decision is for this project or
         every project before invoking the manager. Project enable removes any
         harness deny rule; project disable --deny additionally writes
-        permissions.deny Bash(<name>:*) into .claude/settings.json.
+        permissions.deny Bash(<name>:*) into .claude/settings.json. Enabling a
+        capability quarantined on this machine writes the entry and warns: it
+        stays effective-disabled until the user allows it.
   inherit <name> --project|--global
         Remove the selected scope's explicit entry. A project then inherits the
         machine default; removing the global entry restores default deny.
@@ -478,6 +497,12 @@ DEV_MANAGED_ENV_KEYS = {
 PROJECT_CAPABILITIES_REL = Path("capabilities")
 LEGACY_PROJECT_CAPABILITIES_REL = Path(".capabilities")
 GLOBAL_GATE_FILE = _CONFIG_HOME / "capabilities" / "settings.json"
+# The machine ceiling above both policy scopes. It is this machine's alone, so
+# it is a local file and never a records-store row: a global scope kept in a
+# store can be shared between machines.
+MACHINE_FILE = _CONFIG_HOME / "capabilities" / "machine.json"
+MACHINE_SCHEMA = "capabilities.machine.v1"
+MACHINE_STATES = ("allowed", "quarantined")
 GITIGNORE_BODY = "*/state/\n"
 PROJECT_IDENTITY_REL = "project.json"
 PROJECT_IDENTITY_SCHEMA = "capabilities.project.v1"
@@ -651,9 +676,10 @@ def _store_module():
 
 
 # The verbs that write a project record — policy, configuration, the project's
-# identity and its wiring. Under the read-only switch the manager refuses them;
+# identity and its wiring — and the machine ceiling. Under the read-only switch the manager refuses them;
 # whether the switch is on is the store tier's answer, never the manager's own.
-READ_ONLY_REFUSED_VERBS = ("disable", "enable", "inherit", "init", "relabel", "set")
+READ_ONLY_REFUSED_VERBS = ("allow", "disable", "enable", "inherit", "init",
+                           "quarantine", "relabel", "set")
 
 
 def _read_only_gate(verb: str) -> None:
@@ -1718,6 +1744,53 @@ def _validate_service_deploy(deploy: object) -> list[str]:
     return problems
 
 
+SERVICE_MACHINE_SCHEMA = "capabilities.service.machine.v1"
+SERVICE_MACHINE_KEYS = ("schema", "command", "doctor", "projects", "config", "state")
+SERVICE_MACHINE_VERBS = ("run", "status", "doctor", "join", "leave")
+
+
+def _validate_service_machine(name: str, machine: object, verbs: object) -> list[str]:
+    """`service.machine`: the once-per-machine mode of a bundled service.
+    Unlike the rest of `service`, an unknown key is refused, so a key nothing
+    reads cannot ride in."""
+    if not isinstance(machine, dict):
+        return ["service.machine is not an object"]
+    problems: list[str] = []
+    unknown = sorted(set(machine) - set(SERVICE_MACHINE_KEYS))
+    if unknown:
+        problems.append(f"service.machine has unknown key(s): {', '.join(unknown)}")
+    if machine.get("schema") != SERVICE_MACHINE_SCHEMA:
+        problems.append(f"service.machine.schema must be {SERVICE_MACHINE_SCHEMA!r}")
+    for field in ("command", "doctor"):
+        value = machine.get(field)
+        if (not isinstance(value, list) or not value
+                or not all(isinstance(v, str) and v for v in value)):
+            problems.append(f"service.machine.{field} must be a non-empty argv list")
+        elif value[0] != name or "service" not in value or "--machine" not in value:
+            problems.append(
+                f"service.machine.{field} must start with {name!r} and carry "
+                "'service' and '--machine'")
+    projects = machine.get("projects")
+    home = f"$XDG_CONFIG_HOME/{name}/"
+    if (not isinstance(projects, str) or not projects.startswith(home)
+            or len(projects) == len(home)
+            or ".." in projects[len(home):].split("/")):
+        problems.append(
+            f"service.machine.projects must be a file under {home} "
+            "(the capability's own config home)")
+    for field in ("config", "state"):
+        if field in machine and (not isinstance(machine[field], str)
+                                 or not machine[field]):
+            problems.append(f"service.machine.{field} must be a non-empty string")
+    listed = verbs if isinstance(verbs, list) else []
+    missing = [verb for verb in SERVICE_MACHINE_VERBS if verb not in listed]
+    if missing:
+        problems.append(
+            "a service declaring service.machine must list "
+            f"{', '.join(missing)} in service.verbs")
+    return problems
+
+
 INVENTORY_NETWORK_MODES = ("none", "optional", "required")
 
 
@@ -1796,6 +1869,9 @@ def _validate_manifest(name: str, manifest) -> list[str]:
                 problems.append("service.verbs is not a list of strings")
             if "deploy" in service:
                 problems.extend(_validate_service_deploy(service["deploy"]))
+            if "machine" in service:
+                problems.extend(_validate_service_machine(
+                    name, service["machine"], verbs))
     return problems
 
 # ---------------------------------------------------------------- snapshots
@@ -2141,9 +2217,10 @@ def _scaffold_credentials(name: str, manifest: dict) -> list[str]:
 
 
 def cmd_install(name: str, from_ref: str | None, source_id: str | None,
-                yes: bool) -> None:
+                yes: bool, allow: bool = False) -> None:
     _reject_reserved_capability_name(name)
     _assert_payload_mutable(name)
+    fresh = name not in _installed()
     provenance = {}
     if source_id:
         if from_ref:
@@ -2156,7 +2233,19 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
         "sha256": _sha256(stage / name), "payload_sha256": _payload_sha256(stage),
         **provenance,
     })
-    script = _activate_payload(name, stage)
+    # A capability new to this machine arrives quarantined unless the install
+    # allows it; one already installed keeps the state it has. The ceiling is
+    # written before the payload lands, so no moment exists in which a fresh
+    # payload is installed and not yet quarantined.
+    previous = _load_machine()["capabilities"].get(name)
+    if fresh or allow:
+        _write_machine(name, "allowed" if allow else "quarantined", record=True)
+    try:
+        script = _activate_payload(name, stage)
+    except BaseException:
+        if fresh or allow:
+            _write_machine(name, previous["state"] if previous else None)
+        raise
     reg = _registry_dir(name)
     link = _symlink(name, script)
     notes = _scaffold_credentials(name, manifest)
@@ -2172,8 +2261,14 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
         "installed": name, "registry": str(reg), "symlink": str(link),
         "summary": manifest.get("summary"), "scope": manifest["credentials"]["scope"],
         "bundle": bool(bundle_dir),
+        "machine": _machine_state(name),
         "project_visibility": _project_visibility_hint(name),
     }
+    if result["machine"] == "quarantined":
+        result["machine_hint"] = (
+            f"{name} is quarantined on this machine: no project can use it "
+            f"until the user runs `capabilities allow {name}`; an agent never "
+            "lifts a quarantine itself")
     if notes:
         result["credentials"] = notes
     if post and not yes:
@@ -2202,6 +2297,7 @@ def cmd_uninstall(name: str, purge_credentials: bool) -> None:
             link.unlink()
             removed_link = True
         shutil.rmtree(reg)
+    _write_machine(name, None)
     _sync_skill()
     result = {"uninstalled": name, "symlink_removed": removed_link}
     cred_file = _CONFIG_HOME / name / "credentials.env"
@@ -2985,20 +3081,22 @@ def cmd_list() -> None:
                        "summary": (manifest or {}).get("summary", ""),
                        "tier": _capability_tier(name)}
         local = _gate_state(project_caps.get(name)) if root else "absent"
-        machine = _gate_state(global_caps.get(name))
+        global_state = _gate_state(global_caps.get(name))
         effective, source = _effective_gate_state(
-            project_caps.get(name) if root else None, global_caps.get(name))
+            name, project_caps.get(name) if root else None, global_caps.get(name))
         if root:
             entry["project_gate"] = local
-        entry["global_gate"] = machine
+        entry["global_gate"] = global_state
         entry["effective"] = effective
         entry["source"] = source
+        entry["machine"] = _machine_state(name)
+        entry["machine_connections"] = _machine_connections(name)
         entries.append(entry)
     known = set(global_caps) | (set(project_caps) if root else set())
     enabled_not_installed = []
     for name in sorted(known):
         effective, _ = _effective_gate_state(
-            project_caps.get(name) if root else None, global_caps.get(name))
+            name, project_caps.get(name) if root else None, global_caps.get(name))
         if effective == "enabled" and name not in _installed():
             enabled_not_installed.append(name)
     out: dict = {"installed": entries}
@@ -3018,7 +3116,7 @@ def _inventory_rows(root: Path) -> list[dict]:
     try:
         for name in sorted(installed):
             effective, source = _effective_gate_state(
-                project_caps.get(name), global_caps.get(name))
+                name, project_caps.get(name), global_caps.get(name))
             if effective != "enabled":
                 continue
             _stub, manifest = _load_snapshots(name)
@@ -3658,7 +3756,10 @@ def cmd_dev_install(session_id: str, names: list[str]) -> None:
     for name in names:
         _reject_reserved_capability_name(name)
         proc = subprocess.run(
-            [str(manager), "install", name, "--from", session["source"]["worktree"]],
+            # The session's own isolated machine: the payload under
+            # development is allowed there, or nothing in the lane could run it.
+            [str(manager), "install", name, "--from", session["source"]["worktree"],
+             "--allow"],
             cwd=cwd, env=env, capture_output=True, text=True, timeout=300,
             check=False)
         if proc.returncode != 0:
@@ -3969,7 +4070,7 @@ def cmd_dev_run(session_id: str, capability: str, args: list[str],
     project_caps, global_caps = _policy_views(project)
     project_gate = project_caps.get(capability)
     global_gate = None if project_only else global_caps.get(capability)
-    effective, gate_tier = _effective_gate_state(project_gate, global_gate)
+    effective, gate_tier = _effective_gate_state(capability, project_gate, global_gate)
     if effective != "enabled":
         _die(4, "disabled", f"{capability} is disabled for attached project {project}")
 
@@ -5109,7 +5210,107 @@ def _gate_state(entry) -> str:
     return "absent"
 
 
-def _effective_gate_state(project_entry, global_entry) -> tuple[str, str]:
+def _load_machine() -> dict:
+    """The machine ceiling file; absent reads as an empty ceiling."""
+    if not MACHINE_FILE.exists():
+        return {"schema": MACHINE_SCHEMA, "capabilities": {}}
+    data = _read_json(MACHINE_FILE)
+    entries = data.get("capabilities") if isinstance(data, dict) else None
+    if (not isinstance(data, dict) or data.get("schema") != MACHINE_SCHEMA
+            or not isinstance(entries, dict)):
+        _die(6, "bad_machine_state", f"{MACHINE_FILE} is not a machine ceiling",
+             f'expected {{"schema": "{MACHINE_SCHEMA}", "capabilities": {{...}}}}')
+    for name, entry in entries.items():
+        if not isinstance(entry, dict) or entry.get("state") not in MACHINE_STATES:
+            _die(6, "bad_machine_state",
+                 f"invalid machine entry {name!r} in {MACHINE_FILE}",
+                 'each entry must carry "state": "allowed"|"quarantined"')
+    return data
+
+
+def _machine_state(name: str) -> str:
+    """`allowed` or `quarantined`; no entry, or no file, is allowed."""
+    entry = _load_machine()["capabilities"].get(name)
+    return entry["state"] if entry else "allowed"
+
+
+def _machine_actor() -> str:
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, OSError):
+        return os.environ.get("USER") or "unknown"
+
+
+def _write_machine_locked(name: str, state: str | None, record: bool = False) -> bool:
+    """Set one capability's machine state, or drop its entry with None.
+
+    Returns whether the state changed; an absent entry counts as allowed. An
+    unchanged state is left as it is unless `record` asks for the entry to be
+    written anyway, as an install does. The caller holds the manager mutation
+    lock."""
+    data = _load_machine()
+    entries = data["capabilities"]
+    current = entries.get(name)
+    if state is None:
+        if current is None:
+            return False
+        entries.pop(name)
+        changed = True
+    else:
+        changed = (current["state"] if current else "allowed") != state
+        if not changed and not (record and current is None):
+            return False
+        entries[name] = {
+            "state": state,
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "by": _machine_actor(),
+        }
+    data["schema"] = MACHINE_SCHEMA
+    _atomic_write_text(MACHINE_FILE, json.dumps(
+        data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    return changed
+
+
+def _write_machine(name: str, state: str | None, record: bool = False) -> bool:
+    """Write the machine ceiling atomically under the manager mutation lock."""
+    if _MANAGER_MUTATION_DEPTH:
+        return _write_machine_locked(name, state, record)
+    MANAGER_MUTATION_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with MANAGER_MUTATION_LOCK.open("a+") as mutation:
+        MANAGER_MUTATION_LOCK.chmod(0o600)
+        fcntl.flock(mutation, fcntl.LOCK_EX)
+        return _write_machine_locked(name, state, record)
+
+
+def _machine_connections(name: str) -> int:
+    """How many connections this machine's global scope declares for `name`,
+    leaving out those whose grant there resolves to disabled. Reads the
+    non-secret connections file only: no secret, no network."""
+    store = _store_module()
+    records = store.FileRecords(_CONFIG_HOME / "no-project", _CONFIG_HOME)
+    try:
+        declared = records.resolve_scope(name, "connection", "global")
+        grants = records.resolve_scope(name, "grant", "global")
+    except store.StoreError as exc:
+        _warn(f"{name}: cannot read global connections — {exc.message}")
+        return 0
+    return sum(1 for cid in declared
+               if not (isinstance(grants.get(cid, {}).get("value"), dict)
+                       and grants[cid]["value"].get("enabled") is False))
+
+
+def cmd_machine(name: str, state: str) -> None:
+    """`capabilities allow|quarantine <name>`: this machine's ceiling."""
+    _reject_reserved_capability_name(name)
+    if name not in _installed():
+        _die(3, "not_found", f"{name} is not installed")
+    changed = _write_machine(name, state)
+    _emit({"capability": name, "machine": state, "changed": changed})
+
+
+def _effective_gate_state(name: str, project_entry, global_entry) -> tuple[str, str]:
+    if _machine_state(name) == "quarantined":
+        return "disabled", "machine"
     project_state = _gate_state(project_entry)
     if project_state != "absent":
         return project_state, "project"
@@ -5456,6 +5657,12 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False) -> None:
         result["deny_rule"] = _deny_rule(name)
     if name not in _installed():
         result["note"] = f"{name} is not installed — run `capabilities install {name}`"
+    elif enabled and _machine_state(name) == "quarantined":
+        result["machine"] = "quarantined"
+        result["warning"] = (
+            f"{name} is quarantined on this machine, so it stays disabled in "
+            f"every project; ask the user whether to run `capabilities allow {name}`")
+        _warn(result["warning"])
     _refresh_after_gate(root, result, enabled)
     _emit(result)
 
@@ -5536,7 +5743,7 @@ def _compose_context(root: Path) -> str:
     names = set(project_caps) | set(global_caps)
     enabled = sorted(
         name for name in names
-        if _effective_gate_state(project_caps.get(name), global_caps.get(name))[0]
+        if _effective_gate_state(name, project_caps.get(name), global_caps.get(name))[0]
         == "enabled")
     lines: list[str] = [
         "# Capabilities", "", CONTEXT_BEGIN, "",
@@ -5977,7 +6184,7 @@ def cmd_context(host: str) -> None:
     project_caps, global_caps = _policy_views(root)
     enabled = [
         n for n in set(project_caps) | set(global_caps)
-        if _effective_gate_state(project_caps.get(n), global_caps.get(n))[0]
+        if _effective_gate_state(n, project_caps.get(n), global_caps.get(n))[0]
         == "enabled"]
     result = {"written": str(target), "enabled": sorted(enabled)}
     _emit(result)
@@ -6683,11 +6890,24 @@ def _audit_script(
                "XDG_DATA_HOME": str(home / "data"),
                "XDG_CACHE_HOME": str(home / "cache")}
         for state, expect in (("disabled", 4), ("enabled", 0),
-                              ("inherited", 0), ("absent", 4)):
+                              ("inherited", 0), ("absent", 4),
+                              ("quarantined", 4)):
             capdir = sandbox / "capabilities"
             global_gate = home / "config" / "capabilities" / "settings.json"
             global_gate.unlink(missing_ok=True)
-            if state in ("absent", "inherited"):
+            machine_file = home / "config" / "capabilities" / "machine.json"
+            machine_file.unlink(missing_ok=True)
+            if state == "quarantined":
+                # The ceiling sits above both scopes: enabled at each, still refused.
+                capdir.mkdir(exist_ok=True)
+                _write_json(capdir / "settings.json", {
+                    "capabilities": {name: {"enabled": True}}})
+                _write_json(global_gate, {"capabilities": {name: {"enabled": True}}})
+                _write_json(machine_file, {
+                    "schema": MACHINE_SCHEMA,
+                    "capabilities": {name: {"state": "quarantined",
+                                            "at": "audit", "by": "audit"}}})
+            elif state in ("absent", "inherited"):
                 shutil.rmtree(capdir, ignore_errors=True)
                 (sandbox / ".git").mkdir(exist_ok=True)  # roots the walk
                 if state == "inherited":
@@ -6705,12 +6925,19 @@ def _audit_script(
             if expect == 4:
                 try:
                     envl = json.loads(errs.strip().splitlines()[-1])
-                    expected_code = "disabled" if state == "disabled" else "not_enabled"
+                    expected_code = {"disabled": "disabled",
+                                     "quarantined": "quarantined"}.get(state, "not_enabled")
                     if envl.get("error", {}).get("code") != expected_code:
                         failures.append(
                             f"gate/{state}: envelope code is not {expected_code!r}")
                 except (ValueError, IndexError):
                     failures.append(f"gate/{state}: no JSON error envelope on stderr")
+            if state == "quarantined":
+                rc, _out, _errs = _run_script(script, ["stub"], cwd=sandbox, env=genv)
+                if rc != 0:
+                    failures.append(f"gate/{state}: safe discovery `stub` exited {rc}")
+                machine_file.unlink(missing_ok=True)
+                global_gate.unlink(missing_ok=True)
 
         # refs + ids in an enabled sandbox project
         capdir = sandbox / "capabilities"
@@ -9208,7 +9435,12 @@ def main() -> None:
     elif cmd == "install":
         if not pos:
             _die(6, "input", "install needs a capability name")
-        cmd_install(pos[0], opt("--from"), opt("--source"), flag("--yes"))
+        cmd_install(pos[0], opt("--from"), opt("--source"), flag("--yes"),
+                    flag("--allow"))
+    elif cmd in ("allow", "quarantine"):
+        if len(pos) != 1:
+            _die(6, "input", f"{cmd} needs exactly one capability name")
+        cmd_machine(pos[0], "allowed" if cmd == "allow" else "quarantined")
     elif cmd == "uninstall":
         if not pos:
             _die(6, "input", "uninstall needs a capability name")

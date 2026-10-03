@@ -201,8 +201,11 @@ def test_manager_inventory_carries_the_declared_service_state(tmp_path):
     env.update({"CAPABILITIES_HOME": str(tmp_path / "registry"),
                 "CAPABILITIES_BIN": str(tmp_path / "bin")})
     (tmp_path / "bin").mkdir()
+    # Allowed on the scratch machine: a fresh install otherwise arrives
+    # quarantined, and inventory leaves a quarantined capability out.
     installed = _run(
-        [str(MANAGER), "install", "slack", "--from", str(BUNDLE), "--yes"], env, project
+        [str(MANAGER), "install", "slack", "--from", str(BUNDLE), "--yes", "--allow"],
+        env, project
     )
     assert installed.returncode == 0, installed.stderr
 

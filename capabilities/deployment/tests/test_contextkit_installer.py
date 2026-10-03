@@ -280,6 +280,22 @@ def test_dockerfile_uses_public_installer(tmp_path: Path) -> None:
     print("✓ Dockerfile uses public installer with correct build order")
 
 
+def test_the_image_installs_its_capabilities_allowed(tmp_path: Path) -> None:
+    """A fresh install arrives quarantined on a machine; in an image one agent
+    is one environment, so every locked capability is installed allowed."""
+    for with_contextkit in (True, False):
+        project = setup_test_project(
+            tmp_path, with_contextkit=with_contextkit,
+            name=f"test-allowed-{str(with_contextkit).lower()}")
+        run_cmd(["deployment", "setup", "--force"], cwd=project)
+        dockerfile = (project / "Dockerfile").read_text()
+        installs = [line for line in dockerfile.splitlines()
+                    if "capabilities install" in line]
+        assert installs, dockerfile
+        assert all('capabilities install "$name" --allow;' in line
+                   for line in installs), installs
+
+
 def test_compose_omits_undeclared_contextkit_ref(tmp_path: Path) -> None:
     """Dockerfile ARG defaults remain authoritative unless runtime opts in."""
     project = setup_test_project(tmp_path, with_contextkit=True, name="test-compose")

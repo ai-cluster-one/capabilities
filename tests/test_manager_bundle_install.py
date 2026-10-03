@@ -422,7 +422,8 @@ def test_install_from_source_script_installs_bundle() -> None:
         tmp = Path(td)
         env, cap_home, bin_dir = _env(tmp)
 
-        _run_manager(["install", "telegram", "--from", str(TELEGRAM_SCRIPT)], env)
+        # Allowed, because the test goes on to run the installed service.
+        _run_manager(["install", "telegram", "--from", str(TELEGRAM_SCRIPT), "--allow"], env)
 
         assert (cap_home / "telegram" / "telegram").is_file()
         assert not (cap_home / "telegram" / "bin").exists()
