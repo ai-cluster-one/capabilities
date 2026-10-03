@@ -257,12 +257,19 @@ class _AwayConnection:
 class _AwayHost:
     """A host whose store refuses a listener until `away` is cleared."""
 
-    channel, project, schema = "tasks_claimable", "prj_away", "tasks"
+    channel, project, schema, slug = "tasks_claimable", "prj_away", "tasks", "away"
 
     def __init__(self, state_dir: Path):
         self.state_dir = self.root = state_dir
         self.away = True
         self.attempts: list[float] = []
+
+    def scope(self, _environment):
+        import contextlib
+        return contextlib.nullcontext()
+
+    def recheck(self, _machine=False):
+        return None
 
     def store_key(self):
         return ("away", "5432", "tasks", "tasks", "prefer", "TASKS_DB_PASSWORD")
@@ -304,12 +311,13 @@ def test_a_listener_the_store_refuses_is_asked_for_again_on_a_doubling_interval(
     declaration = {"settings": {"poll_seconds": 3600, "max_parallel": 1,
                                 "shutdown_grace_seconds": 0, "retry_delay_seconds": 60},
                    "lanes": [], "idle": [], "fingerprint": "f"}
-    daemon = service.Daemon(host, declaration, tick=0.05)
-    daemon.open()
+    dispatcher = service.Dispatcher(tick=0.05)
+    daemon = dispatcher.add(host, declaration)
+    dispatcher.open()
     try:
         deadline = time.monotonic() + 3.3
         while time.monotonic() < deadline:
-            daemon.step()
+            dispatcher.step()
         gaps = [b - a for a, b in zip(host.attempts, host.attempts[1:])]
         # Asked at start, then after 0.2s, 0.4s, and 0.8s from then on.
         assert len(host.attempts) >= 5, gaps
@@ -323,7 +331,7 @@ def test_a_listener_the_store_refuses_is_asked_for_again_on_a_doubling_interval(
         host.away = False
         deadline = time.monotonic() + 3
         while daemon.listener is None and time.monotonic() < deadline:
-            daemon.step()
+            dispatcher.step()
         assert daemon.listener is not None
         assert "relisten" in daemon.last_wake["reasons"]
         assert daemon.status()["wake_by"] == "notification"
@@ -332,7 +340,7 @@ def test_a_listener_the_store_refuses_is_asked_for_again_on_a_doubling_interval(
         assert "listening on tasks_claimable again" in (
             daemon.state_dir / "daemon.log").read_text()
     finally:
-        daemon.close()
+        dispatcher.close()
 
 
 # --- Against a real store ----------------------------------------------------
@@ -384,8 +392,24 @@ while not release.exists():
 """
 
 
+def serve(project: Path, entry: dict) -> None:
+    """What the check before every action reads, as a project that may be served
+    holds it: its id, tasks enabled for it, and the connection granted with
+    writes. Written only where the test has not written its own; no slug, so
+    the state root stays the one the test's verbs already wrote to."""
+    envelope = project / "capabilities"
+    for path, value in (
+            (envelope / "project.json", {"schema": "capabilities.project.v1", "id": HERE}),
+            (envelope / "settings.json", {"capabilities": {"tasks": {"enabled": True}}}),
+            (envelope / "tasks" / "connections.json",
+             {"default": "local", "connections": {"local": entry}})):
+        if not path.exists():
+            path.write_text(json.dumps(value))
+
+
 class Harness:
-    """A daemon over the real host, with each turn replaced by FAKE_TURN."""
+    """A dispatcher over one slot on the real host, with each turn replaced by
+    FAKE_TURN. `daemon` is the slot."""
 
     def __init__(self, project: Path, entry: dict):
         self.project = project
@@ -394,20 +418,22 @@ class Harness:
         self.release = project / "release"
         script = project / "fake_turn.py"
         script.write_text(FAKE_TURN)
+        serve(project, entry)
         service = mod._service_module()
         self.service = service
         self.host = mod._ServiceHost(entry, None)
         self.host.turn_command = lambda worker: [sys.executable, str(script), worker,
                                                  str(self.claims), str(self.release)]
-        self.daemon = service.Daemon(self.host, mod._service_declaration(), tick=0.2)
+        self.dispatcher = service.Dispatcher(tick=0.2)
+        self.daemon = self.dispatcher.add(self.host, mod._service_declaration())
 
     def __enter__(self):
-        self.daemon.open()
+        self.dispatcher.open()
         return self
 
     def __exit__(self, *exc):
         self.release.write_text("go")
-        self.daemon.stopping = True
+        self.dispatcher.stopping = True
         deadline = time.monotonic() + 10
         while self.daemon.turns and time.monotonic() < deadline:
             self.daemon.reap()
@@ -416,13 +442,13 @@ class Harness:
             turn.process.kill()
             turn.process.wait()
         self.daemon.turns.clear()
-        self.daemon.close()
+        self.dispatcher.close()
 
     def steps(self, until, seconds: float = 8.0) -> float:
         """Step until `until()` holds; how long it took."""
         started = time.monotonic()
         while time.monotonic() - started < seconds:
-            self.daemon.step()
+            self.dispatcher.step()
             if until():
                 return time.monotonic() - started
         raise AssertionError(f"not reached in {seconds}s; last wake {self.daemon.last_wake}")
@@ -435,7 +461,7 @@ class Harness:
         """Step long enough for every turn started to report its claim."""
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            self.daemon.step()
+            self.dispatcher.step()
 
 
 def add(entry, capsys, kind: str, **fields) -> str:
@@ -452,7 +478,7 @@ def test_the_store_notifies_and_the_daemon_wakes_for_its_own_project_only(
     entry, schema, conn = store
     write_settings(project, "version = 1\npoll_seconds = 3600\n")
     with Harness(project, entry) as h:
-        h.daemon.step()
+        h.dispatcher.step()
         assert h.daemon.status()["wake_by"] == "notification"
         assert h.running() == 0
         reported = mod._inventory(False)["service"]
@@ -505,7 +531,7 @@ def test_the_daemon_brings_a_store_a_trigger_behind_up_to_date_and_logs_it(
     conn.execute(f"drop trigger tasks_notify_claimable on {schema}.tasks")
     write_settings(project, "version = 1\npoll_seconds = 3600\n")
     with Harness(project, entry) as h:
-        h.daemon.step()
+        h.dispatcher.step()
         assert h.daemon.status()["wake_by"] == "notification"
         log = (h.daemon.state_dir / h.service.LOG_FILE).read_text()
         assert (f"brought schema {schema} up to this version: "
@@ -531,7 +557,7 @@ def test_without_the_notification_the_daemon_wakes_by_the_poll(project, store, c
     mod.cmd_migrate(entry, [])
     assert "tasks.tasks_notify_claimable" in json.loads(capsys.readouterr().out)["would_add"]
     with Harness(project, entry) as h:
-        h.daemon.step()
+        h.dispatcher.step()
         assert h.daemon.status()["wake_by"] == "poll"
         assert h.daemon.status()["notification"]["installed"] is False
         add(entry, capsys, "beta")
@@ -551,7 +577,7 @@ def test_the_daemon_wakes_at_the_earliest_pickup_still_ahead(project, store, cap
     conn.execute(f"update {schema}.tasks set pickup_at = now() + interval '2 seconds' "
                  "where id = %s", (tid,))
     with Harness(project, entry) as h:
-        h.daemon.step()
+        h.dispatcher.step()
         assert h.running() == 0
         assert h.daemon.status()["next_wake"]["reason"] == "pickup"
         took = h.steps(lambda: h.running("alpha") == 1, seconds=6)
@@ -604,15 +630,15 @@ def test_reload_publishes_the_new_fingerprint_and_leaves_running_turns(
                                 "max_parallel = 2\n")
         current = mod._service_fingerprint()
         assert h.service.read_fingerprint(state) != current
-        h.daemon.reload_requested = True
-        h.daemon.step()
+        h.dispatcher.reload_requested = True
+        h.dispatcher.step()
         assert h.service.read_fingerprint(state) == current
         assert h.daemon.lanes()[0]["max_parallel"] == 2
         assert turn.process.poll() is None and h.daemon.turns[turn.id] is turn
         # An edit that does not load is refused and the daemon keeps what it had.
         write_settings(project, "version = 1\nticks = 3\n")
-        h.daemon.reload_requested = True
-        h.daemon.step()
+        h.dispatcher.reload_requested = True
+        h.dispatcher.step()
         assert h.service.read_fingerprint(state) == current
         assert "'ticks', which nothing reads" in h.daemon.reload_error
         assert h.daemon.lanes()[0]["max_parallel"] == 2
@@ -638,8 +664,8 @@ def test_stop_waits_for_turns_then_ends_them_and_settles_like_a_lapsed_lease(
         [turn] = h.daemon.turns.values()
         pid = turn.process.pid
         started = time.monotonic()
-        h.daemon.stop_requested = True
-        h.daemon.shutdown()
+        h.dispatcher.stop_requested = True
+        h.dispatcher.shutdown()
         waited = time.monotonic() - started
         assert 1 <= waited < 8
         assert h.daemon.turns == {} and turn.process.poll() is not None
@@ -663,10 +689,10 @@ def test_a_turn_that_finishes_within_the_grace_is_left_to_finish(project, store,
     with Harness(project, entry) as h:
         h.steps(lambda: h.running("beta") == 1)
         [turn] = h.daemon.turns.values()
-        h.daemon.stop_requested = True
+        h.dispatcher.stop_requested = True
         h.release.write_text("go")
         started = time.monotonic()
-        h.daemon.shutdown()
+        h.dispatcher.shutdown()
         assert time.monotonic() - started < 10
         assert turn.process.returncode == 0
         assert "cut off" not in (h.daemon.state_dir / "daemon.log").read_text()
@@ -930,7 +956,7 @@ def test_a_lost_question_connection_is_asked_for_again_on_the_doubling_interval(
     open_query = h.host.open_query
     h.host.open_query = lambda seconds: attempts.append(time.monotonic()) or open_query(seconds)
     with h:
-        h.daemon.step()
+        h.dispatcher.step()
         store_ = h.daemon.store
         assert store_.connections_opened == 2 and len(attempts) == 1
         listening = backend(store_.listener)
@@ -971,7 +997,7 @@ def test_a_lost_listener_is_asked_for_again_on_the_doubling_interval(
     listen = h.host.listen
     h.host.listen = lambda: attempts.append(time.monotonic()) or listen()
     with h:
-        h.daemon.step()
+        h.dispatcher.step()
         store_ = h.daemon.store
         asking = backend(store_.query)
         relay.refuse()
@@ -1006,14 +1032,14 @@ def test_a_question_that_hangs_is_cut_off_and_the_daemon_carries_on(project, sto
     write_settings(project, "version = 1\npoll_seconds = 3600\n")
     h = quick(Harness(project, entry), QUESTION_TIMEOUT_SECONDS=1)
     with h:
-        h.daemon.step()
+        h.dispatcher.step()
         store_ = h.daemon.store
         blocker = psycopg.connect(DSN)
         try:
             blocker.execute(f"lock table {schema}.tasks in access exclusive mode")
             h.daemon.wakes.add("notify")
             started = time.monotonic()
-            h.daemon.step(wait=False)
+            h.dispatcher.step(wait=False)
             took = time.monotonic() - started
             assert 0.9 < took < 5, took
             assert store_.query is None and h.running() == 0
@@ -1145,8 +1171,10 @@ def test_the_daemon_end_to_end_through_the_cli(lab):
     assert started["started"] and started["running"] and started["wake_by"] == "notification"
     pid = started["pid"]
     status = answer_of(tasks_cli(lab, "service", "status"))
-    assert status["lanes"] == [{"worker": "alpha", "max_parallel": 1, "running": 0,
-                                "held_until_poll": False}]
+    slug = json.loads((project / "capabilities" / "project.json").read_text())["slug"]
+    assert status["lanes"] == [{"project": slug, "worker": "alpha", "max_parallel": 1,
+                                "running": 0, "held_until_poll": False}]
+    assert (status["state"], status["reason"]) == ("served", None)
     assert status["next_wake"]["reason"] == "poll" and status["current"] is True
     [held] = status["stores"]
     assert (held["listening"], held["connections_opened"], held["error"]) == (True, 2, None)
@@ -1163,6 +1191,8 @@ def test_the_daemon_end_to_end_through_the_cli(lab):
     assert (raised["status"], raised["worker"]) == ("ok", "alpha")
     log = answer_of(tasks_cli(lab, "service", "logs"))["lines"]
     assert any(f"claimed t-probe" in line for line in log)
+    # Every line names the project by its slug.
+    assert log and all(f" tasks service [{slug}]: " in line for line in log), log
     assert made["created"]
 
     # A worker file edited: doctor says the daemon is behind, reload catches it up.
@@ -1375,3 +1405,58 @@ def test_a_turn_starts_with_the_projects_env_files_over_the_daemons_environment(
     assert "a quoted value" not in said
     if lab["env"]["TASKS_TEST_PASSWORD"]:
         assert lab["env"]["TASKS_TEST_PASSWORD"] not in said
+
+
+@needs_store
+def test_each_turn_reads_the_env_files_as_they_are_when_it_starts(lab):
+    """The daemon reads no env file of the project: each turn reads .env and
+    .env.local itself, so an edit reaches the next turn of the same daemon with
+    no restart. The connection here leaves its host and port to .env.local and
+    the store's secret is in the project's .env, so the daemon itself resolves
+    through the whole cascade, project files included."""
+    project = lab["project"]
+    record = lab["tmp"] / "engine.jsonl"
+    connections = project / "capabilities" / "tasks" / "connections.json"
+    registry = json.loads(connections.read_text())
+    local = registry["connections"]["local"]
+    host, port = local.pop("db_host"), local.pop("db_port")
+    connections.write_text(json.dumps(registry))
+    (project / ".env.local").write_text(
+        f"db_host={host}\ndb_port={port}\nFAKE_ENGINE_RECORD={record}\n")
+
+    def dotenv(probe: str) -> None:
+        (project / ".env").write_text(
+            f"TASKS_TEST_PASSWORD={lab['env']['TASKS_TEST_PASSWORD']}\n"
+            f"FAKE_ENGINE_TASKS={lab['env']['FAKE_ENGINE_TASKS']}\n"
+            f"TURN_PROBE_EDITED={probe}\n")
+
+    dotenv("first")
+    assert answer_of(tasks_cli(lab, "service", "init"))["written"]
+    write_settings(project, "version = 1\npoll_seconds = 3600\nshutdown_grace_seconds = 5\n")
+    minimal = {key: lab["env"][key] for key in (
+        "PATH", "HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "UV_CACHE_DIR",
+        "CAPABILITIES_HOME", "CAPABILITIES_PROJECT_ENVELOPE", "CAPABILITIES_MANAGER_BIN",
+        "TMPDIR") if key in lab["env"]}
+    log = (lab["tmp"] / "supervised.log").open("w")
+    daemon = subprocess.Popen([str(_cli.CLI_PATH), "service", "run"], cwd=project, env=minimal,
+                              stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+    try:
+        poll_for(lambda: answer_of(tasks_cli(lab, "service", "status"))["running"], 60)
+        pid = answer_of(tasks_cli(lab, "service", "status"))["pid"]
+        for key in ("t-first", "t-second"):
+            if key == "t-second":
+                dotenv("second")
+            answer_of(tasks_cli(lab, "add", "--type", "alpha", "--title", key, "--key", key,
+                                "--status", "todo"))
+            poll_for(lambda key=key: answer_of(tasks_cli(lab, "show", key))["task"]["status"]
+                     == "complete", 60)
+        status = answer_of(tasks_cli(lab, "service", "status"))
+        # The same daemon throughout: nothing was restarted for the edit.
+        assert status["pid"] == pid and status["state"] == "served"
+    finally:
+        tasks_cli(lab, "service", "stop", "--timeout", "30", "--force")
+        daemon.wait(timeout=60)
+        log.close()
+    turns = [json.loads(line) for line in record.read_text().splitlines()]
+    assert [turn["env"]["TURN_PROBE_EDITED"] for turn in turns] == ["first", "second"]
+    assert all("CLAUDE_PROJECT_DIR" not in turn["env"] for turn in turns)

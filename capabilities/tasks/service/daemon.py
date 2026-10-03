@@ -1,16 +1,23 @@
-"""The tasks service: one daemon per project that runs the conveyor on its own.
+"""The tasks service: a dispatcher that runs the conveyor on its own for a set
+of projects, one slot each. In project mode the set is one project, the one the
+daemon was started in.
 
-Every enabled worker that takes something is a lane. Whenever a lane has a free
-slot and the store holds work it would take, the daemon starts one child
-process running `tasks run <worker> --apply` - the same claim, frame, profile,
-turn and settlement a person gets from that command - and counts it against the
-lane's cap and the cap across every lane.
+Every enabled worker of a project that takes something is a lane. Whenever a
+lane has a free slot and the store holds work it would take, the daemon starts
+one child process running `tasks run <worker> --apply` in that project - the
+same claim, frame, profile, turn and settlement a person gets from that command
+- and counts it against the lane's cap and the cap across every lane of the
+project.
 
 The daemon decides nothing about a task. It asks the store whether a lane would
 take something, starts the command that takes it, and reads what the command
-wrote back. Everything it knows about the project arrives through the host the
-executable hands it, so this file holds the loop, the processes and the files
-the daemon publishes, and nothing about workers, settings or the store's shape.
+wrote back. Everything it knows about a project arrives through the host the
+executable hands it for that project, and every question about the project is
+asked inside that host's scope, so this file holds the loop, the processes and
+the files the daemon publishes, and nothing about workers, settings or the
+store's shape. Before it asks the store anything for a project at a wake, and
+again before it starts a turn there, it asks the host whether the project may
+be served at all, and while it may not it asks and starts nothing for it.
 
 It wakes when the store notifies that a task became claimable, at every poll,
 at the earliest moment a pickup or a lease falls due, and when one of its own
@@ -144,11 +151,15 @@ def _write_atomic(path: Path, text: str) -> None:
     os.replace(spare, path)
 
 
-def log_line(state_dir: Path, message: str) -> str:
+def log_line(state_dir: Path, project: str, message: str) -> str:
     """Append one line to the service log, as the daemon writes it, and return
-    it. A verb that changes the daemon's runtime state records it here too,
-    whether or not a daemon runs."""
-    line = f"{now_iso()} tasks service: {message}\n"
+    it: `<moment> tasks service [<project>]: <message>`, the project named by
+    its slug. A message that spans lines, as a store's error may, is written
+    on one, so every line of the log carries its project. A verb that changes
+    the daemon's runtime state records it here too, whether or not a daemon
+    runs."""
+    message = " ".join(part.strip() for part in str(message).splitlines() if part.strip())
+    line = f"{now_iso()} tasks service [{project}]: {message}\n"
     with contextlib.suppress(OSError):
         with (Path(state_dir) / LOG_FILE).open("a", encoding="utf-8") as handle:
             handle.write(line)
@@ -231,14 +242,16 @@ class StoreAway(Exception):
 
 
 class Store:
-    """One store the daemon reaches, and what it holds of it: the connection it
+    """One store the dispatcher reaches, and what it holds of it: the connection it
     listens on, the connection its questions go on, and how many connections it
     has opened to it. Each of the two is asked for again on its own doubling
     interval when it is lost or refused."""
 
-    def __init__(self, key, name: str):
+    def __init__(self, key, name: str, host=None):
         self.key = key
         self.name = name
+        # The host whose connection entry opens this store's connections.
+        self.host = host
         self.listener = None
         self.listen_error: str | None = None
         # While there is no listener: when to ask for one again, and how long
@@ -274,9 +287,11 @@ class StorePool:
     def __init__(self):
         self.stores: dict = {}
 
-    def store(self, key, name: str) -> Store:
+    def store(self, key, name: str, host=None) -> Store:
         if key not in self.stores:
-            self.stores[key] = Store(key, name)
+            self.stores[key] = Store(key, name, host)
+        elif self.stores[key].host is None:
+            self.stores[key].host = host
         return self.stores[key]
 
     def rows(self) -> list[dict]:
@@ -287,8 +302,10 @@ class Turn:
     """One child running `tasks run <worker> --apply`."""
 
     def __init__(self, turn_id: str, worker: str, process: subprocess.Popen,
-                 receipt: Path, output: Path, errors: Path, reason: str):
+                 receipt: Path, output: Path, errors: Path, reason: str,
+                 project: str | None = None):
         self.id = turn_id
+        self.project = project
         self.worker = worker
         self.process = process
         self.receipt = receipt
@@ -312,7 +329,7 @@ class Turn:
 
     def row(self) -> dict:
         claim = self.claim or {}
-        return {"id": self.id, "worker": self.worker, "task": claim.get("task"),
+        return {"project": self.project, "id": self.id, "worker": self.worker, "task": claim.get("task"),
                 "execution": claim.get("execution"), "attempt": claim.get("attempt"),
                 "pid": self.process.pid, "started_at": self.started_at,
                 "phase": self.phase}
@@ -323,24 +340,34 @@ class Turn:
                 path.unlink()
 
 
-class Daemon:
-    """The loop. `host` answers every question about the project; `declaration`
-    is what it was started with, already validated. The store the host names is
-    held in `pool`, one of its own unless one is handed in."""
+class ProjectSlot:
+    """One project the dispatcher serves, and everything held for it: its
+    declaration and fingerprint, its wakes, its poll and pickup deadlines, the
+    lanes held until the poll and the tasks held back by the retry delay, the
+    lane rotation, the pause, its turns, its lock and its state root.
 
-    def __init__(self, host, declaration: dict, *, tick: float = TICK_SECONDS,
-                 pool: StorePool | None = None):
+    `host` answers every question about the project; `declaration` is what the
+    slot was started with, already validated. Every question the slot asks of
+    its host runs inside the host's scope for that project, opened from the
+    dispatcher's start environment, so nothing one project resolves is seen by
+    another. Before it asks the store anything at a wake, and again before it
+    starts a turn, the slot asks the host whether the project may be served at
+    all; while it may not, the slot asks and starts nothing."""
+
+    def __init__(self, dispatcher: "Dispatcher", host, declaration: dict, *,
+                 machine: bool = False):
+        self.dispatcher = dispatcher
         self.host = host
         self.declaration = declaration
+        # Machine mode adds the refusals only a machine process needs; a slot
+        # in project mode resolves its project exactly as the project's own
+        # commands do.
+        self.machine = machine
+        self.slug = host.slug
         self.state_dir = Path(host.state_dir)
         self.turns_dir = self.state_dir / TURNS_DIR
-        self.tick = tick
         self.turns: dict[str, Turn] = {}
-        self.stop_requested = False
-        self.reload_requested = False
-        self.stopping = False
-        self.pool = pool if pool is not None else StorePool()
-        self.store = self.pool.store(host.store_key(), host.store_name())
+        self.store = dispatcher.pool.store(host.store_key(), host.store_name(), host)
         self.notification_installed: bool | None = None
         self.next_poll = 0.0
         self.next_moment: float | None = None
@@ -352,6 +379,11 @@ class Daemon:
         self.rotation = 0
         self.reload_error: str | None = None
         self.pause: dict = {"all": None, "lanes": {}}
+        # Why the project may not be served, as ("refused" | "error", reason),
+        # from the last check; and that check's answer for this pass, None
+        # until it is asked.
+        self.refusal: tuple[str, str] | None = None
+        self.checked: bool | None = None
         self.started_at = now_iso()
         self._lock = None
         self._published: str | None = None
@@ -360,8 +392,12 @@ class Daemon:
 
     # --- what it says ----------------------------------------------------------
 
+    def scope(self):
+        """The host's scope for this project, opened from the start environment."""
+        return self.host.scope(self.dispatcher.environment)
+
     def log(self, message: str) -> None:
-        line = log_line(self.state_dir, message)
+        line = log_line(self.state_dir, self.slug, message)
         if self._log_to_stderr:
             sys.stderr.write(line)
             sys.stderr.flush()
@@ -380,11 +416,25 @@ class Daemon:
     def listener(self):
         return self.store.listener
 
+    @property
+    def stopping(self) -> bool:
+        return self.dispatcher.stopping
+
     def settings(self) -> dict:
         return self.declaration["settings"]
 
     def lanes(self) -> list[dict]:
         return self.declaration["lanes"]
+
+    def state(self) -> str:
+        """`refused` or `error` while the project may not be served, `paused`
+        while the pause holds every lane, and `served` otherwise."""
+        if self.refusal is not None:
+            return self.refusal[0]
+        lanes = [lane["worker"] for lane in self.lanes()]
+        if lanes and set(self.holding()) == set(lanes):
+            return "paused"
+        return "served"
 
     def status(self) -> dict:
         now = time.monotonic()
@@ -401,18 +451,21 @@ class Daemon:
             "started_at": self.started_at,
             "project": self.host.project,
             "schema": self.host.schema,
+            "state": self.state(),
+            "reason": self.refusal[1] if self.refusal else None,
             "fingerprint": self.declaration["fingerprint"],
             "wake_by": ("notification" if listening and self.notification_installed
                         else "poll"),
             "notification": {"channel": self.host.channel, "listening": listening,
                              "installed": self.notification_installed,
                              **({"error": listen_error} if listen_error else {})},
-            "stores": self.pool.rows(),
+            "stores": [self.store.row()],
             "poll_seconds": self.settings()["poll_seconds"],
             "max_parallel": self.settings()["max_parallel"],
             "shutdown_grace_seconds": self.settings()["shutdown_grace_seconds"],
             "retry_delay_seconds": self.settings()["retry_delay_seconds"],
-            "lanes": [{"worker": lane["worker"], "max_parallel": lane["max_parallel"],
+            "lanes": [{"project": self.slug, "worker": lane["worker"],
+                       "max_parallel": lane["max_parallel"],
                        "running": sum(1 for t in self.turns.values()
                                       if t.worker == lane["worker"]),
                        "held_until_poll": lane["worker"] in self.held}
@@ -475,236 +528,49 @@ class Daemon:
                  + (f"; cleared {len(left)} file(s) a previous daemon left in turns/"
                     if left else "")
                  + (f"; paused, starting no turn on {', '.join(held)}" if held else ""))
-        self._connect_listener()
-        self.next_poll = time.monotonic() + self.settings()["poll_seconds"]
-        self.publish()
 
-    def close(self) -> None:
+    def unpublish(self) -> None:
         for name in (PID_FILE, FINGERPRINT_FILE, STATUS_FILE):
             with contextlib.suppress(OSError):
                 (self.state_dir / name).unlink()
-        self._drop_listener()
-        self._drop_query()
+
+    def release(self) -> None:
         if self._lock is not None:
             self._lock.close()
             self._lock = None
         self.log("stopped")
 
-    def run(self) -> None:
-        self.open()
+    # --- may it be served ------------------------------------------------------
 
-        def stop(_signum, _frame) -> None:
-            self.stop_requested = True
-
-        def reload(_signum, _frame) -> None:
-            self.reload_requested = True
-
-        signal.signal(signal.SIGTERM, stop)
-        signal.signal(signal.SIGINT, stop)
-        signal.signal(signal.SIGHUP, reload)
+    def served(self, fresh: bool = False) -> bool:
+        """Whether the project may be served now, asked of the host inside the
+        project's scope: once per pass at the first wake that would ask the
+        store anything, and afresh when `fresh`, which is before every turn.
+        A change of answer is said once in the log."""
+        if self.checked is not None and not fresh:
+            return self.checked
         try:
-            while not self.stop_requested:
-                self.step()
-        finally:
-            self.shutdown()
-            self.close()
-
-    def step(self, wait: bool = True) -> None:
-        """One pass: take a reload, look at the children, decide whether this is
-        a wake, dispatch on one, and wait for the next reason to look."""
-        if self.reload_requested:
-            self.reload_requested = False
-            self.reload()
-        self._take_up_pause()
-        self.reap()
-        now = time.monotonic()
-        if now >= self.next_poll:
-            self.wakes.add("poll")
-            self.next_poll = now + self.settings()["poll_seconds"]
-            # What was held back is asked again on the clock, and a listener
-            # that was lost is opened again.
-            self.held.clear()
-            if self.listener is None:
-                self._connect_listener()
-            else:
-                self._check_notification()
-        elif self.listener is None and self.store.relisten_at is not None \
-                and now >= self.store.relisten_at:
-            self._connect_listener()
-        if self.store.query is None and self.store.requery_at is not None \
-                and now >= self.store.requery_at:
-            self._reconnect()
-        self._ping(time.monotonic())
-        if self.next_moment is not None and now >= self.next_moment:
-            self.wakes.add("pickup")
-            self.next_moment = None
-        over = [tid for tid, r in self.recent.items() if now >= r["until"]]
-        for tid in over:
-            del self.recent[tid]
-        if over:
-            self.wakes.add("retry")
-        if self.wakes and not self.stop_requested:
-            wakes, self.wakes = self.wakes, set()
-            self.last_wake = {"at": now_iso(), "reasons": sorted(wakes)}
-            self.dispatch(wakes)
-            self._plan_next_moment()
-        self.publish()
-        if wait and not self.stop_requested:
-            deadlines = ([self.next_poll] + ([self.next_moment] if self.next_moment else [])
-                         + ([self.store.relisten_at] if self.store.relisten_at else [])
-                         + ([self.store.requery_at] if self.store.requery_at else [])
-                         + [r["until"] for r in self.recent.values()])
-            self.wait(max(0.0, min([self.tick] + [d - time.monotonic() for d in deadlines])))
-
-    # --- waking ----------------------------------------------------------------
-
-    def _connect_listener(self) -> None:
-        """Open the listener. A failure is said once, not on every attempt, and
-        the next attempt is planned; a listener opened after one was lost or
-        refused is a wake, since what the store announced meanwhile was lost."""
-        store = self.store
-        self._drop_listener()
-        try:
-            store.listener = self.host.listen()
+            with self.scope():
+                found = self.host.recheck(self.machine)
         except (Exception, SystemExit) as exc:
-            store.listener = None
-            why = _why(exc)
-            if why != store.listen_error:
-                self.log(f"cannot listen for the store's notification, waking by the "
-                         f"poll every {self.settings()['poll_seconds']}s and asking "
-                         f"again: {why}")
-            store.listen_error = why
-            self._relisten_later()
-            return
-        store.opened()
-        store.listener_pinged = time.monotonic()
-        if store.listen_error is not None:
-            self.log(f"listening on {self.host.channel} again; asking the store for work")
-            self.wakes.add("relisten")
-        store.listen_error = None
-        store.relisten_at = None
-        store.relisten_delay = RELISTEN_FIRST_SECONDS
-        if store.query is None:
-            # The store answers, so the questions need not wait out their own
-            # interval: the next one asks for its connection at once.
-            store.requery_at = None
-        self._check_notification()
-
-    def _relisten_later(self) -> None:
-        store = self.store
-        store.relisten_at = time.monotonic() + store.relisten_delay
-        store.relisten_delay = min(store.relisten_delay * 2, RELISTEN_LONGEST_SECONDS)
-
-    def _lose_listener(self, exc: BaseException) -> None:
-        self.log(f"lost the store's notification, waking by the poll and asking "
-                 f"for it again: {_why(exc)}")
-        self._drop_listener()
-        self.store.listen_error = _why(exc)
-        self._relisten_later()
+            found = ("error", _why(exc))
+        if found != self.refusal:
+            if found is not None:
+                self.log(f"{found[0]}: {found[1]}; asking the store nothing and starting "
+                         "no turn for this project until a later check passes")
+            else:
+                self.log("served again: the check before every action passes")
+        self.refusal = found
+        self.checked = found is None
+        return self.checked
 
     # --- asking ----------------------------------------------------------------
 
     def ask(self, question, *, at_once: bool = False):
-        """Put one question to the store on the connection questions go on, and
-        answer what it answers. The connection is opened when there is none, unless
-        the doubling interval since it was lost has not come round, in which case
-        the question is refused at once; `at_once` asks for it regardless. A
-        question that loses its connection, or runs past the store's timeout,
-        drops it and plans the next attempt; any other failure is the question's
-        own and leaves the connection held."""
-        store = self.store
-        if store.query is None:
-            if (not at_once and store.requery_at is not None
-                    and time.monotonic() < store.requery_at):
-                raise StoreAway(f"no connection to the store until it answers again: "
-                                f"{store.query_error}")
-            self._open_query()
-        conn = store.query
-        try:
-            answer = question(conn)
-            conn.commit()
-        except BaseException as exc:
-            if self.host.lost(conn, exc):
-                self._lose_query(exc)
-            else:
-                try:
-                    conn.rollback()
-                except Exception as gone:
-                    self._lose_query(gone)
-            raise
-        store.query_used = time.monotonic()
-        store.requery_delay = RELISTEN_FIRST_SECONDS
-        return answer
+        """Put one question about this project to its store, inside its scope."""
+        return self.dispatcher.ask(self.store, question, scope=self.scope, at_once=at_once)
 
-    def _open_query(self) -> None:
-        """Open the connection questions go on, or plan the next attempt and
-        refuse the question. A failure is said once, not on every attempt."""
-        store = self.store
-        try:
-            store.query = self.host.open_query(QUESTION_TIMEOUT_SECONDS)
-        except (Exception, SystemExit) as exc:
-            store.query = None
-            why = _why(exc)
-            if why != store.query_error:
-                self.log(f"cannot connect to the store to ask it for work, asking again: "
-                         f"{why}")
-            store.query_error = why
-            self._requery_later()
-            raise StoreAway(why) from exc
-        store.opened()
-        store.query_used = time.monotonic()
-        store.requery_at = None
-        if store.query_error is not None:
-            self.log("connected to the store again for its questions")
-        store.query_error = None
-
-    def _reconnect(self) -> None:
-        """The interval since the question connection was lost has come round:
-        open it, and ask for work, since what was asked meanwhile went
-        unanswered."""
-        try:
-            self._open_query()
-        except StoreAway:
-            return
-        self.wakes.add("reconnect")
-
-    def _requery_later(self) -> None:
-        store = self.store
-        store.requery_at = time.monotonic() + store.requery_delay
-        store.requery_delay = min(store.requery_delay * 2, RELISTEN_LONGEST_SECONDS)
-
-    def _lose_query(self, exc: BaseException) -> None:
-        store = self.store
-        why = _why(exc)
-        self._drop_query()
-        if why != store.query_error:
-            self.log(f"lost the store connection its questions go on, asking for it "
-                     f"again in {store.requery_delay:g}s: {why}")
-        store.query_error = why
-        self._requery_later()
-
-    def _drop_query(self) -> None:
-        if self.store.query is not None:
-            with contextlib.suppress(Exception):
-                self.store.query.close()
-        self.store.query = None
-
-    def _ping(self, now: float) -> None:
-        """A round trip on each held connection that is due one, so a proxy in
-        front of the store sees it in use. A ping that fails is that connection
-        lost."""
-        store = self.store
-        if store.listener is not None and now - store.listener_pinged >= PING_SECONDS:
-            store.listener_pinged = now
-            try:
-                self.host.ping(store.listener)
-            except Exception as exc:
-                self._lose_listener(exc)
-        if store.query is not None and now - store.query_used >= PING_SECONDS:
-            with contextlib.suppress(Exception, SystemExit):
-                self.ask(self.host.ping)
-
-    def _check_notification(self) -> None:
+    def check_notification(self) -> None:
         # The store is brought up to this version first, when all it lacks is
         # additive, so a store that lacked the notification gains it here. A
         # store that cannot be asked is said by the check below.
@@ -730,38 +596,18 @@ class Daemon:
                          "`tasks migrate --apply` adds it")
         self.notification_installed = installed
 
-    def _drop_listener(self) -> None:
-        if self.store.listener is not None:
-            with contextlib.suppress(Exception):
-                self.store.listener.close()
-        self.store.listener = None
+    def heard(self, payload) -> bool:
+        """Whether a notification is this project's: its schema and its id."""
+        return (isinstance(payload, dict) and payload.get("project") == self.host.project
+                and payload.get("schema") == self.host.schema)
 
-    def wait(self, seconds: float) -> None:
-        """Sleep until the store notifies or `seconds` pass. A notification for
-        another project or another schema on the same database is not a wake."""
-        if self.listener is None:
-            time.sleep(seconds)
-            return
-        try:
-            got = list(self.listener.notifies(timeout=seconds, stop_after=1))
-            if got:
-                got += list(self.listener.notifies(timeout=0))
-        except Exception as exc:
-            self._lose_listener(exc)
-            return
-        for note in got:
-            try:
-                payload = json.loads(note.payload)
-            except (ValueError, AttributeError):
-                continue
-            if (isinstance(payload, dict) and payload.get("project") == self.host.project
-                    and payload.get("schema") == self.host.schema):
-                self.wakes.add("notify")
-                recent = self.recent.get(str(payload.get("task")))
-                if recent is not None:
-                    # Not dropped: the delay's own wake asks for it again.
-                    self.log(f"task {recent['task']} is claimable again; deferred "
-                             f"to {_at(recent['until'] - time.monotonic())}")
+    def notified(self, payload: dict) -> None:
+        self.wakes.add("notify")
+        recent = self.recent.get(str(payload.get("task")))
+        if recent is not None:
+            # Not dropped: the delay's own wake asks for it again.
+            self.log(f"task {recent['task']} is claimable again; deferred "
+                     f"to {_at(recent['until'] - time.monotonic())}")
 
     def _plan_next_moment(self) -> None:
         try:
@@ -771,6 +617,10 @@ class Daemon:
             return
         self.next_moment = (time.monotonic() + max(0.0, float(seconds)) + 0.5
                             if seconds is not None else None)
+
+    def deadlines(self) -> list[float]:
+        return ([self.next_poll] + ([self.next_moment] if self.next_moment else [])
+                + [r["until"] for r in self.recent.values()])
 
     # --- the pause -------------------------------------------------------------
 
@@ -838,7 +688,8 @@ class Daemon:
                 self.log(f"cannot ask the store for {lane['worker']}'s work: {_why(exc)}")
                 return
             if has_work:
-                self.spawn(lane["worker"], "work", exclude)
+                if self.spawn(lane["worker"], "work", exclude) is None:
+                    return
                 free -= 1
                 started = True
         if started or free <= 0 or not (wakes & _SWEEP_WAKES):
@@ -853,12 +704,18 @@ class Daemon:
             if lane is not None:
                 self.spawn(lane["worker"], "sweep", exclude)
 
-    def spawn(self, worker: str, reason: str, exclude: tuple = ()) -> Turn:
+    def spawn(self, worker: str, reason: str, exclude: tuple = ()) -> Turn | None:
+        """Start one turn, unless the check taken again just before it refuses
+        the project, in which case nothing is started."""
+        if not self.served(fresh=True):
+            return None
         turn_id = uuid.uuid4().hex[:12]
         receipt = self.turns_dir / f"{turn_id}.claim.json"
         output = self.turns_dir / f"{turn_id}.out"
         errors = self.turns_dir / f"{turn_id}.err"
-        env = dict(self.host.turn_env())
+        # What every turn starts from is the dispatcher's start environment,
+        # never the environment a scope left behind.
+        env = dict(self.host.turn_env(self.dispatcher.environment))
         env[RECEIPT_ENV] = str(receipt)
         if exclude:
             env[EXCLUDE_ENV] = ",".join(exclude)
@@ -867,7 +724,7 @@ class Daemon:
                 self.host.turn_command(worker), cwd=str(self.host.root), env=env,
                 stdin=subprocess.DEVNULL, stdout=out, stderr=err,
                 start_new_session=True)
-        turn = Turn(turn_id, worker, process, receipt, output, errors, reason)
+        turn = Turn(turn_id, worker, process, receipt, output, errors, reason, self.slug)
         self.turns[turn_id] = turn
         self.log(f"turn {turn_id} started: worker {worker}, pid {process.pid}"
                  + (", to let its claim put back what is due" if reason == "sweep" else ""))
@@ -946,12 +803,14 @@ class Daemon:
     def reload(self) -> None:
         """Take up the declaration on disk, or keep the one running.
 
-        It is read and validated whole before anything is replaced, so an edit
-        that does not load leaves this daemon dispatching exactly what it had.
-        Turns already running are children held by id and the swap does not
-        touch them. The published fingerprint moves last, and only on success."""
+        It is read and validated whole, inside the project's scope, before
+        anything is replaced, so an edit that does not load leaves this slot
+        dispatching exactly what it had. Turns already running are children
+        held by id and the swap does not touch them. The published fingerprint
+        moves last, and only on success."""
         try:
-            declaration = self.host.load()
+            with self.scope():
+                declaration = self.host.load()
         except (Exception, SystemExit) as exc:
             self.reload_error = _why(exc)
             self.log(f"reload rejected, keeping the declaration loaded: {self.reload_error}")
@@ -965,19 +824,10 @@ class Daemon:
         self.wakes.add("reload")
         self.log(f"reloaded: lanes {', '.join(self._lane_words()) or 'none'}")
 
-    def shutdown(self) -> None:
-        """Stop claiming, give running turns the grace period, then end what is
-        left and settle each raise it held the way a lapsed lease is settled."""
-        self.stopping = True
+    def cut_off(self) -> None:
+        """End every turn still running and settle each raise it held the way a
+        lapsed lease is settled."""
         grace = self.settings()["shutdown_grace_seconds"]
-        if self.turns:
-            self.log(f"stopping: waiting up to {grace}s for {len(self.turns)} turn(s)")
-        self.publish()
-        deadline = time.monotonic() + grace
-        while self.turns and time.monotonic() < deadline:
-            self.reap()
-            if self.turns:
-                time.sleep(0.2)
         for turn in list(self.turns.values()):
             turn.read_receipt()
             with contextlib.suppress(Exception):
@@ -999,4 +849,381 @@ class Daemon:
             self.log(f"turn {turn.id} cut off after {grace}s: worker {turn.worker}"
                      + (f", task {task}" if task else "") + f", {settled}")
             turn.discard_files()
-        self.publish()
+
+
+class Dispatcher:
+    """The loop over a set of project slots: it owns the signals, the stores it
+    holds connections to, the machine cap and the start environment every
+    project's scope and every turn begin from. Project mode is a dispatcher with
+    exactly one slot, the project it was started in, and no machine cap.
+
+    The start environment is taken when the dispatcher is made, before any
+    scope opens, because resolving a project writes what it resolved into the
+    process environment."""
+
+    def __init__(self, *, tick: float = TICK_SECONDS, pool: StorePool | None = None,
+                 machine_cap: int | None = None, environment=None):
+        self.environment = dict(os.environ if environment is None else environment)
+        self.tick = tick
+        self.pool = pool if pool is not None else StorePool()
+        # Turns running at once across every slot; None leaves only each
+        # project's own limits, which is what project mode runs by.
+        self.machine_cap = machine_cap
+        self.slots: list[ProjectSlot] = []
+        self.stop_requested = False
+        self.reload_requested = False
+        self.stopping = False
+
+    def add(self, host, declaration: dict, *, machine: bool = False) -> ProjectSlot:
+        slot = ProjectSlot(self, host, declaration, machine=machine)
+        self.slots.append(slot)
+        return slot
+
+    def stores(self) -> list[Store]:
+        """The stores the slots reach, each once, in the order slots name them."""
+        seen: dict = {}
+        for slot in self.slots:
+            seen.setdefault(slot.store.key, slot.store)
+        return list(seen.values())
+
+    def on(self, store: Store) -> list[ProjectSlot]:
+        return [slot for slot in self.slots if slot.store is store]
+
+    # --- lifecycle -------------------------------------------------------------
+
+    def open(self) -> None:
+        for slot in self.slots:
+            slot.open()
+        for store in self.stores():
+            self._connect_listener(store)
+        for slot in self.slots:
+            slot.next_poll = time.monotonic() + slot.settings()["poll_seconds"]
+            slot.publish()
+
+    def close(self) -> None:
+        for slot in self.slots:
+            slot.unpublish()
+        for store in self.stores():
+            self._drop_listener(store)
+            self._drop_query(store)
+        for slot in self.slots:
+            slot.release()
+
+    def run(self) -> None:
+        self.open()
+
+        def stop(_signum, _frame) -> None:
+            self.stop_requested = True
+
+        def reload(_signum, _frame) -> None:
+            self.reload_requested = True
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        signal.signal(signal.SIGHUP, reload)
+        try:
+            while not self.stop_requested:
+                self.step()
+        finally:
+            self.shutdown()
+            self.close()
+
+    def step(self, wait: bool = True) -> None:
+        """One pass: take a reload, look at the children, decide which slots
+        have a wake, dispatch each one that may be served, and wait for the
+        next reason to look."""
+        if self.reload_requested:
+            self.reload_requested = False
+            for slot in self.slots:
+                slot.reload()
+        for slot in self.slots:
+            # A slot is checked afresh at this pass's first wake.
+            slot.checked = None
+            slot._take_up_pause()
+            slot.reap()
+        now = time.monotonic()
+        polled: dict = {}
+        for slot in self.slots:
+            if now >= slot.next_poll:
+                slot.wakes.add("poll")
+                slot.next_poll = now + slot.settings()["poll_seconds"]
+                # What was held back is asked again on the clock, and a listener
+                # that was lost is opened again.
+                slot.held.clear()
+                polled.setdefault(slot.store.key, []).append(slot)
+        for store in self.stores():
+            if store.key in polled:
+                if store.listener is None:
+                    self._connect_listener(store)
+                else:
+                    for slot in polled[store.key]:
+                        if slot.served():
+                            slot.check_notification()
+            elif store.listener is None and store.relisten_at is not None \
+                    and now >= store.relisten_at:
+                self._connect_listener(store)
+            if store.query is None and store.requery_at is not None \
+                    and now >= store.requery_at:
+                self._reconnect(store)
+        self._ping(time.monotonic())
+        for slot in self.slots:
+            if slot.next_moment is not None and now >= slot.next_moment:
+                slot.wakes.add("pickup")
+                slot.next_moment = None
+            over = [tid for tid, r in slot.recent.items() if now >= r["until"]]
+            for tid in over:
+                del slot.recent[tid]
+            if over:
+                slot.wakes.add("retry")
+            if slot.wakes and not self.stop_requested:
+                wakes, slot.wakes = slot.wakes, set()
+                slot.last_wake = {"at": now_iso(), "reasons": sorted(wakes)}
+                if slot.served():
+                    slot.dispatch(wakes)
+                    slot._plan_next_moment()
+            slot.publish()
+        if wait and not self.stop_requested:
+            deadlines = [d for slot in self.slots for d in slot.deadlines()]
+            for store in self.stores():
+                deadlines += ([store.relisten_at] if store.relisten_at else []) \
+                    + ([store.requery_at] if store.requery_at else [])
+            self.wait(max(0.0, min([self.tick] + [d - time.monotonic() for d in deadlines])))
+
+    def shutdown(self) -> None:
+        """Stop claiming, give each slot's running turns its grace period, then
+        end what is left and settle each raise it held the way a lapsed lease is
+        settled."""
+        self.stopping = True
+        deadlines = {}
+        for slot in self.slots:
+            grace = slot.settings()["shutdown_grace_seconds"]
+            if slot.turns:
+                slot.log(f"stopping: waiting up to {grace}s for {len(slot.turns)} turn(s)")
+            slot.publish()
+            deadlines[id(slot)] = time.monotonic() + grace
+        while True:
+            waiting = [slot for slot in self.slots
+                       if slot.turns and time.monotonic() < deadlines[id(slot)]]
+            if not waiting:
+                break
+            for slot in waiting:
+                slot.reap()
+            if any(slot.turns for slot in waiting):
+                time.sleep(0.2)
+        for slot in self.slots:
+            slot.cut_off()
+            slot.publish()
+
+    # --- waking ----------------------------------------------------------------
+
+    def _connect_listener(self, store: Store) -> None:
+        """Open the listener. A failure is said once, not on every attempt, and
+        the next attempt is planned; a listener opened after one was lost or
+        refused is a wake, since what the store announced meanwhile was lost.
+        It is opened outside every scope: the secret it needs is resolved
+        here, never inside a project's."""
+        self._drop_listener(store)
+        try:
+            store.listener = store.host.listen()
+        except (Exception, SystemExit) as exc:
+            store.listener = None
+            why = _why(exc)
+            if why != store.listen_error:
+                for slot in self.on(store):
+                    slot.log(f"cannot listen for the store's notification, waking by the "
+                             f"poll every {slot.settings()['poll_seconds']}s and asking "
+                             f"again: {why}")
+            store.listen_error = why
+            self._relisten_later(store)
+            return
+        store.opened()
+        store.listener_pinged = time.monotonic()
+        if store.listen_error is not None:
+            for slot in self.on(store):
+                slot.log(f"listening on {slot.host.channel} again; asking the store for work")
+                slot.wakes.add("relisten")
+        store.listen_error = None
+        store.relisten_at = None
+        store.relisten_delay = RELISTEN_FIRST_SECONDS
+        if store.query is None:
+            # The store answers, so the questions need not wait out their own
+            # interval: the next one asks for its connection at once.
+            store.requery_at = None
+        for slot in self.on(store):
+            if slot.served():
+                slot.check_notification()
+
+    def _relisten_later(self, store: Store) -> None:
+        store.relisten_at = time.monotonic() + store.relisten_delay
+        store.relisten_delay = min(store.relisten_delay * 2, RELISTEN_LONGEST_SECONDS)
+
+    def _lose_listener(self, store: Store, exc: BaseException) -> None:
+        for slot in self.on(store):
+            slot.log(f"lost the store's notification, waking by the poll and asking "
+                     f"for it again: {_why(exc)}")
+        self._drop_listener(store)
+        store.listen_error = _why(exc)
+        self._relisten_later(store)
+
+    def _drop_listener(self, store: Store) -> None:
+        if store.listener is not None:
+            with contextlib.suppress(Exception):
+                store.listener.close()
+        store.listener = None
+
+    def wait(self, seconds: float) -> None:
+        """Sleep until a store notifies or `seconds` pass. A notification is
+        handed only to the slot whose project and schema it names; one for
+        another project or another schema on the same database is no wake."""
+        listening = [store for store in self.stores() if store.listener is not None]
+        if not listening:
+            time.sleep(seconds)
+            return
+        if len(listening) == 1:
+            [store] = listening
+            try:
+                got = list(store.listener.notifies(timeout=seconds, stop_after=1))
+                if got:
+                    got += list(store.listener.notifies(timeout=0))
+            except Exception as exc:
+                self._lose_listener(store, exc)
+                return
+            self._route(store, got)
+            return
+        # Several stores: what any of them already holds is taken first, then
+        # the wait is on all of their sockets at once.
+        if self._drain(listening):
+            return
+        import select
+        with contextlib.suppress(Exception):
+            select.select([store.listener.fileno() for store in listening], [], [], seconds)
+        self._drain(listening)
+
+    def _drain(self, stores: list[Store]) -> bool:
+        heard = False
+        for store in stores:
+            if store.listener is None:
+                continue
+            try:
+                got = list(store.listener.notifies(timeout=0))
+            except Exception as exc:
+                self._lose_listener(store, exc)
+                continue
+            heard = heard or bool(got)
+            self._route(store, got)
+        return heard
+
+    def _route(self, store: Store, notes) -> None:
+        slots = self.on(store)
+        for note in notes:
+            try:
+                payload = json.loads(note.payload)
+            except (ValueError, AttributeError):
+                continue
+            for slot in slots:
+                if slot.heard(payload):
+                    slot.notified(payload)
+
+    # --- asking ----------------------------------------------------------------
+
+    def ask(self, store: Store, question, *, scope=None, at_once: bool = False):
+        """Put one question to the store on the connection questions go on, and
+        answer what it answers. The connection is opened when there is none,
+        outside every scope, unless the doubling interval since it was lost has
+        not come round, in which case the question is refused at once;
+        `at_once` asks for it regardless. The question itself runs inside
+        `scope()` when one is given. A question that loses its connection, or
+        runs past the store's timeout, drops it and plans the next attempt; any
+        other failure is the question's own and leaves the connection held."""
+        if store.query is None:
+            if (not at_once and store.requery_at is not None
+                    and time.monotonic() < store.requery_at):
+                raise StoreAway(f"no connection to the store until it answers again: "
+                                f"{store.query_error}")
+            self._open_query(store)
+        conn = store.query
+        try:
+            with (scope() if scope is not None else contextlib.nullcontext()):
+                answer = question(conn)
+            conn.commit()
+        except BaseException as exc:
+            if store.host.lost(conn, exc):
+                self._lose_query(store, exc)
+            else:
+                try:
+                    conn.rollback()
+                except Exception as gone:
+                    self._lose_query(store, gone)
+            raise
+        store.query_used = time.monotonic()
+        store.requery_delay = RELISTEN_FIRST_SECONDS
+        return answer
+
+    def _open_query(self, store: Store) -> None:
+        """Open the connection questions go on, or plan the next attempt and
+        refuse the question. A failure is said once, not on every attempt."""
+        try:
+            store.query = store.host.open_query(QUESTION_TIMEOUT_SECONDS)
+        except (Exception, SystemExit) as exc:
+            store.query = None
+            why = _why(exc)
+            if why != store.query_error:
+                for slot in self.on(store):
+                    slot.log(f"cannot connect to the store to ask it for work, asking "
+                             f"again: {why}")
+            store.query_error = why
+            self._requery_later(store)
+            raise StoreAway(why) from exc
+        store.opened()
+        store.query_used = time.monotonic()
+        store.requery_at = None
+        if store.query_error is not None:
+            for slot in self.on(store):
+                slot.log("connected to the store again for its questions")
+        store.query_error = None
+
+    def _reconnect(self, store: Store) -> None:
+        """The interval since the question connection was lost has come round:
+        open it, and ask for work, since what was asked meanwhile went
+        unanswered."""
+        try:
+            self._open_query(store)
+        except StoreAway:
+            return
+        for slot in self.on(store):
+            slot.wakes.add("reconnect")
+
+    def _requery_later(self, store: Store) -> None:
+        store.requery_at = time.monotonic() + store.requery_delay
+        store.requery_delay = min(store.requery_delay * 2, RELISTEN_LONGEST_SECONDS)
+
+    def _lose_query(self, store: Store, exc: BaseException) -> None:
+        why = _why(exc)
+        self._drop_query(store)
+        if why != store.query_error:
+            for slot in self.on(store):
+                slot.log(f"lost the store connection its questions go on, asking for it "
+                         f"again in {store.requery_delay:g}s: {why}")
+        store.query_error = why
+        self._requery_later(store)
+
+    def _drop_query(self, store: Store) -> None:
+        if store.query is not None:
+            with contextlib.suppress(Exception):
+                store.query.close()
+        store.query = None
+
+    def _ping(self, now: float) -> None:
+        """A round trip on each held connection that is due one, so a proxy in
+        front of the store sees it in use. A ping that fails is that connection
+        lost."""
+        for store in self.stores():
+            if store.listener is not None and now - store.listener_pinged >= PING_SECONDS:
+                store.listener_pinged = now
+                try:
+                    store.host.ping(store.listener)
+                except Exception as exc:
+                    self._lose_listener(store, exc)
+            if store.query is not None and now - store.query_used >= PING_SECONDS:
+                with contextlib.suppress(Exception, SystemExit):
+                    self.ask(store, store.host.ping)

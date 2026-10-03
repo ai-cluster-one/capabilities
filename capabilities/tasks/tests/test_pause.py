@@ -170,7 +170,7 @@ def test_a_pause_starts_no_new_turn_and_leaves_the_running_one_to_finish(
             t.phase == "working" for t in h.daemon.turns.values()))
         [turn] = h.daemon.turns.values()
         pause(capsys, "--reason", "hold")
-        h.daemon.step()
+        h.dispatcher.step()
         assert h.daemon.status()["pause"]["holding"] == ["alpha", "beta"]
         assert h.daemon.status()["pause"]["all"]["reason"] == "hold"
         base.add(entry, capsys, "beta")

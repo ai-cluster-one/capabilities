@@ -422,8 +422,21 @@ SERVICE
   take, the daemon starts `tasks run <worker> --apply` as a child process: the
   same claim, frame, profile, turn and settlement as that command run by hand,
   with its lease. The daemon decides nothing about a task. A turn starts with
-  the daemon's environment and the project's .env and .env.local over it,
-  .env.local winning, as they were when the daemon started.
+  the environment the daemon was started with and reads the project's .env
+  and .env.local over it itself, .env.local winning, so an edit to either
+  reaches the next turn without a restart.
+
+  Before it asks the store anything at a wake, and again just before it starts
+  a turn, the daemon checks the project it serves: its folder and its
+  project.json with the id it was started for are there, tasks is enabled for
+  the project itself, and the connection is still one the project may use and
+  that allows writes, outside the read-only switch - the decision `tasks run`
+  makes. While a check fails, `service status` shows `state` `refused`, or
+  `error` for a folder that is gone, with its `reason`, the log says so once,
+  and the daemon asks the store nothing and starts no turn for the project; it
+  serves it again from the first wake where the check passes, without a
+  restart. Otherwise `state` is `paused` while the pause holds every lane, and
+  `served`.
 
   It wakes when the store notifies that a task of this project became
   claimable - inserted in todo, moved to todo, or its pickup changed while in
@@ -494,8 +507,8 @@ SERVICE
   never touched by a reload, and each turn reads its worker file and profile
   afresh anyway. What a reload cannot change needs `stop` and `start`: the
   connection and the store and schema it reaches, the project the daemon
-  stands in, its state directory, the environment its turns start with, and
-  the executable itself.
+  stands in, its state directory, the environment the daemon was started with,
+  and the executable itself.
 
   `service stop` stops the daemon claiming and gives running turns
   `shutdown_grace_seconds`; what is still running then is ended, its process
@@ -528,7 +541,9 @@ SERVICE
   status, the pause and the log live in the project's capability state,
   `$XDG_STATE_HOME/capabilities/projects/<project-slug>/tasks/`, and `tasks
   inventory` reports from them whether a daemon runs, its lanes and how many
-  turns it is running.
+  turns it is running. Every line of the service log reads `<moment> tasks
+  service [<project-slug>]: <what happened>`, and every lane and turn `service
+  status` lists carries `project`, the same slug.
 
 ARGUMENTS
   A lone `--` ends the flags: everything after it is positional text as written,
@@ -1049,9 +1064,16 @@ SERVICE = {
 
 STATUSES = ("draft", "todo", "in_progress", "waiting", "complete", "closed")
 
-_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
-CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
-_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+def _homes() -> tuple[Path, Path, Path]:
+    """The machine's config home, this capability's user credentials file in
+    it, and the machine's state home, as the environment names them now."""
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    return (config, config / NAME / "credentials.env",
+            Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")))
+
+
+_CONFIG_HOME, CREDENTIALS_ENV, _STATE_HOME = _homes()
 
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
 
@@ -8690,18 +8712,25 @@ def _service_template() -> Path:
     return _bundle_dir() / "service" / "templates" / "config.toml"
 
 
-def _service_state_dir() -> Path:
-    """The capability state root of this project: the project's slug, or a
-    digest of its path where it declares none, under the machine's state home."""
-    root = _project_here()
+def _service_state_key(root: Path) -> str:
+    """What names this project among the projects on this machine: the slug its
+    project.json declares, or a digest of its path where it declares none. The
+    state root, the lock in it and the tag on every service log line are named
+    by it; the project's id is a different field and names its rows."""
     try:
         identity = json.loads((_project_capabilities_dir(root) / "project.json").read_text())
     except (OSError, ValueError):
         identity = {}
     slug = identity.get("slug") if isinstance(identity, dict) else None
-    key = (slug.strip() if isinstance(slug, str) and slug.strip()
-           else "path-" + hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16])
-    return _STATE_HOME / "capabilities" / "projects" / key / NAME
+    return (slug.strip() if isinstance(slug, str) and slug.strip()
+            else "path-" + hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16])
+
+
+def _service_state_dir() -> Path:
+    """The capability state root of this project, under the machine's state
+    home, named by `_service_state_key`."""
+    return (_STATE_HOME / "capabilities" / "projects" / _service_state_key(_project_here())
+            / NAME)
 
 
 def _service_module():
@@ -8971,10 +9000,104 @@ def _settle_cut_off(conn, execution: str) -> list[str]:
     return [str(row["id"]) for row in swept]
 
 
+def _environ_to(snapshot: Mapping[str, str]) -> None:
+    """Put the process environment back to exactly `snapshot`."""
+    for key in [key for key in os.environ if key not in snapshot]:
+        del os.environ[key]
+    for key, value in snapshot.items():
+        if os.environ.get(key) != value:
+            os.environ[key] = value
+
+
+class ProjectScope:
+    """The one seam through which this executable answers for one project of a
+    service that may serve several: everything here that asks which project it
+    stands in reads the process environment, the cached records adapter and the
+    globals below, and a scope sets exactly those.
+
+    On entry it puts the process environment back to `environment`, the start
+    environment the dispatcher took before any scope opened, and points
+    CLAUDE_PROJECT_DIR at `root`, which `_project_root` honours before the cwd;
+    it drops the cached records adapter, disarms CATCH_UP, and sets SCHEMA,
+    PROJECT and PROJECT_IDENTITY to the project's own. On exit it puts the
+    environment back to the same snapshot and every one of those globals back
+    to what it was. A scope opened with no schema or project, to resolve them,
+    starts from the values this module starts with.
+
+    Nothing that resolves a secret runs inside one: the dispatcher opens its
+    store connections outside every scope, and a turn's environment is built
+    from the snapshot, never from what a scope left. Scopes do not nest; the
+    dispatcher is single-threaded and opens one at a time."""
+
+    _GLOBALS = ("SCHEMA", "PROJECT", "PROJECT_IDENTITY", "CATCH_UP", "_RECORDS")
+    current = None   # the scope open now, if any
+
+    def __init__(self, root: Path, environment: Mapping[str, str], *, schema: str = "tasks",
+                 project: str | None = None, identity: dict | None = None):
+        self.root = Path(root)
+        self.environment = environment
+        self.schema, self.project, self.identity = schema, project, identity
+        self._saved: dict = {}
+
+    def __enter__(self) -> "ProjectScope":
+        if ProjectScope.current is not None:
+            raise RuntimeError("a project scope is already open; scopes do not nest")
+        self._saved = {name: globals()[name] for name in self._GLOBALS}
+        _environ_to(self.environment)
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.root)
+        globals().update(_RECORDS=None, CATCH_UP=False, SCHEMA=self.schema,
+                         PROJECT=self.project, PROJECT_IDENTITY=self.identity)
+        ProjectScope.current = self
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        ProjectScope.current = None
+        _environ_to(self.environment)
+        globals().update(self._saved)
+        return False
+
+
+# The connection values a machine service reads from the connection entry alone:
+# it reads no project's environment, so one left to the cascade has no answer.
+_STORE_KEYS = ("db_host", "db_port", "db_name", "db_user", "db_sslmode", "db_schema")
+
+
+def _env_file_keys(path: Path) -> set[str]:
+    """The names an env file sets, read the way `_parse_env_file` reads them,
+    keeping no value."""
+    keys: set[str] = set()
+    try:
+        text = path.read_text()
+    except OSError:
+        return keys
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        keys.add(key)
+    return keys
+
+
+def _refusal_said(stderr: str) -> str:
+    """The refusal a `_die` wrote, as `code: message`."""
+    for line in reversed(stderr.strip().splitlines()):
+        try:
+            error = json.loads(line).get("error") or {}
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(error, dict) and error.get("message"):
+            return f"{error.get('code')}: {error['message']}"
+    return "the check exited without saying why"
+
+
 class _ServiceHost:
-    """What the daemon asks of this project, answered by this executable. The
-    daemon holds the connections; every question here is asked on the one it
-    hands in."""
+    """What the daemon asks of one project, answered by this executable. It is
+    made inside the project's scope, and every question the daemon asks of it
+    runs inside that scope again. The daemon holds the connections; every
+    question here is asked on the one it hands in."""
 
     channel = CLAIMABLE_CHANNEL
 
@@ -8982,29 +9105,86 @@ class _ServiceHost:
         self.entry = entry
         self.connection = connection
         self.root = _project_here()
+        self.slug = _service_state_key(self.root)
         self.state_dir = _service_state_dir()
         self.project = _writing_project()
+        self.identity = PROJECT_IDENTITY
         self.schema = SCHEMA
-        # What every turn starts from, read once when the daemon starts: this
-        # process's environment with the project's .env and .env.local over it,
-        # .env.local winning - the environment an automations job is started
-        # with, so a turn loses nothing by the service starting it instead.
-        self.environment = {**os.environ,
-                            **{key: str(value) for key, value in _project_env().items()}}
+        # Which store the connection reaches, as the pool tells stores apart:
+        # host, port, database, user, sslmode and the name of the secret's key.
+        # Every value here is non-secret.
+        self._store_key = (_conf(entry, "db_host"), _conf(entry, "db_port", "5432"),
+                           _conf(entry, "db_name"), _conf(entry, "db_user"),
+                           _conf(entry, "db_sslmode", "prefer"), _secret_key(entry))
+
+    def scope(self, environment: Mapping[str, str]) -> ProjectScope:
+        return ProjectScope(self.root, environment, schema=self.schema,
+                            project=self.project, identity=self.identity)
 
     def load(self) -> dict:
         return _service_declaration()
 
+    def recheck(self, machine: bool = False) -> tuple[str, str] | None:
+        """Whether this project may be served now: None when it may, otherwise
+        ("refused", why), or ("error", why) for a project folder that is gone.
+
+        Asked inside the project's scope at every wake before the daemon asks
+        the store anything for it, and again before every turn: the folder and
+        its project.json with the id this daemon serves are there, tasks is
+        enabled for the project itself, and the connection is still one the
+        project may use and write through, outside the read-only switch - the
+        decision `tasks run` will make. In machine mode, also that the
+        connection entry states every value the machine reads and that the
+        project's own env files do not set its secret. It reads a few small
+        files and no secret, and what a refusal would write to stderr is kept
+        for the reason instead."""
+        import contextlib
+        import io
+
+        if not self.root.is_dir():
+            return "error", f"the project folder {self.root} is gone"
+        said = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(said):
+                return self._refusal(machine)
+        except Refusal as refused:
+            return "refused", f"{refused.code}: {refused.message}"
+        except SystemExit:
+            return "refused", _refusal_said(said.getvalue())
+
+    def _refusal(self, machine: bool) -> tuple[str, str] | None:
+        identity = _project_capabilities_dir(self.root) / "project.json"
+        if not identity.is_file():
+            return "refused", f"project_identity_missing: {identity} is gone"
+        declared = _declared_project()
+        if declared != self.project:
+            return "refused", (f"project_id_changed: the project now declares "
+                               f"{declared or 'no id'}, and this daemon serves "
+                               f"{self.project}")
+        _require_project_enabled_for_service()
+        reg, _source = _connections_registry()
+        conn_id, entry = _select_connection(reg, self.connection)
+        _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), "run")
+        if not machine:
+            return None
+        missing = [key for key in _STORE_KEYS if (entry or {}).get(key) in (None, "")]
+        if missing:
+            return "refused", (f"connection_incomplete: connection {conn_id!r} leaves "
+                               f"{', '.join(missing)} to the environment, and the machine "
+                               "service reads no project's environment")
+        secret = _secret_key(entry)
+        for name in (".env", ".env.local"):
+            if secret in _env_file_keys(self.root / name):
+                return "refused", (f"project_secret_set: {self.root / name} sets {secret}, "
+                                   "and the machine service connects with the machine's "
+                                   "own; remove it there")
+        return None
+
     def store_key(self) -> tuple:
-        """Which store the connection reaches, as the pool tells stores apart:
-        host, port, database, user, sslmode and the name of the secret's key.
-        Every value here is non-secret."""
-        return (_conf(self.entry, "db_host"), _conf(self.entry, "db_port", "5432"),
-                _conf(self.entry, "db_name"), _conf(self.entry, "db_user"),
-                _conf(self.entry, "db_sslmode", "prefer"), _secret_key(self.entry))
+        return self._store_key
 
     def store_name(self) -> str:
-        host, port, database = self.store_key()[:3]
+        host, port, database = self._store_key[:3]
         return f"{host}:{port}/{database}"
 
     def listen(self):
@@ -9079,13 +9259,16 @@ class _ServiceHost:
             argv += ["--connection", self.connection]
         return argv + ["run", worker, "--apply"]
 
-    def turn_env(self) -> dict:
-        # A raise this process was started under is not the turn's: the turn's
-        # own claim opens the raise that bounds it.
-        env = dict(self.environment)
-        env.pop("TASKS_EXECUTION", None)
-        env.pop(_RECEIPT_ENV, None)
-        env.pop(_EXCLUDE_ENV, None)
+    def turn_env(self, environment: Mapping[str, str]) -> dict:
+        """What a turn starts with: the dispatcher's start environment, without
+        the raise this process was started under - the turn's own claim opens
+        the raise that bounds it - without a receipt or exclusions meant for
+        another turn, and without CLAUDE_PROJECT_DIR, since the turn stands in
+        its project by its cwd. The turn reads the project's .env and .env.local
+        over it itself."""
+        env = dict(environment)
+        for key in ("TASKS_EXECUTION", _RECEIPT_ENV, _EXCLUDE_ENV, "CLAUDE_PROJECT_DIR"):
+            env.pop(key, None)
         return env
 
     def settle_cut_off(self, conn, execution: str) -> list[str]:
@@ -9105,6 +9288,15 @@ def _service_connection(wanted: str | None) -> tuple[str, dict | None]:
     globals()["PROJECT_IDENTITY"] = _project_id_state()
     globals()["PROJECT"] = _declared_project()
     return conn_id, entry
+
+
+def _service_host(root: Path, wanted: str | None,
+                  environment: Mapping[str, str]) -> _ServiceHost:
+    """The host for the project at `root`, resolved inside that project's own
+    scope the way `main` resolves a command's connection, schema and id."""
+    with ProjectScope(root, environment):
+        _conn_id, entry = _service_connection(wanted)
+        return _ServiceHost(entry, wanted)
 
 
 def _loaded_declaration(hint: str | None = None) -> dict:
@@ -9128,7 +9320,8 @@ def _service_status(module) -> dict:
               "state_dir": str(state), "log_file": str(state / module.LOG_FILE)}
     published = module.read_status(state) if running else None
     if published:
-        for key in ("started_at", "wake_by", "notification", "stores", "poll_seconds",
+        for key in ("started_at", "state", "reason", "wake_by", "notification", "stores",
+                    "poll_seconds",
                     "max_parallel", "shutdown_grace_seconds", "retry_delay_seconds",
                     "lanes", "idle", "turns", "deferred", "next_wake", "last_wake",
                     "reload_error", "stopping"):
@@ -9143,7 +9336,8 @@ def _service_status(module) -> dict:
         answer["declaration_error"] = refused.message
         answer["pause"] = _pause_block(module, state, None, None)
         return answer
-    answer["lanes"] = [{**row, "running": 0} for row in _lane_rows(declaration)]
+    slug = _service_state_key(_project_here())
+    answer["lanes"] = [{"project": slug, **row, "running": 0} for row in _lane_rows(declaration)]
     answer["idle"] = declaration["idle"]
     answer["pause"] = _pause_block(module, state, _workers_of(answer["lanes"]), None)
     return answer
@@ -9269,9 +9463,12 @@ def cmd_service_run(wanted: str | None, args: list[str]) -> None:
     declaration = _loaded_declaration()
     conn_id, entry = _service_connection(wanted)
     _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), "run")
-    daemon = module.Daemon(_ServiceHost(entry, wanted), declaration)
+    # Project mode: a dispatcher over one slot, the project this runs in. Its
+    # start environment is taken here, before the slot's scope first opens.
+    dispatcher = module.Dispatcher()
+    dispatcher.add(_service_host(_project_here(), wanted, dispatcher.environment), declaration)
     try:
-        daemon.run()
+        dispatcher.run()
     except RuntimeError as exc:
         _die(5, "service_running", str(exc),
              f"`{NAME} service status` names the daemon that holds it")
@@ -9480,7 +9677,8 @@ def cmd_service_pause(args: list[str]) -> None:
     else:
         pause["all"] = entry
     module.write_pause(state, pause)
-    module.log_line(state, f"pause set by {entry['by']} on "
+    module.log_line(state, _service_state_key(_project_here()),
+                    f"pause set by {entry['by']} on "
                     + (f"lane(s) {', '.join(names)}" if names else "every lane")
                     + (f": {reason}" if reason else ""))
     answer = {"paused": names or "every lane", **entry}
@@ -9518,7 +9716,8 @@ def cmd_service_resume(args: list[str]) -> None:
     changed = pause != before
     if changed:
         module.write_pause(state, pause)
-        module.log_line(state, f"pause lifted by {_actor()} on "
+        module.log_line(state, _service_state_key(_project_here()),
+                        f"pause lifted by {_actor()} on "
                         + (f"lane(s) {', '.join(names)}" if names else "every lane")
                         + (f"; {', '.join(kept)} stay paused by name" if kept else ""))
     answer = {"resumed": names or "every lane", "changed": changed}
@@ -9935,7 +10134,24 @@ def _reads_only(verb: str, rest: list[str]) -> bool:
     return not opts.get("apply")
 
 
+def _turn_reads_project_env() -> None:
+    """A turn the service started reads the project's .env and .env.local over
+    the environment it was started with, .env.local winning, before anything
+    here reads the environment - what the service once read for it when it
+    started, read afresh by every turn, so an edit reaches the next one. A turn
+    of the service is the one command carrying a receipt to write. The raise,
+    the receipt and the exclusions are the service's to hand it, and no env
+    file replaces them."""
+    if not os.environ.get(_RECEIPT_ENV):
+        return
+    kept = ("TASKS_EXECUTION", _RECEIPT_ENV, _EXCLUDE_ENV)
+    os.environ.update({key: str(value) for key, value in _project_env().items()
+                       if key not in kept})
+    globals().update(zip(("_CONFIG_HOME", "CREDENTIALS_ENV", "_STATE_HOME"), _homes()))
+
+
 def main() -> None:
+    _turn_reads_project_env()
     _gate()
     argv = sys.argv[1:]
     if argv[:1] == ["manifest"]:
