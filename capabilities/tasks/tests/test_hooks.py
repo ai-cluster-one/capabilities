@@ -520,7 +520,7 @@ def lab(tmp_path):
     try:
         yield lab
     finally:
-        tasks_cli(lab, "service", "stop", "--timeout", "30", "--force")
+        tasks_cli(lab, "service", "stop", "--end-turns", "--timeout", "30", "--force")
         with psycopg.connect(DSN, autocommit=True) as conn:
             conn.execute(f"drop schema if exists {schema} cascade")
 

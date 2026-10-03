@@ -11,7 +11,8 @@ poll_seconds = 60
 # Turns running at once across every lane.
 max_parallel = 2
 
-# How long `tasks service stop` waits for running turns before ending them.
+# How long `tasks service stop --end-turns` waits for running turns before
+# ending them. A stop without it leaves them running.
 shutdown_grace_seconds = 60
 
 # Seconds after a turn on a task ends before the service starts another on it,

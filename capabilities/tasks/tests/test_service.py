@@ -439,8 +439,9 @@ class Harness:
             self.daemon.reap()
             time.sleep(0.05)
         for turn in list(self.daemon.turns.values()):
-            turn.process.kill()
-            turn.process.wait()
+            if turn.process is not None:
+                turn.process.kill()
+                turn.process.wait()
         self.daemon.turns.clear()
         self.dispatcher.close()
 
@@ -646,7 +647,7 @@ def test_reload_publishes_the_new_fingerprint_and_leaves_running_turns(
 
 
 @needs_store
-def test_stop_waits_for_turns_then_ends_them_and_settles_like_a_lapsed_lease(
+def test_a_stop_ending_turns_waits_then_ends_them_and_settles_like_a_lapsed_lease(
         project, store, capsys):
     entry, schema, conn = store
     write_settings(project, "version = 1\npoll_seconds = 3600\nshutdown_grace_seconds = 1\n")
@@ -663,11 +664,13 @@ def test_stop_waits_for_turns_then_ends_them_and_settles_like_a_lapsed_lease(
             t.phase == "working" for t in h.daemon.turns.values()))
         [turn] = h.daemon.turns.values()
         pid = turn.process.pid
+        h.service.write_end_turns(h.daemon.state_dir, "a-stopper", 90)
         started = time.monotonic()
         h.dispatcher.stop_requested = True
         h.dispatcher.shutdown()
         waited = time.monotonic() - started
         assert 1 <= waited < 8
+        assert not (h.daemon.state_dir / h.service.END_TURNS_FILE).exists()
         assert h.daemon.turns == {} and turn.process.poll() is not None
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
@@ -689,6 +692,7 @@ def test_a_turn_that_finishes_within_the_grace_is_left_to_finish(project, store,
     with Harness(project, entry) as h:
         h.steps(lambda: h.running("beta") == 1)
         [turn] = h.daemon.turns.values()
+        h.service.write_end_turns(h.daemon.state_dir, "a-stopper", 90)
         h.dispatcher.stop_requested = True
         h.release.write_text("go")
         started = time.monotonic()
@@ -1131,7 +1135,7 @@ def lab(tmp_path):
     try:
         yield lab
     finally:
-        tasks_cli(lab, "service", "stop", "--timeout", "30", "--force")
+        tasks_cli(lab, "service", "stop", "--end-turns", "--timeout", "30", "--force")
         with psycopg.connect(DSN, autocommit=True) as conn:
             conn.execute(f"drop schema if exists {schema} cascade")
 
@@ -1263,7 +1267,7 @@ def test_a_task_whose_turns_fail_at_once_is_retried_no_faster_than_the_delay(lab
     time.sleep(5.5)
     status = answer_of(tasks_cli(lab, "service", "status"))
     assert status["retry_delay_seconds"] == 2
-    answer_of(tasks_cli(lab, "service", "stop"))
+    answer_of(tasks_cli(lab, "service", "stop", "--end-turns"))
 
     import datetime
     moment = datetime.datetime.fromisoformat
@@ -1388,7 +1392,7 @@ def test_a_turn_starts_with_the_projects_env_files_over_the_daemons_environment(
         poll_for(lambda: answer_of(tasks_cli(lab, "show", "t-env"))["task"]["status"]
                  == "complete", 60)
     finally:
-        tasks_cli(lab, "service", "stop", "--timeout", "30", "--force")
+        tasks_cli(lab, "service", "stop", "--end-turns", "--timeout", "30", "--force")
         daemon.wait(timeout=60)
         log.close()
     [turn] = [json.loads(line) for line in record.read_text().splitlines()]
@@ -1454,7 +1458,7 @@ def test_each_turn_reads_the_env_files_as_they_are_when_it_starts(lab):
         # The same daemon throughout: nothing was restarted for the edit.
         assert status["pid"] == pid and status["state"] == "served"
     finally:
-        tasks_cli(lab, "service", "stop", "--timeout", "30", "--force")
+        tasks_cli(lab, "service", "stop", "--end-turns", "--timeout", "30", "--force")
         daemon.wait(timeout=60)
         log.close()
     turns = [json.loads(line) for line in record.read_text().splitlines()]

@@ -95,6 +95,8 @@ When it passes, `doctor` lists each worker with its source, what it shadows, whe
 
 Run `tasks service reload` right after editing a worker file, a profile a worker names, or the service settings. The running daemon publishes a fingerprint of the declaration it loaded, and `tasks service doctor` fails while that differs from the files on disk, so whatever watches the service sees that the daemon is not running the declaration on disk. `reload` validates the files first and refuses what does not load, then hands the daemon the declaration on disk and waits until it reports the new one; running turns are never touched. What a reload cannot change, such as the connection or the environment turns start with, needs `stop` and `start`, and `tasks help` SERVICE lists it.
 
+Stopping or restarting the service leaves running turns running: each settles its own task, and the next daemon to serve the project adopts them. `tasks service stop --end-turns` is the one act that ends them, after `shutdown_grace_seconds`, settling what they held.
+
 ## Pausing the service
 
 Run `tasks service pause` to hold the conveyor without stopping the daemon, and `tasks service resume` to let it go again. While the pause holds, the daemon starts no new turn; turns already running are not touched and finish on their own, and the daemon goes on polling and listening, so it is ready the moment the pause lifts. Name workers to pause or resume only those lanes, `tasks service pause --reason "<why>" <worker>...`; with no name the verb covers every lane. A name that is not a lane of the service is refused.

@@ -819,7 +819,8 @@ def test_the_situation_says_how_the_turn_was_started(project):
                  "no person is present",
                  "can be interpreted as approval",
                  "This project's own doctrine governs how you work and where you stop",
-                 "Do not operate the runtime you are running inside"):
+                 "Do not operate the runtime you are running inside",
+                 "ends them only on `tasks service stop --end-turns`"):
         assert said in situation, said
 
 

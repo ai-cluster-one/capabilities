@@ -46,6 +46,17 @@ directory, written by `service pause` and `service resume` whether or not a
 daemon runs, and read on every pass of the loop; it is runtime state, not part
 of the declaration, so it moves no fingerprint and outlives a restart. Turns
 already running are not touched by it.
+
+Its turns outlive it. Each runs in a session of its own with its output on
+files, and settles its own task, so however the daemon stops - a stop, a
+signal, a crash - it stops claiming, publishes, lets go of its lock and leaves
+every running turn running. Every spawn writes a turn record in `turns/`
+naming the process and when it started, and the next daemon to take the
+project's lock adopts every turn whose process is still the one recorded. The
+one act that ends running turns is a stop that asks for it: the stop writes an
+end-turns intent beside the pid before it signals, and a daemon that finds a
+fresh one gives its turns their grace, then ends the rest and settles what
+they held.
 """
 
 from __future__ import annotations
@@ -68,6 +79,7 @@ FINGERPRINT_FILE = "daemon.fingerprint"
 STATUS_FILE = "daemon.json"
 LOG_FILE = "daemon.log"
 PAUSE_FILE = "paused.json"
+END_TURNS_FILE = "end-turns.json"
 TURNS_DIR = "turns"
 RECEIPT_ENV = "TASKS_TURN_RECEIPT"
 EXCLUDE_ENV = "TASKS_TURN_EXCLUDE"
@@ -143,6 +155,43 @@ def read_status(state_dir: Path) -> dict | None:
     except (OSError, ValueError):
         return None
     return found if isinstance(found, dict) else None
+
+
+def process_started(pid: int | None) -> str | None:
+    """When the process `pid` started, as `ps -o lstart=` prints it under the C
+    locale, or None when there is no such process or `ps` cannot say. With the
+    pid it names one process: a pid used again later starts at another moment."""
+    if not pid or pid <= 0:
+        return None
+    try:
+        found = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))],
+                               capture_output=True, text=True, timeout=10,
+                               env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    said = " ".join(found.stdout.split())
+    return said if found.returncode == 0 and said else None
+
+
+def write_end_turns(state_dir: Path, by: str, timeout_seconds: float) -> dict:
+    """Write the intent that the next stop ends running turns: who asked, when,
+    and how long the stop that asked waits, past which the intent is stale."""
+    intent = {"by": by, "at": now_iso(), "timeout_seconds": timeout_seconds}
+    path = Path(state_dir) / END_TURNS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_atomic(path, json.dumps(intent, indent=2) + "\n")
+    return intent
+
+
+def end_turns_age(intent: dict) -> float | None:
+    """Seconds since the intent was written, or None when it names no moment."""
+    try:
+        at = datetime.datetime.fromisoformat(str(intent.get("at")))
+    except (TypeError, ValueError):
+        return None
+    if at.tzinfo is None:
+        return None
+    return (datetime.datetime.now(datetime.timezone.utc) - at).total_seconds()
 
 
 def _write_atomic(path: Path, text: str) -> None:
@@ -299,25 +348,64 @@ class StorePool:
 
 
 class Turn:
-    """One child running `tasks run <worker> --apply`."""
+    """One process running `tasks run <worker> --apply`: a child this daemon
+    started, held by its `process`, or a turn a daemon before it started and
+    this one adopted, which has no `process` and is watched by its pid."""
 
-    def __init__(self, turn_id: str, worker: str, process: subprocess.Popen,
+    def __init__(self, turn_id: str, worker: str, process: subprocess.Popen | None,
                  receipt: Path, output: Path, errors: Path, reason: str,
-                 project: str | None = None):
+                 project: str | None = None, *, pid: int | None = None,
+                 started_at: str | None = None, lstart: str | None = None,
+                 record: Path | None = None):
         self.id = turn_id
         self.project = project
         self.worker = worker
         self.process = process
+        self.pid = process.pid if process is not None else pid
+        self.adopted = process is None
         self.receipt = receipt
         self.output = output
         self.errors = errors
+        self.record = record
         self.reason = reason
-        self.started_at = now_iso()
+        self.started_at = started_at or now_iso()
+        # When the process started, as `ps -o lstart=` prints it: with the pid,
+        # what tells this turn's process from another given its pid later.
+        self.lstart = lstart
         # Claiming until the child says what it took, then working. A lane with
         # a child still claiming is not asked again: the store would answer with
         # the task that child is about to take.
         self.phase = "claiming"
         self.claim: dict | None = None
+
+    def ended(self) -> tuple[bool, int | None]:
+        """Whether the turn's process has ended, and its exit code: always None
+        for an adopted turn, which this daemon cannot wait on."""
+        if self.process is not None:
+            code = self.process.poll()
+            return code is not None, code
+        try:
+            # A turn adopted from a daemon that ran in this same process is
+            # still its child; anywhere else the pid answers.
+            reaped, _status = os.waitpid(self.pid, os.WNOHANG)
+            if reaped == self.pid:
+                return True, None
+        except ChildProcessError:
+            pass
+        except OSError:
+            return True, None
+        return not pid_alive(self.pid), None
+
+    def still_recorded(self) -> bool:
+        """Whether the pid is still the process this turn was recorded as."""
+        return bool(self.lstart) and process_started(self.pid) == self.lstart
+
+    def record_text(self) -> str:
+        return json.dumps({"id": self.id, "project": self.project, "worker": self.worker,
+                           "pid": self.pid, "lstart": self.lstart,
+                           "receipt": str(self.receipt), "output": str(self.output),
+                           "errors": str(self.errors), "started_at": self.started_at},
+                          indent=2) + "\n"
 
     def read_receipt(self) -> bool:
         if self.claim is None:
@@ -331,11 +419,13 @@ class Turn:
         claim = self.claim or {}
         return {"project": self.project, "id": self.id, "worker": self.worker, "task": claim.get("task"),
                 "execution": claim.get("execution"), "attempt": claim.get("attempt"),
-                "pid": self.process.pid, "started_at": self.started_at,
-                "phase": self.phase}
+                "pid": self.pid, "started_at": self.started_at,
+                "adopted": self.adopted, "phase": self.phase}
 
     def discard_files(self) -> None:
-        for path in (self.receipt, self.output, self.errors):
+        for path in (self.receipt, self.output, self.errors, self.record):
+            if path is None:
+                continue
             with contextlib.suppress(OSError):
                 path.unlink()
 
@@ -498,9 +588,11 @@ class ProjectSlot:
 
         The lock is what makes it one daemon per project; the pid and the
         fingerprint are written behind it, because they answer for the same
-        process. Files left in `turns/` by a daemon that did not stop cleanly
-        belong to turns nobody is watching any more: those finish, or their
-        leases lapse, on their own."""
+        process. Then it takes up the turns a daemon before it left running:
+        every turn record in `turns/` whose pid is alive and started at the
+        recorded moment is adopted, and every other is a turn that ended while
+        nothing watched it, said in the log and removed. Files in `turns/` that
+        no record names are cleared."""
         import fcntl
 
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -517,7 +609,13 @@ class ProjectSlot:
         _write_atomic(self.state_dir / FINGERPRINT_FILE,
                       self.declaration["fingerprint"] + "\n")
         self.turns_dir.mkdir(exist_ok=True)
-        left = sorted(self.turns_dir.iterdir())
+        adopted, gone = self._read_records()
+        named = {path for turn in adopted + gone
+                 for path in (turn.record, turn.receipt, turn.output, turn.errors)}
+        # A receipt being written lands under a spare name first.
+        spares = tuple(f".{turn.receipt.name}." for turn in adopted)
+        left = [path for path in sorted(self.turns_dir.iterdir())
+                if path not in named and not path.name.startswith(spares)]
         for path in left:
             with contextlib.suppress(OSError):
                 path.unlink()
@@ -525,9 +623,44 @@ class ProjectSlot:
         held = self.holding()
         self.log(f"started, pid {os.getpid()}, project {self.host.project}, "
                  f"lanes {', '.join(self._lane_words()) or 'none'}"
-                 + (f"; cleared {len(left)} file(s) a previous daemon left in turns/"
+                 + (f"; adopted {len(adopted)} running turn(s)" if adopted else "")
+                 + (f"; cleared {len(left)} file(s) in turns/ that no turn record names"
                     if left else "")
                  + (f"; paused, starting no turn on {', '.join(held)}" if held else ""))
+        for turn in adopted:
+            self.turns[turn.id] = turn
+            turn.read_receipt()
+            self.log(f"turn {turn.id} adopted: worker {turn.worker}, pid {turn.pid}, "
+                     f"started {turn.started_at}"
+                     + (f", holding {turn.claim.get('task')} (attempt "
+                        f"{turn.claim.get('attempt')})" if turn.claim else ", not yet claimed"))
+        for turn in gone:
+            turn.read_receipt()
+            said = self._said(turn)
+            self.log(f"turn {turn.id} ended while unwatched: worker {turn.worker}, "
+                     f"pid {turn.pid}, exit unknown" + (f", {', '.join(said)}" if said else ""))
+            turn.discard_files()
+
+    def _read_records(self) -> tuple[list[Turn], list[Turn]]:
+        """The turns the records in `turns/` name: those whose process is still
+        the one recorded, and those whose process is gone - ended, or its pid
+        now another process's. A record that cannot be read names no turn."""
+        adopted, gone = [], []
+        for path in sorted(self.turns_dir.glob("*.json")):
+            if path.name.count(".") != 1 or path.name.startswith("."):
+                continue  # a receipt, `<id>.claim.json`, or a spare
+            found = _read_json(path)
+            try:
+                turn = Turn(str(found["id"]), str(found["worker"]), None,
+                            Path(found["receipt"]), Path(found["output"]),
+                            Path(found["errors"]), "adopted",
+                            found.get("project") or self.slug, pid=int(found["pid"]),
+                            started_at=found.get("started_at"),
+                            lstart=found.get("lstart"), record=path)
+            except (TypeError, KeyError, ValueError):
+                continue
+            (adopted if turn.still_recorded() else gone).append(turn)
+        return adopted, gone
 
     def unpublish(self) -> None:
         for name in (PID_FILE, FINGERPRINT_FILE, STATUS_FILE):
@@ -724,7 +857,13 @@ class ProjectSlot:
                 self.host.turn_command(worker), cwd=str(self.host.root), env=env,
                 stdin=subprocess.DEVNULL, stdout=out, stderr=err,
                 start_new_session=True)
-        turn = Turn(turn_id, worker, process, receipt, output, errors, reason, self.slug)
+        turn = Turn(turn_id, worker, process, receipt, output, errors, reason, self.slug,
+                    lstart=process_started(process.pid),
+                    record=self.turns_dir / f"{turn_id}.json")
+        # The record is what lets the next daemon adopt this turn if this one
+        # stops first; one that cannot be written leaves the turn unadoptable.
+        with contextlib.suppress(OSError):
+            _write_atomic(turn.record, turn.record_text())
         self.turns[turn_id] = turn
         self.log(f"turn {turn_id} started: worker {worker}, pid {process.pid}"
                  + (", to let its claim put back what is due" if reason == "sweep" else ""))
@@ -737,18 +876,43 @@ class ProjectSlot:
                          f"(attempt {turn.claim.get('attempt')})")
                 if not self.stopping:
                     self.wakes.add("claimed")
-            code = turn.process.poll()
-            if code is None:
+            ended, code = turn.ended()
+            if not ended:
                 continue
             self._finish(turn, code)
 
-    def _finish(self, turn: Turn, code: int) -> None:
+    def _finish(self, turn: Turn, code: int | None) -> None:
+        """Say how a turn ended and let go of it. An adopted turn's exit code is
+        not this daemon's to read, so it is unknown; what it answered is read
+        from its output file either way."""
         turn.read_receipt()
         del self.turns[turn.id]
         if turn.claim and turn.claim.get("task_id"):
             delay = self.settings()["retry_delay_seconds"]
             self.recent[str(turn.claim["task_id"])] = {
                 "task": turn.claim.get("task"), "until": time.monotonic() + delay}
+        said = self._said(turn)
+        if turn.claim and turn.claim.get("task_id"):
+            said.append(f"{turn.claim.get('task')} not run again before "
+                        f"{_at(self.settings()['retry_delay_seconds'])}")
+        self.log(f"turn {turn.id} ended: worker {turn.worker}, "
+                 f"exit {'unknown' if code is None else code}"
+                 + (", adopted" if turn.adopted else "")
+                 + (f", {', '.join(said)}" if said else ""))
+        if turn.claim is None and turn.reason == "work" and not self.stopping:
+            # The store said this lane had work and the claim took none, or the
+            # command failed before claiming. Asking again at once would ask the
+            # same question of the same answer, so the lane waits for the poll.
+            self.held.add(turn.worker)
+            self.log(f"lane {turn.worker} waits for the next poll: its turn took nothing")
+        turn.discard_files()
+        if not self.stopping:
+            self.wakes.add("turn_ended")
+
+    @staticmethod
+    def _said(turn: Turn) -> list[str]:
+        """What a turn's output and error files say about how it ended: what it
+        claimed and how it handed it back, its hooks, and its last error line."""
         try:
             answer = _last_json(turn.output.read_text(errors="replace"))
             trouble = turn.errors.read_text(errors="replace").strip()
@@ -783,22 +947,35 @@ class ProjectSlot:
                                else ""))
         if trouble:
             said.append(f"said {trouble.splitlines()[-1][:300]}")
-        if turn.claim and turn.claim.get("task_id"):
-            said.append(f"{turn.claim.get('task')} not run again before "
-                        f"{_at(self.settings()['retry_delay_seconds'])}")
-        self.log(f"turn {turn.id} ended: worker {turn.worker}, exit {code}"
-                 + (f", {', '.join(said)}" if said else ""))
-        if turn.claim is None and turn.reason == "work" and not self.stopping:
-            # The store said this lane had work and the claim took none, or the
-            # command failed before claiming. Asking again at once would ask the
-            # same question of the same answer, so the lane waits for the poll.
-            self.held.add(turn.worker)
-            self.log(f"lane {turn.worker} waits for the next poll: its turn took nothing")
-        turn.discard_files()
-        if not self.stopping:
-            self.wakes.add("turn_ended")
+        return said
 
     # --- reload and stop -------------------------------------------------------
+
+    def take_end_turns(self) -> bool:
+        """Whether the stop under way is to end this project's running turns:
+        an end-turns intent is in the state root, written no longer ago than the
+        stop that wrote it waits. One older than that is stale - the stop it
+        came with is long over - so it is said, removed and ignored, and cannot
+        turn a later restart into an ending."""
+        found = _read_json(self.state_dir / END_TURNS_FILE)
+        if found is None:
+            return False
+        age = end_turns_age(found)
+        limit = found.get("timeout_seconds")
+        if not isinstance(limit, (int, float)) or isinstance(limit, bool) or limit <= 0:
+            limit = self.settings()["shutdown_grace_seconds"] + 30
+        if age is None or age > limit:
+            self.log(f"ignored the end-turns intent {found.get('by')} wrote at "
+                     f"{found.get('at')}: older than the {limit:g}s its stop waits; "
+                     "running turns are left running")
+            self.drop_end_turns()
+            return False
+        self.log(f"ending running turns, as {found.get('by')} asked at {found.get('at')}")
+        return True
+
+    def drop_end_turns(self) -> None:
+        with contextlib.suppress(OSError):
+            (self.state_dir / END_TURNS_FILE).unlink()
 
     def reload(self) -> None:
         """Take up the declaration on disk, or keep the one running.
@@ -826,14 +1003,21 @@ class ProjectSlot:
 
     def cut_off(self) -> None:
         """End every turn still running and settle each raise it held the way a
-        lapsed lease is settled."""
+        lapsed lease is settled. An adopted turn is ended only while its pid is
+        still the process recorded, so a pid used again is never ended."""
         grace = self.settings()["shutdown_grace_seconds"]
         for turn in list(self.turns.values()):
             turn.read_receipt()
-            with contextlib.suppress(Exception):
-                self.host.kill_tree([turn.process.pid])
-            with contextlib.suppress(Exception):
-                turn.process.wait(timeout=10)
+            if turn.process is not None or turn.still_recorded():
+                with contextlib.suppress(Exception):
+                    self.host.kill_tree([turn.pid])
+            if turn.process is not None:
+                with contextlib.suppress(Exception):
+                    turn.process.wait(timeout=10)
+            else:
+                deadline = time.monotonic() + 10
+                while not turn.ended()[0] and time.monotonic() < deadline:
+                    time.sleep(0.1)
             del self.turns[turn.id]
             task = (turn.claim or {}).get("task")
             if turn.claim and turn.claim.get("execution"):
@@ -990,20 +1174,29 @@ class Dispatcher:
             self.wait(max(0.0, min([self.tick] + [d - time.monotonic() for d in deadlines])))
 
     def shutdown(self) -> None:
-        """Stop claiming, give each slot's running turns its grace period, then
-        end what is left and settle each raise it held the way a lapsed lease is
-        settled."""
+        """Stop claiming. A slot whose project asked for its turns to end gives
+        them its grace period, then ends what is left and settles each raise it
+        held the way a lapsed lease is settled, and removes the intent; every
+        other slot leaves its running turns running, for the next daemon to
+        adopt."""
         self.stopping = True
         deadlines = {}
         for slot in self.slots:
+            slot.reap()
+            ending = slot.take_end_turns()
             grace = slot.settings()["shutdown_grace_seconds"]
-            if slot.turns:
-                slot.log(f"stopping: waiting up to {grace}s for {len(slot.turns)} turn(s)")
+            if ending:
+                deadlines[id(slot)] = time.monotonic() + grace
+                if slot.turns:
+                    slot.log(f"stopping: waiting up to {grace}s for {len(slot.turns)} "
+                             "turn(s), then ending the rest")
+            elif slot.turns:
+                slot.log(f"stopping: leaving {len(slot.turns)} running turn(s) running; "
+                         "the next daemon to serve this project adopts them")
             slot.publish()
-            deadlines[id(slot)] = time.monotonic() + grace
         while True:
-            waiting = [slot for slot in self.slots
-                       if slot.turns and time.monotonic() < deadlines[id(slot)]]
+            waiting = [slot for slot in self.slots if id(slot) in deadlines
+                       and slot.turns and time.monotonic() < deadlines[id(slot)]]
             if not waiting:
                 break
             for slot in waiting:
@@ -1011,8 +1204,10 @@ class Dispatcher:
             if any(slot.turns for slot in waiting):
                 time.sleep(0.2)
         for slot in self.slots:
-            slot.cut_off()
-            slot.publish()
+            if id(slot) in deadlines:
+                slot.cut_off()
+                slot.drop_end_turns()
+                slot.publish()
 
     # --- waking ----------------------------------------------------------------
 

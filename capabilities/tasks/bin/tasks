@@ -170,8 +170,8 @@ ONE TURN OF THE CONVEYOR
   closed.
 
   A raise is cut off when it ended without an ending of its own: closed as
-  abandoned, because its lease lapsed or the service stopped its turn, or
-  marked `cut_off`. When a worker on a claude profile claims a task whose last
+  abandoned, because its lease lapsed or `service stop --end-turns` ended its
+  turn, or marked `cut_off`. When a worker on a claude profile claims a task whose last
   raise by that same worker was cut off and names a claude session, the turn
   resumes that session with a short message instead of the whole frame: which
   task, that the previous turn was cut off, to continue from where it stopped,
@@ -402,9 +402,10 @@ SERVICE
   tasks service start             the daemon detached, logging to its state
   tasks service reload [--timeout 30]
                                   hand the running daemon the declaration on disk
-  tasks service stop [--timeout S] [--force]
-                                  stop claiming, let running turns finish within
-                                  the grace period, end the rest
+  tasks service stop [--end-turns] [--timeout S] [--force]
+                                  stop the daemon and leave running turns
+                                  running; with --end-turns, let them finish
+                                  within the grace period and end the rest
   tasks service pause [--reason TEXT] [<worker>...]
                                   start no new turn, on every lane or on the
                                   named lanes; running turns finish
@@ -469,8 +470,7 @@ SERVICE
   many connections it has opened to it since it started, when it last opened
   one, whether it is listening, and the error that has it away, if any.
   `service doctor` reports the store being away as a warning while the daemon
-  runs, so a supervisor probing it does not restart the daemon and end its
-  turns for an outage.
+  runs, so a supervisor probing it does not restart the daemon for an outage.
 
   The settings are capabilities/tasks/service/config.toml:
 
@@ -478,7 +478,8 @@ SERVICE
     poll_seconds = 60             # the fallback wake, and when a lapsed lease
                                   # or an ended wait is noticed
     max_parallel = 2              # turns running at once across every lane
-    shutdown_grace_seconds = 60   # how long a stop waits for running turns
+    shutdown_grace_seconds = 60   # how long `stop --end-turns` waits for
+                                  # running turns before ending them
     retry_delay_seconds = 60      # how long after a turn on a task ends before
                                   # the service starts another on it
 
@@ -510,11 +511,32 @@ SERVICE
   stands in, its state directory, the environment the daemon was started with,
   and the executable itself.
 
-  `service stop` stops the daemon claiming and gives running turns
-  `shutdown_grace_seconds`; what is still running then is ended, its process
-  tree with it, and the raise it held is settled the way a lapsed lease is:
-  closed as abandoned, the task back in todo. `--force` ends the daemon and
-  its turns at once and leaves their raises to lapse.
+  Running turns outlive the daemon. However it stops - `service stop`, SIGTERM
+  from a supervisor restarting or unloading it, SIGINT from Ctrl-C on a
+  foreground `service run`, a crash - it stops claiming, publishes, lets go of
+  its lock and exits within a second, and every running turn keeps running in
+  its own session, writes its output to its files and settles its own task;
+  its lease, derived from the profile, holds the task while it runs. Every
+  turn the daemon starts is recorded in `turns/<id>.json` in its state: its
+  id, project, worker, pid, when its process started as `ps -o lstart=` prints
+  it, its receipt, output and error files, and when it started. The next
+  daemon to serve the project adopts every recorded turn whose pid is alive
+  and started at the recorded moment: it counts against its lane and the
+  project's cap, its task is never claimed by another turn, `service status`
+  lists it with `adopted` true, and when it ends the log says so with its exit
+  unknown and what its output answered. A recorded turn whose process is gone
+  is logged as ended while unwatched, with what it answered, and its files are
+  removed; a pid now another process's is never adopted.
+
+  `service stop --end-turns` is the one act that ends running turns. It writes
+  `end-turns.json` in the state, who asked and when, before it signals the
+  daemon, which gives running turns `shutdown_grace_seconds`; what is still
+  running then is ended, its process tree with it, and the raise it held is
+  settled the way a lapsed lease is: closed as abandoned, the task back in
+  todo. The daemon removes the intent; one older than the stop's timeout is
+  ignored, so it cannot turn a later restart into an ending. `--force` ends a
+  daemon that does not stop within the timeout, and with `--end-turns` its
+  turns too, leaving their raises to lapse.
 
   `service pause` holds the conveyor without stopping the daemon: while it
   holds, the daemon starts no new turn on the lanes it names, or on every lane
@@ -538,7 +560,8 @@ SERVICE
   `init`, `start` and `run` need tasks enabled for this project itself;
   enabled globally is not asking for a daemon here. `start` and `run` need a
   connection that allows writes. The pid, the fingerprint, the published
-  status, the pause and the log live in the project's capability state,
+  status, the pause, the turn records and the log live in the project's
+  capability state,
   `$XDG_STATE_HOME/capabilities/projects/<project-slug>/tasks/`, and `tasks
   inventory` reports from them whether a daemon runs, its lanes and how many
   turns it is running. Every line of the service log reads `<moment> tasks
@@ -7246,7 +7269,7 @@ This is a scheduled turn and has no live instruction from anybody: a scheduler i
 
 This project's own doctrine governs how you work and where you stop, including the shape an escalation takes. Read it there rather than from this prompt.
 
-Do not operate the runtime you are running inside. Stopping the scheduler or the service that started this turn, restarting it, reloading it, or moving its state ends this turn: it terminates its running jobs on the way down, and the job it is running is you. This applies to every long-lived process here, not only the scheduler: a running daemon belongs to whoever started it."""
+Do not operate the runtime you are running inside: do not stop, restart or reload the scheduler or the service that started this turn, or move its state. A scheduler may end its running jobs when it stops, and the job it is running is you; the tasks service leaves its running turns running when it stops or restarts, and ends them only on `tasks service stop --end-turns`. This applies to every long-lived process here, not only the scheduler: a running daemon belongs to whoever started it."""
 
 _LOAD_ROUTINES = """LOAD THESE ROUTINES
 
@@ -7974,7 +7997,7 @@ def _assignee_of(task: dict) -> str | None:
 
 def _cut_off(raise_row: dict | None) -> bool:
     """Whether this raise ended without an ending of its own: closed as
-    abandoned - its lease lapsed, or the service stopped its turn - or failed
+    abandoned - its lease lapsed, or `service stop --end-turns` ended its turn - or failed
     with its task still in progress when the turn was over, which a timeout, a
     crash or a kill of the harness leaves. `run` marks the second `cut_off`."""
     if not raise_row:
@@ -9569,13 +9592,17 @@ def cmd_service_reload(args: list[str]) -> None:
 
 
 def cmd_service_stop(args: list[str]) -> None:
-    """Ask the daemon to stop and wait for it. It stops claiming, gives running
-    turns its grace period, then ends them and settles what they held."""
+    """Ask the daemon to stop and wait for it. It stops claiming and exits,
+    leaving running turns running for the next daemon to adopt. With
+    `--end-turns` it first writes the intent that ends them: the daemon gives
+    running turns its grace period, then ends the rest and settles what they
+    held."""
     import contextlib
     import signal
     import time as _time
 
-    opts = _flags(args, ("timeout",), bools=("force",))
+    opts = _flags(args, ("timeout",), bools=("force", "end-turns"))
+    end_turns = bool(opts.get("end-turns"))
     module = _service_module()
     state = _service_state_dir()
     pid = module.read_pid(state)
@@ -9589,27 +9616,41 @@ def cmd_service_stop(args: list[str]) -> None:
         grace = _SERVICE_DEFAULTS["shutdown_grace_seconds"]
     timeout = (_seconds(opts["timeout"], "timeout") if opts.get("timeout")
                else float(grace + 30))
+    intent = None
+    if end_turns:
+        # Written before the signal, so the daemon finds it when it takes the
+        # stop; a stale one is ignored by the daemon that finds it.
+        intent = module.write_end_turns(state, _actor(), timeout)
+        module.log_line(state, _service_state_key(_project_here()),
+                        f"end-turns asked by {intent['by']}: the stop ends running turns")
     started = _time.monotonic()
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, signal.SIGTERM)
     while _time.monotonic() - started < timeout:
         if not module.pid_alive(pid):
-            _emit({"stopped": True, "running": False, "pid": pid,
-                   "waited_seconds": round(_time.monotonic() - started, 1)})
+            answer = {"stopped": True, "running": False, "pid": pid,
+                      "waited_seconds": round(_time.monotonic() - started, 1)}
+            if intent is not None:
+                answer["end_turns"] = {"by": intent["by"], "at": intent["at"]}
+            _emit(answer)
             return
         _time.sleep(0.1)
     if not opts.get("force"):
         _die(5, "service_stop_timeout", f"the daemon did not stop within {timeout:g}s",
-             "its turns may still be finishing; `--force` ends the daemon and its "
-             "turns now, and what they held is freed when their leases lapse")
+             ("its turns may still be finishing; `--force` ends the daemon and its "
+              "turns now, and what they held is freed when their leases lapse")
+             if end_turns else
+             ("`--force` ends the daemon now and leaves its turns running; with "
+              "`--end-turns` it ends them too"))
     turns = [row.get("pid") for row in published.get("turns") or []
-             if isinstance(row, dict) and isinstance(row.get("pid"), int)]
+             if isinstance(row, dict) and isinstance(row.get("pid"), int)] if end_turns else []
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, signal.SIGKILL)
     if turns:
         from callva.harness_runner.tree import kill_tree
         kill_tree(turns)
-    for name in (module.PID_FILE, module.FINGERPRINT_FILE, module.STATUS_FILE):
+    for name in (module.PID_FILE, module.FINGERPRINT_FILE, module.STATUS_FILE,
+                 module.END_TURNS_FILE):
         (state / name).unlink(missing_ok=True)
     _emit({"stopped": True, "killed": True, "running": False, "pid": pid,
            "turns_killed": turns})
