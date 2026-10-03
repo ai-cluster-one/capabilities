@@ -244,6 +244,8 @@ capabilities/
 
 In database mode those logical records and document bodies, including the policy gate, live in the store; the envelope still holds project identity, the state guard, and source-owned project material that is not a live record.
 
+**The machine's store setting is the one store pointer.** `capabilities store set` records it and is its only writer: the non-secret values — host, port, database, user, an `sslmode` of `require` or stronger, and an optional root certificate — in `$XDG_CONFIG_HOME/capabilities/store.json`, and the password in the manager's own credentials tier, `$XDG_CONFIG_HOME/capabilities/credentials.env`, at mode 0600, taken from stdin, a file or a named environment variable and never from argv. The manager's store URL resolution takes `CAPABILITIES_STORE_URL` when it is set, for tests and development sessions, else the setting, else the local default. A capability reads the setting from the manager's files through the store tier's `read_store_setting()`, which writes nothing. `capabilities store show` reports the setting without its secret, and `capabilities store doctor` proves that a TLS connection works and that a plain-text one is refused.
+
 `capabilities/` is canonical and intentionally visible so the project's context
 owner and humans share one project body. The runtime also reads a legacy
 `.capabilities/` tree until `capabilities init` migrates it. Migration is

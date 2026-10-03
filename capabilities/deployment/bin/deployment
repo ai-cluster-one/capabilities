@@ -1668,6 +1668,8 @@ from datetime import timedelta as _store_timedelta
 from datetime import timezone as _store_timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote as _store_quote
+from urllib.parse import urlencode as _store_urlencode
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -2806,6 +2808,130 @@ def open_store(url: str | None = None) -> "Store":
     raise StoreError("unknown_store", f"unsupported store scheme {scheme!r}",
                      "expected sqlite:// or postgresql://")
 
+
+
+# --- the machine's store setting ---------------------------------------------
+#
+# Which database a machine's records live in is the machine's, so it is kept
+# beside the machine's other manager records rather than in any project, and the
+# manager is its one writer: `capabilities store set` writes the non-secret
+# values to `store.json` and the password to the manager's own credentials tier,
+# both under `$XDG_CONFIG_HOME/capabilities/`. Whatever reads it reads it here,
+# and reading writes nothing. A Postgres reached across a network is reached
+# over TLS, so the floor on `sslmode` is `require`, and it is checked here for
+# the writer and every reader alike.
+
+STORE_SETTING_SCHEMA = "capabilities.store.v1"
+STORE_PASSWORD_KEY = "CAPABILITIES_STORE_PASSWORD"
+STORE_SSLMODES = ("require", "verify-ca", "verify-full")
+STORE_SSLMODES_REFUSED = ("disable", "allow", "prefer")
+STORE_SETTING_FIELDS = ("host", "port", "database", "user", "sslmode", "sslrootcert")
+
+
+def store_setting_files(config_home: Path | str | None = None) -> tuple[Path, Path]:
+    """The setting file and the password file, in that order."""
+    home = Path(config_home or os.environ.get("XDG_CONFIG_HOME")
+                or os.path.join(os.path.expanduser("~"), ".config"))
+    return (home / "capabilities" / "store.json",
+            home / "capabilities" / "credentials.env")
+
+
+def check_store_setting(values: dict) -> dict:
+    """The setting's non-secret values, checked and normalised, or StoreError."""
+    if not isinstance(values, dict):
+        raise StoreError("bad_store_setting", "the store setting is not an object")
+    unknown = sorted(set(values) - set(STORE_SETTING_FIELDS))
+    if unknown:
+        raise StoreError("bad_store_setting",
+                         f"the store setting carries unknown fields: {', '.join(unknown)}")
+    out: dict = {}
+    for field in ("host", "database", "user"):
+        value = values.get(field)
+        if not isinstance(value, str) or not value or any(
+                ch.isspace() or ch == "\0" for ch in value):
+            raise StoreError("bad_store_setting",
+                             f"the store setting needs a {field} with no whitespace")
+        out[field] = value
+    port = values.get("port", 5432)
+    if isinstance(port, str) and port.isdigit():
+        port = int(port)
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 < port < 65536:
+        raise StoreError("bad_store_setting", "the store port must be 1-65535")
+    out["port"] = port
+    sslmode = values.get("sslmode")
+    if sslmode in STORE_SSLMODES_REFUSED:
+        raise StoreError("sslmode_too_weak",
+                         f"sslmode {sslmode!r} lets the store be reached without TLS",
+                         f"use one of {', '.join(STORE_SSLMODES)}")
+    if sslmode not in STORE_SSLMODES:
+        raise StoreError("bad_store_setting", f"unknown sslmode {sslmode!r}",
+                         f"use one of {', '.join(STORE_SSLMODES)}")
+    out["sslmode"] = sslmode
+    root = values.get("sslrootcert")
+    if root is not None:
+        if not isinstance(root, str) or not root or "\n" in root:
+            raise StoreError("bad_store_setting",
+                             "sslrootcert must be a certificate file path or `system`")
+        out["sslrootcert"] = root
+    return out
+
+
+def read_store_setting(config_home: Path | str | None = None) -> dict | None:
+    """This machine's store setting, or None when it has none.
+
+    The non-secret values come from the setting file and `password` from the
+    manager's credentials tier, None when it holds none. This reads and never
+    writes; `capabilities store set` is the only writer of both files."""
+    setting_file, password_file = store_setting_files(config_home)
+    try:
+        raw = setting_file.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise StoreError("store_setting_unreadable",
+                         f"cannot read the store setting {setting_file}: {exc}") from exc
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise StoreError("bad_store_setting",
+                         f"{setting_file} is not a store setting",
+                         "rewrite it with `capabilities store set`") from exc
+    if not isinstance(data, dict) or data.get("schema") != STORE_SETTING_SCHEMA:
+        raise StoreError("bad_store_setting",
+                         f"{setting_file} is not a {STORE_SETTING_SCHEMA} setting",
+                         "rewrite it with `capabilities store set`")
+    setting = check_store_setting(
+        {k: v for k, v in data.items() if k in STORE_SETTING_FIELDS})
+    setting["password"] = None
+    try:
+        lines = password_file.read_text().splitlines()
+    except FileNotFoundError:
+        lines = []
+    except OSError as exc:
+        raise StoreError("store_setting_unreadable",
+                         f"cannot read the store password file {password_file}: {exc}") from exc
+    prefix = STORE_PASSWORD_KEY + "="
+    for line in lines:
+        if line.startswith(prefix):
+            setting["password"] = line[len(prefix):] or None
+    return setting
+
+
+def store_setting_url(setting: dict, *, with_password: bool = True,
+                      sslmode: str | None = None) -> str:
+    """The setting as a `postgresql://` URL; `sslmode` replaces the setting's
+    own only for a caller proving what the server refuses."""
+    user = _store_quote(setting["user"], safe="")
+    if with_password and setting.get("password"):
+        user += ":" + _store_quote(setting["password"], safe="")
+    host = setting["host"]
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    query = {"sslmode": sslmode or setting["sslmode"]}
+    if setting.get("sslrootcert"):
+        query["sslrootcert"] = setting["sslrootcert"]
+    return (f"postgresql://{user}@{host}:{setting['port']}/"
+            f"{_store_quote(setting['database'], safe='')}?{_store_urlencode(query)}")
 
 # --- records: the two places a project may keep its configuration ------------
 #

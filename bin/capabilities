@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
+#     "psycopg2-binary>=2.9",
 # ]
 # ///
 """
@@ -51,8 +52,12 @@ ENVIRONMENT
                        reads but changes nothing (write verbs, project-record
                        writes and service activation exit 4), and this manager
                        refuses allow, disable, enable, inherit, init,
-                       quarantine, relabel and set.
+                       quarantine, relabel, set and store set.
                        doctor reports it. Unset, `0` or `false` leaves it off.
+  CAPABILITIES_STORE_URL
+                       the store the manager's records use in database mode,
+                       overriding this machine's store setting (see STORE
+                       VERBS); for tests and development sessions.
 
 PROJECT PATH VERB
   path --json [--identity]
@@ -224,6 +229,42 @@ MACHINE VERBS
         Publish one already-committed, verified descendant of the clean source
         checkout's tracked branch; fast-forward the checkout, reconcile locally
         installed changed payloads, and update the manager when it changed.
+
+STORE VERBS
+  The machine's store setting is the one store pointer: the manager's own
+  records in database mode resolve their store from CAPABILITIES_STORE_URL
+  when it is set, else from this setting, else from the local default. Only
+  the manager writes it: the non-secret values to
+  $XDG_CONFIG_HOME/capabilities/store.json, the password to the manager's
+  credentials tier $XDG_CONFIG_HOME/capabilities/credentials.env
+  (CAPABILITIES_STORE_PASSWORD) at mode 0600. A capability reads both through
+  the store tier's read_store_setting(), which writes nothing.
+  store set --host H --database D --user U [--port P]
+            [--sslmode require|verify-ca|verify-full] [--sslrootcert PATH|system]
+            (--password-stdin | --password-file PATH | --password-env KEY)
+        Record the Postgres the machine's store lives in, atomically under the
+        manager's lock. The password comes from stdin, a file or the named
+        environment variable, never from argv; a --password flag is refused.
+        --port defaults to 5432; --sslmode defaults to verify-full with
+        --sslrootcert and to require without it, and disable, allow and prefer
+        are refused (exit 6 sslmode_too_weak). Exit 4 under the read-only
+        switch. Answers as `store show` does, with changed.
+  store show [--json]
+        The setting and where each value came from, with no secret: the
+        password's presence only. in_force names the store the manager's
+        records use and what decided it (CAPABILITIES_STORE_URL, setting,
+        default); overridden_by names CAPABILITIES_STORE_URL while it
+        overrides a setting. JSON {configured, setting {<field> {value,
+        source}} | null, password {present, source}, in_force {store, source},
+        overridden_by}. Output is always JSON, so --json changes nothing.
+  store doctor [--json]
+        Prove the setting: a TLS connection works, reporting the server
+        version and the negotiated TLS, and a plain-text connection to the
+        same server is refused, so a pg_hba.conf that lets plain text back in
+        is noticed. Never prints the password. JSON {ok, store, sslmode,
+        checks {tls {ok, server_version?, tls {version, cipher}?, error?},
+        plain_text_refused {ok, reason}}, overridden_by}. Exit 0 when both
+        hold, 7 when either fails, 3 when the machine has no store setting.
 
 DEVELOPMENT VERBS
   dev start <name> [--project PATH | --no-project] [--source ID-OR-PATH]
@@ -679,7 +720,7 @@ def _store_module():
 # identity and its wiring — and the machine ceiling. Under the read-only switch the manager refuses them;
 # whether the switch is on is the store tier's answer, never the manager's own.
 READ_ONLY_REFUSED_VERBS = ("allow", "disable", "enable", "inherit", "init",
-                           "quarantine", "relabel", "set")
+                           "quarantine", "relabel", "set", "store set")
 
 
 def _read_only_gate(verb: str) -> None:
@@ -702,13 +743,43 @@ def _read_only_report() -> dict | None:
             "refused_here": list(READ_ONLY_REFUSED_VERBS)}
 
 
+def _store_setting() -> dict | None:
+    """This machine's store setting, read through the store tier, or None."""
+    store = _store_module()
+    try:
+        return store.read_store_setting(_CONFIG_HOME)
+    except store.StoreError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+
+
+def _store_resolution() -> tuple[str, str]:
+    """The store the manager's records use in database mode, and what decided:
+    `CAPABILITIES_STORE_URL`, else this machine's store setting, else the local
+    default. The returned URL may carry the setting's password."""
+    configured = os.environ.get("CAPABILITIES_STORE_URL")
+    if configured:
+        return configured, "CAPABILITIES_STORE_URL"
+    setting = _store_setting()
+    if setting is not None:
+        return _store_module().store_setting_url(setting), "setting"
+    return str(DEFAULT_STORE_PATH), "default"
+
+
+def _setting_store_url() -> str | None:
+    """The URL to hand the store tier when the setting decides, else None, which
+    leaves the tier's own resolution of the override and the default as it is."""
+    url, source = _store_resolution()
+    return url if source == "setting" else None
+
+
 def _records_for(root: Path, *, project_only: bool = False):
     """The records surface for one project, with manager errors normalized."""
     store = _store_module()
+    envelope = _project_capabilities_dir(root)
     try:
-        return store.open_records(
-            _project_capabilities_dir(root), _CONFIG_HOME,
-            project_only=project_only)
+        url = _setting_store_url() if store.records_mode(envelope)[0] == "db" else None
+        return store.open_records(envelope, _CONFIG_HOME, url=url,
+                                  project_only=project_only)
     except store.StoreError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
 
@@ -5519,7 +5590,7 @@ def cmd_relabel(slug: str) -> None:
     registry: dict = {"registered": False, "previous": was}
     store = None
     try:
-        store = store_module.open_store()
+        store = store_module.open_store(_setting_store_url())
         # The store is opened, never prepared, by whoever opens it first, and on
         # a machine where no service has ever prepared it the registry has no
         # tables to ask about — so asking raises the driver's own error rather
@@ -5549,20 +5620,283 @@ def cmd_relabel(slug: str) -> None:
            "unchanged": registry["previous"] == slug})
 
 
+def _shown_store(url: str) -> str:
+    """A store URL as a report may print it: no credential, no parameters. The
+    credential ends at the last `@`, so one an override carries unencoded is
+    still dropped whole."""
+    if "://" not in url:
+        return url
+    scheme, rest = url.split("://", 1)
+    if "@" in rest:
+        rest = rest.rsplit("@", 1)[1]
+    return f"{scheme}://{rest.split('?', 1)[0]}"
+
+
 def cmd_path_store() -> None:
     """Where records go, and what decided. A store URL may carry a password, so
     the credential is stripped rather than printed: this is a report, and a
     report is not a place a secret appears."""
-    configured = os.environ.get("CAPABILITIES_STORE_URL")
-    url = configured or str(DEFAULT_STORE_PATH)
-    shown = url
-    if "://" in url:
-        scheme, rest = url.split("://", 1)
-        if "@" in rest:
-            rest = rest.split("@", 1)[1]
-        shown = f"{scheme}://{rest.split('?', 1)[0]}"
-    _emit({"store": shown,
-           "source": "CAPABILITIES_STORE_URL" if configured else "default"})
+    url, source = _store_resolution()
+    _emit({"store": _shown_store(url), "source": source})
+
+
+# ---------------------------------------------------------------- the store setting
+
+STORE_VALUE_OPTIONS = {
+    "--host": "host", "--port": "port", "--database": "database",
+    "--user": "user", "--sslmode": "sslmode", "--sslrootcert": "sslrootcert",
+}
+STORE_PASSWORD_OPTIONS = ("--password-stdin", "--password-file", "--password-env")
+# What a plain-text attempt reads when pg_hba.conf turns it away for lacking
+# TLS: "no encryption" from Postgres 14 on, "SSL off" before it.
+STORE_PLAIN_REFUSAL_MARKERS = ("no encryption", "SSL off")
+
+
+def _store_set_args(args: list[str]) -> tuple[dict, tuple[str, str | None]]:
+    """Parse `store set` strictly. No value an argument carries is echoed back,
+    since a password put on argv by mistake must not reach the output too."""
+    values: dict = {}
+    sources: list[tuple[str, str | None]] = []
+    i = 0
+    while i < len(args):
+        name, eq, inline = args[i].partition("=")
+        if not name.startswith("--"):
+            _die(6, "input", "`capabilities store set` takes options only",
+                 "run `capabilities help` for its options")
+        if name == "--password" or name.startswith("--password") and \
+                name not in STORE_PASSWORD_OPTIONS:
+            _die(6, "secret_on_argv",
+                 "`capabilities store set` takes no password on its command line",
+                 "pass it on stdin with --password-stdin, in a file with "
+                 "--password-file PATH, or in an environment variable named by "
+                 "--password-env KEY")
+        if name == "--password-stdin":
+            if eq:
+                _die(6, "input", "--password-stdin takes no value")
+            sources.append(("stdin", None))
+            i += 1
+            continue
+        if name not in STORE_VALUE_OPTIONS and name not in STORE_PASSWORD_OPTIONS:
+            _die(6, "input", f"unknown store set option: {name}",
+                 "run `capabilities help` for its options")
+        if eq:
+            value, i = inline, i + 1
+        elif i + 1 < len(args):
+            value, i = args[i + 1], i + 2
+        else:
+            _die(6, "input", f"{name} needs a value")
+        if name == "--password-file":
+            sources.append(("file", value))
+        elif name == "--password-env":
+            sources.append(("env", value))
+        elif STORE_VALUE_OPTIONS[name] in values:
+            _die(6, "input", f"{name} is given twice")
+        else:
+            values[STORE_VALUE_OPTIONS[name]] = value
+    if len(sources) != 1:
+        _die(6, "password_source",
+             "`capabilities store set` needs exactly one password source",
+             "one of --password-stdin, --password-file PATH or --password-env KEY")
+    for field in ("host", "database", "user"):
+        if field not in values:
+            _die(6, "input", f"store set needs --{field}")
+    return values, sources[0]
+
+
+def _store_password(source: tuple[str, str | None]) -> str:
+    kind, where = source
+    if kind == "stdin":
+        password = sys.stdin.read()
+    elif kind == "file":
+        try:
+            password = Path(where).expanduser().read_text()
+        except (OSError, UnicodeDecodeError) as exc:
+            _die(6, "password_source",
+                 f"cannot read the password file {where}: {exc.__class__.__name__}")
+    else:
+        if not where or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", where):
+            _die(6, "password_source", "--password-env needs an environment variable name")
+        password = os.environ.get(where) or ""
+        if not password:
+            _die(6, "password_source", f"the environment variable {where} is not set")
+    if password.endswith("\n"):
+        password = password[:-1]
+        if password.endswith("\r"):
+            password = password[:-1]
+    if not password:
+        _die(6, "password_source", "the password is empty")
+    if any(ch in password for ch in "\n\r\0"):
+        _die(6, "password_source", "the password holds a line break or NUL",
+             "the password is kept as one line")
+    return password
+
+
+def _atomic_write_secret(path: Path, body: str) -> None:
+    """Replace a secret file whole at mode 0600; it is never readable by others,
+    not even as the temporary file it is written through."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.",
+                                    suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_path.replace(path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    path.chmod(0o600)
+
+
+def _write_store_setting_locked(setting: dict, password: str) -> bool:
+    store = _store_module()
+    setting_file, password_file = store.store_setting_files(_CONFIG_HOME)
+    try:
+        previous = store.read_store_setting(_CONFIG_HOME)
+    except store.StoreError:
+        previous = None
+    changed = previous != {**setting, "password": password}
+    prefix = store.STORE_PASSWORD_KEY + "="
+    try:
+        kept = [line for line in password_file.read_text().splitlines()
+                if not line.startswith(prefix)]
+    except FileNotFoundError:
+        kept = []
+    _atomic_write_secret(password_file, "\n".join([*kept, prefix + password]) + "\n")
+    _atomic_write_text(setting_file, json.dumps(
+        {"schema": store.STORE_SETTING_SCHEMA, **setting,
+         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+         "by": _machine_actor()},
+        ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    return changed
+
+
+def _write_store_setting(setting: dict, password: str) -> bool:
+    """Write the setting and its password atomically under the manager mutation lock."""
+    if _MANAGER_MUTATION_DEPTH:
+        return _write_store_setting_locked(setting, password)
+    MANAGER_MUTATION_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with MANAGER_MUTATION_LOCK.open("a+") as mutation:
+        MANAGER_MUTATION_LOCK.chmod(0o600)
+        fcntl.flock(mutation, fcntl.LOCK_EX)
+        return _write_store_setting_locked(setting, password)
+
+
+def _store_report() -> dict:
+    """`store show`: the setting, where each value came from, no secret."""
+    store = _store_module()
+    setting_file, password_file = store.store_setting_files(_CONFIG_HOME)
+    setting = _store_setting()
+    url, source = _store_resolution()
+    report: dict = {"configured": setting is not None, "setting": None,
+                    "password": {"present": False, "source": None},
+                    "in_force": {"store": _shown_store(url), "source": source},
+                    "overridden_by": None}
+    if setting is not None:
+        report["setting"] = {
+            field: {"value": setting.get(field), "source": str(setting_file)}
+            for field in store.STORE_SETTING_FIELDS if setting.get(field) is not None}
+        if setting.get("password"):
+            report["password"] = {"present": True, "source": str(password_file)}
+        if source == "CAPABILITIES_STORE_URL":
+            report["overridden_by"] = "CAPABILITIES_STORE_URL"
+    return report
+
+
+def cmd_store_set(args: list[str]) -> None:
+    _read_only_gate("store set")
+    store = _store_module()
+    values, source = _store_set_args(args)
+    if "sslmode" not in values:
+        values["sslmode"] = "verify-full" if values.get("sslrootcert") else "require"
+    root = values.get("sslrootcert")
+    if root is not None and root != "system":
+        path = Path(root).expanduser().resolve()
+        if not path.is_file() or not os.access(path, os.R_OK):
+            _die(6, "bad_store_setting", f"--sslrootcert {root} is not a readable file")
+        values["sslrootcert"] = str(path)
+    try:
+        setting = store.check_store_setting(values)
+    except store.StoreError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+    password = _store_password(source)
+    changed = _write_store_setting(setting, password)
+    _emit({**_store_report(), "changed": changed})
+
+
+def _store_scrub(text: str, setting: dict) -> str:
+    password = setting.get("password")
+    text = " ".join(str(text).split())
+    return text.replace(password, "***") if password else text
+
+
+def _store_probe(setting: dict, sslmode: str | None = None) -> tuple[dict | None, str | None]:
+    """Open one connection with the setting, `sslmode` replacing its own, and
+    say what the server negotiated; or the reason it was not opened."""
+    store = _store_module()
+    try:
+        import psycopg2
+    except ImportError:
+        _die(5, "driver_missing", "psycopg2 is not installed",
+             "reinstall or update the capabilities manager")
+    try:
+        conn = psycopg2.connect(store.store_setting_url(setting, sslmode=sslmode),
+                                connect_timeout=10)
+    except psycopg2.Error as exc:
+        return None, _store_scrub(exc, setting)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT current_setting('server_version'), s.ssl, s.version, "
+                        "s.cipher FROM pg_stat_ssl s WHERE s.pid = pg_backend_pid()")
+            row = cur.fetchone()
+    except psycopg2.Error as exc:
+        return {}, _store_scrub(exc, setting)
+    finally:
+        conn.close()
+    if row is None:
+        return {}, "the server did not report this connection in pg_stat_ssl"
+    return {"server_version": row[0], "ssl": bool(row[1]),
+            "tls": {"version": row[2], "cipher": row[3]}}, None
+
+
+def cmd_store_doctor() -> None:
+    setting = _store_setting()
+    if setting is None:
+        _die(3, "no_store_setting", "this machine has no store setting",
+             "record one with `capabilities store set`")
+    tls: dict = {"ok": False}
+    found, error = _store_probe(setting)
+    if found:
+        tls.update({"server_version": found["server_version"], "tls": found["tls"]})
+        tls["ok"] = found["ssl"] and error is None
+        if not found["ssl"]:
+            tls["error"] = "the connection was opened without TLS"
+    if error:
+        tls["error"] = error
+    plain_found, plain_error = _store_probe(setting, sslmode="disable")
+    if plain_found is not None:
+        plain = {"ok": False,
+                 "reason": "the server accepted a plain-text connection: its "
+                           "pg_hba.conf lets a client in without TLS"}
+    elif any(marker in plain_error for marker in STORE_PLAIN_REFUSAL_MARKERS):
+        plain = {"ok": True, "reason": plain_error}
+    else:
+        plain = {"ok": False,
+                 "reason": "the plain-text attempt failed, but not as a refusal "
+                           f"for lacking TLS: {plain_error}"}
+    _, source = _store_resolution()
+    report = {"ok": tls["ok"] and plain["ok"],
+              "store": _shown_store(_store_module().store_setting_url(setting)),
+              "sslmode": setting["sslmode"],
+              "checks": {"tls": tls, "plain_text_refused": plain},
+              "overridden_by": "CAPABILITIES_STORE_URL"
+              if source == "CAPABILITIES_STORE_URL" else None}
+    _emit(report)
+    if not report["ok"]:
+        sys.exit(7)
 
 
 def _deny_rule(name: str) -> str:
@@ -6469,7 +6803,8 @@ def cmd_doctor() -> None:
         records = None
         store = _store_module()
         try:
-            records = store.open_records(envelope, _CONFIG_HOME)
+            url = _setting_store_url() if store.records_mode(envelope)[0] == "db" else None
+            records = store.open_records(envelope, _CONFIG_HOME, url=url)
             _check_record_connections(findings, records, _installed())
         except store.StoreError as exc:
             findings.append(f"project: records unavailable: {exc.message}")
@@ -9461,6 +9796,18 @@ def main() -> None:
         cmd_inventory(flag("--detail"), flag("--network"), pos)
     elif cmd == "path" and pos and pos[0] == "store":
         cmd_path_store()
+    elif cmd == "store":
+        sub = rest[0] if rest else None
+        if sub == "set":
+            cmd_store_set(rest[1:])
+        elif sub in ("show", "doctor"):
+            extra = [a for a in rest[1:] if a != "--json"]
+            if extra:
+                _die(6, "input", f"store {sub} takes only --json")
+            cmd_store_doctor() if sub == "doctor" else _emit(_store_report())
+        else:
+            _die(6, "input", "store needs a subcommand: set, show or doctor",
+                 "run `capabilities help`")
     elif cmd == "path":
         cmd_path(flag("--json"), flag("--identity"))
     elif cmd == "search":
