@@ -16,9 +16,18 @@ It wakes when the store notifies that a task became claimable, at every poll,
 at the earliest moment a pickup or a lease falls due, and when one of its own
 turns claims or ends. A store without the notification leaves it the poll.
 
-It outlives the store being away. A listener it loses, or cannot open, is asked
-for again on a doubling interval until the store answers, and the moment it
-listens again it asks the store for work, since nothing it missed was announced.
+It holds its connections to the store rather than opening one per question:
+one it listens on, and one every question it asks is put to, each question cut
+off by the store when it runs past `QUESTION_TIMEOUT_SECONDS`. They are kept per
+store in a pool, so whoever asks of the same store shares the same two. The
+listener carries a round trip of its own every `PING_SECONDS`, and so does the
+question connection when nothing else went over it for that long, so a proxy in
+front of the store does not close either as idle.
+
+It outlives the store being away. A connection it loses, or cannot open, is
+asked for again on a doubling interval until the store answers, and the moment
+it has it again it asks the store for work, since what it missed was neither
+announced nor answered.
 
 It never starts a turn on a task one of its turns holds, or on one a turn of its
 own ended on less than `retry_delay_seconds` ago: its turns are told to claim
@@ -60,17 +69,29 @@ EXCLUDE_ENV = "TASKS_TURN_EXCLUDE"
 # A stop or a reload is taken within this, and so is a turn that ended.
 TICK_SECONDS = 1.0
 
-# How soon a listener that was lost, or could not be opened, is asked for again:
-# the first interval, doubled after every attempt that fails, up to the longest.
+# How soon a connection that was lost, or could not be opened, is asked for
+# again: the first interval, doubled after every attempt that fails, up to the
+# longest. The listener and the connection questions go on keep one each.
 RELISTEN_FIRST_SECONDS = 1.0
 RELISTEN_LONGEST_SECONDS = 30.0
+
+# How long one question may run before the store cuts it off. A question cut off
+# counts as its connection lost, so a store that hangs costs the daemon this
+# long and never its loop.
+QUESTION_TIMEOUT_SECONDS = 30
+
+# How often a held connection carries a round trip of its own: the listener
+# always, and the connection questions go on whenever nothing else went over it
+# for this long.
+PING_SECONDS = 120.0
 
 # Wakes that may start a turn only to have its claim run the sweeps: a lapsed
 # lease and an ended wait are put back by a claim and by nothing else, and no
 # write announces either. Starting one on every wake would spin on a sweep that
-# keeps failing, so it happens on the clock and nowhere else. Listening again
-# after the store was away counts as the clock: a lease may have lapsed meanwhile.
-_SWEEP_WAKES = {"start", "poll", "pickup", "reload", "relisten", "resume"}
+# keeps failing, so it happens on the clock and nowhere else. Listening again,
+# or asking again, after the store was away counts as the clock: a lease may
+# have lapsed meanwhile.
+_SWEEP_WAKES = {"start", "poll", "pickup", "reload", "relisten", "reconnect", "resume"}
 
 
 def now_iso() -> str:
@@ -200,6 +221,68 @@ def _why(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+class StoreAway(Exception):
+    """A question with no connection to go on: the one held was lost, and the
+    doubling interval has not yet come round to asking for another."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+class Store:
+    """One store the daemon reaches, and what it holds of it: the connection it
+    listens on, the connection its questions go on, and how many connections it
+    has opened to it. Each of the two is asked for again on its own doubling
+    interval when it is lost or refused."""
+
+    def __init__(self, key, name: str):
+        self.key = key
+        self.name = name
+        self.listener = None
+        self.listen_error: str | None = None
+        # While there is no listener: when to ask for one again, and how long
+        # the wait after that attempt will be if it fails too.
+        self.relisten_at: float | None = None
+        self.relisten_delay = RELISTEN_FIRST_SECONDS
+        self.listener_pinged = 0.0
+        # The same for the connection questions go on, and when the last thing
+        # went over it.
+        self.query = None
+        self.query_error: str | None = None
+        self.requery_at: float | None = None
+        self.requery_delay = RELISTEN_FIRST_SECONDS
+        self.query_used = 0.0
+        self.connections_opened = 0
+        self.last_opened_at: str | None = None
+
+    def opened(self) -> None:
+        self.connections_opened += 1
+        self.last_opened_at = now_iso()
+
+    def row(self) -> dict:
+        return {"store": self.name, "listening": self.listener is not None,
+                "connections_opened": self.connections_opened,
+                "last_opened_at": self.last_opened_at,
+                "error": self.query_error or self.listen_error}
+
+
+class StorePool:
+    """The stores the daemon holds connections to, one entry per distinct store,
+    so everything asked of the same store goes over the same two connections."""
+
+    def __init__(self):
+        self.stores: dict = {}
+
+    def store(self, key, name: str) -> Store:
+        if key not in self.stores:
+            self.stores[key] = Store(key, name)
+        return self.stores[key]
+
+    def rows(self) -> list[dict]:
+        return [store.row() for store in self.stores.values()]
+
+
 class Turn:
     """One child running `tasks run <worker> --apply`."""
 
@@ -242,9 +325,11 @@ class Turn:
 
 class Daemon:
     """The loop. `host` answers every question about the project; `declaration`
-    is what it was started with, already validated."""
+    is what it was started with, already validated. The store the host names is
+    held in `pool`, one of its own unless one is handed in."""
 
-    def __init__(self, host, declaration: dict, *, tick: float = TICK_SECONDS):
+    def __init__(self, host, declaration: dict, *, tick: float = TICK_SECONDS,
+                 pool: StorePool | None = None):
         self.host = host
         self.declaration = declaration
         self.state_dir = Path(host.state_dir)
@@ -254,13 +339,9 @@ class Daemon:
         self.stop_requested = False
         self.reload_requested = False
         self.stopping = False
-        self.listener = None
-        self.listen_error: str | None = None
+        self.pool = pool if pool is not None else StorePool()
+        self.store = self.pool.store(host.store_key(), host.store_name())
         self.notification_installed: bool | None = None
-        # While there is no listener: when to ask for one again, and how long
-        # the wait after that attempt will be if it fails too.
-        self.relisten_at: float | None = None
-        self.relisten_delay = RELISTEN_FIRST_SECONDS
         self.next_poll = 0.0
         self.next_moment: float | None = None
         self.wakes: set[str] = {"start"}
@@ -295,6 +376,10 @@ class Daemon:
             return False
         return (mine.st_dev, mine.st_ino) == (log.st_dev, log.st_ino)
 
+    @property
+    def listener(self):
+        return self.store.listener
+
     def settings(self) -> dict:
         return self.declaration["settings"]
 
@@ -310,6 +395,7 @@ class Daemon:
             wakes.append(("retry", min(r["until"] for r in self.recent.values())))
         reason, due = min(wakes, key=lambda item: item[1])
         listening = self.listener is not None
+        listen_error = self.store.listen_error
         return {
             "pid": os.getpid(),
             "started_at": self.started_at,
@@ -320,7 +406,8 @@ class Daemon:
                         else "poll"),
             "notification": {"channel": self.host.channel, "listening": listening,
                              "installed": self.notification_installed,
-                             **({"error": self.listen_error} if self.listen_error else {})},
+                             **({"error": listen_error} if listen_error else {})},
+            "stores": self.pool.rows(),
             "poll_seconds": self.settings()["poll_seconds"],
             "max_parallel": self.settings()["max_parallel"],
             "shutdown_grace_seconds": self.settings()["shutdown_grace_seconds"],
@@ -397,6 +484,7 @@ class Daemon:
             with contextlib.suppress(OSError):
                 (self.state_dir / name).unlink()
         self._drop_listener()
+        self._drop_query()
         if self._lock is not None:
             self._lock.close()
             self._lock = None
@@ -440,9 +528,13 @@ class Daemon:
                 self._connect_listener()
             else:
                 self._check_notification()
-        elif self.listener is None and self.relisten_at is not None \
-                and now >= self.relisten_at:
+        elif self.listener is None and self.store.relisten_at is not None \
+                and now >= self.store.relisten_at:
             self._connect_listener()
+        if self.store.query is None and self.store.requery_at is not None \
+                and now >= self.store.requery_at:
+            self._reconnect()
+        self._ping(time.monotonic())
         if self.next_moment is not None and now >= self.next_moment:
             self.wakes.add("pickup")
             self.next_moment = None
@@ -459,7 +551,8 @@ class Daemon:
         self.publish()
         if wait and not self.stop_requested:
             deadlines = ([self.next_poll] + ([self.next_moment] if self.next_moment else [])
-                         + ([self.relisten_at] if self.relisten_at else [])
+                         + ([self.store.relisten_at] if self.store.relisten_at else [])
+                         + ([self.store.requery_at] if self.store.requery_at else [])
                          + [r["until"] for r in self.recent.values()])
             self.wait(max(0.0, min([self.tick] + [d - time.monotonic() for d in deadlines])))
 
@@ -469,44 +562,161 @@ class Daemon:
         """Open the listener. A failure is said once, not on every attempt, and
         the next attempt is planned; a listener opened after one was lost or
         refused is a wake, since what the store announced meanwhile was lost."""
+        store = self.store
         self._drop_listener()
         try:
-            self.listener = self.host.listen()
+            store.listener = self.host.listen()
         except (Exception, SystemExit) as exc:
-            self.listener = None
+            store.listener = None
             why = _why(exc)
-            if why != self.listen_error:
+            if why != store.listen_error:
                 self.log(f"cannot listen for the store's notification, waking by the "
                          f"poll every {self.settings()['poll_seconds']}s and asking "
                          f"again: {why}")
-            self.listen_error = why
+            store.listen_error = why
             self._relisten_later()
             return
-        if self.listen_error is not None:
+        store.opened()
+        store.listener_pinged = time.monotonic()
+        if store.listen_error is not None:
             self.log(f"listening on {self.host.channel} again; asking the store for work")
             self.wakes.add("relisten")
-        self.listen_error = None
-        self.relisten_at = None
-        self.relisten_delay = RELISTEN_FIRST_SECONDS
+        store.listen_error = None
+        store.relisten_at = None
+        store.relisten_delay = RELISTEN_FIRST_SECONDS
+        if store.query is None:
+            # The store answers, so the questions need not wait out their own
+            # interval: the next one asks for its connection at once.
+            store.requery_at = None
         self._check_notification()
 
     def _relisten_later(self) -> None:
-        self.relisten_at = time.monotonic() + self.relisten_delay
-        self.relisten_delay = min(self.relisten_delay * 2, RELISTEN_LONGEST_SECONDS)
+        store = self.store
+        store.relisten_at = time.monotonic() + store.relisten_delay
+        store.relisten_delay = min(store.relisten_delay * 2, RELISTEN_LONGEST_SECONDS)
+
+    def _lose_listener(self, exc: BaseException) -> None:
+        self.log(f"lost the store's notification, waking by the poll and asking "
+                 f"for it again: {_why(exc)}")
+        self._drop_listener()
+        self.store.listen_error = _why(exc)
+        self._relisten_later()
+
+    # --- asking ----------------------------------------------------------------
+
+    def ask(self, question, *, at_once: bool = False):
+        """Put one question to the store on the connection questions go on, and
+        answer what it answers. The connection is opened when there is none, unless
+        the doubling interval since it was lost has not come round, in which case
+        the question is refused at once; `at_once` asks for it regardless. A
+        question that loses its connection, or runs past the store's timeout,
+        drops it and plans the next attempt; any other failure is the question's
+        own and leaves the connection held."""
+        store = self.store
+        if store.query is None:
+            if (not at_once and store.requery_at is not None
+                    and time.monotonic() < store.requery_at):
+                raise StoreAway(f"no connection to the store until it answers again: "
+                                f"{store.query_error}")
+            self._open_query()
+        conn = store.query
+        try:
+            answer = question(conn)
+            conn.commit()
+        except BaseException as exc:
+            if self.host.lost(conn, exc):
+                self._lose_query(exc)
+            else:
+                try:
+                    conn.rollback()
+                except Exception as gone:
+                    self._lose_query(gone)
+            raise
+        store.query_used = time.monotonic()
+        store.requery_delay = RELISTEN_FIRST_SECONDS
+        return answer
+
+    def _open_query(self) -> None:
+        """Open the connection questions go on, or plan the next attempt and
+        refuse the question. A failure is said once, not on every attempt."""
+        store = self.store
+        try:
+            store.query = self.host.open_query(QUESTION_TIMEOUT_SECONDS)
+        except (Exception, SystemExit) as exc:
+            store.query = None
+            why = _why(exc)
+            if why != store.query_error:
+                self.log(f"cannot connect to the store to ask it for work, asking again: "
+                         f"{why}")
+            store.query_error = why
+            self._requery_later()
+            raise StoreAway(why) from exc
+        store.opened()
+        store.query_used = time.monotonic()
+        store.requery_at = None
+        if store.query_error is not None:
+            self.log("connected to the store again for its questions")
+        store.query_error = None
+
+    def _reconnect(self) -> None:
+        """The interval since the question connection was lost has come round:
+        open it, and ask for work, since what was asked meanwhile went
+        unanswered."""
+        try:
+            self._open_query()
+        except StoreAway:
+            return
+        self.wakes.add("reconnect")
+
+    def _requery_later(self) -> None:
+        store = self.store
+        store.requery_at = time.monotonic() + store.requery_delay
+        store.requery_delay = min(store.requery_delay * 2, RELISTEN_LONGEST_SECONDS)
+
+    def _lose_query(self, exc: BaseException) -> None:
+        store = self.store
+        why = _why(exc)
+        self._drop_query()
+        if why != store.query_error:
+            self.log(f"lost the store connection its questions go on, asking for it "
+                     f"again in {store.requery_delay:g}s: {why}")
+        store.query_error = why
+        self._requery_later()
+
+    def _drop_query(self) -> None:
+        if self.store.query is not None:
+            with contextlib.suppress(Exception):
+                self.store.query.close()
+        self.store.query = None
+
+    def _ping(self, now: float) -> None:
+        """A round trip on each held connection that is due one, so a proxy in
+        front of the store sees it in use. A ping that fails is that connection
+        lost."""
+        store = self.store
+        if store.listener is not None and now - store.listener_pinged >= PING_SECONDS:
+            store.listener_pinged = now
+            try:
+                self.host.ping(store.listener)
+            except Exception as exc:
+                self._lose_listener(exc)
+        if store.query is not None and now - store.query_used >= PING_SECONDS:
+            with contextlib.suppress(Exception, SystemExit):
+                self.ask(self.host.ping)
 
     def _check_notification(self) -> None:
         # The store is brought up to this version first, when all it lacks is
         # additive, so a store that lacked the notification gains it here. A
         # store that cannot be asked is said by the check below.
         try:
-            applied = self.host.catch_up()
+            applied = self.ask(self.host.catch_up)
         except (Exception, SystemExit):
             applied = None
         if applied:
             self.log(f"brought schema {applied['schema']} up to this version: "
                      + ", ".join(applied["created"] + applied["added"]))
         try:
-            installed = bool(self.host.notification_installed())
+            installed = bool(self.ask(self.host.notification_installed))
         except (Exception, SystemExit) as exc:
             self.log(f"cannot tell whether the store notifies: {_why(exc)}")
             return
@@ -521,10 +731,10 @@ class Daemon:
         self.notification_installed = installed
 
     def _drop_listener(self) -> None:
-        if self.listener is not None:
+        if self.store.listener is not None:
             with contextlib.suppress(Exception):
-                self.listener.close()
-        self.listener = None
+                self.store.listener.close()
+        self.store.listener = None
 
     def wait(self, seconds: float) -> None:
         """Sleep until the store notifies or `seconds` pass. A notification for
@@ -537,11 +747,7 @@ class Daemon:
             if got:
                 got += list(self.listener.notifies(timeout=0))
         except Exception as exc:
-            self.log(f"lost the store's notification, waking by the poll and asking "
-                     f"for it again: {_why(exc)}")
-            self._drop_listener()
-            self.listen_error = _why(exc)
-            self._relisten_later()
+            self._lose_listener(exc)
             return
         for note in got:
             try:
@@ -559,7 +765,7 @@ class Daemon:
 
     def _plan_next_moment(self) -> None:
         try:
-            seconds = self.host.next_moment()
+            seconds = self.ask(self.host.next_moment)
         except (Exception, SystemExit) as exc:
             self.log(f"cannot read the next pickup from the store: {_why(exc)}")
             return
@@ -626,7 +832,8 @@ class Daemon:
             if not self._room(lane):
                 continue
             try:
-                has_work = self.host.lane_has_work(lane["spec"], exclude)
+                has_work = self.ask(lambda conn, spec=lane["spec"]:
+                                    self.host.lane_has_work(conn, spec, exclude))
             except (Exception, SystemExit) as exc:
                 self.log(f"cannot ask the store for {lane['worker']}'s work: {_why(exc)}")
                 return
@@ -637,7 +844,7 @@ class Daemon:
         if started or free <= 0 or not (wakes & _SWEEP_WAKES):
             return
         try:
-            due = self.host.sweep_due()
+            due = self.ask(self.host.sweep_due)
         except (Exception, SystemExit) as exc:
             self.log(f"cannot ask the store what a claim would put back: {_why(exc)}")
             return
@@ -781,7 +988,8 @@ class Daemon:
             task = (turn.claim or {}).get("task")
             if turn.claim and turn.claim.get("execution"):
                 try:
-                    self.host.settle_cut_off(turn.claim["execution"])
+                    self.ask(lambda conn, execution=turn.claim["execution"]:
+                             self.host.settle_cut_off(conn, execution), at_once=True)
                     settled = "settled as a lapsed lease"
                 except (Exception, SystemExit) as exc:
                     settled = f"not settled, so its lease lapses on its own: {_why(exc)}"

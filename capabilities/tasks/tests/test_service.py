@@ -243,6 +243,17 @@ class _AwayListener:
         pass
 
 
+class _AwayConnection:
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
 class _AwayHost:
     """A host whose store refuses a listener until `away` is cleared."""
 
@@ -253,19 +264,36 @@ class _AwayHost:
         self.away = True
         self.attempts: list[float] = []
 
+    def store_key(self):
+        return ("away", "5432", "tasks", "tasks", "prefer", "TASKS_DB_PASSWORD")
+
+    def store_name(self):
+        return "away:5432/tasks"
+
     def listen(self):
         self.attempts.append(time.monotonic())
         if self.away:
             raise mod.Refusal(5, "unreachable", "cannot reach the store: refused")
         return _AwayListener()
 
-    def notification_installed(self):
+    def open_query(self, _timeout):
+        if self.away:
+            raise mod.Refusal(5, "unreachable", "cannot reach the store: refused")
+        return _AwayConnection()
+
+    def lost(self, _conn, _exc):
+        return False
+
+    def ping(self, _conn):
+        pass
+
+    def notification_installed(self, _conn):
         return True
 
-    def next_moment(self):
+    def next_moment(self, _conn):
         return None
 
-    def sweep_due(self):
+    def sweep_due(self, _conn):
         return False
 
 
@@ -299,8 +327,8 @@ def test_a_listener_the_store_refuses_is_asked_for_again_on_a_doubling_interval(
         assert daemon.listener is not None
         assert "relisten" in daemon.last_wake["reasons"]
         assert daemon.status()["wake_by"] == "notification"
-        assert daemon.relisten_at is None
-        assert daemon.relisten_delay == service.RELISTEN_FIRST_SECONDS
+        assert daemon.store.relisten_at is None
+        assert daemon.store.relisten_delay == service.RELISTEN_FIRST_SECONDS
         assert "listening on tasks_claimable again" in (
             daemon.state_dir / "daemon.log").read_text()
     finally:
@@ -704,6 +732,13 @@ class Relay:
         self.port = 0
         self.up()
 
+    def refuse(self) -> None:
+        """Refuse new connections and leave the ones through it open, as a store
+        that stops accepting does."""
+        listener, self.listener = self.listener, None
+        if listener is not None:
+            listener.close()
+
     def up(self) -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -821,6 +856,201 @@ def test_the_daemon_outlives_the_store_going_away_and_listens_again(
         assert "listening on tasks_claimable again" in log
 
 
+# --- The connections it holds -----------------------------------------------
+
+def quick(h: Harness, **constants) -> Harness:
+    """Shorten the daemon's intervals, before it opens anything."""
+    first = constants.pop("first", 0.2)
+    h.service.RELISTEN_FIRST_SECONDS = first
+    h.service.RELISTEN_LONGEST_SECONDS = constants.pop("longest", 0.8)
+    for name, value in constants.items():
+        setattr(h.service, name, value)
+    h.daemon.store.relisten_delay = h.daemon.store.requery_delay = first
+    return h
+
+
+def gaps_of(moments: list[float]) -> list[float]:
+    return [round(b - a, 2) for a, b in zip(moments, moments[1:])]
+
+
+def backend(conn) -> int:
+    return conn.info.backend_pid
+
+
+@needs_store
+def test_every_question_goes_on_one_held_connection_beside_the_listener(
+        project, store, capsys, monkeypatch):
+    """Idle on a one-second poll with two lanes, the daemon opens its listener
+    and the connection its questions go on, and nothing else, however many
+    times it asks."""
+    entry, schema, conn = store
+    write_settings(project, "version = 1\npoll_seconds = 1\n")
+    opened = []
+    real = mod._connect
+
+    def counted(*args, **kwargs):
+        opened.append(time.monotonic())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "_connect", counted)
+    h = Harness(project, entry)
+    asked = []
+    lane_has_work = h.host.lane_has_work
+    h.host.lane_has_work = lambda c, worker, exclude=(): (
+        asked.append(backend(c)) or lane_has_work(c, worker, exclude))
+    with h:
+        h.settle(3.6)
+        store_ = h.daemon.store
+        held = {backend(store_.listener), backend(store_.query)}
+        assert len(opened) == 2 and len(held) == 2
+        # Start and three polls, each asking both lanes, all on the one connection.
+        assert len(asked) >= 6 and set(asked) == {backend(store_.query)}
+        assert "poll" in h.daemon.last_wake["reasons"]
+        [row] = h.daemon.status()["stores"]
+        assert row["store"] == f"{entry['db_host']}:{entry['db_port']}/{entry['db_name']}"
+        assert (row["listening"], row["connections_opened"], row["error"]) == (True, 2, None)
+        assert row["last_opened_at"]
+        live = conn.execute("select count(*) from pg_stat_activity where pid = any(%s)",
+                            (sorted(held),)).fetchone()[0]
+        assert live == 2
+
+
+@needs_store
+def test_a_lost_question_connection_is_asked_for_again_on_the_doubling_interval(
+        project, store, relay, capsys):
+    """The backend under the question connection is terminated while the store
+    takes no new connection: the daemon keeps its listener, asks for the other
+    at a doubling interval, and the moment it has it asks for the work it
+    missed."""
+    entry, schema, conn = store
+    write_settings(project, "version = 1\npoll_seconds = 3600\n")
+    through = {**entry, "db_host": "127.0.0.1", "db_port": str(relay.port)}
+    h = quick(Harness(project, through))
+    attempts = []
+    open_query = h.host.open_query
+    h.host.open_query = lambda seconds: attempts.append(time.monotonic()) or open_query(seconds)
+    with h:
+        h.daemon.step()
+        store_ = h.daemon.store
+        assert store_.connections_opened == 2 and len(attempts) == 1
+        listening = backend(store_.listener)
+        relay.refuse()
+        conn.execute("select pg_terminate_backend(%s)", (backend(store_.query),))
+        add(entry, capsys, "alpha")
+        h.steps(lambda: store_.query is None, seconds=5)
+        assert "notify" in h.daemon.last_wake["reasons"]
+        h.settle(3.0)
+        assert h.running() == 0
+        [row] = h.daemon.status()["stores"]
+        assert row["listening"] is True and row["error"]
+        # Asked again 0.2s after it was lost, then after 0.4s, then 0.8s from then on.
+        gaps = gaps_of(attempts[1:])
+        assert len(gaps) >= 3 and gaps[0] < gaps[1], gaps
+        assert 0.3 < gaps[0] < 0.6 and all(0.6 < gap < 1.2 for gap in gaps[1:]), gaps
+
+        relay.up()
+        h.steps(lambda: h.running("alpha") == 1, seconds=5)
+        assert "reconnect" in h.daemon.last_wake["reasons"]
+        assert store_.connections_opened == 3
+        assert backend(store_.listener) == listening
+        [row] = h.daemon.status()["stores"]
+        assert row["error"] is None
+        log = (h.daemon.state_dir / "daemon.log").read_text()
+        assert log.count("lost the store connection its questions go on") == 1
+        assert "connected to the store again for its questions" in log
+
+
+@needs_store
+def test_a_lost_listener_is_asked_for_again_on_the_doubling_interval(
+        project, store, relay, capsys):
+    entry, schema, conn = store
+    write_settings(project, "version = 1\npoll_seconds = 3600\n")
+    through = {**entry, "db_host": "127.0.0.1", "db_port": str(relay.port)}
+    h = quick(Harness(project, through))
+    attempts = []
+    listen = h.host.listen
+    h.host.listen = lambda: attempts.append(time.monotonic()) or listen()
+    with h:
+        h.daemon.step()
+        store_ = h.daemon.store
+        asking = backend(store_.query)
+        relay.refuse()
+        conn.execute("select pg_terminate_backend(%s)", (backend(store_.listener),))
+        h.steps(lambda: h.daemon.listener is None, seconds=5)
+        h.settle(3.0)
+        gaps = gaps_of(attempts[1:])
+        assert len(gaps) >= 3 and gaps[0] < gaps[1], gaps
+        assert 0.3 < gaps[0] < 0.6 and all(0.6 < gap < 1.2 for gap in gaps[1:]), gaps
+        assert h.daemon.status()["stores"][0]["listening"] is False
+
+        relay.up()
+        h.steps(lambda: h.daemon.listener is not None, seconds=5)
+        assert "relisten" in h.daemon.last_wake["reasons"]
+        add(entry, capsys, "beta")
+        took = h.steps(lambda: h.running("beta") == 1, seconds=5)
+        assert took < 3 and "notify" in h.daemon.last_wake["reasons"]
+        assert store_.connections_opened == 3
+        assert backend(store_.query) == asking
+        [row] = h.daemon.status()["stores"]
+        assert (row["listening"], row["error"]) == (True, None)
+
+
+@needs_store
+def test_a_question_that_hangs_is_cut_off_and_the_daemon_carries_on(project, store, capsys):
+    """A lock held on the tasks table holds every question about them: the
+    store cuts the question off at its timeout, the daemon's pass ends rather
+    than waiting for the lock, and once the lock is gone it is asking again on
+    a new connection and taking work."""
+    import psycopg
+    entry, schema, conn = store
+    write_settings(project, "version = 1\npoll_seconds = 3600\n")
+    h = quick(Harness(project, entry), QUESTION_TIMEOUT_SECONDS=1)
+    with h:
+        h.daemon.step()
+        store_ = h.daemon.store
+        blocker = psycopg.connect(DSN)
+        try:
+            blocker.execute(f"lock table {schema}.tasks in access exclusive mode")
+            h.daemon.wakes.add("notify")
+            started = time.monotonic()
+            h.daemon.step(wait=False)
+            took = time.monotonic() - started
+            assert 0.9 < took < 5, took
+            assert store_.query is None and h.running() == 0
+            log = (h.daemon.state_dir / "daemon.log").read_text()
+            assert "canceling statement due to statement timeout" in log
+            assert "'s work: QueryCanceled" in log
+        finally:
+            blocker.rollback()
+            blocker.close()
+        add(entry, capsys, "alpha")
+        h.steps(lambda: h.running("alpha") == 1, seconds=5)
+        assert store_.connections_opened == 3
+
+
+@needs_store
+def test_the_held_connections_carry_a_round_trip_on_the_ping_interval(
+        project, store, capsys):
+    entry, schema, conn = store
+    write_settings(project, "version = 1\npoll_seconds = 3600\n")
+    h = quick(Harness(project, entry), PING_SECONDS=0.5)
+    pings = []
+    ping = h.host.ping
+    h.host.ping = lambda c: pings.append((backend(c), time.monotonic())) or ping(c)
+    with h:
+        h.settle(2.7)
+        store_ = h.daemon.store
+        listener = [at for pid, at in pings if pid == backend(store_.listener)]
+        assert 4 <= len(listener) <= 6, listener
+        assert all(0.4 < gap < 0.8 for gap in gaps_of(listener)), gaps_of(listener)
+        # The question connection carries nothing on an hour's poll but its pings.
+        assert [pid for pid, _at in pings if pid == backend(store_.query)]
+        last = conn.execute("select query from pg_stat_activity where pid = %s",
+                            (backend(store_.listener),)).fetchone()[0]
+        assert last == "select 1"
+        assert store_.connections_opened == 2
+
+
 # --- The daemon, through the CLI ---------------------------------------------
 
 @pytest.fixture()
@@ -918,6 +1148,9 @@ def test_the_daemon_end_to_end_through_the_cli(lab):
     assert status["lanes"] == [{"worker": "alpha", "max_parallel": 1, "running": 0,
                                 "held_until_poll": False}]
     assert status["next_wake"]["reason"] == "poll" and status["current"] is True
+    [held] = status["stores"]
+    assert (held["listening"], held["connections_opened"], held["error"]) == (True, 2, None)
+    assert held["store"] and held["last_opened_at"]
 
     made = answer_of(tasks_cli(lab, "add", "--type", "alpha", "--title", "probe",
                                "--key", "t-probe", "--status", "todo"))

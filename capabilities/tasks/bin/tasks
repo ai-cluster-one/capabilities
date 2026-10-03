@@ -411,8 +411,8 @@ SERVICE
   tasks service resume [<worker>...]
                                   lift the pause, on every lane or on the named
                                   lanes
-  tasks service status            the lanes, the running turns, the pause and
-                                  the next wake
+  tasks service status            the lanes, the running turns, the pause, the
+                                  next wake and the store connections
   tasks service logs [--tail 100] the end of the service log
 
   One daemon per project runs the conveyor on its own. Every enabled worker that
@@ -438,12 +438,26 @@ SERVICE
   poll, with nothing else to start, a daemon that sees one due starts a turn
   whose claim puts it back.
 
+  The daemon holds two connections to the store for as long as it runs: one
+  it listens on, and one every question it asks the store goes on - whether a
+  lane would take something, whether a claim would put something back, the
+  next pickup, whether the store notifies, and bringing it up to this version.
+  Idle, it opens no other. The store cuts off any question that runs past 30s,
+  and the daemon counts that connection lost. Every 2 minutes the listener
+  carries a `select 1`, and so does the other when nothing else went over it
+  for as long, so a proxy in front of the store does not close either as idle.
+  Its turns are `tasks run` commands and open connections of their own.
+
   The daemon outlives the store being away. Its running turns are left to
-  finish, and it asks for the notification again after 1s, then at a doubling
-  interval of at most 30s, until the store answers; it then listens again and
-  asks the store for work at once. `service doctor` reports the store being
-  away as a warning while the daemon runs, so a supervisor probing it does not
-  restart the daemon and end its turns for an outage.
+  finish, and it asks for each connection it lost, or could not open, again
+  after 1s, then at a doubling interval of at most 30s, until the store
+  answers; with the connection back it asks the store for work at once.
+  `service status` shows, under `stores`, each store the daemon reaches: how
+  many connections it has opened to it since it started, when it last opened
+  one, whether it is listening, and the error that has it away, if any.
+  `service doctor` reports the store being away as a warning while the daemon
+  runs, so a supervisor probing it does not restart the daemon and end its
+  turns for an outage.
 
   The settings are capabilities/tasks/service/config.toml:
 
@@ -7554,15 +7568,20 @@ def _take_past_hooks(entry, worker: dict, base: dict, exclude: tuple) -> dict:
     return answer
 
 
-def _would_take(entry, worker: dict, key: str | None, exclude: tuple = ()) -> dict:
+def _would_take(entry, worker: dict, key: str | None, exclude: tuple = (),
+                conn=None) -> dict:
     """The task a claim would take, asked in the order the claim asks in, and
     writing nothing: no sweep, no raise, no status move.
 
     It answers for the claim that would follow, so it is bounded where that
-    claim is bounded - by the project, and not by what the store holds."""
+    claim is bounded - by the project, and not by what the store holds. It is
+    asked on `conn` when the caller holds one, and on a connection of its own
+    otherwise."""
+    import contextlib
     tz = _zone(entry)
     project = _writing_project()
-    with _connect(entry) as conn, conn.cursor() as cur:
+    held = contextlib.nullcontext(conn) if conn is not None else _connect(entry)
+    with held as conn, conn.cursor() as cur:
         take = None
         if key:
             tid = _task_id(cur, key, writing=True)
@@ -8892,12 +8911,13 @@ def _watch_behind(catalog: dict) -> list[str]:
     return _triggers_absent(catalog, _WATCH_TRIGGERS)
 
 
-def _service_sweep_due(entry) -> bool:
+def _service_sweep_due(conn) -> bool:
     """Whether a claim in this project would put something back: a raise whose
     lease has passed, or a waiting task whose wait is over. Neither is announced
-    by a write, and only a claim acts on either, so the service starts one."""
+    by a write, and only a claim acts on either, so the service starts one.
+    Asked on the service's connection, `conn`."""
     project = _writing_project()
-    with _connect(entry) as conn, conn.cursor() as cur:
+    with conn.cursor() as cur:
         cur.execute(f"""select 1 from {SCHEMA}.task_executions e
                           join {SCHEMA}.tasks t on t.id = e.task_id
                          where t.project_id = %s and e.status = 'running'
@@ -8914,13 +8934,13 @@ def _service_sweep_due(entry) -> bool:
     return any(_wait_over(task, ended) for task in waiting)
 
 
-def _service_next_moment(entry) -> float | None:
+def _service_next_moment(conn) -> float | None:
     """Seconds until the earliest moment work of this project falls due without
     anybody writing: a pickup still ahead on a task in todo or waiting, or a
     lease still running. None when there is none. The store's clock decides, as
-    it does for every pickup."""
+    it does for every pickup. Asked on the service's connection, `conn`."""
     project = _writing_project()
-    with _connect(entry) as conn, conn.cursor() as cur:
+    with conn.cursor() as cur:
         cur.execute(f"""select extract(epoch from (min(at) - now()))::float8 as seconds
                           from (select pickup_at as at from {SCHEMA}.tasks
                                  where project_id = %s and status in ('todo', 'waiting')
@@ -8935,12 +8955,13 @@ def _service_next_moment(entry) -> float | None:
     return row["seconds"] if row and row["seconds"] is not None else None
 
 
-def _settle_cut_off(entry, execution: str) -> list[str]:
+def _settle_cut_off(conn, execution: str) -> list[str]:
     """Settle the raise of a turn the service ended the way a lapsed lease is
     settled: its lease is made to have passed, and the sweep every claim runs
-    closes it as abandoned and puts its task back."""
+    closes it as abandoned and puts its task back. Written on the service's
+    connection, `conn`."""
     project = _writing_project()
-    with _connect(entry) as conn, conn.cursor() as cur:
+    with conn.cursor() as cur:
         cur.execute(f"""update {SCHEMA}.task_executions
                            set lease_until = now() - interval '1 second',
                                detail = coalesce(detail, 'cut off when the service stopped')
@@ -8951,7 +8972,9 @@ def _settle_cut_off(entry, execution: str) -> list[str]:
 
 
 class _ServiceHost:
-    """What the daemon asks of this project, answered by this executable."""
+    """What the daemon asks of this project, answered by this executable. The
+    daemon holds the connections; every question here is asked on the one it
+    hands in."""
 
     channel = CLAIMABLE_CHANNEL
 
@@ -8972,6 +8995,18 @@ class _ServiceHost:
     def load(self) -> dict:
         return _service_declaration()
 
+    def store_key(self) -> tuple:
+        """Which store the connection reaches, as the pool tells stores apart:
+        host, port, database, user, sslmode and the name of the secret's key.
+        Every value here is non-secret."""
+        return (_conf(self.entry, "db_host"), _conf(self.entry, "db_port", "5432"),
+                _conf(self.entry, "db_name"), _conf(self.entry, "db_user"),
+                _conf(self.entry, "db_sslmode", "prefer"), _secret_key(self.entry))
+
+    def store_name(self) -> str:
+        host, port, database = self.store_key()[:3]
+        return f"{host}:{port}/{database}"
+
     def listen(self):
         """A connection listening on the channel. The daemon keeps asking while
         the store is away, so a store it cannot reach is raised to it rather
@@ -8985,29 +9020,56 @@ class _ServiceHost:
             raise
         return conn
 
-    def notification_installed(self) -> bool:
-        with _connect(self.entry) as conn, conn.cursor() as cur:
+    def open_query(self, timeout_seconds: float):
+        """The connection the daemon's questions go on, each statement on it cut
+        off by the store after `timeout_seconds`. Raised to the daemon, like the
+        listener, when the store cannot be reached."""
+        conn = _connect(self.entry, raising=True)
+        try:
+            conn.execute("select set_config('statement_timeout', %s, false)",
+                         (str(int(timeout_seconds * 1000)),))
+            conn.commit()
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    @staticmethod
+    def ping(conn) -> None:
+        conn.execute("select 1")
+
+    @staticmethod
+    def lost(conn, exc: BaseException) -> bool:
+        """Whether `exc`, raised by a question on `conn`, leaves the connection
+        unfit to ask the next one: it is closed or broken, or the store refused
+        the statement as an operational failure - a statement cut off by its
+        timeout among them."""
+        import psycopg
+        return bool(conn.closed or conn.broken or isinstance(exc, psycopg.OperationalError))
+
+    def notification_installed(self, conn) -> bool:
+        with conn.cursor() as cur:
             catalog = _catalog(cur, SCHEMA)
             return "tasks" in catalog["tables"] and not _notify_behind(catalog)
 
-    def catch_up(self) -> dict | None:
+    def catch_up(self, conn) -> dict | None:
         """Bring the store up to this version when it is behind by additive
         changes only, as a command does before it is served; what was applied,
         or None."""
-        with _connect(self.entry, raising=True) as conn:
-            return _catch_up(conn, SCHEMA, self.project)
+        return _catch_up(conn, SCHEMA, self.project)
 
-    def lane_has_work(self, worker: dict, exclude: tuple = ()) -> bool:
+    def lane_has_work(self, conn, worker: dict, exclude: tuple = ()) -> bool:
         # The store's answer alone: a worker's `before` hook is asked by the turn
         # this starts, and a turn its hook let take nothing holds the lane until
         # the poll, as any turn that took nothing does.
-        return _would_take(self.entry, worker, None, exclude)["would_claim"] is not None
+        return _would_take(self.entry, worker, None, exclude,
+                           conn=conn)["would_claim"] is not None
 
-    def sweep_due(self) -> bool:
-        return _service_sweep_due(self.entry)
+    def sweep_due(self, conn) -> bool:
+        return _service_sweep_due(conn)
 
-    def next_moment(self) -> float | None:
-        return _service_next_moment(self.entry)
+    def next_moment(self, conn) -> float | None:
+        return _service_next_moment(conn)
 
     def turn_command(self, worker: str) -> list[str]:
         """Exactly `tasks run <worker> --apply`, by this executable under this
@@ -9026,8 +9088,8 @@ class _ServiceHost:
         env.pop(_EXCLUDE_ENV, None)
         return env
 
-    def settle_cut_off(self, execution: str) -> list[str]:
-        return _settle_cut_off(self.entry, execution)
+    def settle_cut_off(self, conn, execution: str) -> list[str]:
+        return _settle_cut_off(conn, execution)
 
     def kill_tree(self, pids) -> set:
         from callva.harness_runner.tree import kill_tree
@@ -9066,7 +9128,7 @@ def _service_status(module) -> dict:
               "state_dir": str(state), "log_file": str(state / module.LOG_FILE)}
     published = module.read_status(state) if running else None
     if published:
-        for key in ("started_at", "wake_by", "notification", "poll_seconds",
+        for key in ("started_at", "wake_by", "notification", "stores", "poll_seconds",
                     "max_parallel", "shutdown_grace_seconds", "retry_delay_seconds",
                     "lanes", "idle", "turns", "deferred", "next_wake", "last_wake",
                     "reload_error", "stopping"):
