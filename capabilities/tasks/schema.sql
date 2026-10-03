@@ -216,6 +216,11 @@ comment on column tasks.task_executions.run_ref is
 create index if not exists task_executions_task_idx
   on tasks.task_executions (task_id, started_at desc);
 
+-- A run is looked up by the handle its own system knows it by, to find the task
+-- it ran for.
+create index if not exists task_executions_run_idx
+  on tasks.task_executions (run_system, run_ref);
+
 -- Two workers cannot hold one task, because the store refuses the second row
 -- rather than because a dispatcher promised to take one at a time.
 create unique index if not exists task_executions_one_open_idx

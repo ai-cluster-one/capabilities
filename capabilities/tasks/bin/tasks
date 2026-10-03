@@ -39,6 +39,10 @@ READING
                                   the filters `list` takes. Answers no rows
   tasks runs <task>               every raise of it: what held it, how long,
                                   and what came of each
+  tasks runs --run SYSTEM:REF [--run ...] [--since WHEN]
+             [--project ID | --all-projects]
+                                  the raises those runs were, with the task
+                                  each ran for, in one call. See RUNS
   tasks history <task> [--field F]   how its status, pickup, type and assignee
                                   moved, and what caused each move
   tasks watch [--project ID | --all-projects]
@@ -1041,6 +1045,33 @@ ACTIVITY
   `show` always returns a task together with its whole activity trail, oldest
   first, so what was done is read in the same breath as what is to be done.
 
+RUNS
+  tasks runs <task>
+  tasks runs --run SYSTEM:REF [--run SYSTEM:REF ...] [--since WHEN]
+             [--project ID | --all-projects]
+
+  The first form answers every raise of one task. The second goes the other
+  way: from runs a harness or a scheduler knows by its own handle to the raises
+  they were and the task each ran for, for many runs in one call. A raise names
+  its run as `run_system` and `run_ref` - a claude raise from its claim, a
+  codex raise once it is closed - so a session id is asked for as
+  `--run claude:<session id>`.
+
+  --run SYSTEM:REF      repeats; a raise matches when it names exactly that run
+  --since WHEN          raises started at or after it that name a run at all.
+                        A bare date or a full moment, read the way --pickup is
+  --project ID          the scope, as `list` takes it: unsaid, the project the
+  --all-projects        command runs in; `--all-projects` reads every project
+                        in the store and works outside a project
+
+  Give `--run`, `--since` or both; given together, both narrow. The answer is
+  `{"runs": [...]}`, oldest raise first, one row per raise:
+    execution, task_id, project_id, unique_key, title, worker, status,
+    started_at, ended_at, run_system, run_ref
+  A run no raise in scope names answers no row and is not an error, so a caller
+  asking about many runs reads which matched from the rows. The call is one
+  query on one connection however many runs it names.
+
 WATCH
   tasks watch [--project ID | --all-projects] [--json]
 
@@ -1122,10 +1153,10 @@ STORE
   A store behind this version is brought up to it by the first command that
   reaches it, read or write, and by the service when it starts listening and at
   every poll, when everything it lacks is additive: a table, a column that is
-  empty or defaulted, a trigger and the function it runs. It is applied under a
-  lock the store holds for the schema, and the store is read again once the
-  lock is held, so of several clients that find it behind together one applies
-  it and the rest are served as soon as it has. A command reports it as one
+  empty or defaulted, an index, a trigger and the function it runs. It is
+  applied under a lock the store holds for the schema, and the store is read
+  again once the lock is held, so of several clients that find it behind
+  together one applies it and the rest are served as soon as it has. A command reports it as one
   line on stderr before its answer,
     {"migrated": {"schema": S, "created": [TABLE...], "added": [TABLE.THING...]}}
   and the service writes it to its log.
@@ -8589,16 +8620,65 @@ def cmd_run(entry, args: list[str]) -> None:
 def cmd_runs(entry, args: list[str]) -> None:
     """Every raise of one task, oldest first: what held it, how long, and what
     came of it. Kept out of `show` on purpose - a worker reading a task to act on
-    it needs the trail, and bookkeeping in the same payload competes with it."""
-    opts = _flags(args, (), takes=1)
+    it needs the trail, and bookkeeping in the same payload competes with it.
+
+    Given runs or a period instead of a task, it answers the other way round."""
+    opts = _flags(args, ("run", "since", "project"), multi=("run",),
+                  bools=("all-projects",), takes=1)
+    if opts.get("run") or opts.get("since"):
+        if opts["_loose"]:
+            _die(6, "input", "runs takes a task, or --run and --since, not both",
+                 f"{NAME} runs <task> | {NAME} runs --run <system>:<handle>")
+        return _runs_by_ref(entry, opts)
+    if opts.get("project") or opts.get("all-projects"):
+        _die(6, "input", "--project and --all-projects scope --run and --since",
+             f"{NAME} runs --all-projects --run <system>:<handle>")
     if not opts["_loose"]:
-        _die(6, "input", "runs needs a task", f"{NAME} runs <uuid|unique_key>")
+        _die(6, "input", "runs needs a task, or --run or --since",
+             f"{NAME} runs <uuid|unique_key> | {NAME} runs --run <system>:<handle>")
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, opts["_loose"][0])
         cur.execute(f"""select * from {SCHEMA}.task_executions where task_id = %s
                          order by started_at asc""", (tid,))
         rows = _rows(cur)
     _emit({"task": tid, "attempts": len(rows), "executions": rows})
+
+
+def _runs_by_ref(entry, opts: dict) -> None:
+    """The raises that name the runs asked for, or that name any run and started
+    in the period, each with the task it ran for. One query, so a caller holding
+    many handles never pays a round trip per handle; a handle that matches
+    nothing is simply absent from the rows."""
+    systems, refs = [], []
+    for run in opts.get("run", []):
+        system, _, ref = str(run).partition(":")
+        if not system or not ref:
+            _die(6, "input", "--run names the system and the handle",
+                 "--run claude:<session id>, --run <system>:<handle>")
+        systems.append(system); refs.append(ref)
+    # The scope `list` reads, and only that: the other filters are about tasks.
+    scope = {k: opts[k] for k in ("project", "all-projects") if opts.get(k)}
+    where, params = _where(scope)
+    clauses = [where.removeprefix(" where ").replace("project_id", "t.project_id")] \
+        if where else []
+    clauses.append("e.run_ref is not null")
+    if systems:
+        clauses.append("(e.run_system, e.run_ref) in "
+                       "(select * from unnest(%s::text[], %s::text[]))")
+        params += [systems, refs]
+    if opts.get("since"):
+        clauses.append("e.started_at >= %s")
+        params.append(_moment(opts["since"], _zone(entry)))
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"""select e.id as execution, t.id as task_id, t.project_id,
+                               t.unique_key, t.title, e.worker, e.status,
+                               e.started_at, e.ended_at, e.run_system, e.run_ref
+                          from {SCHEMA}.task_executions e
+                          join {SCHEMA}.tasks t on t.id = e.task_id
+                         where {" and ".join(clauses)}
+                         order by e.started_at asc, e.id asc""", params)
+        rows = _rows(cur)
+    _emit({"runs": rows})
 
 
 def cmd_history(entry, args: list[str]) -> None:
@@ -11046,6 +11126,10 @@ _CONSTRAINTS = (("tasks", "tasks_status_check", "waiting"),)
 _KEY_INDEX = ("tasks", "tasks_project_unique_key_idx")
 _STORE_WIDE_KEY = "tasks_unique_key_key"
 
+# Indexes a later version added to a table an earlier one created, each added
+# beside what is there, so a store without one reads as behind and catches up.
+_INDEXES = (("task_executions", "task_executions_run_idx"),)
+
 
 def _bundle_dir() -> Path:
     executable = Path(__file__).resolve()
@@ -11134,6 +11218,12 @@ def _constraints_behind(catalog: dict) -> list[str]:
             and f"'{value}'" not in (defined.get((table, name)) or "")]
 
 
+def _indexes_absent(catalog: dict) -> list[str]:
+    """Later indexes missing from tables that are present, as table.index."""
+    return [f"{t}.{i}" for t, i in _INDEXES
+            if t in catalog["tables"] and (t, i) not in catalog["indexes"]]
+
+
 def _key_scope_behind(catalog: dict) -> list[str]:
     """The per-project key index, as table.index, when the store still keys
     tasks across the whole store or does not yet key them per project."""
@@ -11150,6 +11240,7 @@ def _behind(catalog: dict) -> tuple[list[str], list[str]]:
     what it would add to the tables it has, as table.thing."""
     missing = [t for t in _TABLES if t not in catalog["tables"]]
     lacking = (_columns_absent(catalog) + _constraints_behind(catalog)
+               + _indexes_absent(catalog)
                + _key_scope_behind(catalog) + _notify_behind(catalog)
                + _watch_behind(catalog))
     return missing, lacking
@@ -11159,9 +11250,9 @@ def _behind(catalog: dict) -> tuple[list[str], list[str]]:
 # changes what the store already holds rather than adding beside it: the project
 # column is filled into every row that predates it and then required, the status
 # check is replaced, and the store-wide key is dropped. Everything else it names -
-# a table, a column that is empty or defaulted, a trigger and the function it
-# runs - is added beside what is there, writes no row, and is undone by dropping
-# it. A later change that fills, replaces or drops is named here as it lands.
+# a table, a column that is empty or defaulted, an index, a trigger and the
+# function it runs - is added beside what is there, writes no row, and is undone
+# by dropping it. A later change that fills, replaces or drops is named here as it lands.
 _NOT_ADDITIVE = frozenset(["tasks.project_id",
                            *(f"{t}.{n}" for t, n, _value in _CONSTRAINTS),
                            f"{_KEY_INDEX[0]}.{_KEY_INDEX[1]}"])
