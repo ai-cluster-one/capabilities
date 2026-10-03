@@ -1,5 +1,17 @@
 # coolify — change log
 
+## 2026-10-04 — Pair an instance with `coolify connect`; no secret on the command line or in output
+
+`coolify connect <name> --url <url> (--token-stdin | --token-file <path> | --token-env <KEY>) [--global | --project] [--default] [--ssh-key <path>]` pairs an instance in one act: it writes the connection entry with non-secret values only - `base_url`, `secret_env` (`COOLIFY_<NAME>_TOKEN`) and, with `--ssh-key`, `ssh` with `user: root` and `key_path` - and writes the token to the credentials file of the same scope at mode 0600, the project's `.env.local` under `--project` (the default) or `~/.config/coolify/credentials.env` under `--global`, keeping every other entry and line. It never prints the token, and it ends with the doctor probe; a failed probe keeps what was written and exits 2 or 5. `--token-env` resolves the key through the same files and environment a verb reads it from, so re-pairing on a new URL reads the token already written. Run `coolify help` for the contract.
+
+Three changes reach existing callers:
+
+- Output redacts passwords. Every answer replaces the password in a connection URL with `<redacted>` (`postgres://app:<redacted>@host:5432/app`) and the value of every field whose name contains `password` - `database create`'s `internal_db_url` and `external_db_url` and `databases <uuid>`'s `postgres_password` among them. `--reveal` on the reads and on `database create` prints them in full, only to a terminal; without one it exits 4 `reveal_needs_terminal` before any request.
+- A secret on the command line is deprecated for one release, with a warning on stderr, and goes in the next: `database create --set` or `--set-json` on a password field, which now takes `--set-stdin KEY`, `--set-file KEY=PATH` or `--set-env KEY=ENV_KEY`; and `env set`'s positional VALUE, which now takes `--value-stdin`, `--value-file <path>` or `--value-env <ENV_KEY>`, or standard input when none is given.
+- `projects create <name>` takes the name as its argument. `projects create --name <name>`, and the form with a uuid in front of `create`, keep working for one release with a warning.
+
+`env set` without a value now reads standard input whole, one trailing newline dropped, and reads the terminal without echo only when standard input is one; it read the controlling terminal before even when a value was piped in. An `--set-json` value that is not JSON is no longer echoed in the refusal.
+
 ## 2026-10-04 — A bootstrap guide from a fresh server to a paired instance
 
 `coolify guide bootstrap` takes a setup session from a fresh server reachable as root over SSH to a Coolify instance this machine is paired with: installing Coolify with its root user, minting the API token and handing it to `coolify connect` on standard input, holding auto-update on, serving the instance over HTTPS with its direct ports closed, the git deploy source, a Postgres with TLS enforced ending in `capabilities store set`, application health checks on 127.0.0.1, and reading credentials files with a parser. Each step carries its check and the pitfall that bites there. It was proven against Coolify 4.3.23 and marks the steps that use Coolify internals, to be rechecked on another version. No verb changes.

@@ -1,0 +1,5 @@
+{
+  "uuid": "<db-uuid>",
+  "internal_db_url": "postgres://app:Fx7pQ2LmW9zR@<db-uuid>:5432/postgres",
+  "external_db_url": "postgres://app:Fx7pQ2LmW9zR@<server-ip>:54321/postgres"
+}

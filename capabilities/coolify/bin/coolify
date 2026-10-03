@@ -45,6 +45,8 @@ CONNECTIONS
   names the env var holding its token ("secret_env"); the value resolves through
   cascade tiers 2-4 above. "base_url" sits literally in the entry.
 
+  `coolify connect` (below) writes one entry and its token in one act.
+
   Selection: --connection <id> (accepted anywhere on the command line).
   Unflagged, the registry's "default" pointer applies, else the sole entry;
   several entries without a pointer is refused as ambiguous.
@@ -60,6 +62,32 @@ COMMANDS
       Where every connection's values resolve from (tier, source, secrets
       masked). Local only — no network.
 
+  connect <name> --url <url> (--token-stdin | --token-file <path> |
+                              --token-env <KEY>)
+          [--global | --project] [--default] [--ssh-key <path>]
+      Pair an instance: write the connection entry and its token in one act,
+      then run the doctor probe on it. The entry holds only non-secret values:
+      "base_url", "secret_env" (COOLIFY_<NAME>_TOKEN, the key holding the
+      token) and, with --ssh-key, "ssh": {"user": "root", "key_path": <path>}
+      for reaching the instance's servers. The token is written to the
+      credentials file of the same scope, mode 0600, single-quoted so the
+      parser reads it back whole: --project (the default) writes the
+      project's capabilities/coolify/connections.json and the project's
+      .env.local; --global writes ~/.config/coolify/connections.json and
+      ~/.config/coolify/credentials.env. Other entries and other lines are
+      kept; an existing entry of the same name is replaced, its grant fields
+      kept. --default points the scope's default at it. --url is the instance
+      root, http(s)://host[:port], without /api/v1. --token-stdin reads the
+      token from standard input (no echo on a terminal), --token-file from a
+      file, --token-env resolves an env key through the cascade above. The
+      token is never printed. Answers the entry's paths and the probe's
+      result (version, team, abilities); a failed probe keeps the entry and
+      the token and exits with the probe's category (2 or 5), so a fix needs
+      `coolify --connection <name> doctor`, not a second pairing. A global
+      connection used inside a project still needs that project's grant; the
+      answer says so with the command. Repeating it is safe: it rewrites the
+      same entry and the same line.
+
   doctor [--connection <id>]
       Validate token + reachability (GET /version, GET /teams/current), report
       the Coolify version, token team, and effective token abilities — every
@@ -69,9 +97,10 @@ COMMANDS
 
   projects [<uuid>]
       List projects, or get one project (its environments come inside it).
-  projects create --name <name> [--description <text>]
+  projects create <name> [--description <text>]
       Create a new project. Returns the project_uuid and default environment.
-      Write verb - requires allow_write.
+      `projects create --name <name>` still works for one release, with a
+      warning on stderr. Write verb - requires allow_write.
   resources
       Flat list of every deployable resource (uuid, name, type, status) —
       the lookup an agent runs to find the uuid to act on.
@@ -135,8 +164,14 @@ COMMANDS
       Every other body field is a pass-through, applied after the named flags:
         --set KEY=VALUE       sends VALUE as a JSON string
         --set-json KEY=JSON   sends a parsed JSON value (boolean, number, array)
-      Both repeat. The capability sends these names and values as given and
-      validates neither against the engine — Coolify answers an unknown or
+      Both repeat. A secret field takes its value off the command line:
+        --set-stdin KEY       reads VALUE from standard input (once)
+        --set-file KEY=PATH   reads VALUE from a file
+        --set-env KEY=ENV_KEY reads VALUE from an env key (cascade above)
+      each sent as a JSON string. --set or --set-json on a password field
+      (any name containing "password") still works for one release, with a
+      warning on stderr. The capability sends these names and values as given
+      and validates neither against the engine — Coolify answers an unknown or
       malformed field with 422 naming it. The engine credentials and tuning live
       here and differ per engine (postgres_user/postgres_password/postgres_db,
       mysql_root_password, mariadb_database, mongo_initdb_root_username,
@@ -144,10 +179,9 @@ COMMANDS
       and their neighbours), next to the fields every engine shares (is_public,
       public_port, tags, the limits_* set). Coolify wants each *_conf field
       base64-encoded, and silently drops is_public when public_port is absent.
-      A value passed this way sits in the process argument list, so treat a
-      credential set that way as exposed locally.
       Returns the database uuid, with internal_db_url on every engine except
-      dragonfly, and external_db_url only on a public database.
+      dragonfly, and external_db_url only on a public database, their
+      passwords redacted (see SECRETS); --reveal prints them to a terminal.
       Write verb - requires allow_write.
 
   deploy <uuid> [--force] [--tag T]
@@ -163,14 +197,27 @@ COMMANDS
       List environment variables for an application or service. Every row has
       `value_hidden`; true means Coolify redacted the value (normally because
       the token lacks effective read:sensitive access), not that it is empty.
-  env set <uuid> <KEY> <VALUE> [--type application|service]
-      Set or update an environment variable. For secrets, omit VALUE to read
-      from stdin (one line, no echo). Write verb - requires allow_write.
+  env set <uuid> <KEY> [--value-stdin | --value-file <path> |
+                        --value-env <ENV_KEY>] [--type application|service]
+      Set or update an environment variable. The value comes from standard
+      input (the default, no echo on a terminal, one trailing newline
+      dropped), a file, or an env key resolved through the cascade above.
+      `env set <uuid> <KEY> <VALUE>` still works for one release, with a
+      warning on stderr. Write verb - requires allow_write.
   env rm <uuid> <KEY> [--type application|service]
       Remove an environment variable. Write verb - requires allow_write.
   env bulk <uuid> [--type application|service]
       Bulk update environment variables (PATCH). Reads KEY=VALUE pairs from
       stdin, one per line. Write verb - requires allow_write.
+
+SECRETS
+  A secret never goes on the command line: every verb that takes one reads it
+  from standard input, a file or an env key. Nothing prints one: every answer
+  redacts the password in a connection URL (scheme://user:<redacted>@host) and
+  the value of every field whose name contains "password". --reveal, on the
+  reads (projects, resources, applications, services, databases, servers,
+  deployments, logs, env list) and on database create, prints them in full,
+  and is refused with exit 4 unless stdout is a terminal.
 
 Contract commands (the same on every capability):
   coolify stub                                 One-line awareness text.
@@ -186,8 +233,8 @@ Contract commands (the same on every capability):
 EXIT CODES
   0 success · 2 auth/credentials (401/403, missing token) · 3 not found (404) ·
   4 policy refusal — the project gate (capabilities/settings.json) on any
-  verb, or a write verb on a read-only connection; ask the user, never lift a
-  gate yourself · 5 server/network (timeout, 429 after retries, 5xx) ·
+  verb, a write verb on a read-only connection, or --reveal without a
+  terminal; ask the user, never lift a gate yourself · 5 server/network (timeout, 429 after retries, 5xx) ·
   6 input (a malformed argument, an unknown/ambiguous connection)
 """
 
@@ -196,6 +243,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -4319,17 +4367,53 @@ def _database_overrides(args) -> dict:
         key, sep, value = raw.partition("=")
         if not sep or not key:
             _die(6, "input", f"--set expects KEY=VALUE, got {raw!r}")
+        _warn_argv_secret("--set", key)
         payload[key] = value
     for raw in getattr(args, "set_json", None) or []:
         key, sep, value = raw.partition("=")
         if not sep or not key:
             _die(6, "input", f"--set-json expects KEY=JSON, got {raw!r}")
+        _warn_argv_secret("--set-json", key)
         try:
             payload[key] = json.loads(value)
         except ValueError:
             _die(6, "input",
-                 f"--set-json value for {key!r} is not JSON: {value!r}",
+                 f"--set-json value for {key!r} is not JSON",
                  "quote a JSON literal, for example --set-json is_public=true")
+    return payload
+
+
+def _warn_argv_secret(flag: str, key: str) -> None:
+    if _is_password_field(key):
+        _warn(f"{flag} {key}=... puts a secret on the argument list; this form "
+              "is deprecated and goes in the next release; use --set-stdin "
+              f"{key}, --set-file {key}=<path> or --set-env {key}=<ENV_KEY>")
+
+
+def _database_secret_fields(args, taken: dict) -> dict:
+    """Body fields whose values come from stdin, a file or an env key, so a
+    password never sits on the argument list. Sent as strings, unvalidated,
+    like --set."""
+    payload: dict = {}
+    stdin_keys = getattr(args, "set_stdin", None) or []
+    if len(stdin_keys) > 1:
+        _die(6, "input", "--set-stdin is given once: standard input carries one value",
+             "read the others with --set-file KEY=PATH or --set-env KEY=ENV_KEY")
+    sources = [(key, "--set-stdin", {"stdin": True}) for key in stdin_keys]
+    for flag, attr, kind in (("--set-file", "set_file", "file"),
+                             ("--set-env", "set_env", "env")):
+        for raw in getattr(args, attr, None) or []:
+            key, sep, source = raw.partition("=")
+            if not sep or not key or not source:
+                _die(6, "input", f"{flag} expects KEY={'PATH' if kind == 'file' else 'ENV_KEY'}, got {raw!r}")
+            sources.append((key, flag, {kind: source}))
+    for key, flag, source in sources:
+        if not key:
+            _die(6, "input", f"{flag} expects a field name")
+        if key in taken or key in payload:
+            _die(6, "input", f"field {key!r} is given twice",
+                 "give each body field one source")
+        payload[key] = _secret_from(f"{flag} {key}", **source)
     return payload
 
 
@@ -4357,7 +4441,9 @@ def cmd_database_create(c, args):
         payload["destination_uuid"] = args.destination
     if args.instant_deploy:
         payload["instant_deploy"] = True
-    payload.update(_database_overrides(args))
+    overrides = _database_overrides(args)
+    payload.update(overrides)
+    payload.update(_database_secret_fields(args, overrides))
 
     return _request(c, "POST", f"/databases/{args.engine}", json_body=payload)
 
@@ -4423,6 +4509,321 @@ def _add_app_patch_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+# ── secrets: in from stdin, a file or an env key; out redacted ──────────────
+#
+# A secret never rides on argv, where process lists and shell history keep it,
+# and nothing this capability prints carries one unless a person at a terminal
+# asks for it with --reveal. The argv forms that existed before keep working
+# for one release, with a warning on stderr.
+
+REDACTED = "<redacted>"
+
+# scheme://user:password@ — the password is the run up to the first `@`.
+_URL_PASSWORD_RE = re.compile(
+    r"(?P<head>[A-Za-z][A-Za-z0-9+.\-]*://[^\s:/?#@]+:)(?P<password>[^\s@]+)(?P<at>@)")
+
+
+def _is_password_field(key) -> bool:
+    return isinstance(key, str) and "password" in key.lower()
+
+
+def _redact(value):
+    """The same value with every password in a connection URL, and every
+    password-named field, replaced by REDACTED. Shape is kept, so a caller can
+    still tell a redacted value from an absent one."""
+    if isinstance(value, dict):
+        return {k: (REDACTED if _is_password_field(k) and isinstance(v, str) and v
+                    else _redact(v))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    if isinstance(value, str):
+        return _URL_PASSWORD_RE.sub(
+            lambda m: m.group("head") + REDACTED + m.group("at"), value)
+    return value
+
+
+def _reveal_gate(reveal: bool) -> None:
+    """--reveal prints secrets, so it prints them only where a person reads
+    them: a terminal. Refused before any request is made."""
+    if reveal and not sys.stdout.isatty():
+        _die(4, "reveal_needs_terminal",
+             "--reveal prints passwords in full and does so only to a terminal; "
+             "stdout here is not one",
+             "Do not work around this — read the redacted answer, or ask the "
+             "user to run the command with --reveal in their own terminal.")
+
+
+def _emit_domain(value, reveal: bool = False) -> None:
+    _emit(value if reveal else _redact(value))
+
+
+def _warn(message: str) -> None:
+    sys.stderr.write(json.dumps({"warning": message}, ensure_ascii=False) + "\n")
+
+
+def _strip_one_newline(text: str) -> str:
+    if text.endswith("\r\n"):
+        return text[:-2]
+    if text.endswith("\n"):
+        return text[:-1]
+    return text
+
+
+def _read_stdin_secret() -> str:
+    """Standard input whole, less one trailing newline; without echo when it is
+    a terminal."""
+    if sys.stdin.isatty():
+        import getpass
+        return getpass.getpass("")
+    return _strip_one_newline(sys.stdin.read())
+
+
+def _read_file_secret(path: str, what: str) -> str:
+    try:
+        return _strip_one_newline(Path(path).expanduser().read_text())
+    except OSError as e:
+        _die(6, "input", f"cannot read {what} from {path}: {e.strerror or e}")
+
+
+def _read_env_secret(key: str, what: str) -> str:
+    """An env key resolves through the cascade every secret here resolves
+    through: project .env.local, .env, the user credentials.env, then the
+    process environment."""
+    value = _resolve_env_key(key)[0]
+    if not value:
+        _die(6, "input", f"env key {key} (for {what}) is not set",
+             f"set {key} in the project's .env.local or .env, {CREDENTIALS_ENV}, "
+             "or the environment")
+    return value
+
+
+def _secret_from(what: str, stdin: bool = False, file: str | None = None,
+                 env: str | None = None, allow_empty: bool = False) -> str:
+    """The one secret a flag group names, from exactly one source."""
+    if stdin:
+        value = _read_stdin_secret()
+    elif file is not None:
+        value = _read_file_secret(file, what)
+    else:
+        value = _read_env_secret(env, what)
+    if not value and not allow_empty:
+        _die(6, "input", f"{what} is empty")
+    return value
+
+
+def _env_set_value(args) -> str:
+    """env set's value: from --value-stdin, --value-file or --value-env, or
+    from standard input when none is named. The positional VALUE keeps working
+    for one release, with a warning."""
+    sources = (args.value_stdin, args.value_file is not None,
+               args.value_env is not None)
+    if args.value is not None:
+        if any(sources):
+            _die(6, "input", "env set was given its value twice",
+                 "drop the positional VALUE")
+        _warn("`env set <uuid> <KEY> <VALUE>` puts the value on the argument "
+              "list; this form is deprecated and goes in the next release; use "
+              "--value-stdin, --value-file <path> or --value-env <ENV_KEY>")
+        return args.value
+    if not any(sources):
+        return _secret_from(f"the value of {args.key}", stdin=True,
+                            allow_empty=True)
+    return _secret_from(f"the value of {args.key}", stdin=args.value_stdin,
+                        file=args.value_file, env=args.value_env,
+                        allow_empty=True)
+
+
+# ── connect: write a connection and its token in one act ───────────────────
+
+def _connection_env_key(name: str) -> str:
+    return "COOLIFY_" + re.sub(r"[^A-Z0-9]", "_", name.upper()) + "_TOKEN"
+
+
+def _connect_url(raw: str) -> str:
+    url = raw.strip().rstrip("/")
+    if not re.match(r"https?://[^/\s]+", url):
+        _die(6, "input", f"--url must be http(s)://<host>[:port], got {raw!r}",
+             "for example https://coolify.example.com")
+    if "@" in url.split("://", 1)[1].split("/", 1)[0]:
+        _die(6, "input", "--url must not carry credentials",
+             "the token comes from --token-stdin, --token-file or --token-env")
+    if url.endswith(API_VERSION):
+        _die(6, "input", f"--url is the instance root without {API_VERSION}",
+             f"use {url[:-len(API_VERSION)]}")
+    return url
+
+
+def _check_token_shape(token: str) -> str:
+    token = token.strip()
+    if not token:
+        _die(6, "input", "the token is empty")
+    if any(ch.isspace() for ch in token):
+        _die(6, "input", "the token holds whitespace or more than one line",
+             "hand connect the token alone, one line")
+    if "'" in token or '"' in token:
+        _die(6, "input", "the token holds a quote character, which no Coolify "
+             "token carries", "hand connect the token alone")
+    return token
+
+
+def _env_line_key(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    key = stripped.split("=", 1)[0].strip()
+    if key.startswith("export "):
+        key = key[len("export "):].strip()
+    return key
+
+
+def _write_env_key(path: Path, key: str, value: str) -> None:
+    """Set KEY in an env file, keeping every other line as it was.
+
+    The value is written single-quoted, which the contract's parser reads back
+    whole (a `|` included) and which a shell that sources the file anyway does
+    not split. The file is replaced atomically and left at mode 0600; the write
+    is proven by reading it back through the same parser every verb uses."""
+    lines = path.read_text().splitlines() if path.exists() else []
+    written = f"{key}='{value}'"
+    out, done = [], False
+    for line in lines:
+        if _env_line_key(line) == key:
+            if not done:
+                out.append(written)
+                done = True
+            continue
+        out.append(line)
+    if not done:
+        out.append(written)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write("\n".join(out) + "\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    os.chmod(path, 0o600)
+    if _parse_env_file(path).get(key) != value:
+        _die(5, "credentials_write_failed",
+             f"{path} does not read back the value written for {key}")
+
+
+def cmd_connect(args) -> None:
+    """Pair one Coolify instance: the entry, the token, then the doctor probe."""
+    if getattr(args, "token", None) or getattr(args, "base_url", None):
+        _die(6, "input", "connect takes its URL from --url and its token from "
+             "--token-stdin, --token-file or --token-env",
+             "drop the global --base-url/--token flags")
+    _read_only_gate(f"connect {args.name!r}")
+    name = args.name
+    if not KEY_RE.fullmatch(name):
+        _die(6, "input", f"connection name {name!r} must match {KEY_RE.pattern}")
+    url = _connect_url(args.url)
+    scope = args.scope or "project"
+    root = _project_root()
+    adapter = _records()
+    if scope == "project":
+        if root is None:
+            _die(6, "no_project", "--project pairs this project and there is no "
+                 "project here", "run it inside the project, or pass --global")
+        envelope = getattr(adapter, "envelope", None)
+        if envelope is not None and not Path(envelope).is_dir():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+    ssh = None
+    if args.ssh_key:
+        key_path = Path(args.ssh_key).expanduser().absolute()
+        if not key_path.is_file():
+            _die(6, "input", f"--ssh-key {args.ssh_key!r} is not a file")
+        ssh = {"user": "root", "key_path": str(key_path)}
+    token = _check_token_shape(_secret_from(
+        "the token", stdin=args.token_stdin, file=args.token_file,
+        env=args.token_env))
+
+    secret_env = _connection_env_key(name)
+    credentials = CREDENTIALS_ENV if scope == "global" else root / ".env.local"
+    _write_env_key(credentials, secret_env, token)
+    entry = {"base_url": url, "secret_env": secret_env}
+    if ssh:
+        entry["ssh"] = ssh
+    try:
+        adapter.set(NAME, "connection", name, entry, scope=scope)
+        if args.default:
+            adapter.set(NAME, "setting", "connection.default", name, scope=scope)
+        registry = adapter.scope_source(NAME, "connection", scope)
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+
+    probe = _check_connection({"id": name, "allow_write": WRITE_DEFAULT,
+                               "base_url": url, "token": token})
+    category = probe.pop("category", None)
+    out = {"ok": bool(probe.get("ok")), "connection": name, "scope": scope,
+           "base_url": url, "secret_env": secret_env,
+           "credentials": str(credentials), "registry": registry,
+           "default": bool(args.default)}
+    if ssh:
+        out["ssh"] = ssh
+    out["doctor"] = probe
+    granted = (_inventory_connections()["connections"].get(name) or {}).get("granted")
+    if granted is False:
+        out["usable_here"] = False
+        out["hint"] = _grant_hint(name)
+    _emit(out)
+    if not probe.get("ok"):
+        sys.exit(category or 5)
+
+
+# ── projects: list, get, create <name> ─────────────────────────────────────
+
+def _projects_call(operands: list, name_flag: str | None) -> tuple:
+    """(action, uuid, name) from `projects [<uuid>] | projects create <name>`.
+
+    The forms that went before - `--name` beside `create`, and a uuid in front
+    of `create` - keep working for one release, with a warning."""
+    legacy = ("`projects create --name <name>` is deprecated and goes in the "
+              "next release; use `projects create <name>`")
+    if not operands:
+        return "list", None, None
+    if operands[0] == "create":
+        if len(operands) > 2:
+            _die(6, "input", "projects create takes one name",
+                 "quote a name with spaces: coolify projects create \"<name>\"")
+        if len(operands) == 2:
+            name = operands[1]
+            if name_flag is not None and name_flag != name:
+                _die(6, "input", f"projects create was given two names: "
+                     f"{name!r} and --name {name_flag!r}",
+                     "pass the name once: coolify projects create <name>")
+            if name_flag is not None:
+                _warn(legacy)
+            return "create", None, name
+        if name_flag:
+            _warn(legacy)
+            return "create", None, name_flag
+        _die(6, "input", "projects create requires a name",
+             "coolify projects create <name>")
+    if len(operands) == 2 and operands[1] == "create":
+        if not name_flag:
+            _die(6, "input", "projects create requires a name",
+                 "coolify projects create <name>")
+        _warn(legacy)
+        return "create", None, name_flag
+    if len(operands) == 1:
+        return "get", operands[0], None
+    _die(6, "input", f"projects takes [<uuid>] or create <name>, got {' '.join(operands)!r}")
+
+
+def _add_reveal(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--reveal", action="store_true",
+        help="print passwords in full; refused unless stdout is a terminal")
+
+
 # ── dispatch ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -4441,24 +4842,41 @@ def main() -> None:
 
     sub.add_parser("help")
     sub.add_parser("doctor")
-    sub.add_parser("resources")
+    _add_reveal(sub.add_parser("resources"))
     sub.add_parser("sources")
 
-    # projects with create subcommand
+    sp = sub.add_parser("connect", help="write a connection and its token")
+    sp.add_argument("name")
+    sp.add_argument("--url", required=True)
+    token_source = sp.add_mutually_exclusive_group(required=True)
+    token_source.add_argument("--token-stdin", dest="token_stdin", action="store_true")
+    token_source.add_argument("--token-file", dest="token_file", default=None)
+    token_source.add_argument("--token-env", dest="token_env", default=None)
+    connect_scope = sp.add_mutually_exclusive_group()
+    connect_scope.add_argument("--global", dest="scope", action="store_const",
+                               const="global", default=None)
+    connect_scope.add_argument("--project", dest="scope", action="store_const",
+                               const="project")
+    sp.add_argument("--default", action="store_true")
+    sp.add_argument("--ssh-key", dest="ssh_key", default=None)
+
+    # projects [<uuid>] | projects create <name>
     sp = sub.add_parser("projects")
-    sp.add_argument("uuid", nargs="?", default=None)
-    sp.add_argument("subcmd", nargs="?", default=None, choices=["create"])
+    sp.add_argument("operands", nargs="*", metavar="<uuid> | create <name>")
     sp.add_argument("--name", default=None)
     sp.add_argument("--description", default=None)
+    _add_reveal(sp)
 
     for verb in ("applications", "services", "databases",
                  "servers", "deployments"):
         sp = sub.add_parser(verb)
         sp.add_argument("uuid", nargs="?", default=None)
+        _add_reveal(sp)
 
     sp = sub.add_parser("logs")
     sp.add_argument("uuid")
     sp.add_argument("--lines", type=int, default=100)
+    _add_reveal(sp)
 
     sp = sub.add_parser("deploy")
     sp.add_argument("uuid")
@@ -4549,6 +4967,19 @@ def main() -> None:
         "--set-json", dest="set_json", action="append", metavar="KEY=JSON",
         help="body field sent as parsed JSON, unvalidated; repeatable",
     )
+    sp_create.add_argument(
+        "--set-stdin", dest="set_stdin", action="append", metavar="KEY",
+        help="body field whose value is read from standard input; once",
+    )
+    sp_create.add_argument(
+        "--set-file", dest="set_file", action="append", metavar="KEY=PATH",
+        help="body field whose value is read from a file; repeatable",
+    )
+    sp_create.add_argument(
+        "--set-env", dest="set_env", action="append", metavar="KEY=ENV_KEY",
+        help="body field whose value is read from an env key; repeatable",
+    )
+    _add_reveal(sp_create)
 
     sp = sub.add_parser("env", help="manage application/service environment variables")
     env_sub = sp.add_subparsers(dest="env_cmd", required=True)
@@ -4557,12 +4988,17 @@ def main() -> None:
     sp_list.add_argument("uuid")
     sp_list.add_argument("--type", dest="rtype", default="application",
                         choices=["application", "service"])
+    _add_reveal(sp_list)
 
     sp_set = env_sub.add_parser("set", help="set environment variable")
     sp_set.add_argument("uuid")
     sp_set.add_argument("key")
     sp_set.add_argument("value", nargs="?", default=None,
-                        help="value (omit to read from stdin)")
+                        help="deprecated: puts the value on argv")
+    value_source = sp_set.add_mutually_exclusive_group()
+    value_source.add_argument("--value-stdin", dest="value_stdin", action="store_true")
+    value_source.add_argument("--value-file", dest="value_file", default=None)
+    value_source.add_argument("--value-env", dest="value_env", default=None)
     sp_set.add_argument("--type", dest="rtype", default="application",
                         choices=["application", "service"])
 
@@ -4582,6 +5018,16 @@ def main() -> None:
         sys.stdout.write((__doc__ or "").lstrip("\n")); return
     if args.cmd == "doctor":
         cmd_doctor(args); return
+    if args.cmd == "connect":
+        cmd_connect(args); return
+
+    reveal = bool(getattr(args, "reveal", False))
+    _reveal_gate(reveal)
+    projects_call = (_projects_call(args.operands, args.name)
+                     if args.cmd == "projects" else None)
+    env_value = None
+    if args.cmd == "env" and args.env_cmd == "set":
+        env_value = _env_set_value(args)
 
     conn = _resolve_conn(args)
 
@@ -4591,70 +5037,64 @@ def main() -> None:
     is_write = (
         args.cmd in {"deploy", "start", "stop", "restart", "app", "service",
                      "database"}
-        or (
-            args.cmd == "projects"
-            and hasattr(args, "subcmd")
-            and args.subcmd == "create"
-        )
+        or (projects_call is not None and projects_call[0] == "create")
         or (args.cmd == "env" and args.env_cmd != "list")
     )
 
     if is_write:
         _write_gate(conn["id"], conn["allow_write"], args.cmd)
 
+    def out(value) -> None:
+        _emit_domain(value, reveal)
+
     with _client(conn) as c:
         if args.cmd == "resources":
-            _emit(_slim_list(_request(c, "GET", "/resources")))
+            out(_slim_list(_request(c, "GET", "/resources")))
         elif args.cmd == "sources":
-            _emit(cmd_sources(c))
+            out(cmd_sources(c))
         elif args.cmd == "projects":
-            if hasattr(args, "subcmd") and args.subcmd == "create":
-                if not args.name:
-                    _die(6, "input", "projects create requires --name")
-                _emit(cmd_projects_create(c, args.name, args.description))
+            action, uuid, name = projects_call
+            if action == "create":
+                out(cmd_projects_create(c, name, args.description))
             else:
-                _emit(cmd_collection(c, args.cmd, args.uuid))
+                out(cmd_collection(c, args.cmd, uuid))
         elif args.cmd in ("applications", "services", "databases",
                           "servers", "deployments"):
-            _emit(cmd_collection(c, args.cmd, args.uuid))
+            out(cmd_collection(c, args.cmd, args.uuid))
         elif args.cmd == "logs":
-            _emit(cmd_logs(c, args.uuid, args.lines))
+            out(cmd_logs(c, args.uuid, args.lines))
         elif args.cmd == "deploy":
-            _emit(cmd_deploy(c, args.uuid, args.force, args.tag))
+            out(cmd_deploy(c, args.uuid, args.force, args.tag))
         elif args.cmd in ("start", "stop", "restart"):
-            _emit(cmd_lifecycle(c, args.cmd, args.uuid, args.rtype))
+            out(cmd_lifecycle(c, args.cmd, args.uuid, args.rtype))
         elif args.cmd == "app":
             if args.app_cmd == "create":
-                _emit(cmd_app_create(c, args))
+                out(cmd_app_create(c, args))
             elif args.app_cmd == "update":
-                _emit(cmd_app_update(c, args))
+                out(cmd_app_update(c, args))
             else:
                 _die(6, "unknown_command", f"no handler for app {args.app_cmd!r}")
         elif args.cmd == "service":
             if args.service_cmd == "create":
-                _emit(cmd_service_create(c, args))
+                out(cmd_service_create(c, args))
             else:
                 _die(6, "unknown_command", f"no handler for service {args.service_cmd!r}")
         elif args.cmd == "database":
             if args.database_cmd == "create":
-                _emit(cmd_database_create(c, args))
+                out(cmd_database_create(c, args))
             else:
                 _die(6, "unknown_command",
                      f"no handler for database {args.database_cmd!r}")
         elif args.cmd == "env":
             if args.env_cmd == "list":
-                _emit(cmd_env_list_typed(c, args.uuid, args.rtype))
+                out(cmd_env_list_typed(c, args.uuid, args.rtype))
             elif args.env_cmd == "set":
-                value = args.value
-                if value is None:
-                    import getpass
-                    value = getpass.getpass("")
-                _emit(cmd_env_set_typed(c, args.uuid, args.key, value, args.rtype))
+                out(cmd_env_set_typed(c, args.uuid, args.key, env_value, args.rtype))
             elif args.env_cmd == "rm":
-                _emit(cmd_env_rm_typed(c, args.uuid, args.key, args.rtype))
+                out(cmd_env_rm_typed(c, args.uuid, args.key, args.rtype))
             elif args.env_cmd == "bulk":
                 env_data = sys.stdin.read()
-                _emit(cmd_env_bulk(c, args.uuid, env_data, args.rtype))
+                out(cmd_env_bulk(c, args.uuid, env_data, args.rtype))
             else:
                 _die(6, "unknown_command", f"no handler for env {args.env_cmd!r}")
         else:

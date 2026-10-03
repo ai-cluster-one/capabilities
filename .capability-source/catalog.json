@@ -42,7 +42,7 @@
     },
     "coolify": {
       "path": "capabilities/coolify",
-      "payload_sha256": "3897d475abfb14b393ee88c02acae9998a183cbb49c559bb04f0454919dab1b4",
+      "payload_sha256": "e088493d067278475d419357259f3a11fda86171b89385446218e9e382ee143f",
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance."
     },
     "deployment": {
