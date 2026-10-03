@@ -60,7 +60,8 @@ def test_each_pitfall_sits_at_its_step():
     assert "capabilities set coolify grant <name> '{\"enabled\": true}'" in steps[2]
     assert "--project" not in steps[2]
     assert "resets the instance setting every time Coolify starts" in steps[3]
-    assert "ufw" in steps[4] and "8000" in steps[4] and "6001" in steps[4]
+    assert "ufw" in steps[4] and "DOCKER-USER" in steps[4]
+    assert "share one Let's Encrypt rate limit" in steps[4]
     assert "git-shell" in steps[5] and "uploadpack.allowReachableSHA1InWant" in steps[5]
     assert "without verifying the host key" in steps[5]
     assert "hostnossl all all all reject" in steps[6]
@@ -145,3 +146,62 @@ def test_the_help_gives_connection_before_the_verb_in_connect():
     help_text = coolify_module.__doc__ or ""
     assert "`coolify --connection <name> doctor`" in help_text
     assert "`coolify doctor --connection" not in help_text
+
+
+def test_step_four_needs_root_ssh_alone():
+    """Step 4 closes the direct ports on the server, serves HTTPS on an
+    sslip.io name, and keeps one act outside the server: the fallback domain."""
+    step = _steps()[4]
+    assert "cloud provider" not in step and "Point a DNS A record" not in step
+    assert "coolify.<ip-with-dashes>.sslip.io" in step
+    assert "Let's Encrypt" in step
+    # the fallback, and that it is the only thing outside the server
+    assert "a domain the owner points at the server" in step
+    assert "the one act in this guide that needs anything outside the server" in step
+
+
+def test_step_four_closes_the_three_ports_in_docker_user():
+    step = _steps()[4]
+    assert "iptables -C DOCKER-USER -j COOLIFY-DIRECT 2>/dev/null || iptables -I DOCKER-USER 1 -j COOLIFY-DIRECT" in step
+    drops = [line for line in step.splitlines()
+             if line.startswith("iptables -A COOLIFY-DIRECT") and line.endswith("-j DROP")]
+    assert len(drops) == 2
+    for line in drops:
+        assert '-i "$IF"' in line, "only the public interface"
+        assert "--ctstate NEW" in line, "established and related traffic keeps passing"
+        assert "--ctorigdstport" in line, "the published port, before Docker rewrites it"
+    assert "--ctorigdstport 8000 " in drops[0] and "--ctorigdstport 6001:6002 " in drops[1]
+    assert "iptables -A COOLIFY-DIRECT -j RETURN" in step
+    v6_drops = [line.strip() for line in step.splitlines()
+                if line.strip().startswith("ip6tables -A COOLIFY-DIRECT") and line.endswith("-j DROP")]
+    assert [line.replace("ip6tables", "iptables") for line in v6_drops] == drops, "IPv6 gets the same drops"
+    assert "ip6tables -C DOCKER-USER -j COOLIFY-DIRECT 2>/dev/null || ip6tables -I DOCKER-USER 1 -j COOLIFY-DIRECT" in step
+    assert "ip6tables -C INPUT -j COOLIFY-DIRECT 2>/dev/null || ip6tables -I INPUT 1 -j COOLIFY-DIRECT" in step
+    assert "ends in `INPUT` without passing `DOCKER-USER`" in step, "the guide says why INPUT is hooked for IPv6"
+
+
+def test_step_four_persists_the_rules_through_a_unit_after_docker():
+    step = _steps()[4]
+    for line in ("After=docker.service", "PartOf=docker.service",
+                 "WantedBy=docker.service",
+                 "ExecStart=/usr/local/sbin/coolify-close-direct-ports",
+                 "systemctl enable coolify-close-direct-ports.service",
+                 "systemctl restart coolify-close-direct-ports.service"):
+        assert line in step
+    assert "`iptables-persistent` is not used" in step
+    assert "reboot" in step
+
+
+def test_step_four_checks_from_outside_and_through_the_proxy():
+    step = _steps()[4]
+    assert "for port in 8000 6001 6002; do curl" in step
+    assert "http://[<server-ipv6>]:$port/" in step
+    assert "curl -fsS https://<domain>/api/health" in step
+    assert "curl -fsS http://127.0.0.1:8000/api/health" in step
+    assert "openssl x509 -noout -issuer -dates" in step
+    assert "coolify --connection <name> doctor" in step
+
+
+def test_step_four_re_pairs_the_machine_connection_over_https():
+    assert ("coolify connect <name> --url https://<domain> --token-env <KEY> "
+            "--global --default") in _steps()[4]

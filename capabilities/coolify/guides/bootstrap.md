@@ -6,7 +6,7 @@ Proven against Coolify 4.3.23 on Ubuntu 24.04. Several steps use Coolify interna
 
 ## Before you start
 
-Placeholders: `<server-ip>` is the server's public address, `<domain>` the name the instance will answer on, `<name>` the connection id this machine will know the instance by (for example `main`), and `<email>` the root user's address. This machine pairs with one instance through a machine-level connection: `--global` writes it under `~/.config/coolify/`, and `--default` makes it the machine's default. Run the session inside a project directory; that project uses the pairing once it grants it (step 2).
+Placeholders: `<server-ip>` is the server's public address, `<server-ipv6>` its public IPv6 address if it has one, `<domain>` the name the instance will answer on (by default `coolify.<ip-with-dashes>.sslip.io`, see step 4), `<name>` the connection id this machine will know the instance by (for example `main`), and `<email>` the root user's address. This machine pairs with one instance through a machine-level connection: `--global` writes it under `~/.config/coolify/`, and `--default` makes it the machine's default. Run the session inside a project directory; that project uses the pairing once it grants it (step 2).
 
 No secret is ever printed, put in a prompt, or put on a command line. Each one is generated where it is used, travels through a pipe or a file mode 0600, and is read back by a parser (step 8). Remote steps run as a script on standard input, `ssh root@<server-ip> bash -s <<'EOF' ... EOF`, so a value the script holds in a shell variable is never part of any process's arguments.
 
@@ -137,7 +137,9 @@ It answers `AUTOUPDATE=true`, `{"is_auto_update_enabled":true}` and the version 
 
 ## 4. Serve the instance over HTTPS and close its direct ports
 
-Point a DNS A record for `<domain>` at `<server-ip>`, then give the instance that domain and have Coolify's proxy serve it with a certificate:
+Everything in this step is done on the server over root SSH: no cloud firewall, provider API or DNS change is needed. The instance's name is `coolify.<ip-with-dashes>.sslip.io`, where `<ip-with-dashes>` is `<server-ip>` with its dots replaced by dashes; sslip.io answers every such name with the address written in it, so the name points at the server without anyone creating a record. That name is `<domain>` from here on.
+
+Give the instance that name and have Coolify's proxy serve it, which requests its certificate from Let's Encrypt:
 
 ```sh
 ssh root@<server-ip> bash -s <<'EOF'
@@ -146,7 +148,14 @@ docker exec coolify php artisan tinker --execute '$s = App\Models\InstanceSettin
 EOF
 ```
 
-*Internal*, and the least proven step here: setting the domain is a UI action in Coolify, and this is the code path it runs. Check it from this machine: `curl -fsS https://<domain>/api/health` answers `OK` with a certificate curl accepts. Until it does, do not close any port.
+*Internal*: setting the domain is a UI action in Coolify, and this is the code path it runs. The certificate can take a minute. Check it from this machine:
+
+```sh
+curl -fsS https://<domain>/api/health   # OK
+openssl s_client -connect <domain>:443 -servername <domain> </dev/null 2>/dev/null | openssl x509 -noout -issuer -dates   # issuer is Let's Encrypt
+```
+
+Until both pass, do not close any port. Pitfall: sslip.io names share one Let's Encrypt rate limit across everyone who uses them, so the request can be refused for reasons that have nothing to do with this server. The proxy then serves its own default certificate instead (the issuer names Traefik, not Let's Encrypt), and `ssh root@<server-ip> 'docker logs coolify-proxy 2>&1 | grep -i acme | tail -5'` shows the refusal, such as "too many certificates already issued". The fallback is a domain the owner points at the server: an A record for a name of their choosing with the value `<server-ip>`. It is the one act in this guide that needs anything outside the server. Ask the owner for it, then run the commands above again with that name as `<domain>`.
 
 Re-pair on the HTTPS URL. The token is already in the credentials file, and `--token-env` resolves the key through the same files a verb reads it from:
 
@@ -156,15 +165,73 @@ coolify connect <name> --url https://<domain> --token-env <KEY> --global --defau
 
 where `<KEY>` is the key `coolify connections` names for `<name>` (by default `COOLIFY_<NAME>_TOKEN`). Its probe answers ok on the new URL.
 
-Then close 8000 (UI and API over plain HTTP), 6001 and 6002 at the cloud provider's firewall, keeping 22, 80, 443 and any public database port (step 6) open. Pitfall: Docker publishes container ports through its own packet-filter rules, ahead of a host firewall such as `ufw`, so closing them on the host does not close them; it has to be the provider's firewall in front of the server.
+Then close 8000 (UI and API over plain HTTP), 6001 and 6002 to the outside. Pitfall: Docker publishes container ports through its own packet-filter rules, which a host firewall such as `ufw` never sees, so the rules go in iptables' `DOCKER-USER` chain, the one chain Docker evaluates before its own and never rewrites. A published port is rewritten to the container's port before that chain sees the packet, so the rules match the port the connection was made to (`--ctorigdstport`), not the one it was rewritten to. They drop only new connections arriving on the public interface: replies and established connections still pass, and so do loopback and the traffic between Coolify's containers on Docker's own bridges, which never arrive on that interface. A server with a public IPv6 address gets the same rules for IPv6, hooked into both ip6tables' `DOCKER-USER` and `INPUT`. Where the Docker network carries IPv6, as Coolify's own does, a published port is rewritten for IPv6 just as for IPv4 and the connection passes `DOCKER-USER`; where it does not, Docker's own proxy, a process on the host, answers the port and the connection ends in `INPUT` without passing `DOCKER-USER`. Matching the port the connection was made to covers both paths, so one chain serves both hooks; closing only IPv4 would leave the three ports open over IPv6.
 
-Check from this machine that plain HTTP no longer answers and the paired URL still does:
+The rules are kept in a script that a systemd unit runs every time Docker starts. That is how they survive a reboot. `iptables-persistent` is not used: it restores a saved copy of the whole ruleset before Docker starts, Docker's chains from the last boot included, and Docker then rewrites those, so the two fight over the same tables. The unit runs after Docker, rebuilds only its own chain, and is safe to run again; the block below restarts it, so running the block a second time applies an edited script rather than keeping the rules from the first run.
 
 ```sh
-curl -m 5 http://<server-ip>:8000/api/health   # fails to connect
-nc -z -G 5 <server-ip> 6001; nc -z -G 5 <server-ip> 6002   # both fail
+ssh root@<server-ip> bash -s <<'EOF'
+set -eu
+cat > /usr/local/sbin/coolify-close-direct-ports <<'SH'
+#!/bin/sh
+# Drop new connections from the public interface to Coolify's direct ports.
+set -eu
+IF=$(ip -4 route show default | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')
+[ -n "$IF" ]
+iptables -N COOLIFY-DIRECT 2>/dev/null || iptables -F COOLIFY-DIRECT
+iptables -A COOLIFY-DIRECT -i "$IF" -p tcp -m conntrack --ctstate NEW --ctdir ORIGINAL --ctorigdstport 8000 -j DROP
+iptables -A COOLIFY-DIRECT -i "$IF" -p tcp -m conntrack --ctstate NEW --ctdir ORIGINAL --ctorigdstport 6001:6002 -j DROP
+iptables -A COOLIFY-DIRECT -j RETURN
+iptables -C DOCKER-USER -j COOLIFY-DIRECT 2>/dev/null || iptables -I DOCKER-USER 1 -j COOLIFY-DIRECT
+if ip -6 addr show dev "$IF" scope global | grep -q inet6; then
+  ip6tables -N COOLIFY-DIRECT 2>/dev/null || ip6tables -F COOLIFY-DIRECT
+  ip6tables -A COOLIFY-DIRECT -i "$IF" -p tcp -m conntrack --ctstate NEW --ctdir ORIGINAL --ctorigdstport 8000 -j DROP
+  ip6tables -A COOLIFY-DIRECT -i "$IF" -p tcp -m conntrack --ctstate NEW --ctdir ORIGINAL --ctorigdstport 6001:6002 -j DROP
+  ip6tables -A COOLIFY-DIRECT -j RETURN
+  if ip6tables -S DOCKER-USER >/dev/null 2>&1; then
+    ip6tables -C DOCKER-USER -j COOLIFY-DIRECT 2>/dev/null || ip6tables -I DOCKER-USER 1 -j COOLIFY-DIRECT
+  fi
+  ip6tables -C INPUT -j COOLIFY-DIRECT 2>/dev/null || ip6tables -I INPUT 1 -j COOLIFY-DIRECT
+fi
+SH
+chmod 755 /usr/local/sbin/coolify-close-direct-ports
+cat > /etc/systemd/system/coolify-close-direct-ports.service <<'UNIT'
+[Unit]
+Description=Close Coolify's direct ports 8000, 6001 and 6002 to the public interface
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/coolify-close-direct-ports
+
+[Install]
+WantedBy=docker.service
+UNIT
+systemctl daemon-reload
+systemctl enable coolify-close-direct-ports.service
+systemctl restart coolify-close-direct-ports.service
+iptables -S DOCKER-USER
+iptables -S COOLIFY-DIRECT
+ip6tables -S COOLIFY-DIRECT 2>/dev/null || true
+EOF
+```
+
+`iptables -S DOCKER-USER` lists `-A DOCKER-USER -j COOLIFY-DIRECT` first, and `iptables -S COOLIFY-DIRECT` the two drops and the return; on a server with public IPv6, `ip6tables -S COOLIFY-DIRECT` lists the same. Public database ports (step 6) are not touched by these rules and stay open.
+
+Check from this machine that the three ports no longer answer, and that the instance still works through its proxy and on the server itself:
+
+```sh
+for port in 8000 6001 6002; do curl -s -o /dev/null --connect-timeout 5 http://<server-ip>:$port/; echo "$port: curl exit $?"; done   # 28 (timed out) for each
+for port in 8000 6001 6002; do curl -s -o /dev/null --connect-timeout 5 "http://[<server-ipv6>]:$port/"; echo "$port: curl exit $?"; done   # the same over IPv6, where both ends have it
+curl -fsS https://<domain>/api/health   # OK
+ssh root@<server-ip> 'curl -fsS http://127.0.0.1:8000/api/health'   # OK: loopback is kept
 coolify --connection <name> doctor   # ok on https://<domain>
 ```
+
+Any exit other than 28 (or 7, refused) means something still answers on that port. Then prove the rules come back: `ssh root@<server-ip> reboot`, wait until SSH answers again, and repeat `iptables -S DOCKER-USER` and the checks above; `systemctl status coolify-close-direct-ports.service` shows it ran after Docker started.
 
 ## 5. Prepare the deploy source on the server
 
