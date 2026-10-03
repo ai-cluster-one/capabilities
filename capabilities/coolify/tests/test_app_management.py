@@ -293,5 +293,5 @@ def test_help_and_manifest_declare_new_surface():
     assert "--watch-paths" in help_text
     assert "--auto-deploy-enabled / --no-auto-deploy-enabled" in help_text
     assert [entry["topic"] for entry in coolify_module._guide_menu()] == [
-        "headless-apps"
+        "bootstrap", "headless-apps"
     ]

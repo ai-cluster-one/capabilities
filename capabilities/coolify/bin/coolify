@@ -175,7 +175,7 @@ COMMANDS
 Contract commands (the same on every capability):
   coolify stub                                 One-line awareness text.
   coolify manifest --json                      Machine-readable declaration.
-  coolify guide [headless-apps]                Guide topics / one guide body.
+  coolify guide [bootstrap|headless-apps]      Guide topics / one guide body.
   coolify ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
               [--note <text>]                   (capabilities/coolify/identifiers.json).
   coolify refs                                 Menu of the project's reference files.
