@@ -393,9 +393,11 @@ HOOKS
 SERVICE
   tasks service init [--force]    write capabilities/tasks/service/config.toml
                                   from the shipped template
-  tasks service doctor            settings, workers, store and notification, and
+  tasks service doctor            settings, workers, store and notification,
                                   whether a running daemon holds the declaration
-                                  on disk; exit 6 when anything is wrong, exit 5
+                                  on disk, and whether its planned wake is so
+                                  overdue that it hangs; exit 6 when anything
+                                  is wrong, exit 5
                                   when the store is unreachable and no daemon
                                   runs; with one running that is a warning
   tasks service run               the daemon in the foreground, for a supervisor
@@ -490,6 +492,10 @@ SERVICE
   finish, and it asks for each connection it lost, or could not open, again
   after 1s, then at a doubling interval of at most 30s, until the store
   answers; with the connection back it asks the store for work at once.
+  A connection the path dropped under it is lost as well: a question not
+  answered within 45s has its connection severed, so neither the daemon nor
+  a stop waits on it longer than that. Every store connection, a turn's
+  included, carries TCP keepalives.
   `service status` shows, under `stores`, each store the daemon reaches: how
   many connections it has opened to it since it started, when it last opened
   one, whether it is listening, and the error that has it away, if any.
@@ -4643,12 +4649,21 @@ def _secret_key(entry: dict | None) -> str:
     return (entry or {}).get("secret_env") or DEFAULT_SECRET_ENV
 
 
+# What every store connection asks of TCP, so a path that dropped under it fails
+# the call in about a minute rather than leaving it waiting as long as the
+# operating system would: keepalives prove the peer while nothing is
+# outstanding, and where the platform has it, data left unacknowledged for a
+# minute closes the connection.
+_STORE_LIBPQ = {"keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10,
+                "keepalives_count": 3, "tcp_user_timeout": 60000}
+
+
 def _connect(entry: dict | None, *, raising: bool = False, **libpq):
     """A connection to the store, or exit 5 saying why there is none. A caller
     that outlives an unreachable store passes `raising` and is handed the same
     refusal as a Refusal instead. `libpq` carries connection parameters a
-    caller holding its connection open needs and every other verb leaves at
-    libpq's own defaults."""
+    caller holding its connection open needs, over `_STORE_LIBPQ` and libpq's
+    own defaults."""
     try:
         import psycopg
         from psycopg.rows import dict_row
@@ -4661,7 +4676,7 @@ def _connect(entry: dict | None, *, raising: bool = False, **libpq):
             host=_conf(entry, "db_host"), port=int(_conf(entry, "db_port", "5432")),
             user=_conf(entry, "db_user"), dbname=_conf(entry, "db_name"),
             password=password, sslmode=_conf(entry, "db_sslmode", "prefer"),
-            connect_timeout=10, row_factory=dict_row, **libpq)
+            connect_timeout=10, row_factory=dict_row, **{**_STORE_LIBPQ, **libpq})
     except Exception as exc:
         refusal = Refusal(5, "unreachable", f"cannot reach the store: {exc}",
                           f"`{NAME} connections` shows where every value resolves")
@@ -4677,6 +4692,41 @@ def _connect(entry: dict | None, *, raising: bool = False, **libpq):
         if applied:
             sys.stderr.write(json.dumps({"migrated": applied}, ensure_ascii=False) + "\n")
     return conn
+
+
+def _sever_after(conn, seconds: float):
+    """A context in which `conn`'s socket is shut down once `seconds` pass, so a
+    round trip whose peer vanished is an error now - the driver raises the
+    connection lost - rather than a wait as long as the operating system's."""
+    import contextlib
+    import socket
+    import threading
+
+    fd = conn.pgconn.socket
+
+    def sever():
+        try:
+            peer = socket.socket(fileno=os.dup(fd))
+        except OSError:
+            return
+        try:
+            peer.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        finally:
+            peer.close()
+
+    @contextlib.contextmanager
+    def bounded():
+        timer = threading.Timer(seconds, sever)
+        timer.daemon = True
+        timer.start()
+        try:
+            yield
+        finally:
+            timer.cancel()
+
+    return bounded()
 
 
 SCHEMA = "tasks"          # replaced per run from the selected connection
@@ -8579,12 +8629,12 @@ def cmd_history(entry, args: list[str]) -> None:
 # How a watch keeps its one connection. A proxy in front of the store may close
 # a connection that carries no data for minutes and does not pass TCP keepalives
 # on, so the connection is proven end to end by a round trip on this interval,
-# and a round trip that is not back within the bound is a connection lost. TCP
-# keepalives find a dead socket sooner where they reach.
+# and a round trip that is not back within the bound is a connection lost. The
+# TCP keepalives every store connection carries find a dead socket sooner where
+# they reach.
 _WATCH_PING_SECONDS = 30.0
 _WATCH_ROUND_TRIP_SECONDS = 15.0
-_WATCH_LIBPQ = {"application_name": "tasks-watch", "keepalives": 1,
-                "keepalives_idle": 30, "keepalives_interval": 10, "keepalives_count": 3}
+_WATCH_LIBPQ = {"application_name": "tasks-watch"}
 # A lost connection is asked for again after this long, doubling to the longest.
 _WATCH_RETRY_FIRST = 1.0
 _WATCH_RETRY_LONGEST = 30.0
@@ -8655,31 +8705,9 @@ class _Watch:
 
     def bounded(self, call):
         """One round trip on the held connection, severed when it is not back in
-        time, so a peer that vanished is an error now rather than a wait as long
-        as the operating system's."""
-        import socket
-        import threading
-        fd = self.conn.pgconn.socket
-
-        def sever():
-            try:
-                peer = socket.socket(fileno=os.dup(fd))
-            except OSError:
-                return
-            try:
-                peer.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            finally:
-                peer.close()
-
-        timer = threading.Timer(_WATCH_ROUND_TRIP_SECONDS, sever)
-        timer.daemon = True
-        timer.start()
-        try:
+        time."""
+        with _sever_after(self.conn, _WATCH_ROUND_TRIP_SECONDS):
             return call()
-        finally:
-            timer.cancel()
 
     def open(self) -> str | None:
         """Connect, check the store announces what a watch reports, and listen.
@@ -9493,6 +9521,12 @@ class _ServiceHost:
     @staticmethod
     def ping(conn) -> None:
         conn.execute("select 1")
+
+    @staticmethod
+    def bounded(conn, seconds: float):
+        """A context whose round trips on `conn` are severed when they are not
+        back within `seconds`, raising the connection lost."""
+        return _sever_after(conn, seconds)
 
     @staticmethod
     def lost(conn, exc: BaseException) -> bool:
@@ -10522,6 +10556,21 @@ def cmd_service_init(args: list[str]) -> None:
                     f"`{NAME} service start`, or `{NAME} service run` under a supervisor"]})
 
 
+def _wake_overdue(module, status: dict) -> float | None:
+    """How many seconds the running daemon's published wake is overdue by, when
+    that is more than its loop can be held: twice the longest a round trip may
+    wait. Nothing else keeps it from its wake, so past that it hangs."""
+    import datetime as _dt
+    if status.get("stopping"):
+        return None
+    try:
+        at = _dt.datetime.fromisoformat(str((status.get("next_wake") or {}).get("at")))
+    except (TypeError, ValueError):
+        return None
+    late = (_dt.datetime.now(_dt.timezone.utc) - at).total_seconds()
+    return late if late > 2 * module.ROUND_TRIP_SECONDS else None
+
+
 def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
     _flags(args, ())
     module = _service_module()
@@ -10572,6 +10621,10 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
     # supervisor that restarts on a failing probe leaves it paused and running.
     answer["pause"] = status["pause"]
     if status["running"]:
+        overdue = _wake_overdue(module, status)
+        if overdue is not None:
+            problems.append(f"the daemon's wake planned for {status['next_wake']['at']} is "
+                            f"{overdue:.0f}s overdue; it may hang")
         loaded = module.read_fingerprint(_service_state_dir())
         current = _service_fingerprint()
         if loaded != current:

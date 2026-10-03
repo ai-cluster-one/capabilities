@@ -294,6 +294,10 @@ class _AwayHost:
     def ping(self, _conn):
         pass
 
+    def bounded(self, _conn, _seconds):
+        import contextlib
+        return contextlib.nullcontext()
+
     def notification_installed(self, _conn):
         return True
 
@@ -752,11 +756,14 @@ def test_run_writes_the_receipt_the_service_reads(project, store, capsys, monkey
 class Relay:
     """A TCP relay to the store on a port of its own. `down()` cuts every
     connection through it and refuses new ones, as a store that went away does;
-    `up()` opens the same port again."""
+    `up()` opens the same port again. `stall()` keeps every connection through
+    it open and passes nothing more on them, as a path that dropped under them
+    does."""
 
     def __init__(self, host: str, port: int):
         self.target = (host, port)
         self.pairs: list[tuple[socket.socket, socket.socket]] = []
+        self.stalled: set[socket.socket] = set()
         self.lock = threading.Lock()
         self.listener: socket.socket | None = None
         self.port = 0
@@ -768,6 +775,12 @@ class Relay:
         listener, self.listener = self.listener, None
         if listener is not None:
             listener.close()
+
+    def stall(self) -> None:
+        """Pass nothing more either way on the connections through it, holding
+        them open; new connections pass."""
+        with self.lock:
+            self.stalled.update(end for pair in self.pairs for end in pair)
 
     def up(self) -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -808,14 +821,14 @@ class Relay:
             for a, b in ((client, upstream), (upstream, client)):
                 threading.Thread(target=self._pump, args=(a, b), daemon=True).start()
 
-    @staticmethod
-    def _pump(source: socket.socket, sink: socket.socket) -> None:
+    def _pump(self, source: socket.socket, sink: socket.socket) -> None:
         try:
             while True:
                 data = source.recv(65536)
                 if not data:
                     break
-                sink.sendall(data)
+                if source not in self.stalled:
+                    sink.sendall(data)
         except OSError:
             pass
         for end in (source, sink):
@@ -988,6 +1001,38 @@ def test_a_lost_question_connection_is_asked_for_again_on_the_doubling_interval(
         log = (h.daemon.state_dir / "daemon.log").read_text()
         assert log.count("lost the store connection its questions go on") == 1
         assert "connected to the store again for its questions" in log
+
+
+@needs_store
+def test_connections_the_path_dropped_are_severed_and_asked_for_again(
+        project, store, relay, capsys):
+    """Every connection through the relay stops carrying anything while staying
+    open: the question that goes unanswered, and the listener's round trip, are
+    severed within the bound rather than waited on, no pass of the loop holds
+    longer, and both connections are opened again and the work is taken."""
+    entry, schema, conn = store
+    write_settings(project, "version = 1\npoll_seconds = 1\n")
+    through = {**entry, "db_host": "127.0.0.1", "db_port": str(relay.port)}
+    h = quick(Harness(project, through), ROUND_TRIP_SECONDS=1.0, PING_SECONDS=0.5)
+    with h:
+        h.dispatcher.step()
+        store_ = h.daemon.store
+        assert store_.connections_opened == 2
+        relay.stall()
+        add(entry, capsys, "alpha")
+        passes = []
+
+        def taken() -> bool:
+            passes.append(time.monotonic())
+            return h.running("alpha") == 1
+
+        h.steps(taken, seconds=10)
+        assert max(gaps_of(passes)) < 3.0, gaps_of(passes)
+        assert store_.connections_opened >= 4
+        assert store_.listener is not None and store_.query is not None
+        log = (h.daemon.state_dir / "daemon.log").read_text()
+        assert "lost the store connection its questions go on" in log
+        assert "lost the store's notification" in log
 
 
 @needs_store
@@ -1293,6 +1338,34 @@ def test_a_task_whose_turns_fail_at_once_is_retried_no_faster_than_the_delay(lab
     time.sleep(1.2)
     by_hand = answer_of(tasks_cli(lab, "run", "alpha", "--apply"))
     assert by_hand["claimed"] == "t-fail"
+
+
+@needs_store
+def test_service_doctor_fails_a_daemon_whose_planned_wake_is_long_overdue(lab):
+    """A daemon held past its planned wake by more than a round trip may hold it
+    fails the probe; one that wakes as planned passes it."""
+    import datetime
+    import signal
+
+    project = lab["project"]
+    assert answer_of(tasks_cli(lab, "service", "init"))["written"]
+    write_settings(project, "version = 1\npoll_seconds = 3600\nshutdown_grace_seconds = 5\n")
+    pid = answer_of(tasks_cli(lab, "service", "start"))["pid"]
+    try:
+        assert answer_of(tasks_cli(lab, "service", "doctor"))["ok"]
+        published = Path(answer_of(tasks_cli(lab, "service", "status"))["state_dir"]) / "daemon.json"
+        os.kill(pid, signal.SIGSTOP)
+        status = json.loads(published.read_text())
+        late = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=10)
+        status["next_wake"]["at"] = late.isoformat(timespec="seconds")
+        published.write_text(json.dumps(status))
+        hung = tasks_cli(lab, "service", "doctor")
+        assert hung.returncode == 6
+        assert any("overdue; it may hang" in problem
+                   for problem in json.loads(hung.stdout)["problems"])
+    finally:
+        os.kill(pid, signal.SIGCONT)
+        answer_of(tasks_cli(lab, "service", "stop"))
 
 
 @needs_store

@@ -32,7 +32,10 @@ turns claims or ends. A store without the notification leaves it the poll.
 
 It holds its connections to the store rather than opening one per question:
 one it listens on, and one every question it asks is put to, each question cut
-off by the store when it runs past `QUESTION_TIMEOUT_SECONDS`. They are kept per
+off by the store when it runs past `QUESTION_TIMEOUT_SECONDS`. A question or a
+round trip whose answer is not back within `ROUND_TRIP_SECONDS` has its
+connection severed and counted lost, so a connection the path dropped under it
+holds the loop, and a stop, no longer than that. They are kept per
 store in a pool, so whoever asks of the same store shares the same two. The
 listener carries a round trip of its own every `PING_SECONDS`, and so does the
 question connection when nothing else went over it for that long, so a proxy in
@@ -118,6 +121,12 @@ RELISTEN_LONGEST_SECONDS = 30.0
 # counts as its connection lost, so a store that hangs costs the daemon this
 # long and never its loop.
 QUESTION_TIMEOUT_SECONDS = 30
+
+# The longest a question, or a round trip of the daemon's own, waits for its
+# answer before its connection is severed and counted lost. The store cuts off
+# a question that runs long before this, so it is reached only when no answer
+# can arrive: a path that dropped under a connection the store never closed.
+ROUND_TRIP_SECONDS = QUESTION_TIMEOUT_SECONDS + 15
 
 # How often a held connection carries a round trip of its own: the listener
 # always, and the connection questions go on whenever nothing else went over it
@@ -1578,9 +1587,10 @@ class Dispatcher:
             self._open_query(store)
         conn = store.query
         try:
-            with (scope() if scope is not None else contextlib.nullcontext()):
-                answer = question(conn)
-            conn.commit()
+            with store.host.bounded(conn, ROUND_TRIP_SECONDS):
+                with (scope() if scope is not None else contextlib.nullcontext()):
+                    answer = question(conn)
+                conn.commit()
         except BaseException as exc:
             if store.host.lost(conn, exc):
                 self._lose_query(store, exc)
@@ -1653,7 +1663,8 @@ class Dispatcher:
             if store.listener is not None and now - store.listener_pinged >= PING_SECONDS:
                 store.listener_pinged = now
                 try:
-                    store.host.ping(store.listener)
+                    with store.host.bounded(store.listener, ROUND_TRIP_SECONDS):
+                        store.host.ping(store.listener)
                 except Exception as exc:
                     self._lose_listener(store, exc)
             if store.query is not None and now - store.query_used >= PING_SECONDS:
