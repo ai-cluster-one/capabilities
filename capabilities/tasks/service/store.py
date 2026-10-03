@@ -756,9 +756,15 @@ class Store:
 
     def connections_effective(self, capability: str, scopes: Scopes,
                               write_default: bool = False,
-                              include_disabled: bool = False) -> dict[str, dict[str, Any]]:
+                              include_disabled: bool = False,
+                              machine_read: bool = False) -> dict[str, dict[str, Any]]:
         """Every connection this project may use, already carrying the decision
-        made about it — the one read a capability needs before it acts."""
+        made about it — the one read a capability needs before it acts.
+
+        `machine_read` is the caller's word that this is one of the
+        capability's declared machine reads outside any project: an identity
+        the machine itself declares is then usable, read-only, unless its grant
+        resolves to `enabled: false`."""
         identities = self.config_resolve(capability, "connection", scopes)
         layers = self.config_layers(capability, "grant", scopes)
         # Under the read-only switch every connection is a source, whatever its
@@ -784,6 +790,12 @@ class Store:
                 enabled = identity_is_project
             else:
                 enabled = bool(declared) and (identity_is_project or blessed_here)
+            # A machine read lends the machine's own connection and nothing
+            # more: never a write, and never one a grant switched off.
+            lent = (machine_read and not enabled and entry["scope"] == "global"
+                    and (declared is None or bool(declared)))
+            if lent:
+                enabled = True
             if not enabled and not include_disabled:
                 continue
             grant = rows[0] if rows else None
@@ -792,9 +804,12 @@ class Store:
                 "value": entry["value"],
                 "scope": (entry["scope"], entry["project_id"]),
                 "enabled": enabled,
-                "allow_write": writable and bool(decided.get("allow_write", write_default)),
+                "allow_write": (writable and not lent
+                                and bool(decided.get("allow_write", write_default))),
                 "grant_scope": (grant["scope"], grant["project_id"]) if grant else None,
             }
+            if lent:
+                out[cid]["machine_read"] = True
         return out
 
     @staticmethod
@@ -1473,10 +1488,11 @@ class StoreRecords(Records):
         return self.store.config_delete(capability, collection, key, target)
 
     def connections(self, capability: str, write_default: bool = False,
-                    include_disabled: bool = False) -> dict[str, dict[str, Any]]:
+                    include_disabled: bool = False,
+                    machine_read: bool = False) -> dict[str, dict[str, Any]]:
         return self.store.connections_effective(
             capability, self.scopes, write_default=write_default,
-            include_disabled=include_disabled)
+            include_disabled=include_disabled, machine_read=machine_read)
 
     def document_read(self, capability: str, key: str) -> dict[str, Any] | None:
         return self.store.context_read(capability, key, self.scopes)
@@ -1721,13 +1737,14 @@ class FileRecords(Records):
         return str(self._file(root, capability, collection))
 
     def connections(self, capability: str, write_default: bool = False,
-                    include_disabled: bool = False) -> dict[str, dict[str, Any]]:
+                    include_disabled: bool = False,
+                    machine_read: bool = False) -> dict[str, dict[str, Any]]:
         """Assembled exactly as the store assembles it, from the same two
         collections, so a project changing where it keeps records does not
         change which connection answers."""
         return Store.connections_effective(
             self, capability, None, write_default=write_default,
-            include_disabled=include_disabled)
+            include_disabled=include_disabled, machine_read=machine_read)
 
     def config_resolve(self, capability: str, collection: str, _scopes: Any) -> dict:
         """`connections_effective` reaches for this name; the scopes it passes

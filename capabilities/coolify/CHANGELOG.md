@@ -1,5 +1,9 @@
 # coolify — change log
 
+## 2026-10-04 — `connections`, `doctor` and `servers` read the machine's connections outside a project
+
+Run from a directory that is no project, `coolify connections`, `coolify doctor` and `coolify servers` use the connections declared in `~/.config/coolify/`, read-only, unless a grant switched one off; before, they exited 4 `connection_not_granted` there. Every other verb outside a project is refused as before, and inside a project a connection declared globally still needs the project's grant. `coolify connect <name> ... --global` run outside a project answers `"usable_here": true` with the verbs that use it there. `coolify connections` also reports coolify's effective policy state under `policy`.
+
 ## 2026-10-04 — The bootstrap guide closes the direct ports and serves HTTPS with root SSH alone
 
 Step 4 of `coolify guide bootstrap` needs nothing but root SSH to the server. The instance is served over HTTPS on `coolify.<ip-with-dashes>.sslip.io`, with its certificate issued by Let's Encrypt through Coolify's proxy; when Let's Encrypt refuses because sslip.io's rate limit is shared, the fallback is a domain the owner points at the server, the one act in the guide that needs anything outside it. Ports 8000, 6001 and 6002 are closed on the server in iptables' `DOCKER-USER` chain - new connections from the public interface dropped, established traffic, loopback and Docker's own bridges kept - by a script a systemd unit runs each time Docker starts, so the rules survive a reboot, with `iptables-persistent` not used and the guide saying why. The checks prove the ports closed from outside and the instance still answering through its proxy, and the re-pair stays `coolify connect <name> --url https://<domain> --token-env <KEY> --global --default`. No verb changes.

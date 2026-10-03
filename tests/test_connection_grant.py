@@ -203,7 +203,7 @@ def test_outside_any_project_the_refusal_says_so_and_names_the_first_step(nowher
     nowhere to write one."""
     _declare_global(nowhere, {"default": "personal",
                               "connections": {"personal": GLOBAL_BOX}})
-    result = _run(nowhere, "connections")
+    result = _run(nowhere, "resources")
     assert result.returncode == 4, result.stdout + result.stderr
     error = _error(result)
     assert error["code"] == "connection_not_granted"
@@ -219,7 +219,7 @@ def test_outside_any_project_naming_a_connection_is_refused_the_same_way(nowhere
     the situation the caller is actually in, not a project's missing grant."""
     _declare_global(nowhere, {"connections": {"personal": GLOBAL_BOX,
                                               "other": LOCAL_BOX}})
-    result = _run(nowhere, "--connection", "personal", "servers")
+    result = _run(nowhere, "--connection", "personal", "applications")
     assert result.returncode == 4, result.stdout + result.stderr
     error = _error(result)
     assert error["code"] == "connection_not_granted"

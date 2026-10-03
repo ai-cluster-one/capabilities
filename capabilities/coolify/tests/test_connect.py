@@ -203,6 +203,65 @@ def test_connect_global_from_inside_a_project_names_the_grant(place):
     assert not place.registry.exists()
 
 
+def test_connect_global_outside_a_project_is_usable_by_the_machine_reads(place, monkeypatch):
+    monkeypatch.setattr(coolify_module, "_project_root", lambda: None)
+    code, out, err, _ = _run(
+        ["connect", "main", "--url", URL, "--token-stdin", "--global", "--default"],
+        stdin=TOKEN)
+
+    assert code == 0, err
+    answer = json.loads(out)
+    assert answer["usable_here"] is True
+    assert answer["machine_reads"] == ["connections", "doctor", "servers"]
+    assert "hint" not in answer
+    _assert_no_token(out, err)
+
+
+def test_outside_a_project_the_machine_reads_use_the_global_connection(place, monkeypatch):
+    monkeypatch.setattr(coolify_module, "_project_root", lambda: None)
+    code, _, err, _ = _run(
+        ["connect", "main", "--url", URL, "--token-stdin", "--global", "--default"],
+        stdin=TOKEN)
+    assert code == 0, err
+
+    code, out, err, _ = _run(["connections"])
+    assert code == 0, err
+    report = json.loads(out)
+    assert report["connections"]["main"]["allow_write"] is False
+    assert report["machine_reads"]["connections"]["main"]["scope"] == "machine"
+    _assert_no_token(out, err)
+
+    probe = Probe()
+    code, out, err, _ = _run(["--connection", "main", "doctor"], probe=probe)
+    assert code == 0, err
+    assert json.loads(out)["connections"]["main"]["version"] == "4.3.23"
+
+    probe = Probe()
+    code, out, err, _ = _run(["servers"], probe=probe)
+    assert code == 0, err
+    assert [path for path, _ in probe.seen] == ["/api/v1/servers"]
+
+    for argv in (["deploy", "abc"], ["applications"], ["env", "list", "abc"]):
+        probe = Probe()
+        code, _, err, _ = _run(argv, probe=probe)
+        assert code == 4, argv
+        assert json.loads(err)["error"]["code"] == "connection_not_granted"
+        assert probe.seen == []
+
+
+def test_inside_a_project_the_global_connection_still_needs_the_grant(place):
+    code, _, err, _ = _run(
+        ["connect", "main", "--url", URL, "--token-stdin", "--global", "--default"],
+        stdin=TOKEN)
+    assert code == 0, err
+    for argv in (["servers"], ["connections"], ["doctor"]):
+        probe = Probe()
+        code, _, err, _ = _run(argv, probe=probe)
+        assert code == 4, argv
+        assert json.loads(err)["error"]["code"] == "connection_not_granted"
+        assert probe.seen == []
+
+
 def test_connect_default_points_the_project_default(place):
     code, _, err, _ = _run(
         ["connect", "exp", "--url", URL, "--token-stdin", "--project", "--default"],

@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-04 — A capability's machine reads are validated wherever it is
+
+`capabilities audit`, `source check` and `install` validate a capability's `MACHINE_READS` declaration: a tuple of strings, each a verb the capability's `help` names and none of them in its `WRITE_VERBS`. Audit and source check report a bad declaration as a `connections/machine-reads` failure, and install refuses it with exit 6 `machine_reads_invalid` before anything is installed. A capability that declares none is validated as before.
+
 ## 2026-10-04 — The machine's store setting, the one store pointer
 
 `capabilities store set` records the Postgres this machine's store lives in: host, port, database, user, an `sslmode` of `require`, `verify-ca` or `verify-full` (anything weaker is refused) and an optional root certificate in `$XDG_CONFIG_HOME/capabilities/store.json`, and the password, taken from stdin, a file or a named environment variable and never from argv, in `$XDG_CONFIG_HOME/capabilities/credentials.env` at mode 0600. It is refused under the read-only switch. `capabilities store show` reports the setting and where each value came from without the password, and `capabilities store doctor` proves a TLS connection works, with the server version and the negotiated TLS, and fails when the server accepts plain text. The manager's own records in database mode now resolve their store from the setting; `CAPABILITIES_STORE_URL` still overrides it, and a machine with neither behaves as before. The manager now carries the Postgres driver. Run `capabilities help` for the details.

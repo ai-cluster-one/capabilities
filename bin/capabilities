@@ -1945,6 +1945,89 @@ def _validate_manifest(name: str, manifest) -> list[str]:
                     name, service["machine"], verbs))
     return problems
 
+def _machine_reads_declared(text: str) -> tuple[tuple | None, str | None]:
+    """A capability's `MACHINE_READS` as its source declares it, read without
+    running it: `((), None)` when it declares none, `(verbs, None)` when the
+    declaration is a literal tuple of verb names, `(None, problem)` otherwise."""
+    import ast
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return (), None
+    node = None
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            targets = [stmt.target]
+        else:
+            continue
+        if any(isinstance(t, ast.Name) and t.id == "MACHINE_READS" for t in targets):
+            node = stmt.value
+    if node is None:
+        return (), None
+    try:
+        value = ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        value = None
+    if not isinstance(value, tuple) or not all(
+            isinstance(verb, str) and verb for verb in value):
+        return None, "MACHINE_READS must be a tuple of verb names"
+    return value, None
+
+
+def _write_verbs_declared(text: str) -> set[str]:
+    """Every verb name `WRITE_VERBS` states literally in the source."""
+    import ast
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return set()
+    names: set[str] = set()
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            targets = [stmt.target]
+        else:
+            continue
+        if any(isinstance(t, ast.Name) and t.id == "WRITE_VERBS" for t in targets):
+            names |= {n.value for n in ast.walk(stmt.value)
+                      if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    return names
+
+
+def _machine_reads_problems(script: Path, help_text: str | None = None,
+                            env: dict | None = None) -> list[str]:
+    """The declared machine reads checked where a capability is validated: a
+    tuple of strings, each a verb the capability exposes - one its `help`
+    names - and none of them a write verb. A capability declaring none has
+    nothing to check, and its `help` is not run for it."""
+    try:
+        text = script.read_text()
+    except (OSError, UnicodeDecodeError):
+        return []
+    declared, problem = _machine_reads_declared(text)
+    if problem:
+        return [problem]
+    if not declared:
+        return []
+    writes = _write_verbs_declared(text)
+    problems = [f"MACHINE_READS names the write verb {verb!r}"
+                for verb in declared if verb in writes]
+    if help_text is None:
+        rc, help_text, _err = _run_script(script, ["help"], env=env)
+        if rc != 0:
+            return problems + [
+                f"MACHINE_READS cannot be checked: `help` exited {rc}"]
+    for verb in declared:
+        if verb in writes:
+            continue
+        if not re.search(rf"(?<![\w-]){re.escape(verb)}(?![\w-])", help_text):
+            problems.append(f"MACHINE_READS names {verb!r}, a verb the "
+                            "capability does not expose")
+    return problems
+
 # ---------------------------------------------------------------- snapshots
 
 def _snapshot(name: str, script: Path, registry: Path | None = None) -> dict:
@@ -1964,6 +2047,10 @@ def _snapshot(name: str, script: Path, registry: Path | None = None) -> dict:
     problems = _validate_manifest(name, manifest)
     if problems:
         _die(6, "manifest_invalid", f"{name}: manifest fails validation",
+             "; ".join(problems))
+    problems = _machine_reads_problems(script)
+    if problems:
+        _die(6, "machine_reads_invalid", f"{name}: MACHINE_READS fails validation",
              "; ".join(problems))
     (reg / "stub").write_text(stub_out.strip() + "\n")
     _write_json(reg / "manifest.json", manifest)
@@ -7207,6 +7294,8 @@ def _audit_script(
                      "refs", "inventory"):
             if verb not in out:
                 failures.append(f"help: contract verb {verb!r} undocumented")
+    failures += [f"connections/machine-reads: {p}" for p in _machine_reads_problems(
+        script, out if rc == 0 else None, env=env)]
 
     # The effective gate, exercised in a sandbox: project override, inherited
     # global enable, and default deny. Safe declaration verbs are intentionally
@@ -8122,6 +8211,8 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
                 problems.append(f"manifest: exit {rc}: {err.strip()}")
             if manifest is not None:
                 problems += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
+            problems += [f"connections/machine-reads: {p}"
+                         for p in _machine_reads_problems(script)]
         if problems:
             failures[name] = sorted(set(problems))
             continue
@@ -8171,6 +8262,8 @@ def _catalog_payload_scoped(
                     problems.append(f"manifest: exit {rc}: {err.strip()}")
                 if manifest is not None:
                     problems += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
+                problems += [f"connections/machine-reads: {p}"
+                             for p in _machine_reads_problems(script)]
             if problems:
                 failures[name] = sorted(set(problems))
                 continue

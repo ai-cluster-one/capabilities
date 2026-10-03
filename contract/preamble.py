@@ -37,6 +37,10 @@ these module-level names; they are the only coupling):
                  POST_INSTALL, _CONFIG_HOME, _STATE_HOME
     connections: CREDENTIALS_ENV, CRED_KEYS, WRITE_VERBS, WRITE_DEFAULT
     plus the stdlib imports the helpers use: os, sys, json, Path, NoReturn.
+Optionally, beside WRITE_DEFAULT, `MACHINE_READS`: a tuple of the read verbs
+that, outside any project, use the machine's own connections read-only.
+Absent or empty means none; the manager validates it where it validates a
+capability.
 
 The bare `help` verb is dispatched by `_contract` and reads the CLI's help
 body from a module-level `HELP` constant if defined, else the module docstring
@@ -863,6 +867,64 @@ def _gate() -> None:
          "--project` or `--global` exactly as requested")
 
 
+def _invoked_verb() -> str | None:
+    """The verb this process was invoked with: its first argument once the
+    contract's own `--connection <id>` selection is lifted out of the way."""
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--connection":
+            i += 2
+        elif argv[i].startswith("--connection="):
+            i += 1
+        else:
+            return argv[i]
+    return None
+
+
+def _machine_read(verb: str | None = None) -> bool:
+    """Whether `verb`, else the invoked one, is a machine read here.
+
+    Outside any project there is no scope a grant could have been written in,
+    so a verb the capability declares in `MACHINE_READS` uses the machine's own
+    connections instead, read-only. Inside a project the grant model alone
+    decides, and a capability that declares nothing has no machine reads."""
+    declared = globals().get("MACHINE_READS")
+    if not declared or not isinstance(declared, tuple):
+        return False
+    if _project_root() is not None:
+        return False
+    return (verb if verb is not None else _invoked_verb()) in declared
+
+
+def _policy_state() -> dict:
+    """This capability's effective policy, in the words `capabilities list`
+    uses: `effective` enabled or disabled, the `source` that decided it -
+    `machine` (the ceiling), `project`, `global` or `default` - and the
+    `machine` ceiling itself. A record that cannot be read is reported as the
+    refusal the gate would give, so the report around it still answers."""
+    import contextlib
+    import io
+    errors = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(errors):
+            machine = _machine_state()
+            row = None if machine == "quarantined" else _policy_row()
+    except SystemExit:
+        lines = errors.getvalue().strip().splitlines()
+        try:
+            return {"error": json.loads(lines[-1])["error"]}
+        except (IndexError, ValueError, KeyError, TypeError):
+            return {"error": {"code": "policy_unreadable",
+                              "message": errors.getvalue().strip()}}
+    if machine == "quarantined":
+        return {"effective": "disabled", "source": "machine", "machine": machine}
+    if row is None:
+        return {"effective": "disabled", "source": "default", "machine": machine}
+    return {"effective": "enabled" if row["value"]["enabled"] else "disabled",
+            "source": row.get("scope"), "machine": machine}
+
+
 def _env_dir() -> Path | None:
     """The capability's envelope dir in the project's active capabilities/."""
     root = _project_root()
@@ -1366,23 +1428,54 @@ def _cmd_inventory(argv: list[str]) -> None:
     _emit(report)
 
 
-def _cmd_connections_read_only() -> None:
-    """The capability's own connections report, told that the read-only switch
-    is on. The report stays the capability's: it is taken whole, every
-    connection in it is marked read-only, and the switch is named beside it, so
-    a reader sees why no connection may write."""
+MACHINE_READ_EFFECT = ("outside any project these verbs use the machine's own "
+                       "connections, read-only; inside a project its grants "
+                       "alone decide")
+
+
+def _cmd_connections_reported() -> None:
+    """The capability's own connections report, with what the contract knows
+    beside it. The report stays the capability's: it is taken whole, and the
+    capability's effective policy state is added to it. Under the read-only
+    switch every connection in it is marked read-only and the switch is named
+    beside it, so a reader sees why no connection may write; in a machine read
+    each connection the machine lent is named as the machine's, read-only."""
     import contextlib
     import io
     captured = io.StringIO()
-    with contextlib.redirect_stdout(captured):
-        _cmd_connections()
-    report = json.loads(captured.getvalue())
-    for entry in (report.get("connections") or {}).values():
-        if isinstance(entry, dict):
-            entry["allow_write"] = False
-    report["read_only_switch"] = {
-        "variable": READ_ONLY_ENV, "on": True,
-        "effect": READ_ONLY_EFFECT}
+    try:
+        with contextlib.redirect_stdout(captured):
+            _cmd_connections()
+    except SystemExit:
+        sys.stdout.write(captured.getvalue())
+        raise
+    try:
+        report = json.loads(captured.getvalue())
+    except ValueError:
+        report = None
+    if not isinstance(report, dict):
+        sys.stdout.write(captured.getvalue())
+        return
+    conns = report.get("connections")
+    conns = conns if isinstance(conns, dict) else {}
+    if read_only_switch():
+        for entry in conns.values():
+            if isinstance(entry, dict):
+                entry["allow_write"] = False
+        report["read_only_switch"] = {
+            "variable": READ_ONLY_ENV, "on": True,
+            "effect": READ_ONLY_EFFECT}
+    lent = globals().get("_MACHINE_LENT") or {}
+    if lent:
+        for cid in lent:
+            if isinstance(conns.get(cid), dict):
+                conns[cid]["allow_write"] = False
+        report["machine_reads"] = {
+            "verbs": list(MACHINE_READS),
+            "connections": {cid: {"scope": "machine", "source": source}
+                            for cid, source in sorted(lent.items())},
+            "effect": MACHINE_READ_EFFECT}
+    report["policy"] = _policy_state()
     _emit(report)
 
 
@@ -1412,10 +1505,7 @@ def _contract(argv: list[str]) -> None:
     elif cmd == "context":
         _cmd_context(argv[1:])
     elif cmd == "connections":
-        if read_only_switch():
-            _cmd_connections_read_only()
-        else:
-            _cmd_connections()
+        _cmd_connections_reported()
     elif cmd == "inventory":
         _cmd_inventory(argv[1:])
     elif cmd == "help" and len(argv) == 1:
@@ -1468,6 +1558,11 @@ def _grant_hint(cid: str) -> str:
             f"{grant} run inside this project.")
 
 
+# The connections the machine lent this process for a machine read, by id, each
+# with the file it was declared in; empty in every other process.
+_MACHINE_LENT: dict = {}
+
+
 def _grant_gate(reg: dict, cid: str) -> None:
     """Refuse a connection this project may not use, for read as for write.
 
@@ -1481,6 +1576,9 @@ def _grant_gate(reg: dict, cid: str) -> None:
         return
     if entry.get("scope") == "project":
         message = f"connection {cid!r} is disabled in this project"
+    elif _machine_read():
+        message = (f"connection {cid!r} is switched off on this machine by "
+                   f"its grant")
     elif _project_root() is None:
         message = (f"connection {cid!r} is declared globally and there is no "
                    f"project here to grant it in")
@@ -1515,9 +1613,12 @@ def _connections_composed() -> dict:
     configuring one: nothing resolves through it, and its one reader is each
     capability's own report, naming the origin of its `connection`-tier keys."""
     adapter = _records()
+    machine = _machine_read()
+    _MACHINE_LENT.clear()
     try:
         effective = adapter.connections(NAME, write_default=WRITE_DEFAULT,
-                                        include_disabled=True)
+                                        include_disabled=True,
+                                        machine_read=machine)
         default = adapter.get(NAME, "setting", "connection.default")
     except StoreError as e:
         _die(6, e.slug, e.message, e.hint)
@@ -1530,7 +1631,10 @@ def _connections_composed() -> dict:
     withheld = {cid: e for cid, e in effective.items() if not e["enabled"]}
     if not usable:
         named = ", ".join(sorted(withheld))
-        if _project_root() is None:
+        if machine:
+            refusal = (f"every {NAME} connection this machine declares is "
+                       f"switched off by its grant: {named}")
+        elif _project_root() is None:
             refusal = (f"there is no project here to use a {NAME} connection in, "
                        f"so every connection declared globally stays "
                        f"withheld: {named}")
@@ -1538,28 +1642,34 @@ def _connections_composed() -> dict:
             refusal = (f"no {NAME} connection is usable in this project; every "
                        f"one it can see is withheld: {named}")
         _die(4, "connection_not_granted", refusal, _grant_hint("<id>"))
+    sources = {cid: adapter.scope_source(NAME, "connection", entry["scope"][0])
+               for cid, entry in usable.items()}
+    _MACHINE_LENT.update({cid: sources[cid] for cid, entry in usable.items()
+                          if entry.get("machine_read")})
     return {
         "default": default,
         "connections": {cid: {**entry["value"], "allow_write": entry["allow_write"]}
                         for cid, entry in usable.items()},
-        "sources": {cid: adapter.scope_source(NAME, "connection", entry["scope"][0])
-                    for cid, entry in usable.items()},
+        "sources": sources,
         "withheld": {cid: {"scope": entry["scope"][0]}
                      for cid, entry in withheld.items()},
     }
 
 
-def _inventory_connections() -> dict:
+def _inventory_connections(machine_read: bool | None = None) -> dict:
     """Every connection this project declares, granted or not.
 
     An inventory reports where selection refuses, so this is deliberately the
     one connection read that never dies: no registry is zero connections, and
     a connection the project may not act on is still a connection worth
-    showing. `granted` carries which is which."""
+    showing. `granted` carries which is which. `machine_read` asks as one of
+    the capability's machine reads would, else as the invoked verb does."""
+    machine = _machine_read() if machine_read is None else bool(machine_read)
     try:
         adapter = _records()
         effective = adapter.connections(NAME, write_default=WRITE_DEFAULT,
-                                        include_disabled=True) or {}
+                                        include_disabled=True,
+                                        machine_read=machine) or {}
         default = adapter.get(NAME, "setting", "connection.default")
     except StoreError:
         return {"default": None, "connections": {}}
@@ -1627,6 +1737,12 @@ def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
     The read-only switch closes it for every connection and names itself."""
     if verb in WRITE_VERBS:
         _read_only_gate(f"write verb {verb!r} on connection {conn_id!r}")
+    if verb in WRITE_VERBS and not allow_write and conn_id in _MACHINE_LENT:
+        _die(4, "read_only",
+             f"connection {conn_id!r} is the machine's, lent read-only to a "
+             f"machine read outside any project",
+             "Do not lift the gate yourself — ask the user; a write runs "
+             "inside a project that grants this connection.")
     if verb in WRITE_VERBS and not allow_write:
         _die(4, "read_only",
              f"connection {conn_id!r} does not allow writes",

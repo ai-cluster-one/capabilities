@@ -559,6 +559,10 @@ The principle: **the cascade resolves values; a gate is not a value.** No flag, 
 
 **The read-only switch closes every gate at once and opens none.** `CAPABILITIES_READ_ONLY` set to `1` or `true` (any case) in a capability's environment puts it, and every process it starts, under the switch; unset, `0` or `false` leave everything as declared. Under it every connection resolves read-only whatever its grant or `WRITE_DEFAULT`, and every write verb exits 4 with the code `read_only_switch`, distinct from a connection's own `read_only`. The same refusal covers a write to a project record — identifiers, references, connections, grants, settings, policy — whether a capability or the manager would make it, and a bundled service's `init`, `start`, `run` and `reload`. A capability's operational state and caches keep writing, so a read that refreshes a local store still succeeds. The contract decides the switch once, in the store tier (`read_only_switch()`), because that tier is the one every capability carries and the manager and bundled services import; every writer consults it and none reimplements it. `<name> connections` and `capabilities doctor` report it while it is on.
 
+### Machine reads
+
+Outside any project there is no scope a grant could be written in, so a capability may declare, beside `WRITE_DEFAULT`, the read verbs that there use the machine's own connections: `MACHINE_READS = ("connections", "doctor")`, a tuple of verbs the capability exposes, none of them a write verb, which the manager validates wherever it validates a capability. Absent or empty, the capability has no machine reads. Outside any project a declared verb sees every connection declared globally whose grant does not resolve to `enabled: false`, each one a source whatever its grant or `WRITE_DEFAULT` says, so a write through it exits 4 `read_only`, and `connections` names each one as the machine's under `machine_reads`. Every other verb outside a project is refused the machine's connections, and inside a project grants alone decide what every verb may use. The policy gate and the machine ceiling come first, as for any verb, and the read-only switch still closes every gate.
+
 ### `connections` — the resolution report
 
 `<name> connections` prints where every value of every declared connection resolves from — the programmatic answer to *"which credentials is this using, and from where?"*. It is **purely local**: resolution only, no network, no authentication attempt (readiness stays `doctor`'s question). The report always carries the same shape, so a consumer never branches on cardinality:
@@ -589,6 +593,8 @@ A non-secret value prints in full. A secret prints **masked** — `…` plus the
 def _mask(value: str) -> str:
     return ("…" + value[-4:]) if len(value) >= 8 else "****"
 ```
+
+Beside the connections the report carries `policy`, the capability's effective policy state in the words `capabilities list` uses: `effective` (`enabled` or `disabled`), the `source` that decided it (`machine` for the ceiling, `project`, `global`, or `default` when neither scope says anything) and the `machine` ceiling itself. A policy record that cannot be read is reported there as the refusal the gate would give, and the report still answers.
 
 A **core-only** capability — one carrying the `capability core` fence and no `connections` fence, because it has nothing to resolve (it drives a local tool or the host, with no credentials or endpoint) — still answers `connections`, reporting an empty map: `{ "connections": {}, "default": null }`. That absence is the contract, not a gap: `audit` accepts the empty report in place of the explicit-registry checks, and never writes a registry against such a capability.
 
