@@ -169,7 +169,7 @@ declared base and overlays. `deployment next` likewise emits layout-aware local
 commands. Use `deployment plan` to select the provider adapter.
 
 Docker builds should bootstrap the capabilities manager from the selected
-`CAPABILITIES_REF`, then run `capabilities install <name>` for each non-comment
+`CAPABILITIES_REF`, then run `capabilities install <name> --allow` for each non-comment
 line in `deployment/capabilities.lock`, initialize project contexts with
 `capabilities init`, and verify the capability set with `capabilities doctor` to
 ensure the lock is complete before proceeding.

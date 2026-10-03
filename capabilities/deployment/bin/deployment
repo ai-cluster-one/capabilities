@@ -67,7 +67,7 @@ USAGE
       Refresh deployment/capabilities.lock from the current project capability gate.
       The file is a lightweight install list: one capability name per line,
       comments allowed. Docker builds bootstrap the capabilities manager and run
-      `capabilities install <name>` for each entry.
+      `capabilities install <name> --allow` for each entry.
 
   deployment sync [--check|--adopt]
       Compile the project-enabled deployable-service descriptors into the
@@ -87,6 +87,32 @@ USAGE
       `deployment sync` installs this as its own launchd agent on the
       host-agents profile; run it by hand with --dry-run to see what it would
       do. Settings live under `compiler.host.watchdog` in runtime.json.
+
+  deployment machine sync|next [--text|--json]|status|watchdog [--dry-run]
+      The machine scope, on macOS: supervision for the services that run once
+      per machine rather than once per project. `sync` asks the capabilities
+      manager for the installed set and reads each capability's manifest
+      snapshot; every one that declares `service.machine`, is allowed on this
+      machine, and is not disabled in the machine declaration gets a launcher
+      `capabilities-machine-<name>` and an agent
+      `capabilities.machine.<name>.plist` running its `service.machine.command`
+      in its expanded `service.machine.state` (home when it declares none), with
+      the compiling shell's PATH, RunAtLoad, KeepAlive on unsuccessful exit, and
+      AbandonProcessGroup, so launchd never reaps the work the service started.
+      It also writes `capabilities.machine.watchdog.plist`, which runs
+      `deployment machine watchdog`: one pass asking each machine service's
+      `service.machine.doctor`, with the project watchdog's failure count,
+      timeout and cooldown, and `launchctl kickstart -k` after repeated
+      failures. Every other installed capability is listed as skipped with the
+      reason. A machine service with no joined project is still compiled; it
+      idles. The declaration is `$XDG_CONFIG_HOME/deployment/machine.json`,
+      {"watchdog": {...}, "services": {"<name>": {"disabled": true}}}, and a
+      missing file means defaults; agents and logs land in
+      `$XDG_STATE_HOME/deployment/machine/launchd/`, the same from any working
+      directory. `next` prints the `ln -sf` and `launchctl bootstrap` steps,
+      since handing an agent to launchd stays a person's act; `status` reports
+      each compiled agent and whether it is linked and loaded, and writes
+      nothing. Run `deployment guide profiles` for the model.
 
   deployment doctor [--target <name>]
       Validate deployment/runtime.json, deployment/targets/*.json, and the deployment
@@ -5496,55 +5522,67 @@ def cmd_watchdog(dry_run: bool, now: float | None = None) -> dict:
         service = services[name]
         if not isinstance(service, dict):
             continue
-        label = f"{prefix}.{name}"
-        entry = {"service": name, "label": label, "action": "none"}
-        launchd = _launchd_status(label)
-        entry["loaded"] = launchd["loaded"]
-        if not launchd["loaded"]:
-            entry["detail"] = "not loaded; a person has not started this agent"
-            report["services"].append(entry)
-            continue
-        if not launchd["pid"]:
-            # Between restarts. launchd owns that, and stepping in would race it.
-            entry["detail"] = "no pid; launchd is already restarting it"
-            state.pop(name, None)
-            report["services"].append(entry)
-            continue
+        report["services"].append(_watchdog_check(
+            name, f"{prefix}.{name}", list(service.get("doctor") or []), root,
+            config, state, stamp, dry_run))
 
-        probe = _probe_service(list(service.get("doctor") or []), root,
-                               config["probe_timeout_seconds"])
-        entry.update({"ok": probe["ok"], "detail": probe["detail"]})
-        if probe["ok"] is not False:
-            state.pop(name, None)
-            report["services"].append(entry)
-            continue
+    _save_watchdog_state(report, state_path, state, dry_run)
+    return report
 
-        record = state.get(name) if isinstance(state.get(name), dict) else {}
-        failures = int(record.get("failures") or 0) + 1
-        entry["failures"] = failures
-        last_restart = float(record.get("last_restart") or 0)
-        if failures < config["failures_before_restart"]:
-            entry["action"] = "watching"
-            state[name] = {"failures": failures, "last_restart": last_restart}
-        elif stamp - last_restart < config["restart_cooldown_seconds"]:
-            # Restarting again this soon would mean the restart is not the fix,
-            # and a loop of them buries the evidence of whatever is.
-            entry["action"] = "cooling down"
-            entry["detail"] += (f"; last restart "
-                                f"{int(stamp - last_restart)}s ago")
-            state[name] = {"failures": failures, "last_restart": last_restart}
-        elif dry_run:
-            entry["action"] = "would restart"
-            state[name] = {"failures": failures, "last_restart": last_restart}
-        else:
-            outcome = _kickstart(label)
-            entry["action"] = "restarted" if outcome["restarted"] else "restart failed"
-            entry["detail"] += f"; {outcome['detail']}"
-            state[name] = ({"failures": 0, "last_restart": stamp}
-                           if outcome["restarted"] else
-                           {"failures": failures, "last_restart": last_restart})
-        report["services"].append(entry)
 
+def _watchdog_check(name: str, label: str, doctor: list[str], cwd: Path,
+                    config: dict, state: dict, stamp: float, dry_run: bool) -> dict:
+    """One service's turn in a watchdog pass, recording its count in `state`.
+
+    The project and the machine scope watch their agents by this one decision,
+    so a failure count, a timeout and a cooldown mean the same thing in both."""
+    entry = {"service": name, "label": label, "action": "none"}
+    launchd = _launchd_status(label)
+    entry["loaded"] = launchd["loaded"]
+    if not launchd["loaded"]:
+        entry["detail"] = "not loaded; a person has not started this agent"
+        return entry
+    if not launchd["pid"]:
+        # Between restarts. launchd owns that, and stepping in would race it.
+        entry["detail"] = "no pid; launchd is already restarting it"
+        state.pop(name, None)
+        return entry
+
+    probe = _probe_service(doctor, cwd, config["probe_timeout_seconds"])
+    entry.update({"ok": probe["ok"], "detail": probe["detail"]})
+    if probe["ok"] is not False:
+        state.pop(name, None)
+        return entry
+
+    record = state.get(name) if isinstance(state.get(name), dict) else {}
+    failures = int(record.get("failures") or 0) + 1
+    entry["failures"] = failures
+    last_restart = float(record.get("last_restart") or 0)
+    if failures < config["failures_before_restart"]:
+        entry["action"] = "watching"
+        state[name] = {"failures": failures, "last_restart": last_restart}
+    elif stamp - last_restart < config["restart_cooldown_seconds"]:
+        # Restarting again this soon would mean the restart is not the fix,
+        # and a loop of them buries the evidence of whatever is.
+        entry["action"] = "cooling down"
+        entry["detail"] += (f"; last restart "
+                            f"{int(stamp - last_restart)}s ago")
+        state[name] = {"failures": failures, "last_restart": last_restart}
+    elif dry_run:
+        entry["action"] = "would restart"
+        state[name] = {"failures": failures, "last_restart": last_restart}
+    else:
+        outcome = _kickstart(label)
+        entry["action"] = "restarted" if outcome["restarted"] else "restart failed"
+        entry["detail"] += f"; {outcome['detail']}"
+        state[name] = ({"failures": 0, "last_restart": stamp}
+                       if outcome["restarted"] else
+                       {"failures": failures, "last_restart": last_restart})
+    return entry
+
+
+def _save_watchdog_state(report: dict, state_path: Path, state: dict,
+                         dry_run: bool) -> None:
     if not dry_run:
         try:
             state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5554,7 +5592,6 @@ def cmd_watchdog(dry_run: bool, now: float | None = None) -> dict:
             # not worth failing a watchdog pass over.
             report["state_error"] = f"{type(exc).__name__}: {exc}"[:200]
     report["state_file"] = str(state_path)
-    return report
 
 
 def _desired_state(root: Path, runtime: dict) -> tuple[dict, dict[Path, str],
@@ -6637,6 +6674,474 @@ def cmd_watchdog_command(args) -> None:
     _emit(report)
 
 
+# --- Machine scope ------------------------------------------------------------
+# A service that runs once per machine (its manifest declares `service.machine`)
+# belongs to no project, so its supervision cannot live in one. The machine
+# scope compiles one launchd agent per such service, and one watchdog over them,
+# from the installed manifests and this machine's own settings, into this
+# machine's state home - wherever it is run from, the same files. Like the
+# project scope it stops at the artifact: handing an agent to launchd stays a
+# person's act, and `deployment machine next` prints the steps.
+
+SERVICE_MACHINE_SCHEMA = "capabilities.service.machine.v1"
+MACHINE_LABEL_PREFIX = "capabilities.machine"
+MACHINE_LAUNCHER_PREFIX = "capabilities-machine"
+MACHINE_WATCHDOG = "watchdog"
+# The machine's homes a machine service's declaration is expanded against. They
+# travel with the agent when they are set, so launchd starts the service, and
+# the watchdog, against the same settings and state that sync read.
+MACHINE_HOME_KEYS = ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
+                     "XDG_CACHE_HOME", "CAPABILITIES_HOME")
+
+
+def _machine_homes() -> dict[str, str]:
+    home = Path.home()
+    return {
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": os.environ.get("XDG_CONFIG_HOME") or str(home / ".config"),
+        "XDG_STATE_HOME": os.environ.get("XDG_STATE_HOME") or str(home / ".local" / "state"),
+        "XDG_DATA_HOME": os.environ.get("XDG_DATA_HOME") or str(home / ".local" / "share"),
+        "XDG_CACHE_HOME": os.environ.get("XDG_CACHE_HOME") or str(home / ".cache"),
+    }
+
+
+def _machine_settings_path() -> Path:
+    return Path(_machine_homes()["XDG_CONFIG_HOME"]) / NAME / "machine.json"
+
+
+def _machine_agents_dir() -> Path:
+    return Path(_machine_homes()["XDG_STATE_HOME"]) / NAME / "machine" / "launchd"
+
+
+def _machine_label(name: str) -> str:
+    return f"{MACHINE_LABEL_PREFIX}.{name}"
+
+
+def _machine_settings() -> dict:
+    """This machine's declaration: watchdog settings and the services it keeps
+    out. A missing file is every default; one that cannot be read is refused,
+    because guessing would quietly supervise what a person switched off."""
+    path = _machine_settings_path()
+    data, err = _read_json(path)
+    if err == "missing":
+        data = {}
+    elif err:
+        _die(6, "bad_machine_settings", f"cannot read {path}: {err}",
+             'expected {"watchdog": {...}, "services": {"<name>": {"disabled": true}}}')
+    if not isinstance(data, dict):
+        _die(6, "bad_machine_settings", f"{path} is not a JSON object",
+             'expected {"watchdog": {...}, "services": {"<name>": {"disabled": true}}}')
+    services = data.get("services")
+    disabled = sorted(name for name, entry in (services.items() if isinstance(services, dict) else [])
+                      if isinstance(entry, dict) and entry.get("disabled") is True)
+    return {"path": str(path), "present": err != "missing",
+            "watchdog": _watchdog_config(data.get("watchdog")), "disabled": disabled}
+
+
+def _machine_manager() -> str:
+    """The manager this executable belongs with: an explicit override, the one
+    beside a source checkout, else the one on PATH."""
+    manager = os.environ.get("CAPABILITIES_MANAGER_BIN", "").strip()
+    if manager:
+        return manager
+    source_manager = Path(__file__).resolve().parents[3] / "bin" / "capabilities"
+    return str(source_manager) if source_manager.is_file() else "capabilities"
+
+
+def _machine_installed() -> list[dict]:
+    """The installed set and each capability's machine state, as the manager
+    answers for the machine: asked from the home directory with every project
+    hand-down removed, so the answer is the same from wherever this runs."""
+    env = dict(os.environ)
+    for key in ("CLAUDE_PROJECT_DIR", "CAPABILITIES_PROJECT_ENVELOPE",
+                "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "CAPABILITIES_PROJECT_ID",
+                "CAPABILITIES_PROJECT_ID_ROOT"):
+        env.pop(key, None)
+    home = Path.home()
+    try:
+        proc = subprocess.run([_machine_manager(), "list", "--json"],
+                              cwd=str(home if home.is_dir() else Path("/")),
+                              env=env, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _die(6, "capabilities_manager_unavailable",
+             f"could not ask the capabilities manager for the installed set: {exc}",
+             "install or repair the `capabilities` command")
+    if proc.returncode != 0:
+        _die(6, "capabilities_list_failed",
+             "the capabilities manager could not list the installed set",
+             (proc.stderr or proc.stdout).strip()[:400] or "run `capabilities list --json`")
+    try:
+        rows = json.loads(proc.stdout).get("installed")
+    except (ValueError, AttributeError):
+        rows = None
+    if not isinstance(rows, list):
+        _die(6, "capabilities_list_malformed",
+             "the capabilities manager returned no installed list")
+    return [row for row in rows if isinstance(row, dict) and isinstance(row.get("name"), str)]
+
+
+def _expand_machine_path(value: str) -> Path | None:
+    """`$XDG_STATE_HOME/...` and the like, against this machine's homes."""
+    homes = _machine_homes()
+    text = value
+    if text == "~" or text.startswith("~/"):
+        text = homes["HOME"] + text[1:]
+    for key in sorted(homes, key=len, reverse=True):
+        text = text.replace("${" + key + "}", homes[key]).replace("$" + key, homes[key])
+    if "$" in text or not os.path.isabs(text):
+        return None
+    return Path(os.path.normpath(text))
+
+
+def _argv(value: object) -> bool:
+    return (isinstance(value, list) and bool(value)
+            and all(isinstance(part, str) and part for part in value))
+
+
+def _machine_services() -> tuple[dict[str, dict], list[dict], dict, dict]:
+    """Every machine service this machine supervises, and every installed
+    capability it does not, each with the reason; also the settings read and
+    the manager's row for this capability."""
+    settings = _machine_settings()
+    rows = _machine_installed()
+    services: dict[str, dict] = {}
+    skipped: list[dict] = []
+    for row in sorted(rows, key=lambda item: item["name"]):
+        name = row["name"]
+        manifest, err = _installed_manifest(name)
+        if err or manifest is None:
+            skipped.append({"capability": name,
+                            "reason": f"its manifest snapshot cannot be read ({err})"})
+            continue
+        service = manifest.get("service")
+        machine = service.get("machine") if isinstance(service, dict) else None
+        if machine is None:
+            skipped.append({"capability": name, "reason": "declares no machine service"})
+            continue
+        if row.get("machine") != "allowed":
+            skipped.append({"capability": name, "reason": (
+                f"quarantined on this machine; lifting it is the user's decision "
+                f"(`capabilities allow {name}`)")})
+            continue
+        if name in settings["disabled"]:
+            skipped.append({"capability": name,
+                            "reason": f"disabled in {settings['path']}"})
+            continue
+        if name == MACHINE_WATCHDOG:
+            skipped.append({"capability": name, "reason": (
+                f"its label would be the machine watchdog's "
+                f"({_machine_label(MACHINE_WATCHDOG)})")})
+            continue
+        if (not isinstance(machine, dict)
+                or machine.get("schema") != SERVICE_MACHINE_SCHEMA
+                or not _argv(machine.get("command")) or not _argv(machine.get("doctor"))):
+            skipped.append({"capability": name, "reason": (
+                f"its service.machine is not a valid {SERVICE_MACHINE_SCHEMA} "
+                "declaration")})
+            continue
+        state = machine.get("state")
+        if state is None:
+            # Never a project: a machine service resolves none from where it stands.
+            working = Path(_machine_homes()["HOME"])
+        else:
+            working = _expand_machine_path(state) if isinstance(state, str) else None
+        if working is None:
+            skipped.append({"capability": name, "reason": (
+                f"its service.machine.state {state!r} does not expand to an "
+                "absolute path")})
+            continue
+        services[name] = {"command": list(machine["command"]),
+                          "doctor": list(machine["doctor"]),
+                          "working_directory": working}
+    return services, skipped, settings, next(
+        (row for row in rows if row["name"] == NAME), {})
+
+
+def _machine_environment(search_path: str) -> dict:
+    environment = {"PATH": search_path}
+    for key in MACHINE_HOME_KEYS:
+        value = os.environ.get(key)
+        if value:
+            environment[key] = value
+    return environment
+
+
+def _plist_document(body: dict) -> str:
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+             '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+             '<plist version="1.0">']
+    lines += _plist_fragment(body, 0)
+    lines.append("</plist>")
+    return "\n".join(lines) + "\n"
+
+
+def _machine_desired() -> dict:
+    """What `machine sync` writes, and what it found on the way."""
+    services, skipped, settings, own_row = _machine_services()
+    agents_dir = _machine_agents_dir()
+    watchdog = settings["watchdog"]
+    findings: list[dict] = []
+    if sys.platform != "darwin":
+        findings.append({"severity": "warning", "path": str(agents_dir),
+                         "message": "launchd agents are compiled here but only load on macOS"})
+    search_path = _launchd_search_path(
+        [service["command"] for service in services.values()]
+        + [service["doctor"] for service in services.values()] + [[NAME]])
+    environment = _machine_environment(search_path)
+    texts: dict[Path, str] = {}
+    for name, service in sorted(services.items()):
+        command = service["command"]
+        if not shutil.which(command[0]):
+            findings.append({
+                "severity": "error", "path": f"registry:{name}/manifest.json",
+                "message": f"machine service {name!r} runs {command[0]!r}, which is "
+                           "not on PATH here; launchd needs it resolved at compile time"})
+        working = service["working_directory"]
+        if not working.is_dir():
+            findings.append({
+                "severity": "warning", "path": str(working),
+                "message": f"the working directory of {name!r} does not exist yet, and "
+                           "launchd will not start an agent without it; "
+                           "`deployment machine next` names the step that creates it"})
+        label = _machine_label(name)
+        launcher = agents_dir / f"{MACHINE_LAUNCHER_PREFIX}-{name}"
+        texts[launcher] = _mark_generated(
+            launcher, _host_launcher_text(_launchd_program(command)))
+        plist = agents_dir / f"{label}.plist"
+        texts[plist] = _mark_generated(plist, _plist_document({
+            "Label": label,
+            "ProgramArguments": [str(launcher)],
+            "WorkingDirectory": str(working),
+            "EnvironmentVariables": environment,
+            "RunAtLoad": True,
+            "KeepAlive": {"SuccessfulExit": False},
+            # A machine service starts work that outlives it; launchd must not
+            # reap that work when it stops or restarts the service.
+            "AbandonProcessGroup": True,
+            "ThrottleInterval": 10,
+            "ProcessType": "Background",
+            "StandardOutPath": str(agents_dir / f"{name}.out.log"),
+            "StandardErrorPath": str(agents_dir / f"{name}.err.log"),
+        }))
+    watchdog_label = _machine_label(MACHINE_WATCHDOG)
+    watchdog_plist = agents_dir / f"{watchdog_label}.plist"
+    if services and watchdog["enabled"]:
+        launcher = agents_dir / f"{MACHINE_LAUNCHER_PREFIX}-{MACHINE_WATCHDOG}"
+        texts[launcher] = _mark_generated(launcher, _host_launcher_text(
+            _launchd_program([NAME, "machine", "watchdog"])))
+        # Scheduled, not supervised: see _watchdog_plist.
+        texts[watchdog_plist] = _mark_generated(watchdog_plist, _plist_document({
+            "Label": watchdog_label,
+            "ProgramArguments": [str(launcher)],
+            "WorkingDirectory": str(agents_dir),
+            "EnvironmentVariables": environment,
+            "RunAtLoad": False,
+            "StartInterval": watchdog["interval_seconds"],
+            "ProcessType": "Background",
+            "StandardOutPath": str(agents_dir / "watchdog.out.log"),
+            "StandardErrorPath": str(agents_dir / "watchdog.err.log"),
+        }))
+        if own_row.get("effective") != "enabled":
+            findings.append({
+                "severity": "warning", "path": str(watchdog_plist),
+                "message": f"the watchdog agent runs outside any project, where "
+                           f"{NAME} is not enabled, so its pass would be refused; "
+                           f"it needs `capabilities enable {NAME} --global`, which "
+                           "is the user's decision"})
+    elif watchdog_plist.is_file():
+        findings.append({
+            "severity": "warning", "path": str(watchdog_plist),
+            "message": "no machine watchdog is wanted but its agent is still here; "
+                       f"run `launchctl bootout gui/$UID/{watchdog_label}` and "
+                       "delete this file"})
+    for entry in skipped:
+        stale = agents_dir / f"{_machine_label(entry['capability'])}.plist"
+        if entry["capability"] != MACHINE_WATCHDOG and stale.is_file():
+            findings.append({
+                "severity": "warning", "path": str(stale),
+                "message": f"{entry['capability']} is no longer supervised here "
+                           f"({entry['reason']}) but its agent is still here; run "
+                           f"`launchctl bootout gui/$UID/{_machine_label(entry['capability'])}` "
+                           "and delete this file"})
+    return {"services": services, "skipped": skipped, "settings": settings,
+            "agents_dir": agents_dir, "texts": texts, "findings": findings}
+
+
+def cmd_machine_sync(args) -> None:
+    desired = _machine_desired()
+    findings = desired["findings"]
+    errors = [f for f in findings if f.get("severity") == "error"]
+    written: list[dict] = []
+    if not errors:
+        for path, expected in sorted(desired["texts"].items()):
+            actual = _read_text(path)
+            if actual == expected:
+                written.append({"path": str(path), "action": "unchanged"})
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(expected)
+            if expected.startswith("#!"):
+                path.chmod(path.stat().st_mode | 0o755)
+            written.append({"path": str(path),
+                            "action": "created" if actual is None else "updated"})
+    settings = desired["settings"]
+    _emit({
+        "ok": not errors,
+        "agents_dir": str(desired["agents_dir"]),
+        "settings": {"path": settings["path"], "present": settings["present"]},
+        "services": sorted(desired["services"]),
+        "agents": sorted(path.stem for path in desired["texts"] if path.suffix == ".plist"),
+        "skipped": desired["skipped"],
+        "findings": findings,
+        "written": written,
+    })
+    if errors:
+        sys.exit(6)
+
+
+def _machine_next_payload() -> dict:
+    desired = _machine_desired()
+    agents_dir = desired["agents_dir"]
+    library = Path.home() / "Library" / "LaunchAgents"
+    plists = sorted((path for path in desired["texts"] if path.suffix == ".plist"),
+                    key=lambda path: path.name)
+    labels = [path.stem for path in plists]
+    services = sorted(desired["services"])
+    missing = [str(path) for path in plists if not path.is_file()]
+    stale = [str(path) for path in plists
+             if path.is_file() and _read_text(path) != desired["texts"][path]]
+    steps: list[str] = []
+    if missing or stale:
+        steps.append("Compile first: `deployment machine sync`. Not yet written or "
+                     f"out of date: {', '.join(missing + stale)}.")
+    steps.append(
+        "Stop any copy of these services you started by hand, so launchd does not "
+        "end up beside one: "
+        f"{', '.join(f'`{name} service stop --machine`' for name in services) or 'none declared'}.")
+    workdirs = sorted({str(desired["services"][name]["working_directory"])
+                       for name in services
+                       if not desired["services"][name]["working_directory"].is_dir()})
+    if workdirs:
+        steps.append("Create the working directories launchd starts them in: "
+                     + " ".join(f"`mkdir -p {path}`" for path in workdirs))
+    steps += [
+        "Take down any earlier copy of these agents and remove the installed file, "
+        "not only the job; macOS keeps the program it recorded for an agent until "
+        f"its file leaves `{library}`:",
+        *[f"`launchctl bootout gui/$UID {library / f'{label}.plist'} 2>/dev/null;"
+          f" rm -f {library / f'{label}.plist'}`" for label in labels],
+        f"Link the compiled agents into `{library}`:",
+        *[f"`ln -sf {agents_dir / f'{label}.plist'} {library / f'{label}.plist'}`"
+          for label in labels],
+        *[f"Load it: `launchctl bootstrap gui/$UID {library / f'{label}.plist'}`"
+          for label in labels],
+    ]
+    watchdog_label = _machine_label(MACHINE_WATCHDOG)
+    return {
+        "agents_dir": str(agents_dir),
+        "settings": desired["settings"]["path"],
+        "services": services,
+        "skipped": desired["skipped"],
+        "host_agents": labels,
+        "artifacts": [str(path) for path in plists],
+        "validation": [f"plutil -lint {path}" for path in plists],
+        "steps": steps,
+        "first_run": [f"{name} service doctor --machine" for name in services]
+                     + (["deployment machine watchdog --dry-run"]
+                        if watchdog_label in labels else []),
+        "check_commands": [f"launchctl print gui/$UID/{label}" for label in labels]
+                          + ["deployment machine status"],
+        "manual_control": {
+            "restart": [f"launchctl kickstart -k gui/$UID/{label}" for label in labels],
+            "stop": [f"launchctl kill TERM gui/$UID/{label}" for label in labels],
+            "start": [f"launchctl kickstart gui/$UID/{label}" for label in labels],
+            "remove": [f"launchctl bootout gui/$UID/{label}" for label in labels],
+        },
+    }
+
+
+def _machine_next_markdown(payload: dict) -> str:
+    lines = ["# Machine Agents Next Steps", "",
+             f"Compiled into `{payload['agents_dir']}` from the installed machine "
+             f"services and `{payload['settings']}`.", "", "## 1. Review Files", ""]
+    lines += [f"- `{path}`" for path in payload["artifacts"]] or ["- No machine service is supervised here."]
+    if payload["skipped"]:
+        lines += ["", "Not supervised:", ""]
+        lines += [f"- `{entry['capability']}`: {entry['reason']}" for entry in payload["skipped"]]
+    lines += ["", "## 2. Validate Locally", ""]
+    lines += [f"```sh\n{cmd}\n```" for cmd in payload["validation"]]
+    lines += ["", "## 3. Hand Them To launchd", ""]
+    lines += [f"{idx}. {step}" for idx, step in enumerate(payload["steps"], 1)]
+    lines += ["", "## 4. First Run", ""]
+    lines += [f"```sh\n{cmd}\n```" for cmd in payload["first_run"]]
+    lines += ["", "## 5. Check", "", "```sh", *payload["check_commands"], "```"]
+    control = payload["manual_control"]
+    lines += ["", "## 6. Manual Control", "",
+              "Restart:", "", "```sh", *control["restart"], "```",
+              "", "Stop, and stay stopped:", "", "```sh", *control["stop"], "```",
+              "", "Start again:", "", "```sh", *control["start"], "```",
+              "", "Remove from launchd:", "", "```sh", *control["remove"], "```", ""]
+    return "\n".join(lines)
+
+
+def cmd_machine_next(args) -> None:
+    payload = _machine_next_payload()
+    _emit(payload if args.json else _machine_next_markdown(payload))
+
+
+def cmd_machine_status(args) -> None:
+    """Each compiled machine agent, and what launchd says about it. Reads only."""
+    agents_dir = _machine_agents_dir()
+    library = Path.home() / "Library" / "LaunchAgents"
+    agents = []
+    plists = sorted(agents_dir.glob(f"{MACHINE_LABEL_PREFIX}.*.plist")) if agents_dir.is_dir() else []
+    for path in plists:
+        label = path.stem
+        installed = library / f"{label}.plist"
+        try:
+            linked = installed.resolve() == path.resolve() and installed.exists()
+        except OSError:
+            linked = False
+        launchd = _launchd_status(label)
+        agents.append({"label": label, "artifact": str(path), "compiled": True,
+                       "installed": str(installed), "linked": linked,
+                       "loaded": launchd["loaded"], "pid": launchd["pid"],
+                       "last_exit_status": launchd["last_exit_status"],
+                       "program": launchd["program"]})
+    out = {"agents_dir": str(agents_dir), "agents": agents}
+    if not agents:
+        out["hint"] = "nothing is compiled here; run `deployment machine sync`"
+    _emit(out)
+
+
+def cmd_machine_watchdog(dry_run: bool, now: float | None = None) -> dict:
+    """One pass over the machine agents, as `cmd_watchdog` makes over a project's."""
+    settings = _machine_settings()
+    config = settings["watchdog"]
+    report = {"scope": "machine", "supervisor": "launchd", "enabled": config["enabled"],
+              "dry_run": dry_run, "services": []}
+    if not config["enabled"]:
+        report["skipped"] = f"watchdog disabled in {settings['path']}"
+        return report
+    services = _machine_services()[0]
+    state_path = _machine_agents_dir() / ".watchdog-state.json"
+    state = _read_watchdog_state(state_path)
+    stamp = time.time() if now is None else now
+    for name in sorted(services):
+        working = services[name]["working_directory"]
+        report["services"].append(_watchdog_check(
+            name, _machine_label(name), services[name]["doctor"],
+            working if working.is_dir() else Path.home(),
+            config, state, stamp, dry_run))
+    _save_watchdog_state(report, state_path, state, dry_run)
+    return report
+
+
+def cmd_machine_watchdog_command(args) -> None:
+    _emit(cmd_machine_watchdog(bool(args.dry_run)))
+
+
 def cmd_runtime(args) -> None:
     _emit(_load_runtime(_root()))
 
@@ -6764,6 +7269,18 @@ def main(argv: list[str] | None = None) -> None:
     p_next.add_argument("--json", action="store_true")
     p_next.set_defaults(fn=cmd_next)
 
+    p_machine = sub.add_parser("machine", add_help=False)
+    machine = p_machine.add_subparsers(dest="machine_cmd", required=True)
+    machine.add_parser("sync", add_help=False).set_defaults(fn=cmd_machine_sync)
+    p_machine_next = machine.add_parser("next", add_help=False)
+    p_machine_next.add_argument("--text", action="store_true")
+    p_machine_next.add_argument("--json", action="store_true")
+    p_machine_next.set_defaults(fn=cmd_machine_next)
+    machine.add_parser("status", add_help=False).set_defaults(fn=cmd_machine_status)
+    p_machine_watchdog = machine.add_parser("watchdog", add_help=False)
+    p_machine_watchdog.add_argument("--dry-run", action="store_true")
+    p_machine_watchdog.set_defaults(fn=cmd_machine_watchdog_command)
+
     args, extra = parser.parse_known_args(argv)
     if extra:
         _die(6, "input", f"unknown arguments: {' '.join(extra)}")
@@ -6772,6 +7289,9 @@ def main(argv: list[str] | None = None) -> None:
     previews = getattr(args, "check", False) or getattr(args, "dry_run", False)
     if (args.cmd in WRITE_VERBS or args.cmd == "watchdog") and not previews:
         _read_only_gate(f"`{NAME} {args.cmd}`")
+    if (args.cmd == "machine" and args.machine_cmd in ("sync", "watchdog")
+            and not previews):
+        _read_only_gate(f"`{NAME} machine {args.machine_cmd}`")
     args.fn(args)
 
 
