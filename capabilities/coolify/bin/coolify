@@ -4131,6 +4131,8 @@ def _request(client: httpx.Client, method: str, path: str,
                             f"{field}: {messages}" for field, messages in fields.items())
             except ValueError:
                 pass
+            if resp.status_code == 422:
+                msg = _redact(msg)
             if resp.status_code in (401, 403):
                 _die(2, "unauthorized", msg,
                      "COOLIFY_TOKEN invalid or lacks the required ability",

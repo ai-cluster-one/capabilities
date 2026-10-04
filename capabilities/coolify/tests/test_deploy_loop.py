@@ -135,6 +135,28 @@ def test_422_redacts_password_field(capsys):
     assert 'secret-value' not in capsys.readouterr().err
 
 
+@pytest.mark.parametrize('with_fields', [True, False])
+def test_422_redacts_message_field_names_and_errors(with_fields, capsys):
+    response = fixture('validation-422-secrets')
+    if not with_fields:
+        response.pop('errors')
+    c, _ = client([(422, response)])
+    with pytest.raises(SystemExit) as err:
+        m._request(c, 'POST', '/applications/dockerimage')
+    assert err.value.code == 6
+    captured = capsys.readouterr()
+    assert captured.out == ''
+    for secret in ('fixture-message-secret', 'fixture-field-secret',
+                   'fixture-name-secret', 'fixture-error-secret'):
+        assert secret not in captured.out
+        assert secret not in captured.err
+    message = json.loads(captured.err)['error']['message']
+    assert 'postgres://app:<redacted>@db.example.test:5432/app' in message
+    if with_fields:
+        assert 'postgres_password: <redacted>' in message
+        assert 'Invalid database URL.' in message
+
+
 def states(status,uuid='app-fixture'):
     return [{'uuid':uuid,'status':status}]
 
