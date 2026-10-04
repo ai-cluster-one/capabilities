@@ -59,6 +59,16 @@ def test_each_pitfall_sits_at_its_step():
     assert "--token-stdin --global --default" in steps[2]
     assert "capabilities set coolify grant <name> '{\"enabled\": true}'" in steps[2]
     assert "--project" not in steps[2]
+    # the grant is the user's act, never the session's own
+    assert "this session does not lift that gate itself" in steps[2]
+    assert "ask the user to run that command" in steps[2]
+    assert "do that now in the project this session runs in" not in steps[2]
+    # --default only when no machine default exists yet
+    assert "pass `--default` only if it shows no default yet" in steps[2]
+    # reads work anywhere read-only; writes need a project that granted the pairing
+    assert "work from any directory on the machine pairing alone, read-only" in steps[2]
+    assert "a project the user has granted the pairing to" in steps[2]
+    assert "a setup workspace such as an app's service folder must be such a project" in steps[2]
     assert "resets the instance setting every time Coolify starts" in steps[3]
     assert "ufw" in steps[4] and "DOCKER-USER" in steps[4]
     assert "share one Let's Encrypt rate limit" in steps[4]
@@ -72,6 +82,19 @@ def test_each_pitfall_sits_at_its_step():
 def test_step_six_ends_with_the_store_pointer():
     paragraphs = [p for p in _steps()[6].strip().split("\n\n") if p.strip()]
     assert "`capabilities store set`" in paragraphs[-1]
+
+
+def test_step_six_names_where_the_project_and_server_uuids_come_from():
+    step = _steps()[6]
+    assert "coolify projects create <name>" in step
+    assert "coolify servers" in step
+
+
+def test_step_six_suggests_defaults_for_its_own_placeholders():
+    step = _steps()[6]
+    assert "`<db-name>` `capabilities-store`" in step
+    assert "`<user>` and `<db>` both `capabilities`" in step
+    assert "`<port>` `5432`" in step
 
 
 def test_no_secret_is_put_on_a_command_line_by_the_guide():
@@ -203,5 +226,9 @@ def test_step_four_checks_from_outside_and_through_the_proxy():
 
 
 def test_step_four_re_pairs_the_machine_connection_over_https():
+    step = _steps()[4]
     assert ("coolify connect <name> --url https://<domain> --token-env <KEY> "
-            "--global --default") in _steps()[4]
+            "--global --default") in step
+    # the re-pair must not move an existing machine default
+    assert "keep `--default` only if it already shows none" in step
+    assert "this re-pair must not move an existing machine default" in step

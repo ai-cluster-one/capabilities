@@ -82,6 +82,8 @@ bash /root/coolify-install.sh 4.3.23
 EOF
 ```
 
+The installer prints "Updated value of ROOT_USER_PASSWORD as the current value was empty" even though `ROOT_USER_PASSWORD` was set above and the root user is created as asked; the message is harmless and does not mean the password was ignored.
+
 Pitfall: the seeder fails silently. If the email's domain does not resolve, or the password fails Coolify's strength and breach check, the install finishes and no user is created. Use an address on a real domain with DNS records (`dig +short MX <domain-of-email>` or `dig +short A <domain-of-email>` answers), and let the script generate the password as above: random, with upper case, lower case, digits and a symbol. The password then stays in plain text in `/data/coolify/source/.env` on the server; it is the only copy, and nothing in this guide reads it.
 
 Check that the user exists and the version is the one you asked for:
@@ -96,6 +98,8 @@ It answers `root user present` and `docker.io/coollabsio/coolify:4.3.23`. With n
 
 *Internal.* Coolify has no supported headless way to mint a token. This one creates a root-ability token for the root user in the root team through Laravel's tinker, and is undocumented, so first confirm it still applies to the installed version: `docker exec coolify php artisan list` lists `tinker`, and the step 1 check found user 0 and team 0 (`App\Models\Team::find(0)->name` is `Root Team`). If either has moved, stop and find the new path rather than guessing.
 
+Check `coolify connections` before running this: pass `--default` only if it shows no default yet, since this first pairing must not move one that already exists; if one is set, drop `--default` from the command below.
+
 The token goes straight from the server into `coolify connect` on standard input. The same remote script turns the API on with `POST /api/v1/enable`, sending the token as a header read from standard input, and prints the token only into the pipe:
 
 ```sh
@@ -109,7 +113,11 @@ EOF
 
 Pitfall: `/api/v1/enable` and `/api/v1/servers/{uuid}/validate` take POST only; a GET answers 405 with "This endpoint has changed to a POST request" and changes nothing. Pitfall: never echo the token, paste it, or write it into a prompt; if it is ever shown, revoke it and mint another.
 
-`coolify connect` writes the machine's connection entry (URL and the name of the key that holds the token, nothing secret) to `~/.config/coolify/connections.json` and the token into `~/.config/coolify/credentials.env` at mode 0600, then runs the doctor probe. A project uses this machine pairing once it grants it, by running `capabilities set coolify grant <name> '{"enabled": true}'` in the project; do that now in the project this session runs in, since every later `coolify` command here needs it, and until then `connect` answers `"usable_here": false` with that command. Check that its answer has `"ok": true` and `"version": "4.3.23"`, and, after the grant, that `coolify connections` lists `<name>` with its token masked. If the probe fails, read the `enable:` status the script printed on stderr first: anything but a 2xx means the API is still off.
+`coolify connect` writes the machine's connection entry (URL and the name of the key that holds the token, nothing secret) to `~/.config/coolify/connections.json` and the token into `~/.config/coolify/credentials.env` at mode 0600, then runs the doctor probe.
+
+Reads — `coolify connections`, `coolify --connection <name> doctor`, `coolify servers` — work from any directory on the machine pairing alone, read-only; every write this guide asks for from here on, such as creating a project, a database, or updating an app, runs in a project the user has granted the pairing to, so a setup workspace such as an app's service folder must be such a project.
+
+A project uses this machine pairing once it grants it, by running `capabilities set coolify grant <name> '{"enabled": true}'` in that project; this session does not lift that gate itself, so ask the user to run that command for the project it works in now, or confirm the grant already exists, before any write below, since until then `connect` answers `"usable_here": false` with that command. Check that its answer has `"ok": true` and `"version": "4.3.23"`, and, once the grant is confirmed, that `coolify connections` lists `<name>` with its token masked. If the probe fails, read the `enable:` status the script printed on stderr first: anything but a 2xx means the API is still off.
 
 ## 3. Turn auto-update on so that it holds
 
@@ -157,7 +165,7 @@ openssl s_client -connect <domain>:443 -servername <domain> </dev/null 2>/dev/nu
 
 Until both pass, do not close any port. Pitfall: sslip.io names share one Let's Encrypt rate limit across everyone who uses them, so the request can be refused for reasons that have nothing to do with this server. The proxy then serves its own default certificate instead (the issuer names Traefik, not Let's Encrypt), and `ssh root@<server-ip> 'docker logs coolify-proxy 2>&1 | grep -i acme | tail -5'` shows the refusal, such as "too many certificates already issued". The fallback is a domain the owner points at the server: an A record for a name of their choosing with the value `<server-ip>`. It is the one act in this guide that needs anything outside the server. Ask the owner for it, then run the commands above again with that name as `<domain>`.
 
-Re-pair on the HTTPS URL. The token is already in the credentials file, and `--token-env` resolves the key through the same files a verb reads it from:
+Re-pair on the HTTPS URL. The token is already in the credentials file, and `--token-env` resolves the key through the same files a verb reads it from. Check `coolify connections` first: keep `--default` only if it already shows none, since this re-pair must not move an existing machine default; if one is set, drop `--default` from the command below:
 
 ```sh
 coolify connect <name> --url https://<domain> --token-env <KEY> --global --default
@@ -250,10 +258,10 @@ grep -qF "$(cut -d' ' -f2 /root/.ssh/coolify-deploy.pub)" /home/git/.ssh/authori
 EOF
 ```
 
-Add this machine's public key the same way, so it can push the bodies it deploys (here `~/.ssh/id_ed25519.pub`; use the key this machine pushes with):
+Add this machine's public key the same way, so it can push the bodies it deploys. Do not assume a fixed name such as `~/.ssh/id_ed25519.pub`: find the key SSH actually uses for this server with `ssh -G root@<server-ip> | grep -i identityfile`, which names the private key file, and use that file's `.pub` half (`<identity-file>` below) as the one SSH already picks for this host:
 
 ```sh
-ssh root@<server-ip> "echo 'no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $(cat ~/.ssh/id_ed25519.pub)' >> /home/git/.ssh/authorized_keys"
+ssh root@<server-ip> "echo 'no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $(cat <identity-file>.pub)' >> /home/git/.ssh/authorized_keys"
 ```
 
 Register the deploy key's private half in Coolify (`POST /security/keys`; `coolify` has no verb for it yet). It streams from the server into the request and is never written on this machine or printed:
@@ -268,7 +276,9 @@ Check: `coolify sources` lists `git-deploy` under `private_deploy_keys`, its uui
 
 ## 6. Create a Postgres with TLS enforced
 
-Every database is Postgres 18 with pgvector, public on a port of its own, with a generated password. Generate the password into a file only you can read, and give it to `database create` from that file:
+A fresh instance has a server (the one Coolify installed onto itself in step 1) but no project yet, and `database create` needs the uuid of each. Find `<server-uuid>` with `coolify servers`, which lists the one server and its uuid. Create the project with `coolify projects create <name>`, whose answer carries the new project's uuid as `<project-uuid>`.
+
+Every database is Postgres 18 with pgvector, public on a port of its own, with a generated password. With nothing project-specific to call it, name `<db-name>` `capabilities-store`, `<user>` and `<db>` both `capabilities`, and `<port>` `5432`. Generate the password into a file only you can read, and give it to `database create` from that file; the trailing newline `openssl rand -hex 32 >` writes into that file is harmless, since both Coolify's `--set-file` and `capabilities store set` strip it when they read the file back:
 
 ```sh
 (umask 077; openssl rand -hex 32 > ~/.cache/coolify-bootstrap/pg-password)
@@ -278,7 +288,7 @@ coolify database create --engine postgresql --project <project-uuid> --server <s
 Its answer carries the database uuid and connection URLs with the password redacted. Pitfall: Coolify's API refuses `enable_ssl` and `ssl_mode` on create and on update, and Coolify's own SSL setting still accepts plain-text connections, so TLS is enforced in three more acts that have no API in 4.3.23:
 
 1. *Internal*: switch SSL on in the database's model: `ssh root@<server-ip> "docker exec coolify php artisan tinker --execute '\$d = App\Models\StandalonePostgresql::where(\"uuid\", \"<db-uuid>\")->first(); \$d->enable_ssl = true; \$d->ssl_mode = \"require\"; \$d->save();'"`.
-2. Restart it through the API, which issues its certificate: `coolify restart <db-uuid> --type database`. It reports `exited` states for up to a minute while starting; wait until `coolify databases <db-uuid>` shows `running:healthy`.
+2. Restart it through the API, which issues its certificate: `coolify restart <db-uuid> --type database`. Coolify's stored status reads `exited:unhealthy` for about five to six minutes afterward although the container is healthy within seconds, because Sentinel, the agent inside the server that reports container health back to Coolify, reports only on a state change or every 300 seconds; check the container itself with `ssh root@<server-ip> docker ps` for the immediate answer, and only then wait out the five to six minutes for `coolify databases <db-uuid>` to catch up and show `running:healthy`.
 3. In the container, whose name is the database uuid, replace the catch-all `host all all all ...` line of `/var/lib/postgresql/18/docker/pg_hba.conf` with the two lines `hostnossl all all all reject` and `hostssl all all all scram-sha-256`, then restart it through the API again as in 2. The rule survives an API restart; whether it survives a Coolify update is not proven, which is why the store's doctor checks it.
 
 Check from this machine, with no password needed for either answer:
@@ -288,7 +298,7 @@ psql -w "host=<server-ip> port=<port> user=<user> dbname=<db> sslmode=disable" -
 psql -w "host=<server-ip> port=<port> user=<user> dbname=<db> sslmode=require" -c 'select 1'   # fe_sendauth: no password supplied
 ```
 
-The first is refused for having no encryption; the second gets as far as asking for the password over TLS.
+The first is refused for having no encryption; the second gets as far as asking for the password over TLS. Both checks go over IPv4, which is all `<server-ip>` is: the public Postgres answers over IPv4 only and refuses a connection over IPv6 outright, unlike the proxy in step 4, so there is no IPv6 form of this check to run.
 
 For the central store, the last act of this step is `capabilities store set`, giving it the host, port, database, user, `sslmode=require` and the password from `~/.cache/coolify-bootstrap/pg-password` through standard input or the file, never on a command line; `capabilities help` gives its exact flags. Remove `~/.cache/coolify-bootstrap` once the store's doctor answers ok.
 
