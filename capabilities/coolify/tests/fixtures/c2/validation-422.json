@@ -1,0 +1,11 @@
+{
+  "message": "Validation failed.",
+  "errors": {
+    "project_uuid": [
+      "This field is required."
+    ],
+    "server_uuid": [
+      "This field is required."
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+[
+  {
+    "status": "in_progress",
+    "created_at": "2026-10-04T15:02:41.000000Z",
+    "updated_at": "2026-10-04T15:02:41.000000Z",
+    "deployment_uuid": "deployment-fixture",
+    "application_id": "2"
+  }
+]

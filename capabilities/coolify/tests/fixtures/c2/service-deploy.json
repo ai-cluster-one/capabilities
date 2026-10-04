@@ -1,0 +1,8 @@
+{
+  "deployments": [
+    {
+      "message": "Service c2-proof started. It could take a while, be patient.",
+      "resource_uuid": "service-fixture"
+    }
+  ]
+}

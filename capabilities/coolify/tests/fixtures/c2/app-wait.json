@@ -1,0 +1,6 @@
+{
+  "resource_uuid": "app-fixture",
+  "status": "running:healthy",
+  "deployment_uuid": "deployment-fixture",
+  "deployment_status": "finished"
+}

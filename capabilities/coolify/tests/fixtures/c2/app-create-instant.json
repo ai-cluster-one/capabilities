@@ -1,0 +1,13 @@
+{
+  "uuid": "app-fixture",
+  "domains": "http://app-fixture.example.test",
+  "instant_deploy": true,
+  "deployments": [
+    {
+      "message": "Application c2-app-proof deployment queued.",
+      "resource_uuid": "app-fixture",
+      "deployment_uuid": "deployment-fixture"
+    }
+  ],
+  "deployment_uuid": "deployment-fixture"
+}

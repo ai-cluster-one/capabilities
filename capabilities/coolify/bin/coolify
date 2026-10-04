@@ -137,6 +137,10 @@ COMMANDS
       health-check flags accepted by `app update`. Returns the application uuid.
       Write verb - requires allow_write.
 
+      --instant-deploy creates without queuing, then deploys once, returning
+      deployment_uuid and deployments alongside the new application's uuid.
+      If deployment fails, the created application remains for inspection.
+
   app update <uuid> [options]
       Patch only the supplied application fields:
       --name --domains --ports-exposes --base-directory
@@ -191,9 +195,24 @@ COMMANDS
       passwords redacted (see SECRETS); --reveal prints them to a terminal.
       Write verb - requires allow_write.
 
-  deploy <uuid> [--force] [--tag T]
-      Trigger a deployment of an application/service by uuid (POST /deploy).
-      --force rebuilds without cache; --tag deploys by image tag instead.
+  app|service|database delete <uuid> --yes [--delete-volumes]
+      [--delete-configurations] [--docker-cleanup] [--delete-connected-networks]
+      Delete a resource. Cleanup options default to false, including volumes;
+      each option explicitly opts into that cleanup. Requires allow_write.
+  projects delete <uuid> --yes
+      Delete an empty project. Requires allow_write; remove its resources first.
+
+  deploy [<uuid>] [--force] [--tag T]
+      Trigger a deployment (POST /deploy). Returns deployments with resource_uuid
+      and deployment_uuid (applications; Coolify returns no deployment uuid for
+      services or databases). --force rebuilds without cache; --tag deploys
+      every resource with a tag, rather than selecting an image tag.
+  wait <uuid> [--deployment <uuid>] [--timeout <s>]
+      Poll until the resource reports running:healthy and, when specified, the
+      deployment reports finished. Default timeout: 600 seconds, poll: 5 seconds.
+      Starting/exited states are retried. Failed/cancelled deployments exit 5;
+      timeout exits 5 wait_timeout with the last resource and deployment states.
+      Reads only. A missing resource exits 3.
   start <uuid>   --type application|service|database
   stop <uuid>    --type application|service|database
   restart <uuid> --type application|service|database
@@ -247,6 +266,7 @@ EXIT CODES
 
 from __future__ import annotations
 
+import math
 import argparse
 import json
 import os
@@ -3901,7 +3921,8 @@ def _doctor_gate(report: dict, wanted: str | None) -> None:
 
 SLIM_FIELDS = ("uuid", "name", "description", "status", "type", "fqdn",
                "domains", "git_repository", "git_branch", "server_uuid",
-               "environment_name", "image", "created_at", "updated_at")
+               "environment_name", "image", "created_at", "updated_at",
+               "deployment_uuid", "resource_uuid", "application_uuid", "application_id")
 GITHUB_SOURCE_FIELDS = (
     "uuid", "id", "name", "organization", "html_url", "api_url",
     "is_system_wide", "is_public", "type",
@@ -4043,15 +4064,37 @@ def _client(conn: dict) -> httpx.Client:
     )
 
 
+class _WaitDeadline(Exception):
+    pass
+
+
 def _request(client: httpx.Client, method: str, path: str,
-             params: dict | None = None, json_body: dict | None = None):
+             params: dict | None = None, json_body: dict | None = None,
+             deadline: float | None = None):
+    def pause(seconds):
+        if deadline is not None:
+            seconds = min(seconds, max(0, deadline - time.monotonic()))
+        time.sleep(seconds)
+
     last_status: int | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = client.request(method, path, params=params, json=json_body)
+            kwargs = {}
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _WaitDeadline()
+                kwargs["timeout"] = httpx.Timeout(
+                    connect=min(TIMEOUT.connect or remaining, remaining),
+                    read=min(TIMEOUT.read or remaining, remaining),
+                    write=min(TIMEOUT.write or remaining, remaining),
+                    pool=min(TIMEOUT.pool or remaining, remaining))
+            resp = client.request(method, path, params=params, json=json_body, **kwargs)
         except httpx.TimeoutException:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise _WaitDeadline()
             if attempt < MAX_RETRIES:
-                time.sleep(attempt * 1.5)
+                pause(attempt * 1.5)
                 continue
             _die(5, "timeout", f"request timed out: {method} {path}",
                  "Coolify was unresponsive")
@@ -4063,12 +4106,12 @@ def _request(client: httpx.Client, method: str, path: str,
         if resp.status_code == 429:
             retry_after = float(resp.headers.get("Retry-After", str(attempt * 1.5)))
             if attempt < MAX_RETRIES:
-                time.sleep(retry_after)
+                pause(retry_after)
                 continue
             _die(5, "rate_limited", "rate-limited by Coolify", status=429)
         if resp.status_code >= 500:
             if attempt < MAX_RETRIES:
-                time.sleep(attempt * 1.5)
+                pause(attempt * 1.5)
                 continue
             _die(5, "server_error", f"Coolify returned {resp.status_code}",
                  (resp.text or "")[:300], status=resp.status_code)
@@ -4080,6 +4123,12 @@ def _request(client: httpx.Client, method: str, path: str,
                 j = resp.json()
                 if isinstance(j, dict):
                     msg = j.get("message") or j.get("error") or msg
+                    if resp.status_code == 422 and isinstance(j.get("errors"), dict):
+                        fields = {field: (REDACTED if _is_password_field(field)
+                                          else _redact(messages))
+                                  for field, messages in j["errors"].items()}
+                        msg = str(msg) + ": " + "; ".join(
+                            f"{field}: {messages}" for field, messages in fields.items())
             except ValueError:
                 pass
             if resp.status_code in (401, 403):
@@ -4268,7 +4317,11 @@ def cmd_logs(c, uuid: str, lines: int):
 
 
 def cmd_deploy(c, uuid: str, force: bool, tag: str | None):
-    params: dict = {"uuid": uuid}
+    params: dict = {}
+    if uuid:
+        params["uuid"] = uuid
+    if not uuid and not tag:
+        _die(6, "input", "deploy requires a resource uuid or --tag <tag>")
     if force:
         params["force"] = "true"
     if tag:
@@ -4277,6 +4330,58 @@ def cmd_deploy(c, uuid: str, force: bool, tag: str | None):
     # has changed to a POST request" (405). The ability probe above deliberately
     # keeps using the GET shim, because it must not mutate anything.
     return _request(c, "POST", "/deploy", params=params)
+
+
+DELETE_FLAGS = ("delete_volumes", "delete_configurations", "docker_cleanup",
+                "delete_connected_networks")
+
+
+def _add_delete_arguments(parser):
+    parser.add_argument("--yes", action="store_true", help="confirm deletion")
+    for flag in DELETE_FLAGS:
+        parser.add_argument("--" + flag.replace("_", "-"), action="store_true")
+
+
+def cmd_delete(c, base: str, uuid: str, args):
+    if not args.yes:
+        _die(6, "confirmation_required", "deletion requires --yes")
+    params = {flag: str(bool(getattr(args, flag, False))).lower() for flag in DELETE_FLAGS}
+    # Projects must be empty; their API has no cleanup parameters.
+    if base == "projects" and any(getattr(args, flag, False) for flag in DELETE_FLAGS):
+        _die(6, "input", "project deletion takes no cleanup flags; delete its resources first")
+    return _request(c, "DELETE", f"/{base}/{uuid}",
+                    params=None if base == "projects" else params)
+
+
+def cmd_wait(c, uuid: str, deployment: str | None, timeout: float):
+    if not math.isfinite(timeout) or timeout <= 0:
+        _die(6, "input", "--timeout must be a positive finite number of seconds")
+    deadline = time.monotonic() + timeout
+    last = {"resource_uuid": uuid, "status": "unknown",
+            "deployment_uuid": deployment, "deployment_status": None}
+    def request(path):
+        try:
+            return _request(c, "GET", path, deadline=deadline)
+        except _WaitDeadline:
+            _die(5, "wait_timeout", json.dumps(last), "increase --timeout or inspect the resource and deployment")
+
+    while True:
+        if deployment:
+            row = request(f"/deployments/{deployment}")
+            last["deployment_status"] = row.get("status", "unknown")
+            if last["deployment_status"] in {"failed", "cancelled", "canceled", "cancelled-by-user"}:
+                _die(5, "deployment_failed", json.dumps(last))
+        resources = _list_data(request("/resources"))
+        resource = next((r for r in resources if r.get("uuid") == uuid), None)
+        if resource is None:
+            _die(3, "not_found", f"resource {uuid} not found")
+        last["status"] = resource.get("status", "unknown")
+        if time.monotonic() < deadline and last["status"] == "running:healthy" and (not deployment or last["deployment_status"] == "finished"):
+            return last
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _die(5, "wait_timeout", json.dumps(last), "increase --timeout or inspect the resource and deployment")
+        time.sleep(min(5, remaining))
 
 
 def cmd_lifecycle(c, action: str, uuid: str, rtype: str):
@@ -4524,7 +4629,7 @@ def cmd_app_create(c, args):
     if hasattr(args, 'ports_exposes') and args.ports_exposes:
         payload["ports_exposes"] = args.ports_exposes
     if hasattr(args, 'instant_deploy') and args.instant_deploy:
-        payload["instant_deploy"] = True
+        payload["instant_deploy"] = False
     if hasattr(args, 'destination') and args.destination:
         payload["destination_uuid"] = args.destination
 
@@ -4565,7 +4670,14 @@ def cmd_app_create(c, args):
     else:
         _die(6, "input", "must specify one source type: --image, --dockerfile, or --git-repository")
 
-    return _request(c, "POST", endpoint, json_body=payload)
+    result = _request(c, "POST", endpoint, json_body=payload)
+    if getattr(args, "instant_deploy", False) and isinstance(result, dict) and result.get("uuid"):
+        deployment = cmd_deploy(c, result["uuid"], False, None)
+        result = dict(result, instant_deploy=True, deployments=deployment.get("deployments", []))
+        rows = result["deployments"]
+        if len(rows) == 1 and rows[0].get("deployment_uuid"):
+            result["deployment_uuid"] = rows[0]["deployment_uuid"]
+    return result
 
 
 def cmd_app_update(c, args):
@@ -5057,6 +5169,10 @@ def _projects_call(operands: list, name_flag: str | None) -> tuple:
               "next release; use `projects create <name>`")
     if not operands:
         return "list", None, None
+    if operands[0] == "delete":
+        if len(operands) != 2:
+            _die(6, "input", "projects delete requires one uuid")
+        return "delete", operands[1], None
     if operands[0] == "create":
         if len(operands) > 2:
             _die(6, "input", "projects create takes one name",
@@ -5134,6 +5250,7 @@ def main() -> None:
     sp.add_argument("--name", default=None)
     sp.add_argument("--description", default=None)
     _add_reveal(sp)
+    _add_delete_arguments(sp)
 
     for verb in ("applications", "services", "databases",
                  "servers", "deployments"):
@@ -5147,9 +5264,14 @@ def main() -> None:
     _add_reveal(sp)
 
     sp = sub.add_parser("deploy")
-    sp.add_argument("uuid")
+    sp.add_argument("uuid", nargs="?", default=None)
     sp.add_argument("--force", action="store_true", help="rebuild without cache")
-    sp.add_argument("--tag", default=None, help="deploy by image tag")
+    sp.add_argument("--tag", default=None, help="deploy every resource with this tag")
+
+    sp = sub.add_parser("wait")
+    sp.add_argument("uuid")
+    sp.add_argument("--deployment", default=None)
+    sp.add_argument("--timeout", type=float, default=600)
 
     for verb in ("start", "stop", "restart"):
         sp = sub.add_parser(verb)
@@ -5160,6 +5282,9 @@ def main() -> None:
     # app create/update
     sp = sub.add_parser("app", help="create or update an application")
     app_sub = sp.add_subparsers(dest="app_cmd", required=True)
+    sp_delete = app_sub.add_parser("delete")
+    sp_delete.add_argument("uuid")
+    _add_delete_arguments(sp_delete)
     sp_create = app_sub.add_parser("create", help="create application")
     sp_create.add_argument("--project", required=True, help="project UUID")
     sp_create.add_argument("--server", required=True, help="server UUID")
@@ -5193,6 +5318,9 @@ def main() -> None:
     # service create
     sp = sub.add_parser("service", help="create service")
     service_sub = sp.add_subparsers(dest="service_cmd", required=True)
+    sp_delete = service_sub.add_parser("delete")
+    sp_delete.add_argument("uuid")
+    _add_delete_arguments(sp_delete)
     sp_create = service_sub.add_parser("create", help="create service")
     sp_create.add_argument("--compose", required=True, help="docker-compose file (path or - for stdin)")
     sp_create.add_argument("--project", required=True, help="project UUID")
@@ -5205,6 +5333,9 @@ def main() -> None:
     # database create
     sp = sub.add_parser("database", help="create a database")
     database_sub = sp.add_subparsers(dest="database_cmd", required=True)
+    sp_delete = database_sub.add_parser("delete")
+    sp_delete.add_argument("uuid")
+    _add_delete_arguments(sp_delete)
     sp_create = database_sub.add_parser("create", help="create database")
     sp_create.add_argument(
         "--engine", required=True, choices=list(DATABASE_ENGINES),
@@ -5305,7 +5436,7 @@ def main() -> None:
     is_write = (
         args.cmd in {"deploy", "start", "stop", "restart", "app", "service",
                      "database"}
-        or (projects_call is not None and projects_call[0] == "create")
+        or (projects_call is not None and projects_call[0] in {"create", "delete"})
         or (args.cmd == "env" and args.env_cmd != "list")
     )
 
@@ -5324,6 +5455,8 @@ def main() -> None:
             action, uuid, name = projects_call
             if action == "create":
                 out(cmd_projects_create(c, name, args.description))
+            elif action == "delete":
+                out(cmd_delete(c, "projects", uuid, args))
             else:
                 out(cmd_collection(c, args.cmd, uuid))
         elif args.cmd in ("applications", "services", "databases",
@@ -5333,22 +5466,30 @@ def main() -> None:
             out(cmd_logs(c, args.uuid, args.lines))
         elif args.cmd == "deploy":
             out(cmd_deploy(c, args.uuid, args.force, args.tag))
+        elif args.cmd == "wait":
+            out(cmd_wait(c, args.uuid, args.deployment, args.timeout))
         elif args.cmd in ("start", "stop", "restart"):
             out(cmd_lifecycle(c, args.cmd, args.uuid, args.rtype))
         elif args.cmd == "app":
-            if args.app_cmd == "create":
+            if args.app_cmd == "delete":
+                out(cmd_delete(c, "applications", args.uuid, args))
+            elif args.app_cmd == "create":
                 out(cmd_app_create(c, args))
             elif args.app_cmd == "update":
                 out(cmd_app_update(c, args))
             else:
                 _die(6, "unknown_command", f"no handler for app {args.app_cmd!r}")
         elif args.cmd == "service":
-            if args.service_cmd == "create":
+            if args.service_cmd == "delete":
+                out(cmd_delete(c, "services", args.uuid, args))
+            elif args.service_cmd == "create":
                 out(cmd_service_create(c, args))
             else:
                 _die(6, "unknown_command", f"no handler for service {args.service_cmd!r}")
         elif args.cmd == "database":
-            if args.database_cmd == "create":
+            if args.database_cmd == "delete":
+                out(cmd_delete(c, "databases", args.uuid, args))
+            elif args.database_cmd == "create":
                 out(cmd_database_create(c, args))
             else:
                 _die(6, "unknown_command",

@@ -1,0 +1,6 @@
+{
+  "resource_uuid": "service-fixture",
+  "status": "running:healthy",
+  "deployment_uuid": null,
+  "deployment_status": null
+}

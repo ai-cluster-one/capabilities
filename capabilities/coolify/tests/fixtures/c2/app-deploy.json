@@ -1,0 +1,9 @@
+{
+  "deployments": [
+    {
+      "message": "Application c2-app-proof deployment queued.",
+      "resource_uuid": "app-fixture",
+      "deployment_uuid": "deployment-fixture"
+    }
+  ]
+}
