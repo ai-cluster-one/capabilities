@@ -114,6 +114,27 @@ USAGE
       each compiled agent and whether it is linked and loaded, and writes
       nothing. Run `deployment guide profiles` for the model.
 
+  deployment deploy [--target <name>]
+      Check compiler drift, sync the body through node-<target> over SSH,
+      provision a Coolify application, set environment through bulk stdin,
+      deploy and wait for healthy. On failure request the previous release.
+      Requires agent-box-checkout, a committed branch and a granted connection.
+  deployment rollback [--target <name>] [--to <commit>]
+      Roll back through Coolify and wait. Without --to use the previous release.
+  deployment logs [--target <name>] [--build] [--follow]
+      Read runtime logs or the recorded deployment build log; --follow polls.
+  deployment node login claude|codex [--target <name>] [--print-command]
+      SSH with a terminal into the application's agent container for subscription
+      login. --print-command prepares the command without attempting login.
+  deployment node sync [--target <name>]
+      Fetch node-<target>, rebase and push; abort conflicts and report diverged.
+      Optional target.mirror receives the synced branch. Host-agents compiles
+      an interval job (target.sync_interval, default 60 seconds).
+  deployment node status [--target <name>] [--json]
+      JSON host, release, Git sync, harness, store and per-service placement.
+      runtime service_policy.placement maps service names to node|local|both;
+      services.<name>.placement applies to custom services.
+
   deployment doctor [--target <name>]
       Validate deployment/runtime.json, deployment/targets/*.json, and the deployment
       references. Reports provider readiness as local facts only: whether the
@@ -211,7 +232,7 @@ SUMMARY = ("Project deployment standard - declare the services a project runs, "
            "processes on a Mac, and describe the targets they deploy to.")
 SCOPE = "project"
 CRED_KEYS: list = []
-WRITE_VERBS = {"init", "freeze", "setup", "scaffold", "sync"}
+WRITE_VERBS = {"init", "freeze", "setup", "scaffold", "sync", "deploy", "rollback"}
 WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/deployment/guides/")
@@ -3839,10 +3860,12 @@ def _service_policy(runtime: dict) -> tuple[dict, bool]:
         auto_include = raw.get("auto_include", True)
         default_mode = raw.get("default_mode", "enabled")
         overrides = raw.get("capabilities", {})
+        placement = raw.get("placement", {})
         return {
             "auto_include": auto_include if isinstance(auto_include, bool) else True,
             "default_mode": default_mode if default_mode in ("enabled", "embedded") else "enabled",
             "capabilities": dict(overrides) if isinstance(overrides, dict) else {},
+            "placement": dict(placement) if isinstance(placement, dict) else {},
         }, False
     # Legacy runtime files preserve explicitly listed capability services on first sync.
     overrides: dict[str, str] = {}
@@ -3896,6 +3919,17 @@ def _active_descriptors(root: Path, runtime: dict) -> tuple[
             active[name] = service
         elif mode == "embedded":
             embedded[name] = service
+    placements = policy.get("placement") or {}
+    host = runtime.get("profile") in HOST_PROFILES
+    for name, placement in placements.items():
+        if placement not in ("node", "local", "both"):
+            findings.append({"severity": "error", "path": "deployment/runtime.json",
+                             "message": f"service_policy.placement.{name} must be node|local|both"})
+    for group in (active, embedded):
+        for name in list(group):
+            placement = placements.get(name, ((runtime.get("services") or {}).get(name) or {}).get("placement"))
+            if placement == ("node" if host else "local"):
+                del group[name]
     mount_contracts: dict[str, tuple[str, str]] = {}
     for name, service in {**active, **embedded}.items():
         deploy = service["deploy"]
@@ -4393,7 +4427,7 @@ pass() {
   taken=0
   if [ "$behind" -gt 0 ]; then
     arrived="$(g diff --name-only "HEAD...origin/$branch" | wc -l | tr -d ' ')"
-    if ! g rebase --quiet "origin/$branch"; then
+    if ! g -c rebase.backend=merge rebase --quiet "origin/$branch"; then
       clashing="$(g diff --name-only --diff-filter=U | tr '\n' ' ' | sed 's/ *$//')"
       g rebase --abort > /dev/null 2>&1
       warn "FATAL: rebasing onto origin/$branch conflicts in ${clashing:-unknown paths}; the box keeps its own work and takes nothing in until a person unpicks it"
@@ -4412,6 +4446,9 @@ pass() {
   fi
   if [ "$behind" -eq 0 ] && [ "$ahead" -eq 0 ]; then
     log "$branch - up to date with origin/$branch"
+  fi
+  if [ -n "${AGENT_BODY_REBUILD_COMMAND:-}" ]; then
+    (cd "$APP" && bash -c "$AGENT_BODY_REBUILD_COMMAND") || warn "generated context rebuild failed"
   fi
   return 0
 }
@@ -4554,14 +4591,16 @@ def _entrypoint_template(project_name: str, supervisor_config: str | None = None
         "exec sleep infinity"
     )
     checkout_block = ""
+    rebuild = ""
     if checkout:
         init = ["capabilities init --codex --claude"]
         doctors = [_ENTRYPOINT_DOCTORS["capabilities"]]
         if has_contextkit:
+            rebuild = "export AGENT_BODY_REBUILD_COMMAND='contextkit build'"
             init = ["contextkit init",
                     "capabilities init --codex --claude",
                     "contextkit install-hooks --target codex --target claude",
-                    "contextkit build --target all"]
+                    "contextkit build"]
             doctors.append(_ENTRYPOINT_DOCTORS["contextkit"])
         # A boot that could not reach the remote still boots: the box comes up on
         # the body it has and the supervised pass retries.
@@ -4585,12 +4624,25 @@ if [ -n "${{GIT_DEPLOY_KEY_B64:-}}" ]; then
     chmod 600 "$HOME/.ssh/id_ed25519"
     grep -q '^github.com ' "$HOME/.ssh/known_hosts" 2>/dev/null || \\
       echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' >> "$HOME/.ssh/known_hosts"
+    if [ -n "${{AGENT_GIT_KNOWN_HOSTS_B64:-}}" ]; then
+      host_key="$(printf '%s' "$AGENT_GIT_KNOWN_HOSTS_B64" | base64 -d)"
+      printf 'host.docker.internal %s\\n' "$host_key" >> "$HOME/.ssh/known_hosts"
+    fi
     git config --global user.name "{identity}"
     git config --global user.email "{identity}@local"
   else
     rm -f "$HOME/.ssh/id_ed25519"
     echo "[entrypoint] WARN: GIT_DEPLOY_KEY_B64 is set but not valid base64; git push identity skipped" >&2
   fi
+fi
+{rebuild}
+if [ -n "${{AGENT_STORE_HOST:-}}" ]; then
+  store_args=(--host "$AGENT_STORE_HOST" --port "${{AGENT_STORE_PORT:-5432}}" --database "$AGENT_STORE_DATABASE" --user "$AGENT_STORE_USER" --sslmode "${{AGENT_STORE_SSLMODE:-require}}" --password-stdin)
+  if [ -n "${{AGENT_STORE_SSLROOTCERT:-}}" ]; then
+    store_args+=(--sslrootcert "$AGENT_STORE_SSLROOTCERT")
+  fi
+  printf '%s' "$AGENT_STORE_PASSWORD" | capabilities store set "${{store_args[@]}}" >/dev/null
+  unset AGENT_STORE_PASSWORD
 fi
 {checkout_block}
 if [ -f "$HOME/.claude/.credentials.json" ] || [ -d "$HOME/.claude/projects" ]; then
@@ -4863,6 +4915,9 @@ def _compose_template(project_name: str, runtime: dict,
     env_lines = [
         "x-agent-env: &agent-env",
         "  GIT_DEPLOY_KEY_B64: ${GIT_DEPLOY_KEY_B64:-}",
+        "  AGENT_GIT_KNOWN_HOSTS_B64: ${AGENT_GIT_KNOWN_HOSTS_B64:-}",
+        *[f"  AGENT_STORE_{key}: ${{AGENT_STORE_{key}:-}}" for key in
+          ("HOST", "PORT", "DATABASE", "USER", "SSLMODE", "SSLROOTCERT", "PASSWORD")],
     ]
     build_args = _compiler_config(runtime)["build_args"]
     runtime_services = runtime.get("services") if isinstance(runtime.get("services"), dict) else {}
@@ -4886,9 +4941,16 @@ def _compose_template(project_name: str, runtime: dict,
             f"    image: ${{AGENT_IMAGE:-{slug}-agent}}",
             f"    container_name: {slug}-{compose_name}",
             f"    restart: {json.dumps(str(service.get('restart') or 'unless-stopped'))}",
+            "    extra_hosts:",
+            "      - \"host.docker.internal:host-gateway\"",
             "    environment:",
             "      <<: *agent-env",
         ]
+        if name == "agent" and _is_checkout(runtime):
+            body = _compiler_config(runtime)["container"]["project_root"]
+            block[1:1] = ["    healthcheck:",
+                "      test: " + json.dumps(["CMD-SHELL", "test -d " + shlex.quote(body + "/.git") + " && kill -0 1"]),
+                "      interval: 10s", "      timeout: 5s", "      retries: 6", "      start_period: 30s"]
         command = service.get("command")
         if isinstance(command, list) and command:
             block.insert(-2, f"    command: {json.dumps(command, ensure_ascii=False)}")
@@ -4920,11 +4982,11 @@ def _compose_template(project_name: str, runtime: dict,
         return "\n".join(block)
 
     agent = runtime_services.get("agent")
-    if isinstance(agent, dict):
+    if isinstance(agent, dict) and agent.get("placement") != "local":
         service_blocks.append(render("agent", agent))
     for name in sorted(descriptors):
         service = runtime_services.get(name)
-        if isinstance(service, dict):
+        if isinstance(service, dict) and service.get("placement") != "local":
             service_blocks.append(render(name, service))
     services_text = "\n".join(service_blocks)
     volumes_text = "\n".join(f"  {name}:" for name in sorted(used_volumes))
@@ -5137,6 +5199,7 @@ def _compile_runtime(root: Path, runtime: dict,
         deploy = service["deploy"]
         previous = existing_services.get(name)
         entry = dict(previous) if isinstance(previous, dict) else {}
+        entry["placement"] = (runtime.get("service_policy") or {}).get("placement", {}).get(name, entry.get("placement", "local" if host else "node"))
         entry.setdefault("role", "capability-service")
         if not host:
             entry.setdefault("compose_service", name)
@@ -5155,6 +5218,8 @@ def _compile_runtime(root: Path, runtime: dict,
     policy, _migrated = _service_policy(runtime)
     serialized_policy = dict(policy)
     raw_policy = runtime.get("service_policy")
+    if not serialized_policy.get("placement"):
+        serialized_policy.pop("placement", None)
     if isinstance(raw_policy, dict) and "default_mode" not in raw_policy:
         serialized_policy.pop("default_mode", None)
     capability_config = (dict(runtime.get("capabilities"))
@@ -5588,6 +5653,22 @@ def _host_artifact_texts(root: Path, runtime: dict,
         path = agents_dir / f"{prefix}.{name}.plist"
         texts[path] = _mark_generated(
             path, _launchd_plist(root, runtime, name, service, search_path, launcher))
+    for path in _target_files(root):
+        target, error = _read_json(path)
+        if error or not isinstance(target, dict) or target.get("provider") != "coolify":
+            continue
+        name = "node-sync-" + _slug(target["name"])
+        prefix = _host_label_prefix(runtime, root)
+        launcher = agents_dir / f"{prefix}-{name}"
+        command = [NAME, "node", "sync", "--target", target["name"]]
+        texts[launcher] = _mark_generated(launcher, _host_launcher_text(command))
+        path = agents_dir / f"{prefix}.{name}.plist"
+        texts[path] = _mark_generated(path, _plist_document({
+            "Label": f"{prefix}.{name}", "ProgramArguments": [str(launcher)],
+            "WorkingDirectory": str(root), "EnvironmentVariables": {"PATH": search_path},
+            "StartInterval": int(target.get("sync_interval", 60)), "RunAtLoad": True,
+            "StandardOutPath": str(agents_dir / f"{name}.log"),
+            "StandardErrorPath": str(agents_dir / f"{name}.log")}))
     watchdog = host["watchdog"]
     stale_watchdog = agents_dir / f"{_host_label_prefix(runtime, root)}.watchdog.plist"
     if not watchdog["enabled"] and stale_watchdog.is_file():
@@ -5847,6 +5928,10 @@ def _desired_state(root: Path, runtime: dict) -> tuple[dict, dict[Path, str],
         findings.extend(host_findings)
     else:
         texts = _artifact_texts(root, compiled, active, embedded)
+    if _is_checkout(runtime):
+        attrs = _memory_attributes(root)
+        if attrs:
+            texts[attrs[0]] = attrs[1]
     texts[_runtime_path(root)] = _json_text(compiled)
     texts[root / "deployment" / "capabilities.lock"] = _lock_text(
         root, exclude=_runtime_capability_excludes(runtime))
@@ -5855,7 +5940,7 @@ def _desired_state(root: Path, runtime: dict) -> tuple[dict, dict[Path, str],
 
 def _artifact_drift(root: Path, texts: dict[Path, str]) -> list[dict]:
     drift: list[dict] = []
-    managed_without_marker = {_runtime_path(root), root / "deployment" / "capabilities.lock"}
+    managed_without_marker = {_runtime_path(root), root / "deployment" / "capabilities.lock", root / ".gitattributes"}
     for path, expected in sorted(texts.items(), key=lambda item: _rel(root, item[0])):
         actual = _read_text(path)
         if actual == expected:
@@ -6020,6 +6105,9 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
                 findings.append({"severity": "error", "path": _rel(root, path),
                                  "message": f"services.{service_name} must be an object"})
                 continue
+            if service.get("placement", "node") not in ("node", "local", "both"):
+                findings.append({"severity": "error", "path": _rel(root, path),
+                                 "message": f"services.{service_name}.placement must be node|local|both"})
             for field in ("required_env", "optional_env", "state"):
                 value = service.get(field, [])
                 if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
@@ -6519,6 +6607,8 @@ def _host_next_payload(root: Path, runtime: dict, target_name: str | None) -> di
     # or the thing that restarts a wedged service is itself never running.
     if services and _compiler_config(runtime)["host"]["watchdog"]["enabled"]:
         labels.append(f"{prefix}.watchdog")
+    labels.extend(f"{prefix}.node-sync-{_slug(item['name'])}"
+                  for item in _all_target_payloads(root) if item.get("provider") == "coolify")
     apply_steps = [
         "Stop any copy of these services you started by hand, so launchd does "
         f"not end up beside one: {', '.join(f'`{name} service stop`' for name in services) or 'none declared'}."
@@ -7428,6 +7518,587 @@ def cmd_plan(args) -> None:
         sys.exit(6)
 
 
+# Node execution lives here; provider requests always go through the owning CLI.
+class NodeFailure(Exception):
+    def __init__(self, code, message, exit_code=5):
+        self.code, self.message, self.exit_code = code, message, exit_code
+        super().__init__(message)
+
+
+def _node_run(argv, root, *, stdin=None, timeout=120, check=True, env=None):
+    try:
+        p = subprocess.run(argv, cwd=root, input=stdin, text=True,
+                           capture_output=True, timeout=timeout, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        raise NodeFailure("node_command_failed", f"{Path(argv[0]).name} could not complete")
+    if check and p.returncode:
+        # Never echo command arguments, stdin or a remote process's diagnostics.
+        code, message = "node_command_failed", f"{Path(argv[0]).name} failed (exit {p.returncode})"
+        if Path(argv[0]).name == "coolify" and stdin is None:
+            try:
+                e = json.loads(p.stderr)["error"]
+                code, message = e["code"], e["message"]
+            except (ValueError, KeyError, TypeError):
+                pass
+        raise NodeFailure(code, message, p.returncode)
+    return p
+
+
+def _node_coolify(root, target, *args, stdin=None):
+    command = ["coolify", *args]
+    if target.get("connection"):
+        command += ["--connection", target["connection"]]
+    p = _node_run(command, root, stdin=stdin, timeout=900)
+    try:
+        return json.loads(p.stdout) if p.stdout.strip() else {}
+    except ValueError:
+        raise NodeFailure("provider_output", "coolify returned malformed JSON")
+
+
+def _node_git(root, *args, check=True):
+    env = None
+    if args and args[0] in ("fetch", "push", "ls-remote"):
+        remote = next((a for a in args[1:] if a.startswith("node-")), None)
+        if remote:
+            command = _node_run(["git", "config", "--get", f"remote.{remote}.sshCommand"], root, check=False).stdout.strip()
+            if command:
+                env = {**os.environ, "GIT_SSH_COMMAND": command}
+    return _node_run(["git", *args], root, check=check, env=env).stdout.strip()
+
+
+def _node_state_path(root, target):
+    # Operational facts live outside the versioned body, in this checkout's git dir.
+    gitdir = Path(_node_git(root, "rev-parse", "--absolute-git-dir"))
+    return gitdir / "deployment-nodes" / (_slug(target["name"]) + ".json")
+
+
+def _node_state(root, target):
+    return _read_json(_node_state_path(root, target))[0] or {}
+
+
+def _node_save(root, target, state):
+    p = _node_state_path(root, target)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(_json_text(state))
+    os.replace(tmp, p)
+
+
+def _node_target(root, name):
+    target, _ = _resolve_target(root, name)
+    if target.get("provider") != "coolify":
+        raise NodeFailure("node_provider", "node execution requires a coolify target", 6)
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", str(target.get("name", ""))):
+        raise NodeFailure("target_name", "node target name must be a safe label", 6)
+    if not target.get("server") or not target.get("project"):
+        raise NodeFailure("target_incomplete", "node target needs server and project Coolify identifier labels", 6)
+    return target
+
+
+def _node_connection(target, write=False):
+    rows = _records().connections("coolify", write_default=True, include_disabled=True)
+    cid = target.get("connection")
+    if not cid:
+        if len(rows) != 1:
+            raise NodeFailure("connection_required", "target must select a Coolify connection", 6)
+        cid = next(iter(rows))
+        target["connection"] = cid
+    row = rows.get(cid)
+    if not row or not row["enabled"]:
+        raise NodeFailure("connection_not_granted", f"Coolify connection {cid!r} is not granted to this project", 4)
+    if write and not row["allow_write"]:
+        raise NodeFailure("read_only_connection", f"Coolify connection {cid!r} does not allow writes", 4)
+    return row["value"]
+
+
+def _node_identifier(root, target, label):
+    if not label:
+        raise NodeFailure("target_incomplete", "target needs a server identifier label", 6)
+    value = _node_coolify(root, target, "ids", "get", str(label))
+    if not isinstance(value, str) or not value:
+        raise NodeFailure("target_incomplete", "Coolify identifier must hold a UUID string", 6)
+    return value
+
+
+def _node_host(root, target, write=False):
+    entry = _node_connection(target, write)
+    uuid = _node_identifier(root, target, target.get("server"))
+    server = _node_coolify(root, target, "servers", uuid)
+    if isinstance(server, list):
+        server = server[0]
+    address = server.get("ip") or server.get("address")
+    if not isinstance(address, str) or not re.fullmatch(r"[a-zA-Z0-9.:-]+", address):
+        raise NodeFailure("server_address", "Coolify server has no usable SSH address", 6)
+    ssh = entry.get("ssh") or {}
+    return {"uuid": uuid, "address": address, "name": server.get("name"),
+            "key_path": ssh.get("key_path"), "url": entry.get("base_url"), "connection": target.get("connection")}
+
+
+def _node_ssh_argv(host, *, tty=False, user="root"):
+    argv = ["ssh"]
+    if tty:
+        argv += ["-t"]
+    else:
+        argv += ["-o", "BatchMode=yes"]
+    if host.get("key_path"):
+        argv += ["-i", str(Path(host["key_path"]).expanduser()), "-o", "IdentitiesOnly=yes"]
+    return argv + [f"{user}@{host['address']}"]
+
+
+def _node_ssh(root, host, script, *, stdin=None):
+    return _node_run(_node_ssh_argv(host) + [script], root, stdin=stdin).stdout.strip()
+
+
+def _node_app(root, target, required=True):
+    label = (target.get("resource") or {}).get("identifier_label")
+    if not label:
+        raise NodeFailure("target_incomplete", "target needs resource.identifier_label", 6)
+    try:
+        return _node_identifier(root, target, label)
+    except NodeFailure as e:
+        if e.exit_code == 3 and not required:
+            return None
+        raise
+
+
+def _node_container(root, host, uuid):
+    detail = _node_coolify(root, {"connection": host.get("connection")}, "applications", uuid)
+    app_id = str(detail.get("id") or "")
+    if not app_id.isdigit():
+        raise NodeFailure("node_container", "Coolify application has no numeric container owner id", 3)
+    service = ((_load_runtime(root).get("services") or {}).get("agent") or {}).get("compose_service", "agent")
+    containers = _node_ssh(root, host, "docker ps --filter " + shlex.quote(
+        "label=coolify.applicationId=" + app_id) + " --filter " + shlex.quote(
+        "label=com.docker.compose.service=" + service) + " --format '{{.ID}}'").splitlines()
+    if len(containers) != 1 or not re.fullmatch(r"[a-f0-9]+", containers[0]):
+        raise NodeFailure("node_container", "expected one running agent container", 3)
+    return containers[0]
+
+
+def _node_exec(root, host, container, argv):
+    return _node_ssh(root, host, "docker exec " + shlex.quote(container) + " " + shlex.join(argv))
+
+
+def _node_branch(root):
+    branch = _node_git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if not branch or _node_git(root, "status", "--porcelain"):
+        raise NodeFailure("body_not_committed", "node operations require a clean committed branch", 6)
+    return branch
+
+
+def _node_remote(target):
+    return "node-" + _slug(target["name"])
+
+
+def _node_sync(root, target, mirror=None):
+    import fcntl
+    lock_path = _node_state_path(root, target).with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise NodeFailure("node_busy", "another sync is using this checkout", 6)
+        return _node_sync_locked(root, target, mirror)
+
+
+def _node_sync_locked(root, target, mirror=None):
+    branch = _node_branch(root)
+    remote = _node_remote(target)
+    _node_git(root, "fetch", "--quiet", remote, branch)
+    upstream = f"refs/remotes/{remote}/{branch}"
+    state = _node_state(root, target)
+    if _node_git(root, "rev-parse", "--verify", upstream, check=False) == "":
+        raise NodeFailure("node_remote", "node branch is missing", 3)
+    p = _node_run(["git", "-c", "rebase.backend=merge", "rebase", upstream], root, check=False)
+    if p.returncode:
+        conflicts = _node_git(root, "diff", "--name-only", "--diff-filter=U").splitlines()
+        _node_git(root, "rebase", "--abort")
+        state["sync"] = {"remote": remote, "state": "diverged", "conflicts": conflicts,
+                         "last_sync_at": (state.get("sync") or {}).get("last_sync_at")}
+        _node_save(root, target, state)
+        raise NodeFailure("diverged", "node sync diverged in: " + ", ".join(conflicts), 7)
+    _node_git(root, "push", "--quiet", remote, f"HEAD:refs/heads/{branch}")
+    mirror = mirror or target.get("mirror")
+    if mirror:
+        _node_git(root, "push", "--quiet", mirror, f"HEAD:refs/heads/{branch}")
+    state["sync"] = {"remote": remote, "state": "level", "conflicts": [], "last_sync_at": _now_exact()}
+    _node_save(root, target, state)
+    if _has_contextkit(root):
+        _node_run(["contextkit", "build"], root)
+    return state["sync"]
+
+
+def _node_sync_status(root, target):
+    remote = _node_remote(target)
+    saved = (_node_state(root, target).get("sync") or {})
+    branch = _node_git(root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    counts = _node_git(root, "rev-list", "--left-right", "--count",
+                       f"HEAD...refs/remotes/{remote}/{branch}", check=False).split()
+    if len(counts) != 2:
+        return {**saved, "remote": remote, "state": "unknown", "conflicts": saved.get("conflicts", [])}
+    ahead, behind = map(int, counts)
+    return {**saved, "remote": remote, "state": ("diverged" if ahead and behind else
+            "ahead" if ahead else "behind" if behind else "level"), "conflicts": saved.get("conflicts", [])}
+
+
+def _node_wait(root, target, app, deployment, timeout=600):
+    # Single compatibility seam for C2: use its waiter when installed.
+    help_text = _node_run(["coolify", "help"], root).stdout
+    if "coolify wait " in help_text:
+        return _node_coolify(root, target, "wait", app, "--deployment", deployment,
+                             "--timeout", str(timeout))
+    deadline = time.monotonic() + timeout
+    last = {}
+    while time.monotonic() < deadline:
+        release = _node_coolify(root, target, "deployments", deployment)
+        resource = _node_coolify(root, target, "applications", app)
+        last = {"deployment": release.get("status"), "resource": resource.get("status")}
+        if last["deployment"] in ("failed", "cancelled", "canceled"):
+            raise NodeFailure("deployment_failed", "deployment failed: " + json.dumps(last))
+        if last["deployment"] == "finished" and last["resource"] == "running:healthy":
+            return last
+        time.sleep(2)
+    raise NodeFailure("deployment_timeout", "deployment timed out: " + json.dumps(last))
+
+
+def _node_deployment_uuid(result):
+    if isinstance(result, dict):
+        value = result.get("deployment_uuid")
+        if value:
+            return value
+        for row in result.get("deployments", []):
+            if row.get("deployment_uuid"):
+                return row["deployment_uuid"]
+    raise NodeFailure("provider_output", "coolify deploy did not return a deployment UUID")
+
+
+def _node_prepare_repo(root, runtime, target, host, branch):
+    slug = _slug(runtime.get("name") or root.name)
+    repo = f"/srv/git/{slug}.git"
+    # Key material is private checkout state, never part of the body or argv.
+    key = _node_state_path(root, target).with_suffix(".key")
+    key.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not key.exists():
+        _node_run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", _node_remote(target), "-f", str(key)], root)
+    os.chmod(key, 0o600)
+    public = key.with_suffix(".key.pub").read_text().strip()
+    mac_key = _node_run(["ssh-keygen", "-y", "-f", str(Path(host["key_path"]).expanduser())], root).stdout.strip() if host.get("key_path") else None
+    if not mac_key:
+        raise NodeFailure("ssh_key_required", "paired Coolify connection needs ssh.key_path", 6)
+    script = """set -eu
+id git >/dev/null 2>&1 || useradd --create-home --shell /usr/bin/git-shell git
+install -d -m 755 -o git -g git /srv/git
+install -d -m 700 -o git -g git ~git/.ssh
+touch ~git/.ssh/authorized_keys
+chown git:git ~git/.ssh/authorized_keys
+chmod 600 ~git/.ssh/authorized_keys
+while IFS= read -r key; do
+  grep -qxF "$key" ~git/.ssh/authorized_keys || printf '%s\\n' "$key" >> ~git/.ssh/authorized_keys
+done
+""" + f"test -d {shlex.quote(repo)} || runuser -u git -- git init --bare {shlex.quote(repo)}\n" + f"runuser -u git -- git -C {shlex.quote(repo)} config uploadpack.allowReachableSHA1InWant true\n" + f"runuser -u git -- git -C {shlex.quote(repo)} symbolic-ref HEAD {shlex.quote('refs/heads/' + branch)}\n"
+    # The script is an argument; the public keys alone travel through stdin.
+    _node_ssh(root, host, "bash -c " + shlex.quote(script), stdin=public + "\n" + mac_key + "\n")
+    remote = _node_remote(target)
+    url = f"git@{host['address']}:{repo}"
+    current = _node_git(root, "remote", "get-url", remote, check=False)
+    if current and current != url:
+        raise NodeFailure("node_remote_changed", "existing node remote points elsewhere", 6)
+    if not current:
+        _node_git(root, "remote", "add", remote, url)
+    _node_git(root, "config", f"remote.{remote}.sshCommand", shlex.join(_node_ssh_argv(host, user="git")[:-1]))
+    # _node_git applies this command only when using this node remote.
+    return url, key
+
+
+def _node_environment(root, runtime, target, host, repo_url, key, branch):
+    values = {**os.environ, **_project_env()}
+    env = {}
+    for service in runtime.get("services", {}).values():
+        if service.get("placement") == "local":
+            continue
+        defaults = service.get("environment_defaults") or {}
+        for k in service.get("required_env", []) + service.get("optional_env", []):
+            value = values.get(k, defaults.get(k, ""))
+            if k in service.get("required_env", []) and not value and k != REPO_URL_ENV:
+                raise NodeFailure("environment_missing", f"required environment key {k} is missing", 6)
+            env[k] = value
+    setting = read_store_setting()
+    if setting:
+        for k in ("host", "port", "database", "user", "sslmode", "sslrootcert", "password"):
+            if setting.get(k) is not None:
+                env["AGENT_STORE_" + k.upper()] = str(setting[k])
+    import base64
+    env.update({REPO_URL_ENV: repo_url.replace(host["address"], "host.docker.internal"),
+                REPO_BRANCH_ENV: branch, "GIT_DEPLOY_KEY_B64": base64.b64encode(key.read_bytes()).decode(),
+                "AGENT_GIT_KNOWN_HOSTS_B64": base64.b64encode(_node_ssh(root, host,
+                    "cat /etc/ssh/ssh_host_ed25519_key.pub").encode()).decode()})
+    for k, value in env.items():
+        if not _safe_env_key(k) or "\n" in str(value) or "\r" in str(value):
+            raise NodeFailure("environment_format", f"environment key {k} cannot be sent as one bulk line", 6)
+    return "".join(f"{k}={v}\n" for k, v in sorted(env.items()))
+
+
+def _node_provider_requirements(root, *, create=False):
+    help_text = _node_run(["coolify", "help"], root).stdout
+    required = ["app rollback"]
+    missing = [verb for verb in required if verb not in help_text]
+    if missing:
+        raise NodeFailure("provider_not_ready", "Coolify prerequisite missing: " + ", ".join(missing), 6)
+
+
+def _node_create_environment(root, target, project, name):
+    # Coolify has no environment-create CLI yet. Keep this API seam confined to
+    # that missing operation, using the same connection grant and credential tiers.
+    from urllib import request, error, parse
+    entry = _node_connection(target, write=True)
+    _node_coolify(root, target, "doctor")
+    token_key = entry.get("secret_env")
+    if not isinstance(token_key, str) or not _safe_env_key(token_key):
+        raise NodeFailure("missing_secret", "Coolify connection has no secret env key", 2)
+    project_values = _project_env()
+    machine_values = _parse_env_file(_CONFIG_HOME / "coolify" / "credentials.env")
+    token = project_values.get(token_key) or machine_values.get(token_key) or os.environ.get(token_key)
+    if not token:
+        raise NodeFailure("missing_secret", "Coolify connection token is unset", 2)
+    url = str(entry.get("base_url", "")).rstrip("/") + "/api/v1/projects/" + parse.quote(project, safe="") + "/environments"
+    req = request.Request(url, data=json.dumps({"name": name}).encode(), method="POST",
+                          headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read())
+    except error.HTTPError as e:
+        # The response body may echo input; never forward it or the auth header.
+        raise NodeFailure("environment_create_failed", f"Coolify environment creation returned HTTP {e.code}",
+                          2 if e.code in (401, 403) else 6 if e.code in (400, 409, 422) else 5)
+    except (error.URLError, OSError, ValueError):
+        raise NodeFailure("environment_create_failed", "Coolify environment creation could not complete")
+    if not isinstance(result, dict) or not result.get("uuid"):
+        raise NodeFailure("provider_output", "Coolify environment creation returned no UUID")
+    return result
+
+
+def _node_create_app(root, target, host, repo, branch):
+    ids = _node_coolify(root, target, "ids", "list")
+    project_label = target.get("project")
+    if not project_label:
+        raise NodeFailure("target_incomplete", "target needs a Coolify project label", 6)
+    project = (ids.get(project_label) or {}).get("value")
+    environment = target.get("environment") or "production"
+    if not project:
+        result = _node_coolify(root, target, "projects", "create", project_label)
+        project = result.get("project_uuid") or result.get("uuid")
+        if not project:
+            raise NodeFailure("provider_output", "project creation returned no UUID")
+        _node_coolify(root, target, "ids", "set", project_label, project)
+    detail = _node_coolify(root, target, "projects", project)
+    environments = detail.get("environments", [])
+    if environment not in [row.get("name") for row in environments]:
+        _node_create_environment(root, target, project, environment)
+    deploy_key = target.get("deploy_key")
+    if not deploy_key:
+        # Coolify's own instance deploy key, discovered without its private material.
+        sources = _node_coolify(root, target, "sources")
+        keys = sources.get("private_deploy_keys", []) if isinstance(sources, dict) else []
+        if len(keys) != 1:
+            raise NodeFailure("deploy_key_required", "target needs deploy_key (Coolify identifier label)", 6)
+        deploy_key = keys[0]["uuid"]
+    else:
+        deploy_key = _node_identifier(root, target, deploy_key)
+    result = _node_coolify(root, target, "app", "create", "--project", project,
+        "--server", host["uuid"], "--environment", environment,
+        "--private-deploy-key", deploy_key, "--git-repository", repo,
+        "--git-branch", branch, "--build-pack", "dockercompose",
+        "--docker-compose-location", "/" + _load_runtime(root)["compose_file"],
+        "--name", _slug(root.name) + "-" + _slug(target["name"]),
+        "--health-check-host", "127.0.0.1", "--no-auto-deploy-enabled")
+    app = result.get("uuid") or result.get("application_uuid")
+    if not app:
+        raise NodeFailure("provider_output", "application creation returned no UUID")
+    _node_coolify(root, target, "ids", "set", target["resource"]["identifier_label"], app)
+    return app
+
+
+def cmd_deploy(args):
+    root = _root()
+    target = _node_target(root, args.target)
+    # Grant is checked before local writes, SSH, or any provider mutation.
+    host = _node_host(root, target, write=True)
+    runtime = _load_runtime(root)
+    drift = _sync(root, runtime, check=True)
+    if not drift["ok"]:
+        raise NodeFailure("deployment_drift", "deployment sync --check found drift", 7)
+    if not _is_checkout(runtime):
+        raise NodeFailure("node_profile", "node deploy requires agent-box-checkout", 6)
+    branch = _node_branch(root)
+    app = _node_app(root, target, required=False)
+    _node_provider_requirements(root, create=not app)
+    repo, key = _node_prepare_repo(root, runtime, target, host, branch)
+    # Git's SSH override is scoped to these operations, never inherited by provider calls.
+    remote = _node_remote(target)
+    if _node_git(root, "ls-remote", "--heads", remote, branch):
+        _node_sync(root, target)
+    else:
+        _node_git(root, "push", "--quiet", remote, f"HEAD:refs/heads/{branch}")
+    if not app:
+        app = _node_create_app(root, target, host, repo, branch)
+    previous = _node_state(root, target).get("release") or {}
+    environment = _node_environment(root, runtime, target, host, repo, key, branch)
+    _node_coolify(root, target, "env", "bulk", app, stdin=environment)
+    try:
+        deployment = _node_deployment_uuid(_node_coolify(root, target, "deploy", app))
+        _node_wait(root, target, app, deployment)
+    except NodeFailure as failure:
+        rolled_back = False
+        rollback_error = None
+        if previous.get("commit"):
+            try:
+                result = _node_coolify(root, target, "app", "rollback", app, "--to", previous["commit"])
+                _node_wait(root, target, app, _node_deployment_uuid(result))
+                rolled_back = True
+            except NodeFailure as e:
+                rollback_error = e.code
+        raise NodeFailure(failure.code, failure.message + "; rollback=" +
+                          ("healthy" if rolled_back else rollback_error or "no previous release"), failure.exit_code)
+    state = _node_state(root, target)
+    commit = _node_git(root, "rev-parse", "HEAD")
+    state["release"] = {"commit": commit, "deployment": deployment, "deployed_at": _now_exact(),
+                        "rollback_to": ([previous["commit"]] + previous.get("rollback_to", [])) if previous.get("commit") else []}
+    _node_save(root, target, state)
+    _emit({"target": target["name"], "application": app, "release": state["release"]})
+
+
+def cmd_rollback(args):
+    root = _root()
+    target = _node_target(root, args.target)
+    _node_connection(target, write=True)
+    state = _node_state(root, target)
+    previous = (state.get("release") or {}).get("rollback_to", [])
+    commit = args.to or (previous[0] if previous else None)
+    if not commit:
+        raise NodeFailure("rollback_missing", "no previous release; specify --to", 3)
+    app = _node_app(root, target)
+    result = _node_coolify(root, target, "app", "rollback", app, "--to", commit)
+    deployment = _node_deployment_uuid(result)
+    _node_wait(root, target, app, deployment)
+    old = state.get("release") or {}
+    state["release"] = {"commit": commit, "deployment": deployment, "deployed_at": _now_exact(),
+                        "rollback_to": [old["commit"]] if old.get("commit") else []}
+    _node_save(root, target, state)
+    _emit({"target": target["name"], "release": state["release"]})
+
+
+def cmd_logs(args):
+    root = _root()
+    target = _node_target(root, args.target)
+    _node_connection(target)
+    app = _node_app(root, target)
+    while True:
+        if args.build:
+            deployment = (_node_state(root, target).get("release") or {}).get("deployment")
+            if not deployment:
+                raise NodeFailure("release_missing", "no deployment build log recorded", 3)
+            _emit(_node_coolify(root, target, "deployments", deployment))
+        else:
+            _emit(_node_coolify(root, target, "logs", app))
+        if not args.follow:
+            return
+        time.sleep(2)
+
+
+def cmd_node_login(args):
+    root = _root()
+    target = _node_target(root, args.target)
+    host = _node_host(root, target, write=True)
+    app = _node_app(root, target)
+    container = _node_container(root, host, app)
+    login = ["claude", "login"] if args.harness == "claude" else ["codex", "login", "--device-auth"]
+    command = _node_ssh_argv(host, tty=True) + [shlex.join(["docker", "exec", "-it", container, *login])]
+    if args.print_command:
+        _emit({"target": target["name"], "harness": args.harness, "command": shlex.join(command)})
+    else:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise NodeFailure("terminal_required", "node login requires a terminal; use --print-command", 4)
+        raise SystemExit(subprocess.call(command, cwd=root))
+
+
+def cmd_node_sync(args):
+    root = _root()
+    target = _node_target(root, args.target)
+    _node_connection(target, write=True)
+    _emit({"target": target["name"], "sync": _node_sync(root, target)})
+
+
+def cmd_node_status(args):
+    root = _root()
+    target = _node_target(root, args.target)
+    report = {"target": target["name"], "instance": {"connection": target.get("connection"), "reachable": False},
+        "server": {"reachable": False}, "application": {"uuid": None, "status": "unknown"},
+        "release": _node_state(root, target).get("release"), "sync": _node_sync_status(root, target),
+        "harness": {"claude": "unknown", "codex": "unknown"}, "services": [],
+        "store": {"configured": False, "reachable": False, "tls_enforced": False}, "errors": []}
+    runtime = _load_runtime(root)
+    node_services = {}
+    try:
+        host = _node_host(root, target)
+        report["instance"]["url"] = host["url"]
+        doctor = _node_coolify(root, target, "doctor")
+        probe = (doctor.get("connections") or {}).get(target.get("connection"), doctor)
+        report["instance"].update({"reachable": bool(doctor.get("ok")), "version": probe.get("version")})
+        report["server"].update({"name": host["name"], "address": host["address"]})
+        app = _node_app(root, target)
+        report["application"] = {"uuid": app, "status": _node_coolify(root, target, "applications", app).get("status")}
+        container = _node_container(root, host, app)
+        report["server"]["reachable"] = True
+        for harness, file in (("claude", ".claude/.credentials.json"), ("codex", ".codex/auth.json")):
+            report["harness"][harness] = _node_exec(root, host, container,
+                ["bash", "-c", f'test -s "$HOME/{file}" && echo logged_in || echo logged_out'])
+        services = _node_exec(root, host, container, ["supervisorctl", "-s", "unix:///tmp/agent-box-supervisor.sock", "status"])
+        node_services = {line.split()[0]: line.split()[1].lower() for line in services.splitlines() if len(line.split()) >= 2}
+        detail = _node_coolify(root, target, "applications", app)
+        containers = _node_ssh(root, host, "docker ps -a --filter " + shlex.quote(
+            "label=coolify.applicationId=" + str(detail["id"])) + " --format " + shlex.quote(
+            '{{.Label "com.docker.compose.service"}} {{.State}}'))
+        node_services.update({line.split()[0]: line.split()[1] for line in containers.splitlines() if len(line.split()) == 2})
+        store = json.loads(_node_exec(root, host, container, ["capabilities", "store", "show", "--json"]))
+        report["store"]["configured"] = bool(store.get("configured"))
+        if report["store"]["configured"]:
+            probe = json.loads(_node_exec(root, host, container, ["capabilities", "store", "doctor", "--json"]))
+            checks = probe.get("checks") or {}
+            report["store"].update({"reachable": bool((checks.get("tls") or {}).get("ok")),
+                "tls_enforced": bool((checks.get("plain_text_refused") or {}).get("ok"))})
+    except NodeFailure as e:
+        report["errors"].append({"code": e.code, "message": e.message})
+    services = dict(runtime.get("services") or {})
+    for name in set((services.get("agent") or {}).get("embedded_services", [])) | set((runtime.get("service_policy") or {}).get("placement", {})):
+        services.setdefault(name, {"placement": (runtime.get("service_policy") or {}).get("placement", {}).get(name, "node")})
+    for name, service in services.items():
+        placement = service.get("placement") or (runtime.get("service_policy") or {}).get("placement", {}).get(name, "node")
+        label = _host_label_prefix(runtime, root) + "." + name
+        local = _launchd_status(label)
+        report["services"].append({"name": name, "placement": placement,
+            "node": node_services.get(name, "running" if name == "agent" and report["application"].get("status") == "running:healthy" else "absent"),
+            "local": "running" if local.get("loaded") else "absent"})
+    _emit(report)
+
+
+def _memory_attributes(root):
+    if not _has_contextkit(root):
+        return None
+    raw = _node_run(["contextkit", "path", "memory"], root).stdout.strip()
+    memory = Path(raw).resolve()
+    if not memory.is_relative_to(root.resolve()) or memory == root.resolve():
+        raise NodeFailure("memory_path", "ContextKit memory root must be inside the body", 6)
+    pattern = memory.relative_to(root.resolve()).as_posix() + "/**"
+    # Attribute patterns may contain spaces; quote with Git's C-string syntax.
+    line = json.dumps(pattern) + " merge=union"
+    path = root / ".gitattributes"
+    current = _read_text(path) or ""
+    if line not in current.splitlines():
+        current = current.rstrip("\n") + ("\n" if current else "") + line + "\n"
+    return path, current
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     _gate()
@@ -7510,6 +8181,26 @@ def main(argv: list[str] | None = None) -> None:
     p_machine_watchdog.add_argument("--dry-run", action="store_true")
     p_machine_watchdog.set_defaults(fn=cmd_machine_watchdog_command)
 
+    for verb, fn in (("deploy", cmd_deploy), ("rollback", cmd_rollback), ("logs", cmd_logs)):
+        p = sub.add_parser(verb, add_help=False)
+        p.add_argument("--target")
+        if verb == "rollback":
+            p.add_argument("--to")
+        if verb == "logs":
+            p.add_argument("--build", action="store_true")
+            p.add_argument("--follow", action="store_true")
+        p.set_defaults(fn=fn)
+    node = sub.add_parser("node", add_help=False).add_subparsers(dest="node_cmd", required=True)
+    for verb, fn in (("status", cmd_node_status), ("sync", cmd_node_sync), ("login", cmd_node_login)):
+        p = node.add_parser(verb, add_help=False)
+        p.add_argument("--target")
+        if verb == "status":
+            p.add_argument("--json", action="store_true")
+        if verb == "login":
+            p.add_argument("harness", choices=("claude", "codex"))
+            p.add_argument("--print-command", action="store_true")
+        p.set_defaults(fn=fn)
+
     args, extra = parser.parse_known_args(argv)
     if extra:
         _die(6, "input", f"unknown arguments: {' '.join(extra)}")
@@ -7521,7 +8212,14 @@ def main(argv: list[str] | None = None) -> None:
     if (args.cmd == "machine" and args.machine_cmd in ("sync", "watchdog")
             and not previews):
         _read_only_gate(f"`{NAME} machine {args.machine_cmd}`")
-    args.fn(args)
+    if args.cmd == "node" and args.node_cmd in ("sync", "login"):
+        _read_only_gate(f"`deployment node {args.node_cmd}`")
+    try:
+        args.fn(args)
+    except NodeFailure as e:
+        _die(e.exit_code, e.code, e.message)
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
 
 
 if __name__ == "__main__":

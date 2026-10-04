@@ -1,0 +1,18 @@
+{
+  "ids list": {"node_project": {"value": "project-fixture"}},
+  "ids get node_server": "server-fixture",
+  "ids get node_app": "application-fixture",
+  "ids get node_key": "key-fixture",
+  "servers server-fixture": {"uuid": "server-fixture", "name": "fixture-host", "ip": "192.0.2.10"},
+  "projects project-fixture": {"uuid": "project-fixture", "environments": [{"name": "production", "uuid": "environment-fixture"}]},
+  "projects create": {"project_uuid": "project-fixture"},
+  "sources": {"private_deploy_keys": [{"uuid": "key-fixture", "name": "fixture-key"}]},
+  "app create": {"uuid": "application-fixture"},
+  "applications application-fixture": {"uuid": "application-fixture", "id": 42, "status": "running:healthy"},
+  "deploy application-fixture": {"deployments": [{"resource_uuid": "application-fixture", "deployment_uuid": "deployment-fixture"}]},
+  "deployments deployment-fixture": {"uuid": "deployment-fixture", "status": "finished", "logs": "fixture build complete"},
+  "app rollback": {"deployment_uuid": "rollback-fixture"},
+  "wait application-fixture": {"status": "running:healthy", "deployment_uuid": "deployment-fixture"},
+  "logs application-fixture": {"logs": "fixture runtime ready"},
+  "doctor": {"version": "4.3.23", "ok": true}
+}
