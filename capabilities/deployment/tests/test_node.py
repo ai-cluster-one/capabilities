@@ -169,7 +169,7 @@ def test_logs_runtime_and_build(node, capsys, build):
     assert rows(node)[-1]["argv"][0] == ("deployments" if build else "logs")
 
 
-@pytest.mark.parametrize("harness,expected", [("claude", "claude login"), ("codex", "codex login --device-auth")])
+@pytest.mark.parametrize("harness,expected", [("claude", "claude auth login"), ("codex", "codex login --device-auth")])
 def test_login_prepares_owner_terminal_command(node, capsys, harness, expected):
     node.args.harness = harness
     node.m.cmd_node_login(node.args)

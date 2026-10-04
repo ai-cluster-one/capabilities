@@ -8039,7 +8039,7 @@ def cmd_node_login(args):
     host = _node_host(root, target, write=True)
     app = _node_app(root, target)
     container = _node_container(root, host, app)
-    login = ["claude", "login"] if args.harness == "claude" else ["codex", "login", "--device-auth"]
+    login = ["claude", "auth", "login"] if args.harness == "claude" else ["codex", "login", "--device-auth"]
     command = _node_ssh_argv(host, tty=True) + [shlex.join(["docker", "exec", "-it", container, *login])]
     if args.print_command:
         _emit({"target": target["name"], "harness": args.harness, "command": shlex.join(command)})
