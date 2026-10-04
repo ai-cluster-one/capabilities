@@ -7545,10 +7545,17 @@ def _node_run(argv, root, *, stdin=None, timeout=120, check=True, env=None):
 
 
 def _node_coolify(root, target, *args, stdin=None):
-    command = ["coolify", *args]
-    if target.get("connection"):
-        command += ["--connection", target["connection"]]
+    selection = ["--connection", target["connection"]] if target.get("connection") else []
+    # Contract dispatch requires the verb first; API argparse requires global
+    # options before the verb. Neither path may fall back to another connection.
+    command = (["coolify", *args, *selection] if args and args[0] == "ids"
+               else ["coolify", *selection, *args])
     p = _node_run(command, root, stdin=stdin, timeout=900)
+    if args[:2] == ("ids", "get"):
+        try:
+            return json.loads(p.stdout)
+        except ValueError:
+            return p.stdout.strip()
     try:
         return json.loads(p.stdout) if p.stdout.strip() else {}
     except ValueError:
@@ -7627,11 +7634,23 @@ def _node_host(root, target, write=False):
     if isinstance(server, list):
         server = server[0]
     address = server.get("ip") or server.get("address")
+    if server.get("is_coolify_host") and address in ("host.docker.internal", "localhost", "127.0.0.1"):
+        from urllib.parse import urlparse
+        import socket
+        try:
+            address = socket.gethostbyname(urlparse(entry.get("base_url", "")).hostname)
+        except (OSError, TypeError):
+            raise NodeFailure("server_address", "Coolify instance hostname cannot be resolved for SSH", 6)
     if not isinstance(address, str) or not re.fullmatch(r"[a-zA-Z0-9.:-]+", address):
         raise NodeFailure("server_address", "Coolify server has no usable SSH address", 6)
     ssh = entry.get("ssh") or {}
+    key_path = ssh.get("key_path")
+    if not key_path:
+        config = _node_run(["ssh", "-G", f"root@{address}"], root).stdout
+        key_path = next((line.split(None, 1)[1] for line in config.splitlines()
+                         if line.startswith("identityfile ") and Path(line.split(None, 1)[1]).expanduser().is_file()), None)
     return {"uuid": uuid, "address": address, "name": server.get("name"),
-            "key_path": ssh.get("key_path"), "url": entry.get("base_url"), "connection": target.get("connection")}
+            "key_path": key_path, "url": entry.get("base_url"), "connection": target.get("connection")}
 
 
 def _node_ssh_argv(host, *, tty=False, user="root"):
@@ -7664,11 +7683,11 @@ def _node_app(root, target, required=True):
 def _node_container(root, host, uuid):
     detail = _node_coolify(root, {"connection": host.get("connection")}, "applications", uuid)
     app_id = str(detail.get("id") or "")
-    if not app_id.isdigit():
-        raise NodeFailure("node_container", "Coolify application has no numeric container owner id", 3)
+    owner = ("coolify.applicationId=" + app_id if app_id.isdigit()
+             else "com.docker.compose.project=" + uuid)
     service = ((_load_runtime(root).get("services") or {}).get("agent") or {}).get("compose_service", "agent")
     containers = _node_ssh(root, host, "docker ps --filter " + shlex.quote(
-        "label=coolify.applicationId=" + app_id) + " --filter " + shlex.quote(
+        "label=" + owner) + " --filter " + shlex.quote(
         "label=com.docker.compose.service=" + service) + " --format '{{.ID}}'").splitlines()
     if len(containers) != 1 or not re.fullmatch(r"[a-f0-9]+", containers[0]):
         raise NodeFailure("node_container", "expected one running agent container", 3)
@@ -7848,7 +7867,7 @@ def _node_environment(root, runtime, target, host, repo_url, key, branch):
 
 def _node_provider_requirements(root, *, create=False):
     help_text = _node_run(["coolify", "help"], root).stdout
-    required = ["app rollback"]
+    required = [] if create else ["app rollback"]
     missing = [verb for verb in required if verb not in help_text]
     if missing:
         raise NodeFailure("provider_not_ready", "Coolify prerequisite missing: " + ", ".join(missing), 6)
@@ -7918,10 +7937,11 @@ def _node_create_app(root, target, host, repo, branch):
         "--git-branch", branch, "--build-pack", "dockercompose",
         "--docker-compose-location", "/" + _load_runtime(root)["compose_file"],
         "--name", _slug(root.name) + "-" + _slug(target["name"]),
-        "--health-check-host", "127.0.0.1", "--no-auto-deploy-enabled")
+        "--health-check-host", "127.0.0.1")
     app = result.get("uuid") or result.get("application_uuid")
     if not app:
         raise NodeFailure("provider_output", "application creation returned no UUID")
+    _node_coolify(root, target, "app", "update", app, "--no-auto-deploy-enabled")
     _node_coolify(root, target, "ids", "set", target["resource"]["identifier_label"], app)
     return app
 
@@ -8063,8 +8083,11 @@ def cmd_node_status(args):
         services = _node_exec(root, host, container, ["supervisorctl", "-s", "unix:///tmp/agent-box-supervisor.sock", "status"])
         node_services = {line.split()[0]: line.split()[1].lower() for line in services.splitlines() if len(line.split()) >= 2}
         detail = _node_coolify(root, target, "applications", app)
+        app_id = str(detail.get("id") or "")
+        owner = ("coolify.applicationId=" + app_id if app_id.isdigit()
+                 else "com.docker.compose.project=" + app)
         containers = _node_ssh(root, host, "docker ps -a --filter " + shlex.quote(
-            "label=coolify.applicationId=" + str(detail["id"])) + " --format " + shlex.quote(
+            "label=" + owner) + " --format " + shlex.quote(
             '{{.Label "com.docker.compose.service"}} {{.State}}'))
         node_services.update({line.split()[0]: line.split()[1] for line in containers.splitlines() if len(line.split()) == 2})
         store = json.loads(_node_exec(root, host, container, ["capabilities", "store", "show", "--json"]))

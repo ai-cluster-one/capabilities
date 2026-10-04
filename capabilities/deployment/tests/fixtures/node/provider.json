@@ -7,6 +7,7 @@
   "projects project-fixture": {"uuid": "project-fixture", "environments": [{"name": "production", "uuid": "environment-fixture"}]},
   "projects create": {"project_uuid": "project-fixture"},
   "sources": {"private_deploy_keys": [{"uuid": "key-fixture", "name": "fixture-key"}]},
+  "app update": {},
   "app create": {"uuid": "application-fixture"},
   "applications application-fixture": {"uuid": "application-fixture", "id": 42, "status": "running:healthy"},
   "deploy application-fixture": {"deployments": [{"resource_uuid": "application-fixture", "deployment_uuid": "deployment-fixture"}]},

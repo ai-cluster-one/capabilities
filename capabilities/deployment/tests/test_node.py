@@ -48,7 +48,9 @@ import json, os, sys
 from pathlib import Path
 args=sys.argv[1:]
 if '--connection' in args:
- i=args.index('--connection'); del args[i:i+2]
+ i=args.index('--connection')
+ if (args[0] == 'ids' and i == 0) or (args[0] != 'ids' and i != 0): sys.exit(2)
+ del args[i:i+2]
 if args == ['help']:
  print('coolify wait <uuid>\\ncoolify app rollback <uuid> --to <commit>'); sys.exit()
 with open(os.environ['NODE_TRACE'], 'a') as f: f.write(json.dumps({'argv':args,'stdin':sys.stdin.read()})+'\\n')
@@ -61,6 +63,7 @@ if args[:3] == ['ids','get','node_app'] and os.environ.get('NODE_NEW_APP'):
 key=' '.join(args)
 if key not in fixtures: key=' '.join(args[:2])
 if key not in fixtures: key=args[0]
+if args[:2] == ['ids','get']: print(fixtures[key]); sys.exit()
 print(json.dumps(fixtures[key]))
 ''')
     fake.chmod(0o755)
@@ -134,7 +137,7 @@ def test_first_deploy_records_app_and_disables_auto_deploy(node, monkeypatch, ca
     capsys.readouterr()
     calls = rows(node)
     create = next(r["argv"] for r in calls if r["argv"][:2] == ["app", "create"])
-    assert "--no-auto-deploy-enabled" in create
+    assert ["app", "update", "application-fixture", "--no-auto-deploy-enabled"] in [r["argv"] for r in calls]
     assert create[create.index("--health-check-host") + 1] == "127.0.0.1"
     assert create[create.index("--private-deploy-key") + 1] == "key-fixture"
     assert ["ids", "set", "node_app", "application-fixture"] in [r["argv"] for r in calls]
@@ -438,3 +441,45 @@ def test_descriptor_env_resolves_machine_tier_before_process(node, monkeypatch, 
     monkeypatch.setattr(node.m, "_project_env", lambda: {"FIXTURE_SECRET": "project-secret"})
     env = node.m._node_environment(node.root, node.runtime, node.target, host, "git@192.0.2.10:/srv/git/body.git", node.key, "main")
     assert "FIXTURE_SECRET=project-secret\n" in env
+
+
+def test_local_coolify_host_uses_pairing_address_and_openssh_identity(node, monkeypatch):
+    monkeypatch.setattr("socket.gethostbyname", lambda host: "192.0.2.10")
+    key = node.root / "identity"
+    key.write_text("fixture key")
+    monkeypatch.setattr(node.m, "_records", lambda: SimpleNamespace(connections=lambda *a, **kw: {
+        "fixture": {"enabled": True, "allow_write": True, "value": {"base_url": "https://node.example.invalid"}}}))
+    original = node.m._node_coolify
+    def provider(root, target, *args, **kw):
+        if args[0] == "servers":
+            return {"uuid": "server-fixture", "name": "localhost", "ip": "host.docker.internal", "is_coolify_host": True}
+        return original(root, target, *args, **kw)
+    monkeypatch.setattr(node.m, "_node_coolify", provider)
+    run = node.m._node_run
+    def command(argv, root, **kw):
+        if argv[:2] == ["ssh", "-G"]:
+            return SimpleNamespace(stdout=f"identityfile {key}\n")
+        return run(argv, root, **kw)
+    monkeypatch.setattr(node.m, "_node_run", command)
+    host = node.m._node_host(node.root, node.target)
+    assert host["address"] == "192.0.2.10"
+    assert host["key_path"] == str(key)
+
+
+def test_first_deploy_requires_no_unavailable_rollback(node, monkeypatch):
+    monkeypatch.setattr(node.m, "_node_run", lambda *a, **kw: SimpleNamespace(stdout="coolify wait"))
+    node.m._node_provider_requirements(node.root, create=True)
+    with pytest.raises(node.m.NodeFailure, match="app rollback"):
+        node.m._node_provider_requirements(node.root, create=False)
+
+
+def test_container_discovery_without_numeric_api_id(node, monkeypatch):
+    original = node.m._node_coolify
+    def provider(root, target, *args, **kw):
+        if args[0] == "applications":
+            return {"uuid": "application-fixture", "status": "running:healthy"}
+        return original(root, target, *args, **kw)
+    monkeypatch.setattr(node.m, "_node_coolify", provider)
+    host = {"connection": "fixture"}
+    assert node.m._node_container(node.root, host, "application-fixture") == "aabbccddeeff"
+    assert "label=com.docker.compose.project=application-fixture" in node.ssh[-1][0]
