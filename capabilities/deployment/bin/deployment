@@ -5657,7 +5657,7 @@ def _host_artifact_texts(root: Path, runtime: dict,
         target, error = _read_json(path)
         if error or not isinstance(target, dict) or target.get("provider") != "coolify":
             continue
-        name = "node-sync-" + _slug(target["name"])
+        name = "node-sync-" + target["name"]
         prefix = _host_label_prefix(runtime, root)
         launcher = agents_dir / f"{prefix}-{name}"
         command = [NAME, "node", "sync", "--target", target["name"]]
@@ -6607,7 +6607,7 @@ def _host_next_payload(root: Path, runtime: dict, target_name: str | None) -> di
     # or the thing that restarts a wedged service is itself never running.
     if services and _compiler_config(runtime)["host"]["watchdog"]["enabled"]:
         labels.append(f"{prefix}.watchdog")
-    labels.extend(f"{prefix}.node-sync-{_slug(item['name'])}"
+    labels.extend(f"{prefix}.node-sync-{item['name']}"
                   for item in _all_target_payloads(root) if item.get("provider") == "coolify")
     apply_steps = [
         "Stop any copy of these services you started by hand, so launchd does "
@@ -7569,7 +7569,7 @@ def _node_git(root, *args, check=True):
 def _node_state_path(root, target):
     # Operational facts live outside the versioned body, in this checkout's git dir.
     gitdir = Path(_node_git(root, "rev-parse", "--absolute-git-dir"))
-    return gitdir / "deployment-nodes" / (_slug(target["name"]) + ".json")
+    return gitdir / "deployment-nodes" / (target["name"] + ".json")
 
 
 def _node_state(root, target):
@@ -7687,7 +7687,7 @@ def _node_branch(root):
 
 
 def _node_remote(target):
-    return "node-" + _slug(target["name"])
+    return "node-" + target["name"]
 
 
 def _node_sync(root, target, mirror=None):
@@ -7812,14 +7812,21 @@ done
 
 
 def _node_environment(root, runtime, target, host, repo_url, key, branch):
-    values = {**os.environ, **_project_env()}
+    project_values = _project_env()
     env = {}
     for service in runtime.get("services", {}).values():
         if service.get("placement") == "local":
             continue
         defaults = service.get("environment_defaults") or {}
+        machine_values = {}
+        owners = [service.get("capability"), *service.get("embedded_services", [])]
+        for owner in owners:
+            if isinstance(owner, str) and re.fullmatch(r"[a-z][a-z0-9_-]*", owner):
+                for k, value in _parse_env_file(_CONFIG_HOME / owner / "credentials.env").items():
+                    if value:
+                        machine_values.setdefault(k, value)
         for k in service.get("required_env", []) + service.get("optional_env", []):
-            value = values.get(k, defaults.get(k, ""))
+            value = project_values.get(k) or machine_values.get(k) or os.environ.get(k) or defaults.get(k, "")
             if k in service.get("required_env", []) and not value and k != REPO_URL_ENV:
                 raise NodeFailure("environment_missing", f"required environment key {k} is missing", 6)
             env[k] = value
@@ -8078,7 +8085,7 @@ def cmd_node_status(args):
         local = _launchd_status(label)
         report["services"].append({"name": name, "placement": placement,
             "node": node_services.get(name, "running" if name == "agent" and report["application"].get("status") == "running:healthy" else "absent"),
-            "local": "running" if local.get("loaded") else "absent"})
+            "local": ("running" if local.get("pid") else "stopped") if local.get("loaded") else "absent"})
     _emit(report)
 
 

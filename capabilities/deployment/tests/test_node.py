@@ -409,3 +409,32 @@ def test_environment_fallback_refuses_ungranted_connection_before_token_read(nod
         node.m._node_create_environment(node.root, node.target, "project-fixture", "node")
     assert failure.value.code == "connection_not_granted"
     assert not node.trace.exists()
+
+
+def test_target_identity_does_not_collide_after_slugging(node):
+    first, second = {"name": "prod_test"}, {"name": "prod-test"}
+    assert node.m._node_remote(first) != node.m._node_remote(second)
+    assert node.m._node_state_path(node.root, first) != node.m._node_state_path(node.root, second)
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+def test_descriptor_env_resolves_machine_tier_before_process(node, monkeypatch, embedded):
+    config = node.tmp / "config"
+    credentials = config / "fixture" / "credentials.env"
+    credentials.parent.mkdir(parents=True)
+    credentials.write_text("FIXTURE_SECRET='machine|secret'\n")
+    monkeypatch.setattr(node.m, "_CONFIG_HOME", config)
+    monkeypatch.setattr(node.m, "_project_env", lambda: {})
+    monkeypatch.setenv("FIXTURE_SECRET", "process-secret")
+    owner = node.runtime["services"]["agent"] if embedded else node.runtime["services"].setdefault("fixture", {})
+    owner["required_env"] = ["FIXTURE_SECRET"]
+    if embedded:
+        owner["embedded_services"] = ["fixture"]
+    else:
+        owner["capability"] = "fixture"
+    host = {"address": "192.0.2.10"}
+    env = node.m._node_environment(node.root, node.runtime, node.target, host, "git@192.0.2.10:/srv/git/body.git", node.key, "main")
+    assert "FIXTURE_SECRET=machine|secret\n" in env
+    monkeypatch.setattr(node.m, "_project_env", lambda: {"FIXTURE_SECRET": "project-secret"})
+    env = node.m._node_environment(node.root, node.runtime, node.target, host, "git@192.0.2.10:/srv/git/body.git", node.key, "main")
+    assert "FIXTURE_SECRET=project-secret\n" in env
