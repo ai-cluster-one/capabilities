@@ -298,8 +298,7 @@ def test_defer_sets_the_pickup_and_the_next_task_is_taken(project, store, turns,
     later = shown(entry, capsys, "t-later")
     assert later["task"]["status"] == "todo" and later["activities"] == []
     assert (datetime.datetime.fromisoformat(later["task"]["pickup_at"]) == moment)
-    [change] = changes_of(entry, capsys, "t-later")
-    assert (change["field"], change["actor"]) == ("pickup", "hook:alpha")
+    assert changes_of(entry, capsys, "t-later") == []
     assert raises_of(entry, capsys, "t-later") == []
 
 

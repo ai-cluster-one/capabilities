@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-05 — A hook deferral leaves no row in the task's history
+
+A worker's `before` hook that defers a task - exit 75 with a moment on its last line - still sets the task's pickup to that moment, and no longer records the move in the task's history: the row it wrote, with actor `hook:<worker>`, was written every time a lane was held and carried nothing a reader needed. The trail is unchanged, it never had an entry, and `run` and the service log still name each deferral under `passed_over`. Rows such a deferral wrote before this version stay in the store until removed. Run `tasks help` HOOKS for the contract.
+
 ## 2026-10-03 — Find the task a run was for, for many runs in one call
 
 `tasks runs --run SYSTEM:REF [--run ...] [--since WHEN] [--project ID | --all-projects]` goes from runs to the raises they were: given the handles a harness knows its runs by - `--run claude:<session id>`, repeating - or a period with `--since`, it answers `{"runs": [...]}`, one row per matching raise, oldest first, each carrying `execution`, `task_id`, `project_id`, `unique_key`, `title`, `worker`, `status`, `started_at`, `ended_at`, `run_system` and `run_ref`. Its scope is the one `list` reads, and `--all-projects` reads every project in the store. A run no raise names answers no row and is not an error, and the call is one query on one connection however many runs it names. The schema gains the index `task_executions_run_idx` on `(run_system, run_ref)`, added beside what is there, so a store without it is brought up to it by the first command that reaches it. `tasks runs <task>` is unchanged. Run `tasks help` RUNS for the contract.

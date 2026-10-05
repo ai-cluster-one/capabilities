@@ -370,9 +370,8 @@ HOOKS
 
     exit 0                      go: the task is claimed as always
     exit 75, last stdout line   defer: the task's pickup is set to that moment,
-    a moment                    recorded in its history with actor
-                                `hook:<worker>` and no entry on the trail, and
-                                the next task is asked about
+    a moment                    with no row in its history and no entry on the
+                                trail, and the next task is asked about
     anything else               skip: nothing is written, and the next task is
                                 asked about; so is exit 75 without a moment, a
                                 timeout, and a command that cannot be started
@@ -8300,9 +8299,9 @@ def _hook_moment(text: str | None, tz) -> str | None:
 
 def _defer(entry, worker: dict, tid: str, moment: str) -> bool:
     """Hold a task its worker's `before` hook deferred until the moment it named:
-    the pickup alone, recorded in the history as the hook's, with no entry on the
-    trail. A task that left the queue meanwhile, or that a claimer holds, is not
-    written."""
+    the pickup alone, with no row in the history and no entry on the trail, since
+    a lane held back carries nothing a reader needs. A task that left the queue
+    meanwhile, or that a claimer holds, is not written."""
     with _connect(entry) as conn, conn.cursor() as cur:
         cur.execute(f"""select * from {SCHEMA}.tasks
                          where id::text = %s and status in ('todo', 'waiting')
@@ -8312,9 +8311,7 @@ def _defer(entry, worker: dict, tid: str, moment: str) -> bool:
             conn.commit()
             return False
         cur.execute(f"""update {SCHEMA}.tasks set pickup_at = %s, updated_at = now()
-                         where id::text = %s returning *""", (moment, tid))
-        after = _rows(cur)[0]
-        _record_moves(cur, tid, rows[0], after, actor=f"hook:{worker['name']}")
+                         where id::text = %s""", (moment, tid))
         conn.commit()
     return True
 
