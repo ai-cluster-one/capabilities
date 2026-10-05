@@ -1,19 +1,25 @@
 """The core tier on the manager's capability rows, and its verification.
 
 Which capabilities are core is declared once, by the manager. `list` and
-`inventory` carry it on every row as `tier`, and it moves no gate: a core
-capability is enabled, granted and gated exactly as a standard one is.
+`inventory` carry it on every row as `tier`. The tier acts once, at a core
+capability's first install from the official catalogue, which leaves it
+allowed on the machine and enabled at global scope; from then on it is
+enabled, granted and gated exactly as a standard one is.
 """
 
 from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import functools
+import http.server
 import json
 import os
 import subprocess
 import sys
+import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -161,3 +167,144 @@ def test_verification_reads_the_verified_tree_not_the_running_manager(tmp_path):
     bare = tmp_path / "c"
     (bare / "capabilities").mkdir(parents=True)
     assert M._core_declaration_failures(bare) == []
+
+
+# --- arrival ----------------------------------------------------------------------
+
+class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *_args) -> None:
+        pass
+
+
+def _publish(root: Path, name: str) -> Path:
+    bundle = root / "capabilities" / name
+    script = bundle / "bin" / name
+    script.parent.mkdir(parents=True)
+    script.write_text(M._capability_skeleton(name, True))
+    script.chmod(0o755)
+    return bundle
+
+
+@contextmanager
+def _catalogue(root: Path, *names: str):
+    """A stand-in for the official catalogue: CAPABILITIES_SOURCE pointed at a
+    local server carrying capabilities/<name>/bin/<name> for each name."""
+    for name in names:
+        _publish(root, name)
+    handler = functools.partial(_QuietHandler, directory=str(root))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _machine_env(tmp_path: Path, source: str) -> dict[str, str]:
+    env = dict(os.environ)
+    for key in ("CAPABILITIES_READ_ONLY", "CLAUDE_PROJECT_DIR",
+                "CAPABILITIES_AUTH_CONTEXT", "CAPABILITIES_PROJECT_ENVELOPE",
+                "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "CAPABILITIES_PROJECT_ID",
+                "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_STORE_URL",
+                "CAPABILITIES_DEV_SESSION", "CAPABILITIES_WORKSPACE"):
+        env.pop(key, None)
+    env.update({
+        "HOME": str(tmp_path / "home"),
+        "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        "XDG_STATE_HOME": str(tmp_path / "state"),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        "XDG_DATA_HOME": str(tmp_path / "data"),
+        "CAPABILITIES_HOME": str(tmp_path / "registry"),
+        "CAPABILITIES_BIN": str(tmp_path / "bin"),
+        "CAPABILITIES_SOURCE": source,
+    })
+    return env
+
+
+def _outside(tmp_path: Path) -> Path:
+    place = tmp_path / "home" / "nowhere"
+    place.mkdir(parents=True, exist_ok=True)
+    return place
+
+
+def _machine(env: dict[str, str]) -> dict:
+    path = Path(env["XDG_CONFIG_HOME"]) / "capabilities" / "machine.json"
+    return json.loads(path.read_text())["capabilities"] if path.exists() else {}
+
+
+def _global_policy(env: dict[str, str]) -> dict:
+    path = Path(env["XDG_CONFIG_HOME"]) / "capabilities" / "settings.json"
+    return json.loads(path.read_text())["capabilities"] if path.exists() else {}
+
+
+def test_a_core_capability_arrives_allowed_and_enabled_globally(tmp_path):
+    with _catalogue(tmp_path / "catalogue", CORE) as source:
+        env = _machine_env(tmp_path, source)
+        here = _outside(tmp_path)
+        installed = _manager(here, env, "install", CORE)
+    gate = str(tmp_path / "config" / "capabilities" / "settings.json")
+    assert installed["machine"] == "allowed"
+    assert "machine_hint" not in installed
+    assert installed["global_policy"] == {"enabled": True, "gate": gate}
+    assert _machine(env)[CORE]["state"] == "allowed"
+    assert _global_policy(env) == {CORE: {"enabled": True}}
+    row = {r["name"]: r for r in _manager(here, env, "list")["installed"]}[CORE]
+    assert (row["tier"], row["machine"], row["global_gate"], row["effective"]) == (
+        "core", "allowed", "enabled", "enabled")
+
+
+def test_a_standard_capability_still_arrives_quarantined_with_no_policy(tmp_path):
+    with _catalogue(tmp_path / "catalogue", STANDARD) as source:
+        env = _machine_env(tmp_path, source)
+        installed = _manager(_outside(tmp_path), env, "install", STANDARD)
+    assert installed["machine"] == "quarantined"
+    assert "global_policy" not in installed
+    assert _machine(env)[STANDARD]["state"] == "quarantined"
+    assert _global_policy(env) == {}
+
+
+def test_a_core_name_from_another_source_arrives_as_any_capability(tmp_path):
+    env = _machine_env(tmp_path, "http://127.0.0.1:9")
+    bundle = _publish(tmp_path / "elsewhere", CORE)
+    installed = _manager(_outside(tmp_path), env, "install", CORE, "--from", str(bundle))
+    assert installed["machine"] == "quarantined"
+    assert "global_policy" not in installed
+    assert _global_policy(env) == {}
+
+
+def test_arrival_writes_the_global_record_where_enable_global_would(tmp_path):
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / "capabilities").mkdir()
+    with _catalogue(tmp_path / "catalogue", CORE) as source:
+        env = _machine_env(tmp_path, source)
+        installed = _manager(project, env, "install", CORE)
+    assert installed["global_policy"]["enabled"] is True
+    assert _global_policy(env) == {CORE: {"enabled": True}}
+    row = {r["name"]: r for r in _manager(project, env, "list")["installed"]}[CORE]
+    assert (row["project_gate"], row["global_gate"], row["effective"]) == (
+        "absent", "enabled", "enabled")
+
+
+def test_the_users_later_choices_survive_reinstall_update_and_a_second_arrival(tmp_path):
+    with _catalogue(tmp_path / "catalogue", CORE) as source:
+        env = _machine_env(tmp_path, source)
+        here = _outside(tmp_path)
+        _manager(here, env, "install", CORE)
+        _manager(here, env, "quarantine", CORE)
+        _manager(here, env, "disable", CORE, "--global")
+        reinstalled = _manager(here, env, "install", CORE)
+        assert reinstalled["machine"] == "quarantined"
+        assert "global_policy" not in reinstalled
+        _manager(here, env, "update", CORE)
+        assert _machine(env)[CORE]["state"] == "quarantined"
+        assert _global_policy(env) == {CORE: {"enabled": False}}
+        # Uninstalling drops the machine state but not the user's global
+        # entry, so a second arrival is allowed and the disable is kept.
+        _manager(here, env, "uninstall", CORE)
+        again = _manager(here, env, "install", CORE)
+    assert again["machine"] == "allowed"
+    assert "global_policy" not in again
+    assert _global_policy(env) == {CORE: {"enabled": False}}

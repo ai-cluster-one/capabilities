@@ -1,6 +1,6 @@
 {
   "assets": {
-    "DOCTRINE.md": "88cfb8692267a064cccffe0156e758c1ac80bbf2a1e7e7e7b9b6906f87b7eb97",
+    "DOCTRINE.md": "fe8577be8df8d22a78d838ee5e7d1e9a076dfb1ef628de7078c724d2084cb671",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
     "SHEBANG.md": "5f3e3ffa5b79861e37105195ce1135d23d9f981ac779deba4cf30171844358e3",
     "SOURCES.md": "79e453cf68a08ba2b2e5e460064eb0a5aca8f13071e9d6557be1b7361f1e0075",
@@ -18,12 +18,12 @@
     "guides/repositories.md": "0ec2af6dfc92d20aa283fecab82b7888fb22b2480541cbb597e9a52f680ec2f4",
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "6d71f893bdc8c0da665131e1f57e7e7ea883f91bdd8ef9e411352e54c1cf2547",
+    "manager/CHANGELOG.md": "99d57cf12f7c6ca955b00b4d756f783693754efef7b37cb39ed422b99dc4a694",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "e055213a80b112dbed3139237848604ee2abb4d83667aba31eaccb9520c03bad"
+    "sha256": "0f24a36b5c8371d3c54a4f19920d6b5c00241f1444bb1bde7184ca9b75a3c65b"
   },
   "schema": "capabilities.manager-release.v1"
 }

@@ -87,8 +87,13 @@ MACHINE VERBS
         scaffold credentials per the declared scope, surface declared
         post-install steps (--yes runs them), regenerate the skill.
         A capability new to this machine arrives quarantined (see allow);
-        --allow installs it allowed. Reinstalling or updating an installed
-        capability keeps its machine state; uninstall drops it.
+        --allow installs it allowed. A core capability (see list) new to this
+        machine and installed from the official catalogue - no --from, no
+        --source - arrives allowed and enabled at global scope instead, unless
+        the global scope already holds an entry for it, which is kept; JSON
+        then carries global_policy {enabled, gate} naming where the record
+        went. Reinstalling or updating an installed capability keeps its
+        machine state and writes no policy; uninstall drops the machine state.
         --from accepts: a script file, a bundle directory holding <name> or
         bin/<name>, a repo directory holding capabilities/<name>/bin/<name>, or
         a URL. Source directories, and script paths inside source directories,
@@ -164,9 +169,13 @@ MACHINE VERBS
         the resolved envelope path. `tier` is on every row, "core" or
         "standard": the manager declares the catalogue's core set once, as
         CORE_CAPABILITIES in its own executable, and every other capability is
-        standard. The tier is a mark to group by; it changes no gate, policy,
-        enablement or grant. Source verification refuses a core name the
-        catalogue does not carry. Every row carries `machine` ("allowed" or
+        standard. The tier is a mark to group by, and it acts only at first
+        arrival (see install): there a core capability arrives allowed and
+        enabled at global scope. After that it is gated, enabled and granted
+        exactly as a standard one; a bundled service still needs an explicit
+        project enable, and a connection still needs its grant. Source
+        verification refuses a core name the catalogue does not carry. Every
+        row carries `machine` ("allowed" or
         "quarantined") and `machine_connections`, the connections this
         machine's global scope declares for it less those whose grant there
         is disabled; a quarantined row is effective "disabled" with source
@@ -609,7 +618,10 @@ CORE_CAPABILITIES = ("askproject", "automations", "deployment", "tasks")
 # foundational is a fact about the catalogue, which no single capability is
 # part of deciding, so the manager declares it rather than any manifest. Every
 # catalogue capability not named here is standard. The tier is a mark readers
-# group by and nothing more: it changes no gate, policy, enablement or grant.
+# group by, and it acts once: a core capability's first install from the
+# official catalogue arrives allowed on the machine and enabled at global
+# scope, where that scope holds no entry for it yet. After arrival it is gated,
+# enabled and granted exactly as a standard capability is.
 # Source verification reads this assignment from the tree it verifies and
 # refuses a name that tree's catalogue does not carry.
 CAPABILITIES_CONTEXT_INTRO = (
@@ -2379,6 +2391,11 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
     _reject_reserved_capability_name(name)
     _assert_payload_mutable(name)
     fresh = name not in _installed()
+    # The tier is a fact about the official catalogue, so only a payload from
+    # it arrives as core; one named by --from or --source merely carries the
+    # name and arrives as any other capability does.
+    core_arrival = (fresh and name in CORE_CAPABILITIES
+                    and from_ref is None and source_id is None)
     provenance = {}
     if source_id:
         if from_ref:
@@ -2392,17 +2409,23 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
         **provenance,
     })
     # A capability new to this machine arrives quarantined unless the install
-    # allows it; one already installed keeps the state it has. The ceiling is
-    # written before the payload lands, so no moment exists in which a fresh
-    # payload is installed and not yet quarantined.
+    # allows it or it arrives as core; one already installed keeps the state it
+    # has. The ceiling is written before the payload lands, so no moment exists
+    # in which a fresh payload is installed and not yet quarantined.
     previous = _load_machine()["capabilities"].get(name)
     if fresh or allow:
-        _write_machine(name, "allowed" if allow else "quarantined", record=True)
+        _write_machine(name, "allowed" if allow or core_arrival else "quarantined",
+                       record=True)
+    # A core capability also arrives enabled at global scope, unless that scope
+    # already holds the user's own entry for it.
+    global_policy = _arrival_global_enable(name) if core_arrival else None
     try:
         script = _activate_payload(name, stage)
     except BaseException:
         if fresh or allow:
             _write_machine(name, previous["state"] if previous else None)
+        if global_policy:
+            _arrival_global_enable(name, undo=True)
         raise
     reg = _registry_dir(name)
     link = _symlink(name, script)
@@ -2427,6 +2450,8 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
             f"{name} is quarantined on this machine: no project can use it "
             f"until the user runs `capabilities allow {name}`; an agent never "
             "lifts a quarantine itself")
+    if global_policy:
+        result["global_policy"] = {"enabled": True, "gate": global_policy}
     if notes:
         result["credentials"] = notes
     if post and not yes:
@@ -6086,6 +6111,39 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False) -> None:
         _warn(result["warning"])
     _refresh_after_gate(root, result, enabled)
     _emit(result)
+
+
+def _arrival_global_enable(name: str, undo: bool = False) -> str | None:
+    """Write the global enable a core capability arrives with, at the global
+    scope `enable --global` would write from here, and return where it went.
+    An entry already at that scope is the user's and is left as it is, so
+    nothing is written and None is returned. `undo` removes the entry again
+    when the install that wrote it fails."""
+    root = _project_root()
+    if root is None:
+        gate = _load_gate_file(GLOBAL_GATE_FILE)
+        if undo:
+            gate["capabilities"].pop(name, None)
+        elif name in gate["capabilities"]:
+            return None
+        else:
+            gate["capabilities"][name] = {"enabled": True}
+        _write_json(GLOBAL_GATE_FILE, gate)
+        return str(GLOBAL_GATE_FILE)
+    adapter = _records_for(root)
+    try:
+        if undo:
+            adapter.delete("capabilities", "policy", name, scope="global")
+        elif name in adapter.resolve_scope("capabilities", "policy", "global"):
+            return None
+        else:
+            adapter.set("capabilities", "policy", name, {"enabled": True},
+                        actor="capabilities", scope="global")
+        return _gate_source(adapter, root, "global")
+    except _store_module().StoreError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+    finally:
+        adapter.close()
 
 
 def _inherit_gate(name: str, scope: str) -> None:

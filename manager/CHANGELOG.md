@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-05 — A core capability arrives allowed and enabled globally
+
+`capabilities install <name>` of a core capability (`tier` "core" in `list`) new to this machine, from the official catalogue, now leaves it `allowed` on the machine and writes an explicit global enable record, at the global scope `capabilities enable <name> --global` writes from the same directory; the JSON carries `global_policy {enabled, gate}`. A global entry the user already holds for it is kept and nothing is written. A standard capability, and a core name installed with `--from` or `--source`, still arrives quarantined with no policy written. Reinstalling or updating an installed capability changes neither its machine state nor its policy, and a bundled service still needs an explicit project enable. Run `capabilities help` for the details.
+
 ## 2026-10-04 — A capability's machine reads are validated wherever it is
 
 `capabilities audit`, `source check` and `install` validate a capability's `MACHINE_READS` declaration: a tuple of strings, each a verb the capability's `help` names and none of them in its `WRITE_VERBS`. Audit and source check report a bad declaration as a `connections/machine-reads` failure, and install refuses it with exit 6 `machine_reads_invalid` before anything is installed. A capability that declares none is validated as before.
