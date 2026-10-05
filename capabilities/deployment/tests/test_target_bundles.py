@@ -138,17 +138,28 @@ def test_the_bundle_builds_from_the_root_with_its_own_ignore_file(
                      f"{bundle}/supervisord.conf", f"{bundle}/body-sync.sh"):
             assert "!" + kept in lines
             assert kept in (root / bundle / "Dockerfile").read_text()
-    docker = shutil.which("docker")
-    if docker and subprocess.run([docker, "compose", "version"], capture_output=True).returncode == 0:
-        for project_directory in ([], ["--project-directory", bundle]):
-            parsed = subprocess.run(
-                [docker, "compose", *project_directory, "-f", f"{bundle}/docker-compose.yaml",
-                 "config", "--format", "json"],
-                cwd=root, capture_output=True, text=True, timeout=30,
-                env={**env, "AGENT_REPO_URL": "fixture"})
-            assert parsed.returncode == 0, parsed.stderr
-            build = json.loads(parsed.stdout)["services"]["agent"]["build"]
-            assert Path(build["context"]).resolve() == root.resolve()
+    # Compose resolves the build context the way Coolify runs it: from the
+    # bundle as its own project directory, and from a plain `-f`. The project
+    # runs under a temporary HOME, so the Docker config that holds a per-user
+    # Compose plugin is named from the real one, and the probe runs in exactly
+    # the environment the calls below use.
+    compose_env = {**env, "AGENT_REPO_URL": "fixture",
+                   "DOCKER_CONFIG": os.environ.get("DOCKER_CONFIG")
+                   or str(Path(os.environ.get("HOME") or Path.home()) / ".docker")}
+    docker = shutil.which("docker", path=compose_env.get("PATH"))
+    if docker is None or subprocess.run(
+            [docker, "compose", "version"], cwd=root, env=compose_env,
+            capture_output=True, timeout=30).returncode != 0:
+        pytest.skip("Docker Compose is not reachable here; the context resolution is "
+                    "proven only where it is")
+    for project_directory in ([], ["--project-directory", bundle]):
+        parsed = subprocess.run(
+            [docker, "compose", *project_directory, "-f", f"{bundle}/docker-compose.yaml",
+             "config", "--format", "json"],
+            cwd=root, capture_output=True, text=True, timeout=30, env=compose_env)
+        assert parsed.returncode == 0, parsed.stderr
+        build = json.loads(parsed.stdout)["services"]["agent"]["build"]
+        assert Path(build["context"]).resolve() == root.resolve()
 
 
 def test_next_names_the_coolify_base_directory_and_compose_location(tmp_path: Path) -> None:
