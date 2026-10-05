@@ -308,3 +308,32 @@ def test_the_users_later_choices_survive_reinstall_update_and_a_second_arrival(t
     assert again["machine"] == "allowed"
     assert "global_policy" not in again
     assert _global_policy(env) == {CORE: {"enabled": False}}
+
+
+def test_under_the_read_only_switch_a_core_capability_arrives_as_any_other(tmp_path):
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    (project / "capabilities").mkdir()
+    with _catalogue(tmp_path / "catalogue", CORE) as source:
+        env = _machine_env(tmp_path, source)
+        env["CAPABILITIES_READ_ONLY"] = "1"
+        for place in (_outside(tmp_path), project):
+            installed = _manager(place, env, "install", CORE)
+            assert installed["machine"] == "quarantined"
+            assert "global_policy" not in installed
+            _manager(place, {k: v for k, v in env.items()
+                             if k != "CAPABILITIES_READ_ONLY"}, "uninstall", CORE)
+    assert _global_policy(env) == {}
+
+
+def test_an_arrival_that_cannot_write_the_global_record_leaves_nothing(tmp_path):
+    with _catalogue(tmp_path / "catalogue", CORE) as source:
+        env = _machine_env(tmp_path, source)
+        (tmp_path / "config" / "capabilities" / "settings.json").mkdir(parents=True)
+        result = subprocess.run(
+            [str(MANAGER), "install", CORE], cwd=_outside(tmp_path), env=env,
+            text=True, capture_output=True, timeout=120)
+    assert result.returncode != 0
+    assert CORE not in _machine(env)
+    registry = tmp_path / "registry"
+    assert not registry.exists() or not any(registry.iterdir())

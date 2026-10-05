@@ -90,7 +90,8 @@ MACHINE VERBS
         --allow installs it allowed. A core capability (see list) new to this
         machine and installed from the official catalogue - no --from, no
         --source - arrives allowed and enabled at global scope instead, unless
-        the global scope already holds an entry for it, which is kept; JSON
+        the global scope already holds an entry for it, which is kept, or the
+        process runs under CAPABILITIES_READ_ONLY, which opens no gate; JSON
         then carries global_policy {enabled, gate} naming where the record
         went. Reinstalling or updating an installed capability keeps its
         machine state and writes no policy; uninstall drops the machine state.
@@ -2393,9 +2394,11 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
     fresh = name not in _installed()
     # The tier is a fact about the official catalogue, so only a payload from
     # it arrives as core; one named by --from or --source merely carries the
-    # name and arrives as any other capability does.
+    # name and arrives as any other capability does. The read-only switch
+    # never opens a gate, so under it a core capability arrives as any other.
     core_arrival = (fresh and name in CORE_CAPABILITIES
-                    and from_ref is None and source_id is None)
+                    and from_ref is None and source_id is None
+                    and not _store_module().read_only_switch())
     provenance = {}
     if source_id:
         if from_ref:
@@ -2413,19 +2416,22 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
     # has. The ceiling is written before the payload lands, so no moment exists
     # in which a fresh payload is installed and not yet quarantined.
     previous = _load_machine()["capabilities"].get(name)
-    if fresh or allow:
-        _write_machine(name, "allowed" if allow or core_arrival else "quarantined",
-                       record=True)
-    # A core capability also arrives enabled at global scope, unless that scope
-    # already holds the user's own entry for it.
-    global_policy = _arrival_global_enable(name) if core_arrival else None
+    global_policy = None
     try:
+        if fresh or allow:
+            _write_machine(name, "allowed" if allow or core_arrival else "quarantined",
+                           record=True)
+        # A core capability also arrives enabled at global scope, unless that
+        # scope already holds the user's own entry for it.
+        if core_arrival:
+            global_policy = _arrival_global_enable(name)
         script = _activate_payload(name, stage)
     except BaseException:
         if fresh or allow:
             _write_machine(name, previous["state"] if previous else None)
         if global_policy:
             _arrival_global_enable(name, undo=True)
+        shutil.rmtree(stage, ignore_errors=True)
         raise
     reg = _registry_dir(name)
     link = _symlink(name, script)
