@@ -120,9 +120,10 @@ USAGE
   deployment deploy [--target <name>]
       Check compiler drift, sync the body through node-<target> over SSH,
       provision a Coolify application in the project's existing environment
-      (target.environment, default production; none is created), point its
-      base directory and Compose location at the target's bundle on every
-      deploy, set environment through bulk stdin, deploy and wait for healthy.
+      (target.environment, default production; none is created), named
+      <project>-<target> after the project's ContextKit name or recorded
+      slug, and set that name, its base directory and its Compose location
+      (the target's bundle) on every deploy, set environment through bulk stdin, deploy and wait for healthy.
       On failure request the previous release. Requires agent-box-checkout, a
       committed branch and a granted connection.
   deployment rollback [--target <name>] [--to <commit>]
@@ -8085,7 +8086,32 @@ def _node_provider_requirements(root, *, create=False):
         raise NodeFailure("provider_not_ready", "Coolify prerequisite missing: " + ", ".join(missing), 6)
 
 
-def _node_create_app(root, target, host, repo, branch, compose):
+def _node_app_name(root, target):
+    """The application is named after the project, never after the checkout
+    folder, which differs between a checkout and its worktrees: the name
+    ContextKit holds for the project when its config sets one, else the
+    project slug the capabilities manager recorded, then the target."""
+    project = None
+    if _has_contextkit(root):
+        shown = _node_run(["contextkit", "identity", "show", "--json"], root, check=False)
+        try:
+            identity = json.loads(shown.stdout) if shown.returncode == 0 else {}
+        except ValueError:
+            identity = {}
+        if (isinstance(identity, dict) and identity.get("name_source") == "config"
+                and isinstance(identity.get("name"), str) and identity["name"].strip()):
+            project = identity["name"]
+    if not project:
+        recorded, _error = _read_json(_project_capabilities_dir(root) / "project.json")
+        if isinstance(recorded, dict) and isinstance(recorded.get("slug"), str):
+            project = recorded["slug"]
+    if not project:
+        raise NodeFailure("project_name", "the project has neither a ContextKit name nor a "
+                          "recorded slug to name its Coolify application after", 6)
+    return _slug(project) + "-" + _slug(target["name"])
+
+
+def _node_create_app(root, target, host, repo, branch, compose, name):
     ids = _node_coolify(root, target, "ids", "list")
     project_label = target.get("project")
     if not project_label:
@@ -8123,7 +8149,7 @@ def _node_create_app(root, target, host, repo, branch, compose):
         "--git-branch", branch, "--build-pack", "dockercompose",
         "--base-directory", compose["base_directory"],
         "--docker-compose-location", compose["docker_compose_location"],
-        "--name", _slug(root.name) + "-" + _slug(target["name"]),
+        "--name", name,
         "--health-check-host", "127.0.0.1")
     app = result.get("uuid") or result.get("application_uuid")
     if not app:
@@ -8156,12 +8182,14 @@ def cmd_deploy(args):
     else:
         _node_git(root, "push", "--quiet", remote, f"HEAD:refs/heads/{branch}")
     compose = _coolify_compose_settings(root, runtime, bundle)
+    name = _node_app_name(root, target)
     if not app:
-        app = _node_create_app(root, target, host, repo, branch, compose)
+        app = _node_create_app(root, target, host, repo, branch, compose, name)
     else:
         # An application created before its project moved to per-target bundles
-        # still points at the old Compose file; every deploy sets both again.
-        _node_coolify(root, target, "app", "update", app,
+        # still points at the old Compose file, and one created from a worktree
+        # carries that folder's name; every deploy sets all three again.
+        _node_coolify(root, target, "app", "update", app, "--name", name,
                       "--base-directory", compose["base_directory"],
                       "--docker-compose-location", compose["docker_compose_location"])
     previous = _node_state(root, target).get("release") or {}

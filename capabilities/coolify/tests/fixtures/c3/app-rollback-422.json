@@ -1,0 +1,1 @@
+{"message": "Validation failed.", "errors": {"commit": ["Invalid rollback commit: contains disallowed characters. Only alphanumeric characters, dots, hyphens, underscores, and slashes are allowed."]}}

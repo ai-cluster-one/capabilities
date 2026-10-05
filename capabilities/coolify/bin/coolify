@@ -157,6 +157,22 @@ COMMANDS
       empty string to clear the field (deploy on all changes).
       Write verb - requires allow_write.
 
+  app rollback <uuid> --to <commit|image-tag>
+      Queue a rollback deployment of the application to a previous commit or
+      image tag (POST /applications/<uuid>/rollback). An application built from
+      an image Coolify tags per commit starts that image again; a Docker
+      Compose application is built again from that commit. Returns the
+      deployment_uuid to give `wait --deployment`; Coolify answers without one
+      when it skips the request as a duplicate of a queued deployment. The ref
+      takes letters, digits, '.', '-', '_' and '/', and does not start with
+      '-'. Write verb - requires allow_write.
+  app rollback-images <uuid>
+      What a rollback can start again: the image tags Coolify finds on the
+      server for the application, each with its created_at and is_current, and
+      the current tag. Coolify lists only images named after the application's
+      uuid (or its registry image name), so a Compose application that names
+      its own images lists none and rolls back by commit. Reads only.
+
   service create --compose <file|-> --project <uuid> --server <uuid>
                  --environment <name> [--name <name>] [--instant-deploy]
                  [--destination <uuid>]
@@ -4692,6 +4708,23 @@ def cmd_app_update(c, args):
     )
 
 
+# The ref Coolify 4.3.23 accepts for a rollback; refusing anything else here
+# keeps an unusable value from costing a request and a 422.
+ROLLBACK_REF = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._/-]*")
+
+
+def cmd_app_rollback(c, uuid: str, ref: str):
+    if not ROLLBACK_REF.fullmatch(ref or ""):
+        _die(6, "input", "--to must be a commit or image tag: letters, digits, "
+             "'.', '-', '_' and '/', not starting with '-'")
+    return _request(c, "POST", f"/applications/{uuid}/rollback",
+                    json_body={"commit": ref})
+
+
+def cmd_app_rollback_images(c, uuid: str):
+    return _request(c, "GET", f"/applications/{uuid}/rollback-images")
+
+
 def cmd_service_create(c, args):
     """Create a service from docker-compose file."""
     import base64
@@ -5300,6 +5333,14 @@ def main() -> None:
     sp_create.add_argument("--image", help="registry image (name:tag)")
     sp_create.add_argument("--dockerfile", help="inline dockerfile (file path or - for stdin)")
 
+    sp_rollback = app_sub.add_parser(
+        "rollback", help="roll back to a previous commit or image tag")
+    sp_rollback.add_argument("uuid", help="application UUID")
+    sp_rollback.add_argument("--to", required=True, help="commit or image tag")
+    sp_rollback_images = app_sub.add_parser(
+        "rollback-images", help="list what a rollback can return to")
+    sp_rollback_images.add_argument("uuid", help="application UUID")
+
     sp_update = app_sub.add_parser(
         "update", help="patch supplied application fields only",
     )
@@ -5436,8 +5477,8 @@ def main() -> None:
     # command family (notably `env list`) must remain usable on read-only
     # connections.
     is_write = (
-        args.cmd in {"deploy", "start", "stop", "restart", "app", "service",
-                     "database"}
+        args.cmd in {"deploy", "start", "stop", "restart", "service", "database"}
+        or (args.cmd == "app" and args.app_cmd != "rollback-images")
         or (projects_call is not None and projects_call[0] in {"create", "delete"})
         or (args.cmd == "env" and args.env_cmd != "list")
     )
@@ -5479,6 +5520,10 @@ def main() -> None:
                 out(cmd_app_create(c, args))
             elif args.app_cmd == "update":
                 out(cmd_app_update(c, args))
+            elif args.app_cmd == "rollback":
+                out(cmd_app_rollback(c, args.uuid, args.to))
+            elif args.app_cmd == "rollback-images":
+                out(cmd_app_rollback_images(c, args.uuid))
             else:
                 _die(6, "unknown_command", f"no handler for app {args.app_cmd!r}")
         elif args.cmd == "service":

@@ -30,6 +30,9 @@ def node(tmp_path, monkeypatch):
     (root / "memory").mkdir()
     (root / "memory" / "day.md").write_text("base\n")
     (root / ".gitattributes").write_text('"memory/**" merge=union\n')
+    (root / "capabilities").mkdir()
+    (root / "capabilities" / "project.json").write_text(json.dumps(
+        {"schema": "capabilities.project.v1", "id": "prj_fixture", "slug": "fixture-body"}))
     git(root, "add", ".")
     git(root, "commit", "-qm", "initial")
     remote = tmp_path / "node.git"
@@ -363,7 +366,7 @@ def test_prepared_repo_uses_one_node_key_and_public_stdin(node, monkeypatch):
 
 
 def test_read_only_switch_fences_new_mutating_verbs(node):
-    (node.root / "capabilities").mkdir()
+    (node.root / "capabilities").mkdir(exist_ok=True)
     (node.root / "capabilities/settings.json").write_text(json.dumps({"capabilities": {"deployment": {"enabled": True}}}))
     env = {**os.environ, "CAPABILITIES_READ_ONLY": "1"}
     for args in (("deploy",), ("rollback",), ("node", "sync"), ("node", "login", "claude")):
@@ -426,12 +429,47 @@ def test_every_deploy_points_an_existing_app_at_the_bundle(node, capsys):
     node.m.cmd_deploy(node.args)
     capsys.readouterr()
     calls = [r["argv"] for r in rows(node)]
-    assert ["app", "update", "application-fixture", "--base-directory", "/deployment/targets/test",
-            "--docker-compose-location", "/docker-compose.yaml"] in calls
-    assert calls.index(["app", "update", "application-fixture", "--base-directory",
-                        "/deployment/targets/test", "--docker-compose-location",
-                        "/docker-compose.yaml"]) < next(
-        i for i, argv in enumerate(calls) if argv[0] == "deploy")
+    update = ["app", "update", "application-fixture", "--name", "fixture-body-test",
+              "--base-directory", "/deployment/targets/test",
+              "--docker-compose-location", "/docker-compose.yaml"]
+    assert update in calls
+    assert calls.index(update) < next(i for i, argv in enumerate(calls) if argv[0] == "deploy")
+
+
+def _created_name(node):
+    create = next(r["argv"] for r in rows(node) if r["argv"][:2] == ["app", "create"])
+    return create[create.index("--name") + 1]
+
+
+def test_the_app_is_named_after_the_project_not_the_checkout_folder(node, monkeypatch, capsys):
+    monkeypatch.setenv("NODE_NEW_APP", "1")
+    node.m.cmd_deploy(node.args)
+    capsys.readouterr()
+    # The checkout folder is "desk"; the recorded project slug names the app.
+    assert node.root.name == "desk"
+    assert _created_name(node) == "fixture-body-test"
+
+
+@pytest.mark.parametrize("source,expected", [("config", "fixture-agent-test"),
+                                             ("folder", "fixture-body-test")])
+def test_a_contextkit_name_set_in_config_names_the_app(node, monkeypatch, capsys, source, expected):
+    monkeypatch.setenv("NODE_NEW_APP", "1")
+    monkeypatch.setattr(node.m, "_has_contextkit", lambda root: True)
+    real = node.m._node_run
+    def run(argv, root, **kw):
+        if argv[:3] == ["contextkit", "identity", "show"]:
+            name = "Fixture Agent" if source == "config" else root.name
+            return subprocess.CompletedProcess(argv, 0, json.dumps(
+                {"name": name, "name_source": source}), "")
+        if argv[:2] == ["contextkit", "build"] or argv[:3] == ["contextkit", "path", "memory"]:
+            return subprocess.CompletedProcess(argv, 0, str(root / "memory"), "")
+        return real(argv, root, **kw)
+    monkeypatch.setattr(node.m, "_node_run", run)
+    node.m.cmd_deploy(node.args)
+    capsys.readouterr()
+    # A name ContextKit only derived from the folder is the folder, so the
+    # recorded slug wins over it.
+    assert _created_name(node) == expected
 
 
 def test_a_root_layout_runtime_keeps_its_compose_file_at_the_root(node, capsys):
@@ -440,8 +478,9 @@ def test_a_root_layout_runtime_keeps_its_compose_file_at_the_root(node, capsys):
                                              "env_example": ".env.example", "dockerignore": ".dockerignore"}
     node.m.cmd_deploy(node.args)
     capsys.readouterr()
-    assert ["app", "update", "application-fixture", "--base-directory", "/",
-            "--docker-compose-location", "/docker-compose.yaml"] in [r["argv"] for r in rows(node)]
+    assert ["app", "update", "application-fixture", "--name", "fixture-body-test",
+            "--base-directory", "/", "--docker-compose-location",
+            "/docker-compose.yaml"] in [r["argv"] for r in rows(node)]
 
 
 def test_target_identity_does_not_collide_after_slugging(node):

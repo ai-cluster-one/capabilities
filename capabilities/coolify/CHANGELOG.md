@@ -1,5 +1,9 @@
 # coolify — change log
 
+## 2026-10-05 — `app rollback` and `app rollback-images`
+
+`app rollback <uuid> --to <commit|image-tag>` queues a rollback deployment through Coolify's rollback endpoint and returns the deployment UUID that `wait --deployment` takes; a Docker Compose application is built again from that commit, and an application whose images Coolify tags per commit starts that image again. A ref Coolify would refuse is refused before any request, and the verb is a write. `app rollback-images <uuid>` reads the image tags a rollback can return to and the current one; Coolify lists only images named after the application, so a Compose application that names its own images lists none and rolls back by commit.
+
 ## 2026-10-05 — The bootstrap guide takes the root user's email from the signed-in Claude account
 
 `coolify guide bootstrap` no longer leaves the root user's `<email>` to be guessed: before step 1 the setup session reads the address of the Claude account signed in on the Mac (`oauthAccount.emailAddress` in `~/.claude.json`), shows it to the user and uses the address the user confirms or gives instead. Step 5 now says `ssh -G` lists every identity SSH would try, including defaults that do not exist, so the key to authorize is the first listed file that exists, and that its `.pub` half must exist before the command runs, since a missing file would append an authorized-keys line without a key. No verb changes.
