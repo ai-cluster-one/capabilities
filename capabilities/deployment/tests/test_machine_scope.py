@@ -226,6 +226,9 @@ def test_a_declared_allowed_service_gets_a_launcher_and_an_agent(scratch):
     assert plist["RunAtLoad"] is True
     assert plist["KeepAlive"] == {"SuccessfulExit": False}
     assert plist["AbandonProcessGroup"] is True
+    # The turns a machine service starts build and test; Background would hold
+    # them to the efficiency cores at the lowest priority.
+    assert plist["ProcessType"] == "Standard"
     path_entries = plist["EnvironmentVariables"]["PATH"].split(os.pathsep)
     assert str((base / "bin").resolve()) == path_entries[0]
     assert plist["StandardOutPath"] == str(agents_dir / "mfix.out.log")
@@ -244,6 +247,7 @@ def test_the_watchdog_agent_is_scheduled_and_runs_the_machine_pass(scratch):
     assert plist["RunAtLoad"] is False
     assert "KeepAlive" not in plist
     assert plist["StartInterval"] == 60
+    assert plist["ProcessType"] == "Background"
     launcher = Path(plist["ProgramArguments"][0])
     assert launcher == agents_dir / "capabilities-machine-watchdog"
     assert launcher.read_text().rstrip().endswith('machine watchdog "$@"')
@@ -367,6 +371,10 @@ def test_status_reports_each_compiled_agent_without_writing(scratch):
         assert agents["capabilities.machine.mfix"]["linked"] is True
         assert agents["capabilities.machine.watchdog"]["linked"] is False
         assert all(agent["loaded"] is False for agent in agents.values())
+        assert agents["capabilities.machine.mfix"]["process_type"] == "Standard"
+        assert agents["capabilities.machine.watchdog"]["process_type"] == "Background"
+        assert all(agent["spawn_type"] is None and agent["spawn_type_current"] is None
+                   for agent in agents.values())
     finally:
         (library / plist.name).unlink()
 
@@ -390,6 +398,33 @@ def test_the_read_only_switch_stops_the_writing_verbs(scratch):
         assert _deployment(read_only, base / "home", "machine", verb).returncode == 4
     assert not _agents_dir(base).is_dir() or not any(_agents_dir(base).iterdir())
     assert _deployment(read_only, base / "home", "machine", "status").returncode == 0
+
+
+@pytest.mark.parametrize("spawn, current", [("daemon (3)", True), ("background (2)", False)])
+def test_status_says_whether_launchd_runs_the_compiled_process_type(
+        tmp_path, monkeypatch, capsys, spawn, current):
+    """A loaded agent keeps the class it was bootstrapped with until it is
+    handed to launchd again, so status compares the two."""
+    module = _load(DEPLOYMENT, "deployment_machine_status_under_test")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(module.sys, "platform", "darwin")
+    agents_dir = module._machine_agents_dir()
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "capabilities.machine.mfix.plist").write_bytes(plistlib.dumps(
+        {"Label": "capabilities.machine.mfix", "ProcessType": "Standard"}))
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    launchctl = stubs / "launchctl"
+    launchctl.write_text(f"#!/bin/sh\nprintf '\\tpid = 7\\n\\tspawn type = {spawn}\\n'\n")
+    launchctl.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(stubs), os.environ.get("PATH", "")]))
+    module.cmd_machine_status(None)
+    agent = json.loads(capsys.readouterr().out)["agents"][0]
+    assert agent["loaded"] is True
+    assert agent["process_type"] == "Standard"
+    assert agent["spawn_type"] == spawn.split(" ")[0]
+    assert agent["spawn_type_current"] is current
 
 
 # --- one watchdog pass, in process, with launchctl recorded -------------------

@@ -58,8 +58,10 @@ USAGE
       reaches the box and what the agent commits there both survives a redeploy
       and reaches the remote. `host-agents` supervises the same declared
       services as processes on the machine itself, on macOS: `sync` writes one
-      launchd agent per service under `compiler.host.agents_dir`, and
-      `deployment next` hands over the launchctl steps. `generic` stays
+      launchd agent per service under `compiler.host.agents_dir`, at
+      ProcessType Standard so the work a service starts gets the whole machine
+      (its watchdog runs at Background), and `deployment next` hands over the
+      launchctl steps. `generic` stays
       declaration-only. A Linux host uses a container profile, or `generic`
       with a supervisor the project owns. Run `deployment guide profiles` for
       the trade-offs.
@@ -100,9 +102,11 @@ USAGE
       `capabilities-machine-<name>` and an agent
       `capabilities.machine.<name>.plist` running its `service.machine.command`
       in its expanded `service.machine.state` (home when it declares none), with
-      the compiling shell's PATH, RunAtLoad, KeepAlive on unsuccessful exit, and
-      AbandonProcessGroup, so launchd never reaps the work the service started.
-      It also writes `capabilities.machine.watchdog.plist`, which runs
+      the compiling shell's PATH, RunAtLoad, KeepAlive on unsuccessful exit,
+      AbandonProcessGroup, so launchd never reaps the work the service started,
+      and ProcessType Standard, so that work runs at standard priority on every
+      core. It also writes `capabilities.machine.watchdog.plist`, at ProcessType
+      Background, which runs
       `deployment machine watchdog`: one pass asking each machine service's
       `service.machine.doctor`, with the project watchdog's failure count,
       timeout and cooldown, and `launchctl kickstart -k` after repeated
@@ -113,9 +117,12 @@ USAGE
       missing file means defaults; agents and logs land in
       `$XDG_STATE_HOME/deployment/machine/launchd/`, the same from any working
       directory. `next` prints the `ln -sf` and `launchctl bootstrap` steps,
-      since handing an agent to launchd stays a person's act; `status` reports
-      each compiled agent and whether it is linked and loaded, and writes
-      nothing. Run `deployment guide profiles` for the model.
+      since handing an agent to launchd stays a person's act, and a loaded agent
+      takes a recompiled file only through those steps; `status` reports each
+      compiled agent, whether it is linked and loaded, its compiled
+      `process_type`, the `spawn_type` launchd runs it with, and
+      `spawn_type_current`, false while launchd still runs an earlier
+      compilation, and writes nothing. Run `deployment guide profiles` for the model.
 
   deployment deploy [--target <name>]
       Check compiler drift, sync the body through node-<target> over SSH,
@@ -233,6 +240,7 @@ import argparse
 import hashlib
 import json
 import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -271,6 +279,16 @@ PROFILES = ("generic", "agent-box", "agent-box-checkout", "host-agents")
 # supervised processes on the machine itself.
 CONTAINER_PROFILES = ("agent-box", "agent-box-checkout")
 HOST_PROFILES = ("host-agents",)
+# launchd's ProcessType for the agents a host compiles. A supervised service
+# runs real work and its children inherit the class, so it gets Standard, the
+# full machine; Background would confine it to the efficiency cores at the
+# lowest priority with throttled I/O. A watchdog is a short scheduled probe and
+# stays out of the way.
+SERVICE_PROCESS_TYPE = "Standard"
+WATCHDOG_PROCESS_TYPE = "Background"
+# What `launchctl print` names as the spawn type of each ProcessType.
+LAUNCHD_SPAWN_TYPES = {"Standard": "daemon", "Background": "background",
+                       "Interactive": "interactive", "Adaptive": "adaptive"}
 # A checkout profile builds the same container and fills it differently. The
 # image carries tools and the boot path and no project at all; the checkout
 # arrives at run time on a volume, which the entrypoint clones into while it is
@@ -5721,7 +5739,7 @@ def _launchd_plist(root: Path, runtime: dict, name: str, service: dict,
         body["KeepAlive"] = keep_alive
     body.update({
         "ThrottleInterval": 10,
-        "ProcessType": "Background",
+        "ProcessType": SERVICE_PROCESS_TYPE,
         # launchd opens these itself and creates no directory to hold them, so
         # they sit beside the agents, in the one directory sync guarantees.
         "StandardOutPath": str(agents_dir / f"{name}.out.log"),
@@ -5831,7 +5849,7 @@ def _watchdog_plist(root: Path, runtime: dict, search_path: str,
         "EnvironmentVariables": {"PATH": search_path},
         "RunAtLoad": False,
         "StartInterval": _compiler_config(runtime)["host"]["watchdog"]["interval_seconds"],
-        "ProcessType": "Background",
+        "ProcessType": WATCHDOG_PROCESS_TYPE,
         "StandardOutPath": str(agents_dir / "watchdog.out.log"),
         "StandardErrorPath": str(agents_dir / "watchdog.err.log"),
     }
@@ -5848,7 +5866,8 @@ def _launchd_status(label: str) -> dict:
     """What launchd itself says, asked at use time rather than assumed."""
     installed = (Path.home() / "Library" / "LaunchAgents" / f"{label}.plist")
     state = {"label": label, "installed": installed.is_file(),
-             "loaded": False, "pid": None, "last_exit_status": None, "program": None}
+             "loaded": False, "pid": None, "last_exit_status": None, "program": None,
+             "spawn_type": None}
     if sys.platform != "darwin":
         return state
     try:
@@ -5868,6 +5887,8 @@ def _launchd_status(label: str) -> dict:
             state["last_exit_status"] = stripped.split("=", 1)[1].strip()
         elif stripped.startswith("program = "):
             state["program"] = stripped.split("=", 1)[1].strip()
+        elif stripped.startswith("spawn type = "):
+            state["spawn_type"] = stripped.split("=", 1)[1].split("(", 1)[0].strip()
     return state
 
 
@@ -7452,7 +7473,7 @@ def _machine_desired() -> dict:
             # reap that work when it stops or restarts the service.
             "AbandonProcessGroup": True,
             "ThrottleInterval": 10,
-            "ProcessType": "Background",
+            "ProcessType": SERVICE_PROCESS_TYPE,
             "StandardOutPath": str(agents_dir / f"{name}.out.log"),
             "StandardErrorPath": str(agents_dir / f"{name}.err.log"),
         }))
@@ -7470,7 +7491,7 @@ def _machine_desired() -> dict:
             "EnvironmentVariables": environment,
             "RunAtLoad": False,
             "StartInterval": watchdog["interval_seconds"],
-            "ProcessType": "Background",
+            "ProcessType": WATCHDOG_PROCESS_TYPE,
             "StandardOutPath": str(agents_dir / "watchdog.out.log"),
             "StandardErrorPath": str(agents_dir / "watchdog.err.log"),
         }))
@@ -7636,11 +7657,20 @@ def cmd_machine_status(args) -> None:
         except OSError:
             linked = False
         launchd = _launchd_status(label)
+        try:
+            process_type = plistlib.loads(path.read_bytes()).get("ProcessType")
+        except (OSError, plistlib.InvalidFileException):
+            process_type = None
+        spawn_type = launchd.get("spawn_type")
         agents.append({"label": label, "artifact": str(path), "compiled": True,
                        "installed": str(installed), "linked": linked,
                        "loaded": launchd["loaded"], "pid": launchd["pid"],
                        "last_exit_status": launchd["last_exit_status"],
-                       "program": launchd["program"]})
+                       "program": launchd["program"],
+                       "process_type": process_type, "spawn_type": spawn_type,
+                       "spawn_type_current": (
+                           None if not (launchd["loaded"] and spawn_type and process_type)
+                           else LAUNCHD_SPAWN_TYPES.get(process_type) == spawn_type)})
     out = {"agents_dir": str(agents_dir), "agents": agents}
     if not agents:
         out["hint"] = "nothing is compiled here; run `deployment machine sync`"

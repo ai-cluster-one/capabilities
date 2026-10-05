@@ -127,6 +127,15 @@ def test_a_deliberate_stop_is_honoured_but_a_crash_is_not(tmp_path: Path) -> Non
     assert telegram["KeepAlive"] == {"SuccessfulExit": False}
 
 
+def test_a_service_runs_at_standard_priority_and_its_watchdog_does_not(
+        tmp_path: Path) -> None:
+    root, env = _host_project(tmp_path, ("telegram",))
+    _sync(root, env)
+    agents = _agents(root)
+    assert agents["project.telegram.plist"]["ProcessType"] == "Standard"
+    assert agents["project.watchdog.plist"]["ProcessType"] == "Background"
+
+
 def test_a_host_profile_compiles_no_container_artifacts(tmp_path: Path) -> None:
     root, env = _host_project(tmp_path, ("telegram",))
     _sync(root, env)
@@ -236,7 +245,8 @@ def test_doctor_reports_an_agent_that_was_never_installed(tmp_path: Path) -> Non
     report = json.loads(proc.stdout)
     assert report["host_agents"] == [
         {"label": "project.telegram", "installed": False, "loaded": False,
-         "pid": None, "last_exit_status": None, "program": None}]
+         "pid": None, "last_exit_status": None, "program": None,
+         "spawn_type": None}]
     assert any("not installed" in finding["message"]
                for finding in report["findings"])
 
