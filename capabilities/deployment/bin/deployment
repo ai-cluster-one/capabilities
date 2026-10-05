@@ -26,8 +26,9 @@ USAGE
                    [--with-automations auto|yes|no]
                    [--force] [--dry-run]
       Full bootstrap for a non-technical deployment path. Creates the deployment
-      declarations plus Dockerfile, docker-compose.yaml, .dockerignore,
-      .env.example, entrypoint.sh, and (when needed) supervisord.conf. Agent-box
+      declarations and the target's bundle in deployment/targets/<target>/:
+      docker-compose.yaml, Dockerfile, Dockerfile.dockerignore, .env.example,
+      entrypoint.sh, and (when needed) supervisord.conf. Agent-box
       setup embeds descriptor-default services from explicitly project-enabled
       capabilities in one supervised container; `enabled` remains available for
       separate Compose services. The Telegram/automations flags are
@@ -42,7 +43,7 @@ USAGE
                   [--provider coolify|dockerhost|manual] [--force]
       Create the standard local deployment files:
         deployment/runtime.json
-        deployment/targets/<target>.json
+        deployment/targets/<target>/target.json
         deployment/capabilities.lock
       Existing files are left untouched unless --force is passed. This command
       requires an existing project `capabilities/` envelope; it never writes
@@ -71,7 +72,9 @@ USAGE
 
   deployment sync [--check|--adopt]
       Compile the project-enabled deployable-service descriptors into the
-      runtime service graph, capability lock, Docker Compose, and env example.
+      runtime service graph, capability lock, and, for a container profile,
+      one bundle per declared target (Compose, Dockerfile, ignore file, env
+      example, entrypoint, supervisor configuration) in its folder.
       Only capabilities explicitly enabled in project settings are candidates.
       --check is read-only and exits 7 with structured drift details.
       --adopt explicitly replaces unmarked files at the runtime-declared
@@ -116,9 +119,12 @@ USAGE
 
   deployment deploy [--target <name>]
       Check compiler drift, sync the body through node-<target> over SSH,
-      provision a Coolify application, set environment through bulk stdin,
-      deploy and wait for healthy. On failure request the previous release.
-      Requires agent-box-checkout, a committed branch and a granted connection.
+      provision a Coolify application in the project's existing environment
+      (target.environment, default production; none is created), point its
+      base directory and Compose location at the target's bundle on every
+      deploy, set environment through bulk stdin, deploy and wait for healthy.
+      On failure request the previous release. Requires agent-box-checkout, a
+      committed branch and a granted connection.
   deployment rollback [--target <name>] [--to <commit>]
       Roll back through Coolify and wait. Without --to use the previous release.
   deployment logs [--target <name>] [--build] [--follow]
@@ -168,12 +174,14 @@ Contract commands:
 
 FILES
   deployment/runtime.json
-      The project's runtime declaration: profile, compose file, services,
-      service-level required env, state volumes, runtime capability exclusions,
-      capability lock path, and service_policy and compiler layout.
+      The project's runtime declaration: profile, services, service-level
+      required env, state volumes, runtime capability exclusions, capability
+      lock path, and service_policy and compiler layout. A container runtime
+      that names no artifact path compiles one bundle per target (below).
       compiler.artifacts declares the
       Dockerfile, entrypoint, env example, dockerignore, and optional supervisor paths;
-      compose_file declares the generated base Compose file;
+      compose_file declares the generated base Compose file; either one keeps
+      the runtime on those declared paths instead of per-target bundles;
       compiler.compose_overlays declares untouched project-owned overlays;
       compiler.container supplies agent_home and project_root for portable mounts;
       compiler.build_args is the only source of generated Compose build args.
@@ -183,12 +191,19 @@ FILES
       A string path is compiler-managed for compatibility. Object declarations
       use {path, ownership}, where ownership is managed or external. External
       files must exist but are excluded from drift, sync, and adoption. Setup
-      defaults to managed root paths; declared local Compose overlays are external.
+      declares none, so its runtime compiles per-target bundles; declared local
+      Compose overlays are external.
 
-  deployment/targets/*.json
-      One deployment target per file. Each target chooses a provider
+  deployment/targets/<target>/
+      One folder per deployment target. target.json chooses a provider
       (`coolify`, `dockerhost`, or `manual`) and carries only the adapter-facing
-      resource handle needed to execute that target.
+      resource handle needed to execute that target; a declaration still at
+      deployment/targets/<target>.json is read until it is moved. Beside it,
+      sync compiles the target's bundle: docker-compose.yaml (build context
+      ../../.., the project root), Dockerfile, Dockerfile.dockerignore (Docker
+      reads it for that Dockerfile), .env.example, entrypoint.sh,
+      supervisord.conf when Supervisor runs, and body-sync.sh on the checkout
+      profile. The project root gains only .gitattributes on that profile.
 
   deployment/capabilities.lock
       Lightweight install list for the agent image: one capability per line.
@@ -311,6 +326,32 @@ WATCHDOG_DEFAULTS = {
 }
 PROVIDERS = ("coolify", "dockerhost", "manual")
 PROVIDER_CAPABILITIES = {"coolify": "coolify", "dockerhost": "dockerhost"}
+# A container runtime compiles one bundle per target: everything a build of that
+# target reads sits in deployment/targets/<target>/ beside its declaration, and
+# the project root gains nothing but the files a tool can only read there. The
+# build context stays the project root, because the image copies the agent body
+# from it, so the Compose file reaches it as ../../.. from its own folder, and
+# the ignore file is named for the Dockerfile it serves, since Docker reads a
+# plain .dockerignore only at the root of the context.
+TARGET_FILE = "target.json"
+BUNDLE_FILES = {
+    "compose": "docker-compose.yaml",
+    "dockerfile": "Dockerfile",
+    "dockerignore": "Dockerfile.dockerignore",
+    "entrypoint": "entrypoint.sh",
+    "env_example": ".env.example",
+    "supervisor": "supervisord.conf",
+}
+# What a runtime that names its artifact paths wrote at the root by default. A
+# bundled runtime reports any of these that still carry the generated marker,
+# because they no longer reach a build and only mislead a reader.
+ROOT_LAYOUT_FILES = ("Dockerfile", "docker-compose.yaml", ".dockerignore",
+                     ".env.example", "entrypoint.sh", "supervisord.conf",
+                     SYNC_PROGRAM)
+# Coolify creates this environment with every project; a deploy places its
+# application there unless the target names another existing one, and never
+# creates an environment of its own.
+COOLIFY_ENVIRONMENT = "production"
 
 
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
@@ -3662,7 +3703,7 @@ def _inventory(_network: bool) -> dict:
                              "note": f"no deployment declaration ({err or 'unreadable'})"}]}
     services = runtime.get("services")
     services = services if isinstance(services, dict) else {}
-    targets = sorted(p.stem for p in _target_files(root))
+    targets = _target_names(root)
     items = []
     for name in sorted(services):
         spec = services[name] if isinstance(services[name], dict) else {}
@@ -4057,23 +4098,77 @@ def _safe_container_path(value: object) -> bool:
             and ".." not in Path(value).parts)
 
 
-def _artifact_paths(root: Path, runtime: dict) -> tuple[dict[str, Path], list[Path]]:
+def _bundle_layout(runtime: dict) -> bool:
+    """A container runtime that names no artifact path compiles one bundle per
+    target. One that names them - `compose_file` or `compiler.artifacts`, which
+    every runtime compiled before bundles carries - keeps exactly those paths."""
+    if str(runtime.get("profile") or "") not in CONTAINER_PROFILES:
+        return False
+    compiler = runtime.get("compiler")
+    return ("compose_file" not in runtime
+            and not (isinstance(compiler, dict) and "artifacts" in compiler))
+
+
+def _bundle_dir(root: Path, target: str) -> Path:
+    return _target_dir(root) / target
+
+
+def _safe_target_name(value: object) -> bool:
+    return (isinstance(value, str)
+            and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", value) is not None)
+
+
+def _bundle_needs_supervisor(runtime: dict, embedded: object = None) -> bool:
+    if _is_checkout(runtime):
+        return True
+    if embedded is not None:
+        return bool(embedded)
+    agent = (runtime.get("services") or {}).get("agent")
+    return isinstance(agent, dict) and bool(agent.get("embedded_services"))
+
+
+def _artifact_paths(root: Path, runtime: dict, target: str | None = None,
+                    embedded: object = None) -> tuple[dict[str, Path], list[Path]]:
     compiler = _compiler_config(runtime)
+    overlays = [root / value for value in compiler["compose_overlays"]
+                if _safe_relative_path(value)]
+    if _bundle_layout(runtime):
+        if not _safe_target_name(target):
+            _die(6, "target_required",
+                 "a bundled runtime compiles its artifacts per target; name a declared target",
+                 "`deployment targets` lists the declared targets")
+        bundle = _bundle_dir(root, str(target))
+        paths = {key: bundle / name for key, name in BUNDLE_FILES.items()
+                 if key != "supervisor"}
+        if _bundle_needs_supervisor(runtime, embedded):
+            paths["supervisor"] = bundle / BUNDLE_FILES["supervisor"]
+        return paths, overlays
     compose = runtime.get("compose_file")
     compose_rel = compose if _safe_relative_path(compose) else "docker-compose.yaml"
     paths = {"compose": root / compose_rel}
     for key, value in compiler["artifacts"].items():
         path, _ownership = _artifact_declaration(value)
         paths[key] = root / str(path)
-    overlays = [root / value for value in compiler["compose_overlays"]
-                if _safe_relative_path(value)]
     return paths, overlays
 
 
 def _artifact_ownership(runtime: dict, key: str) -> str:
+    if _bundle_layout(runtime):
+        return "managed"
     value = _compiler_config(runtime)["artifacts"][key]
     _path, ownership = _artifact_declaration(value)
     return str(ownership)
+
+
+def _coolify_compose_settings(root: Path, runtime: dict, target: str) -> dict:
+    """Where Coolify finds the Compose file. Coolify runs Compose with the base
+    directory as its project directory, so the base directory is the Compose
+    file's own folder: the build context the file names relative to itself then
+    resolves the same on the server as in a local `docker compose -f`."""
+    paths, _overlays = _artifact_paths(root, runtime, target)
+    parent = paths["compose"].parent.relative_to(root).as_posix()
+    return {"base_directory": "/" if parent == "." else "/" + parent,
+            "docker_compose_location": "/" + paths["compose"].name}
 
 
 def _resolve_mount_target(target: str, compiler: dict) -> str:
@@ -5055,14 +5150,19 @@ def _runtime_template(profile: str, project_name: str) -> dict:
         "schema": RUNTIME_SCHEMA,
         "name": slug,
         "profile": profile,
-        **({} if profile in HOST_PROFILES else {"compose_file": "docker-compose.yaml"}),
+        # A container profile compiles into each target's bundle; only the
+        # declaration-only profile names a Compose file the project owns.
+        **({} if profile in HOST_PROFILES + CONTAINER_PROFILES
+           else {"compose_file": "docker-compose.yaml"}),
         "image_env": "AGENT_IMAGE" if profile in CONTAINER_PROFILES else None,
         "required_env": [],
         "optional_env": [],
         "services": services,
         "volumes": volumes,
         "compiler": ({"host": _compiler_config({})["host"]}
-                     if profile in HOST_PROFILES else _compiler_config({})),
+                     if profile in HOST_PROFILES else
+                     {key: value for key, value in _compiler_config({}).items()
+                      if key != "artifacts" or profile not in CONTAINER_PROFILES}),
         "service_policy": {
             "auto_include": True,
             "default_mode": "embedded" if profile in CONTAINER_PROFILES else "enabled",
@@ -5122,12 +5222,15 @@ def _compile_runtime(root: Path, runtime: dict,
     # embedded/enabled distinction - which only says how a container is
     # composed - collapses into one flat set.
     host = str(runtime.get("profile") or "") in HOST_PROFILES
+    bundled = _bundle_layout(runtime)
     if host:
         active = {**embedded, **active}
         embedded = {}
     # A checkout profile needs a Supervisor configuration for its own program
-    # even when no capability service is embedded in the box.
-    if ((embedded or str(runtime.get("profile") or "") in CHECKOUT_PROFILES)
+    # even when no capability service is embedded in the box. A bundle decides
+    # that per target when it is rendered.
+    if (not bundled
+            and (embedded or str(runtime.get("profile") or "") in CHECKOUT_PROFILES)
             and "supervisor" not in compiler["artifacts"]):
         managed = all(
             _artifact_declaration(compiler["artifacts"][key])[1] == "managed"
@@ -5238,6 +5341,11 @@ def _compile_runtime(root: Path, runtime: dict,
         # Serializing the image layout back into a host runtime would re-add
         # exactly the sections this profile ignores.
         compiled["compiler"] = {"host": compiler["host"]}
+    elif bundled:
+        # Each target's bundle fixes its own file names, so a bundled runtime
+        # carries no artifact path that a later reader could take for one.
+        compiled["compiler"] = {key: value for key, value in compiler.items()
+                                if key != "artifacts"}
     else:
         compiled["compose_file"] = runtime.get("compose_file") or "docker-compose.yaml"
     return compiled
@@ -5272,14 +5380,17 @@ def _compiled_runtime_findings(runtime: dict, active: dict[str, dict],
     return findings
 
 
-def _target_template(provider: str, target: str, project_name: str) -> dict:
+def _target_template(provider: str, target: str, project_name: str,
+                     compose_file: str = "docker-compose.yaml") -> dict:
     slug = _slug(project_name)
     data = {
         "schema": TARGET_SCHEMA,
         "name": target,
         "provider": provider,
         "connection": None if provider == "manual" else "default",
-        "environment": target,
+        # A Coolify target deploys into the environment every Coolify project
+        # already has, rather than one named after the target.
+        "environment": COOLIFY_ENVIRONMENT if provider == "coolify" else target,
         "resource": {},
     }
     if provider == "coolify":
@@ -5293,8 +5404,18 @@ def _target_template(provider: str, target: str, project_name: str) -> dict:
             "compose_project": slug,
         }
     else:
-        data["resource"] = {"compose_file": "docker-compose.yaml"}
+        data["resource"] = {"compose_file": compose_file}
     return data
+
+
+def _template_compose_file(root: Path, runtime: dict, target: str) -> str:
+    """The Compose file a new target's manual resource names: its own bundle's
+    when the runtime is bundled, the runtime's declared one otherwise."""
+    if _bundle_layout(runtime):
+        paths, _overlays = _artifact_paths(root, runtime, target)
+        return _rel(root, paths["compose"])
+    compose = runtime.get("compose_file")
+    return compose if _safe_relative_path(compose) else "docker-compose.yaml"
 
 
 def _settings(root: Path) -> dict:
@@ -5382,13 +5503,14 @@ def _sha(text: str | None) -> str | None:
 
 
 def _artifact_texts(root: Path, runtime: dict,
-                    active: dict[str, dict], embedded: dict[str, dict]) -> dict[Path, str]:
+                    active: dict[str, dict], embedded: dict[str, dict],
+                    target: str | None = None) -> dict[Path, str]:
     has_contextkit = _has_contextkit(root)
     project_name = str(runtime.get("name") or root.name)
     compiler = _compiler_config(runtime)
     checkout = _is_checkout(runtime)
     project_root = compiler["container"]["project_root"]
-    paths, _overlays = _artifact_paths(root, runtime)
+    paths, _overlays = _artifact_paths(root, runtime, target, embedded)
     build_context = Path(os.path.relpath(root, paths["compose"].parent)).as_posix()
     dockerfile_rel = paths["dockerfile"].relative_to(root).as_posix()
     entrypoint_rel = paths["entrypoint"].relative_to(root).as_posix()
@@ -5904,9 +6026,9 @@ def _save_watchdog_state(report: dict, state_path: Path, state: dict,
     report["state_file"] = str(state_path)
 
 
-def _desired_state(root: Path, runtime: dict) -> tuple[dict, dict[Path, str],
-                                                        dict[str, dict], dict[str, dict],
-                                                        list[dict], bool]:
+def _desired_state(root: Path, runtime: dict, targets: list[str] | None = None
+                   ) -> tuple[dict, dict[Path, str], dict[str, dict], dict[str, dict],
+                              list[dict], bool]:
     active, embedded, findings, migrated = _active_descriptors(root, runtime)
     migrated = migrated or not isinstance(runtime.get("compiler"), dict)
     profile = str(runtime.get("profile") or "")
@@ -5926,6 +6048,24 @@ def _desired_state(root: Path, runtime: dict) -> tuple[dict, dict[Path, str],
         texts, host_findings = _host_artifact_texts(
             root, compiled, {**embedded, **active})
         findings.extend(host_findings)
+    elif _bundle_layout(compiled):
+        texts = {}
+        names = sorted(set(_target_names(root)) | set(targets or []))
+        if not names:
+            findings.append({
+                "severity": "error", "path": _rel(root, _target_dir(root)),
+                "message": "no target declared; a container runtime compiles its "
+                           "artifacts into each target's folder",
+                "hint": "run `deployment init` or `deployment setup` with --target"})
+        for name in names:
+            if not _safe_target_name(name):
+                findings.append({
+                    "severity": "error", "path": _rel(root, _target_dir(root)),
+                    "message": f"target name {name!r} cannot name a folder; use "
+                               "letters, digits, '-' and '_'"})
+                continue
+            texts.update(_artifact_texts(root, compiled, active, embedded, name))
+        findings.extend(_root_layout_leftovers(root))
     else:
         texts = _artifact_texts(root, compiled, active, embedded)
     if _is_checkout(runtime):
@@ -5964,8 +6104,9 @@ def _artifact_drift(root: Path, texts: dict[Path, str]) -> list[dict]:
 
 
 def _sync(root: Path, runtime: dict, *, check: bool,
-          allow_takeover: bool = False) -> dict:
-    compiled, texts, active, embedded, findings, migrated = _desired_state(root, runtime)
+          allow_takeover: bool = False, targets: list[str] | None = None) -> dict:
+    compiled, texts, active, embedded, findings, migrated = _desired_state(
+        root, runtime, targets)
     findings = _validate_runtime(root, runtime, _runtime_path(root)) + findings
     drift = _artifact_drift(root, texts)
     conflicts = [d for d in drift if d["kind"] == "unmanaged_conflict"]
@@ -6009,7 +6150,47 @@ def _target_dir(root: Path) -> Path:
 
 
 def _target_path(root: Path, name: str) -> Path:
-    return _target_dir(root) / f"{name}.json"
+    """A target's declaration sits in its own folder beside its bundle. One
+    written before bundles, deployment/targets/<name>.json, is read where it is
+    until it is moved."""
+    bundled = _target_dir(root) / name / TARGET_FILE
+    legacy = _target_dir(root) / f"{name}.json"
+    if not bundled.exists() and legacy.exists():
+        return legacy
+    return bundled
+
+
+def _target_name(path: Path) -> str:
+    return path.parent.name if path.name == TARGET_FILE else path.stem
+
+
+def _target_names(root: Path) -> list[str]:
+    return [_target_name(path) for path in _target_files(root)]
+
+
+def _duplicate_targets(root: Path) -> list[dict]:
+    tdir = _target_dir(root)
+    if not tdir.is_dir():
+        return []
+    return [{"severity": "error", "path": _rel(root, legacy),
+             "message": f"target {legacy.stem!r} is declared twice; "
+                        f"{_rel(root, tdir / legacy.stem / TARGET_FILE)} is the one read, "
+                        "so remove this file"}
+            for legacy in sorted(tdir.glob("*.json"))
+            if legacy.is_file() and (tdir / legacy.stem / TARGET_FILE).is_file()]
+
+
+def _root_layout_leftovers(root: Path) -> list[dict]:
+    findings = []
+    for name in ROOT_LAYOUT_FILES:
+        path = root / name
+        if path.is_file() and _is_generated(_read_text(path) or ""):
+            findings.append({
+                "severity": "warning", "path": name,
+                "message": "generated for the root layout and no longer part of any "
+                           "build: each target's artifacts compile into its folder under "
+                           "deployment/targets/, so remove this file"})
+    return findings
 
 
 def _load_runtime(root: Path) -> dict:
@@ -6038,7 +6219,15 @@ def _target_files(root: Path) -> list[Path]:
     tdir = _target_dir(root)
     if not tdir.is_dir():
         return []
-    return sorted(p for p in tdir.glob("*.json") if p.is_file())
+    found: dict[str, Path] = {}
+    for path in sorted(tdir.glob("*.json")):
+        if path.is_file():
+            found[path.stem] = path
+    # The folder's declaration wins over a file of the same name left beside it.
+    for path in sorted(tdir.glob(f"*/{TARGET_FILE}")):
+        if path.is_file():
+            found[path.parent.name] = path
+    return [found[name] for name in sorted(found)]
 
 
 def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
@@ -6069,6 +6258,8 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
         if compose_file is not None:
             findings.append({"severity": "error", "path": _rel(root, path),
                              "message": "compose_file does not apply to a host profile"})
+    elif compose_file is None and _bundle_layout(data):
+        pass
     elif not _safe_relative_path(compose_file):
         findings.append({"severity": "error", "path": _rel(root, path),
                          "message": "compose_file must be a safe project-relative path"})
@@ -6160,7 +6351,9 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
                     "message": f"compiler.{key} describes an image and is ignored by this profile"})
     else:
         artifacts = compiler_raw.get("artifacts")
-        if not isinstance(artifacts, dict):
+        if artifacts is None and _bundle_layout(data):
+            pass
+        elif not isinstance(artifacts, dict):
             findings.append({"severity": "error", "path": _rel(root, path),
                              "message": "compiler.artifacts must be an object"})
         else:
@@ -6355,8 +6548,11 @@ def _target_runtime_findings(root: Path, runtime: dict, target: object,
     if not isinstance(target, dict) or target.get("provider") != "manual":
         return []
     resource = target.get("resource") if isinstance(target.get("resource"), dict) else {}
-    target_compose = resource.get("compose_file") or "docker-compose.yaml"
-    runtime_compose = runtime.get("compose_file") or "docker-compose.yaml"
+    if _bundle_layout(runtime):
+        runtime_compose = _template_compose_file(root, runtime, _target_name(path))
+    else:
+        runtime_compose = runtime.get("compose_file") or "docker-compose.yaml"
+    target_compose = resource.get("compose_file") or runtime_compose
     if target_compose == runtime_compose:
         return []
     return [{
@@ -6372,7 +6568,7 @@ def _all_target_payloads(root: Path) -> list[dict]:
     for path in _target_files(root):
         data, err = _read_json(path)
         out.append({
-            "name": path.stem,
+            "name": _target_name(path),
             "path": _rel(root, path),
             "target": data if err is None else None,
             "error": err,
@@ -6423,9 +6619,12 @@ def cmd_init(args) -> None:
     profile = args.profile
     provider = args.provider
     project_name = root.name
+    runtime = _runtime_template(profile, project_name)
     writes = [
-        (_runtime_path(root), _json_text(_runtime_template(profile, project_name))),
-        (_target_path(root, target), _json_text(_target_template(provider, target, project_name))),
+        (_runtime_path(root), _json_text(runtime)),
+        (_target_path(root, target), _json_text(_target_template(
+            provider, target, project_name,
+            _template_compose_file(root, runtime, target)))),
         (root / "deployment" / "capabilities.lock", _lock_text(root)),
     ]
     results = [_write_file(root, path, text, args.force) for path, text in writes]
@@ -6506,7 +6705,7 @@ def cmd_setup(args) -> None:
             overrides[name] = "enabled"
         elif choice == "no":
             overrides[name] = "disabled"
-    preview = _sync(root, runtime, check=True)
+    preview = _sync(root, runtime, check=True, targets=[target])
     if args.dry_run:
         present = set(preview["services"]) | set(preview["embedded_services"])
         _emit({
@@ -6525,10 +6724,12 @@ def cmd_setup(args) -> None:
             "questions": _deployment_questions(),
         })
         return
-    sync = _sync(root, runtime, check=False, allow_takeover=args.force)
+    sync = _sync(root, runtime, check=False, allow_takeover=args.force, targets=[target])
     target_result = (
         _write_file(root, _target_path(root, target),
-                    _json_text(_target_template(args.provider, target, project_name)), args.force)
+                    _json_text(_target_template(
+                        args.provider, target, project_name,
+                        _template_compose_file(root, runtime, target))), args.force)
         if sync["ok"] else
         {"path": _rel(root, _target_path(root, target)), "action": "skipped",
          "message": "service compilation failed before target write"}
@@ -6582,7 +6783,7 @@ def _resolve_target(root: Path, target_name: str | None) -> tuple[dict, Path]:
     if target_name:
         return _load_target(root, target_name), _target_path(root, target_name)
     if target_files:
-        return _load_target(root, target_files[0].stem), target_files[0]
+        return _load_target(root, _target_name(target_files[0])), target_files[0]
     _die(3, "not_found", "no deployment targets found", "run `deployment setup`")
 
 
@@ -6630,7 +6831,7 @@ def _host_next_payload(root: Path, runtime: dict, target_name: str | None) -> di
     return {
         "project": str(root),
         "runtime": _rel(root, _runtime_path(root)),
-        "target": {"name": target.get("name") or target_path.stem,
+        "target": {"name": target.get("name") or _target_name(target_path),
                    "path": _rel(root, target_path),
                    "provider": target.get("provider")},
         "required_env": sorted(required_env),
@@ -6661,12 +6862,12 @@ def _next_payload(root: Path, target_name: str | None) -> dict:
     runtime = _load_runtime(root)
     if str(runtime.get("profile") or "") in HOST_PROFILES:
         return _host_next_payload(root, runtime, target_name)
-    artifact_paths, overlays = _artifact_paths(root, runtime)
+    target, target_path = _resolve_target(root, target_name)
+    artifact_paths, overlays = _artifact_paths(root, runtime, _target_name(target_path))
     compose_args = ["docker", "compose", "-f", _rel(root, artifact_paths["compose"])]
     for overlay in overlays:
         compose_args += ["-f", _rel(root, overlay)]
     compose_command = " ".join(shlex.quote(value) for value in compose_args)
-    target, target_path = _resolve_target(root, target_name)
     slug = _slug(str(runtime.get("name") or root.name))
     services = runtime.get("services") if isinstance(runtime.get("services"), dict) else {}
     agent = services.get("agent") if isinstance(services.get("agent"), dict) else {}
@@ -6688,9 +6889,13 @@ def _next_payload(root: Path, target_name: str | None) -> dict:
         "when it is private. Without them the first boot has nothing to clone and stops.",
     ] if _is_checkout(runtime) else [])
     if provider == "coolify":
+        where = _coolify_compose_settings(root, runtime, _target_name(target_path))
         provider_steps = [
             "In Coolify, create a new Docker Compose resource from this repository.",
-            f"Use `{_rel(root, artifact_paths['compose'])}` as the Compose file.",
+            f"Set its Base Directory to `{where['base_directory']}` and its Docker "
+            f"Compose Location to `{where['docker_compose_location']}`: Coolify runs "
+            "Compose from the base directory, and the build context the file names "
+            "is relative to its own folder.",
             f"Add every required secret from `{_rel(root, artifact_paths['env_example'])}` as Coolify environment variables.",
             "Set `CAPABILITIES_REF` to a branch, tag, or SHA that contains every capability in `deployment/capabilities.lock`.",
             "Deploy the resource.",
@@ -6720,7 +6925,7 @@ def _next_payload(root: Path, target_name: str | None) -> dict:
     return {
         "project": str(root),
         "runtime": _rel(root, _runtime_path(root)),
-        "target": {"name": target.get("name") or target_path.stem,
+        "target": {"name": target.get("name") or _target_name(target_path),
                    "path": _rel(root, target_path),
                    "provider": provider},
         "required_env": sorted(required_env),
@@ -6880,6 +7085,7 @@ def cmd_doctor(args) -> None:
     elif not args.target and not target_paths:
         findings.append({"severity": "warning", "path": "deployment/targets",
                          "message": "no targets declared"})
+    findings.extend(_duplicate_targets(root))
     for path in target_paths:
         if not path.exists():
             continue
@@ -6958,10 +7164,16 @@ def cmd_doctor(args) -> None:
                                        "leaves the old program in place",
                             "hint": "run `deployment next` for the re-registration steps"})
         else:
-            artifact_paths, overlays = _artifact_paths(root, compiled)
-            compose = artifact_paths["compose"]
-            if compose.is_file() and _is_generated(compose.read_text()):
-                findings.extend(_semantic_compose_findings(root, compose, overlays, compiled))
+            names = ([_target_name(path) for path in target_paths if path.exists()]
+                     if _bundle_layout(compiled) else [None])
+            for name in names:
+                if name is not None and not _safe_target_name(name):
+                    continue
+                artifact_paths, overlays = _artifact_paths(root, compiled, name, embedded)
+                compose = artifact_paths["compose"]
+                if compose.is_file() and _is_generated(compose.read_text()):
+                    findings.extend(_semantic_compose_findings(
+                        root, compose, overlays, compiled))
     cap_root = _project_capabilities_dir(root)
     explicit = set(_enabled_capabilities(root))
     if cap_root.is_dir():
@@ -7493,7 +7705,7 @@ def cmd_plan(args) -> None:
         tf.extend(_target_runtime_findings(root, runtime, data, path))
         findings.extend(tf)
         target_payloads.append({
-            "name": data.get("name") or path.stem,
+            "name": data.get("name") or _target_name(path),
             "path": _rel(root, path),
             "provider": data.get("provider"),
             "connection": data.get("connection"),
@@ -7873,44 +8085,13 @@ def _node_provider_requirements(root, *, create=False):
         raise NodeFailure("provider_not_ready", "Coolify prerequisite missing: " + ", ".join(missing), 6)
 
 
-def _node_create_environment(root, target, project, name):
-    # Coolify has no environment-create CLI yet. Keep this API seam confined to
-    # that missing operation, using the same connection grant and credential tiers.
-    from urllib import request, error, parse
-    entry = _node_connection(target, write=True)
-    _node_coolify(root, target, "doctor")
-    token_key = entry.get("secret_env")
-    if not isinstance(token_key, str) or not _safe_env_key(token_key):
-        raise NodeFailure("missing_secret", "Coolify connection has no secret env key", 2)
-    project_values = _project_env()
-    machine_values = _parse_env_file(_CONFIG_HOME / "coolify" / "credentials.env")
-    token = project_values.get(token_key) or machine_values.get(token_key) or os.environ.get(token_key)
-    if not token:
-        raise NodeFailure("missing_secret", "Coolify connection token is unset", 2)
-    url = str(entry.get("base_url", "")).rstrip("/") + "/api/v1/projects/" + parse.quote(project, safe="") + "/environments"
-    req = request.Request(url, data=json.dumps({"name": name}).encode(), method="POST",
-                          headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
-    try:
-        with request.urlopen(req, timeout=30) as response:
-            result = json.loads(response.read())
-    except error.HTTPError as e:
-        # The response body may echo input; never forward it or the auth header.
-        raise NodeFailure("environment_create_failed", f"Coolify environment creation returned HTTP {e.code}",
-                          2 if e.code in (401, 403) else 6 if e.code in (400, 409, 422) else 5)
-    except (error.URLError, OSError, ValueError):
-        raise NodeFailure("environment_create_failed", "Coolify environment creation could not complete")
-    if not isinstance(result, dict) or not result.get("uuid"):
-        raise NodeFailure("provider_output", "Coolify environment creation returned no UUID")
-    return result
-
-
-def _node_create_app(root, target, host, repo, branch):
+def _node_create_app(root, target, host, repo, branch, compose):
     ids = _node_coolify(root, target, "ids", "list")
     project_label = target.get("project")
     if not project_label:
         raise NodeFailure("target_incomplete", "target needs a Coolify project label", 6)
     project = (ids.get(project_label) or {}).get("value")
-    environment = target.get("environment") or "production"
+    environment = target.get("environment") or COOLIFY_ENVIRONMENT
     if not project:
         result = _node_coolify(root, target, "projects", "create", project_label)
         project = result.get("project_uuid") or result.get("uuid")
@@ -7919,8 +8100,13 @@ def _node_create_app(root, target, host, repo, branch):
         _node_coolify(root, target, "ids", "set", project_label, project)
     detail = _node_coolify(root, target, "projects", project)
     environments = detail.get("environments", [])
+    # Every Coolify project comes with its production environment; a deploy
+    # places its application in an existing one and never creates its own.
     if environment not in [row.get("name") for row in environments]:
-        _node_create_environment(root, target, project, environment)
+        raise NodeFailure("environment_missing",
+                          f"Coolify project has no {environment!r} environment; "
+                          "deployment creates none, so name an existing one in the "
+                          f"target or remove the field to use {COOLIFY_ENVIRONMENT!r}", 3)
     deploy_key = target.get("deploy_key")
     if not deploy_key:
         # Coolify's own instance deploy key, discovered without its private material.
@@ -7935,7 +8121,8 @@ def _node_create_app(root, target, host, repo, branch):
         "--server", host["uuid"], "--environment", environment,
         "--private-deploy-key", deploy_key, "--git-repository", repo,
         "--git-branch", branch, "--build-pack", "dockercompose",
-        "--docker-compose-location", "/" + _load_runtime(root)["compose_file"],
+        "--base-directory", compose["base_directory"],
+        "--docker-compose-location", compose["docker_compose_location"],
         "--name", _slug(root.name) + "-" + _slug(target["name"]),
         "--health-check-host", "127.0.0.1")
     app = result.get("uuid") or result.get("application_uuid")
@@ -7949,6 +8136,7 @@ def _node_create_app(root, target, host, repo, branch):
 def cmd_deploy(args):
     root = _root()
     target = _node_target(root, args.target)
+    bundle = _target_name(_resolve_target(root, args.target)[1])
     # Grant is checked before local writes, SSH, or any provider mutation.
     host = _node_host(root, target, write=True)
     runtime = _load_runtime(root)
@@ -7967,8 +8155,15 @@ def cmd_deploy(args):
         _node_sync(root, target)
     else:
         _node_git(root, "push", "--quiet", remote, f"HEAD:refs/heads/{branch}")
+    compose = _coolify_compose_settings(root, runtime, bundle)
     if not app:
-        app = _node_create_app(root, target, host, repo, branch)
+        app = _node_create_app(root, target, host, repo, branch, compose)
+    else:
+        # An application created before its project moved to per-target bundles
+        # still points at the old Compose file; every deploy sets both again.
+        _node_coolify(root, target, "app", "update", app,
+                      "--base-directory", compose["base_directory"],
+                      "--docker-compose-location", compose["docker_compose_location"])
     previous = _node_state(root, target).get("release") or {}
     environment = _node_environment(root, runtime, target, host, repo, key, branch)
     _node_coolify(root, target, "env", "bulk", app, stdin=environment)

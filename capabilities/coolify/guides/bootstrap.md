@@ -8,6 +8,14 @@ Proven against Coolify 4.3.23 on Ubuntu 24.04. Several steps use Coolify interna
 
 Placeholders: `<server-ip>` is the server's public address, `<server-ipv6>` its public IPv6 address if it has one, `<domain>` the name the instance will answer on (by default `coolify.<ip-with-dashes>.sslip.io`, see step 4), `<name>` the connection id this machine will know the instance by (for example `main`), and `<email>` the root user's address. This machine pairs with one instance through a machine-level connection: `--global` writes it under `~/.config/coolify/`, and `--default` makes it the machine's default. Run the session inside a project directory; that project uses the pairing once it grants it (step 2).
 
+`<email>` is never guessed. Read the address of the Claude account signed in on this Mac, show it to the user, and ask whether the root user should have that address or another one; use the address the user confirms or gives:
+
+```sh
+python3 -c 'import json, pathlib; print(json.loads((pathlib.Path.home() / ".claude.json").read_text()).get("oauthAccount", {}).get("emailAddress") or "")'
+```
+
+It prints nothing when no Claude account is signed in, and fails when `~/.claude.json` does not exist; then ask the user for the address. Either way the address must pass step 1's check that its domain resolves.
+
 No secret is ever printed, put in a prompt, or put on a command line. Each one is generated where it is used, travels through a pipe or a file mode 0600, and is read back by a parser (step 8). Remote steps run as a script on standard input, `ssh root@<server-ip> bash -s <<'EOF' ... EOF`, so a value the script holds in a shell variable is never part of any process's arguments.
 
 Keep the session's working files in one directory only you can read; every command below names it again, so a shell that keeps no variables between commands still finds it:
@@ -258,7 +266,7 @@ grep -qF "$(cut -d' ' -f2 /root/.ssh/coolify-deploy.pub)" /home/git/.ssh/authori
 EOF
 ```
 
-Add this machine's public key the same way, so it can push the bodies it deploys. Do not assume a fixed name such as `~/.ssh/id_ed25519.pub`: find the key SSH actually uses for this server with `ssh -G root@<server-ip> | grep -i identityfile`, which names the private key file, and use that file's `.pub` half (`<identity-file>` below) as the one SSH already picks for this host:
+Add this machine's public key the same way, so it can push the bodies it deploys. Do not assume a fixed name such as `~/.ssh/id_ed25519.pub`: find the key SSH actually uses for this server with `ssh -G root@<server-ip> | grep -i identityfile`, which lists the private key files SSH tries in order, including defaults that do not exist; the first listed file that exists is the one SSH picks for this host, and its `.pub` half is `<identity-file>.pub` below. Check that `<identity-file>.pub` exists before running the command, since a missing file would append a line without a key:
 
 ```sh
 ssh root@<server-ip> "echo 'no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $(cat <identity-file>.pub)' >> /home/git/.ssh/authorized_keys"

@@ -16,7 +16,8 @@ The split is deliberate:
 The standard files are:
 
 - `deployment/runtime.json` - one runtime declaration for the project.
-- `deployment/targets/*.json` - one target declaration per deploy destination.
+- `deployment/targets/<name>/target.json` - one target declaration per deploy
+  destination, with the target's compiled bundle beside it.
 - `deployment/capabilities.lock` - lightweight install list for the agent image:
   one capability name per line. It is derived from the project gate, minus the
   host-only names declared by `runtime.json` under `capabilities.exclude`.
@@ -25,8 +26,9 @@ The standard files are:
   setup. When present, they hold genuine project-specific deployment context
   rather than pointers duplicating runtime.json or target JSON schemas.
 
-Use `deployment setup` for a full bootstrap, including Dockerfile, Compose, env
-example, entrypoint, deployment declarations, and human next steps. Use
+Use `deployment setup` for a full bootstrap, including the target's bundle
+(Dockerfile, Compose, env example, entrypoint), deployment declarations, and
+human next steps. Use
 `deployment init` only when you want declarations. `deployment sync` is the sole
 compiler for capability services: it discovers installed
 `manifest.service.deploy` descriptors, filters them through explicit project
@@ -64,8 +66,37 @@ host with an explicit runtime exclusion:
 An enabled or embedded service cannot be excluded because its runtime command
 would be absent from the image.
 
-New setup uses root artifact paths, but runtime v1 can explicitly declare a
-custom compiler layout. `compose_file` selects the generated base Compose file;
+A container runtime that declares no artifact path compiles one bundle per
+target into `deployment/targets/<name>/`, beside the target's `target.json`:
+`docker-compose.yaml`, `Dockerfile`, `Dockerfile.dockerignore`, `.env.example`,
+`entrypoint.sh`, `supervisord.conf` when Supervisor runs, and `body-sync.sh` on
+the checkout profile. The project root gains nothing but `.gitattributes`, which
+the checkout profile needs and git reads only there. `runtime.json` and
+`capabilities.lock` stay shared in `deployment/`, because every target builds
+the same service graph from the same install list.
+
+The build context is the project root, since the image copies the body from it.
+The Compose file names it as `../../..` from its own folder, so
+`docker compose -f deployment/targets/<name>/docker-compose.yaml` builds from the
+root, and so does Coolify with its base directory set to the bundle folder, the
+setting `deployment next` names and `deployment deploy` applies. Docker reads a
+plain `.dockerignore` only at the root of the context, so each bundle's ignore
+file is named for the Dockerfile beside it.
+
+A runtime compiled before bundles names `compose_file` and `compiler.artifacts`
+and keeps exactly those paths; nothing moves until the project moves it. To move
+a project onto bundles: remove `compose_file` and `compiler.artifacts` from
+`deployment/runtime.json`, move each `deployment/targets/<name>.json` to
+`deployment/targets/<name>/target.json`, set a Coolify target's `environment` to
+an environment its project has (normally `production`), and run
+`deployment sync`. Its findings name each generated root file that no longer
+reaches a build; delete those, commit, and deploy, which points the Coolify
+application at the bundle. The environment applies when an application is
+created: one that already sits in another environment stays there until it is
+removed and the next deploy creates it anew. A project that owns any artifact
+itself (`external`) keeps a declared layout instead.
+
+Runtime v1 can instead explicitly declare a custom compiler layout. `compose_file` selects the generated base Compose file;
 `compiler.artifacts` selects the Dockerfile, entrypoint, env example,
 dockerignore, and optional supervisor paths; `compiler.compose_overlays` lists project-owned overlays;
 and `compiler.container` describes the container the compiler renders - the
@@ -153,8 +184,9 @@ are left untouched. For a pre-standard project, first declare the exact
 layout and container paths in `runtime.json`, run `deployment sync --check`,
 review its ownership drift, then run `deployment sync --adopt` to transfer only
 declared managed artifact paths to the compiler. For a `manual` target, also set
-`resource.compose_file` to the same value as runtime `compose_file`; doctor and
-plan reject a mismatch. A legacy runtime without
+`resource.compose_file` to the same value as runtime `compose_file`, or in a
+bundled runtime to the target's own Compose file; doctor and plan reject a
+mismatch. A legacy runtime without
 `service_policy` or `compiler` records root-layout defaults on first sync;
 legacy Telegram/automations setup flags remain policy shorthands.
 
@@ -188,7 +220,8 @@ sequence: `contextkit doctor` to verify configuration, `contextkit build --targe
 to generate host bindings and compile context, and `contextkit audit` to validate the
 built context. Generated host bindings (`.codex/generated/`, `.claude/rules/CONTEXT.md`),
 the ContextKit manager binary (`.contextkit/manager/`), and machine-local bindings
-(`.env.local`) are excluded from the build context via `.dockerignore`. These are
+(`.env.local`) are excluded from the build context via the target's
+`Dockerfile.dockerignore`. These are
 target-local build artifacts, not deployment inputs shipped from the repo.
 
 `deployment` does not require `coolify` to be enabled. If a target chooses

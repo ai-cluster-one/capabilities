@@ -25,6 +25,10 @@ DEPLOYMENT_BIN = next((path for path in (
     if path.is_file()), CAPABILITY / "bin" / "deployment")
 
 
+# Setup compiles the default target's bundle into its own folder.
+BUNDLE = Path("deployment/targets/production")
+
+
 def run_cmd(cmd: list[str], cwd: Path) -> dict[str, Any]:
     """Run command and return parsed JSON output or text."""
     # Replace 'deployment' with local binary path
@@ -111,7 +115,7 @@ def test_dockerignore_excludes_contextkit(tmp_path: Path) -> None:
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 
-    dockerignore = (project / ".dockerignore").read_text()
+    dockerignore = (project / BUNDLE / "Dockerfile.dockerignore").read_text()
 
     # Should exclude ContextKit product paths
     assert ".contextkit/manager/" in dockerignore, \
@@ -154,7 +158,7 @@ def test_dockerfile_uses_public_installer(tmp_path: Path) -> None:
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 
-    dockerfile = (project / "Dockerfile").read_text()
+    dockerfile = (project / BUNDLE / "Dockerfile").read_text()
 
     # Should use public installer
     assert "https://raw.githubusercontent.com/ai-cluster-one/context-kit/" in dockerfile, \
@@ -288,7 +292,7 @@ def test_the_image_installs_its_capabilities_allowed(tmp_path: Path) -> None:
             tmp_path, with_contextkit=with_contextkit,
             name=f"test-allowed-{str(with_contextkit).lower()}")
         run_cmd(["deployment", "setup", "--force"], cwd=project)
-        dockerfile = (project / "Dockerfile").read_text()
+        dockerfile = (project / BUNDLE / "Dockerfile").read_text()
         installs = [line for line in dockerfile.splitlines()
                     if "capabilities install" in line]
         assert installs, dockerfile
@@ -302,7 +306,7 @@ def test_compose_omits_undeclared_contextkit_ref(tmp_path: Path) -> None:
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 
-    compose = (project / "docker-compose.yaml").read_text()
+    compose = (project / BUNDLE / "docker-compose.yaml").read_text()
 
     assert "CONTEXTKIT_REF:" not in compose
     assert "      args:" not in compose
@@ -321,8 +325,8 @@ def test_declared_build_arg_is_compiled_and_documented(tmp_path: Path) -> None:
     runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
     run_cmd(["deployment", "sync"], cwd=project)
 
-    compose = (project / "docker-compose.yaml").read_text()
-    env_example = (project / ".env.example").read_text()
+    compose = (project / BUNDLE / "docker-compose.yaml").read_text()
+    env_example = (project / BUNDLE / ".env.example").read_text()
     assert 'CONTEXTKIT_REF: "pinned-contextkit"' in compose
     assert "CONTEXTKIT_REF=pinned-contextkit" in env_example
 
@@ -335,10 +339,10 @@ def test_non_contextkit_behavior_preserved(tmp_path: Path) -> None:
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 
-    dockerfile = (project / "Dockerfile").read_text()
-    dockerignore = (project / ".dockerignore").read_text()
-    compose = (project / "docker-compose.yaml").read_text()
-    env_example = (project / ".env.example").read_text()
+    dockerfile = (project / BUNDLE / "Dockerfile").read_text()
+    dockerignore = (project / BUNDLE / "Dockerfile.dockerignore").read_text()
+    compose = (project / BUNDLE / "docker-compose.yaml").read_text()
+    env_example = (project / BUNDLE / ".env.example").read_text()
 
     # Should NOT include ContextKit setup
     assert "contextkit" not in dockerfile.lower(), \
@@ -359,7 +363,7 @@ def test_build_fails_on_missing_steps(tmp_path: Path) -> None:
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 
-    dockerfile = (project / "Dockerfile").read_text()
+    dockerfile = (project / BUNDLE / "Dockerfile").read_text()
 
     # Should fail on ContextKit installation failure
     assert "ContextKit installation failed" in dockerfile, \

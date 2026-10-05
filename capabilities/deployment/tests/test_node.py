@@ -79,7 +79,8 @@ print(json.dumps(fixtures[key]))
               "project": "node_project", "environment": "production", "deploy_key": "node_key",
               "resource": {"identifier_label": "node_app"}}
     runtime = m._runtime_template("agent-box-checkout", "fixture-body")
-    monkeypatch.setattr(m, "_resolve_target", lambda r, n: (target, root / "target.json"))
+    monkeypatch.setattr(m, "_resolve_target", lambda r, n: (
+        target, root / "deployment" / "targets" / "test" / "target.json"))
     monkeypatch.setattr(m, "_load_runtime", lambda r: runtime)
     entry = {"base_url": "https://coolify.example.invalid", "ssh": {"key_path": str(tmp_path / "mac-key")}}
     monkeypatch.setattr(m, "_records", lambda: SimpleNamespace(connections=lambda *a, **kw: {
@@ -384,34 +385,63 @@ def test_sync_lock_refuses_overlapping_writer(node):
         assert failure.value.code == 'node_busy'
 
 
-def test_environment_fallback_uses_granted_token_cascade_and_fixture(node, monkeypatch):
+def test_first_deploy_uses_the_existing_production_environment_and_the_bundle(node, monkeypatch, capsys):
+    monkeypatch.setenv("NODE_NEW_APP", "1")
+    node.m.cmd_deploy(node.args)
+    capsys.readouterr()
+    calls = [r["argv"] for r in rows(node)]
+    create = next(argv for argv in calls if argv[:2] == ["app", "create"])
+    assert create[create.index("--environment") + 1] == "production"
+    # Coolify runs Compose from the base directory, so it is the bundle's own
+    # folder and the Compose file is named relative to it.
+    assert create[create.index("--base-directory") + 1] == "/deployment/targets/test"
+    assert create[create.index("--docker-compose-location") + 1] == "/docker-compose.yaml"
+    assert not any("environment" in " ".join(argv) and argv[0] != "app" for argv in calls)
+
+
+def test_deploy_creates_no_environment_of_its_own(node, monkeypatch):
+    monkeypatch.setenv("NODE_NEW_APP", "1")
+    node.target["environment"] = "staging"
     from urllib import request
-    node.entry["secret_env"] = "COOLIFY_FIXTURE_TOKEN"
-    monkeypatch.setattr(node.m, "_project_env", lambda: {"COOLIFY_FIXTURE_TOKEN": "fixture|token"})
-    captured = []
-    class Response:
-        def __enter__(self): return self
-        def __exit__(self, *args): pass
-        def read(self): return (FIXTURE.parent / "environment-create.json").read_bytes()
-    def send(req, **kw):
-        captured.append(req)
-        return Response()
-    monkeypatch.setattr(request, "urlopen", send)
-    result = node.m._node_create_environment(node.root, node.target, "project-fixture", "node")
-    assert result["uuid"] == "environment-fixture"
-    assert captured[0].get_header("Authorization") == "Bearer fixture|token"
-    assert json.loads(captured[0].data) == {"name": "node"}
-    assert captured[0].full_url.endswith("/api/v1/projects/project-fixture/environments")
-    assert "fixture|token" not in json.dumps(rows(node))
-
-
-def test_environment_fallback_refuses_ungranted_connection_before_token_read(node, monkeypatch):
-    monkeypatch.setattr(node.m, "_records", lambda: SimpleNamespace(connections=lambda *a, **kw: {}))
-    monkeypatch.setattr(node.m, "_project_env", lambda: pytest.fail("token read before grant"))
+    monkeypatch.setattr(request, "urlopen", lambda *a, **kw: pytest.fail("deploy called the API itself"))
     with pytest.raises(node.m.NodeFailure) as failure:
-        node.m._node_create_environment(node.root, node.target, "project-fixture", "node")
-    assert failure.value.code == "connection_not_granted"
-    assert not node.trace.exists()
+        node.m.cmd_deploy(node.args)
+    assert failure.value.code == "environment_missing"
+    assert failure.value.exit_code == 3
+    calls = [r["argv"] for r in rows(node)]
+    assert not any(argv[:2] == ["app", "create"] for argv in calls)
+    assert not hasattr(node.m, "_node_create_environment")
+
+
+def test_an_absent_environment_field_means_production(node, monkeypatch, capsys):
+    monkeypatch.setenv("NODE_NEW_APP", "1")
+    del node.target["environment"]
+    node.m.cmd_deploy(node.args)
+    capsys.readouterr()
+    create = next(r["argv"] for r in rows(node) if r["argv"][:2] == ["app", "create"])
+    assert create[create.index("--environment") + 1] == "production"
+
+
+def test_every_deploy_points_an_existing_app_at_the_bundle(node, capsys):
+    node.m.cmd_deploy(node.args)
+    capsys.readouterr()
+    calls = [r["argv"] for r in rows(node)]
+    assert ["app", "update", "application-fixture", "--base-directory", "/deployment/targets/test",
+            "--docker-compose-location", "/docker-compose.yaml"] in calls
+    assert calls.index(["app", "update", "application-fixture", "--base-directory",
+                        "/deployment/targets/test", "--docker-compose-location",
+                        "/docker-compose.yaml"]) < next(
+        i for i, argv in enumerate(calls) if argv[0] == "deploy")
+
+
+def test_a_root_layout_runtime_keeps_its_compose_file_at_the_root(node, capsys):
+    node.runtime["compose_file"] = "docker-compose.yaml"
+    node.runtime["compiler"]["artifacts"] = {"dockerfile": "Dockerfile", "entrypoint": "entrypoint.sh",
+                                             "env_example": ".env.example", "dockerignore": ".dockerignore"}
+    node.m.cmd_deploy(node.args)
+    capsys.readouterr()
+    assert ["app", "update", "application-fixture", "--base-directory", "/",
+            "--docker-compose-location", "/docker-compose.yaml"] in [r["argv"] for r in rows(node)]
 
 
 def test_target_identity_does_not_collide_after_slugging(node):

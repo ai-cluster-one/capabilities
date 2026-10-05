@@ -31,6 +31,8 @@ DEPLOYMENT = _script("deployment")
 # The compiler declares this name once; the suite re-declares it here so a
 # rename has to move both and cannot pass silently.
 SYNC_PROGRAM = "body-sync.sh"
+# Setup compiles the default target's bundle into its own folder.
+BUNDLE = Path("deployment/targets/production")
 SYNC_ENV = ("AGENT_BODY_SYNC", "AGENT_BODY_SYNC_INTERVAL", "AGENT_BODY_SYNC_QUIET")
 GIT_ENV = {
     **os.environ,
@@ -89,10 +91,11 @@ def _setup(root: Path, env: dict[str, str], profile: str) -> dict:
 def test_image_carries_the_boot_path_and_not_the_project(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("telegram",))
     _setup(root, env, "agent-box-checkout")
-    dockerfile = (root / "Dockerfile").read_text()
+    dockerfile = (root / BUNDLE / "Dockerfile").read_text()
     assert "COPY --chown=${USERNAME}:${USERNAME} . /app" not in dockerfile
     assert ("COPY --chown=${USERNAME}:${USERNAME} deployment/capabilities.lock "
-            "entrypoint.sh supervisord.conf " + SYNC_PROGRAM + " /opt/agent/") in dockerfile
+            f"{BUNDLE}/entrypoint.sh {BUNDLE}/supervisord.conf {BUNDLE}/" + SYNC_PROGRAM
+            + " /opt/agent/") in dockerfile
     # A COPY carries the mode the build context held, so every generated program
     # the boot path runs is made executable, not only the entrypoint.
     assert ("RUN chmod +x /opt/agent/entrypoint.sh /opt/agent/" + SYNC_PROGRAM) in dockerfile
@@ -106,17 +109,17 @@ def test_image_carries_the_boot_path_and_not_the_project(tmp_path: Path) -> None
 def test_baked_profile_still_copies_the_project(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("telegram",))
     _setup(root, env, "agent-box")
-    dockerfile = (root / "Dockerfile").read_text()
+    dockerfile = (root / BUNDLE / "Dockerfile").read_text()
     assert "COPY --chown=${USERNAME}:${USERNAME} . /app" in dockerfile
     assert "/opt/agent" not in dockerfile
-    assert 'ENTRYPOINT ["/app/entrypoint.sh"]' in dockerfile
+    assert f'ENTRYPOINT ["/app/{BUNDLE}/entrypoint.sh"]' in dockerfile
 
 
 def test_project_initialization_moves_from_build_to_boot(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("telegram",))
     _setup(root, env, "agent-box-checkout")
-    dockerfile = (root / "Dockerfile").read_text()
-    entrypoint = (root / "entrypoint.sh").read_text()
+    dockerfile = (root / BUNDLE / "Dockerfile").read_text()
+    entrypoint = (root / BUNDLE / "entrypoint.sh").read_text()
     # Without a checkout at build time there is nothing to initialize against.
     assert "capabilities init" not in dockerfile
     assert "capabilities init --codex --claude" in entrypoint
@@ -131,7 +134,7 @@ def test_body_is_a_mount_and_the_clone_is_declared(tmp_path: Path) -> None:
     assert "agent_body" in runtime["services"]["agent"]["state"]
     assert "AGENT_REPO_URL" in runtime["services"]["agent"]["required_env"]
     assert runtime["services"]["agent"]["environment_defaults"]["AGENT_REPO_BRANCH"] == "main"
-    compose = (root / "docker-compose.yaml").read_text()
+    compose = (root / BUNDLE / "docker-compose.yaml").read_text()
     assert "- agent_body:/app" in compose
     # Compose passes only declared keys, so an undeclared one never reaches the
     # entrypoint and a fresh volume would have nothing to clone.
@@ -141,29 +144,30 @@ def test_body_is_a_mount_and_the_clone_is_declared(tmp_path: Path) -> None:
 def test_entrypoint_clones_only_into_an_empty_body(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("telegram",))
     _setup(root, env, "agent-box-checkout")
-    entrypoint = (root / "entrypoint.sh").read_text()
+    entrypoint = (root / BUNDLE / "entrypoint.sh").read_text()
     assert 'if [ -d "$APP/.git" ]; then' in entrypoint
     # Emptiness is judged by files: a fresh named volume is seeded from the
     # image and inherits the empty mount directories it left behind.
     assert '-mindepth 1 -type f -print -quit' in entrypoint
     assert "refusing to touch it" in entrypoint
     assert "git clone --branch" in entrypoint
-    assert subprocess.run(["bash", "-n", str(root / "entrypoint.sh")]).returncode == 0
+    assert subprocess.run(["bash", "-n", str(root / BUNDLE / "entrypoint.sh")]).returncode == 0
 
 
 def test_build_context_is_narrowed_to_the_copied_files(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("telegram",))
     _setup(root, env, "agent-box-checkout")
-    lines = [line for line in (root / ".dockerignore").read_text().splitlines()
+    lines = [line for line in (root / BUNDLE / "Dockerfile.dockerignore").read_text().splitlines()
              if line and not line.startswith("#")]
     assert lines[0] == "*"
     # Excluding a directory stops the walk into it, so each parent of a kept
     # file is re-admitted before its own contents are excluded again.
     assert lines.index("!deployment") < lines.index("deployment/*")
     assert lines.index("deployment/*") < lines.index("!deployment/capabilities.lock")
-    assert "!entrypoint.sh" in lines
-    assert "!supervisord.conf" in lines
-    assert "!" + SYNC_PROGRAM in lines
+    assert lines.index(f"!{BUNDLE}") < lines.index(f"{BUNDLE}/*")
+    assert lines.index(f"{BUNDLE}/*") < lines.index(f"!{BUNDLE}/entrypoint.sh")
+    assert f"!{BUNDLE}/supervisord.conf" in lines
+    assert f"!{BUNDLE}/" + SYNC_PROGRAM in lines
 
 
 def test_a_body_that_is_not_a_volume_is_refused(tmp_path: Path) -> None:
@@ -207,7 +211,7 @@ def test_the_image_name_is_stated_once(tmp_path: Path) -> None:
     for profile in ("agent-box", "agent-box-checkout"):
         root, env = _project(tmp_path / profile, ("telegram",))
         _setup(root, env, profile)
-        assignments = [line for line in (root / ".env.example").read_text().splitlines()
+        assignments = [line for line in (root / BUNDLE / ".env.example").read_text().splitlines()
                        if line.startswith("AGENT_IMAGE=")]
         assert assignments == ["AGENT_IMAGE=agent-box"], (profile, assignments)
 
@@ -215,7 +219,7 @@ def test_the_image_name_is_stated_once(tmp_path: Path) -> None:
 def test_env_example_ends_with_exactly_one_newline(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("telegram",))
     _setup(root, env, "agent-box-checkout")
-    body = (root / ".env.example").read_text()
+    body = (root / BUNDLE / ".env.example").read_text()
     assert body.endswith("\n")
     assert not body.endswith("\n\n")
 
@@ -263,20 +267,20 @@ def _body_on_a_real_remote(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 def _pass(root: Path, **settings: str) -> subprocess.CompletedProcess[str]:
     """One pass of the rendered program, run exactly as the box runs it."""
-    return subprocess.run([str(root / SYNC_PROGRAM), "--once"], capture_output=True,
+    return subprocess.run([str(root / BUNDLE / SYNC_PROGRAM), "--once"], capture_output=True,
                           text=True, timeout=120, env={**GIT_ENV, **settings})
 
 
 def test_the_profile_renders_a_sync_program_the_boot_path_runs_first(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("telegram",))
     _setup(root, env, "agent-box-checkout")
-    program = root / SYNC_PROGRAM
-    # No project declares it: it is not a compiler.artifacts key at all.
+    program = root / BUNDLE / SYNC_PROGRAM
+    # No project declares it: a bundled runtime declares no artifact at all.
     runtime = json.loads((root / "deployment" / "runtime.json").read_text())
-    assert SYNC_PROGRAM not in runtime["compiler"]["artifacts"].values()
+    assert "artifacts" not in runtime["compiler"]
     assert program.is_file()
     assert subprocess.run(["bash", "-n", str(program)]).returncode == 0
-    entrypoint = (root / "entrypoint.sh").read_text()
+    entrypoint = (root / BUNDLE / "entrypoint.sh").read_text()
     boot = f"/opt/agent/{SYNC_PROGRAM} --once"
     # The self-healing requirement, as an ordering: a box that took in a broken
     # declaration has to take in the fix before anything reads the declaration.
@@ -291,7 +295,7 @@ def test_the_sync_program_reaches_for_nothing_but_git(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("telegram", "automations"))
     _setup(root, env, "agent-box-checkout")
     # Everything but the ownership marker the compiler stamps on what it writes.
-    program = "\n".join(line for line in (root / SYNC_PROGRAM).read_text().splitlines()
+    program = "\n".join(line for line in (root / BUNDLE / SYNC_PROGRAM).read_text().splitlines()
                         if not line.startswith("# Generated by deployment sync"))
     # A sync that needed the project's configuration or its scheduler to be
     # healthy could not repair the box whose configuration is what broke.
@@ -314,10 +318,10 @@ def test_a_checkout_box_supervises_the_sync_ahead_of_everything_else(tmp_path: P
     # exists for the profile's own program.
     root, env = _project(tmp_path / "alone")
     _setup(root, env, "agent-box-checkout")
-    config = (root / "supervisord.conf").read_text()
+    config = (root / BUNDLE / "supervisord.conf").read_text()
     assert f"command=/opt/agent/{SYNC_PROGRAM} --loop" in config
     assert "[program:body-sync]" in config
-    assert "exec /usr/bin/supervisord" in (root / "entrypoint.sh").read_text()
+    assert "exec /usr/bin/supervisord" in (root / BUNDLE / "entrypoint.sh").read_text()
     # What makes the runtime off switch work: a box told not to sync exits zero
     # and stays exited, while a program that actually died comes back. The start
     # window that bounds the second half is measured in its own test.
@@ -327,21 +331,21 @@ def test_a_checkout_box_supervises_the_sync_ahead_of_everything_else(tmp_path: P
     # And a capability service, where there is one, starts behind it.
     other, env = _project(tmp_path / "with-service", ("telegram",))
     _setup(other, env, "agent-box-checkout")
-    config = (other / "supervisord.conf").read_text()
+    config = (other / BUNDLE / "supervisord.conf").read_text()
     assert config.index("[program:body-sync]") < config.index("[program:telegram]")
     # The baked profile is left alone: nothing to supervise, no configuration.
     baked, env = _project(tmp_path / "baked")
     _setup(baked, env, "agent-box")
-    assert not (baked / "supervisord.conf").exists()
-    assert not (baked / SYNC_PROGRAM).exists()
+    assert not (baked / BUNDLE / "supervisord.conf").exists()
+    assert not (baked / BUNDLE / SYNC_PROGRAM).exists()
 
 
 def test_the_three_controls_are_declared_once_and_default_to_on(tmp_path: Path) -> None:
     root, env = _project(tmp_path / "checkout")
     _setup(root, env, "agent-box-checkout")
     agent = json.loads((root / "deployment" / "runtime.json").read_text())["services"]["agent"]
-    compose = (root / "docker-compose.yaml").read_text()
-    example = (root / ".env.example").read_text().splitlines()
+    compose = (root / BUNDLE / "docker-compose.yaml").read_text()
+    example = (root / BUNDLE / ".env.example").read_text().splitlines()
     for key in SYNC_ENV:
         assert key in agent["optional_env"], key
         default = agent["environment_defaults"][key]
@@ -356,8 +360,8 @@ def test_the_three_controls_are_declared_once_and_default_to_on(tmp_path: Path) 
     baked, env = _project(tmp_path / "baked")
     _setup(baked, env, "agent-box")
     for key in SYNC_ENV:
-        assert key not in (baked / ".env.example").read_text(), key
-        assert key not in (baked / "docker-compose.yaml").read_text(), key
+        assert key not in (baked / BUNDLE / ".env.example").read_text(), key
+        assert key not in (baked / BUNDLE / "docker-compose.yaml").read_text(), key
 
 
 def test_a_box_takes_in_what_was_pushed_and_sends_what_it_wrote(tmp_path: Path) -> None:
@@ -403,7 +407,7 @@ def test_a_program_that_cannot_run_is_bounded_and_the_off_switch_is_not(tmp_path
     """
     root, env = _project(tmp_path)
     _setup(root, env, "agent-box-checkout")
-    block = (root / "supervisord.conf").read_text()
+    block = (root / BUNDLE / "supervisord.conf").read_text()
     block = block[block.index("[program:body-sync]"):]
     window = int(re.search(r"^startsecs=(\d+)$", block, re.M).group(1))
     assert window > 0
@@ -411,7 +415,7 @@ def test_a_program_that_cannot_run_is_bounded_and_the_off_switch_is_not(tmp_path
     # The off switch, measured rather than read: it exits zero, and it outlives
     # the window first, so Supervisor records EXITED rather than a start failure.
     started = time.monotonic()
-    proc = subprocess.run([str(root / SYNC_PROGRAM), "--loop"], capture_output=True,
+    proc = subprocess.run([str(root / BUNDLE / SYNC_PROGRAM), "--loop"], capture_output=True,
                           text=True, timeout=120, env={**GIT_ENV, "AGENT_BODY_SYNC": "0"})
     held = time.monotonic() - started
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -420,7 +424,7 @@ def test_a_program_that_cannot_run_is_bounded_and_the_off_switch_is_not(tmp_path
 
     # The boot pass answers to no supervisor, so it is not made to wait.
     started = time.monotonic()
-    proc = subprocess.run([str(root / SYNC_PROGRAM), "--once"], capture_output=True,
+    proc = subprocess.run([str(root / BUNDLE / SYNC_PROGRAM), "--once"], capture_output=True,
                           text=True, timeout=120, env={**GIT_ENV, "AGENT_BODY_SYNC": "0"})
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert time.monotonic() - started < window
@@ -444,7 +448,7 @@ def test_a_failing_pass_keeps_the_supervised_program_alive(tmp_path: Path) -> No
     _git(body, "add", "-A")
     _git(body, "commit", "--quiet", "-m", "the box edits the mission")
 
-    proc = subprocess.Popen([str(root / SYNC_PROGRAM), "--loop"],
+    proc = subprocess.Popen([str(root / BUNDLE / SYNC_PROGRAM), "--loop"],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             env={**GIT_ENV, "AGENT_BODY_SYNC_INTERVAL": "1",
                                  "AGENT_BODY_SYNC_QUIET": "0"})

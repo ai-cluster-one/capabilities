@@ -79,6 +79,22 @@ def test_each_pitfall_sits_at_its_step():
     assert "never by sourcing" in GUIDE.read_text() and "`|`" in steps[8]
 
 
+def test_the_root_email_comes_from_the_signed_in_claude_account_with_the_users_word():
+    before = GUIDE.read_text().split("## 1. ")[0]
+    assert "`<email>` is never guessed" in before
+    assert '".claude.json"' in before and '"oauthAccount"' in before and '"emailAddress"' in before
+    assert "show it to the user, and ask" in before
+    assert "the address the user confirms or gives" in before
+    # No address is written into the guide for a session to fall back on.
+    assert not re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", GUIDE.read_text())
+
+
+def test_step_five_takes_the_first_identity_ssh_would_use():
+    step = _steps()[5]
+    assert "the first listed file that exists" in step
+    assert "a missing file would append a line without a key" in step
+
+
 def test_step_six_ends_with_the_store_pointer():
     paragraphs = [p for p in _steps()[6].strip().split("\n\n") if p.strip()]
     assert "`capabilities store set`" in paragraphs[-1]

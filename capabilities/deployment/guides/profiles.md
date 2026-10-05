@@ -7,8 +7,9 @@ different files.
 graph, which capability services are on, the environment they need. Its
 `profile` field picks the **substrate** those services run on.
 
-`deployment/targets/<name>.json` answers **where it goes**: a provider, a
-connection, a resource handle.
+`deployment/targets/<name>/target.json` answers **where it goes**: a provider,
+a connection, a resource handle. On a container profile the same folder holds
+everything compiled for that destination.
 
 Keeping them apart is what lets one declaration reach several destinations
 without the service graph being written twice. Adding a destination is a target
@@ -16,9 +17,9 @@ file. Changing what the services run *on* is a profile.
 
 ## The profiles
 
-`agent-box` compiles a container. `deployment sync` writes a Dockerfile, a
-Compose file, an entrypoint, an env example, and - when services are embedded -
-a Supervisor configuration that runs them as one PID 1. Every embedded service
+`agent-box` compiles a container. `deployment sync` writes, into each target's
+folder, a Dockerfile, a Compose file, an entrypoint, an env example, and - when
+services are embedded - a Supervisor configuration that runs them as one PID 1. Every embedded service
 shares one image and one set of mounts. The project is copied into the image at
 build time.
 
@@ -89,7 +90,7 @@ anything the image left underneath it, so the checkout profile copies the lock,
 the entrypoint, the sync program, and the Supervisor configuration to
 `/opt/agent` and reads them from there. They are copied into one directory, so
 their file names must differ, and `deployment doctor` refuses a declaration that
-collides with one of them. The generated `.dockerignore` narrows the build
+collides with one of them. The generated `Dockerfile.dockerignore` narrows the build
 context to exactly those files.
 
 **What the box needs told.** `AGENT_REPO_URL` is required, and Compose passes

@@ -1,7 +1,9 @@
 # Deployment Targets
 
-A target lives at `deployment/targets/<name>.json` and uses schema
-`capabilities.deployment.target.v1`.
+A target lives at `deployment/targets/<name>/target.json` and uses schema
+`capabilities.deployment.target.v1`. Its folder also holds the bundle `deployment
+sync` compiles for it on a container profile. A declaration written before
+bundles, `deployment/targets/<name>.json`, is read where it is until it moves.
 
 Required fields:
 
@@ -53,7 +55,7 @@ locally, but it does not perform remote operations.
 
 ## Agent nodes through Coolify
 
-A checkout node's target selects `provider: coolify`, an explicitly granted `connection`, `server` (a label in `coolify ids` holding the server UUID), `project` (a project UUID label, created on first deploy), `environment` (the Coolify environment name, normally `production`), `deploy_key` (the instance's deploy-key UUID label), and `resource.identifier_label` (the application UUID label written on first deploy). The connection's `ssh.key_path` is the Mac's root SSH identity; when omitted, the first existing identity from OpenSSH's resolved configuration is used. A local Coolify server reported as `host.docker.internal` uses the instance hostname's resolved address for SSH, with normal host-key verification. Prepare the instance's deploy key through Coolify's bootstrap/provider surface; deployment creates a missing project and environment. The current CLI has no environment-create verb, so that one request uses the granted connection through a narrow adapter to [Coolify's environment endpoint](https://coolify.io/docs/api/endpoints/projects/create-environment). The instance's deploy key must already be authorized for the server's `git` user. A sole key from `coolify sources` can be selected without a `deploy_key` label.
+A checkout node's target selects `provider: coolify`, an explicitly granted `connection`, `server` (a label in `coolify ids` holding the server UUID), `project` (a project UUID label, created on first deploy), `environment` (the Coolify environment name, normally `production`), `deploy_key` (the instance's deploy-key UUID label), and `resource.identifier_label` (the application UUID label written on first deploy). The connection's `ssh.key_path` is the Mac's root SSH identity; when omitted, the first existing identity from OpenSSH's resolved configuration is used. A local Coolify server reported as `host.docker.internal` uses the instance hostname's resolved address for SSH, with normal host-key verification. Prepare the instance's deploy key through Coolify's bootstrap/provider surface; deployment creates a missing project and places the application in the project's existing `environment`, `production` when the field is absent, which Coolify creates with every project. It creates no environment: a named one the project lacks stops the deploy before anything is created. Every deploy sets the application's base directory to the target's bundle folder (`/deployment/targets/<name>`) and its Compose location to `/docker-compose.yaml`, because Coolify runs Compose from the base directory and the bundle names its build context relative to its own folder; an application created before the project moved onto bundles follows on its next deploy. The instance's deploy key must already be authorized for the server's `git` user. A sole key from `coolify sources` can be selected without a `deploy_key` label.
 
 Run `deployment setup --profile agent-box-checkout --target <name> --provider coolify`, fill the target labels and connection, run `deployment sync`, review and commit the declarations and compiler inputs, then run `deployment deploy --target <name>`. A clean body and `deployment sync --check` are required. Redeploying an existing application needs Coolify's rollback interface before deployment starts; an initial deployment has no previous release and can use the deploy and wait surface alone; the waiter uses `coolify wait` when available and otherwise polls deployment and application status behind one adapter.
 

@@ -22,6 +22,8 @@ def _script(name: str) -> Path:
 
 DEPLOYMENT = _script("deployment")
 AUTOMATIONS = _script("automations")
+# Setup compiles the default target's bundle into its own folder.
+BUNDLE = Path("deployment/targets/production")
 
 
 class DeploymentAutomationsTests(unittest.TestCase):
@@ -76,7 +78,7 @@ class DeploymentAutomationsTests(unittest.TestCase):
     def test_auto_adds_automations_service(self) -> None:
         result = self.setup()
         self.assertTrue(result["with_automations"])
-        compose = (self.root / "docker-compose.yaml").read_text()
+        compose = (self.root / BUNDLE / "docker-compose.yaml").read_text()
         self.assertNotIn('command: ["automations", "service", "run"]', compose)
         self.assertIn("automations_state:/home/agent/.local/state/capabilities/projects", compose)
         runtime = json.loads((self.root / "deployment" / "runtime.json").read_text())
@@ -85,11 +87,11 @@ class DeploymentAutomationsTests(unittest.TestCase):
             runtime["volumes"]["automations_state"]["mount"],
             "/home/agent/.local/state/capabilities/projects",
         )
-        supervisor = (self.root / "supervisord.conf").read_text()
+        supervisor = (self.root / BUNDLE / "supervisord.conf").read_text()
         self.assertIn("command=automations service run", supervisor)
         lock = (self.root / "deployment" / "capabilities.lock").read_text().splitlines()
         self.assertIn("automations", lock)
-        env = (self.root / ".env.example").read_text()
+        env = (self.root / BUNDLE / ".env.example").read_text()
         self.assertIn("AUTOMATIONS_ENVIRONMENT=production", env)
         docker = shutil.which("docker")
         compose_available = (subprocess.run(
@@ -98,7 +100,8 @@ class DeploymentAutomationsTests(unittest.TestCase):
         ).returncode == 0) if docker else False
         if compose_available:
             parsed = subprocess.run(
-                ["docker", "compose", "config", "--quiet"],
+                ["docker", "compose", "-f", str(BUNDLE / "docker-compose.yaml"),
+                 "config", "--quiet"],
                 cwd=self.root,
                 capture_output=True,
                 text=True,
@@ -110,8 +113,9 @@ class DeploymentAutomationsTests(unittest.TestCase):
     def test_explicit_no_suppresses_service(self) -> None:
         result = self.setup("--with-automations", "no")
         self.assertFalse(result["with_automations"])
-        compose = (self.root / "docker-compose.yaml").read_text()
+        compose = (self.root / BUNDLE / "docker-compose.yaml").read_text()
         self.assertNotIn('command: ["automations", "service", "run"]', compose)
+        self.assertFalse((self.root / BUNDLE / "supervisord.conf").exists())
         self.assertFalse((self.root / "supervisord.conf").exists())
 
 

@@ -27,6 +27,18 @@ def _script(name: str) -> Path:
 
 
 DEPLOYMENT = _script("deployment")
+# Setup compiles the default target's bundle into its own folder.
+BUNDLE = Path("deployment/targets/production")
+# What a runtime that names its own paths declares; it keeps them instead of
+# compiling per-target bundles.
+ROOT_ARTIFACTS = {"dockerfile": "Dockerfile", "entrypoint": "entrypoint.sh",
+                  "env_example": ".env.example", "dockerignore": ".dockerignore"}
+
+
+def _root_layout(runtime: dict) -> dict:
+    runtime["compose_file"] = "docker-compose.yaml"
+    runtime["compiler"]["artifacts"] = dict(ROOT_ARTIFACTS)
+    return runtime
 
 
 def _manifest(name: str) -> dict:
@@ -83,7 +95,7 @@ def test_auto_discovers_only_explicit_project_services(tmp_path: Path) -> None:
     runtime = json.loads((root / "deployment" / "runtime.json").read_text())
     assert runtime["service_policy"]["default_mode"] == "embedded"
     assert runtime["services"]["agent"]["embedded_services"] == ["automations", "telegram"]
-    supervisor = (root / "supervisord.conf").read_text()
+    supervisor = (root / BUNDLE / "supervisord.conf").read_text()
     assert "command=automations service run" in supervisor
     assert "command=telegram service run" in supervisor
 
@@ -133,7 +145,7 @@ def test_explicit_disable_and_enable_overrides(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stderr
     result = json.loads(proc.stdout)
     assert result["services"] == ["telegram"]
-    compose = (root / "docker-compose.yaml").read_text()
+    compose = (root / BUNDLE / "docker-compose.yaml").read_text()
     assert "project-telegram" in compose
     assert "project-automations" not in compose
 
@@ -163,13 +175,14 @@ def test_embedded_service_merges_contract_into_agent(tmp_path: Path) -> None:
     assert set(agent["state"]) >= {"telegram_state", "claude_state", "codex_state"}
     assert "telegram" not in compiled["services"]
 
-    compose = (root / "docker-compose.yaml").read_text()
+    compose = (root / BUNDLE / "docker-compose.yaml").read_text()
     assert "project-telegram" not in compose
     assert 'TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:-}"' in compose
     assert "telegram_state:/home/agent/.local/state/telegram" in compose
-    assert "command=telegram service run" in (root / "supervisord.conf").read_text()
-    assert "exec /usr/bin/supervisord -c /app/supervisord.conf" in (root / "entrypoint.sh").read_text()
-    dockerfile = (root / "Dockerfile").read_text()
+    assert "command=telegram service run" in (root / BUNDLE / "supervisord.conf").read_text()
+    assert (f"exec /usr/bin/supervisord -c /app/{BUNDLE}/supervisord.conf"
+            in (root / BUNDLE / "entrypoint.sh").read_text())
+    dockerfile = (root / BUNDLE / "Dockerfile").read_text()
     assert "python3 procps supervisor" in dockerfile
     # A declared mount is created in the image, so a fresh named volume inherits
     # the agent's ownership instead of arriving owned by root.
@@ -230,8 +243,8 @@ def test_slack_requires_bot_and_app_tokens(tmp_path: Path) -> None:
     result = _setup(root, env)
     assert result["services"] == []
     assert result["embedded_services"] == ["slack"]
-    compose = (root / "docker-compose.yaml").read_text()
-    env_example = (root / ".env.example").read_text()
+    compose = (root / BUNDLE / "docker-compose.yaml").read_text()
+    env_example = (root / BUNDLE / ".env.example").read_text()
     for key in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"):
         assert f'{key}: "${{{key}:-}}"' in compose
         assert f"{key}=" in env_example
@@ -246,7 +259,7 @@ def test_restart_no_is_rendered_as_a_yaml_string(tmp_path: Path) -> None:
     manifest_path.write_text(json.dumps(manifest) + "\n")
     proc = _run(root, env, "setup", "--provider", "manual", "--with-telegram", "yes", "--force")
     assert proc.returncode == 0, proc.stderr
-    assert 'restart: "no"' in (root / "docker-compose.yaml").read_text()
+    assert 'restart: "no"' in (root / BUNDLE / "docker-compose.yaml").read_text()
 
 
 def test_optional_defaults_are_scoped_to_each_service(tmp_path: Path) -> None:
@@ -271,7 +284,7 @@ def test_optional_defaults_are_scoped_to_each_service(tmp_path: Path) -> None:
     assert sync.returncode == 0, sync.stderr
     result = json.loads(sync.stdout)
     assert result["services"] == ["automations", "telegram"]
-    compose = (root / "docker-compose.yaml").read_text()
+    compose = (root / BUNDLE / "docker-compose.yaml").read_text()
     assert compose.count('SHARED_MODE: "${SHARED_MODE:-automations}"') == 1
     assert compose.count('SHARED_MODE: "${SHARED_MODE:-telegram}"') == 1
 
@@ -289,7 +302,7 @@ def test_stale_service_directory_is_ignored(tmp_path: Path) -> None:
 @pytest.mark.parametrize("path", [
     "deployment/capabilities.lock",
     "deployment/runtime.json",
-    "docker-compose.yaml",
+    "deployment/targets/production/docker-compose.yaml",
 ])
 def test_check_reports_closure_drift_without_writing(tmp_path: Path, path: str) -> None:
     root, env = _project(tmp_path, ("telegram",))
@@ -351,7 +364,8 @@ def test_enabled_override_cannot_bypass_project_gate(tmp_path: Path) -> None:
 
 def test_unmarked_owned_path_is_preserved(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("telegram",))
-    custom = root / "docker-compose.yaml"
+    custom = root / BUNDLE / "docker-compose.yaml"
+    custom.parent.mkdir(parents=True)
     custom.write_text("services:\n  local:\n    image: local\n")
     before = custom.read_text()
     proc = _run(root, env, "setup", "--provider", "manual")
@@ -365,7 +379,7 @@ def test_external_artifact_must_exist_and_is_not_created(tmp_path: Path) -> None
     init = _run(root, env, "init", "--provider", "manual", "--force")
     assert init.returncode == 0, init.stderr
     runtime_path = root / "deployment" / "runtime.json"
-    runtime = json.loads(runtime_path.read_text())
+    runtime = _root_layout(json.loads(runtime_path.read_text()))
     runtime["compiler"]["artifacts"]["dockerfile"] = {
         "path": "deployment/docker/Dockerfile",
         "ownership": "external",
@@ -453,7 +467,7 @@ def test_mixed_ownership_nested_layout_preserves_external_files_and_compose_sema
         "worker_state": {"kind": "shared", "mount": "/home/jess/.local/state/worker"},
     }
     runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
-    target_path = root / "deployment" / "targets" / "production.json"
+    target_path = root / "deployment" / "targets" / "production" / "target.json"
     target = json.loads(target_path.read_text())
     target["resource"]["compose_file"] = "deployment/compose.yaml"
     target_path.write_text(json.dumps(target, indent=2) + "\n")
@@ -589,7 +603,7 @@ def test_a_mount_beside_the_home_is_created_as_root_and_handed_to_the_agent(
 
     proc = _run(root, env, "sync")
     assert proc.returncode == 0, proc.stderr
-    dockerfile = (root / "Dockerfile").read_text()
+    dockerfile = (root / BUNDLE / "Dockerfile").read_text()
     lines = dockerfile.split("\n")
     start = next(i for i, line in enumerate(lines) if line.startswith("RUN mkdir -p \"$HOME/.local/state\""))
     # The agent user cannot make a directory outside its own home, so the layer
@@ -615,7 +629,7 @@ def test_declared_system_packages_reach_the_image(tmp_path: Path) -> None:
 
     proc = _run(root, env, "sync")
     assert proc.returncode == 0, proc.stderr
-    dockerfile = (root / "Dockerfile").read_text()
+    dockerfile = (root / BUNDLE / "Dockerfile").read_text()
     # Appended to the base set, so the base set is still what the other tests read.
     assert "python3 procps supervisor poppler-utils tesseract-ocr \\" in dockerfile
     # The declaration survives the sync that read it.
@@ -632,7 +646,7 @@ def test_declared_system_packages_reach_the_image(tmp_path: Path) -> None:
             if "system_packages" in f["message"] and f["severity"] == "error"], report
     proc = _run(root, env, "sync")
     assert json.loads(proc.stdout)["ok"] is False
-    assert (root / "Dockerfile").read_text() == dockerfile
+    assert (root / BUNDLE / "Dockerfile").read_text() == dockerfile
 
 
 def test_system_packages_are_reported_as_ignored_under_an_external_dockerfile(
@@ -640,7 +654,7 @@ def test_system_packages_are_reported_as_ignored_under_an_external_dockerfile(
     root, env = _project(tmp_path)
     _setup(root, env)
     runtime_path = root / "deployment" / "runtime.json"
-    runtime = json.loads(runtime_path.read_text())
+    runtime = _root_layout(json.loads(runtime_path.read_text()))
     (root / "Dockerfile").write_text("FROM debian:bookworm-slim\n")
     runtime["compiler"]["artifacts"]["dockerfile"] = {
         "path": "Dockerfile", "ownership": "external"}

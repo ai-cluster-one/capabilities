@@ -55,7 +55,7 @@ def test_dockerfile_has_capabilities_doctor_after_init(tmp_path: Path) -> None:
     result = _run(tmp_path, project, "setup", "--profile", "agent-box", "--force")
 
     assert result.returncode == 0, result.stderr
-    dockerfile = (project / "Dockerfile").read_text()
+    dockerfile = (project / "deployment" / "targets" / "production" / "Dockerfile").read_text()
 
     # Find the capabilities installation section
     install_idx = dockerfile.find("capabilities install")
@@ -83,7 +83,7 @@ def test_dockerfile_contextkit_has_doctor_after_capabilities_init(tmp_path: Path
     result = _run(tmp_path, project, "setup", "--profile", "agent-box", "--force")
 
     assert result.returncode == 0, result.stderr
-    dockerfile = (project / "Dockerfile").read_text()
+    dockerfile = (project / "deployment" / "targets" / "production" / "Dockerfile").read_text()
 
     # Verify capabilities doctor comes after capabilities init
     cap_init_idx = dockerfile.find("capabilities init")
@@ -111,7 +111,7 @@ def test_dockerfile_contextkit_does_not_duplicate_capabilities_init(tmp_path: Pa
     result = _run(tmp_path, project, "setup", "--profile", "agent-box", "--force")
 
     assert result.returncode == 0, result.stderr
-    dockerfile = (project / "Dockerfile").read_text()
+    dockerfile = (project / "deployment" / "targets" / "production" / "Dockerfile").read_text()
 
     # Count occurrences of "capabilities init"
     init_count = dockerfile.count("capabilities init")
@@ -129,7 +129,7 @@ def test_dockerfile_ordering_capabilities_to_contextkit(tmp_path: Path) -> None:
     result = _run(tmp_path, project, "setup", "--profile", "agent-box", "--force")
 
     assert result.returncode == 0, result.stderr
-    dockerfile = (project / "Dockerfile").read_text()
+    dockerfile = (project / "deployment" / "targets" / "production" / "Dockerfile").read_text()
 
     # Extract the relevant sections and verify ordering
     steps = [

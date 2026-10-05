@@ -59,8 +59,8 @@ For projects with `.contextkit/config.toml`, the generated Dockerfile:
 
 Generated host bindings (`.codex/generated/`, `.claude/rules/CONTEXT.md`),
 the ContextKit manager binary (`.contextkit/manager/`), and machine-local
-bindings (`.env.local`) are excluded from the Docker build context via
-`.dockerignore`. These are target-local build artifacts, not deployment inputs
-shipped from the repo.
+bindings (`.env.local`) are excluded from the Docker build context via the
+target's `Dockerfile.dockerignore`. These are target-local build artifacts, not
+deployment inputs shipped from the repo.
 
 The build fails if any step from contextkit init through contextkit audit fails.
