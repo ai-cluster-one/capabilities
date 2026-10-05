@@ -21,7 +21,7 @@ A worker file is Markdown. Its YAML front matter is the worker's settings and it
 - `on_request` lists types the worker runs only when a task in `todo` is named to it with `--key`, never by taking the next one.
 - `writes` is what the worker's turn may write, described below.
 - `routines` names the project's procedures, each found at `routines/<name>.md`; the first is the procedure for the work and the rest apply at the moments they name. A worker naming none leaves the turn to choose one by the routines' descriptions, or to work from the project's doctrine, and to say on the trail what it chose.
-- `limits` bounds the worker: `attempts` raises that did work before a task is parked, `lease_seconds` how long a claim is held (by default the profile's timeout plus ten minutes), `hold_seconds_on_exhaustion` how long a task rests after a turn that never got to the work, and `idle_failure_seconds`, under which a failed turn that wrote nothing counts as one that never started.
+- `limits` bounds the worker: `attempts` raises that did work before a task is parked, `lease_seconds` the longest a claim is held (by default the profile's timeout plus ten minutes), within which a running turn holds its task by a short lease it renews while its process lives, `hold_seconds_on_exhaustion` how long a task rests after a turn that never got to the work, and `idle_failure_seconds`, under which a failed turn that wrote nothing counts as one that never started.
 - `park_hint` is one sentence the project adds to the handback when a task is parked at the `attempts` ceiling, and only then: it is what a person about to read a task the work kept failing on should check first.
 - `hooks` names the project's own commands that run around a turn, described below.
 

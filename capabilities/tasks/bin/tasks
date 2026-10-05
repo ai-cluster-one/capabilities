@@ -101,6 +101,14 @@ EXECUTION  (also needs allow_write)
   The store refuses a second open raise on one task, so two workers cannot hold
   it even if two dispatchers try.
 
+  A task an open raise still holds is not claimable, whatever its status says:
+  a turn that moved it out of in_progress and has not been released, or died
+  before it was, still holds it until that raise is released or its lease
+  lapses. A claim passes such a task over and takes the next one, and names it
+  under `passed_over` - the task, `verdict` `held`, the raise as `execution`,
+  and `why` with until when its lease runs - and so do `run` and the service's
+  log line. `--key` naming one is refused, exit 6 `conflict`, naming the raise.
+
   `--outcome ok` completes the task, `failed` returns it to the queue, and
   `handback` hands it to its assignee in `waiting` - or back in `draft` when the
   task names nobody, which the answer says rather than inventing somebody to
@@ -187,6 +195,21 @@ ONE TURN OF THE CONVEYOR
   nothing, and not for the account's limit - the turn starts a fresh session
   with the whole frame instead, and the raise's detail says so. A resumed raise
   counts against `attempts` like any other.
+
+  A turn proves it is alive. Its claim holds the task by a short lease, and
+  while the `run` process lives it renews that lease every beat - a sixth of
+  the store retry window STORE describes, at least 2s and at most 30s apart -
+  to the window and three beats more from the store's now: every 30s, to 270s,
+  unless the window is changed. A renewal never reaches past
+  `limits.lease_seconds` from the claim, which stays the longest one raise may
+  hold its task. When the process is gone - killed, crashed, or out of its
+  window - nothing renews the lease, so it lapses within minutes, and the next
+  claim closes the raise as abandoned and puts the task back as it does any
+  lapsed lease, a task taken from `waiting` back to its wait; the same worker's
+  next turn on it continues that session as a cut-off one. A store away for
+  less than the window lapses no live turn: its first renewal after the store
+  is back lands before the lease it renewed last runs out. `claim` by hand
+  renews nothing and holds what its `--lease` says.
 
 WORKERS
   A worker is one file in the consuming project's capability envelope,
@@ -451,10 +474,10 @@ SERVICE
   off, is not. Whenever a lane has room and the store holds a task it would
   take, the daemon starts `tasks run <worker> --apply` as a child process: the
   same claim, frame, profile, turn and settlement as that command run by hand,
-  with its lease. The daemon decides nothing about a task. A turn starts with
-  the environment the daemon was started with and reads the project's .env
-  and .env.local over it itself, .env.local winning, so an edit to either
-  reaches the next turn without a restart.
+  with its lease and its beat. The daemon decides nothing about a task. A turn
+  starts with the environment the daemon was started with and reads the
+  project's .env and .env.local over it itself, .env.local winning, so an edit
+  to either reaches the next turn without a restart.
 
   Before it asks the store anything at a wake, and again just before it starts
   a turn, the daemon checks the project it serves: its folder and its
@@ -498,7 +521,9 @@ SERVICE
   A connection the path dropped under it is lost as well: a question not
   answered within 45s has its connection severed, so neither the daemon nor
   a stop waits on it longer than that. Every store connection, a turn's
-  included, carries TCP keepalives.
+  included, carries TCP keepalives. A turn waits out a store that is away
+  itself, within the retry window STORE describes, renewing its raise as it
+  goes, so an outage shorter than the window ends no turn.
   `service status` shows, under `stores`, each store the daemon reaches: how
   many connections it has opened to it since it started, when it last opened
   one, whether it is listening, and the error that has it away, if any.
@@ -549,10 +574,11 @@ SERVICE
   foreground `service run`, a crash - it stops claiming, publishes, lets go of
   its lock and exits within a second, and every running turn keeps running in
   its own session, writes its output to its files and settles its own task;
-  its lease, derived from the profile, holds the task while it runs. Every
-  turn the daemon starts is recorded in `turns/<id>.json` in its state: its
-  id, project, worker, pid, when its process started as `ps -o lstart=` prints
-  it, its receipt, output and error files, and when it started. The next
+  its lease, renewed by its own beat and never past the one derived from the
+  profile, holds the task while it runs. Every turn the daemon starts is
+  recorded in `turns/<id>.json` in its state: its id, project, worker, pid,
+  when its process started as `ps -o lstart=` prints it, its receipt, output
+  and error files, and when it started. The next
   daemon to serve the project adopts every recorded turn whose pid is alive
   and started at the recorded moment: it counts against its lane and the
   project's cap, its task is never claimed by another turn, `service status`
@@ -1176,6 +1202,20 @@ STORE
   `doctor` reports the store behind. So is a command that waits 10s for the
   lock, or for the tables to be free, without getting it.
 
+  A command that cannot reach the store does not give up at once. It asks
+  again after 1s, then at a doubling interval of at most 30s, for
+  TASKS_STORE_RETRY_SECONDS - 180 unless set, resolved as a connection value
+  is, from the project's .env.local and .env, the user tier, then the
+  environment - and says so once on stderr, `{"store_away": {"error",
+  "asking_again_for_seconds"}}`; only when that window is spent does it exit 5
+  `unreachable`, as it would have at once. So a network that drops for a minute
+  or two costs a worker's `tasks` calls, and `tasks run` itself, the wait and
+  not the turn. 0 gives up at the first failure. A store that answers and
+  refuses - a role, a password or a database it does not know - is not away,
+  and is refused at once. `doctor` never waits, since it proves the store as
+  it is now; `watch` and the service keep asking for as long as it takes, as
+  their own sections say.
+
 I/O
   Success is JSON on stdout; errors are JSON on stderr.
 
@@ -1186,7 +1226,8 @@ EXIT CODES
   4 policy - the capability is disabled, the connection does not allow writes,
     the worker is switched off, or worker scope or project scope refuses the
     write; ask the user, never lift the gate yourself
-  5 store - unreachable, or the schema is not present; `tasks doctor` proves both.
+  5 store - unreachable once the retry window STORE describes is spent, or the
+    schema is not present; `tasks doctor` proves both.
     For `watch`, also a store that does not announce changes
   6 input - a malformed argument, an unknown flag, a value outside its set, a
     worker file this capability cannot read, or a command run outside a
@@ -4942,32 +4983,109 @@ def _secret_key(entry: dict | None) -> str:
 _STORE_LIBPQ = {"keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10,
                 "keepalives_count": 3, "tcp_user_timeout": 60000}
 
+# How long a command goes on asking for a store it cannot reach before it gives
+# up with exit 5, in seconds, and the name a project or a machine changes it by.
+# A network that drops for a minute or two is weather, and a turn that ends on
+# it loses the work it was carrying; a store gone for longer than this is an
+# outage somebody has to see. Resolved the way a connection value is, so a
+# machine's own .env.local can say it.
+_STORE_RETRY_ENV = "TASKS_STORE_RETRY_SECONDS"
+_STORE_RETRY_DEFAULT = 180
+# The first wait between two asks, doubled after each that fails, up to the
+# longest - the pace the service asks again at.
+_STORE_RETRY_FIRST = 1.0
+_STORE_RETRY_LONGEST = 30.0
 
-def _connect(entry: dict | None, *, raising: bool = False, **libpq):
+# What a store that answered says when it is there but cannot take a connection
+# yet: starting, stopping, recovering, or full. Anything else it answers with -
+# a role, a password or a database it does not know - is not the store being
+# away, and asking again would only make the refusal arrive later.
+_STORE_BUSY = ("starting up", "shutting down", "in recovery", "too many",
+               "remaining connection slots")
+
+
+def _store_retry_seconds() -> int:
+    """The window a command waits out a store it cannot reach, from
+    TASKS_STORE_RETRY_SECONDS, or the default. Zero asks once, as every command
+    did before there was a window."""
+    raw, _tier, source = _resolve_env_key(_STORE_RETRY_ENV)
+    if raw in (None, ""):
+        return _STORE_RETRY_DEFAULT
+    try:
+        seconds = int(str(raw).strip())
+    except ValueError:
+        seconds = -1
+    if seconds < 0:
+        _die(6, "input", f"{_STORE_RETRY_ENV} is {raw!r}"
+             + (f" in {source}" if source else ""),
+             "a whole number of seconds, 0 or more; 0 gives up at the first failure")
+    return seconds
+
+
+def _store_away(exc: BaseException) -> bool:
+    """Whether a connection that failed met a store that is away - nothing
+    answered, the path dropped, the name did not resolve, or the store said it
+    cannot take a connection yet - rather than one that answered and refused."""
+    said = str(exc)
+    if "FATAL:" in said:
+        return any(words in said for words in _STORE_BUSY)
+    return "no password supplied" not in said and "does not support SSL" not in said
+
+
+def _connect(entry: dict | None, *, raising: bool = False, waiting: bool | None = None,
+             **libpq):
     """A connection to the store, or exit 5 saying why there is none. A caller
     that outlives an unreachable store passes `raising` and is handed the same
     refusal as a Refusal instead. `libpq` carries connection parameters a
     caller holding its connection open needs, over `_STORE_LIBPQ` and libpq's
-    own defaults."""
+    own defaults.
+
+    A store that is away is asked for again, after 1s and then at a doubling
+    interval of at most 30s, until the window `_store_retry_seconds` gives is
+    spent, and only then refused: a command, and a turn with it, waits out a
+    network that dropped for a minute rather than ending on it. The first wait
+    says so on stderr, once. `waiting` decides it, and unsaid it waits exactly
+    when it would otherwise exit: a caller passing `raising` keeps asking on a
+    schedule of its own and is told at once."""
     try:
         import psycopg
         from psycopg.rows import dict_row
     except ImportError:  # pragma: no cover - the shebang installs it
         _die(1, "dependency_missing", "psycopg is not available",
              "this script runs under `uv run --script`; invoke it through its shebang")
+    import time
     password, _t, _s = _resolve_env_key(_secret_key(entry))
-    try:
-        conn = psycopg.connect(
-            host=_conf(entry, "db_host"), port=int(_conf(entry, "db_port", "5432")),
-            user=_conf(entry, "db_user"), dbname=_conf(entry, "db_name"),
-            password=password, sslmode=_conf(entry, "db_sslmode", "prefer"),
-            connect_timeout=10, row_factory=dict_row, **{**_STORE_LIBPQ, **libpq})
-    except Exception as exc:
-        refusal = Refusal(5, "unreachable", f"cannot reach the store: {exc}",
-                          f"`{NAME} connections` shows where every value resolves")
-        if raising:
-            raise refusal from exc
-        _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
+    window = _store_retry_seconds() if (not raising if waiting is None else waiting) else 0
+    deadline = time.monotonic() + window
+    delay = _STORE_RETRY_FIRST
+    said = False
+    while True:
+        try:
+            conn = psycopg.connect(
+                host=_conf(entry, "db_host"), port=int(_conf(entry, "db_port", "5432")),
+                user=_conf(entry, "db_user"), dbname=_conf(entry, "db_name"),
+                password=password, sslmode=_conf(entry, "db_sslmode", "prefer"),
+                connect_timeout=10, row_factory=dict_row, **{**_STORE_LIBPQ, **libpq})
+            break
+        except Exception as exc:
+            remaining = deadline - time.monotonic()
+            if (isinstance(exc, psycopg.OperationalError) and _store_away(exc)
+                    and remaining > 0):
+                if not said:
+                    said = True
+                    sys.stderr.write(json.dumps({"store_away": {
+                        "error": str(exc).strip(), "asking_again_for_seconds": window}},
+                        ensure_ascii=False) + "\n")
+                    sys.stderr.flush()
+                # The last ask is at the end of the window rather than before it.
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, _STORE_RETRY_LONGEST)
+                continue
+            refusal = Refusal(5, "unreachable", f"cannot reach the store: {exc}",
+                              f"`{NAME} connections` shows where every value resolves")
+            if raising:
+                raise refusal from exc
+            _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
     if CATCH_UP:
         # On the first connection a command opens, so bringing the store up to
         # this version costs one query on a store that is current and no second
@@ -6646,11 +6764,23 @@ def _not_held_from_waiting() -> str:
             f"order by e.started_at desc limit 1), false))")
 
 
-def _selection(opts: dict, project: str, tz) -> tuple[str, list]:
+def _open_raise_clause(held: bool) -> str:
+    """A task held by a raise still open, whatever its status says - a turn that
+    moved it out of `in_progress` and has not been released yet, or that died
+    before it was - or, with `held` false, a task no open raise holds. The store
+    refuses a second open raise on one task, so a claim that met such a task
+    would fail rather than take it."""
+    return (f"{'' if held else 'not '}exists (select 1 from {SCHEMA}.task_executions h "
+            f"where h.task_id = {SCHEMA}.tasks.id and h.status = 'running')")
+
+
+def _selection(opts: dict, project: str, tz, held: bool = False) -> tuple[str, list]:
     """What one ask of a claim selects: the project, the narrowing the ask names,
-    the statuses it takes - todo unless it names others - and a pickup that has
-    come. `claim` and `run --apply` take from it and `run` without --apply reports
-    from it, so what is reported is what would be taken."""
+    the statuses it takes - todo unless it names others - a pickup that has
+    come, and no open raise holding it. `claim` and `run --apply` take from it
+    and `run` without --apply reports from it, so what is reported is what would
+    be taken. With `held`, the tasks the same ask passes over because an open
+    raise still holds them."""
     where, params = _where({**{k: v for k, v in opts.items()
                                if k in ("type", "assignee", "tag")},
                             "project": project}, tz)
@@ -6677,15 +6807,49 @@ def _selection(opts: dict, project: str, tz) -> tuple[str, list]:
                 clauses.append(_not_held_from_waiting())
                 params = [*params, int(opts["waiting_hold"])]
     clauses.append("(pickup_at is null or pickup_at <= now())")
+    clauses.append(_open_raise_clause(held))
     joiner = " and " if where else " where "
     return f"{where}{joiner}" + " and ".join(clauses), params
 
 
-def _key_refusal(task: dict, due: bool, opts: dict) -> tuple[str, str] | None:
+def _held_over(cur, opts: dict, project: str, tz) -> list[dict]:
+    """The tasks this ask of a claim passes over because an open raise still
+    holds them, each with the raise and until when its lease runs, in the shape
+    `run` reports a task a `before` hook held back."""
+    where, params = _selection(opts, project, tz, held=True)
+    cur.execute(f"""select id, unique_key,
+                           (select jsonb_build_object('execution', h.id, 'worker', h.worker,
+                                                      'until', h.lease_until)
+                              from {SCHEMA}.task_executions h
+                             where h.task_id = {SCHEMA}.tasks.id
+                               and h.status = 'running' limit 1) as held
+                      from {SCHEMA}.tasks{where}
+                     order by pickup_at asc nulls last, created_at asc
+                     limit 20""", params)
+    passed = []
+    for row in _rows(cur):
+        held = row.get("held") or {}
+        passed.append({"task": _address(row), "task_id": str(row["id"]), "verdict": "held",
+                       "execution": held.get("execution"),
+                       "why": f"its raise {held.get('execution')}"
+                              + (f" of worker {held['worker']!r}" if held.get("worker") else "")
+                              + f" is still open, its lease until {held.get('until')}"})
+    return passed
+
+
+def _passed_merged(passed: list, more) -> list:
+    """`passed` with each of `more` it does not already name, by task."""
+    named = {one.get("task_id") for one in passed}
+    return passed + [one for one in more or [] if one.get("task_id") not in named]
+
+
+def _key_refusal(task: dict, due: bool, opts: dict,
+                 held: dict | None = None) -> tuple[str, str] | None:
     """Why the task named with --key cannot be taken by the worker these options
     name, as a sentence and its hint, or None when it can. A named task reaches
     past the order a worker claims in and past the narrowing of its filters,
-    never past the statuses and types it takes."""
+    never past the statuses and types it takes, and never past `held`, the raise
+    still open on it."""
     key = opts["key"]
     accept = opts.get("accept")
     statuses = (sorted({one for entry in accept for one in entry["status"]})
@@ -6694,6 +6858,12 @@ def _key_refusal(task: dict, due: bool, opts: dict) -> tuple[str, str] | None:
         return (f"{key} is {task['status']}, not {' or '.join(statuses)}",
                 "a draft has not been released, one waiting is over to its "
                 "assignee, and one in progress is already held")
+    if held:
+        return (f"{key} is still held by its raise {held['id']}"
+                + (f" of worker {held['worker']!r}" if held.get("worker") else "")
+                + f", open until {held.get('lease_until')}",
+                "it is taken once that raise is released, or once its lease lapses "
+                f"and a claim closes it; `{NAME} runs {key}` shows it")
     if not due:
         return (f"{key} is held until {task['pickup_at']}",
                 "clear the pickup to take it now")
@@ -6740,8 +6910,15 @@ def _claim(entry, opts: dict) -> dict:
     A claim is a write and takes no project of its own: the selection, and both
     sweeps that run before it, are the project's alone, so a worker in one
     project can neither take another project's work nor move another project's
-    tasks while it looks for its own."""
+    tasks while it looks for its own.
+
+    A task an open raise still holds is passed over, whatever its status says,
+    and named under `passed_over`; named with --key, it is refused. `beat`, from
+    `run`, is the short lease a turn that renews its raise holds it by from the
+    start, never longer than the lease it is given."""
     lease = _duration(opts.get("lease") or _LEASE_DEFAULT)
+    if opts.get("beat"):
+        lease = min(lease, int(opts["beat"]))
     project = _writing_project()
     where, params = _selection(opts, project, _zone(entry))
     with _connect(entry) as conn, conn.cursor() as cur:
@@ -6768,19 +6945,24 @@ def _claim(entry, opts: dict) -> dict:
                      "another claimer holds the row; try again")
             task = rows.pop()
             due = task.pop("due")
-            refused = _key_refusal(task, due, opts)
+            refused = _key_refusal(task, due, opts, _open_execution(cur, tid))
             if refused:
                 _die(6, "conflict", *refused)
             rows = [task]
+            passed = []
         else:
+            passed = _held_over(cur, opts, project, _zone(entry))
             cur.execute(f"""select * from {SCHEMA}.tasks{where}
                             order by pickup_at asc nulls last, created_at asc
                             limit 1 for update skip locked""", params)
             rows = _rows(cur)
             if not rows:
                 conn.commit()
-                return {"claimed": None, "swept": [str(r["id"]) for r in swept],
-                        "returned": [_address(t) for t in returned]}
+                answer = {"claimed": None, "swept": [str(r["id"]) for r in swept],
+                          "returned": [_address(t) for t in returned]}
+                if passed:
+                    answer["passed_over"] = passed
+                return answer
         before = rows[0]
         tid = str(before["id"])
         cur.execute(f"select count(*) as n from {SCHEMA}.task_executions where task_id = %s",
@@ -6844,6 +7026,8 @@ def _claim(entry, opts: dict) -> dict:
                   "task": after, "activities": trail,
                   "swept": [str(r["id"]) for r in swept],
                   "returned": [_address(t) for t in returned]}
+        if passed:
+            answer["passed_over"] = passed
         if opts.get("run"):
             answer["previous"] = previous
         return answer
@@ -8024,7 +8208,7 @@ def _asks(worker: dict) -> list[dict]:
 
 
 def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
-          run: tuple | None = None) -> dict:
+          run: tuple | None = None, beat: int | None = None) -> dict:
     """Take the next task this worker matches, or exactly the one named.
 
     One claim per ask, in the order `_asks` gives them, stopping at the first
@@ -8039,11 +8223,18 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
     handle the turn will run under, is recorded on the raise by the same claim.
 
     A worker that declares a `before` hook has each task asked about first, and
-    `_take_past_hooks` takes the first one its hook lets through."""
+    `_take_past_hooks` takes the first one its hook lets through.
+
+    `beat` is the short lease of a turn that renews its raise while it lives;
+    `limits.lease_seconds` stays the longest it may be held for. What every ask
+    passed over because an open raise holds it is carried forward like a
+    sweep."""
     base = {"lease": str(worker["limits"]["lease_seconds"]),
             "worker": worker["name"], "handler": worker["handler"]}
     if run is not None:
         base["run"] = run
+    if beat is not None:
+        base["beat"] = beat
     if worker.get("writes") is not None:
         base["bind"] = worker["writes"]
     if exclude:
@@ -8073,13 +8264,17 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
     if before:
         return _take_past_hooks(entry, worker, base, tuple(exclude))
     swept: list = []
+    passed: list = []
     answer: dict = {"claimed": None, "swept": [], "returned": []}
     for ask in _asks(worker):
         answer = _claim(entry, {**base, **ask})
         swept += answer.get("swept") or []
+        passed = _passed_merged(passed, answer.pop("passed_over", None))
         if answer.get("claimed") is not None:
             break
     answer["swept"] = swept
+    if passed:
+        answer["passed_over"] = passed
     return answer
 
 
@@ -8106,9 +8301,10 @@ def _key_candidate(entry, worker: dict, key: str) -> dict | None:
         cur.execute(f"""select *, (pickup_at is null or pickup_at <= now()) as due
                           from {SCHEMA}.tasks where id = %s""", (tid,))
         row = _rows(cur)[0]
+        held = _open_execution(cur, tid)
     due = row.pop("due")
     refused = _key_refusal(row, due, {"key": key, "worker": worker["name"],
-                                      **_key_types(worker)})
+                                      **_key_types(worker)}, held)
     return row if refused is None else None
 
 
@@ -8136,7 +8332,13 @@ def _take_past_hooks(entry, worker: dict, base: dict, exclude: tuple) -> dict:
     swept, returned = _sweep(entry)
     project, tz = _writing_project(), _zone(entry)
     asked = list(exclude)
+    # What an open raise holds is passed over before any hook is asked about
+    # it, and said the way the claim says it.
     passed: list = []
+    with _connect(entry) as conn, conn.cursor() as cur:
+        for ask in _asks(worker):
+            passed = _passed_merged(passed, _held_over(cur, {**ask, "not_ids": asked},
+                                                       project, tz))
     answer: dict = {"claimed": None}
     while True:
         with _connect(entry) as conn, conn.cursor() as cur:
@@ -8152,6 +8354,7 @@ def _take_past_hooks(entry, worker: dict, base: dict, exclude: tuple) -> dict:
             continue
         answer = _claim(entry, {**base, **ask, "only_id": tid})
         swept += answer.get("swept") or []
+        passed = _passed_merged(passed, answer.pop("passed_over", None))
         if answer.get("claimed") is not None:
             break
     answer["swept"] = swept
@@ -8182,7 +8385,8 @@ def _would_take(entry, worker: dict, key: str | None, exclude: tuple = (),
             row = _rows(cur)[0]
             due = row.pop("due")
             take = (row if _key_refusal(row, due, {"key": key, "worker": worker["name"],
-                                                   **_key_types(worker)}) is None
+                                                   **_key_types(worker)},
+                                        _open_execution(cur, tid)) is None
                     else None)
         else:
             _ask, take = _next_candidate(cur, worker, project, tz, exclude)
@@ -8620,6 +8824,71 @@ def _boot(worker: dict, prompt: str, execution: str, cwd: Path, session):
     return result, int((time.monotonic() - started) * 1000)
 
 
+def _beat_lease() -> tuple[int, int]:
+    """How often a running turn renews its raise, and the lease each renewal
+    gives it, in seconds: every sixth of the store retry window, at least 2s and
+    at most 30s apart, for the window and three beats more.
+
+    The lease outlasts the window on purpose. A store away for less than the
+    window holds back every renewal while it is away, and the first one after
+    it is back still lands before the lease the last one wrote has run out, so
+    an outage the turn waits out never lapses the turn by itself."""
+    window = _store_retry_seconds()
+    every = min(30, max(2, window // 6))
+    return every, window + 3 * every
+
+
+class _Beat:
+    """The proof a running turn is alive: while the `run` process lives, a
+    thread of its own renews the lease of the raise it holds, every `every`
+    seconds, to `lease` seconds from the store's now, and never past `cap`
+    seconds from the claim - `limits.lease_seconds`, the longest one raise may
+    hold its task. When the process is gone nothing renews it, the lease lapses
+    within `lease`, and the sweep every claim runs closes the raise as abandoned
+    and puts the task back, as it does any lapsed lease.
+
+    A renewal that fails is tried again sooner rather than at the next beat,
+    and one that cannot reach the store is not waited out here: the next try is
+    the wait. It renews only a raise still open, and once its raise is closed or
+    swept it stops."""
+
+    def __init__(self, entry, execution: str, cap: int, lease: int, every: int):
+        import threading
+        self.entry, self.execution = entry, execution
+        self.cap, self.lease, self.every = int(cap), int(lease), every
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="tasks-beat", daemon=True)
+        self._thread.start()
+
+    def _renew(self) -> bool:
+        """One renewal; whether the raise is still open."""
+        with _connect(self.entry, raising=True) as conn, \
+                _sever_after(conn, min(self.every, 10)), conn.cursor() as cur:
+            cur.execute(f"""update {SCHEMA}.task_executions
+                               set lease_until = least(
+                                   started_at + make_interval(secs => %s),
+                                   now() + make_interval(secs => %s))
+                             where id::text = %s and status = 'running'
+                         returning id""", (self.cap, self.lease, self.execution))
+            still = cur.fetchone() is not None
+            conn.commit()
+        return still
+
+    def _run(self) -> None:
+        wait = self.every
+        while not self._stop.wait(wait):
+            try:
+                if not self._renew():
+                    return
+                wait = self.every
+            except Exception:
+                wait = max(1, self.every // 6)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=15)
+
+
 def _close(entry, execution: str, outcome: str, status: str, detail: str | None,
            system: str, pointer: str, metrics: dict, tid: str, report: dict) -> None:
     """Close the raise, and say on the trail when it could not be closed.
@@ -8662,7 +8931,9 @@ def cmd_run(entry, args: list[str]) -> None:
     opens the raise and moves the status in one transaction, and refuses a
     second claim on a row that already has one. A turn that dies renews nothing,
     so the lease lapses and the next claim sweeps it: there is no window here to
-    invent and no stranded run to detect."""
+    invent and no stranded run to detect. What makes a dead turn's lease lapse
+    soon is the beat: the claim holds the task by a short lease, and `_Beat`
+    renews it for as long as this process lives."""
     # Where the service that started this turn wants to hear what it took. Read
     # once and removed, so it reaches this process and not the turn it starts.
     receipt = os.environ.pop(_RECEIPT_ENV, None)
@@ -8693,8 +8964,9 @@ def cmd_run(entry, args: list[str]) -> None:
     import uuid
     pinned = str(uuid.uuid4())
     claude = getattr(worker.get("profile"), "harness", None) == "claude"
+    every, short = _beat_lease()
     held = _take(entry, worker, opts.get("key"), *narrowed,
-                 run=("claude", pinned) if claude else None)
+                 run=("claude", pinned) if claude else None, beat=short)
     report = {"worker": worker["name"], "claimed": None,
               "swept": held.get("swept") or [], "applied": True}
     # What the worker's `before` hook held back, and why: said whether or not
@@ -8714,159 +8986,166 @@ def cmd_run(entry, args: list[str]) -> None:
     # park lands it in draft, because a wait would hand it straight back here.
     from_waiting = _claimed_from_waiting(held["execution"])
     park_landing = "draft" if from_waiting else None
-    report.update(claimed=_address(task), attempt=attempt, execution=execution)
-    if receipt:
-        _write_receipt(receipt, {"task": _address(task), "task_id": tid,
-                                 "execution": execution, "attempt": attempt})
+    # From here until the raise is closed this process is what holds the task,
+    # and it says so to the store every beat.
+    beat = _Beat(entry, execution, worker["limits"]["lease_seconds"], short, every)
+    try:
+        report.update(claimed=_address(task), attempt=attempt, execution=execution)
+        if receipt:
+            _write_receipt(receipt, {"task": _address(task), "task_id": tid,
+                                     "execution": execution, "attempt": attempt})
 
-    # A worker naming a routine or a profile that is not there has nothing whole
-    # to give a turn. The task goes back to a person saying what is missing, and
-    # the raise is marked so that it spends no attempt: the task was never tried.
-    if worker["missing"]:
-        _park(entry, tid, execution,
-              f"Worker {worker['name']!r} cannot run this task: "
-              + "; ".join(worker["missing"])
-              + ". Handed back without starting a turn and without spending an "
-              "attempt; `tasks doctor` names the same.",
-              {"missing": True}, park_landing)
-        report["parked"] = True
-        report["missing"] = worker["missing"]
+        # A worker naming a routine or a profile that is not there has nothing whole
+        # to give a turn. The task goes back to a person saying what is missing, and
+        # the raise is marked so that it spends no attempt: the task was never tried.
+        if worker["missing"]:
+            _park(entry, tid, execution,
+                  f"Worker {worker['name']!r} cannot run this task: "
+                  + "; ".join(worker["missing"])
+                  + ". Handed back without starting a turn and without spending an "
+                  "attempt; `tasks doctor` names the same.",
+                  {"missing": True}, park_landing)
+            report["parked"] = True
+            report["missing"] = worker["missing"]
+            _after_hook(entry, worker, tid, execution, report)
+            _emit(report)
+            return
+
+        # Counted after the claim, because the claim is what made this raise exist.
+        if _spent_attempts(entry, tid) > worker["limits"]["attempts"]:
+            # The project's own sentence goes back with this park alone: it speaks to
+            # work that was tried, and what a person about to read a task the work kept
+            # failing on needs to check is the project's knowledge, not this capability's.
+            why = (f"Raised {worker['limits']['attempts']} times without finishing; handed "
+                   "back for a decision rather than dispatched again.")
+            if worker["park_hint"]:
+                why = f"{why} {worker['park_hint']}"
+            _park(entry, tid, execution, why, None, park_landing)
+            report["parked"] = True
+            _after_hook(entry, worker, tid, execution, report)
+            _emit(report)
+            return
+
+        stage = _stage_of(task)
+        assignee = _assignee_of(task)
+        prompt = _prompt(worker, task, held.get("activities") or [], attempt, stage)
+        runner = _harness_runner()
+        # The same worker's last raise on this task was cut off, so its session is
+        # continued with a short message rather than rebuilt from the whole frame.
+        # A raise of another worker is never continued: that one is a handoff.
+        previous = held.get("previous")
+        resumed = fell_back = None
+        if claude and _cut_off(previous) and previous.get("run_system") == "claude" \
+                and previous.get("run_ref"):
+            if _session_kept(previous["run_ref"], worker["profile"]):
+                resumed = previous
+            else:
+                fell_back = (f"The session {previous['run_ref']} of the cut-off raise "
+                             f"{previous['id']} is no longer on this machine, so this turn "
+                             "started a fresh session with the whole frame.")
+        session = (runner.Session.pinned(pinned) if claude else runner.Session.fresh())
+        _before, grew_from = _state(entry, tid)
+        if resumed:
+            _record_run(entry, execution, "claude", resumed["run_ref"])
+            result, elapsed_ms = _boot(worker, _continuation(worker, task, resumed),
+                                       execution, _project_here(),
+                                       runner.Session.resume(resumed["run_ref"]))
+            _after, grown = _state(entry, tid)
+            # A resume refused at launch fails in seconds having written nothing, and
+            # not for the account's limit: the turn is started again, fresh.
+            if (not result.ok and grown == grew_from
+                    and elapsed_ms < worker["limits"]["idle_failure_seconds"] * 1000
+                    and not (result.failure is not None
+                             and result.failure.kind == runner.FailureKind.QUOTA)):
+                why = result.failure.message[:200] if result.failure else "no answer"
+                fell_back = (f"Resuming the session {resumed['run_ref']} of the cut-off "
+                             f"raise {resumed['id']} failed at launch ({why}), so this "
+                             "turn started a fresh session with the whole frame.")
+                resumed = None
+                _record_run(entry, execution, "claude", pinned)
+        if not resumed:
+            result, elapsed_ms = _boot(worker, prompt, execution, _project_here(), session)
+        landing, grew_to = _state(entry, tid)
+
+        detail = result.failure.message[:300] if result.failure else ""
+        # Two ways of recognising a turn that never got to the work, because one is
+        # exact and the other covers what the exact one cannot name. The harness
+        # saying it ran out is the fact, and the library names it from the harness's
+        # own answer rather than from how long the turn lasted. Failing in seconds
+        # while writing nothing is the shape of a turn that never started, whatever
+        # it was.
+        idle = (not result.ok and grew_to == grew_from
+                and elapsed_ms < worker["limits"]["idle_failure_seconds"] * 1000)
+        unspent = idle or (result.failure is not None
+                           and result.failure.kind == runner.FailureKind.QUOTA)
+
+        handed_on = _stage_of(landing) != stage or _assignee_of(landing) != assignee
+        landed, outcome, marks = _settle(landing["status"], _held_ahead(landing),
+                                         handed_on, unspent)
+        if from_waiting:
+            landed, outcome = _settle_from_waiting(landing["status"], landed, outcome,
+                                                   unspent)
+        # What the turn cost is kept whenever the harness reported it, on every path:
+        # a turn stopped by the account's limit after real work still spent that.
+        measured = (("cost_usd", result.cost_usd), ("duration_ms", result.duration_ms),
+                    ("num_turns", result.num_turns), ("elapsed_ms", elapsed_ms),
+                    ("model", result.model))
+        metrics = {k: v for k, v in measured if v is not None}
+        metrics.update(marks)
+        # Nobody moved the task, so the turn was cut off before an ending of its
+        # own: the same worker's next raise on it continues this session.
+        if landing["status"] == "in_progress" and not _held_ahead(landing):
+            metrics["cut_off"] = True
+        if resumed:
+            metrics["resumed_from"] = str(resumed["id"])
+            report["resumed_from"] = str(resumed["id"])
+        if fell_back:
+            report["resume_fell_back"] = fell_back
+        pointer = ((resumed["run_ref"] if resumed else pinned) if result.harness == "claude"
+                   else (result.session_id or pinned))
+        # A returned id that is not the one the turn was given means it did not
+        # honour the pin, and the pointer would otherwise name a transcript that was
+        # never written.
+        if result.session_id and result.session_id != pointer:
+            metrics["session_id_actual"] = result.session_id
+        report.update({k: True for k in marks if k in ("waiting", "handoff")})
+        if unspent:
+            report["returned_unspent"] = True
+
+        said = "; ".join(one for one in (fell_back, detail if not result.ok else None) if one)
+        _close(entry, execution, outcome, landed, said or None,
+               result.harness, pointer, metrics, tid, report)
+        if unspent and landed != "waiting":
+            report["held_until"] = _hold_off(entry, tid,
+                                             worker["limits"]["hold_seconds_on_exhaustion"])
+        elif unspent:
+            # A pickup on a task back in `waiting` would end its wait when it passed,
+            # releasing it into the queue, so the claim reads this raise instead and
+            # takes the task again only once the same hold has passed.
+            report["held_until"] = _held_from_waiting_until(
+                entry, execution, worker["limits"]["hold_seconds_on_exhaustion"])
+        if result.cost_usd is not None:
+            report["cost_total"] = _accumulate_cost(entry, tid, result.cost_usd)
+        # Every raise leaves exactly one entry, including a raise that did nothing. A
+        # task picked up that left no trace is indistinguishable from one never
+        # picked up, and telling those apart is how a stalled queue is noticed.
+        if grew_to == grew_from:
+            _note(entry, tid,
+                  "Raised and left no record: the turn ended without writing to the trail "
+                  f"({'no answer' if not result.ok else 'answered but recorded nothing'}"
+                  f"{': ' + detail if detail else ''}).")
+        # The reading of the turn, not the turn itself: the answer and the harness's
+        # raw report are the worker's, and this verb reads neither.
+        turn = {k: v for k, v in result.to_dict().items()
+                if k not in ("answer", "structured", "raw")}
+        turn["elapsed_ms"] = elapsed_ms
+        report["turn"] = turn
+        report["trail_grew_by"] = grew_to - grew_from
         _after_hook(entry, worker, tid, execution, report)
         _emit(report)
-        return
-
-    # Counted after the claim, because the claim is what made this raise exist.
-    if _spent_attempts(entry, tid) > worker["limits"]["attempts"]:
-        # The project's own sentence goes back with this park alone: it speaks to
-        # work that was tried, and what a person about to read a task the work kept
-        # failing on needs to check is the project's knowledge, not this capability's.
-        why = (f"Raised {worker['limits']['attempts']} times without finishing; handed "
-               "back for a decision rather than dispatched again.")
-        if worker["park_hint"]:
-            why = f"{why} {worker['park_hint']}"
-        _park(entry, tid, execution, why, None, park_landing)
-        report["parked"] = True
-        _after_hook(entry, worker, tid, execution, report)
-        _emit(report)
-        return
-
-    stage = _stage_of(task)
-    assignee = _assignee_of(task)
-    prompt = _prompt(worker, task, held.get("activities") or [], attempt, stage)
-    runner = _harness_runner()
-    # The same worker's last raise on this task was cut off, so its session is
-    # continued with a short message rather than rebuilt from the whole frame.
-    # A raise of another worker is never continued: that one is a handoff.
-    previous = held.get("previous")
-    resumed = fell_back = None
-    if claude and _cut_off(previous) and previous.get("run_system") == "claude" \
-            and previous.get("run_ref"):
-        if _session_kept(previous["run_ref"], worker["profile"]):
-            resumed = previous
-        else:
-            fell_back = (f"The session {previous['run_ref']} of the cut-off raise "
-                         f"{previous['id']} is no longer on this machine, so this turn "
-                         "started a fresh session with the whole frame.")
-    session = (runner.Session.pinned(pinned) if claude else runner.Session.fresh())
-    _before, grew_from = _state(entry, tid)
-    if resumed:
-        _record_run(entry, execution, "claude", resumed["run_ref"])
-        result, elapsed_ms = _boot(worker, _continuation(worker, task, resumed),
-                                   execution, _project_here(),
-                                   runner.Session.resume(resumed["run_ref"]))
-        _after, grown = _state(entry, tid)
-        # A resume refused at launch fails in seconds having written nothing, and
-        # not for the account's limit: the turn is started again, fresh.
-        if (not result.ok and grown == grew_from
-                and elapsed_ms < worker["limits"]["idle_failure_seconds"] * 1000
-                and not (result.failure is not None
-                         and result.failure.kind == runner.FailureKind.QUOTA)):
-            why = result.failure.message[:200] if result.failure else "no answer"
-            fell_back = (f"Resuming the session {resumed['run_ref']} of the cut-off "
-                         f"raise {resumed['id']} failed at launch ({why}), so this "
-                         "turn started a fresh session with the whole frame.")
-            resumed = None
-            _record_run(entry, execution, "claude", pinned)
-    if not resumed:
-        result, elapsed_ms = _boot(worker, prompt, execution, _project_here(), session)
-    landing, grew_to = _state(entry, tid)
-
-    detail = result.failure.message[:300] if result.failure else ""
-    # Two ways of recognising a turn that never got to the work, because one is
-    # exact and the other covers what the exact one cannot name. The harness
-    # saying it ran out is the fact, and the library names it from the harness's
-    # own answer rather than from how long the turn lasted. Failing in seconds
-    # while writing nothing is the shape of a turn that never started, whatever
-    # it was.
-    idle = (not result.ok and grew_to == grew_from
-            and elapsed_ms < worker["limits"]["idle_failure_seconds"] * 1000)
-    unspent = idle or (result.failure is not None
-                       and result.failure.kind == runner.FailureKind.QUOTA)
-
-    handed_on = _stage_of(landing) != stage or _assignee_of(landing) != assignee
-    landed, outcome, marks = _settle(landing["status"], _held_ahead(landing),
-                                     handed_on, unspent)
-    if from_waiting:
-        landed, outcome = _settle_from_waiting(landing["status"], landed, outcome,
-                                               unspent)
-    # What the turn cost is kept whenever the harness reported it, on every path:
-    # a turn stopped by the account's limit after real work still spent that.
-    measured = (("cost_usd", result.cost_usd), ("duration_ms", result.duration_ms),
-                ("num_turns", result.num_turns), ("elapsed_ms", elapsed_ms),
-                ("model", result.model))
-    metrics = {k: v for k, v in measured if v is not None}
-    metrics.update(marks)
-    # Nobody moved the task, so the turn was cut off before an ending of its
-    # own: the same worker's next raise on it continues this session.
-    if landing["status"] == "in_progress" and not _held_ahead(landing):
-        metrics["cut_off"] = True
-    if resumed:
-        metrics["resumed_from"] = str(resumed["id"])
-        report["resumed_from"] = str(resumed["id"])
-    if fell_back:
-        report["resume_fell_back"] = fell_back
-    pointer = ((resumed["run_ref"] if resumed else pinned) if result.harness == "claude"
-               else (result.session_id or pinned))
-    # A returned id that is not the one the turn was given means it did not
-    # honour the pin, and the pointer would otherwise name a transcript that was
-    # never written.
-    if result.session_id and result.session_id != pointer:
-        metrics["session_id_actual"] = result.session_id
-    report.update({k: True for k in marks if k in ("waiting", "handoff")})
-    if unspent:
-        report["returned_unspent"] = True
-
-    said = "; ".join(one for one in (fell_back, detail if not result.ok else None) if one)
-    _close(entry, execution, outcome, landed, said or None,
-           result.harness, pointer, metrics, tid, report)
-    if unspent and landed != "waiting":
-        report["held_until"] = _hold_off(entry, tid,
-                                         worker["limits"]["hold_seconds_on_exhaustion"])
-    elif unspent:
-        # A pickup on a task back in `waiting` would end its wait when it passed,
-        # releasing it into the queue, so the claim reads this raise instead and
-        # takes the task again only once the same hold has passed.
-        report["held_until"] = _held_from_waiting_until(
-            entry, execution, worker["limits"]["hold_seconds_on_exhaustion"])
-    if result.cost_usd is not None:
-        report["cost_total"] = _accumulate_cost(entry, tid, result.cost_usd)
-    # Every raise leaves exactly one entry, including a raise that did nothing. A
-    # task picked up that left no trace is indistinguishable from one never
-    # picked up, and telling those apart is how a stalled queue is noticed.
-    if grew_to == grew_from:
-        _note(entry, tid,
-              "Raised and left no record: the turn ended without writing to the trail "
-              f"({'no answer' if not result.ok else 'answered but recorded nothing'}"
-              f"{': ' + detail if detail else ''}).")
-    # The reading of the turn, not the turn itself: the answer and the harness's
-    # raw report are the worker's, and this verb reads neither.
-    turn = {k: v for k, v in result.to_dict().items()
-            if k not in ("answer", "structured", "raw")}
-    turn["elapsed_ms"] = elapsed_ms
-    report["turn"] = turn
-    report["trail_grew_by"] = grew_to - grew_from
-    _after_hook(entry, worker, tid, execution, report)
-    _emit(report)
+    finally:
+        # Closed or not, the raise is no longer this process's to renew.
+        beat.stop()
 
 
 def cmd_runs(entry, args: list[str]) -> None:
@@ -11639,7 +11918,8 @@ def cmd_doctor(wanted: str | None) -> None:
     reg, _f = _connections_registry()
     conn_id, entry = _select_connection(reg, wanted)
     schema = _schema(entry)
-    with _connect(entry) as conn, conn.cursor() as cur:
+    # A probe answers for the store as it is now, so it never waits one out.
+    with _connect(entry, waiting=False) as conn, conn.cursor() as cur:
         cur.execute("select version() as v")
         server = cur.fetchone()["v"].split(" (")[0]
         # What `migrate` would add, asked the way `migrate` asks it. A store a
