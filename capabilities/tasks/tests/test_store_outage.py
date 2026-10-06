@@ -324,6 +324,139 @@ def test_a_killed_turn_is_cut_off_within_its_short_lease_and_its_task_returns(la
     assert mod._cut_off(runs[-1])
 
 
+@needs_store
+def test_a_renewal_cut_mid_flight_is_tried_again_and_the_lease_is_kept(lab, relay):
+    """The connection three renewals in a row are sent on is cut after the query
+    has passed and before its answer is back. Each is tried again on a new
+    connection within a second, the lease never runs out, each failure is said,
+    and the turn settles as if nothing happened."""
+    schema = schema_of(lab)
+    lab["env"]["FAKE_ENGINE_SLEEP"] = "10"
+    add(lab, "t-cut")
+    relayed(lab, relay, 6)         # a beat every 2s, a lease of 12s
+    relay.cut_on(b"lease_until = least(", 3)
+    turn = start_run(lab)
+    first = poll_for(lambda: raise_of(schema, "t-cut"), 60)
+    left = []
+    while relay.cuts_left:
+        row = raise_of(schema, "t-cut")
+        assert row["status"] == "running", row
+        left.append(row["left"])
+        assert len(left) < 150, "the renewals were never cut"
+        time.sleep(0.2)
+    renewed = poll_for(lambda: (lambda row: row if row["lease_until"]
+                                > first["lease_until"] else None)(
+                                    raise_of(schema, "t-cut")), 15)
+    assert renewed["status"] == "running" and renewed["left"] > 0
+    assert min(left) > 0, left
+
+    out, err = turn.communicate(timeout=120)
+    assert turn.returncode == 0, err
+    report = json.loads(out)
+    assert report["claimed"] == "t-cut" and "lease_lost" not in report
+    assert report["beat_failures"] >= 3
+    assert err.count('"beat_failed"') >= 3
+    settled = raise_of(schema, "t-cut")
+    assert (settled["status"], settled["task_status"]) == ("ok", "complete")
+
+
+def closed_under(schema: str, execution: str) -> None:
+    """Close a running raise the way the sweep closes one whose lease lapsed,
+    and put its task back."""
+    import psycopg
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(f"""update {schema}.task_executions
+                            set status = 'abandoned', ended_at = now(),
+                                detail = 'lease lapsed before release'
+                          where id::text = %s""", (execution,))
+        conn.execute(f"""update {schema}.tasks set status = 'todo'
+                          where id = (select task_id from {schema}.task_executions
+                                       where id::text = %s)""", (execution,))
+
+
+def gone(pids: list[int]) -> bool:
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                               capture_output=True, text=True).stdout.strip()
+        if state and not state.startswith("Z"):
+            return False
+    return True
+
+
+@needs_store
+def test_a_turn_whose_raise_is_closed_under_it_is_ended_at_once(lab, tmp_path):
+    """The raise a live turn holds is closed by a sweep, as one is when a
+    machine slept past its lease. The turn learns it at its next beat, is ended
+    with what it started, says so, and the service's log line names it."""
+    schema = schema_of(lab)
+    lab["env"]["FAKE_ENGINE_SLEEP"] = "120"
+    lab["env"]["TASKS_STORE_RETRY_SECONDS"] = "3"   # a beat every 2s, a lease of 9s
+    add(lab, "t-swept")
+    turn = start_run(lab)
+    try:
+        first = poll_for(lambda: raise_of(schema, "t-swept"), 60)
+        below = poll_for(lambda: descendants(turn.pid) or None, 30)
+        closed_under(schema, first["id"])
+        out, err = turn.communicate(timeout=20)
+    finally:
+        if turn.poll() is None:
+            os.killpg(turn.pid, signal.SIGKILL)
+    report = json.loads(out)
+    assert report["lease_lost"] == "its raise is abandoned, no longer running", report
+    assert report["release_refused"] == "that raise is not open"
+    assert '"lease_lost"' in err
+    poll_for(lambda: gone(below), 10)
+    settled = raise_of(schema, "t-swept")
+    assert (settled["status"], settled["task_status"]) == ("abandoned", "todo")
+
+    output, errors = tmp_path / "turn.out", tmp_path / "turn.err"
+    output.write_text(out)
+    errors.write_text(err)
+    said = mod._service_module().ProjectSlot._said(
+        SimpleNamespace(output=output, errors=errors))
+    assert "lease_lost its raise is abandoned, no longer running" in said
+
+
+@needs_store
+def test_a_turn_whose_lease_runs_out_unrenewed_is_ended(lab, relay, tmp_path):
+    """The store stays away past the lease the last renewal wrote. The turn
+    does not work on unclaimed: it is ended once that lease has run out, with
+    every failed renewal counted."""
+    schema = schema_of(lab)
+    lab["env"]["FAKE_ENGINE_SLEEP"] = "120"
+    add(lab, "t-away")
+    relayed(lab, relay, 6)         # a beat every 2s, a lease of 12s
+    said = tmp_path / "away.err"
+    with said.open("w") as errors:
+        turn = subprocess.Popen([str(_cli.CLI_PATH), "run", "alpha", "--apply"],
+                                cwd=lab["project"], env=lab["env"], text=True,
+                                stdout=subprocess.PIPE, stderr=errors,
+                                start_new_session=True)
+    try:
+        poll_for(lambda: raise_of(schema, "t-away"), 60)
+        below = poll_for(lambda: descendants(turn.pid) or None, 30)
+        relay.down()
+        away = time.monotonic()
+        poll_for(lambda: '"lease_lost"' in said.read_text(), 30)
+        assert time.monotonic() - away < 20
+        # Back at once, so the run can settle what it held once the turn is gone.
+        relay.up()
+        poll_for(lambda: gone(below), 10)
+        out, _ = turn.communicate(timeout=60)
+    finally:
+        if turn.poll() is None:
+            os.killpg(turn.pid, signal.SIGKILL)
+    report = json.loads(out)
+    assert report["lease_lost"].startswith(
+        "its lease ran out with no renewal reaching the store"), report
+    assert report["beat_failures"] >= 3
+    assert '"beat_failed"' in said.read_text()
+
+
 # --- A raise left open -------------------------------------------------------
 
 @needs_store

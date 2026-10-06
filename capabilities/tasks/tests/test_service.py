@@ -758,12 +758,16 @@ class Relay:
     connection through it and refuses new ones, as a store that went away does;
     `up()` opens the same port again. `stall()` keeps every connection through
     it open and passes nothing more on them, as a path that dropped under them
-    does."""
+    does. `cut_on(words, times)` cuts the connection a query carrying `words`
+    is sent on, once the query has passed and before its answer comes back,
+    for the next `times` such queries."""
 
     def __init__(self, host: str, port: int):
         self.target = (host, port)
         self.pairs: list[tuple[socket.socket, socket.socket]] = []
         self.stalled: set[socket.socket] = set()
+        self.clients: set[socket.socket] = set()
+        self.cut_words, self.cuts_left = b"", 0
         self.lock = threading.Lock()
         self.listener: socket.socket | None = None
         self.port = 0
@@ -781,6 +785,10 @@ class Relay:
         them open; new connections pass."""
         with self.lock:
             self.stalled.update(end for pair in self.pairs for end in pair)
+
+    def cut_on(self, words: bytes, times: int) -> None:
+        with self.lock:
+            self.cut_words, self.cuts_left = words, times
 
     def up(self) -> None:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -818,6 +826,7 @@ class Relay:
                 continue
             with self.lock:
                 self.pairs.append((client, upstream))
+                self.clients.add(client)
             for a, b in ((client, upstream), (upstream, client)):
                 threading.Thread(target=self._pump, args=(a, b), daemon=True).start()
 
@@ -829,6 +838,8 @@ class Relay:
                     break
                 if source not in self.stalled:
                     sink.sendall(data)
+                if source in self.clients and self._cutting(data):
+                    break
         except OSError:
             pass
         for end in (source, sink):
@@ -836,6 +847,13 @@ class Relay:
                 end.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+
+    def _cutting(self, data: bytes) -> bool:
+        with self.lock:
+            if self.cuts_left > 0 and self.cut_words and self.cut_words in data:
+                self.cuts_left -= 1
+                return True
+        return False
 
 
 @pytest.fixture

@@ -211,6 +211,17 @@ ONE TURN OF THE CONVEYOR
   is back lands before the lease it renewed last runs out. `claim` by hand
   renews nothing and holds what its `--lease` says.
 
+  A renewal that fails is tried again within seconds on a new connection, and
+  each failure is said on the turn's stderr as `{"beat_failed": {...}}`. The
+  beat keeps time by the wall clock, so a machine that slept renews when it
+  wakes. When the store answers that the raise is no longer running or its
+  lease has run out, or the lease the last renewal wrote runs out with no
+  renewal reaching the store, the raise is lost: `run` ends the turn at once
+  and kills what it started rather than let it work on a task it no longer
+  holds, says `{"lease_lost": {...}}` on stderr, and its answer carries
+  `lease_lost`, the reason, and `beat_failures` when any renewal failed. The
+  service's log line for the turn names both.
+
 WORKERS
   A worker is one file in the consuming project's capability envelope,
   `capabilities/tasks/workers/<name>.md`: Markdown whose YAML front matter is
@@ -8802,7 +8813,7 @@ def _record_run(entry, execution: str, system: str, ref: str) -> None:
         conn.commit()
 
 
-def _boot(worker: dict, prompt: str, execution: str, cwd: Path, session):
+def _boot(worker: dict, prompt: str, execution: str, cwd: Path, session, cancel=None):
     """One harness turn, and the wall time it took. The only thing here that
     knows how a turn is started.
 
@@ -8815,12 +8826,16 @@ def _boot(worker: dict, prompt: str, execution: str, cwd: Path, session):
     The time is measured here rather than read from the result, because a turn
     that never reported carries no duration of its own, and telling a turn that
     died in seconds from one that worked for an hour is exactly what the caller
-    needs in order to decide whether an attempt was spent."""
+    needs in order to decide whether an attempt was spent.
+
+    `cancel`, once set, ends the turn and kills what it started: the beat sets
+    it when the raise is lost."""
     import time
     runner = _harness_runner()
     started = time.monotonic()
     result = runner.run(prompt, worker["profile"], str(cwd), session=session,
-                        environ=os.environ, extra_env={"TASKS_EXECUTION": execution})
+                        environ=os.environ, extra_env={"TASKS_EXECUTION": execution},
+                        cancel=cancel)
     return result, int((time.monotonic() - started) * 1000)
 
 
@@ -8847,42 +8862,96 @@ class _Beat:
     within `lease`, and the sweep every claim runs closes the raise as abandoned
     and puts the task back, as it does any lapsed lease.
 
-    A renewal that fails is tried again sooner rather than at the next beat,
-    and one that cannot reach the store is not waited out here: the next try is
-    the wait. It renews only a raise still open, and once its raise is closed or
-    swept it stops."""
+    A renewal that fails is tried again sooner rather than at the next beat, on
+    a connection of its own, and one that cannot reach the store is not waited
+    out here: the next try is the wait. Each failure is said on stderr and
+    counted in `failures`.
+
+    The beat is kept by the wall clock rather than by a wait's own, because a
+    wait does not count the time a machine sleeps and a lease does. When the
+    store answers that the raise is no longer running, or that its lease has
+    run out, or when the lease the last renewal wrote has run out with no
+    renewal reaching the store since, the raise is lost: anything the turn did
+    from then on would be on a task it no longer holds, with every write it
+    makes refused. The beat says why in `lost`, on stderr, and sets `ended`,
+    which ends the turn."""
 
     def __init__(self, entry, execution: str, cap: int, lease: int, every: int):
         import threading
+        import time
         self.entry, self.execution = entry, execution
         self.cap, self.lease, self.every = int(cap), int(lease), every
+        self.failures = 0
+        self.lost: str | None = None
+        self.ended = threading.Event()
+        # The claim wrote the first lease a moment ago.
+        self._until = time.time() + self.lease
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="tasks-beat", daemon=True)
         self._thread.start()
 
-    def _renew(self) -> bool:
-        """One renewal; whether the raise is still open."""
+    def _renew(self) -> dict:
+        """One renewal: `left`, the seconds the lease it wrote has left, which is
+        None when there was no running raise to renew, and `status`, the raise's
+        status when it was asked."""
         with _connect(self.entry, raising=True) as conn, \
                 _sever_after(conn, min(self.every, 10)), conn.cursor() as cur:
-            cur.execute(f"""update {SCHEMA}.task_executions
-                               set lease_until = least(
-                                   started_at + make_interval(secs => %s),
-                                   now() + make_interval(secs => %s))
-                             where id::text = %s and status = 'running'
-                         returning id""", (self.cap, self.lease, self.execution))
-            still = cur.fetchone() is not None
+            cur.execute(f"""with renewed as (
+                               update {SCHEMA}.task_executions
+                                  set lease_until = least(
+                                      started_at + make_interval(secs => %s),
+                                      now() + make_interval(secs => %s))
+                                where id::text = %s and status = 'running'
+                            returning lease_until)
+                            select (select extract(epoch from lease_until - now())::float8
+                                      from renewed) as left,
+                                   (select status from {SCHEMA}.task_executions
+                                     where id::text = %s) as status""",
+                        (self.cap, self.lease, self.execution, self.execution))
+            row = cur.fetchone()
             conn.commit()
-        return still
+        return row
+
+    def _say(self, said: dict) -> None:
+        try:
+            sys.stderr.write(json.dumps(said, ensure_ascii=False) + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    def _lose(self, why: str) -> None:
+        self.lost = why
+        self._say({"lease_lost": {"execution": self.execution, "why": why}})
+        self.ended.set()
 
     def _run(self) -> None:
-        wait = self.every
-        while not self._stop.wait(wait):
+        import time
+        due = time.time() + self.every
+        while not self._stop.wait(max(0.0, min(1.0, due - time.time()))):
+            if time.time() < due:
+                continue
             try:
-                if not self._renew():
+                row = self._renew()
+            except (Exception, SystemExit) as exc:
+                self.failures += 1
+                why = (str(exc).strip() or type(exc).__name__)[:300]
+                if time.time() >= self._until:
+                    self._lose("its lease ran out with no renewal reaching the store "
+                               f"({self.failures} failed; the last: {why})")
                     return
-                wait = self.every
-            except Exception:
-                wait = max(1, self.every // 6)
+                self._say({"beat_failed": {
+                    "execution": self.execution, "error": why, "failures": self.failures,
+                    "lease_left_seconds": int(self._until - time.time())}})
+                due = time.time() + max(1, self.every // 6)
+                continue
+            if row["left"] is None:
+                self._lose(f"its raise is {row['status'] or 'gone'}, no longer running")
+                return
+            if row["left"] <= 0:
+                self._lose("its lease reached limits.lease_seconds from the claim")
+                return
+            self._until = time.time() + row["left"]
+            due = time.time() + self.every
 
     def stop(self) -> None:
         self._stop.set()
@@ -9049,7 +9118,8 @@ def cmd_run(entry, args: list[str]) -> None:
             _record_run(entry, execution, "claude", resumed["run_ref"])
             result, elapsed_ms = _boot(worker, _continuation(worker, task, resumed),
                                        execution, _project_here(),
-                                       runner.Session.resume(resumed["run_ref"]))
+                                       runner.Session.resume(resumed["run_ref"]),
+                                       beat.ended)
             _after, grown = _state(entry, tid)
             # A resume refused at launch fails in seconds having written nothing, and
             # not for the account's limit: the turn is started again, fresh.
@@ -9064,7 +9134,8 @@ def cmd_run(entry, args: list[str]) -> None:
                 resumed = None
                 _record_run(entry, execution, "claude", pinned)
         if not resumed:
-            result, elapsed_ms = _boot(worker, prompt, execution, _project_here(), session)
+            result, elapsed_ms = _boot(worker, prompt, execution, _project_here(), session,
+                                       beat.ended)
         landing, grew_to = _state(entry, tid)
 
         detail = result.failure.message[:300] if result.failure else ""
@@ -9111,8 +9182,16 @@ def cmd_run(entry, args: list[str]) -> None:
         report.update({k: True for k in marks if k in ("waiting", "handoff")})
         if unspent:
             report["returned_unspent"] = True
+        # The beat ended the turn because the raise was lost, and how many of its
+        # renewals failed on the way: said here, so the service's log names both.
+        lost = f"lease lost: {beat.lost}" if beat.lost else None
+        if beat.lost:
+            report["lease_lost"] = beat.lost
+        if beat.failures:
+            report["beat_failures"] = beat.failures
 
-        said = "; ".join(one for one in (fell_back, detail if not result.ok else None) if one)
+        said = "; ".join(one for one in (lost, fell_back, detail if not result.ok else None)
+                         if one)
         _close(entry, execution, outcome, landed, said or None,
                result.harness, pointer, metrics, tid, report)
         if unspent and landed != "waiting":

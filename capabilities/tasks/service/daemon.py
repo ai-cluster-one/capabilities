@@ -1047,9 +1047,11 @@ class ProjectSlot:
         said = []
         if answer:
             for key in ("claimed", "parked", "returned_unspent", "waiting", "handoff",
-                        "release_refused"):
+                        "lease_lost", "beat_failures", "release_refused"):
                 if answer.get(key) not in (None, False):
-                    said.append(f"{key} {answer[key]}" if key in ("claimed", "release_refused")
+                    said.append(f"{key} {answer[key]}"
+                                if key in ("claimed", "lease_lost", "beat_failures",
+                                           "release_refused")
                                 else key)
             if answer.get("claimed") is None:
                 said.append("claimed nothing")
