@@ -640,7 +640,7 @@ A tagged message stays in context. Suppression happens at the invocation gate, w
 
 ## Control Authority
 
-Service control commands are handled by the daemon before a worker job exists, so they are governed by `control.roles` instead of `authority.roles`. `/status` is safe to expose broadly; `/set` changes per-channel runtime settings; `/reload` validates and reapplies `settings.json` without disconnecting; `/stop` stops queued/running work for the channel.
+Service control commands are handled by the daemon before a worker job exists, so they are governed by `control.roles` instead of `authority.roles`. `/status` is safe to expose broadly: besides the channel's settings it lists the chat replies in flight, numbered, each with its state, sender name and elapsed time and never the message text or an id; `/set` changes per-channel runtime settings; `/reload` validates and reapplies `settings.json` without disconnecting; `/stop` stops queued/running work for the channel, and `/stop N` ends only the reply at position N of the last `/status` list - a reply that finished since is reported rather than shifting N onto another, and delegated jobs are never on that list.
 
 ```json
 {

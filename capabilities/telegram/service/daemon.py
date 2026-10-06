@@ -3515,14 +3515,50 @@ def _set_worker_setting(reg, key, worker, field, value):
     raise ValueError(f"{field} is not supported for worker {worker}")
 
 
-def _status(reg, key):
+IN_FLIGHT_STATES = ("preparing", "queued", "running")
+
+
+def _replies_in_flight(reg, key):
+    """The channel's chat replies not yet finished, oldest message first.
+
+    This order is the numbering `/status` shows and `/stop N` reads back, so it
+    is decided here once. Delegated jobs live in the job register, not in this
+    map, and so are never part of it."""
+    jobs = (reg.get(key, {}).get("jobs") or {}).values()
+    return sorted((job for job in jobs if job.get("status") in IN_FLIGHT_STATES),
+                  key=_job_message_id)
+
+
+def _elapsed_text(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {seconds}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _reply_line(position, job, at):
+    """One numbered line of `/status`. `/status` is safe to hand to anyone in a
+    group, so the line carries no message text and no id: a sender known only by
+    their numeric id is shown as someone."""
+    state = job.get("status")
+    name = str(job.get("sender_name") or "").strip()
+    if not name or name == str(job.get("sender_id") or ""):
+        name = "someone"
+    since = _parse_iso(job.get("started_at") if state == "running" else None) \
+        or _parse_iso(job.get("enqueued_at"))
+    elapsed = f" · {_elapsed_text((at - since).total_seconds())}" if since else ""
+    return f"  {position}. {'running' if state == 'running' else 'waiting'} · {name}{elapsed}"
+
+
+def _status(reg, key, replies=None):
     s = channel_settings(reg, key)
     wm = reg.get(key, {}).get("last_processed_message_id", 0)
-    jobs = (reg.get(key, {}).get("jobs") or {}).values()
-    counts = {}
-    for job in jobs:
-        status = job.get("status") or "unknown"
-        counts[status] = counts.get(status, 0) + 1
+    if replies is None:
+        replies = _replies_in_flight(reg, key)
     worker = s["worker"]
     lines = [
         f"settings [{key}]:",
@@ -3542,8 +3578,12 @@ def _status(reg, key):
         mode = s.get("voice_transcription") or _voice_transcription_mode(group_policy, reg, key)
         lines.append(f"  voice-transcription = {mode}")
     lines.append(f"  watermark = {wm}")
-    if counts:
-        lines.append("  jobs = " + ", ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
+    if replies:
+        at = datetime.now(timezone.utc)
+        lines.append("replies in flight (/stop N ends one):")
+        lines.extend(_reply_line(n, job, at) for n, job in enumerate(replies, 1))
+    else:
+        lines.append("replies in flight: none")
     return "\n".join(lines)
 
 
@@ -6638,6 +6678,40 @@ async def run_session(client):
                 stopped = True
         return "Stopped." if stopped else "Nothing is running right now."
 
+    # The reply ids each channel's last `/status` listed, in the order shown.
+    # `/stop N` reads position N from here rather than from the list as it is
+    # now, so a reply that finished in between cannot shift N onto someone
+    # else's reply. Held in memory only: a restart forgets it, and the next
+    # `/status` shows a fresh list.
+    shown_replies = {}
+
+    def show_status(key):
+        replies = _replies_in_flight(reg, key)
+        shown_replies[key] = [_job_id(job.get("message_id")) for job in replies]
+        return _status(reg, key, replies)
+
+    def stop_one(key, arg):
+        """/stop N: end the one reply at position N of the last `/status` list."""
+        try:
+            position = int(arg)
+        except ValueError:
+            position = 0
+        if position < 1:
+            return "usage: /stop ends everything; /stop N ends reply N from /status"
+        shown = shown_replies.get(key)
+        if shown is None:
+            return "Send /status first, then /stop N with a number from its list."
+        if position > len(shown):
+            return f"There is no {position} in the last /status list."
+        job = _job_map(reg, key).get(shown[position - 1])
+        if not job or job.get("status") not in IN_FLIGHT_STATES:
+            return f"Reply {position} has already finished."
+        run_key = proc_key_for(key, job)
+        if kill_worker_proc(run_key, "/stop"):
+            stopping.add(run_key)
+        mark_job_finished(key, job, "stopped", error="/stop")
+        return f"Stopped {position}."
+
     # --- the job class -------------------------------------------------------
     #
     # The second budget. The dialogue class above answers while the person is
@@ -7486,7 +7560,10 @@ async def run_session(client):
                 reply = _control_denied_reply(cmd, profile)
                 log(f"{key}: denied command {cmd} for {profile['id']} ({profile['role']})")
             elif cmd == "/stop":
-                reply = stop_running(key)
+                args = text.split()[1:]
+                reply = stop_one(key, args[0]) if args else stop_running(key)
+            elif cmd == "/status":
+                reply = show_status(key)
             elif cmd == "/reload":
                 result = reload_runtime_settings()
                 if result["ok"]:

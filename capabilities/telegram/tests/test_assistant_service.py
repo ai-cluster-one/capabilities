@@ -7746,6 +7746,123 @@ class ChannelStopTests(unittest.IsolatedAsyncioTestCase):
             "delegated job, which belongs to no channel, spells its own")
 
 
+    # `/status` lists the chat replies in flight and `/stop N` ends exactly one.
+    # `/status` is documented as safe to hand to anyone in a group, so the list
+    # names no message text and no id. The numbers are positions in the list
+    # last shown, never stored identifiers, and a delegated job is on neither.
+
+    def test_status_numbers_the_replies_in_flight_and_shows_nothing_private(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            reg = daemon.load_register()
+            reg["123"] = {"last_processed_message_id": 0, "jobs": {
+                "12": {"message_id": 12, "status": "queued", "sender_id": "555",
+                       "sender_name": "555", "text": "the secret plan",
+                       "enqueued_at": "2026-01-01T00:00:00+00:00"},
+                "10": {"message_id": 10, "status": "running", "sender_id": "777",
+                       "sender_name": "Group Member", "text": "the other secret",
+                       "enqueued_at": "2026-01-01T00:00:00+00:00",
+                       "started_at": daemon.now()},
+                "9": {"message_id": 9, "status": "done", "sender_id": "777",
+                      "sender_name": "Group Member", "text": "finished long ago"},
+            }}
+
+            status = daemon._status(reg, "123")
+            listed = status.split("replies in flight (/stop N ends one):\n", 1)[1]
+            lines = listed.splitlines()
+            self.assertEqual(len(lines), 2, status)
+            self.assertRegex(lines[0], r"^  1\. running · Group Member · \d+s$")
+            self.assertRegex(lines[1], r"^  2\. waiting · someone · \d+h \d+m$")
+            for private in ("secret", "finished long ago", "555", "777", "jobs ="):
+                self.assertNotIn(private, status)
+
+            reg["123"]["jobs"] = {}
+            self.assertIn("replies in flight: none", daemon._status(reg, "123"))
+
+    async def held_replies(self, daemon, client, message_ids):
+        """Leave one chat reply running per message, each a live process group
+        registered under the key the daemon gave its run."""
+        running = {}
+
+        def worker(_chat, _tail, state=None, procs=None):
+            proc = self.live_stand_in()
+            procs[state["proc_key"]] = proc
+            running[state["proc_key"]] = proc
+            proc.wait()
+            if proc.returncode:
+                raise RuntimeError(f"worker exited {proc.returncode}")
+            return successful_result("answered")
+
+        daemon.WORKERS["stub"] = worker
+        task = asyncio.create_task(daemon.run_session(client))
+        await client.started.wait()
+        for message_id in message_ids:
+            message = Message(message_id, text=f"Assistant, question {message_id}")
+            client.messages.append(message)
+            await client.handler(Event(message))
+        await wait_until(lambda: len(running) == len(message_ids))
+        return task, {key: running[key] for key in
+                      (daemon.worker_proc_key("123", m) for m in message_ids)}
+
+    async def command(self, client, message_id, text):
+        message = Message(message_id, text=text)
+        client.messages.append(message)
+        await client.handler(Event(message))
+        return client.sent[-1]["text"]
+
+    async def test_stop_n_ends_only_the_reply_at_that_position(self):
+        with tempfile.TemporaryDirectory() as td:
+            service_settings = self.stop_settings()
+            service_settings["defaults"].update(max_parallel_dialogue=3, worker_timeout=20)
+            daemon = import_daemon(Path(td), service_settings)
+            client = FakeClient()
+            task, running = await self.held_replies(daemon, client, [130, 131, 132])
+            first, second, third = running.values()
+
+            self.assertIn("Send /status first", await self.command(client, 140, "/stop 2"))
+            for proc in running.values():
+                self.assertIsNone(proc.poll())
+
+            status = await self.command(client, 141, "/status")
+            self.assertIn("  1. running · Test User", status)
+            self.assertIn("  3. running · Test User", status)
+            self.assertNotIn("question", status)
+
+            self.assertEqual(await self.command(client, 142, "/stop 2"), "Stopped 2.")
+            await wait_until(lambda: second.poll() is not None)
+            self.assertIsNone(first.poll())
+            self.assertIsNone(third.poll())
+            jobs = daemon.load_register()["123"]["jobs"]
+            self.assertNotIn("131", jobs)  # a finished reply leaves the map
+            self.assertEqual(jobs["130"]["status"], "running")
+            self.assertEqual(jobs["132"]["status"], "running")
+
+            # The list is the one shown: 3 is still the third reply, and 2 is
+            # reported finished rather than moved onto another reply.
+            self.assertEqual(await self.command(client, 143, "/stop 2"),
+                             "Reply 2 has already finished.")
+            self.assertEqual(await self.command(client, 144, "/stop 4"),
+                             "There is no 4 in the last /status list.")
+            self.assertIn("usage:", await self.command(client, 145, "/stop two"))
+            self.assertIsNone(first.poll())
+            self.assertIsNone(third.poll())
+
+            self.assertEqual(await self.command(client, 146, "/stop"), "Stopped.")
+            await wait_until(lambda: first.poll() is not None and third.poll() is not None)
+            await self.finish(client, task)
+
+    async def test_a_delegated_job_is_not_listed_and_no_number_reaches_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), self.stop_settings())
+            client = FakeClient()
+            task, running = await self.registered_runs(daemon, client, ["job:3d1f9c2e"])
+
+            self.assertIn("replies in flight: none", await self.command(client, 150, "/status"))
+            self.assertEqual(await self.command(client, 151, "/stop 1"),
+                             "There is no 1 in the last /status list.")
+            self.assertIsNone(running["job:3d1f9c2e"].poll())
+            await self.finish(client, task)
+
 class StubVoiceCallSession:
     """The Live session a call runs on, reduced to the handful of things the
     daemon asks of it while answering. Nothing here has an opinion; the point is
