@@ -688,6 +688,105 @@ def test_a_stop_ending_turns_waits_then_ends_them_and_settles_like_a_lapsed_leas
     assert "cut off after 1s" in log and "settled as a lapsed lease" in log
 
 
+def held_raise(entry, schema, conn, capsys, h: Harness, lease: int) -> tuple[str, callable]:
+    """A raise claimed by `lease` seconds, which the next stand-in turn reports
+    as its own claim and every one after it does not; the raise's execution,
+    and how many seconds its lease has left."""
+    tid = add(entry, capsys, "alpha", key="t-held")
+    held = mod._claim(entry, {"type": "alpha", "worker": "alpha", "lease": str(lease)})
+    execution = str(held["execution"]["id"])
+    (h.claims / "alpha.json").write_text(json.dumps(
+        {"task": "t-held", "task_id": tid, "execution": execution, "attempt": 1}))
+
+    def left() -> float:
+        return conn.execute(f"""select extract(epoch from lease_until - now())::float8
+                                  from {schema}.task_executions where id = %s""",
+                            (execution,)).fetchone()[0]
+    return execution, left
+
+
+def swept_by_a_claim(entry) -> list[str]:
+    """What the sweep every claim runs closes; there is no beta work to take."""
+    return mod._claim(entry, {"type": "beta", "worker": "beta", "lease": "60"})["swept"]
+
+
+@needs_store
+def test_the_service_keeps_a_live_turns_lease_and_lets_a_gone_ones_lapse(
+        project, store, capsys, monkeypatch):
+    entry, schema, conn = store
+    monkeypatch.setattr(mod, "_beat_lease", lambda: (1, 3))
+    write_settings(project, "version = 1\npoll_seconds = 3600\n")
+    h = Harness(project, entry)
+    execution, left = held_raise(entry, schema, conn, capsys, h, 3)
+    with h:
+        # The stand-in turn has no beat of its own: only the service renews.
+        turn = h.daemon.spawn("alpha", "work")
+        h.steps(lambda: turn.phase == "working")
+        (h.claims / "alpha.json").unlink()
+        h.settle(7)
+        assert 0 < left() <= 3.5
+        assert execution not in swept_by_a_claim(entry)
+        status = conn.execute(f"select status from {schema}.task_executions where id = %s",
+                              (execution,)).fetchone()[0]
+        assert status == "running"
+        turn.process.kill()
+        turn.process.wait()
+        h.steps(lambda: h.running() == 0)
+        poll_for(lambda: left() < 0, 6)
+        assert execution in swept_by_a_claim(entry)
+    status = conn.execute(f"select status from {schema}.task_executions where id = %s",
+                          (execution,)).fetchone()[0]
+    assert status == "abandoned"
+
+
+@needs_store
+def test_the_service_renews_before_it_starts_a_turn_whose_claim_would_sweep(
+        project, store, capsys, monkeypatch):
+    entry, schema, conn = store
+    # A beat far off, so only the renewal before a turn starts can reach it.
+    monkeypatch.setattr(mod, "_beat_lease", lambda: (3600, 3))
+    write_settings(project, "version = 1\npoll_seconds = 3600\n")
+    h = Harness(project, entry)
+    execution, left = held_raise(entry, schema, conn, capsys, h, 3)
+    with h:
+        turn = h.daemon.spawn("alpha", "work")
+        h.steps(lambda: turn.phase == "working")
+        (h.claims / "alpha.json").unlink()
+        h.settle(0.5)
+        time.sleep(max(0.0, left()) + 0.5)
+        assert left() < 0
+        h.daemon.spawn("beta", "sweep")
+        assert 0 < left() <= 3.5
+        assert execution not in swept_by_a_claim(entry)
+
+
+@needs_store
+def test_a_closed_raise_is_never_revived(project, store, capsys):
+    entry, schema, conn = store
+    tid = add(entry, capsys, "alpha", key="t-closed")
+    held = mod._claim(entry, {"type": "alpha", "worker": "alpha", "lease": "60"})
+    execution = str(held["execution"]["id"])
+    serve(project, entry)
+    host = mod._ServiceHost(entry, None)
+    receipt = {"task": "t-closed", "task_id": tid, "execution": execution, "attempt": 1}
+    conn.execute(f"""update {schema}.task_executions
+                        set status = 'abandoned', ended_at = now(),
+                            lease_until = now() - interval '1 second' where id = %s""",
+                 (execution,))
+    with mod._connect(entry, raising=True) as own:
+        assert host.renew_leases(own, [("alpha", receipt)])["renewed"] == []
+        # A receipt naming another task than the raise's is not that raise's.
+        other = add(entry, capsys, "alpha", key="t-other")
+        again = mod._claim(entry, {"type": "alpha", "worker": "alpha", "lease": "60"})
+        assert host.renew_leases(own, [("alpha", {**receipt, "execution": str(
+            again["execution"]["id"])})])["renewed"] == []
+        assert host.renew_leases(own, [("alpha", {**receipt, "task_id": other, "execution": str(
+            again["execution"]["id"])})])["renewed"] == [str(again["execution"]["id"])]
+    row = conn.execute(f"select status, lease_until < now() from {schema}.task_executions "
+                       "where id = %s", (execution,)).fetchone()
+    assert row == ("abandoned", True)
+
+
 @needs_store
 def test_a_turn_that_finishes_within_the_grace_is_left_to_finish(project, store, capsys):
     entry, schema, conn = store

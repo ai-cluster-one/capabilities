@@ -211,6 +211,13 @@ ONE TURN OF THE CONVEYOR
   is back lands before the lease it renewed last runs out. `claim` by hand
   renews nothing and holds what its `--lease` says.
 
+  A turn the service started has a second beat in the daemon. On the same beat,
+  and again just before it starts any turn, whose claim sweeps lapsed leases,
+  the daemon renews the lease of the raise each of its turns reported, for as
+  long as that turn's process is still the one it recorded, the same way and
+  under the same ceiling, and never one already closed. A turn's lease
+  therefore lapses only once both the turn and the daemon are gone.
+
   A renewal that fails is tried again within seconds on a new connection, and
   each failure is said on the turn's stderr as `{"beat_failed": {...}}`. The
   beat keeps time by whichever of the wall clock and the monotonic clock has
@@ -10018,6 +10025,47 @@ def _service_next_moment(conn) -> float | None:
     return row["seconds"] if row and row["seconds"] is not None else None
 
 
+def _service_renew_leases(conn, held: list) -> dict:
+    """The service's beat: renew the lease of each raise a turn it started still
+    holds, as that turn's own `_Beat` does - to the short lease from the store's
+    now, never past `limits.lease_seconds` from the claim, and never shorter
+    than the lease already written. `held` is (worker, receipt) for each turn
+    whose process is alive, the receipt the turn wrote when it claimed. Only a
+    raise still running, opened by that execution on the task its receipt
+    names, is renewed, so a closed raise is never revived; a turn whose worker
+    is no longer declared whole is left to its own beat. Answers the executions
+    renewed and `every`, how many seconds until the next renewal is due.
+    Written on the service's connection, `conn`."""
+    every, short = _beat_lease()
+    project = _writing_project()
+    declared = _declarations()
+    executions, tasks, caps = [], [], []
+    for worker, receipt in held:
+        found = declared.get(worker)
+        spec = _read_worker(worker, found)[0] if found else None
+        if not spec or not receipt.get("execution") or not receipt.get("task_id"):
+            continue
+        executions.append(str(receipt["execution"]))
+        tasks.append(str(receipt["task_id"]))
+        caps.append(int(spec["limits"]["lease_seconds"]))
+    renewed = []
+    if executions:
+        with conn.cursor() as cur:
+            cur.execute(f"""update {SCHEMA}.task_executions e
+                               set lease_until = greatest(e.lease_until, least(
+                                   e.started_at + make_interval(secs => h.cap),
+                                   now() + make_interval(secs => %s)))
+                              from unnest(%s::text[], %s::text[], %s::int[])
+                                   as h(execution, task_id, cap)
+                             where e.id::text = h.execution and e.task_id::text = h.task_id
+                               and e.status = 'running'
+                               and e.task_id in (select id from {SCHEMA}.tasks
+                                                  where project_id = %s)
+                         returning e.id""", (short, executions, tasks, caps, project))
+            renewed = [str(row["id"]) for row in _rows(cur)]
+    return {"renewed": renewed, "every": every}
+
+
 def _settle_cut_off(conn, execution: str) -> list[str]:
     """Settle the raise of a turn the service ended the way a lapsed lease is
     settled: its lease is made to have passed, and the sweep every claim runs
@@ -10329,6 +10377,9 @@ class _ServiceHost:
 
     def next_moment(self, conn) -> float | None:
         return _service_next_moment(conn)
+
+    def renew_leases(self, conn, held: list) -> dict:
+        return _service_renew_leases(conn, held)
 
     def turn_command(self, worker: str) -> list[str]:
         """Exactly `tasks run <worker> --apply`, by this executable under this

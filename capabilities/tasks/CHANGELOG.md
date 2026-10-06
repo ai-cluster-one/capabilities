@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-06 — The service keeps the lease of every live turn it started
+
+The tasks service now renews the lease of the raise each of its running turns reported, as a second beat beside the turn's own: on the turn's beat, and again just before it starts any turn, since every claim sweeps lapsed leases. It renews only for a turn whose process is still the one it recorded, only a raise still running and opened by that turn's execution on the task it reported, to the same short lease and never past `limits.lease_seconds` from the claim, and never shortens a lease or reopens a closed raise. A turn whose own beat stalls while its process lives therefore keeps its task, and a lease lapses only once both the turn and the service are gone. A renewal that fails is said once in the service log and tried again. Nothing else changes. Run `tasks help` ONE TURN OF THE CONVEYOR for the details.
+
 ## 2026-10-06 — A scan carries each task's runs, their cost and its blockers
 
 Every row of `tasks list` and `tasks search`, with or without `--full`, gains `runs` - `{count, by_worker, cost_usd, without_cost}`: every raise of the task in all and by worker, the sum of the `cost_usd` its raises' metrics recorded (null when none did), and how many recorded none - plus `blocked_by`, the metadata key as stored, and `blocked_by_status`, mapping each name it lists to the status of the task it names, null for a name matching no task. A `tasks watch` line's task row, being a `list` row, carries them too. They are computed in the scan's own query, so a page is still one query. Existing fields are unchanged. Run `tasks help` COLLECTIONS for the fields.

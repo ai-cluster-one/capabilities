@@ -67,6 +67,11 @@ one act that ends running turns is a stop that asks for it: the stop writes an
 end-turns intent beside the pid before it signals, and a daemon that finds a
 fresh one gives its turns their grace, then ends the rest and settles what
 they held.
+
+It is a second heartbeat for its turns. On the beat a turn renews its own
+lease, and again before it starts any turn, whose claim sweeps lapsed leases,
+it renews the lease of the raise each of its live turns reported, so a lease
+lapses only when both the turn and the daemon are gone.
 """
 
 from __future__ import annotations
@@ -538,6 +543,10 @@ class ProjectSlot:
         self.notification_installed: bool | None = None
         self.next_poll = 0.0
         self.next_moment: float | None = None
+        # When the leases of its running turns are next renewed, and why the
+        # last renewal failed.
+        self.next_renew = 0.0
+        self.renew_error: str | None = None
         self.wakes: set[str] = {"start"}
         self.last_wake: dict | None = None
         self.held: set[str] = set()
@@ -869,6 +878,7 @@ class ProjectSlot:
 
     def deadlines(self) -> list[float]:
         return ([self.next_poll] + ([self.next_moment] if self.next_moment else [])
+                + ([self.next_renew] if any(t.claim for t in self.turns.values()) else [])
                 + [r["until"] for r in self.recent.values()])
 
     # --- the pause -------------------------------------------------------------
@@ -958,11 +968,41 @@ class ProjectSlot:
                 started += 1
         return started
 
+    def renew(self, at_once: bool = False) -> None:
+        """The second heartbeat: renew the lease of the raise each running turn
+        holds, on the beat a turn renews its own, so a lease lapses only when
+        both the turn and this daemon are gone. `at_once` renews whether or not
+        the beat is due: every turn's claim sweeps lapsed leases, so one is
+        asked for before every turn starts. Only a turn whose process is still
+        the one recorded, and which has reported its claim, is renewed for."""
+        now = time.monotonic()
+        if not at_once and now < self.next_renew:
+            return
+        held = [(turn.worker, turn.claim) for turn in self.turns.values()
+                if turn.claim and turn.claim.get("execution") and not turn.ended()[0]
+                and (not turn.adopted or turn.still_recorded())]
+        if not held or not self.served():
+            return
+        try:
+            answer = self.ask(lambda conn: self.host.renew_leases(conn, held))
+        except (Exception, SystemExit) as exc:
+            why = _why(exc)
+            if why != self.renew_error:
+                self.log(f"cannot renew the leases of its running turns: {why}")
+            self.renew_error = why
+            self.next_renew = now + RELISTEN_FIRST_SECONDS
+            return
+        if self.renew_error is not None:
+            self.log("renews the leases of its running turns again")
+        self.renew_error = None
+        self.next_renew = now + float(answer["every"])
+
     def spawn(self, worker: str, reason: str, exclude: tuple = ()) -> Turn | None:
         """Start one turn, unless the check taken again just before it refuses
         the project, in which case nothing is started."""
         if not self.served(fresh=True):
             return None
+        self.renew(at_once=True)
         turn_id = uuid.uuid4().hex[:12]
         receipt = self.turns_dir / f"{turn_id}.claim.json"
         output = self.turns_dir / f"{turn_id}.out"
@@ -1305,6 +1345,7 @@ class Dispatcher:
             slot.checked = None
             slot._take_up_pause()
             ended += slot.reap()
+            slot.renew()
         if ended:
             self.cap_freed()
         now = time.monotonic()
