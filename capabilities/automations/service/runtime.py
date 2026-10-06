@@ -7,7 +7,6 @@ import os
 import re
 import shutil
 import signal
-import sqlite3
 import subprocess
 import sys
 import time
@@ -740,7 +739,7 @@ def open_ledger(root: Path, config: dict[str, Any], strict: bool = True):
         raise ConfigError(f"cannot prepare the store: {exc.message}") from exc
     project_id = st._project_id(identity["slug"])
     # An unregistered project reads as empty, never as every project.
-    return st, RunLedger(st._conn, "" if project_id is None else project_id,
+    return st, RunLedger(st, "" if project_id is None else project_id,
                          config["engine"]["environment"])
 
 
@@ -754,13 +753,33 @@ class RunLedger:
     once rather than at each call.
 
     The same class serves a local SQLite store and a coordinated backend; the
-    project scope and query shape do not change with the store deployment."""
+    project scope and query shape do not change with the store deployment. It
+    speaks only through the store's portable surface, so the dialect stays the
+    store's business."""
 
-    def __init__(self, db, project_id: str | None, environment: str):
-        self.db = db
+    def __init__(self, store, project_id: str | None, environment: str):
+        self.store = store
         self.project_id = project_id
         self.environment = environment
         self._scoped = project_id is not None
+        self._in_transaction = False
+
+    def _execute(self, sql: str, params: Sequence[Any] = ()):
+        return self.store._execute(sql, params)
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """One unit of work, joined rather than nested when already inside one,
+        so a write made while a claim holds its lock commits with that claim."""
+        if self._in_transaction:
+            yield
+            return
+        with self.store.transaction():
+            self._in_transaction = True
+            try:
+                yield
+            finally:
+                self._in_transaction = False
 
     # -- the scope, applied once ----------------------------------------------
 
@@ -781,14 +800,17 @@ class RunLedger:
         return [dict(zip(names, row)) for row in cursor.fetchall()]
 
     def _rows(self, predicates: str = "", params: Sequence[Any] = (),
-              order: str = "", limit: int | None = None) -> list[dict[str, Any]]:
+              order: str = "", limit: int | None = None,
+              lock: bool = False) -> list[dict[str, Any]]:
         clause, scope_params = self._where(*([predicates] if predicates else []))
         sql = "SELECT * FROM runs" + clause + (f" ORDER BY {order}" if order else "")
         args = scope_params + list(params)
         if limit is not None:
             sql += " LIMIT ?"
             args.append(limit)
-        return self._dicts(self.db.execute(sql, tuple(args)))
+        if lock and self.store.dialect == "postgres":
+            sql += " FOR UPDATE"
+        return self._dicts(self._execute(sql, args))
 
     # -- reads ----------------------------------------------------------------
 
@@ -803,33 +825,36 @@ class RunLedger:
 
     def counts(self) -> dict[str, int]:
         clause, params = self._where()
-        rows = self.db.execute(
+        rows = self._execute(
             "SELECT status, COUNT(*) AS count FROM runs" + clause + " GROUP BY status",
-            tuple(params)).fetchall()
+            params).fetchall()
         return {row[0]: row[1] for row in rows}
 
     def unfinished(self) -> list[dict[str, Any]]:
         return self._rows("status IN ('starting', 'running')")
 
-    def pending(self) -> list[dict[str, Any]]:
-        return self._rows("status = 'pending'", order="queued_at, id")
+    def pending(self, *, lock: bool = False) -> list[dict[str, Any]]:
+        """The queue in order. `lock` holds the rows for the transaction it is
+        read in: SQLite's write lock already serialises a claim, and Postgres
+        needs the row locks to do the same between two dispatchers."""
+        return self._rows("status = 'pending'", order="queued_at, id", lock=lock)
 
     def has_active(self, slug: str, statuses: Sequence[str]) -> bool:
         marks = ", ".join("?" for _ in statuses)
         clause, params = self._where("automation_slug = ?", f"status IN ({marks})")
-        row = self.db.execute("SELECT 1 FROM runs" + clause + " LIMIT 1",
-                              tuple(params + [slug] + list(statuses))).fetchone()
+        row = self._execute("SELECT 1 FROM runs" + clause + " LIMIT 1",
+                            params + [slug] + list(statuses)).fetchone()
         return row is not None
 
     def count_for(self, slug: str, status: str) -> int:
         clause, params = self._where("automation_slug = ?", "status = ?")
-        return self.db.execute("SELECT COUNT(*) FROM runs" + clause,
-                               tuple(params + [slug, status])).fetchone()[0]
+        return self._execute("SELECT COUNT(*) FROM runs" + clause,
+                             params + [slug, status]).fetchone()[0]
 
     def running(self) -> int:
         clause, params = self._where("status IN ('starting', 'running')")
-        return self.db.execute("SELECT COUNT(*) FROM runs" + clause,
-                               tuple(params)).fetchone()[0]
+        return self._execute("SELECT COUNT(*) FROM runs" + clause,
+                             params).fetchone()[0]
 
     # -- writes ---------------------------------------------------------------
 
@@ -841,42 +866,53 @@ class RunLedger:
 
         `dedupe_key` is unique, so on a shared store this is the whole of the
         mutual exclusion: whichever machine inserts first owns the run and the
-        other is told, rather than discovering the collision by running."""
+        other is told, rather than discovering the collision by running.
+
+        The key is the only conflict the insert treats as someone else's win.
+        Anything else -- a column this store still declares NOT NULL, a
+        reference it cannot satisfy -- is a schema the code no longer matches,
+        and a run that vanishes quietly is worse than one that fails loudly."""
         run_id = uuid.uuid4().hex
         log_path = state_dir / "runs" / f"{run_id}.log"
-        try:
-            self.db.execute(
+        with self.transaction():
+            inserted = self._execute(
                 "INSERT INTO runs (id, project_id, automation_id, automation_slug, "
                 "environment, trigger, scheduled_for, dedupe_key, status, attempt, "
                 "parent_run_id, queued_at, log_path) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?) "
+                "ON CONFLICT (dedupe_key) DO NOTHING",
                 (run_id, self.project_id, automation_uuid, slug,
                  self.environment, trigger, scheduled_for, dedupe_key, attempt,
-                 parent_run_id, iso(), str(log_path)))
-            self.db.commit()
-        except sqlite3.IntegrityError:
-            self.db.rollback()
-            if dedupe_key is not None and self._dedupe_taken(dedupe_key):
-                return None
-            raise
+                 parent_run_id, iso(), str(log_path))).rowcount
+        if not inserted:
+            return None
         return self.get(run_id)
-
-    def _dedupe_taken(self, dedupe_key: str) -> bool:
-        """Whether the key is already on a row, which is the only integrity
-        failure this insert is allowed to treat as someone else's win. Anything
-        else -- a column this store still declares NOT NULL, a reference it
-        cannot satisfy -- is a schema the code no longer matches, and a run that
-        vanishes quietly is worse than one that fails loudly."""
-        row = self.db.execute("SELECT 1 FROM runs WHERE dedupe_key = ? LIMIT 1",
-                              (dedupe_key,)).fetchone()
-        return row is not None
 
     def update(self, run_id: str, **columns: Any) -> None:
         assignments = ", ".join(f"{name} = ?" for name in columns)
         clause, params = self._where("id = ?")
-        self.db.execute(f"UPDATE runs SET {assignments}" + clause,
-                        tuple(list(columns.values()) + params + [run_id]))
-        self.db.commit()
+        with self.transaction():
+            self._execute(f"UPDATE runs SET {assignments}" + clause,
+                          list(columns.values()) + params + [run_id])
+
+    def take(self, run_id: str) -> bool:
+        """Move one pending run to starting, unless another dispatcher did."""
+        clause, params = self._where("id = ?", "status = 'pending'")
+        with self.transaction():
+            return self._execute("UPDATE runs SET status = 'starting'" + clause,
+                                 params + [run_id]).rowcount == 1
+
+
+def _runs_columns(store) -> list[tuple[str, bool]]:
+    """Each column of `runs` with whether it is declared NOT NULL, in order."""
+    if store.dialect == "postgres":
+        rows = store._execute(
+            "SELECT column_name, is_nullable FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'runs' "
+            "ORDER BY ordinal_position").fetchall()
+        return [(row[0], row[1] == "NO") for row in rows]
+    return [(row[1], bool(row[3]))
+            for row in store._execute("PRAGMA table_info(runs)").fetchall()]
 
 
 def runs_schema_defect(store) -> str | None:
@@ -890,11 +926,12 @@ def runs_schema_defect(store) -> str | None:
     outlives the release that relaxed it and no run can be recorded at all.
     """
     try:
-        columns = store._execute("PRAGMA table_info(runs)").fetchall()
+        columns = _runs_columns(store)
     except Exception:
+        if store.dialect == "postgres":
+            store.connection.rollback()
         return None
-    for column in columns:
-        name, notnull = column[1], column[3]
+    for name, notnull in columns:
         if name == "automation_id" and notnull:
             return name
     return None
@@ -922,7 +959,7 @@ def repair_runs_schema(store) -> dict[str, Any]:
         store._execute("ALTER TABLE runs RENAME TO runs_pre_repair")
         for step in create:
             store._execute(step.format(**store._ddl_subs()))
-        columns = [row[1] for row in store._execute("PRAGMA table_info(runs)").fetchall()]
+        columns = [name for name, _ in _runs_columns(store)]
         names = ", ".join(columns)
         store._execute(f"INSERT INTO runs ({names}) SELECT {names} FROM runs_pre_repair")
         moved = store._execute("SELECT COUNT(*) FROM runs").fetchone()[0]
@@ -1072,7 +1109,6 @@ class Daemon:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "runs").mkdir(parents=True, exist_ok=True)
         self.store, self.runs = open_ledger(self.root, self.config)
-        self.db = self.store._conn
         self._uuids = {
             item["id"]: _automation_uuid(self.store, self.runs.project_id, item["id"])
             for item in self.config["automations"]
@@ -1164,12 +1200,11 @@ class Daemon:
         """Take the next pending run, under a lock so two dispatchers cannot
         take the same one. Every question inside asks the ledger, so the answers
         are about this project even where the table is shared."""
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
+        with self.runs.transaction():
+            pending = self.runs.pending(lock=True)
             if self.runs.running() >= self.config["engine"]["max_parallel"]:
-                self.db.commit()
                 return None
-            for row in self.runs.pending():
+            for row in pending:
                 slug = row["automation_slug"]
                 item = self.by_id.get(slug)
                 if item is None or not applies(item, self.config["engine"]["environment"]):
@@ -1180,17 +1215,9 @@ class Daemon:
                 if self.runs.count_for(slug, "starting") + \
                         self.runs.count_for(slug, "running") >= item["max_parallel"]:
                     continue
-                updated = self.db.execute(
-                    "UPDATE runs SET status = 'starting' WHERE id = ? AND status = 'pending'",
-                    (row["id"],)).rowcount
-                if updated:
-                    self.db.commit()
+                if self.runs.take(row["id"]):
                     return row
-            self.db.commit()
             return None
-        except Exception:
-            self.db.rollback()
-            raise
 
     def dispatch(self) -> None:
         while len(self.children) < self.config["engine"]["max_parallel"]:

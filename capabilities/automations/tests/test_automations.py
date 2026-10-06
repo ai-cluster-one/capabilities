@@ -1697,7 +1697,7 @@ def _ledger(st, project_id, environment="production"):
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
     import runtime as rt
-    return rt.RunLedger(st._conn, project_id, environment)
+    return rt.RunLedger(st, project_id, environment)
 
 
 def test_the_ledger_answers_only_about_its_own_project(tmp_path):
@@ -1828,7 +1828,7 @@ def test_a_run_the_schema_cannot_hold_fails_loudly(tmp_path):
     import sqlite3 as _sqlite3
     st, rt = _stale_store(tmp_path)
     project_id = st._project_id("marvin")
-    ledger = rt.RunLedger(st._conn, project_id, "production")
+    ledger = rt.RunLedger(st, project_id, "production")
     with pytest.raises(_sqlite3.IntegrityError):
         ledger.claim(None, "nightly", tmp_path, trigger="manual")
     st.close()
@@ -1839,7 +1839,7 @@ def test_a_dedupe_collision_still_yields_rather_than_raising(tmp_path):
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
     import runtime as rt
-    ledger = rt.RunLedger(st._conn, project_id, "production")
+    ledger = rt.RunLedger(st, project_id, "production")
     dedupe = "marvin:production:nightly:2026-08-23T03:00:00+00:00"
     assert ledger.claim(automation_id, "nightly", tmp_path,
                         trigger="schedule", dedupe_key=dedupe) is not None
