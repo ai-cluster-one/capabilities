@@ -63,6 +63,21 @@ hooks:
 
 Here `scripts/resource-free.py` reads the task from stdin, exits 0 when the resource the work needs is free, and otherwise prints the moment to try again, `2026-01-05T09:00:00+00:00`, and exits 75. `tasks help` HOOKS states the whole contract: the environment, the timeouts and where every held-back task is reported.
 
+## When a task cannot move: escalation
+
+A worker can hold a task back for ever - a `before` hook that keeps answering "not now", a turn that keeps ending without moving it - and without a rule above the workers such a task stands still with nobody named to move it. A project names that rule in `capabilities/tasks/conveyor.toml`, beside its workers:
+
+```toml
+escalate_to = ["supervisor", "owner"]
+stall_after = "6h"
+```
+
+`escalate_to` is the chain a stuck task goes along, in order, and its last name is a person - a name no worker file of the project has. Every name before it is a worker that is switched on and takes the waiting tasks assigned to it, as the supervisor does. `stall_after` is how long a task may be refused before it is escalated, 6h when unsaid.
+
+The claim decides it, for the tasks the claiming worker would take. A task its `before` hook holds back after it has been refused longer than `stall_after` is escalated instead of deferred again; a task whose raises in place - the raises since it last changed status or assignee, apart from those that never started for the account's limit - have reached the worker's `limits.attempts` is escalated instead of claimed. Escalating moves it to `waiting` on the next name in the chain, with one trail entry by `tasks:scan` saying why, since when it stood where it was, and how many raises it had there. If that name cannot move it either, the next escalation goes on, ending at the person. A task assigned to a person is never escalated this way.
+
+Waiting is not refusal: a task behind other work in a busy lane is never escalated, and neither is one in a paused lane, whose wait `tasks service status` shows instead. With a chain, `attempts` counts raises in place, so a pipeline whose every stage is a raise that moves the task keeps its count low and 3 is enough; without a chain nothing here applies and every worker runs as it did. `tasks help` ESCALATION states the contract.
+
 ## Shipped workers and project files
 
 The capability ships two workers. `default` takes every `todo` task of a type no project worker file names in `takes` or `on_request`, so a project with no workers of its own still has its queue worked; its body treats each task as an assignment given within the project's own authority, to act on inside what the project's doctrine lets an unattended turn do. `supervisor` ships switched off; `tasks guide loops` explains its role.
@@ -85,7 +100,7 @@ A worker that is off still owns the types it names: `default` never takes them, 
 
 ## How doctor judges workers
 
-`tasks doctor`, once it has proved the store, reads every worker this project can run and refuses with exit 6, naming every problem in one pass, when any of them is wrong. It refuses a file it cannot read, a key nothing reads, an enabled worker that takes nothing, an enabled worker with an empty body, a profile the library refuses, a profile knob carrying `${`, a profile with no timeout when the worker sets no `lease_seconds`, and a profile or routine the worker names that is not there. It refuses two enabled workers whose filters could select the same task, because a task is taken by exactly one enabled worker; filters are kept apart by status, type or assignee, or by tag sets where neither contains the other.
+`tasks doctor`, once it has proved the store, reads every worker this project can run and refuses with exit 6, naming every problem in one pass, when any of them is wrong. It refuses a file it cannot read, a key nothing reads, an enabled worker that takes nothing, an enabled worker with an empty body, a profile the library refuses, a profile knob carrying `${`, a profile with no timeout when the worker sets no `lease_seconds`, and a profile or routine the worker names that is not there. It refuses two enabled workers whose filters could select the same task, because a task is taken by exactly one enabled worker; filters are kept apart by status, type or assignee, or by tag sets where neither contains the other. It refuses an escalation chain whose last name is a worker, that names before its end a name no worker here has, or a worker that is off or takes no waiting task assigned to it, and it warns a project with enabled workers and no chain.
 
 Two judgements reach past `doctor` into `run`. A worker naming a missing profile or routine has nothing whole to give a turn, so `run` parks the task it takes, saying what is missing, without starting a turn and without spending an attempt. While any project worker file's types cannot be read at all, `default` takes nothing, because it cannot know which types are someone else's.
 
@@ -101,4 +116,4 @@ Stopping or restarting the service leaves running turns running: each settles it
 
 Run `tasks service pause` to hold the conveyor without stopping the daemon, and `tasks service resume` to let it go again. While the pause holds, the daemon starts no new turn; turns already running are not touched and finish on their own, and the daemon goes on polling and listening, so it is ready the moment the pause lifts. Name workers to pause or resume only those lanes, `tasks service pause --reason "<why>" <worker>...`; with no name the verb covers every lane. A name that is not a lane of the service is refused.
 
-The pause is runtime state kept beside the daemon's pid, not a setting in `service/config.toml`. It needs no reload, moves no fingerprint, holds across a restart of the daemon, and can be set or lifted while no daemon runs. `tasks service status` shows which lanes it holds, its reason, when it was set and by whom, and the service log records every pause and resume. `tasks service doctor` reports it and still answers ok, so a supervisor that restarts a service on a failing probe leaves a paused one running. A turn started by hand with `tasks run <worker> --apply` is not held by the pause.
+The pause is runtime state kept beside the daemon's pid, not a setting in `service/config.toml`. It needs no reload, moves no fingerprint, holds across a restart of the daemon, and can be set or lifted while no daemon runs. `tasks service status` shows which lanes it holds, its reason, when it was set and by whom, and for each held lane its oldest due task and how long that has waited, since a paused lane escalates nothing; the service log records every pause and resume. `tasks service doctor` reports it and still answers ok, so a supervisor that restarts a service on a failing probe leaves a paused one running. A turn started by hand with `tasks run <worker> --apply` is not held by the pause.

@@ -1108,6 +1108,11 @@ class ProjectSlot:
                 if held.get("said"):
                     words += f", said {str(held['said'])[:200]}"
                 said.append(words)
+            # Each task the claim escalated rather than took, and to whom.
+            for moved in answer.get("escalated") or []:
+                if isinstance(moved, dict):
+                    said.append(f"escalated {moved.get('task')} to {moved.get('to')}: "
+                                f"{str(moved.get('why'))[:200]}")
             after = answer.get("after_hook")
             if isinstance(after, dict) and after.get("exit") != 0:
                 said.append(f"after hook failed ({after.get('why')})"

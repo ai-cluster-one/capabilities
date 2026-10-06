@@ -167,9 +167,11 @@ ONE TURN OF THE CONVEYOR
   that parks a task does not spend it. A task taken from `waiting` stays there
   while it is held: its hold is read from that raise rather than set as a
   pickup, which would end the wait. At the ceiling the task is handed back to a
-  person instead of dispatched again. A task parked because its worker names a
-  routine or a profile that is not there is marked `missing` and does not spend
-  it either.
+  person instead of dispatched again; in a project that sets an escalation
+  chain, attempts count raises in place instead and the claim escalates the
+  task rather than take it, as ESCALATION states. A task parked because its
+  worker names a routine or a profile that is not there is marked `missing`
+  and does not spend it either.
 
   Every raise leaves exactly one entry. A turn that wrote nothing gets one
   saying so, because a task picked up that left no trace reads exactly like one
@@ -248,12 +250,15 @@ WORKERS
     profile: implementation       # a callva-harness-runner profile, by name
     routines: [development, review]   # optional; the first is the procedure
     limits:                       # optional, every one of them
-      attempts: 3                 # raises that did work before it is parked
+      attempts: 3                 # raises that did work before it is parked;
+                                  # with an escalation chain, raises in place
+                                  # before it is escalated - see ESCALATION
       lease_seconds: 11400        # default: the profile's timeout plus 600
       hold_seconds_on_exhaustion: 1200
       idle_failure_seconds: 120   # under this, having written nothing, a failed
                                   # turn is one that never started
-    park_hint: one sentence added to the handback at the `attempts` ceiling
+    park_hint: one sentence added to the handback, or the escalation, at the
+                                  `attempts` ceiling
     hooks:                        # optional, either or both - see HOOKS
       before: scripts/gate.py --strict    # asked about each task before a claim
       after: scripts/follow.sh            # told how each settled raise ended
@@ -425,7 +430,9 @@ HOOKS
   service's log line; without --apply a deferral is named and not set. A task
   named with --key that its hook holds back is refused with that reason. When
   every task is held back, `run --apply` claims nothing and says why, and the
-  service waits for its next poll.
+  service waits for its next poll. In a project that sets an escalation chain,
+  a task held back after it has been refused longer than `stall_after` is
+  escalated instead, and a deferral is then not set; ESCALATION states it.
 
   `after` is told how a raise ended, once it is settled, whatever the outcome:
   the task as it stands then on stdin, and TASKS_EXECUTION, TASKS_OUTCOME (the
@@ -434,6 +441,62 @@ HOOKS
   the raise; an exit other than 0, a timeout or a command that cannot be
   started is noted as `after_hook` on the raise's metrics, in the answer and in
   the service's log line.
+
+ESCALATION
+  A project names, in `capabilities/tasks/conveyor.toml` beside its workers,
+  whom a task that cannot move goes over to. The claim reads it, so it holds
+  with or without the service:
+
+    escalate_to = ["supervisor", "owner"]   # in order; the last is a person
+    stall_after = "6h"                      # 45m, 6h, 2d or seconds; 6h unsaid
+
+  A name that is no worker file of the project is a person. Every name but the
+  last must be a worker that is switched on and takes waiting tasks assigned
+  to it; the last must be a person. Any other key is refused, and a file that
+  cannot be read refuses `run` with exit 6 `conveyor_invalid`. `doctor` refuses
+  a chain naming a name before its end that is no worker here, ending at a
+  worker, or naming a worker that is off or takes no waiting task assigned to
+  it, and shows the settings as `escalation`; a project with enabled workers
+  and no chain is warned. A project without the file escalates nothing, and
+  every rule above runs as it always did.
+
+  Where a task stands is derived from what the store already records, never
+  stored: its place is its status and assignee, in place since the latest move
+  of either - a raise taking it into `in_progress` and putting it back where it
+  was moves nothing - or since it was created. It has been refused since the
+  later of that and the moment the latest pickup a person, a turn or an
+  exhaustion hold appointed passed; a hook's deferral appoints nothing. Its
+  raises in place are the raises that started after its place began and have
+  ended, except those marked `exhausted`; a raise that moved the task started
+  before its place began, so it is never counted.
+
+  A worker's claim (`run`, by hand or by the service) escalates a task it was
+  about to take, instead of taking it, in two cases:
+
+    its `before` hook holds the task back - a deferral or a skip - when it has
+    been refused longer than `stall_after`; the deferral is not set
+    its raises in place have reached the worker's `limits.attempts`
+
+  Only the claim of the task's own taker escalates it, and only when the hook
+  holds it at that claim: a task waiting its turn behind other work in its
+  lane is not refused and is never escalated. A paused lane claims nothing, so
+  it escalates nothing either; `service status` shows how long its oldest due
+  task has waited. A task assigned to a person is never escalated by these
+  rules. With a chain, `limits.attempts` counts raises in place and the
+  whole-life count that parks a task is not applied.
+
+  To escalate is to move the task: to `waiting`, its pickup let go, assigned
+  to the name after its assignee in the chain, or the chain's first name when
+  its assignee is not in it, with one trail entry by actor `tasks:scan`:
+  whom from and to, why - the hook's last stdout line, or the attempts and the
+  worker's `park_hint` - since when it stood in place, and its raises in place.
+  The moves are rows in its history by the same actor. When the name it went
+  to cannot move it under the same rules, the next escalation goes on to the
+  next name, ending at the person. `run` reports each move under `escalated`
+  - the task, `from`, `to`, `why`, `in_place_since` and `raises_in_place` - and
+  so does the service's log line; without --apply it is named under
+  `would_escalate` and not made. A task named with --key that its claim
+  escalates is refused with exit 6 saying so, after the move.
 
 SERVICE
   tasks service init [--force]    write capabilities/tasks/service/config.toml
@@ -460,7 +523,9 @@ SERVICE
                                   lift the pause, on every lane or on the named
                                   lanes
   tasks service status            the lanes, the running turns, the pause, the
-                                  next wake and the store connections
+                                  next wake and the store connections; for each
+                                  paused lane, `pause.waited`: its oldest due
+                                  task and how long it has waited
   tasks service logs [--tail 100] the end of the service log
   tasks service join              put this project on the machine service's list
   tasks service leave             take this project off it
@@ -6997,6 +7062,10 @@ def _claim(entry, opts: dict) -> dict:
         lease = min(lease, int(opts["beat"]))
     project = _writing_project()
     where, params = _selection(opts, project, _zone(entry))
+    # What a worker's claim escalates by, when its project sets a chain; a claim
+    # by hand, or in a project without one, escalates nothing.
+    escalation = opts.get("escalation")
+    escalated: list = []
     with _connect(entry) as conn, conn.cursor() as cur:
         swept = _sweep_leases(cur, project)
         # Before the selection, so a wait that ended is work this same call can
@@ -7024,20 +7093,41 @@ def _claim(entry, opts: dict) -> dict:
             refused = _key_refusal(task, due, opts, _open_execution(cur, tid))
             if refused:
                 _die(6, "conflict", *refused)
+            moved = _escalated_instead(cur, escalation, task, project)
+            if moved:
+                conn.commit()
+                _die(6, "conflict",
+                     f"{opts['key']} was escalated to {moved['to']} instead of claimed: "
+                     f"{moved['why']}",
+                     f"it is over to {moved['to']} now; `{NAME} show {opts['key']}` "
+                     "carries the entry")
             rows = [task]
             passed = []
         else:
             passed = _held_over(cur, opts, project, _zone(entry))
-            cur.execute(f"""select * from {SCHEMA}.tasks{where}
-                            order by pickup_at asc nulls last, created_at asc
-                            limit 1 for update skip locked""", params)
-            rows = _rows(cur)
+            while True:
+                cur.execute(f"""select * from {SCHEMA}.tasks{where}
+                                order by pickup_at asc nulls last, created_at asc
+                                limit 1 for update skip locked""", params)
+                rows = _rows(cur)
+                moved = rows and _escalated_instead(cur, escalation, rows[0], project)
+                if not moved:
+                    break
+                # Escalated rather than taken: the claim goes on to the next
+                # task this ask selects, as it would past one somebody else took.
+                escalated.append(moved)
+                where, params = _selection(
+                    {**opts, "not_ids": [*(opts.get("not_ids") or []),
+                                         *(one["task_id"] for one in escalated)]},
+                    project, _zone(entry))
             if not rows:
                 conn.commit()
                 answer = {"claimed": None, "swept": [str(r["id"]) for r in swept],
                           "returned": [_address(t) for t in returned]}
                 if passed:
                     answer["passed_over"] = passed
+                if escalated:
+                    answer["escalated"] = escalated
                 return answer
         before = rows[0]
         tid = str(before["id"])
@@ -7104,9 +7194,26 @@ def _claim(entry, opts: dict) -> dict:
                   "returned": [_address(t) for t in returned]}
         if passed:
             answer["passed_over"] = passed
+        if escalated:
+            answer["escalated"] = escalated
         if opts.get("run"):
             answer["previous"] = previous
         return answer
+
+
+def _escalated_instead(cur, escalation: dict | None, task: dict,
+                       project: str) -> dict | None:
+    """Inside a claim, escalate the task it was about to take when its raises
+    in place have reached the worker's attempts, and answer the move; None
+    takes it as always."""
+    if not escalation:
+        return None
+    facts = _in_place(cur, str(task["id"]))
+    why = _attempts_reason(escalation, task, facts)
+    target = _escalation_target(escalation, task.get("assignee")) if why else None
+    if target is None:
+        return None
+    return _escalate(cur, task, target, why, facts, project)
 
 
 def cmd_release(entry, args: list[str]) -> None:
@@ -7295,6 +7402,333 @@ _TAKE_KEYS = ("status", "type", "assignee", "tags")
 _TAKE_STATUSES = ("todo", "waiting")
 
 _WORKER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+
+# The project's conveyor settings: whom a task that cannot move is escalated
+# to, and how long a task may be refused before it is. One file beside the
+# workers, read by the claim, so the escalation holds with or without the
+# service. A project without it escalates nothing and runs exactly as before.
+_CONVEYOR_FILE = "conveyor.toml"
+_CONVEYOR_KEYS = ("escalate_to", "stall_after")
+_STALL_DEFAULT = 6 * 3600
+# Who an escalation is recorded as: the claim scan, not the worker whose claim
+# ran it, because the move is the capability's rule and no turn decided it.
+SCAN_ACTOR = "tasks:scan"
+
+
+def _conveyor_path() -> Path:
+    return _envelope_dir() / _CONVEYOR_FILE
+
+
+def _seconds_of(value) -> int | None:
+    """A duration written as 45m, 6h, 2d, or whole seconds; None when it is not
+    one, or not above zero."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    match = re.fullmatch(r"(\d+)([smhd]?)", str(value).strip().lower())
+    if not match or int(match.group(1)) <= 0:
+        return None
+    return int(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+
+
+def _read_conveyor() -> tuple[dict | None, list[str]]:
+    """The conveyor settings as the file states them, and every way it is not
+    readable. None and no problems when the project has no such file."""
+    import tomllib
+    path = _conveyor_path()
+    if not path.is_file():
+        return None, []
+    try:
+        raw = tomllib.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        return None, [f"{path} could not be read: {exc}"]
+    problems = [f"{path}: it names {key!r}, which nothing reads"
+                for key in sorted(set(raw) - set(_CONVEYOR_KEYS))]
+    chain = raw.get("escalate_to")
+    if chain is None:
+        if "stall_after" in raw:
+            problems.append(f"{path}: `stall_after` is set and `escalate_to` is not, so "
+                            "nothing would ever be escalated")
+        return None, problems or [f"{path}: it sets no `escalate_to`"]
+    if (not isinstance(chain, list) or not chain
+            or not all(isinstance(one, str) and one.strip() for one in chain)):
+        problems.append(f"{path}: `escalate_to` is a list of names, its last a person")
+        return None, problems
+    chain = [one.strip() for one in chain]
+    for twice in sorted({one for one in chain if chain.count(one) > 1}):
+        problems.append(f"{path}: `escalate_to` names {twice!r} twice")
+    stall = _STALL_DEFAULT
+    if "stall_after" in raw:
+        stall = _seconds_of(raw["stall_after"])
+        if stall is None:
+            problems.append(f"{path}: `stall_after` is a duration above zero, written "
+                            "as 45m, 6h, 2d or whole seconds")
+    if problems:
+        return None, problems
+    return {"path": str(path), "escalate_to": chain, "stall_after": stall}, []
+
+
+def _conveyor() -> dict | None:
+    """The conveyor settings a claim decides by, or None when the project sets
+    none. A file that cannot be read refuses the run, as a worker file does:
+    the claim cannot tell what it is asked to escalate."""
+    settings, problems = _read_conveyor()
+    if problems:
+        _die(6, "conveyor_invalid", problems[0],
+             f"`{NAME} doctor` reports every problem; `{NAME} help` ESCALATION states "
+             "the file")
+    return settings
+
+
+def _escalation_of(worker: dict) -> dict | None:
+    """What this worker's claim escalates by: the project's chain and ceiling,
+    its own attempts and park hint, and which names are workers here - every
+    other name is a person. None when the project sets no chain."""
+    settings = _conveyor()
+    if settings is None:
+        return None
+    return {**settings, "worker": worker["name"],
+            "attempts": worker["limits"]["attempts"],
+            "park_hint": worker.get("park_hint") or "",
+            "workers": sorted(_declarations())}
+
+
+def _conveyor_report() -> tuple[dict | None, list[str], str | None]:
+    """The escalation settings as `doctor` shows them, every problem with them,
+    and the warning a project with enabled workers and no chain gets.
+
+    Every name but the last must be a worker here that is switched on and takes
+    waiting tasks assigned to it, or a task escalated to it would stand still
+    again; the last must be a person, a name that is no worker file, because a
+    chain ending at a worker can end at nobody."""
+    settings, problems = _read_conveyor()
+    declared = _declarations()
+    if settings is None:
+        if problems:
+            return None, problems, None
+        enabled = []
+        for name, found in sorted(declared.items()):
+            worker, wrong = _read_worker(name, found)
+            if worker and worker["enabled"]:
+                enabled.append(name)
+        warning = None
+        if enabled:
+            warning = (f"no escalation chain is set, so a task its worker keeps holding "
+                       f"back or cannot finish stands still with nobody named to move "
+                       f"it; set escalate_to in {_conveyor_path()} (`{NAME} help` "
+                       "ESCALATION)")
+        return None, [], warning
+    chain = settings["escalate_to"]
+    where = settings["path"]
+    for at, name in enumerate(chain):
+        last = at == len(chain) - 1
+        if last:
+            if name in declared:
+                problems.append(f"{where}: `escalate_to` ends at {name!r}, which is a worker "
+                                "here; its last entry is a person, a name no worker file has")
+            continue
+        if name not in declared:
+            problems.append(f"{where}: `escalate_to` names {name!r}, which is no worker "
+                            "here; only its last entry may be a person, and one before "
+                            "the end leaves the names after it unreached")
+            continue
+        worker, wrong = _read_worker(name, declared[name])
+        if wrong or worker is None:
+            problems.append(f"{where}: `escalate_to` names worker {name!r}, which cannot "
+                            "be read")
+        elif not worker["enabled"]:
+            problems.append(f"{where}: `escalate_to` names worker {name!r}, which is "
+                            "switched off, so a task escalated to it would stand still")
+        elif not any("waiting" in one["status"]
+                     and (not one["assignee"] or name in one["assignee"])
+                     for one in worker["filters"]):
+            problems.append(f"{where}: `escalate_to` names worker {name!r}, which takes no "
+                            f"waiting task assigned to it; give it a filter "
+                            f"`{{status: [waiting], assignee: [{name}]}}`")
+    block = {"file": where, "escalate_to": chain, "stall_after": settings["stall_after"]}
+    return block, problems, None
+
+
+def _is_person(name, escalation: dict) -> bool:
+    """A name that is no worker file of this project. The chain ends at one, and
+    a task assigned to one is never escalated by the clock or by attempts."""
+    name = (name or "").strip()
+    return bool(name) and name not in escalation["workers"]
+
+
+def _escalation_target(escalation: dict, assignee) -> str | None:
+    """Whom a task on `assignee` is escalated to: the name after it in the
+    chain, or the chain's first name when it is not in the chain. None past the
+    end."""
+    chain = escalation["escalate_to"]
+    assignee = (assignee or "").strip()
+    if assignee in chain:
+        at = chain.index(assignee) + 1
+        return chain[at] if at < len(chain) else None
+    return chain[0]
+
+
+def _in_place_sql() -> str:
+    """The derived facts about where a task stands, as one lateral select over
+    the task `t`, from the moves and raises already recorded:
+
+    place_since   the latest move of its status or assignee, else its creation.
+                  A status row into `in_progress` is claim bookkeeping, and so
+                  is a row out of it back to the status the raise found, which
+                  the row's raise names, or else the latest move into it;
+    refused_since the later of place_since and the moment the latest appointed
+                  pickup passed - a pickup a person, a turn or an exhaustion
+                  hold set, each of which writes a row; a hook's deferral
+                  writes none and is not an appointment;
+    raises_in_place  raises that started after place_since and have ended,
+                  except those marked `exhausted`. A raise that moved the task
+                  set place_since after its own start, so it is never counted."""
+    changes, raises = f"{SCHEMA}.task_changes", f"{SCHEMA}.task_executions"
+    place = f"""coalesce((select max(c.changed_at) from {changes} c
+                           where c.task_id = t.id
+                             and (c.field = 'assignee'
+                                  or (c.field = 'status' and c.new_value <> 'in_progress'
+                                      and (c.old_value is distinct from 'in_progress'
+                                           or c.new_value is distinct from (
+                                               select p.old_value from {changes} p
+                                                where p.task_id = c.task_id
+                                                  and p.field = 'status'
+                                                  and p.new_value = 'in_progress'
+                                                  and case when c.execution_id is null
+                                                           then p.changed_at <= c.changed_at
+                                                           else p.execution_id = c.execution_id
+                                                      end
+                                                order by p.changed_at desc limit 1))))),
+                         t.created_at)"""
+    appointed = f"""(select nullif(c.new_value, '')::timestamptz from {changes} c
+                      where c.task_id = t.id and c.field = 'pickup'
+                      order by c.changed_at desc limit 1)"""
+    return f"""cross join lateral (select {place} as place_since, {appointed} as appointed) pl
+               cross join lateral (
+                 select greatest(pl.place_since,
+                                 case when pl.appointed <= now() then pl.appointed end)
+                          as refused_since,
+                        (select count(*) from {raises} e
+                          where e.task_id = t.id and e.status <> 'running'
+                            and e.started_at > pl.place_since
+                            and not (e.metrics @> '{{"exhausted": true}}'::jsonb))
+                          as raises_in_place) rf"""
+
+
+def _in_place(cur, tid: str) -> dict:
+    """place_since, refused_since, how many seconds it has been refused by the
+    store's clock, and raises_in_place, for one task."""
+    cur.execute(f"""select pl.place_since, rf.refused_since, rf.raises_in_place,
+                           extract(epoch from now() - rf.refused_since)::bigint
+                             as refused_seconds
+                      from {SCHEMA}.tasks t {_in_place_sql()}
+                     where t.id::text = %s""", (tid,))
+    return _rows(cur)[0]
+
+
+def _stamp(moment) -> str:
+    return moment.isoformat() if hasattr(moment, "isoformat") else str(moment)
+
+
+def _span(seconds) -> str:
+    """A number of seconds in the largest unit that says it plainly."""
+    seconds = int(seconds or 0)
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size and seconds % size == 0:
+            return f"{seconds // size}{unit}"
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    if seconds >= 60:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def _attempts_reason(escalation: dict, task: dict, facts: dict) -> str | None:
+    """Why a claim escalates this task instead of taking it, by attempts: its
+    raises in place have reached the worker's `limits.attempts`."""
+    if _is_person(task.get("assignee"), escalation):
+        return None
+    if int(facts["raises_in_place"]) < escalation["attempts"]:
+        return None
+    why = (f"raised {facts['raises_in_place']} times in place without moving it, and "
+           f"worker {escalation['worker']!r} allows {escalation['attempts']} attempts")
+    if escalation["park_hint"]:
+        why = f"{why}. {escalation['park_hint'].rstrip('.')}"
+    return why
+
+
+def _escalate(cur, task: dict, target: str, why: str, facts: dict,
+              project: str) -> dict:
+    """Move a task that cannot move over to `target`: waiting on that name, its
+    pickup let go, a spent blocked_by dropped as any wait drops one, and one
+    entry by the claim scan saying why, since when it stood in place, and its
+    raises in place."""
+    tid = str(task["id"])
+    before = _task_row(cur, tid)
+    extra = ", metadata = metadata - 'blocked_by'" if _spent_blockers(cur, before) else ""
+    cur.execute(f"""update {SCHEMA}.tasks
+                       set status = 'waiting', assignee = %s, pickup_at = null{extra},
+                           updated_at = now()
+                     where id = %s returning *""", (target, tid))
+    after = _rows(cur)[0]
+    _record_moves(cur, tid, before, after, actor=SCAN_ACTOR, origin=project)
+    held_by = (before.get("assignee") or "").strip()
+    place, refused = _stamp(facts["place_since"]), _stamp(facts["refused_since"])
+    said = (f"Escalated from {held_by or 'nobody'} to {target}: {why}. In place since "
+            f"{place}" + (f", due since {refused}" if refused != place else "")
+            + f"; {facts['raises_in_place']} raise(s) in place.")
+    _add_activity(cur, tid, said, SCAN_ACTOR)
+    return {"task": _address(after), "task_id": tid, "from": held_by or None,
+            "to": target, "why": why, "in_place_since": place,
+            "raises_in_place": int(facts["raises_in_place"])}
+
+
+def _escalate_held(entry, escalation: dict, task: dict, said: str | None,
+                   verdict: str, *, write: bool) -> dict | None:
+    """Escalate a task its worker's `before` hook just held back, when it has
+    been refused longer than `stall_after`; None leaves the hold as it is.
+
+    Only the hold of a claim by the task's own taker leads here, so time a task
+    spends waiting its turn in a busy lane escalates nothing. Written only while
+    the task still stands where the hook saw it - same status and assignee,
+    due, no raise open on it - and without `write` the escalation is answered
+    and not made."""
+    if _is_person(task.get("assignee"), escalation):
+        return None
+    target = _escalation_target(escalation, task.get("assignee"))
+    if target is None:
+        return None
+    project = _writing_project()
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"""select * from {SCHEMA}.tasks
+                         where id::text = %s and status = %s
+                           and assignee is not distinct from %s
+                           and (pickup_at is null or pickup_at <= now())
+                           and {_open_raise_clause(False)}
+                         {'for update skip locked' if write else ''}""",
+                    (str(task["id"]), task["status"], task.get("assignee")))
+        rows = _rows(cur)
+        if not rows:
+            conn.commit()
+            return None
+        facts = _in_place(cur, str(task["id"]))
+        if int(facts["refused_seconds"] or 0) <= escalation["stall_after"]:
+            conn.commit()
+            return None
+        why = (f"worker {escalation['worker']!r}'s before hook held it back ({verdict}) "
+               f"after it had been refused for {_span(facts['refused_seconds'])}, past the "
+               f"{_span(escalation['stall_after'])} ceiling; the hook said: "
+               + (said or "nothing"))
+        if not write:
+            conn.commit()
+            return {"task": _address(task), "task_id": str(task["id"]),
+                    "from": (task.get("assignee") or "").strip() or None, "to": target,
+                    "why": why, "in_place_since": _stamp(facts["place_since"]),
+                    "raises_in_place": int(facts["raises_in_place"])}
+        moved = _escalate(cur, rows[0], target, why, facts, project)
+        conn.commit()
+    return moved
 
 
 def _harness_runner():
@@ -8315,6 +8749,8 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
         base["bind"] = worker["writes"]
     if exclude:
         base["not_ids"] = list(exclude)
+    if worker.get("escalation"):
+        base["escalation"] = worker["escalation"]
     before = (worker.get("hooks") or {}).get("before")
     if key:
         swept, returned = [], []
@@ -8327,6 +8763,11 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
             # A task the claim would refuse is refused in the claim's own words,
             # and its hook is never asked about it.
             passed = _ask_before(entry, worker, task, write=True) if task else None
+            if passed and passed["verdict"] == "escalate":
+                _die(6, "conflict", f"{key} was escalated to {passed['to']} instead of "
+                     f"claimed: {passed['why']}",
+                     f"it is over to {passed['to']} now; `{NAME} show {key}` carries "
+                     "the entry")
             if passed:
                 _die(6, "conflict", f"{key} was not claimed: {_passed_words(passed)}",
                      f"the before hook of worker {worker['name']!r} decides when "
@@ -8342,15 +8783,19 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
     swept: list = []
     passed: list = []
     answer: dict = {"claimed": None, "swept": [], "returned": []}
+    escalated: list = []
     for ask in _asks(worker):
         answer = _claim(entry, {**base, **ask})
         swept += answer.get("swept") or []
         passed = _passed_merged(passed, answer.pop("passed_over", None))
+        escalated += answer.pop("escalated", None) or []
         if answer.get("claimed") is not None:
             break
     answer["swept"] = swept
     if passed:
         answer["passed_over"] = passed
+    if escalated:
+        answer["escalated"] = escalated
     return answer
 
 
@@ -8416,6 +8861,7 @@ def _take_past_hooks(entry, worker: dict, base: dict, exclude: tuple) -> dict:
             passed = _passed_merged(passed, _held_over(cur, {**ask, "not_ids": asked},
                                                        project, tz))
     answer: dict = {"claimed": None}
+    escalated: list = []
     while True:
         with _connect(entry) as conn, conn.cursor() as cur:
             ask, task = _next_candidate(cur, worker, project, tz, asked)
@@ -8425,17 +8871,23 @@ def _take_past_hooks(entry, worker: dict, base: dict, exclude: tuple) -> dict:
         tid = str(task["id"])
         asked.append(tid)
         held = _ask_before(entry, worker, task, write=True)
+        if held and held["verdict"] == "escalate":
+            escalated.append(held["escalated"])
+            continue
         if held:
             passed.append(held)
             continue
         answer = _claim(entry, {**base, **ask, "only_id": tid})
         swept += answer.get("swept") or []
         passed = _passed_merged(passed, answer.pop("passed_over", None))
+        escalated += answer.pop("escalated", None) or []
         if answer.get("claimed") is not None:
             break
     answer["swept"] = swept
     answer["returned"] = returned + (answer.get("returned") or [])
     answer["passed_over"] = passed
+    if escalated:
+        answer["escalated"] = escalated
     return answer
 
 
@@ -8451,6 +8903,7 @@ def _would_take(entry, worker: dict, key: str | None, exclude: tuple = (),
     import contextlib
     tz = _zone(entry)
     project = _writing_project()
+    conn_given, would = conn, []
     held = contextlib.nullcontext(conn) if conn is not None else _connect(entry)
     with held as conn, conn.cursor() as cur:
         take = None
@@ -8464,10 +8917,39 @@ def _would_take(entry, worker: dict, key: str | None, exclude: tuple = (),
                                                    **_key_types(worker)},
                                         _open_execution(cur, tid)) is None
                     else None)
+            moved = (take is not None and conn_given is None and worker.get("escalation")
+                     and _would_escalate(cur, worker["escalation"], take))
+            if moved:
+                would.append(moved)
+                take = None
         else:
             _ask, take = _next_candidate(cur, worker, project, tz, exclude)
-    return {"worker": worker["name"], "would_claim": _address(take) if take else None,
-            "applied": False}
+            # Asked by `run` without --apply, never by the service: a task the
+            # claim would escalate rather than take is named, and the next one
+            # is looked for. To the service either is work for the lane.
+            skipped = list(exclude)
+            while take is not None and conn_given is None and worker.get("escalation"):
+                moved = _would_escalate(cur, worker["escalation"], take)
+                if not moved:
+                    break
+                would.append(moved)
+                skipped.append(str(take["id"]))
+                _ask, take = _next_candidate(cur, worker, project, tz, skipped)
+    answer = {"worker": worker["name"], "would_claim": _address(take) if take else None,
+              "applied": False}
+    if would:
+        answer["would_escalate"] = would
+    return answer
+
+
+def _would_escalate(cur, escalation: dict, task: dict) -> dict | None:
+    """What `_escalated_instead` would do with this task, writing nothing."""
+    facts = _in_place(cur, str(task["id"]))
+    why = _attempts_reason(escalation, task, facts)
+    target = _escalation_target(escalation, task.get("assignee")) if why else None
+    if target is None:
+        return None
+    return {"task": _address(task), "task_id": str(task["id"]), "to": target, "why": why}
 
 
 def _would_take_past_hooks(entry, worker: dict, key: str | None,
@@ -8477,14 +8959,30 @@ def _would_take_past_hooks(entry, worker: dict, key: str | None,
     is reported rather than written - a moment it defers to is named and not
     set."""
     passed: list = []
+    would: list = []
     take = None
-    if key:
-        task = _key_candidate(entry, worker, key)
-        held = _ask_before(entry, worker, task, write=False) if task else None
+
+    def judged(task: dict) -> dict | None:
+        """The task when the claim would take it; otherwise what it would do
+        instead is recorded and None is answered."""
+        held = _ask_before(entry, worker, task, write=False)
+        if held and held["verdict"] == "escalate":
+            would.append({k: held["escalated"][k] for k in ("task", "task_id", "to", "why")})
+            return None
         if held:
             passed.append(held)
-        else:
-            take = task
+            return None
+        if worker.get("escalation"):
+            with _connect(entry) as conn, conn.cursor() as cur:
+                moved = _would_escalate(cur, worker["escalation"], task)
+            if moved:
+                would.append(moved)
+                return None
+        return task
+
+    if key:
+        task = _key_candidate(entry, worker, key)
+        take = judged(task) if task else None
     else:
         project, tz = _writing_project(), _zone(entry)
         asked = list(exclude)
@@ -8494,13 +8992,12 @@ def _would_take_past_hooks(entry, worker: dict, key: str | None,
             if task is None:
                 break
             asked.append(str(task["id"]))
-            held = _ask_before(entry, worker, task, write=False)
-            if held:
-                passed.append(held)
-            else:
-                take = task
-    return {"worker": worker["name"], "would_claim": _address(take) if take else None,
-            "applied": False, "passed_over": passed}
+            take = judged(task)
+    answer = {"worker": worker["name"], "would_claim": _address(take) if take else None,
+              "applied": False, "passed_over": passed}
+    if would:
+        answer["would_escalate"] = would
+    return answer
 
 
 # --- A worker's hooks --------------------------------------------------------
@@ -8606,17 +9103,27 @@ def _ask_before(entry, worker: dict, task: dict, *, write: bool) -> dict | None:
     if ran["exit"] == 0:
         return None
     held = {"task": _address(task), "task_id": str(task["id"])}
-    if ran["exit"] == _HOOK_DEFER:
-        moment = _hook_moment(ran["said"], _zone(entry))
-        if moment:
-            held.update(verdict="defer", until=moment, said=ran["said"])
-            if write:
-                held["pickup_set"] = _defer(entry, worker, held["task_id"], moment)
-            return held
+    moment = (_hook_moment(ran["said"], _zone(entry)) if ran["exit"] == _HOOK_DEFER
+              else None)
+    if moment:
+        held.update(verdict="defer", until=moment, said=ran["said"])
+    elif ran["exit"] == _HOOK_DEFER:
         held.update(verdict="skip", why=f"exited {_HOOK_DEFER} without a moment on its "
                     "last line", said=ran["said"])
-        return held
-    held.update(verdict="skip", why=ran["why"], said=ran["said"])
+    else:
+        held.update(verdict="skip", why=ran["why"], said=ran["said"])
+    # Held back by its own taker's claim: past the project's ceiling it is
+    # escalated instead, and the deferral is not written.
+    if worker.get("escalation"):
+        how = (f"deferred to {moment}" if moment else f"skipped: {held['why']}")
+        moved = _escalate_held(entry, worker["escalation"], task, ran["said"], how,
+                               write=write)
+        if moved:
+            return {"task": held["task"], "task_id": held["task_id"],
+                    "verdict": "escalate", "to": moved["to"], "why": moved["why"],
+                    "said": ran["said"], "escalated": moved}
+    if moment and write:
+        held["pickup_set"] = _defer(entry, worker, held["task_id"], moment)
     return held
 
 
@@ -9098,6 +9605,10 @@ def cmd_run(entry, args: list[str]) -> None:
         _die(6, "input", "run needs a worker",
              f"{NAME} run <worker> [--key KEY] [--apply]")
     worker = _worker(opts["_loose"][0])
+    # The project's chain and ceiling, when it sets them: with them the claim
+    # escalates what cannot move and counts attempts in place, and without them
+    # this run is what it always was.
+    worker["escalation"] = _escalation_of(worker)
     if not opts.get("apply"):
         # Nothing is claimed without --apply, so this says which task a claim
         # would find rather than pretending to have taken it.
@@ -9125,6 +9636,8 @@ def cmd_run(entry, args: list[str]) -> None:
     # anything was claimed after it, so a run that claimed nothing says why.
     if "passed_over" in held:
         report["passed_over"] = held["passed_over"]
+    if held.get("escalated"):
+        report["escalated"] = held["escalated"]
     if held.get("claimed") is None:
         _emit(report)
         return
@@ -9164,7 +9677,10 @@ def cmd_run(entry, args: list[str]) -> None:
             return
 
         # Counted after the claim, because the claim is what made this raise exist.
-        if _spent_attempts(entry, tid) > worker["limits"]["attempts"]:
+        # A project with an escalation chain counts attempts in place instead,
+        # in the claim, which escalated the task rather than take it.
+        if (worker["escalation"] is None
+                and _spent_attempts(entry, tid) > worker["limits"]["attempts"]):
             # The project's own sentence goes back with this park alone: it speaks to
             # work that was tried, and what a person about to read a task the work kept
             # failing on needs to check is the project's knowledge, not this capability's.
@@ -11329,6 +11845,50 @@ def _service_status(module) -> dict:
     return answer
 
 
+def _paused_waits(answer: dict, wanted: str | None) -> None:
+    """Add to the pause, for each lane it holds, how long that lane's oldest due
+    task has waited: a paused lane escalates nothing, so this is where the wait
+    shows. Asked of the store only while some lane is held; a store that cannot
+    be asked is said in the block, and the rest of the status stands."""
+    pause = answer.get("pause") or {}
+    held = pause.get("holding") or []
+    if not held:
+        return
+    waits: dict = {}
+    try:
+        _conn_id, entry = _service_connection(wanted)
+        project, tz = _writing_project(), _zone(entry)
+        with _connect(entry, raising=True, waiting=False) as conn, conn.cursor() as cur:
+            for name in held:
+                waits[name] = _oldest_due(cur, _worker(name), project, tz)
+    except (Refusal, SystemExit, Exception) as exc:  # the status answers regardless
+        pause["waited_error"] = (exc.message if isinstance(exc, Refusal)
+                                 else f"the store could not be asked: {exc}")
+    pause["waited"] = waits
+
+
+def _oldest_due(cur, worker: dict, project: str, tz) -> dict:
+    """The due task this worker's claim would select that has been due
+    longest, and since when, by the same derivation an escalation reads."""
+    oldest = None
+    for ask in _asks(worker):
+        where, params = _selection(ask, project, tz)
+        cur.execute(f"""select t.id, t.unique_key, rf.refused_since,
+                               extract(epoch from now() - rf.refused_since)::bigint
+                                 as waited_seconds
+                          from {SCHEMA}.tasks t {_in_place_sql()}
+                         where t.id in (select id from {SCHEMA}.tasks{where})
+                         order by rf.refused_since asc limit 1""", params)
+        found = _rows(cur)
+        if found and (oldest is None or found[0]["waited_seconds"] > oldest["waited_seconds"]):
+            oldest = found[0]
+    if oldest is None:
+        return {"task": None}
+    return {"task": _address(oldest), "due_since": _stamp(oldest["refused_since"]),
+            "waited_seconds": int(oldest["waited_seconds"]),
+            "waited": _span(oldest["waited_seconds"])}
+
+
 def _workers_of(lanes) -> list[str] | None:
     if not isinstance(lanes, list):
         return None
@@ -11833,7 +12393,9 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
         cmd_service_stop(rest)
     elif verb == "status":
         _flags(rest, ())
-        _emit(_service_status(_service_module()))
+        answer = _service_status(_service_module())
+        _paused_waits(answer, wanted)
+        _emit(answer)
     elif verb == "pause":
         cmd_service_pause(rest)
     elif verb == "resume":
@@ -12159,12 +12721,23 @@ def cmd_doctor(wanted: str | None) -> None:
              + "; ".join(broken),
              "a worker file's shape is this capability's contract; `tasks help` "
              "states it")
+    escalation, wrong, unescalated = _conveyor_report()
+    if wrong:
+        _die(6, "conveyor_invalid",
+             f"{len(wrong)} problem(s) in the escalation settings: " + "; ".join(wrong),
+             f"`{NAME} help` ESCALATION states the file")
     answer = {"ok": True, "connection": conn_id, "server": server,
-              "schema": schema, "tables": tables, "workers": workers}
+              "schema": schema, "tables": tables, "workers": workers,
+              "escalation": escalation}
+    warnings = []
     if behind:
         answer["behind"] = behind
-        answer["warning"] = (f"schema {schema} is behind this version: "
-                             f"{', '.join(behind)}; {closes}")
+        warnings.append(f"schema {schema} is behind this version: "
+                        f"{', '.join(behind)}; {closes}")
+    if unescalated:
+        warnings.append(unescalated)
+    if warnings:
+        answer["warning"] = "; ".join(warnings)
     _emit(answer)
 
 
