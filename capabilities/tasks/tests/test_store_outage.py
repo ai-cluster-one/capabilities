@@ -457,6 +457,52 @@ def test_a_turn_whose_lease_runs_out_unrenewed_is_ended(lab, relay, tmp_path):
     assert '"beat_failed"' in said.read_text()
 
 
+@needs_store
+def test_a_turn_that_ends_cleanly_never_says_it_lost_its_lease(lab):
+    """The after hook outlasts several beats once the turn has closed its own
+    raise. The beat stopped with the turn, so nothing finds that raise closed
+    and calls it a loss."""
+    schema = schema_of(lab)
+    lab["env"]["TASKS_STORE_RETRY_SECONDS"] = "3"   # a beat every 2s, a lease of 9s
+    base.write_worker(lab["project"], "alpha",
+                      "takes: [alpha]\nprofile: plain\nhooks:\n  after: /bin/sleep 5")
+    add(lab, "t-clean")
+    turn = start_run(lab)
+    out, err = turn.communicate(timeout=120)
+    assert turn.returncode == 0, err
+    report = json.loads(out)
+    assert report["claimed"] == "t-clean" and "lease_lost" not in report, report
+    assert '"lease_lost"' not in err, err
+    settled = raise_of(schema, "t-clean")
+    assert (settled["status"], settled["task_status"]) == ("ok", "complete")
+
+
+@pytest.mark.parametrize("step", [-60, 60])
+def test_a_wall_clock_step_neither_holds_the_beat_nor_ends_the_turn(monkeypatch, step):
+    """The wall clock is stepped back, as a clock set by hand or by a time
+    server is, and forward, as it reads after a machine wakes. Renewals go on
+    at least at the beat's own pace either way, and the turn is not ended."""
+    renewed: list[float] = []
+
+    class Counted(mod._Beat):
+        def _renew(self) -> dict:
+            renewed.append(time.monotonic())
+            return {"left": 12.0, "status": "running"}
+
+    real = time.time
+    beat = Counted(None, "e-clock", 3600, 12, 2)
+    try:
+        poll_for(lambda: renewed or None, 10)
+        monkeypatch.setattr(time, "time", lambda: real() + step)
+        stepped = time.monotonic()
+        time.sleep(5)
+    finally:
+        beat.stop()
+    after = [at for at in renewed if at > stepped]
+    assert len(after) >= 2, (step, renewed, stepped)
+    assert beat.lost is None and not beat.ended.is_set()
+
+
 # --- A raise left open -------------------------------------------------------
 
 @needs_store

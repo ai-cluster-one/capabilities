@@ -213,8 +213,9 @@ ONE TURN OF THE CONVEYOR
 
   A renewal that fails is tried again within seconds on a new connection, and
   each failure is said on the turn's stderr as `{"beat_failed": {...}}`. The
-  beat keeps time by the wall clock, so a machine that slept renews when it
-  wakes. When the store answers that the raise is no longer running or its
+  beat keeps time by whichever of the wall clock and the monotonic clock has
+  moved further, so a machine that slept renews when it wakes and a wall clock
+  set back holds back no renewal. When the store answers that the raise is no longer running or its
   lease has run out, or the lease the last renewal wrote runs out with no
   renewal reaching the store, the raise is lost: `run` ends the turn at once
   and kills what it started rather than let it work on a task it no longer
@@ -8867,8 +8868,10 @@ class _Beat:
     out here: the next try is the wait. Each failure is said on stderr and
     counted in `failures`.
 
-    The beat is kept by the wall clock rather than by a wait's own, because a
-    wait does not count the time a machine sleeps and a lease does. When the
+    The beat keeps time by whichever of the wall clock and the monotonic clock
+    has moved further: a wait does not count the time a machine sleeps and a
+    lease does, and a wall clock stepped back would hold the beat for the length
+    of the step. When the
     store answers that the raise is no longer running, or that its lease has
     run out, or when the lease the last renewal wrote has run out with no
     renewal reaching the store since, the raise is lost: anything the turn did
@@ -8878,17 +8881,28 @@ class _Beat:
 
     def __init__(self, entry, execution: str, cap: int, lease: int, every: int):
         import threading
-        import time
         self.entry, self.execution = entry, execution
         self.cap, self.lease, self.every = int(cap), int(lease), every
         self.failures = 0
         self.lost: str | None = None
         self.ended = threading.Event()
         # The claim wrote the first lease a moment ago.
-        self._until = time.time() + self.lease
+        self._until = self._at(self.lease)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="tasks-beat", daemon=True)
         self._thread.start()
+
+    @staticmethod
+    def _at(seconds: float) -> tuple[float, float]:
+        """A moment `seconds` from now, on both clocks."""
+        import time
+        return time.time() + seconds, time.monotonic() + seconds
+
+    @staticmethod
+    def _left(moment: tuple[float, float]) -> float:
+        """Seconds until `moment` by the clock that has moved further."""
+        import time
+        return min(moment[0] - time.time(), moment[1] - time.monotonic())
 
     def _renew(self) -> dict:
         """One renewal: `left`, the seconds the lease it wrote has left, which is
@@ -8925,33 +8939,38 @@ class _Beat:
         self.ended.set()
 
     def _run(self) -> None:
-        import time
-        due = time.time() + self.every
-        while not self._stop.wait(max(0.0, min(1.0, due - time.time()))):
-            if time.time() < due:
+        due = self._at(self.every)
+        while not self._stop.wait(max(0.0, min(1.0, self._left(due)))):
+            if self._left(due) > 0:
                 continue
             try:
                 row = self._renew()
             except (Exception, SystemExit) as exc:
+                if self._stop.is_set():
+                    return
                 self.failures += 1
                 why = (str(exc).strip() or type(exc).__name__)[:300]
-                if time.time() >= self._until:
+                if self._left(self._until) <= 0:
                     self._lose("its lease ran out with no renewal reaching the store "
                                f"({self.failures} failed; the last: {why})")
                     return
                 self._say({"beat_failed": {
                     "execution": self.execution, "error": why, "failures": self.failures,
-                    "lease_left_seconds": int(self._until - time.time())}})
-                due = time.time() + max(1, self.every // 6)
+                    "lease_left_seconds": int(self._left(self._until))}})
+                due = self._at(max(1, self.every // 6))
                 continue
+            # Stopped while the renewal was out: the turn is over and its raise may
+            # already be closed by the turn itself, which is not a loss.
+            if self._stop.is_set():
+                return
             if row["left"] is None:
                 self._lose(f"its raise is {row['status'] or 'gone'}, no longer running")
                 return
             if row["left"] <= 0:
                 self._lose("its lease reached limits.lease_seconds from the claim")
                 return
-            self._until = time.time() + row["left"]
-            due = time.time() + self.every
+            self._until = self._at(row["left"])
+            due = self._at(self.every)
 
     def stop(self) -> None:
         self._stop.set()
@@ -9184,6 +9203,9 @@ def cmd_run(entry, args: list[str]) -> None:
             report["returned_unspent"] = True
         # The beat ended the turn because the raise was lost, and how many of its
         # renewals failed on the way: said here, so the service's log names both.
+        # The turn is over, so the beat stops before the raise is closed: a renewal
+        # falling due after the close would find it closed and call that a loss.
+        beat.stop()
         lost = f"lease lost: {beat.lost}" if beat.lost else None
         if beat.lost:
             report["lease_lost"] = beat.lost
