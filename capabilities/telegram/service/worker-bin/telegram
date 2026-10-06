@@ -55,19 +55,43 @@ def parse_progress_send(argv):
     return chat, text, deliver
 
 
+def parse_declared_progress(argv):
+    """The worker-progress grammar: progress TEXT, exactly.
+
+    A send is a note or a message depending on a flag the daemon reads; this
+    verb is the worker saying outright that the line is a note about the work.
+    It names no chat because a note has no destination of its own: it goes to
+    whoever is holding the work - the chat's progress pipeline, or the assistant
+    on a call - and never reaches a person as written."""
+    args = list(argv[1:])
+    if len(args) != 2 or args[1].startswith("--"):
+        fail("worker_progress_invalid",
+             "worker progress syntax is: telegram progress <one text argument>",
+             "quote the complete line; progress takes no flags and no chat")
+    message = args[1]
+    return sys.stdin.read().strip() if message == "-" else message.strip()
+
+
 def write_progress(argv):
-    if argv[1:2] != ["send"]:
+    verb = argv[1:2]
+    if verb not in (["send"], ["progress"]):
         return False
     outbox = os.environ.get("TELEGRAM_PROGRESS_OUTBOX")
     if not outbox:
+        if verb == ["progress"]:
+            fail("worker_progress_unavailable",
+                 "telegram progress is a worker verb and this run has no progress channel",
+                 "it exists only inside a turn the assistant service started")
         return False
-    parsed = parse_progress_send(argv)
-    chat, text, deliver = parsed
     allowed_chat, allowed_topic, allowed_connection = worker_scope()
     if not allowed_chat:
         fail("worker_authority_missing",
              "the daemon did not provide an authorized Telegram chat scope",
              exit_code=4)
+    if verb == ["progress"]:
+        chat, text, deliver = allowed_chat, parse_declared_progress(argv), False
+    else:
+        chat, text, deliver = parse_progress_send(argv)
     if chat in ("current", "$current"):
         chat = allowed_chat
     if str(chat) != allowed_chat:
@@ -378,7 +402,7 @@ def main():
     # A send on the receiving account is a progress/final-delivery write owned by
     # the daemon. A send on a granted second connection is a real capability
     # action; the CLI applies the role grant and the connection write gate.
-    if not cross_connection and write_progress(sys.argv):
+    if (not cross_connection or sys.argv[1:2] == ["progress"]) and write_progress(sys.argv):
         return 0
     enforce_job_scope(sys.argv)
     pin_jobs_to_service_project(sys.argv)

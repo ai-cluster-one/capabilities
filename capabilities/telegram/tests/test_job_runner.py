@@ -1482,6 +1482,24 @@ class StreamProgressJobTests(unittest.IsolatedAsyncioTestCase):
                 td, worker, progress_after=3600, progress_from_stream=True)
         self.assertEqual(sent, ["looking at the ledger"])
 
+    async def test_a_declared_message_is_sent_rather_than_folded(self):
+        """A line the worker declared a message is not a note about the work,
+        so it does not wait in the window for a fold that would rank it."""
+        def worker(_chat, _tail, state=None, _procs=None):
+            state["on_worker_line"](json.dumps(
+                codex_command("item_2", "pwd", "started")))
+            with open(state["progress_outbox"], "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"text": "looking at the ledger"}) + "\n")
+                fh.write(json.dumps({"text": "https://example/ledger",
+                                     "deliver": True}) + "\n")
+            time.sleep(2.0)
+            return successful_result("the ledger is reconciled")
+        with tempfile.TemporaryDirectory() as td:
+            sent = await self.run_codex_job(
+                td, worker, progress_after=3600, progress_from_stream=True)
+        self.assertCountEqual(sent, ["looking at the ledger",
+                                     "https://example/ledger"])
+
     async def test_with_the_setting_off_the_stream_reaches_no_chat(self):
         worker = self.streaming_worker([
             ([codex_command("item_2", "pwd && ls", "started"),

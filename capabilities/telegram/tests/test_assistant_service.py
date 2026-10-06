@@ -1160,6 +1160,37 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                                 for line in daemon._test_logs))
             await self.stop_session(client, task)
 
+    async def test_a_declared_message_is_not_held_by_the_window(self):
+        """`--deliver` is the worker declaring a message the chat is meant to
+        keep, so the window that paces progress has no say over it."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td), settings(progress_after=3600, worker_timeout=20))
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                outbox = Path(state["progress_outbox"])
+                with outbox.open("a", encoding="utf-8") as fh:
+                    for record in ({"text": "step 0"}, {"text": "step 1"},
+                                   {"text": "https://example/x", "deliver": True}):
+                        fh.write(json.dumps(record) + "\n")
+                        fh.flush()
+                        time.sleep(1.2)
+                return successful_result("all done")
+
+            daemon.WORKERS["stub"] = worker
+            message = Message(95, text="Assistant, find the link")
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(
+                lambda: daemon.load_register()["123"]["last_processed_message_id"] == 95,
+                timeout=20)
+
+            self.assertEqual([item["text"] for item in client.sent],
+                             ["step 0", "https://example/x", "all done"])
+            await self.stop_session(client, task)
+
     async def test_an_unthrottled_window_relays_every_progress_line(self):
         """`progress_after = 0` is the setting turned off: today's behaviour."""
         with tempfile.TemporaryDirectory() as td:
@@ -1616,7 +1647,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             await wait_until(lambda: len(client.sent) == 2)
 
             command = (
-                f'{daemon.WORKER_BIN / "telegram"} send -200 "<one short line>"')
+                f'{daemon.WORKER_BIN / "telegram"} progress "<one short line>"')
             self.assertIn(f"Progress command: {command}", captured["prompt"])
             self.assertNotIn("`telegram send <chat_id> <text>`", captured["prompt"])
             self.assertEqual(captured["env"]["TELEGRAM_AUTHORIZED_TOPIC_ID"], "10")
@@ -2880,6 +2911,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                              "running someunknowntool")
             # The worker reporting its own progress is not progress.
             self.assertIsNone(stage("/bin/zsh -lc 'telegram send 42 \"looking\"'"))
+            self.assertIsNone(stage("/bin/zsh -lc 'telegram progress \"looking\"'"))
 
             self.assertEqual(
                 daemon.codex_event_stage(json.dumps({"type": "thread.started"})),
@@ -2895,7 +2927,9 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             daemon = import_daemon(Path(td), settings())
             preamble = daemon.voice_task_preamble(4242, 10)
 
-        self.assertIn("telegram send 4242", preamble)
+        self.assertIn('telegram progress "<one short line>"', preamble)
+        # A message for the caller is still the declared send, and only that.
+        self.assertIn('telegram send 4242 "<the exact thing>" --deliver', preamble)
         self.assertIn("every 10 seconds", preamble)
         self.assertIn("go to the assistant on the call, not to the caller",
                       preamble)
@@ -5621,7 +5655,7 @@ class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_progress_channel_survives_an_exclusive_prompt(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            command = f'{daemon.WORKER_BIN / "telegram"} send 5'
+            command = f'{daemon.WORKER_BIN / "telegram"} progress "'
 
             for state in ({"chat_id": 5},
                           {"chat_id": 5, "context_exclusive": True,
@@ -5671,7 +5705,7 @@ class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
                 "chat_id": 5, "context_exclusive": True,
                 "channel_context": "Report before you go deep."})
 
-            self.assertIn(f'Progress command: {shim} send 5 "<one short line>"',
+            self.assertIn(f'Progress command: {shim} progress "<one short line>"',
                           prompt)
             self.assertIn("Report before you go deep.", prompt)
             self.assertNotIn("{{", prompt)

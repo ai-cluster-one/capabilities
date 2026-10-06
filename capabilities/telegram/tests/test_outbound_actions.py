@@ -805,6 +805,75 @@ class OutboundActionsTests(unittest.TestCase):
                     shim.main()
         self.assertEqual(stopped.exception.code, 4)
 
+    def _outbox_records(self, outbox):
+        return [json.loads(line) for line in Path(outbox).read_text().splitlines()]
+
+    def test_a_declared_progress_line_is_queued_as_progress(self):
+        """`progress` is the worker saying outright that a line is a note about
+        the work: it reaches the outbox pinned to the authorized scope, never as
+        a message, and Telegram itself is not reached."""
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._cross_connection_env(tmpdir)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                calls = self._run_shim(
+                    shim, env, ["telegram", "progress", "found twelve calls"])
+            records = self._outbox_records(env["TELEGRAM_PROGRESS_OUTBOX"])
+        self.assertEqual(calls, [])
+        self.assertEqual(json.loads(out.getvalue())["queued"],
+                         "telegram-service-progress")
+        self.assertEqual(
+            [(r["chat"], r["connection"], r["text"], r["deliver"]) for r in records],
+            [("-1001", "assistant", "found twelve calls", False)])
+
+    def test_send_keeps_its_meaning_beside_the_declared_verbs(self):
+        """A plain send is still read as progress and `--deliver` is still the
+        declared message, so a prompt written before `progress` existed works."""
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._cross_connection_env(tmpdir)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self._run_shim(shim, env, ["telegram", "send", "-1001", "a note"])
+                self._run_shim(shim, env, ["telegram", "send", "-1001",
+                                           "https://example/x", "--deliver"])
+            records = self._outbox_records(env["TELEGRAM_PROGRESS_OUTBOX"])
+        self.assertEqual([(r["text"], r["deliver"]) for r in records],
+                         [("a note", False), ("https://example/x", True)])
+
+    def test_a_declared_progress_line_takes_no_chat_and_no_flags(self):
+        """A note has no destination of its own, so nothing on the line can
+        give it one - not a chat, not `--deliver`, not another connection."""
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._cross_connection_env(tmpdir, grant=["principal"])
+            for argv in (["telegram", "progress", "-1001", "a note"],
+                         ["telegram", "progress", "a note", "--deliver"],
+                         ["telegram", "progress", "--connection", "principal", "a note"],
+                         ["telegram", "progress"]):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit, msg=argv) as stopped:
+                        calls = self._run_shim(shim, env, argv)
+                self.assertNotEqual(stopped.exception.code, 0, argv)
+            self.assertFalse(Path(env["TELEGRAM_PROGRESS_OUTBOX"]).exists())
+
+    def test_a_declared_progress_line_without_a_progress_channel_is_refused(self):
+        """Outside a turn the service started there is nobody to hold the note,
+        and the real CLI has no such verb to hand it to."""
+        shim = import_worker_shim()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = self._cross_connection_env(tmpdir)
+            env.pop("TELEGRAM_PROGRESS_OUTBOX")
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(sys, "argv", ["telegram", "progress", "note"]), \
+                    contextlib.redirect_stderr(err):
+                os.environ.pop("TELEGRAM_PROGRESS_OUTBOX", None)
+                with self.assertRaises(SystemExit):
+                    shim.main()
+        self.assertEqual(json.loads(err.getvalue())["error"]["code"],
+                         "worker_progress_unavailable")
+
     # --- the CLI owns the cross-connection policy -------------------------
 
     def _service_context(self, grant=None, connection="assistant"):

@@ -3236,7 +3236,7 @@ def _shell_stage(command):
         return "running a command"
     head = words[0].rsplit("/", 1)[-1]
     verb = words[1] if len(words) > 1 and not words[1].startswith("-") else ""
-    if head == "telegram" and verb == "send":
+    if head == "telegram" and verb in ("send", "progress"):
         # The worker reporting its progress is not progress. Its words arrive
         # through the outbox and outrank anything derived here anyway.
         return None
@@ -3410,12 +3410,12 @@ def voice_task_preamble(chat_id, seconds):
         "Someone is waiting on a live phone call for this, so silence costs "
         "them directly.\n\n"
         "Report what you are doing as you go, by running\n"
-        f'    {WORKER_BIN / "telegram"} send {chat_id} "<one short line>"\n'
+        f'    {WORKER_BIN / "telegram"} progress "<one short line>"\n'
         "spelled with that exact path. A worker that runs a shell finds the "
         "same thing under the bare name, but one that executes commands "
         "directly resolves the name its own way and reaches the real Telegram "
-        "instead - which sends your working notes to the caller as messages "
-        "rather than to the assistant holding the call.\n"
+        "instead, which has no such command - so your working notes would "
+        "reach nobody rather than the assistant holding the call.\n"
         "as your very first action before you look at anything, and again "
         f"after each real step - roughly every {seconds:.0f} seconds while the "
         "work continues.\n\n"
@@ -3437,8 +3437,8 @@ def voice_task_preamble(chat_id, seconds):
         "result — the progress lines are not.\n\n"
         "One exception, and only for what speech carries badly: a link, an "
         "address, an exact spelling, a long number, a list they will want to "
-        "keep. Add --deliver to the same command and that line is sent to the "
-        "caller as a message instead of reaching the assistant:\n"
+        "keep. Send that as a message, and it reaches the caller instead of "
+        "the assistant:\n"
         f'    {WORKER_BIN / "telegram"} send {chat_id} "<the exact thing>" --deliver\n'
         "Use it for the thing itself, never to report progress or to repeat "
         "aloud what you are about to answer anyway.\n\n"
@@ -4276,7 +4276,7 @@ def build_prompt(tail, state=None):
     if st.get("chat_id") is not None:
         lines.append(
             'Progress command: '
-            f'{WORKER_BIN / "telegram"} send {st["chat_id"]} "<one short line>"')
+            f'{WORKER_BIN / "telegram"} progress "<one short line>"')
     if st.get("jobs_available"):
         lines.append(f'Jobs command: {WORKER_BIN / "telegram"} jobs')
     if st.get("quota_pause"):
@@ -6003,6 +6003,18 @@ async def run_session(client):
                 continue
             text = str(item.get("text") or "").strip()
             if not text or text in ("-", ".", "..."):
+                continue
+            if item.get("deliver"):
+                # Not a note about the work: the worker declared a message the
+                # chat is meant to keep, so neither the window nor the fold
+                # decides whether it arrives.
+                _, _ = await send_channel_message(
+                    ent_id, text, is_direct,
+                    reply_to=None if is_direct else reply_to, mark=mark)
+                if delivered is not None:
+                    delivered.append(_normalize_delivered(text))
+                log(f"{key}: worker delivered a message msg={reply_to or 'direct'} "
+                    f"«{text[:80]}»")
                 continue
             if window is not None:
                 # A run whose progress is folded from its stream: the worker's
