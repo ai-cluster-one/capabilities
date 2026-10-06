@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-06 — A scan carries each task's runs, their cost and its blockers
+
+Every row of `tasks list` and `tasks search`, with or without `--full`, gains `runs` - `{count, by_worker, cost_usd, without_cost}`: every raise of the task in all and by worker, the sum of the `cost_usd` its raises' metrics recorded (null when none did), and how many recorded none - plus `blocked_by`, the metadata key as stored, and `blocked_by_status`, mapping each name it lists to the status of the task it names, null for a name matching no task. A `tasks watch` line's task row, being a `list` row, carries them too. They are computed in the scan's own query, so a page is still one query. Existing fields are unchanged. Run `tasks help` COLLECTIONS for the fields.
+
 ## 2026-10-06 — A turn that lost its raise is ended instead of working on unclaimed
 
 The beat of `tasks run` keeps time by whichever of the wall clock and the monotonic clock has moved further, so a machine that slept renews when it wakes rather than a whole beat later, and a wall clock set back holds back no renewal. A turn whose raise is lost - the store answers that it is no longer running or that its lease has run out, or the lease the last renewal wrote runs out with no renewal reaching the store - is ended at once with everything it started, instead of working on for up to its timeout on a task that was put back and with every write refused. `run` says `{"lease_lost": {...}}` on stderr, its answer carries `lease_lost` with the reason, and the raise's detail, when it can still be closed, begins `lease lost:`. A renewal that fails is still tried again within seconds on a new connection, and each failure is now said on stderr as `{"beat_failed": {...}}` and counted in the answer's `beat_failures`. The service's log line for a turn names `lease_lost` and `beat_failures`. Run `tasks help` ONE TURN OF THE CONVEYOR for the details.

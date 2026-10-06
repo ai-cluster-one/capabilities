@@ -1049,6 +1049,22 @@ COLLECTIONS
   of `updated_at`, the newest trail entry, and the newest start or end of a
   raise. It is never null.
 
+  Each scan row also carries its runs and its blockers, summed by the store in
+  the same query as the rows, never one query per row:
+  `runs`                {count, by_worker, cost_usd, without_cost}: every raise
+                        of the task whatever its status, in all and counted by
+                        worker (a raise with no worker under ""); the sum of the
+                        `cost_usd` each raise's metrics recorded, null when none
+                        did; and how many raises recorded no cost. The sum is
+                        read from the raises, not from the metadata's
+                        `cost_total`
+  `blocked_by`          the metadata's `blocked_by` as stored, null when absent
+  `blocked_by_status`   each name `blocked_by` lists, mapped to the status of
+                        the task it names - matched as an id, or as a key in the
+                        task's own project - and null for a name matching no
+                        task, so a live block is told from an ended one
+                        (complete or closed) without another call
+
   `ready` reads: every field and the whole trail, because it is the queue a
   worker consumes to act, and what is actionable now is short by construction.
 
@@ -5526,13 +5542,54 @@ def _scan_columns(opts: dict) -> str:
     `last_touched_at` is the last moment anything happened to the task: a field
     moved, the trail grew, or a raise started or ended. It is computed in the
     same query as the rows, so it can order the whole set before the page is
-    cut, and it is never null because `updated_at` never is."""
+    cut, and it is never null because `updated_at` never is.
+
+    A row also carries what it needs to be judged without a second call: its
+    runs and their cost, and what it is blocked by. They are subqueries of the
+    same statement, so a page costs one query however many rows it holds."""
     touched = (f"greatest(t.updated_at, "
                f"(select max(a.created_at) from {SCHEMA}.task_activities a "
                f"where a.task_id = t.id), "
                f"(select max(greatest(e.started_at, e.ended_at)) "
                f"from {SCHEMA}.task_executions e where e.task_id = t.id))")
-    return f"{'t.*' if opts.get('full') else _LEAN}, {touched} as last_touched_at"
+    return (f"{'t.*' if opts.get('full') else _LEAN}, {touched} as last_touched_at, "
+            f"{_rollup_columns()}")
+
+
+def _rollup_columns() -> str:
+    """A task's runs and blockers, summed from the store as the row is read.
+
+    `runs` counts every raise, whatever its status, in all and by worker. Its
+    cost is the sum of the `cost_usd` each raise's metrics recorded - read from
+    the raises, never from the metadata's own accumulator - with the raises that
+    recorded none counted beside it, so a partial sum is visible as one.
+
+    `blocked_by` is the metadata's key as stored, and `blocked_by_status` gives
+    each name it holds the status of the task it names, matched the way a wait
+    reads it: as an id, or as a key in the task's own project. A name matching
+    no task answers null."""
+    cost = "e.metrics -> 'cost_usd'"
+    runs = (f"(select jsonb_build_object("
+            f"'count', coalesce(sum(g.n), 0), "
+            f"'by_worker', coalesce(jsonb_object_agg(g.worker, g.n), '{{}}'::jsonb), "
+            f"'cost_usd', sum(g.cost), "
+            f"'without_cost', coalesce(sum(g.uncosted), 0)) "
+            f"from (select coalesce(e.worker, '') as worker, count(*) as n, "
+            f"sum(({cost})::text::float8) filter (where jsonb_typeof({cost}) = 'number') as cost, "
+            f"count(*) filter (where jsonb_typeof({cost}) is distinct from 'number') as uncosted "
+            f"from {SCHEMA}.task_executions e where e.task_id = t.id "
+            f"group by 1) g) as runs")
+    named = ("case when jsonb_typeof(t.metadata -> 'blocked_by') = 'array' "
+             "then t.metadata -> 'blocked_by' else '[]'::jsonb end")
+    blockers = (f"(select coalesce(jsonb_object_agg(n.name, "
+                f"(select b.status from {SCHEMA}.tasks b "
+                f"where b.id::text = n.name "
+                f"or (b.unique_key = n.name and b.project_id = t.project_id) "
+                f"limit 1)), '{{}}'::jsonb) "
+                f"from (select distinct trim(x) as name "
+                f"from jsonb_array_elements_text({named}) x "
+                f"where trim(x) <> '') n) as blocked_by_status")
+    return f"{runs}, t.metadata -> 'blocked_by' as blocked_by, {blockers}"
 
 
 def _order(opts: dict, unsaid: str) -> str:
