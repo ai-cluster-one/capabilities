@@ -7,6 +7,7 @@
 #     "ntgcalls==3.0.0rc5",
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
+#     "psycopg2-binary>=2.9",
 # ]
 # ///
 # The 3.x line is what carries conference calls: joining one needs
