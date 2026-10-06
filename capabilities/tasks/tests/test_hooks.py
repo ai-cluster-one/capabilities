@@ -271,7 +271,8 @@ def test_go_claims_as_before_and_the_hook_is_given_the_task(project, store, turn
 
 
 @needs_store
-def test_defer_sets_the_pickup_and_the_next_task_is_taken(project, store, turns, capsys):
+def test_a_hold_until_a_moment_writes_nothing_and_the_next_task_is_taken(project, store,
+                                                                       turns, capsys):
     import datetime
     entry, _schema, _conn = store
     hooked(project)
@@ -285,25 +286,25 @@ def test_defer_sets_the_pickup_and_the_next_task_is_taken(project, store, turns,
     dry = answer(capsys)
     assert dry["would_claim"] == "t-now" and dry["applied"] is False
     [held] = dry["passed_over"]
-    assert (held["task"], held["verdict"]) == ("t-later", "defer")
-    assert "pickup_set" not in held
+    assert (held["task"], held["verdict"]) == ("t-later", "hold")
     assert shown(entry, capsys, "t-later")["task"]["pickup_at"] is None
 
+    before = shown(entry, capsys, "t-later")["task"]
     mod.cmd_run(entry, ["alpha", "--apply"])
     report = answer(capsys)
     assert report["claimed"] == "t-now" and turns == ["t-now"]
     [held] = report["passed_over"]
-    assert held["verdict"] == "defer" and held["pickup_set"] is True
+    assert held["verdict"] == "hold" and held["until"] == moment.isoformat()
     assert held["said"] == moment.isoformat()
     later = shown(entry, capsys, "t-later")
-    assert later["task"]["status"] == "todo" and later["activities"] == []
-    assert (datetime.datetime.fromisoformat(later["task"]["pickup_at"]) == moment)
+    assert later["task"] == before and later["activities"] == []
+    assert later["task"]["pickup_at"] is None
     assert changes_of(entry, capsys, "t-later") == []
     assert raises_of(entry, capsys, "t-later") == []
 
 
 @needs_store
-def test_defer_to_a_bare_date(project, store, turns, capsys):
+def test_a_hold_until_a_bare_date(project, store, turns, capsys):
     entry, _schema, _conn = store
     hooked(project)
     add(entry, capsys, "t-day")
@@ -312,7 +313,7 @@ def test_defer_to_a_bare_date(project, store, turns, capsys):
     report = answer(capsys)
     assert report["claimed"] is None
     assert report["passed_over"][0]["until"].startswith("2099-01-02T00:00:00")
-    assert shown(entry, capsys, "t-day")["task"]["pickup_at"] is not None
+    assert shown(entry, capsys, "t-day")["task"]["pickup_at"] is None
 
 
 @needs_store
@@ -323,8 +324,8 @@ def test_defer_to_a_bare_date(project, store, turns, capsys):
     ({"exit": 3, "print": "busy"}, "exited 3"),
     ({"sleep": 5}, "timed out after 1s"),
 ])
-def test_skip_writes_nothing_and_the_next_task_is_taken(project, store, turns, capsys,
-                                                       monkeypatch, told, why):
+def test_a_hold_with_no_moment_writes_nothing_and_the_next_task_is_taken(
+        project, store, turns, capsys, monkeypatch, told, why):
     entry, _schema, _conn = store
     monkeypatch.setitem(mod._HOOK_TIMEOUTS, "before", 1)
     hooked(project)
@@ -336,7 +337,7 @@ def test_skip_writes_nothing_and_the_next_task_is_taken(project, store, turns, c
     report = answer(capsys)
     assert report["claimed"] == "t-next"
     [held] = report["passed_over"]
-    assert held["task"] == "t-skip" and held["verdict"] == "skip"
+    assert held["task"] == "t-skip" and held["verdict"] == "hold" and "until" not in held
     assert held["why"].startswith(why)
     assert shown(entry, capsys, "t-skip")["task"] == before
     assert changes_of(entry, capsys, "t-skip") == []
@@ -344,7 +345,7 @@ def test_skip_writes_nothing_and_the_next_task_is_taken(project, store, turns, c
 
 
 @needs_store
-def test_a_hook_that_cannot_start_skips_every_task_and_nothing_is_claimed(
+def test_a_hook_that_cannot_start_holds_every_task_and_nothing_is_claimed(
         project, store, turns, capsys):
     entry, _schema, _conn = store
     write_worker(project, "alpha", "takes: [alpha]\nprofile: plain\nhooks:\n"
@@ -355,7 +356,7 @@ def test_a_hook_that_cannot_start_skips_every_task_and_nothing_is_claimed(
     report = answer(capsys)
     assert report["claimed"] is None and turns == []
     assert [h["task"] for h in report["passed_over"]] == ["t-one", "t-two"]
-    assert all(h["verdict"] == "skip" and h["why"].startswith("could not start")
+    assert all(h["verdict"] == "hold" and h["why"].startswith("could not start")
                for h in report["passed_over"])
     for key in ("t-one", "t-two"):
         assert shown(entry, capsys, key)["task"]["status"] == "todo"
@@ -428,8 +429,11 @@ def test_key_asks_the_hook_about_a_task_whose_lease_lapsed(project, store, turns
 
 
 @needs_store
-def test_after_is_told_the_outcome_and_its_failure_changes_nothing(project, store, turns,
-                                                                   capsys):
+def test_after_is_told_how_the_raise_ended_and_its_failure_holds_the_lane(project, store,
+                                                                         turns, capsys):
+    """An `after` hook that fails answers a hold with no moment: the lane is held
+    for the worker's cool-down, recorded on the raise, and the raise itself is
+    as it was settled."""
     entry, _schema, _conn = store
     hooked(project, before=False, after=True)
     add(entry, capsys, "t-after")
@@ -437,15 +441,20 @@ def test_after_is_told_the_outcome_and_its_failure_changes_nothing(project, stor
     mod.cmd_run(entry, ["alpha", "--apply"])
     report = answer(capsys)
     assert report["claimed"] == "t-after" and "passed_over" not in report
-    assert report["after_hook"] == {"exit": 4, "why": "exited 4", "said": "could not notify"}
+    assert report["after_hook"] == {"exit": 4, "why": "exited 4", "said": "could not notify",
+                                    "verdict": "hold"}
+    assert report["lane_held"]["by"] == "the after hook of worker 'alpha'"
     [told] = seen(project, "after")
     assert told["task"]["status"] == "complete"
     assert told["env"]["TASKS_EXECUTION"] == report["execution"]
     assert (told["env"]["TASKS_OUTCOME"], told["env"]["TASKS_LANDED"]) == ("ok", "complete")
     assert told["env"]["TASKS_TASK_KEY"] == "t-after"
+    assert told["env"]["TASKS_HARNESS_SAID"] == "done"
+    assert json.loads(told["env"]["TASKS_RAISE_METRICS"])["model"] == "m"
     [raised] = raises_of(entry, capsys, "t-after")
     assert raised["status"] == "ok"
     assert raised["metrics"]["after_hook"] == {"why": "exited 4", "said": "could not notify"}
+    assert raised["metrics"]["lane_hold"]["until"] == report["lane_held"]["until"]
 
 
 @needs_store
@@ -457,7 +466,7 @@ def test_after_runs_on_a_park_and_a_quiet_success_leaves_the_metrics_alone(
     add(entry, capsys, "t-park")
     mod.cmd_run(entry, ["alpha", "--apply"])
     report = answer(capsys)
-    assert report["parked"] is True and report["after_hook"] == {"exit": 0}
+    assert report["parked"] is True and report["after_hook"] == {"exit": 0, "verdict": "go"}
     [told] = seen(project, "after")
     assert told["env"]["TASKS_OUTCOME"] == "handback"
     assert told["env"]["TASKS_LANDED"] == told["task"]["status"] == "draft"
@@ -563,13 +572,14 @@ def test_the_service_logs_what_a_hook_held_back_and_does_not_spin(lab):
 
     lines = poll_for(logged, 60)
     [ended] = [line for line in lines if "passed over t-held" in line]
-    assert "claimed nothing" in ended and "skip (exited 3)" in ended
+    assert "claimed nothing" in ended and "hold (exited 3)" in ended
     assert "the resource is busy" in ended
     time.sleep(3)
     lines = answer_of(tasks_cli(lab, "service", "logs"))["lines"]
     assert sum(" started: worker alpha" in line for line in lines) == 1
     status = answer_of(tasks_cli(lab, "service", "status"))
-    assert status["lanes"][0]["held_until_poll"] is True
+    # The held task is remembered until the poll, the hook having named no moment.
+    assert [one["task"] for one in status["deferred"]] == ["t-held"]
     assert len(seen(project, "before")) == 1
     shown = answer_of(tasks_cli(lab, "show", "t-held"))
     assert shown["task"]["status"] == "todo" and shown["task"]["pickup_at"] is None

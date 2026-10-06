@@ -21,7 +21,7 @@ A worker file is Markdown. Its YAML front matter is the worker's settings and it
 - `on_request` lists types the worker runs only when a task in `todo` is named to it with `--key`, never by taking the next one.
 - `writes` is what the worker's turn may write, described below.
 - `routines` names the project's procedures, each found at `routines/<name>.md`; the first is the procedure for the work and the rest apply at the moments they name. A worker naming none leaves the turn to choose one by the routines' descriptions, or to work from the project's doctrine, and to say on the trail what it chose.
-- `limits` bounds the worker: `attempts` raises that did work before a task is parked, `lease_seconds` the longest a claim is held (by default the profile's timeout plus ten minutes), within which a running turn holds its task by a short lease it renews while its process lives, `hold_seconds_on_exhaustion` how long a task rests after a turn that never got to the work, and `idle_failure_seconds`, under which a failed turn that wrote nothing counts as one that never started.
+- `limits` bounds the worker: `attempts` raises that did work before a task is parked, `lease_seconds` the longest a claim is held (by default the profile's timeout plus ten minutes), within which a running turn holds its task by a short lease it renews while its process lives, `cool_down_seconds` how long a task rests after a raise that left it where it was - failed, or abandoned - before any claim takes it again (60 by default; the older `hold_seconds_on_exhaustion` is read as it, and `doctor` names it), and `idle_failure_seconds`, under which a failed turn that wrote nothing counts as one that never started.
 - `park_hint` is one sentence the project adds to the handback when a task is parked at the `attempts` ceiling, and only then: it is what a person about to read a task the work kept failing on should check first.
 - `hooks` names the project's own commands that run around a turn, described below.
 
@@ -45,11 +45,15 @@ The task and its trail reach the turn as quoted data, between markers drawn for 
 
 ### Hooks
 
-A hook lets a project gate or follow a worker's work with a check of its own, without `tasks` knowing what the check is. A worker declares at most two, each one command line run from the project root without a shell, with the task as JSON on stdin and its id, key, type and assignee, the worker's name and the project root in the environment.
+A hook lets a project gate or follow a worker's work with a check of its own, without `tasks` knowing what the check is. A worker declares at most two, one at each handler point of the conveyor - `before` a claim and `after` a raise - each one command line run from the project root without a shell, with the task as JSON on stdin and its id, key, type and assignee, the worker's name and the project root in the environment.
 
-`before` is asked about each task a claim would take, before anything is written. Exit 0 lets the claim go on. Exit 75 with a moment on its last stdout line defers the task: its pickup is set to that moment and the next task is asked about. Anything else skips the task this time, writing nothing. Use it for a condition the store cannot see - a shared resource that is busy, a window the work must wait for, a precondition another system answers - so a task that cannot start now never opens a raise, never spends an attempt and never starts a turn only to stop.
+Both answer in one vocabulary, by their exit: 0 is go; 75 is hold, until the moment on its last stdout line when it prints one; 76 is escalate, its last stdout line the reason. Anything else - another exit, a timeout, a command that cannot start - is a hold with no moment.
 
-`after` is told how a raise ended once it is settled, with the outcome and the status the task landed in. It decides nothing about the raise; use it to follow the work - notify, record, release what `before` checked.
+`before` is asked about each task a claim would take, before anything is written. Go lets the claim take it. Hold writes nothing to the task - no pickup, no history, not even `updated_at` - and the next task is asked about; the service remembers the moment, or its next poll, and starts no turn for that task before then. Escalate sends the task along the project's escalation chain at once. Use it for a condition the store cannot see - a shared resource that is busy, a window the work must wait for, a precondition another system answers - so a task that cannot start now never opens a raise, never spends an attempt and never starts a turn only to stop, and for a condition it can tell will never clear, so the task reaches someone who can act.
+
+`after` is asked once a raise is settled, with the outcome, the status the task landed in, the raise's detail and metrics, and how the turn ended: the harness's exit, its failure kind and what it last said. Go changes nothing. Hold holds the worker's lane - no claim of that worker, the service's or by hand, takes a task until the moment, or for its cool-down without one - and is recorded on the raise, so a service restart keeps it. Escalate sends the task along the chain, unless it already ended. Use it to follow the work - notify, record, release what `before` checked - and to stop a lane on a condition that will hit every task alike.
+
+The capability ships after-raise handlers of its own for the harnesses' accounts. A raise that ended on Claude Code's or Codex's usage limit holds the lane until the reset the harness names - the five-hour and the weekly limits alike - and one naming no reset, or a harness not logged in, for 30 minutes; the raise is no attempt at the work, and no task of the lane is escalated for the time the lane stood held.
 
 ```markdown
 ---
@@ -61,7 +65,7 @@ hooks:
 ---
 ```
 
-Here `scripts/resource-free.py` reads the task from stdin, exits 0 when the resource the work needs is free, and otherwise prints the moment to try again, `2026-01-05T09:00:00+00:00`, and exits 75. `tasks help` HOOKS states the whole contract: the environment, the timeouts and where every held-back task is reported.
+Here `scripts/resource-free.py` reads the task from stdin, exits 0 when the resource the work needs is free, and otherwise prints the moment to try again, `2026-01-05T09:00:00+00:00`, and exits 75. `tasks help` HOOKS states the whole contract: the environment, the timeouts, the shipped handlers and where every held-back task and held lane is reported.
 
 ## When a task cannot move: escalation
 
@@ -72,9 +76,9 @@ escalate_to = ["supervisor", "owner"]
 stall_after = "6h"
 ```
 
-`escalate_to` is the chain a stuck task goes along, in order, and its last name is a person - a name no worker file of the project has. Every name before it is a worker that is switched on and takes the waiting tasks assigned to it, as the supervisor does. `stall_after` is how long a task may be refused before it is escalated, 6h when unsaid.
+`escalate_to` is the chain a stuck task goes along, in order, and its last name is a person - a name no worker file of the project has. Every name before it is a worker that is switched on and takes the waiting tasks assigned to it, as the supervisor does. `stall_after` is how long a task may be held back before it is escalated, 6h when unsaid.
 
-The claim decides it, for the tasks the claiming worker would take. A task its `before` hook holds back after it has been refused longer than `stall_after` is escalated instead of deferred again; a task whose raises in place - the raises since it last changed status or assignee, apart from those that never started for the account's limit - have reached the worker's `limits.attempts` is escalated instead of claimed. Escalating moves it to `waiting` on the next name in the chain, with one trail entry by `tasks:scan` saying why, since when it stood where it was, and how many raises it had there. If that name cannot move it either, the next escalation goes on, ending at the person. A task assigned to a person is never escalated this way.
+The claim decides it, for the tasks the claiming worker would take. A task whose raises in place - the raises since it last changed status or assignee, apart from those that never got to the work - have reached the worker's `limits.attempts` is escalated instead of claimed, before its `before` hook is asked. A task its `before` hook has held back for longer than `stall_after` is escalated instead of held again; the clock starts at the first hold in its place, so time spent waiting its turn never counts, and that first hold is the one thing the claim records, as a row among the task's raises that is no raise. A hook answering escalate sends the task on at once. Escalating moves it to `waiting` on the next name in the chain, with one trail entry by `tasks:scan` saying why, since when it stood where it was, and how many raises it had there. If that name cannot move it either, the next escalation goes on, ending at the person. A task assigned to a person is never escalated this way.
 
 Waiting is not refusal: a task behind other work in a busy lane is never escalated, and neither is one in a paused lane, whose wait `tasks service status` shows instead. With a chain, `attempts` counts raises in place, so a pipeline whose every stage is a raise that moves the task keeps its count low and 3 is enough; without a chain nothing here applies and every worker runs as it did. `tasks help` ESCALATION states the contract.
 
@@ -104,7 +108,7 @@ A worker that is off still owns the types it names: `default` never takes them, 
 
 Two judgements reach past `doctor` into `run`. A worker naming a missing profile or routine has nothing whole to give a turn, so `run` parks the task it takes, saying what is missing, without starting a turn and without spending an attempt. While any project worker file's types cannot be read at all, `default` takes nothing, because it cannot know which types are someone else's.
 
-When it passes, `doctor` lists each worker with its source, what it shadows, whether it is enabled, its description, what it takes, its `writes`, its profile, its routines, its limits and its hooks. `tasks run <worker>` without `--apply` says which task a claim would take and writes nothing; for a worker with a `before` hook it asks the hook, and names what the hook would hold back without setting any pickup.
+When it passes, `doctor` lists each worker with its source, what it shadows, whether it is enabled, its description, what it takes, its `writes`, its profile, its routines, its limits and its hooks. `tasks run <worker>` without `--apply` says which task a claim would take and writes nothing; for a worker with a `before` hook it asks the hook and names what the hook would hold back, and for a held lane it names the hold. `doctor` also names every key a project still sets that is read as another now, such as `hold_seconds_on_exhaustion` or the service's `retry_delay_seconds`.
 
 ## Changing a worker while the service runs
 

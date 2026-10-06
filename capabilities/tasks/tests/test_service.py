@@ -111,8 +111,7 @@ def test_the_manifest_declares_the_service_the_contract_expects():
 def test_the_template_is_the_defaults(project):
     declaration = mod._service_declaration()
     assert declaration["settings"] == {"version": 1, "poll_seconds": 60, "max_parallel": 2,
-                                       "shutdown_grace_seconds": 60,
-                                       "retry_delay_seconds": 60, "lanes": {}}
+                                       "shutdown_grace_seconds": 60, "lanes": {}}
 
 
 def test_every_enabled_worker_that_takes_something_is_a_lane(project):
@@ -301,7 +300,7 @@ class _AwayHost:
     def notification_installed(self, _conn):
         return True
 
-    def next_moment(self, _conn):
+    def next_moment(self, _conn, _cool_downs=None):
         return None
 
     def sweep_due(self, _conn):
@@ -1398,13 +1397,13 @@ def test_init_start_and_run_need_the_project_itself_to_enable_tasks(lab):
 
 @needs_store
 @pytest.mark.parametrize("failing", ["idle", "ordinary"])
-def test_a_task_whose_turns_fail_at_once_is_retried_no_faster_than_the_delay(lab, failing):
+def test_a_task_whose_turns_fail_at_once_is_retried_no_faster_than_the_cool_down(
+        lab, failing):
     """A turn that fails in an instant puts its task straight back in todo, and
-    the store announces it. The service still waits `retry_delay_seconds` after
-    that turn ended before it starts another on the task, whether the failure
-    spent an attempt or not, and the task keeps coming back rather than being
-    lost. The task's own hold is shorter than the delay here, so the delay is
-    what is measured."""
+    the store announces it. No claim takes it again until the worker's
+    cool-down has passed since that raise ended, whether the failure spent an
+    attempt or not, and the task keeps coming back rather than being lost. The
+    service wakes when the cool-down ends; a run by hand is held to it too."""
     project = lab["project"]
     lab["env"]["FAKE_ENGINE_FAIL"] = failing
     write_worker(project, "alpha", """
@@ -1412,14 +1411,13 @@ def test_a_task_whose_turns_fail_at_once_is_retried_no_faster_than_the_delay(lab
         profile: plain
         limits:
           attempts: 50
-          hold_seconds_on_exhaustion: 1
+          cool_down_seconds: 2
     """)
     assert answer_of(tasks_cli(lab, "service", "init"))["written"]
     write_settings(project, """
         version = 1
         poll_seconds = 3600
         shutdown_grace_seconds = 10
-        retry_delay_seconds = 2
     """)
     answer_of(tasks_cli(lab, "service", "start"))
     answer_of(tasks_cli(lab, "add", "--type", "alpha", "--title", "fails",
@@ -1427,8 +1425,6 @@ def test_a_task_whose_turns_fail_at_once_is_retried_no_faster_than_the_delay(lab
     runs = lambda: answer_of(tasks_cli(lab, "runs", "t-fail"))["executions"]  # noqa: E731
     poll_for(runs, 30)
     time.sleep(5.5)
-    status = answer_of(tasks_cli(lab, "service", "status"))
-    assert status["retry_delay_seconds"] == 2
     answer_of(tasks_cli(lab, "service", "stop", "--end-turns"))
 
     import datetime
@@ -1447,12 +1443,15 @@ def test_a_task_whose_turns_fail_at_once_is_retried_no_faster_than_the_delay(lab
         assert row["status"] == "failed"
         assert bool((row["metrics"] or {}).get("exhausted")) is (failing == "idle")
     shown = answer_of(tasks_cli(lab, "show", "t-fail"))["task"]
-    assert shown["status"] == "todo"
-    log = "\n".join(answer_of(tasks_cli(lab, "service", "logs", "--tail", "200"))["lines"])
-    assert "t-fail not run again before" in log
+    assert shown["status"] == "todo" and shown["pickup_at"] is None
 
-    # A run by hand is not the service and selects as it always has.
-    time.sleep(1.2)
+    # A run by hand reads the same cool-down from the last raise.
+    last = max(moment(row["ended_at"]) for row in runs())
+    wait = (last + datetime.timedelta(seconds=2)
+            - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    if wait > 0.5:
+        assert answer_of(tasks_cli(lab, "run", "alpha"))["would_claim"] is None
+    time.sleep(max(0.0, wait) + 0.3)
     by_hand = answer_of(tasks_cli(lab, "run", "alpha", "--apply"))
     assert by_hand["claimed"] == "t-fail"
 

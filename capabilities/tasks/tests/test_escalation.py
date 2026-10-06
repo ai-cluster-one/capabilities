@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -88,6 +89,18 @@ def raised(conn, schema: str, key: str, n: int, *, exhausted: int = 0,
 
 def trail(entry, capsys, key: str) -> list[dict]:
     return shown(entry, capsys, key)["activities"]
+
+
+def held_for(conn, schema: str, key: str, hours: float) -> None:
+    """Make the task's hold episode begin `hours` ago: its first hold was then."""
+    moved = conn.execute(
+        f"""update {schema}.task_executions
+               set started_at = started_at - make_interval(secs => %s),
+                   ended_at = ended_at - make_interval(secs => %s)
+             where metrics ? 'hold'
+               and task_id = (select id from {schema}.tasks where unique_key = %s)""",
+        (hours * 3600, hours * 3600, key)).rowcount
+    assert moved == 1, moved
 
 
 # --- What is declared --------------------------------------------------------
@@ -172,7 +185,7 @@ def moment_ahead(hours: int = 1) -> str:
 
 
 @needs_store
-def test_a_hold_past_the_ceiling_escalates_instead_of_deferring(project, store, turns,
+def test_a_hold_past_the_ceiling_escalates_and_writes_no_pickup(project, store, turns,
                                                                 capsys):
     entry, schema, conn = store
     hooks.hooked(project)
@@ -184,6 +197,12 @@ def test_a_hold_past_the_ceiling_escalates_instead_of_deferring(project, store, 
     tell(project, "before", "t-stuck", exit=75, print=later)
     created = shown(entry, capsys, "t-stuck")["task"]["created_at"]
 
+    # Seven hours in its place, and held for the first time now: not escalated.
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    report = answer(capsys)
+    assert report["claimed"] is None and "escalated" not in report
+    assert report["passed_over"][0]["verdict"] == "hold"
+    held_for(conn, schema, "t-stuck", 6.5)
     mod.cmd_run(entry, ["alpha", "--apply"])
     report = answer(capsys)
     assert report["claimed"] is None and turns == []
@@ -199,6 +218,7 @@ def test_a_hold_past_the_ceiling_escalates_instead_of_deferring(project, store, 
     assert text.startswith("Escalated from nobody to supervisor: ")
     assert later in text
     assert f"In place since {datetime.datetime.fromisoformat(created).isoformat()}" in text
+    assert "held back since" in text
     assert "0 raise(s) in place" in text and "6h ceiling" in text
     assert raises_of(entry, capsys, "t-stuck") == []
     moves = {(c["field"], c["new_value"], c["actor"]) for c in changes_of(entry, capsys,
@@ -221,14 +241,18 @@ def test_a_skip_past_the_ceiling_escalates_with_the_hooks_last_line(project, sto
     mod.cmd_run(entry, ["alpha", "--apply"])
     report = answer(capsys)
     assert report["claimed"] == "t-free" and turns == ["t-free"]
+    assert "escalated" not in report
+    held_for(conn, schema, "t-shut", 2.5)
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    report = answer(capsys)
     [moved] = report["escalated"]
     assert moved["task"] == "t-shut" and "SHUT lane: open work" in moved["why"]
-    assert "skipped: exited 3" in moved["why"]
+    assert "held: exited 3" in moved["why"]
     assert shown(entry, capsys, "t-shut")["task"]["status"] == "waiting"
 
 
 @needs_store
-def test_a_hold_under_the_ceiling_defers_as_before(project, store, turns, capsys):
+def test_a_hold_under_the_ceiling_holds_and_writes_nothing(project, store, turns, capsys):
     entry, schema, conn = store
     hooks.hooked(project)
     supervised(project)
@@ -241,18 +265,17 @@ def test_a_hold_under_the_ceiling_defers_as_before(project, store, turns, capsys
     report = answer(capsys)
     assert report["claimed"] is None and "escalated" not in report
     [held] = report["passed_over"]
-    assert held["verdict"] == "defer" and held["pickup_set"] is True
+    assert held["verdict"] == "hold" and held["until"] == later
     task = shown(entry, capsys, "t-young")["task"]
     assert task["status"] == "todo" and task["assignee"] is None
-    assert datetime.datetime.fromisoformat(task["pickup_at"]) == \
-        datetime.datetime.fromisoformat(later)
+    assert task["pickup_at"] is None
     assert trail(entry, capsys, "t-young") == []
 
 
 @needs_store
 def test_an_appointment_that_passed_restarts_the_clock(project, store, turns, capsys):
-    """A pickup a person appointed holds the task until it comes; time before
-    it was no refusal."""
+    """A pickup a person appointed holds the task until it comes, and a task
+    that waited thirty hours in its place is not escalated at its first hold."""
     entry, schema, conn = store
     hooks.hooked(project)
     supervised(project)
@@ -269,7 +292,7 @@ def test_an_appointment_that_passed_restarts_the_clock(project, store, turns, ca
     tell(project, "before", "t-booked", exit=3, print="not yet")
     mod.cmd_run(entry, ["alpha", "--apply"])
     report = answer(capsys)
-    assert "escalated" not in report and report["passed_over"][0]["verdict"] == "skip"
+    assert "escalated" not in report and report["passed_over"][0]["verdict"] == "hold"
 
 
 @needs_store
@@ -281,6 +304,13 @@ def test_without_apply_the_escalation_is_named_and_not_made(project, store, turn
     add(entry, capsys, "t-dry")
     aged(conn, schema, "t-dry", 7)
     tell(project, "before", "t-dry", exit=75, print=moment_ahead())
+    # A dry run at the first hold names nothing and writes nothing.
+    mod.cmd_run(entry, ["alpha"])
+    assert "would_escalate" not in answer(capsys)
+    assert raises_of(entry, capsys, "t-dry") == []
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    assert "escalated" not in answer(capsys)
+    held_for(conn, schema, "t-dry", 6.5)
     before = shown(entry, capsys, "t-dry")["task"]
     mod.cmd_run(entry, ["alpha"])
     dry = answer(capsys)
@@ -301,6 +331,11 @@ def test_key_on_a_held_task_past_the_ceiling_escalates_and_says_so(project, stor
     add(entry, capsys, "t-named")
     aged(conn, schema, "t-named", 7)
     tell(project, "before", "t-named", exit=3, print="closed")
+    with pytest.raises(SystemExit) as stopped:
+        mod.cmd_run(entry, ["alpha", "--key", "t-named", "--apply"])
+    assert stopped.value.code == 6
+    assert "t-named was not claimed" in capsys.readouterr().err
+    held_for(conn, schema, "t-named", 6.5)
     with pytest.raises(SystemExit) as stopped:
         mod.cmd_run(entry, ["alpha", "--key", "t-named", "--apply"])
     assert stopped.value.code == 6
@@ -385,6 +420,7 @@ def test_three_raises_in_place_escalate_on_the_next_claim(project, store, stubbo
                                                           capsys):
     entry, _schema, _conn = store
     hooks.write_worker(project, "alpha", "takes: [alpha]\nprofile: plain\n"
+                       "limits: {cool_down_seconds: 1}\n"
                        "park_hint: Check the lane before raising it again.")
     supervised(project)
     conveyor(project)
@@ -392,6 +428,7 @@ def test_three_raises_in_place_escalate_on_the_next_claim(project, store, stubbo
     for _ in range(3):
         mod.cmd_run(entry, ["alpha", "--apply"])
         assert answer(capsys)["claimed"] == "t-loop"
+        time.sleep(1.1)
     assert stubborn == ["t-loop"] * 3
     mod.cmd_run(entry, ["alpha", "--apply"])
     report = answer(capsys)
@@ -414,9 +451,11 @@ def test_raises_that_moved_it_or_were_exhausted_do_not_count(project, store, tur
     supervised(project)
     conveyor(project)
     add(entry, capsys, "t-two")
-    raised(conn, schema, "t-two", 2)
+    aged(conn, schema, "t-two", 3)
+    raised(conn, schema, "t-two", 2, hours_ago=2)
     add(entry, capsys, "t-tired")
-    raised(conn, schema, "t-tired", 3, exhausted=1)
+    aged(conn, schema, "t-tired", 3)
+    raised(conn, schema, "t-tired", 3, exhausted=1, hours_ago=2)
     add(entry, capsys, "t-moved")
     aged(conn, schema, "t-moved", 3)
     _first, _second, third = raised(conn, schema, "t-moved", 3, hours_ago=2)
@@ -485,10 +524,13 @@ def test_without_the_settings_attempts_count_as_before(project, store, stubborn,
     """No chain: raises in place escalate nothing, and the whole-life count
     parks the task past the ceiling as it always did."""
     entry, _schema, _conn = store
+    hooks.write_worker(project, "alpha", "takes: [alpha]\nprofile: plain\n"
+                       "limits: {cool_down_seconds: 1}")
     add(entry, capsys, "t-old-rule")
     for _ in range(3):
         mod.cmd_run(entry, ["alpha", "--apply"])
         assert "escalated" not in answer(capsys)
+        time.sleep(1.1)
     mod.cmd_run(entry, ["alpha", "--apply"])
     report = answer(capsys)
     assert report.get("parked") is True and "escalated" not in report
@@ -504,12 +546,16 @@ def test_the_supervisor_that_cannot_move_it_passes_it_to_the_person(project, sto
     supervised(project, hooked=True)
     conveyor(project)
     add(entry, capsys, "t-chain")
-    raised(conn, schema, "t-chain", 3)
+    aged(conn, schema, "t-chain", 10)
+    raised(conn, schema, "t-chain", 3, hours_ago=9)
     mod.cmd_run(entry, ["alpha", "--apply"])
     assert answer(capsys)["escalated"][0]["to"] == "supervisor"
     # On the supervisor, its hook holds it back past the ceiling.
     aged(conn, schema, "t-chain", 7)
     tell(project, "before", "t-chain", exit=3, print="needs the owner")
+    mod.cmd_run(entry, ["supervisor", "--apply"])
+    assert "escalated" not in answer(capsys)
+    held_for(conn, schema, "t-chain", 6.5)
     mod.cmd_run(entry, ["supervisor", "--apply"])
     report = answer(capsys)
     [moved] = report["escalated"]
@@ -536,8 +582,8 @@ def test_a_task_on_the_person_is_never_escalated(project, store, turns, capsys):
     tell(project, "before", "t-person", exit=3, print="still thinking")
     mod.cmd_run(entry, ["owner-desk", "--apply"])
     report = answer(capsys)
-    assert "escalated" not in report and report["passed_over"][0]["verdict"] == "skip"
-    raised(conn, schema, "t-person", 5)
+    assert "escalated" not in report and report["passed_over"][0]["verdict"] == "hold"
+    raised(conn, schema, "t-person", 5, hours_ago=2)
     tell(project, "before", "t-person", exit=0)
     mod.cmd_run(entry, ["owner-desk", "--apply"])
     report = answer(capsys)

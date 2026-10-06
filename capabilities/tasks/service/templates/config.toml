@@ -15,10 +15,6 @@ max_parallel = 2
 # ending them. A stop without it leaves them running.
 shutdown_grace_seconds = 60
 
-# Seconds after a turn on a task ends before the service starts another on it,
-# whatever the turn's ending.
-retry_delay_seconds = 60
-
 # One table per worker whose cap is not 1, named by the worker:
 #
 # [lanes.<worker>]

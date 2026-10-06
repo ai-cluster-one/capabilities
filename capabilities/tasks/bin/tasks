@@ -160,18 +160,24 @@ ONE TURN OF THE CONVEYOR
     todo otherwise              failed - put back without saying why, still
                                 with the same assignee and the same `stage`
 
-  A turn the harness's own report says ran out of quota, and one that fails in
-  seconds having written nothing, are not attempts at the work: the raise is
-  marked `exhausted`, the task is held for `hold_seconds_on_exhaustion` rather
-  than handed straight back into a limit that has not lifted, and the count
-  that parks a task does not spend it. A task taken from `waiting` stays there
-  while it is held: its hold is read from that raise rather than set as a
-  pickup, which would end the wait. At the ceiling the task is handed back to a
-  person instead of dispatched again; in a project that sets an escalation
-  chain, attempts count raises in place instead and the claim escalates the
-  task rather than take it, as ESCALATION states. A task parked because its
-  worker names a routine or a profile that is not there is marked `missing`
-  and does not spend it either.
+  A turn the harness's account could not work - its usage limit spent, or not
+  logged in - and one that fails in seconds having written nothing, are not
+  attempts at the work: the raise is marked `exhausted`, and the count that
+  parks a task does not spend it. The first holds the lane, as HOOKS states
+  for the shipped after-raise handlers; neither writes anything to the task.
+  At the ceiling the task is handed back to a person instead of dispatched
+  again; in a project that sets an escalation chain, attempts count raises in
+  place instead and the claim escalates the task rather than take it, as
+  ESCALATION states. A task parked because its worker names a routine or a
+  profile that is not there is marked `missing` and does not spend it either.
+
+  A raise that left its task where it was - failed, or closed as abandoned -
+  cools the task: no claim takes it again until the worker's
+  `limits.cool_down_seconds` has passed since that raise ended. It is read from
+  the raise, so it holds for a run by hand as for the service, and nothing is
+  written to the task; a task taken from `waiting` stays waiting while it
+  cools. A raise that moved its task cools nothing, and a task named with
+  --key is taken whatever cools it.
 
   Every raise leaves exactly one entry. A turn that wrote nothing gets one
   saying so, because a task picked up that left no trace reads exactly like one
@@ -254,7 +260,8 @@ WORKERS
                                   # with an escalation chain, raises in place
                                   # before it is escalated - see ESCALATION
       lease_seconds: 11400        # default: the profile's timeout plus 600
-      hold_seconds_on_exhaustion: 1200
+      cool_down_seconds: 60       # after a raise that left the task where it
+                                  # was, before a claim takes it again
       idle_failure_seconds: 120   # under this, having written nothing, a failed
                                   # turn is one that never started
     park_hint: one sentence added to the handback, or the escalation, at the
@@ -269,7 +276,10 @@ WORKERS
 
   Any other key is refused. `description` is shown by `doctor` beside the
   worker and is the first paragraph of the frame its turn receives, before
-  anything else in it.
+  anything else in it. `limits.hold_seconds_on_exhaustion` is still read, as
+  `cool_down_seconds`, and `doctor` names it; a worker that names neither
+  takes the service settings' `retry_delay_seconds` when that file still sets
+  one, and 60 otherwise.
 
   TAKES - which tasks the worker claims, as a filter over a task's fields, in
   one of three forms:
@@ -403,44 +413,83 @@ WORKERS
 
 HOOKS
   A worker's `hooks` names commands of the project's own that `run` starts
-  around a turn, so a project can gate or follow its work with its own checks.
-  Each is one command line, split as a shell splits it and run without one,
-  from the project root, with the task as `show` prints it under "task" on
-  stdin and these added to the environment: TASKS_TASK_ID, TASKS_TASK_KEY,
-  TASKS_TASK_TYPE, TASKS_TASK_ASSIGNEE, TASKS_WORKER and TASKS_PROJECT_ROOT.
-  `doctor` shows them, and the service fingerprints them with the worker file.
-  Any other key under `hooks` is refused.
+  around a turn: the two handler points of the conveyor, `before` a claim and
+  `after` a raise. Each is one command line, split as a shell splits it and run
+  without one, from the project root, with the task as `show` prints it under
+  "task" on stdin and these added to the environment: TASKS_TASK_ID,
+  TASKS_TASK_KEY, TASKS_TASK_TYPE, TASKS_TASK_ASSIGNEE, TASKS_WORKER and
+  TASKS_PROJECT_ROOT. `doctor` shows them, and the service fingerprints them
+  with the worker file. Any other key under `hooks` is refused.
+
+  Both answer in one vocabulary, by their exit:
+
+    exit 0                      go
+    exit 75, last stdout line   hold until that moment
+    a moment
+    exit 75 without a moment,   hold, with no moment
+    any other exit, a timeout,
+    a command that cannot start
+    exit 76, last stdout line   escalate at once, the line the reason
+    the reason
+
+  The moment is ISO 8601 with its offset, or a bare date read as `--pickup`
+  reads one. Escalate moves the task along the project's chain as ESCALATION
+  states; where the project sets no chain, or the chain goes nowhere from the
+  task's assignee, it is a hold with no moment.
 
   `before` is asked about each task a claim would take for the worker - by
   `run`, with or without --apply and with --key, and so by the service - before
-  anything is written. It has 30 seconds.
+  anything is written. It has 30 seconds. Go claims the task as always. Hold
+  writes nothing to the task - no pickup, no history row, no trail entry, its
+  `updated_at` unchanged - and the next task is asked about; the service
+  remembers the moment, or its next poll when there is none, and starts no
+  turn for the task before then, and a later claim asks the hook again.
+  Escalate moves the task and the next is asked about. A held task opens no
+  raise, spends no attempt and starts no turn. `run` reports each held task
+  under `passed_over` - the task, `verdict` `hold`, `until` when the hook named
+  a moment, the hook's last stdout line as `said`, and `why` when there was no
+  moment - and so does the service's log line, and each escalation under
+  `escalated`; without --apply nothing is written and an escalation is named
+  under `would_escalate`. A task named with --key that its hook holds back is
+  refused with exit 6 and the reason. When every task is held back, `run
+  --apply` claims nothing and says why. In a project that sets an escalation
+  chain, a task whose raises in place have reached the worker's attempts is
+  escalated before its hook is asked, and a task held back for longer than
+  `stall_after` is escalated instead of held; ESCALATION states both.
 
-    exit 0                      go: the task is claimed as always
-    exit 75, last stdout line   defer: the task's pickup is set to that moment,
-    a moment                    with no row in its history and no entry on the
-                                trail, and the next task is asked about
-    anything else               skip: nothing is written, and the next task is
-                                asked about; so is exit 75 without a moment, a
-                                timeout, and a command that cannot be started
+  `after` is asked once a raise is settled, whatever the outcome, with the
+  task as it stands then on stdin and how the raise ended added to the
+  environment: TASKS_EXECUTION, TASKS_OUTCOME (the raise's outcome),
+  TASKS_LANDED (the status the task landed in), TASKS_RAISE_DETAIL and
+  TASKS_RAISE_METRICS (the raise's detail and its metrics as JSON), and, when a
+  turn ran, TASKS_HARNESS_EXIT, TASKS_HARNESS_FAILURE (the failure's kind, or
+  empty) and TASKS_HARNESS_SAID (what the harness last said: its answer, its
+  failure and the tail of its stderr, at most 4000 characters). It has 60
+  seconds. Go changes nothing. Hold applies to the lane: no claim of this
+  worker - the service's, or `run` by hand - takes a task until the moment, or
+  for the worker's cool-down when there is none; it is recorded on the raise's
+  metrics as `lane_hold` (`until`, `by`, `said`), so it holds across a service
+  restart, and `run` reports it as `lane_held`. A claim on a held lane takes
+  nothing, still sweeps, and answers `lane_held`; a task named with --key is
+  taken whatever holds its lane. Escalate moves the task along the chain while
+  it stands where the raise left it; a task that ended, complete or closed, is
+  never reopened by it, and that answer holds the lane instead. An exit other
+  than 0 is also noted as `after_hook` on the raise's metrics, in the answer
+  and in the service's log line, beside the verdict the answer carries.
 
-  The moment is ISO 8601 with its offset, or a bare date read as `--pickup`
-  reads one. A deferred or skipped task opens no raise, spends no attempt and
-  starts no turn. `run` reports each one under `passed_over` - the task, the
-  verdict, the hook's last stdout line or why it failed - and so does the
-  service's log line; without --apply a deferral is named and not set. A task
-  named with --key that its hook holds back is refused with that reason. When
-  every task is held back, `run --apply` claims nothing and says why, and the
-  service waits for its next poll. In a project that sets an escalation chain,
-  a task held back after it has been refused longer than `stall_after` is
-  escalated instead, and a deferral is then not set; ESCALATION states it.
-
-  `after` is told how a raise ended, once it is settled, whatever the outcome:
-  the task as it stands then on stdin, and TASKS_EXECUTION, TASKS_OUTCOME (the
-  raise's outcome) and TASKS_LANDED (the status the task landed in) added to
-  the environment. It has 60 seconds. What it answers changes nothing about
-  the raise; an exit other than 0, a timeout or a command that cannot be
-  started is noted as `after_hook` on the raise's metrics, in the answer and in
-  the service's log line.
+  This capability ships after-raise handlers of its own, asked before the
+  worker's `after` hook and not switched off by it: a raise whose harness ran
+  out of its usage limit - Claude Code's "You've hit your session limit ·
+  resets 2:20am (Europe/Berlin)", "You've hit your weekly limit · resets Oct
+  9, 10am (...)", Codex's "You've hit your usage limit. ... try again at Sep
+  7th, 2026 9:06 AM.", or the harness library naming the failure a spent quota
+  - holds the lane until the moment the sentence names and a minute more,
+  never further than eight days; a limit that names no moment, and a harness
+  not logged in, hold it for 30 minutes. A time named without a zone is read
+  in this machine's. Such a raise is not an attempt, and while the lane is
+  held no claim of that worker runs, so the stall clock runs against no task
+  of it: a task's time held back counts again only from a hold after the
+  moment. The worker's `after` hook may hold the lane longer, never shorter.
 
 ESCALATION
   A project names, in `capabilities/tasks/conveyor.toml` beside its workers,
@@ -460,36 +509,53 @@ ESCALATION
   and no chain is warned. A project without the file escalates nothing, and
   every rule above runs as it always did.
 
-  Where a task stands is derived from what the store already records, never
-  stored: its place is its status and assignee, in place since the latest move
-  of either - a raise taking it into `in_progress` and putting it back where it
-  was moves nothing - or since it was created. It has been refused since the
-  later of that and the moment the latest pickup a person, a turn or an
-  exhaustion hold appointed passed; a hook's deferral appoints nothing. Its
+  Where a task stands is derived from what the store already records: its
+  place is its status and assignee, in place since the latest move of either -
+  a raise taking it into `in_progress` and putting it back where it was moves
+  nothing - or since it was created. It has been due since the later of that
+  and the moment the latest pickup a person or a turn appointed passed. Its
   raises in place are the raises that started after its place began and have
   ended, except those marked `exhausted`; a raise that moved the task started
   before its place began, so it is never counted.
 
+  How long a task has been held back is counted from the first hold of its
+  `before` hook in its place, never from when it last moved, so a task that
+  waited its turn behind other work is not escalated at its first hold. That
+  moment is the one fact here the store held nowhere, so the first hold of an
+  episode records it: one row among the task's raises, written by the claim,
+  marked `hold` in its metrics, never open and never a raise - `runs`, the
+  scan's `runs`, attempt numbers, raises in place and resumes all leave it
+  out. Later holds write nothing. The episode ends, with nothing written, once
+  a raise starts on the task, once the task moves, and once its worker's lane
+  is held after it began; the next hold begins a new one. A record lost only
+  restarts the clock, so the clock errs toward escalating later, never
+  falsely. Without a chain nothing is recorded.
+
   A worker's claim (`run`, by hand or by the service) escalates a task it was
-  about to take, instead of taking it, in two cases:
+  about to take, instead of taking it, in three cases:
 
-    its `before` hook holds the task back - a deferral or a skip - when it has
-    been refused longer than `stall_after`; the deferral is not set
-    its raises in place have reached the worker's `limits.attempts`
+    its raises in place have reached the worker's `limits.attempts`; this is
+    counted before its `before` hook is asked
+    its `before` hook holds it back, and has held it back in this place for
+    longer than `stall_after`
+    its `before` hook answers escalate; its last line is the reason
 
-  Only the claim of the task's own taker escalates it, and only when the hook
-  holds it at that claim: a task waiting its turn behind other work in its
-  lane is not refused and is never escalated. A paused lane claims nothing, so
-  it escalates nothing either; `service status` shows how long its oldest due
-  task has waited. A task assigned to a person is never escalated by these
-  rules. With a chain, `limits.attempts` counts raises in place and the
-  whole-life count that parks a task is not applied.
+  and a worker's `after` hook escalates a task it answers escalate for, as
+  HOOKS states. Only the claim of the task's own taker escalates it: a task
+  waiting its turn behind other work in its lane is never escalated, and a
+  lane held by a usage limit runs no claim, so its tasks are not escalated for
+  that time. A paused lane claims nothing, so it escalates nothing either;
+  `service status` shows how long its oldest due task has waited. A task
+  assigned to a person is never escalated by these rules. With a chain,
+  `limits.attempts` counts raises in place and the whole-life count that
+  parks a task is not applied.
 
   To escalate is to move the task: to `waiting`, its pickup let go, assigned
   to the name after its assignee in the chain, or the chain's first name when
   its assignee is not in it, with one trail entry by actor `tasks:scan`:
   whom from and to, why - the hook's last stdout line, or the attempts and the
-  worker's `park_hint` - since when it stood in place, and its raises in place.
+  worker's `park_hint` - since when it stood in place, since when it was held
+  back when it was, and its raises in place.
   The moves are rows in its history by the same actor. When the name it went
   to cannot move it under the same rules, the next escalation goes on to the
   next name, ending at the person. `run` reports each move under `escalated`
@@ -622,8 +688,6 @@ SERVICE
     max_parallel = 2              # turns running at once across every lane
     shutdown_grace_seconds = 60   # how long `stop --end-turns` waits for
                                   # running turns before ending them
-    retry_delay_seconds = 60      # how long after a turn on a task ends before
-                                  # the service starts another on it
 
     [lanes.implementation]        # one table per worker, by its name
     max_parallel = 1              # turns of this worker at once; default 1
@@ -633,13 +697,17 @@ SERVICE
   `doctor` does. A lane whose turn takes nothing, or fails before claiming,
   waits for the next poll rather than being asked again at once.
 
-  The service never starts a turn on a task it ran one on within the last
-  `retry_delay_seconds`, nor on a task one of its turns still holds: its turns
-  are told to claim other tasks, and a notification for such a task is deferred
-  to the moment the delay is over rather than dropped. A turn that fails and
-  puts its task straight back is therefore retried at that pace and no faster,
-  whatever the failure. This is the service's own rule: `tasks run` by hand
-  selects as it always has.
+  The service never starts a turn on a task one of its turns still holds, nor
+  on one a worker's `before` hook held back, until the moment the hook named
+  or the next poll: its turns are told to claim other tasks, and a
+  notification for such a task is kept for that moment rather than dropped.
+  `status` lists those holds under `deferred`. How soon a task whose raise
+  failed is taken again - its cool-down - and whether a lane is held are the
+  claim's to decide, from the raises, so the service starts no turn on a lane
+  a hold covers and wakes when a cool-down or a lane hold ends. A settings
+  file that still sets `retry_delay_seconds` loads, the service no longer waits
+  on it, it is read as the cool-down of every worker that names none, and
+  `doctor` and `service doctor` name it.
 
   The daemon publishes a fingerprint of what it loaded - the settings, every
   worker file and every profile a worker names - beside its pid, and `service
@@ -5623,7 +5691,8 @@ def _scan_columns(opts: dict) -> str:
                f"(select max(a.created_at) from {SCHEMA}.task_activities a "
                f"where a.task_id = t.id), "
                f"(select max(greatest(e.started_at, e.ended_at)) "
-               f"from {SCHEMA}.task_executions e where e.task_id = t.id))")
+               f"from {SCHEMA}.task_executions e where e.task_id = t.id "
+               f"and {_a_raise()}))")
     return (f"{'t.*' if opts.get('full') else _LEAN}, {touched} as last_touched_at, "
             f"{_rollup_columns()}")
 
@@ -5650,7 +5719,7 @@ def _rollup_columns() -> str:
             f"sum(({cost})::text::float8) filter (where jsonb_typeof({cost}) = 'number') as cost, "
             f"count(*) filter (where jsonb_typeof({cost}) is distinct from 'number') as uncosted "
             f"from {SCHEMA}.task_executions e where e.task_id = t.id "
-            f"group by 1) g) as runs")
+            f"and {_a_raise()} group by 1) g) as runs")
     named = ("case when jsonb_typeof(t.metadata -> 'blocked_by') = 'array' "
              "then t.metadata -> 'blocked_by' else '[]'::jsonb end")
     blockers = (f"(select coalesce(jsonb_object_agg(n.name, "
@@ -6893,16 +6962,18 @@ _WAITS_ON_ITS_NAME = ("(status <> 'waiting' or case when jsonb_typeof(metadata -
                       "'blocked_by') = 0 else true end)")
 
 
-def _not_held_from_waiting() -> str:
-    """A waiting task whose last raise took it from the wait and returned unspent
-    is held for the worker's `hold_seconds_on_exhaustion` from the moment that
-    raise ended. The hold is read from the raise rather than written as a pickup,
-    because a pickup on a waiting task ends the wait when it passes."""
-    return (f"(status <> 'waiting' or not coalesce((select e.metrics @> "
-            f"jsonb_build_object('{_CLAIMED_FROM}', 'waiting', 'exhausted', true) "
+def _not_cooling() -> str:
+    """A task whose last raise left it where it was - failed, or closed as
+    abandoned - is not taken again until the worker's cool-down has passed since
+    that raise ended. Derived from the raise, so it holds for every claim, a run
+    by hand as much as the service's, and writes nothing to the task. A raise
+    that moved the task ended `ok` or `handback`, and a raise still open holds
+    the task already."""
+    return (f"not coalesce((select e.status in ('failed', 'abandoned') "
             f"and e.ended_at > now() - make_interval(secs => %s) "
             f"from {SCHEMA}.task_executions e where e.task_id = {SCHEMA}.tasks.id "
-            f"order by e.started_at desc limit 1), false))")
+            f"and e.status <> 'running' and {_a_raise()} "
+            f"order by e.started_at desc limit 1), false)")
 
 
 def _open_raise_clause(held: bool) -> str:
@@ -6944,10 +7015,10 @@ def _selection(opts: dict, project: str, tz, held: bool = False) -> tuple[str, l
         params = [*params, statuses]
         if "waiting" in statuses:
             clauses.append(_WAITS_ON_ITS_NAME)
-            if opts.get("waiting_hold"):
-                clauses.append(_not_held_from_waiting())
-                params = [*params, int(opts["waiting_hold"])]
     clauses.append("(pickup_at is null or pickup_at <= now())")
+    if opts.get("cool_down"):
+        clauses.append(_not_cooling())
+        params = [*params, int(opts["cool_down"])]
     clauses.append(_open_raise_clause(held))
     joiner = " and " if where else " where "
     return f"{where}{joiner}" + " and ".join(clauses), params
@@ -7104,6 +7175,13 @@ def _claim(entry, opts: dict) -> dict:
             rows = [task]
             passed = []
         else:
+            # A worker's lane under a hold claims nothing until its moment; the
+            # sweeps above have run, since a claim is what puts back what is due.
+            lane = _lane_held(cur, opts["lane"], project) if opts.get("lane") else None
+            if lane is not None:
+                conn.commit()
+                return {"claimed": None, "swept": [str(r["id"]) for r in swept],
+                        "returned": [_address(t) for t in returned], "lane_held": lane}
             passed = _held_over(cur, opts, project, _zone(entry))
             while True:
                 cur.execute(f"""select * from {SCHEMA}.tasks{where}
@@ -7131,8 +7209,8 @@ def _claim(entry, opts: dict) -> dict:
                 return answer
         before = rows[0]
         tid = str(before["id"])
-        cur.execute(f"select count(*) as n from {SCHEMA}.task_executions where task_id = %s",
-                    (tid,))
+        cur.execute(f"""select count(*) as n from {SCHEMA}.task_executions e
+                         where task_id = %s and {_a_raise()}""", (tid,))
         attempt = cur.fetchone()["n"] + 1
         # What the claim fixes for the life of the raise: the writes its worker
         # declared, and that the task came from `waiting`. Recorded only when
@@ -7153,8 +7231,8 @@ def _claim(entry, opts: dict) -> dict:
         previous = None
         if opts.get("run") and opts.get("worker"):
             cur.execute(f"""select id, status, run_system, run_ref, metrics, detail
-                              from {SCHEMA}.task_executions
-                             where task_id = %s and worker = %s
+                              from {SCHEMA}.task_executions e
+                             where task_id = %s and worker = %s and {_a_raise()}
                              order by started_at desc limit 1""",
                         (tid, opts["worker"]))
             found = _rows(cur)
@@ -7358,10 +7436,18 @@ def _release(entry, ref: str, outcome: str, status: str | None, detail: str | No
 # nothing at all. The lease is not among them: it is derived from the profile
 # the worker names, because a lease has to outlast the turn and only the
 # profile knows how long a turn may run.
-_LIMIT_DEFAULTS = {"attempts": 3, "hold_seconds_on_exhaustion": 1200,
-                   "idle_failure_seconds": 120}
-_LIMIT_KEYS = ("attempts", "lease_seconds", "hold_seconds_on_exhaustion",
-               "idle_failure_seconds")
+_LIMIT_DEFAULTS = {"attempts": 3, "idle_failure_seconds": 120}
+_LIMIT_KEYS = ("attempts", "lease_seconds", "cool_down_seconds", "idle_failure_seconds",
+               "hold_seconds_on_exhaustion")
+
+# How long after a raise that left its task where it was - failed, or closed as
+# abandoned - before a claim takes that task again, when nothing declares it.
+# The one pause between two raises on a task, derived from the last raise, so it
+# holds for a run by hand as for the service. The keys it replaces are still
+# read as it, and `doctor` names them: the worker's `hold_seconds_on_exhaustion`,
+# and the service's `retry_delay_seconds`.
+_COOL_DOWN_DEFAULT = 60
+_DEPRECATED_LIMITS = {"hold_seconds_on_exhaustion": "cool_down_seconds"}
 
 # The margin a derived lease keeps over the profile's timeout: the gap between a
 # turn being killed at its limit and anyone being allowed to conclude it died.
@@ -7374,7 +7460,21 @@ _LEASE_MARGIN = 600
 # worker names a routine or a profile that is not there never reached a turn.
 # None of them is the task's fault, and parking on the third of any would
 # punish the work for the weather.
-_UNSPENT_MARKS = ("exhausted", "waiting", "missing")
+_UNSPENT_MARKS = ("exhausted", "waiting", "missing", "hold")
+
+# A hold episode: the one row a claim writes when a worker's `before` hook first
+# holds a task back in its place, so how long the task has been refused can be
+# counted from then, by every claim, after any restart. It lives among the
+# raises because that is where a task's history of being taken is, and it is
+# never a raise: no turn ran, it is never open, and every reader of raises
+# leaves it out by this mark on its metrics. Nothing closes it; it stops
+# counting once a raise starts on the task, the task moves, or its lane is held.
+_HOLD_MARK = "hold"
+
+
+def _a_raise(alias: str = "e") -> str:
+    """The clause that keeps hold episodes out of a reading of raises."""
+    return f"not ({alias}.metrics ? '{_HOLD_MARK}')"
 
 # The worker this capability ships, and the name a project file takes to
 # replace it.
@@ -7391,9 +7491,23 @@ _WORKER_KEYS = ("enabled", "description", "takes", "tags", "assignee", "on_reque
 # ended. This capability knows nothing of what either checks.
 _HOOK_KEYS = ("before", "after")
 _HOOK_TIMEOUTS = {"before": 30, "after": 60}
-# The exit a `before` hook answers with to hold the task until a moment it names
-# on its last line: EX_TEMPFAIL, "not now, try again later".
-_HOOK_DEFER = 75
+# What a hook answers, by its exit, in the one vocabulary both handler points
+# speak: 0 lets it go; EX_TEMPFAIL, "not now, try again later", holds it until
+# the moment its last line names, or with no moment; the next code escalates the
+# task, its last line the reason. Any other ending - another exit, a timeout, a
+# command that cannot be started - is a hold with no moment.
+_HOOK_HOLD = 75
+_HOOK_ESCALATE = 76
+
+# How long the shipped handlers hold a lane whose harness ran out of its usage
+# limit, or is not logged in, when the harness names no moment it resets.
+_LANE_HOLD_DEFAULT = 1800
+# The furthest ahead a moment a harness names is believed: past a week and a
+# day it is read as that, so a misread date cannot shut a lane for a year.
+_LANE_HOLD_LONGEST = 8 * 86400
+# A reset the harness names to the minute is waited out a minute longer, so the
+# next turn does not reach the account in the minute it is still spent.
+_LANE_HOLD_MARGIN = 60
 
 # What one filter of `takes` may name, each as a list of the values it allows,
 # and the statuses a worker may take a task in: todo, the queue, and waiting,
@@ -7583,7 +7697,13 @@ def _in_place_sql() -> str:
                   writes none and is not an appointment;
     raises_in_place  raises that started after place_since and have ended,
                   except those marked `exhausted`. A raise that moved the task
-                  set place_since after its own start, so it is never counted."""
+                  set place_since after its own start, so it is never counted;
+    held_since    when the hold episode the task is in began: the start of the
+                  latest episode row written after place_since, with no raise
+                  started on the task since and its lane held by no lane hold
+                  reaching past it. Null when the task is in none - never held
+                  in this place, or taken, moved or behind a lane hold since -
+                  so a claim that holds it next begins a new one."""
     changes, raises = f"{SCHEMA}.task_changes", f"{SCHEMA}.task_executions"
     place = f"""coalesce((select max(c.changed_at) from {changes} c
                            where c.task_id = t.id
@@ -7611,20 +7731,41 @@ def _in_place_sql() -> str:
                           as refused_since,
                         (select count(*) from {raises} e
                           where e.task_id = t.id and e.status <> 'running'
-                            and e.started_at > pl.place_since
+                            and e.started_at > pl.place_since and {_a_raise()}
                             and not (e.metrics @> '{{"exhausted": true}}'::jsonb))
-                          as raises_in_place) rf"""
+                          as raises_in_place,
+                        (select h.started_at from {raises} h
+                          where h.task_id = t.id and h.metrics ? '{_HOLD_MARK}'
+                            and h.started_at > pl.place_since
+                            and not exists (select 1 from {raises} r
+                                             where r.task_id = t.id and {_a_raise('r')}
+                                               and r.started_at >= h.started_at)
+                            and not exists (select 1 from {raises} l
+                                              join {SCHEMA}.tasks lt on lt.id = l.task_id
+                                             where lt.project_id = t.project_id
+                                               and l.worker is not distinct from h.worker
+                                               and l.metrics ? 'lane_hold'
+                                               and {_lane_until('l')} > h.started_at)
+                          order by h.started_at desc limit 1)
+                          as held_since) rf"""
 
 
 def _in_place(cur, tid: str) -> dict:
-    """place_since, refused_since, how many seconds it has been refused by the
-    store's clock, and raises_in_place, for one task."""
+    """place_since, refused_since, raises_in_place, held_since and how many
+    seconds the task has been held back since then by the store's clock, for
+    one task."""
     cur.execute(f"""select pl.place_since, rf.refused_since, rf.raises_in_place,
-                           extract(epoch from now() - rf.refused_since)::bigint
-                             as refused_seconds
+                           rf.held_since,
+                           extract(epoch from now() - rf.held_since)::bigint
+                             as held_seconds
                       from {SCHEMA}.tasks t {_in_place_sql()}
                      where t.id::text = %s""", (tid,))
     return _rows(cur)[0]
+
+
+def _lane_until(alias: str = "e") -> str:
+    """The moment a raise's lane hold runs to, as the store reads it."""
+    return f"({alias}.metrics -> 'lane_hold' ->> 'until')::timestamptz"
 
 
 def _stamp(moment) -> str:
@@ -7675,8 +7816,10 @@ def _escalate(cur, task: dict, target: str, why: str, facts: dict,
     _record_moves(cur, tid, before, after, actor=SCAN_ACTOR, origin=project)
     held_by = (before.get("assignee") or "").strip()
     place, refused = _stamp(facts["place_since"]), _stamp(facts["refused_since"])
+    held = _stamp(facts["held_since"]) if facts.get("held_since") else None
     said = (f"Escalated from {held_by or 'nobody'} to {target}: {why}. In place since "
             f"{place}" + (f", due since {refused}" if refused != place else "")
+            + (f", held back since {held}" if held else "")
             + f"; {facts['raises_in_place']} raise(s) in place.")
     _add_activity(cur, tid, said, SCAN_ACTOR)
     return {"task": _address(after), "task_id": tid, "from": held_by or None,
@@ -7684,49 +7827,119 @@ def _escalate(cur, task: dict, target: str, why: str, facts: dict,
             "raises_in_place": int(facts["raises_in_place"])}
 
 
-def _escalate_held(entry, escalation: dict, task: dict, said: str | None,
-                   verdict: str, *, write: bool) -> dict | None:
-    """Escalate a task its worker's `before` hook just held back, when it has
-    been refused longer than `stall_after`; None leaves the hold as it is.
+def _still_where_seen(cur, task: dict, write: bool) -> dict | None:
+    """The task row while it still stands where its claim saw it - same status
+    and assignee, due, no raise open on it - locked when `write` says so; None
+    once anything moved it, which leaves it to whoever did."""
+    cur.execute(f"""select * from {SCHEMA}.tasks
+                     where id::text = %s and status = %s
+                       and assignee is not distinct from %s
+                       and (pickup_at is null or pickup_at <= now())
+                       and {_open_raise_clause(False)}
+                     {'for update skip locked' if write else ''}""",
+                (str(task["id"]), task["status"], task.get("assignee")))
+    rows = _rows(cur)
+    return rows[0] if rows else None
 
-    Only the hold of a claim by the task's own taker leads here, so time a task
-    spends waiting its turn in a busy lane escalates nothing. Written only while
-    the task still stands where the hook saw it - same status and assignee,
-    due, no raise open on it - and without `write` the escalation is answered
-    and not made."""
+
+def _escalation_answer(task: dict, target: str, why: str, facts: dict) -> dict:
+    """An escalation named and not made, in the shape a made one is reported."""
+    return {"task": _address(task), "task_id": str(task["id"]),
+            "from": (task.get("assignee") or "").strip() or None, "to": target,
+            "why": why, "in_place_since": _stamp(facts["place_since"]),
+            "raises_in_place": int(facts["raises_in_place"])}
+
+
+def _attempts_first(entry, escalation: dict, task: dict, *, write: bool) -> dict | None:
+    """Escalate a task whose raises in place have reached the worker's attempts,
+    before its `before` hook is asked about it: a hook that holds it would
+    otherwise keep it from the count that ends it. Without `write` the move is
+    answered and not made."""
+    with _connect(entry) as conn, conn.cursor() as cur:
+        row = _still_where_seen(cur, task, write)
+        if row is None:
+            conn.commit()
+            return None
+        if not write:
+            moved = _would_escalate(cur, escalation, row)
+            conn.commit()
+            return moved
+        moved = _escalated_instead(cur, escalation, row, _writing_project())
+        conn.commit()
+    return moved
+
+
+def _escalate_asked(entry, escalation: dict, task: dict, why: str, *,
+                    write: bool) -> dict | None:
+    """Escalate a task a handler answered `escalate` for, at once, with the
+    handler's words as the reason; None when it cannot go anywhere - it is
+    assigned to a person, or to the chain's last name - or no longer stands
+    where the handler saw it."""
     if _is_person(task.get("assignee"), escalation):
         return None
     target = _escalation_target(escalation, task.get("assignee"))
     if target is None:
         return None
-    project = _writing_project()
     with _connect(entry) as conn, conn.cursor() as cur:
-        cur.execute(f"""select * from {SCHEMA}.tasks
-                         where id::text = %s and status = %s
-                           and assignee is not distinct from %s
-                           and (pickup_at is null or pickup_at <= now())
-                           and {_open_raise_clause(False)}
-                         {'for update skip locked' if write else ''}""",
-                    (str(task["id"]), task["status"], task.get("assignee")))
-        rows = _rows(cur)
-        if not rows:
+        row = _still_where_seen(cur, task, write)
+        if row is None:
             conn.commit()
             return None
         facts = _in_place(cur, str(task["id"]))
-        if int(facts["refused_seconds"] or 0) <= escalation["stall_after"]:
+        if not write:
+            conn.commit()
+            return _escalation_answer(task, target, why, facts)
+        moved = _escalate(cur, row, target, why, facts, _writing_project())
+        conn.commit()
+    return moved
+
+
+def _held_back(entry, escalation: dict, task: dict, said: str | None, how: str, *,
+               write: bool) -> dict | None:
+    """Count a hold of a task by its own taker's `before` hook against
+    `stall_after`, and escalate it once it has been held back longer; None
+    leaves the hold as it is.
+
+    The clock runs from the first hold in the task's place, never from when it
+    last moved, so a task that waited its turn in a busy lane is not escalated
+    at its first hold. That moment is the one thing here no record already
+    holds: the first hold of an episode writes one hold row among the task's
+    raises, the claim's alone, and every later hold reads it. A task not where
+    the hook saw it is left as it is, and without `write` nothing is written."""
+    if _is_person(task.get("assignee"), escalation):
+        return None
+    target = _escalation_target(escalation, task.get("assignee"))
+    if target is None:
+        return None
+    with _connect(entry) as conn, conn.cursor() as cur:
+        row = _still_where_seen(cur, task, write)
+        if row is None:
             conn.commit()
             return None
-        why = (f"worker {escalation['worker']!r}'s before hook held it back ({verdict}) "
-               f"after it had been refused for {_span(facts['refused_seconds'])}, past the "
+        facts = _in_place(cur, str(task["id"]))
+        if facts["held_since"] is None:
+            # The first hold of this episode: never escalated, and recorded so
+            # every claim from now on, by hand or by any service, counts from it.
+            if write:
+                cur.execute(f"""insert into {SCHEMA}.task_executions
+                                  (task_id, attempt, worker, status, metrics,
+                                   started_at, ended_at)
+                                values (%s, 0, %s, 'handback', %s::jsonb, now(), now())""",
+                            (str(row["id"]), escalation["worker"],
+                             json.dumps({_HOLD_MARK: {"said": said, "how": how}})))
+            conn.commit()
+            return None
+        if int(facts["held_seconds"] or 0) <= escalation["stall_after"]:
+            conn.commit()
+            return None
+        why = (f"worker {escalation['worker']!r}'s before hook held it back ({how}) "
+               f"for {_span(facts['held_seconds'])}, past the "
                f"{_span(escalation['stall_after'])} ceiling; the hook said: "
                + (said or "nothing"))
         if not write:
             conn.commit()
-            return {"task": _address(task), "task_id": str(task["id"]),
-                    "from": (task.get("assignee") or "").strip() or None, "to": target,
-                    "why": why, "in_place_since": _stamp(facts["place_since"]),
-                    "raises_in_place": int(facts["raises_in_place"])}
-        moved = _escalate(cur, rows[0], target, why, facts, project)
+            return _escalation_answer(task, target, why, facts)
+        moved = _escalate(cur, row, target, why, facts, _writing_project())
         conn.commit()
     return moved
 
@@ -8081,6 +8294,32 @@ def _resolve_profile(name: str) -> tuple[object, dict, dict]:
     return runner.Profile.from_dict(knobs), knobs, origin
 
 
+def _cool_down_unsaid(declared_limits: dict) -> int:
+    """The cool-down of a worker whose limits do not name one: the deprecated
+    key it replaces, then the service's deprecated retry delay when its settings
+    file sets one, then this capability's default."""
+    held = declared_limits.get("hold_seconds_on_exhaustion")
+    if isinstance(held, int) and not isinstance(held, bool) and held > 0:
+        return held
+    retry = _service_retry_delay()
+    return retry if retry is not None else _COOL_DOWN_DEFAULT
+
+
+def _service_retry_delay() -> int | None:
+    """`retry_delay_seconds` as this project's service settings set it, or None.
+    Read only as the cool-down it became; a file that cannot be read is the
+    service doctor's to report."""
+    import tomllib
+    try:
+        raw = tomllib.loads(_service_settings_path().read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    value = raw.get("retry_delay_seconds")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
 def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
     """One worker as this capability reads it, and everything wrong with it.
 
@@ -8188,13 +8427,19 @@ def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
     if not isinstance(declared_limits, dict):
         wrong("its `limits` is a mapping of whole numbers")
         declared_limits = {}
+    deprecated: list[str] = []
     for key, value in declared_limits.items():
         if key not in _LIMIT_KEYS:
             wrong(f"its limits name {key!r}, which nothing reads")
         elif isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             wrong(f"its limit {key} must be a whole number above zero")
+        elif key in _DEPRECATED_LIMITS:
+            deprecated.append(f"its limits.{key} is read as "
+                              f"limits.{_DEPRECATED_LIMITS[key]}; name that instead")
         else:
             limits[key] = value
+    if "cool_down_seconds" not in limits:
+        limits["cool_down_seconds"] = _cool_down_unsaid(declared_limits)
     if "lease_seconds" not in limits:
         timeout = knobs.get("timeout_seconds")
         if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
@@ -8226,7 +8471,7 @@ def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
             "shorthand": shorthand, "description": description, "writes": writes,
             "profile": profile, "knobs": knobs, "profile_source": origin,
             "routines": routines, "limits": limits, "park_hint": hint.strip(),
-            "hooks": hooks, "body": body, "missing": missing,
+            "hooks": hooks, "body": body, "missing": missing, "deprecated": deprecated,
             "handler": _handler(profile) if profile is not None else None}, []
 
 
@@ -8456,6 +8701,8 @@ def _workers_report() -> tuple[list[dict], list[str]]:
                 row["writes"] = worker["writes"]
             row["routines"] = worker["routines"]
             row["limits"] = worker["limits"]
+            if worker["deprecated"]:
+                row["deprecated"] = worker["deprecated"]
             if worker["hooks"]:
                 row["hooks"] = worker["hooks"]
             row["profile_source"] = worker["profile_source"]
@@ -8700,7 +8947,8 @@ def _asks(worker: dict) -> list[dict]:
     asks once, for any type no other enabled worker takes."""
     if worker["catch_all"]:
         return [{**_selector_filters(worker),
-                 "not_types": list(worker.get("not_types") or [])}]
+                 "not_types": list(worker.get("not_types") or []),
+                 "cool_down": worker["limits"]["cool_down_seconds"]}]
     asks: list[dict] = []
     for one in worker["filters"]:
         narrowing: dict = {}
@@ -8710,11 +8958,37 @@ def _asks(worker: dict) -> list[dict]:
             narrowing["assignees"] = list(one["assignee"])
         if one["status"] != ["todo"]:
             narrowing["statuses"] = list(one["status"])
-        if "waiting" in one["status"]:
-            narrowing["waiting_hold"] = worker["limits"]["hold_seconds_on_exhaustion"]
+        narrowing["cool_down"] = worker["limits"]["cool_down_seconds"]
         for kind in one["type"] or [None]:
             asks.append({**narrowing, **({"type": kind} if kind else {})})
     return asks
+
+
+def _lane_held(cur, worker: str, project: str) -> dict | None:
+    """The lane hold this worker's claims are under now, or None: the furthest
+    moment still ahead that a raise of this worker in this project recorded as
+    `lane_hold` - a shipped handler that read a usage limit in how the raise
+    ended, or the worker's `after` hook answering hold. Derived from the raises,
+    so it holds for a run by hand and across a service restart."""
+    cur.execute(f"""select e.id as execution, e.metrics -> 'lane_hold' as hold,
+                           {_lane_until()} as until
+                      from {SCHEMA}.task_executions e
+                      join {SCHEMA}.tasks t on t.id = e.task_id
+                     where t.project_id = %s and e.worker = %s
+                       and e.metrics ? 'lane_hold' and {_lane_until()} > now()
+                     order by until desc limit 1""", (project, worker))
+    rows = _rows(cur)
+    if not rows:
+        return None
+    hold = rows[0]["hold"] or {}
+    return {"until": hold.get("until") or _stamp(rows[0]["until"]),
+            "execution": str(rows[0]["execution"]),
+            **{k: hold[k] for k in ("by", "said") if hold.get(k)}}
+
+
+def _lane_held_now(entry, worker: dict) -> dict | None:
+    with _connect(entry) as conn, conn.cursor() as cur:
+        return _lane_held(cur, worker["name"], _writing_project())
 
 
 def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
@@ -8752,6 +9026,10 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
     if worker.get("escalation"):
         base["escalation"] = worker["escalation"]
     before = (worker.get("hooks") or {}).get("before")
+    # A held lane claims nothing until its moment; the claim reads it, and a
+    # task named with --key is taken whatever holds the lane.
+    if not key:
+        base["lane"] = worker["name"]
     if key:
         swept, returned = [], []
         if before:
@@ -8771,7 +9049,7 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
             if passed:
                 _die(6, "conflict", f"{key} was not claimed: {_passed_words(passed)}",
                      f"the before hook of worker {worker['name']!r} decides when "
-                     "it is taken; `tasks show` names any pickup it set")
+                     "it is taken; a hold writes nothing to the task")
         answer = _claim(entry, {**base, **_selector_filters(worker), "key": key,
                                 **_key_types(worker)})
         if before:
@@ -8789,7 +9067,7 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
         swept += answer.get("swept") or []
         passed = _passed_merged(passed, answer.pop("passed_over", None))
         escalated += answer.pop("escalated", None) or []
-        if answer.get("claimed") is not None:
+        if answer.get("claimed") is not None or answer.get("lane_held"):
             break
     answer["swept"] = swept
     if passed:
@@ -8857,6 +9135,11 @@ def _take_past_hooks(entry, worker: dict, base: dict, exclude: tuple) -> dict:
     # it, and said the way the claim says it.
     passed: list = []
     with _connect(entry) as conn, conn.cursor() as cur:
+        lane = _lane_held(cur, worker["name"], project)
+        if lane is not None:
+            # No hook is asked on a held lane: nothing would be taken.
+            return {"claimed": None, "swept": swept, "returned": returned,
+                    "lane_held": lane}
         for ask in _asks(worker):
             passed = _passed_merged(passed, _held_over(cur, {**ask, "not_ids": asked},
                                                        project, tz))
@@ -8907,6 +9190,10 @@ def _would_take(entry, worker: dict, key: str | None, exclude: tuple = (),
     held = contextlib.nullcontext(conn) if conn is not None else _connect(entry)
     with held as conn, conn.cursor() as cur:
         take = None
+        lane = None if key else _lane_held(cur, worker["name"], project)
+        if lane is not None:
+            return {"worker": worker["name"], "would_claim": None, "applied": False,
+                    "lane_held": lane}
         if key:
             tid = _task_id(cur, key, writing=True)
             cur.execute(f"""select *, (pickup_at is null or pickup_at <= now()) as due
@@ -8972,14 +9259,12 @@ def _would_take_past_hooks(entry, worker: dict, key: str | None,
         if held:
             passed.append(held)
             return None
-        if worker.get("escalation"):
-            with _connect(entry) as conn, conn.cursor() as cur:
-                moved = _would_escalate(cur, worker["escalation"], task)
-            if moved:
-                would.append(moved)
-                return None
         return task
 
+    lane = None if key else _lane_held_now(entry, worker)
+    if lane is not None:
+        return {"worker": worker["name"], "would_claim": None, "applied": False,
+                "passed_over": [], "lane_held": lane}
     if key:
         task = _key_candidate(entry, worker, key)
         take = judged(task) if task else None
@@ -9074,95 +9359,311 @@ def _hook_moment(text: str | None, tz) -> str | None:
     return stamp.isoformat() if stamp.tzinfo is not None else None
 
 
-def _defer(entry, worker: dict, tid: str, moment: str) -> bool:
-    """Hold a task its worker's `before` hook deferred until the moment it named:
-    the pickup alone, with no row in the history and no entry on the trail, since
-    a lane held back carries nothing a reader needs. A task that left the queue
-    meanwhile, or that a claimer holds, is not written."""
-    with _connect(entry) as conn, conn.cursor() as cur:
-        cur.execute(f"""select * from {SCHEMA}.tasks
-                         where id::text = %s and status in ('todo', 'waiting')
-                         for update skip locked""", (tid,))
-        rows = _rows(cur)
-        if not rows:
-            conn.commit()
-            return False
-        cur.execute(f"""update {SCHEMA}.tasks set pickup_at = %s, updated_at = now()
-                         where id::text = %s""", (moment, tid))
-        conn.commit()
-    return True
+def _verdict(ran: dict, tz) -> dict:
+    """What a hook's ending says, in the one vocabulary both handler points
+    speak: `go`; `hold`, with `until` when its last line names a moment; or
+    `escalate`, its last line the reason. Every other ending - another exit, 75
+    without a moment, a timeout, a command that could not be started - is a hold
+    with no moment and `why` says which."""
+    said = ran["said"]
+    if ran["exit"] == 0:
+        return {"verdict": "go", "said": said}
+    if ran["exit"] == _HOOK_ESCALATE:
+        return {"verdict": "escalate", "said": said,
+                "why": said or f"its hook exited {_HOOK_ESCALATE} and said nothing"}
+    if ran["exit"] == _HOOK_HOLD:
+        moment = _hook_moment(said, tz)
+        if moment:
+            return {"verdict": "hold", "until": moment, "said": said}
+        return {"verdict": "hold", "said": said,
+                "why": f"exited {_HOOK_HOLD} without a moment on its last line"}
+    return {"verdict": "hold", "said": said, "why": ran["why"]}
 
 
 def _ask_before(entry, worker: dict, task: dict, *, write: bool) -> dict | None:
-    """Ask the worker's `before` hook about one task a claim would take. None
-    lets the claim go on; otherwise what held the task back: a deferral to the
-    moment the hook named, set when `write` says so, or a skip that writes
-    nothing - any other exit, a deferral naming no moment, a timeout, or a hook
-    that could not be started."""
-    ran = _run_hook(worker, "before", task)
-    if ran["exit"] == 0:
-        return None
-    held = {"task": _address(task), "task_id": str(task["id"])}
-    moment = (_hook_moment(ran["said"], _zone(entry)) if ran["exit"] == _HOOK_DEFER
-              else None)
-    if moment:
-        held.update(verdict="defer", until=moment, said=ran["said"])
-    elif ran["exit"] == _HOOK_DEFER:
-        held.update(verdict="skip", why=f"exited {_HOOK_DEFER} without a moment on its "
-                    "last line", said=ran["said"])
-    else:
-        held.update(verdict="skip", why=ran["why"], said=ran["said"])
-    # Held back by its own taker's claim: past the project's ceiling it is
-    # escalated instead, and the deferral is not written.
-    if worker.get("escalation"):
-        how = (f"deferred to {moment}" if moment else f"skipped: {held['why']}")
-        moved = _escalate_held(entry, worker["escalation"], task, ran["said"], how,
-                               write=write)
+    """What a claim does with one task it would take, before anything of the
+    task is written: None takes it; otherwise the verdict that held it back or
+    the escalation made instead.
+
+    With an escalation chain, a task whose raises in place reached the worker's
+    attempts is escalated before the hook is asked. Then the worker's `before`
+    hook answers: go takes it; hold writes nothing to the task - the service
+    remembers the moment, or its next poll - and counts against `stall_after`
+    from the first hold in its place; escalate moves it at once along the chain,
+    its last line the reason, and is a hold with no moment where the chain
+    reaches nobody. Without `write` an escalation is named and not made."""
+    escalation = worker.get("escalation")
+    tid = str(task["id"])
+    if escalation:
+        moved = _attempts_first(entry, escalation, task, write=write)
         if moved:
-            return {"task": held["task"], "task_id": held["task_id"],
-                    "verdict": "escalate", "to": moved["to"], "why": moved["why"],
-                    "said": ran["said"], "escalated": moved}
-    if moment and write:
-        held["pickup_set"] = _defer(entry, worker, held["task_id"], moment)
+            return {"task": _address(task), "task_id": tid, "verdict": "escalate",
+                    "to": moved["to"], "why": moved["why"], "escalated": moved}
+    told = _verdict(_run_hook(worker, "before", task), _zone(entry))
+    if told["verdict"] == "go":
+        return None
+    held = {"task": _address(task), "task_id": tid,
+            **{k: v for k, v in told.items() if v is not None}}
+    if escalation:
+        if told["verdict"] == "escalate":
+            moved = _escalate_asked(entry, escalation, task, told["why"], write=write)
+        else:
+            how = (f"held until {told['until']}" if told.get("until")
+                   else f"held: {told.get('why')}")
+            moved = _held_back(entry, escalation, task, told["said"], how, write=write)
+        if moved:
+            return {"task": held["task"], "task_id": tid, "verdict": "escalate",
+                    "to": moved["to"], "why": moved["why"], "said": told["said"],
+                    "escalated": moved}
+    if told["verdict"] == "escalate":
+        # Asked to escalate where the project sets no chain, or the chain goes
+        # nowhere from this assignee: held, with no moment.
+        held.update(verdict="hold",
+                    why=("its before hook asked to escalate it, and "
+                         + ("the project sets no escalation chain" if not escalation
+                            else "the escalation chain goes nowhere from its assignee")))
     return held
 
 
 def _passed_words(held: dict) -> str:
     """One task a `before` hook held back, in a sentence."""
-    if held["verdict"] == "defer":
-        words = f"its before hook deferred it to {held['until']}"
-        if held.get("pickup_set") is False:
-            words += ", and the pickup was not set because the task left the queue"
-        return words
-    return (f"its before hook skipped it ({held['why']})"
+    if held.get("until"):
+        return f"its before hook held it until {held['until']}"
+    return (f"its before hook held it ({held.get('why')})"
             + (f": {held['said']}" if held.get("said") else ""))
 
 
-def _after_hook(entry, worker: dict, tid: str, execution: str, report: dict) -> None:
-    """Tell the worker's `after` hook how a settled raise ended. What it answers
-    changes nothing about the raise; a hook that fails, times out or cannot be
-    started is noted on the raise's metrics and in the report."""
+# --- The shipped after-raise handlers ---------------------------------------
+#
+# How a raise ended can say the harness's account cannot work now: its usage
+# limit is spent, or it is not logged in. Every turn of the lane would end the
+# same way, so the lane is held - until the moment the harness says the limit
+# resets, or for `_LANE_HOLD_DEFAULT` when it names none - and the raise is not
+# an attempt at the work. The sentences are the harnesses' own, as Claude Code
+# and Codex print them:
+#
+#   You've hit your session limit · resets 2:20am (Europe/Berlin)
+#   You've hit your weekly limit · resets Oct 9, 10am (Europe/Berlin)
+#   Claude AI usage limit reached|1790000000
+#   You've hit your usage limit. ... or try again at Sep 7th, 2026 9:06 AM.
+#   You've hit your usage limit. Try again at 3:15 PM.
+
+_LIMIT_SAID = re.compile(
+    r"you['\u2019]ve hit your [^\n.\u00b7]{0,40}?limit|usage limit reached"
+    r"|claude ai usage limit reached", re.IGNORECASE)
+_LIMIT_EPOCH = re.compile(r"usage limit reached\|(\d{9,11})", re.IGNORECASE)
+_LIMIT_IN = re.compile(
+    r"try again in\s+(\d+(?:\.\d+)?)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)\b",
+    re.IGNORECASE)
+_LIMIT_AT = re.compile(
+    r"(?:resets?(?:\s+at)?|reset at|try again (?:at|after))\s+"
+    r"(?:(?P<mon>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+"
+    r"(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+(?:(?P<year>\d{4}),?\s+)?(?:at\s+)?)?"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<half>[ap])\.?m\.?"
+    r"(?:\s*\((?P<zone>[A-Za-z_]+(?:/[A-Za-z0-9_+-]+)*)\))?",
+    re.IGNORECASE)
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov",
+           "dec")
+
+
+def _reset_moment(text: str, now):
+    """The moment a harness's limit sentence says it resets, as an aware
+    datetime, or None when it names none it can be read by. A clock time with no
+    date is its next occurrence; a date with no year is this year's, or next
+    year's once this year's is past. A time named without a zone is the zone of
+    this machine, where the harness printed it."""
+    import datetime
+    epoch = _LIMIT_EPOCH.search(text)
+    if epoch:
+        return datetime.datetime.fromtimestamp(int(epoch.group(1)), datetime.timezone.utc)
+    within = _LIMIT_IN.search(text)
+    if within:
+        unit = within.group(2).lower()[0]
+        size = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+        return now + datetime.timedelta(seconds=float(within.group(1)) * size)
+    at = _LIMIT_AT.search(text)
+    if not at:
+        return None
+    zone = now.astimezone().tzinfo
+    if at.group("zone"):
+        try:
+            import zoneinfo
+            zone = zoneinfo.ZoneInfo(at.group("zone"))
+        except Exception:
+            pass
+    hour = int(at.group("hour")) % 12 + (12 if at.group("half").lower() == "p" else 0)
+    minute = int(at.group("minute") or 0)
+    if hour > 23 or minute > 59:
+        return None
+    here = now.astimezone(zone)
+    try:
+        if at.group("mon"):
+            month = _MONTHS.index(at.group("mon").lower()[:3]) + 1
+            year = int(at.group("year") or here.year)
+            moment = here.replace(year=year, month=month, day=int(at.group("day")),
+                                  hour=hour, minute=minute, second=0, microsecond=0)
+            if not at.group("year") and moment < here - datetime.timedelta(days=1):
+                moment = moment.replace(year=year + 1)
+        else:
+            moment = here.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if moment <= here - datetime.timedelta(minutes=1):
+                moment += datetime.timedelta(days=1)
+    except ValueError:
+        return None
+    return moment
+
+
+def _harness_said(result) -> str:
+    """Everything the harness said about how a turn ended: its answer, its
+    failure and the tail of its stderr, the plainest first."""
+    parts = [result.answer or "", result.failure.message if result.failure else "",
+             result.stderr_tail or ""]
+    return "\n".join(one for one in parts if one)
+
+
+def _limit_ending(result, runner) -> dict | None:
+    """The shipped after-raise handlers: when a turn ended because the
+    harness's account cannot work now, the lane hold that answers it - `until`,
+    `by` and the harness's sentence - and otherwise None.
+
+    A usage limit is read from the harness's own sentence, or from the library
+    naming the failure a spent quota; a harness not logged in, from the library
+    alone. The lane is held until the moment the sentence names, a minute past
+    it, never further than `_LANE_HOLD_LONGEST`, and for `_LANE_HOLD_DEFAULT`
+    when it names none it can be read by, or names one already past."""
+    import datetime
+    if result.ok:
+        return None
+    text = _harness_said(result)
+    kind = result.failure.kind if result.failure else None
+    limited = bool(_LIMIT_SAID.search(text)) or kind == runner.FailureKind.QUOTA
+    if not limited and kind != runner.FailureKind.NOT_AUTHENTICATED:
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    harness = result.harness or "harness"
+    moment = _reset_moment(text, now) if limited else None
+    if moment is not None and moment > now:
+        until = min(moment + datetime.timedelta(seconds=_LANE_HOLD_MARGIN),
+                    now + datetime.timedelta(seconds=_LANE_HOLD_LONGEST))
+        by = f"{harness} usage limit"
+    else:
+        until = now + datetime.timedelta(seconds=_LANE_HOLD_DEFAULT)
+        by = (f"{harness} usage limit, no reset named" if limited
+              else f"{harness} not logged in")
+    sentence = next((line.strip() for line in text.splitlines()
+                     if _LIMIT_SAID.search(line) or "logged in" in line.lower()
+                     or "login" in line.lower()), None)
+    return {"until": until.astimezone(datetime.timezone.utc).isoformat(), "by": by,
+            "said": (sentence or text.strip().splitlines()[-1] if text.strip() else "")[:300]}
+
+
+def _after_hook(entry, worker: dict, tid: str, execution: str, report: dict,
+                result=None) -> None:
+    """Ask the worker's `after` hook about a settled raise, and do what it
+    answers, in the vocabulary the `before` hook speaks.
+
+    It is given the task as it stands then, how the raise ended - its outcome,
+    the status the task landed in, its detail and metrics - and how the turn
+    ended: the harness's exit and failure kind and what it last said. Go
+    changes nothing. Hold holds the lane - this worker's claims, the service's
+    and by hand - until the moment its last line names, or for the worker's
+    cool-down with none, recorded on the raise as `lane_hold`. Escalate moves
+    the task along the project's chain, its last line the reason, while the task
+    still stands where the raise left it; where the chain reaches nobody it is a
+    hold with no moment. An exit other than 0 is noted on the raise's metrics as
+    `after_hook`, as it always was."""
+    import datetime
     if not (worker.get("hooks") or {}).get("after"):
         return
     with _connect(entry) as conn, conn.cursor() as cur:
         task = _task_row(cur, tid)
-        cur.execute(f"""select status from {SCHEMA}.task_executions
+        cur.execute(f"""select status, detail, metrics from {SCHEMA}.task_executions
                          where id::text = %s""", (execution,))
-        row = cur.fetchone()
+        row = cur.fetchone() or {}
+    harness = {"TASKS_HARNESS_EXIT": "", "TASKS_HARNESS_FAILURE": "",
+               "TASKS_HARNESS_SAID": ""}
+    if result is not None:
+        harness = {"TASKS_HARNESS_EXIT": ("" if result.exit_code is None
+                                          else str(result.exit_code)),
+                   "TASKS_HARNESS_FAILURE": str(result.failure.kind) if result.failure else "",
+                   "TASKS_HARNESS_SAID": _harness_said(result)[-4000:]}
     ran = _run_hook(worker, "after", task,
                     {"TASKS_EXECUTION": execution,
-                     "TASKS_OUTCOME": (row or {}).get("status") or "",
-                     "TASKS_LANDED": task.get("status") or ""})
+                     "TASKS_OUTCOME": row.get("status") or "",
+                     "TASKS_LANDED": task.get("status") or "",
+                     "TASKS_RAISE_DETAIL": row.get("detail") or "",
+                     "TASKS_RAISE_METRICS": json.dumps(row.get("metrics") or {}, default=str),
+                     **harness})
     report["after_hook"] = {k: v for k, v in ran.items() if v is not None}
-    if ran["exit"] == 0:
+    told = _verdict(ran, _zone(entry))
+    report["after_hook"]["verdict"] = told["verdict"]
+    noted: dict = {}
+    if ran["exit"] != 0:
+        noted["after_hook"] = {"why": ran["why"], **({"said": ran["said"]} if ran["said"] else {})}
+    escalation = worker.get("escalation")
+    if told["verdict"] == "escalate" and escalation:
+        moved = _escalate_after(entry, escalation, task, told["why"])
+        if moved:
+            report["escalated"] = [*(report.get("escalated") or []), moved]
+        else:
+            told = {"verdict": "hold", "said": told["said"]}
+    elif told["verdict"] == "escalate":
+        told = {"verdict": "hold", "said": told["said"]}
+    if told["verdict"] == "hold":
+        until = told.get("until") or (
+            datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(seconds=worker["limits"]["cool_down_seconds"])).isoformat()
+        hold = {"until": until, "by": f"the after hook of worker {worker['name']!r}",
+                **({"said": told["said"]} if told.get("said") else {})}
+        kept = (row.get("metrics") or {}).get("lane_hold")
+        if not (isinstance(kept, dict) and _later(kept.get("until"), until)):
+            noted["lane_hold"] = hold
+            report["lane_held"] = hold
+    if not noted:
         return
-    noted = {"why": ran["why"], **({"said": ran["said"]} if ran["said"] else {})}
     with _connect(entry) as conn, conn.cursor() as cur:
         cur.execute(f"""update {SCHEMA}.task_executions
-                           set metrics = coalesce(metrics, '{{}}'::jsonb)
-                                         || jsonb_build_object('after_hook', %s::jsonb)
+                           set metrics = coalesce(metrics, '{{}}'::jsonb) || %s::jsonb
                          where id::text = %s""", (json.dumps(noted), execution))
         conn.commit()
+
+
+def _later(one, other) -> bool:
+    """Whether the moment `one` is after `other`, both ISO 8601 with offsets."""
+    import datetime
+    try:
+        return (datetime.datetime.fromisoformat(str(one))
+                > datetime.datetime.fromisoformat(str(other)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _escalate_after(entry, escalation: dict, task: dict, why: str) -> dict | None:
+    """Escalate a task the `after` hook answered escalate for, while it stands
+    where the raise left it: same status and assignee, no raise open on it."""
+    if _is_person(task.get("assignee"), escalation):
+        return None
+    target = _escalation_target(escalation, task.get("assignee"))
+    if target is None:
+        return None
+    if task.get("status") in ("complete", "closed"):
+        # An ending is a person's to reopen; no handler reopens one.
+        return None
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"""select * from {SCHEMA}.tasks
+                         where id::text = %s and status = %s
+                           and assignee is not distinct from %s
+                           and {_open_raise_clause(False)}
+                         for update skip locked""",
+                    (str(task["id"]), task["status"], task.get("assignee")))
+        rows = _rows(cur)
+        if not rows:
+            conn.commit()
+            return None
+        facts = _in_place(cur, str(task["id"]))
+        moved = _escalate(cur, rows[0], target, why, facts, _writing_project())
+        conn.commit()
+    return moved
 
 
 def _spent(rows: list[dict], from_waiting: bool = False) -> int:
@@ -9203,32 +9704,6 @@ def _note(entry, tid: str, text: str) -> None:
     with _connect(entry) as conn, conn.cursor() as cur:
         _add_activity(cur, tid, text, _actor())
         conn.commit()
-
-
-def _hold_off(entry, tid: str, seconds: int) -> str:
-    """Hold the task for a while rather than leave it at the head of the queue,
-    so the next tick does not hand the same task straight back into a limit that
-    has not lifted. The moment is the store's, as every other moment is."""
-    with _connect(entry) as conn, conn.cursor() as cur:
-        before = _task_row(cur, tid)
-        cur.execute(f"""update {SCHEMA}.tasks
-                           set pickup_at = now() + make_interval(secs => %s),
-                               updated_at = now()
-                         where id = %s returning *""", (seconds, tid))
-        after = _rows(cur)[0]
-        _record_moves(cur, tid, before, after, actor=_actor())
-        conn.commit()
-    return after["pickup_at"]
-
-
-def _held_from_waiting_until(entry, execution: str, seconds: int) -> str:
-    """The moment a waiting task this raise returned unspent may be taken again,
-    as the claim will read it from the raise."""
-    with _connect(entry) as conn, conn.cursor() as cur:
-        cur.execute(f"""select ended_at + make_interval(secs => %s) as until
-                          from {SCHEMA}.task_executions where id::text = %s""",
-                    (seconds, str(execution)))
-        return _rows(cur)[0]["until"]
 
 
 def _accumulate_cost(entry, tid: str, cost: float) -> float:
@@ -9638,6 +10113,8 @@ def cmd_run(entry, args: list[str]) -> None:
         report["passed_over"] = held["passed_over"]
     if held.get("escalated"):
         report["escalated"] = held["escalated"]
+    if held.get("lane_held"):
+        report["lane_held"] = held["lane_held"]
     if held.get("claimed") is None:
         _emit(report)
         return
@@ -9724,8 +10201,7 @@ def cmd_run(entry, args: list[str]) -> None:
             # not for the account's limit: the turn is started again, fresh.
             if (not result.ok and grown == grew_from
                     and elapsed_ms < worker["limits"]["idle_failure_seconds"] * 1000
-                    and not (result.failure is not None
-                             and result.failure.kind == runner.FailureKind.QUOTA)):
+                    and _limit_ending(result, runner) is None):
                 why = result.failure.message[:200] if result.failure else "no answer"
                 fell_back = (f"Resuming the session {resumed['run_ref']} of the cut-off "
                              f"raise {resumed['id']} failed at launch ({why}), so this "
@@ -9746,8 +10222,11 @@ def cmd_run(entry, args: list[str]) -> None:
         # it was.
         idle = (not result.ok and grew_to == grew_from
                 and elapsed_ms < worker["limits"]["idle_failure_seconds"] * 1000)
-        unspent = idle or (result.failure is not None
-                           and result.failure.kind == runner.FailureKind.QUOTA)
+        # The shipped after-raise handlers: a turn the harness's account could
+        # not work - a spent usage limit, a login missing - holds the lane until
+        # the moment the harness names, and is no attempt at the work.
+        limit = _limit_ending(result, runner)
+        unspent = idle or limit is not None
 
         handed_on = _stage_of(landing) != stage or _assignee_of(landing) != assignee
         landed, outcome, marks = _settle(landing["status"], _held_ahead(landing),
@@ -9762,6 +10241,8 @@ def cmd_run(entry, args: list[str]) -> None:
                     ("model", result.model))
         metrics = {k: v for k, v in measured if v is not None}
         metrics.update(marks)
+        if limit is not None:
+            metrics["lane_hold"] = limit
         # Nobody moved the task, so the turn was cut off before an ending of its
         # own: the same worker's next raise on it continues this session.
         if landing["status"] == "in_progress" and not _held_ahead(landing):
@@ -9781,6 +10262,8 @@ def cmd_run(entry, args: list[str]) -> None:
         report.update({k: True for k in marks if k in ("waiting", "handoff")})
         if unspent:
             report["returned_unspent"] = True
+        if limit is not None:
+            report["lane_held"] = limit
         # The beat ended the turn because the raise was lost, and how many of its
         # renewals failed on the way: said here, so the service's log names both.
         # The turn is over, so the beat stops before the raise is closed: a renewal
@@ -9796,15 +10279,6 @@ def cmd_run(entry, args: list[str]) -> None:
                          if one)
         _close(entry, execution, outcome, landed, said or None,
                result.harness, pointer, metrics, tid, report)
-        if unspent and landed != "waiting":
-            report["held_until"] = _hold_off(entry, tid,
-                                             worker["limits"]["hold_seconds_on_exhaustion"])
-        elif unspent:
-            # A pickup on a task back in `waiting` would end its wait when it passed,
-            # releasing it into the queue, so the claim reads this raise instead and
-            # takes the task again only once the same hold has passed.
-            report["held_until"] = _held_from_waiting_until(
-                entry, execution, worker["limits"]["hold_seconds_on_exhaustion"])
         if result.cost_usd is not None:
             report["cost_total"] = _accumulate_cost(entry, tid, result.cost_usd)
         # Every raise leaves exactly one entry, including a raise that did nothing. A
@@ -9822,7 +10296,7 @@ def cmd_run(entry, args: list[str]) -> None:
         turn["elapsed_ms"] = elapsed_ms
         report["turn"] = turn
         report["trail_grew_by"] = grew_to - grew_from
-        _after_hook(entry, worker, tid, execution, report)
+        _after_hook(entry, worker, tid, execution, report, result)
         _emit(report)
     finally:
         # Closed or not, the raise is no longer this process's to renew.
@@ -9850,7 +10324,8 @@ def cmd_runs(entry, args: list[str]) -> None:
              f"{NAME} runs <uuid|unique_key> | {NAME} runs --run <system>:<handle>")
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, opts["_loose"][0])
-        cur.execute(f"""select * from {SCHEMA}.task_executions where task_id = %s
+        cur.execute(f"""select * from {SCHEMA}.task_executions e where task_id = %s
+                           and {_a_raise()}
                          order by started_at asc""", (tid,))
         rows = _rows(cur)
     _emit({"task": tid, "attempts": len(rows), "executions": rows})
@@ -10218,11 +10693,13 @@ _SERVICE_VERBS = ("init", "doctor", "run", "start", "reload", "stop", "status", 
 
 # What the settings file may say, and what it leaves to this capability. Any
 # other key is refused: a key nothing reads is a declaration doing nothing.
-_SERVICE_DEFAULTS = {"poll_seconds": 60, "max_parallel": 2, "shutdown_grace_seconds": 60,
-                     "retry_delay_seconds": 60}
+_SERVICE_DEFAULTS = {"poll_seconds": 60, "max_parallel": 2, "shutdown_grace_seconds": 60}
 _SERVICE_MINIMUMS = {"poll_seconds": 1, "max_parallel": 1, "shutdown_grace_seconds": 0,
                      "retry_delay_seconds": 1}
-_SERVICE_KEYS = ("version", *_SERVICE_DEFAULTS, "lanes")
+# Read only as the cool-down every worker without its own takes, and named by
+# `doctor` as the key it was: the service no longer waits on it.
+_SERVICE_DEPRECATED = ("retry_delay_seconds",)
+_SERVICE_KEYS = ("version", *_SERVICE_DEFAULTS, *_SERVICE_DEPRECATED, "lanes")
 _LANE_DEFAULTS = {"max_parallel": 1}
 
 # The store notifies this channel when a task becomes claimable. It is one
@@ -10361,6 +10838,12 @@ def _read_service_settings(path: Path) -> dict:
         if isinstance(value, bool) or not isinstance(value, int) or value < _SERVICE_MINIMUMS[key]:
             refuse(f"its `{key}` is a whole number of at least {_SERVICE_MINIMUMS[key]}")
         settings[key] = value
+    for key in _SERVICE_DEPRECATED:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < _SERVICE_MINIMUMS[key]:
+            refuse(f"its `{key}` is a whole number of at least {_SERVICE_MINIMUMS[key]}")
     lanes = raw.get("lanes", {})
     if not isinstance(lanes, dict):
         refuse("its `lanes` is one table per worker, `[lanes.<worker>]`")
@@ -10520,12 +11003,16 @@ def _service_sweep_due(conn) -> bool:
     return any(_wait_over(task, ended) for task in waiting)
 
 
-def _service_next_moment(conn) -> float | None:
+def _service_next_moment(conn, cool_downs: dict | None = None) -> float | None:
     """Seconds until the earliest moment work of this project falls due without
-    anybody writing: a pickup still ahead on a task in todo or waiting, or a
-    lease still running. None when there is none. The store's clock decides, as
+    anybody writing: a pickup still ahead on a task in todo or waiting, a lease
+    still running, the end of a task's cool-down, or the end of a lane hold.
+    None when there is none. A cool-down is the one of the worker that ran the
+    last raise, from `cool_downs`, or the default. The store's clock decides, as
     it does for every pickup. Asked on the service's connection, `conn`."""
     project = _writing_project()
+    cooling = (f"""l.ended_at + make_interval(secs => coalesce(
+                       (%s::jsonb ->> l.worker)::int, %s))""")
     with conn.cursor() as cur:
         cur.execute(f"""select extract(epoch from (min(at) - now()))::float8 as seconds
                           from (select pickup_at as at from {SCHEMA}.tasks
@@ -10535,8 +11022,25 @@ def _service_next_moment(conn) -> float | None:
                                 select e.lease_until from {SCHEMA}.task_executions e
                                   join {SCHEMA}.tasks t on t.id = e.task_id
                                  where t.project_id = %s and e.status = 'running'
-                                   and e.lease_until > now()) as moments""",
-                    (project, project))
+                                   and e.lease_until > now()
+                                union all
+                                select {cooling} from {SCHEMA}.tasks t
+                                  cross join lateral (
+                                    select e.worker, e.status, e.ended_at
+                                      from {SCHEMA}.task_executions e
+                                     where e.task_id = t.id and e.status <> 'running'
+                                       and {_a_raise()}
+                                     order by e.started_at desc limit 1) l
+                                 where t.project_id = %s and t.status in ('todo', 'waiting')
+                                   and l.status in ('failed', 'abandoned')
+                                   and {cooling} > now()
+                                union all
+                                select {_lane_until()} from {SCHEMA}.task_executions e
+                                  join {SCHEMA}.tasks t on t.id = e.task_id
+                                 where t.project_id = %s and e.metrics ? 'lane_hold'
+                                   and {_lane_until()} > now()) as moments""",
+                    (project, project, json.dumps(cool_downs or {}), _COOL_DOWN_DEFAULT,
+                     project, json.dumps(cool_downs or {}), _COOL_DOWN_DEFAULT, project))
         row = cur.fetchone()
     return row["seconds"] if row and row["seconds"] is not None else None
 
@@ -10891,8 +11395,8 @@ class _ServiceHost:
     def sweep_due(self, conn) -> bool:
         return _service_sweep_due(conn)
 
-    def next_moment(self, conn) -> float | None:
-        return _service_next_moment(conn)
+    def next_moment(self, conn, cool_downs: dict | None = None) -> float | None:
+        return _service_next_moment(conn, cool_downs)
 
     def renew_leases(self, conn, held: list) -> dict:
         return _service_renew_leases(conn, held)
@@ -11824,7 +12328,7 @@ def _service_status(module) -> dict:
     if published:
         for key in ("started_at", "state", "reason", "wake_by", "notification", "stores",
                     "poll_seconds",
-                    "max_parallel", "shutdown_grace_seconds", "retry_delay_seconds",
+                    "max_parallel", "shutdown_grace_seconds",
                     "lanes", "idle", "turns", "deferred", "next_wake", "last_wake",
                     "reload_error", "stopping"):
             answer[key] = published.get(key)
@@ -11997,6 +12501,10 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
                                  "so the service wakes by its poll alone; "
                                  f"`{NAME} migrate --apply` adds it")
     answer["service"] = status
+    retired = _deprecations([])
+    if retired:
+        answer["warning"] = "; ".join([one for one in (answer.get("warning"),) if one]
+                                      + retired)
     # A paused service is working as asked: reported, never a problem, so a
     # supervisor that restarts on a failing probe leaves it paused and running.
     answer["pause"] = status["pause"]
@@ -12736,9 +13244,23 @@ def cmd_doctor(wanted: str | None) -> None:
                         f"{', '.join(behind)}; {closes}")
     if unescalated:
         warnings.append(unescalated)
+    warnings += _deprecations(workers)
     if warnings:
         answer["warning"] = "; ".join(warnings)
     _emit(answer)
+
+
+def _deprecations(workers: list[dict]) -> list[str]:
+    """Every key this project still sets that is read as another now: a
+    worker's, and the service settings' retry delay, each with what it reads as."""
+    said = [f"worker {row['worker']}: {one}" for row in workers
+            for one in row.get("deprecated") or []]
+    if _service_retry_delay() is not None:
+        said.append(f"{_service_settings_path()}: its retry_delay_seconds is read as the "
+                    "cool-down of every worker that names none; the service no longer "
+                    "waits on it, so set limits.cool_down_seconds on the workers and "
+                    "remove it")
+    return said
 
 
 def _guarded(handler, entry, rest) -> None:

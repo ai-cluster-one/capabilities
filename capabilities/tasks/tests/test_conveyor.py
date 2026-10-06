@@ -334,7 +334,7 @@ def test_the_report_names_every_worker_and_what_is_wrong(project):
 
 def test_the_lease_is_the_profiles_timeout_and_a_margin(project):
     assert mod._worker("evaluation")["limits"] == {
-        "attempts": 3, "hold_seconds_on_exhaustion": 1200, "idle_failure_seconds": 120,
+        "attempts": 3, "cool_down_seconds": 60, "idle_failure_seconds": 120,
         "lease_seconds": 1800 + 600}
 
 
@@ -936,8 +936,6 @@ class Store:
         monkeypatch.setattr(mod, "_state", lambda entry, tid: (dict(self.task), self.trail))
         monkeypatch.setattr(mod, "_note",
                             lambda entry, tid, text: self.notes.append(text))
-        monkeypatch.setattr(mod, "_hold_off",
-                            lambda entry, tid, secs: self.held.append(secs) or "later")
         monkeypatch.setattr(mod, "_accumulate_cost",
                             lambda entry, tid, cost: self.costs.append(cost) or cost)
         monkeypatch.setattr(mod, "_release", self.release)
@@ -984,10 +982,10 @@ def test_a_finished_turn_carries_its_measurements_and_its_pinned_session(
     assert store.costs == [3.21] and report["cost_total"] == 3.21
     assert report["trail_grew_by"] == 1 and report["turn"]["ok"] is True
     assert "answer" not in report["turn"] and "raw" not in report["turn"]
-    assert store.notes == [] and store.held == []
+    assert store.notes == [] and "lane_hold" not in released["metrics"]
 
 
-def test_a_quota_failure_returns_the_attempt_and_holds_the_task(
+def test_a_quota_failure_returns_the_attempt_and_holds_the_lane(
         project, monkeypatch, capsys):
     store = Store()
     harness = Harness(Result(ok=False, harness="claude", session_id=None,
@@ -1001,7 +999,9 @@ def test_a_quota_failure_returns_the_attempt_and_holds_the_task(
     assert released["metrics"]["exhausted"] is True
     # What the turn cost is kept on every path.
     assert released["metrics"]["cost_usd"] == 0.42
-    assert store.held == [1200] and report["returned_unspent"] is True
+    assert report["returned_unspent"] is True
+    assert released["metrics"]["lane_hold"]["by"] == "claude usage limit, no reset named"
+    assert report["lane_held"] == released["metrics"]["lane_hold"]
     assert report["turn"]["failure"]["kind"] == "quota"
     # The turn wrote nothing, so the raise leaves the entry that says so.
     assert len(store.notes) == 1 and "left no record" in store.notes[0]
@@ -1018,7 +1018,7 @@ def test_a_long_failure_that_did_work_is_a_plain_attempt(project, monkeypatch, c
     assert (released["outcome"], released["status"]) == ("failed", "todo")
     assert released["detail"] == "timed out after 10800s"
     assert "exhausted" not in released["metrics"]
-    assert store.held == [] and "returned_unspent" not in report
+    assert "lane_hold" not in released["metrics"] and "returned_unspent" not in report
     assert store.notes == []
 
 
@@ -1029,7 +1029,8 @@ def test_a_failure_in_seconds_that_wrote_nothing_never_started(
                            failure=Failure(FailureKind.ERROR, "connection reset")))
     report, released = one_turn(monkeypatch, capsys, store, harness)
     assert released["metrics"]["exhausted"] is True
-    assert store.held == [1200] and report["returned_unspent"] is True
+    # Not the account's limit: the task cools, and the lane is not held.
+    assert "lane_hold" not in released["metrics"] and report["returned_unspent"] is True
 
 
 def test_a_turn_that_waits_on_somebody_is_ok_and_left_held(project, monkeypatch, capsys):
@@ -1046,7 +1047,7 @@ def test_a_turn_that_waits_on_somebody_is_ok_and_left_held(project, monkeypatch,
     assert released["metrics"]["waiting"] is True
     assert report["waiting"] is True
     # The hold is the turn's own: the runner adds none of its own on top.
-    assert store.held == []
+    assert "lane_hold" not in released["metrics"] and "lane_held" not in report
 
 
 def test_a_handoff_at_a_stage_is_ok_and_named(project, monkeypatch, capsys):
@@ -1512,7 +1513,7 @@ def test_a_refused_profile_claims_nothing(project, store, monkeypatch, capsys):
 
 
 @needs_store
-def test_a_turn_that_wrote_nothing_is_returned_held_and_marked(
+def test_a_turn_stopped_by_the_limit_is_returned_and_holds_the_lane(
         project, store, monkeypatch, capsys):
     entry, _schema, _conn = store
     mod.cmd_add(entry, ["--type", "defect", "--title", "A probe", "--key", "t-quota",
@@ -1532,11 +1533,11 @@ def test_a_turn_that_wrote_nothing_is_returned_held_and_marked(
     monkeypatch.setattr(mod, "_harness_runner", Spent)
     mod.cmd_run(entry, ["implementation", "--apply"])
     report = _answer(capsys)
-    assert report["returned_unspent"] is True and report["held_until"]
+    assert report["returned_unspent"] is True and report["lane_held"]["until"]
 
     mod.cmd_show(entry, ["t-quota"])
     shown = _answer(capsys)
-    assert shown["task"]["status"] == "todo" and shown["task"]["pickup_at"]
+    assert shown["task"]["status"] == "todo" and shown["task"]["pickup_at"] is None
     assert "left no record" in shown["activities"][0]["description"]
 
     mod.cmd_runs(entry, ["t-quota"])
@@ -1937,9 +1938,9 @@ def test_a_raise_taken_from_waiting_scores_its_release_the_same_way(
 @needs_store
 def test_a_waiting_task_whose_turn_returned_unspent_is_held_and_stays_waiting(
         project, store, monkeypatch, capsys):
-    """A pickup would end the wait when it passed, so the hold is read from the
-    raise: the task stays waiting, carries no pickup, and is not taken again
-    until `hold_seconds_on_exhaustion` has passed since that raise ended."""
+    """Nothing is written to the task: it stays waiting with no pickup, its
+    lane is held until the limit's moment, and it is not taken again before
+    that moment and its cool-down have both passed."""
     entry, schema, conn = store
     worker_file(project, "decider").write_text(DECIDER)
     _todo(entry, capsys, "t-spent")
@@ -1959,7 +1960,7 @@ def test_a_waiting_task_whose_turn_returned_unspent_is_held_and_stays_waiting(
     monkeypatch.setattr(mod, "_harness_runner", Spent)
     mod.cmd_run(entry, ["decider", "--apply"])
     report = _answer(capsys)
-    assert report["returned_unspent"] is True and report["held_until"]
+    assert report["returned_unspent"] is True and report["lane_held"]["until"]
     mod.cmd_show(entry, ["t-spent"])
     task = _answer(capsys)["task"]
     assert task["status"] == "waiting" and task["pickup_at"] is None
@@ -1969,7 +1970,13 @@ def test_a_waiting_task_whose_turn_returned_unspent_is_held_and_stays_waiting(
     assert len(_raises(entry, capsys, "t-spent")) == 1
 
     conn.execute(f"""update {schema}.task_executions
-                        set ended_at = now() - interval '1201 seconds'""")
+                        set metrics = jsonb_set(metrics, '{{lane_hold,until}}',
+                                                to_jsonb((now() - interval '1 second')::text))""")
+    conn.commit()
+    mod.cmd_run(entry, ["decider", "--apply"])
+    assert _answer(capsys)["claimed"] is None
+    conn.execute(f"""update {schema}.task_executions
+                        set ended_at = now() - interval '61 seconds'""")
     conn.commit()
     mod.cmd_run(entry, ["decider", "--apply"])
     assert _answer(capsys)["claimed"] is not None
@@ -2056,6 +2063,7 @@ def test_a_cut_off_raise_is_resumed_by_the_same_worker(project, store, monkeypat
     [first] = _raises(entry, capsys, "t-cut")
     assert first["status"] == "failed" and first["metrics"]["cut_off"] is True
     _keep_session(project, monkeypatch, first["run_ref"])
+    _cooled(_conn, _schema)
 
     mod.cmd_run(entry, ["implementation", "--apply"])
     report = _answer(capsys)
@@ -2077,13 +2085,23 @@ def test_a_cut_off_raise_is_resumed_by_the_same_worker(project, store, monkeypat
 
 
 def _abandoned_raise(entry, conn, schema, worker, ref):
-    """A raise of `worker` whose lease has lapsed, as a killed turn leaves one."""
+    """A raise of `worker` whose lease lapsed and that a claim closed, as a
+    killed turn leaves one, long enough ago that its task's cool-down is over."""
     held = mod._claim(entry, {"lease": "600", "worker": worker, "handler": "h",
                               "run": ("claude", ref), "type": "defect"})
     conn.execute(f"""update {schema}.task_executions
                         set lease_until = now() - interval '1 second'
                       where id = %s""", (held["execution"]["id"],))
+    mod._sweep(entry)
+    _cooled(conn, schema)
     return held
+
+
+def _cooled(conn, schema):
+    """Every raise ended two hours earlier than it did, so no task still cools."""
+    conn.execute(f"""update {schema}.task_executions
+                        set ended_at = ended_at - interval '2 hours'
+                      where ended_at is not null""")
 
 
 @needs_store
@@ -2138,6 +2156,7 @@ def test_a_raise_that_ended_on_its_own_is_never_resumed(project, store, monkeypa
     [first] = _raises(entry, capsys, "t-ended")
     assert first["status"] == "failed" and "cut_off" not in first["metrics"]
     _keep_session(project, monkeypatch, first["run_ref"])
+    _cooled(_conn, _schema)
     mod.cmd_run(entry, ["implementation", "--apply"])
     report = _answer(capsys)
     assert harness.calls[1]["session"].kind == "pinned"

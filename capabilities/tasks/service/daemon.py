@@ -46,10 +46,13 @@ asked for again on a doubling interval until the store answers, and the moment
 it has it again it asks the store for work, since what it missed was neither
 announced nor answered.
 
-It never starts a turn on a task one of its turns holds, or on one a turn of its
-own ended on less than `retry_delay_seconds` ago: its turns are told to claim
-other tasks, and it wakes again when the delay is over. However a turn fails,
-its task comes back no faster than that.
+It never starts a turn on a task one of its turns holds, or on one a worker's
+`before` hook held back until a moment still ahead, or until its next poll when
+the hook named none: its turns are told to claim other tasks, and it wakes again
+when the moment comes. A hold is remembered here and written nowhere. How soon a
+task whose raise failed is taken again, and whether a lane is held, are the
+store's to answer, from the raises, so they hold for a run by hand and across a
+restart; this daemon only wakes when either ends.
 
 It starts no turn on a lane the pause holds. The pause is a file in its state
 directory, written by `service pause` and `service resume` whether or not a
@@ -515,7 +518,7 @@ class Turn:
 class ProjectSlot:
     """One project the dispatcher serves, and everything held for it: its
     declaration and fingerprint, its wakes, its poll and pickup deadlines, the
-    lanes held until the poll and the tasks held back by the retry delay, the
+    lanes held until the poll and the tasks a `before` hook held back, the
     lane rotation, the pause, its turns, its lock and its state root.
 
     `host` answers every question about the project; `declaration` is what the
@@ -550,8 +553,8 @@ class ProjectSlot:
         self.wakes: set[str] = {"start"}
         self.last_wake: dict | None = None
         self.held: set[str] = set()
-        # Tasks a turn ended on, and when the delay before another is over.
-        self.recent: dict[str, dict] = {}
+        # Tasks a worker's `before` hook held back, and until when.
+        self.holds: dict[str, dict] = {}
         self.rotation = 0
         self.reload_error: str | None = None
         self.pause: dict = {"all": None, "lanes": {}}
@@ -631,8 +634,8 @@ class ProjectSlot:
         wakes = [("poll", self.next_poll)]
         if self.next_moment is not None:
             wakes.append(("pickup", self.next_moment))
-        if self.recent:
-            wakes.append(("retry", min(r["until"] for r in self.recent.values())))
+        if self.holds:
+            wakes.append(("hold", min(r["until"] for r in self.holds.values())))
         reason, due = min(wakes, key=lambda item: item[1])
         listening = self.listener is not None
         listen_error = self.store.listen_error
@@ -659,7 +662,6 @@ class ProjectSlot:
             "poll_seconds": self.settings()["poll_seconds"],
             "max_parallel": self.settings()["max_parallel"],
             "shutdown_grace_seconds": self.settings()["shutdown_grace_seconds"],
-            "retry_delay_seconds": self.settings()["retry_delay_seconds"],
             "lanes": [{"project": self.slug, "worker": lane["worker"],
                        "max_parallel": lane["max_parallel"],
                        "running": sum(1 for t in self.turns.values()
@@ -670,7 +672,7 @@ class ProjectSlot:
             "idle": self.declaration.get("idle", []),
             "turns": [turn.row() for turn in self.turns.values()],
             "deferred": [{"task": r["task"], "task_id": tid, "until": _at(r["until"] - now)}
-                         for tid, r in sorted(self.recent.items(),
+                         for tid, r in sorted(self.holds.items(),
                                               key=lambda item: item[1]["until"])],
             "next_wake": {"at": _at(due - now), "reason": reason},
             "last_wake": self.last_wake,
@@ -861,15 +863,19 @@ class ProjectSlot:
 
     def notified(self, payload: dict) -> None:
         self.wakes.add("notify")
-        recent = self.recent.get(str(payload.get("task")))
-        if recent is not None:
-            # Not dropped: the delay's own wake asks for it again.
-            self.log(f"task {recent['task']} is claimable again; deferred "
-                     f"to {_at(recent['until'] - time.monotonic())}")
+        held = self.holds.get(str(payload.get("task")))
+        if held is not None:
+            # Not dropped: the hold's own wake asks for it again.
+            self.log(f"task {held['task']} is claimable again; its before hook holds "
+                     f"it to {_at(held['until'] - time.monotonic())}")
 
     def _plan_next_moment(self) -> None:
+        # Each lane's cool-down, so the end of a task's is a wake.
+        cool_downs = {lane["worker"]: lane["spec"]["limits"]["cool_down_seconds"]
+                      for lane in self.lanes()
+                      if (lane.get("spec") or {}).get("limits", {}).get("cool_down_seconds")}
         try:
-            seconds = self.ask(self.host.next_moment)
+            seconds = self.ask(lambda conn: self.host.next_moment(conn, cool_downs))
         except (Exception, SystemExit) as exc:
             self.log(f"cannot read the next pickup from the store: {_why(exc)}")
             return
@@ -879,7 +885,7 @@ class ProjectSlot:
     def deadlines(self) -> list[float]:
         return ([self.next_poll] + ([self.next_moment] if self.next_moment else [])
                 + ([self.next_renew] if any(t.claim for t in self.turns.values()) else [])
-                + [r["until"] for r in self.recent.values()])
+                + [r["until"] for r in self.holds.values()])
 
     # --- the pause -------------------------------------------------------------
 
@@ -918,10 +924,10 @@ class ProjectSlot:
 
     def excluded(self) -> tuple[str, ...]:
         """The tasks no turn of this daemon may claim now: those a turn holds and
-        those a turn ended on within the retry delay."""
+        those a `before` hook held back until a moment still ahead."""
         held = {str(t.claim["task_id"]) for t in self.turns.values()
                 if t.claim and t.claim.get("task_id")}
-        return tuple(sorted(held | set(self.recent)))
+        return tuple(sorted(held | set(self.holds)))
 
     def dispatch(self, wakes: set[str], limit: int | None = None) -> int:
         """Start a turn for every lane with room and work, while the cap across
@@ -1053,27 +1059,51 @@ class ProjectSlot:
         from its output file either way."""
         turn.read_receipt()
         del self.turns[turn.id]
-        if turn.claim and turn.claim.get("task_id"):
-            delay = self.settings()["retry_delay_seconds"]
-            self.recent[str(turn.claim["task_id"])] = {
-                "task": turn.claim.get("task"), "until": time.monotonic() + delay}
         said = self._said(turn)
-        if turn.claim and turn.claim.get("task_id"):
-            said.append(f"{turn.claim.get('task')} not run again before "
-                        f"{_at(self.settings()['retry_delay_seconds'])}")
+        remembered = self._remember_holds(turn)
         self.log(f"turn {turn.id} ended: worker {turn.worker}, "
                  f"exit {'unknown' if code is None else code}"
                  + (", adopted" if turn.adopted else "")
                  + (f", {', '.join(said)}" if said else ""))
-        if turn.claim is None and turn.reason == "work" and not self.stopping:
+        if turn.claim is None and turn.reason == "work" and not self.stopping \
+                and not remembered:
             # The store said this lane had work and the claim took none, or the
             # command failed before claiming. Asking again at once would ask the
             # same question of the same answer, so the lane waits for the poll.
+            # A turn whose `before` hook held its tasks back said so, and each
+            # of them is remembered until its moment instead.
             self.held.add(turn.worker)
             self.log(f"lane {turn.worker} waits for the next poll: its turn took nothing")
         turn.discard_files()
         if not self.stopping:
             self.wakes.add("turn_ended")
+
+    def _remember_holds(self, turn: Turn) -> int:
+        """Remember each task the turn's `before` hook held back, until the
+        moment the hook named or this slot's next poll, so no turn is started
+        for it before then, and say how many. Nothing is written for it
+        anywhere."""
+        try:
+            answer = _last_json(turn.output.read_text(errors="replace"))
+        except OSError:
+            answer = None
+        remembered = 0
+        for held in (answer or {}).get("passed_over") or []:
+            if not isinstance(held, dict) or held.get("verdict") != "hold" \
+                    or not held.get("task_id"):
+                continue
+            # A moment already past is no moment: asking again at once would
+            # ask the same hook the same question, so it waits for the poll.
+            until = self.next_poll
+            if held.get("until"):
+                with contextlib.suppress(ValueError, TypeError):
+                    ahead = (datetime.datetime.fromisoformat(str(held["until"]))
+                             - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+                    if ahead > 0:
+                        until = time.monotonic() + ahead
+            self.holds[str(held["task_id"])] = {"task": held.get("task"), "until": until}
+            remembered += 1
+        return remembered
 
     @staticmethod
     def _said(turn: Turn) -> list[str]:
@@ -1113,6 +1143,12 @@ class ProjectSlot:
                 if isinstance(moved, dict):
                     said.append(f"escalated {moved.get('task')} to {moved.get('to')}: "
                                 f"{str(moved.get('why'))[:200]}")
+            lane = answer.get("lane_held")
+            if isinstance(lane, dict):
+                said.append(f"lane held until {lane.get('until')}"
+                            + (f" by {lane['by']}" if lane.get("by") else "")
+                            + (f", said {str(lane['said'])[:200]}" if lane.get("said")
+                               else ""))
             after = answer.get("after_hook")
             if isinstance(after, dict) and after.get("exit") != 0:
                 said.append(f"after hook failed ({after.get('why')})"
@@ -1383,11 +1419,11 @@ class Dispatcher:
             if slot.next_moment is not None and now >= slot.next_moment:
                 slot.wakes.add("pickup")
                 slot.next_moment = None
-            over = [tid for tid, r in slot.recent.items() if now >= r["until"]]
+            over = [tid for tid, r in slot.holds.items() if now >= r["until"]]
             for tid in over:
-                del slot.recent[tid]
+                del slot.holds[tid]
             if over:
-                slot.wakes.add("retry")
+                slot.wakes.add("hold")
             if slot.wakes and not self.stop_requested and not slot.waiting_for_cap:
                 candidates.append(slot)
         self.deal(candidates)

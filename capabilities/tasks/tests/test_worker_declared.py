@@ -116,7 +116,8 @@ def test_the_list_of_types_is_one_filter_of_todo(project):
                                   "assignee": None, "tags": []}]
     assert worker["types"] == ["defect", "change"] and worker["shorthand"] is True
     assert row_of("probe")["takes"] == ["defect", "change"]
-    assert mod._asks(worker) == [{"type": "defect"}, {"type": "change"}]
+    assert mod._asks(worker) == [{"cool_down": 60, "type": "defect"},
+                                 {"cool_down": 60, "type": "change"}]
 
 
 def test_one_filter_map_and_its_status_default(project):
@@ -124,7 +125,7 @@ def test_one_filter_map_and_its_status_default(project):
     worker = mod._worker("probe")
     assert worker["filters"] == [{"status": ["todo"], "type": ["chore"],
                                   "assignee": ["ops"], "tags": []}]
-    assert mod._asks(worker) == [{"assignees": ["ops"], "type": "chore"}]
+    assert mod._asks(worker) == [{"assignees": ["ops"], "cool_down": 60, "type": "chore"}]
     assert row_of("probe")["takes"] == [{"status": ["todo"], "type": ["chore"],
                                          "assignee": ["ops"]}]
 
@@ -138,11 +139,11 @@ profile: plain
 """)
     worker = mod._worker("probe")
     assert worker["types"] == ["defect"]
-    # An ask that takes a waiting task carries the hold it is read against.
+    # Every ask carries the cool-down it is read against.
     assert mod._asks(worker) == [
-        {"statuses": ["todo", "waiting"], "waiting_hold": 1200, "type": "defect"},
+        {"statuses": ["todo", "waiting"], "cool_down": 60, "type": "defect"},
         {"tag": ["urgent"], "assignees": ["supervisor"], "statuses": ["waiting"],
-         "waiting_hold": 1200}]
+         "cool_down": 60}]
 
 
 def test_top_level_tags_and_assignee_mean_the_same_inside_every_filter(project):
@@ -572,7 +573,7 @@ def test_a_task_taken_from_waiting_goes_back_there_when_nothing_settles_it(
         project, store, capsys):
     entry = store
     add(entry, capsys, "w-one", status="waiting", assignee="supervisor")
-    write_worker(project, "supervisor", SUPERVISOR)
+    write_worker(project, "supervisor", SUPERVISOR + "limits: {cool_down_seconds: 1}\n")
     worker = mod._worker("supervisor")
     lapsing = mod._claim(entry, {"key": "w-one", "lease": "1", "worker": "supervisor",
                                  **mod._key_types(worker)})
@@ -584,6 +585,8 @@ def test_a_task_taken_from_waiting_goes_back_there_when_nothing_settles_it(
     assert str(lapsing["execution"]["id"]) in _out(capsys)["swept"]
     mod.cmd_show(entry, ["w-one"])
     assert _out(capsys)["task"]["status"] == "waiting"
+    # The lapsed raise cools the task for the worker's cool-down first.
+    time.sleep(1.1)
     failing = mod._take(entry, worker, None)
     assert failing["task"]["unique_key"] == "w-one"
     mod.cmd_release(entry, [str(failing["execution"]["id"]), "--outcome", "failed",
