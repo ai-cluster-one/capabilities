@@ -1308,6 +1308,9 @@ class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
                 register.store._execute(
                     "UPDATE tg_worker_jobs SET lease_expires_at = ? WHERE id = ?",
                     ("2000-01-01T00:00:00+00:00", row["id"]))
+                register.store._execute(
+                    "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE job_id = ?",
+                    ("2000-01-01T00:00:00+00:00", row["id"]))
 
             client = FakeClient([])
             task = asyncio.create_task(daemon.run_session(client))

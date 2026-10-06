@@ -92,23 +92,25 @@ def channel_identity(key: Any) -> tuple[str, int | None]:
         return raw, None
 
 
-# How the owner of an attempt that holds no runner slot is spelled. Work a
+# How the owner of an attempt outside the runner's budget is spelled. Work a
 # person starts on a call is recorded here like any other job, but it starts the
-# moment it is asked for rather than waiting for one of `max_parallel_jobs`, so
-# its attempt has a lease and no slot row. The spelling belongs to the register
-# for the reason the topic marker does: the reconciler that fences the attempt
-# after a restart is not the process that started it, and the owner column is
-# all it has to tell the two kinds of attempt apart.
+# moment it is asked for rather than waiting for one of `max_parallel_jobs`. Its
+# attempt still has a lease and a slot row, numbered below zero where no runner
+# counts it, so every version of the register fences, renews and stops it the way
+# it does any attempt. The spelling belongs to the register for the reason the
+# topic marker does: the reconciler that fences the attempt after a restart is not
+# the process that started it, and the owner column is all it has to tell the two
+# kinds of attempt apart.
 DIRECT_OWNER_MARKER = "#direct"
 
 
 def direct_owner(owner_id: str) -> str:
-    """The owner id an attempt outside the runner's slots runs under."""
+    """The owner id an attempt outside the runner's budget runs under."""
     return f"{owner_id}{DIRECT_OWNER_MARKER}"
 
 
 def holds_slot(owner_id: Any) -> bool:
-    """Whether an attempt owned by this id was claimed through a slot."""
+    """Whether an attempt owned by this id holds one of the runner's slots."""
     return not str(owner_id or "").endswith(DIRECT_OWNER_MARKER)
 
 # Portable DDL, in the same dialect the core tier writes: a timestamp is TEXT
@@ -708,11 +710,13 @@ class JobRegister:
 
     def begin_direct(self, job_id: str, *, owner_id: str, owner_host: str,
                      lease_seconds: float = 30) -> dict[str, Any] | None:
-        """Take a draft straight into `running`, outside the runner's slots.
+        """Take a draft straight into `running`, outside the runner's budget.
 
         The row never passes through `waiting`, so no runner can claim it while
-        its owner is starting it. The attempt carries a lease like any other,
-        which is what lets a later daemon fence it if this one dies.
+        its owner is starting it. The attempt carries a lease and a slot row like
+        any other, which is what lets a later daemon of any version fence it if
+        this one dies; the slot is numbered below zero, and `claim_next` only
+        ever looks for a free one from zero up to `max_parallel`.
         """
         if holds_slot(owner_id):
             raise JobError("not_a_direct_owner",
@@ -723,15 +727,38 @@ class JobRegister:
                        + timedelta(seconds=max(1.0, lease_seconds))).isoformat(
                            timespec="microseconds")
         clause, params = self._where("id = ?", "state = ?")
-        with self.store.transaction():
-            cur = self.store._execute(
-                "UPDATE tg_worker_jobs SET state = ?, outcome = NULL, "
-                "attempt = attempt + 1, attempt_token = ?, lease_owner = ?, "
-                "lease_expires_at = ?, owner_host = ?, pid = NULL, pgid = NULL, "
-                "started_at = COALESCE(started_at, ?), updated_at = ?" + clause,
-                tuple([RUNNING, token, owner_id, lease_until, owner_host, now, now]
-                      + params + [job_id, DRAFT]))
-        return self.get(job_id) if cur.rowcount else None
+        for _ in range(5):
+            try:
+                with self.store.transaction():
+                    cur = self.store._execute(
+                        "UPDATE tg_worker_jobs SET state = ?, outcome = NULL, "
+                        "attempt = attempt + 1, attempt_token = ?, lease_owner = ?, "
+                        "lease_expires_at = ?, owner_host = ?, pid = NULL, pgid = NULL, "
+                        "started_at = COALESCE(started_at, ?), updated_at = ?" + clause,
+                        tuple([RUNNING, token, owner_id, lease_until, owner_host, now, now]
+                              + params + [job_id, DRAFT]))
+                    if not cur.rowcount:
+                        return None
+                    lowest = self.store._execute(
+                        "SELECT MIN(slot) FROM tg_worker_job_slots WHERE project_id = ? "
+                        "AND environment = ? AND surface = ?",
+                        (self.project_id, self.environment, self.surface)).fetchone()[0]
+                    slot = min(-1, int(lowest) - 1) if lowest is not None else -1
+                    self.store._execute(
+                        "INSERT INTO tg_worker_job_slots (project_id, environment, surface, "
+                        "slot, job_id, owner_id, attempt_token, lease_expires_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (self.project_id, self.environment, self.surface, slot, job_id,
+                         owner_id, token, lease_until))
+            except Exception as exc:
+                # Two direct attempts picking the same number at once is the
+                # ordinary race `claim_next` also meets; the next try picks again.
+                if ("integrity" in type(exc).__name__.lower()
+                        or getattr(exc, "sqlstate", None) == "23505"):
+                    continue
+                raise
+            return self.get(job_id)
+        return None
 
     def claim_next(self, *, owner_id: str, owner_host: str,
                    max_parallel: int, lease_seconds: float = 30) -> dict[str, Any] | None:
@@ -829,8 +856,6 @@ class JobRegister:
                           + [job_id, RUNNING, attempt_token, owner_id]))
                 if cur.rowcount != 1:
                     raise JobError("lease_lost", f"job {job_id} no longer owns its attempt")
-                if not holds_slot(owner_id):
-                    return True
                 slot = self.store._execute(
                     "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE project_id = ? "
                     "AND environment = ? AND surface = ? AND job_id = ? AND owner_id = ? "
@@ -851,9 +876,8 @@ class JobRegister:
 
         The row transition and slot release are one transaction. If its owner
         renewed either record after the snapshot, no predicate matches and the
-        slot remains unavailable. An attempt that held no slot releases none.
-        `result_text`, when given, is queued for delivery to the job's channel
-        in the same transition.
+        slot remains unavailable. `result_text`, when given, is queued for
+        delivery to the job's channel in the same transition.
         """
         job_id = row["id"]
         token = row.get("attempt_token")
@@ -888,8 +912,6 @@ class JobRegister:
             # callback; only after it returns may the slot become reusable.
             if before_release is not None:
                 before_release()
-            if not holds_slot(owner):
-                return self.get(job_id)
             slot = self.store._execute(
                 "DELETE FROM tg_worker_job_slots WHERE project_id = ? AND environment = ? "
                 "AND surface = ? AND job_id = ? AND owner_id = ? AND attempt_token = ? "
@@ -1247,8 +1269,7 @@ class JobRegister:
                     slot_sql += " AND attempt_token = ? AND owner_id = ?"
                     slot_params += [attempt_token, owner_id]
                 slot = self.store._execute(slot_sql, slot_params)
-                if (attempt_token is not None and holds_slot(owner_id)
-                        and slot.rowcount != 1):
+                if attempt_token is not None and slot.rowcount != 1:
                     raise JobError("slot_mismatch", f"job {job_id} lost its owned slot")
                 if attempt_token is not None:
                     self.store._execute(

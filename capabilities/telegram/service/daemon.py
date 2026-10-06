@@ -6659,8 +6659,9 @@ async def run_session(client):
     stopping_jobs = set()
     # Rows of tasks started on a call and running in this session, by job id:
     # the attempt token their lease is renewed under and the proc key of the
-    # worker running now. They hold no slot; the runner renews their lease and
-    # honours a stop for them, and nothing else about them is its business.
+    # worker running now. They hold none of the runner's slots; the runner
+    # renews their lease and honours a stop for them, and nothing else about
+    # them is its business.
     voice_rows = {}
     quota = {"until": None, "reason": None}
 

@@ -820,11 +820,11 @@ class RegisterCase(unittest.TestCase):
         self.assertEqual(self.reg.next_waiting()["id"], row["id"])
 
 
-    # -- work that holds no slot ----------------------------------------------
+    # -- work outside the runner's budget --------------------------------------
     #
     # A task started on a call is recorded here and starts at once: its attempt
-    # has an owner, a token and a lease, and no slot row. Everything below is
-    # what the register has to do differently for it, and nothing more.
+    # has an owner, a token, a lease and a slot row numbered below zero, which no
+    # runner counts. Everything below is what the register has to do for it.
 
     DIRECT = jobs.direct_owner("host-a:1:1")
 
@@ -835,20 +835,26 @@ class RegisterCase(unittest.TestCase):
                                      owner_host="host-a")
 
     def expire(self, job_id):
+        past = "2000-01-01T00:00:00.000000+00:00"
         with self.store.transaction():
             self.store._execute(
                 "UPDATE tg_worker_jobs SET lease_expires_at = ? WHERE id = ?",
-                ("2000-01-01T00:00:00.000000+00:00", job_id))
+                (past, job_id))
+            self.store._execute(
+                "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE job_id = ?",
+                (past, job_id))
 
-    def test_a_direct_attempt_runs_without_waiting_or_a_slot(self):
+    def slot_of(self, job_id):
+        return self.store._execute(
+            "SELECT slot, owner_id, attempt_token, lease_expires_at "
+            "FROM tg_worker_job_slots WHERE job_id = ?", (job_id,)).fetchone()
+
+    def test_a_direct_attempt_runs_without_waiting_or_a_runner_slot(self):
         row = self.direct()
         self.assertEqual(row["state"], jobs.RUNNING)
         self.assertEqual(row["attempt"], 1)
         self.assertEqual(row["lease_owner"], self.DIRECT)
         self.assertIsNotNone(row["attempt_token"])
-        slots = self.store._execute(
-            "SELECT COUNT(*) FROM tg_worker_job_slots").fetchone()[0]
-        self.assertEqual(slots, 0)
         # The one slot is still free for queued work, and the direct row is
         # never what the runner takes.
         queued = self.register(description="queued")
@@ -856,6 +862,30 @@ class RegisterCase(unittest.TestCase):
                                       max_parallel=1)
         self.assertEqual(claimed["id"], queued["id"])
         self.assertEqual(self.reg.running(), 1)
+
+    def test_a_direct_attempt_holds_the_slot_row_every_register_version_fences(self):
+        # A register that knows nothing of direct attempts fences, renews and
+        # stops an attempt by deleting or touching the slot row with its exact
+        # owner, token and lease, and refuses one without it. Each direct
+        # attempt carries that row, below zero where `claim_next` never looks.
+        first, second = self.direct(), self.direct()
+        for row in (first, second):
+            slot, owner, token, lease = self.slot_of(row["id"])
+            self.assertLess(int(slot), 0)
+            self.assertEqual((owner, token, lease),
+                             (self.DIRECT, row["attempt_token"], row["lease_expires_at"]))
+        self.assertNotEqual(self.slot_of(first["id"])[0], self.slot_of(second["id"])[0])
+        self.assertTrue(self.reg.renew(first["id"], first["attempt_token"], self.DIRECT))
+        renewed = self.reg.get(first["id"])
+        self.assertEqual(self.slot_of(first["id"])[3], renewed["lease_expires_at"])
+        self.reg.stop(first["id"], jobs.SUCCEEDED, exit_code=0,
+                      attempt_token=first["attempt_token"], owner_id=self.DIRECT,
+                      result_silent=True)
+        self.assertIsNone(self.slot_of(first["id"]))
+        self.expire(second["id"])
+        self.assertIsNotNone(self.reg.fence_expired_attempt(
+            self.reg.expired_active()[0], "service restarted"))
+        self.assertIsNone(self.slot_of(second["id"]))
 
     def test_only_a_direct_owner_may_begin_outside_the_slots(self):
         row = self.register(submit=False)
@@ -866,7 +896,7 @@ class RegisterCase(unittest.TestCase):
         self.assertIsNone(self.reg.begin_direct(
             submitted["id"], owner_id=self.DIRECT, owner_host="host-a"))
 
-    def test_a_direct_attempt_renews_and_lands_without_a_slot(self):
+    def test_a_direct_attempt_renews_and_lands(self):
         row = self.direct()
         self.assertTrue(self.reg.renew(row["id"], row["attempt_token"], self.DIRECT))
         landed = self.reg.stop(row["id"], jobs.SUCCEEDED, exit_code=0,
