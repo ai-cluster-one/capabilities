@@ -38,6 +38,7 @@ SELF_MARKER = " (you)"
 REPLY_PART_CHARS = 3500          # one outgoing message, at most
 PRESENCE_EVERY = 8.0             # composing lapses on the phone after ~10s
 REGISTER_OVERLAP = 86400         # processed ids are kept this far behind the watermark
+DEFER_RETRY = 5.0                # how often a message the store could not judge is tried again
 
 DEFAULTS = {
     "tail_size": 40,
@@ -674,6 +675,11 @@ class Dialogue:
         self.running: dict[str, dict[str, Run]] = {}
         self.presence_at: dict[str, float] = {}
         self.reload_waiters: list[dict] = []
+        # Messages the store could not judge, oldest first, tried again from
+        # the listener's loop until the store answers or they grow stale.
+        self.deferred: list[dict] = []
+        self.next_retry = 0.0
+        self.store_error: str | None = None
         self.stats = {"admitted": 0, "turns": 0, "answered": 0, "silent": 0,
                       "failed": 0, "stopped": 0, "commands": 0}
         self.profile_cache: dict[str, tuple] = {}
@@ -736,6 +742,9 @@ class Dialogue:
             self.identity = {"jid": account.get("jid"), "lid": account.get("lid"),
                              "device": account.get("device"),
                              "phone": account.get("id") or digits(jid_user(account.get("jid")))}
+            self.log(f"dialogue: the account's own chat is {self.identity['jid']}"
+                     f"{' or ' + self.identity['lid'] if self.identity['lid'] else ''}; "
+                     f"this device is {self.identity['device']}")
         return self.identity
 
     # -- the gate's questions to the store ------------------------------------
@@ -781,36 +790,79 @@ class Dialogue:
 
     def offer(self, msg: dict) -> dict:
         """Judge one captured message and act on the verdict. Runs on the
-        engine's thread; it does no harness work, only the store's."""
+        engine's thread; it does no harness work, only the store's.
+
+        A message the store cannot judge because it cannot be reached is kept
+        and judged again once it answers, never dropped: the gate and the
+        reservation are safe to repeat, so a retry cannot answer it twice."""
         with self.lock:
             try:
-                verdict = self.gate().judge(msg)
+                return self._offer(msg)
             except Exception as exc:
-                self.log(f"dialogue: {msg.get('chat_id')} #{msg.get('id')} not judged: "
-                         f"{type(exc).__name__}: {exc}")
-                return {"admit": False, "reason": "error"}
-            if not verdict["admit"]:
-                if verdict["reason"] not in ("own", "history", "chat_not_allowed"):
-                    self.log(f"dialogue: {msg['chat_id']} #{msg['id']} not answered "
-                             f"({verdict['reason']})")
-                return verdict
-            # The reservation is written before anything else is done with the
-            # message: it is what makes a redelivery a no-op.
-            if not self.register.reserve(msg["chat_id"], msg["id"], msg.get("ts")):
-                verdict.update(admit=False, reason="processed")
-                return verdict
-            self.stats["admitted"] += 1
-            job = self.job(msg, verdict)
-            if verdict["kind"] == "control":
-                self.control(job)
-                return verdict
-            chat = msg["chat_id"]
-            self.queues.setdefault(chat, collections.deque()).append(job)
-            channel = self.channel(chat, job["phone"])
-            self.due[chat] = self.now() + float(channel["debounce"])
-            self.log(f"dialogue: {chat} #{msg['id']} queued for a turn "
-                     f"(role {job['role']})")
+                if not self.cli._store_outage(exc):
+                    self.log(f"dialogue: {msg.get('chat_id')} #{msg.get('id')} not "
+                             f"judged: {type(exc).__name__}: {exc}")
+                    return {"admit": False, "reason": "error"}
+                self.store_error = self.cli._error_line(exc)
+                if all(m.get("id") != msg.get("id") or m.get("chat_id") != msg.get("chat_id")
+                       for m in self.deferred):
+                    self.deferred.append(msg)
+                self.next_retry = self.now() + DEFER_RETRY
+                self.log(f"dialogue: {msg.get('chat_id')} #{msg.get('id')} deferred: the "
+                         f"store could not be reached ({self.store_error})")
+                return {"admit": False, "reason": "deferred"}
+
+    def retry_deferred(self) -> None:
+        """Judge again what the store could not judge, oldest first. A store
+        still down keeps them all for the next attempt."""
+        if not self.deferred or self.now() < self.next_retry:
+            return
+        with self.lock:
+            waiting, self.deferred = self.deferred, []
+            for index, msg in enumerate(waiting):
+                if self.db.broken():
+                    with contextlib.suppress(Exception):
+                        self.db.reconnect()
+                verdict = self.offer(msg)
+                if verdict.get("reason") == "deferred":
+                    self.deferred = waiting[index + 1:] + self.deferred
+                    # `offer` put this one back at the end; keep arrival order.
+                    self.deferred.sort(key=lambda m: (m.get("ts") or 0))
+                    return
+            self.store_error = None
+
+    def _offer(self, msg: dict) -> dict:
+        verdict = self.gate().judge(msg)
+        if not verdict["admit"]:
+            if verdict["reason"] not in ("own", "history", "chat_not_allowed"):
+                self.log(f"dialogue: {msg['chat_id']} #{msg['id']} not answered "
+                         f"({verdict['reason']})")
             return verdict
+        # The reservation is written before anything else is done with the
+        # message: it is what makes a redelivery a no-op. Past it the message
+        # is this service's to answer, so nothing after it may lose it.
+        if not self.register.reserve(msg["chat_id"], msg["id"], msg.get("ts")):
+            verdict.update(admit=False, reason="processed")
+            return verdict
+        self.stats["admitted"] += 1
+        job = self.job(msg, verdict)
+        if verdict["kind"] == "control":
+            try:
+                self.control(job)
+            except Exception as exc:
+                self.log(f"dialogue: {msg['chat_id']} /{job['command'][0]} failed: "
+                         f"{type(exc).__name__}: {exc}")
+            return verdict
+        chat = msg["chat_id"]
+        self.queues.setdefault(chat, collections.deque()).append(job)
+        try:
+            debounce = self.channel(chat, job["phone"])["debounce"]
+        except Exception:
+            debounce = self.policy.channel(chat, job["phone"])["debounce"]
+        self.due[chat] = self.now() + float(debounce)
+        self.log(f"dialogue: {chat} #{msg['id']} queued for a turn "
+                 f"(role {job['role']})")
+        return verdict
 
     def job(self, msg, verdict) -> dict:
         chat = msg["chat_id"]
@@ -979,7 +1031,7 @@ class Dialogue:
                     continue
                 if now < self.due.get(chat, 0):
                     continue
-                limit = int(self.channel(chat, queue[0]["phone"])["max_parallel_dialogue"])
+                limit = int(self.policy.default("max_parallel_dialogue"))
                 runs = self.running.setdefault(chat, {})
                 while queue and len(runs) < limit:
                     job = queue.popleft()
@@ -990,6 +1042,7 @@ class Dialogue:
                                                   daemon=True)
                     run.thread.start()
             chats = [chat for chat, runs in self.running.items() if runs]
+        self.retry_deferred()
         for chat in chats:
             if now - self.presence_at.get(chat, 0) >= PRESENCE_EVERY:
                 self.presence_at[chat] = now
@@ -1213,4 +1266,5 @@ class Dialogue:
 
     def summary(self) -> dict:
         return {"enabled": True, "running": self.busy(), "queued": self.queued(),
+                "deferred": len(self.deferred), "store_error": self.store_error,
                 **self.stats}

@@ -4941,12 +4941,27 @@ class _Store:
         self.write_lock = threading.RLock()
         self.write_depth = 0
         self._error = psycopg.Error
+        self._lost = (psycopg.OperationalError, psycopg.InterfaceError)
+        self.last_used = time.monotonic()
 
     def execute(self, sql: str, params=None):
         with self.write_lock:
+            self.last_used = time.monotonic()
             cursor = self.conn.cursor(row_factory=_row_factory)
             try:
-                cursor.execute(sql, params if params else None)
+                try:
+                    cursor.execute(sql, params if params else None)
+                except self._lost as lost:
+                    # A connection the server closed while it sat idle is
+                    # replaced and the statement sent again, once. Inside a
+                    # transaction the statement cannot be replayed alone, so
+                    # the failure goes to the caller, which owns the whole.
+                    if self.write_depth or not self.broken():
+                        raise
+                    _log(f"store connection lost ({_error_line(lost)}); reconnecting")
+                    self.reconnect()
+                    cursor = self.conn.cursor(row_factory=_row_factory)
+                    cursor.execute(sql, params if params else None)
             except self._error as exc:
                 detail = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
                 _refuse(5, "store_failed",
@@ -4977,6 +4992,9 @@ class _Store:
             conn.autocommit = True
             self.conn = conn
             self.write_depth = 0
+
+
+STORE_IDLE_PROBE = 30.0   # a connection idle this long is proven before a transaction
 
 
 def _store_outage(exc: BaseException) -> bool:
@@ -5015,6 +5033,11 @@ def _writing(db):
             finally:
                 db.write_depth -= 1
             return
+        if time.monotonic() - getattr(db, "last_used", time.monotonic()) > STORE_IDLE_PROBE:
+            # A transaction cannot replay a statement the server refused on a
+            # connection it closed meanwhile, so a connection left idle is
+            # proven, and replaced if it is gone, before one begins.
+            db.execute("SELECT 1")
         with db.conn.transaction():
             db.write_depth += 1
             try:
@@ -10547,7 +10570,10 @@ class _ServiceDaemon:
                     self.publish(last_error=session.errors[-1])
                 self.messages = base + (session.live_messages or 0)
                 if self.dialogue is not None:
-                    self.dialogue.tick(session)
+                    try:
+                        self.dialogue.tick(session)
+                    except Exception as exc:
+                        self.log(f"dialogue: tick failed: {type(exc).__name__}: {exc}")
                 if db is not None:
                     self.maintain_store(db)
                     self.deliver_pending(session, db)

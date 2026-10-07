@@ -523,6 +523,71 @@ class Register(DialogueCase):
 
 @_cli.needs_store
 @needs_runner
+class StoreLoss(DialogueCase):
+    """The store closing a connection that sat idle loses nothing: the
+    statement is sent again on a new one, a write proves its connection first,
+    and a message the store could not judge at all is judged once it answers."""
+
+    def kill(self, db):
+        """Close `db`'s connection from the server side, as an idle timeout does."""
+        import psycopg
+        pid = db.execute("SELECT pg_backend_pid()").fetchone()[0]
+        with psycopg.connect(_cli.STORE_DSN, autocommit=True) as other:
+            other.execute("SELECT pg_terminate_backend(%s)", (pid,))
+        time.sleep(0.2)
+
+    def test_a_statement_on_a_connection_the_server_closed_is_sent_again(self):
+        self.kill(self.db)
+        self.assertEqual(self.db.execute("SELECT 41 + 1").fetchone()[0], 42)
+        self.assertFalse(self.db.broken())
+
+    def test_a_write_proves_an_idle_connection_before_its_transaction(self):
+        self.kill(self.db)
+        with mock.patch.object(wa, "STORE_IDLE_PROBE", 0.0):
+            row = wa._queue_outgoing(self.db, {"chat_id": ALICE_JID, "text": "after",
+                                               "reply_to": None, "mentions": [],
+                                               "typing": False})
+        self.assertEqual(row["delivery"], "pending")
+
+    def test_a_message_arriving_after_an_idle_close_is_answered(self):
+        d = self.make()
+        msg = self.capture(_msg(text="after a quiet hour"))
+        self.kill(self.db)
+        with mock.patch.object(wa, "STORE_IDLE_PROBE", 0.0):
+            verdict = d.offer(msg)
+            self.assertTrue(verdict["admit"], verdict)
+            self.settle(d)
+        self.assertEqual([r["text"] for r in self.outgoing(ALICE_JID)], ["hello back"])
+
+    def test_a_message_the_store_could_not_judge_is_judged_when_it_answers(self):
+        import psycopg
+        d = self.make()
+        msg = self.capture(_msg(text="while the store is away"))
+        real = d.register.seen
+        down = {"on": True}
+
+        def seen(*args):
+            if down["on"]:
+                raise psycopg.OperationalError("server closed the connection unexpectedly")
+            return real(*args)
+        d.register.seen = seen
+        self.assertEqual(d.offer(msg)["reason"], "deferred")
+        self.assertEqual(d.summary()["deferred"], 1)
+        self.assertIn("server closed", d.summary()["store_error"])
+        d.next_retry = 0
+        d.tick(None)
+        self.assertEqual(len(d.deferred), 1)          # still away: kept
+        down["on"] = False
+        d.next_retry = 0
+        self.settle(d)
+        self.assertEqual(d.deferred, [])
+        self.assertIsNone(d.summary()["store_error"])
+        self.assertEqual(len(self.run.calls), 1)
+        self.assertEqual(d.offer(dict(msg))["reason"], "processed")
+
+
+@_cli.needs_store
+@needs_runner
 class Turn(DialogueCase):
     """A turn: what it is told, what it runs on, and what it answers."""
 
