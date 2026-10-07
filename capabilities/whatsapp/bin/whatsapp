@@ -18,15 +18,18 @@ on demand, downloads and transcribes voice notes, and renders an export a projec
 can commit to. Run `whatsapp doctor` first to confirm the chain.
 
 Every verb connects, works, and exits: the engine is whatsmeow, compiled into
-the installed wheel and driven in-process for the life of one invocation.
+the installed wheel and driven in-process for the life of one invocation. The
+bundled assistant service is the one exception: it holds the connection and
+captures live for as long as it runs (see Assistant service).
 
 Startup protocol
   1. `whatsapp doctor` — proves the engine loads, the session exists and
      authorises, and the account matches the connection's binding. It also drains
      whatever the server held for the device while nothing was connected.
   2. Exit 7 means the device is no longer linked: re-link with `whatsapp pair`.
-  3. Exit 8 means another invocation holds this session; wait and retry. Two
-     clients on one linked device desync it, so the lock is never bypassed.
+  3. Exit 8 means another invocation, or the running assistant service, holds
+     this session; wait and retry, or stop the service. Two clients on one
+     linked device desync it, so the lock is never bypassed.
   4. Exit 2/4/6 are credentials, policy, and input as everywhere else.
 
 Connections
@@ -109,7 +112,48 @@ State
         session.db     the engine's own — device, keys, contacts, LID map
         raw/           history chunks exactly as received, written before parsing
         media/         downloaded attachments, keyed by message id
-        lock           held for the duration of any connected verb
+        lock           held for the duration of any connected verb, and by
+                       the assistant service for its whole life
+        service/       the assistant service's control files on this
+                       machine: owner.json, health.json, daemon.pid,
+                       daemon.log
+
+Assistant service
+  `whatsapp service ...` runs a bundled long-running listener, `assistant`, on
+  one account. It holds the account's connection for as long as it runs,
+  through the same engine, capture path, account check and store every verb
+  uses, so each message is written to whatsapp_messages as it arrives (sync
+  type LIVE). A dropped connection is re-established with backoff (2s
+  doubling to 60s), and the offline queue drains on each reconnect. A device
+  removed from the phone is final: the service stops reconnecting and says
+  so in `service status` and `service doctor`. It sends nothing and answers
+  nothing.
+  Its settings are the project's whatsapp service settings records
+  (capabilities/whatsapp/service/settings.json in files mode): `connection`
+  (which connection it runs; null takes the registry's default) and
+  `environment` (a label it reports). Any other key is refused.
+  Activation needs an explicit project enable (`capabilities enable whatsapp
+  --project`) and a configured store. While the service runs, every verb that
+  connects on that account exits 8 naming the service; reads that answer from
+  the store (`status`, `health`, `chats` without --fresh, `messages` the store
+  covers or with --rounds 0) keep working.
+      whatsapp service init [--connection ID] [--force]
+                                       Seed the settings records.
+      whatsapp service start [--connection ID]
+                                       Start the listener detached; returns once
+                                       it holds the account.
+      whatsapp service run [--connection ID]
+                                       Run the listener in the foreground (the
+                                       deploy command).
+      whatsapp service stop [--connection ID] [--timeout S] [--force]
+      whatsapp service reload [--connection ID] [--timeout S]
+                                       Re-read and validate the settings in the
+                                       running listener, without reconnecting.
+      whatsapp service status [--connection ID]
+                                       state, pid, connected, uptime, last event.
+      whatsapp service logs [--connection ID] [--tail N]
+      whatsapp service doctor [--connection ID]
+                                       Settings, store, link and ownership.
 
 Commands
   whatsapp help                        Print this usage block
@@ -268,8 +312,10 @@ Exit codes
   7  unlinked — no session for this connection, or the device was removed from
      the account. Re-link with `whatsapp pair`. Also what an empty read reports
      rather than answering with an absence it never established.
-  8  busy — another invocation holds this session's lock. Retry; never work
-     around it, because two clients on one linked device desync the account.
+  8  busy — another invocation holds this session's lock, or the assistant
+     service runs on the account (the message names it). Retry, or stop the
+     service; never work around it, because two clients on one linked device
+     desync the account.
 """
 
 import argparse
@@ -314,8 +360,34 @@ WRITE_DEFAULT = False    # a WhatsApp send leaves the system — granted per con
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/whatsapp/guides/")
 STATE = True        # True when the capability writes session/cache state
-INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
+INVENTORY = {"network": "none"}   # the assistant service's state is files on this machine
 POST_INSTALL: list = []
+SERVICE = {
+    "name": "assistant",
+    "summary": ("Long-running listener that holds one account's WhatsApp "
+                "connection and captures every message live into the store."),
+    "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs"],
+    "config": "capabilities/whatsapp/service",
+    "state": "<account-state>/service",
+    "deploy": {
+        "schema": "capabilities.service.deploy.v1",
+        "default_policy": "auto",
+        "command": ["whatsapp", "service", "run"],
+        "environment": {
+            "required": [],
+            "optional": [
+                {"key": "CAPABILITIES_STORE_URL"},
+                {"key": "CAPABILITIES_STORE_PASSWORD"},
+            ],
+        },
+        "mounts": [
+            {"name": "whatsapp_state", "kind": "state",
+             "target": "{agent_home}/.local/state/whatsapp"},
+        ],
+        "restart": "unless-stopped",
+        "doctor": ["whatsapp", "service", "doctor"],
+    },
+}
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / "whatsapp" / "credentials.env"
@@ -5027,6 +5099,16 @@ def _session_lock(cfg: dict):
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         handle.close()
+        owner = _service_owner(_service_paths(cfg))
+        if owner is not None:
+            _refuse(8, "session_busy",
+                 f"the {NAME} assistant service (pid {owner.get('pid')}, project "
+                 f"{owner.get('project_root')}) holds the session for connection "
+                 f"{cfg['id']!r} for as long as it runs",
+                 "reads that answer from the store keep working (`status`, "
+                 "`health`, `chats` without --fresh, `messages --rounds 0`); "
+                 f"to use a connected verb, stop it with `{NAME} service stop` "
+                 "in that project")
         _refuse(8, "session_busy",
              f"another invocation holds the session for connection {cfg['id']!r}",
              "wait for it to finish and retry; never work around the lock — two "
@@ -5416,6 +5498,12 @@ class Session:
         self._paired = threading.Event()
         self._logged_out = threading.Event()
         self._drained = threading.Event()
+        # Set when the wire drops under a held session. A verb never waits on
+        # it; the assistant service does, and rebuilds the session from it.
+        self._disconnected = threading.Event()
+        self.disconnect_reason: str | None = None
+        self.last_event_at: float | None = None
+        self.last_message_at: float | None = None
         self._last_chunk = 0.0
         self._on_demand = threading.Event()
         self._on_demand_new = 0
@@ -5430,6 +5518,7 @@ class Session:
         """A handler that dies quietly looks exactly like an idle server. It is
         recorded, printed, and surfaced by whatever verb is running."""
         def wrapper(_client, event):
+            self.last_event_at = time.time()
             try:
                 fn(event)
             except Exception:
@@ -5457,6 +5546,15 @@ class Session:
         client.event(ev.OfflineSyncPreviewEv)(self._guard(self._on_preview))
         client.event(ev.MessageEv)(self._guard(self._on_message))
         client.event(ev.HistorySyncEv)(self._guard(self._on_history))
+        for kind in (ev.DisconnectedEv, ev.StreamReplacedEv,
+                     ev.ConnectFailureEv, ev.TemporaryBanEv):
+            client.event(kind)(self._guard(self._dropped(kind.__name__)))
+
+    def _dropped(self, name: str):
+        def note(_event) -> None:
+            self.disconnect_reason = name
+            self._disconnected.set()
+        return note
 
     def _on_preview(self, event) -> None:
         _log(f"  queued for this device: {event.Total} item(s), "
@@ -5468,6 +5566,7 @@ class Session:
 
     def _on_message(self, event) -> None:
         self.live_messages += _ingest_live(self.db, event)
+        self.last_message_at = time.time()
 
     def _on_history(self, event) -> None:
         sync_type = _SYNC_TYPES.get(event.Data.syncType, str(event.Data.syncType))
@@ -8652,6 +8751,857 @@ def cmd_send(args):
             else _wm_send(cfg, args))
 
 
+# ── The assistant service ───────────────────────────────────────────────────
+#
+# One long-running process per account holds the account's connection and
+# captures what arrives, through the same Session, capture path, account check
+# and store every verb uses. Its control files are machine-local, under the
+# account's state home; what it captures goes only to the store.
+#
+# The service takes the account lock every connected verb takes and keeps it for
+# its whole life, so a second client on the device is impossible by the same
+# mechanism that already prevents one.
+
+SERVICE_SETTINGS_KEYS = ("connection", "environment")
+SERVICE_ENVIRONMENT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.IGNORECASE)
+SERVICE_OWNER_SCHEMA = "whatsapp.service-owner.v1"
+SERVICE_HEALTH_SCHEMA = "whatsapp.service-health.v1"
+SERVICE_NONCE_ENV = "WHATSAPP_SERVICE_LAUNCH_NONCE"
+SERVICE_HEARTBEAT = 15.0          # how often a held connection republishes health
+SERVICE_STALE_AFTER = 60.0        # health older than this from a live pid is stale
+SERVICE_BACKOFF_START = 2.0       # first wait before reconnecting
+SERVICE_BACKOFF_CEILING = 60.0    # the longest wait between attempts
+SERVICE_STABLE_AFTER = 60.0       # a connection held this long resets the backoff
+SERVICE_START_TIMEOUT = 60.0      # `start` waits this long for the daemon's proof
+SERVICE_STOP_TIMEOUT = 40.0       # the engine is given ENGINE_STOP_TIMEOUT inside it
+SERVICE_TICK = 0.5
+
+
+def _json_file(path: Path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _atomic_json(path: Path, value: dict) -> None:
+    """Replace one user-only control file in one step."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2,
+                                    sort_keys=True) + "\n")
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+
+
+def _epoch_iso(value: float | None) -> str | None:
+    if not value:
+        return None
+    return datetime.datetime.fromtimestamp(
+        value, datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def _service_paths(cfg: dict) -> dict[str, Path]:
+    """The account's lock and the service's control files. They sit under the
+    account's home, not the project's, because one account has one connection
+    whichever project starts the service."""
+    home = Path(cfg["home"]).expanduser()
+    state = home / "service"
+    return {"home": home, "lock": home / "lock", "state": state,
+            "owner": state / "owner.json", "health": state / "health.json",
+            "pid": state / "daemon.pid", "log": state / "daemon.log"}
+
+
+def _service_owner(paths: dict[str, Path]) -> dict | None:
+    """The owner record of a service that is alive, else None."""
+    owner = _json_file(paths["owner"])
+    if isinstance(owner, dict) and _pid_alive(owner.get("pid")):
+        return owner
+    return None
+
+
+def _account_lock_free(paths: dict[str, Path]) -> bool:
+    """Whether nothing holds the account lock right now, asked by taking and
+    releasing it at once."""
+    paths["home"].mkdir(parents=True, exist_ok=True, mode=0o700)
+    with paths["lock"].open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    return True
+
+
+def _service_bundle_dir() -> Path:
+    here = Path(__file__).resolve()
+    return here.parent.parent if here.parent.name == "bin" else here.parent
+
+
+def _service_template() -> Path:
+    return _service_bundle_dir() / "service" / "templates" / "settings.json"
+
+
+def _service_project_root() -> Path:
+    root = _project_root()
+    if root is None:
+        _refuse(6, "no_project", "not inside a project",
+                f"run from a project, then `capabilities init` before "
+                f"`{NAME} service init`")
+    return root
+
+
+def _require_service_envelope(root: Path) -> None:
+    envelope = _project_capabilities_dir(root)
+    if not ((envelope / "settings.json").is_file()
+            or (envelope / "project.json").is_file()):
+        _refuse(6, "no_envelope", "no capabilities envelope in this project",
+                f"run `capabilities init` first, then `{NAME} service init`")
+
+
+def _service_settings() -> dict:
+    """The service's settings records, without the registry's own default."""
+    try:
+        rows = _records().resolve(NAME, "setting")
+    except StoreError as exc:
+        _refuse(6, exc.slug, exc.message, exc.hint)
+    return {key: row["value"] for key, row in rows.items()
+            if key != "connection.default"}
+
+
+def _validate_service_settings(data) -> dict:
+    """The closed settings surface: an unknown key is refused, never ignored."""
+    if not isinstance(data, dict):
+        raise ValueError("settings: must be an object")
+    unknown = sorted(set(data) - set(SERVICE_SETTINGS_KEYS))
+    if unknown:
+        raise ValueError(f"settings: unsupported key(s) {', '.join(unknown)}; "
+                         f"the service takes {', '.join(SERVICE_SETTINGS_KEYS)}")
+    connection = data.get("connection")
+    if connection is not None and (not isinstance(connection, str)
+                                   or not connection.strip()):
+        raise ValueError("settings.connection: must be a connection id or null")
+    environment = data.get("environment")
+    if environment is not None and (
+            not isinstance(environment, str)
+            or not SERVICE_ENVIRONMENT_RE.fullmatch(environment)):
+        raise ValueError("settings.environment: must match "
+                         f"{SERVICE_ENVIRONMENT_RE.pattern}")
+    return data
+
+
+def _checked_service_settings() -> dict:
+    data = _service_settings()
+    if not data:
+        _refuse(6, "service_not_initialized",
+                f"the {NAME} assistant service is not initialized in this project",
+                f"run `{NAME} service init` to seed its settings")
+    try:
+        return _validate_service_settings(data)
+    except ValueError as exc:
+        _refuse(6, "service_settings_invalid", str(exc),
+                f"fix the {NAME} service settings record; unsupported keys are "
+                "never ignored")
+
+
+def _service_cfg(settings: dict, connection_flag: str | None) -> dict:
+    """The connection the service runs: the flag, else the settings' own, else
+    the registry's default. Only the engine this CLI carries can be held."""
+    wanted = connection_flag or settings.get("connection") or None
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    cfg, problem = _build_cfg(cid, entry)
+    if problem:
+        _refuse(problem["exit"], problem["code"], problem["message"],
+                problem.get("hint"))
+    if cfg["engine"] != ENGINE_INHOUSE:
+        _refuse(6, "service_engine_unsupported",
+                f"connection {cid!r} runs the {cfg['engine']} engine; the "
+                f"assistant service holds the engine this CLI carries",
+                "select an in-house connection")
+    return cfg
+
+
+def _require_store_setting() -> None:
+    try:
+        read_setting()
+    except DbError as exc:
+        _store_refusal(exc)
+
+
+def _service_prepare(connection_flag: str | None) -> tuple[Path, dict, dict]:
+    """Everything a start or a run checks before it touches the account."""
+    root = _service_project_root()
+    _require_service_envelope(root)
+    settings = _checked_service_settings()
+    cfg = _service_cfg(settings, connection_flag)
+    _require_store_setting()
+    _require_linked(cfg)
+    return root, settings, cfg
+
+
+def _service_health(paths: dict[str, Path], running: bool) -> dict:
+    raw = _json_file(paths["health"])
+    health = dict(raw) if isinstance(raw, dict) else {}
+    updated = health.get("updated_epoch")
+    age = (time.time() - updated) if isinstance(updated, (int, float)) else None
+    state = health.get("state") or ("unknown" if running else "stopped")
+    if running and age is not None and age > SERVICE_STALE_AFTER:
+        state = "stale"
+    if not running and state not in ("logged_out", "failed"):
+        state = "stopped"
+    health["state"] = state
+    health["age_seconds"] = round(age, 1) if age is not None else None
+    return health
+
+
+def _cmd_service_status(connection_flag: str | None) -> dict:
+    root = _service_project_root()
+    settings = _service_settings()
+    cfg = _service_cfg(settings, connection_flag)
+    paths = _service_paths(cfg)
+    owner = _service_owner(paths)
+    running = owner is not None
+    health = _service_health(paths, running)
+    if running and health.get("launch_nonce") != owner.get("launch_nonce"):
+        health = {"state": "unknown", "age_seconds": None}
+    started = health.get("started_epoch")
+    return {
+        "initialized": bool(settings),
+        "running": running,
+        "state": health["state"],
+        "healthy": running and health["state"] == "healthy",
+        "pid": owner.get("pid") if running else None,
+        "connected": bool(health.get("connected")) if running else False,
+        "uptime_seconds": (round(time.time() - started)
+                           if running and isinstance(started, (int, float))
+                           else None),
+        "started_at": health.get("started_at") if running else None,
+        "last_event_at": health.get("last_event_at"),
+        "last_message_at": health.get("last_message_at"),
+        "messages_captured": health.get("messages_captured"),
+        "reconnects": health.get("reconnects"),
+        "last_error": health.get("last_error"),
+        "environment": health.get("environment") if running
+                       else settings.get("environment"),
+        "connection": cfg["id"],
+        "account": cfg["account_key"],
+        "project": str(root),
+        "owner_project": owner.get("project_root") if running else None,
+        "health_age_seconds": health.get("age_seconds"),
+        "control_dir": str(paths["state"]),
+        "log_file": str(paths["log"]),
+    }
+
+
+def _inventory(_network: bool) -> dict:
+    """The assistant service's state on this machine, as `service status` reads
+    it. A project that cannot select a connection has no service to be in any
+    state, and says why rather than failing the whole report."""
+    if _project_root() is None:
+        return {"service": {"state": "not configured",
+                            "detail": "not inside a project"}}
+    import io
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as refused:
+            status = _cmd_service_status(None)
+    except _Refusal as refusal:
+        return {"service": {"state": "not configured", "detail": refusal.message}}
+    except SystemExit:
+        detail = "the service status could not be read"
+        for line in reversed(refused.getvalue().strip().splitlines()):
+            with contextlib.suppress(ValueError, KeyError, TypeError):
+                detail = json.loads(line)["error"]["message"]
+                break
+        return {"service": {"state": "not configured", "detail": detail}}
+    if status["running"]:
+        return {"service": {"state": "running",
+                            "detail": f"pid {status['pid']}, {status['state']}, "
+                                      f"connection {status['connection']}"}}
+    return {"service": {"state": status["state"] if status["initialized"]
+                        else "not initialized",
+                        "detail": f"connection {status['connection']}"}}
+
+
+def _cmd_service_init(connection_flag: str | None, force: bool) -> dict:
+    root = _service_project_root()
+    _require_service_envelope(root)
+    template = _service_template()
+    if not template.is_file():
+        _refuse(3, "service_bundle_missing",
+                f"the bundled settings template is missing: {template}",
+                f"reinstall {NAME} from a bundled source")
+    adapter = _records()
+    existing = _service_settings()
+    if existing and not force:
+        try:
+            _validate_service_settings(existing)
+        except ValueError as exc:
+            _refuse(6, "service_settings_invalid", str(exc),
+                    f"fix the record, or reseed it with `{NAME} service init "
+                    "--force`")
+        return {"initialized": NAME, "project": str(root),
+                "written": [], "skipped": [f"{adapter.source}:{NAME}/settings"],
+                "settings": existing}
+    settings = json.loads(template.read_text())
+    if connection_flag:
+        settings["connection"] = connection_flag
+    try:
+        _validate_service_settings(settings)
+    except ValueError as exc:
+        _refuse(6, "service_settings_invalid", str(exc))
+    try:
+        for key in set(existing) - set(settings):
+            adapter.delete(NAME, "setting", key)
+        for key, value in settings.items():
+            adapter.set(NAME, "setting", key, value,
+                        actor=f"{NAME} service init")
+    except StoreError as exc:
+        _refuse(6, exc.slug, exc.message, exc.hint)
+    return {"initialized": NAME, "project": str(root),
+            "written": [f"{adapter.source}:{NAME}/settings"], "skipped": [],
+            "settings": settings,
+            "next": [f"run `{NAME} service doctor`, then `{NAME} service start`"]}
+
+
+def _cmd_service_start(connection_flag: str | None) -> dict:
+    root, _settings, cfg = _service_prepare(connection_flag)
+    paths = _service_paths(cfg)
+    owner = _service_owner(paths)
+    if owner is not None:
+        _refuse(8, "service_running",
+                f"the {NAME} assistant service already owns account "
+                f"{cfg['account_key']} (pid {owner.get('pid')}, project "
+                f"{owner.get('project_root')})",
+                f"one service holds one account; `{NAME} service status` "
+                "reports it")
+    if not _account_lock_free(paths):
+        _refuse(8, "session_busy",
+                f"another invocation holds the session for connection "
+                f"{cfg['id']!r}",
+                "wait for it to finish and start the service again")
+    paths["state"].mkdir(parents=True, exist_ok=True, mode=0o700)
+    nonce = uuid.uuid4().hex
+    env = dict(os.environ)
+    env[SERVICE_NONCE_ENV] = nonce
+    command = [str(Path(__file__).resolve()), "service", "run",
+               "--connection", cfg["id"]]
+    with paths["log"].open("a", encoding="utf-8") as log:
+        proc = subprocess.Popen(command, cwd=str(root), env=env,
+                                stdin=subprocess.DEVNULL, stdout=log,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+    deadline = time.monotonic() + SERVICE_START_TIMEOUT
+    proven = None
+    while time.monotonic() < deadline and proc.poll() is None:
+        candidate = _service_owner(paths)
+        if candidate and candidate.get("launch_nonce") == nonce:
+            proven = candidate
+            break
+        time.sleep(0.2)
+    if proven is None:
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, 15)
+        tail = []
+        if paths["log"].exists():
+            tail = paths["log"].read_text(errors="replace").splitlines()[-8:]
+        _refuse(5, "service_start_failed",
+                (f"the service exited with {proc.returncode} before it held the "
+                 "account" if proc.poll() is not None else
+                 f"the service did not prove ownership within "
+                 f"{SERVICE_START_TIMEOUT:g}s"),
+                "\n".join(tail) or f"read `{NAME} service logs`")
+    out = _cmd_service_status(cfg["id"])
+    out["started"] = True
+    return out
+
+
+def _cmd_service_run(connection_flag: str | None) -> None:
+    root, settings, cfg = _service_prepare(connection_flag)
+    daemon = _ServiceDaemon(cfg, root, settings,
+                            launch_nonce=os.environ.get(SERVICE_NONCE_ENV)
+                            or uuid.uuid4().hex)
+    sys.exit(daemon.run())
+
+
+def _running_owner(connection_flag: str | None) -> tuple[dict, dict, dict | None]:
+    _service_project_root()
+    cfg = _service_cfg(_service_settings(), connection_flag)
+    paths = _service_paths(cfg)
+    return cfg, paths, _service_owner(paths)
+
+
+def _cmd_service_stop(connection_flag: str | None, timeout: float,
+                      force: bool) -> dict:
+    cfg, paths, owner = _running_owner(connection_flag)
+    if owner is None:
+        return {"stopped": False, "running": False, "connection": cfg["id"],
+                "pid": None}
+    pid = owner["pid"]
+    try:
+        os.kill(pid, 15)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        _refuse(6, "service_stop_failed", f"cannot signal the service {pid}: {exc}")
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            out = {"stopped": True, "running": False, "connection": cfg["id"],
+                   "pid": pid, "lock_free": _account_lock_free(paths)}
+            if paths["owner"].exists():
+                out["warning"] = "the service left its owner record behind"
+            return out
+        time.sleep(0.2)
+    if force:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, 9)
+        time.sleep(0.5)
+        return {"stopped": True, "killed": True, "running": _pid_alive(pid),
+                "connection": cfg["id"], "pid": pid}
+    _refuse(5, "service_stop_timeout",
+            f"the service did not stop within {timeout:g}s",
+            f"retry with `{NAME} service stop --force`")
+
+
+def _cmd_service_reload(connection_flag: str | None, timeout: float) -> dict:
+    """Validate first, then ask the running listener to re-read. The signal goes
+    to the listener alone, never to its process group."""
+    _checked_service_settings()
+    cfg, paths, owner = _running_owner(connection_flag)
+    if owner is None:
+        _refuse(5, "service_not_running",
+                f"the {NAME} assistant service is not running for connection "
+                f"{cfg['id']!r}", f"run `{NAME} service start`")
+    pid = owner["pid"]
+    before = _json_file(paths["health"]) or {}
+    attempts = int(before.get("settings_reload_attempts") or 0)
+    try:
+        os.kill(pid, 1)
+    except ProcessLookupError:
+        _refuse(5, "service_not_running", "the service exited before the reload")
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        health = _json_file(paths["health"]) or {}
+        if int(health.get("settings_reload_attempts") or 0) > attempts:
+            if health.get("settings_reload_error"):
+                _refuse(6, "service_reload_refused",
+                        str(health["settings_reload_error"]),
+                        "the previous settings remain active")
+            return {"reloaded": True, "pid": pid, "connection": cfg["id"],
+                    "settings_generation": health.get("settings_generation"),
+                    "settings_reloaded_at": health.get("settings_reloaded_at"),
+                    "environment": health.get("environment")}
+        time.sleep(0.1)
+    _refuse(5, "service_reload_timeout",
+            f"the service did not acknowledge the reload within {timeout:g}s",
+            f"read `{NAME} service logs`")
+
+
+def _cmd_service_logs(connection_flag: str | None, tail: int) -> dict:
+    _service_project_root()
+    cfg = _service_cfg(_service_settings(), connection_flag)
+    log = _service_paths(cfg)["log"]
+    if not log.exists():
+        _refuse(3, "logs_not_found", f"no service log yet: {log}",
+                f"`{NAME} service start` writes it")
+    lines = log.read_text(errors="replace").splitlines()
+    return {"connection": cfg["id"], "log_file": str(log),
+            "lines": lines[-max(0, tail):]}
+
+
+def _cmd_service_doctor(connection_flag: str | None) -> tuple[dict, int]:
+    """The service's readiness without touching the account: settings, store,
+    link, ownership. The listener holds the connection while it runs, so its
+    own health is what proves the connection then."""
+    root = _service_project_root()
+    checks: list[dict] = []
+    fail = 0
+
+    def check(item: str, ok: bool, detail: str, category: int = 0,
+              code: str | None = None) -> None:
+        nonlocal fail
+        row = {"item": item, "ok": ok, "detail": detail}
+        if code:
+            row["code"] = code
+        checks.append(row)
+        if not ok and not fail:
+            fail = category or 5
+
+    settings = _service_settings()
+    try:
+        _validate_service_settings(settings)
+        check("settings", bool(settings),
+              "valid" if settings else f"not initialized; run `{NAME} service init`",
+              6, None if settings else "service_not_initialized")
+    except ValueError as exc:
+        check("settings", False, str(exc), 6, "service_settings_invalid")
+    try:
+        cfg = _service_cfg(settings if isinstance(settings, dict) else {},
+                           connection_flag)
+    except _Refusal as refusal:
+        check("connection", False, refusal.message, refusal.exit_code,
+              refusal.code)
+        return {"ok": False, "project": str(root), "checks": checks}, fail
+    check("connection", True, f"{cfg['id']} (account {cfg['account_key']})")
+    try:
+        db = _open_store(cfg)
+        location = _store_location(db)
+        db.close()
+        check("store", True, location)
+    except _Refusal as refusal:
+        check("store", False, refusal.message, refusal.exit_code, refusal.code)
+    account_id, _jid, _name = _session_account(cfg)
+    expected = cfg.get("expected_account_id")
+    if account_id is None:
+        check("link", False, f"no linked device; run `{NAME} pair`", 7,
+              "not_linked")
+    elif expected and account_id != expected:
+        check("link", False, f"the session belongs to {account_id}, not the "
+              f"bound {expected}", 2, "account_identity_mismatch")
+    else:
+        check("link", True, f"a device is linked for {account_id}")
+    status = _cmd_service_status(cfg["id"])
+    if status["state"] == "logged_out":
+        check("ownership", False, "the device was removed from the account; "
+              f"the service stopped reconnecting. Stop it, re-link with `{NAME} "
+              "pair --recreate --yes`, and start it again", 7, "logged_out")
+    elif status["running"]:
+        healthy = status["state"] == "healthy" and status["connected"]
+        check("ownership", healthy,
+              f"pid {status['pid']} holds the account from "
+              f"{status['owner_project']}; {status['state']}, "
+              f"{'connected' if status['connected'] else 'not connected'}"
+              + (f"; last error: {status['last_error']}"
+                 if status.get("last_error") and not healthy else ""),
+              5, None if healthy else "service_unhealthy")
+    else:
+        free = _account_lock_free(_service_paths(cfg))
+        check("ownership", free,
+              "not running; the account lock is free" if free else
+              "not running, and another invocation holds the account lock",
+              8, None if free else "session_busy")
+    return {"ok": not fail, "project": str(root), "service": status,
+            "checks": checks}, fail
+
+
+class _ServiceDaemon:
+    """The listener: hold one Session for as long as the wire stays up, rebuild
+    it with backoff when it drops, stop for good when the device is removed.
+
+    `session_factory` and `sleep` are the seams a test drives it through; the
+    process itself always builds the real Session."""
+
+    def __init__(self, cfg: dict, root: Path, settings: dict, *,
+                 launch_nonce: str, session_factory=None):
+        self.cfg = cfg
+        self.root = root
+        self.settings = settings
+        self.nonce = launch_nonce
+        self.paths = _service_paths(cfg)
+        self.session_factory = session_factory or (lambda: Session(cfg))
+        self.stop_requested = threading.Event()
+        self.reload_requested = threading.Event()
+        self.drop_requested = threading.Event()
+        self.started = time.time()
+        self.health: dict = {}
+        self.reconnects = 0
+        self.messages = 0
+        self.attempts: list[float] = []
+        self.stalled = False
+        self.last_error: str | None = None
+
+    # -- process plumbing ---------------------------------------------------
+
+    def log(self, message: str) -> None:
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds")
+        sys.stderr.write(f"{stamp} {message}\n")
+        sys.stderr.flush()
+
+    def install_signals(self) -> None:
+        import signal
+        signal.signal(signal.SIGTERM, lambda *_: self.stop_requested.set())
+        signal.signal(signal.SIGINT, lambda *_: self.stop_requested.set())
+        signal.signal(signal.SIGHUP, lambda *_: self.reload_requested.set())
+        # Drop the socket and go through the reconnect path: the forced
+        # disconnect a reconnect is proven with.
+        signal.signal(signal.SIGUSR1, lambda *_: self.drop_requested.set())
+
+    def owner_record(self) -> dict:
+        return {"schema": SERVICE_OWNER_SCHEMA, "launch_nonce": self.nonce,
+                "pid": os.getpid(), "cli_path": str(Path(__file__).resolve()),
+                "mode": ("development" if os.environ.get("CAPABILITIES_DEV_SESSION")
+                         else "canonical"),
+                "dev_session_id": os.environ.get("CAPABILITIES_DEV_SESSION"),
+                "project_root": str(self.root), "connection": self.cfg["id"],
+                "account": self.cfg["account_key"],
+                "health_file": str(self.paths["health"]),
+                "started_at": _epoch_iso(self.started)}
+
+    def publish(self, state: str | None = None, **updates) -> None:
+        now = time.time()
+        self.health.update({
+            "schema": SERVICE_HEALTH_SCHEMA, "pid": os.getpid(),
+            "launch_nonce": self.nonce, "connection": self.cfg["id"],
+            "account": self.cfg["account_key"],
+            "environment": self.settings.get("environment"),
+            "started_at": _epoch_iso(self.started), "started_epoch": self.started,
+            "updated_at": _epoch_iso(now), "updated_epoch": now,
+            "reconnects": self.reconnects, "messages_captured": self.messages,
+            "stale_after_seconds": SERVICE_STALE_AFTER, **updates})
+        if state is not None:
+            self.health["state"] = state
+        _atomic_json(self.paths["health"], self.health)
+
+    def wait(self, seconds: float) -> None:
+        """Sleep that a stop request cuts short."""
+        self.stop_requested.wait(seconds)
+
+    # -- settings -----------------------------------------------------------
+
+    def apply_reload(self) -> None:
+        self.reload_requested.clear()
+        attempts = int(self.health.get("settings_reload_attempts") or 0) + 1
+        try:
+            data = _validate_service_settings(_service_settings())
+            wanted = data.get("connection")
+            if wanted and wanted != self.cfg["id"]:
+                raise ValueError(
+                    f"settings.connection {wanted!r} differs from the running "
+                    f"{self.cfg['id']!r}; a connection change takes effect on "
+                    "restart")
+        except (ValueError, _Refusal) as exc:
+            message = exc.message if isinstance(exc, _Refusal) else str(exc)
+            self.log(f"reload refused: {message}")
+            self.publish(settings_reload_attempts=attempts,
+                         settings_reload_error=message)
+            return
+        self.settings = data
+        generation = int(self.health.get("settings_generation") or 0) + 1
+        self.log(f"settings reloaded (generation {generation})")
+        self.publish(settings_reload_attempts=attempts, settings_reload_error=None,
+                     settings_generation=generation,
+                     settings_reloaded_at=_epoch_iso(time.time()))
+
+    # -- the connection -----------------------------------------------------
+
+    def track(self, session) -> dict:
+        captured = getattr(session, "live_messages", 0) or 0
+        return {"last_event_at": _epoch_iso(getattr(session, "last_event_at", None))
+                or self.health.get("last_event_at"),
+                "last_message_at": _epoch_iso(getattr(session, "last_message_at", None))
+                or self.health.get("last_message_at"),
+                "session_messages": captured}
+
+    def hold(self) -> str:
+        """One session from open to drop. Answers why it ended: `stopped`,
+        `logged_out`, `fatal` or `disconnected`."""
+        session = None
+        base = self.messages
+        try:
+            session = self.session_factory()
+            self.attempts.append(time.monotonic())
+            session.open()
+            deadline = time.monotonic() + CONNECT_TIMEOUT
+            while not session.wait_connected(1.0):
+                if self.stop_requested.is_set():
+                    return "stopped"
+                if session._logged_out.is_set():
+                    return "logged_out"
+                if time.monotonic() >= deadline:
+                    self.last_error = f"no connection within {CONNECT_TIMEOUT}s"
+                    return "disconnected"
+            session.require_account()
+            # The offline queue drains by the act of connecting, through the
+            # same handlers as everything live; nothing here waits for it.
+            session.refresh_identities()
+            self.log(f"connected as account {self.cfg['account_key']}")
+            self.publish("healthy", connected=True, last_error=None,
+                         connected_at=_epoch_iso(time.time()),
+                         **self.track(session))
+            drained_reported = False
+            beat = time.monotonic()
+            errors_seen = len(session.errors)
+            while True:
+                if self.stop_requested.is_set():
+                    return "stopped"
+                if session._logged_out.is_set():
+                    return "logged_out"
+                if self.drop_requested.is_set():
+                    self.drop_requested.clear()
+                    self.last_error = "forced disconnect"
+                    self.log("forced disconnect: dropping the socket")
+                    with contextlib.suppress(Exception):
+                        session._client.disconnect()
+                    return "disconnected"
+                if session._disconnected.is_set():
+                    self.last_error = (f"connection dropped "
+                                       f"({session.disconnect_reason})")
+                    return "disconnected"
+                if self.reload_requested.is_set():
+                    self.apply_reload()
+                if len(session.errors) > errors_seen:
+                    for error in session.errors[errors_seen:]:
+                        self.log(f"capture handler failed: {error}")
+                    errors_seen = len(session.errors)
+                    self.publish(last_error=session.errors[-1])
+                self.messages = base + (session.live_messages or 0)
+                if not drained_reported and session.offline_count is not None:
+                    drained_reported = True
+                    self.log(f"offline queue drained: {session.offline_count} "
+                             "item(s)")
+                    self.publish(offline_drained=session.offline_count,
+                                 **self.track(session))
+                if time.monotonic() - beat >= SERVICE_HEARTBEAT:
+                    beat = time.monotonic()
+                    connected = True
+                    with contextlib.suppress(Exception):
+                        connected = bool(session._client.is_connected)
+                    self.publish(connected=connected, **self.track(session))
+                self.stop_requested.wait(SERVICE_TICK)
+        except _Refusal as refusal:
+            self.last_error = f"{refusal.code}: {refusal.message}"
+            if refusal.code in ("not_linked", "logged_out"):
+                return "logged_out"
+            if refusal.code in ("account_identity_mismatch",
+                                "store_account_mismatch", "engine_unavailable"):
+                return "fatal"
+            return "disconnected"
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            return "disconnected"
+        finally:
+            if session is not None:
+                self.messages = base + (getattr(session, "live_messages", 0) or 0)
+                with contextlib.suppress(Exception):
+                    self.health.update(self.track(session))
+                session.close()
+                self.stalled = bool(getattr(session, "stalled", False))
+
+    def loop(self) -> int:
+        backoff = SERVICE_BACKOFF_START
+        self.last_error = None
+        while not self.stop_requested.is_set():
+            began = time.monotonic()
+            outcome = self.hold()
+            if self.stalled:
+                self.log("the engine did not release the connection; leaving "
+                         "rather than risk a second client on the device")
+                self.publish("failed", connected=False,
+                             last_error="engine did not stop")
+                return 5
+            if outcome == "stopped" or self.stop_requested.is_set():
+                return 0
+            if outcome in ("logged_out", "fatal"):
+                state = "logged_out" if outcome == "logged_out" else "failed"
+                self.log(f"{state}: {self.last_error or 'device removed'}; "
+                         "not reconnecting")
+                self.publish(state, connected=False, last_error=self.last_error
+                             or "the device was removed from the account")
+                while not self.stop_requested.is_set():
+                    if self.reload_requested.is_set():
+                        self.apply_reload()
+                    self.stop_requested.wait(SERVICE_TICK)
+                return 0
+            if time.monotonic() - began >= SERVICE_STABLE_AFTER:
+                backoff = SERVICE_BACKOFF_START
+            self.reconnects += 1
+            self.log(f"disconnected ({self.last_error}); reconnecting in "
+                     f"{backoff:g}s")
+            self.publish("reconnecting", connected=False,
+                         last_error=self.last_error, next_attempt_in=backoff)
+            self.wait(backoff)
+            backoff = min(backoff * 2, SERVICE_BACKOFF_CEILING)
+        return 0
+
+    def run(self) -> int:
+        """Own the account for the life of the process, or refuse to start."""
+        self.paths["state"].mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.paths["home"].mkdir(parents=True, exist_ok=True, mode=0o700)
+        handle = self.paths["lock"].open("a+")
+        with contextlib.suppress(OSError):
+            self.paths["lock"].chmod(0o600)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            owner = _service_owner(self.paths)
+            _refuse(8, "service_running" if owner else "session_busy",
+                    (f"the {NAME} assistant service already owns account "
+                     f"{self.cfg['account_key']} (pid {owner.get('pid')})"
+                     if owner else
+                     f"another invocation holds the session for connection "
+                     f"{self.cfg['id']!r}"),
+                    "one listener holds one account")
+        self.install_signals()
+        code = 0
+        try:
+            _atomic_json(self.paths["owner"], self.owner_record())
+            self.paths["pid"].write_text(f"{os.getpid()}\n")
+            self.log(f"assistant service starting: connection {self.cfg['id']}, "
+                     f"account {self.cfg['account_key']}, project {self.root}")
+            self.publish("starting", connected=False, last_error=None)
+            code = self.loop()
+            return code
+        finally:
+            with contextlib.suppress(Exception):
+                state = self.health.get("state")
+                self.publish(state if state in ("logged_out", "failed")
+                             else "stopped", connected=False,
+                             stopped_at=_epoch_iso(time.time()))
+            self.log("assistant service stopped")
+            with contextlib.suppress(Exception):
+                owner = _json_file(self.paths["owner"])
+                if isinstance(owner, dict) and owner.get("launch_nonce") == self.nonce:
+                    self.paths["owner"].unlink()
+            with contextlib.suppress(Exception):
+                if self.paths["pid"].read_text().strip() == str(os.getpid()):
+                    self.paths["pid"].unlink()
+            if not self.stalled:
+                # A stalled engine thread may still be on the wire; the lock
+                # then goes only with the process, which leaves at once.
+                with contextlib.suppress(Exception):
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+                    handle.close()
+
+
+def cmd_service(args):
+    action = args.service_command
+    connection = getattr(args, "connection", None)
+    if action == "init":
+        return _cmd_service_init(connection, args.force)
+    if action == "start":
+        return _cmd_service_start(connection)
+    if action == "run":
+        return _cmd_service_run(connection)
+    if action == "stop":
+        return _cmd_service_stop(connection, args.timeout, args.force)
+    if action == "reload":
+        return _cmd_service_reload(connection, args.timeout)
+    if action == "status":
+        return _cmd_service_status(connection)
+    if action == "logs":
+        return _cmd_service_logs(connection, args.tail)
+    report, fail = _cmd_service_doctor(connection)
+    _emit(report)
+    if fail:
+        sys.exit(fail)
+    return None
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 
@@ -8671,6 +9621,15 @@ def _selection_flags(parser, *, suppress: bool = False) -> None:
 
 def main():
     _gate()                      # every verb passes the effective policy gate first
+    if (sys.argv[1:2] or [""])[0] == "manifest":
+        # The contract's manifest plus the bundled service it declares.
+        _emit({"name": NAME, "summary": SUMMARY,
+               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+               "docs": {"base": DOCS_BASE,
+                        "topics": [entry["topic"] for entry in _guide_menu()]},
+               "state": STATE, "inventory": _inventory_declaration(),
+               "post_install": POST_INSTALL, "service": SERVICE})
+        sys.exit(0)
     _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
     parser = argparse.ArgumentParser(
         prog="whatsapp",
@@ -8787,6 +9746,30 @@ def main():
     psend.add_argument("chat_id", nargs="?", help="recipient chat id")
     psend.add_argument("text", nargs="?", help="message text")
 
+    psvc = _sub("service", help="Operate the bundled assistant listener")
+    svc = psvc.add_subparsers(dest="service_command", required=True)
+
+    def _svc(name: str, **kwargs):
+        created = svc.add_parser(name, **kwargs)
+        _selection_flags(created, suppress=True)
+        return created
+
+    sinit = _svc("init", help="Seed the service settings records")
+    sinit.add_argument("--force", action="store_true",
+                       help="reseed settings that already exist")
+    _svc("start", help="Start the listener detached")
+    _svc("run", help="Run the listener in the foreground")
+    sstop = _svc("stop", help="Stop the listener")
+    sstop.add_argument("--timeout", type=float, default=SERVICE_STOP_TIMEOUT)
+    sstop.add_argument("--force", action="store_true",
+                       help="kill it when it does not stop within the timeout")
+    sreload = _svc("reload", help="Re-read and validate settings in the listener")
+    sreload.add_argument("--timeout", type=float, default=10.0)
+    _svc("status", help="State, pid, connection, uptime, last event")
+    slogs = _svc("logs", help="Tail the listener's log")
+    slogs.add_argument("--tail", type=int, default=50)
+    _svc("doctor", help="Settings, store, link and ownership")
+
     args = parser.parse_args()
 
     # The standard write gate: a write verb refuses on a read-only connection,
@@ -8823,6 +9806,7 @@ def main():
         "render": cmd_render,
         "import-legacy": cmd_import_legacy,
         "send": cmd_send,
+        "service": cmd_service,
     }[args.command](args)
 
     if result is not None:

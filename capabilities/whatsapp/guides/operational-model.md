@@ -12,7 +12,7 @@ Linking adds an entry to the account's Linked Devices list on the phone, and tha
 
 **The pairing burst** arrives once, in the seconds after a device links, and carries the account's chats plus a window of their messages. Its depth is a pairing-time declaration. It is never repeated: a reconnect delivers none of it, so an invocation that links a device holds the connection open until the burst has landed.
 
-**The offline queue** is what the server held for the device while nothing was connected. It drains by the act of connecting, at no extra cost, so every verb that reaches the network collects it. This is what makes a design with no daemon viable: between invocations nothing is captured live, and the next connection catches up. How often that happens is the consuming project's decision — by hand, from a routine, or on a schedule.
+**The offline queue** is what the server held for the device while nothing was connected. It drains by the act of connecting, at no extra cost, so every verb that reaches the network collects it. Without the assistant service nothing is captured live between invocations, and the next connection catches up; how often that happens is the consuming project's decision — by hand, from a routine, or on a schedule. With the service running, the account stays connected and each message is captured as it arrives (the `assistant-service` guide).
 
 **Reaching back** is asked for, anchored on the oldest message already held, and answered by the phone rather than by WhatsApp's servers. It walks backwards only; there is no "fetch newer" counterpart, because forward coverage is the queue's job. The phone must be online to answer, and its silence is a distinct failure rather than an empty result.
 
@@ -32,7 +32,7 @@ Declaring a deep initial sync is available where a consumer genuinely wants the 
 
 ## Session lifecycle
 
-Two failure modes deserve deliberate handling, because nothing watches the session between invocations.
+Two failure modes deserve deliberate handling, because without the assistant service nothing watches the session between invocations.
 
 **Removal from the phone** ends the session immediately. The next invocation says so and names re-linking as the remedy.
 
@@ -40,7 +40,7 @@ Two failure modes deserve deliberate handling, because nothing watches the sessi
 
 ## One writer at a time
 
-Two clients driving one linked device desync it and can log it out, so an invocation takes an exclusive lock on the session for as long as it is connected and a second invocation is refused rather than queued. The refusal is never worked around.
+Two clients driving one linked device desync it and can log it out, so an invocation takes an exclusive lock on the session for as long as it is connected and a second invocation is refused rather than queued. The assistant service takes the same lock for its whole life, so while it runs a verb that would connect is refused the same way, naming the service, and reads that the store answers keep working. The refusal is never worked around.
 
 ## Adding an identity
 
