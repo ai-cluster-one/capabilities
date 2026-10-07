@@ -96,7 +96,9 @@ Store
   configures (`capabilities store show` reports it); CAPABILITIES_STORE_URL
   overrides it for a process. Without either, every verb that reads or writes
   the capture exits 6 store_not_configured; help, contract, connections and
-  the other contract commands still answer.
+  the other contract commands still answer. History an earlier version kept in
+  a messages.db file in the state home is not read by any verb until
+  `whatsapp import-legacy` carries it into the store, once.
 
 State
   $XDG_STATE_HOME/whatsapp/<account>/     named for the account, not for the
@@ -193,6 +195,16 @@ Commands
                                        a markdown conversation log (date headers,
                                        sender names, voice transcriptions inlined).
                                        stdout by default; --out writes a file.
+  whatsapp import-legacy [--file PATH]  Import, once, the history an earlier
+                                       version kept in messages.db in the
+                                       account's state home: chats, messages,
+                                       identities, enrichment, chunk records and
+                                       meta. Reads the file read-only and leaves
+                                       it as it is. Rows the store already holds
+                                       win; identities and enrichment fill what
+                                       the store lacks. A second run imports
+                                       nothing. Exit 3 when there is no file, 6
+                                       when it is not a legacy store.
   whatsapp send <chat_id> <text>       Send one text message. Write-enabled
                                        connections only: `send` exits 4 unless
                                        the connection carries allow_write.
@@ -7085,6 +7097,218 @@ def _wm_export(cfg: dict, args):
 
 
 
+# ── Importing a legacy capture ──────────────────────────────────────────────
+#
+# Before the store moved to Postgres, an account's capture was a SQLite file in
+# its state home. `import-legacy` carries that history into the account's rows
+# once. It is the one place the capability reads a SQLite file it once wrote,
+# and it only reads: the file is opened read-only and left exactly as it was.
+# Rows the store already holds win, because the live store is the newer record;
+# enrichment and identities merge, filling what the store lacks.
+
+LEGACY_STORE = "messages.db"
+_LEGACY_BATCH = 500
+
+# (table, legacy columns, epoch-second columns, flag columns, text-time columns)
+_LEGACY_TABLES = {
+    "chats": (("id", "name", "is_group", "last_ts", "unread", "archived",
+               "end_of_history", "updated_at"),
+              ("last_ts",), ("is_group", "archived", "end_of_history"),
+              ("updated_at",)),
+    "messages": (_MESSAGE_COLUMNS, ("ts",), ("from_me", "is_voice"),
+                 ("captured_at",)),
+    "identities": (("jid", "lid", "name", "push_name", "updated_at"),
+                   (), (), ("updated_at",)),
+    "enrichment": (("chat_id", "id", "media_path", "media_state", "media_error",
+                    "transcript", "transcript_language", "transcript_confidence",
+                    "transcript_model", "transcript_provider", "transcript_at",
+                    "transcript_error", "effective_text", "updated_at"),
+                   (), (), ("transcript_at", "updated_at")),
+    "chunks": (("sync_type", "conversations", "messages", "progress", "at",
+                "raw_file"), (), (), ("at",)),
+}
+
+# The parser-version record belongs to the rows the store already holds, and
+# the account binding is checked rather than copied over.
+_LEGACY_META_SKIPPED = ("schema",)
+
+
+def _legacy_rows(conn, table: str) -> list[dict]:
+    """Every row of one legacy table, with the columns this import knows. A
+    column the file never had reads as absent; a table it never had is empty."""
+    columns = _LEGACY_TABLES[table][0]
+    present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if not present:
+        return []
+    select = ", ".join(c if c in present else f"NULL AS {c}" for c in columns)
+    order = " ORDER BY n" if table == "chunks" and "n" in present else ""
+    return [dict(zip(columns, row))
+            for row in conn.execute(f"SELECT {select} FROM {table}{order}")]
+
+
+def _read_legacy(path: Path) -> dict:
+    """The whole legacy capture, read through a read-only handle."""
+    import sqlite3
+    if not path.is_file():
+        _refuse(3, "legacy_store_not_found",
+                f"there is no legacy store at {path}",
+                "nothing to import for this account; pass --file to name "
+                "another copy")
+    try:
+        with contextlib.closing(sqlite3.connect(
+                f"file:{urllib.parse.quote(str(path))}?mode=ro", uri=True)) as conn:
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if "messages" not in tables or "meta" not in tables:
+                raise ValueError("it holds no meta and messages tables")
+            meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
+            data = {table: _legacy_rows(conn, table) for table in _LEGACY_TABLES}
+    except (sqlite3.Error, ValueError) as exc:
+        _refuse(6, "legacy_store_unreadable",
+                f"{path} could not be read as a legacy store: {exc}",
+                "name a messages.db written by an earlier version of this "
+                "capability")
+    data["meta"] = meta
+    return data
+
+
+def _legacy_values(table: str, row: dict) -> list:
+    _columns, epochs, flags, times = _LEGACY_TABLES[table]
+    out = []
+    for column in _LEGACY_TABLES[table][0]:
+        value = row.get(column)
+        if column in flags:
+            value = _flag(value)
+        elif column in times:
+            value = _as_time(value)
+        elif column in epochs:
+            value = value or None
+        out.append(value)
+    return out
+
+
+def _insert_legacy(db, table: str, rows: list[dict], conflict: str) -> int:
+    """Write one legacy table in batches, and count the rows that changed."""
+    columns, epochs, _flags, _times = _LEGACY_TABLES[table]
+    marks = "(%s, " + ", ".join(_TS_PARAM if c in epochs else "%s"
+                                for c in columns) + ")"
+    changed = 0
+    for batch in _batched(rows, size=_LEGACY_BATCH):
+        params: list = []
+        for row in batch:
+            params += [db.account, *_legacy_values(table, row)]
+        changed += db.execute(
+            f"INSERT INTO whatsapp_{table} AS held (account, {', '.join(columns)})"
+            f" VALUES {', '.join([marks] * len(batch))} {conflict}",
+            params).rowcount
+    return changed
+
+
+def _merge_assignments(columns) -> tuple[str, str]:
+    """Fill what the store lacks and keep what it holds: the SET and the WHERE
+    that leaves a row alone when the import would change nothing in it."""
+    sets = ", ".join(f"{c} = COALESCE(held.{c}, excluded.{c})" for c in columns)
+    gaps = " OR ".join(f"(held.{c} IS NULL AND excluded.{c} IS NOT NULL)"
+                       for c in columns)
+    return sets, gaps
+
+
+def _import_chunks(db, rows: list[dict]) -> int:
+    """A chunk record is the same record when every field it carries matches,
+    so a second import finds each one already held."""
+    columns = _LEGACY_TABLES["chunks"][0]
+    casts = {"sync_type": "text", "conversations": "integer", "messages": "integer",
+             "progress": "integer", "at": "timestamptz", "raw_file": "text"}
+    marks = [f"%s::{casts[c]}" for c in columns]
+    added = 0
+    for row in rows:
+        values = _legacy_values("chunks", row)
+        match = " AND ".join(f"{c} IS NOT DISTINCT FROM {m}"
+                             for c, m in zip(columns, marks))
+        added += db.execute(
+            f"INSERT INTO whatsapp_chunks (account, {', '.join(columns)})"
+            f" SELECT %s, {', '.join(marks)}"
+            f" WHERE NOT EXISTS (SELECT 1 FROM whatsapp_chunks"
+            f" WHERE account = %s AND {match})",
+            [db.account, *values, db.account, *values]).rowcount
+    return added
+
+
+def _legacy_account_check(db, cfg: dict, meta: dict, path: Path) -> None:
+    """A legacy file holds one account's history, and it lands only in that
+    account's rows."""
+    legacy = _digits(meta.get("account_id")) or None
+    if not legacy:
+        return
+    held = _get_meta(db, "account_id")
+    expected = (cfg.get("expected_account_id") or held
+                or _digits(cfg.get("number")) or None)
+    if expected and legacy != expected:
+        _refuse(2, "store_account_mismatch",
+                f"{path} holds the history of {legacy}, and connection "
+                f"{cfg['id']!r} is {expected}",
+                "import a file into the connection for the account it belongs to")
+
+
+def _wm_import_legacy(cfg: dict, args) -> dict:
+    """Carry one account's legacy capture into its rows in the store, once.
+
+    Re-running it is harmless: every row it would write is already held, so it
+    reports nothing imported and changes nothing."""
+    db = _open_store(cfg)
+    try:
+        path = (Path(args.file).expanduser() if getattr(args, "file", None)
+                else Path(cfg["home"]).expanduser() / LEGACY_STORE)
+        legacy = _read_legacy(path)
+        meta = legacy["meta"]
+        _legacy_account_check(db, cfg, meta, path)
+        identity_columns = ("lid", "name", "push_name", "updated_at")
+        enrichment_columns = _LEGACY_TABLES["enrichment"][0][2:]
+        imported: dict = {}
+        with _writing(db):
+            imported["chats"] = _insert_legacy(
+                db, "chats", legacy["chats"],
+                "ON CONFLICT (account, id) DO NOTHING")
+            imported["messages"] = _insert_legacy(
+                db, "messages", legacy["messages"],
+                "ON CONFLICT (account, chat_id, id) DO NOTHING")
+            sets, gaps = _merge_assignments(identity_columns)
+            imported["identities"] = _insert_legacy(
+                db, "identities", legacy["identities"],
+                f"ON CONFLICT (account, jid) DO UPDATE SET {sets} WHERE {gaps}")
+            sets, gaps = _merge_assignments(enrichment_columns)
+            imported["enrichment"] = _insert_legacy(
+                db, "enrichment", legacy["enrichment"],
+                f"ON CONFLICT (account, chat_id, id) DO UPDATE SET {sets}"
+                f" WHERE {gaps}")
+            imported["chunks"] = _import_chunks(db, legacy["chunks"])
+            meta_added = 0
+            for key, value in sorted(meta.items()):
+                if key in _LEGACY_META_SKIPPED or value is None:
+                    continue
+                meta_added += db.execute(
+                    "INSERT INTO whatsapp_meta (account, key, value)"
+                    " VALUES (%s, %s, %s) ON CONFLICT (account, key) DO NOTHING",
+                    (db.account, key, str(value))).rowcount
+            imported["meta"] = meta_added
+        result = {
+            "ok": True, "connection": cfg["id"], "account": db.account,
+            "file": str(path),
+            "legacy": {table: len(legacy[table]) for table in _LEGACY_TABLES},
+            "imported": imported,
+            "store": _store_location(db),
+        }
+        version = meta.get("schema")
+        if version != STORE_VERSION:
+            result["warnings"] = [
+                f"the legacy rows were built by parser {version or 'unversioned'}, "
+                f"not the shipping {STORE_VERSION}; the raw chunks in "
+                f"{Path(cfg['home']) / 'raw'} hold what they were built from"]
+        return result
+    finally:
+        db.close()
+
+
 # ── The WAHA bridge ─────────────────────────────────────────────────────────
 #
 # A connection declaring `"engine": "waha"` is driven through a self-hosted
@@ -8411,6 +8635,16 @@ def cmd_export(args):
     return _wm_export(cfg, args)
 
 
+def cmd_import_legacy(args):
+    cfg = get_config(args)
+    if cfg["engine"] != ENGINE_INHOUSE:
+        _refuse(6, "flag_not_supported",
+                f"connection {cfg['id']!r} runs the {cfg['engine']} engine, which "
+                "keeps no legacy store to import",
+                "import-legacy applies to in-house connections only")
+    return _wm_import_legacy(cfg, args)
+
+
 def cmd_send(args):
     cfg = get_config(args)
     _refuse_foreign_flags(cfg, args)
@@ -8543,6 +8777,11 @@ def main():
     pr.add_argument("json_path", help="path to a messages.json produced by `whatsapp export`")
     pr.add_argument("--out", help="write to a file instead of stdout")
 
+    pil = _sub("import-legacy",
+               help="Import the account's pre-Postgres messages.db once")
+    pil.add_argument("--file", help="the legacy store to read (default: "
+                     "messages.db in the account's state home)")
+
     psend = _sub(
         "send", help="Send a text message (write-enabled connections only)")
     psend.add_argument("chat_id", nargs="?", help="recipient chat id")
@@ -8582,6 +8821,7 @@ def main():
         "export": cmd_export,
         "transcribe": cmd_transcribe,
         "render": cmd_render,
+        "import-legacy": cmd_import_legacy,
         "send": cmd_send,
     }[args.command](args)
 

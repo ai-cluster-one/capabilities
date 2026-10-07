@@ -12,6 +12,8 @@ The capture is keyed by the account, not by the project or the connection, becau
 
 The user state home keeps what is not rows: the engine's own login session, the raw history chunks, and the attachments fetched so far, in a folder named for the account.
 
+An account captured before the store moved to Postgres has its earlier history in a `messages.db` file in that same folder, which no verb reads. `whatsapp import-legacy` carries it into the account's rows once: chats, messages, identities, enrichment, chunk records and meta. It opens the file read-only and leaves it, and the raw chunks beside it, exactly where they are. Where the store already holds a row, the store's row stands, because it is the newer record; identities and enrichment are merged, filling only what the store lacks. Running it again imports nothing, so a second run is harmless, but there is no reason for one: after the first, the file is a historical copy.
+
 Three properties of the store are worth knowing as a consumer:
 
 - **Raw history chunks are written to disk before anything parses them.** A parsing fault therefore costs a re-ingest from them and never the data.
