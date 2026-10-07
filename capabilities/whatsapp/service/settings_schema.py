@@ -29,12 +29,15 @@ MAY_ADDRESS_MODES = {"anyone", "allowed_users"}
 CONTROL_COMMANDS = {"status", "set", "reload", "stop", "help", "*"}
 SEND_RATE_CEILING = 120
 
-USER_KEYS = {"name", "role", "profile", "worker_timeout", "context"}
+USER_KEYS = {"name", "role", "profile", "worker_timeout", "context",
+             "voice_transcription"}
 GROUP_KEYS = {"name", "require_reference", "aliases", "may_address",
-              "member_role", "profile", "worker_timeout", "context"}
+              "member_role", "profile", "worker_timeout", "context",
+              "voice_transcription"}
 DEFAULT_KEYS = {"tail_size", "debounce", "max_age", "worker_timeout",
                 "max_parallel_dialogue", "profile", "send_rate",
-                "max_parallel_jobs", "job_profile", "job_recovery"}
+                "max_parallel_jobs", "job_profile", "job_recovery",
+                "voice_transcription"}
 NUMERIC_DEFAULTS = {
     "tail_size": (1, 500, True),
     "debounce": (0, 300, False),
@@ -48,6 +51,12 @@ NUMERIC_DEFAULTS = {
 # continues it on its recorded session, `inspect` stops it and reports it to
 # the chat. A job without a recorded session is always stopped and reported.
 JOB_RECOVERY = {"requeue", "inspect"}
+# Which voice notes the listener transcribes before the turn: none, those
+# addressed without their words (any in a direct chat; in a group one that
+# quotes or mentions the account), or every one in an admitted group, whose
+# transcript then decides whether it was addressed.
+VOICE_TRANSCRIPTION = ("off", "addressed", "auto")
+VOICE_TRANSCRIPTION_DEFAULT = "addressed"
 
 
 def _fail(path, message):
@@ -133,6 +142,13 @@ def _user(value, path):
                 nullable=True)
     if "context" in value:
         _string(value["context"], f"{path}.context", nullable=True)
+    _voice(value, path)
+
+
+def _voice(value, path):
+    if value.get("voice_transcription") is not None:
+        _enum(value["voice_transcription"], VOICE_TRANSCRIPTION,
+              f"{path}.voice_transcription")
 
 
 def _group(value, path):
@@ -170,6 +186,7 @@ def _group(value, path):
                 nullable=True)
     if "context" in value:
         _string(value["context"], f"{path}.context", nullable=True)
+    _voice(value, path)
 
 
 def _capability_rule(value, path):
@@ -284,6 +301,7 @@ def _defaults(value, path):
         _profile(value["job_profile"], f"{path}.job_profile")
     if "job_recovery" in value and value["job_recovery"] is not None:
         _enum(value["job_recovery"], JOB_RECOVERY, f"{path}.job_recovery")
+    _voice(value, path)
 
 
 def validate_settings(settings):
@@ -383,4 +401,27 @@ def profile_names(settings, default, job_default=None):
         add((policy or {}).get("profile"), f"allowed_users.{phone}.profile")
     for jid, policy in (settings.get("allowed_groups") or {}).items():
         add((policy or {}).get("profile"), f"allowed_groups.{jid}.profile")
+    return found
+
+
+def voice_scopes(settings):
+    """Every admitted scope whose voice notes the listener would transcribe,
+    as the settings position that decides it. A `/set` override in a chat is
+    not seen here; it is the chat's own choice, made in the chat."""
+    settings = settings if isinstance(settings, dict) else {}
+    default = (settings.get("defaults") or {}).get("voice_transcription") \
+        or VOICE_TRANSCRIPTION_DEFAULT
+    direct = (settings.get("direct_messages") or {}).get("mode") or "allowlist"
+    found = []
+    if direct != "off":
+        if direct == "anyone" and default != "off":
+            found.append("defaults.voice_transcription")
+        for phone, policy in (settings.get("allowed_users") or {}).items():
+            mode = (policy or {}).get("voice_transcription") or default
+            if mode != "off":
+                found.append(f"allowed_users.{phone}")
+    for jid, policy in (settings.get("allowed_groups") or {}).items():
+        mode = (policy or {}).get("voice_transcription") or default
+        if mode != "off":
+            found.append(f"allowed_groups.{jid}")
     return found

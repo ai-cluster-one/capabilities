@@ -13,6 +13,12 @@ runs on the harness runner from a profile, in its own thread, per chat in
 arrival order after a debounce; its answer goes out as a pending row in
 `whatsapp_messages`, which the listener sends like any other.
 
+A voice note the settings ask to be transcribed is reserved like any other
+message, then fetched through the listener's own connection and transcribed
+on a thread of its own while it waits at its place in the chat's queue; the
+turn reads its words in place of the attachment, and the transcript is stored
+beside the message for every later reader.
+
 A turn may hand longer work to a job through the worker shim on its PATH. Once
 the job is submitted the turn is over: it ends on its own with a short line, or
 is ended after a grace period and the job's description is sent instead. The
@@ -47,6 +53,9 @@ DEFER_RETRY = 5.0                # how often a message the store could not judge
 HANDOFF_POLL = 1.0               # how often a running turn is checked for a submitted job
 HANDOFF_GRACE = 8.0              # how long a turn that handed off may take to end on its own
 HANDOFF_MARK = "\u25b6 "         # what leads the acknowledgement of a handed-off job
+VOICE_KIND = "audioMessage"      # a voice note or an audio file: both are transcribed
+VOICE_MARK = "[voice] "          # what leads a voice note's transcript in a prompt
+VOICE_MODES = ("off", "addressed", "auto")
 WORKER_BIN = Path(__file__).resolve().parent / "worker-bin"
 
 DEFAULTS = {
@@ -57,6 +66,7 @@ DEFAULTS = {
     "max_parallel_dialogue": 1,
     "max_parallel_jobs": 1,
     "job_recovery": "requeue",
+    "voice_transcription": "addressed",
 }
 CONTROL_COMMANDS = ("status", "set", "reload", "stop", "help")
 CONTROL_DEFAULTS = {
@@ -70,6 +80,7 @@ SET_KEYS = {
     "debounce": ("debounce", 0, 300),
     "worker-timeout": ("worker_timeout", 1, 3600),
     "profile": ("profile", None, None),
+    "voice-transcription": ("voice_transcription", None, None),
 }
 ENV_DROP = ("WHATSAPP_SERVICE_LAUNCH_NONCE", "WHATSAPP_SERVICE_RUNNER_EXEC",
             "SSH_AUTH_SOCK")
@@ -89,6 +100,26 @@ def jid_user(jid) -> str:
 
 def is_group(chat_id) -> bool:
     return str(chat_id or "").endswith("@g.us")
+
+
+def is_voice(msg) -> bool:
+    return (msg or {}).get("kind") == VOICE_KIND
+
+
+def voice_failed(reason) -> str:
+    """What a turn reads for a voice note whose words could not be had."""
+    return f"[voice note - transcription failed: {reason}]"
+
+
+def voice_text(transcript=None, error=None) -> str | None:
+    """A voice note as a prompt shows it: its transcript behind the voice
+    marker, the failure marker when transcribing it failed, or None when it
+    was never transcribed."""
+    if transcript and str(transcript).strip():
+        return VOICE_MARK + str(transcript).strip()
+    if error:
+        return voice_failed(error)
+    return None
 
 
 def marker_line(text, marker) -> bool:
@@ -296,11 +327,19 @@ class Policy:
             else self.default("worker_timeout"),
             "profile": entry.get("profile") or self.defaults.get("profile")
             or self.default_profile,
+            "voice_transcription": entry.get("voice_transcription")
+            or self.default("voice_transcription"),
         }
-        for key in ("tail_size", "debounce", "worker_timeout", "profile"):
+        for key in ("tail_size", "debounce", "worker_timeout", "profile",
+                    "voice_transcription"):
             if overrides.get(key) is not None:
                 out[key] = overrides[key]
         return out
+
+    def voice_mode(self, chat_id, phone, overrides=None) -> str:
+        """Which voice notes this chat transcribes: `off`, `addressed` or
+        `auto`, from its `/set` override, then its entry, then the defaults."""
+        return self.channel(chat_id, phone, overrides)["voice_transcription"]
 
     def control_commands(self, role):
         rule = deep_merge(CONTROL_DEFAULTS.get(role) or {},
@@ -492,8 +531,10 @@ class Gate:
     the message on or names why it stops there; the first stop wins."""
 
     def __init__(self, policy: Policy, identity: dict, *, seen, resolve_phone,
-                 quoted_is_ours, sent_here, now=time.time):
+                 quoted_is_ours, sent_here, now=time.time, voice_mode=None):
         self.policy = policy
+        # (chat, phone) -> the chat's voice transcription mode, `/set` included
+        self.voice_mode = voice_mode or policy.voice_mode
         self.identity = identity or {}
         self.seen = seen                      # (chat, id, ts) -> reason | None
         self.resolve_phone = resolve_phone    # (pn_jid, lid) -> digits | None
@@ -545,14 +586,28 @@ class Gate:
         text = msg.get("text") or ""
         if marker_line(text, NO_REPLY_MARKER):
             return stop("noreply")
+        mode = self.voice_mode(chat, phone) if is_voice(msg) else "off"
         if is_group(chat) and not self.addressed(chat, msg):
-            return stop("unaddressed")
+            # Unaddressed by anything but its words: only `auto` listens to
+            # those, and the transcript decides whether it is answered.
+            if mode != "auto":
+                return stop("unaddressed")
+            verdict["voice"] = "ambient"
+        elif mode != "off":
+            verdict["voice"] = "addressed"
         verdict["role"] = self.policy.role(chat, phone)
-        command = parse_command(text, self.policy.aliases(chat))
+        command = None if is_voice(msg) else parse_command(text, self.policy.aliases(chat))
         verdict.update(admit=True, reason="admitted",
                        kind="control" if command else "turn",
                        command=command)
         return verdict
+
+    def names_us(self, chat, text) -> bool:
+        """Whether the text calls the assistant by one of the chat's aliases."""
+        for alias in self.policy.aliases(chat):
+            if re.search(rf"(?iu)(?<!\w)(?:{alias})(?!\w)", str(text or "")):
+                return True
+        return False
 
     def addressed(self, chat, msg) -> bool:
         group = self.policy.group(chat) or {}
@@ -566,11 +621,7 @@ class Gate:
                 return True
             if self.quoted_is_ours(chat, msg["quoted_id"]):
                 return True
-        text = msg.get("text") or ""
-        for alias in self.policy.aliases(chat):
-            if re.search(rf"(?iu)(?<!\w)(?:{alias})(?!\w)", text):
-                return True
-        return False
+        return self.names_us(chat, msg.get("text"))
 
 
 # ── Prompt ──────────────────────────────────────────────────────────────────
@@ -754,7 +805,9 @@ class Dialogue:
         self.next_retry = 0.0
         self.store_error: str | None = None
         self.stats = {"admitted": 0, "turns": 0, "answered": 0, "silent": 0,
-                      "failed": 0, "stopped": 0, "handed_off": 0, "commands": 0}
+                      "failed": 0, "stopped": 0, "handed_off": 0, "commands": 0,
+                      "transcribed": 0, "transcription_failed": 0,
+                      "voice_unaddressed": 0}
         self.profile_cache: dict[str, tuple] = {}
         self.settings = settings
         self.policy = Policy(settings, profiles.DEFAULT_PROFILE)
@@ -860,7 +913,9 @@ class Dialogue:
         return Gate(self.policy, self.own_identity(), seen=self.register.seen,
                     resolve_phone=self.resolve_phone,
                     quoted_is_ours=self.quoted_is_ours, sent_here=self.sent_here,
-                    now=self.now)
+                    now=self.now,
+                    voice_mode=lambda chat, phone: self.policy.voice_mode(
+                        chat, phone, self.register.overrides(chat)))
 
     # -- arrival --------------------------------------------------------------
 
@@ -936,9 +991,57 @@ class Dialogue:
         except Exception:
             debounce = self.policy.channel(chat, job["phone"])["debounce"]
         self.due[chat] = self.now() + float(debounce)
+        if job.get("voice"):
+            # Fetched and transcribed off the engine's thread; the turn waits
+            # for it at its place in the queue, so the chat's order holds.
+            thread = threading.Thread(target=self.transcribe, args=(job,),
+                                      name=f"voice-{msg['id']}", daemon=True)
+            job["voice"]["thread"] = thread
+            thread.start()
         self.log(f"dialogue: {chat} #{msg['id']} queued for a turn "
-                 f"(role {job['role']})")
+                 f"(role {job['role']}"
+                 + (f", voice note to transcribe ({verdict['voice']})"
+                    if job.get("voice") else "") + ")")
         return verdict
+
+    # -- voice notes ----------------------------------------------------------
+
+    def transcribe(self, job) -> None:
+        """Fetch one voice note through the listener's connection and
+        transcribe it, once. The message was reserved before this runs, so a
+        redelivery never reaches here a second time; a failure is answered as
+        a failure rather than tried again.
+
+        An `ambient` note, unaddressed in an `auto` group, is answered only
+        when its transcript names the assistant; otherwise it is dropped from
+        the queue, its transcript kept."""
+        voice = job["voice"]
+        chat, message_id = job["chat_id"], job["message_id"]
+        started = time.monotonic()
+        try:
+            result = self.cli._transcribe_live_voice(
+                self.session, self.db, self.cfg, chat, message_id)
+        except Exception as exc:
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+        took = time.monotonic() - started
+        text = (result.get("text") or "").strip() if result.get("ok") else ""
+        if result.get("ok") and text:
+            self.stats["transcribed"] += 1
+            job["text"] = voice_text(text)
+            self.log(f"dialogue: {chat} #{message_id} voice note transcribed in "
+                     f"{took:.1f}s ({len(text)} characters)")
+        else:
+            reason = result.get("error") or "no speech was recognised"
+            self.stats["transcription_failed"] += 1
+            job["text"] = voice_failed(reason)
+            self.log(f"dialogue: {chat} #{message_id} voice note not transcribed "
+                     f"after {took:.1f}s: {reason}")
+        if voice["mode"] == "ambient" and not (text and self.gate().names_us(chat, text)):
+            voice["drop"] = True
+            self.stats["voice_unaddressed"] += 1
+            self.log(f"dialogue: {chat} #{message_id} not answered (voice "
+                     f"{'unaddressed' if text else 'not transcribed'})")
+        voice["done"].set()
 
     def job(self, msg, verdict) -> dict:
         chat = msg["chat_id"]
@@ -946,8 +1049,11 @@ class Dialogue:
         sender_name = (self.policy.name(phone) or msg.get("push_name")
                        or (f"+{phone}" if phone else msg.get("sender")
                            or msg.get("sender_lid") or "unknown"))
+        voice = ({"mode": verdict["voice"], "done": threading.Event(), "drop": False}
+                 if verdict.get("voice") else None)
         return {"chat_id": chat, "message_id": msg["id"], "ts": msg.get("ts"),
                 "text": msg.get("text") or f"[{msg.get('kind') or 'message'}]",
+                "voice": voice,
                 "quoted_id": msg.get("quoted_id"), "phone": phone,
                 "sender_name": sender_name, "role": verdict["role"],
                 "command": verdict.get("command"), "group": is_group(chat),
@@ -1024,7 +1130,8 @@ class Dialogue:
             f"your role: {job['role']}",
             f"profile: {profile}",
             f"settings: tail={channel['tail_size']}, debounce={channel['debounce']}s, "
-            f"worker-timeout={channel['worker_timeout']}s",
+            f"worker-timeout={channel['worker_timeout']}s, "
+            f"voice-transcription={channel['voice_transcription']}",
             f"turns: running {running}, queued {queued}; answered "
             f"{counters.get('answered', 0)}, silent {counters.get('silent', 0)}, "
             f"failed {counters.get('failed', 0)}",
@@ -1057,6 +1164,8 @@ class Dialogue:
             f"  debounce <0..300>             current: {channel['debounce']}s",
             f"  worker-timeout <1..3600>      current: {channel['worker_timeout']}s",
             f"  profile <name>                current: {channel['profile']}",
+            f"  voice-transcription <off|addressed|auto>"
+            f"  current: {channel['voice_transcription']}",
         ])
 
     def set_command(self, job, args) -> str:
@@ -1066,12 +1175,19 @@ class Dialogue:
         if name == "timeout":
             name = "worker-timeout"
         if name not in SET_KEYS:
-            return "nope: unknown setting; use tail, debounce, worker-timeout or profile"
+            return ("nope: unknown setting; use tail, debounce, worker-timeout, profile "
+                    "or voice-transcription")
         key, low, high = SET_KEYS[name]
         if value.lower() == "default":
             self.register.set_override(job["chat_id"], key, None)
             effective = self.channel(job["chat_id"], job["phone"])[key]
             return f"ok, {name} = default ({effective} effective)"
+        if key == "voice_transcription":
+            value = value.lower()
+            if value not in VOICE_MODES:
+                return "nope: voice-transcription must be " + ", ".join(VOICE_MODES)
+            self.register.set_override(job["chat_id"], key, value)
+            return f"ok, voice-transcription = {value}"
         if key == "profile":
             try:
                 self.profile_cache[value] = self.profiles.resolve(value, self.folders())
@@ -1138,7 +1254,12 @@ class Dialogue:
                 limit = int(self.policy.default("max_parallel_dialogue"))
                 runs = self.running.setdefault(chat, {})
                 while queue and len(runs) < limit:
+                    voice = queue[0].get("voice")
+                    if voice is not None and not voice["done"].is_set():
+                        break
                     job = queue.popleft()
+                    if voice is not None and voice.get("drop"):
+                        continue
                     run = Run(job)
                     runs[job["message_id"]] = run
                     run.thread = threading.Thread(target=self.turn, args=(run,),
@@ -1186,12 +1307,15 @@ class Dialogue:
 
     def tail(self, chat, ts, size) -> list[dict]:
         rows = self.db.execute(
-            f"""SELECT id, sender, sender_lid, from_me, local_id, push_name, kind,
-                       text, quoted_id, extract(epoch FROM ts) AS epoch
-                  FROM whatsapp_messages
-                 WHERE account = %s AND chat_id = %s AND {self.cli._HELD}
-                   AND ts <= {self.cli._TS_PARAM}
-                 ORDER BY ts DESC, captured_at DESC LIMIT %s""",
+            f"""SELECT m.id, m.sender, m.sender_lid, m.from_me, m.local_id, m.push_name,
+                       m.kind, m.text, m.quoted_id, extract(epoch FROM m.ts) AS epoch,
+                       e.transcript, e.transcript_error
+                  FROM whatsapp_messages m
+                  LEFT JOIN whatsapp_enrichment e
+                    ON e.account = m.account AND e.chat_id = m.chat_id AND e.id = m.id
+                 WHERE m.account = %s AND m.chat_id = %s AND {self.cli._HELD_M}
+                   AND m.ts <= {self.cli._TS_PARAM}
+                 ORDER BY m.ts DESC, m.captured_at DESC LIMIT %s""",
             (self.db.account, chat, float(ts or self.now()) + 1, int(size))).fetchall()
         rows = list(reversed(rows))
         keys = {k for r in rows for k in (r["sender"], r["sender_lid"]) if k}
@@ -1222,8 +1346,11 @@ class Dialogue:
                 sender = sender or row["push_name"] or jid_user(row["sender"] or row["sender_lid"] or chat)
             stamp = datetime.datetime.fromtimestamp(float(row["epoch"] or 0),
                                                     datetime.timezone.utc)
+            text = row["text"]
+            if row["kind"] == VOICE_KIND:
+                text = voice_text(row["transcript"], row["transcript_error"]) or text
             out.append({"id": row["id"], "sender": sender,
-                        "text": row["text"] or f"[{row['kind'] or 'message'}]",
+                        "text": text or f"[{row['kind'] or 'message'}]",
                         "quoted_id": row["quoted_id"],
                         "date": stamp.strftime("%Y-%m-%d"), "time": stamp.strftime("%H:%M")})
         return out

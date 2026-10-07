@@ -161,6 +161,16 @@ Assistant service
   group, split between paragraphs) and sent by the listener; an empty answer
   is silent. The listener resolves the runner itself (`uv run --with`); the
   CLI does not carry it.
+  Voice notes: `voice_transcription` (`/set voice-transcription`, else the
+  group's or person's, else `defaults`, else `addressed`) decides which are
+  transcribed before the turn: `off` none; `addressed` every admitted one in
+  a direct chat and, in a group, one that quotes our message; `auto` every
+  one in a group, answered only when its transcript matches an alias. The
+  note is reserved first, fetched through the listener's own connection and
+  sent to Deepgram (DEEPGRAM_API_KEY through the credential cascade); the
+  transcript is stored in whatsapp_enrichment as `transcribe` stores it, and
+  the turn reads `[voice] <transcript>`, or `[voice note - transcription
+  failed: <reason>]`, never retried. The tail shows every stored transcript.
   Jobs: a turn whose role's authority reaches `whatsapp jobs` is told how to
   hand longer work to a job (the `delegation` document) and runs with the
   bundle's worker shim first on PATH, which fixes the chat, the requester, the
@@ -185,12 +195,13 @@ Assistant service
   (capabilities/whatsapp/service/settings.json in files mode): `connection`,
   `environment`, `assistant_name`, `direct_messages {mode allowlist|anyone|
   off, default_role}`, `allowed_users {<phone>: {name, role, profile,
-  worker_timeout, context}}`, `allowed_groups {<jid>@g.us: {name,
-  require_reference, aliases, may_address anyone|allowed_users|[phones],
-  member_role, profile, worker_timeout, context}}`, `control {roles}`,
-  `authority {default, roles}` and `defaults {tail_size, debounce, max_age,
-  worker_timeout, max_parallel_dialogue, profile, send_rate,
-  max_parallel_jobs, job_profile, job_recovery requeue|inspect}`. A top-level
+  worker_timeout, context, voice_transcription}}`, `allowed_groups
+  {<jid>@g.us: {name, require_reference, aliases, may_address
+  anyone|allowed_users|[phones], member_role, profile, worker_timeout,
+  context, voice_transcription}}`, `control {roles}`, `authority {default,
+  roles}` and `defaults {tail_size, debounce, max_age, worker_timeout,
+  max_parallel_dialogue, profile, send_rate, max_parallel_jobs, job_profile,
+  job_recovery requeue|inspect, voice_transcription off|addressed|auto}`. A top-level
   `send_rate` is read as `defaults.send_rate`. Any other key is refused.
   Settings that admit nobody leave the listener capturing and sending and
   answering nothing.
@@ -444,7 +455,8 @@ SUMMARY = ("WhatsApp CLI carrying its own engine — link a device, keep the "
 SCOPE = "user"      # credential scope: "project" | "user"
 CRED_KEYS = [       # the flat keys the cascade resolves for every connection
     {"key": "DEEPGRAM_API_KEY", "secret": True, "required": False,
-     "note": "voice-note transcription (`whatsapp transcribe`)"},
+     "note": "voice-note transcription (`whatsapp transcribe`, and the "
+             "assistant service's voice notes)"},
 ]
 WRITE_VERBS = ["send"]   # domain verbs that mutate the remote system
 WRITE_DEFAULT = False    # a WhatsApp send leaves the system — granted per connection, explicitly
@@ -8980,7 +8992,11 @@ def _content_type_for(path):
     }.get(path.suffix.lower(), "application/octet-stream")
 
 
-def _deepgram_transcribe(audio_path, api_key, model):
+DEEPGRAM_MODEL = "nova-3"
+VOICE_TRANSCRIBE_TIMEOUT = 120    # one listener transcription, per attempt
+
+
+def _deepgram_transcribe(audio_path, api_key, model, timeout=300):
     params = (
         f"model={model}&detect_language=true&smart_format=true"
         f"&punctuate=true&paragraphs=true"
@@ -8993,7 +9009,7 @@ def _deepgram_transcribe(audio_path, api_key, model):
             "Content-Type": _content_type_for(audio_path),
         },
         content=audio_path.read_bytes(),
-        timeout=300,
+        timeout=timeout,
         service="Deepgram",
     )
     channels = dg.get("results", {}).get("channels", [])
@@ -9116,6 +9132,62 @@ def _transcribe_all(args, api_key: str, p: Path, payload: dict, to_do: list,
         _write_json(p, payload)
     return failures
 
+
+
+def _transcribe_live_voice(session, db, cfg: dict, chat_id: str,
+                           message_id: str) -> dict:
+    """One voice note the assistant service admitted, fetched through the
+    connection the listener holds and transcribed, with both results written
+    beside the message the way `export` and `transcribe` write them.
+
+    Answers {"ok": True, "text": ...} or {"ok": False, "error": ...}; every
+    failure is recorded as the transcript's error and none is retried here.
+    A transcript already in the store is answered without paying again."""
+    row = db.execute(
+        f"{_MESSAGE_SELECT} WHERE m.account = %s AND m.chat_id = %s AND m.id = %s",
+        (db.account, chat_id, message_id)).fetchone()
+    if row is None:
+        return {"ok": False, "error": "the message is not in the store"}
+    if row["transcript"]:
+        return {"ok": True, "text": row["transcript"], "stored": True}
+
+    def failed(reason: str) -> dict:
+        _record_transcript(db, chat_id, message_id,
+                           {"error": reason, "provider": "deepgram"})
+        return {"ok": False, "error": reason}
+
+    key, _tier, _source = _resolve_env_key("DEEPGRAM_API_KEY")
+    if not key:
+        return failed("no Deepgram key; DEEPGRAM_API_KEY is not set")
+    path = Path(row["media_path"]) if row["media_path"] else None
+    if path is None or not path.is_file():
+        if row["media_state"] in ("expired", "unfetchable"):
+            return failed(f"the audio is {row['media_state']}"
+                          + (f" ({row['media_error']})" if row["media_error"] else ""))
+        if session is None:
+            return failed("the listener was not connected to fetch the audio")
+        answer = session.fetch_media(row)
+        if answer["state"] != "fetched":
+            _record_media(db, chat_id, message_id, path=None, state=answer["state"],
+                          error=answer.get("error"))
+            return failed(f"the audio could not be fetched: {answer['state']}"
+                          + (f" ({answer['error']})" if answer.get("error") else ""))
+        path = (_connection_home(cfg) / "media"
+                / f"{_safe_id_for_filename(message_id)}"
+                  f"{_media_ext(row['mimetype'], row['file_name'])}")
+        path.write_bytes(answer["data"])
+        _record_media(db, chat_id, message_id, path=str(path), state="fetched")
+    try:
+        result = _deepgram_transcribe(path, key, DEEPGRAM_MODEL,
+                                      timeout=VOICE_TRANSCRIBE_TIMEOUT)
+    except HttpFailure as exc:
+        return failed(f"Deepgram: {exc.message}"[:300])
+    except Exception as exc:
+        return failed(f"Deepgram: {type(exc).__name__}: {exc}"[:300])
+    if not result.get("text"):
+        return failed("no speech was recognised")
+    _record_transcript(db, chat_id, message_id, result)
+    return {"ok": True, "text": result["text"]}
 
 
 # ── Render ──────────────────────────────────────────────────────────────────
@@ -10140,6 +10212,7 @@ def _cmd_service_doctor(connection_flag: str | None) -> tuple[dict, int]:
     own health is what proves the connection then."""
     root = _service_project_root()
     checks: list[dict] = []
+    warnings: list[str] = []
     fail = 0
 
     def check(item: str, ok: bool, detail: str, category: int = 0,
@@ -10180,6 +10253,20 @@ def _cmd_service_doctor(connection_flag: str | None) -> tuple[dict, int]:
                    f"{row.get('source')} {row.get('path')}") if row.get("ok")
                   else f"{where}: {row.get('error')}", 6,
                   None if row.get("ok") else "service_profile_invalid")
+        voice = _service_schema().voice_scopes(settings)
+        if voice and not _resolve_env_key("DEEPGRAM_API_KEY")[0]:
+            warning = (f"no Deepgram key: DEEPGRAM_API_KEY is not set, so a voice "
+                       f"note in {', '.join(voice)} is answered as a failed "
+                       f"transcription; set the key, or voice_transcription "
+                       f"\"off\" there")
+            checks.append({"item": "voice transcription", "ok": True,
+                           "warning": True, "detail": warning})
+            warnings.append(warning)
+        elif voice:
+            check("voice transcription", True,
+                  f"Deepgram key resolved; transcribed in {', '.join(voice)}")
+        else:
+            check("voice transcription", True, "off in every admitted chat")
     elif valid:
         check("dialogue", True, "off: the settings admit no chat, so the listener "
               "captures and sends and answers nothing")
@@ -10228,8 +10315,11 @@ def _cmd_service_doctor(connection_flag: str | None) -> tuple[dict, int]:
               "not running; the account lock is free" if free else
               "not running, and another invocation holds the account lock",
               8, None if free else "session_busy")
-    return {"ok": not fail, "project": str(root), "service": status,
-            "checks": checks}, fail
+    report = {"ok": not fail, "project": str(root), "service": status,
+              "checks": checks}
+    if warnings:
+        report["warnings"] = warnings
+    return report, fail
 
 
 # ── The capture spool ───────────────────────────────────────────────────────
@@ -11164,7 +11254,8 @@ def main():
                         help="Fill voice/audio transcription placeholders via Deepgram")
     pt.add_argument("json_path", help="path to a messages.json produced by `whatsapp export`")
     pt.add_argument("--force", action="store_true", help="re-transcribe even if already filled")
-    pt.add_argument("--model", default="nova-3", help="Deepgram model (default: nova-3)")
+    pt.add_argument("--model", default=DEEPGRAM_MODEL,
+                    help=f"Deepgram model (default: {DEEPGRAM_MODEL})")
 
     pr = _sub("render", help="Pretty-print an exported messages.json as markdown")
     pr.add_argument("json_path", help="path to a messages.json produced by `whatsapp export`")

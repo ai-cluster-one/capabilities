@@ -19,7 +19,7 @@ A message the account sends through this capability is a row there too, written 
 Three properties of the store are worth knowing as a consumer:
 
 - **Raw history chunks are written to disk before anything parses them.** A parsing fault therefore costs a re-ingest from them and never the data.
-- **Enrichment lives beside the messages, never inside them.** A transcript, a downloaded attachment's path, and the loss of one that can no longer be fetched are all keyed to the message they belong to, so nothing the protocol wrote is ever overwritten by something derived.
+- **Enrichment lives beside the messages, never inside them.** A transcript, a downloaded attachment's path, and the loss of one that can no longer be fetched are all keyed to the message they belong to, so nothing the protocol wrote is ever overwritten by something derived. `whatsapp transcribe` and the assistant service's voice notes write it in one shape, a failed transcription recorded as the transcript's error, and the read verbs and exports show it as the message's `transcription`.
 - **Later news never erases earlier capture.** Reaching back covers ground already held, so a field is filled in where it was empty and left alone where it was not.
 
 ## The export

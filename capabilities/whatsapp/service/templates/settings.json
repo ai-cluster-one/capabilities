@@ -49,6 +49,7 @@
     "send_rate": 20,
     "max_parallel_jobs": 1,
     "job_profile": "whatsapp-job-claude",
-    "job_recovery": "requeue"
+    "job_recovery": "requeue",
+    "voice_transcription": "addressed"
   }
 }
