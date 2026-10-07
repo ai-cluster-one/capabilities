@@ -128,19 +128,51 @@ Assistant service
   type LIVE). A dropped connection is re-established with backoff (2s
   doubling to 60s), and the offline queue drains on each reconnect. A device
   removed from the phone is final: the service stops reconnecting and says
-  so in `service status` and `service doctor`. It answers nothing on its own:
-  it sends the messages `send` queues for its account, oldest first and at
-  most `send_rate` a minute. A capture the store cannot take because the store
-  is unreachable is appended to a spool file in the service's state directory
-  and written into the store, in order and once, when it answers again (and at
-  start); `service status` reports the spool depth and the store error. A send
-  a previous run left in flight is failed as interrupted_delivery_unknown at
+  so in `service status` and `service doctor`. It sends the messages `send`
+  queues for its account, oldest first and at most `defaults.send_rate` a
+  minute. A capture the store cannot take because the store is unreachable is
+  appended to a spool file in the service's state directory and written into
+  the store, in order and once, when it answers again (and at start);
+  `service status` reports the spool depth and the store error. A send a
+  previous run left in flight is failed as interrupted_delivery_unknown at
   start and never resent.
+  Dialogue: it answers admitted messages with a dialogue turn. Each live
+  capture passes a gate in this order: its own message (never answered,
+  except what the owner types from the phone in the account's own self-chat),
+  history-sync origin (never), older than `max_age` (dropped), already in the
+  register (dropped), chat allowed, sender allowed (people are named by phone
+  number and matched through the store's phone/LID identities), addressed (a
+  group needs our JID or LID mentioned, a quote of our message, or an alias in
+  the text unless `require_reference` is false; a trailing `#noreply` line
+  opts out everywhere), role, then a control command (/status, /set, /reload,
+  /stop, /help, gated by control roles) or a turn. An admitted message is
+  reserved in whatsapp_register before anything else, so a redelivery or a
+  restart never answers it twice, and nothing before the service's first
+  sight of a chat is answered. Turns run per chat in arrival order after
+  `debounce`, at most `max_parallel_dialogue` at once, through
+  callva-harness-runner on a profile (bundled whatsapp-claude, the default,
+  and whatsapp-codex; a project file in
+  capabilities/whatsapp/service/profiles/ shadows either), fit-checked at
+  start, reload and in `service doctor`, ended at `worker_timeout`. The
+  prompt is the context document, the chat's `context`, the channel state,
+  the request and the last `tail_size` stored messages; the role's
+  `authority` goes to the run as CAPABILITIES_AUTH_CONTEXT. The answer, cut
+  at `=== REPLY ===`, is queued as pending rows (quoting the request in a
+  group, split between paragraphs) and sent by the listener; an empty answer
+  is silent. The listener resolves the runner itself (`uv run --with`); the
+  CLI does not carry it.
   Its settings are the project's whatsapp service settings records
-  (capabilities/whatsapp/service/settings.json in files mode): `connection`
-  (which connection it runs; null takes the registry's default),
-  `environment` (a label it reports) and `send_rate` (messages a minute, 1 to
-  120; null means 20). Any other key is refused.
+  (capabilities/whatsapp/service/settings.json in files mode): `connection`,
+  `environment`, `assistant_name`, `direct_messages {mode allowlist|anyone|
+  off, default_role}`, `allowed_users {<phone>: {name, role, profile,
+  worker_timeout, context}}`, `allowed_groups {<jid>@g.us: {name,
+  require_reference, aliases, may_address anyone|allowed_users|[phones],
+  member_role, profile, worker_timeout, context}}`, `control {roles}`,
+  `authority {default, roles}` and `defaults {tail_size, debounce, max_age,
+  worker_timeout, max_parallel_dialogue, profile, send_rate}`. A top-level
+  `send_rate` is read as `defaults.send_rate`. Any other key is refused.
+  Settings that admit nobody leave the listener capturing and sending and
+  answering nothing.
   Activation needs an explicit project enable (`capabilities enable whatsapp
   --project`) and a configured store. While the service runs, `send` on that
   account hands its message to the service and returns the service's answer,
@@ -400,8 +432,10 @@ POST_INSTALL: list = []
 SERVICE = {
     "name": "assistant",
     "summary": ("Long-running listener that holds one account's WhatsApp "
-                "connection, captures every message live into the store, and "
-                "sends the messages queued for the account."),
+                "connection, captures every message live into the store, "
+                "answers the messages its settings admit with a dialogue turn "
+                "on the harness runner, and sends the messages queued for the "
+                "account."),
     "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs"],
     "config": "capabilities/whatsapp/service",
     "state": "<account-state>/service",
@@ -4788,9 +4822,23 @@ CREATE UNIQUE INDEX whatsapp_messages_by_local_id
 CREATE INDEX whatsapp_messages_outbound
   ON whatsapp_messages (account, requested_at)
   WHERE delivery IN ('pending', 'sending')"""),
+    # What the assistant service has answered, per project, environment,
+    # account and chat: the first message it admitted there, the watermark,
+    # the ids it processed inside the overlap window (id -> epoch seconds), the
+    # chat's `/set` overrides and its counters. A message is reserved here
+    # before anything else is done with it.
+    Step("0013-register", """
+CREATE TABLE whatsapp_register (
+  project_id text NOT NULL, environment text NOT NULL, account text NOT NULL,
+  chat_id text NOT NULL, first_ts timestamptz, watermark timestamptz,
+  processed jsonb NOT NULL DEFAULT '{}'::jsonb,
+  overrides jsonb NOT NULL DEFAULT '{}'::jsonb,
+  counters jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz, updated_at timestamptz,
+  PRIMARY KEY (project_id, environment, account, chat_id))"""),
 ]
 STORE_SCHEMA_MAJOR = 1
-STORE_SCHEMA_MINOR = 1
+STORE_SCHEMA_MINOR = 2
 
 # The rows a read answers with: everything captured, and what this capability
 # sent once WhatsApp took it. A message still waiting or one that never left is
@@ -5573,6 +5621,39 @@ def _live_row(event) -> dict | None:
     return row
 
 
+def _jid_device(jid) -> int | None:
+    """The device number an engine JID carries: 0 for the phone itself, a
+    positive number for a linked device such as this one."""
+    device = getattr(jid, "Device", None)
+    if isinstance(device, int):
+        return device
+    user = str(_jid_str(jid) or "").partition("@")[0]
+    if ":" in user:
+        with contextlib.suppress(ValueError):
+            return int(user.split(":", 1)[1])
+    return 0 if user else None
+
+
+def _live_extras(event) -> dict:
+    """What the dialogue needs of an arriving message beyond its stored row:
+    who it mentions, whose message it quotes, and which of the sender's
+    devices sent it."""
+    out = {"mentions": [], "quoted_participant": None,
+           "sender_device": _jid_device(event.Info.MessageSource.Sender)}
+    try:
+        inner = _unwrap(event.Message)
+        present = [f.name for f, _ in inner.ListFields() if f.name not in _NOT_CONTENT]
+        content = getattr(inner, present[0]) if present and present[0] != "conversation" \
+            else None
+        context = getattr(content, "contextInfo", None) if content is not None else None
+        if context is not None:
+            out["mentions"] = [_bare_jid(j) for j in context.mentionedJID if _bare_jid(j)]
+            out["quoted_participant"] = _bare_jid(context.participant) or None
+    except (AttributeError, ValueError, IndexError):
+        pass
+    return out
+
+
 def _write_live(db, row: dict) -> int:
     """Write one arrived message, its chat and its sender, whole. Writing the
     same message again fills gaps and adds nothing."""
@@ -5646,6 +5727,9 @@ class Session:
         # arrives while the store cannot be reached is kept rather than lost.
         # A verb leaves it unset and fails as itself.
         self.spool = None
+        # The assistant service's dialogue, offered every message captured
+        # live. A verb leaves it unset.
+        self.on_live = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -5708,6 +5792,13 @@ class Session:
                 self.live_messages += self.spool.capture(
                     self.db, {"kind": "live", "row": _spool_row(row)}) or 0
         self.last_message_at = time.time()
+        # Offered only once it is stored, so the turn it may start reads the
+        # message back from the store like every other one in the chat.
+        offer = getattr(self, "on_live", None)
+        if offer is not None:
+            row = _live_row(event)
+            if row:
+                offer({**row, **_live_extras(event)})
 
     def _on_history(self, event) -> None:
         sync_type = _SYNC_TYPES.get(event.Data.syncType, str(event.Data.syncType))
@@ -5823,6 +5914,7 @@ class Session:
         return {"jid": jid,
                 "id": _digits(str(jid).split("@", 1)[0]) if jid else None,
                 "lid": _bare_jid(_jid_str(getattr(me, "LID", None))),
+                "device": _jid_device(me.JID),
                 "name": getattr(me, "PushName", None) or None}
 
     def require_account(self) -> dict:
@@ -9228,8 +9320,8 @@ def cmd_send(args):
 # its whole life, so a second client on the device is impossible by the same
 # mechanism that already prevents one.
 
-SERVICE_SETTINGS_KEYS = ("connection", "environment", "send_rate")
 SERVICE_ENVIRONMENT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.IGNORECASE)
+SERVICE_RUNNER_EXEC_ENV = "WHATSAPP_SERVICE_RUNNER_EXEC"
 SERVICE_OWNER_SCHEMA = "whatsapp.service-owner.v1"
 SERVICE_HEALTH_SCHEMA = "whatsapp.service-health.v1"
 SERVICE_NONCE_ENV = "WHATSAPP_SERVICE_LAUNCH_NONCE"
@@ -9317,8 +9409,44 @@ def _service_bundle_dir() -> Path:
     return here.parent.parent if here.parent.name == "bin" else here.parent
 
 
-def _service_template() -> Path:
-    return _service_bundle_dir() / "service" / "templates" / "settings.json"
+def _service_template(name: str = "settings.json") -> Path:
+    return _service_bundle_dir() / "service" / "templates" / name
+
+
+_SERVICE_MODULES: dict[str, object] = {}
+
+
+def _service_module(name: str):
+    """One of the bundle's service modules, loaded from beside this file. They
+    import nothing of the CLI, so loading one costs nothing a verb would notice."""
+    if name not in _SERVICE_MODULES:
+        import importlib.util
+        path = _service_bundle_dir() / "service" / f"{name}.py"
+        spec = importlib.util.spec_from_file_location(f"whatsapp_service_{name}", path)
+        if spec is None or spec.loader is None or not path.is_file():
+            _refuse(3, "service_bundle_missing",
+                    f"the bundled service module is missing: {path}",
+                    f"reinstall {NAME} from a bundled source")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SERVICE_MODULES[name] = module
+    return _SERVICE_MODULES[name]
+
+
+def _service_schema():
+    return _service_module("settings_schema")
+
+
+class _CliFacade:
+    """The CLI's own functions as the dialogue module reaches them: read live
+    from this module, so the store, the outgoing queue and the records the
+    dialogue uses are the ones every verb uses."""
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
 
 
 def _service_project_root() -> Path:
@@ -9349,30 +9477,19 @@ def _service_settings() -> dict:
 
 
 def _validate_service_settings(data) -> dict:
-    """The closed settings surface: an unknown key is refused, never ignored."""
-    if not isinstance(data, dict):
-        raise ValueError("settings: must be an object")
-    unknown = sorted(set(data) - set(SERVICE_SETTINGS_KEYS))
-    if unknown:
-        raise ValueError(f"settings: unsupported key(s) {', '.join(unknown)}; "
-                         f"the service takes {', '.join(SERVICE_SETTINGS_KEYS)}")
-    connection = data.get("connection")
-    if connection is not None and (not isinstance(connection, str)
-                                   or not connection.strip()):
-        raise ValueError("settings.connection: must be a connection id or null")
-    environment = data.get("environment")
-    if environment is not None and (
-            not isinstance(environment, str)
-            or not SERVICE_ENVIRONMENT_RE.fullmatch(environment)):
-        raise ValueError("settings.environment: must match "
-                         f"{SERVICE_ENVIRONMENT_RE.pattern}")
-    rate = data.get("send_rate")
-    if rate is not None and (isinstance(rate, bool) or not isinstance(rate, int)
-                             or not 1 <= rate <= SEND_RATE_CEILING):
-        raise ValueError("settings.send_rate: must be a whole number of messages "
-                         f"per minute from 1 to {SEND_RATE_CEILING}, or null for "
-                         f"{SEND_RATE_DEFAULT}")
-    return data
+    """The closed settings surface: an unknown key is refused, never ignored.
+    The bundle's schema module owns the walk."""
+    return _service_schema().validate_settings(data)
+
+
+def _settings_send_rate(settings: dict) -> int:
+    """The account's send rate: `defaults.send_rate`, else the deprecated
+    top-level spelling, else the default."""
+    settings = settings or {}
+    rate = (settings.get("defaults") or {}).get("send_rate")
+    if rate is None:
+        rate = settings.get("send_rate")
+    return int(rate or SEND_RATE_DEFAULT)
 
 
 def _checked_service_settings() -> dict:
@@ -9412,6 +9529,144 @@ def _require_store_setting() -> None:
         read_setting()
     except DbError as exc:
         _store_refusal(exc)
+
+
+# ── The dialogue's prerequisites ─────────────────────────────────────────────
+#
+# A dialogue turn runs on callva-harness-runner. The CLI does not carry the
+# runner in its dependency header: every `send` and `messages` resolves that
+# header, and the runner is large. The listener resolves it itself, by running
+# again under `uv run --with` the pinned runner when its settings admit anyone;
+# `start` and `doctor` ask the bundle's profiles script, which pins the same
+# runner in its own header.
+
+
+def _runner_importable() -> bool:
+    try:
+        import callva.harness_runner  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _service_project_id(root: Path) -> str:
+    """The id the register keys this project's rows by, from project.json."""
+    state = _project_id_state_at(root)
+    project_id = (state or {}).get("id")
+    if not project_id:
+        _refuse(6, "project_id_missing",
+                "the dialogue keys what it answered by the project's id, and this "
+                "project declares none",
+                "run `capabilities init` so the project's identity is recorded in "
+                "capabilities/project.json")
+    return str(project_id)
+
+
+def _profile_check(root: Path, names: list[str]) -> list[dict]:
+    """Each profile name's verdict: resolved through the runner's discovery
+    with this project's and the bundle's folders first, and fitted. In-process
+    where the runner is importable, else through the bundle's profiles script."""
+    if not names:
+        return []
+    if _runner_importable():
+        profiles = _service_module("profiles")
+        return profiles.check(names, profiles.folders(root))
+    script = _service_bundle_dir() / "service" / "profiles.py"
+    uv = shutil.which("uv")
+    if uv is None:
+        return [{"name": n, "ok": False,
+                 "error": "uv is not on PATH, so the harness runner cannot be "
+                          "resolved to check the profile"} for n in names]
+    folders = [str(_project_capabilities_dir(root) / NAME / "service" / "profiles"),
+               str(script.parent / "profiles")]
+    command = [uv, "run", "--quiet", "--script", str(script), "check", *names]
+    for folder in folders:
+        command += ["--folder", folder]
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        detail = str(exc)
+    else:
+        try:
+            return json.loads(done.stdout.strip().splitlines()[-1])["profiles"]
+        except (ValueError, KeyError, IndexError):
+            detail = (done.stderr or done.stdout).strip()[-400:] or f"exit {done.returncode}"
+    return [{"name": n, "ok": False,
+             "error": f"the profiles could not be checked: {detail}"} for n in names]
+
+
+def _settings_profiles(settings: dict) -> dict:
+    return _service_schema().profile_names(
+        settings, _service_module("profiles").DEFAULT_PROFILE)
+
+
+def _require_profiles(root: Path, settings: dict) -> None:
+    """Refuse settings whose profiles do not resolve or do not fit, naming the
+    position, the profile and the problem."""
+    reached = _settings_profiles(settings)
+    bad = [r for r in _profile_check(root, list(reached)) if not r.get("ok")]
+    if bad:
+        first = bad[0]
+        _refuse(6, "service_profile_invalid",
+                f"{', '.join(reached.get(first['name']) or [first['name']])}: "
+                f"{first.get('error')}",
+                "name a profile that resolves and fits; `whatsapp service doctor` "
+                "lists every one the settings reach")
+
+
+def _build_dialogue(cfg: dict, root: Path, settings: dict, paths: dict, *,
+                    log=None, on_reload=None):
+    """The listener's dialogue, its profiles resolved and fitted. Needs the
+    runner in this process."""
+    if not _runner_importable():
+        raise ValueError("the dialogue needs callva-harness-runner in the "
+                         "listener; restart the service to enable it")
+    dialogue_module = _service_module("dialogue")
+    profiles = _service_module("profiles")
+    project_id = _service_project_id(root)
+    db = _open_store(cfg)
+    dialogue = dialogue_module.Dialogue(
+        _CliFacade(), cfg=cfg, root=root, settings=settings, project_id=project_id,
+        db=db, state_dir=paths["state"], profiles=profiles, log=log,
+        on_reload=on_reload)
+    try:
+        dialogue.prepare()
+    except ValueError:
+        db.close()
+        raise
+    return dialogue
+
+
+def _rerun_with_runner(cfg: dict) -> NoReturn:
+    """Run this listener again with the harness runner beside the CLI's own
+    dependencies. The launch nonce and everything else in the environment go
+    with it."""
+    if os.environ.get(SERVICE_RUNNER_EXEC_ENV):
+        _refuse(5, "harness_library_missing",
+                "the listener was started with the harness runner and still "
+                "cannot import it",
+                f"check that uv can resolve {_service_module_pin()}")
+    uv = shutil.which("uv")
+    if uv is None:
+        _refuse(5, "harness_library_missing",
+                "the dialogue runs on callva-harness-runner, and uv is not on PATH "
+                "to resolve it", "put uv on PATH, where the CLI's own shebang finds it")
+    env = dict(os.environ)
+    env[SERVICE_RUNNER_EXEC_ENV] = "1"
+    command = [uv, "run", "--quiet", "--with", _service_module_pin(), "--script",
+               str(Path(__file__).resolve()), "service", "run", "--connection",
+               cfg["id"]]
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execvpe(uv, command, env)
+
+
+def _service_module_pin() -> str:
+    """The runner pin, read from the profiles script's own header, so the
+    listener and the script cannot run different runners."""
+    text = (_service_bundle_dir() / "service" / "profiles.py").read_text()
+    found = re.search(r'"(callva-harness-runner==[^"]+)"', text)
+    return found.group(1) if found else "callva-harness-runner"
 
 
 def _service_prepare(connection_flag: str | None) -> tuple[Path, dict, dict]:
@@ -9468,7 +9723,9 @@ def _cmd_service_status(connection_flag: str | None) -> dict:
         "messages_sent": health.get("messages_sent"),
         "send_failures": health.get("send_failures"),
         "send_rate": (health.get("send_rate") if running
-                      else settings.get("send_rate") or SEND_RATE_DEFAULT),
+                      else _settings_send_rate(settings)),
+        "dialogue": (health.get("dialogue") if running
+                     else {"enabled": _service_schema().dialogue_configured(settings)}),
         "spool_depth": _spool_depth(paths["spool"]),
         "store_error": health.get("store_error") if running else None,
         "reconnects": health.get("reconnects"),
@@ -9514,6 +9771,20 @@ def _inventory(_network: bool) -> dict:
                         "detail": f"connection {status['connection']}"}}
 
 
+def _seed_service_context(adapter) -> list[str]:
+    """Seed the dialogue's prose where the project has none. It is the
+    project's to write, so it is never overwritten, `--force` included."""
+    template = _service_template("context.md")
+    try:
+        if adapter.document_read(NAME, "context") is not None or not template.is_file():
+            return []
+        adapter.document_put(NAME, "context", template.read_text(),
+                             author=f"{NAME} service init")
+    except StoreError as exc:
+        _refuse(6, exc.slug, exc.message, exc.hint)
+    return [f"{adapter.source}:{NAME}/context"]
+
+
 def _cmd_service_init(connection_flag: str | None, force: bool) -> dict:
     root = _service_project_root()
     _require_service_envelope(root)
@@ -9541,22 +9812,31 @@ def _cmd_service_init(connection_flag: str | None, force: bool) -> dict:
         _validate_service_settings(settings)
     except ValueError as exc:
         _refuse(6, "service_settings_invalid", str(exc))
+    written = [f"{adapter.source}:{NAME}/settings"]
+    skipped = []
     try:
         for key in set(existing) - set(settings):
             adapter.delete(NAME, "setting", key)
         for key, value in settings.items():
             adapter.set(NAME, "setting", key, value,
                         actor=f"{NAME} service init")
+        seeded = _seed_service_context(adapter)
+        written += seeded
+        if not seeded:
+            skipped.append(f"{adapter.source}:{NAME}/context")
     except StoreError as exc:
         _refuse(6, exc.slug, exc.message, exc.hint)
     return {"initialized": NAME, "project": str(root),
-            "written": [f"{adapter.source}:{NAME}/settings"], "skipped": [],
+            "written": written, "skipped": skipped,
             "settings": settings,
             "next": [f"run `{NAME} service doctor`, then `{NAME} service start`"]}
 
 
 def _cmd_service_start(connection_flag: str | None) -> dict:
-    root, _settings, cfg = _service_prepare(connection_flag)
+    root, settings, cfg = _service_prepare(connection_flag)
+    if _service_schema().dialogue_configured(settings):
+        _service_project_id(root)
+        _require_profiles(root, settings)
     paths = _service_paths(cfg)
     owner = _service_owner(paths)
     if owner is not None:
@@ -9609,9 +9889,24 @@ def _cmd_service_start(connection_flag: str | None) -> dict:
 
 def _cmd_service_run(connection_flag: str | None) -> None:
     root, settings, cfg = _service_prepare(connection_flag)
+    dialogue = None
+    paths = _service_paths(cfg)
+    if _service_schema().dialogue_configured(settings):
+        _service_project_id(root)
+        if not _runner_importable():
+            _rerun_with_runner(cfg)
+        try:
+            dialogue = _build_dialogue(cfg, root, settings, paths)
+        except ValueError as exc:
+            _refuse(6, "service_profile_invalid", str(exc),
+                    "name a profile that resolves and fits; `whatsapp service "
+                    "doctor` lists every one the settings reach")
     daemon = _ServiceDaemon(cfg, root, settings,
                             launch_nonce=os.environ.get(SERVICE_NONCE_ENV)
-                            or uuid.uuid4().hex)
+                            or uuid.uuid4().hex, dialogue=dialogue)
+    if dialogue is not None:
+        dialogue.log = daemon.log
+        dialogue.on_reload = daemon.reload_requested.set
     sys.exit(daemon.run())
 
 
@@ -9720,13 +10015,36 @@ def _cmd_service_doctor(connection_flag: str | None) -> tuple[dict, int]:
             fail = category or 5
 
     settings = _service_settings()
+    valid = False
     try:
         _validate_service_settings(settings)
+        valid = bool(settings)
+        notes = _service_schema().deprecations(settings)
         check("settings", bool(settings),
-              "valid" if settings else f"not initialized; run `{NAME} service init`",
+              ("valid" + (f" ({'; '.join(notes)})" if notes else ""))
+              if settings else f"not initialized; run `{NAME} service init`",
               6, None if settings else "service_not_initialized")
     except ValueError as exc:
         check("settings", False, str(exc), 6, "service_settings_invalid")
+    if valid and _service_schema().dialogue_configured(settings):
+        try:
+            project_id = _service_project_id(root)
+            check("dialogue", True, f"answers admitted messages; register keyed by "
+                  f"project {project_id}")
+        except _Refusal as refusal:
+            check("dialogue", False, refusal.message, refusal.exit_code, refusal.code)
+        reached = _settings_profiles(settings)
+        for row in _profile_check(root, list(reached)):
+            where = ", ".join(reached.get(row["name"]) or [])
+            check(f"profile {row['name']}", bool(row.get("ok")),
+                  (f"{where}: {row.get('harness')} "
+                   f"(model {row.get('model') or 'the harness default'}) from "
+                   f"{row.get('source')} {row.get('path')}") if row.get("ok")
+                  else f"{where}: {row.get('error')}", 6,
+                  None if row.get("ok") else "service_profile_invalid")
+    elif valid:
+        check("dialogue", True, "off: the settings admit no chat, so the listener "
+              "captures and sends and answers nothing")
     try:
         cfg = _service_cfg(settings if isinstance(settings, dict) else {},
                            connection_flag)
@@ -9956,7 +10274,7 @@ class _ServiceDaemon:
     process itself always builds the real Session."""
 
     def __init__(self, cfg: dict, root: Path, settings: dict, *,
-                 launch_nonce: str, session_factory=None):
+                 launch_nonce: str, session_factory=None, dialogue=None):
         self.cfg = cfg
         self.root = root
         self.settings = settings
@@ -9980,6 +10298,9 @@ class _ServiceDaemon:
         self.send_failures = 0
         self.recovered = False
         self.next_store_attempt = 0.0
+        # The dialogue, when the settings admit anyone; None leaves the
+        # listener capturing and sending and answering nothing.
+        self.dialogue = dialogue
 
     # -- process plumbing ---------------------------------------------------
 
@@ -10022,6 +10343,8 @@ class _ServiceDaemon:
             "messages_sent": self.sent, "send_failures": self.send_failures,
             "send_rate": self.send_rate(), "spool_depth": self.spool.depth(),
             "store_error": self.spool.store_error,
+            "dialogue": (self.dialogue.summary() if self.dialogue is not None
+                         else {"enabled": False}),
             "stale_after_seconds": SERVICE_STALE_AFTER, **updates})
         if state is not None:
             self.health["state"] = state
@@ -10044,13 +10367,23 @@ class _ServiceDaemon:
                     f"settings.connection {wanted!r} differs from the running "
                     f"{self.cfg['id']!r}; a connection change takes effect on "
                     "restart")
+            if self.dialogue is not None:
+                self.dialogue.update_settings(data)
+            elif _service_schema().dialogue_configured(data):
+                self.dialogue = _build_dialogue(self.cfg, self.root, data,
+                                                self.paths, log=self.log,
+                                                on_reload=self.reload_requested.set)
         except (ValueError, _Refusal) as exc:
             message = exc.message if isinstance(exc, _Refusal) else str(exc)
             self.log(f"reload refused: {message}")
             self.publish(settings_reload_attempts=attempts,
                          settings_reload_error=message)
+            if self.dialogue is not None:
+                self.dialogue.after_reload(message)
             return
         self.settings = data
+        if self.dialogue is not None:
+            self.dialogue.after_reload(None)
         generation = int(self.health.get("settings_generation") or 0) + 1
         self.log(f"settings reloaded (generation {generation})")
         self.publish(settings_reload_attempts=attempts, settings_reload_error=None,
@@ -10060,7 +10393,7 @@ class _ServiceDaemon:
     # -- the store and what is sent through it -------------------------------
 
     def send_rate(self) -> int:
-        return int((self.settings or {}).get("send_rate") or SEND_RATE_DEFAULT)
+        return _settings_send_rate(self.settings)
 
     def maintain_store(self, db) -> None:
         """Bring the store back into step: reconnect a dropped connection,
@@ -10139,6 +10472,18 @@ class _ServiceDaemon:
                 or self.health.get("last_message_at"),
                 "session_messages": captured}
 
+    def offer_live(self, message: dict) -> None:
+        """Hand one live capture to the dialogue. Runs on the engine's thread,
+        so nothing it raises may reach the engine."""
+        dialogue = self.dialogue
+        if dialogue is None:
+            return
+        try:
+            dialogue.offer(message)
+        except Exception as exc:
+            self.log(f"dialogue: {message.get('chat_id')} #{message.get('id')} "
+                     f"failed: {type(exc).__name__}: {exc}")
+
     def hold(self) -> str:
         """One session from open to drop. Answers why it ended: `stopped`,
         `logged_out`, `fatal` or `disconnected`."""
@@ -10148,6 +10493,9 @@ class _ServiceDaemon:
             session = self.session_factory()
             self.attempts.append(time.monotonic())
             session.spool = self.spool
+            if self.dialogue is not None:
+                self.dialogue.attach(session)
+                session.on_live = self.offer_live
             db = getattr(session, "db", None)
             if db is not None:
                 # What a previous run kept goes in before anything new arrives.
@@ -10198,6 +10546,8 @@ class _ServiceDaemon:
                     errors_seen = len(session.errors)
                     self.publish(last_error=session.errors[-1])
                 self.messages = base + (session.live_messages or 0)
+                if self.dialogue is not None:
+                    self.dialogue.tick(session)
                 if db is not None:
                     self.maintain_store(db)
                     self.deliver_pending(session, db)
@@ -10226,6 +10576,8 @@ class _ServiceDaemon:
             self.last_error = f"{type(exc).__name__}: {exc}"
             return "disconnected"
         finally:
+            if self.dialogue is not None:
+                self.dialogue.attach(None)
             if session is not None:
                 self.messages = base + (getattr(session, "live_messages", 0) or 0)
                 with contextlib.suppress(Exception):
@@ -10299,6 +10651,9 @@ class _ServiceDaemon:
             code = self.loop()
             return code
         finally:
+            if self.dialogue is not None:
+                with contextlib.suppress(Exception):
+                    self.dialogue.shutdown()
             with contextlib.suppress(Exception):
                 state = self.health.get("state")
                 self.publish(state if state in ("logged_out", "failed")

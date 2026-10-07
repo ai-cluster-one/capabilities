@@ -1,5 +1,51 @@
 {
   "connection": null,
   "environment": "production",
-  "send_rate": 20
+  "assistant_name": "Assistant",
+  "direct_messages": {
+    "mode": "allowlist",
+    "default_role": "direct_user"
+  },
+  "allowed_users": {},
+  "allowed_groups": {},
+  "control": {
+    "roles": {
+      "supervisor": {
+        "commands": ["status", "set", "reload", "stop", "help"]
+      },
+      "channel_admin": {
+        "commands": ["status", "set", "help"]
+      },
+      "direct_user": {
+        "commands": ["status", "help"]
+      },
+      "group_member": {
+        "commands": ["status", "help"]
+      }
+    }
+  },
+  "authority": {
+    "roles": {
+      "supervisor": {
+        "allowed_capabilities": {
+          "*": true
+        }
+      },
+      "direct_user": {
+        "allowed_capabilities": {}
+      },
+      "group_member": {
+        "allowed_capabilities": {}
+      }
+    }
+  },
+  "defaults": {
+    "tail_size": 40,
+    "debounce": 3,
+    "max_age": 600,
+    "worker_timeout": 120,
+    "max_parallel_dialogue": 1,
+    "profile": "whatsapp-claude",
+    "send_rate": 20
+  }
 }

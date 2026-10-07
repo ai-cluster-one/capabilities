@@ -142,11 +142,13 @@ class Settings(unittest.TestCase):
     def test_the_seeded_template_is_valid(self):
         template = json.loads(wa._service_template().read_text())
         self.assertEqual(wa._validate_service_settings(template), template)
-        self.assertEqual(set(template), set(wa.SERVICE_SETTINGS_KEYS))
+        schema = wa._service_schema()
+        self.assertEqual(set(template),
+                         schema.TOP_LEVEL - set(schema.DEPRECATED_TOP_LEVEL))
 
     def test_an_unknown_key_is_refused(self):
-        with self.assertRaisesRegex(ValueError, "unsupported key"):
-            wa._validate_service_settings({"connection": None, "allowed_users": {}})
+        with self.assertRaisesRegex(ValueError, "unsupported property 'voice'"):
+            wa._validate_service_settings({"connection": None, "voice": {}})
 
     def test_a_bad_environment_is_refused(self):
         with self.assertRaisesRegex(ValueError, "environment"):

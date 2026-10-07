@@ -106,13 +106,14 @@ class Schema(StoreCase):
         steps = [r["step"] for r in self.db.execute(
             "SELECT step FROM schema_ledger WHERE owner = 'whatsapp'"
             " ORDER BY step").fetchall()]
-        self.assertEqual(steps[-3:], ["0010-messages-delivery",
-                                      "0011-messages-by-local-id",
-                                      "0012-messages-outbound"])
+        self.assertEqual(steps[9:12], ["0010-messages-delivery",
+                                       "0011-messages-by-local-id",
+                                       "0012-messages-outbound"])
         version = self.db.execute(
             "SELECT major, minor FROM schema_version WHERE owner = 'whatsapp'"
         ).fetchone()
-        self.assertEqual((version["major"], version["minor"]), (1, 1))
+        self.assertEqual((version["major"], version["minor"]),
+                         (1, wa.STORE_SCHEMA_MINOR))
 
     def test_a_captured_message_reads_back_as_before(self):
         self.captured("m1")

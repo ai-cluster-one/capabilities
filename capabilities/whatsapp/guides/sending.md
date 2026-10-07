@@ -52,4 +52,4 @@ Reads show what WhatsApp has: a message still pending, or one that failed, is no
 
 ## The send rate
 
-The service sends at most `send_rate` messages a minute for its account, oldest first; the rest wait their turn as pending rows. The setting is the service's (`send_rate`, 1 to 120, default 20). Automated volume on one account is what WhatsApp acts against, and it acts against the whole account, so the cap is per account rather than per caller.
+The service sends at most `defaults.send_rate` messages a minute for its account, oldest first; the rest wait their turn as pending rows. The setting is the service's (`defaults.send_rate`, 1 to 120, default 20; a top-level `send_rate` is read as it). Automated volume on one account is what WhatsApp acts against, and it acts against the whole account, so the cap is per account rather than per caller.
