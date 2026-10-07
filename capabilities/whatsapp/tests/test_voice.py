@@ -20,6 +20,9 @@ import test_dialogue as td  # noqa: E402  (beside this file on sys.path)
 wa, dialogue, schema = td.wa, td.dialogue, td.schema
 ALICE, ALICE_JID, GROUP, OWN = td.ALICE, td.ALICE_JID, td.GROUP, td.OWN
 KEY = "dg-test-key"
+SPOKEN = "please book the room for friday"
+DM_ECHO = f"{dialogue.VOICE_ECHO_DIRECT}\n> {SPOKEN}"
+FAILED = dialogue.VOICE_ECHO_FAILED
 
 
 def _voice(**over) -> dict:
@@ -255,7 +258,10 @@ class Voice(td.DialogueCase):
         request = prompt.split("--- Current request ---")[1].split("--- Conversation")[0]
         self.assertIn("[voice] please book the room for friday", request)
         self.assertNotIn("[audioMessage]", prompt)
-        self.assertEqual([r["text"] for r in self.outgoing(ALICE_JID)], ["hello back"])
+        sent = self.outgoing(ALICE_JID)
+        self.assertEqual([r["text"] for r in sent], [DM_ECHO, "hello back"])
+        self.assertIsNone(sent[0]["quoted_id"])
+        self.assertLess(sent[0]["requested_at"], sent[1]["requested_at"])
         self.assertEqual(self.db.execute(
             "SELECT count(*) FROM whatsapp_jobs WHERE account = %s",
             (self.db.account,)).fetchone()[0], 0)
@@ -305,7 +311,8 @@ class Voice(td.DialogueCase):
         self.assertEqual(len(self.deepgram.calls), 1)
         self.assertEqual(self.session.fetched, [msg["id"]])
         self.assertEqual(len(self.run.calls), 1)
-        self.assertEqual(len(self.outgoing(ALICE_JID)), 1)
+        self.assertEqual([r["text"] for r in self.outgoing(ALICE_JID)],
+                         [DM_ECHO, "hello back"])
 
     def test_the_reservation_is_written_before_the_transcription_starts(self):
         gate = threading.Event()
@@ -379,6 +386,9 @@ class Voice(td.DialogueCase):
         self.assertEqual(len(self.run.calls), 1)
         self.assertIn("[voice] please book", self.run.calls[0]["prompt"])
         self.assertIsNone(self.enrichment(plain))
+        self.assertEqual([(r["text"], r["quoted_id"]) for r in self.outgoing(GROUP)
+                          if r["local_id"] != quoted],
+                         [(f"> {SPOKEN}", msg["id"]), ("hello back", msg["id"])])
 
     def test_auto_hears_every_group_voice_note_and_answers_one_that_names_us(self):
         settings = td._settings(allowed_groups={GROUP: {
@@ -390,12 +400,17 @@ class Voice(td.DialogueCase):
         self.settle(d)
         self.assertEqual(len(self.run.calls), 1)
         self.assertIn("[voice] helper, what is on the agenda?", self.run.calls[0]["prompt"])
-        self.assertEqual(self.outgoing(GROUP)[-1]["quoted_id"], named["id"])
+        sent = self.outgoing(GROUP)
+        self.assertEqual([(r["text"], r["quoted_id"]) for r in sent[-2:]],
+                         [("> helper, what is on the agenda?", named["id"]),
+                          ("hello back", named["id"])])
         self.deepgram.text = "see you all tomorrow"
         unnamed, _ = self.voice(d, chat_id=GROUP)
         self.settle(d)
         self.assertEqual(len(self.deepgram.calls), 2)
         self.assertEqual(len(self.run.calls), 1)
+        self.assertEqual([(r["text"], r["quoted_id"]) for r in self.outgoing(GROUP)[-1:]],
+                         [("> see you all tomorrow", unnamed["id"])])
         self.assertEqual(self.enrichment(unnamed)["transcript"], "see you all tomorrow")
         self.assertEqual(d.summary()["voice_unaddressed"], 1)
 
@@ -439,6 +454,8 @@ class Voice(td.DialogueCase):
         self.assertIn("[voice note - transcription failed: the audio could not be "
                       "fetched: expired (status code 410)]", request)
         self.assertEqual(self.deepgram.calls, [])
+        self.assertEqual(self.outgoing(ALICE_JID)[0]["text"],
+                         f"{dialogue.VOICE_ECHO_DIRECT}\n> {FAILED}")
         row = self.enrichment(msg)
         self.assertEqual(row["media_state"], "expired")
         self.assertIn("expired", row["transcript_error"])
@@ -446,6 +463,7 @@ class Voice(td.DialogueCase):
         self.settle(d)
         self.assertEqual(session.fetched, [msg["id"]])
         self.assertEqual(len(self.run.calls), 1)
+        self.assertEqual(len(self.outgoing(ALICE_JID)), 2)
 
     def test_a_deepgram_error_reaches_the_turn_as_a_failure(self):
         self.deepgram.error = wa.HttpFailure(5, "server_error", "Deepgram returned 503")
@@ -458,6 +476,9 @@ class Voice(td.DialogueCase):
         self.assertEqual(self.enrichment(msg)["transcript_error"],
                          "Deepgram: Deepgram returned 503")
         self.assertEqual(d.summary()["transcription_failed"], 1)
+        self.assertEqual([r["text"] for r in self.outgoing(ALICE_JID)],
+                         [f"{dialogue.VOICE_ECHO_DIRECT}\n> {FAILED}",
+                          "hello back"])
 
     def test_without_a_key_the_turn_is_told_so(self):
         d = self.make()
@@ -477,7 +498,58 @@ class Voice(td.DialogueCase):
             request = self.failed_prompt(d)
         self.assertIn("[voice note - transcription failed: RuntimeError: boom]", request)
 
+    def test_an_unaddressed_auto_note_that_fails_is_echoed_and_not_answered(self):
+        settings = td._settings(allowed_groups={GROUP: {
+            "aliases": ["Helper"], "voice_transcription": "auto"}})
+        self.deepgram.error = wa.HttpFailure(5, "timeout", "request timed out")
+        d = self.make(settings)
+        msg, _ = self.voice(d, chat_id=GROUP)
+        self.settle(d)
+        self.assertEqual(self.run.calls, [])
+        self.assertEqual([(r["text"], r["quoted_id"]) for r in self.outgoing(GROUP)],
+                         [(f"> {FAILED}", msg["id"])])
+
     # -- the tail -------------------------------------------------------------
+
+    def delivered(self):
+        """Mark every queued row sent, as the listener would once it sent it."""
+        self.db.execute(
+            "UPDATE whatsapp_messages SET delivery = 'sent', id = 'WA' || local_id,"
+            " ts = requested_at - interval '8 seconds'"
+            " WHERE account = %s AND delivery = 'pending'", (self.db.account,))
+
+    def test_an_echo_is_never_the_assistants_words_nor_a_second_copy(self):
+        settings = td._settings(allowed_groups={GROUP: {
+            "name": "Team", "aliases": ["Helper"], "voice_transcription": "auto"}})
+        d = self.make(settings)
+        self.deepgram.text = "see you all tomorrow"
+        heard, _ = self.voice(d, chat_id=GROUP, ts=int(time.time()) - 20)
+        self.settle(d)
+        self.assertEqual(len(self.outgoing(GROUP)), 1)
+        self.delivered()
+        self.arrive(d, chat_id=GROUP, text="Helper, who is coming tomorrow?")
+        self.settle(d)
+        self.deepgram.text = SPOKEN
+        self.voice(d, ts=int(time.time()) - 20)
+        self.settle(d)
+        self.delivered()
+        self.arrive(d, text="and the time?")
+        self.settle(d)
+        group_tail = self.run.calls[0]["prompt"].split("--- Conversation ---")[1]
+        self.assertEqual(group_tail.count("see you all tomorrow"), 1)
+        self.assertIn(f"#{heard['id']}] Alice: [voice] see you all tomorrow", group_tail)
+        self.assertNotIn("> see you all tomorrow", group_tail)
+        direct_tail = self.run.calls[-1]["prompt"].split("--- Conversation ---")[1]
+        self.assertEqual(direct_tail.count(SPOKEN), 1)
+        self.assertIn(f"Alice: [voice] {SPOKEN}", direct_tail)
+        self.assertNotIn(dialogue.VOICE_ECHO_DIRECT, direct_tail)
+        self.assertIn("Helper (you): hello back", direct_tail)
+
+    def test_the_echo_quotes_every_line(self):
+        self.assertEqual(dialogue.voice_echo("one\n\ntwo", direct=False), "> one\n>\n> two")
+        self.assertEqual(dialogue.voice_echo("one", direct=True),
+                         f"{dialogue.VOICE_ECHO_DIRECT}\n> one")
+
 
     def test_the_tail_shows_older_voice_notes_by_their_transcript(self):
         for mode in ("addressed", "off"):

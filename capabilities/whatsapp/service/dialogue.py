@@ -15,9 +15,10 @@ arrival order after a debounce; its answer goes out as a pending row in
 
 A voice note the settings ask to be transcribed is reserved like any other
 message, then fetched through the listener's own connection and transcribed
-on a thread of its own while it waits at its place in the chat's queue; the
-turn reads its words in place of the attachment, and the transcript is stored
-beside the message for every later reader.
+on a thread of its own while it waits at its place in the chat's queue. Its
+words are echoed into the chat at once, before any turn, and stored beside the
+message for every later reader; the turn, when the ordinary rules call for
+one, reads them in place of the attachment.
 
 A turn may hand longer work to a job through the worker shim on its PATH. Once
 the job is submitted the turn is over: it ends on its own with a short line, or
@@ -56,6 +57,9 @@ HANDOFF_MARK = "\u25b6 "         # what leads the acknowledgement of a handed-of
 VOICE_KIND = "audioMessage"      # a voice note or an audio file: both are transcribed
 VOICE_MARK = "[voice] "          # what leads a voice note's transcript in a prompt
 VOICE_MODES = ("off", "addressed", "auto")
+VOICE_ECHO_DIRECT = "Твоё сообщение:"   # what leads a voice echo in a direct chat
+VOICE_ECHO_FAILED = "[голосовое — не удалось расшифровать]"  # the echo of a failure
+VOICE_ECHOES_KEPT = 500          # echo ids a chat's register remembers
 WORKER_BIN = Path(__file__).resolve().parent / "worker-bin"
 
 DEFAULTS = {
@@ -120,6 +124,15 @@ def voice_text(transcript=None, error=None) -> str | None:
     if error:
         return voice_failed(error)
     return None
+
+
+def voice_echo(spoken, *, direct: bool) -> str:
+    """The message that repeats a voice note's words into its chat: quoted
+    lines, behind the direct-chat prefix where no reply shows whose note it
+    was."""
+    quoted = "\n".join(f"> {line}" if line.strip() else ">"
+                       for line in str(spoken).strip().splitlines())
+    return f"{VOICE_ECHO_DIRECT}\n{quoted}" if direct else quoted
 
 
 def marker_line(text, marker) -> bool:
@@ -484,6 +497,24 @@ class Register:
                 "UPDATE whatsapp_register SET overrides = %s::jsonb, updated_at = now()"
                 " WHERE project_id = %s AND environment = %s AND account = %s"
                 " AND chat_id = %s", (json.dumps(overrides), *self.key, chat_id))
+
+    def echoes(self, chat_id) -> set:
+        """The local ids of the voice echoes sent in this chat."""
+        return set(self.counters(chat_id).get("voice_echoes") or [])
+
+    def record_echo(self, chat_id, local_id) -> None:
+        with self.cli._writing(self.db):
+            row = self._row(chat_id, lock=True)
+            if row is None:
+                return
+            counters = self._json(row["counters"])
+            echoes = list(counters.get("voice_echoes") or [])
+            echoes.append(local_id)
+            counters["voice_echoes"] = echoes[-VOICE_ECHOES_KEPT:]
+            self.db.execute(
+                "UPDATE whatsapp_register SET counters = %s::jsonb, updated_at = now()"
+                " WHERE project_id = %s AND environment = %s AND account = %s"
+                " AND chat_id = %s", (json.dumps(counters), *self.key, chat_id))
 
     def bump(self, chat_id, **changes) -> None:
         with self.cli._writing(self.db):
@@ -1012,9 +1043,11 @@ class Dialogue:
         redelivery never reaches here a second time; a failure is answered as
         a failure rather than tried again.
 
-        An `ambient` note, unaddressed in an `auto` group, is answered only
-        when its transcript names the assistant; otherwise it is dropped from
-        the queue, its transcript kept."""
+        Its words, or the failure, are echoed into the chat before anything
+        else: plainly behind a prefix in a direct chat, quoting the note in a
+        group. An `ambient` note, unaddressed in an `auto` group, is then
+        answered only when its transcript names the assistant; otherwise it
+        is dropped from the queue, echoed and its transcript kept."""
         voice = job["voice"]
         chat, message_id = job["chat_id"], job["message_id"]
         started = time.monotonic()
@@ -1036,12 +1069,36 @@ class Dialogue:
             job["text"] = voice_failed(reason)
             self.log(f"dialogue: {chat} #{message_id} voice note not transcribed "
                      f"after {took:.1f}s: {reason}")
+        self.echo(job, text or VOICE_ECHO_FAILED)
         if voice["mode"] == "ambient" and not (text and self.gate().names_us(chat, text)):
             voice["drop"] = True
             self.stats["voice_unaddressed"] += 1
             self.log(f"dialogue: {chat} #{message_id} not answered (voice "
                      f"{'unaddressed' if text else 'not transcribed'})")
         voice["done"].set()
+
+    def echo(self, job, spoken) -> None:
+        """Queue the echo of one voice note, once. A failed send is logged and
+        not repeated: the reservation is the record that the note was handled,
+        and a second attempt could repeat a message that did go out."""
+        chat = job["chat_id"]
+        request = {"chat_id": chat, "text": voice_echo(spoken, direct=not job["group"]),
+                   "reply_to": job["message_id"] if job["group"] else None,
+                   "mentions": []}
+        try:
+            try:
+                row = self.cli._queue_outgoing(self.db, request)
+            except self.cli._Refusal as refusal:
+                if refusal.code != "quoted_not_found":
+                    raise
+                request["reply_to"] = None
+                row = self.cli._queue_outgoing(self.db, request)
+            self.register.record_echo(chat, row["local_id"])
+            self.log(f"dialogue: {chat} #{job['message_id']} voice echo queued as "
+                     f"{row['local_id']}")
+        except Exception as exc:
+            self.log(f"dialogue: {chat} #{job['message_id']} voice echo not sent: "
+                     f"{type(exc).__name__}: {exc}")
 
     def job(self, msg, verdict) -> dict:
         chat = msg["chat_id"]
@@ -1306,6 +1363,9 @@ class Dialogue:
                 run.thread.join(max(0.0, deadline - time.monotonic()))
 
     def tail(self, chat, ts, size) -> list[dict]:
+        # A voice echo repeats the note it follows, which is shown by its
+        # transcript; it is neither the assistant's words nor a second copy.
+        echoes = self.register.echoes(chat)
         rows = self.db.execute(
             f"""SELECT m.id, m.sender, m.sender_lid, m.from_me, m.local_id, m.push_name,
                        m.kind, m.text, m.quoted_id, extract(epoch FROM m.ts) AS epoch,
@@ -1316,8 +1376,10 @@ class Dialogue:
                  WHERE m.account = %s AND m.chat_id = %s AND {self.cli._HELD_M}
                    AND m.ts <= {self.cli._TS_PARAM}
                  ORDER BY m.ts DESC, m.captured_at DESC LIMIT %s""",
-            (self.db.account, chat, float(ts or self.now()) + 1, int(size))).fetchall()
-        rows = list(reversed(rows))
+            (self.db.account, chat, float(ts or self.now()) + 1,
+             int(size) + min(len(echoes), int(size)))).fetchall()
+        rows = [r for r in rows if not (r["local_id"] and r["local_id"] in echoes)]
+        rows = list(reversed(rows[:int(size)]))
         keys = {k for r in rows for k in (r["sender"], r["sender_lid"]) if k}
         if not is_group(chat):
             keys.add(chat)

@@ -169,8 +169,12 @@ Assistant service
   note is reserved first, fetched through the listener's own connection and
   sent to Deepgram (DEEPGRAM_API_KEY through the credential cascade); the
   transcript is stored in whatsapp_enrichment as `transcribe` stores it, and
-  the turn reads `[voice] <transcript>`, or `[voice note - transcription
-  failed: <reason>]`, never retried. The tail shows every stored transcript.
+  each transcribed note is echoed into the chat before any turn (a direct
+  chat: `Твоё сообщение:` and the quoted transcript; a group: the quoted
+  transcript replying to the note; a failure: `[голосовое — не удалось
+  расшифровать]`). A turn, when one runs, reads `[voice] <transcript>`, or
+  `[voice note - transcription failed: <reason>]`, never retried. The tail
+  shows every stored transcript under its sender and leaves the echoes out.
   Jobs: a turn whose role's authority reaches `whatsapp jobs` is told how to
   hand longer work to a job (the `delegation` document) and runs with the
   bundle's worker shim first on PATH, which fixes the chat, the requester, the
