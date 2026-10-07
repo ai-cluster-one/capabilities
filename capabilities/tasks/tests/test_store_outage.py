@@ -313,7 +313,8 @@ def test_a_killed_turn_is_cut_off_within_its_short_lease_and_its_task_returns(la
     # Nothing renews it now: it lapses within the lease the last beat wrote.
     lapsed = poll_for(lambda: (lambda row: row if row["left"] < 0 else None)(
         raise_of(schema, "t-killed")), 15)
-    assert lapsed["status"] == "running" and lapsed["task_status"] == "in_progress"
+    # The claim never moved the task: it rests in todo throughout.
+    assert lapsed["status"] == "running" and lapsed["task_status"] == "todo"
     # And the next claim settles it the way any lapsed lease is settled.
     claim = answer_of(cli(lab, "claim", "--type", "nothing-of-this-type"))
     assert claim["claimed"] is None and claim["swept"] == [first["id"]]
@@ -522,9 +523,11 @@ def test_a_claim_passes_over_a_task_an_open_raise_holds(lab, tmp_path):
         "t-held", "held", execution)
     assert f"its raise {execution} of worker 'alpha' is still open" in passed["why"]
 
+    # A claim moves no task, so t-next rests in todo while its raise holds it
+    # and is passed over the same way.
     nothing = answer_of(cli(lab, "claim", "--type", "alpha"))
     assert nothing["claimed"] is None
-    assert [one["task"] for one in nothing["passed_over"]] == ["t-held"]
+    assert sorted(one["task"] for one in nothing["passed_over"]) == ["t-held", "t-next"]
 
     for args in (["claim", "--key", "t-held"], ["run", "alpha", "--key", "t-held", "--apply"]):
         refused = cli(lab, *args)
@@ -537,7 +540,7 @@ def test_a_claim_passes_over_a_task_an_open_raise_holds(lab, tmp_path):
     ran = cli(lab, "run", "alpha", "--apply")
     report = answer_of(ran)
     assert report["claimed"] is None
-    assert [one["task"] for one in report["passed_over"]] == ["t-held"]
+    assert sorted(one["task"] for one in report["passed_over"]) == ["t-held", "t-next"]
     # The service's log line for that turn says so.
     output, errors = tmp_path / "turn.out", tmp_path / "turn.err"
     output.write_text(ran.stdout)

@@ -779,8 +779,12 @@ def test_a_claim_sweeps_nothing_of_another_projects(two_projects, capsys,
     answer = _answer(capsys)
     assert answer["task"]["unique_key"] == "h-1"
     assert answer["swept"] == [] and answer["returned"] == []
+    # Their raise is still running, swept by nobody here; its lease ran out, so
+    # it holds nothing and the task shows where it rests.
+    assert conn.execute(f"select status from {schema}.task_executions where id = %s",
+                        (execution,)).fetchone()[0] == "running"
     mod.cmd_show(entry, [task_uuid(conn, schema, THERE, "t-1")])
-    assert _answer(capsys)["task"]["status"] == "in_progress"
+    assert _answer(capsys)["task"]["status"] == "todo"
     mod.cmd_show(entry, [task_uuid(conn, schema, THERE, "t-2")])
     assert _answer(capsys)["task"]["status"] == "waiting"
 

@@ -389,29 +389,31 @@ def test_a_release_landing_where_nobody_takes_it_is_refused(project, store, caps
     answer(capsys)
     mod.cmd_claim(entry, ["--key", "t-rel"])
     execution = answer(capsys)["execution"]["id"]
-    conn.execute(f"update {schema}.tasks set assignee = 'supervisor' where unique_key = 't-rel'")
-    error = refused(capsys, mod.cmd_release, entry, [execution, "--outcome", "failed"])
+    # A release moves the task only where it is told, and that move is judged.
+    error = refused(capsys, mod.cmd_release, entry, [execution, "--outcome", "failed",
+                                                     "--assignee", "supervisor"])
     assert "no enabled worker takes it (status todo" in error["message"]
     [raised] = hooks.raises_of(entry, capsys, "t-rel")
     assert raised["status"] == "running"  # nothing was closed
-    mod.cmd_release(entry, [execution, "--outcome", "handback"])
+    mod.cmd_release(entry, [execution, "--outcome", "handback", "--status", "waiting",
+                            "--assignee", "supervisor"])
     assert answer(capsys)["task"]["status"] == "waiting"
 
 
 @needs_store
-def test_in_progress_is_written_only_by_a_claim(project, store, capsys):
+def test_in_progress_is_never_written(project, store, capsys):
     entry, schema, conn = store
     add(entry, capsys, "t-hand")
     error = refused(capsys, mod.cmd_set, entry, ["t-hand", "--status", "in_progress"])
-    assert error["code"] == "policy" and "only by a claim" in error["message"]
+    assert error["code"] == "policy" and "in_progress is not stored" in error["message"]
     error = refused(capsys, mod.cmd_add, entry, ["--type", "alpha", "--title", "x",
                                                  "--status", "in_progress"])
-    assert "only by a claim" in error["message"]
+    assert "in_progress is not stored" in error["message"]
     mod.cmd_claim(entry, ["--key", "t-hand"])
     execution = answer(capsys)["execution"]["id"]
     error = refused(capsys, mod.cmd_release, entry, [execution, "--outcome", "ok",
                                                      "--status", "in_progress"])
-    assert "only by a claim" in error["message"]
+    assert "in_progress is not stored" in error["message"]
     assert shown(entry, capsys, "t-hand")["task"]["status"] == "in_progress"
 
 

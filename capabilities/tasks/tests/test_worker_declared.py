@@ -598,15 +598,16 @@ def test_a_task_taken_from_waiting_goes_back_there_when_nothing_settles_it(
 
 
 def test_settlement_of_a_task_taken_from_waiting():
-    assert mod._settle_from_waiting("in_progress", "todo", "failed", False) == (
-        "waiting", "failed")
-    assert mod._settle_from_waiting("in_progress", "todo", "failed", True) == (
-        "waiting", "failed")
-    assert mod._settle_from_waiting("todo", "todo", "failed", False) == ("todo", "ok")
-    assert mod._settle_from_waiting("waiting", "waiting", "handback", False) == (
-        "waiting", "handback")
-    assert mod._settle_from_waiting("complete", "complete", "ok", False) == (
-        "complete", "ok")
+    """The claim left it waiting, so nothing is put back: a turn that moved
+    nothing leaves it in the wait, and moving it to todo released it."""
+    rested = {"status": "waiting", "assignee": "decider", "pickup_at": None, "metadata": {}}
+    settle = lambda unspent=False, **moved: mod._settle(  # noqa: E731
+        rested, {**rested, **moved}, unspent)
+    assert settle() == ("failed", {"cut_off": True})
+    assert settle(unspent=True) == ("failed", {"exhausted": True, "cut_off": True})
+    assert settle(status="todo") == ("ok", {})
+    assert settle(assignee="the owner") == ("handback", {})
+    assert settle(status="complete") == ("ok", {})
 
 
 def test_attempts_from_waiting_and_from_the_queue_are_counted_apart():

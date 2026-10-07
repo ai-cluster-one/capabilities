@@ -21,7 +21,7 @@ The trail is how a later turn continues work an earlier one started, and how a p
 Three things a task board carries are outside its scope on purpose.
 
 - Ranking. There is no priority field. What runs first is decided by which worker takes what, described below, not by a number someone has to keep current.
-- Per-project status vocabularies. The statuses are a fixed set and each means one thing: `draft` nobody has released yet, `todo` released and takeable, `in_progress` held by a claim, `waiting` over to the name it carries, `complete` done, `closed` over without being done. A project's own vocabulary lives in its task types, which are free text and name its pipelines.
+- Per-project status vocabularies. The statuses are a fixed set and each means one thing: `draft` nobody has released yet, `todo` released and takeable, `in_progress` shown while an open raise holds it and never stored, `waiting` over to the name it carries, `complete` done, `closed` over without being done. A project's own vocabulary lives in its task types, which are free text and name its pipelines.
 - A large backlog kept so that nothing is lost. A draft is not out of the way: it reads as work somebody has yet to release. Ideas and long-range plans belong where people plan; a task is raised here when there is work for an agent to do.
 
 ## Where order comes from

@@ -224,14 +224,26 @@ def test_every_kind_arrives_with_the_task_as_a_list_row(lab):
     assert _changes(seen, task) == ["activity_added"]
     assert seen[0]["task"]["activities_count"] == 1
 
+    # A claim writes nothing to the task: the raise announces it, with the task
+    # shown in progress, and counted so.
     claimed = _answer(_tasks(lab, "claim", "--key", "k-1", "--worker", "w"))
     seen = watch.until(lambda l: l["event"] == "counts")
-    assert sorted(_changes(seen, task)) == ["run_started", "task_changed"]
+    assert _changes(seen, task) == ["run_started"]
     assert all(l["task"]["status"] == "in_progress" for l in seen if "task" in l)
+    assert seen[-1]["counts"]["in_progress"] == 1 and seen[-1]["counts"]["todo"] == 0
 
+    # A raise that ends without a move announces its end, the task where it rests.
+    _answer(_tasks(lab, "release", claimed["execution"]["id"], "--outcome", "failed"))
+    seen = watch.until(lambda l: l["event"] == "counts")
+    assert _changes(seen, task) == ["run_ended"]
+    assert all(l["task"]["status"] == "todo" for l in seen if "task" in l)
+    assert seen[-1]["counts"]["in_progress"] == 0 and seen[-1]["counts"]["todo"] == 1
+
+    claimed = _answer(_tasks(lab, "claim", "--key", "k-1", "--worker", "w"))
+    watch.until(lambda l: l["event"] == "counts")
     _answer(_tasks(lab, "release", claimed["execution"]["id"], "--outcome", "ok"))
     seen = watch.until(lambda l: l["event"] == "counts")
-    assert "run_ended" in _changes(seen, task)
+    assert sorted(_changes(seen, task)) == ["run_ended", "task_changed"]
     assert seen[-1]["counts"]["complete"] == 1
 
 
@@ -385,7 +397,8 @@ def test_a_hold_episode_row_announces_nothing_and_a_raise_still_does(lab):
     assert _changes(watch.quiet(), task) == []
     _answer(_tasks(lab, "claim", "--key", "k-hold", "--worker", "w"))
     seen = watch.until(lambda l: l["event"] == "counts")
-    assert sorted(_changes(seen, task)) == ["run_started", "task_changed"]
+    # A claim writes nothing to the task: the raise alone announces it.
+    assert _changes(seen, task) == ["run_started"]
 
 
 @needs_store

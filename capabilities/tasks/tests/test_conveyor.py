@@ -714,41 +714,56 @@ def test_a_wait_an_exhaustion_and_a_missing_park_are_none_of_them_spent():
 
 # --- What is settled ---------------------------------------------------------
 
-def settle(landed, *, held=False, moved=False, unspent=False):
-    return mod._settle(landed, held, moved, unspent)
+def settle(landed, *, rested="todo", held=False, moved=False, unspent=False):
+    """Score a raise whose task the claim found resting in `rested` and the
+    turn left in `landed`: `held` with a pickup it set still ahead, `moved`
+    handed to another assignee."""
+    import datetime
+    before = {"status": rested, "assignee": "worker", "pickup_at": None, "metadata": {}}
+    ahead = (datetime.datetime.now(datetime.timezone.utc)
+             + datetime.timedelta(days=1)).isoformat()
+    landing = {**before, "status": landed, "pickup_at": ahead if held else None,
+               "assignee": "next" if moved else "worker"}
+    return mod._settle(before, landing, unspent)
 
 
 def test_an_ending_reached_on_purpose_is_ok():
-    assert settle("complete") == ("complete", "ok", {})
-    assert settle("closed") == ("closed", "ok", {})
+    assert settle("complete") == ("ok", {})
+    assert settle("closed") == ("ok", {})
 
 
 def test_a_turn_told_to_wait_on_somebody_is_ok_and_not_an_attempt():
-    for landed in ("todo", "in_progress"):
-        assert settle(landed, held=True) == ("todo", "ok", {"waiting": True})
+    assert settle("todo", held=True) == ("ok", {"waiting": True})
+    assert settle("waiting", rested="waiting", held=True) == ("ok", {"waiting": True})
 
 
 def test_a_handoff_at_a_stage_is_ok():
-    assert settle("todo", moved=True) == ("todo", "ok", {"handoff": True})
+    assert settle("todo", moved=True) == ("ok", {"handoff": True})
 
 
 def test_a_gate_stop_is_a_handback_wherever_it_landed():
-    assert settle("waiting") == ("waiting", "handback", {})
-    assert settle("draft") == ("draft", "handback", {})
+    assert settle("waiting") == ("handback", {})
+    assert settle("draft") == ("handback", {})
+    # A wait passed on to another name is over to that name.
+    assert settle("waiting", rested="waiting", moved=True) == ("handback", {})
 
 
-def test_a_task_left_in_progress_is_forced_back_and_failed():
-    assert settle("in_progress") == ("todo", "failed", {})
+def test_a_task_taken_from_waiting_and_released_to_the_queue_is_ok():
+    assert settle("todo", rested="waiting") == ("ok", {})
 
 
-def test_put_back_without_saying_why_is_a_failure():
-    assert settle("todo") == ("todo", "failed", {})
+def test_a_turn_that_moved_nothing_is_cut_off_and_failed():
+    # The claim never moved the task, so a turn that moved nothing left it
+    # exactly where it rested, and nothing puts it back.
+    for rested in ("todo", "waiting"):
+        assert settle(rested, rested=rested) == ("failed", {"cut_off": True})
 
 
 def test_a_turn_that_never_reached_the_work_is_not_an_attempt():
-    # Whatever the task says, and however far it got.
-    for landed in ("todo", "complete", "waiting", "in_progress"):
-        assert settle(landed, unspent=True) == ("todo", "failed", {"exhausted": True})
+    # However far it got: one that moved nothing is also continued as cut off.
+    assert settle("todo", unspent=True) == ("failed", {"exhausted": True, "cut_off": True})
+    for landed in ("complete", "waiting"):
+        assert settle(landed, unspent=True) == ("failed", {"exhausted": True})
 
 
 def test_a_pickup_already_passed_is_not_a_hold():
@@ -820,7 +835,8 @@ def test_the_situation_says_how_the_turn_was_started(project):
                  "can be interpreted as approval",
                  "This project's own doctrine governs how you work and where you stop",
                  "Do not operate the runtime you are running inside",
-                 "ends them only on `tasks service stop --end-turns`"):
+                 "keeps the lease of every turn it started",
+                 "ends its turns at once only on `tasks service stop --end-turns`"):
         assert said in situation, said
 
 
@@ -916,7 +932,8 @@ class Store:
     """The slice of the ledger one turn reads and writes."""
 
     def __init__(self, kind="defect", raises=None, stage=None):
-        self.task = a_task(kind, metadata={"stage": stage} if stage else {})
+        # Stored as it rests: a claim never moves it, and shows it in_progress.
+        self.task = a_task(kind, status="todo", metadata={"stage": stage} if stage else {})
         self.trail = 0
         self.raises = raises or []
         self.released: list = []
@@ -929,11 +946,14 @@ class Store:
         monkeypatch.setattr(mod, "_harness_runner", lambda: harness)
         monkeypatch.setattr(mod, "_claim", lambda entry, opts: {
             "claimed": "id-1", "attempt": len(self.raises) + 1,
-            "execution": {"id": "exec-1"}, "task": dict(self.task),
+            "execution": {"id": "exec-1"}, "task": {**self.task, "status": "in_progress"},
             "activities": [], "swept": []})
         monkeypatch.setattr(mod, "_spent_attempts",
                             lambda entry, tid: mod._spent(self.raises))
-        monkeypatch.setattr(mod, "_state", lambda entry, tid: (dict(self.task), self.trail))
+        # A copy as a store read is: the run compares where the task rests
+        # before the turn with where the turn left it.
+        monkeypatch.setattr(mod, "_state",
+                            lambda entry, tid: (json.loads(json.dumps(self.task)), self.trail))
         monkeypatch.setattr(mod, "_note",
                             lambda entry, tid, text: self.notes.append(text))
         monkeypatch.setattr(mod, "_accumulate_cost",
@@ -971,7 +991,7 @@ def test_a_finished_turn_carries_its_measurements_and_its_pinned_session(
     assert harness.seen["extra"]["extra_env"] == {"TASKS_EXECUTION": "exec-1"}
     assert "TASKS_EXECUTION" not in os.environ
 
-    assert (released["outcome"], released["status"]) == ("ok", "complete")
+    assert (released["outcome"], released["status"]) == ("ok", None)
     assert released["detail"] is None
     assert released["run"] == f"claude:{harness.seen['session'].id}"
     assert released["metrics"]["cost_usd"] == 3.21
@@ -994,7 +1014,7 @@ def test_a_quota_failure_returns_the_attempt_and_holds_the_lane(
                            failure=Failure(FailureKind.QUOTA, "You've hit your limit")))
     report, released = one_turn(monkeypatch, capsys, store, harness)
 
-    assert (released["outcome"], released["status"]) == ("failed", "todo")
+    assert (released["outcome"], released["status"]) == ("failed", None)
     assert released["detail"] == "You've hit your limit"
     assert released["metrics"]["exhausted"] is True
     # What the turn cost is kept on every path.
@@ -1015,7 +1035,7 @@ def test_a_long_failure_that_did_work_is_a_plain_attempt(project, monkeypatch, c
                     writes=True)
     report, released = one_turn(monkeypatch, capsys, store, harness)
 
-    assert (released["outcome"], released["status"]) == ("failed", "todo")
+    assert (released["outcome"], released["status"]) == ("failed", None)
     assert released["detail"] == "timed out after 10800s"
     assert "exhausted" not in released["metrics"]
     assert "lane_hold" not in released["metrics"] and "returned_unspent" not in report
@@ -1043,7 +1063,7 @@ def test_a_turn_that_waits_on_somebody_is_ok_and_left_held(project, monkeypatch,
                     lands="todo", holds=tomorrow, writes=True)
     report, released = one_turn(monkeypatch, capsys, store, harness)
 
-    assert (released["outcome"], released["status"]) == ("ok", "todo")
+    assert (released["outcome"], released["status"]) == ("ok", None)
     assert released["metrics"]["waiting"] is True
     assert report["waiting"] is True
     # The hold is the turn's own: the runner adds none of its own on top.
@@ -1056,7 +1076,7 @@ def test_a_handoff_at_a_stage_is_ok_and_named(project, monkeypatch, capsys):
                            duration_ms=10, num_turns=2),
                     lands="todo", stage="verify", writes=True)
     report, released = one_turn(monkeypatch, capsys, store, harness)
-    assert (released["outcome"], released["status"]) == ("ok", "todo")
+    assert (released["outcome"], released["status"]) == ("ok", None)
     assert released["metrics"]["handoff"] is True and report["handoff"] is True
 
 
@@ -1065,7 +1085,7 @@ def test_a_gate_stop_hands_the_task_back(project, monkeypatch, capsys):
     harness = Harness(Result(ok=True, harness="claude", session_id=None, cost_usd=0.7,
                            duration_ms=10, num_turns=5), lands="waiting", writes=True)
     _report, released = one_turn(monkeypatch, capsys, store, harness)
-    assert (released["outcome"], released["status"]) == ("handback", "waiting")
+    assert (released["outcome"], released["status"]) == ("handback", None)
     assert "waiting" not in released["metrics"]
 
 
@@ -1838,7 +1858,7 @@ def test_an_assignee_given_to_a_task_that_had_none_is_a_handoff(project, store,
 
 
 @needs_store
-def test_landing_in_todo_with_the_same_assignee_and_stage_is_a_failure(
+def test_a_turn_that_moves_nothing_is_a_failure_continued_as_cut_off(
         project, store, monkeypatch, capsys):
     entry, _schema, _conn = store
     _todo(entry, capsys, "t-same", "--assignee", "builder")
@@ -1851,8 +1871,9 @@ def test_landing_in_todo_with_the_same_assignee_and_stage_is_a_failure(
     assert "handoff" not in report
     [raised] = _raises(entry, capsys, "t-same")
     assert raised["status"] == "failed" and "handoff" not in raised["metrics"]
-    # It ended on purpose, badly: not a cut-off, so nothing is resumed from it.
-    assert "cut_off" not in raised["metrics"]
+    # The claim never moved the task, so a turn that leaves it where it rested
+    # moved nothing, whatever it wrote: the same worker's next raise continues it.
+    assert raised["metrics"]["cut_off"] is True
 
 
 @needs_store
@@ -2149,12 +2170,13 @@ def test_a_raise_that_ended_on_its_own_is_never_resumed(project, store, monkeypa
     entry, _schema, _conn = store
     _todo(entry, capsys, "t-ended")
     harness = _turns(monkeypatch,
-                     _lands(entry, monkeypatch, capsys, "t-ended", "--status", "todo"),
+                     _lands(entry, monkeypatch, capsys, "t-ended", "--status", "todo",
+                            "--assignee", "builder"),
                      _lands(entry, monkeypatch, capsys, "t-ended", "--status", "complete"))
     mod.cmd_run(entry, ["implementation", "--apply"])
     _answer(capsys)
     [first] = _raises(entry, capsys, "t-ended")
-    assert first["status"] == "failed" and "cut_off" not in first["metrics"]
+    assert first["status"] == "ok" and "cut_off" not in first["metrics"]
     _keep_session(project, monkeypatch, first["run_ref"])
     _cooled(_conn, _schema)
     mod.cmd_run(entry, ["implementation", "--apply"])

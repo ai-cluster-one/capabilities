@@ -310,6 +310,7 @@ class ReleaseCursor:
         self.ended = [dict(r) for r in (ended or [])]
         self.answer: list[dict] = []
         self.changes: list[tuple] = []
+        self.written = ""
 
     def __enter__(self):
         return self
@@ -331,11 +332,18 @@ class ReleaseCursor:
             self.answer = [{**EXECUTION, "status": params[0], "ended_at": "now"}]
         elif text.startswith("select * from") and "tasks where id" in text:
             self.answer = [dict(self.task)]
+        elif "tasks t where t.id" in text:
+            # The task as a reader is shown it: the raise is closed by now.
+            self.answer = [dict(self.task)]
         elif "status in ('complete','closed')" in text:
             self.answer = [dict(r) for r in self.ended]
-        elif text.startswith("update") and "tasks set status" in text:
-            self.task["status"] = params[0]
-            landed(self, text)
+        elif text.startswith("update") and "tasks set" in text:
+            self.written = text
+            body = text.split(" set ", 1)[1].split(" where ", 1)[0]
+            named = [one.split(" = ")[0] for one in body.split(", ") if one.endswith("= %s")]
+            for column, value in zip(named, params):
+                self.task[column] = value
+            landed(self, body)
             self.answer = [dict(self.task)]
         elif "task_changes" in text:
             self.changes.append(params)
@@ -409,6 +417,9 @@ class FakeConn:
         return self.cur
 
     def commit(self):
+        pass
+
+    def rollback(self):
         pass
 
 
@@ -495,60 +506,71 @@ def test_set_settles_nothing_on_a_landing_that_is_not_a_wait(setting, capsys):
     assert "pickup_at = null" not in cur.written
 
 
-def test_a_handback_lands_the_task_with_its_assignee(releasing, capsys):
-    cur = releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
-                     "pickup_at": None, "type": "defect"}, ["--outcome", "handback"])
+def resting(**fields) -> dict:
+    """A task as a claim leaves it: where it rested, its raise open."""
+    return {"id": "t-1", "project_id": HERE, "status": "todo", "assignee": "the owner",
+            "pickup_at": None, "type": "defect", "metadata": {}, **fields}
+
+
+def test_a_release_moves_nothing_it_is_not_told_to(releasing, capsys):
+    """The claim never moved the task, so closing its raise leaves it exactly
+    where it rested, whatever came of the raise."""
+    assert mod._OUTCOMES == ("ok", "failed", "handback")
+    for outcome in ("failed", "handback"):
+        for status in ("todo", "waiting"):
+            cur = releasing(resting(status=status, pickup_at=THEN), ["--outcome", outcome])
+            answer = _answer(capsys)
+            assert answer["task"]["status"] == status and answer["moved"] == []
+            assert answer["task"]["pickup_at"] == THEN
+            assert cur.changes == [] and cur.written == ""
+            assert "instead_of_waiting" not in answer
+
+
+def test_ok_alone_completes_the_task(releasing, capsys):
+    """The one landing kept, for a claim worked by hand."""
+    cur = releasing(resting(), ["--outcome", "ok"])
     answer = _answer(capsys)
-    assert mod._OUTCOMES["handback"] == "waiting"
-    assert answer["task"]["status"] == "waiting" and answer["moved"] == ["status"]
-    assert "instead_of_waiting" not in answer
-    assert cur.changes[0][1:4] == ("status", "in_progress", "waiting")
+    assert mod._OK_LANDING == "complete"
+    assert answer["task"]["status"] == "complete" and answer["moved"] == ["status"]
+    assert cur.changes[0][1:4] == ("status", "todo", "complete")
 
 
-def test_a_handback_on_a_task_naming_nobody_lands_in_draft(releasing, capsys):
+def test_status_and_assignee_move_it(releasing, capsys):
+    releasing(resting(), ["--outcome", "handback", "--status", "waiting",
+                          "--assignee", "the reviewer"])
+    answer = _answer(capsys)
+    assert (answer["task"]["status"], answer["task"]["assignee"]) == ("waiting", "the reviewer")
+    assert answer["moved"] == ["status", "assignee"]
+    releasing(resting(), ["--outcome", "ok", "--status", "todo", "--assignee", "builder"])
+    answer = _answer(capsys)
+    assert (answer["task"]["status"], answer["task"]["assignee"]) == ("todo", "builder")
+    assert answer["moved"] == ["assignee"]
+
+
+def test_a_release_into_waiting_names_whom_it_waits_for(releasing, capsys):
     for nobody in (None, "  "):
-        cur = releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": nobody,
-                         "pickup_at": None, "type": "defect"}, ["--outcome", "handback"])
-        answer = _answer(capsys)
-        assert answer["task"]["status"] == "draft"
-        # Said out loud: a runner cannot invent whom the task waits for, and a
-        # caller told `handback` would otherwise believe it landed in waiting.
-        assert "names no assignee" in answer["instead_of_waiting"]
+        with pytest.raises(SystemExit) as ended:
+            releasing(resting(assignee=nobody), ["--outcome", "handback", "--status", "waiting"])
+        assert ended.value.code == 6
+        assert "waits on nobody" in capsys.readouterr().err
 
 
-def test_status_still_overrides_the_landing(releasing, capsys):
-    releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
-               "pickup_at": None, "type": "defect"},
-              ["--outcome", "handback", "--status", "todo"])
-    assert _answer(capsys)["task"]["status"] == "todo"
-    # And an override naming `waiting` answers to the same rule as the outcome.
-    releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": None,
-               "pickup_at": None, "type": "defect"},
-              ["--outcome", "ok", "--status", "waiting"])
-    landed = _answer(capsys)
-    assert landed["task"]["status"] == "draft" and landed["instead_of_waiting"]
-
-
-def test_a_handback_drops_a_hold_from_before_the_wait(releasing, capsys):
-    cur = releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
-                     "pickup_at": THEN, "type": "defect", "metadata": {}},
-                    ["--outcome", "handback"])
+def test_a_release_into_a_wait_drops_a_hold_from_before_it(releasing, capsys):
+    cur = releasing(resting(pickup_at=THEN), ["--outcome", "handback", "--status", "waiting"])
     answer = _answer(capsys)
     assert answer["task"]["status"] == "waiting" and answer["task"]["pickup_at"] is None
     assert answer["moved"] == ["status", "pickup"]
     assert [c[1:4] for c in cur.changes if c[1] == "pickup"] == [("pickup", THEN, None)]
 
 
-def test_a_handback_drops_a_spent_blocked_by_and_keeps_a_live_one(releasing, capsys):
-    releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
-               "pickup_at": None, "type": "defect", "metadata": {}, "blocked_by": ["t-9"]},
-              ["--outcome", "handback"], ended=[{"id": "t-9"}])
+def test_a_release_into_a_wait_drops_a_spent_blocked_by_and_keeps_a_live_one(releasing,
+                                                                           capsys):
+    releasing(resting(blocked_by=["t-9"]), ["--outcome", "handback", "--status", "waiting"],
+              ended=[{"id": "t-9"}])
     spent = _answer(capsys)
     assert spent["blocked_by_spent"] == ["t-9"] and spent["task"]["blocked_by"] == []
 
-    releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
-               "pickup_at": None, "type": "defect", "metadata": {}, "blocked_by": ["t-9"]},
-              ["--outcome", "handback"])
+    releasing(resting(blocked_by=["t-9"]), ["--outcome", "handback", "--status", "waiting"])
     kept = _answer(capsys)
     assert "blocked_by_spent" not in kept
     assert kept["task"]["blocked_by"] == ["t-9"]
@@ -556,20 +578,12 @@ def test_a_handback_drops_a_spent_blocked_by_and_keeps_a_live_one(releasing, cap
 
 def test_a_landing_that_is_not_a_wait_keeps_the_hold(releasing, capsys):
     # Completed, the task is over and nothing about it is a wait.
-    releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
-               "pickup_at": THEN, "type": "defect", "metadata": {}, "blocked_by": ["t-9"]},
-              ["--outcome", "ok"], ended=[{"id": "t-9"}])
+    releasing(resting(pickup_at=THEN, blocked_by=["t-9"]), ["--outcome", "ok"],
+              ended=[{"id": "t-9"}])
     done = _answer(capsys)
+    assert done["task"]["status"] == "complete"
     assert done["task"]["pickup_at"] == THEN
     assert done["task"]["blocked_by"] == ["t-9"]
-
-    # And a handback the store could hand to nobody lands in `draft`, which is
-    # backlog carrying a hold rather than a wait beginning.
-    releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": None,
-               "pickup_at": THEN, "type": "defect", "metadata": {}},
-              ["--outcome", "handback"])
-    drafted = _answer(capsys)
-    assert drafted["task"]["status"] == "draft" and drafted["task"]["pickup_at"] == THEN
 
 
 # --- What a scan says about who is waited on ---------------------------------
@@ -683,19 +697,31 @@ def test_ready_and_claim_both_pass_a_waiting_task_over(store, capsys):
 
 
 @needs_store
-def test_a_handback_hands_the_task_to_its_assignee(store, capsys):
+def test_a_handback_hands_the_task_on_only_where_it_is_told(store, capsys):
     entry, schema, conn = store
     seed(entry, capsys, "w-5", status="todo", assignee="the owner")
     seed(entry, capsys, "w-6", status="todo")
 
+    # Told nothing, the release closes the raise and the task rests where it was.
     mod.cmd_claim(entry, ["--key", "w-5", "--worker", "a worker"])
     mod.cmd_release(entry, [_answer(capsys)["execution"]["id"], "--outcome", "handback"])
+    kept = _answer(capsys)
+    assert kept["task"]["status"] == "todo" and kept["moved"] == []
+
+    mod.cmd_claim(entry, ["--key", "w-5", "--worker", "a worker"])
+    mod.cmd_release(entry, [_answer(capsys)["execution"]["id"], "--outcome", "handback",
+                            "--status", "waiting"])
     assert _answer(capsys)["task"]["status"] == "waiting"
 
+    # A wait names whom it waits for, and the raise stays open when it does not.
     mod.cmd_claim(entry, ["--key", "w-6", "--worker", "a worker"])
-    mod.cmd_release(entry, [_answer(capsys)["execution"]["id"], "--outcome", "handback"])
-    unnamed = _answer(capsys)
-    assert unnamed["task"]["status"] == "draft" and unnamed["instead_of_waiting"]
+    execution = _answer(capsys)["execution"]["id"]
+    error = _refused(capsys, mod.cmd_release, entry,
+                     [execution, "--outcome", "handback", "--status", "waiting"])
+    assert error["exit"] == 6 and "waits on nobody" in error["message"]
+    mod.cmd_release(entry, [execution, "--outcome", "handback", "--status", "waiting",
+                            "--assignee", "the owner"])
+    assert _answer(capsys)["task"]["status"] == "waiting"
 
 
 @needs_store
@@ -794,7 +820,8 @@ def test_a_handback_hands_over_a_wait_that_begins_clean(store, capsys):
     past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     seed(entry, capsys, "g-3", status="todo", assignee="the owner", pickup=past)
     mod.cmd_claim(entry, ["--key", "g-3", "--worker", "a worker"])
-    mod.cmd_release(entry, [_answer(capsys)["execution"]["id"], "--outcome", "handback"])
+    mod.cmd_release(entry, [_answer(capsys)["execution"]["id"], "--outcome", "handback",
+                            "--status", "waiting"])
     handed = _answer(capsys)
     assert handed["task"]["status"] == "waiting" and handed["task"]["pickup_at"] is None
     assert "pickup" in handed["moved"]

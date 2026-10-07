@@ -776,7 +776,9 @@ def test_a_closed_raise_is_never_revived(project, store, capsys):
         assert host.renew_leases(own, [("alpha", receipt)])["renewed"] == []
         # A receipt naming another task than the raise's is not that raise's.
         other = add(entry, capsys, "alpha", key="t-other")
-        again = mod._claim(entry, {"type": "alpha", "worker": "alpha", "lease": "60"})
+        # Named: the closed raise left t-closed resting in todo, as every
+        # claim leaves its task, so asking for the next would take it again.
+        again = mod._claim(entry, {"key": "t-other", "worker": "alpha", "lease": "60"})
         assert host.renew_leases(own, [("alpha", {**receipt, "execution": str(
             again["execution"]["id"])})])["renewed"] == []
         assert host.renew_leases(own, [("alpha", {**receipt, "task_id": other, "execution": str(
@@ -843,8 +845,11 @@ def test_run_writes_the_receipt_the_service_reads(project, store, capsys, monkey
     monkeypatch.setattr(mod, "_harness_runner", lambda: recorder)
     mod.cmd_run(entry, ["alpha", "--apply"])
     report = json.loads(capsys.readouterr().out)
+    # With the cap the service renews its lease to, since the service is its
+    # one writer.
     assert seen["receipt"] == {"task": "t-receipt", "task_id": tid,
-                               "execution": report["execution"], "attempt": 1}
+                               "execution": report["execution"], "attempt": 1,
+                               "lease_seconds": mod._worker("alpha")["limits"]["lease_seconds"]}
     # Written before the turn, and never handed to it.
     assert mod._RECEIPT_ENV not in seen["env"]
 

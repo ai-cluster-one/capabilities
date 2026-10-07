@@ -514,7 +514,8 @@ def test_claim_and_release_are_outside_the_scope(store, capsys, monkeypatch):
     monkeypatch.setenv("TASKS_EXECUTION", execution)
     mod.cmd_release(entry, [execution, "--outcome", "failed"])
     released = _answer(capsys)
-    assert released["task"]["status"] == "todo" and released["moved"] == ["status"]
+    # Closed, and the task left where the claim found it: nothing moved.
+    assert released["task"]["status"] == "todo" and released["moved"] == []
     # And claiming again under a stale variable still works.
     again = _claim(entry, capsys, "c-one")
     assert again != execution

@@ -406,14 +406,13 @@ def test_key_asks_the_hook_about_a_task_whose_wait_ended(project, store, turns, 
 
 @needs_store
 def test_key_asks_the_hook_about_a_task_whose_lease_lapsed(project, store, turns, capsys):
-    """An in-progress task whose raise's lease has lapsed becomes claimable only
-    when the sweep frees it; its hook is asked about it all the same, and no
-    raise is opened beside the one the sweep closed."""
+    """A task whose raise's lease has lapsed becomes claimable only when the
+    sweep closes that raise; its hook is asked about it all the same, and no
+    raise is opened beside the one the sweep closed. The claim left it resting
+    in todo, as every claim does."""
     entry, schema, conn = store
     hooked(project)
     tid = add(entry, capsys, "t-lapsed")
-    conn.execute(f"update {schema}.tasks set status = 'in_progress' "
-                 "where unique_key = 't-lapsed'")
     conn.execute(f"""insert into {schema}.task_executions
                        (task_id, attempt, worker, status, lease_until)
                      values ('{tid}', 1, 'alpha', 'running', now() - interval '1 minute')""")

@@ -65,16 +65,19 @@ files, and settles its own task, so however the daemon stops - a stop, a
 signal, a crash - it stops claiming, publishes, lets go of its lock and leaves
 every running turn running. Every spawn writes a turn record in `turns/`
 naming the process and when it started, and the next daemon to take the
-project's lock adopts every turn whose process is still the one recorded. The
-one act that ends running turns is a stop that asks for it: the stop writes an
+project's lock adopts every turn whose process is still the one recorded,
+within the lease each one was last renewed to. The one act that ends running
+turns at once is a stop that asks for it: the stop writes an
 end-turns intent beside the pid before it signals, and a daemon that finds a
 fresh one gives its turns their grace, then ends the rest and settles what
 they held.
 
-It is a second heartbeat for its turns. On the beat a turn renews its own
-lease, and again before it starts any turn, whose claim sweeps lapsed leases,
-it renews the lease of the raise each of its live turns reported, so a lease
-lapses only when both the turn and the daemon are gone.
+It is the one heartbeat of its turns. A turn it started renews nothing and
+only watches its lease; on the beat, and again before it starts any turn,
+whose claim sweeps lapsed leases, the daemon renews the lease of the raise
+each of its live turns reported. A turn whose daemon is gone keeps its raise
+only until that lease runs out, unless a daemon serving the project adopts it
+first, and then ends itself.
 """
 
 from __future__ import annotations
@@ -975,9 +978,9 @@ class ProjectSlot:
         return started
 
     def renew(self, at_once: bool = False) -> None:
-        """The second heartbeat: renew the lease of the raise each running turn
-        holds, on the beat a turn renews its own, so a lease lapses only when
-        both the turn and this daemon are gone. `at_once` renews whether or not
+        """The heartbeat of this daemon's turns, the one writer of their leases:
+        renew the lease of the raise each running turn holds, so a lease lapses
+        once the turn or every daemon serving it is gone. `at_once` renews whether or not
         the beat is due: every turn's claim sweeps lapsed leases, so one is
         asked for before every turn starts. Only a turn whose process is still
         the one recorded, and which has reported its claim, is renewed for."""
