@@ -161,6 +161,26 @@ Assistant service
   group, split between paragraphs) and sent by the listener; an empty answer
   is silent. The listener resolves the runner itself (`uv run --with`); the
   CLI does not carry it.
+  Jobs: a turn whose role's authority reaches `whatsapp jobs` is told how to
+  hand longer work to a job (the `delegation` document) and runs with the
+  bundle's worker shim first on PATH, which fixes the chat, the requester, the
+  origin message and the job profile from the turn's environment and refuses
+  a call that names any of them. Submitting a draft ends the turn: its own
+  short line, or after a grace period the job's description, is the
+  acknowledgement. The listener's job runner claims waiting jobs in arrival
+  order within `defaults.max_parallel_jobs`, each with a slot row, a lease
+  and a fencing token in whatsapp_jobs / whatsapp_job_slots, and runs each
+  through callva-harness-runner on its profile (`defaults.job_profile`,
+  bundled whatsapp-job-claude) with the `job-worker` document as its prompt,
+  recording pid and session at start. An amendment stops the attempt and
+  continues the same session. The result is queued once, as pending rows
+  quoting the message that asked for it. A spent quota stops the job as
+  `quota` and pauses the queue until it lifts; a refused model or any other
+  failure is recorded and reported to the chat. A job whose listener went
+  away is interrupted and, per `defaults.job_recovery`, continued on its
+  session (`requeue`) or stopped and reported (`inspect`); a result not yet
+  delivered is delivered after a restart, once. /status lists the chat's
+  open jobs and /stop stops them with the running turn.
   Its settings are the project's whatsapp service settings records
   (capabilities/whatsapp/service/settings.json in files mode): `connection`,
   `environment`, `assistant_name`, `direct_messages {mode allowlist|anyone|
@@ -169,7 +189,8 @@ Assistant service
   require_reference, aliases, may_address anyone|allowed_users|[phones],
   member_role, profile, worker_timeout, context}}`, `control {roles}`,
   `authority {default, roles}` and `defaults {tail_size, debounce, max_age,
-  worker_timeout, max_parallel_dialogue, profile, send_rate}`. A top-level
+  worker_timeout, max_parallel_dialogue, profile, send_rate,
+  max_parallel_jobs, job_profile, job_recovery requeue|inspect}`. A top-level
   `send_rate` is read as `defaults.send_rate`. Any other key is refused.
   Settings that admit nobody leave the listener capturing and sending and
   answering nothing.
@@ -196,6 +217,9 @@ Assistant service
       whatsapp service logs [--connection ID] [--tail N]
       whatsapp service doctor [--connection ID]
                                        Settings, store, link and ownership.
+      whatsapp jobs help               The job register's verbs: list, active,
+                                       show, register, submit, amend, discard,
+                                       stop, resume.
 
 Commands
   whatsapp help                        Print this usage block
@@ -434,8 +458,8 @@ SERVICE = {
     "summary": ("Long-running listener that holds one account's WhatsApp "
                 "connection, captures every message live into the store, "
                 "answers the messages its settings admit with a dialogue turn "
-                "on the harness runner, and sends the messages queued for the "
-                "account."),
+                "on the harness runner, runs the jobs those turns hand over, "
+                "and sends the messages queued for the account."),
     "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs"],
     "config": "capabilities/whatsapp/service",
     "state": "<account-state>/service",
@@ -4836,9 +4860,83 @@ CREATE TABLE whatsapp_register (
   counters jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz, updated_at timestamptz,
   PRIMARY KEY (project_id, environment, account, chat_id))"""),
+    # The work a dialogue turn hands over, per project, environment, account
+    # and chat: what was asked, by whom, from which message, how it ran (the
+    # engine's session is the checkpoint), who owns the current attempt and
+    # until when, why it stopped, and its result until it is delivered. `host`
+    # is the machine whose listener holds the attempt, since a pid means
+    # something only there.
+    Step("0014-jobs", """
+CREATE TABLE whatsapp_jobs (
+  id text NOT NULL, project_id text NOT NULL, environment text NOT NULL,
+  account text NOT NULL, chat_id text NOT NULL,
+  surface text NOT NULL DEFAULT 'whatsapp',
+  requested_by text NOT NULL, origin_message_id text, description text NOT NULL,
+  profile text, engine text, model text, session_id text,
+  host text, pid integer, pgid integer,
+  state text NOT NULL, outcome text,
+  attempt integer NOT NULL DEFAULT 0, amendments integer NOT NULL DEFAULT 0,
+  stop_requested boolean NOT NULL DEFAULT false,
+  exit_code integer, error text, log_path text,
+  attempt_token text, lease_owner text, lease_expires_at timestamptz,
+  resume_at timestamptz,
+  result_text text, result_silent boolean NOT NULL DEFAULT false,
+  delivery_state text, delivery_attempts integer NOT NULL DEFAULT 0,
+  delivery_error text, delivered_at timestamptz, delivered_message_id text,
+  created_at timestamptz NOT NULL, started_at timestamptz,
+  finished_at timestamptz, execution_finished_at timestamptz,
+  updated_at timestamptz NOT NULL,
+  CONSTRAINT whatsapp_jobs_pkey PRIMARY KEY (id),
+  CONSTRAINT whatsapp_jobs_state_check
+    CHECK (state IN ('draft', 'waiting', 'running', 'stopped')),
+  CONSTRAINT whatsapp_jobs_outcome_check
+    CHECK (outcome IN ('succeeded', 'failed', 'cancelled', 'interrupted',
+                       'quota', 'model_refused')),
+  CONSTRAINT whatsapp_jobs_delivery_check
+    CHECK (delivery_state IN ('pending', 'delivered')))"""),
+    Step("0015-jobs-queue", """
+CREATE INDEX whatsapp_jobs_queue
+  ON whatsapp_jobs (project_id, environment, account, state, created_at)"""),
+    Step("0016-jobs-by-chat", """
+CREATE INDEX whatsapp_jobs_by_chat
+  ON whatsapp_jobs (project_id, environment, account, chat_id, state)"""),
+    # Two concurrent continuations of one session cannot both be running.
+    Step("0017-jobs-live-session", """
+CREATE UNIQUE INDEX whatsapp_jobs_live_session
+  ON whatsapp_jobs (session_id) WHERE state = 'running'"""),
+    # One message hands over at most one job.
+    Step("0018-jobs-by-origin", """
+CREATE UNIQUE INDEX whatsapp_jobs_by_origin
+  ON whatsapp_jobs (project_id, environment, account, chat_id, origin_message_id)
+  WHERE origin_message_id IS NOT NULL"""),
+    # Text added to a job while it runs, kept until the engine has taken it.
+    Step("0019-job-amendments", """
+CREATE TABLE whatsapp_job_amendments (
+  id text NOT NULL, project_id text NOT NULL, environment text NOT NULL,
+  account text NOT NULL, job_id text NOT NULL, text text NOT NULL,
+  state text NOT NULL, claim_token text, created_at timestamptz NOT NULL,
+  claimed_at timestamptz, acked_at timestamptz,
+  CONSTRAINT whatsapp_job_amendments_pkey PRIMARY KEY (id),
+  CONSTRAINT whatsapp_job_amendments_state_check
+    CHECK (state IN ('pending', 'claimed', 'acked')))"""),
+    Step("0020-job-amendments-pending", """
+CREATE INDEX whatsapp_job_amendments_pending
+  ON whatsapp_job_amendments
+     (project_id, environment, account, job_id, state, created_at)"""),
+    # One row per attempt holding one of the `max_parallel_jobs` slots, so the
+    # budget is a fact of the store rather than of one listener's memory.
+    Step("0021-job-slots", """
+CREATE TABLE whatsapp_job_slots (
+  project_id text NOT NULL, environment text NOT NULL, account text NOT NULL,
+  slot integer NOT NULL, job_id text NOT NULL, owner_id text NOT NULL,
+  attempt_token text NOT NULL, lease_expires_at timestamptz NOT NULL,
+  CONSTRAINT whatsapp_job_slots_pkey
+    PRIMARY KEY (project_id, environment, account, slot),
+  CONSTRAINT whatsapp_job_slots_job_key
+    UNIQUE (project_id, environment, account, job_id))"""),
 ]
 STORE_SCHEMA_MAJOR = 1
-STORE_SCHEMA_MINOR = 2
+STORE_SCHEMA_MINOR = 3
 
 # The rows a read answers with: everything captured, and what this capability
 # sent once WhatsApp took it. A message still waiting or one that never left is
@@ -9619,8 +9717,9 @@ def _profile_check(root: Path, names: list[str]) -> list[dict]:
 
 
 def _settings_profiles(settings: dict) -> dict:
+    profiles = _service_module("profiles")
     return _service_schema().profile_names(
-        settings, _service_module("profiles").DEFAULT_PROFILE)
+        settings, profiles.DEFAULT_PROFILE, profiles.DEFAULT_JOB_PROFILE)
 
 
 def _require_profiles(root: Path, settings: dict) -> None:
@@ -9657,6 +9756,10 @@ def _build_dialogue(cfg: dict, root: Path, settings: dict, paths: dict, *,
     except ValueError:
         db.close()
         raise
+    # The job runner has a store connection of its own: a job's claim waits
+    # on rows another listener holds, and the capture must never wait with it.
+    dialogue.jobs = _service_module("jobs").JobRunner(
+        _CliFacade(), dialogue=dialogue, db=_open_store(cfg))
     return dialogue
 
 
@@ -9794,18 +9897,30 @@ def _inventory(_network: bool) -> dict:
                         "detail": f"connection {status['connection']}"}}
 
 
-def _seed_service_context(adapter) -> list[str]:
-    """Seed the dialogue's prose where the project has none. It is the
-    project's to write, so it is never overwritten, `--force` included."""
-    template = _service_template("context.md")
-    try:
-        if adapter.document_read(NAME, "context") is not None or not template.is_file():
-            return []
-        adapter.document_put(NAME, "context", template.read_text(),
-                             author=f"{NAME} service init")
-    except StoreError as exc:
-        _refuse(6, exc.slug, exc.message, exc.hint)
-    return [f"{adapter.source}:{NAME}/context"]
+# The service's prose, seeded from the bundle's templates: the dialogue's
+# context, what a turn is told about handing work to a job, and the whole of a
+# job worker's prompt.
+SERVICE_DOCUMENTS = ("context", "delegation", "job-worker")
+
+
+def _seed_service_context(adapter) -> tuple[list[str], list[str]]:
+    """Seed the service's prose where the project has none. It is the
+    project's to write, so a document it holds is never overwritten, `--force`
+    included. Answers what was written and what was left as it was."""
+    written, kept = [], []
+    for key in SERVICE_DOCUMENTS:
+        template = _service_template(f"{key}.md")
+        label = f"{adapter.source}:{NAME}/{key}"
+        try:
+            if adapter.document_read(NAME, key) is not None or not template.is_file():
+                kept.append(label)
+                continue
+            adapter.document_put(NAME, key, template.read_text(),
+                                 author=f"{NAME} service init")
+        except StoreError as exc:
+            _refuse(6, exc.slug, exc.message, exc.hint)
+        written.append(label)
+    return written, kept
 
 
 def _cmd_service_init(connection_flag: str | None, force: bool) -> dict:
@@ -9825,8 +9940,9 @@ def _cmd_service_init(connection_flag: str | None, force: bool) -> dict:
             _refuse(6, "service_settings_invalid", str(exc),
                     f"fix the record, or reseed it with `{NAME} service init "
                     "--force`")
-        return {"initialized": NAME, "project": str(root),
-                "written": [], "skipped": [f"{adapter.source}:{NAME}/settings"],
+        seeded, kept = _seed_service_context(adapter)
+        return {"initialized": NAME, "project": str(root), "written": seeded,
+                "skipped": [f"{adapter.source}:{NAME}/settings", *kept],
                 "settings": existing}
     settings = json.loads(template.read_text())
     if connection_flag:
@@ -9843,10 +9959,9 @@ def _cmd_service_init(connection_flag: str | None, force: bool) -> dict:
         for key, value in settings.items():
             adapter.set(NAME, "setting", key, value,
                         actor=f"{NAME} service init")
-        seeded = _seed_service_context(adapter)
+        seeded, kept = _seed_service_context(adapter)
         written += seeded
-        if not seeded:
-            skipped.append(f"{adapter.source}:{NAME}/context")
+        skipped += kept
     except StoreError as exc:
         _refuse(6, exc.slug, exc.message, exc.hint)
     return {"initialized": NAME, "project": str(root),
@@ -10377,6 +10492,16 @@ class _ServiceDaemon:
         """Sleep that a stop request cuts short."""
         self.stop_requested.wait(seconds)
 
+    def start_jobs(self) -> None:
+        """Start the dialogue's job runner. It looks at the register on its own
+        thread, whether or not the connection is up, so its leases are renewed
+        through a reconnect and its results queue for the next connection."""
+        jobs = getattr(self.dialogue, "jobs", None) if self.dialogue is not None else None
+        if jobs is not None:
+            jobs.start()
+            self.log(f"job runner started (owner {jobs.owner_id}, at most "
+                     f"{jobs.max_parallel()} at once, recovery {jobs.recovery()})")
+
     # -- settings -----------------------------------------------------------
 
     def apply_reload(self) -> None:
@@ -10396,6 +10521,7 @@ class _ServiceDaemon:
                 self.dialogue = _build_dialogue(self.cfg, self.root, data,
                                                 self.paths, log=self.log,
                                                 on_reload=self.reload_requested.set)
+                self.start_jobs()
         except (ValueError, _Refusal) as exc:
             message = exc.message if isinstance(exc, _Refusal) else str(exc)
             self.log(f"reload refused: {message}")
@@ -10674,10 +10800,14 @@ class _ServiceDaemon:
             self.log(f"assistant service starting: connection {self.cfg['id']}, "
                      f"account {self.cfg['account_key']}, project {self.root}")
             self.publish("starting", connected=False, last_error=None)
+            self.start_jobs()
             code = self.loop()
             return code
         finally:
             if self.dialogue is not None:
+                if getattr(self.dialogue, "jobs", None) is not None:
+                    with contextlib.suppress(Exception):
+                        self.dialogue.jobs.shutdown()
                 with contextlib.suppress(Exception):
                     self.dialogue.shutdown()
             with contextlib.suppress(Exception):
@@ -10699,6 +10829,187 @@ class _ServiceDaemon:
                 with contextlib.suppress(Exception):
                     fcntl.flock(handle, fcntl.LOCK_UN)
                     handle.close()
+
+
+# ── Jobs ────────────────────────────────────────────────────────────────────
+#
+# The register of work a dialogue turn hands over, read and moved from the
+# command line. A worker the service started reaches it through the shim on its
+# PATH, which fixes the chat, the requester and the origin message; this verb
+# checks them again against the environment the service set, so a worker that
+# reached the CLI some other way is held to the same scope.
+
+JOBS_HELP = """whatsapp jobs — the register of work that outlives a conversation
+
+  jobs list [--state S] [--outcome O] [--limit N]   jobs in this project, newest first
+  jobs active [--limit N]                           only what is waiting or running
+  jobs show <id>                                    one job, staged amendments included
+  jobs register "<one-line outcome>"                write a draft; nothing runs it yet
+  jobs submit <id> --confirm-active-jobs-checked    hand a draft to the runner
+  jobs amend <id> "<what changed>"                  continue a job with added context
+  jobs discard <id>                                 drop a draft nobody will submit
+  jobs stop <id>                                    stop the work; it keeps its session
+  jobs resume <id>                                  continue a stopped job
+
+A job runs in arrival order within defaults.max_parallel_jobs, on the profile
+named by defaults.job_profile, and answers into the chat it was registered
+from, quoting the message that asked for it. States: draft, waiting, running,
+stopped; a stopped job's outcome is succeeded, failed, cancelled, interrupted,
+quota or model_refused. Outside a worker, --chat narrows to one chat and
+register takes --chat and --requested-by."""
+
+
+def _jobs_environment(settings: dict) -> str:
+    """The environment a job is filed under: the one the listener runs, which
+    it hands its workers, else the settings' own."""
+    return (os.environ.get("WHATSAPP_ENVIRONMENT", "").strip()
+            or settings.get("environment") or "production")
+
+
+def _job_scope(args) -> None:
+    """Hold a worker the service started to the chat, requester and origin it
+    was started for. A terminal call is a maintainer's and stays unscoped."""
+    if not os.environ.get("WHATSAPP_DAEMON_CHILD", "").strip():
+        return
+    chat = os.environ.get("WHATSAPP_AUTHORIZED_CHAT_ID", "").strip()
+    actor = os.environ.get("WHATSAPP_AUTHORIZED_REQUESTER", "").strip()
+    if not chat or not actor:
+        _refuse(4, "job_scope_missing",
+                "a worker the WhatsApp service started reached the job register "
+                "without the chat and requester it acts for",
+                "the service hands its workers WHATSAPP_AUTHORIZED_CHAT_ID and "
+                "WHATSAPP_AUTHORIZED_REQUESTER")
+    for name, given, wanted in (("chat", args.chat, chat), ("actor", args.actor, actor)):
+        if given and str(given) != wanted:
+            _refuse(4, "job_scope_denied",
+                    f"a worker's job {name} differs from the one its turn was started for")
+    args.chat, args.actor = chat, actor
+    if args.jobs_command == "register":
+        origin = os.environ.get("WHATSAPP_AUTHORIZED_ORIGIN_MESSAGE_ID", "").strip()
+        profile = os.environ.get("WHATSAPP_AUTHORIZED_JOB_PROFILE", "").strip()
+        for name, given, wanted in (("requester", args.requested_by, actor),
+                                    ("origin message", args.origin_message_id, origin),
+                                    ("profile", args.profile, profile)):
+            if given and wanted and str(given) != wanted:
+                _refuse(4, "job_scope_denied",
+                        f"a worker's job {name} differs from the one its turn was "
+                        "started for")
+        args.requested_by = actor
+        args.origin_message_id = origin or None
+        args.profile = profile or args.profile
+
+
+def _open_jobs(args):
+    """The project's job register on this account, and the module it lives in."""
+    root = _service_project_root()
+    settings = _service_settings()
+    connection = (os.environ.get("WHATSAPP_AUTHORIZED_CONNECTION", "").strip()
+                  if os.environ.get("WHATSAPP_DAEMON_CHILD") else None) or args.connection
+    cfg = _service_cfg(settings, connection)
+    project_id = _service_project_id(root)
+    module = _service_module("jobs")
+    db = _open_store(cfg)
+    return module, module.JobRegister(_CliFacade(), db, project_id,
+                                      _jobs_environment(settings)), settings
+
+
+def _job_row(row: dict) -> dict:
+    out = {k: v for k, v in row.items()
+           if k not in ("attempt_token", "lease_owner", "project_id", "surface")}
+    out["stopping"] = bool(out.pop("stop_requested", False))
+    return out
+
+
+def _require_job(register, job_id: str, chat: str | None, actor: str | None) -> dict:
+    row = register.get(job_id, actor_id=actor)
+    if row is None:
+        _refuse(2, "job_not_found", f"no job {job_id} in this project's register",
+                f"run `{NAME} jobs list` to see the ids")
+    if chat and row["chat_id"] != chat:
+        _refuse(4, "job_scope_denied", f"job {job_id} belongs to chat {row['chat_id']}, "
+                f"not {chat}")
+    return row
+
+
+def cmd_jobs(args):
+    action = args.jobs_command
+    if action == "help":
+        sys.stdout.write(JOBS_HELP + "\n")
+        return None
+    _job_scope(args)
+    chat = _normalize_chat_id(args.chat) if args.chat else None
+    actor = args.actor
+    module, register, settings = _open_jobs(args)
+    try:
+        if action in ("list", "active"):
+            if action == "active":
+                rows = register.open_jobs(chat, actor_id=actor)[:args.limit]
+            else:
+                rows = register.list(limit=args.limit, state=args.state,
+                                     outcome=args.outcome, chat_id=chat, actor_id=actor)
+            return {"environment": register.environment, "account": register.account,
+                    "chat_id": chat, "counts": register.counts(actor_id=actor),
+                    "slots_in_use": register.slots_in_use(),
+                    "jobs": [_job_row(r) for r in rows]}
+        if action == "register":
+            if not chat:
+                _refuse(6, "no_chat", "a job needs the chat it reports into",
+                        "pass --chat <chat-id>")
+            if not args.requested_by:
+                _refuse(6, "no_requester", "a job needs the person whose authority "
+                        "it carries", "pass --requested-by <phone number>")
+            profile = (args.profile or (settings.get("defaults") or {}).get("job_profile")
+                       or _service_module("profiles").DEFAULT_JOB_PROFILE)
+            row = register.register(chat_id=chat, requested_by=args.requested_by,
+                                    description=args.description,
+                                    origin_message_id=args.origin_message_id,
+                                    profile=profile)
+            out = _job_row(row)
+            out["next"] = (f"submit it with `{NAME} jobs submit {row['id']} "
+                           "--confirm-active-jobs-checked` once its outcome line says "
+                           "what will be delivered")
+            return out
+        row = _require_job(register, args.id, chat, actor)
+        if action == "show":
+            out = _job_row(row)
+            out["pending_amendment"] = register.pending_amendment(args.id)
+            return out
+        if action == "submit":
+            if not args.confirm_active_jobs_checked:
+                _refuse(6, "active_jobs_unconfirmed",
+                        "submitting needs confirmation that the active jobs were read",
+                        f"read `{NAME} jobs active`, and if this outcome is not already "
+                        "among them pass --confirm-active-jobs-checked")
+            return _job_row(register.submit(args.id, actor_id=actor))
+        if action == "amend":
+            register.stage_amendment(args.id, args.text, actor_id=actor)
+            register.amend(args.id, actor_id=actor)
+            return {"id": args.id, "amendment": "staged",
+                    "pending_amendment": register.pending_amendment(args.id),
+                    "instruction": "Say the correction is folded into the job that "
+                                   "already exists. Do not register a new one."}
+        if action == "discard":
+            if row["state"] != module.DRAFT:
+                _refuse(6, "job_not_a_draft", f"job {args.id} is {row['state']}, not a "
+                        "draft", f"work that has started is stopped with `{NAME} jobs "
+                        "stop` and stays continuable")
+            register.discard(args.id, actor_id=actor)
+            return {"id": args.id, "discarded": True, "description": row["description"]}
+        if action == "stop":
+            if register.request_stop(args.id, actor_id=actor) is None:
+                _refuse(6, "job_not_running", f"job {args.id} is {row['state']}, so "
+                        "there is nothing to stop", f"`{NAME} jobs resume` continues a "
+                        "stopped job")
+            return {"id": args.id, "stopping": True,
+                    "instruction": "The listener ends the work on its next look at the "
+                                   "register. The job keeps its session and its place."}
+        if action == "resume":
+            return _job_row(register.resume(args.id, actor_id=actor))
+    except module.JobError as exc:
+        _refuse(6, exc.slug, exc.message, exc.hint)
+    finally:
+        register.db.close()
+    return None
 
 
 def cmd_service(args):
@@ -10901,6 +11212,44 @@ def main():
     slogs.add_argument("--tail", type=int, default=50)
     _svc("doctor", help="Settings, store, link and ownership")
 
+    pjobs = _sub("jobs", help="The register of work that outlives a conversation")
+    jobs_sub = pjobs.add_subparsers(dest="jobs_command", required=True)
+
+    def _job(name: str, *, needs_id: bool = True, **kwargs):
+        created = jobs_sub.add_parser(name, **kwargs)
+        _selection_flags(created, suppress=True)
+        if needs_id:
+            created.add_argument("id", help="the job id, from `jobs list`")
+        created.add_argument("--chat", help="only this chat's jobs")
+        created.add_argument("--actor", help=argparse.SUPPRESS)
+        return created
+
+    jobs_sub.add_parser("help", help="Every jobs verb and its flags")
+    jlist = _job("list", needs_id=False, help="Jobs in this project, newest first")
+    jlist.add_argument("--state", choices=["draft", "waiting", "running", "stopped"])
+    jlist.add_argument("--outcome", choices=["succeeded", "failed", "cancelled",
+                                             "interrupted", "quota", "model_refused"])
+    jlist.add_argument("--limit", type=int, default=50)
+    jactive = _job("active", needs_id=False, help="Only what is waiting or running")
+    jactive.add_argument("--limit", type=int, default=50)
+    _job("show", help="One job, staged amendments included")
+    jreg = _job("register", needs_id=False, help="Write a draft; nothing runs it yet")
+    jreg.add_argument("description", help="one line: the outcome, in the requester's terms")
+    jreg.add_argument("--requested-by", dest="requested_by",
+                      help="the phone number whose authority the job carries")
+    jreg.add_argument("--origin-message-id", dest="origin_message_id",
+                      help="the message the job answers, quoted with its result")
+    jreg.add_argument("--profile", help="the job profile (default: defaults.job_profile)")
+    jsubmit = _job("submit", help="Hand a draft to the runner")
+    jsubmit.add_argument("--confirm-active-jobs-checked", action="store_true",
+                         dest="confirm_active_jobs_checked",
+                         help="you read `jobs active` and this outcome is not there")
+    jamend = _job("amend", help="Continue a job with added context, keeping its session")
+    jamend.add_argument("text", help="what changed, in the requester's terms")
+    _job("discard", help="Drop a draft nobody will submit")
+    _job("stop", help="Stop the work; it keeps its session and its place")
+    _job("resume", help="Continue a stopped job")
+
     args = parser.parse_args()
 
     # The standard write gate: a write verb refuses on a read-only connection,
@@ -10938,6 +11287,7 @@ def main():
         "import-legacy": cmd_import_legacy,
         "send": cmd_send,
         "service": cmd_service,
+        "jobs": cmd_jobs,
     }[args.command](args)
 
     if result is not None:

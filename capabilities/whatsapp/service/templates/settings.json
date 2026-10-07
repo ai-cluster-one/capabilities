@@ -46,6 +46,9 @@
     "worker_timeout": 120,
     "max_parallel_dialogue": 1,
     "profile": "whatsapp-claude",
-    "send_rate": 20
+    "send_rate": 20,
+    "max_parallel_jobs": 1,
+    "job_profile": "whatsapp-job-claude",
+    "job_recovery": "requeue"
   }
 }

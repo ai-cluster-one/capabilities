@@ -1,0 +1,15 @@
+# Profile "whatsapp-job-codex": a WhatsApp job on codex.
+#
+# A job is handed work out of a dialogue turn and runs until it is done, with
+# the same access a dialogue turn has: full access, approvals never asked, and
+# the project's hooks run without trust recorded on the machine. The
+# requester's authority is not here: the service hands it to each run as
+# CAPABILITIES_AUTH_CONTEXT. A job has no room waiting on it, so this deadline
+# is its only one.
+
+harness = "codex"
+model = "sol"
+approval_policy = "never"
+codex_config = { sandbox_mode = "danger-full-access" }
+bypass_hook_trust = true
+timeout_seconds = 86400

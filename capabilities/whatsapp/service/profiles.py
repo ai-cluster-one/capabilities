@@ -5,14 +5,15 @@
 #     "callva-harness-runner==0.8.0",
 # ]
 # ///
-"""The profiles a WhatsApp dialogue turn may run on, and whether one fits.
+"""The profiles a WhatsApp dialogue turn or job may run on, and whether one fits.
 
 A profile says how the model runs; it is a callva-harness-runner profile file,
 found by the runner's own discovery with this service's folders first: the
 project's `capabilities/whatsapp/service/profiles/`, then the bundle's
 `service/profiles/`, then the machine folder, then the runner's shipped set.
 The first file found is used whole. The bundle ships `whatsapp-claude` and
-`whatsapp-codex`; a project file of the same name shadows either.
+`whatsapp-codex` for dialogue turns and `whatsapp-job-claude` and
+`whatsapp-job-codex` for jobs; a project file of the same name shadows any.
 
 Fit is what the service needs of a profile to work, checked after the runner
 has read and validated the file: free text it can cut at the reply marker, and
@@ -33,7 +34,9 @@ from pathlib import Path
 
 RUNNER_PIN = "callva-harness-runner==0.8.0"
 DEFAULT_PROFILE = "whatsapp-claude"
-BUNDLED = ("whatsapp-claude", "whatsapp-codex")
+DEFAULT_JOB_PROFILE = "whatsapp-job-claude"
+BUNDLED = ("whatsapp-claude", "whatsapp-codex", "whatsapp-job-claude",
+           "whatsapp-job-codex")
 HERE = Path(__file__).resolve().parent
 
 

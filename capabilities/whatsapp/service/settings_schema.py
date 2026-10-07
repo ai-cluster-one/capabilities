@@ -33,7 +33,8 @@ USER_KEYS = {"name", "role", "profile", "worker_timeout", "context"}
 GROUP_KEYS = {"name", "require_reference", "aliases", "may_address",
               "member_role", "profile", "worker_timeout", "context"}
 DEFAULT_KEYS = {"tail_size", "debounce", "max_age", "worker_timeout",
-                "max_parallel_dialogue", "profile", "send_rate"}
+                "max_parallel_dialogue", "profile", "send_rate",
+                "max_parallel_jobs", "job_profile", "job_recovery"}
 NUMERIC_DEFAULTS = {
     "tail_size": (1, 500, True),
     "debounce": (0, 300, False),
@@ -41,7 +42,12 @@ NUMERIC_DEFAULTS = {
     "worker_timeout": (1, 3600, False),
     "max_parallel_dialogue": (1, 32, True),
     "send_rate": (1, SEND_RATE_CEILING, True),
+    "max_parallel_jobs": (1, 32, True),
 }
+# What happens to a job whose listener went away while it ran: `requeue`
+# continues it on its recorded session, `inspect` stops it and reports it to
+# the chat. A job without a recorded session is always stopped and reported.
+JOB_RECOVERY = {"requeue", "inspect"}
 
 
 def _fail(path, message):
@@ -274,6 +280,10 @@ def _defaults(value, path):
                     integer=integer, nullable=True)
     if "profile" in value:
         _profile(value["profile"], f"{path}.profile")
+    if "job_profile" in value:
+        _profile(value["job_profile"], f"{path}.job_profile")
+    if "job_recovery" in value and value["job_recovery"] is not None:
+        _enum(value["job_recovery"], JOB_RECOVERY, f"{path}.job_recovery")
 
 
 def validate_settings(settings):
@@ -355,9 +365,10 @@ def dialogue_configured(settings):
     return bool(settings.get("allowed_users")) and (direct.get("mode") or "allowlist") != "off"
 
 
-def profile_names(settings, default):
+def profile_names(settings, default, job_default=None):
     """Every profile name the settings reach, the default first, each once,
-    with the positions that name it."""
+    with the positions that name it. The job profile is reached when the
+    settings name one or a default for it is given."""
     settings = settings if isinstance(settings, dict) else {}
     found = {}
 
@@ -366,6 +377,8 @@ def profile_names(settings, default):
             found.setdefault(name, []).append(where)
 
     add((settings.get("defaults") or {}).get("profile") or default, "defaults.profile")
+    add((settings.get("defaults") or {}).get("job_profile") or job_default,
+        "defaults.job_profile")
     for phone, policy in (settings.get("allowed_users") or {}).items():
         add((policy or {}).get("profile"), f"allowed_users.{phone}.profile")
     for jid, policy in (settings.get("allowed_groups") or {}).items():

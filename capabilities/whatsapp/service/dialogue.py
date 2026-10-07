@@ -13,6 +13,11 @@ runs on the harness runner from a profile, in its own thread, per chat in
 arrival order after a debounce; its answer goes out as a pending row in
 `whatsapp_messages`, which the listener sends like any other.
 
+A turn may hand longer work to a job through the worker shim on its PATH. Once
+the job is submitted the turn is over: it ends on its own with a short line, or
+is ended after a grace period and the job's description is sent instead. The
+job runner (`jobs.py`) runs the job and answers into the chat later.
+
 Nothing here imports the CLI. The listener hands in `cli`, an object whose
 attributes are the CLI's own functions (the store, the outgoing queue, the
 records), so this module and the verbs share one implementation of each.
@@ -39,6 +44,10 @@ REPLY_PART_CHARS = 3500          # one outgoing message, at most
 PRESENCE_EVERY = 8.0             # composing lapses on the phone after ~10s
 REGISTER_OVERLAP = 86400         # processed ids are kept this far behind the watermark
 DEFER_RETRY = 5.0                # how often a message the store could not judge is tried again
+HANDOFF_POLL = 1.0               # how often a running turn is checked for a submitted job
+HANDOFF_GRACE = 8.0              # how long a turn that handed off may take to end on its own
+HANDOFF_MARK = "\u25b6 "         # what leads the acknowledgement of a handed-off job
+WORKER_BIN = Path(__file__).resolve().parent / "worker-bin"
 
 DEFAULTS = {
     "tail_size": 40,
@@ -46,6 +55,8 @@ DEFAULTS = {
     "max_age": 600,
     "worker_timeout": 120,
     "max_parallel_dialogue": 1,
+    "max_parallel_jobs": 1,
+    "job_recovery": "requeue",
 }
 CONTROL_COMMANDS = ("status", "set", "reload", "stop", "help")
 CONTROL_DEFAULTS = {
@@ -594,6 +605,9 @@ def build_prompt(state: dict, tail: list[dict]) -> str:
     """Service context, the chat's own overlay, the channel state the service
     resolved, the current request, and the conversation tail from the store."""
     context = (state.get("context") or "").strip()
+    delegation = (state.get("delegation") or "").strip()
+    if delegation:
+        context = f"{context}\n\n{delegation}" if context else delegation
     overlay = (state.get("channel_context") or "").strip()
     req = state.get("request") or {}
     settings = state.get("settings") or {}
@@ -614,6 +628,10 @@ def build_prompt(state: dict, tail: list[dict]) -> str:
     lines.append("Delivery: final reply is sent by the service "
                  + ("as a reply quoting the request message" if req.get("quoted")
                     else "as a plain direct message"))
+    if state.get("jobs_command"):
+        lines.append(f"Jobs command: {state['jobs_command']}")
+    if state.get("queue_paused"):
+        lines.append(f"Queue paused: {state['queue_paused']}")
     request = [
         "--- Current request ---",
         f"Message: #{req.get('message_id')}",
@@ -626,6 +644,59 @@ def build_prompt(state: dict, tail: list[dict]) -> str:
     parts = [context] if context else []
     if overlay:
         parts.append("--- Channel-specific context ---\n" + overlay)
+    parts.append("--- Channel state ---\n" + "\n".join(lines))
+    parts.append("\n".join(request))
+    parts.append("--- Conversation ---\n"
+                 + format_conversation(tail, state.get("assistant_name") or "the assistant"))
+    return "\n\n".join(parts)
+
+
+def build_job_prompt(state: dict, tail: list[dict]) -> str:
+    """A job's prompt: the job worker's own prose as the whole of its context,
+    the channel state naming the job, the work, and the conversation it came
+    from. A job continuing its session is told only what changed."""
+    job = state.get("job") or {}
+    req = state.get("request") or {}
+    settings = state.get("settings") or {}
+    run = [f"registered job {job.get('id')}", f"attempt {job.get('attempt')}"]
+    if job.get("origin_message_id"):
+        run.append(f"registered from message #{job['origin_message_id']}")
+    if job.get("amendments"):
+        run.append(f"{job['amendments']} amendment(s)")
+    delivery = ("what you return at the end is posted into this chat when the job "
+                "finishes, quoting the message that asked for it; return nothing and "
+                "nothing is posted")
+    if state.get("resumed"):
+        added = state.get("amendments") or []
+        lines = ["Run: " + ", ".join(run) + ", continued on its session"]
+        if added:
+            lines.append("The person added this to the job, in this order:")
+            lines += [f"- {text}" for text in added]
+            lines.append("Continue the job with it taken into account.")
+        else:
+            lines.append("The service stopped while this job was running. Continue it "
+                         "from where it stopped.")
+        lines.append(f"Delivery: {delivery}.")
+        return "\n".join(lines)
+    lines = ["Run: " + ", ".join(run)]
+    if state.get("now"):
+        lines.append(f"Time: {state['now']}")
+    bits = [f"chat_id={state.get('chat_id')}", f"type={state.get('chat_type')}",
+            f"connection={state.get('connection')}", f"profile={settings.get('profile')}"]
+    if state.get("chat_name"):
+        bits.append(f"name={state['chat_name']}")
+    lines.append("Channel: " + ", ".join(bits))
+    lines.append(f"Counterpart(s): {req.get('sender_name')} (role: {req.get('sender_role')})")
+    lines.append(f"Tool authority: {authority_summary(state.get('authority'))}")
+    lines.append(f"Context window: {len(tail)} msgs (of max {settings.get('tail_size')})")
+    lines.append(f"Delivery: {delivery}")
+    text = "\n\n".join([job.get("description") or "", *(state.get("amendments") or [])])
+    request = ["--- Current request ---",
+               f"Message: #{req.get('message_id')}",
+               f"From: {req.get('sender_name')} (role: {req.get('sender_role')})",
+               "Kind: registered job", text.strip(), ""]
+    context = (state.get("context") or "").strip()
+    parts = [context] if context else []
     parts.append("--- Channel state ---\n" + "\n".join(lines))
     parts.append("\n".join(request))
     parts.append("--- Conversation ---\n"
@@ -647,6 +718,8 @@ class Run:
         self.thread: threading.Thread | None = None
         self.started = time.time()
         self.pid = None
+        self.handoff: dict | None = None     # the job this turn submitted
+        self.handed_off = False              # ended by the service after the handoff
 
 
 class Dialogue:
@@ -681,13 +754,15 @@ class Dialogue:
         self.next_retry = 0.0
         self.store_error: str | None = None
         self.stats = {"admitted": 0, "turns": 0, "answered": 0, "silent": 0,
-                      "failed": 0, "stopped": 0, "commands": 0}
+                      "failed": 0, "stopped": 0, "handed_off": 0, "commands": 0}
         self.profile_cache: dict[str, tuple] = {}
         self.settings = settings
         self.policy = Policy(settings, profiles.DEFAULT_PROFILE)
         self.environment = settings.get("environment") or "production"
         self.register = Register(cli, db, project_id, self.environment)
         self.project_id = project_id
+        # The job runner, when the listener runs one; None offers no delegation.
+        self.jobs = None
 
     # -- settings and profiles ----------------------------------------------
 
@@ -697,7 +772,8 @@ class Dialogue:
         from_schema = self.cli._service_schema()
         cache = {}
         for name, where in from_schema.profile_names(
-                settings, self.profiles.DEFAULT_PROFILE).items():
+                settings, self.profiles.DEFAULT_PROFILE,
+                self.profiles.DEFAULT_JOB_PROFILE).items():
             try:
                 cache[name] = self.profiles.resolve(name, self.folders())
             except ValueError as exc:
@@ -875,6 +951,7 @@ class Dialogue:
                 "quoted_id": msg.get("quoted_id"), "phone": phone,
                 "sender_name": sender_name, "role": verdict["role"],
                 "command": verdict.get("command"), "group": is_group(chat),
+                "sender": msg.get("sender") or msg.get("sender_lid"),
                 "self_chat": chat in {self.identity.get("jid"), self.identity.get("lid")}}
 
     def channel(self, chat, phone) -> dict:
@@ -940,7 +1017,7 @@ class Dialogue:
             profile = f"{channel['profile']} (unusable: {exc})"
         running = len(self.running.get(chat) or {})
         queued = len(self.queues.get(chat) or ())
-        return "\n".join([
+        lines = [
             f"assistant service: connection {self.cfg.get('id')}, environment "
             f"{self.environment}",
             f"this chat: {chat} ({'group' if job['group'] else 'direct'}), "
@@ -951,7 +1028,26 @@ class Dialogue:
             f"turns: running {running}, queued {queued}; answered "
             f"{counters.get('answered', 0)}, silent {counters.get('silent', 0)}, "
             f"failed {counters.get('failed', 0)}",
-        ])
+        ]
+        return "\n".join(lines + self.job_status_lines(chat))
+
+    def job_status_lines(self, chat) -> list[str]:
+        """The chat's open jobs, oldest first, and the queue's pause."""
+        if self.jobs is None:
+            return []
+        try:
+            rows = self.jobs.open_jobs(chat)
+        except Exception as exc:
+            return [f"jobs: the register could not be read ({self.cli._error_line(exc)})"]
+        lines = [f"jobs: {len(rows)} open in this chat"
+                 + (f" (at most {self.jobs.max_parallel()} run at once)" if rows else "")]
+        for row in rows:
+            state = row["state"] + (", stopping" if row.get("stop_requested") else "")
+            lines.append(f"- {row['id'][:8]} {state}: {row['description']}")
+        notice = self.jobs.pause_notice()
+        if notice:
+            lines.append(f"queue paused: {notice}")
+        return lines
 
     def set_help(self, job) -> str:
         channel = self.channel(job["chat_id"], job["phone"])
@@ -1000,6 +1096,8 @@ class Dialogue:
                          "remain active" if error else "ok, settings reloaded")
 
     def stop_chat(self, chat) -> bool:
+        """`/stop`: end the chat's running turn, drop what is queued, and stop
+        the chat's jobs."""
         stopped = False
         with self.lock:
             self.queues.pop(chat, None)
@@ -1008,6 +1106,12 @@ class Dialogue:
                 run.stopped = True
                 run.cancel.set()
                 stopped = True
+        if self.jobs is not None:
+            try:
+                stopped = self.jobs.stop_chat(chat) or stopped
+            except Exception as exc:
+                self.log(f"dialogue: {chat} /stop could not reach the job register: "
+                         f"{self.cli._error_line(exc)}")
         return stopped
 
     # -- the turn ------------------------------------------------------------
@@ -1124,9 +1228,101 @@ class Dialogue:
                         "date": stamp.strftime("%Y-%m-%d"), "time": stamp.strftime("%H:%M")})
         return out
 
-    def context_document(self) -> str:
-        doc = self.cli._records().document_read(self.cli.NAME, "context")
+    def context_document(self, key: str = "context") -> str:
+        doc = self.cli._records().document_read(self.cli.NAME, key)
         return ((doc or {}).get("body") or "").strip()
+
+    # -- jobs -----------------------------------------------------------------
+
+    cut_answer = staticmethod(cut_at_reply_marker)
+    split_text = staticmethod(split_reply)
+
+    def jobs_available(self, role) -> bool:
+        """Whether a turn for this role may hand work to a job: the listener
+        runs a job runner, its register answers, and the role's authority
+        admits `whatsapp jobs` (or the settings declare no authority)."""
+        if self.jobs is None:
+            return False
+        allowed = self.policy.authority(role)
+        if allowed is not None:
+            caps = allowed.get("allowed_capabilities") or {}
+            rule = caps.get(self.cli.NAME, caps.get("*"))
+            if rule in (None, False):
+                return False
+            if isinstance(rule, dict):
+                if rule.get("deny") is True or rule.get("enabled") is False \
+                        or rule.get("allow") is False:
+                    return False
+                verbs = rule.get("verbs")
+                if isinstance(verbs, list) and "jobs" not in verbs:
+                    return False
+        return self.jobs.reachable()
+
+    def job_profile_name(self) -> str:
+        return self.policy.defaults.get("job_profile") or self.profiles.DEFAULT_JOB_PROFILE
+
+    def worker_env(self, chat, origin_message_id, requester) -> dict:
+        """The service's variables every worker it starts runs with: the turn's
+        scope, which the shim and the CLI read rather than any argument, and
+        the shim ahead of everything else on PATH."""
+        env = {
+            "WHATSAPP_DAEMON_CHILD": "1",
+            "WHATSAPP_AUTHORIZED_CONNECTION": str(self.cfg.get("id")),
+            "WHATSAPP_AUTHORIZED_CHAT_ID": chat,
+            "WHATSAPP_AUTHORIZED_ORIGIN_MESSAGE_ID": str(origin_message_id or ""),
+            "WHATSAPP_AUTHORIZED_JOB_PROFILE": self.job_profile_name(),
+            "WHATSAPP_ENVIRONMENT": self.environment,
+            "WHATSAPP_REAL_WHATSAPP": str(Path(self.cli.__file__).resolve()),
+            "PATH": os.pathsep.join([str(WORKER_BIN), os.environ.get("PATH", "")]),
+        }
+        if requester:
+            env["WHATSAPP_AUTHORIZED_REQUESTER"] = str(requester)
+        return env
+
+    def job_role(self, row) -> str:
+        return self.policy.role(row["chat_id"], digits(row.get("requested_by")) or None)
+
+    def job_call(self, row: dict, amendments: list[str]) -> dict:
+        """Everything one job attempt runs with, as `call` is for a turn."""
+        chat = row["chat_id"]
+        phone = digits(row.get("requested_by")) or None
+        role = self.job_role(row)
+        sender_name = self.policy.name(phone) or (f"+{phone}" if phone
+                                                  else row.get("requested_by"))
+        channel = self.channel(chat, phone)
+        name = row.get("profile") or self.job_profile_name()
+        profile, origin = self.profile(name)
+        allowed = self.policy.authority(role)
+        group = is_group(chat)
+        authority = None
+        if allowed is not None:
+            authority = {"version": 1, "source": "whatsapp", "connection": self.cfg.get("id"),
+                         "chat_id": chat, "chat_type": "group" if group else "private",
+                         "chat_name": (self.policy.group(chat) or {}).get("name"),
+                         "sender_id": phone, "sender_name": sender_name,
+                         "sender_role": role, "job_id": row["id"], **allowed}
+        resumed = bool(row.get("session_id"))
+        tail = [] if resumed else self.tail(chat, self.now(), channel["tail_size"])
+        own = {self.identity.get("jid"), self.identity.get("lid")} - {None}
+        state = {
+            "context": "" if resumed else self.context_document("job-worker"),
+            "now": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "chat_id": chat, "chat_type": ("group" if group else
+                                           "self" if chat in own else "direct"),
+            "chat_name": (self.policy.group(chat) or {}).get("name"),
+            "connection": self.cfg.get("id"), "settings": {**channel, "profile": name},
+            "authority": authority, "assistant_name": self.policy.assistant_name,
+            "job": row, "amendments": amendments, "resumed": resumed,
+            "request": {"message_id": row.get("origin_message_id"),
+                        "sender_name": sender_name, "sender_role": role},
+        }
+        extra_env = self.worker_env(chat, row.get("origin_message_id"),
+                                    row.get("requested_by"))
+        extra_env["WHATSAPP_AUTHORIZED_JOB_ID"] = row["id"]
+        return {"prompt": build_job_prompt(state, tail), "profile": profile,
+                "origin": origin, "cwd": str(self.root),
+                "environ": scrub_env(os.environ), "extra_env": extra_env,
+                "authority": authority}
 
     def write_authority(self, authority, stem) -> str:
         folder = self.state_dir / "authority"
@@ -1155,8 +1351,12 @@ class Dialogue:
                          "sender_role": job["role"], **allowed}
         tail = self.tail(chat, job["ts"], channel["tail_size"])
         entry = self.policy.entry(chat, job["phone"])
+        delegate = self.jobs_available(job["role"])
         state = {
             "context": self.context_document(),
+            "delegation": self.context_document("delegation") if delegate else "",
+            "jobs_command": f"{WORKER_BIN / self.cli.NAME} jobs" if delegate else None,
+            "queue_paused": self.jobs.pause_notice() if delegate else None,
             "channel_context": entry.get("context"),
             "now": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
             "chat_id": chat, "chat_type": ("group" if job["group"] else
@@ -1168,18 +1368,12 @@ class Dialogue:
                         "sender_role": job["role"], "text": job["text"],
                         "quoted_id": job["quoted_id"], "quoted": job["group"]},
         }
-        extra_env = {
-            "WHATSAPP_DAEMON_CHILD": "1",
-            "WHATSAPP_AUTHORIZED_CONNECTION": str(self.cfg.get("id")),
-            "WHATSAPP_AUTHORIZED_CHAT_ID": chat,
-            "WHATSAPP_AUTHORIZED_ORIGIN_MESSAGE_ID": job["message_id"],
-        }
-        if job["phone"]:
-            extra_env["WHATSAPP_AUTHORIZED_REQUESTER"] = job["phone"]
+        extra_env = self.worker_env(chat, job["message_id"],
+                                    job["phone"] or job.get("sender"))
         return {"prompt": build_prompt(state, tail), "profile": profile, "origin": origin,
                 "cwd": str(self.root), "environ": scrub_env(os.environ),
                 "extra_env": extra_env, "authority": authority,
-                "timeout": float(channel["worker_timeout"])}
+                "timeout": float(channel["worker_timeout"]), "delegate": delegate}
 
     def runner_run(self):
         if self._run is not None:
@@ -1198,6 +1392,7 @@ class Dialogue:
         chat = job["chat_id"]
         authority_file = None
         timer = None
+        ended = threading.Event()
         self.stats["turns"] += 1
         outcome = "failed"
         try:
@@ -1218,11 +1413,25 @@ class Dialogue:
             if run.cancel.is_set():
                 outcome = "stopped"
                 return
+            if call.get("delegate"):
+                watcher = threading.Thread(target=self.watch_handoff, args=(run, ended),
+                                           name=f"handoff-{job['message_id']}", daemon=True)
+                watcher.start()
             result = self.runner_run()(
                 call["prompt"], call["profile"], call["cwd"], session=self.session_fresh(),
                 environ=call["environ"], extra_env=call["extra_env"], cancel=run.cancel,
                 on_start=lambda started: setattr(run, "pid", getattr(started, "pid", None)))
+            ended.set()
             timer.cancel()
+            if run.handoff is not None:
+                answer = "" if run.handed_off else cut_at_reply_marker(
+                    getattr(result, "answer", "") or "")
+                self.say(job, answer or HANDOFF_MARK + run.handoff["description"],
+                         typing=True)
+                outcome = "handed_off"
+                self.log(f"dialogue: {chat} #{job['message_id']} handed off to job "
+                         f"{run.handoff['id']}")
+                return
             if run.stopped:
                 outcome = "stopped"
                 return
@@ -1250,6 +1459,7 @@ class Dialogue:
             with contextlib.suppress(Exception):
                 self.say(job, "I could not answer this one (error).")
         finally:
+            ended.set()
             if timer is not None:
                 timer.cancel()
             if authority_file:
@@ -1264,7 +1474,29 @@ class Dialogue:
                 self.presence(self.session, chat, composing=False)
             self.log(f"dialogue: {chat} #{job['message_id']} turn {outcome}")
 
+    def watch_handoff(self, run: Run, ended: threading.Event) -> None:
+        """Watch a running turn for the job it hands its request to. Once one
+        is submitted the turn is over: it gets `HANDOFF_GRACE` seconds to end
+        on its own, and is then ended so it cannot start the work a second
+        time."""
+        job = run.job
+        while not ended.wait(HANDOFF_POLL):
+            try:
+                row = self.jobs.register.submitted_from(job["chat_id"], job["message_id"])
+            except Exception:
+                continue
+            if row is not None:
+                run.handoff = row
+                break
+        if run.handoff is None or ended.wait(HANDOFF_GRACE):
+            return
+        run.handed_off = True
+        run.cancel.set()
+
     def summary(self) -> dict:
-        return {"enabled": True, "running": self.busy(), "queued": self.queued(),
-                "deferred": len(self.deferred), "store_error": self.store_error,
-                **self.stats}
+        out = {"enabled": True, "running": self.busy(), "queued": self.queued(),
+               "deferred": len(self.deferred), "store_error": self.store_error,
+               **self.stats}
+        if self.jobs is not None:
+            out["jobs"] = self.jobs.summary()
+        return out

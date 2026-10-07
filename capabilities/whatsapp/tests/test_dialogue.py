@@ -431,10 +431,10 @@ class Register(DialogueCase):
     def test_the_register_is_a_step_of_its_own_under_the_naming_law(self):
         steps = [r["step"] for r in self.db.execute(
             "SELECT step FROM schema_ledger WHERE owner = 'whatsapp' ORDER BY step")]
-        self.assertEqual(steps[-1], "0013-register")
+        self.assertEqual(steps[12], "0013-register")
         version = self.db.execute(
             "SELECT major, minor FROM schema_version WHERE owner = 'whatsapp'").fetchone()
-        self.assertEqual((version["major"], version["minor"]), (1, 2))
+        self.assertEqual((version["major"], version["minor"]), (1, wa.STORE_SCHEMA_MINOR))
         columns = {r["column_name"] for r in self.db.execute(
             "SELECT column_name FROM information_schema.columns"
             " WHERE table_name = 'whatsapp_register'")}
