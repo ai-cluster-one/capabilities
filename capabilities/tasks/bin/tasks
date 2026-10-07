@@ -375,7 +375,9 @@ WORKERS
   A routine or a profile a worker names that is not there fails loudly:
   `doctor` names it, and `run` parks the task it takes - handed back with an
   entry naming what is missing, without starting a turn and without spending
-  an attempt.
+  an attempt. In a project that sets an escalation chain, any claim of the
+  project escalates the tasks such a worker takes first, as ESCALATION
+  states, so there is nothing left for it to park.
 
   `${VAR}` inside a front-matter string is read from the environment, then from
   the project's `.env` and `.env.local`, and a name nothing answers for is
@@ -550,12 +552,16 @@ ESCALATION
   `limits.attempts` counts raises in place and the whole-life count that
   parks a task is not applied.
 
-  To escalate is to move the task: to `waiting`, its pickup let go, assigned
-  to the name after its assignee in the chain, or the chain's first name when
-  its assignee is not in it, with one trail entry by actor `tasks:scan`:
-  whom from and to, why - the hook's last stdout line, or the attempts and the
-  worker's `park_hint` - since when it stood in place, since when it was held
-  back when it was, and its raises in place.
+  To escalate is to move the task: to `waiting`, its pickup and its
+  `blocked_by` let go, assigned to the name after its assignee in the chain,
+  or the chain's first name when its assignee is not in it, with one trail
+  entry by actor `tasks:scan`: whom from and to, why - the hook's last stdout
+  line, the attempts and the worker's `park_hint`, or the dead end below -
+  since when it stood in place, since when it was held back when it was, its
+  raises in place, and the blockers it let go while they were still open. The
+  blockers go because no worker's filter takes a waiting task whose
+  `blocked_by` names an open task, so kept, they would hide the task from the
+  name it went to; a blocker still wanted is set again by whoever takes it.
   The moves are rows in its history by the same actor. When the name it went
   to cannot move it under the same rules, the next escalation goes on to the
   next name, ending at the person. `run` reports each move under `escalated`
@@ -563,6 +569,62 @@ ESCALATION
   so does the service's log line; without --apply it is named under
   `would_escalate` and not made. A task named with --key that its claim
   escalates is refused with exit 6 saying so, after the move.
+
+  DEAD ENDS. A task can stand where no rule will ever move it and nobody named
+  will: a dead end. A run's first claim - the claim of any worker of the
+  project, by hand or by the service - scans the project's open tasks for them
+  in one read, after the sweeps and before it takes anything, and decides from
+  the store and the worker files alone. A task on a person or on nobody is
+  never one, and neither is one an open raise holds. A task in `todo` or
+  `waiting` is a dead end when:
+
+    no enabled worker takes it  its assignee is a worker here, and no enabled
+                                worker that can be read takes it there - by
+                                status, type, assignee and tags, a worker's
+                                `on_request` types counting as taken - which
+                                is what a task on a worker switched off, or on
+                                one whose file cannot be read, comes to. A
+                                waiting task whose wait ends on its own, by an
+                                appointed pickup or by blockers, is returned to
+                                `todo` when it does, so a worker taking it
+                                there takes it too
+    its worker cannot run       every worker that takes it names a profile or
+                                a routine that is not there
+    its blockers can never      it waits on a `blocked_by` that names no task,
+    all end                     names a draft, which only a person releases, or
+                                waits on it in turn through blockers still open
+
+  With a chain, each is escalated at once - no ceiling is waited out - and the
+  entry's why names the rule: "no enabled worker takes it (status, type,
+  assignee, tags)" with what the assignee's worker takes or why it takes
+  nothing, "its worker cannot run" with what is missing, or "its blockers can
+  never all end" with the name, the draft or the cycle. Without a chain
+  nothing moves: `run` names each under `dead_ends` - the task and `why` - and
+  so does the service's log line. A task named with --key is left to that run.
+  The service starts a claim for a dead end its project's chain would move, at
+  its poll, as it does for a lapsed lease.
+
+  A write never leaves a task in one by construction. `add`, `set` and
+  `release` refuse with exit 4 `policy` a write that would leave a task in
+  `todo` or `waiting` on a name that is a worker here which no enabled worker
+  takes there, naming the rule and what that worker takes; `set` judges a
+  write that moves the task's status, assignee or type, as it stands once
+  written. A person's name is any name that is no worker file, and is always
+  taken. A task of another project is not judged here, since its workers are
+  that project's. `meta set` refuses blockers that can never all end, as
+  METADATA VALUES states, and `in_progress` is written only by a claim. A
+  worker switched off or edited after tasks were left on it is caught by the
+  scan.
+
+  `doctor` names, per worker, every place its turn may land the task it holds
+  where no enabled worker takes it: a name in its `writes.held.assignee` that
+  is a worker here, with each status of `todo` and `waiting` its
+  `writes.held.status` allows - `todo` when it writes no status, since a turn
+  that leaves its task in progress is put back there - for the types and tags
+  its own filters take. Each is listed on the worker as `lands_untaken`
+  (`assignee`, `status`, `types`) and said as a warning; the write itself is
+  refused, so the turn stops short of its ending there. A worker writing any
+  assignee, or none, names no place to judge.
 
 SERVICE
   tasks service init [--force]    write capabilities/tasks/service/config.toml
@@ -923,7 +985,11 @@ FIELDS  (add and set take the same set)
   --status VALUE        draft | todo | in_progress | waiting | complete | closed.
                         Defaults to draft on add. `draft` means one thing and
                         only one: nobody has released it yet. `ready` never
-                        returns one and `claim` never takes one.
+                        returns one and `claim` never takes one. `in_progress`
+                        is written only by a claim, which opens the raise that
+                        holds the task there: `add`, `set` and `release` refuse
+                        it with exit 4, since a task put there by hand has no
+                        raise, so no claim takes it and no lease frees it.
 
                         `waiting` means the task is over to its assignee, and it
                         names whom it waits for: setting it needs an assignee,
@@ -956,7 +1022,9 @@ FIELDS  (add and set take the same set)
                         not out of the way: it still reads as backlog somebody
                         has yet to release.
   --assignee TEXT       who carries it. Free text - a name, not a key into any
-                        directory.
+                        directory. A name that is a worker of this project is
+                        held to what that worker takes: ESCALATION states the
+                        writes refused for leaving a task where nobody takes it.
   --pickup WHEN         do not raise the task before this moment. A bare date
                         means midnight in the connection's timezone; give a full
                         moment (2026-09-10T14:30+03:00) when the hour matters.
@@ -993,6 +1061,12 @@ METADATA VALUES
   Metadata is for what code filters on. Anything a person reads belongs in the
   description: a copy of the conversation in here will disagree with the
   conversation, and the worker will believe the copy.
+
+  `blocked_by` is a list of tasks, each by its key in this project or by its
+  id, and the capability reads it as the wait a task is in. `meta set` refuses
+  with exit 4 a list naming something that is no task, or one that closes a
+  cycle - a blocker that, through blockers still open, waits on this task -
+  because blockers that can never all end are a wait nobody ends.
 
 ACTOR
   Every write carries who made it. `add` keeps it as the task's `created_by`,
@@ -1285,7 +1359,8 @@ WATCH
     {"event": K, "task": ROW}
         K is `task_changed` (the task was created, a field moved, or it was
         saved), `activity_added` (its trail grew), `run_started` or
-        `run_ended` (a raise opened or closed). ROW is the task as one `list`
+        `run_ended` (a raise opened or closed; the row a hold episode records,
+        being no raise, announces nothing). ROW is the task as one `list`
         row prints it, read when the change arrives, so it is the task as it
         is now. Changes committed together arrive together, one line per kind
         and task, so a burst that moves one task twice prints it once.
@@ -1392,8 +1467,9 @@ EXIT CODES
     reader going away
   3 not found - no task for that uuid or unique key, or no worker of that name
   4 policy - the capability is disabled, the connection does not allow writes,
-    the worker is switched off, or worker scope or project scope refuses the
-    write; ask the user, never lift the gate yourself
+    the worker is switched off, worker scope or project scope refuses the
+    write, or the write would leave a task where it can never move - see
+    ESCALATION; ask the user, never lift the gate yourself
   5 store - unreachable once the retry window STORE describes is spent, or the
     schema is not present; `tasks doctor` proves both.
     For `watch`, also a store that does not announce changes
@@ -6409,6 +6485,13 @@ def cmd_add(entry, args: list[str]) -> None:
             # assignee a draft does not need.
             coerced = _worker_new(values, _execution_lookup(cur))
             _wait_has_a_name(values["status"], values.get("assignee"))
+        # A task is created where it can move: never in progress, which only a
+        # claim writes, and never open on a worker that does not take it there.
+        if values["status"] == "in_progress":
+            _die(4, "policy", _IN_PROGRESS_REFUSAL, _IN_PROGRESS_HINT)
+        landing = _landing_refusal({**values, "tags": [], "metadata": {}})
+        if landing:
+            _die(4, "policy", landing, _LANDING_HINT)
         cols = list(values)
         cur.execute(f"""insert into {SCHEMA}.tasks ({', '.join(cols)})
                         values ({', '.join(['%s'] * len(cols))})
@@ -6467,6 +6550,10 @@ def cmd_set(entry, args: list[str]) -> None:
         # nobody asked about open on somebody else's task.
         if not values or set(values) - {"status", "type", "assignee", "pickup_at"}:
             _worker_gate("set", tid, lookup)
+        # Only a claim puts a task in progress, because only a claim opens the
+        # raise that holds it there; a worker's own fence already refuses it.
+        if values.get("status") == "in_progress":
+            _die(4, "policy", _IN_PROGRESS_REFUSAL, _IN_PROGRESS_HINT)
         before = _task_row(cur, tid)
         handed_back = (before["project_id"] != _writing_project()
                        and before["status"] == "waiting"
@@ -6486,6 +6573,15 @@ def cmd_set(entry, args: list[str]) -> None:
         cur.execute(f"""update {SCHEMA}.tasks set {', '.join(assignments)}
                          where id = %s returning *""", [values[c] for c in cols] + [tid])
         row = _rows(cur)[0]
+        # A write that moves where a task stands - its status, its assignee or
+        # its type - may not leave it open on a worker that does not take it
+        # there. Judged on the row as written, so a wait's dropped pickup and
+        # spent blockers count, and nothing is kept when it is refused.
+        if handed_back or {"status", "assignee", "type"} & set(values):
+            landing = _landing_refusal(row)
+            if landing:
+                conn.rollback()
+                _die(4, "policy", landing, _LANDING_HINT)
         # The move is recorded here, under the verb that made it, rather than by
         # whoever remembered to write it down afterwards.
         moved = _record_moves(cur, tid, before, row,
@@ -6607,6 +6703,19 @@ def cmd_meta(entry, args: list[str]) -> None:
                 except json.JSONDecodeError:
                     value = raw
                 params += [key, json.dumps(value)]
+                if key == "blocked_by":
+                    # Blockers that can never all end are a wait nobody ends: a
+                    # name that is no task, or a list that waits on this task
+                    # through its own blockers, is refused before it is written.
+                    named = _blocked_by({"metadata": {"blocked_by": value}})
+                    why = (_Blockers(cur).problem(_task_row(cur, tid), named, drafts=False)
+                           if named else None)
+                    if why:
+                        _die(4, "policy",
+                             f"a blocked_by may not name blockers that can never all "
+                             f"end: {why}",
+                             "name each blocker by its key in this project or by its "
+                             "id, and no task that waits on this one")
             # One statement for every pair. jsonb_build_object takes at most 100
             # arguments, so 50 pairs; the parser above admits 48.
             built = ", ".join(["%s::text, %s::jsonb"] * len(pairs))
@@ -7137,11 +7246,21 @@ def _claim(entry, opts: dict) -> dict:
     # by hand, or in a project without one, escalates nothing.
     escalation = opts.get("escalation")
     escalated: list = []
+    dead_ends: list = []
     with _connect(entry) as conn, conn.cursor() as cur:
         swept = _sweep_leases(cur, project)
         # Before the selection, so a wait that ended is work this same call can
         # take rather than work the next call finds.
         returned = _sweep_waiting(cur, project)
+        if opts.get("structure") is not None:
+            # A run's first claim scans the project for dead ends, after the
+            # sweeps so a wait they ended on a name nobody takes in todo is
+            # caught by this same claim. A task named with --key is that run's.
+            spare = (_task_id(cur, opts["key"], writing=True),) if opts.get("key") else ()
+            scanned = _scan(cur, escalation, opts["structure"], project, write=True,
+                            spare=spare)
+            escalated += scanned["escalated"]
+            dead_ends += scanned["dead_ends"]
         if opts.get("key"):
             # Naming a task asks a different question from asking for work, and
             # it deserves a different answer. Finding nothing is the ordinary
@@ -7180,8 +7299,13 @@ def _claim(entry, opts: dict) -> dict:
             lane = _lane_held(cur, opts["lane"], project) if opts.get("lane") else None
             if lane is not None:
                 conn.commit()
-                return {"claimed": None, "swept": [str(r["id"]) for r in swept],
-                        "returned": [_address(t) for t in returned], "lane_held": lane}
+                answer = {"claimed": None, "swept": [str(r["id"]) for r in swept],
+                          "returned": [_address(t) for t in returned], "lane_held": lane}
+                if escalated:
+                    answer["escalated"] = escalated
+                if dead_ends:
+                    answer["dead_ends"] = dead_ends
+                return answer
             passed = _held_over(cur, opts, project, _zone(entry))
             while True:
                 cur.execute(f"""select * from {SCHEMA}.tasks{where}
@@ -7206,6 +7330,8 @@ def _claim(entry, opts: dict) -> dict:
                     answer["passed_over"] = passed
                 if escalated:
                     answer["escalated"] = escalated
+                if dead_ends:
+                    answer["dead_ends"] = dead_ends
                 return answer
         before = rows[0]
         tid = str(before["id"])
@@ -7274,6 +7400,8 @@ def _claim(entry, opts: dict) -> dict:
             answer["passed_over"] = passed
         if escalated:
             answer["escalated"] = escalated
+        if dead_ends:
+            answer["dead_ends"] = dead_ends
         if opts.get("run"):
             answer["previous"] = previous
         return answer
@@ -7319,6 +7447,10 @@ def cmd_release(entry, args: list[str]) -> None:
     status = opts.get("status") or None
     if status is not None:
         _one_of(status, STATUSES, "status")
+        if status == "in_progress":
+            _die(4, "policy", _IN_PROGRESS_REFUSAL,
+                 "release lands the task anywhere else; the raise it closes is what "
+                 "held it in progress")
     metrics = "{}"
     if opts.get("metrics"):
         try:
@@ -7338,16 +7470,22 @@ def cmd_release(entry, args: list[str]) -> None:
     ref = opts["_loose"][0]
     try:
         answer = _release(entry, ref, outcome, status, opts.get("detail"),
-                          run_system, run_ref, metrics)
+                          run_system, run_ref, metrics, judged=True)
     except Refusal as refused:
         _die(refused.exit_code, refused.code, refused.message, refused.hint)
     _emit(answer)
 
 
 def _release(entry, ref: str, outcome: str, status: str | None, detail: str | None,
-             run_system: str | None, run_ref: str | None, metrics: str) -> dict:
+             run_system: str | None, run_ref: str | None, metrics: str,
+             judged: bool = False) -> dict:
     """Closing the raise itself, answered rather than printed, and refusing by
     exception rather than by exit.
+
+    `judged`, for the verb, refuses a landing that leaves the task open on a
+    worker that does not take it there. `run` closing its own raise is not
+    judged: it puts the task back where its claim found it, and the claim
+    scan catches what that leaves.
 
     `run` closes the raise it opened, and a lapse is exactly the case where it
     must go on: the task may already be with somebody else, and saying so on the
@@ -7417,6 +7555,11 @@ def _release(entry, ref: str, outcome: str, status: str | None, detail: str | No
         cur.execute(f"""update {SCHEMA}.tasks set status = %s{extra}, updated_at = now()
                          where id = %s returning *""", (status, tid))
         after = _rows(cur)[0]
+        landing = _landing_refusal(after) if judged else None
+        if landing:
+            conn.rollback()
+            raise Refusal(4, "policy", landing, _LANDING_HINT
+                          + "; --status lands it elsewhere")
         moved = _record_moves(cur, tid, before, after, execution_id=str(closed["id"]),
                               actor=execution.get("worker"))
         conn.commit()
@@ -7802,12 +7945,21 @@ def _attempts_reason(escalation: dict, task: dict, facts: dict) -> str | None:
 def _escalate(cur, task: dict, target: str, why: str, facts: dict,
               project: str) -> dict:
     """Move a task that cannot move over to `target`: waiting on that name, its
-    pickup let go, a spent blocked_by dropped as any wait drops one, and one
-    entry by the claim scan saying why, since when it stood in place, and its
-    raises in place."""
+    pickup and its blocked_by let go, and one entry by the claim scan saying
+    why, since when it stood in place, its raises in place, and the blockers it
+    let go that were still open.
+
+    The blockers go because an escalation hands the task to someone to decide
+    now: a waiting task whose blocked_by still names an open task is taken by no
+    worker's filter, so kept, they would hide the task from the very name it
+    went to. Named in the entry, a blocker still wanted is set again by
+    whoever takes it."""
     tid = str(task["id"])
     before = _task_row(cur, tid)
-    extra = ", metadata = metadata - 'blocked_by'" if _spent_blockers(cur, before) else ""
+    named = _blocked_by(before)
+    extra = ", metadata = metadata - 'blocked_by'" if named else ""
+    ended = _ended_among(cur, sorted(set(named)), before["project_id"]) if named else set()
+    still = [one for one in named if one not in ended]
     cur.execute(f"""update {SCHEMA}.tasks
                        set status = 'waiting', assignee = %s, pickup_at = null{extra},
                            updated_at = now()
@@ -7820,11 +7972,16 @@ def _escalate(cur, task: dict, target: str, why: str, facts: dict,
     said = (f"Escalated from {held_by or 'nobody'} to {target}: {why}. In place since "
             f"{place}" + (f", due since {refused}" if refused != place else "")
             + (f", held back since {held}" if held else "")
-            + f"; {facts['raises_in_place']} raise(s) in place.")
+            + f"; {facts['raises_in_place']} raise(s) in place."
+            + (f" Its blocked_by ({', '.join(still)}) is let go while still open, so "
+               f"{target} takes it now." if still else ""))
     _add_activity(cur, tid, said, SCAN_ACTOR)
-    return {"task": _address(after), "task_id": tid, "from": held_by or None,
-            "to": target, "why": why, "in_place_since": place,
-            "raises_in_place": int(facts["raises_in_place"])}
+    moved = {"task": _address(after), "task_id": tid, "from": held_by or None,
+             "to": target, "why": why, "in_place_since": place,
+             "raises_in_place": int(facts["raises_in_place"])}
+    if still:
+        moved["blocked_by_let_go"] = still
+    return moved
 
 
 def _still_where_seen(cur, task: dict, write: bool) -> dict | None:
@@ -7942,6 +8099,353 @@ def _held_back(entry, escalation: dict, task: dict, said: str | None, how: str, 
         moved = _escalate(cur, row, target, why, facts, _writing_project())
         conn.commit()
     return moved
+
+
+# --- Structural dead ends ----------------------------------------------------
+
+# The statuses a task stands in while it is over to somebody: the two a worker
+# takes a task in. A dead end is a task in one of them that no rule will ever
+# move and that names nobody who will.
+_OPEN = ("todo", "waiting")
+_ENDED = ("complete", "closed")
+
+
+def _structure() -> dict | None:
+    """Every worker of this project as a dead end is judged by it: the names
+    that are workers here, the ones read whole and the ones that cannot be,
+    and each filter an enabled, readable worker selects by - its `takes`, the
+    catch-all's, and its `on_request` types, which a person takes by naming
+    the task. None while the retired workers.toml stands, which `run` and
+    `doctor` refuse on their own."""
+    if _retired_workers_file():
+        return None
+    declared = _declarations()
+    read, unreadable, filters = {}, {}, []
+    for name, found in sorted(declared.items()):
+        worker, problems = _read_worker(name, found)
+        if worker is None:
+            unreadable[name] = problems[0][2] if problems else "it cannot be read"
+            continue
+        read[name] = worker
+        if not worker["enabled"]:
+            continue
+        filters += [(name, one) for one in _worker_filters(worker, declared)]
+        if worker["on_request"]:
+            filters.append((name, {"status": ["todo"], "type": list(worker["on_request"]),
+                                   "assignee": None, "tags": []}))
+    return {"declared": declared, "names": set(declared), "read": read,
+            "unreadable": unreadable, "filters": filters}
+
+
+def _selects(one: dict, task: dict, status: str) -> bool:
+    """Whether one filter selects this task were it in `status`, by type,
+    assignee and tags. Its pickup and its blockers are when, not who."""
+    if status not in one["status"]:
+        return False
+    kind = task.get("type")
+    if one.get("type") is not None and kind not in one["type"]:
+        return False
+    if one.get("not_type") is not None and kind in one["not_type"]:
+        return False
+    if one.get("assignee") and (task.get("assignee") or "").strip() not in one["assignee"]:
+        return False
+    return set(one.get("tags") or []) <= set(task.get("tags") or [])
+
+
+def _takers(structure: dict, task: dict) -> list[str]:
+    """The enabled, readable workers that take this task where it stands. A
+    waiting task whose wait ends on its own - an appointed pickup, or blockers -
+    is returned to todo when it does, so a worker taking it there takes it
+    too."""
+    statuses = [task.get("status")]
+    if task.get("status") == "waiting" and (task.get("pickup_at") or _blocked_by(task)):
+        statuses.append("todo")
+    found: list[str] = []
+    for name, one in structure["filters"]:
+        if name not in found and any(_selects(one, task, s) for s in statuses):
+            found.append(name)
+    return found
+
+
+def _untaken_words(structure: dict, task: dict) -> str:
+    """Why nobody takes this task: where it stands, and what the worker its
+    assignee names is - switched off, unreadable, or taking something else."""
+    name = (task.get("assignee") or "").strip()
+    words = (f"no enabled worker takes it (status {task.get('status')}, type "
+             f"{task.get('type')}, assignee {name or 'nobody'}, tags "
+             f"{', '.join(task.get('tags') or []) or 'none'})")
+    if name in structure["unreadable"]:
+        return f"{words}; worker {name!r} cannot be read: {structure['unreadable'][name]}"
+    worker = structure["read"].get(name)
+    if worker is None:
+        return words
+    if not worker["enabled"]:
+        return f"{words}; worker {name!r} is switched off"
+    takes = [_filter_words(one) for one in _worker_filters(worker, structure["declared"])]
+    if worker["on_request"]:
+        takes.append(f"{{type {', '.join(worker['on_request'])} named with --key}}")
+    return f"{words}; worker {name!r} takes {' or '.join(takes) or 'nothing'}"
+
+
+class _Blockers:
+    """The tasks `blocked_by` lists name, resolved as a wait reads them - by id
+    in any project, or by key within the naming task's project - with the names
+    those tasks list in turn while they are still open, read in as few queries
+    as the chain is deep. One instance answers for every task one scan or one
+    write asks about."""
+
+    _DEEPEST = 32
+
+    def __init__(self, cur):
+        self.cur = cur
+        self.ids: dict = {}      # (project, name) -> task id, or None for no task
+        self.rows: dict = {}     # task id -> {label, project, status, names}
+
+    def keep(self, row: dict) -> None:
+        self.rows[str(row["id"])] = {
+            "label": row.get("unique_key") or str(row["id"]),
+            "project": row["project_id"], "status": row["status"],
+            "names": _blocked_by({"metadata": {"blocked_by": row.get("blocked_by")}}
+                                 if "blocked_by" in row else row)}
+
+    def load(self, wanted) -> None:
+        pending = {pair for pair in wanted if pair not in self.ids}
+        for _round in range(self._DEEPEST):
+            if not pending:
+                return
+            names = sorted({name for _project, name in pending})
+            self.cur.execute(f"""select id, unique_key, project_id, status,
+                                        metadata -> 'blocked_by' as blocked_by
+                                   from {SCHEMA}.tasks
+                                  where id::text = any(%s) or unique_key = any(%s)""",
+                             (names, names))
+            found = _rows(self.cur)
+            for project, name in pending:
+                row = next((r for r in found if str(r["id"]) == name), None) or next(
+                    (r for r in found if r["unique_key"] == name
+                     and r["project_id"] == project), None)
+                self.ids[(project, name)] = str(row["id"]) if row else None
+                if row and str(row["id"]) not in self.rows:
+                    self.keep(row)
+            pending = {(row["project"], name) for row in self.rows.values()
+                       if row["status"] not in _ENDED
+                       for name in row["names"]} - set(self.ids)
+
+    def problem(self, task: dict, names: list[str], *, drafts: bool = True) -> str | None:
+        """Why these blockers of `task` can never all end, in one clause, or
+        None: a name that is no task, a blocker in draft - only a person
+        releases one - when `drafts` asks, or blockers that wait on the task
+        itself in turn. A blocker that has ended holds nothing."""
+        project, tid = task["project_id"], str(task["id"])
+        self.load({(project, name) for name in names})
+        unknown = [name for name in names if self.ids.get((project, name)) is None]
+        if unknown:
+            return ", ".join(f"{name!r}" for name in unknown) + " names no task"
+        if drafts:
+            draft = [name for name in names
+                     if self.rows[self.ids[(project, name)]]["status"] == "draft"]
+            if draft:
+                return (", ".join(f"{name!r}" for name in draft)
+                        + " is a draft, which only a person releases")
+        path = self.cycle(tid, project, names)
+        if path:
+            label = task.get("unique_key") or tid
+            return "they wait on it in turn: " + " -> ".join([label, *path])
+        return None
+
+    def cycle(self, tid: str, project: str, names: list[str]) -> list[str] | None:
+        """The names leading from the task through open blockers back to it,
+        or None when none does."""
+        stack = [(self.ids.get((project, name)), [name]) for name in names]
+        seen: set = set()
+        while stack:
+            at, path = stack.pop()
+            if at == tid:
+                return path
+            if at is None or at in seen:
+                continue
+            seen.add(at)
+            row = self.rows.get(at)
+            if row is None or row["status"] in _ENDED:
+                continue
+            stack += [(self.ids.get((row["project"], name)), [*path, name])
+                      for name in row["names"]]
+        return None
+
+
+def _structural(structure: dict, task: dict, blockers: _Blockers) -> str | None:
+    """Why this open task can never move as things stand, decided from the
+    store and the worker files alone, or None. Asked of a task no person holds
+    and no raise holds: on a name that is a worker here that no enabled worker
+    takes, a task whose worker cannot run, and a waiting task whose blockers
+    can never all end."""
+    name = (task.get("assignee") or "").strip()
+    takers = _takers(structure, task)
+    if not takers:
+        return _untaken_words(structure, task) if name else None
+    stuck = [structure["read"][one] for one in takers if structure["read"][one]["missing"]]
+    if len(stuck) == len(takers):
+        return (f"its worker cannot run: worker {stuck[0]['name']!r}: "
+                + "; ".join(stuck[0]["missing"]))
+    named = _blocked_by(task)
+    if task.get("status") == "waiting" and named:
+        why = blockers.problem(task, named)
+        if why:
+            return f"its blockers can never all end: {why}"
+    return None
+
+
+def _dead_ends(cur, project: str, structure: dict, spare=()) -> list[tuple[dict, str]]:
+    """Every open task of this project that can never move as things stand,
+    with why, from one read of its open tasks no raise holds. A task on a
+    person is none: the chain ends at one, and a person moves it. `spare` names
+    tasks to leave alone - the one a run was asked to take by --key."""
+    cur.execute(f"""select id, unique_key, project_id, status, type, assignee, tags,
+                           pickup_at, metadata -> 'blocked_by' as blocked_by
+                      from {SCHEMA}.tasks
+                     where project_id = %s and status in ('todo', 'waiting')
+                       and {_open_raise_clause(False)}
+                     order by created_at asc""", (project,))
+    rows = [row for row in _rows(cur) if str(row["id"]) not in spare]
+    blockers = _Blockers(cur)
+    for row in rows:
+        row["metadata"] = {"blocked_by": row.pop("blocked_by")}
+        blockers.keep(row)
+    found = []
+    for row in rows:
+        name = (row.get("assignee") or "").strip()
+        if name and name not in structure["names"]:
+            continue
+        why = _structural(structure, row, blockers)
+        if why:
+            found.append((row, why))
+    return found
+
+
+def _scan(cur, escalation: dict | None, structure: dict, project: str, *,
+          write: bool, spare=()) -> dict:
+    """The claim scan's dead ends: every one is escalated at once along the
+    project's chain, with its reason as the entry's why, or named under
+    `dead_ends` when the project sets no chain. Without `write` an escalation
+    is named under `escalated` and not made."""
+    escalated, reported = [], []
+    for task, why in _dead_ends(cur, project, structure, spare):
+        tid = str(task["id"])
+        target = (_escalation_target(escalation, task.get("assignee"))
+                  if escalation else None)
+        if target is None:
+            reported.append({"task": _address(task), "task_id": tid, "why": why})
+            continue
+        if not write:
+            escalated.append({"task": _address(task), "task_id": tid, "to": target,
+                              "why": why})
+            continue
+        # Moved only while it still stands where the scan saw it, and only by
+        # the one claim that locks it.
+        cur.execute(f"""select * from {SCHEMA}.tasks
+                         where id = %s and status = %s
+                           and assignee is not distinct from %s
+                           and {_open_raise_clause(False)}
+                         for update skip locked""",
+                    (tid, task["status"], task.get("assignee")))
+        rows = _rows(cur)
+        if rows:
+            escalated.append(_escalate(cur, rows[0], target, why, _in_place(cur, tid),
+                                       project))
+    return {"escalated": escalated, "dead_ends": reported}
+
+
+def _structural_due(conn) -> bool:
+    """Whether a claim in this project would escalate a dead end, asked by the
+    service, which starts one for it as it does for a lapsed lease. Only with a
+    chain: a dead end a claim would only report is no reason to start a turn."""
+    settings, problems = _read_conveyor()
+    if settings is None or problems:
+        return False
+    structure = _structure()
+    if structure is None:
+        return False
+    escalation = {**settings, "workers": sorted(structure["names"])}
+    with conn.cursor() as cur:
+        dead = _dead_ends(cur, _writing_project(), structure)
+    return any(_escalation_target(escalation, task.get("assignee")) for task, _why in dead)
+
+
+def _landing_refusal(task: dict) -> str | None:
+    """Why a write may not leave this task where it would stand: open on a name
+    that is a worker here which no enabled worker takes there. None for a task
+    that is not open, one on a person or on nobody, and one of another project,
+    whose workers this project cannot read."""
+    if task.get("status") not in _OPEN:
+        return None
+    name = (task.get("assignee") or "").strip()
+    if not name or task.get("project_id") != _writing_project():
+        return None
+    if _project_root() is None or _retired_workers_file() or name not in _declarations():
+        return None
+    structure = _structure()
+    if structure is None or _takers(structure, task):
+        return None
+    return ("a write may not leave a task where no enabled worker takes it: "
+            + _untaken_words(structure, task))
+
+
+_LANDING_HINT = (f"assign it to a worker that takes it there, or to a person; "
+                 f"`{NAME} doctor` shows what each worker takes")
+
+_IN_PROGRESS_REFUSAL = ("in_progress is written only by a claim, which opens the raise "
+                        "that holds the task; set by hand it has no raise, so no claim "
+                        "takes it and no lease frees it")
+_IN_PROGRESS_HINT = (f"hold it as waiting on your own name, or take it with `{NAME} claim "
+                     "--key <task>`")
+
+
+def _coverage(rows: list[dict]) -> list[str]:
+    """Every place an enabled worker's turn may land the task it holds that no
+    enabled worker takes, for `doctor`: an open status its `writes.held.status`
+    allows - todo when it writes no status, since a turn that leaves its task
+    in progress is put back in todo - on a name in its `writes.held.assignee`
+    that is a worker here, for the types and tags its own filters take. Each
+    is added to the worker's row as `lands_untaken`, and answered as one
+    warning per worker. A worker writing any assignee, or none, names no place
+    to judge; a person's name is always taken."""
+    structure = _structure()
+    if structure is None:
+        return []
+    warnings = []
+    for row in rows:
+        worker = structure["read"].get(row["worker"])
+        if worker is None or not worker["enabled"] or worker["writes"] is None:
+            continue
+        held = worker["writes"].get("held") or {}
+        names = held.get("assignee")
+        if not isinstance(names, list):
+            continue
+        statuses = held.get("status")
+        statuses = (list(WORKER_STATUSES) if statuses == ANY
+                    else statuses if isinstance(statuses, list) else ["todo"])
+        gaps: list[dict] = []
+        for status in (one for one in _OPEN if one in statuses):
+            for who in names:
+                if who not in structure["names"]:
+                    continue
+                kinds = []
+                for one in _worker_filters(worker, structure["declared"]):
+                    for kind in one.get("type") or [None]:
+                        task = {"status": status, "type": kind, "assignee": who,
+                                "tags": list(one.get("tags") or [])}
+                        label = kind or "any"
+                        if not _takers(structure, task) and label not in kinds:
+                            kinds.append(label)
+                if kinds:
+                    gaps.append({"assignee": who, "status": status, "types": kinds})
+        if gaps:
+            row["lands_untaken"] = gaps
+            warnings.append(f"worker {row['worker']} may land the task it holds where no "
+                            "enabled worker takes it: "
+                            + "; ".join(f"{gap['status']} on {gap['assignee']} (type "
+                                        f"{', '.join(gap['types'])})" for gap in gaps))
+    return warnings
 
 
 def _harness_runner():
@@ -9030,13 +9534,15 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
     # task named with --key is taken whatever holds the lane.
     if not key:
         base["lane"] = worker["name"]
+    # The project's dead ends are scanned once a run, by its first claim.
+    structure = worker.get("structure")
     if key:
-        swept, returned = [], []
+        swept, returned, scanned = [], [], {}
         if before:
             # The sweeps first, as the claim runs them: a task whose wait ended
             # or whose lease lapsed becomes claimable only there, and its hook is
             # asked about it like any other.
-            swept, returned = _sweep(entry)
+            swept, returned, scanned = _sweep(entry, worker, key)
             task = _key_candidate(entry, worker, key)
             # A task the claim would refuse is refused in the claim's own words,
             # and its hook is never asked about it.
@@ -9051,10 +9557,15 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
                      f"the before hook of worker {worker['name']!r} decides when "
                      "it is taken; a hold writes nothing to the task")
         answer = _claim(entry, {**base, **_selector_filters(worker), "key": key,
-                                **_key_types(worker)})
+                                **_key_types(worker),
+                                **({"structure": structure} if structure and not before
+                                   else {})})
         if before:
             answer["swept"] = swept + (answer.get("swept") or [])
             answer["returned"] = returned + (answer.get("returned") or [])
+            for field in ("escalated", "dead_ends"):
+                if scanned.get(field):
+                    answer[field] = scanned[field] + (answer.get(field) or [])
         return answer
     if before:
         return _take_past_hooks(entry, worker, base, tuple(exclude))
@@ -9062,11 +9573,15 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
     passed: list = []
     answer: dict = {"claimed": None, "swept": [], "returned": []}
     escalated: list = []
-    for ask in _asks(worker):
-        answer = _claim(entry, {**base, **ask})
+    dead_ends: list = []
+    for at, ask in enumerate(_asks(worker)):
+        answer = _claim(entry, {**base, **ask,
+                                **({"structure": structure} if structure and at == 0
+                                   else {})})
         swept += answer.get("swept") or []
         passed = _passed_merged(passed, answer.pop("passed_over", None))
         escalated += answer.pop("escalated", None) or []
+        dead_ends += answer.pop("dead_ends", None) or []
         if answer.get("claimed") is not None or answer.get("lane_held"):
             break
     answer["swept"] = swept
@@ -9074,6 +9589,8 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
         answer["passed_over"] = passed
     if escalated:
         answer["escalated"] = escalated
+    if dead_ends:
+        answer["dead_ends"] = dead_ends
     return answer
 
 
@@ -9107,15 +9624,23 @@ def _key_candidate(entry, worker: dict, key: str) -> dict | None:
     return row if refused is None else None
 
 
-def _sweep(entry) -> tuple[list, list]:
-    """The two sweeps a claim runs before it selects, on their own: what a hooked
-    worker's candidates are chosen from has to be what its claim would see."""
+def _sweep(entry, worker: dict | None = None,
+           key: str | None = None) -> tuple[list, list, dict]:
+    """The two sweeps a claim runs before it selects, and then the scan for dead
+    ends a run's first claim makes, on their own: what a hooked worker's
+    candidates are chosen from has to be what its claim would see. A task named
+    with --key is left to that run."""
     project = _writing_project()
+    scanned: dict = {}
     with _connect(entry) as conn, conn.cursor() as cur:
         swept = _sweep_leases(cur, project)
         returned = _sweep_waiting(cur, project)
+        if worker is not None and worker.get("structure") is not None:
+            spare = (_task_id(cur, key, writing=True),) if key else ()
+            scanned = _scan(cur, worker.get("escalation"), worker["structure"], project,
+                            write=True, spare=spare)
         conn.commit()
-    return [str(r["id"]) for r in swept], [_address(t) for t in returned]
+    return [str(r["id"]) for r in swept], [_address(t) for t in returned], scanned
 
 
 def _take_past_hooks(entry, worker: dict, base: dict, exclude: tuple) -> dict:
@@ -9128,7 +9653,7 @@ def _take_past_hooks(entry, worker: dict, base: dict, exclude: tuple) -> dict:
     attempt. A task it lets through is claimed by the same claim as always,
     narrowed to that one task, so a task somebody else took meanwhile is simply
     not taken and the next candidate is asked about."""
-    swept, returned = _sweep(entry)
+    swept, returned, scanned = _sweep(entry, worker)
     project, tz = _writing_project(), _zone(entry)
     asked = list(exclude)
     # What an open raise holds is passed over before any hook is asked about
@@ -9139,12 +9664,14 @@ def _take_past_hooks(entry, worker: dict, base: dict, exclude: tuple) -> dict:
         if lane is not None:
             # No hook is asked on a held lane: nothing would be taken.
             return {"claimed": None, "swept": swept, "returned": returned,
-                    "lane_held": lane}
+                    "lane_held": lane,
+                    **{field: scanned[field] for field in ("escalated", "dead_ends")
+                       if scanned.get(field)}}
         for ask in _asks(worker):
             passed = _passed_merged(passed, _held_over(cur, {**ask, "not_ids": asked},
                                                        project, tz))
     answer: dict = {"claimed": None}
-    escalated: list = []
+    escalated: list = list(scanned.get("escalated") or [])
     while True:
         with _connect(entry) as conn, conn.cursor() as cur:
             ask, task = _next_candidate(cur, worker, project, tz, asked)
@@ -9171,6 +9698,8 @@ def _take_past_hooks(entry, worker: dict, base: dict, exclude: tuple) -> dict:
     answer["passed_over"] = passed
     if escalated:
         answer["escalated"] = escalated
+    if scanned.get("dead_ends"):
+        answer["dead_ends"] = scanned["dead_ends"]
     return answer
 
 
@@ -9188,12 +9717,27 @@ def _would_take(entry, worker: dict, key: str | None, exclude: tuple = (),
     project = _writing_project()
     conn_given, would = conn, []
     held = contextlib.nullcontext(conn) if conn is not None else _connect(entry)
+    dead_ends: list = []
     with held as conn, conn.cursor() as cur:
         take = None
+        if conn_given is None and worker.get("structure") is not None:
+            # Asked by `run` without --apply, never by the service: the dead ends
+            # the claim's scan would escalate are named, and are not candidates.
+            spare = (_task_id(cur, key, writing=True),) if key else ()
+            scanned = _scan(cur, worker.get("escalation"), worker["structure"], project,
+                            write=False, spare=spare)
+            would += scanned["escalated"]
+            dead_ends = scanned["dead_ends"]
+            exclude = (*exclude, *(one["task_id"] for one in scanned["escalated"]))
         lane = None if key else _lane_held(cur, worker["name"], project)
         if lane is not None:
-            return {"worker": worker["name"], "would_claim": None, "applied": False,
-                    "lane_held": lane}
+            answer = {"worker": worker["name"], "would_claim": None, "applied": False,
+                      "lane_held": lane}
+            if would:
+                answer["would_escalate"] = would
+            if dead_ends:
+                answer["dead_ends"] = dead_ends
+            return answer
         if key:
             tid = _task_id(cur, key, writing=True)
             cur.execute(f"""select *, (pickup_at is null or pickup_at <= now()) as due
@@ -9226,6 +9770,8 @@ def _would_take(entry, worker: dict, key: str | None, exclude: tuple = (),
               "applied": False}
     if would:
         answer["would_escalate"] = would
+    if dead_ends:
+        answer["dead_ends"] = dead_ends
     return answer
 
 
@@ -9261,10 +9807,26 @@ def _would_take_past_hooks(entry, worker: dict, key: str | None,
             return None
         return task
 
+    dead_ends: list = []
+    if worker.get("structure") is not None:
+        # The dead ends the claim's scan would escalate are named, and are not
+        # candidates; their hook is never asked about them.
+        with _connect(entry) as conn, conn.cursor() as cur:
+            spare = (_task_id(cur, key, writing=True),) if key else ()
+            scanned = _scan(cur, worker.get("escalation"), worker["structure"],
+                            _writing_project(), write=False, spare=spare)
+        would += scanned["escalated"]
+        dead_ends = scanned["dead_ends"]
+        exclude = (*exclude, *(one["task_id"] for one in scanned["escalated"]))
     lane = None if key else _lane_held_now(entry, worker)
     if lane is not None:
-        return {"worker": worker["name"], "would_claim": None, "applied": False,
-                "passed_over": [], "lane_held": lane}
+        answer = {"worker": worker["name"], "would_claim": None, "applied": False,
+                  "passed_over": [], "lane_held": lane}
+        if would:
+            answer["would_escalate"] = would
+        if dead_ends:
+            answer["dead_ends"] = dead_ends
+        return answer
     if key:
         task = _key_candidate(entry, worker, key)
         take = judged(task) if task else None
@@ -9282,6 +9844,8 @@ def _would_take_past_hooks(entry, worker: dict, key: str | None,
               "applied": False, "passed_over": passed}
     if would:
         answer["would_escalate"] = would
+    if dead_ends:
+        answer["dead_ends"] = dead_ends
     return answer
 
 
@@ -10084,6 +10648,9 @@ def cmd_run(entry, args: list[str]) -> None:
     # escalates what cannot move and counts attempts in place, and without them
     # this run is what it always was.
     worker["escalation"] = _escalation_of(worker)
+    # Every worker of the project, as its first claim judges the dead ends it
+    # scans for: escalated along the chain, or named under `dead_ends`.
+    worker["structure"] = _structure()
     if not opts.get("apply"):
         # Nothing is claimed without --apply, so this says which task a claim
         # would find rather than pretending to have taken it.
@@ -10113,6 +10680,8 @@ def cmd_run(entry, args: list[str]) -> None:
         report["passed_over"] = held["passed_over"]
     if held.get("escalated"):
         report["escalated"] = held["escalated"]
+    if held.get("dead_ends"):
+        report["dead_ends"] = held["dead_ends"]
     if held.get("lane_held"):
         report["lane_held"] = held["lane_held"]
     if held.get("claimed") is None:
@@ -10982,9 +11551,9 @@ def _watch_behind(catalog: dict) -> list[str]:
 
 def _service_sweep_due(conn) -> bool:
     """Whether a claim in this project would put something back: a raise whose
-    lease has passed, or a waiting task whose wait is over. Neither is announced
-    by a write, and only a claim acts on either, so the service starts one.
-    Asked on the service's connection, `conn`."""
+    lease has passed, a waiting task whose wait is over, or a dead end it would
+    escalate. None is announced by a write, and only a claim acts on any, so
+    the service starts one. Asked on the service's connection, `conn`."""
     project = _writing_project()
     with conn.cursor() as cur:
         cur.execute(f"""select 1 from {SCHEMA}.task_executions e
@@ -11000,7 +11569,7 @@ def _service_sweep_due(conn) -> bool:
         waiting = _rows(cur)
         ended = _ended_among(cur, sorted({key for task in waiting
                                           for key in _blocked_by(task)}), project)
-    return any(_wait_over(task, ended) for task in waiting)
+    return any(_wait_over(task, ended) for task in waiting) or _structural_due(conn)
 
 
 def _service_next_moment(conn, cool_downs: dict | None = None) -> float | None:
@@ -12940,6 +13509,13 @@ _STORE_WIDE_KEY = "tasks_unique_key_key"
 # beside what is there, so a store without one reads as behind and catches up.
 _INDEXES = (("task_executions", "task_executions_run_idx"),)
 
+# Trigger functions a later version changed, each named with text its body now
+# carries. `create or replace` revisits a function on every apply, but nothing
+# applies the schema to a store that reads as current, so a store whose function
+# predates the change reads as behind and catches up, the way a store a column
+# behind does: the watch function stopped announcing a hold episode's row.
+_FUNCTIONS = (("notify_watch", "metrics ? 'hold'"),)
+
 
 def _bundle_dir() -> Path:
     executable = Path(__file__).resolve()
@@ -12994,15 +13570,22 @@ def _catalog(cur, schema: str) -> dict:
                      from pg_trigger g
                      join pg_class t on t.oid = g.tgrelid
                      join pg_namespace n on n.oid = t.relnamespace
-                    where n.nspname = %(s)s and not g.tgisinternal""", {"s": schema})
+                    where n.nspname = %(s)s and not g.tgisinternal
+                   union all
+                   select 'function', null, p.proname::text, p.prosrc
+                     from pg_proc p
+                     join pg_namespace n on n.oid = p.pronamespace
+                    where n.nspname = %(s)s""", {"s": schema})
     catalog: dict = {"tables": [], "columns": set(), "constraints": {},
-                     "indexes": set(), "triggers": set()}
+                     "indexes": set(), "triggers": set(), "functions": {}}
     for row in cur.fetchall():
         kind, table, name = row["kind"], row["tbl"], row["name"]
         if kind == "table":
             catalog["tables"].append(table)
         elif kind == "constraint":
             catalog["constraints"][(table, name)] = row["definition"]
+        elif kind == "function":
+            catalog["functions"][name] = row["definition"] or ""
         else:
             catalog[{"column": "columns", "index": "indexes",
                      "trigger": "triggers"}[kind]].add((table, name))
@@ -13034,6 +13617,15 @@ def _indexes_absent(catalog: dict) -> list[str]:
             if t in catalog["tables"] and (t, i) not in catalog["indexes"]]
 
 
+def _functions_behind(catalog: dict) -> list[str]:
+    """Trigger functions the store holds whose body predates a change this
+    version made, as name(). One the store lacks outright comes with its
+    trigger, which is reported as the trigger."""
+    held = catalog.get("functions") or {}
+    return [f"{name}()" for name, carries in _FUNCTIONS
+            if name in held and carries not in held[name]]
+
+
 def _key_scope_behind(catalog: dict) -> list[str]:
     """The per-project key index, as table.index, when the store still keys
     tasks across the whole store or does not yet key them per project."""
@@ -13052,7 +13644,7 @@ def _behind(catalog: dict) -> tuple[list[str], list[str]]:
     lacking = (_columns_absent(catalog) + _constraints_behind(catalog)
                + _indexes_absent(catalog)
                + _key_scope_behind(catalog) + _notify_behind(catalog)
-               + _watch_behind(catalog))
+               + _watch_behind(catalog) + _functions_behind(catalog))
     return missing, lacking
 
 
@@ -13244,6 +13836,9 @@ def cmd_doctor(wanted: str | None) -> None:
                         f"{', '.join(behind)}; {closes}")
     if unescalated:
         warnings.append(unescalated)
+    # Every place a worker may land the task it holds that nobody takes there:
+    # the write would be refused, and the turn stopped short of its ending.
+    warnings += _coverage(workers)
     warnings += _deprecations(workers)
     if warnings:
         answer["warning"] = "; ".join(warnings)

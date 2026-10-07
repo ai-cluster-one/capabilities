@@ -367,3 +367,44 @@ def test_a_disabled_capability_is_refused_with_exit_4(lab):
                           env=lab["env"], text=True, capture_output=True, timeout=120,
                           stdin=subprocess.DEVNULL)
     assert proc.returncode == 4 and proc.stdout == ""
+
+
+@needs_store
+def test_a_hold_episode_row_announces_nothing_and_a_raise_still_does(lab):
+    import psycopg
+    watch, _ready_line = _ready(lab)
+    task = _answer(_tasks(lab, "add", "--type", "change", "--title", "held",
+                          "--key", "k-hold", "--status", "todo"))["created"]
+    watch.until(lambda l: l["event"] == "counts")
+    with psycopg.connect(DSN) as conn:
+        conn.execute(f"""insert into {lab['schema']}.task_executions
+                           (task_id, attempt, worker, status, metrics, started_at, ended_at)
+                         values (%s, 0, 'w', 'handback', %s::jsonb, now(), now())""",
+                     (task, json.dumps({"hold": {"said": "not now", "how": "held"}})))
+        conn.commit()
+    assert _changes(watch.quiet(), task) == []
+    _answer(_tasks(lab, "claim", "--key", "k-hold", "--worker", "w"))
+    seen = watch.until(lambda l: l["event"] == "counts")
+    assert sorted(_changes(seen, task)) == ["run_started", "task_changed"]
+
+
+@needs_store
+def test_a_store_whose_watch_function_announces_holds_catches_up(lab):
+    import psycopg
+    from psycopg.rows import dict_row
+    schema = lab["schema"]
+    ddl = mod._schema_ddl(schema)
+    start = ddl.index(f"create or replace function {schema}.notify_watch()")
+    end = ddl.index("$$ language plpgsql;", start) + len("$$ language plpgsql;")
+    function = ddl[start:end]
+    skip = function[function.index("        -- A hold episode"):
+                    function.index("        task := new.task_id;")]
+    with psycopg.connect(DSN, autocommit=True, row_factory=dict_row) as conn:
+        conn.execute(function.replace(skip, ""))
+        with conn.cursor() as cur:
+            _missing, behind = mod._behind(mod._catalog(cur, schema))
+        assert behind == ["notify_watch()"]
+        _answer(_tasks(lab, "list"))
+        with conn.cursor() as cur:
+            _missing, behind = mod._behind(mod._catalog(cur, schema))
+        assert behind == []

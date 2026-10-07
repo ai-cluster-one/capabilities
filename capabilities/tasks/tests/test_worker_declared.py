@@ -477,6 +477,11 @@ def taken(entry, name: str) -> str | None:
 @needs_store
 def test_each_form_selects_exactly_what_it_describes(project, store, capsys):
     entry = store
+    # The workers first: a task is written only where a worker that is on takes it.
+    write_worker(project, "default", "enabled: false")
+    write_worker(project, "implementation", IMPLEMENTATION)
+    write_worker(project, "supervisor", SUPERVISOR)
+    write_worker(project, "ops", "takes: [{type: [chore], assignee: [ops]}]\nprofile: plain")
     add(entry, capsys, "d-todo")
     add(entry, capsys, "c-todo", kind="change")
     add(entry, capsys, "chore-ops", kind="chore", assignee="ops")
@@ -487,11 +492,6 @@ def test_each_form_selects_exactly_what_it_describes(project, store, capsys):
     mod.cmd_meta(entry, ["set", "w-blocked", "blocked_by", '["d-todo"]'])
     capsys.readouterr()
     add(entry, capsys, "w-super", kind="change", status="waiting", assignee="supervisor")
-
-    write_worker(project, "default", "enabled: false")
-    write_worker(project, "implementation", IMPLEMENTATION)
-    write_worker(project, "supervisor", SUPERVISOR)
-    write_worker(project, "ops", "takes: [{type: [chore], assignee: [ops]}]\nprofile: plain")
 
     # The supervisor takes the one task waiting on its name and nothing else.
     assert taken(entry, "supervisor") == "w-super"
@@ -509,13 +509,13 @@ def test_each_form_selects_exactly_what_it_describes(project, store, capsys):
 @needs_store
 def test_writes_are_fixed_at_the_claim(project, store, capsys, monkeypatch):
     entry = store
-    add(entry, capsys, "held", status="waiting", assignee="supervisor")
-    add(entry, capsys, "other", status="waiting", assignee="someone")
     path = write_worker(project, "supervisor", SUPERVISOR + """
 writes:
   held: {status: [todo, waiting, complete, closed], assignee: "*"}
   other: {status: [todo, waiting], assignee: "*", metadata: [blocked_by]}
 """)
+    add(entry, capsys, "held", status="waiting", assignee="supervisor")
+    add(entry, capsys, "other", status="waiting", assignee="someone")
     answer = mod._take(entry, mod._worker("supervisor"), None)
     execution = answer["execution"]
     assert execution["metrics"][mod._BOUND_WRITES]["other"]["status"] == ["todo", "waiting"]
@@ -549,11 +549,11 @@ writes:
 @needs_store
 def test_new_tasks_are_held_to_the_new_scope(project, store, capsys, monkeypatch):
     entry = store
-    add(entry, capsys, "held", status="waiting", assignee="supervisor")
     write_worker(project, "supervisor", SUPERVISOR + """
 writes:
   new: {status: [todo, waiting], type: [defect, change]}
 """)
+    add(entry, capsys, "held", status="waiting", assignee="supervisor")
     execution = mod._take(entry, mod._worker("supervisor"), None)["execution"]["id"]
     monkeypatch.setenv("TASKS_EXECUTION", str(execution))
     mod.cmd_add(entry, ["--type", "defect", "--title", "t", "--status", "todo"])
@@ -572,8 +572,8 @@ writes:
 def test_a_task_taken_from_waiting_goes_back_there_when_nothing_settles_it(
         project, store, capsys):
     entry = store
-    add(entry, capsys, "w-one", status="waiting", assignee="supervisor")
     write_worker(project, "supervisor", SUPERVISOR + "limits: {cool_down_seconds: 1}\n")
+    add(entry, capsys, "w-one", status="waiting", assignee="supervisor")
     worker = mod._worker("supervisor")
     lapsing = mod._claim(entry, {"key": "w-one", "lease": "1", "worker": "supervisor",
                                  **mod._key_types(worker)})

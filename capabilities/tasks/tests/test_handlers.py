@@ -401,7 +401,8 @@ def ends(store, monkeypatch, capsys):
                 return Result(ok=False, harness=told["harness"],
                               answer=told["said"] if told["harness"] == "claude" else "",
                               session_id=session.id, model="m",
-                              failure=Failure(FailureKind.QUOTA, told["said"]))
+                              failure=Failure(told.get("kind", FailureKind.QUOTA),
+                                              told["said"]))
             monkeypatch.setenv("TASKS_EXECUTION", execution)
             mod.cmd_activity(entry, [key, "done"])
             if not told["leave"]:
@@ -707,3 +708,38 @@ def test_the_service_escalates_a_held_task_by_the_clock_kept_across_a_restart(la
     poll_for(lambda: answer_of(tasks_cli(lab, "show", "t-gate"))["task"]["assignee"]
              == "owner", 60)
     answer_of(tasks_cli(lab, "service", "stop", "--end-turns"))
+
+
+@pytest.mark.parametrize("kind", [FailureKind.ERROR, FailureKind.CRASH,
+                                  FailureKind.INVALID_OUTPUT])
+def test_a_codex_limit_sentence_holds_whatever_failure_the_library_names(kind):
+    """Codex's sentence is the fact: the library may name the failure something
+    other than a spent quota, and the lane is held all the same."""
+    before = datetime.datetime.now(UTC)
+    hold = mod._limit_ending(ending(CODEX_TODAY, harness="codex", kind=kind), _Runner)
+    reset = mod._reset_moment(CODEX_TODAY, before)
+    until = datetime.datetime.fromisoformat(hold["until"])
+    assert hold["by"] == "codex usage limit"
+    assert until - reset <= datetime.timedelta(seconds=mod._LANE_HOLD_MARGIN + 5)
+    hold = mod._limit_ending(ending(CODEX_NO_MOMENT, harness="codex", kind=kind), _Runner)
+    assert hold["by"] == "codex usage limit, no reset named"
+
+
+@needs_store
+def test_a_codex_limit_under_another_failure_kind_holds_the_lane(project, store, ends,
+                                                                 capsys):
+    entry, schema, conn = store
+    add(entry, capsys, "t-first")
+    add(entry, capsys, "t-second")
+    ends.update(said=CODEX_TODAY, harness="codex", kind=FailureKind.ERROR)
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    report = answer(capsys)
+    assert report["claimed"] == "t-first" and report["returned_unspent"] is True
+    assert report["lane_held"]["by"] == "codex usage limit"
+    [raised] = raises_of(entry, capsys, "t-first")
+    assert raised["metrics"]["exhausted"] is True and "lane_hold" in raised["metrics"]
+    ends.update(said=None)
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    applied = answer(capsys)
+    assert applied["claimed"] is None and applied["lane_held"]["by"] == "codex usage limit"
+    assert ends["ran"] == ["t-first"]

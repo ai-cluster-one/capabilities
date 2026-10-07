@@ -1143,6 +1143,12 @@ class ProjectSlot:
                 if isinstance(moved, dict):
                     said.append(f"escalated {moved.get('task')} to {moved.get('to')}: "
                                 f"{str(moved.get('why'))[:200]}")
+            # Each dead end the claim found and could not escalate, the project
+            # setting no chain.
+            for stuck in answer.get("dead_ends") or []:
+                if isinstance(stuck, dict):
+                    said.append(f"dead end {stuck.get('task')}: "
+                                f"{str(stuck.get('why'))[:200]}")
             lane = answer.get("lane_held")
             if isinstance(lane, dict):
                 said.append(f"lane held until {lane.get('until')}"

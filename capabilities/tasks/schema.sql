@@ -281,6 +281,13 @@ begin
         project := new.project_id;
         kind := 'task_changed';
     else
+        -- A hold episode's row is no raise: it records when a worker's before
+        -- hook first held the task back, and nothing a reader shows changed.
+        if tg_table_name = 'task_executions' then
+            if new.metrics ? 'hold' then
+                return null;
+            end if;
+        end if;
         task := new.task_id;
         execute format('select project_id from %I.tasks where id = $1', tg_table_schema)
            into project using task;
