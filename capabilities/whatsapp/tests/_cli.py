@@ -6,6 +6,10 @@ manager installs it: as that file. The engine is imported lazily by the script,
 so everything below the network — the store, the parser, the envelope — is
 reachable with no engine present and no dependency to install.
 
+The capture lives in Postgres. The store-backed cases read WHATSAPP_TEST_DSN, a
+throwaway database's URL, and skip when it is unset; each case writes under an
+account of its own, so cases never see each other's rows.
+
 A source checkout keeps that file under `bin/` and an installed bundle keeps
 it at the bundle root, so the path is resolved rather than named: naming one
 layout passes where the test was written and fails where the capability is
@@ -15,7 +19,11 @@ installed.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+import tempfile
+import unittest
+import uuid
 from pathlib import Path
 
 CAPABILITY_DIR = Path(__file__).resolve().parents[1]
@@ -66,3 +74,24 @@ def engine_available(module) -> bool:
         return True
     except BaseException:
         return False
+
+
+STORE_DSN = os.environ.get("WHATSAPP_TEST_DSN")
+
+
+def needs_store(case):
+    """Skip a store-backed case where no throwaway database is named."""
+    return unittest.skipUnless(STORE_DSN, "WHATSAPP_TEST_DSN is unset")(case)
+
+
+def store_env() -> dict:
+    """The environment a store-backed case runs under: the throwaway database
+    as the store override, and no machine setting reachable behind it."""
+    return {"CAPABILITIES_STORE_URL": STORE_DSN or "",
+            "XDG_CONFIG_HOME": tempfile.mkdtemp()}
+
+
+def store_cfg(**extra) -> dict:
+    """A connection whose home and account are this case's alone."""
+    return {"id": "test", "home": tempfile.mkdtemp(),
+            "account_key": f"test-{uuid.uuid4().hex[:12]}", **extra}

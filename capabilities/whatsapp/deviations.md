@@ -56,10 +56,11 @@ outlives its invocation outlives the lock that invocation released, which is the
 two-clients-on-one-device state that desyncs the account. Ending deliberately is
 what makes the lock mean anything.
 
-## The store is rebuilt from raw chunks, not migrated
+## Parsed rows are rebuilt from raw chunks, not migrated
 
-A change to how a history chunk becomes rows raises the parser version, and a
-store opened at an older version re-parses the chunks it kept rather than
-altering the rows in place. The chunks are written before anything parses them
-precisely so this is possible; enrichment lives in its own table and is never
-touched by the rebuild.
+The tables' shape is migrated through the store's ledger like any other owner's.
+What a history chunk becomes is not: a change to how a chunk becomes rows raises
+the parser version, and an account whose rows were built at an older version has
+the chunks it kept re-parsed rather than its rows altered in place. The chunks
+are written before anything parses them precisely so this is possible;
+enrichment lives in its own table and is never touched by the rebuild.

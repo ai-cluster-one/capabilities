@@ -2,15 +2,19 @@
 
 How a WhatsApp history is kept, and what a consuming project reads.
 
-Two places hold messages, and the split between them is the point. The **store** is where capture writes: one database per account under the user state home, holding every chat and message the account has handed over, the material that lets an attachment be fetched later, and the enrichment derived from them. The **export** is what a project reads: a folder per conversation, written on request, holding the messages a project registered and the attachments that came with them.
+Two places hold messages, and the split between them is the point. The **store** is where capture writes: the machine's Postgres store, holding every chat and message each account has handed over, the material that lets an attachment be fetched later, and the enrichment derived from them. The **export** is what a project reads: a folder per conversation, written on request, holding the messages a project registered and the attachments that came with them.
 
 ## The store
 
-The store is the capability's own, git-ignored, and never edited by hand. It is user-scoped, because it is minted by one human's linked device, so several projects consuming the same account share one capture rather than each building their own.
+The store is the Postgres database the machine's store setting names (`capabilities store set` writes it, `capabilities store show` reports it, and `CAPABILITIES_STORE_URL` overrides it for one process). The capability keeps its capture there in tables of its own, every one named `whatsapp_*` and created on first use, and they are never edited by hand. Without a store setting there is nowhere to capture to, so every verb that reads or writes the capture refuses as a configuration error; `help` and `contract` still answer.
 
-Three properties of it are worth knowing as a consumer:
+The capture is keyed by the account, not by the project or the connection, because it is minted by one human's linked device: several projects consuming the same account share one capture rather than each building their own, and two accounts never mix.
 
-- **Raw history chunks are written to disk before anything parses them.** A parsing fault therefore costs a re-ingest and never the data.
+The user state home keeps what is not rows: the engine's own login session, the raw history chunks, and the attachments fetched so far, in a folder named for the account.
+
+Three properties of the store are worth knowing as a consumer:
+
+- **Raw history chunks are written to disk before anything parses them.** A parsing fault therefore costs a re-ingest from them and never the data.
 - **Enrichment lives beside the messages, never inside them.** A transcript, a downloaded attachment's path, and the loss of one that can no longer be fetched are all keyed to the message they belong to, so nothing the protocol wrote is ever overwritten by something derived.
 - **Later news never erases earlier capture.** Reaching back covers ground already held, so a field is filled in where it was empty and left alone where it was not.
 

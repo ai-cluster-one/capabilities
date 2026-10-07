@@ -2,6 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
+#     "capabilities-contract==0.1.0",
 #     "httpx>=0.27",
 #     "puremagic>=1.28",
 #     "qrcode>=7.4",
@@ -9,10 +10,10 @@
 # ]
 # ///
 """
-whatsapp — WhatsApp CLI carrying its own engine: one linked device, one local store.
+whatsapp — WhatsApp CLI carrying its own engine: one linked device, one store.
 
 Agent-invoked. Links a WhatsApp account as a companion device, keeps the account's
-chats and messages in a capability-local store, reads from that store, deepens it
+chats and messages in the machine's Postgres store, reads from it, deepens it
 on demand, downloads and transcribes voice notes, and renders an export a project
 can commit to. Run `whatsapp doctor` first to confirm the chain.
 
@@ -86,7 +87,16 @@ Credentials (4-tier cascade; first non-empty wins)
   flags > project .env(.local) > ~/.config/whatsapp/credentials.env > process env.
         DEEPGRAM_API_KEY   only `whatsapp transcribe` reads it
   The linked-device session is not a configured secret: it is minted by pairing
-  and lives in the user state home, per account, beside the store.
+  and lives in the user state home, per account.
+
+Store
+  Chats, messages, identities, enrichment and capture provenance live in the
+  machine's Postgres store, in whatsapp_* tables keyed by the account, created
+  and migrated on first use. The store is the one `capabilities store set`
+  configures (`capabilities store show` reports it); CAPABILITIES_STORE_URL
+  overrides it for a process. Without either, every verb that reads or writes
+  the capture exits 6 store_not_configured; help, contract, connections and
+  the other contract commands still answer.
 
 State
   $XDG_STATE_HOME/whatsapp/<account>/     named for the account, not for the
@@ -95,7 +105,6 @@ State
                                           capture, and two aliases for one
                                           account share one home
         session.db     the engine's own — device, keys, contacts, LID map
-        messages.db    chats, messages, enrichment, capture provenance
         raw/           history chunks exactly as received, written before parsing
         media/         downloaded attachments, keyed by message id
         lock           held for the duration of any connected verb
@@ -109,8 +118,9 @@ Commands
   whatsapp status                      Human-readable account / session / store view
   whatsapp health                      Store readiness — what the capture holds
                                        per chat, its span, and what is missing.
-                                       Local only; answers "is there anything to
-                                       consume?" without touching the network.
+                                       Reads the store only; answers "is there
+                                       anything to consume?" without connecting
+                                       to WhatsApp.
   whatsapp pair [--number DIGITS] [--qr] [--days N] [--full] [--hold SECONDS]
                 [--wait] [--recreate --yes]
                                        Link this machine as a companion device.
@@ -237,10 +247,12 @@ Exit codes
      or a write verb on a read-only connection (allow_write: false). Ask the user;
      never lift a gate yourself.
   5  server / network — the engine could not load, the connection failed, a
-     round-trip timed out, an engine event handler failed, or the phone did not
-     answer a history request the read needed
+     round-trip timed out, an engine event handler failed, the phone did not
+     answer a history request the read needed, or the store could not be
+     reached or answered with an error
   6  input / validation — a malformed argument or date, an incoherent connection
-     entry, or an unsupported operation
+     entry, an unsupported operation, or a store that is not configured or whose
+     setting is invalid
   7  unlinked — no session for this connection, or the device was removed from
      the account. Re-link with `whatsapp pair`. Also what an empty read reports
      rather than answering with an absence it never established.
@@ -258,7 +270,6 @@ import os
 import platform
 import re
 import shutil
-import sqlite3
 import subprocess
 import sys
 import threading
@@ -271,6 +282,7 @@ from pathlib import Path
 from typing import NoReturn
 
 import httpx
+from capabilities_contract.db import DbError, Step, connect, migrate, read_setting
 
 DEFAULT_SESSION = "default"
 
@@ -278,7 +290,7 @@ DEFAULT_SESSION = "default"
 
 NAME = "whatsapp"
 SUMMARY = ("WhatsApp CLI carrying its own engine — link a device, keep the "
-           "account's chats and messages in a local store, read and deepen them "
+           "account's chats and messages in a Postgres store, read and deepen them "
            "on demand, transcribe voice notes, and export a chat to JSON.")
 SCOPE = "user"      # credential scope: "project" | "user"
 CRED_KEYS = [       # the flat keys the cascade resolves for every connection
@@ -4576,42 +4588,67 @@ def _is_group(chat_id: str) -> bool:
 
 # ── The store ───────────────────────────────────────────────────────────────
 #
-# The engine is transport: whatsmeow's own SQLite holds the device, its keys,
-# contacts and the LID map, and no messages at all. What arrives is ours to keep.
-# Raw chunks land on disk before anything parses them, so a parser fault costs a
-# re-ingest and never the data.
+# The engine is transport: whatsmeow's own session file holds the device, its
+# keys, contacts and the LID map, and no messages at all. What arrives is ours to
+# keep, and it is kept in the machine's Postgres store, in tables owned by this
+# capability and keyed by the account: an account has one history whichever
+# project reads it. Raw chunks land on disk before anything parses them, so a
+# parser fault costs a re-ingest and never the data.
 
-STORE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (
-  key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS chats (
-  id TEXT PRIMARY KEY, name TEXT, is_group INTEGER DEFAULT 0,
-  last_ts INTEGER, unread INTEGER DEFAULT 0, archived INTEGER DEFAULT 0,
-  end_of_history INTEGER DEFAULT 0, updated_at TEXT);
-CREATE TABLE IF NOT EXISTS messages (
-  chat_id TEXT NOT NULL, id TEXT NOT NULL,
-  sender TEXT, sender_lid TEXT, from_me INTEGER DEFAULT 0, ts INTEGER,
-  kind TEXT, text TEXT, push_name TEXT, quoted_id TEXT,
-  mimetype TEXT, seconds INTEGER, is_voice INTEGER DEFAULT 0,
-  file_name TEXT, file_length INTEGER, direct_path TEXT,
-  media_key BLOB, file_enc_sha256 BLOB, file_sha256 BLOB,
-  sync_type TEXT, captured_at TEXT,
-  PRIMARY KEY (chat_id, id));
-CREATE INDEX IF NOT EXISTS messages_by_time ON messages(chat_id, ts);
-CREATE TABLE IF NOT EXISTS enrichment (
-  chat_id TEXT NOT NULL, id TEXT NOT NULL,
-  media_path TEXT, media_state TEXT, media_error TEXT,
-  transcript TEXT, transcript_language TEXT, transcript_confidence REAL,
-  transcript_model TEXT, transcript_provider TEXT, transcript_at TEXT,
-  transcript_error TEXT, effective_text TEXT, updated_at TEXT,
-  PRIMARY KEY (chat_id, id));
-CREATE TABLE IF NOT EXISTS identities (
-  jid TEXT PRIMARY KEY, lid TEXT, name TEXT, push_name TEXT, updated_at TEXT);
-CREATE INDEX IF NOT EXISTS identities_by_lid ON identities(lid);
-CREATE TABLE IF NOT EXISTS chunks (
-  n INTEGER PRIMARY KEY AUTOINCREMENT, sync_type TEXT, conversations INTEGER,
-  messages INTEGER, progress INTEGER, at TEXT, raw_file TEXT);
-"""
+# Each step is applied once, in order, under the store's migration ledger. An
+# applied step is never edited: a change to the tables is a new step.
+STORE_STEPS = [
+    Step("0001-meta", """
+CREATE TABLE whatsapp_meta (
+  account text NOT NULL, key text NOT NULL, value text,
+  PRIMARY KEY (account, key))"""),
+    Step("0002-chats", """
+CREATE TABLE whatsapp_chats (
+  account text NOT NULL, id text NOT NULL, name text,
+  is_group boolean DEFAULT false, last_ts timestamptz,
+  unread integer DEFAULT 0, archived boolean DEFAULT false,
+  end_of_history boolean DEFAULT false, updated_at timestamptz,
+  PRIMARY KEY (account, id))"""),
+    Step("0003-messages", """
+CREATE TABLE whatsapp_messages (
+  account text NOT NULL, chat_id text NOT NULL, id text NOT NULL,
+  sender text, sender_lid text, from_me boolean DEFAULT false, ts timestamptz,
+  kind text, text text, push_name text, quoted_id text,
+  mimetype text, seconds integer, is_voice boolean DEFAULT false,
+  file_name text, file_length bigint, direct_path text,
+  media_key bytea, file_enc_sha256 bytea, file_sha256 bytea,
+  sync_type text, captured_at timestamptz,
+  PRIMARY KEY (account, chat_id, id))"""),
+    Step("0004-messages-by-time", """
+CREATE INDEX whatsapp_messages_by_time
+  ON whatsapp_messages (account, chat_id, ts)"""),
+    Step("0005-enrichment", """
+CREATE TABLE whatsapp_enrichment (
+  account text NOT NULL, chat_id text NOT NULL, id text NOT NULL,
+  media_path text, media_state text, media_error text,
+  transcript text, transcript_language text,
+  transcript_confidence double precision,
+  transcript_model text, transcript_provider text, transcript_at timestamptz,
+  transcript_error text, effective_text text, updated_at timestamptz,
+  PRIMARY KEY (account, chat_id, id))"""),
+    Step("0006-identities", """
+CREATE TABLE whatsapp_identities (
+  account text NOT NULL, jid text NOT NULL, lid text, name text,
+  push_name text, updated_at timestamptz,
+  PRIMARY KEY (account, jid))"""),
+    Step("0007-identities-by-lid", """
+CREATE INDEX whatsapp_identities_by_lid
+  ON whatsapp_identities (account, lid)"""),
+    Step("0008-chunks", """
+CREATE TABLE whatsapp_chunks (
+  n bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  account text NOT NULL, sync_type text, conversations integer,
+  messages integer, progress integer, at timestamptz, raw_file text)"""),
+    Step("0009-chunks-by-account", """
+CREATE INDEX whatsapp_chunks_by_account ON whatsapp_chunks (account)"""),
+]
+STORE_SCHEMA_MAJOR = 1
+STORE_SCHEMA_MINOR = 0
 
 # The parser version the rows were built by. Raise it whenever a change to
 # `_describe` or `_ingest_history` would produce different rows from the same
@@ -4624,24 +4661,106 @@ STORE_VERSION = "1"
 # reach-back for exactly the chats that have depth.
 NO_MORE_ON_PRIMARY = 1
 
+# A store setting that cannot be used is a configuration fault; a store that
+# cannot be reached or refuses the migration is the environment's.
+_STORE_CONFIG_SLUGS = frozenset({
+    "store_not_configured", "store_not_postgres", "store_setting_unreadable",
+    "bad_store_setting", "sslmode_too_weak", "bad_schema_name"})
 
-class _Store(sqlite3.Connection):
-    """One store connection, shared by the caller's thread and the engine's.
+# Times the capability reasons about as epoch seconds. The store keeps every
+# time as timestamptz; these columns, and the aggregates named after them, come
+# back as the seconds the readers compare and format, and every other time comes
+# back as the ISO text it was written as.
+_EPOCH_COLUMNS = frozenset({"ts", "last_ts", "oldest", "newest", "last_activity"})
 
-    The engine dispatches events on its own thread, so two threads write here.
-    They share one connection deliberately — a second connection would take a
-    second SQLite write lock and deadlock against the first — and every write
-    goes through `_writing`, which serialises them and makes each one whole.
+# A message time is written from epoch seconds.
+_TS_PARAM = "to_timestamp(%s::double precision)"
 
-    Reads are not serialised. SQLite's own connection-level locking is what
-    makes that safe, and it holds only while the driver is compiled for full
-    thread safety — a property of the runtime, not of this code, so it is
-    checked at open rather than assumed."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+def _store_refusal(exc: DbError) -> NoReturn:
+    _refuse(6 if exc.slug in _STORE_CONFIG_SLUGS else 5, exc.slug, exc.message,
+            exc.hint)
+
+
+def _from_store(name: str, value):
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, datetime.datetime):
+        if name in _EPOCH_COLUMNS:
+            return int(value.timestamp())
+        return value.astimezone(datetime.timezone.utc).isoformat()
+    if isinstance(value, memoryview):
+        return bytes(value)
+    return value
+
+
+class _Row:
+    """One result row, addressable by position and by column name."""
+
+    __slots__ = ("_index", "_values")
+
+    def __init__(self, index: dict, values: list):
+        self._index = index
+        self._values = values
+
+    def __getitem__(self, key):
+        if isinstance(key, (int, slice)):
+            return self._values[key]
+        return self._values[self._index[key]]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def keys(self) -> list:
+        return list(self._index)
+
+
+def _row_factory(cursor):
+    names = [column.name for column in (cursor.description or [])]
+    index = {name: i for i, name in enumerate(names)}
+
+    def make(values):
+        return _Row(index, [_from_store(n, v) for n, v in zip(names, values)])
+    return make
+
+
+class _Store:
+    """One store connection for one account, shared by the caller's thread and
+    the engine's.
+
+    The engine dispatches events on its own thread, so two threads use this
+    connection. Every statement runs under one lock, and every write goes
+    through `_writing`, which holds that lock for the whole transaction: a
+    statement from the other thread never lands inside a transaction it is not
+    part of, and each write is whole."""
+
+    def __init__(self, conn, account: str, schema: str):
+        import psycopg
+        self.conn = conn
+        self.account = account
+        self.schema = schema
         self.write_lock = threading.RLock()
         self.write_depth = 0
+        self._error = psycopg.Error
+
+    def execute(self, sql: str, params=None):
+        with self.write_lock:
+            cursor = self.conn.cursor(row_factory=_row_factory)
+            try:
+                cursor.execute(sql, params if params else None)
+            except self._error as exc:
+                detail = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
+                _refuse(5, "store_failed",
+                        f"the store refused a statement: {detail}",
+                        "prove the store with `capabilities store doctor`, then "
+                        "retry")
+            return cursor
+
+    def close(self) -> None:
+        self.conn.close()
 
 
 @contextlib.contextmanager
@@ -4652,60 +4771,79 @@ def _writing(db):
     write from the caller's thread must never commit half of one raised by the
     handler thread. Nested writes join the transaction their caller opened."""
     with db.write_lock:
-        outermost = db.write_depth == 0
-        if outermost:
-            db.execute("BEGIN IMMEDIATE")
-        db.write_depth += 1
-        try:
-            yield
-        except BaseException:
-            db.write_depth -= 1
-            if outermost:
-                db.execute("ROLLBACK")
-            raise
-        db.write_depth -= 1
-        if outermost:
-            db.execute("COMMIT")
+        if db.write_depth:
+            db.write_depth += 1
+            try:
+                yield
+            finally:
+                db.write_depth -= 1
+            return
+        with db.conn.transaction():
+            db.write_depth += 1
+            try:
+                yield
+            finally:
+                db.write_depth -= 1
+
+
+def _get_meta(db, key: str) -> str | None:
+    row = db.execute(
+        "SELECT value FROM whatsapp_meta WHERE account = %s AND key = %s",
+        (db.account, key)).fetchone()
+    return row["value"] if row else None
+
+
+def _set_meta(db, key: str, value: str) -> None:
+    db.execute(
+        """INSERT INTO whatsapp_meta (account, key, value) VALUES (%s, %s, %s)
+           ON CONFLICT (account, key) DO UPDATE SET value = excluded.value""",
+        (db.account, key, value))
+
+
+def _drop_meta(db, key: str) -> None:
+    db.execute("DELETE FROM whatsapp_meta WHERE account = %s AND key = %s",
+               (db.account, key))
+
+
+def _engine_device(path: Path) -> tuple[str | None, str | None] | None:
+    """(jid, push name) of the device the engine's own session file holds, read
+    without opening a connection, or None when it holds none.
+
+    The session file is the engine's login state, handed to it by path; this is
+    the one place the capability looks inside it, and it only reads."""
+    import sqlite3
+    if not path.exists():
+        return None
+    try:
+        with contextlib.closing(
+                sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
+            row = db.execute(
+                "SELECT jid, push_name FROM whatsmeow_device LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return None
+    if not row or not row[0]:
+        return None
+    return str(row[0]), row[1]
 
 
 def _home_account(home: Path) -> str | None:
-    """Which account a state home already holds, asked of the files themselves.
-
-    The store records the account it was first written for, and the engine's
-    own session records the linked device, so a home populated by either says
-    whose it is without a connection being opened."""
-    store = home / "messages.db"
-    if store.exists():
-        try:
-            with contextlib.closing(
-                    sqlite3.connect(f"file:{store}?mode=ro", uri=True)) as db:
-                row = db.execute(
-                    "SELECT value FROM meta WHERE key = 'account_id'").fetchone()
-            if row and row[0]:
-                return _digits(row[0])
-        except sqlite3.Error:
-            pass
-    session = home / "session.db"
-    if session.exists():
-        try:
-            with contextlib.closing(
-                    sqlite3.connect(f"file:{session}?mode=ro", uri=True)) as db:
-                row = db.execute(
-                    "SELECT jid FROM whatsmeow_device LIMIT 1").fetchone()
-            if row and row[0]:
-                return _digits(str(row[0]).split("@", 1)[0])
-        except sqlite3.Error:
-            pass
+    """Which account a state home already holds, asked of the engine's own
+    session there, which records the linked device without a connection being
+    opened."""
+    device = _engine_device(home / "session.db")
+    if device:
+        return _digits(device[0].split("@", 1)[0])
     return None
 
 
 def _account_home(key: str, cid: str) -> Path:
-    """Where one account's capture lives: under the account's own identity.
+    """Where one account's session and files live: under the account's own
+    identity.
 
     A connection id is an alias the consuming project chooses and may rename,
-    while the session and the store belong to the account. Naming the home
+    while the session and the capture belong to the account. Naming the home
     after the alias made a rename read as an account that had never paired,
-    orphaned the capture under the old name, and let two aliases for one
+    orphaned the session under the old name, and let two aliases for one
     account build two captures of it. Naming it after the account means the
     alias moves freely, and two aliases for one account arrive at one home —
     which is what lets several projects share one capture instead of each
@@ -4714,7 +4852,7 @@ def _account_home(key: str, cid: str) -> Path:
     A home still sitting under an old alias is adopted the first time that
     alias resolves, and only when it holds this account or holds none at all.
     One holding somebody else is left exactly where it is: two accounts are
-    never merged into a single file to make a path resolve."""
+    never merged into a single home to make a path resolve."""
     root = _state_dir()
     home = root / key
     if home.exists():
@@ -4735,45 +4873,52 @@ def _connection_home(cfg: dict) -> Path:
     return home
 
 
-def _open_store(cfg: dict) -> "_Store":
-    """The store for one connection, brought up to the shipping parser version.
+def _store_account(cfg: dict) -> str:
+    """The account a connection's rows are keyed by: the identity its state home
+    is named for."""
+    return str(cfg.get("account_key") or Path(cfg["home"]).expanduser().name)
 
-    A store written by an older parser is rebuilt from the chunks it kept, which
+
+def _open_store(cfg: dict) -> "_Store":
+    """The store for one connection's account, its tables migrated and its rows
+    brought up to the shipping parser version.
+
+    Rows written by an older parser are rebuilt from the chunks it kept, which
     is the whole reason they are kept."""
     home = _connection_home(cfg)
-    db = None
     try:
-        if sqlite3.threadsafety < 3:
-            _refuse(5, "sqlite_not_serialized",
-                    "this Python's SQLite is not built for full thread safety "
-                    f"(threadsafety={sqlite3.threadsafety}), and the engine "
-                    "dispatches its events on a second thread",
-                    "run the capability on a Python whose sqlite3 reports "
-                    "threadsafety 3")
-        db = sqlite3.connect(home / "messages.db", check_same_thread=False,
-                             timeout=30, factory=_Store, isolation_level=None)
-        db.row_factory = sqlite3.Row
-        db.executescript(STORE_SCHEMA)
-        held = db.execute("SELECT value FROM meta WHERE key = 'schema'").fetchone()
-        version = held["value"] if held else None
-    except sqlite3.Error as exc:
-        if db is not None:
-            db.close()
-        _refuse(5, "store_unreadable",
-             f"the store for connection {cfg['id']!r} could not be opened: {exc}",
-             f"the store is {home / 'messages.db'}; the history chunks beside it "
-             f"in {home / 'raw'} can rebuild it once it is moved aside")
+        setting = read_setting()
+        conn = connect(application_name=NAME, setting=setting)
+    except DbError as exc:
+        _store_refusal(exc)
+    try:
+        result = migrate(conn, NAME, STORE_STEPS, major=STORE_SCHEMA_MAJOR,
+                         minor=STORE_SCHEMA_MINOR)
+        conn.autocommit = True
+    except DbError as exc:
+        conn.close()
+        _store_refusal(exc)
+    except Exception as exc:
+        conn.close()
+        _refuse(5, "store_failed",
+                f"the store could not be prepared: {type(exc).__name__}: {exc}",
+                "prove the store with `capabilities store doctor`, then retry")
+    for warning in result.warnings:
+        _log(warning)
+    db = _Store(conn, _store_account(cfg), setting.schema)
+    version = _get_meta(db, "schema")
     if version is None:
         # No version and no rows is a store that has just been created. No
         # version with rows in it is one written before the parser was
         # versioned at all, which is exactly the case a rebuild is for.
-        existing = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        existing = db.execute(
+            "SELECT COUNT(*) FROM whatsapp_messages WHERE account = %s",
+            (db.account,)).fetchone()[0]
         if existing:
             _reingest_raw(db, home, from_version="unversioned")
         else:
             with _writing(db):
-                db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES "
-                           "('schema', ?)", (STORE_VERSION,))
+                _set_meta(db, "schema", STORE_VERSION)
     elif version != STORE_VERSION:
         _reingest_raw(db, home, from_version=version)
     return db
@@ -4821,18 +4966,16 @@ def _reingest_raw(db, home: Path, *, from_version: str) -> dict:
             # assert that, retire the retry, and leave stale rows behind with
             # nothing to notice them. The note is carried where `health` and
             # `doctor` both read it.
-            db.execute(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES "
-                "('rebuild_incomplete', ?)",
-                (f"{failed} of {len(chunks)} chunk(s) unreadable at {_iso_now()}; "
-                 f"rows from them were built by parser {from_version}",))
+            _set_meta(db, "rebuild_incomplete",
+                      f"{failed} of {len(chunks)} chunk(s) unreadable at "
+                      f"{_iso_now()}; rows from them were built by parser "
+                      f"{from_version}")
             _log("the unreadable chunks are still on disk and nothing was "
                  "discarded; the rebuild will be attempted again on the next "
                  "invocation")
         else:
-            db.execute("DELETE FROM meta WHERE key = 'rebuild_incomplete'")
-            db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES "
-                       "('schema', ?)", (STORE_VERSION,))
+            _drop_meta(db, "rebuild_incomplete")
+            _set_meta(db, "schema", STORE_VERSION)
     return {"rebuilt": rebuilt, "failed": failed}
 
 
@@ -4844,34 +4987,17 @@ def _session_exists(cfg: dict) -> bool:
     """A linked device is a row in the engine's own device table. Absence is a
     real state — never paired here, or unlinked from the phone — and it is what
     exit 7 reports."""
-    path = _session_db(cfg)
-    if not path.exists():
-        return False
-    try:
-        with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
-            row = db.execute(
-                "SELECT jid FROM whatsmeow_device LIMIT 1").fetchone()
-            return bool(row and row[0])
-    except sqlite3.Error:
-        return False
+    return _engine_device(_session_db(cfg)) is not None
 
 
 def _session_account(cfg: dict) -> tuple[str | None, str | None, str | None]:
     """(account id, jid, push name) as the engine's own store records them,
     read without opening a connection."""
-    path = _session_db(cfg)
-    if not path.exists():
+    device = _engine_device(_session_db(cfg))
+    if device is None:
         return None, None, None
-    try:
-        with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
-            row = db.execute(
-                "SELECT jid, push_name FROM whatsmeow_device LIMIT 1").fetchone()
-    except sqlite3.Error:
-        return None, None, None
-    if not row or not row[0]:
-        return None, None, None
-    jid = _bare_jid(row[0])
-    return _digits(str(jid).split("@", 1)[0]), jid, row[1]
+    jid = _bare_jid(device[0])
+    return _digits(str(jid).split("@", 1)[0]), jid, device[1]
 
 
 @contextlib.contextmanager
@@ -5035,14 +5161,16 @@ def _remember_identity(db, jid: str | None, lid: str | None = None,
         return
     key = jid or lid
     db.execute(
-        """INSERT INTO identities (jid, lid, name, push_name, updated_at)
-           VALUES (?,?,?,?,?)
-           ON CONFLICT(jid) DO UPDATE SET
-             lid = COALESCE(excluded.lid, identities.lid),
-             name = COALESCE(NULLIF(excluded.name,''), identities.name),
-             push_name = COALESCE(NULLIF(excluded.push_name,''), identities.push_name),
+        """INSERT INTO whatsapp_identities
+                  (account, jid, lid, name, push_name, updated_at)
+           VALUES (%s,%s,%s,%s,%s,%s)
+           ON CONFLICT (account, jid) DO UPDATE SET
+             lid = COALESCE(excluded.lid, whatsapp_identities.lid),
+             name = COALESCE(NULLIF(excluded.name,''), whatsapp_identities.name),
+             push_name = COALESCE(NULLIF(excluded.push_name,''),
+                                  whatsapp_identities.push_name),
              updated_at = excluded.updated_at""",
-        (key, lid, name, push_name, _iso_now()))
+        (db.account, key, lid, name, push_name, _iso_now()))
 
 
 def _iso_now() -> str:
@@ -5053,18 +5181,20 @@ def _upsert_chat(db, chat_id: str, name: str | None, last_ts: int | None,
                  unread: int | None = None, archived: int | None = None,
                  end_of_history: int = 0) -> None:
     db.execute(
-        """INSERT INTO chats (id, name, is_group, last_ts, unread, archived,
-                              end_of_history, updated_at)
-           VALUES (?,?,?,?,?,?,?,?)
-           ON CONFLICT(id) DO UPDATE SET
-             name = COALESCE(NULLIF(excluded.name,''), chats.name),
-             last_ts = MAX(COALESCE(chats.last_ts,0), COALESCE(excluded.last_ts,0)),
-             unread = COALESCE(excluded.unread, chats.unread),
-             archived = COALESCE(excluded.archived, chats.archived),
-             end_of_history = MAX(chats.end_of_history, excluded.end_of_history),
-             updated_at = excluded.updated_at""",
-        (chat_id, name or None, 1 if _is_group(chat_id) else 0, last_ts,
-         unread, archived, end_of_history, _iso_now()))
+        f"""INSERT INTO whatsapp_chats (account, id, name, is_group, last_ts,
+                                       unread, archived, end_of_history,
+                                       updated_at)
+            VALUES (%s,%s,%s,%s,{_TS_PARAM},%s,%s,%s,%s)
+            ON CONFLICT (account, id) DO UPDATE SET
+              name = COALESCE(NULLIF(excluded.name,''), whatsapp_chats.name),
+              last_ts = GREATEST(whatsapp_chats.last_ts, excluded.last_ts),
+              unread = COALESCE(excluded.unread, whatsapp_chats.unread),
+              archived = COALESCE(excluded.archived, whatsapp_chats.archived),
+              end_of_history = COALESCE(whatsapp_chats.end_of_history, false)
+                               OR COALESCE(excluded.end_of_history, false),
+              updated_at = excluded.updated_at""",
+        (db.account, chat_id, name or None, _is_group(chat_id), last_ts,
+         unread, _flag(archived), bool(end_of_history), _iso_now()))
 
 
 _MESSAGE_COLUMNS = ("chat_id", "id", "sender", "sender_lid", "from_me", "ts",
@@ -5077,6 +5207,20 @@ _MESSAGE_COLUMNS = ("chat_id", "id", "sender", "sender_lid", "from_me", "ts",
 _FILL_COLUMNS = tuple(c for c in _MESSAGE_COLUMNS
                       if c not in ("chat_id", "id", "captured_at"))
 
+# Columns written as something other than the value itself.
+_MESSAGE_PARAMS = {"ts": _TS_PARAM}
+_MESSAGE_FLAGS = ("from_me", "is_voice")
+
+
+def _flag(value) -> bool | None:
+    """A protocol flag as the store keeps it; absence stays absence."""
+    return None if value is None else bool(value)
+
+
+def _message_values(row: dict, columns) -> list:
+    return [_flag(row.get(c)) if c in _MESSAGE_FLAGS else row.get(c)
+            for c in columns]
+
 
 def _upsert_message(db, row: dict, *, authoritative: bool = False) -> bool:
     """Write one message, and say whether the store had never seen it.
@@ -5088,18 +5232,22 @@ def _upsert_message(db, row: dict, *, authoritative: bool = False) -> bool:
     A re-ingest is the exception. It replays the chunk that produced the row, so
     it is authoritative over whatever an earlier parser made of the same bytes —
     filling gaps there would preserve the very values it exists to correct."""
+    marks = ", ".join(_MESSAGE_PARAMS.get(c, "%s") for c in _MESSAGE_COLUMNS)
     inserted = db.execute(
-        f"""INSERT OR IGNORE INTO messages ({', '.join(_MESSAGE_COLUMNS)})
-            VALUES ({', '.join('?' * len(_MESSAGE_COLUMNS))})""",
-        [row.get(col) for col in _MESSAGE_COLUMNS]).rowcount
+        f"""INSERT INTO whatsapp_messages (account, {', '.join(_MESSAGE_COLUMNS)})
+            VALUES (%s, {marks})
+            ON CONFLICT (account, chat_id, id) DO NOTHING""",
+        [db.account, *_message_values(row, _MESSAGE_COLUMNS)]).rowcount
     if inserted:
         return True
-    assignment = "{c} = ?" if authoritative else "{c} = COALESCE({c}, ?)"
+    assignment = "{c} = {p}" if authoritative else "{c} = COALESCE({c}, {p})"
     db.execute(
-        f"""UPDATE messages
-               SET {', '.join(assignment.format(c=c) for c in _FILL_COLUMNS)}
-             WHERE chat_id = ? AND id = ?""",
-        [row.get(col) for col in _FILL_COLUMNS] + [row["chat_id"], row["id"]])
+        f"""UPDATE whatsapp_messages
+               SET {', '.join(assignment.format(c=c, p=_MESSAGE_PARAMS.get(c, '%s'))
+                              for c in _FILL_COLUMNS)}
+             WHERE account = %s AND chat_id = %s AND id = %s""",
+        [*_message_values(row, _FILL_COLUMNS), db.account, row["chat_id"],
+         row["id"]])
     return False
 
 
@@ -5168,9 +5316,9 @@ def _ingest_history(db, data, home: Path, sync_type: str, *,
                                        push_name=row["push_name"])
         if record:
             db.execute(
-                "INSERT INTO chunks (sync_type, conversations, messages, progress,"
-                " at, raw_file) VALUES (?,?,?,?,?,?)",
-                (sync_type, conversations, messages,
+                "INSERT INTO whatsapp_chunks (account, sync_type, conversations,"
+                " messages, progress, at, raw_file) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (db.account, sync_type, conversations, messages,
                  getattr(data, "progress", None) or None, _iso_now(), raw_name))
     return conversations, messages, new
 
@@ -5425,7 +5573,8 @@ class Session:
         from whichever session happens to sit in the state home. The connection
         pins it when it declares `expected_account_id`; the store pins it in any
         case, from the first account it was written for, so a re-link to a
-        different number cannot interleave two people's histories in one file."""
+        different number cannot interleave two people's histories in one
+        capture."""
         account = self.account()
         expected = self.cfg.get("expected_account_id")
         if expected and account["id"] and account["id"] != expected:
@@ -5434,31 +5583,25 @@ class Session:
                  f"{account['id']}, not the bound {expected}",
                  "use the session owned by the configured account, or correct "
                  "expected_account_id in connections.json")
-        held = self.db.execute(
-            "SELECT value FROM meta WHERE key = 'account_id'").fetchone()
-        if held and held["value"] and account["id"] \
-                and held["value"] != account["id"]:
+        held = _get_meta(self.db, "account_id")
+        if held and account["id"] and held != account["id"]:
             _refuse(2, "store_account_mismatch",
                  f"the store for connection {self.cfg['id']!r} holds the history "
-                 f"of {held['value']}, and this session authorises as "
-                 f"{account['id']}",
-                 f"correct the account this connection names, or move "
-                 f"{Path(self.cfg['home']) / 'messages.db'} aside — a home is "
-                 f"named for one account and a store holds one account")
-        if account["id"] and not (held and held["value"]):
+                 f"of {held}, and this session authorises as {account['id']}",
+                 f"correct the account this connection names — a home and its "
+                 f"rows in the store are named for one account "
+                 f"({self.db.account}) and hold one account")
+        if account["id"] and not held:
             with _writing(self.db):
-                self.db.execute(
-                    "INSERT OR REPLACE INTO meta (key, value) VALUES "
-                    "('account_id', ?)", (account["id"],))
+                _set_meta(self.db, "account_id", account["id"])
         return account
 
     def refresh_identities(self, *, max_age: int = 6 * 3600) -> int:
         """Copy the engine's own contact store into ours, so a LID resolves to a
         name rather than to an opaque number. Contacts change slowly and there
         are thousands of them, so the copy is not repeated on every connect."""
-        last = self.db.execute(
-            "SELECT value FROM meta WHERE key = 'contacts_copied_at'").fetchone()
-        if last and (time.time() - float(last["value"] or 0)) < max_age:
+        last = _get_meta(self.db, "contacts_copied_at")
+        if last and (time.time() - float(last or 0)) < max_age:
             return 0
         try:
             contacts = self._client.contact.get_all_contacts()
@@ -5483,15 +5626,15 @@ class Session:
                     push = push or getattr(source, "PushName", None) or None
                 _remember_identity(self.db, jid, None, name=name, push_name=push)
                 written += 1
-            self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES "
-                            "('contacts_copied_at', ?)", (str(time.time()),))
+            _set_meta(self.db, "contacts_copied_at", str(time.time()))
         return written
 
     def resolve_lid(self, lid: str) -> str | None:
         """A LID's phone form, asked of the engine once and remembered."""
         row = self.db.execute(
-            "SELECT jid FROM identities WHERE lid = ? AND jid NOT LIKE '%@lid'",
-            (lid,)).fetchone()
+            "SELECT jid FROM whatsapp_identities"
+            " WHERE account = %s AND lid = %s AND jid NOT LIKE '%%@lid'",
+            (self.db.account, lid)).fetchone()
         if row:
             return row["jid"]
         engine = _engine()
@@ -5517,8 +5660,9 @@ class Session:
         merely sent would be lying. The phone must be online to answer, and its
         absence is reported as itself rather than as an empty chat."""
         anchor = self.db.execute(
-            "SELECT id, ts, from_me FROM messages WHERE chat_id = ? AND ts > 0"
-            " ORDER BY ts ASC LIMIT 1", (chat_id,)).fetchone()
+            "SELECT id, ts, from_me FROM whatsapp_messages"
+            " WHERE account = %s AND chat_id = %s AND ts > to_timestamp(0)"
+            " ORDER BY ts ASC LIMIT 1", (self.db.account, chat_id)).fetchone()
         if anchor is None:
             return {"ok": False, "reason": "no_anchor", "new": 0}
         engine = _engine()
@@ -5611,7 +5755,7 @@ class Session:
             return
         try:
             self.db.close()
-        except sqlite3.Error:
+        except Exception:
             pass
 
     def report_handler_errors(self) -> None:
@@ -5659,14 +5803,15 @@ _MESSAGE_SELECT = """
 SELECT m.*, e.media_path, e.media_state, e.media_error, e.transcript,
        e.transcript_language, e.transcript_confidence, e.transcript_model,
        e.transcript_provider, e.transcript_at, e.transcript_error
-  FROM messages m
-  LEFT JOIN enrichment e ON e.chat_id = m.chat_id AND e.id = m.id
+  FROM whatsapp_messages m
+  LEFT JOIN whatsapp_enrichment e
+    ON e.account = m.account AND e.chat_id = m.chat_id AND e.id = m.id
 """
 
 
 def _batched(values, size: int = 400):
-    """SQLite binds a bounded number of parameters per statement, and a chat's
-    message count is not bounded. Nothing here should fail because a
+    """A statement binds a bounded number of parameters, and a chat's message
+    count is not bounded. Nothing here should fail because a
     conversation grew."""
     values = list(values)
     for start in range(0, len(values), size):
@@ -5685,11 +5830,11 @@ def _identity_index(db, ids) -> dict:
         return {}
     rows = []
     for batch in _batched(sorted(wanted), size=400):
-        marks = ",".join("?" * len(batch))
+        marks = ",".join(["%s"] * len(batch))
         rows += db.execute(
-            f"SELECT jid, lid, name, push_name FROM identities "
-            f"WHERE jid IN ({marks}) OR lid IN ({marks})",
-            list(batch) * 2).fetchall()
+            f"SELECT jid, lid, name, push_name FROM whatsapp_identities "
+            f"WHERE account = %s AND (jid IN ({marks}) OR lid IN ({marks}))",
+            [db.account, *batch, *batch]).fetchall()
     index: dict = {}
     for row in rows:
         phone = row["jid"] if not (row["jid"] or "").endswith("@lid") else None
@@ -5801,23 +5946,25 @@ def _envelope(row, chat_name: str | None, is_group: bool, index: dict) -> dict:
 
 
 def _chat_row(db, chat_id: str):
-    return db.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
+    return db.execute("SELECT * FROM whatsapp_chats WHERE account = %s AND id = %s",
+                      (db.account, chat_id)).fetchone()
 
 
 def _read_messages(db, chat_id: str, *, limit: int | None,
                    from_ts: int | None, to_ts: int | None) -> list[dict]:
     """The window a caller asked for, oldest-first, out of the store."""
-    where = ["m.chat_id = ?"]
-    params: list = [chat_id]
+    where = ["m.account = %s", "m.chat_id = %s"]
+    params: list = [db.account, chat_id]
     if from_ts:
-        where.append("m.ts >= ?")
+        where.append(f"m.ts >= {_TS_PARAM}")
         params.append(from_ts)
     if to_ts:
-        where.append("m.ts < ?")
+        where.append(f"m.ts < {_TS_PARAM}")
         params.append(to_ts)
-    sql = f"{_MESSAGE_SELECT} WHERE {' AND '.join(where)} ORDER BY m.ts DESC, m.id DESC"
+    sql = (f"{_MESSAGE_SELECT} WHERE {' AND '.join(where)}"
+           f" ORDER BY m.ts DESC NULLS LAST, m.id DESC")
     if limit:
-        sql += " LIMIT ?"
+        sql += " LIMIT %s"
         params.append(limit)
     rows = list(db.execute(sql, params))
     rows.reverse()
@@ -5836,20 +5983,20 @@ def _coverage(db, chat_id: str, *, limit: int | None,
     Counted inside that window, because a chat holding hundreds of recent
     messages says nothing about whether it holds the fifty before a date the
     caller named."""
-    where = ["chat_id = ?"]
-    params: list = [chat_id]
+    where = ["account = %s", "chat_id = %s"]
+    params: list = [db.account, chat_id]
     if from_ts:
-        where.append("ts >= ?")
+        where.append(f"ts >= {_TS_PARAM}")
         params.append(from_ts)
     if to_ts:
-        where.append("ts < ?")
+        where.append(f"ts < {_TS_PARAM}")
         params.append(to_ts)
     window = db.execute(
-        f"SELECT COUNT(*) AS n, MIN(NULLIF(ts,0)) AS oldest, MAX(ts) AS newest"
-        f"  FROM messages WHERE {' AND '.join(where)}", params).fetchone()
+        f"SELECT COUNT(*) AS n, MIN(ts) AS oldest, MAX(ts) AS newest"
+        f"  FROM whatsapp_messages WHERE {' AND '.join(where)}", params).fetchone()
     whole = db.execute(
-        "SELECT COUNT(*) AS n, MIN(NULLIF(ts,0)) AS oldest FROM messages"
-        "  WHERE chat_id = ?", (chat_id,)).fetchone()
+        "SELECT COUNT(*) AS n, MIN(ts) AS oldest FROM whatsapp_messages"
+        "  WHERE account = %s AND chat_id = %s", (db.account, chat_id)).fetchone()
     chat = _chat_row(db, chat_id)
     held = window["n"] or 0
     if chat is not None and chat["end_of_history"]:
@@ -5867,8 +6014,8 @@ def _coverage(db, chat_id: str, *, limit: int | None,
 
 def _oldest_held(db, chat_id: str) -> int | None:
     row = db.execute(
-        "SELECT MIN(NULLIF(ts,0)) AS oldest FROM messages WHERE chat_id = ?",
-        (chat_id,)).fetchone()
+        "SELECT MIN(ts) AS oldest FROM whatsapp_messages"
+        " WHERE account = %s AND chat_id = %s", (db.account, chat_id)).fetchone()
     return row["oldest"]
 
 
@@ -5970,30 +6117,40 @@ def _reach_verdict(reach: dict | None, produced: int, chat_id: str,
 # ── The in-house engine's commands ──────────────────────────────────────────
 
 
+def _store_location(db) -> str:
+    """Where an account's capture lives, said without the store's address."""
+    return f"postgres schema {db.schema}, whatsapp_* tables, account {db.account}"
+
+
 def _store_facts(cfg: dict) -> dict:
     db = _open_store(cfg)
     try:
         counts = db.execute(
-            "SELECT (SELECT COUNT(*) FROM chats) AS chats,"
-            "       (SELECT COUNT(*) FROM messages) AS messages,"
-            "       (SELECT MIN(NULLIF(ts,0)) FROM messages) AS oldest,"
-            "       (SELECT MAX(ts) FROM messages) AS newest,"
-            "       (SELECT COUNT(*) FROM messages WHERE is_voice = 1) AS voice_notes,"
-            "       (SELECT COUNT(*) FROM messages WHERE direct_path IS NOT NULL) AS with_media,"
-            "       (SELECT COUNT(*) FROM messages WHERE kind = 'placeholderMessage'"
-            "          OR kind = 'empty') AS unreadable,"
-            "       (SELECT COUNT(*) FROM enrichment WHERE media_state = 'fetched') AS media_fetched,"
-            "       (SELECT COUNT(*) FROM enrichment WHERE media_state IN ('expired','error','unfetchable')) AS media_lost,"
-            "       (SELECT COUNT(*) FROM enrichment WHERE transcript IS NOT NULL) AS transcribed,"
-            "       (SELECT COUNT(*) FROM chunks) AS chunks,"
-            "       (SELECT MAX(at) FROM chunks) AS last_capture,"
-            "       (SELECT value FROM meta WHERE key = 'rebuild_incomplete')"
-            "         AS rebuild_incomplete"
-        ).fetchone()
+            "SELECT (SELECT COUNT(*) FROM whatsapp_chats WHERE account = %(a)s) AS chats,"
+            "       (SELECT COUNT(*) FROM whatsapp_messages WHERE account = %(a)s) AS messages,"
+            "       (SELECT MIN(ts) FROM whatsapp_messages WHERE account = %(a)s) AS oldest,"
+            "       (SELECT MAX(ts) FROM whatsapp_messages WHERE account = %(a)s) AS newest,"
+            "       (SELECT COUNT(*) FROM whatsapp_messages WHERE account = %(a)s"
+            "          AND is_voice) AS voice_notes,"
+            "       (SELECT COUNT(*) FROM whatsapp_messages WHERE account = %(a)s"
+            "          AND direct_path IS NOT NULL) AS with_media,"
+            "       (SELECT COUNT(*) FROM whatsapp_messages WHERE account = %(a)s"
+            "          AND (kind = 'placeholderMessage' OR kind = 'empty')) AS unreadable,"
+            "       (SELECT COUNT(*) FROM whatsapp_enrichment WHERE account = %(a)s"
+            "          AND media_state = 'fetched') AS media_fetched,"
+            "       (SELECT COUNT(*) FROM whatsapp_enrichment WHERE account = %(a)s"
+            "          AND media_state IN ('expired','error','unfetchable')) AS media_lost,"
+            "       (SELECT COUNT(*) FROM whatsapp_enrichment WHERE account = %(a)s"
+            "          AND transcript IS NOT NULL) AS transcribed,"
+            "       (SELECT COUNT(*) FROM whatsapp_chunks WHERE account = %(a)s) AS chunks,"
+            "       (SELECT MAX(at) FROM whatsapp_chunks WHERE account = %(a)s) AS last_capture,"
+            "       (SELECT value FROM whatsapp_meta WHERE account = %(a)s"
+            "          AND key = 'rebuild_incomplete') AS rebuild_incomplete",
+            {"a": db.account}).fetchone()
         facts = dict(counts)
+        facts["location"] = _store_location(db)
     finally:
         db.close()
-    facts["path"] = str(Path(cfg["home"]) / "messages.db")
     for key in ("oldest", "newest"):
         ts = facts.get(key)
         facts[key] = datetime.datetime.fromtimestamp(ts).isoformat() if ts else None
@@ -6107,7 +6264,7 @@ def _wm_status(cfg: dict) -> str:
         f"Store:    {facts['chats']} chats, {facts['messages']} messages",
         f"Span:     {(facts['oldest'] or '—')[:10]} … {(facts['newest'] or '—')[:10]}",
         f"Capture:  {facts['chunks']} chunk(s), last {facts['last_capture'] or '—'}",
-        f"Path:     {facts['path']}",
+        f"Location: {facts['location']}",
     ]
     return "\n".join(lines)
 
@@ -6115,7 +6272,7 @@ def _wm_status(cfg: dict) -> str:
 def _wm_health(cfg: dict) -> None:
     """What the capture holds and what is missing from it.
 
-    Local only: whether there is anything here to consume is the store's
+    Store only: whether there is anything here to consume is the store's
     question, and whether the account still answers is `doctor`'s. An empty
     store is a fact about the capture, not a fault in it, so it is reported as
     one and does not colour the exit."""
@@ -6250,11 +6407,9 @@ def _wm_pair(cfg: dict, args) -> None:
         if not args.yes:
             held = _open_store(cfg)
             try:
-                row = held.execute(
-                    "SELECT value FROM meta WHERE key = 'account_id'").fetchone()
+                owner = _get_meta(held, "account_id")
             finally:
                 held.close()
-            owner = row["value"] if row else None
             _refuse(6, "confirm_recreate",
                  f"--recreate discards the linked session for {cfg['id']!r} and "
                  f"links a new device"
@@ -6326,7 +6481,7 @@ def _wm_pair(cfg: dict, args) -> None:
               "sync_window": "full" if full else f"{days}d",
               "captured": {"chunks": len(session.chunks),
                            "chats": facts["chats"], "messages": facts["messages"]},
-              "store": facts["path"]}
+              "store": facts["location"]}
     if not cfg.get("expected_account_id") and account.get("id"):
         result["identity_binding"] = {
             "connection": cfg["id"], "expected_account_id": account["id"],
@@ -6350,12 +6505,15 @@ def _wm_chats(cfg: dict, args):
     try:
         rows = list(db.execute(
             """SELECT c.id, c.name, c.is_group, c.unread,
-                      COALESCE(MAX(m.ts), c.last_ts, 0) AS last_activity,
+                      COALESCE(MAX(m.ts), c.last_ts) AS last_activity,
                       COUNT(m.id) AS messages,
-                      MIN(NULLIF(m.ts,0)) AS oldest
-                 FROM chats c LEFT JOIN messages m ON m.chat_id = c.id
-                GROUP BY c.id
-                ORDER BY last_activity DESC"""))
+                      MIN(m.ts) AS oldest
+                 FROM whatsapp_chats c
+                 LEFT JOIN whatsapp_messages m
+                   ON m.account = c.account AND m.chat_id = c.id
+                WHERE c.account = %s
+                GROUP BY c.account, c.id
+                ORDER BY last_activity DESC NULLS LAST""", (db.account,)))
         search = (args.search or "").lower()
         results = []
         for row in rows:
@@ -6509,12 +6667,14 @@ def _wm_contact(cfg: dict, args):
     db = _open_store(cfg)
     try:
         row = db.execute(
-            "SELECT jid, lid, name, push_name FROM identities WHERE jid = ? OR lid = ?",
-            (contact_id, contact_id)).fetchone()
+            "SELECT jid, lid, name, push_name FROM whatsapp_identities"
+            " WHERE account = %s AND (jid = %s OR lid = %s)",
+            (db.account, contact_id, contact_id)).fetchone()
         chat = _chat_row(db, contact_id)
         counts = db.execute(
-            "SELECT COUNT(*) AS n, MAX(ts) AS newest FROM messages WHERE chat_id = ?",
-            (contact_id,)).fetchone()
+            "SELECT COUNT(*) AS n, MAX(ts) AS newest FROM whatsapp_messages"
+            " WHERE account = %s AND chat_id = %s",
+            (db.account, contact_id)).fetchone()
     finally:
         db.close()
     if row is None and chat is None:
@@ -6586,26 +6746,42 @@ def _record_media(db, chat_id: str, message_id: str, *, path: str | None,
                   state: str, error: str | None = None) -> None:
     with _writing(db):
         db.execute(
-            """INSERT INTO enrichment (chat_id, id, media_path, media_state,
-                                       media_error, updated_at)
-               VALUES (?,?,?,?,?,?)
-               ON CONFLICT(chat_id, id) DO UPDATE SET
+            """INSERT INTO whatsapp_enrichment (account, chat_id, id, media_path,
+                                                media_state, media_error,
+                                                updated_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (account, chat_id, id) DO UPDATE SET
                  media_path = excluded.media_path,
                  media_state = excluded.media_state,
                  media_error = excluded.media_error,
                  updated_at = excluded.updated_at""",
-            (chat_id, message_id, path, state, error, _iso_now()))
+            (db.account, chat_id, message_id, path, state, error, _iso_now()))
+
+
+def _as_time(value) -> str | None:
+    """A time carried in from a file, as the store can keep it: ISO text it
+    parses, or nothing rather than a value it would refuse."""
+    if not value:
+        return None
+    try:
+        datetime.datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return str(value)
 
 
 def _record_transcript(db, chat_id: str, message_id: str, result: dict) -> None:
     with _writing(db):
         db.execute(
-            """INSERT INTO enrichment (chat_id, id, transcript, transcript_language,
-                                       transcript_confidence, transcript_model,
-                                       transcript_provider, transcript_at,
-                                       transcript_error, effective_text, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(chat_id, id) DO UPDATE SET
+            """INSERT INTO whatsapp_enrichment (account, chat_id, id, transcript,
+                                                transcript_language,
+                                                transcript_confidence,
+                                                transcript_model,
+                                                transcript_provider,
+                                                transcript_at, transcript_error,
+                                                effective_text, updated_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (account, chat_id, id) DO UPDATE SET
                  transcript = excluded.transcript,
                  transcript_language = excluded.transcript_language,
                  transcript_confidence = excluded.transcript_confidence,
@@ -6615,10 +6791,10 @@ def _record_transcript(db, chat_id: str, message_id: str, result: dict) -> None:
                  transcript_error = excluded.transcript_error,
                  effective_text = excluded.effective_text,
                  updated_at = excluded.updated_at""",
-            (chat_id, message_id, result.get("text"), result.get("language"),
-             result.get("confidence"), result.get("model"), result.get("provider"),
-             result.get("transcribed_at"), result.get("error"), result.get("text"),
-             _iso_now()))
+            (db.account, chat_id, message_id, result.get("text"),
+             result.get("language"), result.get("confidence"), result.get("model"),
+             result.get("provider"), _as_time(result.get("transcribed_at")),
+             result.get("error"), result.get("text"), _iso_now()))
 
 
 def _pending_media(db, chat_id: str, wanted_kinds: set,
@@ -6630,13 +6806,14 @@ def _pending_media(db, chat_id: str, wanted_kinds: set,
            if m.get("type") in wanted_kinds and (m.get("media") or {})]
     rows = []
     for batch in _batched(ids):
-        marks = ",".join("?" * len(batch))
+        marks = ",".join(["%s"] * len(batch))
         rows += db.execute(
             f"""SELECT m.id, m.direct_path, m.media_key, e.media_state, e.media_path
-                  FROM messages m LEFT JOIN enrichment e
-                    ON e.chat_id = m.chat_id AND e.id = m.id
-                 WHERE m.chat_id = ? AND m.id IN ({marks})""",
-            [chat_id, *batch]).fetchall()
+                  FROM whatsapp_messages m LEFT JOIN whatsapp_enrichment e
+                    ON e.account = m.account AND e.chat_id = m.chat_id
+                   AND e.id = m.id
+                 WHERE m.account = %s AND m.chat_id = %s AND m.id IN ({marks})""",
+            [db.account, chat_id, *batch]).fetchall()
     pending = []
     for row in rows:
         if row["media_state"] in ("expired", "unfetchable"):
@@ -6658,10 +6835,11 @@ def _fetch_media(session: "Session", chat_id: str, pending: list[str]) -> dict:
     cache = _connection_home(session.cfg) / "media"
     rows = []
     for batch in _batched(pending):
-        marks = ",".join("?" * len(batch))
+        marks = ",".join(["%s"] * len(batch))
         rows += list(session.db.execute(
-            f"SELECT * FROM messages WHERE chat_id = ? AND id IN ({marks})",
-            [chat_id, *batch]))
+            f"SELECT * FROM whatsapp_messages"
+            f" WHERE account = %s AND chat_id = %s AND id IN ({marks})",
+            [session.db.account, chat_id, *batch]))
     for n, row in enumerate(rows, 1):
         _log(f"  media [{n}/{len(rows)}] {row['id']} …")
         answer = session.fetch_media(row)
@@ -6740,8 +6918,9 @@ def _adopt_prior_transcriptions(db, chat_id: str, prior: dict) -> int:
         if not (isinstance(transcription, dict) and transcription.get("text")):
             continue
         held = db.execute(
-            "SELECT transcript FROM enrichment WHERE chat_id = ? AND id = ?",
-            (chat_id, message_id)).fetchone()
+            "SELECT transcript FROM whatsapp_enrichment"
+            " WHERE account = %s AND chat_id = %s AND id = %s",
+            (db.account, chat_id, message_id)).fetchone()
         if held and held["transcript"]:
             continue
         _record_transcript(db, chat_id, message_id, transcription)
@@ -7833,29 +8012,33 @@ def _deepgram_transcribe(audio_path, api_key, model):
     }
 
 
-def _store_transcript(args, payload: dict, message_id: str, result: dict) -> None:
-    """A transcription is enrichment: it belongs beside the message in the store
+def _transcript_store(args, payload: dict):
+    """The store a transcription of this export belongs in, opened, or None.
+
+    A transcription is enrichment: it belongs beside the message in the store
     as well as in the export that asked for it, so the next export carries it
     without paying for the work twice. A payload from another connection, or one
-    served by the bridge, simply has nowhere to put it."""
-    chat_id = (payload.get("chat") or {}).get("id")
-    if not chat_id:
-        return
+    served by the bridge, simply has nowhere to put it. The store is opened
+    before any work is paid for, so one that cannot be opened refuses the run
+    rather than a transcription already bought."""
+    if not (payload.get("chat") or {}).get("id"):
+        return None
     try:
         reg, _ = _connections_registry()
         cid, entry = _select_connection(reg, getattr(args, "connection", None))
         cfg, problem = _build_cfg(cid, entry, None)
     except SystemExit:
-        return
+        return None
     if problem or cfg["engine"] != ENGINE_INHOUSE:
-        return
+        return None
     if payload.get("connection") and payload["connection"] != cfg["id"]:
-        return
-    db = _open_store(cfg)
-    try:
-        _record_transcript(db, chat_id, message_id, result)
-    finally:
-        db.close()
+        return None
+    return _open_store(cfg)
+
+
+def _store_transcript(db, payload: dict, message_id: str, result: dict) -> None:
+    if db is not None:
+        _record_transcript(db, payload["chat"]["id"], message_id, result)
 
 
 def cmd_transcribe(args):
@@ -7889,6 +8072,23 @@ def cmd_transcribe(args):
         _log("Nothing to transcribe (use --force to re-run).")
         return {"ok": True, "transcribed": 0, "failed": 0, "file": str(p)}
 
+    store = _transcript_store(args, payload)
+    try:
+        failures = _transcribe_all(args, api_key, p, payload, to_do, store)
+    finally:
+        if store is not None:
+            store.close()
+    _log(f"Done. {len(to_do) - failures}/{len(to_do)} transcribed. File: {p}")
+    return {
+        "ok": failures == 0,
+        "transcribed": len(to_do) - failures,
+        "failed": failures,
+        "file": str(p),
+    }
+
+
+def _transcribe_all(args, api_key: str, p: Path, payload: dict, to_do: list,
+                    store) -> int:
     _log(f"Transcribing {len(to_do)} file(s) with Deepgram (model={args.model})...")
     failures = 0
     for n, (idx, m, ap) in enumerate(to_do, 1):
@@ -7909,19 +8109,12 @@ def cmd_transcribe(args):
             m["transcription"] = result
             failures += 1
             _log(f"       → ERROR: {e}")
-        _store_transcript(args, payload, m["id"], result)
+        _store_transcript(store, payload, m["id"], result)
         # Saved after every file, so an interruption costs one transcription
         # rather than all of them — and replaced whole, so it never costs the
         # export itself.
         _write_json(p, payload)
-
-    _log(f"Done. {len(to_do) - failures}/{len(to_do)} transcribed. File: {p}")
-    return {
-        "ok": failures == 0,
-        "transcribed": len(to_do) - failures,
-        "failed": failures,
-        "file": str(p),
-    }
+    return failures
 
 
 

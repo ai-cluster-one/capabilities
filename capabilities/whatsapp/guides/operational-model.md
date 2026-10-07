@@ -2,7 +2,7 @@
 
 How a WhatsApp identity is linked, what arrives when, and what each of those arrivals costs.
 
-A connection is one WhatsApp identity, driven by the engine the CLI carries: whatsmeow, compiled into the installed wheel and run in-process, so a consuming project needs nothing beyond the CLI. The credential is the linked-device session itself, minted by pairing into the user state home beside the account's store, under a folder named for the account rather than for the connection that reached it. A connection may instead name a self-hosted WAHA bridge, in which case the identity is that instance's session and the bridge's own wiring lives on the entry; the verb surface is the same either way.
+A connection is one WhatsApp identity, driven by the engine the CLI carries: whatsmeow, compiled into the installed wheel and run in-process, so a consuming project needs nothing beyond the CLI. The credential is the linked-device session itself, minted by pairing into the user state home, under a folder named for the account rather than for the connection that reached it. What the account hands over is captured into the machine's Postgres store, keyed by the same account; the store must be configured before any verb that reads or writes the capture will run. A connection may instead name a self-hosted WAHA bridge, in which case the identity is that instance's session and the bridge's own wiring lives on the entry; the verb surface is the same either way.
 
 ## The device
 
@@ -20,7 +20,7 @@ Linking adds an entry to the account's Linked Devices list on the phone, and tha
 
 A shallow initial window does not cap how far the capability can later go: anchored paging walks straight past the pairing boundary. So the default takes little at pairing and deepens when a read asks for more than the store holds. Reaching back is paid for per request, so warming a large conversation is minutes of work rather than an instant.
 
-Declaring a deep initial sync is available where a consumer genuinely wants the whole archive on disk from the start. It is a deliberate choice, because an archive already written cannot be unwritten.
+Declaring a deep initial sync is available where a consumer genuinely wants the whole archive captured from the start. It is a deliberate choice, because an archive already written cannot be unwritten.
 
 ## What the record cannot hold
 
@@ -44,6 +44,6 @@ Two clients driving one linked device desync it and can log it out, so an invoca
 
 ## Adding an identity
 
-Adding a second WhatsApp identity is a connection-registry edit plus one pairing ceremony. Each account keeps its own session and its own store, so two accounts never share a file.
+Adding a second WhatsApp identity is a connection-registry edit plus one pairing ceremony. Each account keeps its own session and its own rows in the store, so two accounts never share a capture.
 
 A connection id is an alias, and the state it reaches is named for the account instead. So renaming an entry keeps the session and the capture it already had, and two entries naming one account arrive at one home rather than building two captures of it — which is what makes several projects consuming one account share one capture. Naming the account is therefore what an in-house entry does before it can pair: the phone number, or a pinned `expected_account_id`. An account's home already written under an older alias is adopted the first time that alias resolves, and one holding a different account is left alone rather than merged.
