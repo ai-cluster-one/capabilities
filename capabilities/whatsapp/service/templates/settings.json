@@ -1,4 +1,5 @@
 {
   "connection": null,
-  "environment": "production"
+  "environment": "production",
+  "send_rate": 20
 }

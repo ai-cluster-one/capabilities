@@ -116,7 +116,9 @@ State
                        the assistant service for its whole life
         service/       the assistant service's control files on this
                        machine: owner.json, health.json, daemon.pid,
-                       daemon.log
+                       daemon.log, and capture-spool.jsonl while the store
+                       is unreachable (capture-spool.rejected.jsonl keeps
+                       a spooled capture the store refused for its content)
 
 Assistant service
   `whatsapp service ...` runs a bundled long-running listener, `assistant`, on
@@ -126,17 +128,25 @@ Assistant service
   type LIVE). A dropped connection is re-established with backoff (2s
   doubling to 60s), and the offline queue drains on each reconnect. A device
   removed from the phone is final: the service stops reconnecting and says
-  so in `service status` and `service doctor`. It sends nothing and answers
-  nothing.
+  so in `service status` and `service doctor`. It answers nothing on its own:
+  it sends the messages `send` queues for its account, oldest first and at
+  most `send_rate` a minute. A capture the store cannot take because the store
+  is unreachable is appended to a spool file in the service's state directory
+  and written into the store, in order and once, when it answers again (and at
+  start); `service status` reports the spool depth and the store error. A send
+  a previous run left in flight is failed as interrupted_delivery_unknown at
+  start and never resent.
   Its settings are the project's whatsapp service settings records
   (capabilities/whatsapp/service/settings.json in files mode): `connection`
-  (which connection it runs; null takes the registry's default) and
-  `environment` (a label it reports). Any other key is refused.
+  (which connection it runs; null takes the registry's default),
+  `environment` (a label it reports) and `send_rate` (messages a minute, 1 to
+  120; null means 20). Any other key is refused.
   Activation needs an explicit project enable (`capabilities enable whatsapp
-  --project`) and a configured store. While the service runs, every verb that
-  connects on that account exits 8 naming the service; reads that answer from
-  the store (`status`, `health`, `chats` without --fresh, `messages` the store
-  covers or with --rounds 0) keep working.
+  --project`) and a configured store. While the service runs, `send` on that
+  account hands its message to the service and returns the service's answer,
+  every other verb that connects on that account exits 8 naming the service,
+  and reads that answer from the store (`status`, `health`, `chats` without
+  --fresh, `messages` the store covers or with --rounds 0) keep working.
       whatsapp service init [--connection ID] [--force]
                                        Seed the settings records.
       whatsapp service start [--connection ID]
@@ -249,15 +259,37 @@ Commands
                                        the store lacks. A second run imports
                                        nothing. Exit 3 when there is no file, 6
                                        when it is not a legacy store.
-  whatsapp send <chat_id> <text>       Send one text message. Write-enabled
+  whatsapp send <chat_id> <text> [--reply-to MESSAGE_ID]
+                [--mention PHONE]... [--typing]
+                                       Send one text message. Write-enabled
                                        connections only: `send` exits 4 unless
-                                       the connection carries allow_write.
-                                       Reports the id the account minted, which
-                                       is what a later read carries. What goes
-                                       out is an ordinary message, carrying no
-                                       machine marking of any kind, so saying
-                                       who is writing is the sender's job and
-                                       belongs in the text.
+                                       the connection carries allow_write,
+                                       before anything is written.
+                                       The message is first a pending row in
+                                       the store. With the assistant service
+                                       running on the account the service sends
+                                       it and `send` waits up to 60s for its
+                                       answer; otherwise `send` connects and
+                                       sends it. Reports the id the account
+                                       minted, which is what a later read
+                                       carries, with local_id (the row's
+                                       internal id), delivery and sent_by
+                                       (service or direct). A failed send exits
+                                       5 send_failed; no answer in time exits 5
+                                       send_pending naming the local id, and
+                                       the row is still sent when the service
+                                       can, so sending again sends twice.
+                                       --reply-to quotes a message of the same
+                                       chat the store holds (exit 3 otherwise);
+                                       --mention mentions a number, repeatable,
+                                       and its @number leads the text unless
+                                       the text carries it; --typing shows
+                                       composing for 1.5-3.5s, then paused,
+                                       before sending.
+                                       What goes out is an ordinary message,
+                                       carrying no machine marking of any kind,
+                                       so saying who is writing is the sender's
+                                       job and belongs in the text.
 
 Chat and contact IDs
   DMs    — <number>@s.whatsapp.net  e.g. 15551234567@s.whatsapp.net
@@ -298,14 +330,16 @@ Exit codes
   0  success
   2  auth — missing / rejected credentials, or the session authorises as an
      account other than the connection's expected_account_id
-  3  not found — the addressed chat, contact, or file does not exist
+  3  not found — the addressed chat, contact, file, or quoted message does
+     not exist
   4  policy refusal — the project gate (capabilities/settings.json) on any verb,
      or a write verb on a read-only connection (allow_write: false). Ask the user;
      never lift a gate yourself.
   5  server / network — the engine could not load, the connection failed, a
      round-trip timed out, an engine event handler failed, the phone did not
-     answer a history request the read needed, or the store could not be
-     reached or answered with an error
+     answer a history request the read needed, a send failed or was not
+     answered in time, or the store could not be reached or answered with an
+     error
   6  input / validation — a malformed argument or date, an incoherent connection
      entry, an unsupported operation, or a store that is not configured or whose
      setting is invalid
@@ -326,6 +360,7 @@ import fcntl
 import json
 import os
 import platform
+import random
 import re
 import shutil
 import subprocess
@@ -365,7 +400,8 @@ POST_INSTALL: list = []
 SERVICE = {
     "name": "assistant",
     "summary": ("Long-running listener that holds one account's WhatsApp "
-                "connection and captures every message live into the store."),
+                "connection, captures every message live into the store, and "
+                "sends the messages queued for the account."),
     "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs"],
     "config": "capabilities/whatsapp/service",
     "state": "<account-state>/service",
@@ -4530,8 +4566,9 @@ def _engine():
         from neonize.client import NewClient
         from neonize import events as nev
         from neonize.utils.jid import build_jid, Jid2String
-        from neonize.utils.enum import MediaType
+        from neonize.utils.enum import ChatPresence, ChatPresenceMedia, MediaType
         from neonize.proto.Neonize_pb2 import JID
+        from neonize.proto.waE2E import WAWebProtobufsE2E_pb2 as e2e
         from neonize.proto.waCompanionReg import (
             WAWebProtobufsCompanionReg_pb2 as companion)
         from neonize.proto.waHistorySync import (
@@ -4553,6 +4590,8 @@ def _engine():
         "NewClient": NewClient, "events": nev, "build_jid": build_jid,
         "Jid2String": Jid2String, "MediaType": MediaType, "JID": JID,
         "companion": companion, "history_proto": history_proto,
+        "e2e": e2e, "ChatPresence": ChatPresence,
+        "ChatPresenceMedia": ChatPresenceMedia,
     }
     return _ENGINE
 
@@ -4730,9 +4769,34 @@ CREATE TABLE whatsapp_chunks (
   messages integer, progress integer, at timestamptz, raw_file text)"""),
     Step("0009-chunks-by-account", """
 CREATE INDEX whatsapp_chunks_by_account ON whatsapp_chunks (account)"""),
+    # A message this capability sends is a row like any other, carrying its
+    # delivery: `pending` until a sender claims it, `sending` while it is on the
+    # wire, then `sent` with the id WhatsApp minted, or `failed` with the
+    # reason. Until it is sent its id is the internal one in local_id.
+    Step("0010-messages-delivery", """
+ALTER TABLE whatsapp_messages
+  ADD COLUMN local_id text, ADD COLUMN delivery text,
+  ADD COLUMN delivery_error text, ADD COLUMN requested_at timestamptz,
+  ADD COLUMN sent_at timestamptz, ADD COLUMN mentions text[],
+  ADD COLUMN typing boolean,
+  ADD CONSTRAINT whatsapp_messages_delivery_check
+    CHECK (delivery IN ('pending', 'sending', 'sent', 'failed'))"""),
+    Step("0011-messages-by-local-id", """
+CREATE UNIQUE INDEX whatsapp_messages_by_local_id
+  ON whatsapp_messages (account, local_id) WHERE local_id IS NOT NULL"""),
+    Step("0012-messages-outbound", """
+CREATE INDEX whatsapp_messages_outbound
+  ON whatsapp_messages (account, requested_at)
+  WHERE delivery IN ('pending', 'sending')"""),
 ]
 STORE_SCHEMA_MAJOR = 1
-STORE_SCHEMA_MINOR = 0
+STORE_SCHEMA_MINOR = 1
+
+# The rows a read answers with: everything captured, and what this capability
+# sent once WhatsApp took it. A message still waiting or one that never left is
+# not part of the conversation.
+_HELD = "(delivery IS NULL OR delivery = 'sent')"
+_HELD_M = "(m.delivery IS NULL OR m.delivery = 'sent')"
 
 # The parser version the rows were built by. Raise it whenever a change to
 # `_describe` or `_ingest_history` would produce different rows from the same
@@ -4845,6 +4909,47 @@ class _Store:
 
     def close(self) -> None:
         self.conn.close()
+
+    def broken(self) -> bool:
+        """Whether the connection is known to be gone, without asking the
+        store."""
+        return bool(getattr(self.conn, "closed", False)
+                    or getattr(self.conn, "broken", False))
+
+    def reconnect(self) -> None:
+        """Replace a connection the store dropped. The tables were migrated
+        when this store was first opened; a new connection needs none of that."""
+        with self.write_lock:
+            with contextlib.suppress(Exception):
+                self.conn.close()
+            try:
+                conn = connect(application_name=NAME, setting=read_setting())
+            except DbError as exc:
+                _store_refusal(exc)
+            conn.autocommit = True
+            self.conn = conn
+            self.write_depth = 0
+
+
+def _store_outage(exc: BaseException) -> bool:
+    """Whether a failed store write failed because the store could not be
+    reached, rather than because of what was written.
+
+    Only an outage is waited out. A statement the store refuses for its content
+    would be refused again on every retry, so it is a fault to report, not a
+    reason to hold everything behind it."""
+    import psycopg
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError)):
+            return True
+        if isinstance(exc, DbError) and exc.slug == "store_unreachable":
+            return True
+        if isinstance(exc, _Refusal) and exc.code == "store_unreachable":
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 @contextlib.contextmanager
@@ -5345,20 +5450,30 @@ def _upsert_message(db, row: dict, *, authoritative: bool = False) -> bool:
     return False
 
 
+def _write_raw_chunk(home: Path, data, sync_type: str) -> str:
+    """Put one history chunk on disk exactly as it arrived, and name it.
+
+    Its file name carries its own identity rather than a sequence read from the
+    store: the engine delivers events on its own thread with nothing serialising
+    them, and two deliveries computing the same next number would have one
+    overwrite the other's bytes."""
+    raw_name = (f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
+                f"-{sync_type}.pb")
+    (home / "raw" / raw_name).write_bytes(data.SerializeToString())
+    return raw_name
+
+
 def _ingest_history(db, data, home: Path, sync_type: str, *,
-                    record: bool = True,
+                    record: bool = True, raw_name: str | None = None,
                     authoritative: bool = False) -> tuple[int, int, int]:
     """Write one history chunk down.
 
     The protobuf lands on disk before it is parsed, so a parser fault costs a
-    re-ingest and never the data. Its file name carries its own identity rather
-    than a sequence read from the store: the engine delivers events on its own
-    thread with nothing serialising them, and two deliveries computing the same
-    next number would have one overwrite the other's bytes."""
-    if record:
-        raw_name = (f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
-                    f"-{sync_type}.pb")
-        (home / "raw" / raw_name).write_bytes(data.SerializeToString())
+    re-ingest and never the data. A caller that already put it there names the
+    file; the chunk is recorded once per file, so writing the same file down a
+    second time adds no second record of it."""
+    if record and raw_name is None:
+        raw_name = _write_raw_chunk(home, data, sync_type)
 
     conversations = messages = new = 0
     with _writing(db):
@@ -5408,7 +5523,9 @@ def _ingest_history(db, data, home: Path, sync_type: str, *,
                 if row["push_name"] and (sender or sender_lid):
                     _remember_identity(db, sender or sender_lid, sender_lid,
                                        push_name=row["push_name"])
-        if record:
+        if record and not db.execute(
+                "SELECT 1 FROM whatsapp_chunks WHERE account = %s AND raw_file = %s",
+                (db.account, raw_name)).fetchone():
             db.execute(
                 "INSERT INTO whatsapp_chunks (account, sync_type, conversations,"
                 " messages, progress, at, raw_file) VALUES (%s,%s,%s,%s,%s,%s,%s)",
@@ -5418,12 +5535,19 @@ def _ingest_history(db, data, home: Path, sync_type: str, *,
 
 
 def _ingest_live(db, event) -> int:
-    """One message as it arrives. Its timestamp is milliseconds where a history
-    chunk's is seconds; `_ts_seconds` is the single place that knows."""
+    """One message as it arrives."""
+    row = _live_row(event)
+    return _write_live(db, row) if row else 0
+
+
+def _live_row(event) -> dict | None:
+    """The row one arriving message becomes, read off the event alone. Its
+    timestamp is milliseconds where a history chunk's is seconds; `_ts_seconds`
+    is the single place that knows."""
     source = event.Info.MessageSource
     chat_id = _jid_str(source.Chat)
     if not chat_id:
-        return 0
+        return None
     sender = _jid_str(source.Sender)
     sender_alt = _jid_str(getattr(source, "SenderAlt", None))
     sender_bare = _bare_jid(sender)
@@ -5446,12 +5570,19 @@ def _ingest_live(db, event) -> int:
             "file_name", "file_length", "direct_path", "media_key",
             "file_enc_sha256", "file_sha256")},
     }
+    return row
+
+
+def _write_live(db, row: dict) -> int:
+    """Write one arrived message, its chat and its sender, whole. Writing the
+    same message again fills gaps and adds nothing."""
+    sender_pn, sender_lid = row.get("sender"), row.get("sender_lid")
     with _writing(db):
-        _upsert_chat(db, chat_id, None, _ts_seconds(event.Info.Timestamp))
+        _upsert_chat(db, row["chat_id"], None, row.get("ts"))
         added = 1 if _upsert_message(db, row) else 0
         if sender_pn or sender_lid:
             _remember_identity(db, sender_pn or sender_lid, sender_lid,
-                               push_name=push_name)
+                               push_name=row.get("push_name"))
     return added
 
 
@@ -5511,6 +5642,10 @@ class Session:
         self._client = None
         self._thread = None
         self.stalled = False
+        # The assistant service hands its capture spool in here, so what
+        # arrives while the store cannot be reached is kept rather than lost.
+        # A verb leaves it unset and fails as itself.
+        self.spool = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -5565,13 +5700,26 @@ class Session:
         self._drained.set()
 
     def _on_message(self, event) -> None:
-        self.live_messages += _ingest_live(self.db, event)
+        if self.spool is None:
+            self.live_messages += _ingest_live(self.db, event)
+        else:
+            row = _live_row(event)
+            if row:
+                self.live_messages += self.spool.capture(
+                    self.db, {"kind": "live", "row": _spool_row(row)}) or 0
         self.last_message_at = time.time()
 
     def _on_history(self, event) -> None:
         sync_type = _SYNC_TYPES.get(event.Data.syncType, str(event.Data.syncType))
-        conversations, messages, new = _ingest_history(
-            self.db, event.Data, self.home, sync_type)
+        if self.spool is None:
+            conversations, messages, new = _ingest_history(
+                self.db, event.Data, self.home, sync_type)
+        else:
+            raw_name = _write_raw_chunk(self.home, event.Data, sync_type)
+            conversations, messages, new = self.spool.capture(
+                self.db, {"kind": "history", "raw_file": raw_name,
+                          "sync_type": sync_type},
+                data=event.Data) or (0, 0, 0)
         self.chunks.append({"sync_type": sync_type, "chats": conversations,
                             "messages": messages, "new": new})
         self._last_chunk = time.monotonic()
@@ -5773,6 +5921,7 @@ class Session:
         anchor = self.db.execute(
             "SELECT id, ts, from_me FROM whatsapp_messages"
             " WHERE account = %s AND chat_id = %s AND ts > to_timestamp(0)"
+            f" AND {_HELD}"
             " ORDER BY ts ASC LIMIT 1", (self.db.account, chat_id)).fetchone()
         if anchor is None:
             return {"ok": False, "reason": "no_anchor", "new": 0}
@@ -6064,7 +6213,7 @@ def _chat_row(db, chat_id: str):
 def _read_messages(db, chat_id: str, *, limit: int | None,
                    from_ts: int | None, to_ts: int | None) -> list[dict]:
     """The window a caller asked for, oldest-first, out of the store."""
-    where = ["m.account = %s", "m.chat_id = %s"]
+    where = ["m.account = %s", "m.chat_id = %s", _HELD_M]
     params: list = [db.account, chat_id]
     if from_ts:
         where.append(f"m.ts >= {_TS_PARAM}")
@@ -6094,7 +6243,7 @@ def _coverage(db, chat_id: str, *, limit: int | None,
     Counted inside that window, because a chat holding hundreds of recent
     messages says nothing about whether it holds the fifty before a date the
     caller named."""
-    where = ["account = %s", "chat_id = %s"]
+    where = ["account = %s", "chat_id = %s", _HELD]
     params: list = [db.account, chat_id]
     if from_ts:
         where.append(f"ts >= {_TS_PARAM}")
@@ -6107,7 +6256,8 @@ def _coverage(db, chat_id: str, *, limit: int | None,
         f"  FROM whatsapp_messages WHERE {' AND '.join(where)}", params).fetchone()
     whole = db.execute(
         "SELECT COUNT(*) AS n, MIN(ts) AS oldest FROM whatsapp_messages"
-        "  WHERE account = %s AND chat_id = %s", (db.account, chat_id)).fetchone()
+        f"  WHERE account = %s AND chat_id = %s AND {_HELD}",
+        (db.account, chat_id)).fetchone()
     chat = _chat_row(db, chat_id)
     held = window["n"] or 0
     if chat is not None and chat["end_of_history"]:
@@ -6126,7 +6276,8 @@ def _coverage(db, chat_id: str, *, limit: int | None,
 def _oldest_held(db, chat_id: str) -> int | None:
     row = db.execute(
         "SELECT MIN(ts) AS oldest FROM whatsapp_messages"
-        " WHERE account = %s AND chat_id = %s", (db.account, chat_id)).fetchone()
+        f" WHERE account = %s AND chat_id = %s AND {_HELD}",
+        (db.account, chat_id)).fetchone()
     return row["oldest"]
 
 
@@ -6238,14 +6389,20 @@ def _store_facts(cfg: dict) -> dict:
     try:
         counts = db.execute(
             "SELECT (SELECT COUNT(*) FROM whatsapp_chats WHERE account = %(a)s) AS chats,"
-            "       (SELECT COUNT(*) FROM whatsapp_messages WHERE account = %(a)s) AS messages,"
-            "       (SELECT MIN(ts) FROM whatsapp_messages WHERE account = %(a)s) AS oldest,"
-            "       (SELECT MAX(ts) FROM whatsapp_messages WHERE account = %(a)s) AS newest,"
             "       (SELECT COUNT(*) FROM whatsapp_messages WHERE account = %(a)s"
+            f"          AND {_HELD}) AS messages,"
+            "       (SELECT MIN(ts) FROM whatsapp_messages WHERE account = %(a)s"
+            f"          AND {_HELD}) AS oldest,"
+            "       (SELECT MAX(ts) FROM whatsapp_messages WHERE account = %(a)s"
+            f"          AND {_HELD}) AS newest,"
+            "       (SELECT COUNT(*) FROM whatsapp_messages WHERE account = %(a)s"
+            f"          AND {_HELD}"
             "          AND is_voice) AS voice_notes,"
             "       (SELECT COUNT(*) FROM whatsapp_messages WHERE account = %(a)s"
+            f"          AND {_HELD}"
             "          AND direct_path IS NOT NULL) AS with_media,"
             "       (SELECT COUNT(*) FROM whatsapp_messages WHERE account = %(a)s"
+            f"          AND {_HELD}"
             "          AND (kind = 'placeholderMessage' OR kind = 'empty')) AS unreadable,"
             "       (SELECT COUNT(*) FROM whatsapp_enrichment WHERE account = %(a)s"
             "          AND media_state = 'fetched') AS media_fetched,"
@@ -6622,6 +6779,7 @@ def _wm_chats(cfg: dict, args):
                  FROM whatsapp_chats c
                  LEFT JOIN whatsapp_messages m
                    ON m.account = c.account AND m.chat_id = c.id
+                  AND (m.delivery IS NULL OR m.delivery = 'sent')
                 WHERE c.account = %s
                 GROUP BY c.account, c.id
                 ORDER BY last_activity DESC NULLS LAST""", (db.account,)))
@@ -6784,7 +6942,7 @@ def _wm_contact(cfg: dict, args):
         chat = _chat_row(db, contact_id)
         counts = db.execute(
             "SELECT COUNT(*) AS n, MAX(ts) AS newest FROM whatsapp_messages"
-            " WHERE account = %s AND chat_id = %s",
+            f" WHERE account = %s AND chat_id = %s AND {_HELD}",
             (db.account, contact_id)).fetchone()
     finally:
         db.close()
@@ -7863,41 +8021,347 @@ def _waha_send(cfg, args):
             "message_id": minted, "length": len(text)}
 
 
+# ── Sending ─────────────────────────────────────────────────────────────────
+#
+# Every message this capability sends is first a row in whatsapp_messages,
+# from_me, with a delivery state and an internal id (local_id, also its id until
+# WhatsApp mints one). Whoever holds the account's connection sends it: the
+# assistant service when it runs on the account, else the `send` invocation
+# itself. The copy WhatsApp hands back for a sent message lands on the same row,
+# because by then the row carries WhatsApp's id.
+
+OUTBOUND_SYNC = "OUTBOUND"        # the provenance of a row written to be sent
+OUTBOUND_WAIT = 60.0              # `send` waits this long for the service's answer
+OUTBOUND_POLL = 0.5               # how often it asks
+SEND_RATE_DEFAULT = 20            # messages per minute the service sends, at most
+SEND_RATE_CEILING = 120
+TYPING_SECONDS = (1.5, 3.5)       # how long `--typing` shows composing, jittered
+DELIVERY_INTERRUPTED = "interrupted_delivery_unknown"
+
+
+def _mention_jid(raw: str) -> str:
+    digits = _digits(raw)
+    if not digits:
+        _refuse(6, "bad_mention", f"{raw!r} is not a phone number to mention",
+                "pass --mention as digits with the country code")
+    return f"{digits}@s.whatsapp.net"
+
+
+def _outgoing_request(args) -> dict:
+    """What one `send` asks for, checked before anything is written."""
+    text = _require_text(args)
+    mentions = []
+    for raw in getattr(args, "mentions", None) or []:
+        jid = _mention_jid(raw)
+        if jid not in mentions:
+            mentions.append(jid)
+    # A mention renders where its number is written; one the text does not
+    # carry would notify without showing, so its token leads the text.
+    missing = [f"@{jid.split('@', 1)[0]}" for jid in mentions
+               if f"@{jid.split('@', 1)[0]}" not in text]
+    if missing:
+        text = " ".join(missing) + " " + text
+    reply_to = getattr(args, "reply_to", None)
+    if reply_to is not None and not str(reply_to).strip():
+        _refuse(6, "bad_reply_to", "--reply-to needs a message id")
+    return {"chat_id": _normalize_chat_id(args.chat_id), "text": text,
+            "reply_to": str(reply_to).strip() if reply_to else None,
+            "mentions": mentions, "typing": bool(getattr(args, "typing", False))}
+
+
+def _queue_outgoing(db, request: dict) -> dict:
+    """Write the message to be sent as a pending row, and return it.
+
+    A quote names a message the store holds in that chat; one it does not hold
+    cannot be quoted, because a quote carries the quoted message itself."""
+    if request.get("reply_to"):
+        quoted = db.execute(
+            "SELECT id FROM whatsapp_messages WHERE account = %s AND chat_id = %s"
+            f" AND id = %s AND {_HELD}",
+            (db.account, request["chat_id"], request["reply_to"])).fetchone()
+        if quoted is None:
+            _refuse(3, "quoted_not_found",
+                    f"the store holds no message {request['reply_to']!r} in "
+                    f"{request['chat_id']}",
+                    f"read the chat with `{NAME} messages` and quote an id it "
+                    "returns")
+    local_id = f"out-{uuid.uuid4().hex}"
+    kind = ("extendedTextMessage" if request.get("reply_to")
+            or request.get("mentions") else "conversation")
+    with _writing(db):
+        db.execute(
+            f"""INSERT INTO whatsapp_messages
+                   (account, chat_id, id, local_id, from_me, ts, kind, text,
+                    quoted_id, mentions, typing, delivery, requested_at,
+                    sync_type, captured_at)
+                VALUES (%s, %s, %s, %s, true, {_TS_PARAM}, %s, %s, %s, %s, %s,
+                        'pending', clock_timestamp(), %s, %s)""",
+            (db.account, request["chat_id"], local_id, local_id, time.time(),
+             kind, request["text"], request.get("reply_to"),
+             request.get("mentions") or None, bool(request.get("typing")),
+             OUTBOUND_SYNC, _iso_now()))
+    return _outgoing_row(db, local_id)
+
+
+def _outgoing_row(db, local_id: str):
+    return db.execute(
+        "SELECT * FROM whatsapp_messages WHERE account = %s AND local_id = %s",
+        (db.account, local_id)).fetchone()
+
+
+def _claim_outgoing(db, local_id: str | None = None):
+    """Take the oldest pending message of the account for sending, or the one
+    named. A message is claimed once: whoever claims it is the only sender it
+    will ever have."""
+    only = " AND local_id = %s" if local_id else ""
+    with _writing(db):
+        # The pick is materialised once. As a sub-select it may be evaluated
+        # again for each row the update visits, and claim more than one.
+        return db.execute(
+            f"""WITH next AS MATERIALIZED (
+                     SELECT chat_id, id FROM whatsapp_messages
+                      WHERE account = %s AND delivery = 'pending'{only}
+                      ORDER BY requested_at, local_id
+                      LIMIT 1 FOR UPDATE SKIP LOCKED)
+                UPDATE whatsapp_messages m SET delivery = 'sending'
+                  FROM next
+                 WHERE m.account = %s AND m.chat_id = next.chat_id
+                   AND m.id = next.id
+                RETURNING m.*""",
+            (db.account, *([local_id] if local_id else []), db.account)
+        ).fetchone()
+
+
+def _recover_interrupted(db) -> list[str]:
+    """Close out every message a sender claimed and never answered for.
+
+    Whether it reached WhatsApp cannot be known from here, and sending it again
+    could deliver it twice, so it is failed with that reason and never resent."""
+    with _writing(db):
+        rows = db.execute(
+            """UPDATE whatsapp_messages
+                  SET delivery = 'failed', delivery_error = %s
+                WHERE account = %s AND delivery = 'sending'
+            RETURNING local_id""", (DELIVERY_INTERRUPTED, db.account)).fetchall()
+    return [r["local_id"] for r in rows]
+
+
+def _apply_delivery(db, outcome: dict) -> None:
+    """Write down what became of one message. Writing the same outcome twice
+    changes nothing."""
+    local_id = outcome["local_id"]
+    with _writing(db):
+        row = _outgoing_row(db, local_id)
+        if row is None or row["delivery"] in ("sent", "failed"):
+            return
+        if outcome["state"] != "sent":
+            db.execute(
+                "UPDATE whatsapp_messages SET delivery = 'failed',"
+                " delivery_error = %s WHERE account = %s AND local_id = %s",
+                (outcome.get("error") or "unknown", db.account, local_id))
+            return
+        wa_id, stamp = outcome["message_id"], outcome.get("timestamp") or time.time()
+        echo = db.execute(
+            "SELECT id FROM whatsapp_messages WHERE account = %s AND chat_id = %s"
+            " AND id = %s", (db.account, row["chat_id"], wa_id)).fetchone()
+        if echo is not None:
+            # WhatsApp's own copy arrived before the answer did. It is the same
+            # message, so the copy takes the delivery and the pending row goes.
+            db.execute(
+                "DELETE FROM whatsapp_messages WHERE account = %s AND local_id = %s",
+                (db.account, local_id))
+            db.execute(
+                f"""UPDATE whatsapp_messages
+                       SET local_id = %s, delivery = 'sent', delivery_error = NULL,
+                           requested_at = %s, sent_at = {_TS_PARAM},
+                           mentions = %s, typing = %s,
+                           text = COALESCE(text, %s),
+                           quoted_id = COALESCE(quoted_id, %s)
+                     WHERE account = %s AND chat_id = %s AND id = %s""",
+                (local_id, row["requested_at"], stamp, row["mentions"],
+                 _flag(row["typing"]), row["text"], row["quoted_id"],
+                 db.account, row["chat_id"], wa_id))
+        else:
+            db.execute(
+                f"""UPDATE whatsapp_messages
+                       SET id = %s, delivery = 'sent', delivery_error = NULL,
+                           ts = {_TS_PARAM}, sent_at = {_TS_PARAM}
+                     WHERE account = %s AND local_id = %s""",
+                (wa_id, stamp, stamp, db.account, local_id))
+        _upsert_chat(db, row["chat_id"], None, int(stamp))
+
+
+def _quoted_participant(db, row, own_jid: str | None) -> str | None:
+    """Who wrote the message a quote carries: the account for its own, the
+    sender in a group, and the other side of a direct chat."""
+    if row["from_me"]:
+        return own_jid
+    if _is_group(row["chat_id"]):
+        return row["sender"] or row["sender_lid"]
+    return row["chat_id"]
+
+
+def _outgoing_message(db, row, own_jid: str | None = None):
+    """The protocol message one row becomes: plain text, or text carrying its
+    quote and its mentions."""
+    e2e = _engine()["e2e"]
+    mentions = list(row["mentions"] or [])
+    quoted = None
+    if row["quoted_id"]:
+        quoted = db.execute(
+            "SELECT * FROM whatsapp_messages WHERE account = %s AND chat_id = %s"
+            " AND id = %s", (db.account, row["chat_id"], row["quoted_id"])).fetchone()
+    if not mentions and quoted is None and not row["quoted_id"]:
+        return e2e.Message(conversation=row["text"])
+    context = e2e.ContextInfo(mentionedJID=mentions)
+    if row["quoted_id"]:
+        context.stanzaID = row["quoted_id"]
+        participant = (_quoted_participant(db, quoted, own_jid)
+                       if quoted is not None else None)
+        if participant:
+            context.participant = participant
+        context.quotedMessage.CopyFrom(
+            e2e.Message(conversation=(quoted["text"] if quoted is not None
+                                      else None) or ""))
+    return e2e.Message(extendedTextMessage=e2e.ExtendedTextMessage(
+        text=row["text"], contextInfo=context))
+
+
+def _deliver(session, row, *, pause=None, jitter=None) -> dict:
+    """Put one claimed message on the wire and say what became of it. The
+    caller writes the outcome down; nothing here touches the row."""
+    engine = _engine()
+    pause = pause or time.sleep
+    jitter = jitter or random.uniform
+    user, _, server = row["chat_id"].partition("@")
+    to = engine["build_jid"](user, server)
+    outcome = {"local_id": row["local_id"], "chat_id": row["chat_id"]}
+    try:
+        own = None
+        with contextlib.suppress(Exception):
+            own = session.account().get("jid")
+        message = _outgoing_message(session.db, row, own)
+        if row["typing"]:
+            presence, media = engine["ChatPresence"], engine["ChatPresenceMedia"]
+            session._client.send_chat_presence(
+                to, presence.CHAT_PRESENCE_COMPOSING,
+                media.CHAT_PRESENCE_MEDIA_TEXT)
+            pause(jitter(*TYPING_SECONDS))
+            session._client.send_chat_presence(
+                to, presence.CHAT_PRESENCE_PAUSED, media.CHAT_PRESENCE_MEDIA_TEXT)
+        response = session._client.send_message(to, message)
+    except Exception as exc:
+        outcome.update(state="failed", error=f"{type(exc).__name__}: {exc}"[:500])
+        return outcome
+    minted = getattr(response, "ID", None) or None
+    if not minted:
+        outcome.update(state="failed", error="WhatsApp answered without an id")
+        return outcome
+    outcome.update(state="sent", message_id=minted,
+                   timestamp=_ts_seconds(getattr(response, "Timestamp", 0))
+                   or int(time.time()))
+    return outcome
+
+
+def _send_result(cfg: dict, row, *, via: str) -> dict:
+    """What `send` answers with, read off the row the message ended as."""
+    stamp = row["ts"] or 0
+    return {"ok": True, "connection": cfg["id"], "chat": row["chat_id"],
+            "message_id": row["id"], "timestamp": stamp,
+            "date": (datetime.datetime.fromtimestamp(stamp).isoformat()
+                     if stamp else None),
+            "length": len(row["text"] or ""), "local_id": row["local_id"],
+            "delivery": row["delivery"], "sent_by": via}
+
+
+def _refuse_undelivered(row) -> NoReturn:
+    if row["delivery"] == "failed":
+        _refuse(5, "send_failed",
+                f"the message was not sent: {row['delivery_error']} "
+                f"(local id {row['local_id']})",
+                "the account must be reachable and the recipient must exist; "
+                "nothing was delivered unless the reason says it is unknown")
+    _refuse(5, "send_pending",
+            f"the message is still {row['delivery']} after "
+            f"{OUTBOUND_WAIT:g}s (local id {row['local_id']})",
+            f"the assistant service sends it when it can; `{NAME} service "
+            "status` shows whether it is connected. Sending again would send it "
+            "twice")
+
+
+def _send_direct(cfg: dict, request: dict) -> dict:
+    """No service holds the account, so this invocation connects and sends the
+    row itself, under the lock every connected verb takes."""
+    with _session_lock(cfg):
+        session = Session(cfg)
+        try:
+            row = _queue_outgoing(session.db, request)
+            claimed = _claim_outgoing(session.db, row["local_id"])
+            try:
+                session.open()
+                session.require_connected()
+                session.require_account()
+                session.drain()
+                session.refresh_identities()
+            except _Refusal as refusal:
+                _apply_delivery(session.db, {
+                    "local_id": row["local_id"], "state": "failed",
+                    "error": f"{refusal.code}: {refusal.message}"})
+                raise
+            outcome = _deliver(session, claimed)
+            _apply_delivery(session.db, outcome)
+            if outcome["state"] == "sent":
+                # Long enough for the account's own copy to arrive and land on
+                # the row it was sent from.
+                session.drain(timeout=SEND_SETTLE, settle=SEND_SETTLE,
+                              ceiling=SEND_SETTLE)
+            final = _outgoing_row(session.db, row["local_id"])
+            session.report_handler_errors()
+        finally:
+            session.close()
+    if final["delivery"] != "sent":
+        _refuse_undelivered(final)
+    return _send_result(cfg, final, via="direct")
+
+
+def _send_via_service(cfg: dict, request: dict, *, wait: float | None = None) -> dict:
+    """The assistant service holds the account's only connection, so the row is
+    left for it to send, and its answer is waited for."""
+    db = _open_store(cfg)
+    try:
+        row = _queue_outgoing(db, request)
+        deadline = time.monotonic() + (OUTBOUND_WAIT if wait is None else wait)
+        while True:
+            row = _outgoing_row(db, row["local_id"])
+            if row["delivery"] in ("sent", "failed") \
+                    or time.monotonic() >= deadline:
+                break
+            time.sleep(OUTBOUND_POLL)
+    finally:
+        db.close()
+    if row["delivery"] != "sent":
+        _refuse_undelivered(row)
+    return _send_result(cfg, row, via="service")
+
+
 def _wm_send(cfg, args):
     """Send one text message and report the id the account minted for it.
 
-    The message goes out on a live session, so this opens one under the same
-    lock every other connected verb takes. What comes back is the account's own
-    id for the message, which is what a later read will carry: an answer that
-    said only "sent" could not be joined to anything.
-
-    The copy that lands in the store is not written here. A linked device sees
-    its own outbound message the way it sees any other -- it arrives back on the
-    wire -- so it is captured by the same path as everything else rather than by
-    a second writer that would have to agree with it.
-    """
-    text = _require_text(args)
-    chat_id = _normalize_chat_id(args.chat_id)
-    engine = _engine()
-    user, _, server = chat_id.partition("@")
-    with _session(cfg) as session:
+    The message is a row before it is anything else. While the assistant
+    service holds the account, the service sends it and this waits for the
+    answer; otherwise this invocation connects and sends it. Either way the
+    caller gets the same answer, and the row records what became of it."""
+    request = _outgoing_request(args)
+    if _service_owner(_service_paths(cfg)) is None:
         try:
-            response = session._client.send_message(
-                engine["build_jid"](user, server), text)
-        except Exception as exc:
-            _refuse(5, "send_failed",
-                 f"the message was not sent: {type(exc).__name__}: {exc}",
-                 "the account must be reachable and the recipient must exist; "
-                 "nothing was delivered")
-        minted = getattr(response, "ID", None) or None
-        stamp = _ts_seconds(getattr(response, "Timestamp", 0)) or 0
-        session.drain(timeout=SEND_SETTLE, settle=SEND_SETTLE,
-                      ceiling=SEND_SETTLE)
-    return {"ok": True, "connection": cfg["id"], "chat": chat_id,
-            "message_id": minted, "timestamp": stamp,
-            "date": (datetime.datetime.fromtimestamp(stamp).isoformat()
-                     if stamp else None),
-            "length": len(text)}
+            return _send_direct(cfg, request)
+        except _Refusal as refusal:
+            # The lock is taken before anything is written, so a service that
+            # started in between has seen no row from this invocation.
+            if refusal.code != "session_busy" \
+                    or _service_owner(_service_paths(cfg)) is None:
+                raise
+    return _send_via_service(cfg, request)
 
 
 def _waha_export(cfg, args):
@@ -8746,7 +9210,9 @@ def cmd_import_legacy(args):
 
 def cmd_send(args):
     cfg = get_config(args)
-    _refuse_foreign_flags(cfg, args)
+    _refuse_foreign_flags(cfg, args, {"reply_to": "--reply-to",
+                                      "mentions": "--mention",
+                                      "typing": "--typing"})
     return (_waha_send(cfg, args) if cfg["engine"] == ENGINE_WAHA
             else _wm_send(cfg, args))
 
@@ -8762,7 +9228,7 @@ def cmd_send(args):
 # its whole life, so a second client on the device is impossible by the same
 # mechanism that already prevents one.
 
-SERVICE_SETTINGS_KEYS = ("connection", "environment")
+SERVICE_SETTINGS_KEYS = ("connection", "environment", "send_rate")
 SERVICE_ENVIRONMENT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.IGNORECASE)
 SERVICE_OWNER_SCHEMA = "whatsapp.service-owner.v1"
 SERVICE_HEALTH_SCHEMA = "whatsapp.service-health.v1"
@@ -8821,7 +9287,8 @@ def _service_paths(cfg: dict) -> dict[str, Path]:
     state = home / "service"
     return {"home": home, "lock": home / "lock", "state": state,
             "owner": state / "owner.json", "health": state / "health.json",
-            "pid": state / "daemon.pid", "log": state / "daemon.log"}
+            "pid": state / "daemon.pid", "log": state / "daemon.log",
+            "spool": state / "capture-spool.jsonl"}
 
 
 def _service_owner(paths: dict[str, Path]) -> dict | None:
@@ -8899,6 +9366,12 @@ def _validate_service_settings(data) -> dict:
             or not SERVICE_ENVIRONMENT_RE.fullmatch(environment)):
         raise ValueError("settings.environment: must match "
                          f"{SERVICE_ENVIRONMENT_RE.pattern}")
+    rate = data.get("send_rate")
+    if rate is not None and (isinstance(rate, bool) or not isinstance(rate, int)
+                             or not 1 <= rate <= SEND_RATE_CEILING):
+        raise ValueError("settings.send_rate: must be a whole number of messages "
+                         f"per minute from 1 to {SEND_RATE_CEILING}, or null for "
+                         f"{SEND_RATE_DEFAULT}")
     return data
 
 
@@ -8992,6 +9465,12 @@ def _cmd_service_status(connection_flag: str | None) -> dict:
         "last_event_at": health.get("last_event_at"),
         "last_message_at": health.get("last_message_at"),
         "messages_captured": health.get("messages_captured"),
+        "messages_sent": health.get("messages_sent"),
+        "send_failures": health.get("send_failures"),
+        "send_rate": (health.get("send_rate") if running
+                      else settings.get("send_rate") or SEND_RATE_DEFAULT),
+        "spool_depth": _spool_depth(paths["spool"]),
+        "store_error": health.get("store_error") if running else None,
         "reconnects": health.get("reconnects"),
         "last_error": health.get("last_error"),
         "environment": health.get("environment") if running
@@ -9297,6 +9776,178 @@ def _cmd_service_doctor(connection_flag: str | None) -> tuple[dict, int]:
             "checks": checks}, fail
 
 
+# ── The capture spool ───────────────────────────────────────────────────────
+#
+# The service acknowledges what WhatsApp hands it as it arrives, and WhatsApp
+# does not hand it over again. A capture the store cannot take at that moment is
+# therefore appended to a local file, in arrival order, and written into the
+# store from there once the store answers. It holds an outage and nothing else:
+# while it is not empty every new capture joins the back of it, so the store
+# receives everything in the order it arrived, and it is empty again as soon as
+# the store is.
+
+SPOOL_RETRY = 5.0                 # how often a store that is down is tried again
+_SPOOL_BYTES = ("media_key", "file_enc_sha256", "file_sha256")
+
+
+def _spool_row(row: dict) -> dict:
+    """A captured row as a line of JSON can carry it."""
+    out = dict(row)
+    for key in _SPOOL_BYTES:
+        if out.get(key) is not None:
+            out[key] = base64.b64encode(bytes(out[key])).decode("ascii")
+    return out
+
+
+def _unspool_row(row: dict) -> dict:
+    out = dict(row)
+    for key in _SPOOL_BYTES:
+        if out.get(key) is not None:
+            out[key] = base64.b64decode(out[key])
+    return out
+
+
+def _apply_spooled(db, home: Path, record: dict, data=None):
+    """Write one capture into the store. Each kind is written so that writing
+    it a second time adds nothing, which is what lets a replay that stopped
+    halfway simply start again."""
+    kind = record.get("kind")
+    if kind == "live":
+        return _write_live(db, _unspool_row(record["row"]))
+    if kind == "history":
+        if data is None:
+            data = _engine()["history_proto"].HistorySync()
+            data.ParseFromString((home / "raw" / record["raw_file"]).read_bytes())
+        return _ingest_history(db, data, home, record["sync_type"],
+                               raw_name=record["raw_file"])
+    if kind == "delivery":
+        _apply_delivery(db, record["outcome"])
+        return None
+    raise ValueError(f"unknown spooled capture kind {kind!r}")
+
+
+def _error_line(exc: BaseException) -> str:
+    detail = getattr(exc, "message", None) or str(exc)
+    return f"{type(exc).__name__}: {(detail.strip().splitlines() or [''])[0]}"[:300]
+
+
+def _spool_depth(path: Path) -> int:
+    try:
+        with path.open("rb") as handle:
+            return sum(1 for line in handle if line.strip())
+    except OSError:
+        return 0
+
+
+class _CaptureSpool:
+    """The append-only buffer for captures the store could not take.
+
+    The engine's thread captures and the service's own thread replays, so both
+    go through one lock: a capture never lands between a replay's read of the
+    file and its rewrite."""
+
+    def __init__(self, path: Path, home: Path):
+        self.path = Path(path)
+        self.home = Path(home)
+        self.rejected_path = self.path.with_name(self.path.stem + ".rejected.jsonl")
+        self.lock = threading.RLock()
+        self.store_error: str | None = None
+        self._depth = _spool_depth(self.path)
+
+    def depth(self) -> int:
+        return self._depth
+
+    def _write_line(self, path: Path, value) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        line = json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n"
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def capture(self, db, record: dict, *, data=None):
+        """Write one capture into the store, or keep it here when the store
+        cannot be reached or something kept here is still waiting. Answers what
+        the write answered, or None when it was kept."""
+        with self.lock:
+            if self._depth == 0:
+                try:
+                    result = _apply_spooled(db, self.home, record, data)
+                    self.store_error = None
+                    return result
+                except Exception as exc:
+                    if not _store_outage(exc):
+                        raise
+                    self.store_error = _error_line(exc)
+            self._write_line(self.path, {**record, "spooled_at": _iso_now()})
+            self._depth += 1
+            return None
+
+    def _read(self) -> list:
+        try:
+            lines = self.path.read_bytes().splitlines()
+        except FileNotFoundError:
+            return []
+        records = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                # A line a crash cut short is not a capture anyone can write.
+                records.append({"kind": "unreadable",
+                                "line": line.decode("utf-8", "replace")})
+        return records
+
+    def _rewrite(self, records: list) -> None:
+        if not records:
+            with contextlib.suppress(FileNotFoundError):
+                self.path.unlink()
+            self._depth = 0
+            return
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False,
+                                        sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(0o600)
+        os.replace(temporary, self.path)
+        self._depth = len(records)
+
+    def replay(self, db) -> dict:
+        """Write what is kept into the store, oldest first, until it is empty
+        or the store stops answering. A capture the store refuses for what it
+        is, rather than for being down, is set aside in the rejected file so it
+        cannot hold back everything behind it."""
+        with self.lock:
+            records = self._read()
+            consumed = written = rejected = 0
+            try:
+                for record in records:
+                    try:
+                        _apply_spooled(db, self.home, record)
+                        written += 1
+                    except Exception as exc:
+                        if _store_outage(exc):
+                            self.store_error = _error_line(exc)
+                            break
+                        self._write_line(self.rejected_path, {
+                            **record, "rejected_at": _iso_now(),
+                            "error": _error_line(exc)})
+                        rejected += 1
+                    consumed += 1
+                else:
+                    self.store_error = None
+            finally:
+                self._rewrite(records[consumed:])
+            return {"written": written, "rejected": rejected, "left": self._depth}
+
+
 class _ServiceDaemon:
     """The listener: hold one Session for as long as the wire stays up, rebuild
     it with backoff when it drops, stop for good when the device is removed.
@@ -9322,6 +9973,13 @@ class _ServiceDaemon:
         self.attempts: list[float] = []
         self.stalled = False
         self.last_error: str | None = None
+        self.spool = _CaptureSpool(self.paths["spool"], self.paths["home"])
+        self.clock = time.monotonic
+        self.sent_times: list[float] = []
+        self.sent = 0
+        self.send_failures = 0
+        self.recovered = False
+        self.next_store_attempt = 0.0
 
     # -- process plumbing ---------------------------------------------------
 
@@ -9361,6 +10019,9 @@ class _ServiceDaemon:
             "started_at": _epoch_iso(self.started), "started_epoch": self.started,
             "updated_at": _epoch_iso(now), "updated_epoch": now,
             "reconnects": self.reconnects, "messages_captured": self.messages,
+            "messages_sent": self.sent, "send_failures": self.send_failures,
+            "send_rate": self.send_rate(), "spool_depth": self.spool.depth(),
+            "store_error": self.spool.store_error,
             "stale_after_seconds": SERVICE_STALE_AFTER, **updates})
         if state is not None:
             self.health["state"] = state
@@ -9396,6 +10057,78 @@ class _ServiceDaemon:
                      settings_generation=generation,
                      settings_reloaded_at=_epoch_iso(time.time()))
 
+    # -- the store and what is sent through it -------------------------------
+
+    def send_rate(self) -> int:
+        return int((self.settings or {}).get("send_rate") or SEND_RATE_DEFAULT)
+
+    def maintain_store(self, db) -> None:
+        """Bring the store back into step: reconnect a dropped connection,
+        write what the spool kept, and close out sends a previous run left
+        unanswered. A store that is still down is tried again after a pause."""
+        now = self.clock()
+        waiting = self.spool.depth() or db.broken() or not self.recovered
+        if not waiting or now < self.next_store_attempt:
+            return
+        before = self.spool.depth()
+        try:
+            if db.broken():
+                db.reconnect()
+            if before:
+                result = self.spool.replay(db)
+                if result["written"] or result["rejected"]:
+                    self.log(f"spool replayed: {result['written']} written, "
+                             f"{result['rejected']} rejected, {result['left']} left")
+            if not self.spool.depth() and not self.recovered:
+                interrupted = _recover_interrupted(db)
+                self.recovered = True
+                for local_id in interrupted:
+                    self.log(f"send {local_id} was interrupted with its delivery "
+                             f"unknown; failed as {DELIVERY_INTERRUPTED}, not resent")
+        except Exception as exc:
+            if not _store_outage(exc):
+                raise
+            self.spool.store_error = _error_line(exc)
+        if self.spool.depth() or db.broken():
+            self.next_store_attempt = now + SPOOL_RETRY
+        if before or self.spool.depth():
+            self.publish()
+
+    def deliver_pending(self, session, db) -> int:
+        """Send what is waiting for this account, oldest first, within the
+        account's rate. Answers how many went out."""
+        if self.spool.depth() or db.broken() or not self.recovered:
+            return 0
+        window = 60.0
+        now = self.clock()
+        self.sent_times = [t for t in self.sent_times if now - t < window]
+        delivered = 0
+        while len(self.sent_times) < self.send_rate() \
+                and not self.stop_requested.is_set():
+            try:
+                row = _claim_outgoing(db)
+            except Exception as exc:
+                if not _store_outage(exc):
+                    raise
+                self.spool.store_error = _error_line(exc)
+                break
+            if row is None:
+                break
+            self.sent_times.append(self.clock())
+            outcome = _deliver(session, row)
+            # Through the spool, so an answer the store cannot take now is
+            # written once it can, rather than leaving the row unanswered.
+            self.spool.capture(db, {"kind": "delivery", "outcome": outcome})
+            if outcome["state"] == "sent":
+                self.sent += 1
+                delivered += 1
+                self.log(f"sent {row['local_id']} as {outcome['message_id']}")
+            else:
+                self.send_failures += 1
+                self.log(f"send {row['local_id']} failed: {outcome['error']}")
+            self.publish()
+        return delivered
+
     # -- the connection -----------------------------------------------------
 
     def track(self, session) -> dict:
@@ -9414,6 +10147,12 @@ class _ServiceDaemon:
         try:
             session = self.session_factory()
             self.attempts.append(time.monotonic())
+            session.spool = self.spool
+            db = getattr(session, "db", None)
+            if db is not None:
+                # What a previous run kept goes in before anything new arrives.
+                self.next_store_attempt = 0.0
+                self.maintain_store(db)
             session.open()
             deadline = time.monotonic() + CONNECT_TIMEOUT
             while not session.wait_connected(1.0):
@@ -9459,6 +10198,9 @@ class _ServiceDaemon:
                     errors_seen = len(session.errors)
                     self.publish(last_error=session.errors[-1])
                 self.messages = base + (session.live_messages or 0)
+                if db is not None:
+                    self.maintain_store(db)
+                    self.deliver_pending(session, db)
                 if not drained_reported and session.offline_count is not None:
                     drained_reported = True
                     self.log(f"offline queue drained: {session.offline_count} "
@@ -9745,6 +10487,14 @@ def main():
         "send", help="Send a text message (write-enabled connections only)")
     psend.add_argument("chat_id", nargs="?", help="recipient chat id")
     psend.add_argument("text", nargs="?", help="message text")
+    psend.add_argument("--reply-to", dest="reply_to", metavar="MESSAGE_ID",
+                       help="quote this message of the same chat, by its id")
+    psend.add_argument("--mention", dest="mentions", action="append",
+                       metavar="PHONE",
+                       help="mention this number (repeatable); its @number "
+                            "leads the text unless the text already carries it")
+    psend.add_argument("--typing", action="store_true",
+                       help="show composing for a short, jittered moment first")
 
     psvc = _sub("service", help="Operate the bundled assistant listener")
     svc = psvc.add_subparsers(dest="service_command", required=True)
