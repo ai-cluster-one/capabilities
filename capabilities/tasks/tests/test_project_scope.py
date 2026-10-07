@@ -664,8 +664,9 @@ def test_two_projects_each_own_the_same_key(two_projects, capsys, monkeypatch):
 @needs_store
 def test_a_wait_is_freed_only_by_its_own_projects_key(two_projects, capsys,
                                                       monkeypatch):
-    """A blocker named by key is read in the waiting task's project. Another
-    project's task of the same key ending frees nothing here."""
+    """A blocker named by key is resolved in the waiting task's project, and
+    kept by its id. Another project's task of the same key ending frees nothing
+    here."""
     entry, schema, conn = two_projects
     monkeypatch.setattr(mod, "PROJECT", THERE)
     mod.cmd_add(entry, ["--type", "probe", "--title", "theirs", "--key", "gate",
@@ -674,13 +675,14 @@ def test_a_wait_is_freed_only_by_its_own_projects_key(two_projects, capsys,
     monkeypatch.setattr(mod, "PROJECT", HERE)
     mod.cmd_add(entry, ["--type", "probe", "--title", "ours", "--key", "gate",
                         "--status", "todo"])
-    capsys.readouterr()
-    mod.cmd_meta(entry, ["set", "h-2", "blocked_by", '["gate"]'])
+    ours = _answer(capsys)["created"]
+    mod.cmd_set(entry, ["h-2", "--blocked-by", "gate"])
+    assert _answer(capsys)["task"]["blocked_by"] == [ours]
     mod.cmd_set(entry, ["h-2", "--status", "waiting", "--assignee", "someone"])
     capsys.readouterr()
     from psycopg.rows import dict_row
     with conn.cursor(row_factory=dict_row) as cur:
-        assert mod._ended_among(cur, ["gate"], HERE) == set()
+        assert mod._ended_among(cur, [ours]) == set()
     mod.cmd_claim(entry, ["--worker", "a worker"])
     assert _answer(capsys)["returned"] == []
     mod.cmd_show(entry, ["h-2"])

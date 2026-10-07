@@ -20,6 +20,7 @@ create table if not exists tasks.tasks (
   tags         text[]      not null default '{}',
   metadata     jsonb       not null default '{}'::jsonb,
   pickup_at    timestamptz,
+  blocked_by   uuid[]      not null default '{}',
   created_by   text,
   created_at   timestamptz not null default now(),
   updated_at   timestamptz not null default now()
@@ -41,12 +42,21 @@ comment on column tasks.tasks.metadata is
 comment on column tasks.tasks.status is
   'draft is unreleased, todo is releasable, in_progress is held by a claim, '
   'waiting is over to the assignee it names and returns to todo at its pickup '
-  'moment or when everything metadata.blocked_by names has ended, '
+  'moment or when every task blocked_by names has ended, '
   'complete is done, closed is over without having been done - superseded, '
   'obsolete, or answered somewhere else. Both terminal states leave the queue; '
   'only one of them claims the work happened.';
 comment on column tasks.tasks.pickup_at is
   'Do not raise the task before this moment. Empty means no appointed moment, not permission.';
+-- In the create above for a new store, and added here for one that predates it,
+-- empty on every row that exists: `tasks migrate --apply` moves the blockers a
+-- task kept in its metadata before the column existed.
+alter table tasks.tasks add column if not exists blocked_by uuid[] not null default '{}';
+comment on column tasks.tasks.blocked_by is
+  'The tasks this one waits on, by id, in any project. Every id names a task '
+  'when it is written and none leads back to this task through blockers still '
+  'open. While one of them has not ended the task is offered to no claim, '
+  'whatever its open status; a blocker that ended stays listed and holds nothing.';
 -- In the create above for a new store, and added here for one that predates it.
 alter table tasks.tasks add column if not exists created_by text;
 comment on column tasks.tasks.created_by is

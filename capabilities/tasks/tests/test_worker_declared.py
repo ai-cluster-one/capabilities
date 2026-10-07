@@ -185,7 +185,7 @@ def test_a_named_task_is_accepted_by_status_and_type(project):
     assert mod._key_refusal(waiting, True, opts) is None
     said, _hint = mod._key_refusal({**waiting, "status": "todo"}, True, opts)
     assert said == "k is todo, not waiting"
-    said, _hint = mod._key_refusal({**waiting, "metadata": {"blocked_by": ["t-1"]}}, True, opts)
+    said, _hint = mod._key_refusal(waiting, True, opts, None, ["t-1"])
     assert "waits on the tasks its blocked_by names" in said
     write_worker(project, "probe", IMPLEMENTATION)
     opts = {"key": "k", "worker": "probe", **mod._key_types(mod._worker("probe"))}

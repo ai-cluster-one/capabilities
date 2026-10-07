@@ -72,13 +72,17 @@ def store(monkeypatch):
             conn.execute(f"drop schema {schema} cascade")
 
 
-def _task(conn, schema, key, status="todo", project=HERE, metadata=None) -> str:
+def _task(conn, schema, key, status="todo", project=HERE, metadata=None,
+          blocked_by=()) -> str:
     return str(conn.execute(
         f"""insert into {schema}.tasks (project_id, type, unique_key, title, status,
-                                        metadata)
-            values (%s, 'change', %s, %s, %s, %s::jsonb) returning id""",
+                                        metadata, blocked_by)
+            values (%s, 'change', %s, %s, %s, %s::jsonb, %s::uuid[]) returning id""",
         (project, key, f"title of {key}", status,
-         json.dumps(metadata or {}))).fetchone()[0])
+         json.dumps(metadata or {}), list(blocked_by))).fetchone()[0])
+
+
+NOBODY = "00000000-0000-4000-8000-000000000000"
 
 
 def _raise(conn, schema, task, attempt, worker, metrics=None) -> None:
@@ -101,11 +105,9 @@ def seeded(store):
     uncosted = _task(conn, schema, "uncosted")
     _raise(conn, schema, uncosted, 1, "executor")
     ended = _task(conn, schema, "ended", status="complete")
-    _task(conn, schema, "elsewhere", project=THERE)
-    _task(conn, schema, "blocked", metadata={
-        "blocked_by": ["ran", ended, " ended ", "elsewhere", "nobody", ""]})
-    _task(conn, schema, "free", metadata={"blocked_by": "not a list"})
-    return entry, {"idle": idle, "ran": ran, "ended": ended}
+    elsewhere = _task(conn, schema, "elsewhere", project=THERE, status="draft")
+    _task(conn, schema, "blocked", blocked_by=[ran, ended, elsewhere, NOBODY])
+    return entry, {"idle": idle, "ran": ran, "ended": ended, "elsewhere": elsewhere}
 
 
 def _scan(capsys, verb, entry, *args) -> dict:
@@ -131,20 +133,25 @@ def test_a_scan_row_carries_its_runs_and_their_cost(seeded, capsys, full):
 
 
 @needs_store
-def test_a_scan_row_carries_its_blockers_and_their_status(seeded, capsys):
+@pytest.mark.parametrize("full", [False, True])
+def test_a_scan_row_carries_its_blockers_and_their_status(seeded, capsys, full):
     entry, ids = seeded
-    for verb, args in ((mod.cmd_list, []), (mod.cmd_search, ["blocked"])):
+    flags = ["--full"] if full else []
+    for verb, args in ((mod.cmd_list, flags), (mod.cmd_search, ["blocked", *flags])):
         rows = _scan(capsys, verb, entry, *args)
         blocked = rows["blocked"]
-        assert blocked["blocked_by"] == ["ran", ids["ended"], " ended ",
-                                         "elsewhere", "nobody", ""]
-        # Open and ended are told apart; another project's key and an unknown
-        # name match no task, as a wait reads them.
-        assert blocked["blocked_by_status"] == {"ran": "todo", ids["ended"]: "complete",
-                                                "ended": "complete",
-                                                "elsewhere": None, "nobody": None}
-    rows = _scan(capsys, mod.cmd_list, entry)
-    assert rows["idle"]["blocked_by"] is None
+        listed = [ids["ran"], ids["ended"], ids["elsewhere"], NOBODY]
+        assert blocked["blocked_by"] == listed
+        # Open and ended are told apart, another project's task is read by its
+        # id, and an id that names no task answers null.
+        assert blocked["blocked_by_status"] == {ids["ran"]: "todo",
+                                                ids["ended"]: "complete",
+                                                ids["elsewhere"]: "draft", NOBODY: None}
+        if full:
+            # The metadata mirrors the field for one release.
+            assert blocked["metadata"] == {"blocked_by": listed}
+    rows = _scan(capsys, mod.cmd_list, entry, *flags)
+    assert rows["idle"]["blocked_by"] == []
     assert rows["idle"]["blocked_by_status"] == {}
-    assert rows["free"]["blocked_by"] == "not a list"
-    assert rows["free"]["blocked_by_status"] == {}
+    if full:
+        assert rows["idle"]["metadata"] == {}

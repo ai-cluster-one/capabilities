@@ -47,14 +47,18 @@ def refused(capsys, verb, entry, args) -> dict:
 
 
 def raw_task(conn, schema: str, key: str, *, kind: str = "alpha", status: str = "todo",
-             assignee: str | None = None, blocked_by=None) -> None:
+             assignee: str | None = None, blocked_by=()) -> str:
     """A task written straight into the store, as drift leaves one: the CLI
-    refuses to write it."""
-    conn.execute(f"""insert into {schema}.tasks
-                       (project_id, type, title, unique_key, status, assignee, metadata)
-                     values (%s, %s, %s, %s, %s, %s, %s::jsonb)""",
-                 (hooks.HERE, kind, f"a {kind}", key, status, assignee,
-                  json.dumps({"blocked_by": blocked_by} if blocked_by is not None else {})))
+    refuses to write it. Its blockers are ids."""
+    return str(conn.execute(
+        f"""insert into {schema}.tasks
+              (project_id, type, title, unique_key, status, assignee, blocked_by)
+            values (%s, %s, %s, %s, %s, %s, %s::uuid[]) returning id""",
+        (hooks.HERE, kind, f"a {kind}", key, status, assignee,
+         list(blocked_by))).fetchone()[0])
+
+
+NOWHERE = "00000000-0000-4000-8000-000000000000"
 
 
 def entries(entry, capsys, key: str) -> list[str]:
@@ -263,19 +267,21 @@ def test_blockers_that_can_never_all_end_are_escalated(project, store, turns, ca
     esc.conveyor(project)
     if case == "unknown":
         raw_task(conn, schema, "t-blocked", status="waiting", assignee="supervisor",
-                 blocked_by=["t-nowhere"])
-        said = "'t-nowhere' names no task"
+                 blocked_by=[NOWHERE])
+        said = f"'{NOWHERE}' names no task"
     elif case == "draft":
         mod.cmd_add(entry, ["--type", "alpha", "--title", "d", "--key", "t-draft"])
-        answer(capsys)
+        draft = answer(capsys)["created"]
         raw_task(conn, schema, "t-blocked", status="waiting", assignee="supervisor",
-                 blocked_by=["t-draft"])
+                 blocked_by=[draft])
         said = "'t-draft' is a draft"
     else:
-        raw_task(conn, schema, "t-blocked", status="waiting", assignee="supervisor",
-                 blocked_by=["t-other"])
-        raw_task(conn, schema, "t-other", status="waiting", assignee="the owner",
-                 blocked_by=["t-blocked"])
+        blocked = raw_task(conn, schema, "t-blocked", status="waiting",
+                           assignee="supervisor")
+        other = raw_task(conn, schema, "t-other", status="waiting", assignee="the owner",
+                         blocked_by=[blocked])
+        conn.execute(f"update {schema}.tasks set blocked_by = %s::uuid[] where id = %s",
+                     ([other], blocked))
         said = "t-blocked -> t-other -> t-blocked"
     mod.cmd_run(entry, ["alpha", "--apply"])
     [moved] = answer(capsys)["escalated"]
@@ -284,7 +290,7 @@ def test_blockers_that_can_never_all_end_are_escalated(project, store, turns, ca
     assert said in moved["why"]
     task = shown(entry, capsys, "t-blocked")["task"]
     assert (task["status"], task["assignee"]) == ("waiting", "owner")
-    assert "blocked_by" not in task["metadata"]
+    assert task["blocked_by"] == [] and "blocked_by" not in task["metadata"]
 
 
 @needs_store
@@ -292,9 +298,9 @@ def test_blockers_still_open_are_no_dead_end(project, store, turns, capsys):
     entry, schema, conn = store
     esc.supervised(project)
     esc.conveyor(project)
-    add(entry, capsys, "t-first")
+    first = add(entry, capsys, "t-first")
     raw_task(conn, schema, "t-second", status="waiting", assignee="supervisor",
-             blocked_by=["t-first"])
+             blocked_by=[first])
     mod.cmd_run(entry, ["alpha", "--apply"])
     report = answer(capsys)
     assert report["claimed"] == "t-first" and "escalated" not in report
@@ -305,25 +311,28 @@ def test_blockers_still_open_are_no_dead_end(project, store, turns, capsys):
 @needs_store
 def test_an_escalation_lets_go_of_open_blockers_so_its_target_takes_it(project, store,
                                                                        turns, capsys):
-    """A task escalated into waiting while its blocked_by still names an open
-    task would be hidden from the name it went to, whose filter takes no waiting
-    task with open blockers: the escalation lets the blockers go and says so."""
+    """A task escalated into waiting while its blocked_by still lists an open
+    task would be hidden from the name it went to, since no claim takes a task
+    with open blockers: the escalation lets the blockers go and says so. A task
+    with an open blocker is offered to no claim, so what escalates one is the
+    scan - here, a worker switched off with the task left on it."""
     entry, schema, conn = store
-    hooks.hooked(project)
     esc.supervised(project)
     esc.conveyor(project)
-    add(entry, capsys, "t-open")
-    add(entry, capsys, "t-esc")
-    mod.cmd_meta(entry, ["set", "t-esc", "blocked_by", '["t-open"]'])
+    write_worker(project, "gamma", "enabled: false\n"
+                 "takes: {status: [todo], type: [beta], assignee: [gamma]}\nprofile: plain")
+    still_open = add(entry, capsys, "t-open", kind="beta")
+    mod.cmd_set(entry, ["t-open", "--assignee", "the owner"])
     answer(capsys)
-    tell(project, "before", "t-open", exit=75)
-    tell(project, "before", "t-esc", exit=76, print="cannot go on")
+    raw_task(conn, schema, "t-esc", kind="beta", assignee="gamma",
+             blocked_by=[still_open])
     mod.cmd_run(entry, ["alpha", "--apply"])
     [moved] = answer(capsys)["escalated"]
     assert (moved["task"], moved["to"]) == ("t-esc", "supervisor")
+    assert moved["blocked_by_let_go"] == [still_open]
     task = shown(entry, capsys, "t-esc")["task"]
     assert (task["status"], task["assignee"]) == ("waiting", "supervisor")
-    assert "blocked_by" not in task["metadata"]
+    assert task["blocked_by"] == [] and "blocked_by" not in task["metadata"]
     assert "Its blocked_by (t-open) is let go" in entries(entry, capsys, "t-esc")[-1]
     mod.cmd_run(entry, ["supervisor"])
     assert answer(capsys)["would_claim"] == "t-esc"
@@ -415,7 +424,7 @@ def test_a_blocked_by_that_can_never_end_is_refused(project, store, capsys):
     error = refused(capsys, mod.cmd_meta, entry, ["set", "t-a", "blocked_by", '["t-zz"]'])
     assert error["code"] == "policy" and "'t-zz' names no task" in error["message"]
     error = refused(capsys, mod.cmd_meta, entry, ["set", "t-a", "blocked_by", '["t-a"]'])
-    assert "t-a -> t-a" in error["message"]
+    assert "'t-a' names itself" in error["message"]
     mod.cmd_meta(entry, ["set", "t-a", "blocked_by", json.dumps([tid_b])])
     answer(capsys)
     error = refused(capsys, mod.cmd_meta, entry, ["set", "t-b", "blocked_by", '["t-a"]'])
@@ -424,5 +433,6 @@ def test_a_blocked_by_that_can_never_end_is_refused(project, store, capsys):
     # A blocker that has ended holds nothing, so it closes no cycle.
     mod.cmd_set(entry, ["t-a", "--status", "complete"])
     answer(capsys)
+    tid_a = shown(entry, capsys, "t-a")["task"]["id"]
     mod.cmd_meta(entry, ["set", "t-b", "blocked_by", '["t-a"]'])
-    assert answer(capsys)["metadata"]["blocked_by"] == ["t-a"]
+    assert answer(capsys)["metadata"]["blocked_by"] == [tid_a]

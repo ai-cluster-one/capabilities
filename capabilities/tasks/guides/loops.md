@@ -45,7 +45,7 @@ A task waiting on a person's name stays there until something moves it: no claim
 
 ### Waiting returns on its own
 
-A task need not wait on a person. Landed in `waiting` with a pickup moment (`tasks set <task> --status waiting --assignee <who> --pickup <when>`, one call), it returns to `todo` once the moment has passed. With `blocked_by` in its metadata naming other tasks, it returns once every one of them has ended. Either way the next claim puts it back and the service notices it at its poll, so a wait on time or on other work needs nobody to end it. `tasks help` FIELDS states how entering `waiting` treats a pickup or `blocked_by` the task already carried.
+A task need not wait on a person. Landed in `waiting` with a pickup moment (`tasks set <task> --status waiting --assignee <who> --pickup <when>`, one call), it returns to `todo` once the moment has passed. With `blocked_by` naming other tasks (`--blocked-by` in the same call), it returns once every one of them has ended. A task in `todo` with blockers still open waits on them too: no claim takes it until they end. Either way the next claim puts it back and the service notices it at its poll, so a wait on time or on other work needs nobody to end it. `tasks help` FIELDS states how entering `waiting` treats a pickup or `blocked_by` the task already carried.
 
 ## Designing a loop
 

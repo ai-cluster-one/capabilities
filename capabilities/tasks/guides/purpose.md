@@ -30,7 +30,7 @@ Order is the product of three things, and nothing else.
 
 - What workers take. Each worker declares which tasks it claims as filters over status, type, assignee and tags, tried in the order it lists them and each filter's types in the order it names them, so the order of a worker's `takes` is its whole arbitration. Among the tasks that match, the soonest pickup goes first and then the oldest task.
 - `pickup`, the moment before which a task is not raised. It holds work back; it never grants permission, which is what `todo` does.
-- `blocked_by`, a metadata key holding a list of tasks, by uuid or key. A task waiting on them returns to `todo` on its own once every one of them has ended.
+- `blocked_by`, the task's own field: the tasks it waits on, given by key in its project or by id in any and kept by id. While any of them has not ended no claim takes the task, whatever its open status; a waiting one returns to `todo` on its own once every one of them has ended. `tasks set <task> --blocked-by <task>[,<task>...]` writes it and refuses a name that is no task, the task itself, or a cycle.
 
 Tags filter: a worker's claim and the scans (`list`, `ready`, `search`, `counts`) can be narrowed to tasks carrying all the tags named. Anything else a project wants to carry goes in metadata, which takes any key and any value, is written by naming each key so a write never drops the rest, and is matched by `tasks search` along with the task's text. Metadata is for what code filters on; what a person reads belongs in the description or the trail.
 

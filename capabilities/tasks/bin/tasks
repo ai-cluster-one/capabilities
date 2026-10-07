@@ -299,10 +299,11 @@ WORKERS
 
   A worker takes a task in `todo`, or in `waiting` when its filter names
   `waiting` - and only a worker whose filter names it ever claims a waiting
-  task. A waiting task is claimable while it waits on the name it carries: not
-  while its pickup is still ahead, and not while its `blocked_by` names a task
-  still open. Claiming it moves it to `in_progress` as any claim does, and
-  whatever the turn does not settle goes back to `waiting` rather than into
+  task. No task is claimable while its `blocked_by` lists a task that has not
+  ended, in `todo` as much as in `waiting`, and none while its pickup is still
+  ahead: a waiting task is claimable while it waits on the name it carries.
+  Claiming it moves it to `in_progress` as any claim does, and whatever the
+  turn does not settle goes back to `waiting` rather than into
   the queue: a turn that never got to the work, one that ended leaving the
   task in progress, a lease that lapses, and `release --outcome failed`
   without `--status`. A turn that moves it to `todo` released it, which scores
@@ -559,9 +560,9 @@ ESCALATION
   line, the attempts and the worker's `park_hint`, or the dead end below -
   since when it stood in place, since when it was held back when it was, its
   raises in place, and the blockers it let go while they were still open. The
-  blockers go because no worker's filter takes a waiting task whose
-  `blocked_by` names an open task, so kept, they would hide the task from the
-  name it went to; a blocker still wanted is set again by whoever takes it.
+  blockers go because no claim takes a task whose `blocked_by` lists an open
+  task, so kept, they would hide the task from the name it went to; a blocker
+  still wanted is set again by whoever takes it.
   The moves are rows in its history by the same actor. When the name it went
   to cannot move it under the same rules, the next escalation goes on to the
   next name, ending at the person. `run` reports each move under `escalated`
@@ -590,9 +591,10 @@ ESCALATION
                                 there takes it too
     its worker cannot run       every worker that takes it names a profile or
                                 a routine that is not there
-    its blockers can never      it waits on a `blocked_by` that names no task,
-    all end                     names a draft, which only a person releases, or
-                                waits on it in turn through blockers still open
+    its blockers can never      its `blocked_by` lists an id that names no
+    all end                     task, the task itself, a draft, which only a
+                                person releases, or a task that waits on it in
+                                turn through blockers still open
 
   With a chain, each is escalated at once - no ceiling is waited out - and the
   entry's why names the rule: "no enabled worker takes it (status, type,
@@ -611,10 +613,10 @@ ESCALATION
   write that moves the task's status, assignee or type, as it stands once
   written. A person's name is any name that is no worker file, and is always
   taken. A task of another project is not judged here, since its workers are
-  that project's. `meta set` refuses blockers that can never all end, as
-  METADATA VALUES states, and `in_progress` is written only by a claim. A
-  worker switched off or edited after tasks were left on it is caught by the
-  scan.
+  that project's. `add`, `set` and `meta set` refuse blockers that can never
+  all end, as FIELDS states for `--blocked-by`, and `in_progress` is written
+  only by a claim. A worker switched off or edited after tasks were left on it
+  is caught by the scan.
 
   `doctor` names, per worker, every place its turn may land the task it holds
   where no enabled worker takes it: a name in its `writes.held.assignee` that
@@ -998,7 +1000,7 @@ FIELDS  (add and set take the same set)
                         `ready` never returns one and `claim` never takes one -
                         and it comes back on its own: the next claim returns it
                         to `todo` once its pickup moment has passed, or once
-                        every task its metadata's `blocked_by` names has ended.
+                        every task its `blocked_by` names has ended.
                         Waiting on neither, it waits on the name it carries, and
                         nothing but a person or that assignee moves it.
 
@@ -1036,10 +1038,30 @@ FIELDS  (add and set take the same set)
                         nothing, and reports {"exists": id}. That is what makes a
                         seed re-runnable. Another project holding the same key
                         does not stop the add.
+  --blocked-by TASK[,TASK...]
+                        the tasks this one waits on, each by its id - in any
+                        project - or by its key in this project, and stored by
+                        id; `set` replaces the whole list. While any of them
+                        has not ended, no claim takes the task, whatever its
+                        open status: a `todo` task is taken once every one has
+                        ended, and a `waiting` one returns to `todo` on its own
+                        then; `ready` leaves out a task a blocker still holds.
+                        A blocker that ended stays listed and holds nothing.
+                        Refused with exit 4 `policy`, before anything is
+                        written, when a name is no task - a key names a task
+                        only in this project, so name another project's task by
+                        its id - when the list names the task itself, or when a
+                        blocker waits on it in turn through blockers still open:
+                        blockers that can never all end are a wait nobody ends.
+                        A draft is accepted, since a person may still release
+                        it; the claim scan escalates a task that keeps one (see
+                        DEAD ENDS). `show` and every `list` and `search` row
+                        print it as the task's `blocked_by`.
   --clear FIELD         empty a field outright; repeatable. Clearable: objective,
-                        description, assignee, pickup, unique-key. Type, title and
-                        status cannot be cleared. A field not passed is left alone,
-                        so `set` never blanks anything by omission.
+                        description, assignee, pickup, unique-key, blocked-by.
+                        Type, title and status cannot be cleared. A field not
+                        passed is left alone, so `set` never blanks anything by
+                        omission.
 
   Tags and metadata are absent from this table on purpose. No flag takes a whole
   tag list or a whole metadata object, so a call meaning to change one thing can
@@ -1062,11 +1084,16 @@ METADATA VALUES
   description: a copy of the conversation in here will disagree with the
   conversation, and the worker will believe the copy.
 
-  `blocked_by` is a list of tasks, each by its key in this project or by its
-  id, and the capability reads it as the wait a task is in. `meta set` refuses
-  with exit 4 a list naming something that is no task, or one that closes a
-  cycle - a blocker that, through blockers still open, waits on this task -
-  because blockers that can never all end are a wait nobody ends.
+  `blocked_by` is no metadata key: it is the task's own field (FIELDS,
+  `--blocked-by`). For one release `meta set <task> blocked_by '[...]'` still
+  writes that field, with the same names and the same refusals as `set
+  --blocked-by`, and `meta rm <task> blocked_by` empties it; both answer
+  `deprecated` and say so on stderr, and both stop taking the key in the next
+  release. For the same release every task row whose metadata carries no
+  `blocked_by` of its own shows the field's ids there as well, so a reader of
+  `metadata.blocked_by` still finds them; read the top-level `blocked_by`
+  instead. A metadata `blocked_by` still stored is one `migrate --apply` could
+  not move (STORE): nothing reads it, and `doctor` names it.
 
 ACTOR
   Every write carries who made it. `add` keeps it as the task's `created_by`,
@@ -1145,19 +1172,20 @@ WORKER SCOPE
     type        the type it may set
     assignee    the assignee it may set
     pickup      "*" or nothing: a pickup is a moment, not a value to list
-    metadata    the metadata keys it may write over or remove
+    metadata    the metadata keys it may write over or remove; `blocked_by`
+                among them answers for the task's `blocked_by` field
     tags        the tags it may remove
 
   `new` names status, type, assignee and pickup only. Two rules read it, and
   only two: a field a scope does not list may not be written in that scope,
   and `"*"` - alone or in the list - means any value, emptying a field
   included. Adding is never configured and always allowed, on every task: an
-  activity, a tag, a metadata key not already there. A field `writes` does not
-  name - title, objective, description, the key, and a bare save - is written
-  on the task the raise holds and on no other. `add` lands a status `new` does
-  not allow in draft rather than refusing it, and the answer reports the
-  coercion under `coerced`; it refuses a type, assignee or pickup `new` does
-  not allow.
+  activity, a tag, a metadata key not already there, blockers on a task that
+  lists none. A field `writes` does not name - title, objective, description,
+  the key, and a bare save - is written on the task the raise holds and on no
+  other. `add` lands a status `new` does not allow in draft rather than
+  refusing it, and the answer reports the coercion under `coerced`; it refuses
+  a type, assignee or pickup `new` does not allow.
 
   A worker with no `writes` is held to this, which is the fence every worker
   had before a file could say otherwise:
@@ -1272,12 +1300,12 @@ COLLECTIONS
                         did; and how many raises recorded no cost. The sum is
                         read from the raises, not from the metadata's
                         `cost_total`
-  `blocked_by`          the metadata's `blocked_by` as stored, null when absent
-  `blocked_by_status`   each name `blocked_by` lists, mapped to the status of
-                        the task it names - matched as an id, or as a key in the
-                        task's own project - and null for a name matching no
-                        task, so a live block is told from an ended one
-                        (complete or closed) without another call
+  `blocked_by`          the ids of the tasks it waits on, the task's own field,
+                        empty when none
+  `blocked_by_status`   each id `blocked_by` lists, mapped to the status of the
+                        task it names, null for an id matching no task, so a
+                        live block is told from an ended one (complete or
+                        closed) without another call
 
   `ready` reads: every field and the whole trail, because it is the queue a
   worker consumes to act, and what is actionable now is short by construction.
@@ -1439,10 +1467,23 @@ STORE
   `doctor` and `migrate` name what it lacks, and `watch` on a store without
   its triggers refuses with exit 5 `schema_behind`.
 
+  `blocked_by` became a field of its own: a store gains the empty column like
+  any additive change, and `migrate --apply` moves into it, in the same
+  transaction, the blockers tasks kept in their metadata before - store-wide,
+  each name an id of any project or a key of the task's own, the touch trigger
+  held off so no task reads as having moved. A name that resolves to no task
+  stays in the metadata, where nothing reads it, and is listed under
+  `backfilled` by project and named by `doctor`; running it again moves
+  nothing more. `migrate` without --apply reports the same under
+  `would_backfill`. Until it runs, a blocker left in the metadata holds
+  nothing.
+
   A connection without allow_write, a process under the read-only switch, and a
   role the store does not let create objects are never brought up to date: a
-  command over one is served as it would have been, reading as before, and
-  `doctor` reports the store behind. So is a command that waits 10s for the
+  command over one is served as it would have been, reading as before - a store
+  without the `blocked_by` field reads every task as blocked by nothing, and a
+  write of blockers is refused with exit 6 `schema_behind` - and `doctor`
+  reports the store behind. So is a command that waits 10s for the
   lock, or for the tables to be free, without getting it.
 
   A command that cannot reach the store does not give up at once. It asks
@@ -5338,7 +5379,34 @@ def _connect(entry: dict | None, *, raising: bool = False, waiting: bool | None 
         applied = _catch_up(conn, SCHEMA, PROJECT)
         if applied:
             sys.stderr.write(json.dumps({"migrated": applied}, ensure_ascii=False) + "\n")
+    if BLOCKED_BY_KEPT is None:
+        # Asked once per run, after any catch-up, so a store this command could
+        # not bring up to date - a read-only connection, a role that may not
+        # create - is still read as it would have been, its tasks blocked by
+        # nothing, rather than refused for a column it does not have yet.
+        with conn.cursor() as cur:
+            cur.execute("""select exists (select 1 from information_schema.columns
+                                           where table_schema = %s and table_name = 'tasks'
+                                             and column_name = 'blocked_by') as kept""",
+                        (SCHEMA,))
+            globals()["BLOCKED_BY_KEPT"] = bool(cur.fetchone()["kept"])
+        conn.rollback()
     return conn
+
+
+def _blocked_by_field(alias: str = "") -> str:
+    """The `blocked_by` field as a query reads it from `alias`: the column, or
+    an empty list on a store that has not gained it yet."""
+    return f"{alias}blocked_by" if BLOCKED_BY_KEPT is not False else "'{}'::uuid[]"
+
+
+def _blocked_by_writable() -> None:
+    """Refuse a write of `blocked_by` to a store that has no field for it."""
+    if BLOCKED_BY_KEPT is False:
+        _die(6, "schema_behind",
+             "this store has no blocked_by field yet, so the blockers would be "
+             "written nowhere a claim reads them",
+             f"run `{NAME} migrate --apply` against this store")
 
 
 def _sever_after(conn, seconds: float):
@@ -5378,6 +5446,7 @@ def _sever_after(conn, seconds: float):
 
 SCHEMA = "tasks"          # replaced per run from the selected connection
 CATCH_UP = False          # armed per run for a command whose connection may write
+BLOCKED_BY_KEPT = None    # whether the store's tasks have a blocked_by field, asked once per run
 _IDENT = __import__("re").compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -5476,13 +5545,31 @@ def _jsonable(v):
         return float(v)
     if isinstance(v, _uuid.UUID):
         return str(v)
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(one) for one in v]
     return v
 
 
 def _rows(cur) -> list[dict]:
     """One converter for every column, so a type the store returns natively - a
-    timestamp, a uuid - never reaches the encoder raw."""
-    return [{k: _jsonable(v) for k, v in row.items()} for row in cur.fetchall()]
+    timestamp, a uuid, a list of uuids - never reaches the encoder raw."""
+    return [_mirrored({k: _jsonable(v) for k, v in row.items()}) for row in cur.fetchall()]
+
+
+def _mirrored(row: dict) -> dict:
+    """A task row whose metadata also shows its `blocked_by`, for one release.
+
+    `blocked_by` lived in the metadata before it had a column, and readers of a
+    task's metadata found it there. Every row that carries both the column and
+    the metadata shows the column's ids under the metadata's key as well, unless
+    the metadata still holds names of its own - ones `migrate --apply` could not
+    resolve - which are shown as stored. Deprecated: the mirror goes in the
+    next release, and the top-level `blocked_by` is the field to read."""
+    meta, named = row.get("metadata"), row.get("blocked_by")
+    if isinstance(meta, dict) and isinstance(named, list) and named \
+            and "blocked_by" not in meta:
+        row["metadata"] = {**meta, "blocked_by": list(named)}
+    return row
 
 
 def _one_of(value: str, allowed: tuple, label: str) -> None:
@@ -5730,7 +5817,7 @@ _LIST_FLAGS = (("project", "type", "status", "tag", "assignee", "per-page",
 # are the expensive half of a task and stay out until asked for: a list is read
 # to pick one row, not to read every row's reasoning.
 _LEAN = ("id, project_id, type, unique_key, title, status, assignee, tags, "
-         "pickup_at, created_at, updated_at")
+         "pickup_at, blocked_by, created_at, updated_at")
 _LIST_BOOLS = ("pickup-set", "pickup-unset", "full", "assigned-here")
 # `ready` is the queue one project's worker consumes, so the whole store is a
 # question only the two scans answer.
@@ -5769,7 +5856,9 @@ def _scan_columns(opts: dict) -> str:
                f"(select max(greatest(e.started_at, e.ended_at)) "
                f"from {SCHEMA}.task_executions e where e.task_id = t.id "
                f"and {_a_raise()}))")
-    return (f"{'t.*' if opts.get('full') else _LEAN}, {touched} as last_touched_at, "
+    lean = _LEAN.replace("blocked_by", f"{_blocked_by_field('t.')} as blocked_by")
+    full = "t.*" if BLOCKED_BY_KEPT is not False else "t.*, '{}'::uuid[] as blocked_by"
+    return (f"{full if opts.get('full') else lean}, {touched} as last_touched_at, "
             f"{_rollup_columns()}")
 
 
@@ -5781,10 +5870,9 @@ def _rollup_columns() -> str:
     the raises, never from the metadata's own accumulator - with the raises that
     recorded none counted beside it, so a partial sum is visible as one.
 
-    `blocked_by` is the metadata's key as stored, and `blocked_by_status` gives
-    each name it holds the status of the task it names, matched the way a wait
-    reads it: as an id, or as a key in the task's own project. A name matching
-    no task answers null."""
+    `blocked_by_status` gives each id the task's `blocked_by` column lists the
+    status of the task it names, null for an id matching no task; the column
+    itself is one of the row's fields."""
     cost = "e.metrics -> 'cost_usd'"
     runs = (f"(select jsonb_build_object("
             f"'count', coalesce(sum(g.n), 0), "
@@ -5796,17 +5884,11 @@ def _rollup_columns() -> str:
             f"count(*) filter (where jsonb_typeof({cost}) is distinct from 'number') as uncosted "
             f"from {SCHEMA}.task_executions e where e.task_id = t.id "
             f"and {_a_raise()} group by 1) g) as runs")
-    named = ("case when jsonb_typeof(t.metadata -> 'blocked_by') = 'array' "
-             "then t.metadata -> 'blocked_by' else '[]'::jsonb end")
-    blockers = (f"(select coalesce(jsonb_object_agg(n.name, "
-                f"(select b.status from {SCHEMA}.tasks b "
-                f"where b.id::text = n.name "
-                f"or (b.unique_key = n.name and b.project_id = t.project_id) "
-                f"limit 1)), '{{}}'::jsonb) "
-                f"from (select distinct trim(x) as name "
-                f"from jsonb_array_elements_text({named}) x "
-                f"where trim(x) <> '') n) as blocked_by_status")
-    return f"{runs}, t.metadata -> 'blocked_by' as blocked_by, {blockers}"
+    blockers = (f"(select coalesce(jsonb_object_agg(n.id::text, "
+                f"(select b.status from {SCHEMA}.tasks b where b.id = n.id)), "
+                f"'{{}}'::jsonb) "
+                f"from unnest({_blocked_by_field('t.')}) as n(id)) as blocked_by_status")
+    return f"{runs}, {blockers}"
 
 
 def _order(opts: dict, unsaid: str) -> str:
@@ -5960,8 +6042,9 @@ def cmd_list(entry, args: list[str]) -> None:
 
 
 def cmd_ready(entry, args: list[str]) -> None:
-    """What may be picked up now: an open status, and no pickup moment still in
-    the future. Two statuses are never ready, and by being what they are rather
+    """What may be picked up now: an open status, no pickup moment still in
+    the future, and no blocker its `blocked_by` lists that has not ended. Two
+    statuses are never ready, and by being what they are rather
     than by any moment: `draft`, which nobody has released, and `waiting`, which
     is over to its assignee until something returns it.
 
@@ -5972,7 +6055,8 @@ def cmd_ready(entry, args: list[str]) -> None:
     _per_page(opts)
     where, params = _where(opts, _zone(entry))
     joiner = " and " if where else " where "
-    where = where + joiner + "status in ('todo','in_progress') and (pickup_at is null or pickup_at <= now())"
+    where = (where + joiner + "status in ('todo','in_progress') "
+             f"and (pickup_at is null or pickup_at <= now()) and not {_holds(f'{SCHEMA}.tasks')}")
     with _connect(entry) as conn, conn.cursor() as cur:
         cur.execute(f"select count(*) as n from {SCHEMA}.tasks{where}", params)
         total = cur.fetchone()["n"]
@@ -6057,11 +6141,15 @@ def cmd_counts(entry, args: list[str]) -> None:
 # --- Writing -----------------------------------------------------------------
 
 _SCALARS = ("type", "title", "objective", "description", "status", "assignee", "pickup")
-_CLEARABLE = ("objective", "description", "assignee", "pickup", "unique-key")
+_CLEARABLE = ("objective", "description", "assignee", "pickup", "unique-key",
+              "blocked-by")
 _COLUMN = {"type": "type", "title": "title", "objective": "objective",
            "description": "description", "status": "status", "assignee": "assignee",
            "pickup": "pickup_at",
-           "unique-key": "unique_key"}
+           "unique-key": "unique_key", "blocked-by": "blocked_by"}
+# How a value is bound where the column's type is not the one a Python value
+# adapts to: a list of ids is sent as text[] and written into a uuid[].
+_PLACEHOLDER = {"blocked_by": "%s::uuid[]"}
 
 
 def _scalar_updates(opts: dict, tz) -> dict:
@@ -6096,17 +6184,18 @@ def _spent_blockers(cur, task: dict) -> list[str]:
 
     A `blocked_by` is spent once nothing it names is still open: it cannot be
     what a wait beginning now is for, and left in place the next claim reads it
-    and returns the task within the minute. One name still open is a live reason
-    to wait, so this answers with nothing and the key is left exactly as it is."""
+    and returns the task within the minute. One blocker still open is a live
+    reason to wait, so this answers with nothing and the list is left exactly as
+    it is."""
     named = _blocked_by(task)
     if not named:
         return []
-    ended = _ended_among(cur, sorted(set(named)), task["project_id"])
-    return named if all(key in ended for key in named) else []
+    ended = _ended_among(cur, sorted(set(named)))
+    return named if all(one in ended for one in named) else []
 
 
-def _settle_the_wait(cur, status: str | None, before: dict,
-                     pickup_named: bool) -> tuple[list[str], list[str]]:
+def _settle_the_wait(cur, status: str | None, before: dict, pickup_named: bool,
+                     blockers_named: bool = False) -> tuple[list[str], list[str]]:
     """What a transition into `waiting` lets go of: assignments to splice into
     the write, and the blockers it found spent.
 
@@ -6118,10 +6207,10 @@ def _settle_the_wait(cur, status: str | None, before: dict,
     task within the minute. A decision asked for would evaporate unanswered.
 
     So a wait begins clean. The pickup is dropped unless this same call appoints
-    one, which is a moment chosen for the wait rather than inherited, and the
-    spent `blocked_by` goes with it. Both are visible where a field move always
-    is: the dropped pickup as a change row, the removed key in the verb's own
-    answer.
+    one, which is a moment chosen for the wait rather than inherited, and a
+    spent `blocked_by` is emptied unless this same call names the blockers.
+    Both are visible where a field move always is: the dropped pickup as a
+    change row, the emptied blockers in the verb's own answer.
 
     A task already waiting begins no wait by landing there again, whether a
     person passes it on or a release closes the raise that stopped it there. Its
@@ -6137,9 +6226,9 @@ def _settle_the_wait(cur, status: str | None, before: dict,
         assignments.append(
             "pickup_at = case when pickup_at > now() then pickup_at else null end"
             if before.get("status") == "waiting" else "pickup_at = null")
-    spent = _spent_blockers(cur, before)
+    spent = [] if blockers_named else _spent_blockers(cur, before)
     if spent:
-        assignments.append("metadata = metadata - 'blocked_by'")
+        assignments.append("blocked_by = '{}'")
     return assignments, spent
 
 
@@ -6448,7 +6537,7 @@ def cmd_add(entry, args: list[str]) -> None:
     holds creates nothing, changes nothing, and reports the task that holds it. A
     key is unique within a project, so another project holding it is no reason
     to refuse."""
-    opts = _flags(args, _SCALARS + ("key", "actor"))
+    opts = _flags(args, _SCALARS + ("key", "actor", "blocked-by"))
     if not opts.get("type") or not opts.get("title"):
         _die(6, "input", "add needs --type and --title",
              "the goal belongs in --objective, the reasoning in --description")
@@ -6492,9 +6581,14 @@ def cmd_add(entry, args: list[str]) -> None:
         landing = _landing_refusal({**values, "tags": [], "metadata": {}})
         if landing:
             _die(4, "policy", landing, _LANDING_HINT)
+        # A task being created waits on nothing yet, so no blocker can wait on
+        # it in turn: only whether each name is a task is asked.
+        if "blocked-by" in opts:
+            values["blocked_by"] = _blockers_given(
+                cur, values["project_id"], None, _blocked_by_flag(opts["blocked-by"]))
         cols = list(values)
         cur.execute(f"""insert into {SCHEMA}.tasks ({', '.join(cols)})
-                        values ({', '.join(['%s'] * len(cols))})
+                        values ({', '.join(_PLACEHOLDER.get(c, '%s') for c in cols)})
                         returning id, type, unique_key, title, status""",
                     [values[c] for c in cols])
         row = _rows(cur)[0]
@@ -6521,17 +6615,22 @@ def cmd_set(entry, args: list[str]) -> None:
     project a task is assigned to may make on another project's task. Handing a
     waiting task back or on from there returns it to `todo` at once, so the
     project that raised it picks it up."""
-    opts = _flags(args, _SCALARS + ("unique-key", "clear", "actor"),
+    opts = _flags(args, _SCALARS + ("unique-key", "clear", "actor", "blocked-by"),
                   multi=("clear",), takes=1)
     if not opts["_loose"]:
         _die(6, "input", "set needs a task", f"{NAME} set <uuid|unique_key> [fields]")
     tz = _zone(entry)
     values = _scalar_updates(opts, tz)
+    if "blocked-by" in opts:
+        values["blocked_by"] = _blocked_by_flag(opts["blocked-by"])
     for field in opts.get("clear", []):
         if field not in _CLEARABLE:
             _die(6, "input", f"cannot clear {field!r}",
                  f"clearable: {', '.join(_CLEARABLE)}")
-        values[_COLUMN[field]] = None
+        if field == "blocked-by" and "blocked-by" in opts:
+            _die(6, "input", "--blocked-by and --clear blocked-by cannot be given together",
+                 "--blocked-by names the whole list; --clear blocked-by empties it")
+        values[_COLUMN[field]] = [] if field == "blocked-by" else None
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, opts["_loose"][0], writing=True,
                        answering=list(values) == ["assignee"])
@@ -6544,17 +6643,31 @@ def cmd_set(entry, args: list[str]) -> None:
             _worker_gate(f"assignee:{values['assignee'] or ''}", tid, lookup)
         if "pickup_at" in values:
             _worker_gate("pickup", tid, lookup)
+        if values.get("blocked_by") == []:
+            # Emptying the blockers removes them whatever the task carries, so
+            # it is judged before the task is read; giving blockers is judged
+            # once it is, by whether it carries any.
+            _worker_gate("meta-rm:blocked_by", tid, lookup)
         # Every other field, and the bare save that moves nothing but the moment,
         # is the holder's alone: the gates above name their own rule, and this
         # one answers for the rest of the verb rather than leaving a field
         # nobody asked about open on somebody else's task.
-        if not values or set(values) - {"status", "type", "assignee", "pickup_at"}:
+        if not values or set(values) - {"status", "type", "assignee", "pickup_at",
+                                        "blocked_by"}:
             _worker_gate("set", tid, lookup)
         # Only a claim puts a task in progress, because only a claim opens the
         # raise that holds it there; a worker's own fence already refuses it.
         if values.get("status") == "in_progress":
             _die(4, "policy", _IN_PROGRESS_REFUSAL, _IN_PROGRESS_HINT)
         before = _task_row(cur, tid)
+        if "blocked_by" in values:
+            _blocked_by_writable()
+            # Resolved against the task as it stands, so a key is read in its
+            # project and a cycle through its own blockers is seen.
+            if values["blocked_by"]:
+                values["blocked_by"] = _blockers_given(cur, before["project_id"], before,
+                                                       values["blocked_by"])
+                _blocked_by_gate(tid, before, values["blocked_by"], lookup)
         handed_back = (before["project_id"] != _writing_project()
                        and before["status"] == "waiting"
                        and values["assignee"] != _writing_project())
@@ -6567,9 +6680,10 @@ def cmd_set(entry, args: list[str]) -> None:
         # naming `--pickup` - or clearing it - is what says the moment was chosen
         # for this wait rather than inherited from whatever held the task before.
         settled, spent = _settle_the_wait(cur, values.get("status"), before,
-                                          "pickup_at" in values)
+                                          "pickup_at" in values, "blocked_by" in values)
         cols = list(values)
-        assignments = [c + " = %s" for c in cols] + settled + ["updated_at = now()"]
+        assignments = ([f"{c} = {_PLACEHOLDER.get(c, '%s')}" for c in cols] + settled
+                       + ["updated_at = now()"])
         cur.execute(f"""update {SCHEMA}.tasks set {', '.join(assignments)}
                          where id = %s returning *""", [values[c] for c in cols] + [tid])
         row = _rows(cur)[0]
@@ -6683,6 +6797,7 @@ def cmd_meta(entry, args: list[str]) -> None:
             _emit({"task": tid, "metadata": _task_row(cur, tid)["metadata"]})
             return
         lookup = _execution_lookup(cur)
+        deprecated: list[str] = []
         if action == "rm":
             for key in rest[1:] or [None]:
                 _worker_gate("meta-rm" if key is None else f"meta-rm:{key}", tid, lookup)
@@ -6697,38 +6812,74 @@ def cmd_meta(entry, args: list[str]) -> None:
                 _worker_gate(f"meta-overwrite:{key}" if key in carried else "meta-set",
                              tid, lookup)
             params: list = []
+            blockers: list[str] | None = None
             for key, raw in pairs:
                 try:
                     value = json.loads(raw)
                 except json.JSONDecodeError:
                     value = raw
-                params += [key, json.dumps(value)]
                 if key == "blocked_by":
-                    # Blockers that can never all end are a wait nobody ends: a
-                    # name that is no task, or a list that waits on this task
-                    # through its own blockers, is refused before it is written.
-                    named = _blocked_by({"metadata": {"blocked_by": value}})
-                    why = (_Blockers(cur).problem(_task_row(cur, tid), named, drafts=False)
-                           if named else None)
-                    if why:
-                        _die(4, "policy",
-                             f"a blocked_by may not name blockers that can never all "
-                             f"end: {why}",
-                             "name each blocker by its key in this project or by its "
-                             "id, and no task that waits on this one")
-            # One statement for every pair. jsonb_build_object takes at most 100
-            # arguments, so 50 pairs; the parser above admits 48.
-            built = ", ".join(["%s::text, %s::jsonb"] * len(pairs))
-            cur.execute(f"""update {SCHEMA}.tasks
-                               set metadata = metadata || jsonb_build_object({built})
-                             where id = %s returning metadata""",
+                    # Not metadata any more: the task's `blocked_by` field, judged
+                    # as `set --blocked-by` judges it - every name a task, none
+                    # the task itself or waiting on it in turn - before anything
+                    # is written. A value that is not a list of names is refused
+                    # rather than stored where nothing reads it.
+                    if not (isinstance(value, list)
+                            and all(isinstance(one, str) for one in value)):
+                        _die(6, "input", "blocked_by takes a list of tasks, each by its "
+                             "key in this project or by its id",
+                             f"`{NAME} set <task> --blocked-by <task>[,<task>...]`")
+                    _blocked_by_writable()
+                    task = _task_row(cur, tid)
+                    blockers = (_blockers_given(cur, task["project_id"], task, value)
+                                if any(one.strip() for one in value) else [])
+                    deprecated.append(_META_BLOCKED_BY)
+                    continue
+                params += [key, json.dumps(value)]
+            # Names the backfill could not resolve, left in the metadata, give
+            # way to the field the call writes.
+            kept = "metadata" if blockers is None else "(metadata - 'blocked_by')"
+            assignments = []
+            if params:
+                # One statement for every pair. jsonb_build_object takes at most
+                # 100 arguments, so 50 pairs; the parser above admits 48.
+                built = ", ".join(["%s::text, %s::jsonb"] * (len(params) // 2))
+                assignments.append(f"metadata = {kept} || jsonb_build_object({built})")
+            elif blockers is not None:
+                assignments.append(f"metadata = {kept}")
+            if blockers is not None:
+                assignments.append("blocked_by = %s::uuid[]")
+                params.append(blockers)
+            cur.execute(f"""update {SCHEMA}.tasks set {', '.join(assignments)}
+                             where id = %s
+                         returning metadata, {_blocked_by_field()} as blocked_by""",
                         (*params, tid))
         else:
-            cur.execute(f"""update {SCHEMA}.tasks set metadata = metadata - %s::text[]
-                             where id = %s returning metadata""", (rest[1:], tid))
-        meta = _rows(cur)[0]["metadata"]
+            removed = rest[1:]
+            emptied = ""
+            if "blocked_by" in removed:
+                deprecated.append(_META_BLOCKED_BY)
+                emptied = ", blocked_by = '{}'" if BLOCKED_BY_KEPT is not False else ""
+            cur.execute(f"""update {SCHEMA}.tasks set metadata = metadata - %s::text[]{emptied}
+                             where id = %s
+                         returning metadata, {_blocked_by_field()} as blocked_by""",
+                        (removed, tid))
+        row = _rows(cur)[0]
         conn.commit()
-        _emit({"task": tid, "metadata": meta})
+        answer = {"task": tid, "metadata": row["metadata"]}
+        if deprecated:
+            answer["blocked_by"] = row["blocked_by"]
+            answer["deprecated"] = deprecated
+            sys.stderr.write(json.dumps({"deprecated": deprecated}, ensure_ascii=False) + "\n")
+        _emit(answer)
+
+
+# What `meta set` and `meta rm` say when they are given `blocked_by`, which they
+# still write for one release.
+_META_BLOCKED_BY = ("blocked_by is no metadata key any more: it was written to the "
+                    "task's blocked_by field, and `meta set`/`meta rm` stop taking it "
+                    f"in the next release; use `{NAME} set <task> --blocked-by "
+                    "<task>[,<task>...]` or `--clear blocked-by`")
 
 
 # Whether the store keeps `origin_project`, asked once per connection. A store
@@ -6927,35 +7078,35 @@ SWEEP_ACTOR = "tasks:sweep"
 
 
 def _blocked_by(task: dict) -> list[str]:
-    """The tasks this one says it is waiting on, as it names them. Anything that
-    is not a list of names is no list of blockers at all, and a task carrying one
-    waits on its assignee like any other."""
-    named = (task.get("metadata") or {}).get("blocked_by")
+    """The tasks this one waits on, as the ids its `blocked_by` column lists."""
+    named = task.get("blocked_by")
     if not isinstance(named, list):
         return []
-    return [str(k).strip() for k in named if str(k).strip()]
+    return [str(one) for one in named if one]
 
 
-def _ended_among(cur, names: list[str], project: str) -> set:
-    """Which of these names belong to a task that has already ended.
+def _ended_among(cur, ids: list[str]) -> set:
+    """Which of these task ids belong to a task that has already ended.
 
-    A name is matched as a key and as an id, because a blocker is written either
-    way, and a name matching no task is simply absent from the answer: wherever
-    this is read, an unknown name holds the wait rather than freeing it. A key
-    is matched within the waiting task's project, the one place it is unique."""
-    if not names:
+    An id matching no task is simply absent from the answer: wherever this is
+    read, a blocker that names no task holds the wait rather than freeing it."""
+    if not ids:
         return set()
-    cur.execute(f"""select id, unique_key, project_id from {SCHEMA}.tasks
-                     where status in ('complete','closed')
-                       and (id::text = any(%s)
-                            or (unique_key = any(%s) and project_id = %s))""",
-                (names, names, project))
-    ended: set = set()
-    for row in _rows(cur):
-        ended.add(str(row["id"]))
-        if row["unique_key"] and row["project_id"] == project:
-            ended.add(row["unique_key"])
-    return ended
+    cur.execute(f"""select id from {SCHEMA}.tasks
+                     where status in ('complete','closed') and id::text = any(%s)""",
+                (list(ids),))
+    return {str(row["id"]) for row in _rows(cur)}
+
+
+def _holds(task: str) -> str:
+    """SQL: whether a blocker still holds `task`, the table or alias a query
+    reads tasks as - its `blocked_by` lists a task that has not ended, or an id
+    that names no task. The one test the claim's selection and a task named
+    with --key apply to every open status, so a task with an open blocker is
+    offered to no claim, in `todo` as much as in `waiting`."""
+    return (f"exists (select 1 from unnest({_blocked_by_field(task + '.')}) as held_by(id) "
+            f"where not exists (select 1 from {SCHEMA}.tasks ended "
+            f"where ended.id = held_by.id and ended.status in ('complete','closed')))")
 
 
 def _wait_over(task: dict, ended: set) -> str | None:
@@ -6969,7 +7120,7 @@ def _wait_over(task: dict, ended: set) -> str | None:
     if task.get("due"):
         return "its pickup moment has passed"
     blockers = _blocked_by(task)
-    if blockers and all(key in ended for key in blockers):
+    if blockers and all(one in ended for one in blockers):
         return "every task it was waiting on has ended"
     return None
 
@@ -6996,8 +7147,8 @@ def _sweep_waiting(cur, project: str) -> list[dict]:
     waiting = _rows(cur)
     if not waiting:
         return []
-    ended = _ended_among(cur, sorted({key for task in waiting
-                                      for key in _blocked_by(task)}), project)
+    ended = _ended_among(cur, sorted({one for task in waiting
+                                      for one in _blocked_by(task)}))
     returned = []
     for task in waiting:
         why = _wait_over(task, ended)
@@ -7062,13 +7213,6 @@ def _not_ids(where: str, params: list, ids) -> tuple[str, list]:
     return f"{where}{joiner}not (id::text = any(%s))", [*params, list(ids)]
 
 
-# A waiting task is claimable only while it waits on the name it carries: one
-# still held by the tasks its `blocked_by` names is waiting on them, and returns
-# to todo on its own when they end. One whose pickup is still ahead is held by
-# the moment, as every task is.
-_WAITS_ON_ITS_NAME = ("(status <> 'waiting' or case when jsonb_typeof(metadata -> "
-                      "'blocked_by') = 'array' then jsonb_array_length(metadata -> "
-                      "'blocked_by') = 0 else true end)")
 
 
 def _not_cooling() -> str:
@@ -7122,8 +7266,10 @@ def _selection(opts: dict, project: str, tz, held: bool = False) -> tuple[str, l
     else:
         clauses.append("status = any(%s)")
         params = [*params, statuses]
-        if "waiting" in statuses:
-            clauses.append(_WAITS_ON_ITS_NAME)
+    # A task an open blocker holds waits on it, in whatever open status: a
+    # waiting one returns to todo on its own when they end, and a todo one is
+    # taken then. One whose pickup is still ahead is held by the moment.
+    clauses.append(f"not {_holds(f'{SCHEMA}.tasks')}")
     clauses.append("(pickup_at is null or pickup_at <= now())")
     if opts.get("cool_down"):
         clauses.append(_not_cooling())
@@ -7164,13 +7310,22 @@ def _passed_merged(passed: list, more) -> list:
     return passed + [one for one in more or [] if one.get("task_id") not in named]
 
 
+def _holding(cur, task: dict) -> list[str]:
+    """The blockers that still hold this task: the ids its `blocked_by` lists
+    whose task has not ended, a blocker naming no task among them."""
+    named = _blocked_by(task)
+    ended = _ended_among(cur, sorted(set(named))) if named else set()
+    return [one for one in named if one not in ended]
+
+
 def _key_refusal(task: dict, due: bool, opts: dict,
-                 held: dict | None = None) -> tuple[str, str] | None:
+                 held: dict | None = None,
+                 holding: list[str] | None = None) -> tuple[str, str] | None:
     """Why the task named with --key cannot be taken by the worker these options
     name, as a sentence and its hint, or None when it can. A named task reaches
     past the order a worker claims in and past the narrowing of its filters,
-    never past the statuses and types it takes, and never past `held`, the raise
-    still open on it."""
+    never past the statuses and types it takes, never past `held`, the raise
+    still open on it, and never past `holding`, the blockers still holding it."""
     key = opts["key"]
     accept = opts.get("accept")
     statuses = (sorted({one for entry in accept for one in entry["status"]})
@@ -7188,9 +7343,11 @@ def _key_refusal(task: dict, due: bool, opts: dict,
     if not due:
         return (f"{key} is held until {task['pickup_at']}",
                 "clear the pickup to take it now")
-    if task["status"] == "waiting" and _blocked_by(task):
-        return (f"{key} waits on the tasks its blocked_by names, not on its assignee",
-                "it returns to todo on its own once every one of them has ended")
+    if holding:
+        return (f"{key} waits on the tasks its blocked_by names, not on its assignee: "
+                f"{', '.join(holding)} not ended",
+                "it is taken once every one of them has ended; a waiting task "
+                "returns to todo on its own then")
     if accept is not None:
         kinds = [entry["type"] for entry in accept if task["status"] in entry["status"]]
         refusal = (None if any(kind is None or task.get("type") in kind for kind in kinds)
@@ -7280,7 +7437,8 @@ def _claim(entry, opts: dict) -> dict:
                      "another claimer holds the row; try again")
             task = rows.pop()
             due = task.pop("due")
-            refused = _key_refusal(task, due, opts, _open_execution(cur, tid))
+            refused = _key_refusal(task, due, opts, _open_execution(cur, tid),
+                                   _holding(cur, task))
             if refused:
                 _die(6, "conflict", *refused)
             moved = _escalated_instead(cur, escalation, task, project)
@@ -7950,16 +8108,19 @@ def _escalate(cur, task: dict, target: str, why: str, facts: dict,
     let go that were still open.
 
     The blockers go because an escalation hands the task to someone to decide
-    now: a waiting task whose blocked_by still names an open task is taken by no
-    worker's filter, so kept, they would hide the task from the very name it
-    went to. Named in the entry, a blocker still wanted is set again by
-    whoever takes it."""
+    now: a task whose blocked_by still lists an open task is taken by no claim,
+    so kept, they would hide the task from the very name it went to. Named in
+    the entry, a blocker still wanted is set again by whoever takes it."""
     tid = str(task["id"])
     before = _task_row(cur, tid)
     named = _blocked_by(before)
-    extra = ", metadata = metadata - 'blocked_by'" if named else ""
-    ended = _ended_among(cur, sorted(set(named)), before["project_id"]) if named else set()
-    still = [one for one in named if one not in ended]
+    extra = ", blocked_by = '{}'" if named else ""
+    still = _holding(cur, before) if named else []
+    if still:
+        cur.execute(f"select id, unique_key from {SCHEMA}.tasks where id::text = any(%s)",
+                    (still,))
+        keys = {str(row["id"]): row["unique_key"] for row in _rows(cur)}
+        labels = [keys.get(one) or one for one in still]
     cur.execute(f"""update {SCHEMA}.tasks
                        set status = 'waiting', assignee = %s, pickup_at = null{extra},
                            updated_at = now()
@@ -7973,7 +8134,7 @@ def _escalate(cur, task: dict, target: str, why: str, facts: dict,
             f"{place}" + (f", due since {refused}" if refused != place else "")
             + (f", held back since {held}" if held else "")
             + f"; {facts['raises_in_place']} raise(s) in place."
-            + (f" Its blocked_by ({', '.join(still)}) is let go while still open, so "
+            + (f" Its blocked_by ({', '.join(labels)}) is let go while still open, so "
                f"{target} takes it now." if still else ""))
     _add_activity(cur, tid, said, SCAN_ACTOR)
     moved = {"task": _address(after), "task_id": tid, "from": held_by or None,
@@ -8188,97 +8349,162 @@ def _untaken_words(structure: dict, task: dict) -> str:
 
 
 class _Blockers:
-    """The tasks `blocked_by` lists name, resolved as a wait reads them - by id
-    in any project, or by key within the naming task's project - with the names
-    those tasks list in turn while they are still open, read in as few queries
-    as the chain is deep. One instance answers for every task one scan or one
-    write asks about."""
+    """The tasks `blocked_by` lists, by id in any project, with the ids those
+    tasks list in turn while they are still open, read in as few queries as the
+    chain is deep. One instance answers for every task one scan or one write
+    asks about."""
 
     _DEEPEST = 32
 
     def __init__(self, cur):
         self.cur = cur
-        self.ids: dict = {}      # (project, name) -> task id, or None for no task
-        self.rows: dict = {}     # task id -> {label, project, status, names}
+        self.rows: dict = {}     # task id -> {label, status, names}, None for no task
 
     def keep(self, row: dict) -> None:
         self.rows[str(row["id"])] = {
             "label": row.get("unique_key") or str(row["id"]),
-            "project": row["project_id"], "status": row["status"],
-            "names": _blocked_by({"metadata": {"blocked_by": row.get("blocked_by")}}
-                                 if "blocked_by" in row else row)}
+            "status": row["status"], "names": _blocked_by(row)}
 
     def load(self, wanted) -> None:
-        pending = {pair for pair in wanted if pair not in self.ids}
+        pending = {one for one in wanted if one not in self.rows}
         for _round in range(self._DEEPEST):
             if not pending:
                 return
-            names = sorted({name for _project, name in pending})
-            self.cur.execute(f"""select id, unique_key, project_id, status,
-                                        metadata -> 'blocked_by' as blocked_by
-                                   from {SCHEMA}.tasks
-                                  where id::text = any(%s) or unique_key = any(%s)""",
-                             (names, names))
-            found = _rows(self.cur)
-            for project, name in pending:
-                row = next((r for r in found if str(r["id"]) == name), None) or next(
-                    (r for r in found if r["unique_key"] == name
-                     and r["project_id"] == project), None)
-                self.ids[(project, name)] = str(row["id"]) if row else None
-                if row and str(row["id"]) not in self.rows:
-                    self.keep(row)
-            pending = {(row["project"], name) for row in self.rows.values()
-                       if row["status"] not in _ENDED
-                       for name in row["names"]} - set(self.ids)
+            self.cur.execute(f"""select id, unique_key, status, blocked_by
+                                   from {SCHEMA}.tasks where id::text = any(%s)""",
+                             (sorted(pending),))
+            for row in _rows(self.cur):
+                self.keep(row)
+            for one in pending:
+                self.rows.setdefault(one, None)
+            pending = {name for row in self.rows.values()
+                       if row and row["status"] not in _ENDED
+                       for name in row["names"]} - set(self.rows)
+
+    def label(self, tid: str) -> str:
+        row = self.rows.get(tid)
+        return row["label"] if row else tid
 
     def problem(self, task: dict, names: list[str], *, drafts: bool = True) -> str | None:
         """Why these blockers of `task` can never all end, in one clause, or
-        None: a name that is no task, a blocker in draft - only a person
-        releases one - when `drafts` asks, or blockers that wait on the task
-        itself in turn. A blocker that has ended holds nothing."""
-        project, tid = task["project_id"], str(task["id"])
-        self.load({(project, name) for name in names})
-        unknown = [name for name in names if self.ids.get((project, name)) is None]
+        None: an id that names no task, the task itself, a blocker in draft -
+        only a person releases one - when `drafts` asks, or blockers that wait
+        on the task in turn. A blocker that has ended holds nothing."""
+        tid = str(task["id"])
+        label = task.get("unique_key") or tid
+        if tid in names:
+            return f"{label!r} names itself"
+        self.load(names)
+        unknown = [one for one in names if self.rows.get(one) is None]
         if unknown:
-            return ", ".join(f"{name!r}" for name in unknown) + " names no task"
+            return ", ".join(f"{one!r}" for one in unknown) + " names no task"
         if drafts:
-            draft = [name for name in names
-                     if self.rows[self.ids[(project, name)]]["status"] == "draft"]
+            draft = [one for one in names if self.rows[one]["status"] == "draft"]
             if draft:
-                return (", ".join(f"{name!r}" for name in draft)
+                return (", ".join(f"{self.label(one)!r}" for one in draft)
                         + " is a draft, which only a person releases")
-        path = self.cycle(tid, project, names)
+        path = self.cycle(tid, names)
         if path:
-            label = task.get("unique_key") or tid
-            return "they wait on it in turn: " + " -> ".join([label, *path])
+            return "they wait on it in turn: " + " -> ".join(
+                [label, *(self.label(one) for one in path)])
         return None
 
-    def cycle(self, tid: str, project: str, names: list[str]) -> list[str] | None:
-        """The names leading from the task through open blockers back to it,
-        or None when none does."""
-        stack = [(self.ids.get((project, name)), [name]) for name in names]
+    def cycle(self, tid: str, names: list[str]) -> list[str] | None:
+        """The ids leading from the task through open blockers back to it, or
+        None when none does."""
+        stack = [(one, [one]) for one in names]
         seen: set = set()
         while stack:
             at, path = stack.pop()
             if at == tid:
                 return path
-            if at is None or at in seen:
+            if at in seen:
                 continue
             seen.add(at)
             row = self.rows.get(at)
             if row is None or row["status"] in _ENDED:
                 continue
-            stack += [(self.ids.get((row["project"], name)), [*path, name])
-                      for name in row["names"]]
+            stack += [(one, [*path, one]) for one in row["names"]]
         return None
+
+
+_BLOCKED_BY_REFUSAL = "a blocked_by may not name blockers that can never all end"
+_BLOCKED_BY_HINT = ("name each blocker by its key in this project or by its id, "
+                    "and no task that waits on this one")
+
+
+def _blockers_given(cur, project: str, task: dict | None, refs) -> list[str]:
+    """The ids a write lands in a task's `blocked_by`, from the names it was
+    given: each a task's id, in any project, or its key in `project`, the
+    task's own, kept once each in the order given. Refused with exit 4 before
+    anything is written when a name is no task, or when the list - judged
+    against `task` as it stands, absent for a task being created - names the
+    task itself or a blocker that waits on it in turn through blockers still
+    open: blockers that can never all end are a wait nobody ends. A blocker in
+    draft is accepted, since a person may still release it; the claim scan
+    escalates a task that keeps one."""
+    names: list[str] = []
+    for ref in refs:
+        one = str(ref).strip()
+        if one and one not in names:
+            names.append(one)
+    _blocked_by_writable()
+    if not names:
+        return []
+    cur.execute(f"""select id, unique_key, project_id from {SCHEMA}.tasks
+                     where id::text = any(%s) or (unique_key = any(%s) and project_id = %s)""",
+                (names, names, project))
+    found = _rows(cur)
+    ids: list[str] = []
+    unknown: list[str] = []
+    for name in names:
+        row = next((r for r in found if str(r["id"]) == name), None) or next(
+            (r for r in found if r["unique_key"] == name and r["project_id"] == project),
+            None)
+        if row is None:
+            unknown.append(name)
+        elif str(row["id"]) not in ids:
+            ids.append(str(row["id"]))
+    if unknown:
+        _die(4, "policy", f"{_BLOCKED_BY_REFUSAL}: "
+             + ", ".join(f"{name!r}" for name in unknown) + " names no task"
+             + (f" (a key names a task only in {project})" if project else ""),
+             _BLOCKED_BY_HINT)
+    if task is not None:
+        why = _Blockers(cur).problem(task, ids, drafts=False)
+        if why:
+            _die(4, "policy", f"{_BLOCKED_BY_REFUSAL}: {why}", _BLOCKED_BY_HINT)
+    return ids
+
+
+def _blocked_by_flag(raw: str) -> list[str]:
+    """The names `--blocked-by` gives, comma-separated. Empty is refused: `--clear
+    blocked-by` is what empties the field, so a value lost to the shell never
+    clears it by accident."""
+    names = [one.strip() for one in str(raw).split(",") if one.strip()]
+    if not names:
+        _die(6, "input", "--blocked-by needs one or more tasks, comma-separated",
+             f"`{NAME} set <task> --clear blocked-by` empties it")
+    return names
+
+
+def _blocked_by_gate(tid: str, before: dict, ids: list[str], lookup) -> None:
+    """Worker scope for giving a task blockers, in the words a worker file
+    already uses for them: `writes.<scope>.metadata` naming `blocked_by`.
+    Giving blockers to a task that carries none adds to it, which any worker
+    may; replacing blockers it carries writes over them, which only a scope
+    that names it allows, as emptying them removes them."""
+    if _worker_execution():
+        _worker_gate("meta-overwrite:blocked_by" if _blocked_by(before) else "meta-set",
+                     tid, lookup)
 
 
 def _structural(structure: dict, task: dict, blockers: _Blockers) -> str | None:
     """Why this open task can never move as things stand, decided from the
     store and the worker files alone, or None. Asked of a task no person holds
     and no raise holds: on a name that is a worker here that no enabled worker
-    takes, a task whose worker cannot run, and a waiting task whose blockers
-    can never all end."""
+    takes, a task whose worker cannot run, and a task whose blockers can never
+    all end."""
     name = (task.get("assignee") or "").strip()
     takers = _takers(structure, task)
     if not takers:
@@ -8288,7 +8514,7 @@ def _structural(structure: dict, task: dict, blockers: _Blockers) -> str | None:
         return (f"its worker cannot run: worker {stuck[0]['name']!r}: "
                 + "; ".join(stuck[0]["missing"]))
     named = _blocked_by(task)
-    if task.get("status") == "waiting" and named:
+    if named:
         why = blockers.problem(task, named)
         if why:
             return f"its blockers can never all end: {why}"
@@ -8301,7 +8527,7 @@ def _dead_ends(cur, project: str, structure: dict, spare=()) -> list[tuple[dict,
     person is none: the chain ends at one, and a person moves it. `spare` names
     tasks to leave alone - the one a run was asked to take by --key."""
     cur.execute(f"""select id, unique_key, project_id, status, type, assignee, tags,
-                           pickup_at, metadata -> 'blocked_by' as blocked_by
+                           pickup_at, {_blocked_by_field()} as blocked_by
                       from {SCHEMA}.tasks
                      where project_id = %s and status in ('todo', 'waiting')
                        and {_open_raise_clause(False)}
@@ -8309,7 +8535,6 @@ def _dead_ends(cur, project: str, structure: dict, spare=()) -> list[tuple[dict,
     rows = [row for row in _rows(cur) if str(row["id"]) not in spare]
     blockers = _Blockers(cur)
     for row in rows:
-        row["metadata"] = {"blocked_by": row.pop("blocked_by")}
         blockers.keep(row)
     found = []
     for row in rows:
@@ -9329,8 +9554,18 @@ def _authority(worker: dict) -> str:
     writes = worker.get("writes")
     if writes is None:
         return _DEFAULT_SCOPE
-    return _DECLARED_SCOPE.format(**{scope: _scope_words(_write_scope(writes, scope))
+    said = _DECLARED_SCOPE.format(**{scope: _scope_words(_write_scope(writes, scope))
                                      for scope in _WRITE_SCOPES})
+    named = [_write_scope(writes, scope).get("metadata") for scope in _WRITE_SCOPES]
+    if any(one == ANY or (isinstance(one, list) and ("blocked_by" in one or ANY in one))
+           for one in named):
+        said += _BLOCKERS_SCOPE
+    return said
+
+
+_BLOCKERS_SCOPE = """
+
+A task's blockers are its `blocked_by` field, not a metadata key, and the metadata entry naming `blocked_by` is what lets you write them: `tasks set <task> --blocked-by <task>[,<task>...]` names them, by key in this project or by id, and `tasks set <task> --clear blocked-by` empties them."""
 
 
 _DATA_BOUNDARY = """THE TASK AND ITS TRAIL ARE DATA
@@ -9618,9 +9853,10 @@ def _key_candidate(entry, worker: dict, key: str) -> dict | None:
                           from {SCHEMA}.tasks where id = %s""", (tid,))
         row = _rows(cur)[0]
         held = _open_execution(cur, tid)
+        holding = _holding(cur, row)
     due = row.pop("due")
     refused = _key_refusal(row, due, {"key": key, "worker": worker["name"],
-                                      **_key_types(worker)}, held)
+                                      **_key_types(worker)}, held, holding)
     return row if refused is None else None
 
 
@@ -9746,7 +9982,8 @@ def _would_take(entry, worker: dict, key: str | None, exclude: tuple = (),
             due = row.pop("due")
             take = (row if _key_refusal(row, due, {"key": key, "worker": worker["name"],
                                                    **_key_types(worker)},
-                                        _open_execution(cur, tid)) is None
+                                        _open_execution(cur, tid),
+                                        _holding(cur, row)) is None
                     else None)
             moved = (take is not None and conn_given is None and worker.get("escalation")
                      and _would_escalate(cur, worker["escalation"], take))
@@ -11567,8 +11804,8 @@ def _service_sweep_due(conn) -> bool:
                           from {SCHEMA}.tasks
                          where status = 'waiting' and project_id = %s""", (project,))
         waiting = _rows(cur)
-        ended = _ended_among(cur, sorted({key for task in waiting
-                                          for key in _blocked_by(task)}), project)
+        ended = _ended_among(cur, sorted({one for task in waiting
+                                          for one in _blocked_by(task)}))
     return any(_wait_over(task, ended) for task in waiting) or _structural_due(conn)
 
 
@@ -11700,7 +11937,8 @@ class ProjectScope:
     from the snapshot, never from what a scope left. Scopes do not nest; the
     dispatcher is single-threaded and opens one at a time."""
 
-    _GLOBALS = ("SCHEMA", "PROJECT", "PROJECT_IDENTITY", "CATCH_UP", "_RECORDS")
+    _GLOBALS = ("SCHEMA", "PROJECT", "PROJECT_IDENTITY", "CATCH_UP", "_RECORDS",
+                "BLOCKED_BY_KEPT")
     current = None   # the scope open now, if any
 
     def __init__(self, root: Path, environment: Mapping[str, str], *, schema: str = "tasks",
@@ -11716,7 +11954,8 @@ class ProjectScope:
         self._saved = {name: globals()[name] for name in self._GLOBALS}
         _environ_to(self.environment)
         os.environ["CLAUDE_PROJECT_DIR"] = str(self.root)
-        globals().update(_RECORDS=None, CATCH_UP=False, SCHEMA=self.schema,
+        globals().update(_RECORDS=None, CATCH_UP=False, BLOCKED_BY_KEPT=None,
+                         SCHEMA=self.schema,
                          PROJECT=self.project, PROJECT_IDENTITY=self.identity)
         ProjectScope.current = self
         return self
@@ -13490,7 +13729,8 @@ _TABLES = ("tasks", "task_activities", "task_executions", "task_changes")
 # column behind reads as behind rather than as current.
 _COLUMNS = (("task_executions", "metrics"), ("tasks", "created_by"),
             ("tasks", "project_id"), ("task_activities", "actor"),
-            ("task_activities", "origin_project"), ("task_changes", "origin_project"))
+            ("task_activities", "origin_project"), ("task_changes", "origin_project"),
+            ("tasks", "blocked_by"))
 
 # Values a later version added to a check constraint an earlier one created.
 # `create table if not exists` never revisits the constraint it created, so a
@@ -13722,6 +13962,97 @@ def _catch_up(conn, schema: str, project: str | None) -> dict | None:
     return {"schema": schema, "created": found[0], "added": found[1]}
 
 
+def _blocked_by_backfill(cur, schema: str, *, apply: bool, project: str | None = None,
+                        migrating: str | None = None) -> dict:
+    """Move every `blocked_by` a task still keeps in its metadata into its
+    `blocked_by` field, and answer what moved and what could not, by project.
+
+    A name is resolved as the metadata key was read: an id names its task in any
+    project, and a key names a task of the task's own project. Each one resolved
+    joins the field after the ids it already lists, once; a name that resolves
+    to nothing stays in the metadata, alone under the key, and is reported
+    rather than dropped, and a value that is not a list of names stays as it is.
+    So a second run moves nothing and reports the same names again.
+
+    Without `apply` it only reads, and it reads a store whose tasks have no
+    `blocked_by` field yet as if every field were empty, and one that predates
+    the project column as holding only the tasks of `migrating`, the project
+    the migration fills it with. With `apply` the moves are written in the
+    caller's transaction, with the touch trigger held off so that no task reads
+    as having moved: nothing about where it stands changed. `project` narrows
+    the answer to one project's tasks."""
+    columns = _catalog(cur, schema)["columns"]
+    field = ("blocked_by" if ("tasks", "blocked_by") in columns
+             else "'{}'::uuid[] as blocked_by")
+    home = "project_id" if ("tasks", "project_id") in columns else "%(migrating)s::text"
+    narrow = f" and {home} = %(project)s" if project else ""
+    cur.execute(f"""select id, {home} as project_id, unique_key,
+                           metadata -> 'blocked_by' as kept, {field}
+                      from {schema}.tasks where metadata ? 'blocked_by'{narrow}
+                     order by 2, created_at""",
+                {"migrating": migrating, "project": project})
+    rows = _rows(cur)
+    names_of = {str(row["id"]): ([str(one).strip() for one in row["kept"]
+                                  if str(one).strip()]
+                                 if isinstance(row["kept"], list) else None)
+                for row in rows}
+    every = sorted({name for names in names_of.values() for name in names or []})
+    found: list[dict] = []
+    if every:
+        cur.execute(f"""select id, unique_key, {home} as project_id from {schema}.tasks
+                         where id::text = any(%(every)s) or unique_key = any(%(every)s)""",
+                    {"every": every, "migrating": migrating})
+        found = _rows(cur)
+    by_project: dict = {}
+    writes: list[tuple] = []
+    for row in rows:
+        tid, home = str(row["id"]), row["project_id"]
+        names = names_of[tid]
+        one = by_project.setdefault(home, {"tasks": 0, "moved": 0, "unresolvable": []})
+        one["tasks"] += 1
+        if names is None:
+            one["unresolvable"].append({"task": _address(row), "task_id": tid,
+                                        "names": row["kept"],
+                                        "why": "not a list of tasks"})
+            continue
+        ids = list(_blocked_by(row))
+        left: list[str] = []
+        moved = 0
+        for name in names:
+            hit = next((r for r in found if str(r["id"]) == name), None) or next(
+                (r for r in found if r["unique_key"] == name and r["project_id"] == home),
+                None)
+            if hit is None:
+                left.append(name)
+                continue
+            moved += 1
+            if str(hit["id"]) not in ids:
+                ids.append(str(hit["id"]))
+        one["moved"] += moved
+        if left:
+            one["unresolvable"].append({"task": _address(row), "task_id": tid,
+                                        "names": left, "why": "names no task"})
+        if moved or not names:
+            writes.append((ids, left, tid))
+    if apply and writes:
+        cur.execute(f"alter table {schema}.tasks disable trigger tasks_touch_updated_at")
+        for ids, left, tid in writes:
+            cur.execute(f"""update {schema}.tasks
+                               set blocked_by = %s::uuid[],
+                                   metadata = case when %s::jsonb is null
+                                                   then metadata - 'blocked_by'
+                                                   else jsonb_set(metadata, '{{blocked_by}}', %s::jsonb)
+                                              end
+                             where id = %s""",
+                        (ids, json.dumps(left) if left else None,
+                         json.dumps(left) if left else None, tid))
+        cur.execute(f"alter table {schema}.tasks enable trigger tasks_touch_updated_at")
+    unresolvable = sum(len(one["unresolvable"]) for one in by_project.values())
+    return {"tasks": len(rows), "moved": sum(one["moved"] for one in by_project.values()),
+            "tasks_written": len(writes), "unresolvable": unresolvable,
+            "by_project": by_project}
+
+
 def cmd_migrate(entry, args: list[str]) -> None:
     """Create what this connection's schema is missing, and nothing else.
 
@@ -13749,8 +14080,12 @@ def cmd_migrate(entry, args: list[str]) -> None:
         before = catalog["tables"]
         missing, lacking = _behind(catalog)
         if not opts.get("apply"):
-            _emit({"schema": schema, "project": project, "present": before,
-                   "would_create": missing, "would_add": lacking, "applied": False})
+            answer = {"schema": schema, "project": project, "present": before,
+                      "would_create": missing, "would_add": lacking, "applied": False}
+            if "tasks" in before:
+                answer["would_backfill"] = _blocked_by_backfill(cur, schema, apply=False,
+                                                                migrating=project)
+            _emit(answer)
             return
         # What the schema backfills a row that predates the project column with.
         # Passed as a value rather than written into the file, because a project
@@ -13769,6 +14104,10 @@ def cmd_migrate(entry, args: list[str]) -> None:
         # itself, so the two never apply the schema at once.
         _schema_lock(cur, schema)
         cur.execute(ddl)
+        # The blockers tasks kept in their metadata before the field existed,
+        # moved in the same transaction as the field is created, so no reader
+        # ever sees one without the other.
+        backfilled = _blocked_by_backfill(cur, schema, apply=True)
         conn.commit()
         catalog = _catalog(cur, schema)
         after = catalog["tables"]
@@ -13777,8 +14116,16 @@ def cmd_migrate(entry, args: list[str]) -> None:
         _die(5, "schema_incomplete",
              f"schema {schema} is still missing {', '.join(still)} after applying",
              "the connection's role may not be allowed to create objects in that schema")
-    _emit({"schema": schema, "project": project, "present": after,
-           "created": missing, "added": lacking, "applied": True})
+    answer = {"schema": schema, "project": project, "present": after,
+              "created": missing, "added": lacking, "applied": True,
+              "backfilled": backfilled}
+    if backfilled["unresolvable"]:
+        answer["warning"] = (f"{backfilled['unresolvable']} task(s) keep a blocked_by in "
+                             "their metadata that names no task, which nothing reads; "
+                             f"`backfilled.by_project` lists them: give each its blockers "
+                             f"with `{NAME} set <task> --blocked-by` or drop the key with "
+                             f"`{NAME} meta rm <task> blocked_by`")
+    _emit(answer)
 
 
 # --- Doctor ------------------------------------------------------------------
@@ -13800,6 +14147,12 @@ def cmd_doctor(wanted: str | None) -> None:
         catalog = _catalog(cur, schema)
         tables = catalog["tables"]
         missing, behind = _behind(catalog)
+        # Blockers still kept where nothing reads them since the field holds
+        # them: moved by `migrate --apply`, or named for a person to settle.
+        here = _declared_project()
+        left = (_blocked_by_backfill(cur, schema, apply=False, project=here)
+                if "tasks" in tables and here else None)
+        left = left if left and left["tasks"] else None
     # Who closes the gap: the next command, when all of it is additive, and
     # otherwise only `migrate --apply`.
     closes = (f"`{NAME} migrate --apply` adds it, and nothing else does: it is not "
@@ -13836,6 +14189,15 @@ def cmd_doctor(wanted: str | None) -> None:
                         f"{', '.join(behind)}; {closes}")
     if unescalated:
         warnings.append(unescalated)
+    if left:
+        answer["blocked_by_in_metadata"] = left
+        warnings.append(
+            f"{left['tasks']} task(s) of this project still keep blocked_by in their "
+            f"metadata, which nothing reads: {left['moved']} name(s) "
+            f"`{NAME} migrate --apply` moves to the blocked_by field"
+            + (f", and {left['unresolvable']} task(s) naming no task, which stay "
+               f"until someone sets their blockers or removes the key"
+               if left["unresolvable"] else ""))
     # Every place a worker may land the task it holds that nobody takes there:
     # the write would be refused, and the turn stopped short of its ending.
     warnings += _coverage(workers)

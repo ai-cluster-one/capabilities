@@ -279,7 +279,10 @@ def test_no_field_of_another_task_is_a_workers_to_write(field, setting, capsys):
 
 @pytest.mark.parametrize("field", mod._CLEARABLE)
 def test_no_field_of_another_task_is_a_workers_to_clear(field, setting, capsys):
-    assert _set_refused(setting, capsys, [OTHER, "--clear", field]) == refusal("set", OTHER)
+    # Blockers are written under the metadata scope a worker file already names
+    # them in, so emptying them is removing that key.
+    op = "meta-rm:blocked_by" if field == "blocked-by" else "set"
+    assert _set_refused(setting, capsys, [OTHER, "--clear", field]) == refusal(op, OTHER)
 
 
 def test_a_bare_save_on_another_task_is_a_write_too(setting, capsys):

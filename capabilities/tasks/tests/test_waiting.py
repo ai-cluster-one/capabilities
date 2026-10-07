@@ -67,7 +67,7 @@ def test_the_help_says_what_waiting_means():
     for needle in ("`waiting` means the task is over to its assignee",
                    "a task that waits on nobody is a stall with a name missing",
                    "once its pickup moment has passed",
-                   "`blocked_by` names has ended",
+                   "every task its `blocked_by` names has ended",
                    "it lands that task on draft, todo, waiting, complete or closed",
                    "A wait begins clean, because a hold from before the wait "
                    "does not say when the wait is over",
@@ -100,7 +100,7 @@ def test_every_other_status_needs_no_name():
 def waits(**fields) -> dict:
     return {"id": "t-1", "unique_key": "k-1", "project_id": HERE,
             "status": "waiting", "assignee": "the owner", "metadata": {},
-            "pickup_at": None, "due": False, **fields}
+            "blocked_by": [], "pickup_at": None, "due": False, **fields}
 
 
 def test_a_moment_that_has_passed_ends_it():
@@ -108,7 +108,7 @@ def test_a_moment_that_has_passed_ends_it():
 
 
 def test_the_last_blocker_ending_ends_it():
-    task = waits(metadata={"blocked_by": ["a", "b"]})
+    task = waits(blocked_by=["a", "b"])
     assert mod._wait_over(task, {"a", "b"}) == "every task it was waiting on has ended"
     assert mod._wait_over(task, {"a"}) is None
     assert mod._wait_over(task, set()) is None
@@ -116,17 +116,18 @@ def test_the_last_blocker_ending_ends_it():
 
 def test_waiting_on_neither_waits_on_the_person():
     assert mod._wait_over(waits(), {"a", "b"}) is None
-    # A blocked_by that is not a list of names is no list of blockers at all,
-    # and an empty one names nothing to have ended.
-    for named in (None, "a", {}, [], ["", "  "]):
-        assert mod._blocked_by(waits(metadata={"blocked_by": named})) == []
-        assert mod._wait_over(waits(metadata={"blocked_by": named}), {"a"}) is None
+    # An empty blocked_by names nothing to have ended, and a blocker kept in
+    # the metadata is no blocker: the field is the one place it is read.
+    for named in (None, [], [""]):
+        assert mod._blocked_by(waits(blocked_by=named)) == []
+        assert mod._wait_over(waits(blocked_by=named), {"a"}) is None
+    assert mod._blocked_by(waits(metadata={"blocked_by": ["a"]})) == []
 
 
 def test_a_blocker_that_names_no_task_holds_it():
     # Nothing ended it, so it did not end. The conservative answer is the only
     # safe one: the alternative frees a task because a name was mistyped.
-    assert mod._wait_over(waits(metadata={"blocked_by": ["gone"]}), {"a"}) is None
+    assert mod._wait_over(waits(blocked_by=["gone"]), {"a"}) is None
 
 
 # --- The hold a wait must not inherit ----------------------------------------
@@ -182,17 +183,18 @@ def test_no_other_landing_settles_anything():
 
 
 def test_a_spent_blocked_by_is_dropped():
-    task = waits(metadata={"blocked_by": ["k-9", "k-8"]})
-    cur = Ended([{"id": "t-9", "unique_key": "k-9", "project_id": HERE},
-                 {"id": "t-8", "unique_key": "k-8", "project_id": HERE}])
+    task = waits(blocked_by=["t-9", "t-8"])
+    cur = Ended([{"id": "t-9"}, {"id": "t-8"}])
     assert mod._settle_the_wait(cur, "waiting", task, True) == (
-        ["metadata = metadata - 'blocked_by'"], ["k-9", "k-8"])
-    assert cur.asked_for == (["k-8", "k-9"], ["k-8", "k-9"], HERE)
+        ["blocked_by = '{}'"], ["t-9", "t-8"])
+    assert cur.asked_for == (["t-8", "t-9"],)
+    # Blockers the same call names were chosen for the wait, and stand.
+    assert mod._settle_the_wait(cur, "waiting", task, True, True) == ([], [])
 
 
 def test_a_blocked_by_with_one_task_still_open_is_kept():
-    task = waits(metadata={"blocked_by": ["k-9", "k-8"]})
-    half = Ended([{"id": "t-9", "unique_key": "k-9", "project_id": HERE}])
+    task = waits(blocked_by=["t-9", "t-8"])
+    half = Ended([{"id": "t-9"}])
     assert mod._settle_the_wait(half, "waiting", task, True) == ([], [])
     # And a name matching no task has not ended here either, exactly as in the
     # sweep: an unknown blocker holds the wait rather than clearing it away.
@@ -264,17 +266,16 @@ def test_the_sweep_returns_a_wait_that_is_over():
 
 
 def test_the_sweep_returns_a_task_whose_blockers_have_ended():
-    cur = SweepCursor([waits(metadata={"blocked_by": ["k-9", "k-8"]})],
-                      ended=[{"id": "t-9", "unique_key": "k-9", "project_id": HERE},
-                             {"id": "t-8", "unique_key": "k-8", "project_id": HERE}])
+    cur = SweepCursor([waits(blocked_by=["t-9", "t-8"])],
+                      ended=[{"id": "t-9"}, {"id": "t-8"}])
     [returned] = mod._sweep_waiting(cur, HERE)
     assert returned["status"] == "todo"
-    assert cur.asked_for == (["k-8", "k-9"], ["k-8", "k-9"], HERE)
+    assert cur.asked_for == (["t-8", "t-9"],)
     assert cur.activities[0][1].endswith("every task it was waiting on has ended.")
 
 
 def test_the_sweep_leaves_a_task_waiting_on_a_person():
-    cur = SweepCursor([waits(), waits(id="t-2", metadata={"blocked_by": ["k-9"]})])
+    cur = SweepCursor([waits(), waits(id="t-2", blocked_by=["t-9"])])
     assert mod._sweep_waiting(cur, HERE) == []
     assert cur.changes == [] and cur.activities == []
 
@@ -297,9 +298,8 @@ def landed(cur, text: str) -> None:
     lets a fake prove they were written at all."""
     if "pickup_at = null" in text:
         cur.task["pickup_at"] = None
-    if "metadata - 'blocked_by'" in text:
-        cur.task["metadata"] = {k: v for k, v in (cur.task.get("metadata") or {}).items()
-                                if k != "blocked_by"}
+    if "blocked_by = '{}'" in text:
+        cur.task["blocked_by"] = []
 
 
 class ReleaseCursor:
@@ -466,31 +466,32 @@ def test_set_keeps_a_moment_appointed_in_the_same_call(setting, capsys):
 
 
 def test_set_drops_a_spent_blocked_by_and_says_so(setting, capsys):
-    cur = setting(held(metadata={"blocked_by": ["k-9"], "cost_total": "1.5"}),
+    cur = setting(held(blocked_by=["t-9"], metadata={"cost_total": "1.5"}),
                   ["--status", "waiting", "--assignee", "the owner"],
-                  ended=[{"id": "t-9", "unique_key": "k-9", "project_id": HERE}])
+                  ended=[{"id": "t-9"}])
     answer = _answer(capsys)
-    assert answer["blocked_by_spent"] == ["k-9"]
-    # That key and nothing else: the rest of the metadata is not this verb's.
+    assert answer["blocked_by_spent"] == ["t-9"]
+    # That field and nothing else: the metadata is not this verb's.
+    assert answer["task"]["blocked_by"] == []
     assert answer["task"]["metadata"] == {"cost_total": "1.5"}
     assert cur.changes and all(c[1] != "pickup" for c in cur.changes)
 
 
 def test_set_keeps_a_blocked_by_still_naming_an_open_task(setting, capsys):
-    setting(held(metadata={"blocked_by": ["k-9"]}),
+    setting(held(blocked_by=["t-9"]),
             ["--status", "waiting", "--assignee", "the owner"])
     answer = _answer(capsys)
     assert "blocked_by_spent" not in answer
-    assert answer["task"]["metadata"] == {"blocked_by": ["k-9"]}
+    assert answer["task"]["blocked_by"] == ["t-9"]
 
 
 def test_set_settles_nothing_on_a_landing_that_is_not_a_wait(setting, capsys):
-    cur = setting(held(pickup_at=THEN, metadata={"blocked_by": ["k-9"]}),
+    cur = setting(held(pickup_at=THEN, blocked_by=["t-9"]),
                   ["--assignee", "the owner"],
-                  ended=[{"id": "t-9", "unique_key": "k-9", "project_id": HERE}])
+                  ended=[{"id": "t-9"}])
     answer = _answer(capsys)
     assert answer["task"]["pickup_at"] == THEN
-    assert answer["task"]["metadata"] == {"blocked_by": ["k-9"]}
+    assert answer["task"]["blocked_by"] == ["t-9"]
     assert "pickup_at = null" not in cur.written
 
 
@@ -540,27 +541,27 @@ def test_a_handback_drops_a_hold_from_before_the_wait(releasing, capsys):
 
 def test_a_handback_drops_a_spent_blocked_by_and_keeps_a_live_one(releasing, capsys):
     releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
-               "pickup_at": None, "type": "defect", "metadata": {"blocked_by": ["k-9"]}},
-              ["--outcome", "handback"], ended=[{"id": "t-9", "unique_key": "k-9", "project_id": HERE}])
+               "pickup_at": None, "type": "defect", "metadata": {}, "blocked_by": ["t-9"]},
+              ["--outcome", "handback"], ended=[{"id": "t-9"}])
     spent = _answer(capsys)
-    assert spent["blocked_by_spent"] == ["k-9"] and spent["task"]["metadata"] == {}
+    assert spent["blocked_by_spent"] == ["t-9"] and spent["task"]["blocked_by"] == []
 
     releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
-               "pickup_at": None, "type": "defect", "metadata": {"blocked_by": ["k-9"]}},
+               "pickup_at": None, "type": "defect", "metadata": {}, "blocked_by": ["t-9"]},
               ["--outcome", "handback"])
     kept = _answer(capsys)
     assert "blocked_by_spent" not in kept
-    assert kept["task"]["metadata"] == {"blocked_by": ["k-9"]}
+    assert kept["task"]["blocked_by"] == ["t-9"]
 
 
 def test_a_landing_that_is_not_a_wait_keeps_the_hold(releasing, capsys):
     # Completed, the task is over and nothing about it is a wait.
     releasing({"id": "t-1", "project_id": HERE, "status": "in_progress", "assignee": "the owner",
-               "pickup_at": THEN, "type": "defect", "metadata": {"blocked_by": ["k-9"]}},
-              ["--outcome", "ok"], ended=[{"id": "t-9", "unique_key": "k-9", "project_id": HERE}])
+               "pickup_at": THEN, "type": "defect", "metadata": {}, "blocked_by": ["t-9"]},
+              ["--outcome", "ok"], ended=[{"id": "t-9"}])
     done = _answer(capsys)
     assert done["task"]["pickup_at"] == THEN
-    assert done["task"]["metadata"] == {"blocked_by": ["k-9"]}
+    assert done["task"]["blocked_by"] == ["t-9"]
 
     # And a handback the store could hand to nobody lands in `draft`, which is
     # backlog carrying a hold rather than a wait beginning.
@@ -771,9 +772,12 @@ def test_a_gate_stop_survives_the_claim_that_follows_it(store, capsys):
     assert dropped["new_value"] is None and dropped["old_value"]
 
     # A blocked_by with nothing left to wait on goes with it, said out loud.
+    mod.cmd_show(entry, ["g-blocker"])
+    blocker = _answer(capsys)["task"]["id"]
     mod.cmd_set(entry, ["g-2", "--status", "waiting", "--assignee", "the owner"])
     spent = _answer(capsys)
-    assert spent["blocked_by_spent"] == ["g-blocker"]
+    assert spent["blocked_by_spent"] == [blocker]
+    assert spent["task"]["blocked_by"] == []
     assert "blocked_by" not in spent["task"]["metadata"]
 
     # The next claim is where a stop used to evaporate. Both are still waiting.
@@ -817,10 +821,12 @@ def test_a_wait_keeps_what_was_chosen_for_it(store, capsys):
     appointed = _answer(capsys)
     assert appointed["task"]["pickup_at"] is not None
 
-    # A blocker still open is a live reason to wait, and the key is untouched.
+    # A blocker still open is a live reason to wait, and the field is untouched.
+    mod.cmd_show(entry, ["g-open"])
+    still_open = _answer(capsys)["task"]["id"]
     mod.cmd_set(entry, ["g-5", "--status", "waiting", "--assignee", "the owner"])
     kept = _answer(capsys)
-    assert kept["task"]["metadata"]["blocked_by"] == ["g-open"]
+    assert kept["task"]["blocked_by"] == [still_open]
     assert "blocked_by_spent" not in kept
 
     mod.cmd_claim(entry, ["--type", "nothing"])
