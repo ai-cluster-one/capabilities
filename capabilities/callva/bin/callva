@@ -3030,8 +3030,18 @@ def open_store(url: str | None = None) -> "Store":
 # and reading writes nothing. A Postgres reached across a network is reached
 # over TLS, so the floor on `sslmode` is `require`, and it is checked here for
 # the writer and every reader alike.
+#
+# A `capabilities.store.v1` setting binds the schema `agentkit` inside that
+# database. A `capabilities.store.v2` setting may name another in `db_schema`,
+# since the document's own `schema` key already holds the setting's id. Both
+# are read; the writer writes v2 only when a schema is named, so a reader that
+# knows only v1 keeps reading every setting written without one.
 
 STORE_SETTING_SCHEMA = "capabilities.store.v1"
+STORE_SETTING_SCHEMA_V2 = "capabilities.store.v2"
+STORE_SETTING_SCHEMAS = (STORE_SETTING_SCHEMA, STORE_SETTING_SCHEMA_V2)
+STORE_SCHEMA_FIELD = "db_schema"
+STORE_DEFAULT_SCHEMA = "agentkit"
 STORE_PASSWORD_KEY = "CAPABILITIES_STORE_PASSWORD"
 STORE_SSLMODES = ("require", "verify-ca", "verify-full")
 STORE_SSLMODES_REFUSED = ("disable", "allow", "prefer")
@@ -3086,12 +3096,26 @@ def check_store_setting(values: dict) -> dict:
     return out
 
 
+def check_store_schema_name(name: object) -> str:
+    """A schema the store may be bound to: a lowercase identifier, never
+    `public` and never a system schema."""
+    if not isinstance(name, str) or not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", name):
+        raise StoreError("bad_schema_name",
+                         f"schema name {name!r} is not a lowercase identifier",
+                         "use letters, digits and underscores, starting with a letter or _")
+    if name in ("public", "information_schema") or name.startswith("pg_"):
+        raise StoreError("bad_schema_name", f"schema {name!r} is reserved",
+                         f"name a schema of the store's own, such as {STORE_DEFAULT_SCHEMA}")
+    return name
+
+
 def read_store_setting(config_home: Path | str | None = None) -> dict | None:
     """This machine's store setting, or None when it has none.
 
-    The non-secret values come from the setting file and `password` from the
-    manager's credentials tier, None when it holds none. This reads and never
-    writes; `capabilities store set` is the only writer of both files."""
+    The non-secret values come from the setting file, `db_schema` from it too
+    when a v2 setting names one and `agentkit` otherwise, and `password` from
+    the manager's credentials tier, None when it holds none. This reads and
+    never writes; `capabilities store set` is the only writer of both files."""
     setting_file, password_file = store_setting_files(config_home)
     try:
         raw = setting_file.read_text()
@@ -3106,12 +3130,16 @@ def read_store_setting(config_home: Path | str | None = None) -> dict | None:
         raise StoreError("bad_store_setting",
                          f"{setting_file} is not a store setting",
                          "rewrite it with `capabilities store set`") from exc
-    if not isinstance(data, dict) or data.get("schema") != STORE_SETTING_SCHEMA:
+    if not isinstance(data, dict) or data.get("schema") not in STORE_SETTING_SCHEMAS:
         raise StoreError("bad_store_setting",
-                         f"{setting_file} is not a {STORE_SETTING_SCHEMA} setting",
+                         f"{setting_file} is not a "
+                         f"{' or '.join(STORE_SETTING_SCHEMAS)} setting",
                          "rewrite it with `capabilities store set`")
     setting = check_store_setting(
         {k: v for k, v in data.items() if k in STORE_SETTING_FIELDS})
+    setting[STORE_SCHEMA_FIELD] = STORE_DEFAULT_SCHEMA
+    if data["schema"] == STORE_SETTING_SCHEMA_V2 and data.get(STORE_SCHEMA_FIELD) is not None:
+        setting[STORE_SCHEMA_FIELD] = check_store_schema_name(data[STORE_SCHEMA_FIELD])
     setting["password"] = None
     try:
         lines = password_file.read_text().splitlines()

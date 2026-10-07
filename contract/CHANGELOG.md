@@ -1,5 +1,9 @@
 # contract — change log
 
+## 2026-10-07 — The store tier reads a store setting that names its schema
+
+`read_store_setting()` reads a `capabilities.store.v2` setting as well as a v1 one and returns `db_schema`: the schema a v2 setting names, else `agentkit`. A v2 setting naming a schema that is not a lowercase identifier, or that is `public`, `information_schema` or `pg_*`, is refused as `bad_schema_name`; `check_store_schema_name()` carries that rule. A v1 setting reads as before, with `db_schema` `agentkit`. Every capability carries the change through `sync-contract`.
+
 ## 2026-10-04 — Machine reads outside a project, and the policy state in `connections`
 
 A capability may declare `MACHINE_READS`, a tuple of read verbs, beside `WRITE_DEFAULT`. Outside any project a declared verb uses the connections declared globally whose grant does not resolve to `enabled: false`, each one read-only: a write through it exits 4 `read_only`, and `connections` names each one under `machine_reads` with the scope `machine`. Every other verb outside a project, and every verb inside one, resolves its connections as before, and the policy gate, the machine ceiling and the read-only switch apply as before. `<name> connections` now also carries `policy`, the capability's effective policy state: `effective`, its `source` (`machine`, `project`, `global` or `default`) and the `machine` ceiling. A capability that declares no `MACHINE_READS` changes in nothing else. Every capability carries the change through `sync-contract`.

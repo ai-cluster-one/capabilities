@@ -52,7 +52,7 @@ ENVIRONMENT
                        reads but changes nothing (write verbs, project-record
                        writes and service activation exit 4), and this manager
                        refuses allow, disable, enable, inherit, init,
-                       quarantine, relabel, set and store set.
+                       quarantine, relabel, set, store set and store unset.
                        doctor reports it. Unset, `0` or `false` leaves it off.
   CAPABILITIES_STORE_URL
                        the store the manager's records use in database mode,
@@ -248,20 +248,29 @@ STORE VERBS
   $XDG_CONFIG_HOME/capabilities/store.json, the password to the manager's
   credentials tier $XDG_CONFIG_HOME/capabilities/credentials.env
   (CAPABILITIES_STORE_PASSWORD) at mode 0600. A capability reads both through
-  the store tier's read_store_setting(), which writes nothing.
+  the store tier's read_store_setting(), which writes nothing. The setting
+  also names the schema inside the database that tools bind to: db_schema in
+  a capabilities.store.v2 setting, and agentkit for a v1 setting or a v2 one
+  that names none.
   store set --host H --database D --user U [--port P]
             [--sslmode require|verify-ca|verify-full] [--sslrootcert PATH|system]
+            [--schema NAME]
             (--password-stdin | --password-file PATH | --password-env KEY)
         Record the Postgres the machine's store lives in, atomically under the
-        manager's lock. The password comes from stdin, a file or the named
-        environment variable, never from argv; a --password flag is refused.
-        --port defaults to 5432; --sslmode defaults to verify-full with
-        --sslrootcert and to require without it, and disable, allow and prefer
-        are refused (exit 6 sslmode_too_weak). Exit 4 under the read-only
-        switch. Answers as `store show` does, with changed.
+        manager's lock, replacing any setting whole. The password comes from
+        stdin, a file or the named environment variable, never from argv; a
+        --password flag is refused. --port defaults to 5432; --sslmode
+        defaults to verify-full with --sslrootcert and to require without it,
+        and disable, allow and prefer are refused (exit 6 sslmode_too_weak).
+        --schema writes a v2 setting naming that schema: a lowercase
+        identifier, never public, information_schema or pg_* (exit 6
+        bad_schema_name); without it the setting is v1 and binds agentkit.
+        Exit 4 under the read-only switch. Answers as `store show` does, with
+        changed.
   store show [--json]
         The setting and where each value came from, with no secret: the
-        password's presence only. in_force names the store the manager's
+        password's presence only; db_schema's source is default when the
+        setting names none. in_force names the store the manager's
         records use and what decided it (CAPABILITIES_STORE_URL, setting,
         default); overridden_by names CAPABILITIES_STORE_URL while it
         overrides a setting. JSON {configured, setting {<field> {value,
@@ -269,12 +278,21 @@ STORE VERBS
         overridden_by}. Output is always JSON, so --json changes nothing.
   store doctor [--json]
         Prove the setting: a TLS connection works, reporting the server
-        version and the negotiated TLS, and a plain-text connection to the
+        version and the negotiated TLS; a plain-text connection to the
         same server is refused, so a pg_hba.conf that lets plain text back in
-        is noticed. Never prints the password. JSON {ok, store, sslmode,
-        checks {tls {ok, server_version?, tls {version, cipher}?, error?},
-        plain_text_refused {ok, reason}}, overridden_by}. Exit 0 when both
-        hold, 7 when either fails, 3 when the machine has no store setting.
+        is noticed; and the role may use the setting's schema - USAGE and
+        CREATE on it when it exists, CREATE on the database when it does not
+        yet, since the first migration creates it. Never prints the password.
+        JSON {ok, store, sslmode, db_schema, checks {tls {ok, server_version?,
+        tls {version, cipher}?, error?}, plain_text_refused {ok, reason},
+        schema {ok, name, exists, reason}}, overridden_by}. Exit 0 when all
+        three hold, 7 when any fails, 3 when the machine has no store setting.
+  store unset
+        Remove the setting and its password, keeping every other key in the
+        credentials tier, under the manager's lock, so the machine's records
+        resolve as they did before any setting. Exit 4 under the read-only
+        switch. Answers as `store show` does, with changed; removing no
+        setting is not an error.
 
 DEVELOPMENT VERBS
   dev start <name> [--project PATH | --no-project] [--source ID-OR-PATH]
@@ -733,7 +751,7 @@ def _store_module():
 # identity and its wiring — and the machine ceiling. Under the read-only switch the manager refuses them;
 # whether the switch is on is the store tier's answer, never the manager's own.
 READ_ONLY_REFUSED_VERBS = ("allow", "disable", "enable", "inherit", "init",
-                           "quarantine", "relabel", "set", "store set")
+                           "quarantine", "relabel", "set", "store set", "store unset")
 
 
 def _read_only_gate(verb: str) -> None:
@@ -5764,6 +5782,7 @@ STORE_VALUE_OPTIONS = {
     "--host": "host", "--port": "port", "--database": "database",
     "--user": "user", "--sslmode": "sslmode", "--sslrootcert": "sslrootcert",
 }
+STORE_SCHEMA_OPTION = "--schema"
 STORE_PASSWORD_OPTIONS = ("--password-stdin", "--password-file", "--password-env")
 # What a plain-text attempt reads when pg_hba.conf turns it away for lacking
 # TLS: "no encryption" from Postgres 14 on, "SSL off" before it.
@@ -5794,7 +5813,8 @@ def _store_set_args(args: list[str]) -> tuple[dict, tuple[str, str | None]]:
             sources.append(("stdin", None))
             i += 1
             continue
-        if name not in STORE_VALUE_OPTIONS and name not in STORE_PASSWORD_OPTIONS:
+        if name not in STORE_VALUE_OPTIONS and name not in STORE_PASSWORD_OPTIONS \
+                and name != STORE_SCHEMA_OPTION:
             _die(6, "input", f"unknown store set option: {name}",
                  "run `capabilities help` for its options")
         if eq:
@@ -5807,6 +5827,10 @@ def _store_set_args(args: list[str]) -> tuple[dict, tuple[str, str | None]]:
             sources.append(("file", value))
         elif name == "--password-env":
             sources.append(("env", value))
+        elif name == STORE_SCHEMA_OPTION:
+            if "db_schema" in values:
+                _die(6, "input", f"{name} is given twice")
+            values["db_schema"] = value
         elif STORE_VALUE_OPTIONS[name] in values:
             _die(6, "input", f"{name} is given twice")
         else:
@@ -5869,14 +5893,29 @@ def _atomic_write_secret(path: Path, body: str) -> None:
     path.chmod(0o600)
 
 
-def _write_store_setting_locked(setting: dict, password: str) -> bool:
+def _store_setting_id(setting_file: Path) -> str | None:
+    """The document id the setting file carries, or None."""
+    try:
+        data = json.loads(setting_file.read_text())
+    except (OSError, ValueError):
+        return None
+    return data.get("schema") if isinstance(data, dict) else None
+
+
+def _write_store_setting_locked(setting: dict, password: str,
+                                schema: str | None) -> bool:
+    """Write the setting: v2 naming `schema` when one is given, else v1."""
     store = _store_module()
     setting_file, password_file = store.store_setting_files(_CONFIG_HOME)
+    document = (store.STORE_SETTING_SCHEMA_V2 if schema is not None
+                else store.STORE_SETTING_SCHEMA)
     try:
         previous = store.read_store_setting(_CONFIG_HOME)
     except store.StoreError:
         previous = None
-    changed = previous != {**setting, "password": password}
+    changed = (previous != {**setting, store.STORE_SCHEMA_FIELD:
+                            schema or store.STORE_DEFAULT_SCHEMA, "password": password}
+               or _store_setting_id(setting_file) != document)
     prefix = store.STORE_PASSWORD_KEY + "="
     try:
         kept = [line for line in password_file.read_text().splitlines()
@@ -5884,23 +5923,51 @@ def _write_store_setting_locked(setting: dict, password: str) -> bool:
     except FileNotFoundError:
         kept = []
     _atomic_write_secret(password_file, "\n".join([*kept, prefix + password]) + "\n")
+    named = {store.STORE_SCHEMA_FIELD: schema} if schema is not None else {}
     _atomic_write_text(setting_file, json.dumps(
-        {"schema": store.STORE_SETTING_SCHEMA, **setting,
+        {"schema": document, **setting, **named,
          "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
          "by": _machine_actor()},
         ensure_ascii=False, indent=2, sort_keys=True) + "\n")
     return changed
 
 
-def _write_store_setting(setting: dict, password: str) -> bool:
-    """Write the setting and its password atomically under the manager mutation lock."""
+def _unset_store_setting_locked() -> bool:
+    """Remove the setting file and the password line, keeping every other key
+    in the credentials tier. True when either was there."""
+    store = _store_module()
+    setting_file, password_file = store.store_setting_files(_CONFIG_HOME)
+    changed = setting_file.exists()
+    setting_file.unlink(missing_ok=True)
+    prefix = store.STORE_PASSWORD_KEY + "="
+    try:
+        lines = password_file.read_text().splitlines()
+    except FileNotFoundError:
+        return changed
+    kept = [line for line in lines if not line.startswith(prefix)]
+    if len(kept) != len(lines):
+        changed = True
+        if any(line.strip() for line in kept):
+            _atomic_write_secret(password_file, "\n".join(kept) + "\n")
+        else:
+            password_file.unlink()
+    return changed
+
+
+def _with_store_lock(write):
+    """Run one write of the setting under the manager mutation lock."""
     if _MANAGER_MUTATION_DEPTH:
-        return _write_store_setting_locked(setting, password)
+        return write()
     MANAGER_MUTATION_LOCK.parent.mkdir(parents=True, exist_ok=True)
     with MANAGER_MUTATION_LOCK.open("a+") as mutation:
         MANAGER_MUTATION_LOCK.chmod(0o600)
         fcntl.flock(mutation, fcntl.LOCK_EX)
-        return _write_store_setting_locked(setting, password)
+        return write()
+
+
+def _write_store_setting(setting: dict, password: str, schema: str | None = None) -> bool:
+    """Write the setting and its password atomically under the manager mutation lock."""
+    return _with_store_lock(lambda: _write_store_setting_locked(setting, password, schema))
 
 
 def _store_report() -> dict:
@@ -5917,6 +5984,12 @@ def _store_report() -> dict:
         report["setting"] = {
             field: {"value": setting.get(field), "source": str(setting_file)}
             for field in store.STORE_SETTING_FIELDS if setting.get(field) is not None}
+        document = _read_json(setting_file) or {}
+        named = (document.get("schema") == store.STORE_SETTING_SCHEMA_V2
+                 and document.get(store.STORE_SCHEMA_FIELD) is not None)
+        report["setting"][store.STORE_SCHEMA_FIELD] = {
+            "value": setting[store.STORE_SCHEMA_FIELD],
+            "source": str(setting_file) if named else "default"}
         if setting.get("password"):
             report["password"] = {"present": True, "source": str(password_file)}
         if source == "CAPABILITIES_STORE_URL":
@@ -5936,12 +6009,21 @@ def cmd_store_set(args: list[str]) -> None:
         if not path.is_file() or not os.access(path, os.R_OK):
             _die(6, "bad_store_setting", f"--sslrootcert {root} is not a readable file")
         values["sslrootcert"] = str(path)
+    schema = values.pop("db_schema", None)
     try:
         setting = store.check_store_setting(values)
+        if schema is not None:
+            schema = store.check_store_schema_name(schema)
     except store.StoreError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
     password = _store_password(source)
-    changed = _write_store_setting(setting, password)
+    changed = _write_store_setting(setting, password, schema)
+    _emit({**_store_report(), "changed": changed})
+
+
+def cmd_store_unset() -> None:
+    _read_only_gate("store unset")
+    changed = _with_store_lock(_unset_store_setting_locked)
     _emit({**_store_report(), "changed": changed})
 
 
@@ -5980,6 +6062,49 @@ def _store_probe(setting: dict, sslmode: str | None = None) -> tuple[dict | None
             "tls": {"version": row[2], "cipher": row[3]}}, None
 
 
+def _store_schema_check(setting: dict) -> dict:
+    """Whether the setting's role may use its schema: USAGE and CREATE on it
+    when it exists, CREATE on the database when it does not yet, because the
+    first migration creates it there."""
+    import psycopg2
+    name = setting["db_schema"]
+    out = {"ok": False, "name": name, "exists": None}
+    try:
+        conn = psycopg2.connect(_store_module().store_setting_url(setting),
+                                connect_timeout=10)
+    except psycopg2.Error as exc:
+        out["reason"] = f"not checked: {_store_scrub(exc, setting)}"
+        return out
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT current_user, current_database(), n.oid IS NOT NULL, "
+                "n.oid IS NOT NULL AND has_schema_privilege(n.oid, 'USAGE'), "
+                "n.oid IS NOT NULL AND has_schema_privilege(n.oid, 'CREATE'), "
+                "has_database_privilege(current_database(), 'CREATE') "
+                "FROM (SELECT 1) one LEFT JOIN pg_namespace n ON n.nspname = %s",
+                (name,))
+            user, database, exists, usage, create, create_db = cur.fetchone()
+    except psycopg2.Error as exc:
+        out["reason"] = f"not checked: {_store_scrub(exc, setting)}"
+        return out
+    finally:
+        conn.close()
+    out["exists"] = bool(exists)
+    if exists:
+        missing = [p for p, held in (("USAGE", usage), ("CREATE", create)) if not held]
+        out["ok"] = not missing
+        out["reason"] = (f"role {user} may use and create in schema {name}" if not missing
+                         else f"role {user} lacks {' and '.join(missing)} on schema {name}")
+    else:
+        out["ok"] = bool(create_db)
+        out["reason"] = (f"schema {name} does not exist yet, and role {user} may create "
+                         f"it in database {database}" if create_db
+                         else f"schema {name} does not exist and role {user} may not "
+                              f"create schemas in database {database}")
+    return out
+
+
 def cmd_store_doctor() -> None:
     setting = _store_setting()
     if setting is None:
@@ -6005,11 +6130,17 @@ def cmd_store_doctor() -> None:
         plain = {"ok": False,
                  "reason": "the plain-text attempt failed, but not as a refusal "
                            f"for lacking TLS: {plain_error}"}
+    if tls["ok"]:
+        schema = _store_schema_check(setting)
+    else:
+        schema = {"ok": False, "name": setting["db_schema"], "exists": None,
+                  "reason": "not checked: no TLS connection to the store"}
     _, source = _store_resolution()
-    report = {"ok": tls["ok"] and plain["ok"],
+    report = {"ok": tls["ok"] and plain["ok"] and schema["ok"],
               "store": _shown_store(_store_module().store_setting_url(setting)),
               "sslmode": setting["sslmode"],
-              "checks": {"tls": tls, "plain_text_refused": plain},
+              "db_schema": setting["db_schema"],
+              "checks": {"tls": tls, "plain_text_refused": plain, "schema": schema},
               "overridden_by": "CAPABILITIES_STORE_URL"
               if source == "CAPABILITIES_STORE_URL" else None}
     _emit(report)
@@ -9957,13 +10088,17 @@ def main() -> None:
         sub = rest[0] if rest else None
         if sub == "set":
             cmd_store_set(rest[1:])
+        elif sub == "unset":
+            if rest[1:]:
+                _die(6, "input", "store unset takes no arguments")
+            cmd_store_unset()
         elif sub in ("show", "doctor"):
             extra = [a for a in rest[1:] if a != "--json"]
             if extra:
                 _die(6, "input", f"store {sub} takes only --json")
             cmd_store_doctor() if sub == "doctor" else _emit(_store_report())
         else:
-            _die(6, "input", "store needs a subcommand: set, show or doctor",
+            _die(6, "input", "store needs a subcommand: set, show, doctor or unset",
                  "run `capabilities help`")
     elif cmd == "path":
         cmd_path(flag("--json"), flag("--identity"))

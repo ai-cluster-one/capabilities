@@ -5,9 +5,9 @@
     "SHEBANG.md": "5f3e3ffa5b79861e37105195ce1135d23d9f981ac779deba4cf30171844358e3",
     "SOURCES.md": "79e453cf68a08ba2b2e5e460064eb0a5aca8f13071e9d6557be1b7361f1e0075",
     "TEMPLATE.md": "921239fba3718440af8e9538c8d43a123f0701addac89a90c80f9a4452c30b8d",
-    "contract/CHANGELOG.md": "f057e4501b51a7ea11cbc19a1cd6a419b61ad0630b746320b6db45782e943f01",
+    "contract/CHANGELOG.md": "42d551674810ec7626ccc2e94ae4c0a346be6f00faddd4397ee2f5d6154163bf",
     "contract/preamble.py": "6733b87e67bf0e857ede2e9347fa3a3e154c2ad4dfa482db9b426a5e830f6e61",
-    "contract/store.py": "0ef5c3f06c6be48ca1bb31f5db1c836280dfeb94d25720900b7a8037219f1b67",
+    "contract/store.py": "f412b94d6a79639f936081501c1246e30b7356c22ba57473e2a3ef6397774d7e",
     "guides/authoring.md": "e467e5343a54e99c991592d06233fd98b7be13fa32a174d0f27d3a8a06478724",
     "guides/conforming.md": "1c3a44cd7662cb26eec400d05290f6b9f364758387e8d3f974ad8eb74abde93b",
     "guides/contract.md": "72408b3b5d035b15f9d98b5a5dc3d558870f391ed254b8c5f017656be75a13f4",
@@ -18,12 +18,12 @@
     "guides/repositories.md": "0ec2af6dfc92d20aa283fecab82b7888fb22b2480541cbb597e9a52f680ec2f4",
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "bfb8149791c9f97a831e738a3f8523cf0493492859ecfc8fa1df43ceadda9a6b",
+    "manager/CHANGELOG.md": "c6b970c4eb5b73f6fd3347953b6ad547cfa8028ac98b54f1d7589902170e3fc5",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "ec8b57e19eede73b1386abbde4adeeaf5a9fb9dfc9cf1049f742fd41cd991156"
+    "sha256": "71c0be1bf1e1c6b951b172b3f271f11db78ef3410c8519c3f13862b5e1490009"
   },
   "schema": "capabilities.manager-release.v1"
 }

@@ -1,4 +1,4 @@
-"""The machine's store setting: `capabilities store set|show|doctor`.
+"""The machine's store setting: `capabilities store set|show|doctor|unset`.
 
 The setting is the one store pointer. The manager writes it, the non-secret
 values to `$XDG_CONFIG_HOME/capabilities/store.json` and the password to its
@@ -273,6 +273,108 @@ def test_set_is_refused_under_the_read_only_switch(tmp_path):
     assert not _files(env)[0].exists() and not _files(env)[1].exists()
 
 
+def test_set_with_a_schema_writes_a_v2_setting_and_without_one_a_v1(tmp_path):
+    env = _env(tmp_path)
+    setting_file = _files(env)[0]
+    _ok(_set(env))
+    written = json.loads(setting_file.read_text())
+    assert written["schema"] == "capabilities.store.v1" and "db_schema" not in written
+    payload = _ok(_set(env, "--schema", "agentkit"))
+    assert payload["changed"] is True
+    written = json.loads(setting_file.read_text())
+    assert written["schema"] == "capabilities.store.v2"
+    assert written["db_schema"] == "agentkit"
+    assert payload["setting"]["db_schema"] == {"value": "agentkit",
+                                               "source": str(setting_file)}
+    assert _ok(_set(env, "--schema", "agentkit"))["changed"] is False
+    assert _ok(_set(env, "--schema", "tools"))["changed"] is True
+    assert _ok(_set(env))["setting"]["db_schema"] == {"value": "agentkit",
+                                                      "source": "default"}
+    assert json.loads(setting_file.read_text())["schema"] == "capabilities.store.v1"
+
+
+@pytest.mark.parametrize("name", ["public", "information_schema", "pg_toast", "Tools",
+                                  "1tools", "tools-x", ""])
+def test_set_refuses_a_schema_that_is_reserved_or_not_an_identifier(tmp_path, name):
+    env = _env(tmp_path)
+    result = _set(env, "--schema", name)
+    assert result.returncode == 6 and _error(result)["code"] == "bad_schema_name"
+    assert not _files(env)[0].exists() and not _files(env)[1].exists()
+
+
+def test_a_v1_setting_written_before_the_schema_is_read_as_agentkit(tmp_path):
+    env = _env(tmp_path)
+    setting_file = _files(env)[0]
+    setting_file.parent.mkdir(parents=True)
+    setting_file.write_text(json.dumps({
+        "schema": "capabilities.store.v1", "host": "db.example.test", "port": 5432,
+        "database": "app", "user": "agent", "sslmode": "require",
+        "db_schema": "ignored_in_v1"}))
+    assert S.read_store_setting(env["XDG_CONFIG_HOME"])["db_schema"] == "agentkit"
+    payload = _ok(_manager(env, "store", "show"))
+    assert payload["setting"]["db_schema"] == {"value": "agentkit", "source": "default"}
+    assert payload["setting"]["host"]["value"] == "db.example.test"
+
+
+def test_a_v2_setting_naming_a_bad_schema_is_refused_when_read(tmp_path):
+    env = _env(tmp_path)
+    setting_file = _files(env)[0]
+    setting_file.parent.mkdir(parents=True)
+    setting_file.write_text(json.dumps({
+        "schema": "capabilities.store.v2", "host": "db.example.test", "port": 5432,
+        "database": "app", "user": "agent", "sslmode": "require", "db_schema": "public"}))
+    with pytest.raises(S.StoreError) as raised:
+        S.read_store_setting(env["XDG_CONFIG_HOME"])
+    assert raised.value.slug == "bad_schema_name"
+    result = _manager(env, "store", "show")
+    assert result.returncode == 6 and _error(result)["code"] == "bad_schema_name"
+
+
+# --- unset --------------------------------------------------------------------
+
+def test_unset_removes_the_setting_and_its_password_and_keeps_other_keys(tmp_path):
+    env = _env(tmp_path)
+    setting_file, password_file = _files(env)
+    password_file.parent.mkdir(parents=True)
+    password_file.write_text("OTHER_KEY=kept\n")
+    _ok(_set(env, "--schema", "tools"))
+    result = _manager(env, "store", "unset")
+    _no_secret(result)
+    payload = _ok(result)
+    assert payload["changed"] is True and payload["configured"] is False
+    assert payload["in_force"]["source"] == "default"
+    assert not setting_file.exists()
+    assert password_file.read_text() == "OTHER_KEY=kept\n"
+    assert stat.S_IMODE(password_file.stat().st_mode) == 0o600
+    assert S.read_store_setting(env["XDG_CONFIG_HOME"]) is None
+    assert _ok(_manager(env, "store", "unset"))["changed"] is False
+
+
+def test_unset_removes_a_password_file_it_leaves_empty(tmp_path):
+    env = _env(tmp_path)
+    _ok(_set(env))
+    _ok(_manager(env, "store", "unset"))
+    assert sorted(p.name for p in _files(env)[0].parent.iterdir()) == []
+
+
+def test_unset_removes_a_setting_that_no_longer_reads(tmp_path):
+    env = _env(tmp_path)
+    setting_file = _files(env)[0]
+    setting_file.parent.mkdir(parents=True)
+    setting_file.write_text("not json")
+    assert _manager(env, "store", "show").returncode == 6
+    assert _ok(_manager(env, "store", "unset"))["changed"] is True
+    assert not setting_file.exists()
+
+
+def test_unset_is_refused_under_the_read_only_switch(tmp_path):
+    env = _env(tmp_path)
+    _ok(_set(env))
+    result = _manager(env, "store", "unset", extra={"CAPABILITIES_READ_ONLY": "1"})
+    assert result.returncode == 4 and _error(result)["code"] == "read_only_switch"
+    assert _files(env)[0].exists() and _password_line(env)
+
+
 # --- show ---------------------------------------------------------------------
 
 def test_show_without_a_setting_reports_the_default(tmp_path):
@@ -297,7 +399,8 @@ def test_show_reports_each_value_and_its_source_without_the_secret(tmp_path):
         field: {"value": value, "source": str(setting_file)}
         for field, value in (("host", "db.example.test"), ("port", 6543),
                              ("database", "app"), ("user", "agent"),
-                             ("sslmode", "require"))}
+                             ("sslmode", "require"))} | {
+        "db_schema": {"value": "agentkit", "source": "default"}}
     assert payload["password"] == {"present": True, "source": str(password_file)}
     assert payload["in_force"] == {"store": "postgresql://db.example.test:6543/app",
                                    "source": "setting"}
@@ -360,7 +463,10 @@ def test_a_capability_reads_the_setting_through_the_store_tier_and_writes_nothin
     assert read() is None
     _ok(_set(env, "--port", "6543"))
     assert read() == {"host": "db.example.test", "port": 6543, "database": "app",
-                      "user": "agent", "sslmode": "require", "password": PASSWORD}
+                      "user": "agent", "sslmode": "require", "db_schema": "agentkit",
+                      "password": PASSWORD}
+    _ok(_set(env, "--schema", "tools"))
+    assert read()["db_schema"] == "tools"
 
 
 def test_the_store_tier_builds_the_url_with_the_password_encoded():
@@ -429,6 +535,12 @@ class Cluster:
             cur.execute("CREATE ROLE agent LOGIN PASSWORD %s", (PASSWORD,))
             cur.execute("CREATE DATABASE app OWNER agent ENCODING 'UTF8' "
                         "TEMPLATE template0")
+            cur.execute("CREATE DATABASE foreign_db ENCODING 'UTF8' TEMPLATE template0")
+        admin.close()
+        admin = self.connect(ADMIN, "app")
+        admin.autocommit = True
+        with admin.cursor() as cur:
+            cur.execute("CREATE SCHEMA locked")
         admin.close()
 
     def connect(self, user: str, database: str, password: str | None = None):
@@ -492,6 +604,49 @@ def test_doctor_passes_when_tls_works_and_plain_text_is_refused(tmp_path, enforc
     plain = payload["checks"]["plain_text_refused"]
     assert plain["ok"] is True and "no encryption" in plain["reason"]
     assert payload["store"] == f"postgresql://127.0.0.1:{enforced.port}/app"
+    assert payload["db_schema"] == "agentkit"
+    assert payload["checks"]["schema"]["ok"] is True
+    assert payload["checks"]["schema"]["exists"] is False
+
+
+def test_doctor_passes_for_a_named_schema_the_role_may_use(tmp_path, enforced):
+    env = _env(tmp_path)
+    _set_cluster(env, enforced, "--schema", "tools")
+    payload = _ok(_manager(env, "store", "doctor"))
+    assert payload["ok"] is True and payload["db_schema"] == "tools"
+    assert payload["checks"]["schema"]["name"] == "tools"
+    admin = enforced.connect("agent", "app", PASSWORD)
+    admin.autocommit = True
+    with admin.cursor() as cur:
+        cur.execute("CREATE SCHEMA IF NOT EXISTS tools")
+    admin.close()
+    schema = _ok(_manager(env, "store", "doctor"))["checks"]["schema"]
+    assert schema["ok"] is True and schema["exists"] is True
+
+
+def test_doctor_fails_when_the_role_may_not_use_the_schema(tmp_path, enforced):
+    env = _env(tmp_path)
+    _set_cluster(env, enforced, "--schema", "locked")
+    result = _manager(env, "store", "doctor")
+    _no_secret(result)
+    assert result.returncode == 7, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False and payload["checks"]["tls"]["ok"] is True
+    schema = payload["checks"]["schema"]
+    assert schema["ok"] is False and schema["exists"] is True
+    assert "lacks USAGE and CREATE on schema locked" in schema["reason"]
+
+
+def test_doctor_fails_when_the_role_may_not_create_the_missing_schema(tmp_path, enforced):
+    env = _env(tmp_path)
+    _ok(_manager(env, "store", "set", "--host", "127.0.0.1", "--port", str(enforced.port),
+                 "--database", "foreign_db", "--user", "agent", "--schema", "tools",
+                 "--password-stdin", stdin=PASSWORD + "\n"))
+    result = _manager(env, "store", "doctor")
+    assert result.returncode == 7, result.stdout + result.stderr
+    schema = json.loads(result.stdout)["checks"]["schema"]
+    assert schema["ok"] is False and schema["exists"] is False
+    assert "may not create schemas in database foreign_db" in schema["reason"]
 
 
 def test_doctor_verifies_the_server_certificate_with_verify_full(tmp_path, enforced):
