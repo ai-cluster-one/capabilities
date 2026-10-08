@@ -106,6 +106,141 @@ Commands:
       publishes the new declaration as loaded, so a success is demonstrated
       rather than assumed. Changing the state root or the records backend still
       needs a real restart.
+  automations service pause [--reason TEXT]
+      Hold this project: its scheduler registers no firing and starts no run
+      until resumed, in either mode, and running jobs finish; a manual run
+      enqueued meanwhile waits. The pause is paused.json in the project's state
+      root, so it outlives a restart, and `service status` reports it as
+      `paused`. Answers {"paused", "pause": {"reason", "at", "by"}, "pause_file"}.
+  automations service resume
+      Lift the pause. Answers {"resumed", "pause_file"}, `resumed` false when
+      the project was not paused.
+  automations service join
+      Put this project on the machine service's opt-in list; see Machine mode.
+  automations service leave
+      Take this project off it.
+
+Machine mode:
+  The same scheduler also runs once per machine, serving every project that
+  joined it, so the projects on one machine share one process, one store
+  connection and an optional cap on the jobs they run at once. A project that
+  does not join keeps its own daemon exactly as above.
+
+  automations service init --machine [--force]
+      Write the machine settings from the template.
+  automations service run --machine
+      The machine process in the foreground, for a supervisor.
+  automations service start --machine
+      The machine process detached.
+  automations service status --machine
+      The process, its cap and store, and every project on the list with its
+      state.
+  automations service doctor --machine
+      The supervision probe; a project's own trouble is reported and fails
+      nothing.
+  automations service reload --machine [--timeout 20]
+      Hand it the machine settings on disk, and each project its own
+      declaration.
+  automations service stop --machine [--timeout 30] [--force]
+      Stop it; every project's running jobs are interrupted within that
+      project's shutdown grace, as a stop of its own daemon interrupts them.
+  automations service logs --machine [--project <id-or-slug>] [--tail 100]
+      The machine log, or one project's lines in it.
+  automations service leave --machine --project <id-or-slug>
+      Take any project off the list from anywhere, one whose folder is gone
+      included.
+  automations service launch -- <command...>
+      What the machine process starts each job through, in the job's project;
+      not for direct use.
+
+  A project opts in by an act of its own: `automations service join`, run in a
+  project that enables automations for itself (`capabilities enable
+  automations --project`), puts it on the opt-in list
+  $XDG_CONFIG_HOME/automations/service/projects.toml, keyed by its durable id,
+  with its root, its slug and when and by whom it joined; `leave` takes it off.
+  Only these verbs write the list, atomically and under a lock in the machine
+  state root. `join` refuses with exit 6 a project with no durable id it may
+  write under (`no_project_identity`), one whose records are in the store
+  (`database_mode_unsupported`), one whose .env or .env.local sets
+  CAPABILITIES_STORE_URL or CAPABILITIES_STORE_PASSWORD (`project_store_set`),
+  since the machine process keeps every project's runs in the machine's store,
+  and one whose slug another joined project has (`slug_taken`), since the two
+  would share a state root. It answers {"joined", "project": {"id", "slug",
+  "root"}, "list"}, `joined` false when already on the list, and starts
+  nothing.
+
+  Exactly one machine process runs per machine, by the lock in its state root
+  $XDG_STATE_HOME/capabilities/machine/automations/, which is also its working
+  directory and holds its pid, its status daemon.json and its log. It refuses
+  to run while no store is configured, holds one store connection for every
+  project, and follows the list without a reload: a project that joins is
+  served from the first pass at which it can be. For each project it serves it
+  holds the project's own daemon.lock and writes the project's daemon.pid and
+  daemon.fingerprint, so `service status`, `doctor`, `reload`, `logs`,
+  `pause`, `resume` and `inventory` in a joined project work as before and
+  speak of the machine process. It loads no project's environment, and its own
+  environment supplies no project's AUTOMATIONS_* selectors: each project's
+  declaration and selectors are read inside that project's own resolution,
+  from its own files. Each job starts through `service launch`, which puts the
+  project's .env and .env.local under the job in the job's own process, with
+  the project as its working directory and the same variables a project
+  daemon hands it. Before every tick for a project it checks again that the
+  project is on the list and enables automations for itself. Every run lands
+  in the one automations_runs table under the project's id and this host.
+
+  A project the machine process cannot serve is reported with the reason and
+  the others are served. `refused`: it does not enable automations for itself,
+  its id or slug moved since it joined, or a project-mode daemon holds its lock
+  ("a project-mode daemon, pid N, serves this project; stop it there"); asked
+  again every second. `error`: its folder is gone, or its declaration does not
+  load, which holds the lock and serves nothing until `service reload` there,
+  or `reload --machine`, takes one. `paused` while it is paused, `served`
+  otherwise. In a joined project `service start` and `run` exit 4
+  `joined_to_machine_service`, naming `service leave`, and `service stop`
+  exits 4 while the machine process serves it, naming `service pause` and
+  `service stop --machine`; a project-mode daemon still serving a project that
+  joined may be stopped as ever, and the machine process takes the project at
+  its next pass. A project that leaves has its running jobs interrupted, as a
+  stop of its own daemon would, and is let go once they have ended.
+
+  The machine settings are $XDG_CONFIG_HOME/automations/service/config.toml,
+  written by `init --machine`:
+
+    version = 1
+    max_parallel = 8   # jobs running at once across every joined project;
+                       # absent, only each project's own limits apply
+
+  Any other key is refused, and no file is no cap. Their fingerprint is what
+  `reload --machine` and `doctor --machine` compare; the list is not part of
+  it. Under the cap, projects with work are dealt one start each in turn, from
+  the project after the last one dealt, each start chosen by that project's
+  own queue and limits, so with a cap of one starts go round the projects.
+
+  Every line the service writes, in either mode, reads `<moment> automations
+  service [<project-slug>]: <what happened>`. The machine process tags its own
+  lines `[machine]`, writes every line to its log, and writes a project's
+  lines to that project's daemon.log too. `status --machine` answers `mode`,
+  `running`, `pid`, `started_at`, `published_at`, `fingerprint` and
+  `current`, `projects_file` (its path and how many joined), `cap`
+  (`max_parallel`, `running`, `binding`), `store` (which store is in force),
+  `store_connection` while it runs, and `projects`: for every project on the
+  list its slug as `project`, `project_id`, `root`, `joined_at`, `joined_by`,
+  `present`, `enabled_explicitly`, `state` (`served`, `paused`, `refused`,
+  `error`, or null with no machine process) and `reason`, and while it is held
+  its `environment`, `fingerprint`, `reload_error`, `automations`, `running`
+  and `pause`. `service status` in a joined project answers `mode` "machine"
+  and the machine's word on it under `machine`. `doctor --machine` exits 0
+  while the process holds its lock, published its status within twice its
+  publish interval, runs the machine settings on disk and holds its store
+  connection; a project in `error` or `refused` fails it not, since restarting
+  the process cannot repair a project.
+
+  The machine verbs are the one operational use of automations that resolves
+  no project and reads no policy row: the process checks each project's own
+  explicit enable itself. `join` needs automations enabled for the project
+  itself, like `init`, `start` and `run`, and the read-only switch refuses
+  `join`, `leave`, `pause` and `resume` as it refuses `init`, `start`, `run`
+  and `reload`.
 
 Environment:
   AUTOMATIONS_ENVIRONMENT  Active environment selector (default: development).
@@ -195,6 +330,7 @@ import json
 import os
 import signal
 import shutil
+import socket
 import stat
 import tempfile
 import sqlite3
@@ -225,10 +361,21 @@ INVENTORY = {"network": "none"}   # config and daemon state are both local
 POST_INSTALL: list = []
 SERVICE = {
     "name": "scheduler",
-    "summary": "Project-local scheduler, store-backed queue, and subprocess workers.",
-    "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs"],
+    "summary": ("Project-local scheduler, store-backed queue, and subprocess workers, "
+                "also run once per machine for the projects that join it."),
+    "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs",
+              "pause", "resume", "join", "leave"],
     "config": "capabilities/automations/service/config.toml",
     "state": "$XDG_STATE_HOME/capabilities/projects/<project-slug>/automations",
+    # The same scheduler once per machine, for every project that joined it.
+    "machine": {
+        "schema": "capabilities.service.machine.v1",
+        "command": ["automations", "service", "run", "--machine"],
+        "doctor": ["automations", "service", "doctor", "--machine"],
+        "projects": "$XDG_CONFIG_HOME/automations/service/projects.toml",
+        "config": "$XDG_CONFIG_HOME/automations/service/config.toml",
+        "state": "$XDG_STATE_HOME/capabilities/machine/automations",
+    },
     "deploy": {
         "schema": "capabilities.service.deploy.v1",
         "default_policy": "auto",
@@ -3813,8 +3960,51 @@ def _service_dir(root: Path) -> Path:
     return _project_capabilities_dir(root) / NAME / "service"
 
 
+# The selectors of where and how a project's scheduler runs. Each is read from
+# the process environment first and then from the project's .env and
+# .env.local, and only these keys are read from those files, so resolving a
+# project - as the machine service does for every project it serves - holds
+# none of the project's other values.
+_SELECTOR_KEYS = ("AUTOMATIONS_ENVIRONMENT", "AUTOMATIONS_NAMESPACE",
+                  "AUTOMATIONS_CONFIG", "AUTOMATIONS_STATE_DIR")
+
+
+def _env_file_entries(path: Path, keep: tuple[str, ...] = ()) -> dict:
+    """Every name an env file sets, read the way `_parse_env_file` reads it,
+    each with its value only where `keep` names it and None otherwise, so a
+    caller asking what a file sets holds no value it did not ask for."""
+    out: dict = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        out[key] = value.strip().strip('"').strip("'") if key in keep else None
+    return out
+
+
+def _project_selectors() -> dict:
+    """The project's own selectors from its .env and .env.local (.local wins)."""
+    root = _project_root()
+    if root is None:
+        return {}
+    merged: dict = {}
+    for name in (".env", ".env.local"):
+        merged.update({key: value for key, value in
+                       _env_file_entries(root / name, _SELECTOR_KEYS).items()
+                       if key in _SELECTOR_KEYS})
+    return merged
+
+
 def _config_path(root: Path) -> Path:
-    override = os.environ.get("AUTOMATIONS_CONFIG") or _project_env().get("AUTOMATIONS_CONFIG")
+    override = os.environ.get("AUTOMATIONS_CONFIG") or _project_selectors().get("AUTOMATIONS_CONFIG")
     if override:
         path = Path(override).expanduser()
         return path if path.is_absolute() else root / path
@@ -3822,7 +4012,7 @@ def _config_path(root: Path) -> Path:
 
 
 def _state_override(root: Path) -> Path | None:
-    override = os.environ.get("AUTOMATIONS_STATE_DIR") or _project_env().get("AUTOMATIONS_STATE_DIR")
+    override = os.environ.get("AUTOMATIONS_STATE_DIR") or _project_selectors().get("AUTOMATIONS_STATE_DIR")
     if override:
         path = Path(override).expanduser()
         return path if path.is_absolute() else root / path
@@ -4155,23 +4345,30 @@ def _runtime_module():
     return module
 
 
-def _load(root: Path):
-    runtime = _runtime_module()
-    try:
-        config = runtime.load_effective_config(root, _config_path(root), _state_path(root))
-    except runtime.ConfigError as exc:
-        _die(6, "invalid_config", str(exc), "run `automations service init` or repair config.toml")
-    project_env = _project_env()
+def _load_config(runtime, root: Path) -> dict[str, Any]:
+    """The declaration as the project's scheduler acts on it, in either mode.
+    Raises the runtime's ConfigError."""
+    config = runtime.load_effective_config(root, _config_path(root), _state_path(root))
+    selectors = _project_selectors()
     config["engine"]["environment"] = (
         os.environ.get("AUTOMATIONS_ENVIRONMENT")
-        or project_env.get("AUTOMATIONS_ENVIRONMENT")
+        or selectors.get("AUTOMATIONS_ENVIRONMENT")
         or config["engine"]["environment"]
     )
     config["engine"]["namespace"] = (
         os.environ.get("AUTOMATIONS_NAMESPACE")
-        or project_env.get("AUTOMATIONS_NAMESPACE")
+        or selectors.get("AUTOMATIONS_NAMESPACE")
         or config["engine"]["namespace"]
     )
+    return config
+
+
+def _load(root: Path):
+    runtime = _runtime_module()
+    try:
+        config = _load_config(runtime, root)
+    except runtime.ConfigError as exc:
+        _die(6, "invalid_config", str(exc), "run `automations service init` or repair config.toml")
     return runtime, config
 
 
@@ -4270,15 +4467,21 @@ def service_status(root: Path) -> dict[str, Any]:
             counts = runtime.counts(root, _load(root)[1])
         except Exception as exc:
             counts_error = f"{type(exc).__name__}: {exc}"
+    joined = _joined_here()
     return {
         "initialized": initialized,
         "records_mode": records_mode,
         "running": running,
         "pid": pid if running else None,
         "stale_pid": bool(pid and not running),
+        # Who serves this project: its own daemon, or the machine service it
+        # joined, whose view of this project rides along under `machine`.
+        "mode": "machine" if joined else "project",
+        **({"machine": _machine_view(runtime, joined)} if joined else {}),
+        "paused": runtime.read_pause(state),
         "project": str(root),
         "environment": os.environ.get("AUTOMATIONS_ENVIRONMENT")
-        or _project_env().get("AUTOMATIONS_ENVIRONMENT")
+        or _project_selectors().get("AUTOMATIONS_ENVIRONMENT")
         or "development",
         # The environment above is this invocation's, and a supervisor's is not
         # visible from a terminal opened later, so the two are ordinarily
@@ -4961,6 +5164,7 @@ def cmd_retry(run_id: str) -> dict[str, Any]:
 
 def cmd_service_start() -> dict[str, Any]:
     root = _root_required()
+    _joined_refusal("start")
     _runtime, _config, migration = _prepare_service(root)
     status = service_status(root)
     if status["running"]:
@@ -5085,7 +5289,12 @@ def cmd_service_stop(timeout: float, force: bool) -> dict[str, Any]:
     # not go is reported in the payload and never raised: the daemon is stopped
     # either way, and that is what the caller asked for.
     def released(payload: dict[str, Any]) -> dict[str, Any]:
-        pid_file.unlink(missing_ok=True)
+        # The pid file goes only while it still names the daemon this stop was
+        # about: the moment that daemon lets go of the lock, the machine service
+        # a joined project waits for may take it and write its own.
+        current = _read_pid(pid_file)
+        if current == pid or not _pid_alive(current):
+            pid_file.unlink(missing_ok=True)
         reason = _forget_state_root(root)
         if reason is not None:
             payload["state_record_error"] = reason
@@ -5093,6 +5302,13 @@ def cmd_service_stop(timeout: float, force: bool) -> dict[str, Any]:
 
     if not _pid_alive(pid):
         return released({"stopped": False, "running": False, "pid": None})
+    if pid == _machine_pid(_runtime_module()):
+        _die(4, "joined_to_machine_service",
+             f"the machine {NAME} service, pid {pid}, serves this project, so `{NAME} "
+             "service stop` here is refused: it would stop the service of every project",
+             f"`{NAME} service pause` holds this project alone; `{NAME} service leave` "
+             f"takes it back to project mode; `{NAME} service stop --machine` stops the "
+             "machine service for every project")
 
     def send(sig: signal.Signals) -> None:
         try:
@@ -5126,6 +5342,7 @@ def cmd_service_logs(tail: int) -> dict[str, Any]:
 
 def cmd_service_run() -> NoReturn:
     root = _root_required()
+    _joined_refusal("run")
     _prepare_service(root)
     # This process becomes the daemon, so it has no payload to carry the news:
     # stderr is the surface a supervisor captures, and it is written before the
@@ -5136,6 +5353,858 @@ def cmd_service_run() -> NoReturn:
         sys.stderr.flush()
     runtime = _runtime_path()
     os.execvpe(sys.executable, [sys.executable, str(runtime)], _service_env(root))
+
+
+# --- machine mode -------------------------------------------------------------
+
+# What points a process at one project. The machine process stands in none, and
+# a scope it opens for a project points at that project alone.
+_PROJECT_POINTERS = ("CLAUDE_PROJECT_DIR", "CAPABILITIES_PROJECT_ID",
+                     "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_PROJECT_ENVELOPE",
+                     "CAPABILITIES_PROJECT_ENVELOPE_ROOT", *_SELECTOR_KEYS)
+# The run ledger is kept in the machine's store. A project whose own env files
+# name a store would keep its runs there under its own daemon and in the
+# machine's under the machine service, so it does not join.
+_STORE_ENV_KEYS = ("CAPABILITIES_STORE_URL", "CAPABILITIES_STORE_PASSWORD")
+_PROJECTS_HEADER = ("# Projects served by the machine automations service. Written by "
+                    "`automations service join|leave`; do not edit by hand.")
+_PROJECT_ENTRY_KEYS = ("root", "slug", "joined_at", "joined_by")
+_MACHINE_KEYS = ("version", "max_parallel")
+_NOT_ENABLED = (f"project_enable_required: {NAME} is not enabled explicitly for this "
+                f"project, and the machine service acts only for one that enables it "
+                f"(`capabilities enable {NAME} --project`)")
+
+
+class _Refusal(Exception):
+    def __init__(self, exit_code: int, code: str, message: str, hint: str | None = None):
+        super().__init__(message)
+        self.exit_code, self.code, self.message, self.hint = exit_code, code, message, hint
+
+
+def _machine_service_dir() -> Path:
+    return _CONFIG_HOME / NAME / "service"
+
+
+def _machine_projects_path() -> Path:
+    return _machine_service_dir() / "projects.toml"
+
+
+def _machine_settings_path() -> Path:
+    return _machine_service_dir() / "config.toml"
+
+
+def _machine_state_dir() -> Path:
+    return _STATE_HOME / "capabilities" / "machine" / NAME
+
+
+def _default_project_state_dir(slug: str) -> Path:
+    return _STATE_HOME / "capabilities" / "projects" / slug / NAME
+
+
+def _actor() -> str:
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
+    return f"{user}@{socket.gethostname()}"
+
+
+def _utc_moment(value) -> str:
+    """A moment as the list writes it: UTC to the second, `Z`."""
+    import datetime as _dt
+    if isinstance(value, _dt.datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(_dt.timezone.utc)
+        return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return str(value)
+
+
+def _read_machine_projects(path: Path | None = None) -> dict:
+    """The opt-in list, every project on it by its id: its root, slug and when
+    and by whom it joined. No file is an empty list; a file that does not read
+    as the list is a refusal saying what is wrong with it."""
+    path = path or _machine_projects_path()
+
+    def refuse(sentence: str) -> NoReturn:
+        raise _Refusal(6, "projects_invalid", f"{path}: {sentence}",
+                       f"`{NAME} service join` and `{NAME} service leave` write it; "
+                       "repair it, or remove it and join the projects again")
+
+    if not path.exists():
+        return {}
+    try:
+        raw = tomllib.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        refuse(f"it could not be read: {exc}")
+    unknown = sorted(set(raw) - {"version", "projects"})
+    if unknown:
+        refuse(f"it names {', '.join(map(repr, unknown))}, which nothing reads")
+    if isinstance(raw.get("version"), bool) or raw.get("version") != 1:
+        refuse("its `version` is 1")
+    projects = raw.get("projects", {})
+    if not isinstance(projects, dict):
+        refuse("its `projects` is one table per project, `[projects.<id>]`")
+    listed = {}
+    for project, entry in projects.items():
+        if not isinstance(entry, dict):
+            refuse(f"its `projects.{project}` is a table")
+        extra = sorted(set(entry) - set(_PROJECT_ENTRY_KEYS))
+        if extra:
+            refuse(f"its `projects.{project}` names {', '.join(map(repr, extra))}, "
+                   "which nothing reads")
+        root, slug = entry.get("root"), entry.get("slug")
+        if not isinstance(root, str) or not Path(root).is_absolute():
+            refuse(f"its `projects.{project}.root` is an absolute path")
+        if not isinstance(slug, str) or not slug.strip():
+            refuse(f"its `projects.{project}.slug` is the project's slug")
+        listed[str(project)] = {"root": root, "slug": slug,
+                                "joined_at": _utc_moment(entry.get("joined_at")),
+                                "joined_by": str(entry.get("joined_by") or "")}
+    return listed
+
+
+def _write_machine_projects(listed: dict, path: Path | None = None) -> None:
+    """Write the opt-in list whole, under a spare name first, so a reader finds
+    the list before the write or after it and never half of it. JSON's string
+    escapes are TOML's for every character."""
+    path = path or _machine_projects_path()
+    text = lambda value: json.dumps(str(value), ensure_ascii=False)  # noqa: E731
+    lines = [_PROJECTS_HEADER, "version = 1", ""]
+    for project, entry in sorted(listed.items()):
+        key = project if all(c.isalnum() or c in "_-" for c in project) else text(project)
+        lines += [f"[projects.{key}]", f"root = {text(entry['root'])}",
+                  f"slug = {text(entry['slug'])}", f"joined_at = {entry['joined_at']}",
+                  f"joined_by = {text(entry['joined_by'])}", ""]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    spare = path.with_name(f".{path.name}.{os.getpid()}")
+    spare.write_text("\n".join(lines))
+    os.replace(spare, path)
+
+
+class _MachineListLock:
+    """The lock `join` and `leave` write the list under, in the machine state
+    root, so two of them never write over each other."""
+
+    def __enter__(self):
+        import fcntl
+
+        state = _machine_state_dir()
+        state.mkdir(parents=True, exist_ok=True)
+        self._handle = (state / "projects.lock").open("a+")
+        fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        self._handle.close()
+        return False
+
+
+def _listed_projects() -> dict:
+    try:
+        return _read_machine_projects()
+    except _Refusal as refused:
+        _die(refused.exit_code, refused.code, refused.message, refused.hint)
+
+
+def _read_machine_settings(path: Path | None = None) -> dict:
+    """The machine settings, whole and checked, or the refusal that says what is
+    wrong with them. A missing file is the defaults: no cap."""
+    path = path or _machine_settings_path()
+
+    def refuse(sentence: str) -> NoReturn:
+        raise _Refusal(6, "service_invalid", f"{path}: {sentence}",
+                       f"`{NAME} help` states the machine settings; `{NAME} service init "
+                       "--machine --force` writes the shipped template")
+
+    settings: dict = {"version": 1, "max_parallel": None}
+    if not path.is_file():
+        return settings
+    try:
+        raw = tomllib.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        refuse(f"it could not be read: {exc}")
+    unknown = sorted(set(raw) - set(_MACHINE_KEYS))
+    if unknown:
+        refuse(f"it names {', '.join(map(repr, unknown))}, which nothing reads")
+    if isinstance(raw.get("version"), bool) or raw.get("version") != 1:
+        refuse("its `version` is 1")
+    if "max_parallel" in raw:
+        value = raw["max_parallel"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            refuse("its `max_parallel` is a whole number of at least 1")
+        settings["max_parallel"] = value
+    return settings
+
+
+def _machine_fingerprint() -> str:
+    """Which machine settings the file holds right now. The opt-in list is not
+    part of it: joining and leaving are taken up without a reload."""
+    try:
+        seen = hashlib.sha256(_machine_settings_path().read_bytes()).hexdigest()
+    except OSError:
+        seen = "absent"
+    return hashlib.sha256(f"machine-settings:{seen}".encode()).hexdigest()[:12]
+
+
+def _without_project_pointers() -> dict:
+    return {key: value for key, value in os.environ.items() if key not in _PROJECT_POINTERS}
+
+
+@contextlib.contextmanager
+def _project_scope(root: Path):
+    """Stand in one project for the length of a block: the process environment
+    points at that project alone and its records adapter is opened afresh; on
+    the way out both are put back exactly as they were. What runs inside reads
+    the project's identity, policy, declaration and selectors, and no other
+    value its env files hold."""
+    global _RECORDS
+    saved_env, saved_records = dict(os.environ), _RECORDS
+    for key in _PROJECT_POINTERS:
+        os.environ.pop(key, None)
+    os.environ["CLAUDE_PROJECT_DIR"] = str(root)
+    _RECORDS = None
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+        _RECORDS = saved_records
+
+
+def _ask_in_project(root: Path, question):
+    """Answer `question` inside the project's scope. A refusal it would have
+    exited with is raised as a _Refusal instead, so one project's answer never
+    ends the process asking."""
+    import io
+
+    said = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(said), _project_scope(root):
+            return question()
+    except SystemExit as stop:
+        error: dict = {}
+        for line in reversed(said.getvalue().strip().splitlines()):
+            with contextlib.suppress(ValueError, AttributeError):
+                error = json.loads(line).get("error") or {}
+                break
+        raise _Refusal(stop.code if isinstance(stop.code, int) else 6,
+                       error.get("code") or "refused",
+                       error.get("message") or "the check exited without saying why",
+                       error.get("hint")) from None
+
+
+def _project_store_set(root: Path) -> list[str]:
+    """Which of the store's keys the project's own env files set, by name."""
+    return [f"{root / name} sets {key}" for name in (".env", ".env.local")
+            for key in _env_file_entries(root / name) if key in _STORE_ENV_KEYS]
+
+
+def _servable_here() -> tuple[str, str]:
+    """This project's id and slug, if the machine service may serve it, or the
+    refusal that says why not: no durable id it may write under, records in the
+    store, or a store named in its own env files. Asked by `join`, and by the
+    machine service before it serves a project."""
+    root = _project_root()
+    envelope = _project_capabilities_dir(root)
+    project = _project_id(write=True, refuse=False)
+    if not (envelope / "project.json").is_file() or not project:
+        raise _Refusal(6, "no_project_identity",
+                       f"this project has no durable id it may write under in "
+                       f"{envelope / 'project.json'}, and the machine service's list "
+                       "names a project by it", "run `capabilities init` in the project")
+    try:
+        mode, _source = records_mode(envelope)
+    except StoreError as wrong:
+        raise _Refusal(6, wrong.slug, wrong.message, wrong.hint) from None
+    if mode == "db":
+        raise _Refusal(6, "database_mode_unsupported",
+                       "this project keeps its capability records in the store, and the "
+                       "machine service does not read them in this version",
+                       f"keep the project in files mode, or serve it with `{NAME} service start`")
+    found = _project_store_set(root)
+    if found:
+        raise _Refusal(6, "project_store_set",
+                       f"{'; '.join(found)}, and the machine service keeps every project's "
+                       "runs in the machine's store",
+                       "remove it from the project's env files; the machine's store "
+                       "setting names the store (`capabilities store show`)")
+    return project, _state_project_key(root)
+
+
+class _ProjectHost:
+    """One joined project as the machine process sees it: where it stands, and
+    the questions the machine asks of it, each answered inside the project's
+    own resolution."""
+
+    def __init__(self, runtime, entry: dict, root: Path, config_path: Path, state_dir: Path):
+        self.runtime = runtime
+        self.entry = entry
+        self.root, self.config_path, self.state_dir = root, config_path, state_dir
+
+    def load(self) -> dict[str, Any]:
+        try:
+            return _ask_in_project(self.root, lambda: _load_config(self.runtime, self.root))
+        except _Refusal as refused:
+            raise self.runtime.ConfigError(f"{refused.code}: {refused.message}") from None
+
+    def check(self) -> tuple[str, str] | None:
+        """Asked before every action for the project: its folder is there and it
+        still enables automations for itself."""
+        if not self.root.is_dir():
+            return ("error", f"the project folder {self.root} is gone")
+        try:
+            enabled = _ask_in_project(self.root, _project_enabled_explicitly)
+        except _Refusal as refused:
+            return ("refused", f"{refused.code}: {refused.message}")
+        except Exception as exc:
+            return ("error", f"{type(exc).__name__}: {exc}")
+        return None if enabled else ("refused", _NOT_ENABLED)
+
+    def launcher(self, command: list[str]) -> list[str]:
+        """How a job of this project starts: through `service launch`, which
+        resolves the project's own environment in the job's process and execs
+        the job, so the machine process never holds it."""
+        return [sys.executable, str(Path(__file__).resolve()), "service", "launch", "--",
+                *command]
+
+
+class _MachineHost:
+    """What the machine service asks of this executable about the machine: its
+    list, its settings, and for each project on the list a host for it or why
+    it cannot be served yet."""
+
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.state_dir = _machine_state_dir()
+        self.projects_file = _machine_projects_path()
+        self.config_file = _machine_settings_path()
+
+    def list_witness(self):
+        try:
+            seen = os.stat(self.projects_file)
+        except OSError:
+            return None
+        return (seen.st_mtime_ns, seen.st_size, seen.st_ino)
+
+    def read_list(self) -> dict:
+        return _read_machine_projects(self.projects_file)
+
+    def load_settings(self) -> dict:
+        # Taken before the file is read, as a project's declaration is.
+        fingerprint = _machine_fingerprint()
+        return {**_read_machine_settings(self.config_file), "fingerprint": fingerprint}
+
+    @staticmethod
+    def project_state_dir(slug: str) -> Path:
+        return _default_project_state_dir(slug)
+
+    def admit(self, entry: dict):
+        """(host, None) for a project on the list that can be served now, or
+        (None, (state, reason)): `error` for a folder that is gone or a question
+        that failed, `refused` for what the checks refuse and for a project whose
+        id, slug or root moved since it joined."""
+        root = Path(entry["root"])
+        if not root.is_dir():
+            return None, ("error", f"the project folder {root} is gone")
+
+        def probe():
+            here = _project_root()
+            if here is None or here.resolve() != root.resolve():
+                raise _Refusal(6, "not_a_project_root",
+                               f"{root} no longer resolves as a project root")
+            project, slug = _servable_here()
+            if project != entry["id"]:
+                raise _Refusal(6, "project_id_changed",
+                               f"the project now declares id {project}, and it joined as "
+                               f"{entry['id']}")
+            if slug != entry["slug"]:
+                raise _Refusal(6, "slug_changed",
+                               f"the project now declares slug {slug} and joined as "
+                               f"{entry['slug']}; `{NAME} service leave` and `{NAME} "
+                               "service join` there take the new one")
+            if not _project_enabled_explicitly():
+                raise _Refusal(4, *_NOT_ENABLED.split(": ", 1))
+            return _config_path(root), _state_path(root)
+
+        try:
+            config_path, state_dir = _ask_in_project(root, probe)
+        except _Refusal as refused:
+            return None, ("refused", f"{refused.code}: {refused.message}")
+        except Exception as exc:
+            return None, ("error", f"{type(exc).__name__}: {exc}")
+        return _ProjectHost(self.runtime, entry, root, config_path, state_dir), None
+
+
+def _machine_pid(runtime) -> int | None:
+    """The machine process's pid while it runs, else None."""
+    pid = runtime.read_pid(_machine_state_dir())
+    return pid if runtime.pid_alive(pid) else None
+
+
+def _joined_here() -> dict | None:
+    """This project's entry on the machine service's opt-in list, or None: not
+    on it, no id, outside a project, or a list that does not load."""
+    if _project_root() is None:
+        return None
+    project = _project_id()
+    if not project:
+        return None
+    try:
+        entry = _read_machine_projects().get(project)
+    except _Refusal:
+        return None
+    return {**entry, "id": project} if entry else None
+
+
+def _joined_refusal(verb: str) -> None:
+    """`start` and `run` in a joined project: the machine service serves it, and
+    a project daemon would compete with it for the project's lock."""
+    if _joined_here():
+        _die(4, "joined_to_machine_service",
+             f"this project is joined to the machine {NAME} service, which serves it, so "
+             f"`{NAME} service {verb}` here is refused",
+             f"`{NAME} service leave` takes it back to project mode first")
+
+
+def _machine_view(runtime, joined: dict) -> dict:
+    """What the machine service says of one joined project, while it runs."""
+    pid = _machine_pid(runtime)
+    published = (runtime.read_status(_machine_state_dir()) or {}) if pid else {}
+    seen = next((row for row in published.get("projects") or []
+                 if isinstance(row, dict) and row.get("project_id") == joined["id"]), {})
+    return {"running": pid is not None, "pid": pid, "joined_at": joined.get("joined_at"),
+            "state": seen.get("state"),
+            "reason": seen.get("reason") if pid else "the machine service is not running"}
+
+
+def _enabled_at(root: Path) -> bool:
+    try:
+        return bool(_ask_in_project(root, _project_enabled_explicitly))
+    except Exception:
+        return False
+
+
+def _machine_status(runtime) -> dict:
+    """The machine service as its status file and the list say: whether it
+    runs, its settings, its cap and store, and every project on the list with
+    what is true of it now. With no process running, every entry still answers
+    `present` and `enabled_explicitly`."""
+    state = _machine_state_dir()
+    pid = runtime.read_pid(state)
+    running = runtime.pid_alive(pid)
+    published = (runtime.read_status(state) or {}) if running else {}
+    try:
+        listed, list_error = _read_machine_projects(), None
+    except _Refusal as refused:
+        listed, list_error = {}, refused.message
+    try:
+        settings, settings_error = _read_machine_settings(), None
+    except _Refusal as refused:
+        settings, settings_error = None, refused.message
+    answer = {
+        "mode": "machine", "running": running, "pid": pid if running else None,
+        "stale_pid": bool(pid and not running),
+        "started_at": published.get("started_at"),
+        "published_at": published.get("published_at"),
+        "fingerprint": published.get("fingerprint"),
+        "current": (published.get("fingerprint") == _machine_fingerprint()) if running else None,
+        "reload_error": published.get("reload_error"),
+        "config": str(_machine_settings_path()),
+        "initialized": _machine_settings_path().is_file(),
+        "state_dir": str(state), "log_file": str(state / runtime.LOG_FILE),
+        "projects_file": {"path": str(_machine_projects_path()), "joined": len(listed),
+                          **({"error": list_error} if list_error else {})},
+        "cap": published.get("cap") or {
+            "max_parallel": (settings or {}).get("max_parallel"), "running": 0,
+            "binding": False},
+        **_store_named(runtime),
+    }
+    if running:
+        answer["store_connection"] = published.get("store")
+    if settings_error:
+        answer["settings_error"] = settings_error
+    rows = {row.get("project_id"): row for row in published.get("projects") or []
+            if isinstance(row, dict)}
+    projects = []
+    for project, entry in sorted(listed.items(), key=lambda item: (item[1]["slug"], item[0])):
+        root = Path(entry["root"])
+        row = {"project": entry["slug"], "project_id": project, "root": entry["root"],
+               "joined_at": entry["joined_at"], "joined_by": entry["joined_by"],
+               "present": root.is_dir(),
+               "enabled_explicitly": root.is_dir() and _enabled_at(root)}
+        seen = rows.get(project)
+        if seen:
+            for key, value in seen.items():
+                row.setdefault(key, value)
+        else:
+            row.update(state=None, reason=("the machine service is not running" if not running
+                                           else "not yet taken up by the machine service"))
+        projects.append(row)
+    answer["projects"] = projects
+    return answer
+
+
+def _machine_lock_held() -> bool:
+    """Whether a process holds the machine lock, asked with a shared lock taken
+    and let go at once."""
+    import fcntl
+
+    try:
+        handle = (_machine_state_dir() / "daemon.lock").open("a+")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        handle.close()
+    return False
+
+
+def _project_answer(project: str, entry: dict) -> dict:
+    return {"id": project, "slug": entry["slug"], "root": entry["root"]}
+
+
+def cmd_service_join() -> dict[str, Any]:
+    """Put this project on the machine service's opt-in list. It refuses a
+    project the machine service may not serve, and a slug another joined
+    project already has, since the two would share a state root. It operates
+    no daemon."""
+    root = _require_project_enabled_for_service()
+    try:
+        project, slug = _servable_here()
+    except _Refusal as refused:
+        _die(refused.exit_code, refused.code, refused.message, refused.hint)
+    path = _machine_projects_path()
+    with _MachineListLock():
+        listed = _listed_projects()
+        if project in listed:
+            return {"joined": False, "reason": "already on the machine service's list",
+                    "project": _project_answer(project, listed[project]), "list": str(path)}
+        taken = sorted(other for other, found in listed.items() if found["slug"] == slug)
+        if taken:
+            _die(6, "slug_taken",
+                 f"project {taken[0]} at {listed[taken[0]]['root']} is joined with slug "
+                 f"{slug!r}, and two projects of one slug would share a state root",
+                 "give one of them another slug in its project.json, or leave the other "
+                 f"with `{NAME} service leave --machine --project {taken[0]}`")
+        import datetime as _dt
+        listed[project] = {"root": str(root), "slug": slug,
+                           "joined_at": _utc_moment(_dt.datetime.now(_dt.timezone.utc)),
+                           "joined_by": _actor()}
+        _write_machine_projects(listed, path)
+    runtime = _runtime_module()
+    state = _state_path(root)
+    if state.is_dir():
+        runtime.append_line(state / runtime.LOG_FILE, runtime.log_line(
+            slug, f"joined the machine service, by {listed[project]['joined_by']}"))
+    answer = {"joined": True, "project": _project_answer(project, listed[project]),
+              "list": str(path)}
+    pid = _read_pid(state / "daemon.pid")
+    if _pid_alive(pid) and pid != _machine_pid(runtime):
+        answer["next"] = (f"a project-mode daemon, pid {pid}, still serves this project; "
+                          f"`{NAME} service stop` here hands it to the machine service")
+    return answer
+
+
+def cmd_service_leave(machine: bool, named: str | None) -> dict[str, Any]:
+    """Take a project off the opt-in list: this project, or with `--machine
+    --project <id-or-slug>` any project from anywhere, a folder that is gone
+    included."""
+    path = _machine_projects_path()
+    if machine:
+        named = (named or "").strip()
+        if not named:
+            _die(6, "input", "leave --machine names the project it takes off the list",
+                 f"`{NAME} service leave --machine --project <id-or-slug>`; "
+                 f"`{NAME} service status --machine` lists them")
+        here = None
+    else:
+        if named:
+            _die(6, "input", "--project names a project to leave from anywhere, with --machine",
+                 f"`{NAME} service leave` leaves this project")
+        _root_required()
+        here = _project_id()
+        if not here:
+            _die(6, "no_project_identity", "this project has no durable id, so it is on no list",
+                 "run `capabilities init` in the project")
+        named = here
+    with _MachineListLock():
+        listed = _listed_projects()
+        found = [project for project, entry in listed.items()
+                 if project == named or (here is None and entry["slug"] == named)]
+        if not found:
+            return {"left": False, "reason": "not on the machine service's list",
+                    "project": {"id": here} if here else {"named": named}, "list": str(path)}
+        project = found[0]
+        entry = listed.pop(project)
+        _write_machine_projects(listed, path)
+    runtime = _runtime_module()
+    state = _default_project_state_dir(entry["slug"])
+    if state.is_dir():
+        runtime.append_line(state / runtime.LOG_FILE, runtime.log_line(
+            entry["slug"], f"left the machine service, by {_actor()}"))
+    return {"left": True, "project": _project_answer(project, entry), "list": str(path)}
+
+
+def cmd_service_pause(reason: str | None) -> dict[str, Any]:
+    """Hold this project: its scheduler registers and starts nothing until
+    resumed, in either mode, and running jobs finish."""
+    root = _root_required()
+    runtime = _runtime_module()
+    state = _state_path(root)
+    state.mkdir(parents=True, exist_ok=True)
+    pause = {"reason": (reason or "").strip() or None, "at": runtime.iso(), "by": _actor()}
+    runtime.write_atomic(state / runtime.PAUSE_FILE, json.dumps(pause, indent=2) + "\n")
+    return {"paused": True, "pause": pause, "pause_file": str(state / runtime.PAUSE_FILE)}
+
+
+def cmd_service_resume() -> dict[str, Any]:
+    root = _root_required()
+    runtime = _runtime_module()
+    path = _state_path(root) / runtime.PAUSE_FILE
+    held = path.exists()
+    path.unlink(missing_ok=True)
+    return {"resumed": held, "pause_file": str(path),
+            **({} if held else {"reason": "this project was not paused"})}
+
+
+def cmd_service_launch(command: list[str]) -> NoReturn:
+    """One job of the machine service, started in its project: the project's
+    own environment - its .env and .env.local, as its own daemon carries them -
+    is put under the job here, in the job's process, and the job is exec'd in
+    its place. The machine process never holds that environment."""
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if not command:
+        _die(6, "input", f"`{NAME} service launch -- <command...>` names the job to start")
+    root = _require_project_enabled_for_service()
+    carried = {key: value for key, value in os.environ.items()
+               if key.startswith("AUTOMATION_") or key == "AUTOMATIONS_BIN"}
+    env = _service_env(root)
+    env.update(carried)
+    try:
+        os.execvpe(command[0], command, env)
+    except OSError as exc:
+        _die(5, "launch_failed", f"cannot start {command[0]}: {exc}")
+
+
+def cmd_service_init_machine(force: bool) -> dict[str, Any]:
+    template = _template("machine.toml")
+    if not template.is_file():
+        _die(3, "service_bundle_missing",
+             f"the shipped machine settings template is missing at {template}",
+             "reinstall automations from a bundled source directory")
+    target = _machine_settings_path()
+    written, skipped = [], []
+    if target.exists() and not force:
+        skipped.append(str(target))
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(template.read_text())
+        written.append(str(target))
+    return {"initialized": NAME, "mode": "machine", "config": str(target),
+            "written": written, "skipped": skipped,
+            "next": [f"`{NAME} service join` in each project the machine service is to serve",
+                     f"`{NAME} service start --machine`, or `{NAME} service run --machine` "
+                     "under a supervisor"]}
+
+
+def _machine_settings_or_die() -> None:
+    try:
+        _read_machine_settings()
+    except _Refusal as refused:
+        _die(refused.exit_code, refused.code, refused.message, refused.hint)
+
+
+def cmd_service_run_machine() -> None:
+    """The machine process in the foreground: what a supervisor runs. It stands
+    in its own state root with nothing in its environment pointing at a
+    project."""
+    _machine_settings_or_die()
+    state = _machine_state_dir()
+    state.mkdir(parents=True, exist_ok=True)
+    os.chdir(state)
+    for key in _PROJECT_POINTERS:
+        os.environ.pop(key, None)
+    runtime = _runtime_module()
+    try:
+        runtime.MachineService(_MachineHost(runtime)).run()
+    except RuntimeError as exc:
+        _die(5, "service_running", str(exc),
+             f"`{NAME} service status --machine` names the process that holds it")
+
+
+def cmd_service_start_machine() -> dict[str, Any]:
+    _machine_settings_or_die()
+    runtime = _runtime_module()
+    state = _machine_state_dir()
+    state.mkdir(parents=True, exist_ok=True)
+    if _machine_pid(runtime):
+        answer = _machine_status(runtime)
+        answer["already_running"] = True
+        return answer
+    try:
+        runtime.StoreLink().open().close()
+    except runtime.StoreUnavailable as exc:
+        _store_refusal(exc)
+    log_path = state / runtime.LOG_FILE
+    with log_path.open("a", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "service", "run", "--machine"],
+            cwd=str(state), env=_without_project_pointers(), stdin=subprocess.DEVNULL,
+            stdout=log, stderr=log, start_new_session=True)
+    deadline = time.monotonic() + 30
+    while True:
+        if process.poll() is not None:
+            tail = log_path.read_text(errors="replace").splitlines()[-8:]
+            _die(5, "service_start_failed",
+                 f"the machine process exited with {process.returncode}", "\n".join(tail))
+        if runtime.read_pid(state) == process.pid and runtime.read_status(state):
+            break
+        if time.monotonic() > deadline:
+            _die(5, "service_start_failed", "the machine process did not report itself "
+                 "running within 30s", f"`{NAME} service logs --machine`")
+        time.sleep(0.05)
+    answer = _machine_status(runtime)
+    answer["started"] = True
+    return answer
+
+
+def cmd_service_doctor_machine() -> dict[str, Any]:
+    """The supervision probe: ok while the machine process holds its lock,
+    published its status lately, runs the machine settings on disk and holds
+    its store connection. A project in `error` or `refused` is reported and
+    fails nothing: restarting the process cannot repair a project."""
+    import datetime as _dt
+
+    runtime = _runtime_module()
+    status = _machine_status(runtime)
+    problems = []
+    if not status["running"]:
+        problems.append(f"no machine process runs; `{NAME} service start --machine`, or "
+                        f"`{NAME} service run --machine` under a supervisor")
+    else:
+        published = runtime.read_status(_machine_state_dir()) or {}
+        limit = 2 * float(published.get("publish_seconds") or runtime.PUBLISH_SECONDS)
+        try:
+            at = _dt.datetime.fromisoformat(str(published.get("published_at")))
+            age = (_dt.datetime.now(_dt.timezone.utc) - at).total_seconds()
+        except (TypeError, ValueError):
+            age = None
+        if not _machine_lock_held():
+            problems.append(f"pid {status['pid']} is alive but holds no machine lock in "
+                            f"{_machine_state_dir()}; it is not the machine process")
+        if published.get("pid") != status["pid"] or age is None or age > limit:
+            problems.append(f"the machine process has not published its status within "
+                            f"{limit:g}s; it may hang")
+        if not status["current"]:
+            problems.append("the machine process runs machine settings that have changed "
+                            f"since; `{NAME} service reload --machine` hands it the file on disk")
+        connection = status.get("store_connection") or {}
+        if not connection.get("connected"):
+            problems.append(f"the machine process holds no store connection: "
+                            f"{connection.get('error') or 'reconnecting'}")
+    if status.get("settings_error"):
+        problems.append(status["settings_error"])
+    answer = {"ok": not problems, "mode": "machine", "machine": status,
+              "projects": [{key: row.get(key) for key in
+                            ("project", "project_id", "present", "enabled_explicitly",
+                             "state", "reason")} for row in status["projects"]]}
+    if problems:
+        answer["problems"] = problems
+    return answer
+
+
+def cmd_service_reload_machine(timeout: float) -> dict[str, Any]:
+    """Hand the machine process the machine settings on disk, and every project
+    its own declaration, and wait until it says it has."""
+    runtime = _runtime_module()
+    state = _machine_state_dir()
+    pid = _machine_pid(runtime)
+    if not pid:
+        _die(5, "service_not_running", f"no machine {NAME} service is running",
+             f"`{NAME} service start --machine` starts one")
+    _machine_settings_or_die()
+    target = _machine_fingerprint()
+    fingerprint_file = state / runtime.DAEMON_FINGERPRINT_FILE
+
+    def loaded() -> str | None:
+        with contextlib.suppress(OSError):
+            return fingerprint_file.read_text().strip()
+        return None
+
+    before = (runtime.read_status(state) or {}).get("reloads") or 0
+    was = loaded()
+    try:
+        os.kill(pid, signal.SIGHUP)
+    except ProcessLookupError:
+        _die(5, "service_not_running", "the machine process exited before the reload")
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while time.monotonic() < deadline:
+        if not runtime.pid_alive(pid):
+            _die(5, "service_reload_failed", "the machine process exited during the reload",
+                 f"`{NAME} service logs --machine`")
+        published = runtime.read_status(state) or {}
+        if (published.get("reloads") or 0) > before and loaded() == target:
+            return {"reloaded": True, "running": True, "pid": pid, "fingerprint": target,
+                    "changed": was != target,
+                    "projects": [{key: row.get(key) for key in
+                                  ("project", "state", "reason", "reload_error")}
+                                 for row in published.get("projects") or []]}
+        time.sleep(0.1)
+    _die(5, "service_reload_failed",
+         f"the machine process did not publish the reload within {timeout:g}s",
+         f"`{NAME} service logs --machine` says why")
+
+
+def cmd_service_stop_machine(timeout: float, force: bool) -> dict[str, Any]:
+    """Ask the machine process to stop and wait for it. Every project's running
+    jobs are interrupted within that project's shutdown grace, as a stop of
+    its own daemon interrupts them."""
+    runtime = _runtime_module()
+    state = _machine_state_dir()
+    pid = runtime.read_pid(state)
+    if not runtime.pid_alive(pid):
+        (state / runtime.PID_FILE).unlink(missing_ok=True)
+        return {"stopped": False, "running": False, "pid": None, "mode": "machine"}
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    started = time.monotonic()
+    while time.monotonic() - started < timeout:
+        if not runtime.pid_alive(pid):
+            return {"stopped": True, "running": False, "pid": pid, "mode": "machine",
+                    "waited_seconds": round(time.monotonic() - started, 1)}
+        time.sleep(0.1)
+    if not force:
+        _die(5, "service_stop_timeout",
+             f"the machine process did not stop within {timeout:g}s",
+             f"retry with `{NAME} service stop --machine --force`")
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    for name in (runtime.PID_FILE, runtime.DAEMON_FINGERPRINT_FILE, runtime.STATUS_FILE):
+        (state / name).unlink(missing_ok=True)
+    return {"stopped": True, "killed": True, "running": False, "pid": pid, "mode": "machine"}
+
+
+def cmd_service_logs_machine(tail: int, named: str | None) -> dict[str, Any]:
+    runtime = _runtime_module()
+    path = _machine_state_dir() / runtime.LOG_FILE
+    if not path.is_file():
+        _die(3, "logs_not_found", f"the machine service log does not exist yet: {path}",
+             f"`{NAME} service start --machine` writes it")
+    lines = path.read_text(errors="replace").splitlines()
+    answer: dict = {"log_file": str(path)}
+    named = (named or "").strip()
+    if named:
+        try:
+            listed = _read_machine_projects()
+        except _Refusal:
+            listed = {}
+        slug = listed[named]["slug"] if named in listed else named
+        tag = f" {NAME} service [{slug}]: "
+        lines = [line for line in lines if tag in line]
+        answer["project"] = slug
+    answer["lines"] = lines[-max(0, tail):]
+    return answer
 
 
 def _agent_prompt(raw: str) -> str:
@@ -5408,17 +6477,29 @@ def main() -> None:
     service_sub = service.add_subparsers(dest="service_cmd", required=True)
     init = service_sub.add_parser("init", add_help=False)
     init.add_argument("--force", action="store_true")
-    service_sub.add_parser("doctor", add_help=False)
-    service_sub.add_parser("run", add_help=False)
-    service_sub.add_parser("start", add_help=False)
+    machine_verbs = [init]
+    machine_verbs.append(service_sub.add_parser("doctor", add_help=False))
+    machine_verbs.append(service_sub.add_parser("run", add_help=False))
+    machine_verbs.append(service_sub.add_parser("start", add_help=False))
     reload_parser = service_sub.add_parser("reload", add_help=False)
     reload_parser.add_argument("--timeout", type=float, default=20.0)
     stop = service_sub.add_parser("stop", add_help=False)
-    stop.add_argument("--timeout", type=float, default=15.0)
+    stop.add_argument("--timeout", type=float)
     stop.add_argument("--force", action="store_true")
-    service_sub.add_parser("status", add_help=False)
+    machine_verbs.append(service_sub.add_parser("status", add_help=False))
     service_logs = service_sub.add_parser("logs", add_help=False)
     service_logs.add_argument("--tail", type=int, default=100)
+    service_logs.add_argument("--project")
+    pause = service_sub.add_parser("pause", add_help=False)
+    pause.add_argument("--reason")
+    service_sub.add_parser("resume", add_help=False)
+    service_sub.add_parser("join", add_help=False)
+    leave = service_sub.add_parser("leave", add_help=False)
+    leave.add_argument("--project")
+    launch = service_sub.add_parser("launch", add_help=False)
+    launch.add_argument("command", nargs=argparse.REMAINDER)
+    for verb in (*machine_verbs, reload_parser, stop, service_logs, leave):
+        verb.add_argument("--machine", action="store_true")
 
     args = parser.parse_args(argv)
     if args.cmd in ("run", "cancel", "retry"):
@@ -5453,6 +6534,31 @@ def main() -> None:
         if args.timeout is not None and args.timeout < 1:
             _die(6, "invalid_timeout", "--timeout must be at least 1 second")
         _emit(cmd_agent(args.profile, args.prompt, args.schema, args.timeout))
+    elif args.cmd == "service" and getattr(args, "machine", False):
+        # The machine verbs resolve no project: the gate let them through for
+        # that reason, and the machine service checks each project itself.
+        if args.service_cmd == "init":
+            _emit(cmd_service_init_machine(args.force))
+        elif args.service_cmd == "doctor":
+            result = cmd_service_doctor_machine()
+            _emit(result)
+            if not result["ok"]:
+                raise SystemExit(6)
+        elif args.service_cmd == "run":
+            cmd_service_run_machine()
+        elif args.service_cmd == "start":
+            _emit(cmd_service_start_machine())
+        elif args.service_cmd == "reload":
+            _emit(cmd_service_reload_machine(args.timeout))
+        elif args.service_cmd == "stop":
+            _emit(cmd_service_stop_machine(
+                30.0 if args.timeout is None else args.timeout, args.force))
+        elif args.service_cmd == "status":
+            _emit(_machine_status(_runtime_module()))
+        elif args.service_cmd == "logs":
+            _emit(cmd_service_logs_machine(args.tail, args.project))
+        elif args.service_cmd == "leave":
+            _emit(cmd_service_leave(True, args.project))
     elif args.cmd == "service":
         if args.service_cmd == "init":
             _emit(cmd_service_init(args.force))
@@ -5468,11 +6574,24 @@ def main() -> None:
         elif args.service_cmd == "reload":
             _emit(cmd_service_reload(args.timeout))
         elif args.service_cmd == "stop":
-            _emit(cmd_service_stop(args.timeout, args.force))
+            _emit(cmd_service_stop(15.0 if args.timeout is None else args.timeout, args.force))
         elif args.service_cmd == "status":
             _emit(service_status(_root_required()))
         elif args.service_cmd == "logs":
+            if args.project:
+                _die(6, "input", "--project filters the machine log, with --machine",
+                     f"`{NAME} service logs` reads this project's log")
             _emit(cmd_service_logs(args.tail))
+        elif args.service_cmd in ("pause", "resume"):
+            _read_only_gate(f"`{NAME} service {args.service_cmd}`")
+            _emit(cmd_service_pause(args.reason) if args.service_cmd == "pause"
+                  else cmd_service_resume())
+        elif args.service_cmd == "join":
+            _emit(cmd_service_join())
+        elif args.service_cmd == "leave":
+            _emit(cmd_service_leave(False, args.project))
+        elif args.service_cmd == "launch":
+            cmd_service_launch(args.command)
 
 
 if __name__ == "__main__":

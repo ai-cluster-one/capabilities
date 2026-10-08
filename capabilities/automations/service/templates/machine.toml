@@ -1,0 +1,9 @@
+# The machine automations service: one process on this machine serving every
+# project that joined it with `automations service join`. Each project's own
+# declaration and limits still apply; these are the machine's. `automations help`
+# states every key; any other is refused.
+version = 1
+
+# Jobs running at once across every joined project. Absent: only each
+# project's own limits apply.
+max_parallel = 8
