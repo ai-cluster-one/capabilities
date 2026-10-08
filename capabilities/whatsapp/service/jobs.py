@@ -906,11 +906,11 @@ class JobRunner:
 
     def _send(self, row: dict) -> list[str]:
         """Queue one result as pending messages, the first quoting the message
-        that asked for the work. Runs inside the delivery's transaction."""
+        that asked for the work. Runs inside the delivery's transaction. It
+        goes out with no pause of its own."""
         sent = []
         for index, part in enumerate(self.dialogue.split_text(row.get("result_text") or "")):
             request = {"chat_id": row["chat_id"], "text": part, "mentions": [],
-                       "typing": index == 0,
                        "reply_to": row.get("origin_message_id") if index == 0 else None}
             try:
                 queued = self.cli._queue_outgoing(self.db, request)

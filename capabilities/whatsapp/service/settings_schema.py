@@ -37,7 +37,7 @@ GROUP_KEYS = {"name", "require_reference", "aliases", "may_address",
 DEFAULT_KEYS = {"tail_size", "debounce", "max_age", "worker_timeout",
                 "max_parallel_dialogue", "profile", "send_rate",
                 "max_parallel_jobs", "job_profile", "job_recovery",
-                "voice_transcription"}
+                "voice_transcription", "stall_seconds"}
 NUMERIC_DEFAULTS = {
     "tail_size": (1, 500, True),
     "debounce": (0, 300, False),
@@ -46,6 +46,9 @@ NUMERIC_DEFAULTS = {
     "max_parallel_dialogue": (1, 32, True),
     "send_rate": (1, SEND_RATE_CEILING, True),
     "max_parallel_jobs": (1, 32, True),
+    # How long the listener may make no progress before it leaves to be
+    # restarted, and how stale a holder's health must be to be taken over.
+    "stall_seconds": (30, 3600, True),
 }
 # What happens to a job whose listener went away while it ran: `requeue`
 # continues it on its recorded session, `inspect` stops it and reports it to

@@ -560,6 +560,26 @@ class Runner(JobsCase):
 
 @_cli.needs_store
 @td.needs_runner
+@td.needs_engine
+class ResultPace(JobsCase):
+    """A job's result goes out with no pause of its own."""
+
+    def test_a_result_is_sent_with_no_pause(self):
+        d, runner = self.make_jobs()
+        job, msg = self.submit(runner)
+        self.assertTrue(self.until(runner, lambda: self.row(runner, job["id"])
+                                   .get("delivery_state") == "delivered"))
+        rows = self.outgoing(ALICE_JID)
+        self.assertEqual([(r["text"], r["typing"]) for r in rows], [("The result.", 0)])
+        session = td.Reacting(self.db)
+        pauses: list = []
+        outcome = wa._deliver(session, wa._claim_outgoing(self.db), pause=pauses.append)
+        self.assertEqual((outcome["state"], pauses, [c[0] for c in session.calls]),
+                         ("sent", [], ["send"]))
+
+
+@_cli.needs_store
+@td.needs_runner
 class Failures(JobsCase):
     def test_a_spent_quota_pauses_the_queue_and_resumes_it(self):
         d, runner = self.make_jobs(run=JobRun(fail="quota"))

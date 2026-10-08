@@ -36,7 +36,7 @@ This is the failure that looks like a working fix: the code sets the variable, t
 
 A message is written into the store before it goes anywhere: a row in `whatsapp_messages`, from the account, with a delivery state and an internal id (`local_id`). It starts `pending`, becomes `sending` when a sender claims it, and ends `sent`, carrying the id WhatsApp minted and the time it was sent, or `failed`, carrying the reason. The copy of a sent message WhatsApp hands back lands on the same row, because by then the row carries WhatsApp's id, so a sent message is held once.
 
-Who sends the row depends on who holds the account's connection. With the assistant service running on the account, the service sends it and `send` waits up to 60 seconds for the service's answer, so a worker or any other process sends through the same verb while the service runs. Without the service, `send` connects and sends the row itself. The answer is the same either way: the id WhatsApp minted, plus `local_id`, `delivery` and `sent_by` (`service` or `direct`).
+Who sends the row depends on who holds the account's connection. With the assistant service running on the account, the service sends it and `send` waits up to 60 seconds for the service's answer, so a worker or any other process sends through the same verb while the service runs. Queuing the row wakes the service's sender at once: in the service's own process directly, and from any other process through a Postgres notification on the channel `whatsapp_outbox`, carrying the account, sent when the row commits; a half-second poll stands behind both. Without the service, `send` connects and sends the row itself. The answer is the same either way: the id WhatsApp minted, plus `local_id`, `delivery` and `sent_by` (`service` or `direct`).
 
 A send the service has not answered within the wait exits 5 `send_pending` and names the local id. The row is still sent when the service can, so sending the same text again sends it twice. A row a sender claimed and never answered for - the process ended while the message was on the wire - is failed at the service's next start as `interrupted_delivery_unknown` and never sent again: whether it reached WhatsApp cannot be known, and sending it again could deliver it twice.
 
@@ -48,7 +48,7 @@ Reads show what WhatsApp has: a message still pending, or one that failed, is no
 
 `--mention <phone>` mentions a number, and repeats for several. A mention renders where its `@number` is written in the text, so a number the text does not carry is put at its start.
 
-`--typing` shows the account composing in the chat for a moment between 1.5 and 3.5 seconds, jittered, then paused, before the message goes.
+`--typing` shows the account composing in the chat for a moment between 1.5 and 3.5 seconds, jittered, then paused, before the message goes. The assistant service's own answers and job results carry no such pause: the chat has shown the account composing since the request was admitted.
 
 ## The send rate
 

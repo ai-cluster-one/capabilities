@@ -704,7 +704,7 @@ class Turn(DialogueCase):
         self.answer(d)
         rows = self.outgoing(ALICE_JID)
         self.assertEqual([(r["text"], r["delivery"], r["quoted_id"], r["typing"])
-                          for r in rows], [("The answer.", "pending", None, True)])
+                          for r in rows], [("The answer.", "pending", None, 0)])
 
     def test_a_group_answer_quotes_the_request(self):
         d = self.make()
@@ -841,6 +841,154 @@ class Control(DialogueCase):
                                      mentions=[OWN])
         self.assertEqual(verdict["kind"], "control")
         self.assertEqual(self.outgoing(GROUP)[-1]["quoted_id"], _msg_["id"])
+
+
+# ── What the person sees at once ────────────────────────────────────────────
+
+
+class Reacting:
+    """A held session reduced to what an admission shows the person: each
+    receipt and presence is recorded with the moment it was sent."""
+
+    def __init__(self, db):
+        self.db = db
+        self.calls: list = []
+        calls = self.calls
+
+        class Client:
+            is_connected = True
+
+            def mark_read(self, *ids, chat, sender, receipt, timestamp=None):
+                calls.append(("read", ids, f"{chat.User}@{chat.Server}",
+                              f"{sender.User}@{sender.Server}", receipt.name,
+                              time.monotonic()))
+
+            def send_chat_presence(self, to, state, media):
+                calls.append(("presence", state.name, time.monotonic()))
+
+            def send_message(self, to, message):
+                calls.append(("send", time.monotonic()))
+                return types.SimpleNamespace(ID=f"WAR{time.monotonic_ns()}",
+                                             Timestamp=int(time.time() * 1000))
+        self._client = Client()
+
+    def account(self):
+        return {"jid": OWN, "lid": OWN_LID, "device": OWN_DEVICE, "id": OWN_PHONE}
+
+    def wait_for(self, count, limit=3.0):
+        deadline = time.monotonic() + limit
+        while time.monotonic() < deadline and len(self.calls) < count:
+            time.sleep(0.005)
+        return self.calls
+
+
+@_cli.needs_store
+@needs_runner
+@needs_engine
+class Admission(DialogueCase):
+    """An admitted message is marked read and the chat shows the account
+    composing at once - before the debounce and before any model starts -
+    and the answer goes out with no pause of its own."""
+
+    def admit(self, d, session, **over):
+        msg = self.capture(_msg(**over))
+        began = time.monotonic()
+        verdict = d.offer(msg)
+        return msg, verdict, began
+
+    def test_read_then_composing_at_admission_before_the_turn(self):
+        d = self.make(_settings(defaults={"debounce": 3}))
+        session = Reacting(self.db)
+        d.attach(session)
+        for chat, sender, over in (
+                (ALICE_JID, ALICE_JID, {}),
+                (GROUP, ALICE_JID, {"text": "@15550000000 hi", "mentions": [OWN]})):
+            with self.subTest(chat=chat):
+                session.calls.clear()
+                msg, verdict, began = self.admit(d, session, chat_id=chat, **over)
+                self.assertTrue(verdict["admit"])
+                calls = session.wait_for(2)
+                self.assertEqual([c[0] for c in calls], ["read", "presence"])
+                read, presence = calls
+                self.assertEqual(read[1:5], ((msg["id"],), chat, sender, "READ"))
+                self.assertEqual(presence[1], "CHAT_PRESENCE_COMPOSING")
+                took = presence[-1] - began
+                sys.stderr.write(f"\n  measured ({chat}): admission -> read "
+                                 f"{1000 * (read[-1] - began):.1f} ms, -> composing "
+                                 f"{1000 * took:.1f} ms\n")
+                self.assertLess(took, 0.3)
+                # Before the debounce and before any model: no turn has run.
+                self.assertEqual(self.run.calls, [])
+
+    def test_a_voice_note_shows_composing_from_admission(self):
+        d = self.make(_settings(defaults={"debounce": 0}))
+        session = Reacting(self.db)
+        d.attach(session)
+        transcribing = threading.Event()
+        release = threading.Event()
+
+        def slow(session_, db, cfg, chat, message_id):
+            transcribing.set()
+            release.wait(5)
+            return {"ok": True, "text": "spoken words"}
+        with mock.patch.object(wa, "_transcribe_live_voice", slow):
+            msg, verdict, began = self.admit(d, session, kind="audioMessage", text=None)
+            self.assertEqual(verdict.get("voice"), "addressed")
+            calls = session.wait_for(2)
+            self.assertEqual([c[0] for c in calls[:2]], ["read", "presence"])
+            self.assertLess(calls[1][-1] - began, 0.3)
+            self.assertTrue(transcribing.wait(2))
+            self.assertEqual(self.run.calls, [])
+            release.set()
+            self.settle(d)
+
+    def test_composing_is_kept_up_through_the_debounce(self):
+        d = self.make(_settings(defaults={"debounce": 1}))
+        session = Reacting(self.db)
+        d.attach(session)
+        with mock.patch.object(dialogue, "PRESENCE_EVERY", 0.2):
+            self.admit(d, session)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not self.run.calls:
+                d.tick(session)
+                time.sleep(0.01)
+        composing = [c for c in session.calls if c[:2] == ("presence", "CHAT_PRESENCE_COMPOSING")]
+        self.assertGreaterEqual(len(composing), 3)
+
+    def test_an_answer_goes_out_with_no_pause_of_its_own(self):
+        d = self.make()
+        session = Reacting(self.db)
+        d.attach(session)
+        self.admit(d, session)
+        self.settle(d)
+        row = self.outgoing(ALICE_JID)[0]
+        self.assertEqual((row["text"], row["typing"]), ("hello back", 0))
+        pauses: list = []
+        session.calls.clear()
+        outcome = wa._deliver(session, wa._claim_outgoing(self.db), pause=pauses.append)
+        self.assertEqual((outcome["state"], pauses, [c[0] for c in session.calls]),
+                         ("sent", [], ["send"]))
+
+
+@_cli.needs_store
+@needs_runner
+class Broadcasts(DialogueCase):
+    """A status update, a broadcast list or a channel post is captured and
+    never judged: no gate, no store question, no log line."""
+
+    def test_a_broadcast_skips_the_gate(self):
+        d = self.make()
+        d.gate = mock.Mock(side_effect=AssertionError("judged"))
+        for chat in ("status@broadcast", "1234567890@broadcast",
+                     "120363000000000009@newsletter"):
+            with self.subTest(chat=chat):
+                verdict = d.offer(self.capture(_msg(chat_id=chat, sender=ALICE_JID)))
+                self.assertEqual((verdict["admit"], verdict["reason"]),
+                                 (False, "broadcast"))
+                self.assertIsNone(self.register_row(chat))
+        d.gate.assert_not_called()
+        self.assertEqual(self.logs, [])
+        self.assertEqual(d.stats["admitted"], 0)
 
 
 # ── The listener ────────────────────────────────────────────────────────────

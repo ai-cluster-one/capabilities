@@ -13,6 +13,12 @@ runs on the harness runner from a profile, in its own thread, per chat in
 arrival order after a debounce; its answer goes out as a pending row in
 `whatsapp_messages`, which the listener sends like any other.
 
+The moment a message is admitted for a turn, before its debounce and before
+any model starts, the person sees it was taken up: the message is marked
+read and the chat shows the account composing, refreshed until the turn ends
+and paused when it ends without an answer. A broadcast (`status@broadcast`
+and the like) or a channel post is captured and never judged at all.
+
 A voice note the settings ask to be transcribed is reserved like any other
 message, then fetched through the listener's own connection and transcribed
 on a thread of its own while it waits at its place in the chat's queue. Its
@@ -42,6 +48,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from queue import SimpleQueue
 
 REPLY_MARKER = re.compile(r"^[ \t]*=== REPLY ===[ \t]*$", re.M)
 NO_REPLY_MARKER = "#noreply"
@@ -104,6 +111,12 @@ def jid_user(jid) -> str:
 
 def is_group(chat_id) -> bool:
     return str(chat_id or "").endswith("@g.us")
+
+
+def is_broadcast(chat_id) -> bool:
+    """A status update, a broadcast list or a channel post: captured, never a
+    conversation anyone can be answered in."""
+    return str(chat_id or "").endswith(("@broadcast", "@newsletter"))
 
 
 def is_voice(msg) -> bool:
@@ -829,6 +842,11 @@ class Dialogue:
         self.due: dict[str, float] = {}
         self.running: dict[str, dict[str, Run]] = {}
         self.presence_at: dict[str, float] = {}
+        # What an admission shows the person at once - read, then composing -
+        # sent from a thread of its own, so the engine's thread never waits on
+        # the wire for it.
+        self.reactions: SimpleQueue = SimpleQueue()
+        self.reactor: threading.Thread | None = None
         self.reload_waiters: list[dict] = []
         # Messages the store could not judge, oldest first, tried again from
         # the listener's loop until the store answers or they grow stale.
@@ -956,7 +974,13 @@ class Dialogue:
 
         A message the store cannot judge because it cannot be reached is kept
         and judged again once it answers, never dropped: the gate and the
-        reservation are safe to repeat, so a retry cannot answer it twice."""
+        reservation are safe to repeat, so a retry cannot answer it twice.
+
+        A broadcast is never judged: it is no conversation, and a start
+        draining many of them must not wait on the store for each."""
+        if is_broadcast(msg.get("chat_id")):
+            return {"admit": False, "reason": "broadcast",
+                    "chat_id": msg.get("chat_id"), "message_id": msg.get("id")}
         with self.lock:
             try:
                 return self._offer(msg)
@@ -1022,6 +1046,7 @@ class Dialogue:
         except Exception:
             debounce = self.policy.channel(chat, job["phone"])["debounce"]
         self.due[chat] = self.now() + float(debounce)
+        self.react(job)
         if job.get("voice"):
             # Fetched and transcribed off the engine's thread; the turn waits
             # for it at its place in the queue, so the chat's order holds.
@@ -1034,6 +1059,56 @@ class Dialogue:
                  + (f", voice note to transcribe ({verdict['voice']})"
                     if job.get("voice") else "") + ")")
         return verdict
+
+    # -- what the person sees at once ----------------------------------------
+
+    def react(self, job) -> None:
+        """Show the person their message was taken up: marked read and the
+        chat composing, as soon as it is admitted. The composing is refreshed
+        by `tick` from here on, so it is stamped now."""
+        self.presence_at[job["chat_id"]] = self.now()
+        self.reactions.put((job, time.monotonic()))
+        if self.reactor is None or not self.reactor.is_alive():
+            self.reactor = threading.Thread(target=self._react_loop,
+                                            name="dialogue-react", daemon=True)
+            self.reactor.start()
+
+    def _react_loop(self) -> None:
+        while True:
+            item = self.reactions.get()
+            if item is None:
+                return
+            job, admitted = item
+            try:
+                self.mark_read(job)
+                self.presence(self.session, job["chat_id"], composing=True)
+                self.log(f"dialogue: {job['chat_id']} #{job['message_id']} read and "
+                         f"composing sent {1000 * (time.monotonic() - admitted):.0f} ms "
+                         "after admission")
+            except Exception as exc:
+                self.log(f"dialogue: {job['chat_id']} #{job['message_id']} could not "
+                         f"show it was taken up: {type(exc).__name__}: {exc}")
+
+    def mark_read(self, job) -> None:
+        """Send the read receipt for one admitted message. In a group the
+        receipt names the sender; in a direct chat the chat is the sender."""
+        session = self.session
+        if session is None:
+            return
+        engine = self.cli._engine()
+        chat = job["chat_id"]
+        user, _, server = chat.partition("@")
+        chat_jid = engine["build_jid"](user, server)
+        sender_jid = chat_jid
+        if job["group"] and job.get("sender"):
+            s_user, _, s_server = str(job["sender"]).partition("@")
+            sender_jid = engine["build_jid"](s_user, s_server)
+        try:
+            session._client.mark_read(job["message_id"], chat=chat_jid, sender=sender_jid,
+                                      receipt=engine["ReceiptType"].READ)
+        except Exception as exc:
+            self.log(f"dialogue: {chat} #{job['message_id']} not marked read: "
+                     f"{type(exc).__name__}: {exc}")
 
     # -- voice notes ----------------------------------------------------------
 
@@ -1122,13 +1197,15 @@ class Dialogue:
 
     # -- sending --------------------------------------------------------------
 
-    def say(self, job, text, *, typing=False) -> list[str]:
-        """Queue an answer to one request as pending rows, quoted in a group."""
+    def say(self, job, text) -> list[str]:
+        """Queue an answer to one request as pending rows, quoted in a group.
+        It goes out with no pause of its own: the chat has shown the account
+        composing since the request was admitted."""
         sent = []
         for index, part in enumerate(split_reply(text)):
             request = {"chat_id": job["chat_id"], "text": part,
                        "reply_to": job["message_id"] if job["group"] and index == 0 else None,
-                       "mentions": [], "typing": bool(typing and index == 0)}
+                       "mentions": []}
             try:
                 row = self.cli._queue_outgoing(self.db, request)
             except self.cli._Refusal as refusal:
@@ -1291,7 +1368,9 @@ class Dialogue:
 
     def tick(self, session=None) -> None:
         """Called from the listener's own loop: start what is due, keep the
-        typing indicator up, forget what finished."""
+        typing indicator up from admission to the end of the turn, forget what
+        finished."""
+        idle = []
         with self.lock:
             now = self.now()
             for chat, runs in list(self.running.items()):
@@ -1300,11 +1379,17 @@ class Dialogue:
                         runs.pop(key)
                 if not runs:
                     self.running.pop(chat, None)
-                    self.presence_at.pop(chat, None)
+                    if not self.queues.get(chat):
+                        self.presence_at.pop(chat, None)
             for chat, queue in list(self.queues.items()):
                 if not queue:
                     self.queues.pop(chat, None)
                     self.due.pop(chat, None)
+                    if not self.running.get(chat) and \
+                            self.presence_at.pop(chat, None) is not None:
+                        # Everything admitted here was dropped before a turn
+                        # ran: the composing it showed is taken down.
+                        idle.append(chat)
                     continue
                 if now < self.due.get(chat, 0):
                     continue
@@ -1323,8 +1408,11 @@ class Dialogue:
                                                   name=f"turn-{job['message_id']}",
                                                   daemon=True)
                     run.thread.start()
-            chats = [chat for chat, runs in self.running.items() if runs]
+            chats = [chat for chat in set(self.running) | set(self.queues)
+                     if self.running.get(chat) or self.queues.get(chat)]
         self.retry_deferred()
+        for chat in idle:
+            self.presence(session, chat, composing=False)
         for chat in chats:
             if now - self.presence_at.get(chat, 0) >= PRESENCE_EVERY:
                 self.presence_at[chat] = now
@@ -1351,6 +1439,7 @@ class Dialogue:
             return sum(len(queue) for queue in self.queues.values())
 
     def shutdown(self, wait: float = 5.0) -> None:
+        self.reactions.put(None)
         with self.lock:
             self.queues.clear()
             runs = [run for chat in self.running.values() for run in chat.values()]
@@ -1615,8 +1704,7 @@ class Dialogue:
             if run.handoff is not None:
                 answer = "" if run.handed_off else cut_at_reply_marker(
                     getattr(result, "answer", "") or "")
-                self.say(job, answer or HANDOFF_MARK + run.handoff["description"],
-                         typing=True)
+                self.say(job, answer or HANDOFF_MARK + run.handoff["description"])
                 outcome = "handed_off"
                 self.log(f"dialogue: {chat} #{job['message_id']} handed off to job "
                          f"{run.handoff['id']}")
@@ -1640,7 +1728,7 @@ class Dialogue:
             if not answer:
                 outcome = "silent"
                 return
-            self.say(job, answer, typing=True)
+            self.say(job, answer)
             outcome = "answered"
         except Exception as exc:
             self.log(f"dialogue: {chat} #{job['message_id']} turn error: "

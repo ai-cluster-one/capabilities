@@ -50,6 +50,7 @@
     "max_parallel_jobs": 1,
     "job_profile": "whatsapp-job-claude",
     "job_recovery": "requeue",
-    "voice_transcription": "addressed"
+    "voice_transcription": "addressed",
+    "stall_seconds": 120
   }
 }

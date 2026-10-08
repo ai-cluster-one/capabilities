@@ -130,12 +130,26 @@ Assistant service
   removed from the phone is final: the service stops reconnecting and says
   so in `service status` and `service doctor`. It sends the messages `send`
   queues for its account, oldest first and at most `defaults.send_rate` a
-  minute. A capture the store cannot take because the store is unreachable is
+  minute; a queued row wakes the sender at once (in-process, or through a
+  Postgres notification on channel whatsapp_outbox from any other process),
+  with a half-second poll behind it. A capture the store cannot take because the store is unreachable is
   appended to a spool file in the service's state directory and written into
   the store, in order and once, when it answers again (and at start);
   `service status` reports the spool depth and the store error. A send a
   previous run left in flight is failed as interrupted_delivery_unknown at
   start and never resent.
+  Liveness: a heartbeat thread publishes health every 15s whatever the
+  engine and the dialogue are doing, and a watchdog thread checks that the
+  listener's loop keeps going round and that no engine handler runs on; when
+  either has made no progress for `defaults.stall_seconds` (default 120) the
+  listener writes every thread's stack to its log and leaves with exit 9 for
+  its supervisor to restart. SIGTERM is honoured within 30s even when the
+  loop is blocked (exit 9 when it had to be forced). A `service run` or
+  `service start` that finds the account held by a listener whose health is
+  older than `stall_seconds` ends it (SIGTERM, then SIGKILL after 15s) and
+  takes over; a holder with fresh health is respected (exit 8). Health older
+  than 60s from a live holder is `stale`: `service status` reports it with
+  its age, and `service doctor` - the deploy doctor - fails on it.
   Dialogue: it answers admitted messages with a dialogue turn. Each live
   capture passes a gate in this order: its own message (never answered,
   except what the owner types from the phone in the account's own self-chat),
@@ -148,7 +162,11 @@ Assistant service
   /stop, /help, gated by control roles) or a turn. An admitted message is
   reserved in whatsapp_register before anything else, so a redelivery or a
   restart never answers it twice, and nothing before the service's first
-  sight of a chat is answered. Turns run per chat in arrival order after
+  sight of a chat is answered. A broadcast (status@broadcast, a broadcast
+  list, a channel post) is captured and never judged. The moment a message is
+  admitted for a turn it is marked read and the chat shows the account
+  composing, refreshed until the turn ends and paused when it ends without
+  an answer. Turns run per chat in arrival order after
   `debounce`, at most `max_parallel_dialogue` at once, through
   callva-harness-runner on a profile (bundled whatsapp-claude, the default,
   and whatsapp-codex; a project file in
@@ -158,8 +176,8 @@ Assistant service
   the request and the last `tail_size` stored messages; the role's
   `authority` goes to the run as CAPABILITIES_AUTH_CONTEXT. The answer, cut
   at `=== REPLY ===`, is queued as pending rows (quoting the request in a
-  group, split between paragraphs) and sent by the listener; an empty answer
-  is silent. The listener resolves the runner itself (`uv run --with`); the
+  group, split between paragraphs) and sent by the listener with no pause of
+  its own, as is a job's result; an empty answer is silent. The listener resolves the runner itself (`uv run --with`); the
   CLI does not carry it.
   Voice notes: `voice_transcription` (`/set voice-transcription`, else the
   group's or person's, else `defaults`, else `addressed`) decides which are
@@ -205,7 +223,8 @@ Assistant service
   context, voice_transcription}}`, `control {roles}`, `authority {default,
   roles}` and `defaults {tail_size, debounce, max_age, worker_timeout,
   max_parallel_dialogue, profile, send_rate, max_parallel_jobs, job_profile,
-  job_recovery requeue|inspect, voice_transcription off|addressed|auto}`. A top-level
+  job_recovery requeue|inspect, voice_transcription off|addressed|auto,
+  stall_seconds 30..3600}`. A top-level
   `send_rate` is read as `defaults.send_rate`. Any other key is refused.
   Settings that admit nobody leave the listener capturing and sending and
   answering nothing.
@@ -219,10 +238,11 @@ Assistant service
                                        Seed the settings records.
       whatsapp service start [--connection ID]
                                        Start the listener detached; returns once
-                                       it holds the account.
+                                       it holds the account (taking it over
+                                       from a stale holder).
       whatsapp service run [--connection ID]
                                        Run the listener in the foreground (the
-                                       deploy command).
+                                       deploy command). Exit 9 when it stalled.
       whatsapp service stop [--connection ID] [--timeout S] [--force]
       whatsapp service reload [--connection ID] [--timeout S]
                                        Re-read and validate the settings in the
@@ -421,6 +441,10 @@ Exit codes
      service runs on the account (the message names it). Retry, or stop the
      service; never work around it, because two clients on one linked device
      desync the account.
+  9  stalled — `service run` only: the listener made no progress for
+     `defaults.stall_seconds`, or did not stop within 30s of SIGTERM, and
+     left with every thread's stack in its log, for its supervisor to
+     restart it.
 """
 
 import argparse
@@ -428,6 +452,7 @@ import base64
 import contextlib
 import datetime
 import fcntl
+import itertools
 import json
 import os
 import platform
@@ -4640,7 +4665,8 @@ def _engine():
         from neonize.client import NewClient
         from neonize import events as nev
         from neonize.utils.jid import build_jid, Jid2String
-        from neonize.utils.enum import ChatPresence, ChatPresenceMedia, MediaType
+        from neonize.utils.enum import (ChatPresence, ChatPresenceMedia, MediaType,
+                                        ReceiptType)
         from neonize.proto.Neonize_pb2 import JID
         from neonize.proto.waE2E import WAWebProtobufsE2E_pb2 as e2e
         from neonize.proto.waCompanionReg import (
@@ -4665,7 +4691,7 @@ def _engine():
         "Jid2String": Jid2String, "MediaType": MediaType, "JID": JID,
         "companion": companion, "history_proto": history_proto,
         "e2e": e2e, "ChatPresence": ChatPresence,
-        "ChatPresenceMedia": ChatPresenceMedia,
+        "ChatPresenceMedia": ChatPresenceMedia, "ReceiptType": ReceiptType,
     }
     return _ENGINE
 
@@ -5867,14 +5893,24 @@ class Session:
         # The assistant service's dialogue, offered every message captured
         # live. A verb leaves it unset.
         self.on_live = None
+        # Every handler running right now, with when it began: how the
+        # service's watchdog tells a handler that never returns.
+        self.inflight: dict[int, tuple[str, float]] = {}
+        self._inflight_ids = itertools.count()
 
     # -- lifecycle ---------------------------------------------------------
 
     def _guard(self, fn):
         """A handler that dies quietly looks exactly like an idle server. It is
         recorded, printed, and surfaced by whatever verb is running."""
+        name = getattr(fn, "__name__", "handler")
+        if not hasattr(self, "inflight"):
+            self.inflight, self._inflight_ids = {}, itertools.count()
+
         def wrapper(_client, event):
             self.last_event_at = time.time()
+            token = next(self._inflight_ids)
+            self.inflight[token] = (name, time.monotonic())
             try:
                 fn(event)
             except Exception:
@@ -5882,6 +5918,8 @@ class Session:
                 self.errors.append(detail.strip().splitlines()[-1])
                 _log("engine handler failed — this is a failure, not an empty "
                      "server:\n" + detail)
+            finally:
+                self.inflight.pop(token, None)
         return wrapper
 
     def _register(self, client) -> None:
@@ -8268,6 +8306,13 @@ TYPING_SECONDS = (1.5, 3.5)       # how long `--typing` shows composing, jittere
 DELIVERY_INTERRUPTED = "interrupted_delivery_unknown"
 
 
+# A queued message wakes the account's sender at once: in this process through
+# the event the running listener hands in, from any other process through a
+# notification on this channel, carrying the account, sent when the row commits.
+OUTBOX_CHANNEL = "whatsapp_outbox"
+_OUTBOX_WAKE: threading.Event | None = None
+
+
 def _mention_jid(raw: str) -> str:
     digits = _digits(raw)
     if not digits:
@@ -8329,6 +8374,12 @@ def _queue_outgoing(db, request: dict) -> dict:
              kind, request["text"], request.get("reply_to"),
              request.get("mentions") or None, bool(request.get("typing")),
              OUTBOUND_SYNC, _iso_now()))
+        db.execute("SELECT pg_notify(%s, %s)", (OUTBOX_CHANNEL, db.account))
+    wake = _OUTBOX_WAKE
+    if wake is not None and not db.write_depth:
+        # Committed: the sender can claim it now. Inside a caller's
+        # transaction the notification wakes it once that commits.
+        wake.set()
     return _outgoing_row(db, local_id)
 
 
@@ -9529,7 +9580,15 @@ SERVICE_BACKOFF_CEILING = 60.0    # the longest wait between attempts
 SERVICE_STABLE_AFTER = 60.0       # a connection held this long resets the backoff
 SERVICE_START_TIMEOUT = 60.0      # `start` waits this long for the daemon's proof
 SERVICE_STOP_TIMEOUT = 40.0       # the engine is given ENGINE_STOP_TIMEOUT inside it
-SERVICE_TICK = 0.5
+SERVICE_TICK = 0.5                # the sender's fallback poll; a queued row wakes it at once
+SERVICE_STALL_DEFAULT = 120       # defaults.stall_seconds: no progress this long ends the listener
+SERVICE_STALL_EXIT = 9            # how a listener leaves that stalled or could not stop in time
+SERVICE_TERM_GRACE = 30.0         # a stop request is honoured within this, blocked or not
+SERVICE_WATCH_EVERY = 1.0         # how often the watchdog looks at progress
+SERVICE_TAKEOVER_GRACE = 15.0     # a stale holder's time to leave after SIGTERM, before SIGKILL
+SERVICE_STALE_CONFIRM = 2.0       # a holder found stale is read again after this, once
+SERVICE_STALL_SEAM_ENV = "WHATSAPP_SERVICE_STALL_SEAM"
+OUTBOX_LISTEN_WAIT = 5.0          # how long one wait for a notification lasts
 
 
 def _json_file(path: Path):
@@ -9554,7 +9613,8 @@ def _pid_alive(pid) -> bool:
 def _atomic_json(path: Path, value: dict) -> None:
     """Replace one user-only control file in one step."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2,
                                     sort_keys=True) + "\n")
     temporary.chmod(0o600)
@@ -9586,6 +9646,45 @@ def _service_owner(paths: dict[str, Path]) -> dict | None:
     if isinstance(owner, dict) and _pid_alive(owner.get("pid")):
         return owner
     return None
+
+
+def _owner_stale_for(paths: dict[str, Path], owner: dict | None,
+                     limit: float) -> float | None:
+    """How long the account's live holder has published no health, when that
+    is longer than `limit`; else None. Health published under another launch
+    is none of this holder's, so its silence counts from its own start."""
+    if not owner:
+        return None
+    health = _json_file(paths["health"])
+    updated = None
+    if isinstance(health, dict) and health.get("launch_nonce") == owner.get("launch_nonce"):
+        updated = health.get("updated_epoch")
+    if not isinstance(updated, (int, float)):
+        with contextlib.suppress(OSError):
+            updated = paths["owner"].stat().st_mtime
+    if not isinstance(updated, (int, float)):
+        return None
+    age = time.time() - updated
+    return age if age > limit else None
+
+
+def _listener_process(pid) -> bool:
+    """Whether a pid is a listener at all, asked of the process table, so an
+    owner record whose pid now names something else is never signalled."""
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(int(pid))],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return " service run" in out
+
+
+def _try_flock(handle) -> bool:
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
 
 
 def _account_lock_free(paths: dict[str, Path]) -> bool:
@@ -9687,6 +9786,13 @@ def _settings_send_rate(settings: dict) -> int:
     if rate is None:
         rate = settings.get("send_rate")
     return int(rate or SEND_RATE_DEFAULT)
+
+
+def _settings_stall_seconds(settings: dict) -> int:
+    """How long the listener may make no progress: `defaults.stall_seconds`,
+    else the default."""
+    value = ((settings or {}).get("defaults") or {}).get("stall_seconds")
+    return int(value or SERVICE_STALL_DEFAULT)
 
 
 def _checked_service_settings() -> dict:
@@ -9906,7 +10012,9 @@ def _cmd_service_status(connection_flag: str | None) -> dict:
     running = owner is not None
     health = _service_health(paths, running)
     if running and health.get("launch_nonce") != owner.get("launch_nonce"):
-        health = {"state": "unknown", "age_seconds": None}
+        silent = _owner_stale_for(paths, owner, SERVICE_STALE_AFTER)
+        health = ({"state": "stale", "age_seconds": round(silent, 1)}
+                  if silent is not None else {"state": "unknown", "age_seconds": None})
     started = health.get("started_epoch")
     return {
         "initialized": bool(settings),
@@ -9939,6 +10047,10 @@ def _cmd_service_status(connection_flag: str | None) -> dict:
         "project": str(root),
         "owner_project": owner.get("project_root") if running else None,
         "health_age_seconds": health.get("age_seconds"),
+        "stale_after_seconds": SERVICE_STALE_AFTER,
+        "progress_age_seconds": (health.get("progress_age_seconds")
+                                 if running else None),
+        "stall_seconds": _settings_stall_seconds(settings),
         "control_dir": str(paths["state"]),
         "log_file": str(paths["log"]),
     }
@@ -10053,14 +10165,17 @@ def _cmd_service_start(connection_flag: str | None) -> dict:
         _require_profiles(root, settings)
     paths = _service_paths(cfg)
     owner = _service_owner(paths)
-    if owner is not None:
+    stale = _owner_stale_for(paths, owner, _settings_stall_seconds(settings))
+    if owner is not None and stale is None:
         _refuse(8, "service_running",
                 f"the {NAME} assistant service already owns account "
                 f"{cfg['account_key']} (pid {owner.get('pid')}, project "
                 f"{owner.get('project_root')})",
                 f"one service holds one account; `{NAME} service status` "
                 "reports it")
-    if not _account_lock_free(paths):
+    # A holder stale beyond stall_seconds is the listener's to take over;
+    # anything else holding the lock is waited for.
+    if owner is None and not _account_lock_free(paths):
         _refuse(8, "session_busy",
                 f"another invocation holds the session for connection "
                 f"{cfg['id']!r}",
@@ -10098,6 +10213,8 @@ def _cmd_service_start(connection_flag: str | None) -> dict:
                 "\n".join(tail) or f"read `{NAME} service logs`")
     out = _cmd_service_status(cfg["id"])
     out["started"] = True
+    if owner is not None:
+        out["took_over_from"] = owner.get("pid")
     return out
 
 
@@ -10304,6 +10421,15 @@ def _cmd_service_doctor(connection_flag: str | None) -> tuple[dict, int]:
         check("ownership", False, "the device was removed from the account; "
               f"the service stopped reconnecting. Stop it, re-link with `{NAME} "
               "pair --recreate --yes`, and start it again", 7, "logged_out")
+    elif status["running"] and status["state"] == "stale":
+        check("ownership", False,
+              f"pid {status['pid']} holds the account from "
+              f"{status['owner_project']} but has published no health for "
+              f"{status['health_age_seconds']:.0f}s (stale after "
+              f"{SERVICE_STALE_AFTER:g}s): it is not making progress. A stalled "
+              f"listener leaves on its own after stall_seconds "
+              f"({status['stall_seconds']}s); `{NAME} service start` or `run` "
+              "takes over a holder stale beyond it", 5, "service_stale")
     elif status["running"]:
         healthy = status["state"] == "healthy" and status["connected"]
         check("ownership", healthy,
@@ -10502,6 +10628,14 @@ class _ServiceDaemon:
     """The listener: hold one Session for as long as the wire stays up, rebuild
     it with backoff when it drops, stop for good when the device is removed.
 
+    It never holds the account hostage. A heartbeat thread publishes health on
+    its own schedule, whatever the engine and the dialogue are doing; a
+    watchdog thread checks that the listener's loop keeps going round and that
+    no engine handler runs for ever, and when either stops for longer than
+    `stall_seconds` it writes every thread's stack to the log and leaves at
+    once with exit 9, for its supervisor to restart. A stop request is honoured
+    within a grace period even when the loop is blocked.
+
     `session_factory` and `sleep` are the seams a test drives it through; the
     process itself always builds the real Session."""
 
@@ -10533,6 +10667,23 @@ class _ServiceDaemon:
         # The dialogue, when the settings admit anyone; None leaves the
         # listener capturing and sending and answering nothing.
         self.dialogue = dialogue
+        # Set by whatever wants the loop to look again at once: a queued
+        # message, a stop, a reload, a forced drop.
+        self.wake = threading.Event()
+        # Liveness: where the loop last made progress, the session whose
+        # handlers are watched, and what leaving looks like.
+        self.health_lock = threading.Lock()
+        self.progress_at = time.monotonic()
+        self.progress_where = "starting"
+        self.session = None
+        self.stall_seconds = _settings_stall_seconds(settings)
+        self.term_grace = SERVICE_TERM_GRACE
+        self.term_timer: threading.Timer | None = None
+        self.leaving = threading.Event()
+        self.exit_lock = threading.Lock()
+        self.hard_exit = os._exit
+        self.backstop = True
+        self.took_over: int | None = None
 
     # -- process plumbing ---------------------------------------------------
 
@@ -10542,14 +10693,193 @@ class _ServiceDaemon:
         sys.stderr.write(f"{stamp} {message}\n")
         sys.stderr.flush()
 
+    def request_stop(self) -> None:
+        self.stop_requested.set()
+        self.wake.set()
+
     def install_signals(self) -> None:
         import signal
-        signal.signal(signal.SIGTERM, lambda *_: self.stop_requested.set())
-        signal.signal(signal.SIGINT, lambda *_: self.stop_requested.set())
-        signal.signal(signal.SIGHUP, lambda *_: self.reload_requested.set())
+
+        def flag(event):
+            def handler(*_):
+                event.set()
+                self.wake.set()
+            return handler
+        signal.signal(signal.SIGTERM, flag(self.stop_requested))
+        signal.signal(signal.SIGINT, flag(self.stop_requested))
+        signal.signal(signal.SIGHUP, flag(self.reload_requested))
         # Drop the socket and go through the reconnect path: the forced
         # disconnect a reconnect is proven with.
-        signal.signal(signal.SIGUSR1, lambda *_: self.drop_requested.set())
+        signal.signal(signal.SIGUSR1, flag(self.drop_requested))
+        if os.environ.get(SERVICE_STALL_SEAM_ENV) == "1":
+            # Block the loop for good, the way a lock never released would:
+            # how the stall rule is exercised.
+            signal.signal(signal.SIGUSR2, lambda *_: self.stall_seam())
+        # The interpreter runs a handler only on the main thread, between two
+        # of its steps, so a main thread that is blocked never runs one. The
+        # signal itself writes to the wakeup descriptor, so a thread of its
+        # own sees a stop request whatever the main thread is doing.
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(write_fd, False)
+        signal.set_wakeup_fd(write_fd, warn_on_full_buffer=False)
+        threading.Thread(target=self.watch_signals, args=(read_fd,),
+                         name="service-signals", daemon=True).start()
+
+    def watch_signals(self, read_fd: int) -> None:
+        import signal
+        stops = {int(signal.SIGTERM), int(signal.SIGINT)}
+        while True:
+            try:
+                data = os.read(read_fd, 64)
+            except OSError:
+                return
+            if not data:
+                return
+            if stops & set(data):
+                self.request_stop()
+                self.honour_stop()
+
+    def honour_stop(self) -> None:
+        """Leave within the grace period of a stop request, however it is
+        going: a listener asked to stop that cannot is as stuck as one that
+        stalled."""
+        if self.term_timer is not None:
+            return
+        timer = threading.Timer(self.term_grace, lambda: self.leave_stalled(
+            f"the stop request was not honoured within {self.term_grace:g}s"))
+        timer.daemon = True
+        self.term_timer = timer
+        timer.start()
+
+    def stall_seam(self) -> None:
+        self.log("stall seam: blocking the listener's loop on purpose")
+        never = threading.Lock()
+        never.acquire()
+        never.acquire()
+
+    # -- liveness -------------------------------------------------------------
+
+    def beat(self, where: str) -> None:
+        """The loop made progress, here."""
+        self.progress_at = time.monotonic()
+        self.progress_where = where
+
+    def stalled_on(self) -> str | None:
+        """What has made no progress for longer than `stall_seconds`, or None.
+        The clock is the monotonic one, which stands still while the machine
+        sleeps, so a sleep is never a stall."""
+        now = time.monotonic()
+        idle = now - self.progress_at
+        if idle > self.stall_seconds:
+            return (f"the listener's loop made no progress for {idle:.0f}s (last "
+                    f"at: {self.progress_where})")
+        inflight = getattr(self.session, "inflight", None) or {}
+        for name, began in list(inflight.values()):
+            if now - began > self.stall_seconds:
+                return f"the engine handler {name} has run for {now - began:.0f}s"
+        return None
+
+    def watch_progress(self) -> None:
+        import faulthandler
+        while not self.leaving.wait(SERVICE_WATCH_EVERY):
+            if self.backstop:
+                # Should this thread itself never run again - the interpreter
+                # held for good - the interpreter's own watchdog dumps and exits.
+                faulthandler.dump_traceback_later(2 * self.stall_seconds, exit=True)
+            stalled = self.stalled_on()
+            if stalled:
+                self.leave_stalled(stalled)
+                return
+        if self.backstop:
+            faulthandler.cancel_dump_traceback_later()
+
+    def heartbeat(self) -> None:
+        """Publish health on a schedule of its own. The wall clock decides
+        when, so the first look after the machine wakes publishes at once."""
+        last = 0.0
+        while not self.leaving.wait(1.0):
+            if time.time() - last >= SERVICE_HEARTBEAT:
+                last = time.time()
+                with contextlib.suppress(Exception):
+                    self.write_health(None, {}, timeout=5.0)
+
+    def dump_stacks(self, reason: str) -> None:
+        """Every thread's stack, into the daemon log and onto stderr, written
+        straight to the descriptors so no lock a stuck thread holds is needed."""
+        import faulthandler
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds")
+        header = f"{stamp} stalled: {reason}; the stack of every thread follows\n"
+        targets = [2]
+        log_fd = None
+        with contextlib.suppress(OSError):
+            self.paths["state"].mkdir(parents=True, exist_ok=True, mode=0o700)
+            log_fd = os.open(self.paths["log"],
+                             os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            mine, theirs = os.fstat(log_fd), None
+            with contextlib.suppress(OSError):
+                theirs = os.fstat(2)
+            if theirs is None or (mine.st_dev, mine.st_ino) != (theirs.st_dev,
+                                                                 theirs.st_ino):
+                targets.append(log_fd)
+        for fd in targets:
+            with contextlib.suppress(Exception):
+                os.write(fd, header.encode())
+                faulthandler.dump_traceback(file=fd, all_threads=True)
+        if log_fd is not None:
+            os.close(log_fd)
+
+    def leave_stalled(self, reason: str) -> None:
+        """Leave now, for the supervisor to start a listener that works:
+        stacks to the log, health marked stalled, exit 9. Nothing is released
+        gracefully - a graceful release may wait on what is stuck - and the
+        account lock goes with the process."""
+        if not self.exit_lock.acquire(blocking=False):
+            return
+        if self.backstop:
+            import faulthandler
+            faulthandler.cancel_dump_traceback_later()
+        self.dump_stacks(reason)
+        with contextlib.suppress(Exception):
+            self.write_health("stalled", {"connected": False, "last_error": reason,
+                                          "stalled_at": _epoch_iso(time.time())},
+                              timeout=1.0)
+        envelope = {"error": {
+            "code": "service_stalled", "message": reason,
+            "hint": f"the listener left with exit {SERVICE_STALL_EXIT} to be "
+                    "restarted; the stacks above say where it stood"}}
+        with contextlib.suppress(OSError):
+            os.write(2, (json.dumps(envelope, ensure_ascii=False) + "\n").encode())
+        self.hard_exit(SERVICE_STALL_EXIT)
+
+    def listen_outbox(self) -> None:
+        """Wake the sender when another process queues a message for this
+        account. The poll in the loop remains the fallback."""
+        account = _store_account(self.cfg)
+        conn = None
+        reported = False
+        while not self.leaving.is_set():
+            try:
+                if conn is None:
+                    conn = connect(application_name=f"{NAME}-outbox",
+                                   setting=read_setting())
+                    conn.autocommit = True
+                    conn.execute(f"LISTEN {OUTBOX_CHANNEL}")
+                    reported = False
+                for note in conn.notifies(timeout=OUTBOX_LISTEN_WAIT):
+                    if note.payload == account:
+                        self.wake.set()
+            except Exception as exc:
+                if not reported:
+                    self.log(f"outbox notifications unavailable "
+                             f"({_error_line(exc)}); the sender polls")
+                    reported = True
+                with contextlib.suppress(Exception):
+                    conn.close()
+                conn = None
+                self.leaving.wait(SPOOL_RETRY)
+        with contextlib.suppress(Exception):
+            conn.close()
 
     def owner_record(self) -> dict:
         return {"schema": SERVICE_OWNER_SCHEMA, "launch_nonce": self.nonce,
@@ -10563,28 +10893,50 @@ class _ServiceDaemon:
                 "started_at": _epoch_iso(self.started)}
 
     def publish(self, state: str | None = None, **updates) -> None:
-        now = time.time()
-        self.health.update({
-            "schema": SERVICE_HEALTH_SCHEMA, "pid": os.getpid(),
-            "launch_nonce": self.nonce, "connection": self.cfg["id"],
-            "account": self.cfg["account_key"],
-            "environment": self.settings.get("environment"),
-            "started_at": _epoch_iso(self.started), "started_epoch": self.started,
-            "updated_at": _epoch_iso(now), "updated_epoch": now,
-            "reconnects": self.reconnects, "messages_captured": self.messages,
-            "messages_sent": self.sent, "send_failures": self.send_failures,
-            "send_rate": self.send_rate(), "spool_depth": self.spool.depth(),
-            "store_error": self.spool.store_error,
-            "dialogue": (self.dialogue.summary() if self.dialogue is not None
-                         else {"enabled": False}),
-            "stale_after_seconds": SERVICE_STALE_AFTER, **updates})
-        if state is not None:
-            self.health["state"] = state
-        _atomic_json(self.paths["health"], self.health)
+        dialogue = (self.dialogue.summary() if self.dialogue is not None
+                    else {"enabled": False})
+        self.write_health(state, {"dialogue": dialogue, **updates})
+
+    def write_health(self, state: str | None, updates: dict, *,
+                     timeout: float = -1) -> bool:
+        """Write the health file. The heartbeat calls this alone, with nothing
+        the engine or the dialogue holds, so health keeps its own time."""
+        if not self.health_lock.acquire(timeout=timeout):
+            return False
+        try:
+            now = time.time()
+            self.health.update({
+                "schema": SERVICE_HEALTH_SCHEMA, "pid": os.getpid(),
+                "launch_nonce": self.nonce, "connection": self.cfg["id"],
+                "account": self.cfg["account_key"],
+                "environment": self.settings.get("environment"),
+                "started_at": _epoch_iso(self.started), "started_epoch": self.started,
+                "updated_at": _epoch_iso(now), "updated_epoch": now,
+                "reconnects": self.reconnects, "messages_captured": self.messages,
+                "messages_sent": self.sent, "send_failures": self.send_failures,
+                "send_rate": self.send_rate(), "spool_depth": self.spool.depth(),
+                "store_error": self.spool.store_error,
+                "progress_age_seconds": round(time.monotonic() - self.progress_at, 1),
+                "progress_at": self.progress_where,
+                "stall_seconds": self.stall_seconds,
+                "stale_after_seconds": SERVICE_STALE_AFTER, **updates})
+            if state is not None:
+                self.health["state"] = state
+            _atomic_json(self.paths["health"], self.health)
+            return True
+        finally:
+            self.health_lock.release()
 
     def wait(self, seconds: float) -> None:
-        """Sleep that a stop request cuts short."""
-        self.stop_requested.wait(seconds)
+        """Sleep that a stop request cuts short. Waiting is what the loop is
+        meant to be doing, so it counts as progress."""
+        deadline = time.monotonic() + seconds
+        while not self.stop_requested.is_set():
+            self.beat("waiting to reconnect")
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            self.stop_requested.wait(min(left, 1.0))
 
     def start_jobs(self) -> None:
         """Start the dialogue's job runner. It looks at the register on its own
@@ -10625,6 +10977,7 @@ class _ServiceDaemon:
                 self.dialogue.after_reload(message)
             return
         self.settings = data
+        self.stall_seconds = _settings_stall_seconds(data)
         if self.dialogue is not None:
             self.dialogue.after_reload(None)
         generation = int(self.health.get("settings_generation") or 0) + 1
@@ -10698,7 +11051,12 @@ class _ServiceDaemon:
             if outcome["state"] == "sent":
                 self.sent += 1
                 delivered += 1
-                self.log(f"sent {row['local_id']} as {outcome['message_id']}")
+                waited = ""
+                with contextlib.suppress(Exception):
+                    queued = datetime.datetime.fromisoformat(str(row["requested_at"]))
+                    waited = (f", {1000 * (time.time() - queued.timestamp()):.0f} ms "
+                              "after it was queued")
+                self.log(f"sent {row['local_id']} as {outcome['message_id']}{waited}")
             else:
                 self.send_failures += 1
                 self.log(f"send {row['local_id']} failed: {outcome['error']}")
@@ -10733,7 +11091,9 @@ class _ServiceDaemon:
         session = None
         base = self.messages
         try:
+            self.beat("opening a session")
             session = self.session_factory()
+            self.session = session
             self.attempts.append(time.monotonic())
             session.spool = self.spool
             if self.dialogue is not None:
@@ -10747,6 +11107,7 @@ class _ServiceDaemon:
             session.open()
             deadline = time.monotonic() + CONNECT_TIMEOUT
             while not session.wait_connected(1.0):
+                self.beat("connecting")
                 if self.stop_requested.is_set():
                     return "stopped"
                 if session._logged_out.is_set():
@@ -10766,6 +11127,7 @@ class _ServiceDaemon:
             beat = time.monotonic()
             errors_seen = len(session.errors)
             while True:
+                self.beat("holding the connection")
                 if self.stop_requested.is_set():
                     return "stopped"
                 if session._logged_out.is_set():
@@ -10809,7 +11171,8 @@ class _ServiceDaemon:
                     with contextlib.suppress(Exception):
                         connected = bool(session._client.is_connected)
                     self.publish(connected=connected, **self.track(session))
-                self.stop_requested.wait(SERVICE_TICK)
+                if self.wake.wait(SERVICE_TICK):
+                    self.wake.clear()
         except _Refusal as refusal:
             self.last_error = f"{refusal.code}: {refusal.message}"
             if refusal.code in ("not_linked", "logged_out"):
@@ -10822,6 +11185,7 @@ class _ServiceDaemon:
             self.last_error = f"{type(exc).__name__}: {exc}"
             return "disconnected"
         finally:
+            self.beat("closing the session")
             if self.dialogue is not None:
                 self.dialogue.attach(None)
             if session is not None:
@@ -10830,11 +11194,13 @@ class _ServiceDaemon:
                     self.health.update(self.track(session))
                 session.close()
                 self.stalled = bool(getattr(session, "stalled", False))
+            self.session = None
 
     def loop(self) -> int:
         backoff = SERVICE_BACKOFF_START
         self.last_error = None
         while not self.stop_requested.is_set():
+            self.beat("starting a connection")
             began = time.monotonic()
             outcome = self.hold()
             if self.stalled:
@@ -10852,6 +11218,7 @@ class _ServiceDaemon:
                 self.publish(state, connected=False, last_error=self.last_error
                              or "the device was removed from the account")
                 while not self.stop_requested.is_set():
+                    self.beat("logged out, waiting to be stopped")
                     if self.reload_requested.is_set():
                         self.apply_reload()
                     self.stop_requested.wait(SERVICE_TICK)
@@ -10867,6 +11234,37 @@ class _ServiceDaemon:
             backoff = min(backoff * 2, SERVICE_BACKOFF_CEILING)
         return 0
 
+    def take_over(self, handle, owner: dict) -> bool:
+        """End a holder that has stopped making progress and take the account
+        from it. A holder is taken over only when it is a listener, its health
+        is older than `stall_seconds` and still is a moment later; it is asked
+        to leave first and killed only when it does not."""
+        import signal
+        stale = _owner_stale_for(self.paths, owner, self.stall_seconds)
+        if stale is None:
+            return False
+        time.sleep(SERVICE_STALE_CONFIRM)
+        stale = _owner_stale_for(self.paths, owner, self.stall_seconds)
+        pid = owner.get("pid")
+        if stale is None or not _listener_process(pid):
+            return False
+        self.log(f"the account's holder, pid {pid}, has published no health for "
+                 f"{stale:.0f}s (limit {self.stall_seconds}s); ending it and taking "
+                 "over")
+        for sig, grace in ((signal.SIGTERM, SERVICE_TAKEOVER_GRACE),
+                           (signal.SIGKILL, 5.0)):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, sig)
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                if _try_flock(handle):
+                    self.log(f"took the account over from pid {pid}"
+                             + (" after killing it" if sig == signal.SIGKILL else ""))
+                    self.took_over = pid
+                    return True
+                time.sleep(0.1)
+        return False
+
     def run(self) -> int:
         """Own the account for the life of the process, or refuse to start."""
         self.paths["state"].mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -10874,19 +11272,21 @@ class _ServiceDaemon:
         handle = self.paths["lock"].open("a+")
         with contextlib.suppress(OSError):
             self.paths["lock"].chmod(0o600)
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            handle.close()
+        if not _try_flock(handle):
             owner = _service_owner(self.paths)
-            _refuse(8, "service_running" if owner else "session_busy",
-                    (f"the {NAME} assistant service already owns account "
-                     f"{self.cfg['account_key']} (pid {owner.get('pid')})"
-                     if owner else
-                     f"another invocation holds the session for connection "
-                     f"{self.cfg['id']!r}"),
-                    "one listener holds one account")
+            if owner is None or not self.take_over(handle, owner):
+                handle.close()
+                _refuse(8, "service_running" if owner else "session_busy",
+                        (f"the {NAME} assistant service already owns account "
+                         f"{self.cfg['account_key']} (pid {owner.get('pid')})"
+                         if owner else
+                         f"another invocation holds the session for connection "
+                         f"{self.cfg['id']!r}"),
+                        "one listener holds one account")
         self.install_signals()
+        global _OUTBOX_WAKE
+        _OUTBOX_WAKE = self.wake
+        self.beat("starting")
         code = 0
         try:
             _atomic_json(self.paths["owner"], self.owner_record())
@@ -10894,6 +11294,10 @@ class _ServiceDaemon:
             self.log(f"assistant service starting: connection {self.cfg['id']}, "
                      f"account {self.cfg['account_key']}, project {self.root}")
             self.publish("starting", connected=False, last_error=None)
+            for target, name in ((self.heartbeat, "service-heartbeat"),
+                                 (self.watch_progress, "service-watchdog"),
+                                 (self.listen_outbox, "service-outbox")):
+                threading.Thread(target=target, name=name, daemon=True).start()
             self.start_jobs()
             code = self.loop()
             return code
@@ -10917,6 +11321,12 @@ class _ServiceDaemon:
             with contextlib.suppress(Exception):
                 if self.paths["pid"].read_text().strip() == str(os.getpid()):
                     self.paths["pid"].unlink()
+            self.leaving.set()
+            if self.backstop:
+                import faulthandler
+                faulthandler.cancel_dump_traceback_later()
+            if _OUTBOX_WAKE is self.wake:
+                _OUTBOX_WAKE = None
             if not self.stalled:
                 # A stalled engine thread may still be on the wire; the lock
                 # then goes only with the process, which leaves at once.
