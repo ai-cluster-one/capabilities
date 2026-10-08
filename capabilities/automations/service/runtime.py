@@ -2178,13 +2178,18 @@ class MachineService:
     def _admit(self, entry: dict) -> None:
         """Serve a project on the list if it can be: the checks a project takes
         before every action, asked of the host; then the project's lock; then
-        its declaration. What stops it is said once, until it changes."""
+        its declaration. What stops it is said once, until it changes. A state
+        root the project cannot be served from is the project's `error`, and
+        asked again like any other refusal."""
         host, refusal = self.host.admit(entry)
         lock = None
         if refusal is None:
             state_dir = Path(host.state_dir)
-            lock = take_lock(state_dir)
-            if lock is None:
+            try:
+                lock = take_lock(state_dir)
+            except OSError as exc:
+                refusal = ("error", f"its state root {state_dir} cannot be used: {_why(exc)}")
+            if refusal is None and lock is None:
                 holder = read_pid(state_dir)
                 if holder == os.getpid():
                     refusal = ("refused", "the machine service is still letting go of it")
@@ -2194,17 +2199,26 @@ class MachineService:
                 else:
                     refusal = ("refused", "another process holds this project's lock "
                                           f"{state_dir / LOCK_FILE}")
-        if refusal is not None:
-            entry["state"], entry["reason"] = refusal
-            if entry.get("said") != refusal:
-                entry["said"] = refusal
-                self.project_log(entry["slug"], self.host.project_state_dir(entry["slug"]),
-                                 f"{refusal[0]}: {refusal[1]}; asking again every "
-                                 f"{ADMIT_SECONDS:g}s and starting nothing for it meanwhile")
-            return
-        slot = ProjectSlot(self, entry, host, lock)
-        entry["slot"], entry["said"] = slot, None
-        slot.open()
+        if refusal is None:
+            slot = ProjectSlot(self, entry, host, lock)
+            try:
+                slot.open()
+            except OSError as exc:
+                if read_pid(slot.state_dir) == os.getpid():
+                    with contextlib.suppress(OSError):
+                        (slot.state_dir / PID_FILE).unlink()
+                lock.close()
+                refusal = ("error", f"its state root {slot.state_dir} cannot be used: "
+                                    f"{_why(exc)}")
+            else:
+                entry["slot"], entry["said"] = slot, None
+                return
+        entry["state"], entry["reason"] = refusal
+        if entry.get("said") != refusal:
+            entry["said"] = refusal
+            self.project_log(entry["slug"], self.host.project_state_dir(entry["slug"]),
+                             f"{refusal[0]}: {refusal[1]}; asking again every "
+                             f"{ADMIT_SECONDS:g}s and starting nothing for it meanwhile")
 
     # --- stopping --------------------------------------------------------------
 

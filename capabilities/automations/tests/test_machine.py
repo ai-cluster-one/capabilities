@@ -455,6 +455,40 @@ def test_a_project_that_does_not_load_is_paused_or_refused_leaves_the_others_ser
 
 
 @needs_store
+@pytest.mark.skipif(os.geteuid() == 0, reason="permissions do not bind root")
+def test_a_project_whose_state_root_cannot_be_used_is_an_error_and_the_others_stay_served(farm):
+    """One project whose state root cannot be made, and one whose state root
+    takes its lock but not its pid, are each `error` with the reason; the
+    others are served throughout, and each is served once its root is usable."""
+    farm.project("alpha")
+    sealed = farm.tmp / "sealed"
+    sealed.mkdir()
+    farm.project("delta", env_text=f"AUTOMATIONS_STATE_DIR={sealed / 'delta'}\n")
+    shut = farm.tmp / "shut"
+    shut.mkdir()
+    (shut / "daemon.lock").touch()
+    farm.project("omega", env_text=f"AUTOMATIONS_STATE_DIR={shut}\n")
+    for name in ("alpha", "delta", "omega"):
+        assert farm.ok(name, "service", "join")["joined"] is True
+    sealed.chmod(0o555)
+    shut.chmod(0o555)
+    try:
+        farm.ok(None, "service", "start", "--machine")
+        for name in ("delta", "omega"):
+            assert "cannot be used" in farm.until_state(name, "error")["reason"]
+        farm.until_state("alpha", "served")
+        queued = farm.ok("alpha", "run", "probe")["run"]
+        until(lambda: any(r["id"] == queued["id"] and r["status"] == "succeeded"
+                          for r in farm.runs("alpha")), 30, "alpha's manual run")
+        assert farm.machine()["running"] is True
+    finally:
+        sealed.chmod(0o755)
+        shut.chmod(0o755)
+    for name in ("delta", "omega"):
+        farm.until_state(name, "served")
+
+
+@needs_store
 def test_one_process_serves_a_project_at_a_time_in_both_directions(farm):
     farm.project("alpha", beat=False)
     own = farm.ok("alpha", "service", "start")
