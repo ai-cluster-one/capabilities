@@ -1,10 +1,11 @@
 """The machine's store setting: `capabilities store set|show|doctor|unset`.
 
-The setting is the one store pointer. The manager writes it, the non-secret
-values to `$XDG_CONFIG_HOME/capabilities/store.json` and the password to its
-own credentials tier at mode 0600; its own records in database mode resolve
-their store from it, `CAPABILITIES_STORE_URL` overriding it; a capability reads
-it through the store tier and writes nothing.
+The setting is the one store pointer, the family's file
+`$XDG_CONFIG_HOME/agentkit/store.json` with the password inside it at mode
+0600. The manager writes it; its own records in database mode resolve their
+store from it, `AGENTKIT_STORE_URL` then `CAPABILITIES_STORE_URL` overriding
+it; a capability reads it through the store tier and writes nothing. While the
+file is absent the legacy pair under `$XDG_CONFIG_HOME/capabilities/` is read.
 
 Everything runs against a scratch HOME. The doctor and the records tests build
 a throwaway PostgreSQL with TLS on a loopback port when `initdb`, `pg_ctl` and
@@ -61,6 +62,7 @@ def _env(tmp_path: Path) -> dict[str, str]:
                 "CAPABILITIES_AUTH_CONTEXT", "CAPABILITIES_PROJECT_ENVELOPE",
                 "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "CAPABILITIES_PROJECT_ID",
                 "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_STORE_URL",
+                "AGENTKIT_STORE_URL",
                 "CAPABILITIES_STORE_MODE", "CAPABILITIES_DEV_SESSION",
                 "CAPABILITIES_WORKSPACE", "STORE_FIX_PASSWORD"):
         env.pop(key, None)
@@ -106,14 +108,33 @@ def _no_secret(result: subprocess.CompletedProcess, secret: str = PASSWORD) -> N
     assert secret not in result.stdout and secret not in result.stderr
 
 
+def _family(env: dict) -> Path:
+    return Path(env["XDG_CONFIG_HOME"]) / "agentkit" / "store.json"
+
+
+def _written(env: dict) -> dict:
+    return json.loads(_family(env).read_text())
+
+
 def _files(env: dict) -> tuple[Path, Path]:
+    """The legacy pair."""
     home = Path(env["XDG_CONFIG_HOME"]) / "capabilities"
     return home / "store.json", home / "credentials.env"
 
 
-def _password_line(env: dict) -> list[str]:
-    return [line for line in _files(env)[1].read_text().splitlines()
-            if line.startswith("CAPABILITIES_STORE_PASSWORD=")]
+def _legacy(env: dict, document: dict | None = None, password: str | None = "old") -> None:
+    setting_file, password_file = _files(env)
+    setting_file.parent.mkdir(parents=True, exist_ok=True)
+    setting_file.write_text(json.dumps(document or {
+        "schema": "capabilities.store.v1", "host": "legacy.example.test", "port": 5432,
+        "database": "app", "user": "agent", "sslmode": "require"}))
+    if password is not None:
+        password_file.write_text(f"OTHER_KEY=kept\nCAPABILITIES_STORE_PASSWORD={password}\n")
+
+
+def _nothing_written(env: dict) -> bool:
+    return not _family(env).exists() and not _files(env)[0].exists() \
+        and not _files(env)[1].exists()
 
 
 BASE = ("--host", "db.example.test", "--database", "app", "--user", "agent")
@@ -134,7 +155,8 @@ def test_set_takes_the_password_from_stdin(tmp_path):
     payload = _ok(result)
     assert payload["changed"] is True and payload["configured"] is True
     assert payload["password"]["present"] is True
-    assert _password_line(env) == ["CAPABILITIES_STORE_PASSWORD=" + PASSWORD]
+    assert _written(env)["password"] == PASSWORD
+    assert not _files(env)[0].exists() and not _files(env)[1].exists()
     assert S.read_store_setting(env["XDG_CONFIG_HOME"])["password"] == PASSWORD
 
 
@@ -168,7 +190,7 @@ def test_set_never_takes_the_password_on_argv(tmp_path, argv):
     result = _manager(env, "store", "set", *BASE, *argv)
     assert result.returncode == 6, result.stdout + result.stderr
     _no_secret(result)
-    assert not _files(env)[0].exists() and not _files(env)[1].exists()
+    assert _nothing_written(env)
 
 
 def test_set_needs_exactly_one_password_source(tmp_path):
@@ -179,7 +201,7 @@ def test_set_needs_exactly_one_password_source(tmp_path):
                     stdin=PASSWORD)
     assert both.returncode == 6 and _error(both)["code"] == "password_source"
     _no_secret(both)
-    assert not _files(env)[0].exists()
+    assert _nothing_written(env)
 
 
 @pytest.mark.parametrize("mode", ["disable", "allow", "prefer"])
@@ -189,7 +211,22 @@ def test_set_refuses_an_sslmode_below_require(tmp_path, mode):
     assert result.returncode == 6
     assert _error(result)["code"] == "sslmode_too_weak"
     _no_secret(result)
-    assert not _files(env)[0].exists() and not _files(env)[1].exists()
+    assert _nothing_written(env)
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "::1", "/var/run/postgresql"])
+def test_set_admits_disable_only_for_a_local_host(tmp_path, host):
+    env = _env(tmp_path)
+    payload = _ok(_manager(env, "store", "set", "--host", host, "--database", "app",
+                           "--user", "agent", "--sslmode", "disable", "--password-stdin",
+                           stdin=PASSWORD + "\n"))
+    assert payload["setting"]["sslmode"]["value"] == "disable"
+    assert _written(env)["host"] == host
+    for mode in ("allow", "prefer"):
+        refused = _manager(env, "store", "set", "--host", host, "--database", "app",
+                           "--user", "agent", "--sslmode", mode, "--password-stdin",
+                           stdin=PASSWORD + "\n")
+        assert refused.returncode == 6 and _error(refused)["code"] == "sslmode_too_weak"
 
 
 @pytest.mark.parametrize("mode", ["require", "verify-ca", "verify-full"])
@@ -200,7 +237,7 @@ def test_set_accepts_require_and_stronger(tmp_path, mode):
     extra = ("--sslrootcert", str(root)) if mode != "require" else ()
     payload = _ok(_set(env, "--sslmode", mode, *extra))
     assert payload["setting"]["sslmode"]["value"] == mode
-    written = json.loads(_files(env)[0].read_text())
+    written = _written(env)
     assert written["sslmode"] == mode
     if extra:
         assert written["sslrootcert"] == str(root.resolve())
@@ -218,28 +255,39 @@ def test_set_defaults_the_port_and_the_sslmode(tmp_path):
     assert payload["setting"]["port"]["value"] == 6543
 
 
-def test_set_writes_the_setting_and_the_password_file_with_their_modes(tmp_path):
+def test_set_writes_the_family_file_whole_at_0600_and_leaves_the_legacy_pair(tmp_path):
     env = _env(tmp_path)
     setting_file, password_file = _files(env)
-    password_file.parent.mkdir(parents=True)
-    password_file.write_text("OTHER_KEY=kept\nCAPABILITIES_STORE_PASSWORD=old\n")
-    password_file.chmod(0o644)
-    _ok(_set(env))
-    assert stat.S_IMODE(password_file.stat().st_mode) == 0o600
-    assert password_file.read_text() == (
-        "OTHER_KEY=kept\nCAPABILITIES_STORE_PASSWORD=" + PASSWORD + "\n")
-    written = json.loads(setting_file.read_text())
-    assert written["schema"] == S.STORE_SETTING_SCHEMA
-    assert {k: written[k] for k in ("host", "port", "database", "user", "sslmode")} == {
-        "host": "db.example.test", "port": 5432, "database": "app", "user": "agent",
-        "sslmode": "require"}
-    assert PASSWORD not in setting_file.read_text()
-    assert sorted(p.name for p in setting_file.parent.iterdir()) == [
-        "credentials.env", "store.json"]
+    _legacy(env)
+    legacy_before = (setting_file.read_text(), password_file.read_text())
+    payload = _ok(_set(env))
+    path = _family(env)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert _written(env) == {
+        "schema": "agentkit.store.v1", "host": "db.example.test", "port": 5432,
+        "database": "app", "user": "agent", "sslmode": "require", "password": PASSWORD}
+    assert sorted(p.name for p in path.parent.iterdir()) == ["store.json"]
+    assert (setting_file.read_text(), password_file.read_text()) == legacy_before
+    assert payload["setting"]["host"] == {"value": "db.example.test", "source": str(path)}
     again = _ok(_set(env))
     assert again["changed"] is False
     changed = _ok(_set(env, password="another-" + PASSWORD))
     assert changed["changed"] is True
+    assert _written(env)["password"] == "another-" + PASSWORD
+
+
+def test_set_never_replaces_a_version_it_does_not_know(tmp_path):
+    env = _env(tmp_path)
+    path = _family(env)
+    path.parent.mkdir(parents=True)
+    newer = json.dumps({"schema": "agentkit.store.v2", "host": "h", "future": True})
+    path.write_text(newer)
+    for args in (("store", "set", *BASE, "--password-stdin"), ("store", "unset")):
+        result = _manager(env, *args, stdin=PASSWORD + "\n")
+        assert result.returncode == 6 and _error(result)["code"] == "store_setting_too_new"
+        assert path.read_text() == newer
+    shown = _manager(env, "store", "show")
+    assert shown.returncode == 6 and _error(shown)["code"] == "store_setting_too_new"
 
 
 def test_set_writes_under_the_manager_lock(tmp_path):
@@ -256,12 +304,12 @@ def test_set_writes_under_the_manager_lock(tmp_path):
         waiting.stdin.close()
         time.sleep(2.0)
         assert waiting.poll() is None
-        assert not _files(env)[0].exists() and not _files(env)[1].exists()
+        assert _nothing_written(env)
     out, err = waiting.stdout.read(), waiting.stderr.read()
     waiting.wait(timeout=60)
     assert waiting.returncode == 0, out + err
     assert PASSWORD not in out + err
-    assert _files(env)[0].exists() and _password_line(env)
+    assert _written(env)["password"] == PASSWORD
 
 
 def test_set_is_refused_under_the_read_only_switch(tmp_path):
@@ -270,27 +318,26 @@ def test_set_is_refused_under_the_read_only_switch(tmp_path):
     assert result.returncode == 4
     assert _error(result)["code"] == "read_only_switch"
     _no_secret(result)
-    assert not _files(env)[0].exists() and not _files(env)[1].exists()
+    assert _nothing_written(env)
 
 
-def test_set_with_a_schema_writes_a_v2_setting_and_without_one_a_v1(tmp_path):
+def test_set_names_the_schema_only_when_one_is_given(tmp_path):
     env = _env(tmp_path)
-    setting_file = _files(env)[0]
+    path = _family(env)
     _ok(_set(env))
-    written = json.loads(setting_file.read_text())
-    assert written["schema"] == "capabilities.store.v1" and "db_schema" not in written
+    written = _written(env)
+    assert written["schema"] == "agentkit.store.v1" and "db_schema" not in written
     payload = _ok(_set(env, "--schema", "agentkit"))
     assert payload["changed"] is True
-    written = json.loads(setting_file.read_text())
-    assert written["schema"] == "capabilities.store.v2"
+    written = _written(env)
+    assert written["schema"] == "agentkit.store.v1"
     assert written["db_schema"] == "agentkit"
-    assert payload["setting"]["db_schema"] == {"value": "agentkit",
-                                               "source": str(setting_file)}
+    assert payload["setting"]["db_schema"] == {"value": "agentkit", "source": str(path)}
     assert _ok(_set(env, "--schema", "agentkit"))["changed"] is False
     assert _ok(_set(env, "--schema", "tools"))["changed"] is True
     assert _ok(_set(env))["setting"]["db_schema"] == {"value": "agentkit",
                                                       "source": "default"}
-    assert json.loads(setting_file.read_text())["schema"] == "capabilities.store.v1"
+    assert "db_schema" not in _written(env)
 
 
 @pytest.mark.parametrize("name", ["public", "information_schema", "pg_toast", "Tools",
@@ -299,7 +346,7 @@ def test_set_refuses_a_schema_that_is_reserved_or_not_an_identifier(tmp_path, na
     env = _env(tmp_path)
     result = _set(env, "--schema", name)
     assert result.returncode == 6 and _error(result)["code"] == "bad_schema_name"
-    assert not _files(env)[0].exists() and not _files(env)[1].exists()
+    assert _nothing_written(env)
 
 
 def test_a_v1_setting_written_before_the_schema_is_read_as_agentkit(tmp_path):
@@ -313,7 +360,8 @@ def test_a_v1_setting_written_before_the_schema_is_read_as_agentkit(tmp_path):
     assert S.read_store_setting(env["XDG_CONFIG_HOME"])["db_schema"] == "agentkit"
     payload = _ok(_manager(env, "store", "show"))
     assert payload["setting"]["db_schema"] == {"value": "agentkit", "source": "default"}
-    assert payload["setting"]["host"]["value"] == "db.example.test"
+    assert payload["setting"]["host"] == {"value": "db.example.test", "source": "legacy"}
+    assert payload["exists"] is False
 
 
 def test_a_v2_setting_naming_a_bad_schema_is_refused_when_read(tmp_path):
@@ -332,39 +380,39 @@ def test_a_v2_setting_naming_a_bad_schema_is_refused_when_read(tmp_path):
 
 # --- unset --------------------------------------------------------------------
 
-def test_unset_removes_the_setting_and_its_password_and_keeps_other_keys(tmp_path):
+def test_unset_removes_the_file_and_the_legacy_pair_and_keeps_other_keys(tmp_path):
     env = _env(tmp_path)
     setting_file, password_file = _files(env)
-    password_file.parent.mkdir(parents=True)
-    password_file.write_text("OTHER_KEY=kept\n")
+    _legacy(env)
     _ok(_set(env, "--schema", "tools"))
     result = _manager(env, "store", "unset")
     _no_secret(result)
     payload = _ok(result)
     assert payload["changed"] is True and payload["configured"] is False
     assert payload["in_force"]["source"] == "default"
-    assert not setting_file.exists()
+    assert not _family(env).exists() and not setting_file.exists()
     assert password_file.read_text() == "OTHER_KEY=kept\n"
     assert stat.S_IMODE(password_file.stat().st_mode) == 0o600
     assert S.read_store_setting(env["XDG_CONFIG_HOME"]) is None
     assert _ok(_manager(env, "store", "unset"))["changed"] is False
 
 
-def test_unset_removes_a_password_file_it_leaves_empty(tmp_path):
+def test_unset_removes_a_legacy_password_file_it_leaves_empty(tmp_path):
     env = _env(tmp_path)
-    _ok(_set(env))
-    _ok(_manager(env, "store", "unset"))
+    _legacy(env, password=None)
+    _files(env)[1].write_text("CAPABILITIES_STORE_PASSWORD=old\n")
+    assert _ok(_manager(env, "store", "unset"))["changed"] is True
     assert sorted(p.name for p in _files(env)[0].parent.iterdir()) == []
 
 
 def test_unset_removes_a_setting_that_no_longer_reads(tmp_path):
     env = _env(tmp_path)
-    setting_file = _files(env)[0]
-    setting_file.parent.mkdir(parents=True)
-    setting_file.write_text("not json")
-    assert _manager(env, "store", "show").returncode == 6
-    assert _ok(_manager(env, "store", "unset"))["changed"] is True
-    assert not setting_file.exists()
+    for path in (_family(env), _files(env)[0]):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not json")
+        assert _manager(env, "store", "show").returncode == 6
+        assert _ok(_manager(env, "store", "unset"))["changed"] is True
+        assert not path.exists()
 
 
 def test_unset_is_refused_under_the_read_only_switch(tmp_path):
@@ -372,7 +420,7 @@ def test_unset_is_refused_under_the_read_only_switch(tmp_path):
     _ok(_set(env))
     result = _manager(env, "store", "unset", extra={"CAPABILITIES_READ_ONLY": "1"})
     assert result.returncode == 4 and _error(result)["code"] == "read_only_switch"
-    assert _files(env)[0].exists() and _password_line(env)
+    assert _written(env)["password"] == PASSWORD
 
 
 # --- show ---------------------------------------------------------------------
@@ -381,6 +429,7 @@ def test_show_without_a_setting_reports_the_default(tmp_path):
     env = _env(tmp_path)
     payload = _ok(_manager(env, "store", "show", "--json"))
     assert payload["configured"] is False and payload["setting"] is None
+    assert payload["path"] == str(_family(env)) and payload["exists"] is False
     assert payload["password"] == {"present": False, "source": None}
     assert payload["in_force"] == {
         "store": str(Path(env["XDG_STATE_HOME"]) / "capabilities" / "store.db"),
@@ -394,14 +443,16 @@ def test_show_reports_each_value_and_its_source_without_the_secret(tmp_path):
     result = _manager(env, "store", "show")
     _no_secret(result)
     payload = _ok(result)
-    setting_file, password_file = _files(env)
+    setting_file = _family(env)
+    assert payload["path"] == str(setting_file) and payload["exists"] is True
+    assert Path(payload["path"]).is_absolute()
     assert payload["setting"] == {
         field: {"value": value, "source": str(setting_file)}
         for field, value in (("host", "db.example.test"), ("port", 6543),
                              ("database", "app"), ("user", "agent"),
                              ("sslmode", "require"))} | {
         "db_schema": {"value": "agentkit", "source": "default"}}
-    assert payload["password"] == {"present": True, "source": str(password_file)}
+    assert payload["password"] == {"present": True, "source": str(setting_file)}
     assert payload["in_force"] == {"store": "postgresql://db.example.test:6543/app",
                                    "source": "setting"}
     assert payload["overridden_by"] is None
@@ -419,6 +470,33 @@ def test_show_reports_the_override_while_it_is_set(tmp_path):
                                    "source": "CAPABILITIES_STORE_URL"}
     assert payload["overridden_by"] == "CAPABILITIES_STORE_URL"
     assert payload["setting"]["host"]["value"] == "db.example.test"
+    first = f"postgresql://someone:{PASSWORD}@first.example.test:5432/family"
+    result = _manager(env, "store", "show", extra={"CAPABILITIES_STORE_URL": override,
+                                                   "AGENTKIT_STORE_URL": first})
+    _no_secret(result)
+    payload = _ok(result)
+    assert payload["in_force"] == {"store": "postgresql://first.example.test:5432/family",
+                                   "source": "AGENTKIT_STORE_URL"}
+    assert payload["overridden_by"] == "AGENTKIT_STORE_URL"
+
+
+def test_show_reads_the_legacy_pair_while_the_file_is_absent_and_the_file_after(tmp_path):
+    env = _env(tmp_path)
+    _legacy(env, {"schema": "capabilities.store.v2", "host": "legacy.example.test",
+                  "port": 5432, "database": "app", "user": "agent", "sslmode": "require",
+                  "db_schema": "tools"})
+    payload = _ok(_manager(env, "store", "show"))
+    assert payload["configured"] is True and payload["exists"] is False
+    assert payload["path"] == str(_family(env))
+    assert payload["setting"]["host"] == {"value": "legacy.example.test", "source": "legacy"}
+    assert payload["setting"]["db_schema"] == {"value": "tools", "source": "legacy"}
+    assert payload["password"] == {"present": True, "source": "legacy"}
+    _ok(_set(env))
+    payload = _ok(_manager(env, "store", "show"))
+    assert payload["exists"] is True
+    assert payload["setting"]["host"] == {"value": "db.example.test",
+                                          "source": str(_family(env))}
+    assert payload["setting"]["db_schema"] == {"value": "agentkit", "source": "default"}
 
 
 # --- the helper a capability reads it through -----------------------------------
@@ -482,6 +560,12 @@ def test_the_store_tier_builds_the_url_with_the_password_encoded():
                                       "sslrootcert": ["/etc/ssl/root.crt"]}
     assert "sslmode=disable" in S.store_setting_url(setting, sslmode="disable")
     assert PASSWORD not in S.store_setting_url(setting, with_password=False)
+    socket_url = S.store_setting_url({**setting, "host": "/var/run/postgresql",
+                                      "sslmode": "disable"})
+    parsed = urlparse(socket_url)
+    assert parsed.hostname is None and parsed.path == "/app"
+    assert parse_qs(parsed.query)["host"] == ["/var/run/postgresql"]
+    assert parse_qs(parsed.query)["port"] == ["5432"]
 
 
 # --- a throwaway PostgreSQL with TLS ----------------------------------------------
@@ -583,8 +667,14 @@ def enforced(cluster):
     cluster.hba(ENFORCED_HBA)
 
 
-def _set_cluster(env: dict, cluster: Cluster, *extra_args: str) -> None:
-    _ok(_manager(env, "store", "set", "--host", "127.0.0.1", "--port", str(cluster.port),
+# A name for the loopback cluster that is not one the doctor takes for this
+# machine, so the checks a store across a network gets are the ones that run.
+REMOTE_NAME = "127.1"
+
+
+def _set_cluster(env: dict, cluster: Cluster, *extra_args: str,
+                 host: str = REMOTE_NAME) -> None:
+    _ok(_manager(env, "store", "set", "--host", host, "--port", str(cluster.port),
                  "--database", "app", "--user", "agent", *extra_args,
                  "--password-stdin", stdin=PASSWORD + "\n"))
 
@@ -603,7 +693,7 @@ def test_doctor_passes_when_tls_works_and_plain_text_is_refused(tmp_path, enforc
     assert tls["tls"]["version"].startswith("TLS") and tls["tls"]["cipher"]
     plain = payload["checks"]["plain_text_refused"]
     assert plain["ok"] is True and "no encryption" in plain["reason"]
-    assert payload["store"] == f"postgresql://127.0.0.1:{enforced.port}/app"
+    assert payload["store"] == f"postgresql://{REMOTE_NAME}:{enforced.port}/app"
     assert payload["db_schema"] == "agentkit"
     assert payload["checks"]["schema"]["ok"] is True
     assert payload["checks"]["schema"]["exists"] is False
@@ -639,7 +729,7 @@ def test_doctor_fails_when_the_role_may_not_use_the_schema(tmp_path, enforced):
 
 def test_doctor_fails_when_the_role_may_not_create_the_missing_schema(tmp_path, enforced):
     env = _env(tmp_path)
-    _ok(_manager(env, "store", "set", "--host", "127.0.0.1", "--port", str(enforced.port),
+    _ok(_manager(env, "store", "set", "--host", REMOTE_NAME, "--port", str(enforced.port),
                  "--database", "foreign_db", "--user", "agent", "--schema", "tools",
                  "--password-stdin", stdin=PASSWORD + "\n"))
     result = _manager(env, "store", "doctor")
@@ -652,9 +742,36 @@ def test_doctor_fails_when_the_role_may_not_create_the_missing_schema(tmp_path, 
 def test_doctor_verifies_the_server_certificate_with_verify_full(tmp_path, enforced):
     env = _env(tmp_path)
     _set_cluster(env, enforced, "--sslmode", "verify-full",
-                 "--sslrootcert", str(enforced.cert))
+                 "--sslrootcert", str(enforced.cert), host="127.0.0.1")
     payload = _ok(_manager(env, "store", "doctor"))
     assert payload["ok"] is True and payload["sslmode"] == "verify-full"
+
+
+def test_doctor_skips_the_plain_text_check_for_a_local_store(tmp_path, enforced):
+    env = _env(tmp_path)
+    _set_cluster(env, enforced, host="127.0.0.1")
+    enforced.hba(PLAIN_HBA)
+    result = _manager(env, "store", "doctor")
+    _no_secret(result)
+    payload = _ok(result)
+    assert payload["ok"] is True and payload["checks"]["tls"]["ok"] is True
+    plain = payload["checks"]["plain_text_refused"]
+    assert plain["ok"] is True and plain["skipped"] is True
+    assert "on this machine" in plain["reason"]
+
+
+def test_doctor_passes_a_local_store_reached_without_tls(tmp_path, enforced):
+    env = _env(tmp_path)
+    enforced.hba(PLAIN_HBA)
+    _set_cluster(env, enforced, "--sslmode", "disable", host="127.0.0.1")
+    result = _manager(env, "store", "doctor")
+    _no_secret(result)
+    payload = _ok(result)
+    assert payload["ok"] is True and payload["sslmode"] == "disable"
+    tls = payload["checks"]["tls"]
+    assert tls["ok"] is True and "without TLS" in tls["reason"]
+    assert payload["checks"]["plain_text_refused"]["skipped"] is True
+    assert payload["checks"]["schema"]["ok"] is True
 
 
 def test_doctor_fails_when_the_server_accepts_plain_text(tmp_path, enforced):
@@ -770,4 +887,4 @@ def test_without_a_setting_records_resolve_as_before(tmp_path):
     _ok(_manager(_project_env(env, files), "enable", "slack", "--project", cwd=files))
     assert json.loads((files / "capabilities" / "settings.json").read_text()) == {
         "capabilities": {"slack": {"enabled": True}}}
-    assert not _files(env)[0].exists()
+    assert _nothing_written(env)

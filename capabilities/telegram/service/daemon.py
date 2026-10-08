@@ -8,7 +8,7 @@
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract==0.1.0",
+#     "capabilities-contract==0.2.0",
 # ]
 # ///
 # The 3.x line is what carries conference calls: joining one needs

@@ -244,7 +244,7 @@ capabilities/
 
 In database mode those logical records and document bodies, including the policy gate, live in the store; the envelope still holds project identity, the state guard, and source-owned project material that is not a live record.
 
-**The machine's store setting is the one store pointer.** `capabilities store set` records it and is its only writer: the non-secret values — host, port, database, user, an `sslmode` of `require` or stronger, and an optional root certificate — in `$XDG_CONFIG_HOME/capabilities/store.json`, and the password in the manager's own credentials tier, `$XDG_CONFIG_HOME/capabilities/credentials.env`, at mode 0600, taken from stdin, a file or a named environment variable and never from argv. The manager's store URL resolution takes `CAPABILITIES_STORE_URL` when it is set, for tests and development sessions, else the setting, else the local default. A capability reads the setting from the manager's files through the store tier's `read_store_setting()`, which writes nothing. `capabilities store show` reports the setting without its secret, and `capabilities store doctor` proves that a TLS connection works and that a plain-text one is refused.
+**The machine's store setting is the one store pointer.** The manager's records in database mode resolve their store from it, and its file, format and writers are [the store setting](#the-store-setting).
 
 `capabilities/` is canonical and intentionally visible so the project's context
 owner and humans share one project body. The runtime also reads a legacy
@@ -317,6 +317,42 @@ The `ids` verbs manage the identifier collection through the adapter:
 | `ids rm <label>` | Removes the label. Unknown label → exit 3. |
 
 `ids set` writes the project scope selected by `project.json`; in files mode it creates `capabilities/<name>/` on demand inside an existing envelope. In a project with no envelope it exits 6, naming `capabilities init` as the remediation.
+
+## The store setting
+
+A machine has one store setting, shared by every tool of the family that reaches its database — the capabilities, ContextKit and AgentKit — whether or not the others are installed. It is a file each tool reads and writes with its own code, never a library one tool takes from another.
+
+**Path.** `$XDG_CONFIG_HOME/agentkit/store.json` when `XDG_CONFIG_HOME` is set; `~/.config/agentkit/store.json` only when it is unset. No other place is looked in. A reader reports the absolute path it resolved, since a process started outside a shell, such as an app opened from the Finder or a launchd agent, does not see an `XDG_CONFIG_HOME` a shell profile exports.
+
+**Format, version 1.** One JSON object, at mode 0600, the password inside it:
+
+| Field | Required | Value |
+|---|---|---|
+| `schema` | yes | `"agentkit.store.v1"`, the format version |
+| `host` | yes | host name, address, or the directory of a Unix socket |
+| `port` | yes | integer 1-65535 |
+| `database` | yes | database name |
+| `user` | yes | role name |
+| `password` | no | the role's password; absent when the role needs none |
+| `sslmode` | yes | `require`, `verify-ca` or `verify-full`; `disable` only for a local host |
+| `sslrootcert` | no | a root certificate file path, or `system` |
+| `db_schema` | no | the schema inside the database that every tool binds to; `agentkit` when absent |
+
+`host`, `database` and `user` carry no whitespace. A version 1 file carries these fields and no others.
+
+**Where each tool's tables live.** Every tool keeps its tables inside `db_schema`, each under its own prefix, with its own migrations and ledger, and refers to another tool's rows by value only, never by a foreign key.
+
+**TLS.** A store reached across a network is reached over TLS: `sslmode` is `require` or stronger. `disable` is allowed only when `host` is a local host — `localhost`, a loopback address, or a Unix socket directory — and `allow` and `prefer` never.
+
+**Versions.** A reader refuses a version it does not know with a clear error rather than guessing at it. A writer never replaces or removes a file of a version it does not know, and writes the lowest version that expresses what it holds.
+
+**Writes.** Any tool of the family may write the file. A write replaces the whole file atomically — a temporary file in the same directory, renamed over it — at mode 0600. In this package the manager is the writer: `capabilities store set` and `capabilities store unset`, taking the password from stdin, a file or a named environment variable and never from argv; `capabilities store show` reports the setting and the path without its secret, and `capabilities store doctor` proves it.
+
+**Override.** `AGENTKIT_STORE_URL`, a `postgresql://` URL, replaces the setting for the process that carries it, for tests and development sessions; it binds `agentkit`. In this package `CAPABILITIES_STORE_URL` overrides the same way after it.
+
+**Legacy files.** While the file is absent, this package's readers read the setting where the manager kept it before: the non-secret values in `$XDG_CONFIG_HOME/capabilities/store.json` and the password as `CAPABILITIES_STORE_PASSWORD` in `$XDG_CONFIG_HOME/capabilities/credentials.env`. Nothing writes them any more, and `capabilities store unset` removes them with the file.
+
+A capability reads the setting through the store tier's `read_store_setting()`, which writes nothing, and its runtime state reaches the store through the shared database library ([runtime state in the store](#runtime-state-in-the-store)).
 
 ## The capability policy gate
 
@@ -631,11 +667,11 @@ Known limitation, recorded for fast diagnosis: two projects driving the *same* a
 
 ## Runtime state in the store
 
-Runtime state is what a capability's own processes coordinate through — a service's run ledger, its job tables, the session a capability resumes from one call to the next — and it lives in the PostgreSQL the machine's store setting names ([the store setting](#project-records-and-the-envelope); DOCTRINE rule 22).
+Runtime state is what a capability's own processes coordinate through — a service's run ledger, its job tables, the session a capability resumes from one call to the next — and it lives in the PostgreSQL the machine's store setting names ([the store setting](#the-store-setting); DOCTRINE rule 22).
 
 A capability reaches it through the shared database library, `capabilities-contract` on PyPI, imported as `capabilities_contract.db` and pinned to an exact version in the script's PEP-723 dependencies. The library reads the store setting and writes nothing, connects bound to the schema the setting names, and applies each owner's migration steps once under that owner's ledger; the library's own documentation carries its call surface and error codes. The capability is the owner of its tables: the owner is its name, every object a migration step creates is named `<name>_…` inside the setting's schema, and its steps are recorded in the ledger under that name, so tools at different releases share one database and each changes only its own tables.
 
-A service that keeps runtime state resolves the store before it takes any work. With no store configured it refuses to run with the error code `store_not_configured` and a hint naming `capabilities store set`, and its `service doctor` reports the same. The library finds a store only through `CAPABILITIES_STORE_URL`, for tests and development sessions, or the store setting, and both name a PostgreSQL.
+A service that keeps runtime state resolves the store before it takes any work. With no store configured it refuses to run with the error code `store_not_configured` and a hint naming `capabilities store set`, and its `service doctor` reports the same. The library finds a store only through an override, `AGENTKIT_STORE_URL` then `CAPABILITIES_STORE_URL`, for tests and development sessions, or the store setting, and each names a PostgreSQL.
 
 ## The I/O contract
 

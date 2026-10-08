@@ -92,8 +92,9 @@ print(json.dumps(fixtures[key]))
     key = tmp_path / "private-node-key"
     key.write_text("fixture-private-material")
     monkeypatch.setattr(m, "_node_prepare_repo", lambda *a: ("git@192.0.2.10:/srv/git/body.git", key))
-    monkeypatch.setattr(m, "read_store_setting", lambda: {"host": "store.example.invalid", "port": 5432,
-        "database": "fixture", "user": "fixture", "sslmode": "require", "password": "fixture-store-secret"})
+    monkeypatch.setattr(m, "find_store_setting", lambda: ({"host": "store.example.invalid", "port": 5432,
+        "database": "fixture", "user": "fixture", "sslmode": "require", "db_schema": "fixture_schema",
+        "password": "fixture-store-secret"}, {"read": "family", "db_schema_named": True}))
     calls = []
     def ssh(r, host, script, **kw):
         calls.append((script, kw.get("stdin")))
@@ -130,9 +131,22 @@ def test_deploy_fixture_sets_env_off_argv_and_waits(node, capsys):
     assert [r["argv"][0] for r in requests][-3:] == ["env", "deploy", "wait"]
     env = next(r["stdin"] for r in requests if r["argv"][:2] == ["env", "bulk"])
     assert "AGENT_STORE_PASSWORD=fixture-store-secret" in env
+    assert "AGENT_STORE_DB_SCHEMA=fixture_schema" in env
     assert "AGENT_REPO_URL=git@host.docker.internal:/srv/git/body.git" in env
     assert "fixture-store-secret" not in json.dumps([r["argv"] for r in requests]) + json.dumps(result)
     assert "fixture-private-material" not in json.dumps(result)
+
+
+def test_deploy_carries_no_schema_the_setting_does_not_name(node, monkeypatch, capsys):
+    monkeypatch.setattr(node.m, "find_store_setting", lambda: ({"host": "store.example.invalid",
+        "port": 5432, "database": "fixture", "user": "fixture", "sslmode": "require",
+        "db_schema": "agentkit", "password": "fixture-store-secret"},
+        {"read": "legacy", "db_schema_named": False}))
+    node.m.cmd_deploy(node.args)
+    capsys.readouterr()
+    env = next(r["stdin"] for r in rows(node) if r["argv"][:2] == ["env", "bulk"])
+    assert "AGENT_STORE_HOST=store.example.invalid" in env
+    assert "AGENT_STORE_DB_SCHEMA" not in env
 
 
 def test_first_deploy_records_app_and_disables_auto_deploy(node, monkeypatch, capsys):
@@ -279,6 +293,7 @@ def test_entrypoint_pins_node_host_and_sets_store_without_password_argv(node):
     assert 'AGENT_GIT_KNOWN_HOSTS_B64' in script
     assert '--password-stdin' in script
     assert 'printf \'%s\' "$AGENT_STORE_PASSWORD"' in script
+    assert '--schema "$AGENT_STORE_DB_SCHEMA"' in script
     assert '--password "$' not in script
     assert subprocess.run(["bash", "-n"], input=script, text=True).returncode == 0
 

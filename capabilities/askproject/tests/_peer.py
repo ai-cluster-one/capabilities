@@ -8,7 +8,7 @@ The script imports callva-harness-runner when a profile or a peer is needed, so
 the suite runs where that library is importable:
 
     uv run --with pytest --with 'callva-harness-runner==0.8.0' \\
-        --with 'capabilities-contract==0.1.0' \\
+        --with 'capabilities-contract==0.2.0' \\
         python -m pytest capabilities/askproject/tests -q
 
 Every ask records its session in the machine's store, so a test that asks

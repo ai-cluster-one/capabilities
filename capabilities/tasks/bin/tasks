@@ -4284,38 +4284,78 @@ def open_store(url: str | None = None) -> "Store":
 
 # --- the machine's store setting ---------------------------------------------
 #
-# Which database a machine's records live in is the machine's, so it is kept
-# beside the machine's other manager records rather than in any project, and the
-# manager is its one writer: `capabilities store set` writes the non-secret
-# values to `store.json` and the password to the manager's own credentials tier,
-# both under `$XDG_CONFIG_HOME/capabilities/`. Whatever reads it reads it here,
+# Which database a machine's records live in is the machine's, and the whole
+# family of tools on it - the capabilities, ContextKit, AgentKit - shares one
+# answer: the store setting file, `$XDG_CONFIG_HOME/agentkit/store.json`, or
+# `~/.config/agentkit/store.json` when `XDG_CONFIG_HOME` is unset, holding the
+# connection values and the password at mode 0600. Its format is the executable
+# standard's (SHEBANG.md, "The store setting"); in this package the manager is
+# its writer, `capabilities store set`, and whatever reads it reads it here,
 # and reading writes nothing. A Postgres reached across a network is reached
-# over TLS, so the floor on `sslmode` is `require`, and it is checked here for
-# the writer and every reader alike.
+# over TLS, so the floor on `sslmode` is `require`, and `disable` is admitted
+# only for a store on this machine; it is checked here for the writer and every
+# reader alike.
 #
-# A `capabilities.store.v1` setting binds the schema `agentkit` inside that
-# database. A `capabilities.store.v2` setting may name another in `db_schema`,
-# since the document's own `schema` key already holds the setting's id. Both
-# are read; the writer writes v2 only when a schema is named, so a reader that
-# knows only v1 keeps reading every setting written without one.
+# While the file is absent the setting is read where the manager kept it
+# before: the non-secret values in `$XDG_CONFIG_HOME/capabilities/store.json`
+# (`capabilities.store.v1`, binding `agentkit`, or `capabilities.store.v2`,
+# which may name `db_schema`) and the password in the manager's credentials
+# tier beside it. That legacy pair is read, never written.
 
+STORE_SETTING_FORMAT = "agentkit.store.v1"
+STORE_SETTING_FORMAT_PREFIX = "agentkit.store."
 STORE_SETTING_SCHEMA = "capabilities.store.v1"
 STORE_SETTING_SCHEMA_V2 = "capabilities.store.v2"
 STORE_SETTING_SCHEMAS = (STORE_SETTING_SCHEMA, STORE_SETTING_SCHEMA_V2)
 STORE_SCHEMA_FIELD = "db_schema"
 STORE_DEFAULT_SCHEMA = "agentkit"
 STORE_PASSWORD_KEY = "CAPABILITIES_STORE_PASSWORD"
+STORE_URL_OVERRIDES = ("AGENTKIT_STORE_URL", "CAPABILITIES_STORE_URL")
 STORE_SSLMODES = ("require", "verify-ca", "verify-full")
 STORE_SSLMODES_REFUSED = ("disable", "allow", "prefer")
+STORE_SSLMODE_LOCAL = "disable"
 STORE_SETTING_FIELDS = ("host", "port", "database", "user", "sslmode", "sslrootcert")
+STORE_FORMAT_FIELDS = ("schema", *STORE_SETTING_FIELDS, "password", STORE_SCHEMA_FIELD)
+
+
+def _store_config_home(config_home: Path | str | None) -> Path:
+    return Path(config_home or os.environ.get("XDG_CONFIG_HOME")
+                or os.path.join(os.path.expanduser("~"), ".config"))
+
+
+def store_setting_path(config_home: Path | str | None = None) -> Path:
+    """The family's store setting file, as an absolute path."""
+    return Path(os.path.abspath(_store_config_home(config_home) / "agentkit" / "store.json"))
 
 
 def store_setting_files(config_home: Path | str | None = None) -> tuple[Path, Path]:
-    """The setting file and the password file, in that order."""
-    home = Path(config_home or os.environ.get("XDG_CONFIG_HOME")
-                or os.path.join(os.path.expanduser("~"), ".config"))
+    """The legacy setting file and password file, in that order."""
+    home = Path(os.path.abspath(_store_config_home(config_home)))
     return (home / "capabilities" / "store.json",
             home / "capabilities" / "credentials.env")
+
+
+def store_url_override() -> tuple[str | None, str | None]:
+    """The override in force and the variable it came from: `AGENTKIT_STORE_URL`,
+    else `CAPABILITIES_STORE_URL`, else (None, None)."""
+    for name in STORE_URL_OVERRIDES:
+        if os.environ.get(name):
+            return os.environ[name], name
+    return None, None
+
+
+def store_host_is_local(host: object) -> bool:
+    """Whether the host is this machine: a Unix socket directory, `localhost`,
+    or a loopback address."""
+    import ipaddress
+    if not isinstance(host, str) or not host:
+        return False
+    if host.startswith("/") or host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
 def check_store_setting(values: dict) -> dict:
@@ -4341,11 +4381,13 @@ def check_store_setting(values: dict) -> dict:
         raise StoreError("bad_store_setting", "the store port must be 1-65535")
     out["port"] = port
     sslmode = values.get("sslmode")
-    if sslmode in STORE_SSLMODES_REFUSED:
+    local = sslmode == STORE_SSLMODE_LOCAL and store_host_is_local(out["host"])
+    if sslmode in STORE_SSLMODES_REFUSED and not local:
         raise StoreError("sslmode_too_weak",
                          f"sslmode {sslmode!r} lets the store be reached without TLS",
-                         f"use one of {', '.join(STORE_SSLMODES)}")
-    if sslmode not in STORE_SSLMODES:
+                         f"use one of {', '.join(STORE_SSLMODES)}; disable is "
+                         "admitted only for a local host or Unix socket")
+    if sslmode not in STORE_SSLMODES and not local:
         raise StoreError("bad_store_setting", f"unknown sslmode {sslmode!r}",
                          f"use one of {', '.join(STORE_SSLMODES)}")
     out["sslmode"] = sslmode
@@ -4371,13 +4413,66 @@ def check_store_schema_name(name: object) -> str:
     return name
 
 
-def read_store_setting(config_home: Path | str | None = None) -> dict | None:
-    """This machine's store setting, or None when it has none.
+def store_setting_version(path: Path) -> str | None:
+    """The format version the file at `path` declares, or None when it is
+    absent or declares none. A writer reads this before it replaces the file,
+    and never replaces a version it does not know."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    version = data.get("schema") if isinstance(data, dict) else None
+    return version if isinstance(version, str) else None
 
-    The non-secret values come from the setting file, `db_schema` from it too
-    when a v2 setting names one and `agentkit` otherwise, and `password` from
-    the manager's credentials tier, None when it holds none. This reads and
-    never writes; `capabilities store set` is the only writer of both files."""
+
+def store_setting_document(setting: dict, password: str | None,
+                           schema: str | None = None) -> dict:
+    """The file a writer writes: the lowest format version that expresses the
+    setting, `db_schema` only when one is named, `password` only when there is
+    one."""
+    values = check_store_setting(setting)
+    document = {"schema": STORE_SETTING_FORMAT, **values}
+    if password:
+        document["password"] = password
+    if schema is not None:
+        document[STORE_SCHEMA_FIELD] = check_store_schema_name(schema)
+    return document
+
+
+def _read_family_store_setting(path: Path, raw: str) -> tuple[dict, bool]:
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise StoreError("bad_store_setting", f"{path} is not a store setting",
+                         "rewrite it with `capabilities store set`") from exc
+    version = data.get("schema") if isinstance(data, dict) else None
+    if isinstance(version, str) and version.startswith(STORE_SETTING_FORMAT_PREFIX) \
+            and version != STORE_SETTING_FORMAT:
+        raise StoreError("store_setting_too_new",
+                         f"{path} is a {version} setting, which this tool does not know",
+                         "update this tool; the setting was written by a newer one")
+    if version != STORE_SETTING_FORMAT:
+        raise StoreError("bad_store_setting", f"{path} is not a {STORE_SETTING_FORMAT} setting",
+                         "rewrite it with `capabilities store set`")
+    unknown = sorted(set(data) - set(STORE_FORMAT_FIELDS))
+    if unknown:
+        raise StoreError("bad_store_setting",
+                         f"{path} carries fields {STORE_SETTING_FORMAT} does not have: "
+                         f"{', '.join(unknown)}",
+                         "rewrite it with `capabilities store set`")
+    setting = check_store_setting(
+        {k: v for k, v in data.items() if k in STORE_SETTING_FIELDS})
+    named = data.get(STORE_SCHEMA_FIELD) is not None
+    setting[STORE_SCHEMA_FIELD] = (check_store_schema_name(data[STORE_SCHEMA_FIELD])
+                                   if named else STORE_DEFAULT_SCHEMA)
+    password = data.get("password")
+    if password is not None and (not isinstance(password, str) or "\n" in password):
+        raise StoreError("bad_store_setting", f"{path} carries a password that is not one line")
+    setting["password"] = password or None
+    return setting, named
+
+
+def _read_legacy_store_setting(config_home: Path | str | None) -> tuple[dict, bool] | None:
     setting_file, password_file = store_setting_files(config_home)
     try:
         raw = setting_file.read_text()
@@ -4400,7 +4495,8 @@ def read_store_setting(config_home: Path | str | None = None) -> dict | None:
     setting = check_store_setting(
         {k: v for k, v in data.items() if k in STORE_SETTING_FIELDS})
     setting[STORE_SCHEMA_FIELD] = STORE_DEFAULT_SCHEMA
-    if data["schema"] == STORE_SETTING_SCHEMA_V2 and data.get(STORE_SCHEMA_FIELD) is not None:
+    named = data["schema"] == STORE_SETTING_SCHEMA_V2 and data.get(STORE_SCHEMA_FIELD) is not None
+    if named:
         setting[STORE_SCHEMA_FIELD] = check_store_schema_name(data[STORE_SCHEMA_FIELD])
     setting["password"] = None
     try:
@@ -4414,7 +4510,47 @@ def read_store_setting(config_home: Path | str | None = None) -> dict | None:
     for line in lines:
         if line.startswith(prefix):
             setting["password"] = line[len(prefix):] or None
-    return setting
+    return setting, named
+
+
+def find_store_setting(config_home: Path | str | None = None) -> tuple[dict | None, dict]:
+    """This machine's store setting, or None, and where it was found.
+
+    The second value is `{path, exists, read, db_schema_named}`: the family
+    file's absolute path, whether it exists, `family` or `legacy` for where the
+    setting was read (None when there is none), and whether the setting names
+    its schema rather than taking the default. The family file is read when it
+    exists; the legacy pair only when it does not. This reads and never writes."""
+    path = store_setting_path(config_home)
+    where = {"path": str(path), "exists": False, "read": None, "db_schema_named": False}
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        raw = None
+    except OSError as exc:
+        raise StoreError("store_setting_unreadable",
+                         f"cannot read the store setting {path}: {exc}") from exc
+    if raw is not None:
+        where["exists"] = True
+        setting, named = _read_family_store_setting(path, raw)
+        where.update(read="family", db_schema_named=named)
+        return setting, where
+    legacy = _read_legacy_store_setting(config_home)
+    if legacy is None:
+        return None, where
+    setting, named = legacy
+    where.update(read="legacy", db_schema_named=named)
+    return setting, where
+
+
+def read_store_setting(config_home: Path | str | None = None) -> dict | None:
+    """This machine's store setting, or None when it has none.
+
+    The values `host`, `port`, `database`, `user`, `sslmode`, `sslrootcert`
+    when set, `db_schema` (the named schema, else `agentkit`) and `password`
+    (None when there is none), from the family file or, while it is absent,
+    the legacy pair. This reads and never writes."""
+    return find_store_setting(config_home)[0]
 
 
 def store_setting_url(setting: dict, *, with_password: bool = True,
@@ -4425,13 +4561,19 @@ def store_setting_url(setting: dict, *, with_password: bool = True,
     if with_password and setting.get("password"):
         user += ":" + _store_quote(setting["password"], safe="")
     host = setting["host"]
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
     query = {"sslmode": sslmode or setting["sslmode"]}
     if setting.get("sslrootcert"):
         query["sslrootcert"] = setting["sslrootcert"]
+    database = _store_quote(setting["database"], safe="")
+    if host.startswith("/"):
+        # A Unix socket directory cannot sit in the authority, so it and the
+        # port travel as parameters.
+        query = {"host": host, "port": str(setting["port"]), **query}
+        return f"postgresql://{user}@/{database}?{_store_urlencode(query)}"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
     return (f"postgresql://{user}@{host}:{setting['port']}/"
-            f"{_store_quote(setting['database'], safe='')}?{_store_urlencode(query)}")
+            f"{database}?{_store_urlencode(query)}")
 
 # --- records: the two places a project may keep its configuration ------------
 #

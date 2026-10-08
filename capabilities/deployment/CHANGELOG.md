@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-08 — A node's store setting carries its schema
+
+`deployment deploy` sends the schema the machine's store setting names as `AGENT_STORE_DB_SCHEMA` beside the other `AGENT_STORE_*` values, and the node's entrypoint passes it to `capabilities store set --schema`, so the node's store setting file binds the same schema as this machine's. A setting that names no schema sends none, and the node binds `agentkit` as before. The setting is read from the machine's store setting file, or from the manager's former files while it is absent.
+
 ## 2026-10-05 — Supervised services run at standard priority
 
 The launchd agents `deployment sync` (host-agents) and `deployment machine sync` compile for a service now carry `ProcessType Standard` instead of `Background`, so a service and everything it starts - agent turns, builds, test runs - run at standard priority on every core rather than at the lowest priority on the efficiency cores with throttled I/O. The two watchdog agents, short scheduled probes, stay `Background`. `deployment machine status` reports each agent's compiled `process_type`, the `spawn_type` launchd runs it with, and `spawn_type_current`, which stays false until a loaded agent is handed to launchd again; the project doctor's `host_agents` entries carry `spawn_type`. An existing install picks the change up by running the sync and then the steps `deployment machine next` (or `deployment next`) prints.

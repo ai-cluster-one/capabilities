@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract==0.1.0",
+#     "capabilities-contract==0.2.0",
 #     "puremagic>=1.28",
 #     "neonize @ https://github.com/ai-cluster-one/neonize/releases/download/v0.5.2-histsync.1/neonize-0.5.2-py3-none-any.whl",
 # ]

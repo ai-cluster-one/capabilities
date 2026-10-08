@@ -1,5 +1,9 @@
 # contract — change log
 
+## 2026-10-08 — The store tier reads the family's store setting file
+
+`read_store_setting()` reads `$XDG_CONFIG_HOME/agentkit/store.json` (`~/.config/agentkit/store.json` when `XDG_CONFIG_HOME` is unset), an `agentkit.store.v1` file carrying the password and an optional `db_schema`, and falls back to the manager's former pair, `$XDG_CONFIG_HOME/capabilities/store.json` and `credentials.env`, only while that file is absent. A file of an unknown `agentkit.store.*` version is refused as `store_setting_too_new`, and a field the format does not have as `bad_store_setting`. `check_store_setting()` admits `sslmode` `disable` for a local host - a Unix socket directory, `localhost` or a loopback address - and `store_setting_url()` carries a socket directory as a parameter. The tier adds `find_store_setting()`, which also says where the setting was found, `store_setting_path()`, `store_url_override()` (`AGENTKIT_STORE_URL`, then `CAPABILITIES_STORE_URL`), `store_host_is_local()`, `store_setting_version()` and `store_setting_document()`. A machine with only the former pair reads as before. Every capability carries the change through `sync-contract`.
+
 ## 2026-10-07 — The store tier reads a store setting that names its schema
 
 `read_store_setting()` reads a `capabilities.store.v2` setting as well as a v1 one and returns `db_schema`: the schema a v2 setting names, else `agentkit`. A v2 setting naming a schema that is not a lowercase identifier, or that is `public`, `information_schema` or `pg_*`, is refused as `bad_schema_name`; `check_store_schema_name()` carries that rule. A v1 setting reads as before, with `db_schema` `agentkit`. Every capability carries the change through `sync-contract`.
