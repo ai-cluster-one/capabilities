@@ -8,6 +8,7 @@
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
+#     "capabilities-contract==0.1.0",
 # ]
 # ///
 # The 3.x line is what carries conference calls: joining one needs
@@ -418,8 +419,17 @@ def _records():
 # daemon uses is resolved at import and then fixed for the life of the process,
 # and the store is no different: a value re-read on each open is a value that
 # can change under a running daemon, which is how a queue ends up split across
-# two databases nobody chose.
-STORE_URL = os.environ.get("CAPABILITIES_STORE_URL") or None
+# two databases nobody chose. A machine with no store keeps the refusal instead,
+# and `main` refuses to run on it: delegation with nowhere to record the work
+# would be lost without anybody being told.
+def _resolve_store_setting():
+    try:
+        return jobs.store_setting(), None
+    except jobs.JobError as exc:
+        return None, exc
+
+
+STORE_SETTING, STORE_REFUSAL = _resolve_store_setting()
 
 _JOB_STORE = None
 _JOB_REGISTER = None
@@ -439,9 +449,10 @@ def job_register():
     """
     global _JOB_STORE, _JOB_REGISTER
     if _JOB_REGISTER is None:
+        if STORE_REFUSAL is not None:
+            raise STORE_REFUSAL
         _JOB_STORE, _JOB_REGISTER = jobs.open_register(
-            _records_module(), PROJECT_CAPABILITIES_DIR, ENVIRONMENT,
-            url=STORE_URL,
+            PROJECT_CAPABILITIES_DIR, ENVIRONMENT, setting=STORE_SETTING,
             project_id=jobs.handed_project_id(PROJECT_ROOT) or None)
     return _JOB_REGISTER
 
@@ -9725,6 +9736,9 @@ async def main():
         if EXPECTED_ACCOUNT_ID is None:
             sys.exit(
                 f"Telegram connection {CONNECTION!r} has no positive expected_account_id")
+        if STORE_REFUSAL is not None:
+            sys.exit(f"{STORE_REFUSAL.slug}: {STORE_REFUSAL.message}"
+                     + (f" - {STORE_REFUSAL.hint}" if STORE_REFUSAL.hint else ""))
         api_id, api_hash = resolve_creds()
         CONNECTION_STATE_DIR.mkdir(parents=True, exist_ok=True)   # telethon opens the session sqlite here;
         SERVICE_STATE_DIR.mkdir(parents=True, exist_ok=True)

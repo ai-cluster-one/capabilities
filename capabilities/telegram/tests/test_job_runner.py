@@ -24,6 +24,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_assistant_service import (  # noqa: E402
     CODEX_MODEL_REFUSAL_STDOUT,
+    STORE_DSN,
     REFUSED_MODEL,
     Event,
     StubVoiceCallSession,
@@ -75,19 +76,34 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         is exactly why the surface is a CLI over a table rather than a call.
         """
         return daemon.jobs.open_register(
-            daemon._records_module(), daemon.PROJECT_CAPABILITIES_DIR,
-            daemon.ENVIRONMENT, url=daemon.STORE_URL)
+            daemon.PROJECT_CAPABILITIES_DIR, daemon.ENVIRONMENT,
+            setting=daemon.STORE_SETTING)
 
     def daemon_with_store(self, td, **overrides):
         daemon = import_daemon(Path(td), job_settings(**overrides), store=True)
         # The store this daemon opens must be the throwaway one the fixture
         # made. A daemon that resolved it later, from the ambient environment,
         # would write a real machine's queue from a test.
-        self.assertEqual(daemon.STORE_URL, str(Path(td) / "store.sqlite3"))
+        self.assertEqual(daemon.STORE_SETTING.url, STORE_DSN)
         daemon.WORKERS["stub"] = lambda *a: successful_result("done")
         return daemon
 
     # -- the register is reachable from the daemon ----------------------------
+
+    async def test_the_daemon_refuses_to_run_without_a_store(self):
+        """Delegation with nowhere to record the work would be lost without
+        anybody being told, so a machine with no store is refused at launch,
+        before Telegram is reached."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), job_settings(),
+                                   connection_extra={"expected_account_id": 42})
+            self.assertEqual(daemon.STORE_REFUSAL.slug, "store_not_configured")
+            with mock.patch.object(daemon, "resolve_creds",
+                                   side_effect=AssertionError("reached Telegram")):
+                with self.assertRaises(SystemExit) as stopped:
+                    await daemon.main()
+            self.assertIn("store_not_configured", str(stopped.exception.code))
+            self.assertIn("capabilities store set", str(stopped.exception.code))
 
     async def test_the_daemon_opens_its_register_scoped_to_its_environment(self):
         with tempfile.TemporaryDirectory() as td:
@@ -191,9 +207,12 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                          if key.startswith("TELEGRAM_AUTHORIZED_")
                          or key == "TELEGRAM_DAEMON_CHILD"}
                 child.update({"CLAUDE_PROJECT_DIR": str(daemon.PROJECT_ROOT),
-                              "CAPABILITIES_STORE_URL": str(daemon.STORE_URL),
+                              "CAPABILITIES_STORE_URL": daemon.STORE_SETTING.url,
                               "TELEGRAM_ENVIRONMENT": daemon.ENVIRONMENT})
-                with mock.patch.dict(os.environ, child, clear=False):
+                # The CLI reads the same store, bound to this case's schema.
+                with mock.patch.dict(os.environ, child, clear=False), \
+                        mock.patch.object(cli._jobs_module(), "store_setting",
+                                          lambda: daemon.STORE_SETTING):
                     os.environ.pop("TELEGRAM_AUTHORIZED_TOPIC_ID", None)
                     chat, topic, actor = cli._job_scope(asked)
                     answer = cli.cmd_jobs_list(
@@ -656,6 +675,9 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             client.messages.append(message)
             await client.handler(Event(message))
             await wait_until(lambda: len(runs) == 2, timeout=8)
+            # The second run has started; its stop lands once it returns.
+            await wait_until(lambda: register.get(row["id"])["outcome"] is not None,
+                             timeout=8)
 
             self.assertEqual(len(register.list()), 1, "an amendment is not a new row")
             after = register.get(row["id"])
@@ -849,7 +871,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         supervised = job_settings()
         supervised["direct_messages"]["default_role"] = role
         daemon = import_daemon(Path(td), supervised, store=True)
-        self.assertEqual(daemon.STORE_URL, str(Path(td) / "store.sqlite3"))
+        self.assertEqual(daemon.STORE_SETTING.url, STORE_DSN)
         self.addCleanup(daemon.close_job_register)
         register = daemon.job_register()
         row = queued(register, channel_key="123", requested_by="777",
@@ -939,10 +961,10 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             expired = "2000-01-01T00:00:00+00:00"
             with register.store.transaction():
                 register.store._execute(
-                    "UPDATE tg_worker_jobs SET lease_expires_at = ? WHERE id = ?",
+                    "UPDATE telegram_jobs SET lease_expires_at = ? WHERE id = ?",
                     (expired, row["id"]))
                 register.store._execute(
-                    "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE job_id = ?",
+                    "UPDATE telegram_job_slots SET lease_expires_at = ? WHERE job_id = ?",
                     (expired, row["id"]))
             hold = asyncio.Event()
             loop = asyncio.get_running_loop()
@@ -1306,10 +1328,10 @@ class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
                                     session_id="thread-9")
             with register.store.transaction():
                 register.store._execute(
-                    "UPDATE tg_worker_jobs SET lease_expires_at = ? WHERE id = ?",
+                    "UPDATE telegram_jobs SET lease_expires_at = ? WHERE id = ?",
                     ("2000-01-01T00:00:00+00:00", row["id"]))
                 register.store._execute(
-                    "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE job_id = ?",
+                    "UPDATE telegram_job_slots SET lease_expires_at = ? WHERE job_id = ?",
                     ("2000-01-01T00:00:00+00:00", row["id"]))
 
             client = FakeClient([])

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import importlib.util
 import itertools
 import json
@@ -16,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -216,6 +218,12 @@ class AudioParameters:
     (root / "ntgcalls.py").write_text("")
 
 
+# The job register lives in Postgres. A case that opens it reads
+# TELEGRAM_TEST_DSN, a throwaway database's URL, and skips without one; each
+# case's daemon binds a schema of its own, so cases never see each other's rows.
+STORE_DSN = os.environ.get("TELEGRAM_TEST_DSN")
+
+
 def import_daemon(tmp: Path, service_settings: dict, *,
                   connection_extra: dict | None = None,
                   voice_context: str | None = None,
@@ -226,18 +234,21 @@ def import_daemon(tmp: Path, service_settings: dict, *,
     """Import one daemon against a throwaway project.
 
     `store` gives that project the identity and the store the job register
-    needs. Configuration stays in files: where a project keeps its settings and
-    where its queue lives are different questions, and the register answers the
+    needs, and skips the case where no throwaway database is named.
+    Configuration stays in files: where a project keeps its settings and where
+    its queue lives are different questions, and the register answers the
     second one the same way whatever the first says. Without it the register
     cannot open, and the daemon keeps answering with the job class off — the
     degradation every other test here exercises.
     """
+    if store and not STORE_DSN:
+        raise unittest.SkipTest("TELEGRAM_TEST_DSN is unset")
     project = tmp / "project"
     service_dir = project / "capabilities" / "telegram" / "service"
     service_dir.mkdir(parents=True)
     if store:
         (project / "capabilities" / "project.json").write_text(json.dumps({
-            "id": "11111111-1111-4111-8111-111111111111",
+            "id": f"prj_test_{uuid.uuid4().hex}",
             "slug": "testproject",
             "store": "files",
         }) + "\n")
@@ -300,7 +311,7 @@ def import_daemon(tmp: Path, service_settings: dict, *,
             "TELEGRAM_SERVICE_STATE_DIR": str(tmp / "service-state"),
         })
         if store:
-            os.environ["CAPABILITIES_STORE_URL"] = str(tmp / "store.sqlite3")
+            os.environ["CAPABILITIES_STORE_URL"] = STORE_DSN
         else:
             os.environ.pop("CAPABILITIES_STORE_URL", None)
         os.environ.pop("TELEGRAM_SERVICE_VOICE_CONTEXT", None)
@@ -316,6 +327,9 @@ def import_daemon(tmp: Path, service_settings: dict, *,
         spec.loader.exec_module(module)
         module._test_logs = []
         module.log = module._test_logs.append
+        if store:
+            module.STORE_SETTING = dataclasses.replace(
+                module.STORE_SETTING, schema=f"tgtest_{uuid.uuid4().hex}")
         return module
     finally:
         os.environ.clear()
@@ -1235,8 +1249,8 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             if state["current_request"]["kind"] == "registered job":
                 return successful_result("count complete")
             store, register = daemon.jobs.open_register(
-                daemon._records_module(), daemon.PROJECT_CAPABILITIES_DIR,
-                daemon.ENVIRONMENT, url=daemon.STORE_URL)
+                daemon.PROJECT_CAPABILITIES_DIR, daemon.ENVIRONMENT,
+                setting=daemon.STORE_SETTING)
             try:
                 row = register.register(
                     channel_key=state["channel_key"],
@@ -1336,8 +1350,8 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 if state["current_request"]["kind"] == "registered job":
                     return successful_result("count complete")
                 store, register = daemon.jobs.open_register(
-                    daemon._records_module(), daemon.PROJECT_CAPABILITIES_DIR,
-                    daemon.ENVIRONMENT, url=daemon.STORE_URL)
+                    daemon.PROJECT_CAPABILITIES_DIR, daemon.ENVIRONMENT,
+                    setting=daemon.STORE_SETTING)
                 try:
                     row = register.register(
                         channel_key=state["channel_key"],

@@ -8,11 +8,12 @@ has minutes or hours left, and a correction arriving meanwhile is an amendment
 to work already in flight rather than a second request. That second class is
 what this module records.
 
-The store is the home, not a private database beside it. `automations` already
-established the shape — a capability declares its own namespace and migrates it
-itself, and the core tier knows nothing about these columns — and the reason it
-is a table rather than a JSON blob is the same one: the runner filters on
-`project_id`, `environment`, `surface` and `state` on every tick.
+The machine's store is the home, not a private database beside it: the
+capability owns its `telegram_*` tables there and migrates them itself, through
+the shared database library and under its own ledger, and nothing else knows
+these columns. The reason it is a table rather than a JSON blob is that the
+runner filters on `project_id`, `environment`, `surface` and `state` on every
+tick.
 
 WHAT THE REGISTER HOLDS, AND WHAT IT REFUSES TO HOLD
 ===================================================
@@ -58,9 +59,6 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from uuid import uuid4
 
-
-STORE_NAMESPACE = "telegram"
-STORE_VERSION = 3
 
 # How `channel_key` spells a forum topic. The column is written by whoever
 # registers a job and read back by the daemon that has to find the channel
@@ -113,104 +111,78 @@ def holds_slot(owner_id: Any) -> bool:
     """Whether an attempt owned by this id holds one of the runner's slots."""
     return not str(owner_id or "").endswith(DIRECT_OWNER_MARKER)
 
-# Portable DDL, in the same dialect the core tier writes: a timestamp is TEXT
-# holding an ISO instant and a flag is INTEGER, because those are the two
-# constructs SQLite and PostgreSQL both spell the same way. `{json}` is the one
-# substitution this schema needs from the store.
-STORE_MIGRATIONS = [
-    """
-    CREATE TABLE IF NOT EXISTS tg_worker_jobs (
-        id                TEXT PRIMARY KEY,
-        project_id        TEXT NOT NULL,
-        environment       TEXT NOT NULL,
-        surface           TEXT NOT NULL,
-        channel_key       TEXT NOT NULL,
-        requested_by      TEXT NOT NULL,
-        origin_message_id TEXT,
-        description       TEXT NOT NULL,
-        engine            TEXT NOT NULL,
-        model             TEXT,
-        session_id        TEXT,
-        pid               INTEGER,
-        state             TEXT NOT NULL,
-        outcome           TEXT,
-        attempt           INTEGER NOT NULL DEFAULT 0,
-        amendments        INTEGER NOT NULL DEFAULT 0,
-        stop_requested    INTEGER NOT NULL DEFAULT 0,
-        exit_code         INTEGER,
-        error             TEXT,
-        log_path          TEXT,
-        created_at        TEXT NOT NULL,
-        started_at        TEXT,
-        finished_at       TEXT,
-        updated_at        TEXT NOT NULL
-    )
-    """,
-    # How the runner selects the next job.
-    """
-    CREATE INDEX IF NOT EXISTS tg_worker_jobs_queue_idx
-        ON tg_worker_jobs (project_id, environment, surface, state)
-    """,
-    # How a caller lists the open jobs of one channel.
-    """
-    CREATE INDEX IF NOT EXISTS tg_worker_jobs_channel_idx
-        ON tg_worker_jobs (project_id, surface, channel_key, state)
-    """,
-    # Two concurrent resumes of one session cannot both enter `running`.
-    # Sequential amendments are unaffected; only the concurrent case is
-    # refused, and it is refused by the schema rather than by a lock somebody
-    # has to remember to take.
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS tg_worker_jobs_live_session_idx
-        ON tg_worker_jobs (session_id) WHERE state = 'running'
-    """,
-    # Version 2: execution ownership, durable delivery, and quota recovery.
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN attempt_token TEXT
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN lease_owner TEXT
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN lease_expires_at TEXT
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN owner_host TEXT
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN pgid INTEGER
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN resume_at TEXT
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN result_text TEXT
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN result_silent INTEGER NOT NULL DEFAULT 0
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN execution_finished_at TEXT
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN delivery_state TEXT
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN delivery_error TEXT
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN delivered_at TEXT
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS tg_worker_jobs_origin_idx
-        ON tg_worker_jobs (project_id, environment, surface, channel_key, origin_message_id)
-        WHERE origin_message_id IS NOT NULL
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS tg_worker_job_amendments (
+# The register's tables, owned by this capability in the machine's store and
+# migrated through the shared database library under the owner `telegram`: each
+# step is applied once and recorded in that owner's ledger, and never edited once
+# released - a change is a new step. The columns are the ones the register has
+# always kept: a timestamp is TEXT holding an ISO instant and a flag is INTEGER,
+# so every comparison and every reader below sees the values it always saw.
+STORE_OWNER = "telegram"
+STORE_SCHEMA_MAJOR = 1
+STORE_SCHEMA_MINOR = 0
+STORE_STEPS = (
+    ("0001-jobs", """
+    CREATE TABLE telegram_jobs (
+        id                        TEXT PRIMARY KEY,
+        project_id                TEXT NOT NULL,
+        environment               TEXT NOT NULL,
+        surface                   TEXT NOT NULL,
+        channel_key               TEXT NOT NULL,
+        requested_by              TEXT NOT NULL,
+        origin_message_id         TEXT,
+        description               TEXT NOT NULL,
+        engine                    TEXT NOT NULL,
+        model                     TEXT,
+        session_id                TEXT,
+        pid                       INTEGER,
+        state                     TEXT NOT NULL,
+        outcome                   TEXT,
+        attempt                   INTEGER NOT NULL DEFAULT 0,
+        amendments                INTEGER NOT NULL DEFAULT 0,
+        stop_requested            INTEGER NOT NULL DEFAULT 0,
+        exit_code                 INTEGER,
+        error                     TEXT,
+        log_path                  TEXT,
+        created_at                TEXT NOT NULL,
+        started_at                TEXT,
+        finished_at               TEXT,
+        updated_at                TEXT NOT NULL,
+        attempt_token             TEXT,
+        lease_owner               TEXT,
+        lease_expires_at          TEXT,
+        owner_host                TEXT,
+        pgid                      INTEGER,
+        resume_at                 TEXT,
+        result_text               TEXT,
+        result_silent             INTEGER NOT NULL DEFAULT 0,
+        execution_finished_at     TEXT,
+        delivery_state            TEXT,
+        delivery_attempts         INTEGER NOT NULL DEFAULT 0,
+        delivery_error            TEXT,
+        delivered_at              TEXT,
+        delivery_owner            TEXT,
+        delivery_token            TEXT,
+        delivery_lease_expires_at TEXT
+    );
+    -- How the runner selects the next job.
+    CREATE INDEX telegram_jobs_queue_idx
+        ON telegram_jobs (project_id, environment, surface, state);
+    -- How a caller lists the open jobs of one channel.
+    CREATE INDEX telegram_jobs_channel_idx
+        ON telegram_jobs (project_id, surface, channel_key, state);
+    -- Two concurrent resumes of one session cannot both enter `running`.
+    -- Sequential amendments are unaffected; only the concurrent case is
+    -- refused, and it is refused by the schema rather than by a lock somebody
+    -- has to remember to take.
+    CREATE UNIQUE INDEX telegram_jobs_live_session_idx
+        ON telegram_jobs (session_id) WHERE state = 'running';
+    -- One Telegram update registers one job, however many deliveries race.
+    CREATE UNIQUE INDEX telegram_jobs_origin_idx
+        ON telegram_jobs (project_id, environment, surface, channel_key, origin_message_id)
+        WHERE origin_message_id IS NOT NULL;
+    """),
+    ("0002-job-amendments", """
+    CREATE TABLE telegram_job_amendments (
         id            TEXT PRIMARY KEY,
         project_id    TEXT NOT NULL,
         environment   TEXT NOT NULL,
@@ -222,47 +194,28 @@ STORE_MIGRATIONS = [
         created_at    TEXT NOT NULL,
         claimed_at    TEXT,
         acked_at      TEXT
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS tg_worker_job_amendments_pending_idx
-        ON tg_worker_job_amendments
-        (project_id, environment, surface, job_id, state, created_at)
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS tg_worker_job_slots (
-        project_id      TEXT NOT NULL,
-        environment     TEXT NOT NULL,
-        surface         TEXT NOT NULL,
+    );
+    CREATE INDEX telegram_job_amendments_pending_idx
+        ON telegram_job_amendments
+        (project_id, environment, surface, job_id, state, created_at);
+    """),
+    ("0003-job-slots", """
+    CREATE TABLE telegram_job_slots (
+        project_id       TEXT NOT NULL,
+        environment      TEXT NOT NULL,
+        surface          TEXT NOT NULL,
         slot             INTEGER NOT NULL,
         job_id           TEXT NOT NULL,
         owner_id         TEXT NOT NULL,
         attempt_token    TEXT NOT NULL,
         lease_expires_at TEXT NOT NULL,
-        PRIMARY KEY (project_id, environment, surface, slot),
-        UNIQUE (project_id, environment, surface, job_id)
-    )
-    """,
-    # Version 3: delivery is itself a leased single-consumer operation.
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN delivery_owner TEXT
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN delivery_token TEXT
-    """,
-    """
-    ALTER TABLE tg_worker_jobs ADD COLUMN delivery_lease_expires_at TEXT
-    """,
-]
-
-# Store.migrate applies the supplied body as one version step. Keep each
-# additive generation separate so an upgrade from v2 does not replay v2's
-# ALTER TABLE statements before adding v3.
-STORE_MIGRATION_STEPS = {
-    1: STORE_MIGRATIONS[:4],
-    2: STORE_MIGRATIONS[4:-3],
-    3: STORE_MIGRATIONS[-3:],
-}
+        CONSTRAINT telegram_job_slots_pkey
+            PRIMARY KEY (project_id, environment, surface, slot),
+        CONSTRAINT telegram_job_slots_job_key
+            UNIQUE (project_id, environment, surface, job_id)
+    );
+    """),
+)
 
 # WHAT A JOB IS DOING, AND WHY IT IS DOING THAT
 # =============================================
@@ -357,56 +310,96 @@ def handed_project_id(root: Path) -> str:
         return ""
 
 
-def open_register(store_module, envelope: Path, environment: str,
-                  surface: str = "telegram", url: str | None = None,
-                  project_id: str | None = None, register: bool = True):
+def store_setting():
+    """The store this machine names for runtime state, read through the shared
+    database library: `CAPABILITIES_STORE_URL`, else the manager's store setting.
+
+    There is no local default. A register nobody else can see is a queue whose
+    work silently goes nowhere, so a machine with no store is told so -
+    `store_not_configured`, with the library's hint - rather than handed one."""
+    try:
+        from capabilities_contract.db import DbError, read_setting
+    except ImportError as exc:
+        raise JobError("store_library_missing",
+                       "the shared database library capabilities-contract is not installed",
+                       "run the capability through its own script header, which pins it") from exc
+    try:
+        return read_setting()
+    except DbError as exc:
+        raise JobError(exc.slug, exc.message, exc.hint) from exc
+
+
+class JobStore:
+    """The register's connection to the store: one psycopg connection bound to
+    the setting's schema, in autocommit so that each `transaction()` is the
+    whole of a unit of work. The register writes `?` for a parameter, as it
+    always has; this is the one place that spells it for the driver."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def _execute(self, sql: str, params: Sequence[Any] = ()):
+        return self.conn.execute(sql.replace("?", "%s"), tuple(params))
+
+    def transaction(self):
+        return self.conn.transaction()
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+def open_register(envelope: Path, environment: str, surface: str = "telegram",
+                  project_id: str | None = None, setting=None):
     """The store this project's jobs live in, and the register onto it.
 
-    There is no file-mode register. A queue, a slot count and a cancellation
-    flag are records nobody authors and nobody reviews, and a capability keeping
-    its own database for them was only ever the easy thing. The caller closes
-    the store.
+    There is no file-mode register and no local database. A queue, a slot count
+    and a cancellation flag are what every process serving the project
+    coordinates through, so they live in the machine's store, in this
+    capability's own tables, migrated here under its own ledger. The caller
+    closes the store.
 
-    Registering stamps the project id, so the id is the one the launching CLI
-    resolved for a write and passes in; project.json's own id stands in only
-    where no launcher resolved one. A read whose project id may not be stamped
-    passes `register` False and reads the project as it is already registered.
+    The project id is the one the launching CLI resolved and passes in;
+    project.json's own id stands in only where no launcher resolved one.
+    `setting` is the store already resolved by a caller that reads it once;
+    otherwise it is read now.
     """
     identity = project_identity(envelope)
-    slug = identity.get("slug")
-    if not slug:
+    project_id = project_id or identity.get("id")
+    if not project_id:
         raise JobError("no_project_identity",
-                       f"{Path(envelope) / 'project.json'} declares no slug",
+                       f"{Path(envelope) / 'project.json'} declares no id",
                        "run `capabilities init` in the project")
-    store = store_module.open_store(url)
+    if setting is None:
+        setting = store_setting()
+    from capabilities_contract.db import DbError, connect, migrate
     try:
-        store.migrate()
-        if register:
-            store.project_register(project_id or identity.get("id"), slug)
-        for version in range(1, STORE_VERSION + 1):
-            if store.schema_version(STORE_NAMESPACE) < version:
-                store.migrate(
-                    STORE_NAMESPACE, version, STORE_MIGRATION_STEPS[version])
-    except store_module.StoreError as exc:
-        store.close()
-        raise JobError("store_unavailable",
-                       f"cannot prepare the store: {exc.message}") from exc
+        conn = connect(application_name=STORE_OWNER, setting=setting)
+    except DbError as exc:
+        raise JobError(exc.slug, exc.message, exc.hint) from exc
+    try:
+        migrate(conn, STORE_OWNER, STORE_STEPS, major=STORE_SCHEMA_MAJOR,
+                minor=STORE_SCHEMA_MINOR)
+        conn.autocommit = True
+    except DbError as exc:
+        conn.close()
+        raise JobError(exc.slug, exc.message, exc.hint) from exc
     except Exception:
-        store.close()
+        conn.close()
         raise
-    project_id = store._project_id(slug)
-    return store, JobRegister(store, project_id, environment, surface, slug=slug)
+    store = JobStore(conn)
+    return store, JobRegister(store, str(project_id), environment, surface)
 
 
 class JobRegister:
     """Every question and every claim about jobs, in one place that knows whose.
 
-    The same class serves a local SQLite store and a coordinated backend; the
-    scope and the query shape do not change with the deployment.
+    The store is shared by every daemon and every CLI serving the project, on
+    one machine or several; the scope and the query shape do not change with
+    how many of them there are.
     """
 
     def __init__(self, store, project_id: str, environment: str,
-                 surface: str = "telegram", slug: str | None = None):
+                 surface: str = "telegram"):
         if not project_id:
             raise JobError("no_project_scope",
                            "the job register requires a registered project")
@@ -446,7 +439,7 @@ class JobRegister:
     def _rows(self, predicates: str = "", params: Sequence[Any] = (),
               order: str = "", limit: int | None = None) -> list[dict[str, Any]]:
         clause, scope = self._where(*([predicates] if predicates else []))
-        sql = "SELECT * FROM tg_worker_jobs" + clause
+        sql = "SELECT * FROM telegram_jobs" + clause
         if order:
             sql += f" ORDER BY {order}"
         args = scope + list(params)
@@ -522,7 +515,7 @@ class JobRegister:
             predicates.append("requested_by = ?")
             values.append(str(actor_id))
         clause, params = self._where(*predicates)
-        return self.store._execute("SELECT COUNT(*) FROM tg_worker_jobs" + clause,
+        return self.store._execute("SELECT COUNT(*) FROM telegram_jobs" + clause,
                                    tuple(params + values)).fetchone()[0]
 
     def counts(self, *, actor_id: str | None = None) -> dict[str, Any]:
@@ -535,10 +528,10 @@ class JobRegister:
             values.append(str(actor_id))
         clause, params = self._where(*predicates)
         states = dict(self.store._execute(
-            "SELECT state, COUNT(*) FROM tg_worker_jobs" + clause + " GROUP BY state",
+            "SELECT state, COUNT(*) FROM telegram_jobs" + clause + " GROUP BY state",
             tuple(params + values)).fetchall())
         outcomes = dict(self.store._execute(
-            "SELECT outcome, COUNT(*) FROM tg_worker_jobs" + clause
+            "SELECT outcome, COUNT(*) FROM telegram_jobs" + clause
             + " AND outcome IS NOT NULL GROUP BY outcome",
             tuple(params + values)).fetchall())
         return {"state": states, "outcome": outcomes}
@@ -569,7 +562,7 @@ class JobRegister:
 
     def quota_until(self) -> str | None:
         row = self.store._execute(
-            "SELECT MAX(resume_at) FROM tg_worker_jobs WHERE project_id = ? AND "
+            "SELECT MAX(resume_at) FROM telegram_jobs WHERE project_id = ? AND "
             "environment = ? AND surface = ? AND state = ? AND outcome = ? "
             "AND resume_at > ?",
             (self.project_id, self.environment, self.surface, STOPPED, QUOTA, iso())).fetchone()
@@ -589,7 +582,7 @@ class JobRegister:
         claimed: list[str] = []
         with self.store.transaction():
             rows = self.store._execute(
-                "SELECT id FROM tg_worker_jobs WHERE project_id = ? AND environment = ? "
+                "SELECT id FROM telegram_jobs WHERE project_id = ? AND environment = ? "
                 "AND surface = ? AND (delivery_state = ? OR (delivery_state = ? "
                 "AND delivery_lease_expires_at <= ?)) ORDER BY execution_finished_at, id LIMIT ?",
                 (self.project_id, self.environment, self.surface, "pending",
@@ -600,7 +593,7 @@ class JobRegister:
                     "id = ?", "(delivery_state = ? OR (delivery_state = ? "
                     "AND delivery_lease_expires_at <= ?))")
                 cur = self.store._execute(
-                    "UPDATE tg_worker_jobs SET delivery_state = ?, delivery_owner = ?, "
+                    "UPDATE telegram_jobs SET delivery_state = ?, delivery_owner = ?, "
                     "delivery_token = ?, delivery_lease_expires_at = ?, "
                     "delivery_attempts = delivery_attempts + 1, updated_at = ?" + clause,
                     tuple(["delivering", owner_id, token, until, now] + params
@@ -640,7 +633,7 @@ class JobRegister:
         try:
             with self.store.transaction():
                 self.store._execute(
-                    "INSERT INTO tg_worker_jobs (id, project_id, environment, surface, "
+                    "INSERT INTO telegram_jobs (id, project_id, environment, surface, "
                     "channel_key, requested_by, origin_message_id, description, engine, "
                     "model, state, attempt, amendments, stop_requested, "
                     "created_at, updated_at) "
@@ -668,7 +661,7 @@ class JobRegister:
         assignments = ", ".join(f"{name} = ?" for name in columns)
         clause, params = self._where("id = ?")
         with self.store.transaction():
-            self.store._execute(f"UPDATE tg_worker_jobs SET {assignments}" + clause,
+            self.store._execute(f"UPDATE telegram_jobs SET {assignments}" + clause,
                                 tuple(list(columns.values()) + params + [job_id]))
         return self.get(job_id)
 
@@ -691,7 +684,7 @@ class JobRegister:
         clause, params = self._where("id = ?", "state = ?")
         with self.store.transaction():
             cur = self.store._execute(
-            "UPDATE tg_worker_jobs SET state = ?, outcome = NULL, "
+            "UPDATE telegram_jobs SET state = ?, outcome = NULL, "
             "attempt = attempt + 1, attempt_token = ?, lease_owner = ?, "
             "lease_expires_at = ?, owner_host = ?, pid = ?, pgid = ?, "
             "started_at = COALESCE(started_at, ?), updated_at = ?" + clause,
@@ -731,7 +724,7 @@ class JobRegister:
             try:
                 with self.store.transaction():
                     cur = self.store._execute(
-                        "UPDATE tg_worker_jobs SET state = ?, outcome = NULL, "
+                        "UPDATE telegram_jobs SET state = ?, outcome = NULL, "
                         "attempt = attempt + 1, attempt_token = ?, lease_owner = ?, "
                         "lease_expires_at = ?, owner_host = ?, pid = NULL, pgid = NULL, "
                         "started_at = COALESCE(started_at, ?), updated_at = ?" + clause,
@@ -740,12 +733,12 @@ class JobRegister:
                     if not cur.rowcount:
                         return None
                     lowest = self.store._execute(
-                        "SELECT MIN(slot) FROM tg_worker_job_slots WHERE project_id = ? "
+                        "SELECT MIN(slot) FROM telegram_job_slots WHERE project_id = ? "
                         "AND environment = ? AND surface = ?",
                         (self.project_id, self.environment, self.surface)).fetchone()[0]
                     slot = min(-1, int(lowest) - 1) if lowest is not None else -1
                     self.store._execute(
-                        "INSERT INTO tg_worker_job_slots (project_id, environment, surface, "
+                        "INSERT INTO telegram_job_slots (project_id, environment, surface, "
                         "slot, job_id, owner_id, attempt_token, lease_expires_at) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (self.project_id, self.environment, self.surface, slot, job_id,
@@ -777,28 +770,28 @@ class JobRegister:
         try:
             with self.store.transaction():
                 used = {int(r[0]) for r in self.store._execute(
-                    "SELECT slot FROM tg_worker_job_slots WHERE project_id = ? AND "
+                    "SELECT slot FROM telegram_job_slots WHERE project_id = ? AND "
                     "environment = ? AND surface = ?",
                     (self.project_id, self.environment, self.surface)).fetchall()}
                 slot = next((n for n in range(max_parallel) if n not in used), None)
                 if slot is None:
                     return None
                 candidate = self.store._execute(
-                    "SELECT id FROM tg_worker_jobs WHERE project_id = ? AND surface = ? "
+                    "SELECT id FROM telegram_jobs WHERE project_id = ? AND surface = ? "
                     "AND environment = ? AND state = ? ORDER BY created_at, id LIMIT ?",
                     (self.project_id, self.surface, self.environment, WAITING, 1)).fetchone()
                 if not candidate:
                     return None
                 job_id = candidate[0]
                 self.store._execute(
-                    "INSERT INTO tg_worker_job_slots (project_id, environment, surface, "
+                    "INSERT INTO telegram_job_slots (project_id, environment, surface, "
                     "slot, job_id, owner_id, attempt_token, lease_expires_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (self.project_id, self.environment, self.surface, slot, job_id,
                      owner_id, token, lease_until))
                 clause, params = self._where("id = ?", "state = ?")
                 cur = self.store._execute(
-                    "UPDATE tg_worker_jobs SET state = ?, outcome = NULL, "
+                    "UPDATE telegram_jobs SET state = ?, outcome = NULL, "
                     "attempt = attempt + 1, attempt_token = ?, lease_owner = ?, "
                     "lease_expires_at = ?, owner_host = ?, pid = NULL, pgid = NULL, "
                     "started_at = COALESCE(started_at, ?), updated_at = ?" + clause,
@@ -823,7 +816,7 @@ class JobRegister:
             "id = ?", "state = ?", "attempt_token = ?", "lease_owner = ?")
         with self.store.transaction():
             cur = self.store._execute(
-                "UPDATE tg_worker_jobs SET pid = ?, pgid = ?, updated_at = ?" + clause,
+                "UPDATE telegram_jobs SET pid = ?, pgid = ?, updated_at = ?" + clause,
                 tuple([int(pid), int(pgid or pid), iso()] + params
                       + [job_id, RUNNING, attempt_token, owner_id]))
         return bool(cur.rowcount)
@@ -836,7 +829,7 @@ class JobRegister:
         assignments = ", ".join(f"{name} = ?" for name in columns)
         with self.store.transaction():
             cur = self.store._execute(
-                f"UPDATE tg_worker_jobs SET {assignments}" + clause,
+                f"UPDATE telegram_jobs SET {assignments}" + clause,
                 tuple(list(columns.values()) + params
                       + [job_id, RUNNING, attempt_token, owner_id]))
         return self.get(job_id) if cur.rowcount else None
@@ -851,13 +844,13 @@ class JobRegister:
         try:
             with self.store.transaction():
                 cur = self.store._execute(
-                    "UPDATE tg_worker_jobs SET lease_expires_at = ?, updated_at = ?" + clause,
+                    "UPDATE telegram_jobs SET lease_expires_at = ?, updated_at = ?" + clause,
                     tuple([until, iso()] + params
                           + [job_id, RUNNING, attempt_token, owner_id]))
                 if cur.rowcount != 1:
                     raise JobError("lease_lost", f"job {job_id} no longer owns its attempt")
                 slot = self.store._execute(
-                    "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE project_id = ? "
+                    "UPDATE telegram_job_slots SET lease_expires_at = ? WHERE project_id = ? "
                     "AND environment = ? AND surface = ? AND job_id = ? AND owner_id = ? "
                     "AND attempt_token = ?",
                     (until, self.project_id, self.environment, self.surface, job_id,
@@ -898,7 +891,7 @@ class JobRegister:
             delivery_values = [result_text, "pending"]
         with self.store.transaction():
             cur = self.store._execute(
-                "UPDATE tg_worker_jobs SET state = ?, outcome = ?, pid = NULL, pgid = NULL, "
+                "UPDATE telegram_jobs SET state = ?, outcome = ?, pid = NULL, pgid = NULL, "
                 "stop_requested = 0, finished_at = ?, execution_finished_at = ?, "
                 "error = ?, lease_expires_at = NULL, updated_at = ?" + delivery + clause,
                 tuple([STOPPED, INTERRUPTED, now, now, str(reason)[:500], now]
@@ -907,13 +900,13 @@ class JobRegister:
             if cur.rowcount != 1:
                 return None
             # A local process group must be stopped while the exact attempt is
-            # fenced and its slot is still held. SQLite's BEGIN IMMEDIATE and
-            # PostgreSQL's row update keep renew/claim from crossing this
+            # fenced and its slot is still held. The row update's lock keeps
+            # renew/claim from crossing this
             # callback; only after it returns may the slot become reusable.
             if before_release is not None:
                 before_release()
             slot = self.store._execute(
-                "DELETE FROM tg_worker_job_slots WHERE project_id = ? AND environment = ? "
+                "DELETE FROM telegram_job_slots WHERE project_id = ? AND environment = ? "
                 "AND surface = ? AND job_id = ? AND owner_id = ? AND attempt_token = ? "
                 "AND lease_expires_at = ?",
                 (self.project_id, self.environment, self.surface, job_id,
@@ -921,7 +914,7 @@ class JobRegister:
             if slot.rowcount != 1:
                 raise JobError("slot_mismatch", f"job {job_id} expired without its exact slot")
             self.store._execute(
-                "UPDATE tg_worker_job_amendments SET state = ?, claim_token = NULL, "
+                "UPDATE telegram_job_amendments SET state = ?, claim_token = NULL, "
                 "claimed_at = NULL WHERE project_id = ? AND environment = ? AND surface = ? "
                 "AND job_id = ? AND state = ? AND claim_token = ?",
                 ("pending", self.project_id, self.environment, self.surface,
@@ -934,7 +927,7 @@ class JobRegister:
         marks = self._marks(states)
         cur = self.store._execute(
             "SELECT id, text, state, claim_token, created_at FROM "
-            "tg_worker_job_amendments WHERE project_id = ? AND environment = ? "
+            "telegram_job_amendments WHERE project_id = ? AND environment = ? "
             f"AND surface = ? AND job_id = ? AND state IN ({marks}) "
             "ORDER BY created_at, id",
             (self.project_id, self.environment, self.surface, job_id, *states))
@@ -959,12 +952,12 @@ class JobRegister:
         clause, params = self._where(*predicates)
         with self.store.transaction():
             self.store._execute(
-                "INSERT INTO tg_worker_job_amendments (id, project_id, environment, "
+                "INSERT INTO telegram_job_amendments (id, project_id, environment, "
                 "surface, job_id, text, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (amendment_id, self.project_id, self.environment, self.surface,
                  job_id, text, "pending", now))
             cur = self.store._execute(
-                "UPDATE tg_worker_jobs SET amendments = amendments + 1, updated_at = ?"
+                "UPDATE telegram_jobs SET amendments = amendments + 1, updated_at = ?"
                 + clause, tuple([now] + params + values))
             if not cur.rowcount:
                 raise JobError("job_not_found", f"no job {job_id} in this actor scope")
@@ -982,18 +975,17 @@ class JobRegister:
 
     def _lock_attempt(self, job_id: str, attempt_token: str, owner_id: str) -> bool:
         """Lock one exact attempt and its slot in the common row-then-slot order."""
-        lock = " FOR UPDATE" if self.store.dialect == "postgres" else ""
         job = self.store._execute(
-            "SELECT 1 FROM tg_worker_jobs WHERE project_id = ? AND environment = ? "
+            "SELECT 1 FROM telegram_jobs WHERE project_id = ? AND environment = ? "
             "AND surface = ? AND id = ? AND state = ? AND attempt_token = ? "
-            "AND lease_owner = ?" + lock,
+            "AND lease_owner = ? FOR UPDATE",
             (self.project_id, self.environment, self.surface, job_id, RUNNING,
              attempt_token, owner_id)).fetchone()
         if not job:
             return False
         slot = self.store._execute(
-            "SELECT 1 FROM tg_worker_job_slots WHERE project_id = ? AND environment = ? "
-            "AND surface = ? AND job_id = ? AND attempt_token = ? AND owner_id = ?" + lock,
+            "SELECT 1 FROM telegram_job_slots WHERE project_id = ? AND environment = ? "
+            "AND surface = ? AND job_id = ? AND attempt_token = ? AND owner_id = ? FOR UPDATE",
             (self.project_id, self.environment, self.surface, job_id,
              attempt_token, owner_id)).fetchone()
         return bool(slot)
@@ -1011,7 +1003,7 @@ class JobRegister:
             if not self._lock_attempt(job_id, attempt_token, owner_id):
                 return []
             self.store._execute(
-                "UPDATE tg_worker_job_amendments SET state = ?, claim_token = ?, "
+                "UPDATE telegram_job_amendments SET state = ?, claim_token = ?, "
                 "claimed_at = ? WHERE project_id = ? AND environment = ? AND surface = ? "
                 "AND job_id = ? AND state = ?",
                 ("claimed", attempt_token, now, self.project_id, self.environment,
@@ -1025,7 +1017,7 @@ class JobRegister:
             if not self._lock_attempt(job_id, attempt_token, owner_id):
                 return 0
             cur = self.store._execute(
-                "UPDATE tg_worker_job_amendments SET state = ?, acked_at = ? WHERE "
+                "UPDATE telegram_job_amendments SET state = ?, acked_at = ? WHERE "
                 "project_id = ? AND environment = ? AND surface = ? AND job_id = ? "
                 "AND state = ? AND claim_token = ?",
                 ("acked", iso(), self.project_id, self.environment, self.surface,
@@ -1043,7 +1035,7 @@ class JobRegister:
         ids = [item["id"] for item in pending]
         with self.store.transaction():
             self.store._execute(
-                f"UPDATE tg_worker_job_amendments SET state = ?, acked_at = ? WHERE "
+                f"UPDATE telegram_job_amendments SET state = ?, acked_at = ? WHERE "
                 f"id IN ({self._marks(ids)}) AND state = ?",
                 ("acked", iso(), *ids, "pending"))
         return [item["text"] for item in pending]
@@ -1085,7 +1077,7 @@ class JobRegister:
         clause, params = self._where(*predicates)
         with self.store.transaction():
             self.store._execute(
-            "UPDATE tg_worker_jobs SET state = ?, "
+            "UPDATE telegram_jobs SET state = ?, "
             "outcome = NULL, pid = NULL, pgid = NULL, stop_requested = 0, error = NULL, "
             "lease_owner = NULL, lease_expires_at = NULL, "
             "exit_code = NULL, finished_at = NULL, execution_finished_at = NULL, "
@@ -1104,7 +1096,7 @@ class JobRegister:
             "id = ?", "state = ?", "attempt_token = ?", "lease_owner = ?")
         with self.store.transaction():
             current = self.store._execute(
-                "SELECT engine, session_id FROM tg_worker_jobs" + clause,
+                "SELECT engine, session_id FROM telegram_jobs" + clause,
                 tuple(params + [job_id, RUNNING, attempt_token, owner_id])).fetchone()
             if not current:
                 return None
@@ -1113,7 +1105,7 @@ class JobRegister:
             error = None if safe else (
                 "amendment is pending but this attempt exposed no resumable checkpoint")
             cur = self.store._execute(
-                "UPDATE tg_worker_jobs SET state = ?, outcome = ?, pid = NULL, pgid = NULL, "
+                "UPDATE telegram_jobs SET state = ?, outcome = ?, pid = NULL, pgid = NULL, "
                 "stop_requested = 0, error = ?, lease_expires_at = NULL, finished_at = ?, "
                 "updated_at = ?" + clause,
                 tuple([state, outcome, error, None if safe else now, now]
@@ -1121,14 +1113,14 @@ class JobRegister:
             if cur.rowcount != 1:
                 return None
             slot = self.store._execute(
-                "DELETE FROM tg_worker_job_slots WHERE project_id = ? AND environment = ? "
+                "DELETE FROM telegram_job_slots WHERE project_id = ? AND environment = ? "
                 "AND surface = ? AND job_id = ? AND owner_id = ? AND attempt_token = ?",
                 (self.project_id, self.environment, self.surface, job_id,
                  owner_id, attempt_token))
             if slot.rowcount != 1:
                 raise JobError("slot_mismatch", f"job {job_id} lost its owned slot")
             self.store._execute(
-                "UPDATE tg_worker_job_amendments SET state = ?, claim_token = NULL, "
+                "UPDATE telegram_job_amendments SET state = ?, claim_token = NULL, "
                 "claimed_at = NULL WHERE project_id = ? AND environment = ? AND surface = ? "
                 "AND job_id = ? AND state = ? AND claim_token = ?",
                 ("pending", self.project_id, self.environment, self.surface,
@@ -1160,7 +1152,7 @@ class JobRegister:
         clause, params = self._where(*predicates)
         with self.store.transaction():
             cur = self.store._execute(
-                "UPDATE tg_worker_jobs SET stop_requested = 1, updated_at = ?" + clause,
+                "UPDATE telegram_jobs SET stop_requested = 1, updated_at = ?" + clause,
                 tuple([iso()] + params + values))
         return self.get(job_id, actor_id=actor_id) if cur.rowcount else None
 
@@ -1185,7 +1177,7 @@ class JobRegister:
         clause, params = self._where(*predicates)
         with self.store.transaction():
             cur = self.store._execute(
-                "DELETE FROM tg_worker_jobs" + clause, tuple(params + values))
+                "DELETE FROM telegram_jobs" + clause, tuple(params + values))
         return row if cur.rowcount else None
 
     def cancel_waiting(self, job_id: str, *, error: str,
@@ -1257,11 +1249,11 @@ class JobRegister:
         assignments = ", ".join(f"{name} = ?" for name in columns)
         with self.store.transaction():
             cur = self.store._execute(
-                f"UPDATE tg_worker_jobs SET {assignments}" + clause,
+                f"UPDATE telegram_jobs SET {assignments}" + clause,
                 tuple(list(columns.values()) + params + values))
             if cur.rowcount:
                 slot_sql = (
-                    "DELETE FROM tg_worker_job_slots WHERE project_id = ? AND environment = ? "
+                    "DELETE FROM telegram_job_slots WHERE project_id = ? AND environment = ? "
                     "AND surface = ? AND job_id = ?")
                 slot_params: list[Any] = [self.project_id, self.environment,
                                           self.surface, job_id]
@@ -1273,7 +1265,7 @@ class JobRegister:
                     raise JobError("slot_mismatch", f"job {job_id} lost its owned slot")
                 if attempt_token is not None:
                     self.store._execute(
-                        "UPDATE tg_worker_job_amendments SET state = ?, claim_token = NULL, "
+                        "UPDATE telegram_job_amendments SET state = ?, claim_token = NULL, "
                         "claimed_at = NULL WHERE project_id = ? AND environment = ? "
                         "AND surface = ? AND job_id = ? AND state = ? AND claim_token = ?",
                         ("pending", self.project_id, self.environment, self.surface,
@@ -1288,7 +1280,7 @@ class JobRegister:
             "id = ?", "delivery_state = ?", "delivery_token = ?", "delivery_owner = ?")
         with self.store.transaction():
             cur = self.store._execute(
-                "UPDATE tg_worker_jobs SET delivery_state = ?, delivery_error = ?, "
+                "UPDATE telegram_jobs SET delivery_state = ?, delivery_error = ?, "
                 "delivered_at = ?, delivery_owner = NULL, delivery_token = NULL, "
                 "delivery_lease_expires_at = NULL, updated_at = ?" + clause,
                 tuple(["delivered" if delivered else "pending",
@@ -1364,7 +1356,7 @@ class JobRegister:
         assignments = ", ".join(f"{name} = ?" for name in columns)
         with self.store.transaction():
             cur = self.store._execute(
-                f"UPDATE tg_worker_jobs SET {assignments}" + clause,
+                f"UPDATE telegram_jobs SET {assignments}" + clause,
                 tuple(list(columns.values()) + params + values))
         return self.get(job_id, actor_id=actor_id) if cur.rowcount else None
 

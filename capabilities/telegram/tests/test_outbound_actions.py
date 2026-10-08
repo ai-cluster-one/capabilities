@@ -1349,9 +1349,10 @@ class ServiceDoctorExitTests(unittest.TestCase):
     on, so its verdict has to reach the exit code. The payload is the contract a
     consuming project already reads; only the exit code answers for `ok`."""
 
-    PAYLOAD_KEYS = {"ok", "service", "workers", "connection", "note"}
+    PAYLOAD_KEYS = {"ok", "service", "workers", "store", "connection", "note"}
+    STORE_OK = {"ok": True, "source": "CAPABILITIES_STORE_URL", "schema": "agentkit"}
 
-    def _run_doctor(self, cli, tmp, health):
+    def _run_doctor(self, cli, tmp, health, store=None):
         """Drive the real dispatch for one runtime-health shape and return
         (exit_code, payload). The verdict is computed by the real
         `cmd_service_doctor` over the real `_service_runtime_health`; only the
@@ -1381,6 +1382,8 @@ class ServiceDoctorExitTests(unittest.TestCase):
                 mock.patch.object(cli, "_load_config", lambda *a, **k: cfg), \
                 mock.patch.object(cli, "_write_gate", lambda *a: None), \
                 mock.patch.object(cli, "cmd_service_status", fake_status), \
+                mock.patch.object(cli, "_service_store_check",
+                                  lambda root: store or self.STORE_OK), \
                 mock.patch.object(sys, "argv", ["telegram", "service", "doctor"]), \
                 contextlib.redirect_stdout(captured):
             try:
@@ -1435,6 +1438,20 @@ class ServiceDoctorExitTests(unittest.TestCase):
         self.assertEqual(payload["service"]["health"]["state"], "stopped")
         self.assertTrue(payload["ok"])
         self.assertEqual(code, 0)
+
+    def test_a_machine_without_a_store_fails(self):
+        """The service refuses to run without a store, so the doctor a deploy
+        gates on says so rather than passing a service that cannot start."""
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
+            os.environ.pop("CAPABILITIES_STORE_URL", None)
+            store = cli._service_store_check(Path(tmp))
+            code, payload = self._run_doctor(cli, tmp, health=None, store=store)
+        self.assertEqual(payload["store"]["code"], "store_not_configured")
+        self.assertIn("capabilities store set", payload["store"]["hint"])
+        self.assertFalse(payload["ok"])
+        self.assertEqual(code, 5)
 
     def test_the_inventory_verdict_is_the_doctor_s_without_the_workers(self):
         """`inventory` judges by the doctor's local checks and never makes the
@@ -1628,6 +1645,8 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
                 mock.patch.object(cli, "_load_config", lambda *a, **k: cfg), \
                 mock.patch.object(cli, "_write_gate", lambda *a: None), \
                 mock.patch.object(cli, "cmd_service_status", fake_status), \
+                mock.patch.object(cli, "_service_store_check",
+                                  lambda root: {"ok": True}), \
                 mock.patch.object(sys, "argv", ["telegram", "service", "doctor"]), \
                 contextlib.redirect_stdout(captured):
             try:

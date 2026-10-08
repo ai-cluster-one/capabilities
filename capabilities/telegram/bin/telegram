@@ -2,6 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
+#     "capabilities-contract==0.1.0",
 #     "httpx>=0.27",
 #     "qrcode>=7.4",
 #     "telethon==1.43.2",
@@ -177,6 +178,17 @@ Commands:
                                                not ok. `doctor` exits 5 when its
                                                own verdict is `ok: false`, so a
                                                script can gate on it.
+                                               The job register lives in the
+                                               machine's Postgres store, in
+                                               telegram_* tables migrated on
+                                               first use; `doctor` reports
+                                               whether it opens. The store is
+                                               the one `capabilities store set`
+                                               configures, and
+                                               CAPABILITIES_STORE_URL overrides
+                                               it for a process. With neither,
+                                               `start`, `run` and `jobs` exit 6
+                                               store_not_configured.
 
 Chat references:
   <chat> can be @username, a phone (+1555…), a numeric id, or a chat title
@@ -215,9 +227,10 @@ Exit codes:
      yourself
   5  server / network — Telegram unreachable, flood-wait, Deepgram 5xx, and
      `service doctor` reporting `ok: false` — a running daemon whose update
-     sync is not fresh, or a configured (worker, model) pair its binary did
-     not accept
-  6  input / validation — a malformed argument, a bad date
+     sync is not fresh, a configured (worker, model) pair its binary did
+     not accept, or a job register the store did not open
+  6  input / validation — a malformed argument, a bad date, a machine with
+     no store configured for the service or its jobs
 
 Quirks worth knowing:
   - This is a full-account MTProto session — a personal user account, so it
@@ -307,6 +320,7 @@ SERVICE = {
                 {"key": "DEEPGRAM_API_KEY"},
                 {"key": "TELEGRAM_CHANNEL_ENABLED", "default": "true"},
                 {"key": "TG_WORKER"},
+                {"key": "CAPABILITIES_STORE_URL"},
             ],
         },
         "mounts": [
@@ -5717,18 +5731,43 @@ def _job_environment(root: Path) -> str:
 
 
 def _open_job_register(root: Path, write: bool = True):
-    """The job register. Opening it registers the project, which stamps its id,
-    so a read whose id may not be stamped reads without registering."""
+    """The job register, in the machine's store. A write is keyed by the project
+    id verified for this invocation; a read takes the id in every state."""
     module = _jobs_module()
-    project_id = _project_id(write=True, refuse=write)
+    project_id = _project_id(write=True) if write else _project_id()
     try:
         _store, register = module.open_register(
-            sys.modules[__name__], _project_capabilities_dir(root),
-            _job_environment(root), project_id=project_id,
-            register=write or project_id is not None)
+            _project_capabilities_dir(root), _job_environment(root),
+            project_id=project_id)
         return module, register
     except module.JobError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
+
+
+def _require_service_store():
+    """The store the service's job register lives in. The service resolves it
+    before it takes any work and refuses to run on a machine that has none."""
+    module = _jobs_module()
+    try:
+        return module.store_setting()
+    except module.JobError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+
+
+def _service_store_check(root: Path) -> dict:
+    """Whether the job register opens in the machine's store: the setting is
+    read, the store is reached and the register's tables are migrated."""
+    module = _jobs_module()
+    try:
+        setting = module.store_setting()
+        store, _register = module.open_register(
+            _project_capabilities_dir(root), _job_environment(root),
+            project_id=_project_id(), setting=setting)
+    except module.JobError as exc:
+        return {"ok": False, "code": exc.slug, "error": exc.message,
+                "hint": exc.hint}
+    store.close()
+    return {"ok": True, "source": setting.source, "schema": setting.schema}
 
 
 def _job_channel_key(chat: str | None, topic_id: str | None) -> str | None:
@@ -6580,6 +6619,7 @@ def _service_start_result(connection_flag: str | None, session_flag: str | None)
                  json.dumps(status["owner"], sort_keys=True))
         status["already_running"] = True
         return status
+    _require_service_store()
     daemon = _service_daemon()
     if not daemon.is_file():
         _die(3, "service_bundle_missing", f"bundled daemon not found: {daemon}",
@@ -6858,9 +6898,11 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) ->
     session_file = Path(cfg["session"] + ".session")
     status["session_file_exists"] = session_file.exists()
     workers = _service_worker_preflight(root, settings or {})
-    return {"ok": local_ok and workers["ok"],
+    store = _service_store_check(root)
+    return {"ok": local_ok and workers["ok"] and store["ok"],
             "service": status,
             "workers": workers,
+            "store": store,
             "connection": cfg["id"],
             "note": ("`telegram doctor` performs the authenticated Telegram round-trip; "
                      "a running service is healthy only while its update sync stays fresh; "
@@ -6877,6 +6919,7 @@ def cmd_service_run(connection_flag: str | None, session_flag: str | None) -> No
     account_id = _service_account_id(cfg)
     _require_ownership_marker(account_id)
     _write_gate(cfg["id"], cfg["allow_write"], "send")
+    _require_service_store()
     daemon = _service_daemon()
     if not daemon.is_file():
         _die(3, "service_bundle_missing", f"bundled daemon not found: {daemon}",
@@ -7168,9 +7211,10 @@ def main() -> None:
             if not report["ok"]:
                 # An entrypoint or a deploy step gates on this, so the verdict
                 # has to reach the exit code. What reaches `ok: false` is a
-                # running daemon whose update sync is not fresh, or a configured
-                # (worker, model) pair its binary did not accept: a
-                # server/network outcome, category 5.
+                # running daemon whose update sync is not fresh, a configured
+                # (worker, model) pair its binary did not accept, or a job
+                # register the store did not open: a server/network outcome,
+                # category 5.
                 sys.exit(5)
         elif args.service_cmd == "run":
             cmd_service_run(connection_flag, session_flag)

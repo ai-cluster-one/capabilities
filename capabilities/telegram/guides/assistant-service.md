@@ -218,7 +218,7 @@ Two hosts running a daemon on one account each derive their own `control/` direc
 | `register.json` | the service state dir | Not by construction; it is the file that decides what a daemon answers, below. |
 | the auth session | `$XDG_STATE_HOME/telegram/<connection>/session.session`, or the `session` path the connection declares; the un-keyed path the connection named `default` keeps instead is recorded in this bundle's `deviations.md` | No — its location is derived from the connection id, not from the account id and not from the machine. What re-authenticating elsewhere does to it is recorded there too. |
 | `settings.json`, `context.md`, `delegation.md`, `job-worker.md`, `voice-agent.md` | the project envelope, handed to the daemon at launch | No — they are project files, versioned with the project. |
-| registered jobs | the shared capabilities store, scoped by project and environment | No — see *Registered Jobs*. The store is a local SQLite file under `$XDG_STATE_HOME/capabilities/` unless `CAPABILITIES_STORE_URL` points it at a PostgreSQL instance. |
+| registered jobs | the machine's Postgres store, scoped by project and environment | No — see *Registered Jobs*. The store is the one `capabilities store set` configures, or `CAPABILITIES_STORE_URL` for one process; the service does not run without one. |
 
 `register.json` is what decides whether a message is answered. It holds, per channel, the jobs already reserved and the last processed message id. A message is skipped only because that file already knows it: `reserve_job` is the single idempotency boundary for live delivery and startup catch-up alike, and it asks `_message_is_known`, which reads this register and nothing else.
 
@@ -260,7 +260,7 @@ Two classes of work run side by side, with separate budgets and one ledger.
 
 A **dialogue turn** answers in the channel and is expected to finish while the person is still there. Its unit is the addressed message, its record is the watermark register, and `max_parallel_dialogue` caps how many one channel runs at once.
 
-A **registered job** is work that outlives the sentence that asked for it. It is a row in `tg_worker_jobs` in the shared capabilities store, drained by the job runner in arrival order within `max_parallel_jobs` slots for the whole daemon. `job_poll_interval` is how often the runner looks.
+A **registered job** is work that outlives the sentence that asked for it. It is a row in `telegram_jobs` in the machine's Postgres store, drained by the job runner in arrival order within `max_parallel_jobs` slots for the whole daemon. `job_poll_interval` is how often the runner looks.
 
 A task started on a call is a row in the same ledger, without passing through the queue: it starts the moment it is asked for, holds none of the runner's slots, and is bounded by the one-task-per-call rule instead (see *Doing work from a call*).
 
@@ -343,7 +343,7 @@ When the engine reports the subscription spent, the running job stops with outco
 
 A job records execution completion and result before delivery. A separate durable delivery state retries an unavailable Telegram channel after restart without running the worker again, and an owner/token lease permits only one concurrent sender. Delivery is intentionally at least once: if Telegram accepts a send and the daemon crashes before persisting its acknowledgement, the result may be repeated after the lease expires because this path does not persist a stable Telegram `random_id`. That rare crash-window duplicate is an accepted limitation; the execution itself is not repeated. Results report into their own channel as replies to the originating message. Progress lines use the same outbox a dialogue turn does, and with `progress_from_stream` on a codex job's progress is also folded from its event stream.
 
-The register needs the store. Where a project keeps its *configuration* is a separate question, answered by `project.json`; a queue lives in the store either way. Without a project identity the register cannot open, the job class is off for the session, and the conversation is unaffected.
+The register needs the store. Its tables are `telegram_jobs`, `telegram_job_amendments` and `telegram_job_slots`, created in the schema the store setting names and migrated by the capability under its own ledger the first time the register opens. Where a project keeps its *configuration* is a separate question, answered by `project.json`; a queue lives in the store either way. On a machine with no store configured the service refuses to start (`store_not_configured`, exit 6) and `service doctor` reports it, because delegation with nowhere to record the work would be lost without anybody being told. Without a project identity, or while a configured store cannot be reached, the register cannot open, the job class is off for the session, and the conversation is unaffected.
 
 ## Group Call Recording
 

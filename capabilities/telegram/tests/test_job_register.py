@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
-"""The job register: isolation, arrival order, amendment, and cancellation."""
+"""The job register: isolation, arrival order, amendment, and cancellation.
+
+The register lives in Postgres. These cases read TELEGRAM_TEST_DSN, a throwaway
+database's URL, and skip without one; each case binds a schema of its own, so
+cases never see each other's rows - the live-session index spans every project.
+"""
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
+from unittest import mock
 
 
 TELEGRAM_DIR = Path(__file__).resolve().parents[1]
 SERVICE_DIR = TELEGRAM_DIR / "service"
+STORE_DSN = os.environ.get("TELEGRAM_TEST_DSN")
 
 
 def _module(name: str, path: Path):
@@ -22,10 +32,22 @@ def _module(name: str, path: Path):
     return module
 
 
-store = _module("telegram_service_store_test", SERVICE_DIR / "store.py")
 jobs = _module("telegram_service_jobs_test", SERVICE_DIR / "jobs.py")
 
 
+def project_id() -> str:
+    return f"prj_test_{uuid.uuid4().hex}"
+
+
+def store_setting():
+    """The throwaway database as the store in force, as a service reads it,
+    bound to a schema of this case's own."""
+    with mock.patch.dict(os.environ, {"CAPABILITIES_STORE_URL": STORE_DSN}):
+        setting = jobs.store_setting()
+    return dataclasses.replace(setting, schema=f"tgtest_{uuid.uuid4().hex}")
+
+
+@unittest.skipUnless(STORE_DSN, "TELEGRAM_TEST_DSN is unset")
 class RegisterCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -33,13 +55,18 @@ class RegisterCase(unittest.TestCase):
         root = Path(self.tmp.name)
         self.envelope = root / "capabilities"
         self.envelope.mkdir(parents=True)
+        self.project_id = project_id()
         (self.envelope / "project.json").write_text(
-            json.dumps({"id": "11111111-1111-4111-8111-111111111111",
-                        "slug": "testproject", "store": "db"}))
-        self.url = str(root / "store.sqlite3")
-        self.store, self.reg = jobs.open_register(
-            store, self.envelope, "development", url=self.url)
+            json.dumps({"id": self.project_id, "slug": "testproject",
+                        "store": "db"}))
+        self.setting = store_setting()
+        self.store, self.reg = self.open()
         self.addCleanup(self.store.close)
+
+    def open(self, envelope=None, **kwargs):
+        """Another connection to the same store, as another process opens it."""
+        return jobs.open_register(envelope or self.envelope, "development",
+                                  setting=self.setting, **kwargs)
 
     def register(self, reg=None, submit=True, **overrides):
         """A job most tests want in the queue. Registering opens a draft, so
@@ -55,28 +82,59 @@ class RegisterCase(unittest.TestCase):
 
     # -- the channel a job reports into --------------------------------------
 
-    def test_registration_stamps_the_id_the_launcher_resolved(self):
-        """The id is the one the telegram CLI resolved for a write and passed
-        in, not project.json's copy of it."""
-        url = str(Path(self.tmp.name) / "resolved.sqlite3")
-        resolved_store, _reg = jobs.open_register(
-            store, self.envelope, "development", url=url,
-            project_id="22222222-2222-4222-8222-222222222222")
+    def test_the_register_is_keyed_by_the_id_the_launcher_resolved(self):
+        """The id is the one the telegram CLI resolved and passed in, not
+        project.json's copy of it; project.json's stands in only without one."""
+        resolved = project_id()
+        resolved_store, reg = self.open(project_id=resolved)
         self.addCleanup(resolved_store.close)
-        self.assertEqual(resolved_store._project_id("testproject"),
-                         "22222222-2222-4222-8222-222222222222")
-        self.assertEqual(self.store._project_id("testproject"),
-                         "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(reg.project_id, resolved)
+        self.assertEqual(self.reg.project_id, self.project_id)
 
-    def test_a_read_leaves_registration_out(self):
-        """A read whose project id may not be stamped opens the register
-        without registering, and reads the project as it is registered."""
+    def test_a_project_without_an_id_is_refused(self):
         (self.envelope / "project.json").write_text(
             json.dumps({"slug": "testproject", "store": "db"}))
-        read_store, reader = jobs.open_register(
-            store, self.envelope, "development", url=self.url, register=False)
-        self.addCleanup(read_store.close)
-        self.assertEqual(reader.project_id, "11111111-1111-4111-8111-111111111111")
+        with self.assertRaises(jobs.JobError) as caught:
+            self.open()
+        self.assertEqual(caught.exception.slug, "no_project_identity")
+
+    # -- the store ------------------------------------------------------------
+
+    def test_a_machine_without_a_store_is_refused(self):
+        """No local default stands in: a queue nobody else can see is work
+        that silently goes nowhere."""
+        with tempfile.TemporaryDirectory() as config:
+            env = {k: v for k, v in os.environ.items()
+                   if k != "CAPABILITIES_STORE_URL"}
+            env["XDG_CONFIG_HOME"] = config
+            with mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(jobs.JobError) as caught:
+                    jobs.open_register(self.envelope, "development")
+        self.assertEqual(caught.exception.slug, "store_not_configured")
+
+    def test_the_tables_are_the_capabilitys_own_under_its_ledger(self):
+        ledger = self.store._execute(
+            "SELECT step FROM schema_ledger WHERE owner = ? ORDER BY step",
+            (jobs.STORE_OWNER,)).fetchall()
+        self.assertEqual([row[0] for row in ledger],
+                         [step for step, _sql in jobs.STORE_STEPS])
+        version = self.store._execute(
+            "SELECT major, minor FROM schema_version WHERE owner = ?",
+            (jobs.STORE_OWNER,)).fetchone()
+        self.assertEqual(tuple(version),
+                         (jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR))
+        tables = {row[0] for row in self.store._execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = current_schema() AND table_name LIKE ?",
+            ("telegram\\_%",)).fetchall()}
+        self.assertEqual(tables, {"telegram_jobs", "telegram_job_amendments",
+                                  "telegram_job_slots"})
+
+    def test_reopening_applies_nothing_twice(self):
+        again_store, again = self.open()
+        self.addCleanup(again_store.close)
+        self.register()
+        self.assertIsNotNone(again.next_waiting())
 
     def test_a_topic_key_round_trips(self):
         """The key is written by whoever registers the job and read back by the
@@ -128,22 +186,19 @@ class RegisterCase(unittest.TestCase):
         """The same machine runs development and production; a dev job must not
         be eligible for a production runner."""
         self.register()
-        production = jobs.JobRegister(self.store, self.reg.project_id, "production",
-                                      slug="testproject")
+        production = jobs.JobRegister(self.store, self.reg.project_id, "production")
         self.assertIsNone(production.next_waiting())
         self.assertIsNotNone(self.reg.next_waiting())
 
     def test_project_isolates_the_queue(self):
-        self.store.project_register("22222222-2222-4222-8222-222222222222", "other")
-        other = jobs.JobRegister(self.store, self.store._project_id("other"),
-                                 "development", slug="other")
+        other = jobs.JobRegister(self.store, project_id(), "development")
         self.register()
         self.assertIsNone(other.next_waiting())
 
     def test_surface_isolates_the_queue(self):
         self.register()
         elsewhere = jobs.JobRegister(self.store, self.reg.project_id, "development",
-                                     surface="slack", slug="testproject")
+                                     surface="slack")
         self.assertIsNone(elsewhere.next_waiting())
 
     def test_a_register_without_a_project_is_refused(self):
@@ -153,55 +208,6 @@ class RegisterCase(unittest.TestCase):
     def test_an_unaddressable_environment_is_refused(self):
         with self.assertRaises(jobs.JobError):
             jobs.JobRegister(self.store, self.reg.project_id, "dev/prod")
-
-    def test_version_one_store_expands_to_the_durable_schema(self):
-        with tempfile.TemporaryDirectory() as td:
-            envelope = Path(td) / "capabilities"
-            envelope.mkdir()
-            envelope.joinpath("project.json").write_text(json.dumps({
-                "id": "33333333-3333-4333-8333-333333333333",
-                "slug": "upgrade", "store": "db"}))
-            url = str(Path(td) / "upgrade.sqlite3")
-            old = store.open_store(url)
-            old.migrate()
-            old.project_register("33333333-3333-4333-8333-333333333333", "upgrade")
-            old.migrate(jobs.STORE_NAMESPACE, 1, jobs.STORE_MIGRATIONS[:4])
-            old.close()
-            upgraded_store, upgraded = jobs.open_register(
-                store, envelope, "development", url=url)
-            try:
-                row = upgraded.register(
-                    channel_key="1", requested_by="2", description="upgraded",
-                    engine="stub", origin_message_id="3")
-                self.assertIn("attempt_token", row)
-                self.assertIn("delivery_state", row)
-                self.assertEqual(upgraded.store.schema_version("telegram"), 3)
-            finally:
-                upgraded_store.close()
-
-    def test_version_two_store_adds_only_delivery_leases(self):
-        with tempfile.TemporaryDirectory() as td:
-            envelope = Path(td) / "capabilities"
-            envelope.mkdir()
-            envelope.joinpath("project.json").write_text(json.dumps({
-                "id": "44444444-4444-4444-8444-444444444444",
-                "slug": "upgrade-two", "store": "db"}))
-            url = str(Path(td) / "upgrade.sqlite3")
-            old = store.open_store(url)
-            old.migrate()
-            old.project_register("44444444-4444-4444-8444-444444444444", "upgrade-two")
-            old.migrate(jobs.STORE_NAMESPACE, 2, jobs.STORE_MIGRATIONS[:-3])
-            old.close()
-            upgraded_store, upgraded = jobs.open_register(
-                store, envelope, "development", url=url)
-            try:
-                row = upgraded.register(
-                    channel_key="1", requested_by="2", description="upgraded",
-                    engine="stub")
-                self.assertIn("delivery_owner", row)
-                self.assertEqual(upgraded.store.schema_version("telegram"), 3)
-            finally:
-                upgraded_store.close()
 
     # -- registration ---------------------------------------------------------
 
@@ -248,8 +254,7 @@ class RegisterCase(unittest.TestCase):
 
     def test_primary_key_reads_and_writes_do_not_cross_environment(self):
         row = self.register()
-        production = jobs.JobRegister(self.store, self.reg.project_id, "production",
-                                      slug="testproject")
+        production = jobs.JobRegister(self.store, self.reg.project_id, "production")
         self.assertIsNone(production.get(row["id"]))
         self.assertIsNone(production.update(row["id"], description="crossed"))
         self.assertIsNone(production.request_stop(row["id"]))
@@ -285,8 +290,7 @@ class RegisterCase(unittest.TestCase):
                                       max_parallel=1, lease_seconds=30)
         self.assertEqual(claimed["id"], first["id"])
         self.assertTrue(claimed["attempt_token"])
-        peer_store, peer = jobs.open_register(
-            store, self.envelope, "development", url=self.url)
+        peer_store, peer = self.open()
         self.addCleanup(peer_store.close)
         self.assertIsNone(peer.claim_next(
             owner_id="daemon-b", owner_host="host-a", max_parallel=1),
@@ -317,16 +321,15 @@ class RegisterCase(unittest.TestCase):
         running = self.reg.claim_next(
             owner_id="daemon-a", owner_host="host-a", max_parallel=1,
             lease_seconds=30)
-        peer_store, peer = jobs.open_register(
-            store, self.envelope, "development", url=self.url)
+        peer_store, peer = self.open()
         self.addCleanup(peer_store.close)
         expired = "2000-01-01T00:00:00.000000+00:00"
         with self.store.transaction():
             self.store._execute(
-                "UPDATE tg_worker_jobs SET lease_expires_at = ? WHERE id = ?",
+                "UPDATE telegram_jobs SET lease_expires_at = ? WHERE id = ?",
                 (expired, row["id"]))
             self.store._execute(
-                "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE job_id = ?",
+                "UPDATE telegram_job_slots SET lease_expires_at = ? WHERE job_id = ?",
                 (expired, row["id"]))
         stale = peer.get(row["id"])
         self.assertTrue(self.reg.renew(
@@ -345,16 +348,15 @@ class RegisterCase(unittest.TestCase):
         second = self.register(description="second")
         running = self.reg.claim_next(
             owner_id="daemon-a", owner_host="host-a", max_parallel=1)
-        peer_store, peer = jobs.open_register(
-            store, self.envelope, "development", url=self.url)
+        peer_store, peer = self.open()
         self.addCleanup(peer_store.close)
         expired = "2000-01-01T00:00:00.000000+00:00"
         with self.store.transaction():
             self.store._execute(
-                "UPDATE tg_worker_jobs SET lease_expires_at = ? WHERE id = ?",
+                "UPDATE telegram_jobs SET lease_expires_at = ? WHERE id = ?",
                 (expired, row["id"]))
             self.store._execute(
-                "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE job_id = ?",
+                "UPDATE telegram_job_slots SET lease_expires_at = ? WHERE job_id = ?",
                 ("2000-01-01T00:00:01.000000+00:00", row["id"]))
         observed = peer.get(row["id"])
         with self.assertRaises(jobs.JobError):
@@ -365,13 +367,13 @@ class RegisterCase(unittest.TestCase):
             owner_id="daemon-b", owner_host="host-a", max_parallel=1))
         with self.store.transaction():
             self.store._execute(
-                "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE job_id = ?",
+                "UPDATE telegram_job_slots SET lease_expires_at = ? WHERE job_id = ?",
                 (expired, row["id"]))
         slots_during_fence = []
 
         def observe_slot():
             slots_during_fence.append(peer.store._execute(
-                "SELECT COUNT(*) FROM tg_worker_job_slots WHERE job_id = ?",
+                "SELECT COUNT(*) FROM telegram_job_slots WHERE job_id = ?",
                 (row["id"],)).fetchone()[0])
 
         stopped = peer.fence_expired_attempt(
@@ -688,8 +690,7 @@ class RegisterCase(unittest.TestCase):
         self.assertEqual(done["delivery_state"], "pending")
         self.assertEqual(self.reg.pending_deliveries()[0]["result_text"],
                          "the durable answer")
-        reopened_store, reopened = jobs.open_register(
-            store, self.envelope, "development", url=self.url)
+        reopened_store, reopened = self.open()
         self.addCleanup(reopened_store.close)
         self.assertEqual(reopened.pending_deliveries()[0]["result_text"],
                          "the durable answer")
@@ -707,8 +708,7 @@ class RegisterCase(unittest.TestCase):
         self.reg.stop(row["id"], jobs.SUCCEEDED,
                       attempt_token=running["attempt_token"], owner_id="daemon-a",
                       result_text="durable result")
-        peer_store, peer = jobs.open_register(
-            store, self.envelope, "development", url=self.url)
+        peer_store, peer = self.open()
         self.addCleanup(peer_store.close)
         first = self.reg.claim_deliveries("sender-a", lease_seconds=30)
         self.assertEqual([item["id"] for item in first], [row["id"]])
@@ -799,10 +799,10 @@ class RegisterCase(unittest.TestCase):
         expired = "2000-01-01T00:00:00.000000+00:00"
         with self.store.transaction():
             self.store._execute(
-                "UPDATE tg_worker_jobs SET lease_expires_at = ? WHERE id = ?",
+                "UPDATE telegram_jobs SET lease_expires_at = ? WHERE id = ?",
                 (expired, row["id"]))
             self.store._execute(
-                "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE job_id = ?",
+                "UPDATE telegram_job_slots SET lease_expires_at = ? WHERE job_id = ?",
                 (expired, row["id"]))
         interrupted = self.reg.interrupt_active("service restarted")
         self.assertEqual([r["id"] for r in interrupted], [row["id"]])
@@ -838,16 +838,16 @@ class RegisterCase(unittest.TestCase):
         past = "2000-01-01T00:00:00.000000+00:00"
         with self.store.transaction():
             self.store._execute(
-                "UPDATE tg_worker_jobs SET lease_expires_at = ? WHERE id = ?",
+                "UPDATE telegram_jobs SET lease_expires_at = ? WHERE id = ?",
                 (past, job_id))
             self.store._execute(
-                "UPDATE tg_worker_job_slots SET lease_expires_at = ? WHERE job_id = ?",
+                "UPDATE telegram_job_slots SET lease_expires_at = ? WHERE job_id = ?",
                 (past, job_id))
 
     def slot_of(self, job_id):
         return self.store._execute(
             "SELECT slot, owner_id, attempt_token, lease_expires_at "
-            "FROM tg_worker_job_slots WHERE job_id = ?", (job_id,)).fetchone()
+            "FROM telegram_job_slots WHERE job_id = ?", (job_id,)).fetchone()
 
     def test_a_direct_attempt_runs_without_waiting_or_a_runner_slot(self):
         row = self.direct()
