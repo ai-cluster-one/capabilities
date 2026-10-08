@@ -620,7 +620,7 @@ def _state_dir() -> Path:
     return _STATE_HOME / NAME
 ```
 
-- **Project scope** → `<root>/capabilities/<name>/state/` — session cookies, scrape caches, pin-pending markers, session maps, each project isolated to its own account session. The manager-owned `capabilities/.gitignore` guarantees `*/state/` never commits. Outside an initialized envelope state falls back to the user state home; operational use there still requires global policy enable and an explicit global connections registry where the capability bears connections.
+- **Project scope** → `<root>/capabilities/<name>/state/` — session cookies, scrape caches, pin-pending markers, each project isolated to its own account session. The manager-owned `capabilities/.gitignore` guarantees `*/state/` never commits. Outside an initialized envelope state falls back to the user state home; operational use there still requires global policy enable and an explicit global connections registry where the capability bears connections.
 - **User scope** → `$XDG_STATE_HOME/<name>/` (default `~/.local/state/<name>/`).
 
 A stateful capability keys its state **per connection** — `<state-dir>/<connection-id>/…` — so two connections of one capability never share a session. The guides cache is the exception: guide content is capability-scoped and connection-independent, so it stays unkeyed at the user state home.
@@ -628,6 +628,14 @@ A stateful capability keys its state **per connection** — `<state-dir>/<connec
 **Bulk data stores are relocatable at the root, fixed inside.** A capability that syncs bulk data (message archives, exports) defaults the store to `<state-dir>/<connection-id>/…` like any state — and MAY expose the **root** as a per-connection key on the connection entry (e.g. `messages_dir`: absolute, or relative to the project root) for a consumer who wants the data elsewhere. Only the root moves: the structure beneath it is the CLI's contract, documented in its help, identical wherever the root points. The `*/state/` gitignore guard covers only the default location, so the guard travels as a responsibility: `doctor` verifies the active root is git-ignored and warns when it is not (DOCTRINE rule 16 — synced data is minted by credentials and never commits).
 
 Known limitation, recorded for fast diagnosis: two projects driving the *same* account of a single-session service thrash each other's cookies (login here invalidates the cookie there). Per-project state trades that for account isolation — the right trade where re-logins are cheap.
+
+## Runtime state in the store
+
+Runtime state is what a capability's own processes coordinate through — a service's run ledger, its job tables, the session a capability resumes from one call to the next — and it lives in the PostgreSQL the machine's store setting names ([the store setting](#project-records-and-the-envelope); DOCTRINE rule 22).
+
+A capability reaches it through the shared database library, `capabilities-contract` on PyPI, imported as `capabilities_contract.db` and pinned to an exact version in the script's PEP-723 dependencies. The library reads the store setting and writes nothing, connects bound to the schema the setting names, and applies each owner's migration steps once under that owner's ledger; the library's own documentation carries its call surface and error codes. The capability is the owner of its tables: the owner is its name, every object a migration step creates is named `<name>_…` inside the setting's schema, and its steps are recorded in the ledger under that name, so tools at different releases share one database and each changes only its own tables.
+
+A service that keeps runtime state resolves the store before it takes any work. With no store configured it refuses to run with the error code `store_not_configured` and a hint naming `capabilities store set`, and its `service doctor` reports the same. The library finds a store only through `CAPABILITIES_STORE_URL`, for tests and development sessions, or the store setting, and both name a PostgreSQL.
 
 ## The I/O contract
 
