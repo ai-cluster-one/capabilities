@@ -8,7 +8,12 @@ The script imports callva-harness-runner when a profile or a peer is needed, so
 the suite runs where that library is importable:
 
     uv run --with pytest --with 'callva-harness-runner==0.8.0' \\
+        --with 'capabilities-contract==0.1.0' \\
         python -m pytest capabilities/askproject/tests -q
+
+Every ask records its session in the machine's store, so a test that asks
+needs a PostgreSQL: ASKPROJECT_TEST_DSN names a throwaway database, and such a
+test is skipped while it is unset.
 """
 
 import json
@@ -16,6 +21,10 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
+
+STORE_DSN = os.environ.get("ASKPROJECT_TEST_DSN", "")
 
 CAPABILITY = Path(__file__).resolve().parents[1]
 SCRIPT = next((path for path in (
@@ -31,6 +40,14 @@ def shipped_path(name: str) -> Path:
 
 CHAIN_KEYS = ("ASKPROJECT_ENGINE", "ASKPROJECT_MODEL", "ASKPROJECT_EFFORT",
               "ASKPROJECT_TIMEOUT")
+
+
+def store_env(env: dict) -> dict:
+    """`env` pointed at the test store; skips the calling test without one."""
+    if not STORE_DSN:
+        pytest.skip("ASKPROJECT_TEST_DSN is unset")
+    env["CAPABILITIES_STORE_URL"] = STORE_DSN
+    return env
 
 
 def fake_source(engine: str) -> str:
@@ -112,6 +129,7 @@ class Lab:
     def ask(self, *extra: str, env: dict | None = None, quiet: bool = True,
             timeout: int = 60):
         """One ask of the target; returns (process, parsed stdout or None, launch or None)."""
+        store_env(self.env)
         self.record.unlink(missing_ok=True)
         args = [str(self.target), "what is here?", *extra]
         if quiet:

@@ -8,12 +8,12 @@ what the engine said. See _peer.py for how to run the suite.
 import importlib.util
 import json
 import os
-import uuid
+import socket
 from importlib.machinery import SourceFileLoader
 
 import pytest
 
-from _peer import SCRIPT, Lab
+from _peer import SCRIPT, STORE_DSN, Lab, request, store_env
 
 
 def _load_cli():
@@ -37,6 +37,7 @@ def _open_stdin_ask(lab, *extra):
     """An ask whose own stdin is a pipe nobody writes to or closes."""
     import subprocess
     import sys
+    store_env(lab.env)
     read_fd, write_fd = os.pipe()
     try:
         return subprocess.run(
@@ -48,32 +49,55 @@ def _open_stdin_ask(lab, *extra):
         os.close(write_fd)
 
 
-def test_database_project_migrates_session_map_from_file(tmp_path, monkeypatch):
-    root = tmp_path / "caller"
-    envelope = root / "capabilities"
-    state_file = envelope / "askproject" / "state" / "sessions.json"
-    state_file.parent.mkdir(parents=True)
-    project_id = str(uuid.uuid4())
-    slug = "fixture-" + project_id[:8]
-    (envelope / "project.json").write_text(json.dumps({
-        "schema": "capabilities.project.v1", "id": project_id,
-        "slug": slug, "store": "db",
-    }))
-    original = {"/tmp/target": {"last_session_id": "thread-1"}}
-    state_file.write_text(json.dumps(original))
-    store_path = tmp_path / "store.db"
-    with CLI.SQLiteStore.open(str(store_path)) as store:
-        store.migrate()
-        store.project_register(project_id, slug)
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(root))
-    monkeypatch.setenv("CAPABILITIES_PROJECT_ENVELOPE", str(envelope))
-    monkeypatch.setenv("CAPABILITIES_STORE_URL", str(store_path))
+def _stored(lab) -> list[tuple]:
+    """The rows this lab's caller holds in askproject_sessions, read directly."""
+    import psycopg
+    with psycopg.connect(STORE_DSN) as conn:
+        return conn.execute(
+            "SELECT project_id, host, target_path, engine, last_session_id, "
+            "last_mode, last_profile, interactions, last_used_at, last_attempt "
+            "FROM agentkit.askproject_sessions WHERE project_id = %s",
+            (f"path:{lab.caller.resolve()}",)).fetchall()
 
-    assert CLI.load_state() == original
-    updated = {**original, "/tmp/other": {"last_session_id": "thread-2"}}
-    CLI.save_state(updated)
-    with CLI.SQLiteStore.open(str(store_path)) as store:
-        assert store.state_get("askproject", "sessions", ("project", slug)) == updated
+
+def test_a_second_question_resumes_the_session_the_first_recorded_in_the_store(lab):
+    first, result, _ = lab.ask("--engine", "codex")
+    assert first.returncode == 0, first.stderr
+    session = result["session_id"]
+
+    [row] = _stored(lab)
+    assert row[:7] == (f"path:{lab.caller.resolve()}", socket.gethostname(),
+                       str(lab.target), "codex", session, "read", "codex-read")
+    assert row[7] == 1 and row[8] is not None
+    assert row[9]["status"] == "completed" and row[9]["session_id"] == session
+
+    second, result, launch = lab.ask("-c")
+    assert second.returncode == 0, second.stderr
+    assert (result["resumed"], result["session_id"]) == (True, session)
+    assert request(launch, "thread/resume")["threadId"] == session
+    assert _stored(lab)[0][7] == 2
+    # Nothing is kept beside the project any more.
+    assert not (lab.caller / "capabilities" / "askproject" / "state").exists()
+
+
+def test_without_a_store_an_ask_refuses_before_any_peer_starts(lab):
+    proc = lab.run(str(lab.target), "what is here?", "--quiet")
+    assert proc.returncode == 6, proc.stdout + proc.stderr
+    error = json.loads(proc.stderr.strip().splitlines()[-1])["error"]
+    assert error["code"] == "store_not_configured"
+    assert "capabilities store set" in error["hint"]
+    assert not lab.record.exists()
+    assert not (lab.caller / "capabilities" / "askproject" / "state").exists()
+
+    listed = lab.run("targets", "--json")
+    assert listed.returncode == 6
+    assert json.loads(listed.stderr)["error"]["code"] == "store_not_configured"
+
+    doctor = lab.run("doctor")
+    assert doctor.returncode == 2
+    report = json.loads(doctor.stdout)
+    assert (report["ok"], report["store"], report["store_error"]["code"]) == (
+        False, None, "store_not_configured")
 
 
 def test_codex_progress_is_concise_and_stdout_stays_json(lab):

@@ -18,7 +18,7 @@ import sys
 import time
 from pathlib import Path
 
-from _peer import fake_source
+from _peer import fake_source, store_env
 
 CAPABILITY = Path(__file__).resolve().parents[1]
 SCRIPT = next((path for path in (
@@ -64,6 +64,7 @@ def _ask(tmp_path: Path, target: Path) -> dict:
     env["XDG_CONFIG_HOME"] = str(tmp_path / "config")
     env["XDG_STATE_HOME"] = str(tmp_path / "state")
     env.pop("CLAUDE_PROJECT_DIR", None)
+    store_env(env)
 
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), str(target), "what is here?", "--quiet"],

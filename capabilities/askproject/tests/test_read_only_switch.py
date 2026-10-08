@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from _peer import fake_source
+from _peer import fake_source, store_env
 
 CAPABILITY = Path(__file__).resolve().parents[1]
 SCRIPT = next((path for path in (
@@ -54,6 +54,7 @@ def lab(tmp_path):
     env["PEER_MARKER"] = str(tmp_path / "peer-saw")
     for leaked in ("CLAUDE_PROJECT_DIR", SWITCH, "CAPABILITIES_STORE_URL"):
         env.pop(leaked, None)
+    store_env(env)
     return {"caller": _project(tmp_path / "caller"),
             "target": _project(tmp_path / "target"),
             "marker": tmp_path / "peer-saw", "env": env}

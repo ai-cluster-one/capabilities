@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from _peer import fake_source
+from _peer import fake_source, store_env
 
 CAPABILITY = Path(__file__).resolve().parents[1]
 SCRIPT = next((path for path in (
@@ -57,6 +57,7 @@ def _run(tmp_path: Path, cwd: Path, target: str, *extra: str):
     env["XDG_STATE_HOME"] = str(tmp_path / "state")
     env["PEER_MARKER"] = str(marker)
     env.pop("CLAUDE_PROJECT_DIR", None)
+    store_env(env)
 
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), target, "what is here?", "--quiet", *extra],
@@ -166,6 +167,7 @@ def test_a_caller_without_a_project_root_still_dispatches(tmp_path):
     env["XDG_STATE_HOME"] = str(tmp_path / "state")
     env["PEER_MARKER"] = str(marker)
     env.pop("CLAUDE_PROJECT_DIR", None)
+    store_env(env)
 
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), str(target), "what is here?", "--quiet"],
@@ -227,6 +229,10 @@ def test_the_session_key_is_not_canonicalised(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert peer_ran is True
 
-    state = json.loads(
-        (caller / "capabilities" / "askproject" / "state" / "sessions.json").read_text())
-    assert list(state) == [spelling]
+    listed = subprocess.run(
+        [sys.executable, str(SCRIPT), "targets", "--json"], cwd=caller,
+        env=store_env({**{k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"},
+                       "XDG_CONFIG_HOME": str(tmp_path / "config")}),
+        text=True, capture_output=True, timeout=30)
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    assert [e["target"] for e in json.loads(listed.stdout)["targets"]] == [spelling]
