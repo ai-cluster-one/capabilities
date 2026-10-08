@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-08 — The run ledger lives in the machine's store
+
+Runs and their queue now live in the table `automations_runs` of the PostgreSQL the machine's store setting names, or the one `CAPABILITIES_STORE_URL` names, reached through the shared `capabilities-contract` library under its own migration ledger. The table starts empty: nothing is read from or written to `store.db`, which stays as it was, and runs pending there are not carried over; the next schedule creates new ones. Each run carries the project's id and the host it was recorded on, and a scheduled firing is deduplicated within its project. `service run` and `service start` refuse with `store_not_configured` and a hint naming `capabilities store set` while the machine has no store, `doctor` and `service doctor` fail the same way, and `service status` reports `store` as `setting` or `CAPABILITIES_STORE_URL`, or null with `store_error`. A daemon whose store connection drops reconnects on its next tick instead of exiting. `doctor --repair` is still accepted and has nothing to repair. The deployment descriptor passes `CAPABILITIES_STORE_URL` and `CAPABILITIES_STORE_PASSWORD` through.
+
 ## 2026-10-06 — The run ledger works on a PostgreSQL store
 
 With `CAPABILITIES_STORE_URL` naming a `postgresql://` store and its driver present, the scheduler now enqueues, claims, runs, cancels and retries runs there, and `run`, `runs`, `show`, `logs`, `cancel`, `retry`, `service status` and `doctor` read and write them; before, every one of them failed on the first run query. A scheduled firing is still claimed once however many daemons share the store: its dedupe key decides it on either backend, and on PostgreSQL a dispatcher holds the pending rows it is choosing from until it has taken one. `doctor` reads the `runs` columns from the database's own catalogue on PostgreSQL. On the SQLite default nothing changes, and existing run history reads as it did.

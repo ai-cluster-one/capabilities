@@ -29,6 +29,13 @@ MANAGER = next((path for path in (
     CAPABILITY.parents[1] / ".manager" / "capabilities")
     if path.is_file()), Path(shutil.which("capabilities") or "capabilities"))
 
+# The run ledger lives in PostgreSQL. The cases that reach it read
+# AUTOMATIONS_TEST_DSN, a throwaway database's URL, and skip when it is unset;
+# every case works under a project id of its own, so cases never see each
+# other's runs.
+DSN = os.environ.get("AUTOMATIONS_TEST_DSN")
+needs_store = unittest.skipUnless(DSN, "AUTOMATIONS_TEST_DSN is unset")
+
 SPEC = importlib.util.spec_from_file_location("automations_runtime_test", RUNTIME_PATH)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError("cannot load automations runtime")
@@ -59,15 +66,21 @@ class AutomationsTests(unittest.TestCase):
         )
         # In-process code reads the ambient environment, not `self.env`, so a
         # fixture that only pointed the subprocesses at a scratch store was
-        # writing its projects into the developer's real one.
+        # writing its projects into the developer's real one. The store is the
+        # throwaway database or none at all, and the machine's store setting is
+        # out of reach either way.
         self.store_path = Path(self.tmp.name) / "store.db"
-        self._store_url_before = os.environ.get("CAPABILITIES_STORE_URL")
-        os.environ["CAPABILITIES_STORE_URL"] = str(self.store_path)
+        self._env_before = {key: os.environ.get(key)
+                            for key in ("CAPABILITIES_STORE_URL", "XDG_CONFIG_HOME")}
+        os.environ["XDG_CONFIG_HOME"] = str(Path(self.tmp.name) / "xdg-config")
+        if DSN:
+            os.environ["CAPABILITIES_STORE_URL"] = DSN
+        else:
+            os.environ.pop("CAPABILITIES_STORE_URL", None)
         self.env = dict(os.environ)
         self.env.update(
             {
                 "CLAUDE_PROJECT_DIR": str(self.root),
-                "CAPABILITIES_STORE_URL": str(Path(self.tmp.name) / "store.db"),
                 "AUTOMATIONS_ENVIRONMENT": "test",
                 "XDG_STATE_HOME": str(Path(self.tmp.name) / "xdg-state"),
             }
@@ -157,10 +170,11 @@ retries = 1
     def tearDown(self) -> None:
         with contextlib.suppress(Exception):
             self.cli("service", "stop", "--timeout", "2", "--force")
-        if self._store_url_before is None:
-            os.environ.pop("CAPABILITIES_STORE_URL", None)
-        else:
-            os.environ["CAPABILITIES_STORE_URL"] = self._store_url_before
+        for key, value in self._env_before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         self.tmp.cleanup()
 
     def cli(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -265,6 +279,7 @@ retries = 1
         status = json.loads(self.cli("service", "status").stdout)
         self.assertEqual(status["state_dir"], str(override))
 
+    @needs_store
     def test_service_start_copies_durable_legacy_state_and_repoints_logs(self) -> None:
         legacy = self.root / "capabilities" / "automations" / "state"
         (legacy / "runs").mkdir(parents=True)
@@ -279,10 +294,9 @@ retries = 1
         self.assertIsNotNone(row)
         old_log = Path(row["log_path"])
         old_log.write_text("historical output\n")
-        store, ledger = RUNTIME.open_ledger(self.root, config)
-        ledger.update(row["id"], status="succeeded",
-                      finished_at=datetime.now(timezone.utc).isoformat())
-        store.close()
+        with RUNTIME.open_ledger(self.root, config) as ledger:
+            ledger.update(row["id"], status="succeeded",
+                          finished_at=datetime.now(timezone.utc).isoformat())
 
         started = json.loads(self.cli("service", "start").stdout)
         self.assertIn("state_migration", started)
@@ -296,6 +310,7 @@ retries = 1
         self.assertEqual(Path(shown["log_path"]).read_text(), "historical output\n")
         self.assertTrue(old_log.is_file())
 
+    @needs_store
     def test_service_start_refuses_conflicting_legacy_state(self) -> None:
         legacy = self.root / "capabilities" / "automations" / "state"
         legacy.mkdir(parents=True)
@@ -312,6 +327,7 @@ retries = 1
         self.assertEqual((legacy / "cursor.json").read_text(), '{"source": 1}\n')
         self.assertEqual((target / "cursor.json").read_text(), '{"target": 2}\n')
 
+    @needs_store
     def test_service_starts_again_after_the_daemon_wrote_to_its_own_log(self) -> None:
         # The daemon's log is the one file the service itself makes diverge:
         # start opens the XDG copy in append mode, so the first line the daemon
@@ -338,6 +354,7 @@ retries = 1
         self.assertTrue(restarted["started"])
         self.assertEqual((legacy / "daemon.log").read_text(), "output from the in-repo daemon\n")
 
+    @needs_store
     def test_run_supervised_project_still_reads_its_migrated_daemon_log(self) -> None:
         # `service start` is the only thing that ever creates the XDG daemon.log,
         # so a project supervised by `service run` has nothing there but what the
@@ -365,6 +382,7 @@ retries = 1
         self.assertEqual(logs["lines"], ["output from the in-repo daemon"])
         self.assertEqual((legacy / "daemon.log").read_text(), "output from the in-repo daemon\n")
 
+    @needs_store
     def test_status_answers_for_the_state_root_a_supervised_daemon_pinned(self) -> None:
         # A supervisor's environment is invisible to a shell opened afterwards,
         # so an invocation that re-derives the root answers about a directory the
@@ -411,6 +429,7 @@ retries = 1
         self.assertEqual(spent["state_dir_source"], "default")
         self.assertIn(str(pinned), spent["state_dirs_considered"])
 
+    @needs_store
     def test_a_daemon_starts_when_its_state_root_cannot_be_recorded(self) -> None:
         # An envelope that refuses the record - a read-only mount, foreign
         # ownership - is an inability to write down a fact about a daemon that
@@ -452,6 +471,7 @@ retries = 1
             envelope.chmod(0o755)
             self.cli("service", "stop", "--force", check=False)
 
+    @needs_store
     def test_the_state_root_record_stays_out_of_what_the_project_commits(self) -> None:
         # The record names a path on this machine, and some projects commit their
         # whole body on an interval. It lives in the project state home, which the
@@ -482,6 +502,7 @@ retries = 1
             supervised.terminate()
             supervised.wait(timeout=15)
 
+    @needs_store
     def test_a_daemon_an_earlier_release_started_is_still_found_and_stopped(self) -> None:
         # An earlier release wrote the record beside the state home. A daemon it
         # started under an override is findable through that record alone, so a
@@ -513,6 +534,7 @@ retries = 1
         self.assertFalse(unguarded.exists())
         self.assertFalse((pinned / "daemon.pid").exists())
 
+    @needs_store
     def test_the_first_start_stops_the_project_carrying_an_earlier_record(self) -> None:
         # A record an earlier release left beside the state home, committed with
         # the body, leaves the project at the first daemon start: the project's
@@ -534,6 +556,7 @@ retries = 1
         self.assertFalse([path for path in self.git("ls-files").splitlines()
                           if path.endswith("state-root.json")])
 
+    @needs_store
     def test_the_state_root_record_never_reads_as_the_envelope_layout(self) -> None:
         # The record lives in the directory the envelope layout kept its state in,
         # and the upgrade from that layout takes that directory's existence for
@@ -560,6 +583,7 @@ retries = 1
         self.cli("service", "stop", "--timeout", "5")
         self.assertFalse(state_home.exists())
 
+    @needs_store
     def test_a_legacy_state_directory_the_record_shares_is_migrated_as_before(self) -> None:
         # A directory the record found already there is the envelope layout as
         # it always was, emptied or not: it is still migrated and kept, and the
@@ -806,6 +830,7 @@ script = "capabilities/automations/scripts/job.py"
         return subprocess.run([str(CLI), *args], cwd=self.root, env=env,
                               capture_output=True, text=True, timeout=30)
 
+    @needs_store
     def test_the_read_only_switch_refuses_what_changes_and_keeps_reads(self) -> None:
         # A writing agent profile, so the refusal of a turn that may change the
         # project is proven without ever starting an engine.
@@ -833,6 +858,7 @@ script = "capabilities/automations/scripts/job.py"
                 proc = self._under_switch("true", *args)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
+    @needs_store
     def test_with_the_switch_off_a_manual_run_is_still_enqueued(self) -> None:
         for value in (None, "0", "false"):
             with self.subTest(value=value):
@@ -844,6 +870,7 @@ script = "capabilities/automations/scripts/job.py"
         self.assertEqual(proc.returncode, 3)
         self.assertEqual(json.loads(proc.stderr)["error"]["code"], "unknown_agent")
 
+    @needs_store
     def test_job_receives_the_cli_path(self) -> None:
         self.cli("service", "start")
         queued = json.loads(self.cli("run", "agentbin").stdout)
@@ -884,6 +911,7 @@ script = "capabilities/automations/scripts/job.py"
             RUNTIME.config_fingerprint(RUNTIME.load_config(self.root, config_path)),
         )
 
+    @needs_store
     def test_doctor_fails_while_the_daemon_runs_a_superseded_configuration(self) -> None:
         self.cli("service", "start")
         self.assertTrue(json.loads(self.cli("doctor").stdout)["ok"])
@@ -910,6 +938,7 @@ schedule = "0 3 * * *"
         self.cli("service", "reload")
         self.assertTrue(json.loads(self.cli("doctor").stdout)["ok"])
 
+    @needs_store
     def test_doctor_stays_quiet_about_configuration_while_stopped(self) -> None:
         # A stopped daemon is not running the wrong declaration; it is not
         # running one at all, and saying otherwise would restart nothing.
@@ -936,6 +965,7 @@ script = "capabilities/automations/scripts/job.py"
         self.assertTrue((state / "daemon.pid").is_file(), "supervised daemon did not start")
         return daemon
 
+    @needs_store
     def test_doctor_reports_the_environment_its_daemon_loaded(self) -> None:
         # A supervisor starts the daemon with its own selector and the shell that
         # asks afterwards carries none, so an answer computed from the asking
@@ -961,6 +991,7 @@ script = "capabilities/automations/scripts/job.py"
             daemon.terminate()
             daemon.wait(timeout=15)
 
+    @needs_store
     def test_doctor_fails_when_the_daemon_schedules_none_of_the_declarations(self) -> None:
         # The failure this closes: a daemon started under a selector no
         # automation is declared for is alive, answering, and scheduling
@@ -989,6 +1020,7 @@ script = "capabilities/automations/scripts/job.py"
         self.assertIsNone(stopped["daemon_environment"])
         self.assertNotIn("environment_idle", stopped)
 
+    @needs_store
     def test_an_automation_declared_for_every_environment_keeps_doctor_quiet(self) -> None:
         # An automation naming no environment runs under all of them, so a
         # daemon holding one is scheduling whatever its selector is, and a
@@ -1010,6 +1042,7 @@ schedule = "0 3 * * *"
             daemon.terminate()
             daemon.wait(timeout=15)
 
+    @needs_store
     def test_a_daemon_that_published_no_environment_is_reported_without_failing(self) -> None:
         # A daemon started by an older payload published the bare fingerprint
         # and keeps running across an upgrade, scheduling correctly all the
@@ -1050,6 +1083,7 @@ schedule = "0 3 * * *"
         self.assertTrue(stopped["ok"])
         self.assertNotIn("environment_unknown", stopped)
 
+    @needs_store
     def test_inventory_judges_automations_by_the_running_daemons_environment(self) -> None:
         # Whether an automation is active is decided by the daemon that runs it,
         # under the environment it was started with, and a terminal asking later
@@ -1318,6 +1352,7 @@ every_seconds = 30
         self.assertIn("project_enable_required", proc.stderr)
         self.assertEqual(path.read_text(), self.SET_CONFIG)
 
+    @needs_store
     def test_set_publishes_the_change_to_a_running_daemon(self) -> None:
         self.cli("service", "start")
         pid = json.loads(self.cli("service", "status").stdout)["pid"]
@@ -1360,12 +1395,50 @@ every_seconds = 30
         identity = self.root / "capabilities" / "project.json"
         identity.write_text(json.dumps({**json.loads(identity.read_text()),
                                         "store": "db"}) + "\n")
+        self.env["CAPABILITIES_STORE_URL"] = str(self.store_path)
         path = self._set_config()
         proc = self.cli("set", "job", "--name", "x", check=False)
         self.assertEqual(proc.returncode, 6, proc.stderr)
         self.assertIn("config_in_store", proc.stderr)
         self.assertEqual(path.read_text(), self.SET_CONFIG)
 
+    def test_without_a_store_the_service_refuses_and_says_why(self) -> None:
+        """Runtime state has no local default: with no store configured nothing
+        that would keep a run starts, and each answer names the fix."""
+        self.env.pop("CAPABILITIES_STORE_URL", None)
+        for args in (("service", "start"), ("service", "run"), ("service", "doctor"),
+                     ("doctor",), ("run", "job")):
+            proc = self.cli(*args, check=False)
+            self.assertEqual(proc.returncode, 6, (args, proc.stderr))
+            error = json.loads(proc.stderr)["error"]
+            self.assertEqual(error["code"], "store_not_configured", args)
+            self.assertIn("capabilities store set", error["hint"], args)
+        status = json.loads(self.cli("service", "status").stdout)
+        self.assertFalse(status["running"])
+        self.assertIsNone(status["store"])
+        self.assertEqual(status["store_error"]["code"], "store_not_configured")
+        self.assertFalse(self.store_path.exists())
+
+    @needs_store
+    def test_a_manual_run_is_a_row_of_the_run_ledger(self) -> None:
+        import socket
+        status = json.loads(self.cli("service", "status").stdout)
+        self.assertEqual(status["store"], "CAPABILITIES_STORE_URL")
+        self.assertEqual(status["schema"], "agentkit")
+        run = json.loads(self.cli("run", "job").stdout)["run"]
+        conn = RUNTIME._database().connect(application_name="automations-test")
+        try:
+            row = conn.execute(
+                "SELECT project_id, automation_slug, trigger, host "
+                "FROM automations_runs WHERE id = %s", [run["id"]]).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row, (self.project_id, "job", "manual", socket.gethostname()))
+        self.assertFalse(self.store_path.exists())
+        repaired = json.loads(self.cli("doctor", "--repair").stdout)["repaired"]
+        self.assertFalse(repaired["repaired"])
+
+    @needs_store
     def test_manual_run_history_and_logs(self) -> None:
         doctor = json.loads(self.cli("doctor").stdout)
         self.assertTrue(doctor["ok"])
@@ -1419,6 +1492,7 @@ every_seconds = 30
         self.assertEqual(mounts["automations_state"]["target"],
                          "{agent_home}/.local/state/capabilities/projects")
 
+    @needs_store
     def test_service_reload_publishes_an_edited_declaration_without_restarting(self) -> None:
         self.cli("service", "start")
         pid = json.loads(self.cli("service", "status").stdout)["pid"]
@@ -1446,6 +1520,7 @@ schedule = "0 3 * * *"
         again = json.loads(self.cli("service", "reload").stdout)
         self.assertFalse(again["reloaded"])
 
+    @needs_store
     def test_service_reload_refuses_a_declaration_that_does_not_load(self) -> None:
         self.cli("service", "start")
         pid = json.loads(self.cli("service", "status").stdout)["pid"]
@@ -1469,6 +1544,7 @@ schedule = "0 3 * * *"
         config_path.write_text(good)
         self.assertEqual(json.loads(self.cli("service", "status").stdout)["pid"], pid)
 
+    @needs_store
     def test_service_reload_leaves_running_work_alone(self) -> None:
         self.cli("service", "start")
         queued = json.loads(self.cli("run", "slow").stdout)
@@ -1492,6 +1568,7 @@ schedule = "0 4 * * *"
         self.cli("cancel", run_id)
         self.wait_status(run_id, {"canceled"})
 
+    @needs_store
     def test_cancel_running_job(self) -> None:
         self.cli("service", "start")
         queued = json.loads(self.cli("run", "slow").stdout)
@@ -1514,6 +1591,7 @@ schedule = "0 4 * * *"
         with self.assertRaises(RUNTIME.ConfigError):
             RUNTIME.parse_cron("0 8 * JAN MON")
 
+    @needs_store
     def test_ticker_deduplicates_one_interval_bucket(self) -> None:
         config_path = self.root / "schedule.toml"
         config_path.write_text(
@@ -1543,27 +1621,27 @@ retries = 0
             daemon.schedule_due(when)
             daemon.schedule_due(when)
         finally:
-            daemon.store.close()
+            daemon.runs.close()
         rows = RUNTIME.list_runs(self.root, RUNTIME.load_config(self.root, config_path),
                                  limit=10)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "pending")
         self.assertEqual(rows[0]["trigger"], "schedule")
 
+    @needs_store
     def test_startup_recovery_requeues_by_policy(self) -> None:
         config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
         state_dir = self.root / "capabilities" / "automations" / "state"
         config = RUNTIME.load_config(self.root, config_path)
         row = RUNTIME.enqueue_manual(self.root, config, state_dir, "job")
         self.assertIsNotNone(row)
-        store, ledger = RUNTIME.open_ledger(self.root, config)
-        ledger.update(row["id"], status="running")
-        store.close()
+        with RUNTIME.open_ledger(self.root, config) as ledger:
+            ledger.update(row["id"], status="running")
         daemon = RUNTIME.Daemon(self.root, config_path, state_dir)
         try:
             daemon.recover()
         finally:
-            daemon.store.close()
+            daemon.runs.close()
         rows = RUNTIME.list_runs(self.root, config, limit=10)
         original = next(item for item in rows if item["id"] == row["id"])
         recovered = next(item for item in rows if item["parent_run_id"] == row["id"])
@@ -1571,6 +1649,7 @@ retries = 0
         self.assertEqual(recovered["status"], "pending")
         self.assertEqual(recovered["trigger"], "recovery")
 
+    @needs_store
     def test_timeout_and_automatic_retry(self) -> None:
         self.cli("service", "start")
         timeout_run = json.loads(self.cli("run", "timeout").stdout)["run"]
@@ -1599,29 +1678,6 @@ if __name__ == "__main__":
 
 
 # --- the ledger on a shared store --------------------------------------------
-
-def _store_with_automation(tmp_path):
-    """A store holding one project and one automation, as two machines sharing
-    a database would see it."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
-    import store as store_mod
-    import runtime as rt
-
-    st = store_mod.SQLiteStore.open(str(tmp_path / "shared.db"))
-    st.migrate()
-    st.project_register("11111111-2222-3333-4444-555555555555", "marvin")
-    st.migrate(rt.STORE_NAMESPACE, rt.STORE_VERSION, rt.STORE_MIGRATIONS)
-    project_id = st._project_id("marvin")
-    automation_id = rt.store_upsert(st, "project", project_id, {
-        "slug": "nightly", "name": None, "description": None, "enabled": 1,
-        "script_key": "script.nightly", "schedule": "0 3 * * *", "every_seconds": None,
-        "timeout_seconds": 300.0, "max_parallel": 1, "max_pending": 1,
-        "overlap": "skip", "retries": 0, "arguments": [], "environments": [],
-    })
-    st._conn.commit()
-    return st, project_id, automation_id
-
 
 def test_the_store_rebuild_carries_the_labels_a_person_wrote(tmp_path, monkeypatch):
     """The same config has to read the same way from either source. A label the
@@ -1662,204 +1718,147 @@ def test_the_store_rebuild_carries_the_labels_a_person_wrote(tmp_path, monkeypat
     assert item["description"] == "Why it exists, for whoever reads the listing."
 
 
-def _claim(st, project_id, automation_id, dedupe):
-    """One machine trying to claim one scheduled firing."""
-    import uuid as _uuid
-    st._execute(
-        "INSERT INTO runs (id, project_id, automation_id, automation_slug, environment, "
-        "trigger, scheduled_for, dedupe_key, status, queued_at, log_path) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (str(_uuid.uuid4()), project_id, automation_id, "nightly", "production",
-         "schedule", "2026-08-23T03:00:00+00:00", dedupe, "pending",
-         "2026-08-23T03:00:00+00:00", "/dev/null"))
-    st._conn.commit()
+@pytest.fixture
+def ledger_env(tmp_path, monkeypatch):
+    """The throwaway database as the store, and the machine's setting out of reach."""
+    if not DSN:
+        pytest.skip("AUTOMATIONS_TEST_DSN is unset")
+    monkeypatch.setenv("CAPABILITIES_STORE_URL", DSN)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+    (tmp_path / "runs").mkdir(exist_ok=True)
+    opened = []
+
+    def ledger(project_id=None, environment="production"):
+        led = RUNTIME.RunLedger(project_id or f"prj_{uuid.uuid4().hex[:12]}",
+                                environment).open()
+        opened.append(led)
+        return led
+
+    yield ledger
+    for led in opened:
+        led.close()
 
 
-def test_two_machines_cannot_both_claim_one_scheduled_firing(tmp_path):
-    """The whole reason the ledger moves to a shared store."""
-    import sqlite3 as _sqlite3
-    st, project_id, automation_id = _store_with_automation(tmp_path)
-    dedupe = "marvin:production:nightly:2026-08-23T03:00:00+00:00"
-
-    _claim(st, project_id, automation_id, dedupe)
-    with pytest.raises(_sqlite3.IntegrityError):
-        _claim(st, project_id, automation_id, dedupe)
-
-    assert st._execute("SELECT COUNT(*) FROM runs WHERE dedupe_key = ?",
-                       (dedupe,)).fetchone()[0] == 1
-    st.close()
+DEDUPE = "fixture:production:nightly:2026-08-23T03:00:00+00:00"
 
 
-def test_a_different_firing_of_the_same_automation_still_claims(tmp_path):
-    st, project_id, automation_id = _store_with_automation(tmp_path)
-    _claim(st, project_id, automation_id, "marvin:production:nightly:2026-08-23T03:00:00+00:00")
-    _claim(st, project_id, automation_id, "marvin:production:nightly:2026-08-24T03:00:00+00:00")
-    assert st._execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
-    st.close()
+def test_two_machines_cannot_both_claim_one_scheduled_firing(tmp_path, ledger_env):
+    """The whole reason the ledger lives in a shared store: two daemons of one
+    project, on two machines, race one firing and exactly one owns it."""
+    a = ledger_env()
+    b = ledger_env(a.project_id)
+    first = a.claim("nightly", tmp_path, trigger="schedule", dedupe_key=DEDUPE)
+    second = b.claim("nightly", tmp_path, trigger="schedule", dedupe_key=DEDUPE)
+    assert first is not None and second is None
+    assert len(a.list()) == 1
 
 
-def test_a_run_cannot_name_an_automation_that_is_not_there(tmp_path):
-    """The uuid reference is a real constraint, not a naming convention."""
-    import sqlite3 as _sqlite3
-    st, project_id, _automation_id = _store_with_automation(tmp_path)
-    with pytest.raises(_sqlite3.IntegrityError):
-        _claim(st, project_id, "99999999-9999-9999-9999-999999999999", "x")
-    st.close()
+def test_a_different_firing_of_the_same_automation_still_claims(tmp_path, ledger_env):
+    led = ledger_env()
+    assert led.claim("nightly", tmp_path, trigger="schedule", dedupe_key=DEDUPE)
+    assert led.claim("nightly", tmp_path, trigger="schedule",
+                     dedupe_key=DEDUPE.replace("08-23", "08-24"))
+    assert len(led.list()) == 2
 
 
-def _ledger(st, project_id, environment="production"):
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
-    import runtime as rt
-    return rt.RunLedger(st, project_id, environment)
+def test_two_projects_never_take_each_others_firings(tmp_path, ledger_env):
+    """One database serves every project, and two projects in directories of the
+    same name build the same dedupe key; each still owns its own firing."""
+    ours, theirs = ledger_env(), ledger_env()
+    assert ours.claim("nightly", tmp_path, trigger="schedule", dedupe_key=DEDUPE)
+    assert theirs.claim("nightly", tmp_path, trigger="schedule", dedupe_key=DEDUPE)
 
 
-def test_the_ledger_answers_only_about_its_own_project(tmp_path):
+def test_the_ledger_answers_only_about_its_own_project(tmp_path, ledger_env):
     """The reason scoping is a boundary and not a WHERE clause fifteen callers
     are trusted to remember."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
-    import runtime as rt
-
-    st, mine, automation_id = _store_with_automation(tmp_path)
-    st.project_register("99999999-8888-7777-6666-555555555555", "other")
-    theirs = st._project_id("other")
-    other_automation = rt.store_upsert(st, "project", theirs, {
-        "slug": "nightly", "name": None, "description": None, "enabled": 1,
-        "script_key": "script.nightly", "schedule": "0 3 * * *", "every_seconds": None,
-        "timeout_seconds": 300.0, "max_parallel": 1, "max_pending": 1,
-        "overlap": "skip", "retries": 0, "arguments": [], "environments": [],
-    })
-    st._conn.commit()
-
-    ours = _ledger(st, mine)
-    others = _ledger(st, theirs)
-    (tmp_path / "runs").mkdir(exist_ok=True)
-
-    assert ours.claim(automation_id, "nightly", tmp_path, trigger="manual") is not None
-    assert others.claim(other_automation, "nightly", tmp_path, trigger="manual") is not None
+    ours, others = ledger_env(), ledger_env()
+    assert ours.claim("nightly", tmp_path, trigger="manual") is not None
+    assert others.claim("nightly", tmp_path, trigger="manual") is not None
 
     assert len(ours.list()) == 1
     assert len(others.list()) == 1
     assert ours.counts() == {"pending": 1}
-    assert st._execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
 
     # and a run belonging to the other project is invisible, not merely filtered
     theirs_run = others.list()[0]
     assert ours.get(theirs_run["id"]) is None
-    st.close()
 
 
-def test_two_ledgers_racing_one_firing_leave_one_run(tmp_path):
-    st, project_id, automation_id = _store_with_automation(tmp_path)
-    (tmp_path / "runs").mkdir(exist_ok=True)
-    a, b = _ledger(st, project_id), _ledger(st, project_id)
-    dedupe = "marvin:production:nightly:2026-08-23T03:00:00+00:00"
-
-    first = a.claim(automation_id, "nightly", tmp_path, trigger="schedule", dedupe_key=dedupe)
-    second = b.claim(automation_id, "nightly", tmp_path, trigger="schedule", dedupe_key=dedupe)
-
-    assert first is not None and second is None
-    assert len(a.list()) == 1
-    st.close()
-
-
-def test_the_ledger_counts_per_automation_within_the_project(tmp_path):
-    st, project_id, automation_id = _store_with_automation(tmp_path)
-    (tmp_path / "runs").mkdir(exist_ok=True)
-    led = _ledger(st, project_id)
-    led.claim(automation_id, "nightly", tmp_path, trigger="manual")
+def test_the_ledger_counts_per_automation_within_the_project(tmp_path, ledger_env):
+    led = ledger_env()
+    led.claim("nightly", tmp_path, trigger="manual")
 
     assert led.count_for("nightly", "pending") == 1
     assert led.count_for("other-thing", "pending") == 0
     assert led.has_active("nightly", ["pending"]) is True
     assert led.running() == 0
-    st.close()
 
 
-# --- a store whose runs table predates the nullable automation reference ------
-
-def _stale_store(tmp_path):
-    """A store as it stands on a machine whose `runs` table was created before
-    the automation reference was allowed to be empty."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
-    import store as store_mod
-    import runtime as rt
-
-    st = store_mod.SQLiteStore.open(str(tmp_path / "stale.db"))
-    st.migrate()
-    st.project_register("11111111-2222-3333-4444-555555555555", "marvin")
-    stale = [step.replace("automation_id     TEXT REFERENCES automations(id),",
-                          "automation_id     TEXT NOT NULL REFERENCES automations(id),")
-             for step in rt.STORE_MIGRATIONS]
-    st.migrate(rt.STORE_NAMESPACE, rt.STORE_VERSION, stale)
-    st._conn.commit()
-    return st, rt
-
-
-def test_a_stale_runs_table_is_named_by_the_defect_check(tmp_path):
-    st, rt = _stale_store(tmp_path)
-    assert rt.runs_schema_defect(st) == "automation_id"
-    st.close()
+def test_a_run_reads_as_it_always_has_and_says_where_it_was_recorded(tmp_path, ledger_env):
+    """Times come back as the ISO text they were written as and the cancel flag
+    as 0 or 1, so `runs` and `show` print what they printed before; the host is
+    the machine the run was recorded on."""
+    import socket
+    led = ledger_env()
+    row = led.claim("nightly", tmp_path, trigger="schedule",
+                    scheduled_for="2026-08-23T03:00:00+00:00", dedupe_key=DEDUPE)
+    assert row["scheduled_for"] == "2026-08-23T03:00:00+00:00"
+    assert row["queued_at"].endswith("+00:00")
+    assert row["cancel_requested"] == 0
+    assert row["host"] == socket.gethostname()
+    assert row["project_id"] == led.project_id
+    assert "automation_id" not in row
+    led.update(row["id"], cancel_requested=True, finished_at="2026-08-23T03:00:05+00:00")
+    row = led.get(row["id"])
+    assert row["cancel_requested"] == 1
+    assert row["finished_at"] == "2026-08-23T03:00:05+00:00"
 
 
-def test_repairing_the_runs_table_keeps_its_rows_and_widens_the_column(tmp_path):
-    st, rt = _stale_store(tmp_path)
-    project_id = st._project_id("marvin")
-    automation_id = rt.store_upsert(st, "project", project_id, {
-        "slug": "nightly", "name": None, "description": None, "enabled": 1,
-        "script_key": "script.nightly", "schedule": "0 3 * * *", "every_seconds": None,
-        "timeout_seconds": 300.0, "max_parallel": 1, "max_pending": 1,
-        "overlap": "skip", "retries": 0, "arguments": [], "environments": [],
-    })
-    st._conn.commit()
-    _claim(st, project_id, automation_id, "marvin:production:nightly:2026-08-23T03:00:00+00:00")
-
-    outcome = rt.repair_runs_schema(st)
-    assert outcome["repaired"] is True
-    assert outcome["rows_preserved"] == 1
-    assert rt.runs_schema_defect(st) is None
-    assert st._execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
-    indexes = {row[0] for row in st._execute(
-        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'runs'")}
-    assert {"runs_status_idx", "runs_automation_idx"} <= indexes
-    st.close()
+def test_a_run_the_schema_cannot_hold_fails_loudly(tmp_path, ledger_env):
+    """The dedupe key is the only conflict a claim treats as someone else's win;
+    a run the table cannot hold raises instead of vanishing."""
+    led = ledger_env(environment=None)
+    with pytest.raises(Exception) as caught:
+        led.claim("nightly", tmp_path, trigger="manual")
+    assert "null value" in str(caught.value)
 
 
-def test_repairing_a_healthy_runs_table_changes_nothing(tmp_path):
-    st, _project_id, _automation_id = _store_with_automation(tmp_path)
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
-    import runtime as rt
-    assert rt.repair_runs_schema(st)["repaired"] is False
-    st.close()
+def test_a_dedupe_collision_still_yields_rather_than_raising(tmp_path, ledger_env):
+    led = ledger_env()
+    assert led.claim("nightly", tmp_path, trigger="schedule", dedupe_key=DEDUPE) is not None
+    assert led.claim("nightly", tmp_path, trigger="schedule", dedupe_key=DEDUPE) is None
 
 
-def test_a_run_the_schema_cannot_hold_fails_loudly(tmp_path):
-    """The failure this replaces was silent: the scheduler read `None` as
-    someone else's claim and dropped the firing."""
-    import sqlite3 as _sqlite3
-    st, rt = _stale_store(tmp_path)
-    project_id = st._project_id("marvin")
-    ledger = rt.RunLedger(st, project_id, "production")
-    with pytest.raises(_sqlite3.IntegrityError):
-        ledger.claim(None, "nightly", tmp_path, trigger="manual")
-    st.close()
+def test_a_dropped_connection_is_noticed_and_reopened(tmp_path, ledger_env):
+    """The store is across a network; a connection the server ends is noticed as
+    lost, not taken for a fault in the work, and a new one carries on."""
+    led = ledger_env()
+    led.claim("nightly", tmp_path, trigger="manual")
+    ledger_env().conn.execute("SELECT pg_terminate_backend(%s)",
+                              [led.conn.info.backend_pid])
+    with pytest.raises(Exception):
+        led.list()
+    assert led.lost()
+    led.reopen()
+    assert not led.lost()
+    assert len(led.list()) == 1
 
 
-def test_a_dedupe_collision_still_yields_rather_than_raising(tmp_path):
-    st, project_id, automation_id = _store_with_automation(tmp_path)
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
-    import runtime as rt
-    ledger = rt.RunLedger(st, project_id, "production")
-    dedupe = "marvin:production:nightly:2026-08-23T03:00:00+00:00"
-    assert ledger.claim(automation_id, "nightly", tmp_path,
-                        trigger="schedule", dedupe_key=dedupe) is not None
-    assert ledger.claim(automation_id, "nightly", tmp_path,
-                        trigger="schedule", dedupe_key=dedupe) is None
-    st.close()
+def test_the_ledger_refuses_without_a_store(tmp_path, monkeypatch):
+    """Runtime state has no local default: with no store configured the ledger
+    does not open, and says so in the library's words."""
+    monkeypatch.delenv("CAPABILITIES_STORE_URL", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+    root = tmp_path / "project"
+    (root / "capabilities").mkdir(parents=True)
+    (root / "capabilities" / "project.json").write_text(json.dumps(
+        {"schema": "capabilities.project.v1", "id": "prj_nostore00000", "slug": "nostore"}))
+    with pytest.raises(RUNTIME.StoreUnavailable) as caught:
+        RUNTIME.open_ledger(root, {"engine": {"environment": "development"}})
+    assert caught.value.slug == "store_not_configured"
+    assert "capabilities store set" in caught.value.hint
+    assert not (tmp_path / "store.db").exists()
 
 
 def test_registration_stamps_the_id_its_launcher_resolved(tmp_path, monkeypatch):
@@ -1884,30 +1883,20 @@ def test_registration_stamps_the_id_its_launcher_resolved(tmp_path, monkeypatch)
     assert asked == [True, False]
 
 
-def test_a_read_whose_id_may_not_be_stamped_reads_without_registering(tmp_path, monkeypatch):
-    """A read never refuses over the project id: the registration it would make
-    is left out, and an unregistered project reads as empty, never as every
-    project."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
-    import store as store_mod
-
+def test_a_read_with_no_id_to_read_under_reads_as_empty(tmp_path, ledger_env, monkeypatch):
+    """A read never refuses over the project id, and a project with no id reads
+    as empty, never as every project."""
+    other = ledger_env()
+    other.claim("nightly", tmp_path, trigger="manual")
     root = tmp_path / "project"
     (root / "capabilities").mkdir(parents=True)
     (root / "capabilities" / "project.json").write_text(json.dumps(
         {"schema": "capabilities.project.v1", "slug": "unstamped"}))
-    monkeypatch.setenv("CAPABILITIES_STORE_URL", str(tmp_path / "shared.db"))
-    other = store_mod.SQLiteStore.open(str(tmp_path / "shared.db"))
-    other.migrate()
-    other.project_register("prj_other0000000", "other")
-    other.migrate(RUNTIME.STORE_NAMESPACE, RUNTIME.STORE_VERSION, RUNTIME.STORE_MIGRATIONS)
-    other.close()
     monkeypatch.setattr(RUNTIME, "PROJECT_ID_FOR_WRITE", lambda strict=True: None)
-
-    st, ledger = RUNTIME.open_ledger(root, {"engine": {"environment": "development"}},
-                                     strict=False)
-    try:
-        assert st._project_id("unstamped") is None
-        assert ledger._scoped and ledger.list(limit=10) == []
-    finally:
-        st.close()
+    monkeypatch.delenv("CAPABILITIES_PROJECT_ID", raising=False)
+    with RUNTIME.open_ledger(root, {"engine": {"environment": "development"}},
+                             strict=False) as ledger:
+        assert ledger.project_id == ""
+        assert ledger.list(limit=10) == []
+    with pytest.raises(RUNTIME.ConfigError):
+        RUNTIME.open_ledger(root, {"engine": {"environment": "development"}})

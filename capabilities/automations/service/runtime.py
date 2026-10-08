@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -235,7 +236,7 @@ def load_agents(raw: dict[str, Any]) -> dict[str, Any]:
 # `automations` declares its own namespace and migrates it itself; the core
 # tier knows nothing about these columns. They are columns rather than a JSON
 # blob because the scheduler filters on them on every tick — `enabled`, the
-# environment, the pending count against `runs` — which is the test for whether
+# environment, the pending count in the run ledger — which is the test for whether
 # a record class has earned a table of its own.
 #
 # `script_key` names a document, not a path. The version that runs is whichever
@@ -276,47 +277,6 @@ STORE_MIGRATIONS = [
     """
     CREATE INDEX IF NOT EXISTS automations_due_idx
         ON automations (scope, project_id, enabled)
-    """,
-    # The ledger. It differs from the one a file-mode project keeps in its own
-    # SQLite in two ways, and both are the point: a run names its project, and
-    # it names its automation by id rather than by the label a person types.
-    #
-    # `dedupe_key` was already project, environment, automation and scheduled
-    # time, and already unique. On a store two machines share, that uniqueness
-    # stops being bookkeeping and becomes the thing that keeps them from both
-    # firing one schedule: whichever inserts first wins and the other is told.
-    """
-    CREATE TABLE IF NOT EXISTS runs (
-        id                TEXT PRIMARY KEY,
-        project_id        TEXT REFERENCES projects(id),
-        -- The uuid when the automation is a row in this store, and null when
-        -- the project still declares its automations in a file. The slug is
-        -- always there, because a run has to say what it ran whether or not
-        -- anything else knows about it.
-        automation_id     TEXT REFERENCES automations(id),
-        automation_slug   TEXT NOT NULL,
-        environment       TEXT NOT NULL,
-        trigger           TEXT NOT NULL,
-        scheduled_for     TEXT,
-        dedupe_key        TEXT UNIQUE,
-        status            TEXT NOT NULL,
-        attempt           INTEGER NOT NULL DEFAULT 1,
-        parent_run_id     TEXT,
-        queued_at         TEXT NOT NULL,
-        started_at        TEXT,
-        finished_at       TEXT,
-        pid               INTEGER,
-        exit_code         INTEGER,
-        summary           TEXT,
-        log_path          TEXT NOT NULL,
-        cancel_requested  INTEGER NOT NULL DEFAULT 0
-    )
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS runs_status_idx ON runs (status, queued_at)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS runs_automation_idx ON runs (automation_id, queued_at)
     """,
 ]
 
@@ -708,64 +668,175 @@ def applies(item: dict[str, Any], environment: str) -> bool:
     )
 
 
-def open_ledger(root: Path, config: dict[str, Any], strict: bool = True):
-    """The store this project's runs live in, and the ledger onto it.
+# --- the run ledger -------------------------------------------------------------
 
-    There is no file-mode ledger any more. A run, a queue, a cursor are records
-    nobody authors and nobody reviews, so a capability keeping its own database
-    for them was only ever the easy thing; the store exists unconditionally and
-    this is where automations joins it. The caller closes the store.
+# The ledger is what every daemon of a project coordinates through, so it lives
+# in the machine's store, reached through the shared database library, in this
+# capability's own table and migration ledger (DOCTRINE rule 22). The owner the
+# library records the steps under is the capability's name, and every object a
+# step creates is named after it.
+#
+# `dedupe_key` is project, environment, automation and scheduled time. It is the
+# whole of the mutual exclusion between machines running one project: whichever
+# inserts a firing first owns it and the other is told. It is unique within its
+# project rather than across the table, because one database serves every
+# project on every machine, and two projects living in directories of the same
+# name would otherwise take each other's firings.
+#
+# `host` names the machine a run was recorded on, because the log a run points
+# at is a file on that machine and means nothing on any other.
+LEDGER_OWNER = "automations"
+LEDGER_MAJOR = 1
+LEDGER_MINOR = 0
+LEDGER_STEPS = [
+    ("0001-runs", """
+    CREATE TABLE automations_runs (
+        id                text PRIMARY KEY,
+        project_id        text NOT NULL,
+        automation_slug   text NOT NULL,
+        environment       text NOT NULL,
+        trigger           text NOT NULL,
+        scheduled_for     timestamptz,
+        dedupe_key        text,
+        status            text NOT NULL,
+        attempt           integer NOT NULL DEFAULT 1,
+        parent_run_id     text,
+        queued_at         timestamptz NOT NULL,
+        started_at        timestamptz,
+        finished_at       timestamptz,
+        pid               integer,
+        exit_code         integer,
+        summary           text,
+        log_path          text NOT NULL,
+        cancel_requested  boolean NOT NULL DEFAULT false,
+        host              text NOT NULL,
+        CONSTRAINT automations_runs_dedupe_key UNIQUE (project_id, dedupe_key)
+    )
+    """),
+    ("0002-runs-status-index", """
+    CREATE INDEX automations_runs_status_idx
+        ON automations_runs (project_id, status, queued_at)
+    """),
+]
 
-    Opening registers the project, which stamps its id. A read path passes
-    `strict` False: where the id may not be stamped the registration is left
-    out and the ledger reads the project as it is registered, or as empty."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+class StoreUnavailable(Exception):
+    """The store the ledger lives in cannot be used: none is configured, its
+    setting cannot be read, or the database cannot be reached or refuses the
+    migration. `slug` is the shared library's, so every capability names one
+    cause with one word, and `hint` says what to do about it."""
+
+    def __init__(self, slug: str, message: str, hint: str | None = None):
+        super().__init__(message)
+        self.slug = slug
+        self.message = message
+        self.hint = hint
+
+
+def _database():
     try:
-        import store as _store
+        from capabilities_contract import db
     except ImportError as exc:
-        raise ConfigError("the store module is not installed beside the service") from exc
-    finally:
-        sys.path.pop(0)
-    identity = _project_identity(root)
-    st = _store.open_store()
+        raise StoreUnavailable(
+            "driver_missing", "the shared database library is not installed",
+            "reinstall automations, whose script header pins capabilities-contract") from exc
+    return db
+
+
+def store_in_force() -> dict[str, str]:
+    """Which store the ledger uses, read and never written: the machine's store
+    setting, or the `CAPABILITIES_STORE_URL` override, and the schema it binds.
+    Raises StoreUnavailable when there is none to use."""
+    db = _database()
     try:
-        registered = _registration_id(root, identity, strict)
-        st.migrate()
-        if registered or strict:
-            st.project_register(registered, identity["slug"])
-        st.migrate(STORE_NAMESPACE, STORE_VERSION, STORE_MIGRATIONS)
-    except _store.StoreError as exc:
-        st.close()
-        raise ConfigError(f"cannot prepare the store: {exc.message}") from exc
-    project_id = st._project_id(identity["slug"])
-    # An unregistered project reads as empty, never as every project.
-    return st, RunLedger(st, "" if project_id is None else project_id,
-                         config["engine"]["environment"])
+        setting = db.read_setting()
+    except db.DbError as exc:
+        raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
+    return {"store": "CAPABILITIES_STORE_URL" if setting.url is not None else "setting",
+            "schema": setting.schema}
+
+
+def open_ledger(root: Path, config: dict[str, Any], strict: bool = True) -> "RunLedger":
+    """The ledger of this project's runs, open on the store. The caller closes it.
+
+    A run is recorded under the project's id, the one the launching CLI resolves
+    for a write. A read path passes `strict` False and reads under the id the
+    project declares even where it may not be stamped; a project with no id at
+    all reads as empty, never as every project."""
+    identity = _project_identity(root)
+    project_id = _registration_id(root, identity, strict)
+    if not strict:
+        project_id = project_id or _handed_project_id(root) or identity.get("id") or ""
+    elif not project_id:
+        raise ConfigError("this project declares no id to record its runs under")
+    return RunLedger(project_id, config["engine"]["environment"]).open()
 
 
 class RunLedger:
     """Every question and every claim about runs, in one place that knows whose.
 
-    The ledger is shared: on a store two machines write to, a query that forgets
-    which project it is asking about would answer with another project's runs.
-    Scoping cannot therefore be a `WHERE` clause fifteen callers are trusted to
-    remember — it is the reason this boundary exists, and it is applied here
-    once rather than at each call.
+    The table is shared: one database holds the runs of every project on every
+    machine, so a query that forgot which project it is asking about would answer
+    with another project's runs. Scoping cannot therefore be a `WHERE` clause
+    fifteen callers are trusted to remember — it is the reason this boundary
+    exists, and it is applied here once rather than at each call.
 
-    The same class serves a local SQLite store and a coordinated backend; the
-    project scope and query shape do not change with the store deployment. It
-    speaks only through the store's portable surface, so the dialect stays the
-    store's business."""
+    Rows come back as they always have: times as the ISO text they were written
+    as, and the cancel flag as 0 or 1, so what `runs` and `show` print does not
+    depend on how the store keeps them."""
 
-    def __init__(self, store, project_id: str | None, environment: str):
-        self.store = store
+    def __init__(self, project_id: str, environment: str):
         self.project_id = project_id
         self.environment = environment
-        self._scoped = project_id is not None
+        self.host = socket.gethostname()
+        self.conn = None
+        self.warnings: list[str] = []
         self._in_transaction = False
 
+    def open(self) -> "RunLedger":
+        db = _database()
+        try:
+            conn = db.connect(application_name=LEDGER_OWNER)
+        except db.DbError as exc:
+            raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
+        try:
+            result = db.migrate(conn, LEDGER_OWNER, LEDGER_STEPS,
+                                major=LEDGER_MAJOR, minor=LEDGER_MINOR)
+            conn.autocommit = True
+        except db.DbError as exc:
+            conn.close()
+            raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
+        except BaseException:
+            conn.close()
+            raise
+        self.conn = conn
+        self.warnings = list(result.warnings)
+        return self
+
+    def close(self) -> None:
+        if self.conn is not None:
+            with contextlib.suppress(Exception):
+                self.conn.close()
+            self.conn = None
+        self._in_transaction = False
+
+    def __enter__(self) -> "RunLedger":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def lost(self) -> bool:
+        """Whether the connection is gone, so the next statement cannot succeed
+        on it whatever it is."""
+        return self.conn is None or self.conn.closed or self.conn.broken
+
+    def reopen(self) -> None:
+        self.close()
+        self.open()
+
     def _execute(self, sql: str, params: Sequence[Any] = ()):
-        return self.store._execute(sql, params)
+        return self.conn.execute(sql, list(params))
 
     @contextlib.contextmanager
     def transaction(self):
@@ -774,7 +845,7 @@ class RunLedger:
         if self._in_transaction:
             yield
             return
-        with self.store.transaction():
+        with self.conn.transaction():
             self._in_transaction = True
             try:
                 yield
@@ -784,50 +855,51 @@ class RunLedger:
     # -- the scope, applied once ----------------------------------------------
 
     def _where(self, *predicates: str) -> tuple[str, list]:
-        parts, params = [], []
-        if self._scoped:
-            parts.append("project_id = ?")
-            params.append(self.project_id)
-        parts.extend(predicates)
-        return (" WHERE " + " AND ".join(parts)) if parts else "", params
+        return " WHERE " + " AND ".join(("project_id = %s", *predicates)), [self.project_id]
 
     @staticmethod
-    def _dicts(cursor) -> list[dict[str, Any]]:
-        """Rows as dicts without depending on a row factory. The ledger runs
-        against a bare store connection and, later, against a driver that has no
-        such notion at all, so the column names come from the cursor."""
+    def _value(value: Any) -> Any:
+        if isinstance(value, datetime):
+            return iso(value)
+        if isinstance(value, bool):
+            return int(value)
+        return value
+
+    @classmethod
+    def _dicts(cls, cursor) -> list[dict[str, Any]]:
         names = [c[0] for c in cursor.description]
-        return [dict(zip(names, row)) for row in cursor.fetchall()]
+        return [{name: cls._value(value) for name, value in zip(names, row)}
+                for row in cursor.fetchall()]
 
     def _rows(self, predicates: str = "", params: Sequence[Any] = (),
               order: str = "", limit: int | None = None,
               lock: bool = False) -> list[dict[str, Any]]:
         clause, scope_params = self._where(*([predicates] if predicates else []))
-        sql = "SELECT * FROM runs" + clause + (f" ORDER BY {order}" if order else "")
+        sql = "SELECT * FROM automations_runs" + clause + (f" ORDER BY {order}" if order else "")
         args = scope_params + list(params)
         if limit is not None:
-            sql += " LIMIT ?"
+            sql += " LIMIT %s"
             args.append(limit)
-        if lock and self.store.dialect == "postgres":
+        if lock:
             sql += " FOR UPDATE"
         return self._dicts(self._execute(sql, args))
 
     # -- reads ----------------------------------------------------------------
 
     def get(self, run_id: str) -> dict[str, Any] | None:
-        rows = self._rows("id = ?", (run_id,))
+        rows = self._rows("id = %s", (run_id,))
         return rows[0] if rows else None
 
     def list(self, *, limit: int = 50, status: str | None = None) -> list[dict[str, Any]]:
         if status:
-            return self._rows("status = ?", (status,), order="queued_at DESC", limit=limit)
+            return self._rows("status = %s", (status,), order="queued_at DESC", limit=limit)
         return self._rows(order="queued_at DESC", limit=limit)
 
     def counts(self) -> dict[str, int]:
         clause, params = self._where()
         rows = self._execute(
-            "SELECT status, COUNT(*) AS count FROM runs" + clause + " GROUP BY status",
-            params).fetchall()
+            "SELECT status, COUNT(*) AS count FROM automations_runs" + clause
+            + " GROUP BY status", params).fetchall()
         return {row[0]: row[1] for row in rows}
 
     def unfinished(self) -> list[dict[str, Any]]:
@@ -835,147 +907,65 @@ class RunLedger:
 
     def pending(self, *, lock: bool = False) -> list[dict[str, Any]]:
         """The queue in order. `lock` holds the rows for the transaction it is
-        read in: SQLite's write lock already serialises a claim, and Postgres
-        needs the row locks to do the same between two dispatchers."""
+        read in, so two dispatchers cannot take the same one."""
         return self._rows("status = 'pending'", order="queued_at, id", lock=lock)
 
     def has_active(self, slug: str, statuses: Sequence[str]) -> bool:
-        marks = ", ".join("?" for _ in statuses)
-        clause, params = self._where("automation_slug = ?", f"status IN ({marks})")
-        row = self._execute("SELECT 1 FROM runs" + clause + " LIMIT 1",
-                            params + [slug] + list(statuses)).fetchone()
+        clause, params = self._where("automation_slug = %s", "status = ANY(%s)")
+        row = self._execute("SELECT 1 FROM automations_runs" + clause + " LIMIT 1",
+                            params + [slug, list(statuses)]).fetchone()
         return row is not None
 
     def count_for(self, slug: str, status: str) -> int:
-        clause, params = self._where("automation_slug = ?", "status = ?")
-        return self._execute("SELECT COUNT(*) FROM runs" + clause,
+        clause, params = self._where("automation_slug = %s", "status = %s")
+        return self._execute("SELECT COUNT(*) FROM automations_runs" + clause,
                              params + [slug, status]).fetchone()[0]
 
     def running(self) -> int:
         clause, params = self._where("status IN ('starting', 'running')")
-        return self._execute("SELECT COUNT(*) FROM runs" + clause,
+        return self._execute("SELECT COUNT(*) FROM automations_runs" + clause,
                              params).fetchone()[0]
 
     # -- writes ---------------------------------------------------------------
 
-    def claim(self, automation_uuid: str | None, slug: str, state_dir: Path, *,
+    def claim(self, slug: str, state_dir: Path, *,
               trigger: str, scheduled_for: str | None = None,
               dedupe_key: str | None = None, attempt: int = 1,
               parent_run_id: str | None = None) -> dict[str, Any] | None:
         """Take one firing, or find it already taken.
 
-        `dedupe_key` is unique, so on a shared store this is the whole of the
-        mutual exclusion: whichever machine inserts first owns the run and the
-        other is told, rather than discovering the collision by running.
-
         The key is the only conflict the insert treats as someone else's win.
-        Anything else -- a column this store still declares NOT NULL, a
-        reference it cannot satisfy -- is a schema the code no longer matches,
-        and a run that vanishes quietly is worse than one that fails loudly."""
+        Anything else is a schema the code no longer matches, and a run that
+        vanishes quietly is worse than one that fails loudly."""
         run_id = uuid.uuid4().hex
         log_path = state_dir / "runs" / f"{run_id}.log"
         with self.transaction():
             inserted = self._execute(
-                "INSERT INTO runs (id, project_id, automation_id, automation_slug, "
+                "INSERT INTO automations_runs (id, project_id, automation_slug, "
                 "environment, trigger, scheduled_for, dedupe_key, status, attempt, "
-                "parent_run_id, queued_at, log_path) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?) "
-                "ON CONFLICT (dedupe_key) DO NOTHING",
-                (run_id, self.project_id, automation_uuid, slug,
-                 self.environment, trigger, scheduled_for, dedupe_key, attempt,
-                 parent_run_id, iso(), str(log_path))).rowcount
+                "parent_run_id, queued_at, log_path, host) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s) "
+                "ON CONFLICT (project_id, dedupe_key) DO NOTHING",
+                (run_id, self.project_id, slug, self.environment, trigger,
+                 scheduled_for, dedupe_key, attempt, parent_run_id, iso(),
+                 str(log_path), self.host)).rowcount
         if not inserted:
             return None
         return self.get(run_id)
 
     def update(self, run_id: str, **columns: Any) -> None:
-        assignments = ", ".join(f"{name} = ?" for name in columns)
-        clause, params = self._where("id = ?")
+        assignments = ", ".join(f"{name} = %s" for name in columns)
+        clause, params = self._where("id = %s")
         with self.transaction():
-            self._execute(f"UPDATE runs SET {assignments}" + clause,
+            self._execute(f"UPDATE automations_runs SET {assignments}" + clause,
                           list(columns.values()) + params + [run_id])
 
     def take(self, run_id: str) -> bool:
         """Move one pending run to starting, unless another dispatcher did."""
-        clause, params = self._where("id = ?", "status = 'pending'")
+        clause, params = self._where("id = %s", "status = 'pending'")
         with self.transaction():
-            return self._execute("UPDATE runs SET status = 'starting'" + clause,
+            return self._execute("UPDATE automations_runs SET status = 'starting'" + clause,
                                  params + [run_id]).rowcount == 1
-
-
-def _runs_columns(store) -> list[tuple[str, bool]]:
-    """Each column of `runs` with whether it is declared NOT NULL, in order."""
-    if store.dialect == "postgres":
-        rows = store._execute(
-            "SELECT column_name, is_nullable FROM information_schema.columns "
-            "WHERE table_schema = current_schema() AND table_name = 'runs' "
-            "ORDER BY ordinal_position").fetchall()
-        return [(row[0], row[1] == "NO") for row in rows]
-    return [(row[1], bool(row[3]))
-            for row in store._execute("PRAGMA table_info(runs)").fetchall()]
-
-
-def runs_schema_defect(store) -> str | None:
-    """The name of a column this store still declares NOT NULL that the code
-    expects to leave empty, or None when the table matches.
-
-    `runs.automation_id` is empty for a project that declares its automations in
-    a file: there is no row for it to point at. A store first created before
-    that was true still carries the old NOT NULL, and `CREATE TABLE IF NOT
-    EXISTS` never revisits a table that already exists, so the constraint
-    outlives the release that relaxed it and no run can be recorded at all.
-    """
-    try:
-        columns = _runs_columns(store)
-    except Exception:
-        if store.dialect == "postgres":
-            store.connection.rollback()
-        return None
-    for name, notnull in columns:
-        if name == "automation_id" and notnull:
-            return name
-    return None
-
-
-def repair_runs_schema(store) -> dict[str, Any]:
-    """Rebuild `runs` so the automation reference may be empty, keeping rows.
-
-    This is a repair, not a migration: `migrate()` refuses a step that drops or
-    renames, because a host on an older release shares this database and has to
-    survive whatever a newer one does to it. Widening a column is safe for that
-    older host -- it simply never writes an empty one -- but SQLite cannot widen
-    in place, and the rebuild that does it is exactly the shape the guard
-    refuses to take on trust. So it is asked for deliberately, once, by someone
-    who has read what it will do.
-    """
-    defect = runs_schema_defect(store)
-    if defect is None:
-        return {"repaired": False, "reason": "runs already allows an empty automation reference"}
-    create = [step for step in STORE_MIGRATIONS
-              if "CREATE TABLE IF NOT EXISTS runs " in " ".join(step.split())]
-    indexes = [step for step in STORE_MIGRATIONS
-               if "CREATE INDEX" in step.upper() and " ON RUNS " in " ".join(step.split()).upper()]
-    with store.transaction():
-        store._execute("ALTER TABLE runs RENAME TO runs_pre_repair")
-        for step in create:
-            store._execute(step.format(**store._ddl_subs()))
-        columns = [name for name, _ in _runs_columns(store)]
-        names = ", ".join(columns)
-        store._execute(f"INSERT INTO runs ({names}) SELECT {names} FROM runs_pre_repair")
-        moved = store._execute("SELECT COUNT(*) FROM runs").fetchone()[0]
-        # The old table's indexes carry its name and go down with it, so they are
-        # rebuilt from the same steps that declare them rather than left missing.
-        store._execute("DROP TABLE runs_pre_repair")
-        for step in indexes:
-            store._execute(step.format(**store._ddl_subs()))
-    return {"repaired": True, "column": defect, "rows_preserved": moved}
-
-
-def _automation_uuid(store, project_id: str | None, slug: str) -> str | None:
-    row = store._execute(
-        "SELECT id FROM automations WHERE scope = 'project' AND project_id = ? AND slug = ?",
-        (project_id, slug)).fetchone()
-    return row[0] if row else None
 
 
 def enqueue_manual(
@@ -989,60 +979,43 @@ def enqueue_manual(
             f"automation {automation_id!r} is disabled or not enabled for environment "
             f"{config['engine']['environment']!r}"
         )
-    store, ledger = open_ledger(root, config)
-    try:
-        row = ledger.claim(_automation_uuid(store, ledger.project_id, automation_id),
-                           automation_id, state_dir, trigger="manual")
-    finally:
-        store.close()
+    with open_ledger(root, config) as ledger:
+        row = ledger.claim(automation_id, state_dir, trigger="manual")
     assert row is not None
     return row
 
 
 def list_runs(root: Path, config: dict[str, Any], *, limit: int = 50,
               status: str | None = None) -> list[dict[str, Any]]:
-    store, ledger = open_ledger(root, config, strict=False)
-    try:
+    with open_ledger(root, config, strict=False) as ledger:
         return ledger.list(limit=limit, status=status)
-    finally:
-        store.close()
 
 
 def get_run(root: Path, config: dict[str, Any], run_id: str) -> dict[str, Any] | None:
-    store, ledger = open_ledger(root, config, strict=False)
-    try:
+    with open_ledger(root, config, strict=False) as ledger:
         return ledger.get(run_id)
-    finally:
-        store.close()
 
 
 def counts(root: Path, config: dict[str, Any]) -> dict[str, int]:
-    store, ledger = open_ledger(root, config, strict=False)
-    try:
+    with open_ledger(root, config, strict=False) as ledger:
         return ledger.counts()
-    finally:
-        store.close()
 
 
 def request_cancel(root: Path, config: dict[str, Any], run_id: str) -> dict[str, Any] | None:
-    store, ledger = open_ledger(root, config)
-    try:
+    with open_ledger(root, config) as ledger:
         row = ledger.get(run_id)
         if row is None:
             return None
         if row["status"] == "pending":
-            ledger.update(run_id, status="canceled", cancel_requested=1, finished_at=iso())
+            ledger.update(run_id, status="canceled", cancel_requested=True, finished_at=iso())
         elif row["status"] in {"starting", "running"}:
-            ledger.update(run_id, cancel_requested=1)
+            ledger.update(run_id, cancel_requested=True)
         return ledger.get(run_id)
-    finally:
-        store.close()
 
 
 def retry_run(root: Path, config: dict[str, Any], state_dir: Path,
               run_id: str) -> dict[str, Any] | None:
-    store, ledger = open_ledger(root, config)
-    try:
+    with open_ledger(root, config) as ledger:
         row = ledger.get(run_id)
         if row is None:
             return None
@@ -1056,11 +1029,8 @@ def retry_run(root: Path, config: dict[str, Any], state_dir: Path,
                 f"environment {config['engine']['environment']!r}"
             )
         return ledger.claim(
-            _automation_uuid(store, ledger.project_id, slug), slug, state_dir,
-            trigger="retry", attempt=int(row["attempt"]) + 1,
+            slug, state_dir, trigger="retry", attempt=int(row["attempt"]) + 1,
             parent_run_id=row["parent_run_id"] or row["id"])
-    finally:
-        store.close()
 
 
 def _summary(log_path: Path) -> str | None:
@@ -1108,14 +1078,12 @@ class Daemon:
         self.reload_error: str | None = None
         self.state_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "runs").mkdir(parents=True, exist_ok=True)
-        self.store, self.runs = open_ledger(self.root, self.config)
-        self._uuids = {
-            item["id"]: _automation_uuid(self.store, self.runs.project_id, item["id"])
-            for item in self.config["automations"]
-        }
+        self.runs = open_ledger(self.root, self.config)
+        for warning in self.runs.warnings:
+            _say(warning)
 
     def _claim(self, slug: str, **kwargs) -> dict[str, Any] | None:
-        return self.runs.claim(self._uuids.get(slug), slug, self.state_dir, **kwargs)
+        return self.runs.claim(slug, self.state_dir, **kwargs)
 
     def recover(self) -> None:
         rows = self.runs.unfinished()
@@ -1423,16 +1391,39 @@ class Daemon:
                 if self.reload_requested:
                     self.reload_requested = False
                     self.reload_declaration(fingerprint_path)
-                self.reap()
-                self.schedule_due(utc_now())
-                self.dispatch()
+                self.tick()
                 time.sleep(self.config["engine"]["tick_seconds"])
         finally:
             self.shutdown()
             pid_path.unlink(missing_ok=True)
             fingerprint_path.unlink(missing_ok=True)
-            self.store.close()
+            self.runs.close()
             lock.close()
+
+    def tick(self) -> None:
+        """Reap, schedule and dispatch once.
+
+        The store is across a network, and a connection it drops is no reason
+        to end the children this daemon is running: a tick that finds its
+        connection gone says so, opens a new one if it can, and leaves the work
+        to the next tick, whose dedupe keys make a repeated firing harmless."""
+        try:
+            self.reap()
+            self.schedule_due(utc_now())
+            self.dispatch()
+        except Exception as exc:
+            if not self.runs.lost():
+                raise
+            _say(f"lost the store connection, reconnecting: {exc}")
+            try:
+                self.runs.reopen()
+            except StoreUnavailable as again:
+                _say(f"the store is still unavailable: {again.message}")
+
+
+def _say(message: str) -> None:
+    sys.stderr.write(f"automations daemon: {message}\n")
+    sys.stderr.flush()
 
 
 def run_from_env() -> None:
@@ -1449,6 +1440,10 @@ def run_from_env() -> None:
 if __name__ == "__main__":
     try:
         run_from_env()
+    except StoreUnavailable as exc:
+        sys.stderr.write(f"automations daemon: {exc.slug}: {exc.message}"
+                         + (f"; {exc.hint}" if exc.hint else "") + "\n")
+        raise SystemExit(1)
     except Exception as exc:
         sys.stderr.write(f"automations daemon: {exc}\n")
         raise SystemExit(1)

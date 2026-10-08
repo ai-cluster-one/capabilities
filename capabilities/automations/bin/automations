@@ -1,7 +1,9 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = [
+#     "capabilities-contract==0.1.0",
+# ]
 # ///
 """automations — project-local scheduler and subprocess runner.
 
@@ -34,10 +36,10 @@ Commands:
       failing, when a running daemon published no environment at all - one
       started before this payload - because a missing record says what this
       answer cannot speak to rather than that anything is wrong.
-      Reports a store whose
-      `runs` table predates the nullable automation reference, which stops a
-      file-declared automation recording any run. `--repair` rebuilds that
-      table in place, keeping every row.
+      Exits 6 `store_not_configured` when the machine has no store to keep
+      the run ledger in, and 5 when the store cannot be reached. `--repair`
+      is accepted and repairs nothing: the ledger's table is created whole by
+      its own migration.
   automations list
       List configured automations and whether they apply to this environment.
   automations set <automation-id> [--name TEXT] [--description TEXT] [--enabled true|false]
@@ -74,7 +76,7 @@ Commands:
   automations run <automation-id>
       Enqueue one manual run. The daemon dispatches it asynchronously.
   automations runs [--limit N] [--status STATUS]
-      List recent run records from the capabilities store.
+      List recent run records from the run ledger.
   automations show <run-id>
       Show one run record.
   automations logs <run-id> [--tail N]
@@ -93,7 +95,10 @@ Commands:
       Create project-local config and an example script.
   automations service doctor|run|start|stop|status|logs
       Manage the bundled scheduler service. `run` stays in the foreground for
-      Docker Compose; `start` is the local background convenience.
+      Docker Compose; `start` is the local background convenience. `run` and
+      `start` refuse with exit 6 `store_not_configured` while the machine has
+      no store, and `status` names the store in force as `store`: `setting`,
+      `CAPABILITIES_STORE_URL`, or null with `store_error`.
   automations service reload [--timeout SEC]
       Publish an edited configuration to the daemon already running, without
       stopping the jobs it is running. The configuration is validated first, and
@@ -116,6 +121,13 @@ Environment:
   AUTOMATIONS_STATE_DIR are read from the process environment first and then from
   the project's .env and .env.local (.local wins), so a project declares one for
   every invocation made in it, `service status` included, without a shell export.
+
+Run ledger:
+  Runs, the queue and their history live in the table automations_runs of
+  the PostgreSQL the machine's store setting names (`capabilities store set`),
+  or of the one `CAPABILITIES_STORE_URL` names, reached through the shared
+  capabilities-contract library. Each run carries its project's id and the
+  host it was recorded on; its log stays a file on that host.
 
 Scheduling:
   Each automation may use a numeric five-field cron `schedule`, an
@@ -226,6 +238,8 @@ SERVICE = {
             "optional": [
                 {"key": "AUTOMATIONS_ENVIRONMENT", "default": "production"},
                 {"key": "AUTOMATIONS_NAMESPACE"},
+                {"key": "CAPABILITIES_STORE_URL"},
+                {"key": "CAPABILITIES_STORE_PASSWORD"},
             ],
         },
         "mounts": [
@@ -4069,9 +4083,8 @@ def _migrate_legacy_state(root: Path, runtime, config: dict[str, Any]) -> dict[s
     except (OSError, RuntimeError) as exc:
         raise runtime.ConfigError(f"cannot migrate legacy automation state: {exc}") from exc
 
-    store, ledger = runtime.open_ledger(root, config)
     repointed = 0
-    try:
+    with runtime.open_ledger(root, config) as ledger:
         legacy_resolved = legacy.resolve()
         for row in ledger._rows():
             old_log = Path(row["log_path"])
@@ -4086,8 +4099,6 @@ def _migrate_legacy_state(root: Path, runtime, config: dict[str, Any]) -> dict[s
             if new_log.is_file() and str(new_log) != row["log_path"]:
                 ledger.update(row["id"], log_path=str(new_log))
                 repointed += 1
-    finally:
-        store.close()
     return {
         "source": str(legacy), "target": str(target),
         "files_copied": copied, "run_logs_repointed": repointed,
@@ -4096,13 +4107,33 @@ def _migrate_legacy_state(root: Path, runtime, config: dict[str, Any]) -> dict[s
 
 
 def _prepare_service(root: Path):
+    """Everything the daemon needs before it may take any work, the store first:
+    the ledger is opened and migrated here, so a machine with no store, or one
+    that cannot be reached, refuses before a daemon is started at all."""
     runtime, config = _load(root)
+    try:
+        runtime.open_ledger(root, config).close()
+    except runtime.StoreUnavailable as exc:
+        _store_refusal(exc)
+    except runtime.ConfigError as exc:
+        _die(6, "not_runnable", str(exc))
     try:
         migration = _migrate_legacy_state(root, runtime, config)
     except runtime.ConfigError as exc:
         _die(6, "state_migration_failed", str(exc),
              "resolve the conflicting XDG and legacy files, then start again")
     return runtime, config, migration
+
+
+# A store setting that cannot be used is a configuration fault; a store that
+# cannot be reached or refuses the migration is the environment's.
+_STORE_CONFIG_SLUGS = frozenset({
+    "store_not_configured", "store_not_postgres", "store_setting_unreadable",
+    "bad_store_setting", "sslmode_too_weak", "bad_schema_name"})
+
+
+def _store_refusal(exc) -> NoReturn:
+    _die(6 if exc.slug in _STORE_CONFIG_SLUGS else 5, exc.slug, exc.message, exc.hint)
 
 
 def _runtime_module():
@@ -4267,12 +4298,23 @@ def service_status(root: Path) -> dict[str, Any]:
         # there is none, because an envelope that refuses the file makes that
         # `false` wrong in a way no directory listing explains.
         **({"state_record_error": record_error} if record_error else {}),
-        "store": os.environ.get("CAPABILITIES_STORE_URL") or "default",
+        **_store_named(runtime),
         "pid_file": str(pid_file),
         "log_file": str(state / "daemon.log"),
         "counts": counts,
         **({"counts_error": counts_error} if counts_error else {}),
     }
+
+
+def _store_named(runtime) -> dict[str, Any]:
+    """Which store the run ledger is kept in, named without reaching it."""
+    try:
+        return runtime.store_in_force()
+    except runtime.StoreUnavailable as exc:
+        error = {"code": exc.slug, "message": exc.message}
+        if exc.hint:
+            error["hint"] = exc.hint
+        return {"store": None, "store_error": error}
 
 
 def _service_findings(runtime, config: dict, state: Path, running: bool,
@@ -4370,16 +4412,10 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
     runtime, config = _load(root)
     state = _state_path(root)
     state.mkdir(parents=True, exist_ok=True)
-    schema_defect = None
-    repaired = None
     try:
-        store, _ledger = runtime.open_ledger(root, config, strict=False)
-        try:
-            if repair:
-                repaired = runtime.repair_runs_schema(store)
-            schema_defect = runtime.runs_schema_defect(store)
-        finally:
-            store.close()
+        runtime.open_ledger(root, config, strict=False).close()
+    except runtime.StoreUnavailable as exc:
+        _store_refusal(exc)
     except Exception as exc:
         _die(5, "state_unavailable", f"the store is unavailable: {exc}")
     status = service_status(root)
@@ -4391,7 +4427,7 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
     environment_idle = found["environment_idle"]
     environment_unknown = found["environment_unknown"]
     result = {
-        "ok": not missing_scripts and schema_defect is None and config_stale is None
+        "ok": not missing_scripts and config_stale is None
         and environment_idle is None,
         "project": str(root),
         "environment": config["engine"]["environment"],
@@ -4409,17 +4445,10 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
         result["environment_idle"] = environment_idle
     if environment_unknown is not None:
         result["environment_unknown"] = environment_unknown
-    if repaired is not None:
-        result["repaired"] = repaired
-    if schema_defect is not None:
-        result["schema_defect"] = {
-            "table": "runs",
-            "column": schema_defect,
-            "message": (
-                f"this store still declares runs.{schema_defect} NOT NULL, so a project "
-                "declaring its automations in a file cannot record a run"
-            ),
-            "hint": "run `automations doctor --repair` to rebuild the table, keeping its rows",
+    if repair:
+        result["repaired"] = {
+            "repaired": False,
+            "reason": "the run ledger's table is created whole by its own migration",
         }
     return result
 
@@ -4951,7 +4980,13 @@ def cmd_service_start() -> dict[str, Any]:
             text=True,
             start_new_session=True,
         )
-    time.sleep(0.4)
+    # The daemon opens its ledger on the store before it writes its pid, and
+    # the store is across a network, so this answers once the daemon has said
+    # it is running or has exited, rather than after a guess at how long that takes.
+    deadline = time.monotonic() + 15
+    while proc.poll() is None and time.monotonic() < deadline \
+            and _read_pid(state / "daemon.pid") != proc.pid:
+        time.sleep(0.05)
     if proc.poll() is not None:
         tail = log_path.read_text(errors="replace").splitlines()[-8:]
         _die(5, "service_start_failed", f"automations daemon exited with {proc.returncode}", "\n".join(tail))
@@ -5441,4 +5476,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        # The runtime module is loaded afresh by each verb that needs it, so its
+        # exception class is matched by name rather than by identity.
+        if type(exc).__name__ != "StoreUnavailable":
+            raise
+        _store_refusal(exc)
