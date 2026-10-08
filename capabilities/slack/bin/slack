@@ -4420,18 +4420,27 @@ def _inventory(_network: bool) -> dict:
     capability. The answer is `service status` read, not a new judgement of
     liveness: a pid file on this machine and the process it names. A project
     that cannot select a connection has no daemon to be in any state, and
-    says why instead of failing the whole report."""
+    says why instead of failing the whole report. Its verdict is `service
+    doctor`'s up to the point the doctor calls Slack."""
     try:
         with contextlib.redirect_stderr(io.StringIO()) as refused:
             status = _service_status(None)
     except SystemExit:
-        return {"service": {"state": "not configured",
-                            "detail": _inventory_refusal(refused.getvalue())}}
+        reason = _inventory_refusal(refused.getvalue())
+        return {"service": {"state": "not configured", "detail": reason,
+                            "ok": False, "problem": reason}}
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as refused:
+            _service_local_check(None)
+        verdict = {"ok": True}
+    except SystemExit:
+        verdict = {"ok": False, "problem": _inventory_refusal(refused.getvalue())}
     if status["running"]:
         return {"service": {"state": "running",
-                            "detail": f"pid {status['pid']}, connection {status['connection']}"}}
+                            "detail": f"pid {status['pid']}, connection {status['connection']}",
+                            **verdict}}
     return {"service": {"state": "stopped" if status["initialized"] else "not initialized",
-                        "detail": f"connection {status['connection']}"}}
+                        "detail": f"connection {status['connection']}", **verdict}}
 
 
 def _inventory_refusal(stderr: str) -> str:
@@ -4460,11 +4469,20 @@ def _service_tokens() -> tuple[str, str]:
     return bot, app
 
 
-def cmd_service_doctor(flag: str | None) -> None:
+def _service_local_check(flag: str | None) -> tuple[Path, str, bool, str, str]:
+    """Everything `service doctor` judges before it calls Slack: the settings
+    and the worker they name, the connection and its policy, and both tokens.
+    A refusal exits as the doctor's would, so `inventory` judges by this and
+    calls nothing."""
     root = _service_root()
     _service_settings_strict(root, check_worker=True)
     cid, allow_write = _service_connection_policy(root, flag)
     bot, app = _service_tokens()
+    return root, cid, allow_write, bot, app
+
+
+def cmd_service_doctor(flag: str | None) -> None:
+    root, cid, allow_write, bot, app = _service_local_check(flag)
     identity = _api("auth.test", bot, json_body={})
     # apps.connections.open validates the app-level token and Socket Mode enablement.
     _api("apps.connections.open", app, json_body={})

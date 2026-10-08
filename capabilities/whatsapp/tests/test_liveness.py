@@ -624,6 +624,17 @@ class Reports(unittest.TestCase):
         self.health(age=1)
         self.assertEqual(wa._cmd_service_doctor(None)[1], 0)
 
+    def test_the_inventory_verdict_is_the_doctor_s_without_the_store(self):
+        """`inventory` judges by the doctor's local checks and never opens the
+        store, so a reader colouring the service reaches nothing."""
+        wa._open_store.side_effect = AssertionError("the inventory verdict opened the store")
+        self.health(age=1)
+        self.assertEqual(wa._inventory_verdict(), {"ok": True})
+        self.health(age=300)
+        verdict = wa._inventory_verdict()
+        self.assertFalse(verdict["ok"])
+        self.assertTrue(verdict["problem"].startswith("service_stale: pid "))
+
     def test_the_deploy_doctor_is_service_doctor_and_exits_non_zero(self):
         self.assertEqual(wa.SERVICE["deploy"]["doctor"], ["whatsapp", "service", "doctor"])
         self.health(age=300)

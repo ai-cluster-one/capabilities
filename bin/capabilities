@@ -415,7 +415,13 @@ PROJECT VERBS (run inside a consuming project)
         capability reports an inventory of its own and how much of it needs
         the network. The survey runs only the capabilities that ship a
         service, each once for its service's state from its own local report
-        (`unknown`, with the reason, when it cannot answer). --detail also asks
+        (`unknown`, with the reason, when it cannot answer). A service row
+        carries `state` (`running` while a process serves the project, its
+        own or the machine service it joined), `detail`, and the verdict of
+        the service's local checks: `ok` true when they find nothing wrong,
+        false with a one-line `problem` when they do, null when the capability
+        gives no verdict. The checks are the local part of its `service
+        doctor`, with no network call and no model turn. --detail also asks
         each one for its own report — `<name> inventory`, local and effect-free
         — running them together, so a reader assembling a whole project spends
         one process per capability here instead of several in every caller.
@@ -3351,7 +3357,7 @@ def _inventory_rows(root: Path) -> list[dict]:
                     "name": service.get("name"),
                     "summary": service.get("summary"),
                     "verbs": service.get("verbs") or [],
-                    "state": None, "detail": None},
+                    "state": None, "detail": None, "ok": None, "problem": None},
                 "inventory": {"declared": manifest.get("inventory") is not None,
                               "network": ((manifest.get("inventory") or {})
                                           .get("network"))},
@@ -3386,14 +3392,22 @@ def _inventory_service_state(answer: dict) -> dict:
     """The service state a capability's own report gave, or why there is none.
 
     `unknown` is a state rather than a missing one, so a row whose capability
-    could not be asked still says that it could not, and why."""
+    could not be asked still says that it could not, and why. The verdict is
+    the capability's too, passed through as given: `ok` is null wherever the
+    capability gave none, so a reader never takes silence for health."""
     service = (answer.get("report") or {}).get("service")
     if isinstance(service, dict) and str(service.get("state") or "").strip():
-        return {"state": service["state"], "detail": service.get("detail")}
+        ok = service.get("ok") if isinstance(service.get("ok"), bool) else None
+        problem = service.get("problem")
+        return {"state": service["state"], "detail": service.get("detail"), "ok": ok,
+                "problem": (problem if ok is False and isinstance(problem, str)
+                            and problem.strip() else None)}
     if "error" in answer:
-        return {"state": "unknown", "detail": answer["error"].get("message")}
+        return {"state": "unknown", "detail": answer["error"].get("message"),
+                "ok": None, "problem": None}
     return {"state": "unknown",
-            "detail": "the capability's inventory reports no service state"}
+            "detail": "the capability's inventory reports no service state",
+            "ok": None, "problem": None}
 
 
 def cmd_inventory(detail: bool, network: bool, wanted: list[str]) -> None:
@@ -7365,6 +7379,11 @@ def _validate_inventory(name: str, out: str, manifest) -> list[str]:
     if service is not None and (not isinstance(service, dict)
                                 or not str(service.get("state") or "").strip()):
         problems.append(f"service is neither null nor {{state, detail?}}: {service!r}")
+    elif isinstance(service, dict) and "ok" in service:
+        if not isinstance(service["ok"], bool):
+            problems.append(f"service ok is neither true nor false: {service['ok']!r}")
+        elif service["ok"] is False and not str(service.get("problem") or "").strip():
+            problems.append("service ok is false and names no problem")
     if service is None and isinstance(manifest, dict) and manifest.get("service"):
         problems.append("the capability ships a service and reports no state for it")
     return problems

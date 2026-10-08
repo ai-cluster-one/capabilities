@@ -10058,31 +10058,59 @@ def _cmd_service_status(connection_flag: str | None) -> dict:
 
 def _inventory(_network: bool) -> dict:
     """The assistant service's state on this machine, as `service status` reads
-    it. A project that cannot select a connection has no service to be in any
-    state, and says why rather than failing the whole report."""
+    it, and `service doctor`'s verdict without the store. A project that cannot
+    select a connection has no service to be in any state, and says why rather
+    than failing the whole report."""
     if _project_root() is None:
         return {"service": {"state": "not configured",
-                            "detail": "not inside a project"}}
+                            "detail": "not inside a project",
+                            "ok": False, "problem": "not inside a project"}}
     import io
     try:
         with contextlib.redirect_stderr(io.StringIO()) as refused:
             status = _cmd_service_status(None)
     except _Refusal as refusal:
-        return {"service": {"state": "not configured", "detail": refusal.message}}
+        return {"service": {"state": "not configured", "detail": refusal.message,
+                            "ok": False, "problem": refusal.message}}
     except SystemExit:
-        detail = "the service status could not be read"
-        for line in reversed(refused.getvalue().strip().splitlines()):
-            with contextlib.suppress(ValueError, KeyError, TypeError):
-                detail = json.loads(line)["error"]["message"]
-                break
-        return {"service": {"state": "not configured", "detail": detail}}
+        detail = _inventory_refusal(refused.getvalue())
+        return {"service": {"state": "not configured", "detail": detail,
+                            "ok": False, "problem": detail}}
     if status["running"]:
         return {"service": {"state": "running",
                             "detail": f"pid {status['pid']}, {status['state']}, "
-                                      f"connection {status['connection']}"}}
+                                      f"connection {status['connection']}",
+                            **_inventory_verdict()}}
     return {"service": {"state": status["state"] if status["initialized"]
                         else "not initialized",
-                        "detail": f"connection {status['connection']}"}}
+                        "detail": f"connection {status['connection']}",
+                        **_inventory_verdict()}}
+
+
+def _inventory_refusal(stderr: str) -> str:
+    """The message a refused read left on stderr, as one line."""
+    for line in reversed(stderr.strip().splitlines()):
+        with contextlib.suppress(ValueError, KeyError, TypeError):
+            return json.loads(line)["error"]["message"]
+    return "the service status could not be read"
+
+
+def _inventory_verdict() -> dict:
+    """`service doctor`'s verdict from this machine alone, its first failing
+    check named."""
+    import io
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as refused:
+            report, fail = _cmd_service_doctor(None, local=True)
+    except _Refusal as refusal:
+        return {"ok": False, "problem": f"{refusal.code}: {refusal.message}"}
+    except SystemExit:
+        return {"ok": False, "problem": _inventory_refusal(refused.getvalue())}
+    if not fail:
+        return {"ok": True}
+    first = next(row for row in report["checks"] if not row["ok"])
+    return {"ok": False,
+            "problem": f"{first.get('code') or first['item']}: {first['detail']}"}
 
 
 # The service's prose, seeded from the bundle's templates: the dialogue's
@@ -10327,10 +10355,13 @@ def _cmd_service_logs(connection_flag: str | None, tail: int) -> dict:
             "lines": lines[-max(0, tail):]}
 
 
-def _cmd_service_doctor(connection_flag: str | None) -> tuple[dict, int]:
+def _cmd_service_doctor(connection_flag: str | None,
+                        local: bool = False) -> tuple[dict, int]:
     """The service's readiness without touching the account: settings, store,
     link, ownership. The listener holds the connection while it runs, so its
-    own health is what proves the connection then."""
+    own health is what proves the connection then. `local` leaves out every
+    check that would leave this machine - the store, and a profile check the
+    runner cannot answer in process - so `inventory` judges by the rest."""
     root = _service_project_root()
     checks: list[dict] = []
     warnings: list[str] = []
@@ -10366,7 +10397,8 @@ def _cmd_service_doctor(connection_flag: str | None) -> tuple[dict, int]:
         except _Refusal as refusal:
             check("dialogue", False, refusal.message, refusal.exit_code, refusal.code)
         reached = _settings_profiles(settings)
-        for row in _profile_check(root, list(reached)):
+        in_process = not local or _runner_importable()
+        for row in _profile_check(root, list(reached)) if in_process else []:
             where = ", ".join(reached.get(row["name"]) or [])
             check(f"profile {row['name']}", bool(row.get("ok")),
                   (f"{where}: {row.get('harness')} "
@@ -10400,10 +10432,11 @@ def _cmd_service_doctor(connection_flag: str | None) -> tuple[dict, int]:
         return {"ok": False, "project": str(root), "checks": checks}, fail
     check("connection", True, f"{cfg['id']} (account {cfg['account_key']})")
     try:
-        db = _open_store(cfg)
-        location = _store_location(db)
-        db.close()
-        check("store", True, location)
+        if not local:
+            db = _open_store(cfg)
+            location = _store_location(db)
+            db.close()
+            check("store", True, location)
     except _Refusal as refusal:
         check("store", False, refusal.message, refusal.exit_code, refusal.code)
     account_id, _jid, _name = _session_account(cfg)

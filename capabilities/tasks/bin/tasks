@@ -11725,19 +11725,23 @@ def _service_module():
 
 def _inventory(network: bool) -> dict:
     """The service's state, read from what it left on this machine: whether a
-    daemon runs for this project, its lanes and how many turns it is running.
-    The queue itself is the store's and is not counted here. Local, and nothing
-    is written."""
+    daemon runs for this project, its lanes and how many turns it is running,
+    and `service doctor`'s verdict without the store's checks. The queue
+    itself is the store's and is not counted here. Local, and nothing is
+    written."""
     if _project_root() is None:
-        return {"service": {"state": "stopped", "detail": "not in a project"}}
+        return {"service": {"state": "stopped", "detail": "not in a project",
+                            "ok": False, "problem": "not in a project"}}
     module = _service_module()
     state = _service_state_dir()
     pid = module.read_pid(state)
+    verdict = _inventory_verdict(module)
     if not module.pid_alive(pid):
         initialized = _service_settings_path().is_file()
         return {"service": {"state": "stopped",
                             "detail": "no daemon runs for this project" + (
-                                "" if initialized else "; its settings are not initialized")}}
+                                "" if initialized else "; its settings are not initialized"),
+                            **verdict}}
     published = module.read_status(state) or {}
     lanes = ", ".join(str(row.get("worker")) for row in published.get("lanes") or []
                       if isinstance(row, dict))
@@ -11746,7 +11750,31 @@ def _inventory(network: bool) -> dict:
     return {"service": {"state": "running",
                         "detail": f"{served_by}pid {pid}, lanes {lanes or 'none'}, "
                                   f"{len(published.get('turns') or [])} turn(s) running, "
-                                  f"woken by {published.get('wake_by') or 'the poll'}"}}
+                                  f"woken by {published.get('wake_by') or 'the poll'}",
+                        **verdict}}
+
+
+def _inventory_verdict(module) -> dict:
+    """`service doctor`'s verdict from this machine alone - its declaration,
+    its connection and whatever serves it - the first problem named."""
+    import contextlib
+    import io
+
+    problems: list[str] = []
+    try:
+        _service_declaration()
+    except Refusal as refused:
+        problems.append(refused.message)
+    said = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(said):
+            _service_connection(None)
+            problems += _service_serving_problems(module, _service_status(module))[0]
+    except Refusal as refused:
+        problems.append(f"{refused.code}: {refused.message}")
+    except SystemExit:
+        problems.append(_refusal_said(said.getvalue()))
+    return {"ok": False, "problem": problems[0]} if problems else {"ok": True}
 
 
 def _read_service_settings(path: Path) -> dict:
@@ -13405,6 +13433,40 @@ def _wake_overdue(module, status: dict) -> float | None:
     return late if late > 2 * module.ROUND_TRIP_SECONDS else None
 
 
+def _service_serving_problems(module, status: dict) -> tuple[list[str], dict | None]:
+    """What `service doctor` finds wrong with whatever serves this project,
+    from what it left on this machine: a running daemon's overdue wake or
+    stale declaration, and a joined project the machine process does not
+    serve. Answers the problems and the stale fingerprints, if any. Nothing
+    here asks the store, so `inventory` judges by it too."""
+    problems: list[str] = []
+    stale = None
+    if status["running"]:
+        overdue = _wake_overdue(module, status)
+        if overdue is not None:
+            problems.append(f"the daemon's wake planned for {status['next_wake']['at']} is "
+                            f"{overdue:.0f}s overdue; it may hang")
+        loaded = module.read_fingerprint(_service_state_dir())
+        current = _service_fingerprint()
+        if loaded != current:
+            stale = {"loaded": loaded, "current": current}
+            problems.append("the running daemon loaded a declaration that has changed "
+                            "since: settings, a worker file or a profile it names; "
+                            f"`{NAME} service reload` hands it the one on disk")
+    machine = status.get("machine")
+    if machine is not None:
+        # A joined project is well while the machine process serves it, paused
+        # or not.
+        if not machine["running"]:
+            problems.append("this project is joined to the machine tasks service, and no "
+                            f"machine process runs; `{NAME} service start --machine`")
+        elif machine["state"] not in ("served", "paused"):
+            problems.append(f"the machine tasks service does not serve this project: "
+                            f"{machine['state'] or 'not yet taken up'}"
+                            + (f": {machine['reason']}" if machine.get("reason") else ""))
+    return problems, stale
+
+
 def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
     _flags(args, ())
     module = _service_module()
@@ -13458,29 +13520,10 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
     # A paused service is working as asked: reported, never a problem, so a
     # supervisor that restarts on a failing probe leaves it paused and running.
     answer["pause"] = status["pause"]
-    if status["running"]:
-        overdue = _wake_overdue(module, status)
-        if overdue is not None:
-            problems.append(f"the daemon's wake planned for {status['next_wake']['at']} is "
-                            f"{overdue:.0f}s overdue; it may hang")
-        loaded = module.read_fingerprint(_service_state_dir())
-        current = _service_fingerprint()
-        if loaded != current:
-            answer["declaration_stale"] = {"loaded": loaded, "current": current}
-            problems.append("the running daemon loaded a declaration that has changed "
-                            "since: settings, a worker file or a profile it names; "
-                            f"`{NAME} service reload` hands it the one on disk")
-    machine = status.get("machine")
-    if machine is not None:
-        # A joined project is well while the machine process serves it, paused
-        # or not.
-        if not machine["running"]:
-            problems.append("this project is joined to the machine tasks service, and no "
-                            f"machine process runs; `{NAME} service start --machine`")
-        elif machine["state"] not in ("served", "paused"):
-            problems.append(f"the machine tasks service does not serve this project: "
-                            f"{machine['state'] or 'not yet taken up'}"
-                            + (f": {machine['reason']}" if machine.get("reason") else ""))
+    serving, stale = _service_serving_problems(module, status)
+    problems += serving
+    if stale is not None:
+        answer["declaration_stale"] = stale
     answer["ok"] = not problems
     if problems:
         answer["problems"] = problems

@@ -1436,6 +1436,56 @@ class ServiceDoctorExitTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(code, 0)
 
+    def test_the_inventory_verdict_is_the_doctor_s_without_the_workers(self):
+        """`inventory` judges by the doctor's local checks and never makes the
+        workers' live calls, so a reader colouring the service pays nothing."""
+        cli = import_cli()
+        cfg = {"id": "probe", "allow_write": True, "session": "probe"}
+        for health, expected in (
+                ({"state": "healthy", "last_sync_at": self._stamp(1),
+                  "stale_after_seconds": 600}, {"ok": True}),
+                ({"state": "healthy", "last_sync_at": self._stamp(900),
+                  "stale_after_seconds": 60},
+                 {"ok": False,
+                  "problem": "the running service is not healthy: health stale"}),
+                (None, {"ok": True})):
+            with tempfile.TemporaryDirectory() as tmp:
+                health_path = Path(tmp) / "health.json"
+                if health:
+                    health_path.write_text(json.dumps(health))
+                runtime = cli._service_runtime_health(health_path, health is not None)
+                status = {"initialized": True, "running": health is not None,
+                          "healthy": runtime["healthy"], "health": runtime}
+
+                def no_worker_call(*_a, **_k):
+                    raise AssertionError("inventory made the workers' live call")
+
+                with mock.patch.object(cli, "_service_project_root", lambda: Path(tmp)), \
+                        mock.patch.object(cli, "_require_service_initialized",
+                                          lambda root: None), \
+                        mock.patch.object(cli, "_validate_service_settings",
+                                          lambda root: None), \
+                        mock.patch.object(cli, "_service_wanted_connection",
+                                          lambda root, flag: "probe"), \
+                        mock.patch.object(cli, "_load_config", lambda *a, **k: cfg), \
+                        mock.patch.object(cli, "_write_gate", lambda *a: None), \
+                        mock.patch.object(cli, "cmd_service_status",
+                                          lambda *a: dict(status)), \
+                        mock.patch.object(cli, "_service_worker_preflight", no_worker_call):
+                    self.assertEqual(cli._inventory_verdict(), expected)
+
+    def test_a_refused_local_check_is_the_inventory_problem(self):
+        cli = import_cli()
+
+        def refuse(root):
+            cli._die(6, "service_not_initialized", "the assistant service is not initialized")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(cli, "_service_project_root", lambda: Path(tmp)), \
+                mock.patch.object(cli, "_require_service_initialized", refuse):
+            self.assertEqual(cli._inventory_verdict(), {
+                "ok": False, "problem": "the assistant service is not initialized"})
+
     def test_the_failing_verdict_still_emits_the_whole_payload(self):
         """A consuming project reads this payload; the exit code is added to it
         rather than taken out of it."""

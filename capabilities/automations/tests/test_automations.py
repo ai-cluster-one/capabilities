@@ -1073,6 +1073,7 @@ schedule = "0 3 * * *"
         # No daemon: this invocation's environment is the only one there is.
         idle = json.loads(self.cli("inventory").stdout)
         self.assertEqual(idle["service"]["state"], "stopped")
+        self.assertIs(idle["service"]["ok"], True)
         self.assertEqual(states(idle)["job"], "active")
         self.assertEqual(states(idle)["nightly"], "other environment")
         self.assertIn("test", active(idle)["note"])
@@ -1082,6 +1083,7 @@ schedule = "0 3 * * *"
             report = json.loads(self.cli("inventory").stdout)
             self.assertEqual(report["service"]["state"], "running")
             self.assertIn("production", report["service"]["detail"])
+            self.assertIs(report["service"]["ok"], True)
             self.assertEqual(states(report)["nightly"], "active")
             self.assertEqual(states(report)["job"], "other environment")
             self.assertEqual(active(report)["value"], 1)
@@ -1096,6 +1098,18 @@ schedule = "0 3 * * *"
             self.assertEqual(states(unknown)["nightly"], "enabled")
             self.assertEqual(states(unknown)["job"], "enabled")
             self.assertNotIn("active here", [m["label"] for m in unknown["metrics"]])
+
+            # The verdict is doctor's own local finding: a declaration edited
+            # under a running daemon reads as a problem, with no store asked.
+            config_path.write_text(config_path.read_text() + """
+[[automations]]
+id = "later"
+script = "capabilities/automations/scripts/job.py"
+schedule = "0 4 * * *"
+""")
+            stale = json.loads(self.cli("inventory").stdout)["service"]
+            self.assertIs(stale["ok"], False)
+            self.assertTrue(stale["problem"].startswith("config_stale: "))
         finally:
             daemon.terminate()
             daemon.wait(timeout=15)

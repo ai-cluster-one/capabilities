@@ -12,7 +12,7 @@
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "06380b17d162c6d2b53083848fb7c2d3d28307d7d255ccedf550b771253d85d4",
+      "payload_sha256": "501f4f85d98c340807401a789a487e37f9435cddfee0b7280275f5848537a735",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {
@@ -132,7 +132,7 @@
     },
     "slack": {
       "path": "capabilities/slack",
-      "payload_sha256": "4819a0c83d2b19ab4e30bb00b07164fb8da892c6ba49bd9e26aa1a49449b3113",
+      "payload_sha256": "0d8c203618a84cb98038ce841ce9d24a757e4ddc57ae870f46a421d3bd517fb4",
       "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy."
     },
     "stripe": {
@@ -142,12 +142,12 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "1ef8dff161a4080e899aaa8dc460d5e5467834c0b0e950a717ec6346d09d228f",
+      "payload_sha256": "cd59afc2c9daa2f2c7e452548eaa018568de4781154abe0ca71b108cd8608757",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "cfd2a0351b87981c1014281084f10a787b27533a85cc929b420e20aeeec25b97",
+      "payload_sha256": "ffcaa57ac146be09ae014c87b763f788652e3f9e5db3b09ce98da65496e7d6cb",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {
@@ -157,7 +157,7 @@
     },
     "whatsapp": {
       "path": "capabilities/whatsapp",
-      "payload_sha256": "38cddfba4353ffbd83a396348f87862d2c5a7e525c44a6f0d524f5bef58b56e4",
+      "payload_sha256": "3817630f496d97cc6573193da9e4533152608e7d91b46c9e0955916c6334907b",
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON."
     },
     "windmill": {

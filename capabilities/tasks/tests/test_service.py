@@ -218,12 +218,38 @@ def test_the_state_lives_under_the_projects_capability_state(project):
                                         / "lab" / "tasks")
 
 
-def test_inventory_reports_the_service_stopped_without_a_daemon(project):
+def test_inventory_reports_the_service_stopped_without_a_daemon(project, monkeypatch):
+    monkeypatch.setattr(mod, "_service_connection", lambda wanted: ("main", {}))
     assert mod.INVENTORY == {"network": "none"}
     assert mod._inventory(False) == {"service": {
-        "state": "stopped", "detail": "no daemon runs for this project"}}
+        "state": "stopped", "detail": "no daemon runs for this project", "ok": True}}
     (project / "capabilities" / "tasks" / "service" / "config.toml").unlink()
-    assert "not initialized" in mod._inventory(False)["service"]["detail"]
+    service = mod._inventory(False)["service"]
+    assert "not initialized" in service["detail"]
+    # The verdict is `service doctor`'s, judged without the store.
+    assert service["ok"] is False and "no service settings" in service["problem"]
+
+
+def test_inventory_names_what_the_doctor_finds_wrong_with_what_serves_it(project, monkeypatch):
+    monkeypatch.setattr(mod, "_service_connection", lambda wanted: ("main", {}))
+    monkeypatch.setattr(mod, "_service_status", lambda module: {
+        "running": False, "machine": {"running": False, "state": None}})
+    assert mod._inventory_verdict(mod._service_module()) == {
+        "ok": False, "problem": "this project is joined to the machine tasks service, and "
+                                "no machine process runs; `tasks service start --machine`"}
+
+    def no_store(*_a, **_k):
+        raise AssertionError("the inventory verdict asked the store")
+
+    monkeypatch.setattr(mod, "_connect", no_store)
+    monkeypatch.setattr(mod, "_service_status", lambda module: {
+        "running": False, "machine": {"running": True, "state": "served"}})
+    assert mod._inventory_verdict(mod._service_module()) == {"ok": True}
+
+    monkeypatch.setattr(mod, "_service_connection", lambda wanted: mod._die(
+        6, "connections_required", "this project holds no connection"))
+    assert mod._inventory_verdict(mod._service_module()) == {
+        "ok": False, "problem": "connections_required: this project holds no connection"}
 
 
 def test_the_notification_is_part_of_the_schema():

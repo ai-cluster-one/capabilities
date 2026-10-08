@@ -219,6 +219,7 @@ def test_manager_inventory_carries_the_declared_service_state(tmp_path):
     assert unconfigured["name"] == "assistant"
     assert unconfigured["state"] == "not configured"
     assert "connections registry" in unconfigured["detail"]
+    assert unconfigured["ok"] is False and unconfigured["problem"] == unconfigured["detail"]
 
     assert _run([str(SCRIPT), "service", "init"], env, project).returncode == 0
     (project / "capabilities" / "slack" / "connections.json").write_text(
@@ -228,6 +229,9 @@ def test_manager_inventory_carries_the_declared_service_state(tmp_path):
     configured = service_row()
     assert configured["state"] == "stopped"
     assert configured["detail"] == "connection workspace"
+    # The verdict is `service doctor`'s before it calls Slack: here, no tokens.
+    assert configured["ok"] is False
+    assert "SLACK_BOT_TOKEN" in configured["problem"]
 
 
 def test_audit_rejects_a_service_whose_inventory_reports_no_state(tmp_path):

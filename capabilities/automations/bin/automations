@@ -163,6 +163,9 @@ Inventory:
     script          the script path as declared
     environments    the declared environments, comma-separated; absent when
                     none are declared
+  Its `service` carries `ok` and, when false, `problem`: the findings
+  `doctor` makes from this machine alone - missing_scripts, config_stale,
+  environment_idle - and none of the store's.
 
 Exit codes:
   0 success · 3 not found · 4 disabled by project policy · 5 runtime failure ·
@@ -3689,12 +3692,14 @@ def _inventory(_network: bool) -> dict:
 
     The service's state is part of every answer, a project with no
     configuration included, because a reader assembling a project takes it
-    from here and nowhere else."""
+    from here and nowhere else. So is its verdict: the checks `doctor` makes
+    from this machine alone, and none of the store's."""
     root = _project_root()
     if root is None:
         return {"metrics": [{"label": "automations", "value": 0,
                              "note": "not inside a project"}],
-                "service": {"state": "not configured", "detail": "not inside a project"}}
+                "service": {"state": "not configured", "detail": "not inside a project",
+                            "ok": False, "problem": "not inside a project"}}
     state = _state_path(root)
     pid = _read_pid(state / "daemon.pid")
     running = _pid_alive(pid)
@@ -3702,15 +3707,17 @@ def _inventory(_network: bool) -> dict:
     if not _config_path(root).is_file():
         return {"metrics": [{"label": "automations", "value": 0,
                              "note": "no configuration in this project"}],
-                "service": live or {"state": "not initialized",
-                                    "detail": "no configuration in this project"}}
+                "service": {**(live or {"state": "not initialized",
+                                        "detail": "no configuration in this project"}),
+                            "ok": False, "problem": "no configuration in this project"}}
     try:
         runtime, config = _load(root)
     except SystemExit:
         return {"metrics": [{"label": "automations", "value": 0,
                              "note": "configuration does not load"}],
-                "service": live or {"state": "stopped",
-                                    "detail": "configuration does not load"}}
+                "service": {**(live or {"state": "stopped",
+                                        "detail": "configuration does not load"}),
+                            "ok": False, "problem": "configuration does not load"}}
     environment = _judging_environment(runtime, config, state, running)
     whose = "the running daemon's" if running else "no daemon running"
     declared = config["automations"]
@@ -3732,8 +3739,23 @@ def _inventory(_network: bool) -> dict:
         "service": {"state": "running" if running else "stopped",
                     "detail": (f"pid {pid}, environment {environment or 'unpublished'}"
                                if running else
-                               f"environment: {environment}")},
+                               f"environment: {environment}"),
+                    **_service_verdict(_service_findings(
+                        runtime, config, state, running,
+                        environment if running else None))},
     }
+
+
+def _service_verdict(found: dict[str, Any]) -> dict[str, Any]:
+    """The inventory's verdict on the service: `doctor`'s local findings,
+    the first of them named in one line."""
+    if found["missing_scripts"]:
+        return {"ok": False, "problem": "missing_scripts: "
+                + ", ".join(map(str, found["missing_scripts"]))}
+    for code in ("config_stale", "environment_idle"):
+        if found[code] is not None:
+            return {"ok": False, "problem": f"{code}: {found[code]['message']}"}
+    return {"ok": True}
 
 
 def _manifest_payload() -> dict[str, Any]:
@@ -4253,32 +4275,20 @@ def service_status(root: Path) -> dict[str, Any]:
     }
 
 
-def cmd_doctor(repair: bool = False) -> dict[str, Any]:
-    root = _root_required()
-    runtime, config = _load(root)
-    state = _state_path(root)
-    state.mkdir(parents=True, exist_ok=True)
+def _service_findings(runtime, config: dict, state: Path, running: bool,
+                      daemon_environment: str | None) -> dict[str, Any]:
+    """What the service's health answer finds from this machine alone: the
+    declared scripts, and whether a running daemon is current and selecting
+    anything. Nothing here reaches the store, so `doctor` and `inventory`
+    judge these by the same code and only `doctor` adds the store's checks."""
     missing_scripts = [
         item["script"] for item in config["automations"] if not item["script_path"].is_file()
     ]
-    schema_defect = None
-    repaired = None
-    try:
-        store, _ledger = runtime.open_ledger(root, config, strict=False)
-        try:
-            if repair:
-                repaired = runtime.repair_runs_schema(store)
-            schema_defect = runtime.runs_schema_defect(store)
-        finally:
-            store.close()
-    except Exception as exc:
-        _die(5, "state_unavailable", f"the store is unavailable: {exc}")
-    status = service_status(root)
     # A daemon that is alive is not thereby current: it loaded its declaration
     # once, at startup, and every edit since is something it has never seen.
     # Nothing else in the system can notice that, so the health answer does.
     config_stale = None
-    if status["running"]:
+    if running:
         loaded = runtime.read_config_fingerprint(state)
         current = runtime.config_fingerprint(config)
         if loaded != current:
@@ -4316,12 +4326,11 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
     # this payload, on the first health check after an upgrade. So it is said in
     # the payload instead of in the exit code: `environment_unknown` names what
     # this answer cannot speak to, and leaves `ok` to the things it can.
-    daemon_environment = status["daemon_environment"]
     environment_idle = None
     environment_unknown = None
     environment_scoped = config["automations"] and all(
         item["environments"] for item in config["automations"])
-    if status["running"] and environment_scoped:
+    if running and environment_scoped:
         declared = sorted({name for item in config["automations"]
                            for name in item["environments"]})
         selected = [item["id"] for item in config["automations"]
@@ -4351,6 +4360,36 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
                 "hint": "start the service under a declared environment, or declare these "
                         "automations for the one it runs under",
             }
+    return {"missing_scripts": missing_scripts, "config_stale": config_stale,
+            "environment_idle": environment_idle,
+            "environment_unknown": environment_unknown}
+
+
+def cmd_doctor(repair: bool = False) -> dict[str, Any]:
+    root = _root_required()
+    runtime, config = _load(root)
+    state = _state_path(root)
+    state.mkdir(parents=True, exist_ok=True)
+    schema_defect = None
+    repaired = None
+    try:
+        store, _ledger = runtime.open_ledger(root, config, strict=False)
+        try:
+            if repair:
+                repaired = runtime.repair_runs_schema(store)
+            schema_defect = runtime.runs_schema_defect(store)
+        finally:
+            store.close()
+    except Exception as exc:
+        _die(5, "state_unavailable", f"the store is unavailable: {exc}")
+    status = service_status(root)
+    daemon_environment = status["daemon_environment"]
+    found = _service_findings(runtime, config, state, status["running"],
+                              daemon_environment)
+    missing_scripts = found["missing_scripts"]
+    config_stale = found["config_stale"]
+    environment_idle = found["environment_idle"]
+    environment_unknown = found["environment_unknown"]
     result = {
         "ok": not missing_scripts and schema_defect is None and config_stale is None
         and environment_idle is None,

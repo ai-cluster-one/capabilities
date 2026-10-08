@@ -6359,26 +6359,50 @@ def _inventory(_network: bool) -> dict:
     reader assembling a project learns it without a second process per
     capability. The answer is the liveness `service status` reports - the pid
     files and health record on this machine - and nothing a status read does
-    not already do. A project that cannot select a connection has no daemon to
-    be in any state, and says why instead of failing the whole report."""
+    not already do. Its verdict is `service doctor`'s without the workers' live
+    calls. A project that cannot select a connection has no daemon to be in
+    any state, and says why instead of failing the whole report."""
     root = _project_root()
     if root is None:
-        return {"service": {"state": "not configured", "detail": "not inside a project"}}
+        return {"service": {"state": "not configured", "detail": "not inside a project",
+                            "ok": False, "problem": "not inside a project"}}
     try:
         with contextlib.redirect_stderr(io.StringIO()) as refused:
             live = _service_liveness(root, None, None)
             initialized = _service_initialized(root)
     except SystemExit:
-        return {"service": {"state": "not configured",
-                            "detail": _inventory_refusal(refused.getvalue())}}
+        reason = _inventory_refusal(refused.getvalue())
+        return {"service": {"state": "not configured", "detail": reason,
+                            "ok": False, "problem": reason}}
     if live["owner_running"]:
         owner = live["owner"] if isinstance(live["owner"], dict) else {}
         pid = owner.get("pid") or live["pid"]
-        return {"service": {"state": "running",
-                            "detail": f"pid {pid}, health {live['health']['state']}, "
-                                      f"connection {live['connection']}"}}
-    return {"service": {"state": "stopped" if initialized else "not initialized",
-                        "detail": f"connection {live['connection']}"}}
+        service = {"state": "running",
+                   "detail": f"pid {pid}, health {live['health']['state']}, "
+                             f"connection {live['connection']}"}
+    else:
+        service = {"state": "stopped" if initialized else "not initialized",
+                   "detail": f"connection {live['connection']}"}
+    return {"service": {**service, **_inventory_verdict()}}
+
+
+def _inventory_verdict() -> dict:
+    """`service doctor`'s local verdict, the first thing it found named."""
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as refused:
+            _root, _settings, cfg, status, ok = _service_local_check(None, None)
+    except SystemExit:
+        return {"ok": False, "problem": _inventory_refusal(refused.getvalue())}
+    if ok:
+        return {"ok": True}
+    if not status["initialized"]:
+        problem = "the service is not initialized"
+    elif not cfg["allow_write"]:
+        problem = f"connection {cfg['id']} does not allow send"
+    else:
+        problem = (f"the running service is not healthy: health "
+                   f"{status['health']['state']}")
+    return {"ok": False, "problem": problem}
 
 
 def _inventory_refusal(stderr: str) -> str:
@@ -6808,10 +6832,12 @@ def cmd_service_logs(connection_flag: str | None, session_flag: str | None,
             "lines": lines[-max(0, tail):]}
 
 
-def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) -> dict:
-    """The service's verdict, for the caller to gate on. Like `telegram doctor`,
-    it exits 0 only while the verdict is ok; the dispatcher below turns an
-    `ok: false` into exit 5."""
+def _service_local_check(connection_flag: str | None,
+                         session_flag: str | None) -> tuple[Path, dict, dict, dict, bool]:
+    """Everything `service doctor` judges from this machine: the settings, the
+    connection and its send grant, and whether a running daemon's update sync
+    is fresh. A refusal exits as the doctor's would. The workers' live calls
+    are the doctor's alone, so `inventory` can judge by this and spend nothing."""
     root = _service_project_root()
     _require_service_initialized(root)
     settings = _validate_service_settings(root)
@@ -6819,12 +6845,20 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) ->
     cfg = _load_config(wanted, session_flag)
     _write_gate(cfg["id"], cfg["allow_write"], "send")
     status = cmd_service_status(cfg["id"], session_flag)
+    runtime_ok = not status["running"] or status["healthy"]
+    return root, settings, cfg, status, (status["initialized"] and cfg["allow_write"]
+                                         and runtime_ok)
+
+
+def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) -> dict:
+    """The service's verdict, for the caller to gate on. Like `telegram doctor`,
+    it exits 0 only while the verdict is ok; the dispatcher below turns an
+    `ok: false` into exit 5."""
+    root, settings, cfg, status, local_ok = _service_local_check(connection_flag, session_flag)
     session_file = Path(cfg["session"] + ".session")
     status["session_file_exists"] = session_file.exists()
-    runtime_ok = not status["running"] or status["healthy"]
     workers = _service_worker_preflight(root, settings or {})
-    return {"ok": (status["initialized"] and cfg["allow_write"] and runtime_ok
-                   and workers["ok"]),
+    return {"ok": local_ok and workers["ok"],
             "service": status,
             "workers": workers,
             "connection": cfg["id"],
