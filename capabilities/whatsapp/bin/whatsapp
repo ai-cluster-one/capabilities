@@ -5390,10 +5390,12 @@ def _session_exists(cfg: dict) -> bool:
     return _engine_device(_session_db(cfg)) is not None
 
 
-def _session_account(cfg: dict) -> tuple[str | None, str | None, str | None]:
+def _session_account(cfg: dict, session: Path | None = None
+                     ) -> tuple[str | None, str | None, str | None]:
     """(account id, jid, push name) as the engine's own store records them,
-    read without opening a connection."""
-    device = _engine_device(_session_db(cfg))
+    read without opening a connection - from `session` when given, which
+    leaves the account's home as it is."""
+    device = _engine_device(session or _session_db(cfg))
     if device is None:
         return None, None, None
     jid = _bare_jid(device[0])
@@ -10360,8 +10362,11 @@ def _cmd_service_doctor(connection_flag: str | None,
     """The service's readiness without touching the account: settings, store,
     link, ownership. The listener holds the connection while it runs, so its
     own health is what proves the connection then. `local` leaves out every
-    check that would leave this machine - the store, and a profile check the
-    runner cannot answer in process - so `inventory` judges by the rest."""
+    check that would leave this machine or change the account's state - the
+    store, a profile check the runner cannot answer in process, and the probe
+    of a free account lock, which takes the lock - and reads the link without
+    creating the account's home, so `inventory` judges by the rest and writes
+    nothing."""
     root = _service_project_root()
     checks: list[dict] = []
     warnings: list[str] = []
@@ -10439,7 +10444,8 @@ def _cmd_service_doctor(connection_flag: str | None,
             check("store", True, location)
     except _Refusal as refusal:
         check("store", False, refusal.message, refusal.exit_code, refusal.code)
-    account_id, _jid, _name = _session_account(cfg)
+    account_id, _jid, _name = _session_account(
+        cfg, Path(cfg["home"]).expanduser() / "session.db" if local else None)
     expected = cfg.get("expected_account_id")
     if account_id is None:
         check("link", False, f"no linked device; run `{NAME} pair`", 7,
@@ -10472,7 +10478,7 @@ def _cmd_service_doctor(connection_flag: str | None,
               + (f"; last error: {status['last_error']}"
                  if status.get("last_error") and not healthy else ""),
               5, None if healthy else "service_unhealthy")
-    else:
+    elif not local:
         free = _account_lock_free(_service_paths(cfg))
         check("ownership", free,
               "not running; the account lock is free" if free else

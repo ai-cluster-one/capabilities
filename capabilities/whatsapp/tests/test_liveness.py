@@ -31,6 +31,7 @@ sys.path.insert(0, str(TESTS_DIR))
 import _cli  # noqa: E402
 
 wa = _cli.load()
+SESSION_ACCOUNT = wa._session_account
 ENGINE = _cli.engine_available(wa)
 needs_engine = unittest.skipUnless(ENGINE, "the engine does not load on this host")
 CHAT = "15550001111@s.whatsapp.net"
@@ -634,6 +635,21 @@ class Reports(unittest.TestCase):
         verdict = wa._inventory_verdict()
         self.assertFalse(verdict["ok"])
         self.assertTrue(verdict["problem"].startswith("service_stale: pid "))
+
+    def test_the_inventory_verdict_leaves_a_stopped_account_as_it_found_it(self):
+        """With the service stopped, the verdict neither creates the account's
+        home nor takes its lock, which `service run` and every session take
+        with LOCK_NB and would find busy."""
+        home = Path(self.cfg["home"]) / "account"
+        self.cfg["home"] = str(home)
+        self.paths["owner"].unlink()
+        with mock.patch.object(wa, "_session_account", new=SESSION_ACCOUNT), \
+                mock.patch.object(wa, "_account_lock_free", side_effect=AssertionError(
+                    "the inventory verdict took the account lock")):
+            verdict = wa._inventory_verdict()
+        self.assertEqual(verdict["ok"], False)
+        self.assertTrue(verdict["problem"].startswith("not_linked: "))
+        self.assertFalse(home.exists())
 
     def test_the_deploy_doctor_is_service_doctor_and_exits_non_zero(self):
         self.assertEqual(wa.SERVICE["deploy"]["doctor"], ["whatsapp", "service", "doctor"])
