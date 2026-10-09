@@ -86,7 +86,8 @@ MACHINE VERBS
         Fetch the capability into the registry, symlink its executable onto
         PATH, snapshot `stub` + `manifest --json` (keyed by payload hash),
         scaffold credentials per the declared scope, surface declared
-        post-install steps (--yes runs them), regenerate the skill.
+        post-install steps (--yes runs them), migrate its tables (see
+        update), regenerate the skill.
         A capability new to this machine arrives quarantined (see allow);
         --allow installs it allowed. A core capability (see list) new to this
         machine and installed from the official catalogue - no --from, no
@@ -112,6 +113,12 @@ MACHINE VERBS
   update [<name>]
         Re-fetch one capability (or all) from its recorded source; refresh
         snapshots; regenerate the skill.
+        Install, update and the release that reconciles this machine run
+        `<name> migrate` once the payload is in place, when its manifest
+        declares tables in the machine's store, and report it as `migrate`
+        {ok, applied, version} or {ok: false, exit, error}. A refusal - no
+        store configured, store unreachable or busy, the capability
+        quarantined - leaves the payload installed; its first call migrates.
   update --check [<name>] [--json]
         Report, for every installed capability or the one named, whether its
         recorded source carries a different payload. Writes no registry entry,
@@ -2397,6 +2404,38 @@ def _symlink(name: str, script: Path) -> Path:
     return link
 
 
+MIGRATE_TIMEOUT_SECONDS = 120
+
+
+def _migrate_tables(name: str, script: Path, manifest: dict) -> dict | None:
+    """Run `<name> migrate` for a payload whose manifest declares tables in the
+    machine's store, so its tables reach its code where the code arrives.
+
+    It runs outside any project, as the snapshots do. A refusal is reported and
+    never undoes the payload: the capability's own first call still migrates on
+    its locked fallback path."""
+    if manifest.get("tables") is not True:
+        return None
+    rc, out, err = _run_script(script, ["migrate"], timeout=MIGRATE_TIMEOUT_SECONDS)
+    if rc == 0:
+        try:
+            report = json.loads(out)
+        except ValueError:
+            report = {}
+        return {"ok": True, "applied": report.get("applied") or [],
+                "version": report.get("version")}
+    error = None
+    for line in reversed(err.strip().splitlines()):
+        try:
+            error = json.loads(line)["error"]
+            break
+        except (ValueError, KeyError, TypeError):
+            continue
+    return {"ok": False, "exit": rc,
+            "error": error or {"code": "migrate_failed",
+                               "message": err.strip()[-500:] or f"exited {rc}"}}
+
+
 def _scaffold_credentials(name: str, manifest: dict) -> list[str]:
     """Per declared scope. Returns human-facing notes. Never writes a secret."""
     notes: list[str] = []
@@ -2482,6 +2521,7 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
         raise
     reg = _registry_dir(name)
     link = _symlink(name, script)
+    migrated = _migrate_tables(name, script, manifest)
     notes = _scaffold_credentials(name, manifest)
     post = manifest.get("post_install") or []
     ran = []
@@ -2505,6 +2545,8 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
             "lifts a quarantine itself")
     if global_policy:
         result["global_policy"] = {"enabled": True, "gate": global_policy}
+    if migrated is not None:
+        result["migrate"] = migrated
     if notes:
         result["credentials"] = notes
     if post and not yes:
@@ -2573,8 +2615,12 @@ def cmd_update(name: str | None) -> None:
             "sha256": _sha256(stage / n), "payload_sha256": after,
             **provenance,
         })
-        _activate_payload(n, stage)
-        results.append({"name": n, "changed": before != after})
+        script = _activate_payload(n, stage)
+        entry = {"name": n, "changed": before != after}
+        migrated = _migrate_tables(n, script, manifest)
+        if migrated is not None:
+            entry["migrate"] = migrated
+        results.append(entry)
     _sync_skill()
     _emit({"updated": results})
 
@@ -9075,7 +9121,7 @@ def _activate_released_capability(
     })
     _activate_payload(name, stage)
     _symlink(name, _script_path(name))
-    return {
+    result = {
         "name": name,
         "action": "update",
         "outcome": "applied",
@@ -9084,6 +9130,10 @@ def _activate_released_capability(
         "source_commit": commit,
         "summary": manifest.get("summary"),
     }
+    migrated = _migrate_tables(name, _script_path(name), manifest)
+    if migrated is not None:
+        result["migrate"] = migrated
+    return result
 
 
 def _remove_released_capability(name: str) -> dict:

@@ -35,6 +35,7 @@ Every script implements the same contract verbs alongside its domain verbs. This
 | `ids list\|get\|set\|rm` | The project identifiers envelope, managed. |
 | `refs` | The menu of the project's reference files, from front-matter. |
 | `inventory` | What the capability holds in this project: headline metrics and the things inside. Local only by default — no network, no writes. |
+| `migrate` / `migrate status` | Only for a capability that declares `TABLES`: apply its pending migration steps to its tables in the machine's store / report where they stand, without a lock, changing nothing (see [runtime state in the store](#runtime-state-in-the-store)). |
 
 The declaration facts feed the contract from **constants at the top of the script** — one home each. Guide topics are the exception: their one home is the set of shipped Markdown filenames. Contract verbs render from these sources so they cannot disagree with one another:
 
@@ -49,6 +50,7 @@ WRITE_VERBS = {"create", "comment", "complete"}   # domain verbs that mutate the
 WRITE_DEFAULT = True    # a connection's allow_write when its entry is silent; False when writes leave the system
 DOCS_BASE = "https://raw.githubusercontent.com/<org>/capabilities/main/capabilities/asana/guides/"
 STATE = False       # True when the capability writes session/cache state
+TABLES = False      # True when it keeps tables in the machine's store, with a _tables() builder
 INVENTORY = None    # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
 POST_INSTALL = []   # [{"cmd": …, "note": …}] steps the manager offers at install
 SERVICE = None      # or {"name", "summary", "verbs", ...} when a bundled service ships
@@ -103,6 +105,7 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
   "state": false,
   "inventory": { "network": "optional" },
   "post_install": [],
+  "tables": false,
   "service": {
     "name": "assistant",
     "summary": "Project-local assistant daemon using the bundled service engine.",
@@ -136,6 +139,7 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 | `state` | `true` declares the capability writes session/cache state (see [state](#state)). |
 | `inventory` | `null` when the capability reports nothing of its own; otherwise `{ "network": "none" \| "optional" \| "required" }` — how much of its report needs the remote system (see [inventory](#inventory--what-the-capability-holds-here)). |
 | `post_install[]` | `{ "cmd", "note" }` steps the manager **offers** at install — idempotent, never auto-run. |
+| `tables` | `true` declares the capability keeps tables in the machine's store and answers `migrate`; the manager runs `<name> migrate` where the payload arrives (see [runtime state in the store](#runtime-state-in-the-store)). |
 | `service` *(optional)* | Metadata for a bundled service: at minimum `name`, `summary`, and `verbs[]`. The CLI owns its lifecycle contract under `<name> service ...`. |
 | `service.deploy` *(optional)* | Versioned, provider-neutral deploy descriptor. Its v1 contract declares an argv `command`, service-only `environment.required[]` and optional `{key, default?}` entries, named `state`/`shared` mounts, Compose restart policy, optional doctor argv, and `default_policy` (`auto` or `disabled`). Mount targets are absolute or start with `{agent_home}` / `{project_root}` and are resolved by the consuming runtime. Generic CLI credentials do not become service requirements unless the descriptor declares them. |
 | `service.machine` *(optional)* | Declares that the service also runs once per machine for every project that opted in to it (see [machine mode](#machine-mode)). Its v1 contract (`capabilities.service.machine.v1`) names the argv `command` that runs it in the foreground and the argv `doctor` that proves it, each starting with the capability's name and carrying `--machine`; `projects`, the file under the capability's own config home where it lists the projects that opted in; and optionally `config` and `state`, the machine homes of its settings and its runtime files. Any other key is refused. A capability declaring it lists `join` and `leave` among its service verbs. The manager validates it during audit, source check, and install. |
@@ -414,7 +418,7 @@ def _gate() -> None:
 | absent | `true` | enabled by inheritance |
 | absent | `false` or absent | disabled |
 
-The gate is a **guardrail, not a security boundary** — project resolution remains cwd-based. A malformed policy is a configuration error and operational absence is closed. The exit-4 envelope routes the scope decision to the human. Bundled service `init`, `start`, `run`, and `join` additionally require explicit project enable: inherited global availability grants CLI use, not ownership of a project daemon or consent to a machine one. A service that declares `service.machine` takes `--machine` on its service verbs, and such a call is the one operational use that resolves no project and reads no policy row: the machine service acts for a project only while that project explicitly enables the capability and is on the service's opt-in list, and checks both itself before every action it takes for that project ([machine mode](#machine-mode)). The read-only switch refuses its `init`, `start`, `run`, `reload`, and `leave` as it refuses a project's. This rule lives once in the preamble: `_gate()` applies it only when the executable declares a `SERVICE` manifest surface, so each service implements its lifecycle without repeating policy logic and domain commands merely named `service` remain ordinary CLI verbs.
+The gate is a **guardrail, not a security boundary** — project resolution remains cwd-based. A malformed policy is a configuration error and operational absence is closed. The exit-4 envelope routes the scope decision to the human. Bundled service `init`, `start`, `run`, and `join` additionally require explicit project enable: inherited global availability grants CLI use, not ownership of a project daemon or consent to a machine one. A service that declares `service.machine` takes `--machine` on its service verbs, and such a call resolves no project and reads no policy row: the machine service acts for a project only while that project explicitly enables the capability and is on the service's opt-in list, and checks both itself before every action it takes for that project ([machine mode](#machine-mode)). `migrate` of a capability that declares `TABLES` likewise resolves no project and reads no policy row, because it acts on the machine's store rather than for a project and the manager runs it outside any project; it still answers to the machine ceiling, and `migrate`, not `migrate status`, to the read-only switch. The read-only switch refuses its `init`, `start`, `run`, `reload`, and `leave` as it refuses a project's. This rule lives once in the preamble: `_gate()` applies it only when the executable declares a `SERVICE` manifest surface, so each service implements its lifecycle without repeating policy logic and domain commands merely named `service` remain ordinary CLI verbs.
 
 ## Bundled services
 
@@ -670,6 +674,8 @@ Known limitation, recorded for fast diagnosis: two projects driving the *same* a
 Runtime state is what a capability's own processes coordinate through — a service's run ledger, its job tables, the session a capability resumes from one call to the next — and it lives in the PostgreSQL the machine's store setting names ([the store setting](#the-store-setting); DOCTRINE rule 22).
 
 A capability reaches it through the shared database library, `capabilities-contract` on PyPI, imported as `capabilities_contract.db` and pinned to an exact version in the script's PEP-723 dependencies. The library reads the store setting and writes nothing, connects bound to the schema the setting names, and applies each owner's migration steps once under that owner's ledger; the library's own documentation carries its call surface and error codes. The capability is the owner of its tables: the owner is its name, every object a migration step creates is named `<name>_…` inside the setting's schema, and its steps are recorded in the ledger under that name, so tools at different releases share one database and each changes only its own tables.
+
+**Migrations run when asked.** A capability that keeps tables declares `TABLES = True` beside `STATE`, and a `_tables()` builder returning its steps and its schema version `(steps, major, minor)`; the vendored contract then answers `<name> migrate`, which applies the pending steps under the library's lock, and `<name> migrate status`, which reports where the tables stand without a lock and changes nothing. Three callers ask for it: the manager runs `<name> migrate` when it installs or updates the payload, so the tables reach the code where the code arrives, and reports a refusal without undoing the payload; a service runs it once when it starts; and an ordinary call that finds its tables missing or older than its code migrates once on the library's locked fallback path. Every other call takes no lock and applies nothing. The library bounds each wait - a connect, a lock - and reports one that runs out as `store_unreachable` or `store_busy`, so `doctor` answers within a watchdog's timeout rather than hanging, and both ends of a connection probe an idle peer so the store drops a client that died; the bounds are the library's to state.
 
 A service that keeps runtime state resolves the store before it takes any work. With no store configured it refuses to run with the error code `store_not_configured` and a hint naming `capabilities store set`, and its `service doctor` reports the same. The library finds a store only through an override, `AGENTKIT_STORE_URL` then `CAPABILITIES_STORE_URL`, for tests and development sessions, or the store setting, and each names a PostgreSQL.
 

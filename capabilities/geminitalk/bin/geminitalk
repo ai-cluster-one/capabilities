@@ -1052,6 +1052,11 @@ def _gate() -> None:
     machine service checks each opted-in project's own policy before every
     action it takes for that project. `join` is a project act and always takes
     the ordinary path.
+
+    `migrate` of a capability that declares `TABLES` acts on the machine's
+    store rather than for a project, so it too reads no policy row: it answers
+    to the machine ceiling, and `migrate` (not `migrate status`) to the
+    read-only switch.
     """
     _auth_gate()
     verb = sys.argv[1] if len(sys.argv) > 1 else "help"
@@ -1059,6 +1064,10 @@ def _gate() -> None:
     if not safe:
         _machine_gate()
     service_action = sys.argv[2] if len(sys.argv) > 2 else None
+    if verb == "migrate" and _tables_declared():
+        if service_action != "status":
+            _read_only_gate(f"`{NAME} migrate`")
+        return
     service_contract = globals().get("SERVICE")
     service_call = isinstance(service_contract, dict) and verb == "service"
     machine_service = service_call and isinstance(service_contract.get("machine"), dict)
@@ -1653,6 +1662,61 @@ def _cmd_inventory(argv: list[str]) -> None:
     _emit(report)
 
 
+# A store setting that cannot be used is a configuration fault; a store that
+# cannot be reached, is busy, or refuses the migration is the environment's.
+_STORE_SETTING_SLUGS = frozenset({
+    "store_not_configured", "store_not_postgres", "store_setting_unreadable",
+    "store_setting_too_new", "bad_store_setting", "sslmode_too_weak",
+    "bad_schema_name", "driver_missing"})
+
+
+def _tables_declared() -> bool:
+    """Whether the capability keeps tables in the machine's store (`TABLES`)."""
+    return bool(globals().get("TABLES"))
+
+
+def _cmd_migrate(argv: list[str]) -> None:
+    """`migrate` applies the capability's pending steps to its tables in the
+    machine's store, through the shared database library and under its lock;
+    `migrate status` reports where they stand, without a lock, changing nothing.
+    The manager runs `migrate` when it installs or updates the payload, and a
+    service runs it when it starts."""
+    if argv not in ([], ["status"]):
+        _die(6, "input", f"unknown migrate arguments {' '.join(argv)!r}",
+             f"{NAME} migrate [status]")
+    steps, major, minor = _tables()
+    try:
+        from capabilities_contract import db
+    except ImportError:
+        _die(6, "driver_missing",
+             "the shared database library capabilities-contract is not installed",
+             f"run {NAME} through its own script header, which pins it")
+    conn = None
+    try:
+        conn = db.connect(application_name=NAME)
+        if argv:
+            found = db.status(conn, NAME, steps, major=major, minor=minor)
+            stored = (None if found.stored_major is None
+                      else {"major": found.stored_major, "minor": found.stored_minor})
+            report = {"owner": found.owner, "schema": found.schema, "state": found.state,
+                      "code": {"major": found.major, "minor": found.minor},
+                      "store": stored, "applied": found.applied,
+                      "pending": found.pending, "changed": found.changed,
+                      "warnings": found.warnings}
+        else:
+            done = db.migrate(conn, NAME, steps, major=major, minor=minor)
+            report = {"owner": done.owner, "schema": done.schema,
+                      "applied": done.applied, "skipped": done.skipped,
+                      "version": {"major": done.major, "minor": done.minor},
+                      "warnings": done.warnings}
+    except db.DbError as exc:
+        _die(6 if exc.slug in _STORE_SETTING_SLUGS else 5, exc.slug, exc.message, exc.hint)
+    finally:
+        if conn is not None:
+            conn.close()
+    _emit(report)
+
+
 MACHINE_READ_EFFECT = ("outside any project these verbs use the machine's own "
                        "connections, read-only; inside a project its grants "
                        "alone decide")
@@ -1720,7 +1784,9 @@ def _contract(argv: list[str]) -> None:
                "docs": {"base": DOCS_BASE,
                         "topics": [entry["topic"] for entry in _guide_menu()]},
                "state": STATE, "inventory": _inventory_declaration(),
-               "post_install": POST_INSTALL})
+               "post_install": POST_INSTALL, "tables": _tables_declared()})
+    elif cmd == "migrate" and _tables_declared():
+        _cmd_migrate(argv[1:])
     elif cmd == "guide":
         _cmd_guide(argv[1:])
     elif cmd == "ids":

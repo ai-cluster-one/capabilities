@@ -1058,11 +1058,47 @@ def test_geminitalk_generation_complete_marks_turn_done() -> None:
             assert done is True
 
 
+ASKPROJECT_SCRIPT = REPO / "capabilities" / "askproject" / "bin" / "askproject"
+
+
+def test_install_migrates_a_capability_that_declares_tables_and_reports_a_refusal() -> None:
+    """With no store configured, the install's migrate is refused and reported,
+    and the payload stays installed; a capability without tables runs none."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        env, cap_home, bin_dir = _env(tmp)
+        env.pop("AGENTKIT_STORE_URL", None)
+        env.pop("CAPABILITIES_STORE_URL", None)
+
+        installed = json.loads(_run_manager(
+            ["install", "askproject", "--from", str(ASKPROJECT_SCRIPT), "--allow"], env).stdout)
+
+        assert (cap_home / "askproject" / "askproject").is_file()
+        manifest = json.loads((cap_home / "askproject" / "manifest.json").read_text())
+        assert manifest["tables"] is True
+        assert installed["migrate"]["ok"] is False, installed
+        assert installed["migrate"]["exit"] == 6
+        assert installed["migrate"]["error"]["code"] == "store_not_configured"
+
+        status = subprocess.run([str(bin_dir / "askproject"), "migrate", "status"],
+                                env=env, cwd=str(tmp), capture_output=True, text=True,
+                                timeout=300)
+        assert status.returncode == 6, status.stderr
+        assert _error_envelope(status)["error"]["code"] == "store_not_configured"
+
+        plain = json.loads(_run_manager(
+            ["install", "geminitalk", "--from", str(GEMINITALK_SCRIPT)], env).stdout)
+        assert "migrate" not in plain
+        assert json.loads((cap_home / "geminitalk" / "manifest.json").read_text())[
+            "tables"] is False
+
+
 if __name__ == "__main__":
     tests = [
         ("install from source script installs bundle", test_install_from_source_script_installs_bundle),
         ("update migrates script source to bundle", test_update_migrates_script_source_to_bundle),
         ("install keeps nonempty source bin directory", test_install_keeps_nonempty_source_bin_directory),
+        ("install migrates a capability that declares tables", test_install_migrates_a_capability_that_declares_tables_and_reports_a_refusal),
         ("telegram daemon sigterm stops without traceback", test_telegram_daemon_sigterm_stops_without_traceback),
         ("auth context denies unlisted capability", test_capability_auth_context_denies_unlisted_capability),
         ("telegram worker wrapper limits current chat scope", test_telegram_worker_wrapper_limits_current_chat_scope),
