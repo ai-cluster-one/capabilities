@@ -1,5 +1,9 @@
 # mailbox — change log
 
+## 2026-10-29 — `mailbox send` names the sender
+
+A connection's optional `display_name`, or `send --from-name NAME` over it, puts a name in front of the address in the From header, rendered with `formataddr`; the envelope sender stays the bare address, and the result reports the `from` header sent. The envelope no longer carries an empty recipient when a message has no Cc, where `getaddresses` of an empty header read as one blank address.
+
 ## 2026-10-29 — `mailbox send` takes Bcc recipients
 
 `mailbox send --bcc A`, repeatable like `--to` and `--cc`, delivers the message to A through the SMTP envelope alone. No Bcc header is written, so neither the message the recipients receive nor the copy saved to Sent names a Bcc recipient. The JSON result lists them under `bcc`. Sends without `--bcc` are unchanged.
