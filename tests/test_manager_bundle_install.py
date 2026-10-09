@@ -615,7 +615,7 @@ def test_capability_auth_context_verb_list_gates_domain_verbs() -> None:
             "capabilities": {"mailbox": {"enabled": True}},
         }) + "\n")
         base = dict(os.environ)
-        base.pop("CAPABILITIES_STORE_URL", None)
+        base.pop("AGENTKIT_DB_URL", None)
         base.update({"XDG_CONFIG_HOME": str(config),
                      "CLAUDE_PROJECT_DIR": str(project)})
 
@@ -1067,8 +1067,8 @@ def test_install_migrates_a_capability_that_declares_tables_and_reports_a_refusa
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         env, cap_home, bin_dir = _env(tmp)
-        env.pop("AGENTKIT_STORE_URL", None)
-        env.pop("CAPABILITIES_STORE_URL", None)
+        env.pop("AGENTKIT_DB_HOST", None)
+        env.pop("AGENTKIT_DB_URL", None)
 
         installed = json.loads(_run_manager(
             ["install", "askproject", "--from", str(ASKPROJECT_SCRIPT), "--allow"], env).stdout)

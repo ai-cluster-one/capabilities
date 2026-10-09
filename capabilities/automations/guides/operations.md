@@ -1,6 +1,6 @@
 # Operating automations
 
-Run `automations doctor` after configuration changes. It validates the config, script paths, shared records store, environment selection, and bundled runtime.
+Run `automations doctor` after configuration changes. It validates the config, script paths, the store the run ledger lives in, environment selection, and bundled runtime.
 
 The daemon reads configuration at startup, so a change to schedules, limits, environment selectors, or script declarations is declared and not yet in force. `automations service reload` closes that gap: the configuration is validated before it replaces anything, a daemon that rejects it keeps the one it is running, and jobs already dispatched finish under the declaration that started them. Reaching for a restart instead ends that work for no reason. Changing the state root or the records backend is what a reload genuinely cannot do, and still needs one.
 

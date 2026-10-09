@@ -231,91 +231,9 @@ def load_agents(raw: dict[str, Any]) -> dict[str, Any]:
     return {"default": default, "workers": profiles}
 
 
-# --- the store schema this capability owns -----------------------------------
-
-# `automations` declares its own namespace and migrates it itself; the core
-# tier knows nothing about these columns. They are columns rather than a JSON
-# blob because the scheduler filters on them on every tick — `enabled`, the
-# environment, the pending count in the run ledger — which is the test for whether
-# a record class has earned a table of its own.
-#
-# `script_key` names a document, not a path. The version that runs is whichever
-# one the document's pin names, so editing a script and deploying it stay two
-# separate acts.
-STORE_NAMESPACE = "automations"
-STORE_VERSION = 2
-STORE_MIGRATIONS = [
-    """
-    CREATE TABLE IF NOT EXISTS automations (
-        id               TEXT PRIMARY KEY,
-        scope            TEXT NOT NULL,
-        project_id       TEXT REFERENCES projects(id),
-        slug             TEXT NOT NULL,
-        name             TEXT,
-        description      TEXT,
-        enabled          INTEGER NOT NULL DEFAULT 1,
-        script_key       TEXT NOT NULL,
-        schedule         TEXT,
-        every_seconds    REAL,
-        timeout_seconds  REAL NOT NULL DEFAULT 300,
-        max_parallel     INTEGER NOT NULL DEFAULT 1,
-        max_pending      INTEGER NOT NULL DEFAULT 1,
-        overlap          TEXT NOT NULL DEFAULT 'skip',
-        retries          INTEGER NOT NULL DEFAULT 0,
-        arguments        {json},
-        environments     {json},
-        updated_at       TEXT NOT NULL
-    )
-    """,
-    # The slug is what a person types and what a run refers to; the id is what
-    # a row refers to. Unique per scope, because two projects may each have an
-    # automation they both call `nightly`.
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS automations_slug_idx
-        ON automations (scope, COALESCE(project_id, ''), slug)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS automations_due_idx
-        ON automations (scope, project_id, enabled)
-    """,
-]
-
-
-def store_upsert(store, scope: str, project_id: str | None, item: dict) -> str:
-    """Write one automation row and return its id. The table is this
-    capability's, so the SQL that touches it lives here beside the schema rather
-    than in whatever tool happens to be filling it in."""
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    existing = store._execute(
-        "SELECT id FROM automations WHERE scope = ? AND COALESCE(project_id,'') = ? "
-        "AND slug = ?", (scope, project_id or "", item["slug"])).fetchone()
-    values = (item["name"], item["description"], item["enabled"], item["script_key"],
-              item["schedule"], item["every_seconds"], item["timeout_seconds"],
-              item["max_parallel"], item["max_pending"], item["overlap"], item["retries"],
-              store._encode(item["arguments"]), store._encode(item["environments"]), now)
-    if existing:
-        store._execute(
-            "UPDATE automations SET name = ?, description = ?, enabled = ?, script_key = ?, "
-            "schedule = ?, every_seconds = ?, timeout_seconds = ?, max_parallel = ?, "
-            "max_pending = ?, overlap = ?, retries = ?, arguments = ?, environments = ?, "
-            "updated_at = ? WHERE id = ?", values + (existing[0],))
-        return existing[0]
-    row_id = str(uuid.uuid4())
-    store._execute(
-        "INSERT INTO automations (id, scope, project_id, slug, name, description, enabled, "
-        "script_key, schedule, every_seconds, timeout_seconds, max_parallel, max_pending, "
-        "overlap, retries, arguments, environments, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (row_id, scope, project_id, item["slug"]) + values)
-    return row_id
-
-
 def load_effective_config(root: Path, config_path: Path,
                           state_dir: Path) -> dict[str, Any]:
-    """The config the scheduler acts on, from whichever source this project
-    keeps its records in. One entry point, so no caller has to know which."""
-    if _store_mode(root)[0] == "db":
-        return load_config_from_store(root, state_dir)
+    """The config the scheduler acts on: the project's config file."""
     return load_config(root, config_path)
 
 
@@ -397,25 +315,6 @@ def read_daemon_environment(state_dir: Path) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _store_mode(root: Path) -> tuple[str, str]:
-    """Where this project keeps its records, asked of the one place that knows.
-
-    An automation is a table row with no file half on purpose -- `config.toml`
-    carries its description in comments a writer would destroy -- so this fork
-    stays. What does not stay is a second opinion about which mode is in force."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    try:
-        import store as _store
-    except ImportError:
-        return "files", "no store module beside the service"
-    finally:
-        sys.path.pop(0)
-    try:
-        return _store.records_mode(root / "capabilities")
-    except _store.StoreError as exc:
-        raise ConfigError(exc.message) from exc
-
-
 def _project_identity(root: Path) -> dict:
     try:
         return json.loads((root / "capabilities" / "project.json").read_text())
@@ -448,86 +347,6 @@ def _registration_id(root: Path, identity: dict, strict: bool = True) -> str | N
     if callable(PROJECT_ID_FOR_WRITE):
         return PROJECT_ID_FOR_WRITE(strict)
     return _handed_project_id(root) or identity.get("id")
-
-
-def materialise_script(state_dir: Path, key: str, version: str, body: str) -> Path:
-    """Write a script's active version where a subprocess can run it.
-
-    The file is named by the version's hash, so a cached copy can never be the
-    wrong text: a different version is a different filename, and the old one
-    simply stops being asked for."""
-    cache = state_dir / "scripts"
-    cache.mkdir(parents=True, exist_ok=True)
-    suffix = ".py" if not key.endswith(".schema") else ".json"
-    path = cache / f"{key}.{version}{suffix}"
-    if not path.is_file() or path.read_text() != body:
-        path.write_text(body)
-    return path
-
-
-def load_config_from_store(root: Path, state_dir: Path) -> dict[str, Any]:
-    """The same normalised config, composed out of the store.
-
-    Everything the scheduler reads on a tick is here: the engine settings, the
-    agent profiles, and one row per automation. A script is not a path into the
-    repository any more — it is a context item, and the version that runs is
-    whichever one is active, written out under its own hash so a subprocess has
-    something to execute."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    try:
-        import store as _store
-    except ImportError as exc:
-        raise ConfigError("this project keeps its records in the store, but the "
-                          "store module is not installed beside the service") from exc
-    finally:
-        sys.path.pop(0)
-
-    identity = _project_identity(root)
-    scopes = _store.Scopes(project=identity["slug"])
-    try:
-        with _store.open_store() as st:
-            engine = st.config_get("automations", "setting", "engine", scopes) or {}
-            agents = st.config_get("automations", "setting", "agents", scopes) or {}
-            chain = st._chain(scopes)
-            clause, params = st._chain_clause(chain)
-            rows = st._execute(
-                "SELECT slug, name, description, enabled, script_key, schedule, "
-                "every_seconds, timeout_seconds, max_parallel, max_pending, overlap, "
-                f"retries, arguments, environments FROM automations WHERE ({clause}) "
-                "ORDER BY slug", params).fetchall()
-            scripts = {}
-            for row in rows:
-                doc = st.context_read("automations", row[4], scopes)
-                if doc is None:
-                    raise ConfigError(
-                        f"automation {row[0]!r} names script {row[4]!r}, which has no "
-                        "active version")
-                scripts[row[4]] = materialise_script(state_dir, row[4], doc["hash"],
-                                                     doc["body"])
-    except _store.StoreError as exc:
-        raise ConfigError(f"cannot read the store: {exc.message}") from exc
-
-    raw = {"version": 1, "engine": dict(engine), "agents": dict(agents), "automations": []}
-    for row in rows:
-        raw["automations"].append({
-            # The record names a versioned document, not an operator-supplied
-            # filesystem path. Keep the materialized name relative to its XDG
-            # cache and fence it to that cache below.
-            "id": row[0], "name": row[1], "description": row[2],
-            "enabled": bool(row[3]),
-            "script": str(scripts[row[4]].relative_to(state_dir.resolve())),
-            "schedule": row[5], "every_seconds": row[6], "timeout_seconds": row[7],
-            "max_parallel": row[8], "max_pending": row[9], "overlap": row[10],
-            "retries": row[11],
-            "arguments": st_decode(row[12]), "environments": st_decode(row[13]),
-        })
-    return normalise_config(root, raw, script_root=state_dir)
-
-
-def st_decode(value: Any) -> Any:
-    if value is None:
-        return []
-    return json.loads(value) if isinstance(value, str) else value
 
 
 def load_config(root: Path, config_path: Path) -> dict[str, Any]:

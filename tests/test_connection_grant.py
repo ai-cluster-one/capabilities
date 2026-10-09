@@ -55,8 +55,8 @@ def lab(tmp_path):
         "CLAUDE_PROJECT_DIR": str(project),
     })
     for leaked in ("COOLIFY_BASE_URL", "COOLIFY_TOKEN", "VIRTUAL_ENV",
-                   "CAPABILITIES_PROJECT_ENVELOPE", "CAPABILITIES_STORE_URL",
-                   "CAPABILITIES_STORE_MODE"):
+                   "CAPABILITIES_PROJECT_ENVELOPE", "AGENTKIT_DB_URL",
+                   "AGENTKIT_DB_HOST"):
         env.pop(leaked, None)
     env["COOLIFY_TOKEN"] = "test-token"
     return {"project": project, "envelope": envelope, "config": config, "env": env}
@@ -190,7 +190,7 @@ def nowhere(tmp_path):
     })
     for leaked in ("CLAUDE_PROJECT_DIR", "COOLIFY_BASE_URL", "COOLIFY_TOKEN",
                    "VIRTUAL_ENV", "CAPABILITIES_PROJECT_ENVELOPE",
-                   "CAPABILITIES_STORE_URL", "CAPABILITIES_STORE_MODE"):
+                   "AGENTKIT_DB_URL", "AGENTKIT_DB_HOST"):
         env.pop(leaked, None)
     env["COOLIFY_TOKEN"] = "test-token"
     return {"project": bare, "envelope": bare / "capabilities",

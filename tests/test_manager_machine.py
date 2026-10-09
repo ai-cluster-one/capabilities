@@ -113,7 +113,7 @@ def _env(tmp_path: Path) -> dict[str, str]:
     for key in ("CAPABILITIES_READ_ONLY", "CLAUDE_PROJECT_DIR",
                 "CAPABILITIES_AUTH_CONTEXT", "CAPABILITIES_PROJECT_ENVELOPE",
                 "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "CAPABILITIES_PROJECT_ID",
-                "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_STORE_URL",
+                "CAPABILITIES_PROJECT_ID_ROOT", "AGENTKIT_DB_URL",
                 "CAPABILITIES_DEV_SESSION", "CAPABILITIES_WORKSPACE"):
         env.pop(key, None)
     env.update({

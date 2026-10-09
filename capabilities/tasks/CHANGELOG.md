@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-09 — `service join` no longer refuses database-mode records
+
+`tasks service join` and the machine service no longer refuse a project with `database_mode_unsupported`: records are kept in files only, and a `project.json` declaring `"store": "db"` is refused by the records layer with `bad_store_mode`.
+
 ## 2026-10-09 — The store is the machine's: tasks keeps its tables in the store setting's schema, and a connection names no store
 
 Breaking. tasks no longer reaches PostgreSQL through its connection. Every command, `doctor`, `watch`, the project service and the machine service reach the store the machine's store setting names - set with `capabilities store set`, or AGENTKIT_STORE_URL or CAPABILITIES_STORE_URL for a test or a development session - through the shared database library, `capabilities-contract`, which the script header now pins. The tables live in the schema the setting binds, renamed `tasks_tasks`, `tasks_activities`, `tasks_changes` and `tasks_executions`, with their functions `tasks_touch_updated_at`, `tasks_notify_claimable` and `tasks_notify_watch` and every index, constraint and trigger named `tasks_*`, under tasks' own migration ledger beside every other tool's tables. The notification channels `tasks_claimable` and `tasks_watch` and their payloads are unchanged; a payload's `schema` is the bound schema. With no store configured every command, `doctor`, `service run`, `service start` and `service doctor` refuse with exit 6 `store_not_configured`, naming `capabilities store set`.

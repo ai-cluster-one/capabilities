@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-09 — Automations are read from config.toml only
+
+The scheduler no longer reads automations from records kept in a database: the `automations` table, its migration and the configuration rebuilt from it are gone, and `config.toml` is the one source. `service status` drops `records_mode`, `set` no longer refuses with `config_in_store`, and `service join` no longer refuses with `database_mode_unsupported`; a `project.json` declaring `"store": "db"` is refused by the records layer with `bad_store_mode`.
+
 ## 2026-10-09 — Jobs stop and time out whether or not the store answers
 
 The scheduler stops, times out and kills its jobs from its own table of the processes it started, and writes their outcomes to the store afterwards, each on its own. With the store unreachable, a stop now ends every running job within the project's shutdown grace in both modes, a job that overruns its timeout is stopped, and a job started as the connection drops is still watched; before, the first failed write left the remaining jobs running unsupervised. An outcome the store does not take is kept and written once it answers. One still unwritten when the scheduler stops is named in the service log with its run id and exit code, and the next start records it `interrupted` as before, which re-runs it under `engine.recovery = "retry"`. A cancel requested during an outage takes effect once the store answers. A job killed at the end of the shutdown grace may now record exit code -9.

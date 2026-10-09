@@ -21,8 +21,9 @@ The contract has three fenced regions; the store tier is canonical in
     references, guide, ids) plus the file/project/IO plumbing. EVERY capability
     carries it, connection-bearing or not.
 
-  - **store** — the records adapter used by identifiers, policy, settings and
-    operational state. EVERY capability carries it because core calls into it.
+  - **store** — the records adapter used by identifiers, policy, settings,
+    connections and documents, all kept in files. EVERY capability carries it
+    because core calls into it.
 
   - **connections** — the credential cascade and connection resolver. Only a
     capability that implements connections carries this fence. Omitting it is the
@@ -184,9 +185,7 @@ def _project_root() -> Path | None:
             return None
         legacy = d / ".capabilities"
         # Either marker names a project. `settings.json` is the gate and
-        # `project.json` the identity; a project keeping its records in the
-        # store needs the second and may eventually stop carrying the first,
-        # so neither is required while both worlds are in use.
+        # `project.json` the identity; either one alone is enough.
         if ((d / "capabilities" / "settings.json").is_file()
                 or (d / "capabilities" / "project.json").is_file()
                 or (d / ".contextkit" / "config.toml").is_file()
@@ -947,28 +946,10 @@ def _env_dir() -> Path | None:
 _RECORDS = None
 
 
-def _store_source_label() -> str:
-    """A credential-free label for the store that answered.
-
-    Core-only capabilities need this just as much as connection-bearing ones,
-    so it belongs with the records adapter rather than in the connections tier.
-    """
-    url = os.environ.get("CAPABILITIES_STORE_URL") or "?"
-    if "://" not in url:
-        return f"store(sqlite:{url})"
-    scheme, rest = url.split("://", 1)
-    if "@" in rest:
-        rest = rest.split("@", 1)[1]
-    return f"store({scheme}://{rest.split('?', 1)[0]})"
-
-
 def _records():
-    """The adapter this project's records are read and written through.
-
-    Everything below takes what this returns and none of it can tell which it
-    got. That is the whole of the arrangement: a call site that can tell where
-    a record lives is a call site that will eventually decide for itself, and
-    then there are two answers to a question that has one."""
+    """The adapter this project's records are read and written through: the
+    project's envelope, then the user's config home. Everything below asks it
+    for a collection, never for a path."""
     global _RECORDS
     if _RECORDS is None:
         root = _project_root()
@@ -981,23 +962,7 @@ def _records():
                 envelope, _CONFIG_HOME, project_only=project_only)
         except StoreError as e:
             _die(6, e.slug, e.message, e.hint)
-        if _RECORDS.mode == "db":
-            _RECORDS.source = _store_source_label()
     return _RECORDS
-
-
-def _store_mode() -> tuple[str, str]:
-    """Where this project keeps its records, as a report rather than a fork.
-
-    Nothing branches on this any more; it is here because a status surface may
-    still want to say which source answered. One project may be moved without moving any other, so the answer is
-    per project and lives beside the project's identity — it has to be readable
-    before the store is reachable.
-
-    The declaration itself is read in one place, `records_mode`, and acted on
-    in one place, `open_records`."""
-    adapter = _records()
-    return (adapter.mode, adapter.source)
 
 
 def _project_identity() -> dict:
@@ -1139,16 +1104,10 @@ def _render_ids_markdown(data: dict) -> str:
     return "\n".join(lines)
 
 
-def _identifiers_scopes() -> "Scopes":
-    identity = _project_identity()
-    return Scopes(project=identity["slug"])
-
-
 def _identifiers_load() -> dict:
-    """The identifiers envelope, from wherever this project keeps its records.
-
-    The shape is the same either way — `{label: {value, note}}` — so the help
-    section, the report and `ids get` never learn which answered."""
+    """The identifiers envelope, resolved through the records adapter, in one
+    shape — `{label: {value, note}}` — for the help section, the report and
+    `ids get`."""
     try:
         resolved = _records().resolve(NAME, "identifier")
     except StoreError as e:
@@ -1158,8 +1117,8 @@ def _identifiers_load() -> dict:
 
 
 def _identifiers_write(label: str, value, note: str) -> None:
-    """Rule 15 holds either way: a capability is the sole writer of its own
-    identifiers, addressed by (capability, collection) rather than by path."""
+    """Rule 15: a capability is the sole writer of its own identifiers,
+    addressed by (capability, collection) rather than by path."""
     kept = note or (_identifiers_load().get(label) or {}).get("note", "")
     try:
         _records().set(NAME, "identifier", label, value,
@@ -1267,10 +1226,7 @@ def _front_matter(body: str) -> tuple[str | None, str | None]:
 
 
 def _reference_bodies() -> dict[str, str]:
-    """Every reference this project can see, keyed by its document key.
-
-    In the store a reference is a pinned document like any other long text, so
-    an edit reaches every host at once and an unpinned draft reaches none."""
+    """Every reference this project can see, keyed by its document key."""
     out: dict[str, str] = {}
     try:
         adapter = _records()
@@ -1288,9 +1244,7 @@ def _reference_bodies() -> dict[str, str]:
 def _cmd_refs(argv: list[str] | None = None) -> None:
     """`refs` lists what this project can load; `refs show <name>` prints one.
 
-    The listing carries a `source` rather than a path, because a reference kept
-    in the store has no path to open — `refs show` is the one way to read a
-    body that works whichever source answered."""
+    The listing carries each reference's path; `refs show` prints a body."""
     argv = argv or []
     bodies = _reference_bodies()
     adapter = _records()

@@ -251,7 +251,7 @@ handed over, or handed over and since unloaded, is visible rather than assumed.
 ## One substrate at a time
 
 Two profiles that both run the same service are two processes competing for one
-identity - one Telegram account, one SQLite queue, one state directory. Nothing
+identity - one Telegram account, one job queue, one state directory. Nothing
 in this capability prevents a container and a host agent from being started
 against the same project, because nothing here can see the other machine. That
 remains an operator decision, and it is worth making deliberately rather than

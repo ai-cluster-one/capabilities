@@ -1,32 +1,29 @@
-"""The machine's store setting: `capabilities store set|show|doctor|unset`.
+"""The database a project uses, and the machine's level of it:
+`capabilities store set|show|doctor|unset`.
 
-The setting is the one store pointer, the family's file
-`$XDG_CONFIG_HOME/agentkit/store.json` with the password inside it at mode
-0600. The manager writes it; its own records in database mode resolve their
-store from it, `AGENTKIT_STORE_URL` then `CAPABILITIES_STORE_URL` overriding
-it; a capability reads it through the store tier and writes nothing. While the
-file is absent the legacy pair under `$XDG_CONFIG_HOME/capabilities/` is read.
+The shared database library resolves it per project through one cascade - the
+project's `.env.local`/`.env`, then the process environment, then the machine's
+store setting file `$XDG_CONFIG_HOME/agentkit/store.json` - and the manager asks
+it, never deciding the order itself. `store show` and `store doctor` report every
+level for a project; `store set` and `store unset` write only the machine file,
+in the format the library reads.
 
-Everything runs against a scratch HOME. The doctor and the records tests build
-a throwaway PostgreSQL with TLS on a loopback port when `initdb`, `pg_ctl` and
-`openssl` are on PATH and psycopg2 is importable, and skip otherwise.
+Everything runs against a scratch HOME. The doctor tests build a throwaway
+PostgreSQL with TLS on a loopback port when `initdb`, `pg_ctl` and `openssl` are
+on PATH and psycopg is importable, and skip otherwise.
 """
 
 from __future__ import annotations
 
 import fcntl
-import importlib.machinery
-import importlib.util
 import json
 import os
 import shutil
 import socket
 import stat
 import subprocess
-import sys
 import tempfile
 import time
-import uuid
 from pathlib import Path
 
 import pytest
@@ -34,26 +31,22 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 MANAGER = REPO / "bin" / "capabilities"
-NAME = "storefix"
 # Distinctive, and carrying every character a URL or an env file could mangle,
 # so its absence from output is meaningful and its round trip is proven.
 PASSWORD = "pw-Zq7!x@%3A/#?&= 'q\"\\end"
+# The same secret as a URL may carry it, percent-encoded.
+URL_PASSWORD = "urlpw-Zq7x9secret"
 ADMIN = "pgadmin"
-
-sys.path.insert(0, str(REPO / "contract"))
-import store as S  # noqa: E402
-
-
-def _manager_module():
-    loader = importlib.machinery.SourceFileLoader(
-        "capabilities_manager_store_setting_under_test", str(MANAGER))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
+DB_KEYS = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTKIT_DB_NAME",
+           "AGENTKIT_DB_USER", "AGENTKIT_DB_PASSWORD", "AGENTKIT_DB_SCHEMA",
+           "AGENTKIT_DB_SSLMODE", "AGENTKIT_DB_SSLROOTCERT")
 
 
-M = _manager_module()
+@pytest.fixture(autouse=True)
+def _no_ambient_database(monkeypatch):
+    """The library reads the process environment, so this process carries none."""
+    for key in DB_KEYS:
+        monkeypatch.delenv(key, raising=False)
 
 
 def _env(tmp_path: Path) -> dict[str, str]:
@@ -61,10 +54,8 @@ def _env(tmp_path: Path) -> dict[str, str]:
     for key in ("CAPABILITIES_READ_ONLY", "CLAUDE_PROJECT_DIR",
                 "CAPABILITIES_AUTH_CONTEXT", "CAPABILITIES_PROJECT_ENVELOPE",
                 "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "CAPABILITIES_PROJECT_ID",
-                "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_STORE_URL",
-                "AGENTKIT_STORE_URL",
-                "CAPABILITIES_STORE_MODE", "CAPABILITIES_DEV_SESSION",
-                "CAPABILITIES_WORKSPACE", "STORE_FIX_PASSWORD"):
+                "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_DEV_SESSION",
+                "CAPABILITIES_WORKSPACE", "STORE_FIX_PASSWORD", *DB_KEYS):
         env.pop(key, None)
     env.update({
         "HOME": str(tmp_path / "home"),
@@ -104,8 +95,9 @@ def _error(result: subprocess.CompletedProcess) -> dict:
     raise AssertionError(result.stdout + result.stderr)
 
 
-def _no_secret(result: subprocess.CompletedProcess, secret: str = PASSWORD) -> None:
-    assert secret not in result.stdout and secret not in result.stderr
+def _no_secret(result: subprocess.CompletedProcess, *secrets: str) -> None:
+    for secret in (PASSWORD, URL_PASSWORD, *secrets):
+        assert secret not in result.stdout and secret not in result.stderr
 
 
 def _family(env: dict) -> Path:
@@ -116,25 +108,28 @@ def _written(env: dict) -> dict:
     return json.loads(_family(env).read_text())
 
 
-def _files(env: dict) -> tuple[Path, Path]:
-    """The legacy pair."""
+def _legacy_files(env: dict) -> tuple[Path, Path]:
+    """The pair the manager once read, which nothing reads or writes now."""
     home = Path(env["XDG_CONFIG_HOME"]) / "capabilities"
     return home / "store.json", home / "credentials.env"
 
 
-def _legacy(env: dict, document: dict | None = None, password: str | None = "old") -> None:
-    setting_file, password_file = _files(env)
-    setting_file.parent.mkdir(parents=True, exist_ok=True)
-    setting_file.write_text(json.dumps(document or {
-        "schema": "capabilities.store.v1", "host": "legacy.example.test", "port": 5432,
-        "database": "app", "user": "agent", "sslmode": "require"}))
-    if password is not None:
-        password_file.write_text(f"OTHER_KEY=kept\nCAPABILITIES_STORE_PASSWORD={password}\n")
-
-
 def _nothing_written(env: dict) -> bool:
-    return not _family(env).exists() and not _files(env)[0].exists() \
-        and not _files(env)[1].exists()
+    return not _family(env).exists()
+
+
+def _library_reads(env: dict):
+    """The machine level as the shared database library reads it."""
+    from capabilities_contract import db
+    return db.resolve_setting(None, config_home=env["XDG_CONFIG_HOME"])
+
+
+def _project(tmp_path: Path, env_text: str = "", name: str = ".env") -> Path:
+    root = tmp_path / "consumer"
+    (root / ".git").mkdir(parents=True, exist_ok=True)
+    if env_text:
+        (root / name).write_text(env_text)
+    return root
 
 
 BASE = ("--host", "db.example.test", "--database", "app", "--user", "agent")
@@ -148,16 +143,20 @@ def _set(env: dict, *extra_args: str, password: str = PASSWORD,
 
 # --- set ----------------------------------------------------------------------
 
-def test_set_takes_the_password_from_stdin(tmp_path):
+def test_set_takes_the_password_from_stdin_and_writes_what_the_library_reads(tmp_path):
     env = _env(tmp_path)
     result = _set(env)
     _no_secret(result)
     payload = _ok(result)
     assert payload["changed"] is True and payload["configured"] is True
-    assert payload["password"]["present"] is True
+    assert payload["in_force"] == "machine"
+    assert payload["setting"]["password"] == "***"
+    assert payload["setting"]["sources"] == [str(_family(env))]
     assert _written(env)["password"] == PASSWORD
-    assert not _files(env)[0].exists() and not _files(env)[1].exists()
-    assert S.read_store_setting(env["XDG_CONFIG_HOME"])["password"] == PASSWORD
+    read = _library_reads(env)
+    assert (read.level, read.host, read.port, read.database, read.user, read.sslmode,
+            read.schema, read.password) == ("machine", "db.example.test", 5432, "app",
+                                            "agent", "require", "agentkit", PASSWORD)
 
 
 def test_set_takes_the_password_from_a_file(tmp_path):
@@ -167,7 +166,7 @@ def test_set_takes_the_password_from_a_file(tmp_path):
     result = _manager(env, "store", "set", *BASE, "--password-file", str(secret))
     _no_secret(result)
     _ok(result)
-    assert S.read_store_setting(env["XDG_CONFIG_HOME"])["password"] == PASSWORD
+    assert _library_reads(env).password == PASSWORD
 
 
 def test_set_takes_the_password_from_a_named_environment_variable(tmp_path):
@@ -176,7 +175,7 @@ def test_set_takes_the_password_from_a_named_environment_variable(tmp_path):
                       extra={"STORE_FIX_PASSWORD": PASSWORD})
     _no_secret(result)
     _ok(result)
-    assert S.read_store_setting(env["XDG_CONFIG_HOME"])["password"] == PASSWORD
+    assert _library_reads(env).password == PASSWORD
     unset = _manager(env, "store", "set", *BASE, "--password-env", "STORE_FIX_PASSWORD")
     assert unset.returncode == 6 and _error(unset)["code"] == "password_source"
 
@@ -220,7 +219,7 @@ def test_set_admits_disable_only_for_a_local_host(tmp_path, host):
     payload = _ok(_manager(env, "store", "set", "--host", host, "--database", "app",
                            "--user", "agent", "--sslmode", "disable", "--password-stdin",
                            stdin=PASSWORD + "\n"))
-    assert payload["setting"]["sslmode"]["value"] == "disable"
+    assert payload["setting"]["sslmode"] == "disable"
     assert _written(env)["host"] == host
     for mode in ("allow", "prefer"):
         refused = _manager(env, "store", "set", "--host", host, "--database", "app",
@@ -236,7 +235,7 @@ def test_set_accepts_require_and_stronger(tmp_path, mode):
     root.write_text("fixture certificate\n")
     extra = ("--sslrootcert", str(root)) if mode != "require" else ()
     payload = _ok(_set(env, "--sslmode", mode, *extra))
-    assert payload["setting"]["sslmode"]["value"] == mode
+    assert payload["setting"]["sslmode"] == mode
     written = _written(env)
     assert written["sslmode"] == mode
     if extra:
@@ -246,19 +245,31 @@ def test_set_accepts_require_and_stronger(tmp_path, mode):
 def test_set_defaults_the_port_and_the_sslmode(tmp_path):
     env = _env(tmp_path)
     payload = _ok(_set(env))
-    assert payload["setting"]["port"]["value"] == 5432
-    assert payload["setting"]["sslmode"]["value"] == "require"
+    assert payload["setting"]["port"] == 5432
+    assert payload["setting"]["sslmode"] == "require"
     root = tmp_path / "root.crt"
     root.write_text("fixture certificate\n")
     payload = _ok(_set(env, "--sslrootcert", str(root), "--port", "6543"))
-    assert payload["setting"]["sslmode"]["value"] == "verify-full"
-    assert payload["setting"]["port"]["value"] == 6543
+    assert payload["setting"]["sslmode"] == "verify-full"
+    assert payload["setting"]["port"] == 6543
+    assert _written(env)["port"] == 6543
 
 
-def test_set_writes_the_family_file_whole_at_0600_and_leaves_the_legacy_pair(tmp_path):
+def test_set_refuses_a_port_that_is_not_one(tmp_path):
     env = _env(tmp_path)
-    setting_file, password_file = _files(env)
-    _legacy(env)
+    result = _set(env, "--port", "seventy")
+    assert result.returncode == 6 and _error(result)["code"] == "bad_store_setting"
+    _no_secret(result)
+    assert str(tmp_path) not in _error(result)["message"]
+    assert _nothing_written(env)
+
+
+def test_set_writes_the_machine_file_whole_at_0600_and_leaves_the_legacy_pair(tmp_path):
+    env = _env(tmp_path)
+    setting_file, password_file = _legacy_files(env)
+    setting_file.parent.mkdir(parents=True)
+    setting_file.write_text('{"schema": "capabilities.store.v1"}')
+    password_file.write_text("OTHER_KEY=kept\n")
     legacy_before = (setting_file.read_text(), password_file.read_text())
     payload = _ok(_set(env))
     path = _family(env)
@@ -268,12 +279,14 @@ def test_set_writes_the_family_file_whole_at_0600_and_leaves_the_legacy_pair(tmp
         "database": "app", "user": "agent", "sslmode": "require", "password": PASSWORD}
     assert sorted(p.name for p in path.parent.iterdir()) == ["store.json"]
     assert (setting_file.read_text(), password_file.read_text()) == legacy_before
-    assert payload["setting"]["host"] == {"value": "db.example.test", "source": str(path)}
+    assert payload["setting"]["host"] == "db.example.test"
     again = _ok(_set(env))
     assert again["changed"] is False
     changed = _ok(_set(env, password="another-" + PASSWORD))
     assert changed["changed"] is True
     assert _written(env)["password"] == "another-" + PASSWORD
+    assert _ok(_manager(env, "store", "unset"))["changed"] is True
+    assert (setting_file.read_text(), password_file.read_text()) == legacy_before
 
 
 def test_set_never_replaces_a_version_it_does_not_know(tmp_path):
@@ -286,8 +299,10 @@ def test_set_never_replaces_a_version_it_does_not_know(tmp_path):
         result = _manager(env, *args, stdin=PASSWORD + "\n")
         assert result.returncode == 6 and _error(result)["code"] == "store_setting_too_new"
         assert path.read_text() == newer
-    shown = _manager(env, "store", "show")
-    assert shown.returncode == 6 and _error(shown)["code"] == "store_setting_too_new"
+    shown = _ok(_manager(env, "store", "show"))
+    assert shown["levels"]["machine"]["error"]["code"] == "store_setting_too_new"
+    assert shown["error"]["code"] == "store_setting_too_new"
+    assert shown["in_force"] == "machine" and shown["configured"] is False
 
 
 def test_set_writes_under_the_manager_lock(tmp_path):
@@ -323,20 +338,17 @@ def test_set_is_refused_under_the_read_only_switch(tmp_path):
 
 def test_set_names_the_schema_only_when_one_is_given(tmp_path):
     env = _env(tmp_path)
-    path = _family(env)
     _ok(_set(env))
     written = _written(env)
     assert written["schema"] == "agentkit.store.v1" and "db_schema" not in written
     payload = _ok(_set(env, "--schema", "agentkit"))
     assert payload["changed"] is True
-    written = _written(env)
-    assert written["schema"] == "agentkit.store.v1"
-    assert written["db_schema"] == "agentkit"
-    assert payload["setting"]["db_schema"] == {"value": "agentkit", "source": str(path)}
+    assert _written(env)["db_schema"] == "agentkit"
+    assert payload["setting"]["schema"] == "agentkit"
     assert _ok(_set(env, "--schema", "agentkit"))["changed"] is False
-    assert _ok(_set(env, "--schema", "tools"))["changed"] is True
-    assert _ok(_set(env))["setting"]["db_schema"] == {"value": "agentkit",
-                                                      "source": "default"}
+    assert _ok(_set(env, "--schema", "tools"))["setting"]["schema"] == "tools"
+    assert _library_reads(env).schema == "tools"
+    assert _ok(_set(env))["setting"]["schema"] == "agentkit"
     assert "db_schema" not in _written(env)
 
 
@@ -349,70 +361,29 @@ def test_set_refuses_a_schema_that_is_reserved_or_not_an_identifier(tmp_path, na
     assert _nothing_written(env)
 
 
-def test_a_v1_setting_written_before_the_schema_is_read_as_agentkit(tmp_path):
-    env = _env(tmp_path)
-    setting_file = _files(env)[0]
-    setting_file.parent.mkdir(parents=True)
-    setting_file.write_text(json.dumps({
-        "schema": "capabilities.store.v1", "host": "db.example.test", "port": 5432,
-        "database": "app", "user": "agent", "sslmode": "require",
-        "db_schema": "ignored_in_v1"}))
-    assert S.read_store_setting(env["XDG_CONFIG_HOME"])["db_schema"] == "agentkit"
-    payload = _ok(_manager(env, "store", "show"))
-    assert payload["setting"]["db_schema"] == {"value": "agentkit", "source": "default"}
-    assert payload["setting"]["host"] == {"value": "db.example.test", "source": "legacy"}
-    assert payload["exists"] is False
-
-
-def test_a_v2_setting_naming_a_bad_schema_is_refused_when_read(tmp_path):
-    env = _env(tmp_path)
-    setting_file = _files(env)[0]
-    setting_file.parent.mkdir(parents=True)
-    setting_file.write_text(json.dumps({
-        "schema": "capabilities.store.v2", "host": "db.example.test", "port": 5432,
-        "database": "app", "user": "agent", "sslmode": "require", "db_schema": "public"}))
-    with pytest.raises(S.StoreError) as raised:
-        S.read_store_setting(env["XDG_CONFIG_HOME"])
-    assert raised.value.slug == "bad_schema_name"
-    result = _manager(env, "store", "show")
-    assert result.returncode == 6 and _error(result)["code"] == "bad_schema_name"
-
-
 # --- unset --------------------------------------------------------------------
 
-def test_unset_removes_the_file_and_the_legacy_pair_and_keeps_other_keys(tmp_path):
+def test_unset_removes_the_machine_file(tmp_path):
     env = _env(tmp_path)
-    setting_file, password_file = _files(env)
-    _legacy(env)
     _ok(_set(env, "--schema", "tools"))
     result = _manager(env, "store", "unset")
     _no_secret(result)
     payload = _ok(result)
     assert payload["changed"] is True and payload["configured"] is False
-    assert payload["in_force"]["source"] == "default"
-    assert not _family(env).exists() and not setting_file.exists()
-    assert password_file.read_text() == "OTHER_KEY=kept\n"
-    assert stat.S_IMODE(password_file.stat().st_mode) == 0o600
-    assert S.read_store_setting(env["XDG_CONFIG_HOME"]) is None
+    assert payload["in_force"] is None
+    assert not _family(env).exists()
     assert _ok(_manager(env, "store", "unset"))["changed"] is False
-
-
-def test_unset_removes_a_legacy_password_file_it_leaves_empty(tmp_path):
-    env = _env(tmp_path)
-    _legacy(env, password=None)
-    _files(env)[1].write_text("CAPABILITIES_STORE_PASSWORD=old\n")
-    assert _ok(_manager(env, "store", "unset"))["changed"] is True
-    assert sorted(p.name for p in _files(env)[0].parent.iterdir()) == []
 
 
 def test_unset_removes_a_setting_that_no_longer_reads(tmp_path):
     env = _env(tmp_path)
-    for path in (_family(env), _files(env)[0]):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("not json")
-        assert _manager(env, "store", "show").returncode == 6
-        assert _ok(_manager(env, "store", "unset"))["changed"] is True
-        assert not path.exists()
+    path = _family(env)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("not json")
+    shown = _ok(_manager(env, "store", "show"))
+    assert shown["levels"]["machine"]["error"]["code"] == "bad_store_setting"
+    assert _ok(_manager(env, "store", "unset"))["changed"] is True
+    assert not path.exists()
 
 
 def test_unset_is_refused_under_the_read_only_switch(tmp_path):
@@ -423,149 +394,135 @@ def test_unset_is_refused_under_the_read_only_switch(tmp_path):
     assert _written(env)["password"] == PASSWORD
 
 
-# --- show ---------------------------------------------------------------------
+# --- show: every level of the cascade ------------------------------------------
 
-def test_show_without_a_setting_reports_the_default(tmp_path):
+def test_show_with_no_level_answering(tmp_path):
     env = _env(tmp_path)
     payload = _ok(_manager(env, "store", "show", "--json"))
     assert payload["configured"] is False and payload["setting"] is None
-    assert payload["path"] == str(_family(env)) and payload["exists"] is False
-    assert payload["password"] == {"present": False, "source": None}
-    assert payload["in_force"] == {
-        "store": str(Path(env["XDG_STATE_HOME"]) / "capabilities" / "store.db"),
-        "source": "default"}
-    assert payload["overridden_by"] is None
+    assert payload["in_force"] is None and payload["error"] is None
+    assert payload["project"] is None
+    levels = payload["levels"]
+    assert levels["project"] == {"asked": False, "answers": False, "setting": None,
+                                 "error": None}
+    assert levels["environment"]["answers"] is False
+    assert levels["machine"]["path"] == str(_family(env))
+    assert Path(levels["machine"]["path"]).is_absolute()
+    assert levels["machine"]["exists"] is False and levels["machine"]["answers"] is False
 
 
-def test_show_reports_each_value_and_its_source_without_the_secret(tmp_path):
+def test_show_reports_the_machine_level_without_its_secret(tmp_path):
     env = _env(tmp_path)
     _ok(_set(env, "--port", "6543"))
     result = _manager(env, "store", "show")
     _no_secret(result)
     payload = _ok(result)
-    setting_file = _family(env)
-    assert payload["path"] == str(setting_file) and payload["exists"] is True
-    assert Path(payload["path"]).is_absolute()
+    assert payload["in_force"] == "machine"
     assert payload["setting"] == {
-        field: {"value": value, "source": str(setting_file)}
-        for field, value in (("host", "db.example.test"), ("port", 6543),
-                             ("database", "app"), ("user", "agent"),
-                             ("sslmode", "require"))} | {
-        "db_schema": {"value": "agentkit", "source": "default"}}
-    assert payload["password"] == {"present": True, "source": str(setting_file)}
-    assert payload["in_force"] == {"store": "postgresql://db.example.test:6543/app",
-                                   "source": "setting"}
-    assert payload["overridden_by"] is None
-    assert _ok(_manager(env, "path", "store")) == payload["in_force"]
+        "level": "machine", "sources": [str(_family(env))], "schema": "agentkit",
+        "host": "db.example.test", "port": 6543, "database": "app", "user": "agent",
+        "sslmode": "require", "sslrootcert": None, "password": "***"}
+    assert payload["levels"]["machine"]["setting"] == payload["setting"]
+    assert payload["levels"]["machine"]["exists"] is True
 
 
-def test_show_reports_the_override_while_it_is_set(tmp_path):
+def test_the_project_level_wins_and_every_level_is_still_reported(tmp_path):
     env = _env(tmp_path)
     _ok(_set(env))
-    override = f"postgresql://someone:{PASSWORD}@other.example.test:5432/elsewhere"
-    result = _manager(env, "store", "show", extra={"CAPABILITIES_STORE_URL": override})
-    _no_secret(result)
-    payload = _ok(result)
-    assert payload["in_force"] == {"store": "postgresql://other.example.test:5432/elsewhere",
-                                   "source": "CAPABILITIES_STORE_URL"}
-    assert payload["overridden_by"] == "CAPABILITIES_STORE_URL"
-    assert payload["setting"]["host"]["value"] == "db.example.test"
-    first = f"postgresql://someone:{PASSWORD}@first.example.test:5432/family"
-    result = _manager(env, "store", "show", extra={"CAPABILITIES_STORE_URL": override,
-                                                   "AGENTKIT_STORE_URL": first})
-    _no_secret(result)
-    payload = _ok(result)
-    assert payload["in_force"] == {"store": "postgresql://first.example.test:5432/family",
-                                   "source": "AGENTKIT_STORE_URL"}
-    assert payload["overridden_by"] == "AGENTKIT_STORE_URL"
+    root = _project(tmp_path, f"AGENTKIT_DB_URL=postgresql://agent:{URL_PASSWORD}"
+                              "@project.example.test:5433/projectdb\n"
+                              "AGENTKIT_DB_SCHEMA=projectschema\n")
+    for args, cwd in ((("--project", str(root)), None), ((), root)):
+        result = _manager(env, "store", "show", *args, cwd=cwd,
+                          extra={"AGENTKIT_DB_HOST": "env.example.test",
+                                 "AGENTKIT_DB_NAME": "envdb", "AGENTKIT_DB_USER": "u"})
+        _no_secret(result)
+        payload = _ok(result)
+        assert payload["project"] == str(root.resolve())
+        assert payload["in_force"] == "project"
+        setting = payload["setting"]
+        assert setting["level"] == "project" and setting["schema"] == "projectschema"
+        assert setting["sources"] == [str(root.resolve() / ".env")]
+        assert setting["url"]["host"] == "project.example.test"
+        assert setting["url"]["password"] == "***"
+        levels = payload["levels"]
+        assert levels["project"]["asked"] is True and levels["project"]["answers"] is True
+        assert levels["environment"]["setting"]["host"] == "env.example.test"
+        assert levels["environment"]["setting"]["sources"] == [
+            "AGENTKIT_DB_HOST", "AGENTKIT_DB_NAME", "AGENTKIT_DB_USER"]
+        assert levels["machine"]["setting"]["host"] == "db.example.test"
 
 
-def test_show_reads_the_legacy_pair_while_the_file_is_absent_and_the_file_after(tmp_path):
+def test_env_local_wins_key_by_key_over_env(tmp_path):
     env = _env(tmp_path)
-    _legacy(env, {"schema": "capabilities.store.v2", "host": "legacy.example.test",
-                  "port": 5432, "database": "app", "user": "agent", "sslmode": "require",
-                  "db_schema": "tools"})
-    payload = _ok(_manager(env, "store", "show"))
-    assert payload["configured"] is True and payload["exists"] is False
-    assert payload["path"] == str(_family(env))
-    assert payload["setting"]["host"] == {"value": "legacy.example.test", "source": "legacy"}
-    assert payload["setting"]["db_schema"] == {"value": "tools", "source": "legacy"}
-    assert payload["password"] == {"present": True, "source": "legacy"}
+    root = _project(tmp_path, "AGENTKIT_DB_HOST=from-env.example.test\n"
+                              "AGENTKIT_DB_NAME=app\nAGENTKIT_DB_USER=agent\n")
+    (root / ".env.local").write_text("AGENTKIT_DB_HOST=from-local.example.test\n")
+    payload = _ok(_manager(env, "store", "show", "--project", str(root)))
+    assert payload["setting"]["host"] == "from-local.example.test"
+    assert payload["setting"]["database"] == "app"
+    assert sorted(payload["setting"]["sources"]) == sorted(
+        [str(root.resolve() / ".env.local"), str(root.resolve() / ".env")])
+
+
+def test_the_environment_level_answers_outside_a_project(tmp_path):
+    env = _env(tmp_path)
     _ok(_set(env))
-    payload = _ok(_manager(env, "store", "show"))
-    assert payload["exists"] is True
-    assert payload["setting"]["host"] == {"value": "db.example.test",
-                                          "source": str(_family(env))}
-    assert payload["setting"]["db_schema"] == {"value": "agentkit", "source": "default"}
+    result = _manager(env, "store", "show", extra={
+        "AGENTKIT_DB_URL": f"postgresql://agent:{URL_PASSWORD}@env.example.test/envdb"})
+    _no_secret(result)
+    payload = _ok(result)
+    assert payload["in_force"] == "environment"
+    assert payload["setting"]["sources"] == ["AGENTKIT_DB_URL"]
+    assert payload["levels"]["project"]["asked"] is False
+    assert payload["levels"]["machine"]["answers"] is True
 
 
-# --- the helper a capability reads it through -----------------------------------
-
-def _fixture_capability(tmp_path: Path) -> Path:
-    """The manager's own core-only scaffold, answering one verb with what the
-    stamped store tier reads, before any gate, so the helper is all that runs."""
-    text = M._capability_skeleton(NAME, True)
-    marker = "\ndef main() -> None:\n    _gate()\n"
-    assert marker in text
-    text = text.replace(marker, (
-        "\ndef main() -> None:\n"
-        "    if sys.argv[1:] == [\"store-setting\"]:\n"
-        "        print(json.dumps({\"setting\": read_store_setting()}))\n"
-        "        return\n"
-        "    _gate()\n"), 1)
-    script = tmp_path / "bundle" / NAME
-    script.parent.mkdir(parents=True)
-    script.write_text(text)
-    script.chmod(0o755)
-    return script
-
-
-def _tree(root: Path) -> dict:
-    return {str(p.relative_to(root)): (p.read_bytes(), p.stat().st_mtime_ns)
-            for p in sorted(root.rglob("*")) if p.is_file()} if root.exists() else {}
-
-
-def test_a_capability_reads_the_setting_through_the_store_tier_and_writes_nothing(tmp_path):
+def test_a_level_the_library_refuses_is_reported_as_refused(tmp_path):
     env = _env(tmp_path)
-    script = _fixture_capability(tmp_path)
-    roots = [tmp_path / name for name in ("config", "state", "cache", "data", "home")]
-
-    def read() -> dict:
-        before = [_tree(root) for root in roots]
-        result = subprocess.run([str(script), "store-setting"], cwd=_outside(env), env=env,
-                                text=True, capture_output=True, timeout=180)
-        assert result.returncode == 0, result.stdout + result.stderr
-        assert [_tree(root) for root in roots] == before
-        return json.loads(result.stdout)["setting"]
-
-    assert read() is None
-    _ok(_set(env, "--port", "6543"))
-    assert read() == {"host": "db.example.test", "port": 6543, "database": "app",
-                      "user": "agent", "sslmode": "require", "db_schema": "agentkit",
-                      "password": PASSWORD}
-    _ok(_set(env, "--schema", "tools"))
-    assert read()["db_schema"] == "tools"
+    _ok(_set(env))
+    root = _project(tmp_path, "AGENTKIT_DB_HOST=remote.example.test\nAGENTKIT_DB_NAME=app\n"
+                              "AGENTKIT_DB_USER=agent\nAGENTKIT_DB_SSLMODE=disable\n")
+    payload = _ok(_manager(env, "store", "show", "--project", str(root)))
+    assert payload["configured"] is False and payload["setting"] is None
+    assert payload["in_force"] == "project"
+    assert payload["error"]["code"] == "sslmode_too_weak"
+    assert payload["levels"]["project"]["error"]["code"] == "sslmode_too_weak"
+    assert payload["levels"]["machine"]["setting"]["host"] == "db.example.test"
+    doctor = _manager(env, "store", "doctor", "--project", str(root))
+    assert doctor.returncode == 6 and _error(doctor)["code"] == "sslmode_too_weak"
 
 
-def test_the_store_tier_builds_the_url_with_the_password_encoded():
-    setting = {"host": "db.example.test", "port": 5432, "database": "app",
-               "user": "agent", "sslmode": "verify-full",
-               "sslrootcert": "/etc/ssl/root.crt", "password": PASSWORD}
-    url = S.store_setting_url(setting)
-    from urllib.parse import parse_qs, unquote, urlparse
-    parsed = urlparse(url)
-    assert parsed.scheme == "postgresql" and parsed.hostname == "db.example.test"
-    assert unquote(parsed.password) == PASSWORD and unquote(parsed.username) == "agent"
-    assert parse_qs(parsed.query) == {"sslmode": ["verify-full"],
-                                      "sslrootcert": ["/etc/ssl/root.crt"]}
-    assert "sslmode=disable" in S.store_setting_url(setting, sslmode="disable")
-    assert PASSWORD not in S.store_setting_url(setting, with_password=False)
-    socket_url = S.store_setting_url({**setting, "host": "/var/run/postgresql",
-                                      "sslmode": "disable"})
-    parsed = urlparse(socket_url)
-    assert parsed.hostname is None and parsed.path == "/app"
-    assert parse_qs(parsed.query)["host"] == ["/var/run/postgresql"]
-    assert parse_qs(parsed.query)["port"] == ["5432"]
+def test_the_retired_variables_and_the_legacy_pair_decide_nothing(tmp_path):
+    env = _env(tmp_path)
+    setting_file, password_file = _legacy_files(env)
+    setting_file.parent.mkdir(parents=True)
+    setting_file.write_text(json.dumps({
+        "schema": "capabilities.store.v1", "host": "legacy.example.test", "port": 5432,
+        "database": "app", "user": "agent", "sslmode": "require"}))
+    password_file.write_text("CAPABILITIES_STORE_PASSWORD=old\n")
+    payload = _ok(_manager(env, "store", "show", extra={
+        "CAPABILITIES_STORE_URL": "postgresql://a@retired.example.test/x",
+        "AGENTKIT_STORE_URL": "postgresql://a@retired.example.test/y",
+        "CAPABILITIES_STORE_PASSWORD": "old"}))
+    assert payload["configured"] is False and payload["in_force"] is None
+    doctor = _manager(env, "store", "doctor")
+    assert doctor.returncode == 3 and _error(doctor)["code"] == "no_store_setting"
+
+
+def test_show_and_doctor_take_only_a_project_and_json(tmp_path):
+    env = _env(tmp_path)
+    for sub in ("show", "doctor"):
+        bad = _manager(env, "store", sub, "--verbose")
+        assert bad.returncode == 6 and _error(bad)["code"] == "input"
+        gone = _manager(env, "store", sub, "--project", str(tmp_path / "absent"))
+        assert gone.returncode == 6 and _error(gone)["code"] == "input"
+
+
+def test_path_store_is_gone(tmp_path):
+    env = _env(tmp_path)
+    result = _manager(env, "path", "store")
+    assert result.returncode == 6 and _error(result)["code"] == "input"
 
 
 # --- a throwaway PostgreSQL with TLS ----------------------------------------------
@@ -616,7 +573,9 @@ class Cluster:
         admin = self.connect(ADMIN, "postgres")
         admin.autocommit = True
         with admin.cursor() as cur:
-            cur.execute("CREATE ROLE agent LOGIN PASSWORD %s", (PASSWORD,))
+            from psycopg import sql
+            cur.execute(sql.SQL("CREATE ROLE agent LOGIN PASSWORD {}").format(
+                sql.Literal(PASSWORD)))
             cur.execute("CREATE DATABASE app OWNER agent ENCODING 'UTF8' "
                         "TEMPLATE template0")
             cur.execute("CREATE DATABASE foreign_db ENCODING 'UTF8' TEMPLATE template0")
@@ -628,10 +587,10 @@ class Cluster:
         admin.close()
 
     def connect(self, user: str, database: str, password: str | None = None):
-        import psycopg2
-        return psycopg2.connect(host="127.0.0.1", port=self.port, user=user,
-                                dbname=database, password=password,
-                                sslmode="require", connect_timeout=10)
+        import psycopg
+        return psycopg.connect(host="127.0.0.1", port=self.port, user=user,
+                               dbname=database, password=password,
+                               sslmode="require", connect_timeout=10)
 
     def hba(self, body: str, reload: bool = True) -> None:
         (self.data / "pg_hba.conf").write_text(body)
@@ -646,7 +605,7 @@ class Cluster:
 
 @pytest.fixture(scope="module")
 def cluster():
-    pytest.importorskip("psycopg2")
+    pytest.importorskip("psycopg")
     for tool in ("initdb", "pg_ctl", "openssl"):
         if shutil.which(tool) is None:
             pytest.skip(f"{tool} is not on PATH")
@@ -668,15 +627,21 @@ def enforced(cluster):
 
 
 # A name for the loopback cluster that is not one the doctor takes for this
-# machine, so the checks a store across a network gets are the ones that run.
+# machine, so the checks a database across a network gets are the ones that run.
 REMOTE_NAME = "127.1"
 
 
 def _set_cluster(env: dict, cluster: Cluster, *extra_args: str,
-                 host: str = REMOTE_NAME) -> None:
+                 host: str = REMOTE_NAME, database: str = "app") -> None:
     _ok(_manager(env, "store", "set", "--host", host, "--port", str(cluster.port),
-                 "--database", "app", "--user", "agent", *extra_args,
+                 "--database", database, "--user", "agent", *extra_args,
                  "--password-stdin", stdin=PASSWORD + "\n"))
+
+
+def _cluster_url(cluster: Cluster, database: str = "app", host: str = REMOTE_NAME) -> str:
+    from urllib.parse import quote
+    return (f"postgresql://agent:{quote(PASSWORD, safe='')}@{host}:{cluster.port}/"
+            f"{database}?sslmode=require")
 
 
 # --- doctor -----------------------------------------------------------------------
@@ -687,16 +652,51 @@ def test_doctor_passes_when_tls_works_and_plain_text_is_refused(tmp_path, enforc
     result = _manager(env, "store", "doctor", "--json")
     _no_secret(result)
     payload = _ok(result)
-    assert payload["ok"] is True
+    assert payload["ok"] is True and payload["in_force"] == "machine"
     tls = payload["checks"]["tls"]
     assert tls["ok"] is True and tls["server_version"]
     assert tls["tls"]["version"].startswith("TLS") and tls["tls"]["cipher"]
     plain = payload["checks"]["plain_text_refused"]
     assert plain["ok"] is True and "no encryption" in plain["reason"]
-    assert payload["store"] == f"postgresql://{REMOTE_NAME}:{enforced.port}/app"
-    assert payload["db_schema"] == "agentkit"
+    assert payload["setting"]["host"] == REMOTE_NAME
+    assert payload["setting"]["port"] == enforced.port
+    assert payload["db_schema"] == "agentkit" and payload["sslmode"] == "require"
     assert payload["checks"]["schema"]["ok"] is True
     assert payload["checks"]["schema"]["exists"] is False
+
+
+def test_doctor_probes_the_project_level_when_it_answers(tmp_path, enforced):
+    """The machine level names a database the role may not create its schema
+    in; the project's URL names one it may. The project's is the one probed."""
+    env = _env(tmp_path)
+    _set_cluster(env, enforced, "--schema", "tools", database="foreign_db")
+    machine_only = _manager(env, "store", "doctor")
+    assert machine_only.returncode == 7, machine_only.stdout + machine_only.stderr
+    root = _project(tmp_path, f"AGENTKIT_DB_URL={_cluster_url(enforced)}\n", name=".env.local")
+    for args, cwd in ((("--project", str(root)), None), ((), root)):
+        result = _manager(env, "store", "doctor", *args, cwd=cwd)
+        _no_secret(result)
+        payload = _ok(result)
+        assert payload["ok"] is True and payload["in_force"] == "project"
+        assert payload["setting"]["sources"] == [str(root.resolve() / ".env.local")]
+        assert payload["setting"]["url"]["dbname"] == "app"
+        assert payload["setting"]["url"]["password"] == "***"
+        assert payload["checks"]["plain_text_refused"]["ok"] is True
+        assert payload["checks"]["schema"]["name"] == "agentkit"
+        assert payload["levels"]["machine"]["setting"]["database"] == "foreign_db"
+
+
+def test_doctor_probes_the_environment_level(tmp_path, enforced):
+    env = _env(tmp_path)
+    result = _manager(env, "store", "doctor", extra={
+        "AGENTKIT_DB_HOST": REMOTE_NAME, "AGENTKIT_DB_PORT": str(enforced.port),
+        "AGENTKIT_DB_NAME": "app", "AGENTKIT_DB_USER": "agent",
+        "AGENTKIT_DB_PASSWORD": PASSWORD, "AGENTKIT_DB_SCHEMA": "envschema"})
+    _no_secret(result)
+    payload = _ok(result)
+    assert payload["ok"] is True and payload["in_force"] == "environment"
+    assert payload["db_schema"] == "envschema"
+    assert payload["levels"]["machine"]["answers"] is False
 
 
 def test_doctor_passes_for_a_named_schema_the_role_may_use(tmp_path, enforced):
@@ -729,9 +729,7 @@ def test_doctor_fails_when_the_role_may_not_use_the_schema(tmp_path, enforced):
 
 def test_doctor_fails_when_the_role_may_not_create_the_missing_schema(tmp_path, enforced):
     env = _env(tmp_path)
-    _ok(_manager(env, "store", "set", "--host", REMOTE_NAME, "--port", str(enforced.port),
-                 "--database", "foreign_db", "--user", "agent", "--schema", "tools",
-                 "--password-stdin", stdin=PASSWORD + "\n"))
+    _set_cluster(env, enforced, "--schema", "tools", database="foreign_db")
     result = _manager(env, "store", "doctor")
     assert result.returncode == 7, result.stdout + result.stderr
     schema = json.loads(result.stdout)["checks"]["schema"]
@@ -794,97 +792,26 @@ def test_doctor_without_a_setting_is_not_found(tmp_path):
     assert result.returncode == 3 and _error(result)["code"] == "no_store_setting"
 
 
-# --- the one pointer ----------------------------------------------------------------
-
-def _db_project(tmp_path: Path, env: dict) -> tuple[Path, str, str]:
-    root = tmp_path / "consumer"
-    (root / ".git").mkdir(parents=True)
-    envelope = root / "capabilities"
-    envelope.mkdir()
-    project_id = str(uuid.uuid4())
-    slug = "fixture-" + project_id[:8]
-    (envelope / "project.json").write_text(json.dumps({
-        "schema": "capabilities.project.v1", "id": project_id, "slug": slug,
-        "store": "db"}))
-    return root, project_id, slug
-
-
-def _project_env(env: dict, root: Path) -> dict:
-    return {**env, "CLAUDE_PROJECT_DIR": str(root)}
-
-
-def _policy(store, slug: str, name: str):
-    return store.config_get("capabilities", "policy", name,
-                            S.Scopes(slug, include_global=False))
-
-
-def test_database_mode_records_go_through_the_setting(tmp_path, enforced):
+def test_no_manager_verb_creates_a_table(tmp_path, enforced):
+    """Records are files; with a database configured at every level the
+    manager's verbs still create nothing in it."""
     env = _env(tmp_path)
-    root, project_id, slug = _db_project(tmp_path, env)
     _set_cluster(env, enforced)
-    url = S.store_setting_url(S.read_store_setting(env["XDG_CONFIG_HOME"]))
-    with S.PostgresStore.open(url) as store:
-        store.migrate()
-        store.project_register(project_id, slug)
-    result = _manager(_project_env(env, root), "enable", "slack", "--project", cwd=root)
-    _no_secret(result)
-    assert result.returncode == 0, result.stdout + result.stderr
-    with S.PostgresStore.open(url) as store:
-        assert _policy(store, slug, "slack") == {"enabled": True}
-    assert not (Path(env["XDG_STATE_HOME"]) / "capabilities" / "store.db").exists()
-    assert not (root / "capabilities" / "settings.json").exists()
-    listed = _ok(_manager(_project_env(env, root), "list", cwd=root))
-    assert "slack" in listed["enabled_not_installed"]
-
-
-def test_the_override_wins_over_the_setting(tmp_path, enforced):
-    env = _env(tmp_path)
-    root, project_id, slug = _db_project(tmp_path, env)
-    _set_cluster(env, enforced)
-    url = S.store_setting_url(S.read_store_setting(env["XDG_CONFIG_HOME"]))
-    with S.PostgresStore.open(url) as store:
-        store.migrate()
-        store.project_register(project_id, slug)
-    override = tmp_path / "override.db"
-    with S.SQLiteStore.open(str(override)) as store:
-        store.migrate()
-        store.project_register(project_id, slug)
-    extra = {"CAPABILITIES_STORE_URL": str(override)}
-    _ok(_manager(_project_env(env, root), "enable", "notion", "--project", cwd=root,
-                 extra=extra))
-    with S.SQLiteStore.open(str(override)) as store:
-        assert _policy(store, slug, "notion") == {"enabled": True}
-    with S.PostgresStore.open(url) as store:
-        assert _policy(store, slug, "notion") is None
-    assert _ok(_manager(env, "path", "store", extra=extra)) == {
-        "store": str(override), "source": "CAPABILITIES_STORE_URL"}
-
-
-def test_without_a_setting_records_resolve_as_before(tmp_path):
-    env = _env(tmp_path)
-    # A database-mode project with today's URL source.
-    root, project_id, slug = _db_project(tmp_path, env)
-    today = tmp_path / "today.db"
-    with S.SQLiteStore.open(str(today)) as store:
-        store.migrate()
-        store.project_register(project_id, slug)
-    _ok(_manager(_project_env(env, root), "enable", "notion", "--project", cwd=root,
-                 extra={"CAPABILITIES_STORE_URL": str(today)}))
-    with S.SQLiteStore.open(str(today)) as store:
-        assert _policy(store, slug, "notion") == {"enabled": True}
-    # The same project with no URL at all reaches the local default.
-    default = Path(env["XDG_STATE_HOME"]) / "capabilities" / "store.db"
-    default.parent.mkdir(parents=True)
-    shutil.copy2(today, default)
-    _ok(_manager(_project_env(env, root), "enable", "slack", "--project", cwd=root))
-    with S.SQLiteStore.open(str(default)) as store:
-        assert _policy(store, slug, "slack") == {"enabled": True}
-    assert _ok(_manager(env, "path", "store")) == {"store": str(default), "source": "default"}
-    # A files-mode project keeps its gate in settings.json.
-    files = tmp_path / "files-project"
-    (files / ".git").mkdir(parents=True)
-    (files / "capabilities").mkdir()
-    _ok(_manager(_project_env(env, files), "enable", "slack", "--project", cwd=files))
-    assert json.loads((files / "capabilities" / "settings.json").read_text()) == {
-        "capabilities": {"slack": {"enabled": True}}}
-    assert _nothing_written(env)
+    root = _project(tmp_path, f"AGENTKIT_DB_URL={_cluster_url(enforced)}\n")
+    (root / "capabilities").mkdir()
+    project_env = {**env, "CLAUDE_PROJECT_DIR": str(root)}
+    for args in (("init",), ("enable", "slack", "--project"), ("list",),
+                 ("relabel", "renamed-fixture"), ("store", "show"), ("store", "doctor"),
+                 ("doctor",)):
+        _manager(project_env, *args, cwd=root)
+    assert json.loads((root / "capabilities" / "settings.json").read_text())[
+        "capabilities"]["slack"] == {"enabled": True}
+    admin = enforced.connect(ADMIN, "app")
+    try:
+        with admin.cursor() as cur:
+            cur.execute("SELECT schemaname, tablename FROM pg_tables WHERE schemaname "
+                        "NOT IN ('pg_catalog', 'information_schema')")
+            assert cur.fetchall() == []
+    finally:
+        admin.close()
+    assert not list(tmp_path.rglob("*.db"))

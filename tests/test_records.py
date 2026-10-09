@@ -1,8 +1,5 @@
-"""The two places a project may keep its configuration, held to one answer.
-
-The point of an adapter is that nothing downstream can tell which one it got.
-That is only true if both give the same answer to the same question, so the
-central test here asks every question twice."""
+"""The files a project keeps its configuration in, read and written through
+the records adapter."""
 
 import json
 import sys
@@ -228,118 +225,58 @@ class FileAdapter(unittest.TestCase):
             self.assertEqual(caught.exception.slug, "files_mode")
 
 
-class ModeIsReadOnce(unittest.TestCase):
-    def setUp(self):
-        self.tmp = TemporaryDirectory()
-        self.env = build_envelope(Path(self.tmp.name), "fixture", str(uuid.uuid4()))
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_a_project_that_says_nothing_keeps_files(self):
-        self.assertEqual(S.records_mode(self.env)[0], "files")
-
-    def test_the_declaration_is_what_answers(self):
-        body = json.loads((self.env / "project.json").read_text())
-        body["store"] = "db"
-        (self.env / "project.json").write_text(json.dumps(body))
-        self.assertEqual(S.records_mode(self.env)[0], "db")
-
-    def test_a_declaration_nobody_understands_is_refused(self):
-        (self.env / "project.json").write_text(json.dumps({"slug": "x", "store": "maybe"}))
-        with self.assertRaises(S.StoreError) as caught:
-            S.records_mode(self.env)
-        self.assertEqual(caught.exception.slug, "bad_store_mode")
-
-
-class BothAdaptersAgree(unittest.TestCase):
-    """The load-bearing test. Every question is asked of a directory and of a
-    database holding the same records, and the answers are compared."""
+class OpenRecords(unittest.TestCase):
+    """Records are kept in files only, whatever a project declares."""
 
     def setUp(self):
         self.tmp = TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.slug = "fixture-" + uuid.uuid4().hex[:8]
-        self.project_id = str(uuid.uuid4())
-        self.env = build_envelope(self.root, self.slug, self.project_id)
+        self.env = build_envelope(self.root, "fixture", str(uuid.uuid4()))
         self.globals = self.root / "config"
-        self.globals.mkdir()
-        self.files = S.FileRecords(self.env, self.globals, self.project_id, self.slug)
-
-        self.store = S.SQLiteStore.open(str(self.root / "store.db"))
-        self.store.migrate()
-        self.store.project_register(self.project_id, self.slug)
-        self.db = S.StoreRecords(self.store, S.Scopes(project=self.slug),
-                                 ("project", self.slug))
-        for capability, collection in COLLECTIONS_UNDER_TEST:
-            for key, row in self.files.resolve(capability, collection).items():
-                self.db.set(capability, collection, key, row["value"], note=row["note"])
-        for key in self.files.document_keys("telegram"):
-            doc = self.files.document_read("telegram", key)
-            self.db.document_put("telegram", key, doc["body"])
 
     def tearDown(self):
-        self.store.close()
         self.tmp.cleanup()
 
-    def test_every_collection_resolves_to_the_same_values(self):
-        for capability, collection in COLLECTIONS_UNDER_TEST:
-            with self.subTest(capability=capability, collection=collection):
-                as_files = {k: v["value"] for k, v in
-                            self.files.resolve(capability, collection).items()}
-                as_rows = {k: v["value"] for k, v in
-                           self.db.resolve(capability, collection).items()}
-                self.assertEqual(as_files, as_rows)
-                self.assertTrue(as_files, "the fixture holds nothing to compare")
+    def _declare(self, **fields):
+        body = json.loads((self.env / "project.json").read_text())
+        body.update(fields)
+        (self.env / "project.json").write_text(json.dumps(body))
 
-    def test_notes_survive_the_crossing(self):
-        self.assertEqual(
-            self.db.resolve("clickup", "identifier")["capabilities-board"]["note"],
-            "the board")
+    def test_a_project_that_says_nothing_reads_files(self):
+        records = S.open_records(self.env, self.globals)
+        self.assertEqual(records.mode, "files")
+        self.assertEqual(records.source, str(self.env))
+        self.assertEqual(records.get("clickup", "identifier", "flat-one"), "no-note")
 
-    def test_connections_are_decided_the_same_way(self):
-        for capability in ("clickup", "telegram"):
-            with self.subTest(capability=capability):
-                a = self.files.connections(capability)
-                b = self.db.connections(capability)
-                self.assertEqual(sorted(a), sorted(b))
-                for cid in a:
-                    self.assertEqual(a[cid]["value"], b[cid]["value"])
-                    self.assertEqual(a[cid]["allow_write"], b[cid]["allow_write"])
-                    self.assertEqual(a[cid]["enabled"], b[cid]["enabled"])
+    def test_a_project_declaring_files_reads_files(self):
+        self._declare(store="files")
+        self.assertEqual(S.open_records(self.env, self.globals).mode, "files")
 
-    def test_a_disabled_connection_is_dropped_by_both(self):
-        self.assertNotIn("legacy", self.files.connections("clickup"))
-        self.assertNotIn("legacy", self.db.connections("clickup"))
+    def test_a_project_declaring_a_database_is_refused(self):
+        for declared in ("db", "maybe"):
+            with self.subTest(declared=declared):
+                self._declare(store=declared)
+                with self.assertRaises(S.StoreError) as caught:
+                    S.open_records(self.env, self.globals)
+                self.assertEqual(caught.exception.slug, "bad_store_mode")
 
-    def test_documents_answer_to_the_same_keys_with_the_same_bodies(self):
-        self.assertEqual(sorted(self.files.document_keys("telegram")),
-                         sorted(self.db.document_keys("telegram")))
-        for key in self.files.document_keys("telegram"):
-            with self.subTest(key=key):
-                self.assertEqual(self.files.document_read("telegram", key)["body"],
-                                 self.db.document_read("telegram", key)["body"])
+    def test_project_only_leaves_the_global_scope_out(self):
+        (self.globals / "clickup").mkdir(parents=True)
+        (self.globals / "clickup" / "identifiers.json").write_text(json.dumps(
+            {"global-only": {"value": "hidden", "note": ""}}))
+        self.assertIn("global-only", S.open_records(self.env, self.globals)
+                      .resolve("clickup", "identifier"))
+        self.assertNotIn("global-only", S.open_records(self.env, self.globals,
+                                                       project_only=True)
+                         .resolve("clickup", "identifier"))
 
-    def test_a_document_hashes_alike_on_both_sides(self):
-        """The hash an edit is checked against must not depend on where the
-        text was kept, or a checkout taken in one mode could never be put back
-        in the other."""
-        for key in self.files.document_keys("telegram"):
-            with self.subTest(key=key):
-                self.assertEqual(self.files.document_read("telegram", key)["hash"],
-                                 self.db.document_read("telegram", key)["hash"])
-
-    def test_only_the_store_hands_out_nothing_to_open(self):
-        self.assertIsNotNone(self.files.document_path("telegram", "context"))
-        self.assertIsNone(self.db.document_path("telegram", "context"))
-
-    def test_project_only_store_does_not_inherit_global_entries(self):
-        self.store.config_set("clickup", "identifier", "global-only", "hidden",
-                              ("global", ""))
-        project_only = S.StoreRecords(
-            self.store, S.Scopes(project=self.slug, include_global=False),
-            ("project", self.slug))
-        self.assertNotIn("global-only", project_only.resolve("clickup", "identifier"))
+    def test_the_tier_keeps_no_database(self):
+        for name in ("Store", "SQLiteStore", "PostgresStore", "StoreRecords",
+                     "open_store", "records_mode", "default_store_path",
+                     "read_store_setting", "find_store_setting", "store_setting_url"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(S, name))
+        self.assertNotIn("sqlite3", (Path(S.__file__)).read_text())
 
 
 if __name__ == "__main__":

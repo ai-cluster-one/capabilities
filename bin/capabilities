@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "psycopg2-binary>=2.9",
+#     "capabilities-contract==0.4.0",
 # ]
 # ///
 """
@@ -54,11 +54,12 @@ ENVIRONMENT
                        refuses allow, disable, enable, inherit, init,
                        quarantine, relabel, set, store set and store unset.
                        doctor reports it. Unset, `0` or `false` leaves it off.
-  AGENTKIT_STORE_URL, CAPABILITIES_STORE_URL
-                       the store the manager's records use in database mode,
-                       overriding this machine's store setting, the first one
-                       set winning (see STORE VERBS); for tests and
-                       development sessions.
+  AGENTKIT_DB_URL, AGENTKIT_DB_HOST, AGENTKIT_DB_PORT, AGENTKIT_DB_NAME,
+  AGENTKIT_DB_USER, AGENTKIT_DB_PASSWORD, AGENTKIT_DB_SCHEMA,
+  AGENTKIT_DB_SSLMODE, AGENTKIT_DB_SSLROOTCERT
+                       the environment level of the database cascade, below a
+                       project's .env.local/.env and above the machine's store
+                       setting (see STORE VERBS).
 
 PROJECT PATH VERB
   path --json [--identity]
@@ -71,10 +72,10 @@ PROJECT PATH VERB
         bound project whose ContextKit cannot answer is an error.
 
 THE PROJECT ENVELOPE
-  Every project file the system owns — identity, the state guard, and each
-  file-mode capability's identifiers, references, connections and state — sits
-  in one envelope. Database-backed live records, including the gate, sit in the
-  configured store. In a project bound by `.contextkit/config.toml` its location
+  Every project file the system owns — identity, the gate, the state guard,
+  and each capability's identifiers, references, connections, settings and
+  state — sits in one envelope; records are kept in files only. In a project
+  bound by `.contextkit/config.toml` its location
   belongs to ContextKit and is asked for, never assumed or stored:
   `contextkit path capabilities`, once per invocation. Without that binding the
   envelope is <root>/capabilities and the project depends on nothing outside
@@ -249,73 +250,83 @@ MACHINE VERBS
         installed changed payloads, and update the manager when it changed.
 
 STORE VERBS
-  The machine's store setting is the one store pointer, shared by every tool
-  of the family on this machine: the file $XDG_CONFIG_HOME/agentkit/store.json
-  (~/.config/agentkit/store.json when XDG_CONFIG_HOME is unset), an
-  agentkit.store.v1 document holding host, port, database, user, password,
-  sslmode, an optional sslrootcert and an optional db_schema (default
-  agentkit), at mode 0600. Its format is SHEBANG.md's "The store setting".
-  The manager's own records in database mode resolve their store from
-  AGENTKIT_STORE_URL, else CAPABILITIES_STORE_URL, else this setting, else
-  the local default. A capability reads the setting through the store tier's
-  read_store_setting(), which writes nothing. While the file is absent the
-  setting is read from the legacy pair $XDG_CONFIG_HOME/capabilities/store.json
-  and CAPABILITIES_STORE_PASSWORD in
-  $XDG_CONFIG_HOME/capabilities/credentials.env, which nothing writes.
+  Which PostgreSQL a project's capabilities keep their tables in is resolved
+  per project through one cascade, by the shared database library
+  capabilities-contract (capabilities_contract.db) and nowhere else; the
+  first level that answers is used whole:
+    project      the AGENTKIT_DB_* keys in the project's .env.local and .env,
+                 .env.local winning key by key;
+    environment  the same keys in the process environment;
+    machine      this machine's store setting file,
+                 $XDG_CONFIG_HOME/agentkit/store.json
+                 (~/.config/agentkit/store.json when XDG_CONFIG_HOME is unset),
+                 an agentkit.store.v1 document holding host, port, database,
+                 user, password, sslmode, an optional sslrootcert and an
+                 optional db_schema (default agentkit), at mode 0600. Its
+                 format is SHEBANG.md's "The store setting".
+  Within the project or environment level AGENTKIT_DB_URL, a postgresql://
+  URL, wins over that level's separate keys; AGENTKIT_DB_SCHEMA applies
+  beside it. Records (the gate, connections, settings, identifiers,
+  references) are files and never in the database; the database holds only
+  the tables capabilities migrate for themselves. These verbs never create a
+  table.
   store set --host H --database D --user U [--port P]
             [--sslmode require|verify-ca|verify-full|disable]
             [--sslrootcert PATH|system] [--schema NAME]
             (--password-stdin | --password-file PATH | --password-env KEY)
-        Record the Postgres the machine's store lives in, writing the setting
-        file whole (a temporary file renamed over it, mode 0600) under the
-        manager's lock. A file declaring a format version this manager does
-        not know is left as it is (exit 6 store_setting_too_new). The legacy
-        pair is left as it is. The password comes from stdin, a file or the
-        named environment variable, never from argv; a --password flag is
-        refused. --port defaults to 5432; --sslmode defaults to verify-full
-        with --sslrootcert and to require without it; disable is admitted only
-        for a local host (a Unix socket directory, localhost or a loopback
-        address), and disable elsewhere, allow and prefer are refused (exit 6
-        sslmode_too_weak). --schema names the schema the setting binds: a
-        lowercase identifier, never public, information_schema or pg_* (exit
-        6 bad_schema_name); without it the file names none and binds agentkit.
-        Exit 4 under the read-only switch. Answers as `store show` does, with
+        Write the machine level: the setting file whole (a temporary file
+        renamed over it, mode 0600) under the manager's lock, in the format
+        the library reads, which is proven before the file is replaced. A
+        file declaring a format version this manager does not know is left
+        as it is (exit 6 store_setting_too_new). The password comes from
+        stdin, a file or the named environment variable, never from argv; a
+        --password flag is refused. --port defaults to 5432; --sslmode
+        defaults to verify-full with --sslrootcert and to require without it;
+        disable is admitted only for a local host (a Unix socket directory,
+        localhost or a loopback address), and disable elsewhere, allow and
+        prefer are refused (exit 6 sslmode_too_weak). --schema names the
+        schema the setting binds: a lowercase identifier, never public,
+        information_schema or pg_* (exit 6 bad_schema_name); without it the
+        file names none and binds agentkit. Exit 4 under the read-only
+        switch. Answers as `store show` does for the current project, with
         changed.
-  store show [--json]
-        The setting and where each value came from, with no secret: the
-        password's presence only. path is the setting file's absolute path
-        and exists whether it is there; a value's source is that path, legacy
-        when it was read from the legacy pair, and default for a db_schema the
-        setting names none of. in_force names the store the manager's records
-        use and what decided it (AGENTKIT_STORE_URL, CAPABILITIES_STORE_URL,
-        setting, default); overridden_by names the variable while it
-        overrides a setting. JSON {configured, path, exists, setting {<field>
-        {value, source}} | null, password {present, source}, in_force {store,
-        source}, overridden_by}. Output is always JSON, so --json changes
-        nothing.
-  store doctor [--json]
-        Prove the setting: a TLS connection works, reporting the server
-        version and the negotiated TLS; a plain-text connection to the
-        same server is refused, so a pg_hba.conf that lets plain text back in
-        is noticed; and the role may use the setting's schema - USAGE and
-        CREATE on it when it exists, CREATE on the database when it does not
-        yet, since the first migration creates it. A store on a local host is
-        not reached across a network: its plain-text check is skipped
-        (skipped true), and with sslmode disable a working connection without
-        TLS passes the tls check. Never prints the password. JSON {ok, store,
-        sslmode, db_schema, checks {tls {ok, server_version?, tls {version,
-        cipher}?, reason?, error?}, plain_text_refused {ok, reason,
-        skipped?}, schema {ok, name, exists, reason}}, overridden_by}. Exit 0
-        when all three hold, 7 when any fails, 3 when the machine has no
-        store setting.
+  store show [--project PATH] [--json]
+        Every level of the cascade for the current project, or for the
+        project at PATH: what each level holds, its secrets redacted (a
+        password as ***, a URL as the parameters libpq reads from it, never
+        its text), the files or variables its values came from, and which
+        level is in force. Reads only. JSON {configured, project, in_force,
+        setting, error, levels {project {asked, answers, setting, error},
+        environment {answers, setting, error}, machine {path, exists,
+        answers, setting, error}}}: setting is the library's report of the
+        level in force {level, sources, schema, url{...} | host, port,
+        database, user, sslmode, sslrootcert, password}; error {code,
+        message, hint} names a level the library refuses. Output is always
+        JSON, so --json changes nothing.
+  store doctor [--project PATH] [--json]
+        Prove the database in force for the current project, or for the
+        project at PATH, whichever level answered: a TLS connection works,
+        reporting the server version and the negotiated TLS; a plain-text
+        connection to the same server is refused, so a pg_hba.conf that lets
+        plain text back in is noticed; and the role may use the setting's
+        schema - USAGE and CREATE on it when it exists, CREATE on the
+        database when it does not yet, since the first migration creates it.
+        A database on a local host is not reached across a network: its
+        plain-text check is skipped (skipped true), and with sslmode disable
+        a working connection without TLS passes the tls check. Never prints
+        a secret. JSON {ok, project, in_force, setting, levels, sslmode,
+        db_schema, checks {tls {ok, server_version?, tls {version, cipher}?,
+        reason?, error?}, plain_text_refused {ok, reason, skipped?}, schema
+        {ok, name, exists, reason}}}, setting and levels as `store show`.
+        Exit 0 when all three hold, 7 when any fails, 3 no_store_setting when
+        no level answers, 6 with the library's code when the level in force
+        is refused.
   store unset
-        Remove the setting file, and the legacy pair's setting file and
-        password line, keeping every other key in the credentials tier, under
-        the manager's lock, so the machine's records resolve as they did
-        before any setting. A file of a format version this manager does not
-        know is left as it is (exit 6 store_setting_too_new). Exit 4 under the
-        read-only switch. Answers as `store show` does, with changed; removing
-        no setting is not an error.
+        Remove the machine level's setting file under the manager's lock. A
+        file of a format version this manager does not know is left as it is
+        (exit 6 store_setting_too_new). Exit 4 under the read-only switch.
+        Answers as `store show` does, with changed; removing no setting is
+        not an error.
 
 DEVELOPMENT VERBS
   dev start <name> [--project PATH | --no-project] [--source ID-OR-PATH]
@@ -392,14 +403,11 @@ PROJECT VERBS (run inside a consuming project)
         A legacy project `.capabilities/` envelope is preflighted and migrated
         into visible `capabilities/`; content conflicts refuse before writes.
   relabel <slug>
-        Give this project a new label, keeping the id its records are scoped
-        by. The label lives in the project identity and in the store registry,
-        so the rename writes both; registration alone refuses a changed label
-        because a project must not quietly answer to a second name. Records
-        are not moved and are not re-scoped — they never referred to the label.
-        Refused when another project already holds the label. A project that
-        has never opened the store simply has one side to write. Renaming the
-        directory is unrelated and needs no command. Idempotent.
+        Give this project a new label, keeping its id: the label lives in the
+        project identity, and that file is the one write. Records are not
+        moved and are not re-scoped — they never referred to the label; no
+        database is touched. Renaming the directory is unrelated and needs no
+        command. Idempotent.
   context --claude|--codex|--fragment
         Compose the session injection from the gate + snapshots + project
         envelopes. --fragment prints the manager-owned Markdown block without
@@ -577,12 +585,6 @@ LEGACY_DEV_SESSION_SCHEMA = "capabilities.dev.session.v1"
 DEV_STATE_ROOT = _STATE_HOME / "capabilities" / "dev"
 DEV_DATA_ROOT = _DATA_HOME / "capabilities" / "dev"
 MANAGER_MUTATION_LOCK = _STATE_HOME / "capabilities" / "manager-mutation.lock"
-# Where records live when nothing overrides it. Operational tracking always
-# goes to a store — a capability inventing its own database for a queue or a
-# ledger is an accident of that being easy, not a decision — so the store has
-# to exist without anyone having configured one. The manager answers for the
-# location at use time and never records it, as it does for the envelope.
-DEFAULT_STORE_PATH = _STATE_HOME / "capabilities" / "store.db"
 _MANAGER_MUTATION_DEPTH = 0
 DEV_MANAGED_ENV_KEYS = {
     "HOME", "PATH", "CAPABILITIES_HOME", "CAPABILITIES_BIN",
@@ -596,8 +598,7 @@ PROJECT_CAPABILITIES_REL = Path("capabilities")
 LEGACY_PROJECT_CAPABILITIES_REL = Path(".capabilities")
 GLOBAL_GATE_FILE = _CONFIG_HOME / "capabilities" / "settings.json"
 # The machine ceiling above both policy scopes. It is this machine's alone, so
-# it is a local file and never a records-store row: a global scope kept in a
-# store can be shared between machines.
+# it is a local file of its own, apart from the global policy scope.
 MACHINE_FILE = _CONFIG_HOME / "capabilities" / "machine.json"
 MACHINE_SCHEMA = "capabilities.machine.v1"
 MACHINE_STATES = ("allowed", "quarantined")
@@ -803,50 +804,12 @@ def _read_only_report() -> dict | None:
             "refused_here": list(READ_ONLY_REFUSED_VERBS)}
 
 
-def _store_found() -> tuple[dict | None, dict]:
-    """This machine's store setting, read through the store tier, or None, and
-    where the tier found it."""
-    store = _store_module()
-    try:
-        return store.find_store_setting(_CONFIG_HOME)
-    except store.StoreError as exc:
-        _die(6, exc.slug, exc.message, exc.hint)
-
-
-def _store_setting() -> dict | None:
-    """This machine's store setting, read through the store tier, or None."""
-    return _store_found()[0]
-
-
-def _store_resolution() -> tuple[str, str]:
-    """The store the manager's records use in database mode, and what decided:
-    `AGENTKIT_STORE_URL`, else `CAPABILITIES_STORE_URL`, else this machine's
-    store setting, else the local default. The returned URL may carry the
-    setting's password."""
-    configured, variable = _store_module().store_url_override()
-    if configured:
-        return configured, variable
-    setting = _store_setting()
-    if setting is not None:
-        return _store_module().store_setting_url(setting), "setting"
-    return str(DEFAULT_STORE_PATH), "default"
-
-
-def _setting_store_url() -> str | None:
-    """The URL to hand the store tier when an override or the setting decides,
-    else None, which leaves the tier's own resolution of the default as it is."""
-    url, source = _store_resolution()
-    return url if source != "default" else None
-
-
 def _records_for(root: Path, *, project_only: bool = False):
     """The records surface for one project, with manager errors normalized."""
     store = _store_module()
     envelope = _project_capabilities_dir(root)
     try:
-        url = _setting_store_url() if store.records_mode(envelope)[0] == "db" else None
-        return store.open_records(envelope, _CONFIG_HOME, url=url,
-                                  project_only=project_only)
+        return store.open_records(envelope, _CONFIG_HOME, project_only=project_only)
     except store.StoreError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
 
@@ -948,9 +911,7 @@ def _project_root() -> Path | None:
             return None
         legacy = d / LEGACY_PROJECT_CAPABILITIES_REL
         # Either marker names a project. `settings.json` is the gate and
-        # `project.json` the identity; a project keeping its records in the
-        # store needs the second and may eventually stop carrying the first,
-        # so neither is required while both worlds are in use.
+        # `project.json` the identity; either one alone is enough.
         if ((d / PROJECT_CAPABILITIES_REL / "settings.json").is_file()
                 or (d / PROJECT_CAPABILITIES_REL / PROJECT_IDENTITY_REL).is_file()
                 or (d / CONTEXTKIT_CONFIG_REL).is_file()
@@ -4435,11 +4396,6 @@ def cmd_dev_run(session_id: str, capability: str, args: list[str],
             "CAPABILITIES_DEV_EXECUTION": "project",
             **_project_id_handoff(project),
         })
-        if registry_mode == "db":
-            env["CAPABILITIES_STORE_URL"] = (
-                os.environ.get("CAPABILITIES_STORE_URL")
-                or str(DEFAULT_STORE_PATH)
-            )
         if project_only:
             env["CAPABILITIES_RECORDS_PROJECT_ONLY"] = "1"
         proc = subprocess.run(
@@ -5730,9 +5686,9 @@ def _ensure_envelope(root: Path) -> list[str]:
         existing = gi.read_text() if gi.exists() else ""
         gi.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n")
                       + GITIGNORE_BODY)
-    identity = _ensure_project_identity(capdir, root)
+    _ensure_project_identity(capdir, root)
     gate_file = capdir / "settings.json"
-    if identity.get("store", "files") == "files" and not gate_file.exists():
+    if not gate_file.exists():
         _write_json(gate_file, {"capabilities": {}})
     return migrated
 
@@ -5740,11 +5696,8 @@ def _ensure_envelope(root: Path) -> list[str]:
 def _ensure_project_identity(capdir: Path, root: Path) -> dict:
     """Who this project is, minted once and committed.
 
-    Two things cannot live in a shared store: where the store is, and which row
-    the asker is. The first is an environment variable; this is the second. The
-    id travels with the repository, so a laptop and a server resolve to the same
-    project without being told, and a stranger claiming a held label is refused
-    rather than admitted into someone else's rows."""
+    The id travels with the repository, so a laptop and a server resolve to the
+    same project without being told."""
     identity_file = capdir / PROJECT_IDENTITY_REL
     if identity_file.is_file():
         identity = _read_json(identity_file) or {}
@@ -5784,18 +5737,12 @@ def _default_project_slug(root: Path) -> str:
 
 
 def cmd_relabel(slug: str) -> None:
-    """Give this project a new label, keeping the id its rows are scoped by.
+    """Give this project a new label, keeping its id.
 
-    The label is carried in two places — the project's own identity file and
-    the store's registry — so a rename is one act with two writes, and doing
-    only one of them is the state this verb exists to leave nobody in: the
-    registry refuses a label it did not issue, and the project can no longer
-    say who it is. The manager performs it because it is the writer of project
-    identity and of migration (DOCTRINE rule 15).
-
-    Nothing else moves. Rows were never scoped by the label, and the directory
-    on disk was never the label either, so renaming the directory remains a
-    thing that needs no command at all.
+    The label lives in the project's identity file and nowhere else, so the
+    rename is that one write. Records were never scoped by the label, and the
+    directory on disk was never the label either, so renaming the directory
+    remains a thing that needs no command at all.
     """
     root = _require_project()
     identity = _read_json(_envelope_home(root) / PROJECT_IDENTITY_REL)
@@ -5804,59 +5751,18 @@ def cmd_relabel(slug: str) -> None:
         _die(6, "no_project_identity",
              f"{_envelope_home(root) / PROJECT_IDENTITY_REL} carries no project id",
              "run `capabilities init` in the project to mint its identity")
-    store_module = _store_module()
-    was = identity.get("slug")
-    registry: dict = {"registered": False, "previous": was}
-    store = None
+    store = _store_module()
     try:
-        store = store_module.open_store(_setting_store_url())
-        # The store is opened, never prepared, by whoever opens it first, and on
-        # a machine where no service has ever prepared it the registry has no
-        # tables to ask about — so asking raises the driver's own error rather
-        # than answering. The migration is the manager's to write (DOCTRINE rule
-        # 15) and is the same idempotent one every first writer of `projects`
-        # runs, so it is run here: then "this project holds no label" is read
-        # from a registry that exists, rather than guessed from an exception a
-        # locked or unreadable store raises in the same words.
-        store.migrate()
-        registry["previous"] = store.project_relabel(project_id, slug)
-        registry["registered"] = True
-    except store_module.StoreError as exc:
-        # A project that has never opened the store holds no row to move; that
-        # is not a failed rename, it is a rename with one side to write. Any
-        # other refusal is the store declining, and it is passed on as given.
-        if exc.slug != "unknown_project":
-            _die(6, exc.slug, exc.message, exc.hint)
-    finally:
-        if store is not None:
-            store.close()
+        store._store_check("slug", slug, store.CAPABILITY_RE)
+    except store.StoreError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+    was = identity.get("slug")
     identity["slug"] = slug
     _write_json(_envelope_home(root) / PROJECT_IDENTITY_REL, identity)
     _emit({"ok": True, "project": str(root), "id": project_id,
-           "slug": slug, "previous_slug": registry["previous"],
+           "slug": slug, "previous_slug": was,
            "identity": str(_envelope_home(root) / PROJECT_IDENTITY_REL),
-           "store_registry": "relabelled" if registry["registered"] else "no row to move",
-           "unchanged": registry["previous"] == slug})
-
-
-def _shown_store(url: str) -> str:
-    """A store URL as a report may print it: no credential, no parameters. The
-    credential ends at the last `@`, so one an override carries unencoded is
-    still dropped whole."""
-    if "://" not in url:
-        return url
-    scheme, rest = url.split("://", 1)
-    if "@" in rest:
-        rest = rest.rsplit("@", 1)[1]
-    return f"{scheme}://{rest.split('?', 1)[0]}"
-
-
-def cmd_path_store() -> None:
-    """Where records go, and what decided. A store URL may carry a password, so
-    the credential is stripped rather than printed: this is a report, and a
-    report is not a place a secret appears."""
-    url, source = _store_resolution()
-    _emit({"store": _shown_store(url), "source": source})
+           "unchanged": was == slug})
 
 
 # ---------------------------------------------------------------- the store setting
@@ -5976,11 +5882,112 @@ def _atomic_write_secret(path: Path, body: str) -> None:
     path.chmod(0o600)
 
 
+def _db_module():
+    """The shared database library, which alone resolves which database a
+    project uses. Imported on use, so every verb that never asks runs without
+    it; the script header pins it."""
+    try:
+        from capabilities_contract import db
+    except ImportError:
+        _die(5, "driver_missing",
+             "the shared database library capabilities-contract is not installed",
+             "run the manager through its own script header, which pins it")
+    return db
+
+
+def _db_error(exc) -> dict:
+    return {"code": exc.slug, "message": exc.message, "hint": exc.hint}
+
+
+@contextmanager
+def _db_environment_cleared():
+    """The process environment without the cascade's keys, for the span of one
+    question asked of a lower level."""
+    db = _db_module()
+    held = {key: os.environ.pop(key) for key in db.KEYS if key in os.environ}
+    try:
+        yield
+    finally:
+        os.environ.update(held)
+
+
+def _db_level(ask) -> tuple[object | None, dict | None]:
+    """One level's answer: its setting, or None when it does not answer, or the
+    library's refusal of it."""
+    db = _db_module()
+    try:
+        return ask(), None
+    except db.DbError as exc:
+        if exc.slug == "store_not_configured":
+            return None, None
+        return None, _db_error(exc)
+
+
+def _db_store_project(project: str | None) -> Path | None:
+    """The project the store verbs answer for: --project PATH, else the current
+    project, else none, in which case the project level is not asked."""
+    if project is None:
+        return _project_root()
+    root = Path(project).expanduser().resolve()
+    if not root.is_dir():
+        _die(6, "input", f"--project {project} is not a directory")
+    return root
+
+
+def _store_report(root: Path | None) -> tuple[dict, object | None, dict | None]:
+    """`store show`: every level of the cascade for `root`, as the library
+    answers each, secrets redacted, and the level in force. Each lower level is
+    asked on its own - the levels above it held out of the question - so a
+    level is reported whether or not it is the one in force; which one is in
+    force is the library's own answer for the project."""
+    db = _db_module()
+    with tempfile.TemporaryDirectory(prefix="capabilities-store-") as empty:
+        levels: dict = {}
+        if root is not None:
+            with _db_environment_cleared():
+                found, error = _db_level(lambda: db.resolve_setting(root, config_home=empty))
+            levels["project"] = {"asked": True, "answers": found is not None or error is not None,
+                                 "setting": found.report() if found else None, "error": error}
+        else:
+            levels["project"] = {"asked": False, "answers": False, "setting": None,
+                                 "error": None}
+        found, error = _db_level(lambda: db.resolve_setting(None, config_home=empty))
+        levels["environment"] = {"answers": found is not None or error is not None,
+                                 "setting": found.report() if found else None, "error": error}
+    path = db.setting_path()
+    with _db_environment_cleared():
+        found, error = _db_level(lambda: db.resolve_setting(None))
+    levels["machine"] = {"path": str(path), "exists": path.exists(),
+                         "answers": found is not None or error is not None,
+                         "setting": found.report() if found else None, "error": error}
+    in_force, refused = _db_level(lambda: db.resolve_setting(root))
+    report = {"configured": in_force is not None,
+              "project": str(root) if root is not None else None,
+              "in_force": in_force.level if in_force is not None else None,
+              "setting": in_force.report() if in_force is not None else None,
+              "error": refused, "levels": levels}
+    if refused is not None:
+        report["in_force"] = next((level for level in db.LEVELS
+                                   if levels[level]["answers"]), None)
+    return report, in_force, refused
+
+
+def _setting_file_version(path: Path) -> str | None:
+    """The format version the file at `path` declares, or None when it is
+    absent or declares none. A writer reads this before it replaces the file,
+    and never replaces a version it does not know."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    version = data.get("schema") if isinstance(data, dict) else None
+    return version if isinstance(version, str) else None
+
+
 def _refuse_unknown_store_version(path: Path) -> None:
     """A writer never replaces a setting whose format version it does not know."""
-    store = _store_module()
-    version = store.store_setting_version(path)
-    if version is not None and version != store.STORE_SETTING_FORMAT:
+    version = _setting_file_version(path)
+    if version is not None and version != _db_module().SETTING_FORMAT:
         _die(6, "store_setting_too_new",
              f"{path} is a {version} setting, which this manager does not know, "
              "so it is left as it is",
@@ -5988,17 +5995,35 @@ def _refuse_unknown_store_version(path: Path) -> None:
              "tool that wrote it")
 
 
-def _write_store_setting_locked(setting: dict, password: str,
-                                schema: str | None) -> bool:
-    """Write the family file whole: the lowest format version that expresses
-    the setting, naming `schema` only when one is given."""
-    store = _store_module()
-    path = store.store_setting_path(_CONFIG_HOME)
+def _store_setting_document(values: dict, schema: str | None) -> dict:
+    """The machine file `store set` writes, without its password, proven
+    readable by the library before anything is replaced: it is written to a
+    scratch config home and read back there through the machine level alone, so
+    a value the library would refuse is refused here, in the library's words."""
+    db = _db_module()
+    document = {"schema": db.SETTING_FORMAT, **values}
+    if isinstance(document.get("port"), str) and document["port"].isdigit():
+        document["port"] = int(document["port"])
+    document.setdefault("port", 5432)
+    if schema is not None:
+        document["db_schema"] = schema
+    with tempfile.TemporaryDirectory(prefix="capabilities-store-") as scratch:
+        probe = db.setting_path(scratch)
+        probe.parent.mkdir(parents=True)
+        probe.write_text(json.dumps(document))
+        with _db_environment_cleared():
+            try:
+                db.resolve_setting(None, config_home=scratch)
+            except db.DbError as exc:
+                message = exc.message.replace(str(probe), "the setting")
+                _die(6, exc.slug, message, exc.hint)
+    return document
+
+
+def _write_store_setting_locked(document: dict) -> bool:
+    """Write the machine file whole."""
+    path = _db_module().setting_path()
     _refuse_unknown_store_version(path)
-    try:
-        document = store.store_setting_document(setting, password, schema)
-    except store.StoreError as exc:
-        _die(6, exc.slug, exc.message, exc.hint)
     try:
         current = json.loads(path.read_text())
     except (OSError, ValueError):
@@ -6009,28 +6034,11 @@ def _write_store_setting_locked(setting: dict, password: str,
 
 
 def _unset_store_setting_locked() -> bool:
-    """Remove the family file and the legacy pair's setting file and password
-    line, keeping every other key in the credentials tier, so the legacy
-    fallback cannot bring the setting back. True when any was there."""
-    store = _store_module()
-    path = store.store_setting_path(_CONFIG_HOME)
+    """Remove the machine file. True when it was there."""
+    path = _db_module().setting_path()
     _refuse_unknown_store_version(path)
-    setting_file, password_file = store.store_setting_files(_CONFIG_HOME)
-    changed = path.exists() or setting_file.exists()
+    changed = path.exists()
     path.unlink(missing_ok=True)
-    setting_file.unlink(missing_ok=True)
-    prefix = store.STORE_PASSWORD_KEY + "="
-    try:
-        lines = password_file.read_text().splitlines()
-    except FileNotFoundError:
-        return changed
-    kept = [line for line in lines if not line.startswith(prefix)]
-    if len(kept) != len(lines):
-        changed = True
-        if any(line.strip() for line in kept):
-            _atomic_write_secret(password_file, "\n".join(kept) + "\n")
-        else:
-            password_file.unlink()
     return changed
 
 
@@ -6045,39 +6053,12 @@ def _with_store_lock(write):
         return write()
 
 
-def _write_store_setting(setting: dict, password: str, schema: str | None = None) -> bool:
-    """Write the setting and its password atomically under the manager mutation lock."""
-    return _with_store_lock(lambda: _write_store_setting_locked(setting, password, schema))
-
-
-def _store_report() -> dict:
-    """`store show`: the setting, where each value came from, no secret."""
-    store = _store_module()
-    setting, where = _store_found()
-    origin = where["path"] if where["read"] == "family" else "legacy"
-    url, source = _store_resolution()
-    report: dict = {"configured": setting is not None,
-                    "path": where["path"], "exists": where["exists"], "setting": None,
-                    "password": {"present": False, "source": None},
-                    "in_force": {"store": _shown_store(url), "source": source},
-                    "overridden_by": None}
-    if setting is not None:
-        report["setting"] = {
-            field: {"value": setting.get(field), "source": origin}
-            for field in store.STORE_SETTING_FIELDS if setting.get(field) is not None}
-        report["setting"][store.STORE_SCHEMA_FIELD] = {
-            "value": setting[store.STORE_SCHEMA_FIELD],
-            "source": origin if where["db_schema_named"] else "default"}
-        if setting.get("password"):
-            report["password"] = {"present": True, "source": origin}
-        if source in store.STORE_URL_OVERRIDES:
-            report["overridden_by"] = source
-    return report
+def cmd_store_show(project: str | None) -> None:
+    _emit(_store_report(_db_store_project(project))[0])
 
 
 def cmd_store_set(args: list[str]) -> None:
     _read_only_gate("store set")
-    store = _store_module()
     values, source = _store_set_args(args)
     if "sslmode" not in values:
         values["sslmode"] = "verify-full" if values.get("sslrootcert") else "require"
@@ -6088,49 +6069,63 @@ def cmd_store_set(args: list[str]) -> None:
             _die(6, "bad_store_setting", f"--sslrootcert {root} is not a readable file")
         values["sslrootcert"] = str(path)
     schema = values.pop("db_schema", None)
-    try:
-        setting = store.check_store_setting(values)
-        if schema is not None:
-            schema = store.check_store_schema_name(schema)
-    except store.StoreError as exc:
-        _die(6, exc.slug, exc.message, exc.hint)
-    password = _store_password(source)
-    changed = _write_store_setting(setting, password, schema)
-    _emit({**_store_report(), "changed": changed})
+    document = _store_setting_document(values, schema)
+    document["password"] = _store_password(source)
+    changed = _with_store_lock(lambda: _write_store_setting_locked(document))
+    _emit({**_store_report(_project_root())[0], "changed": changed})
 
 
 def cmd_store_unset() -> None:
     _read_only_gate("store unset")
     changed = _with_store_lock(_unset_store_setting_locked)
-    _emit({**_store_report(), "changed": changed})
+    _emit({**_store_report(_project_root())[0], "changed": changed})
 
 
-def _store_scrub(text: str, setting: dict) -> str:
-    password = setting.get("password")
+def _setting_secrets(setting) -> list[str]:
+    """The secret values a setting carries, so an error text never shows one."""
+    secrets = [setting.password] if setting.password else []
+    if setting.url is not None:
+        try:
+            from psycopg.conninfo import conninfo_to_dict
+            secrets += [str(value) for key, value in conninfo_to_dict(setting.url).items()
+                        if key in ("password", "sslpassword") and value]
+        except Exception:
+            pass
+        secrets.append(setting.url)
+    return secrets
+
+
+def _store_scrub(text, setting) -> str:
     text = " ".join(str(text).split())
-    return text.replace(password, "***") if password else text
+    for secret in sorted(_setting_secrets(setting), key=len, reverse=True):
+        text = text.replace(secret, "***")
+    return text
 
 
-def _store_probe(setting: dict, sslmode: str | None = None) -> tuple[dict | None, str | None]:
+def _store_connect(setting, sslmode: str | None = None):
+    """One connection with the setting, `sslmode` replacing its own, through
+    the arguments the library connects with."""
+    import psycopg
+    kwargs = setting.connect_kwargs()
+    if sslmode is not None:
+        kwargs["sslmode"] = sslmode
+    return psycopg.connect(**kwargs, application_name="capabilities", connect_timeout=10)
+
+
+def _store_probe(setting, sslmode: str | None = None) -> tuple[dict | None, str | None]:
     """Open one connection with the setting, `sslmode` replacing its own, and
     say what the server negotiated; or the reason it was not opened."""
-    store = _store_module()
+    import psycopg
     try:
-        import psycopg2
-    except ImportError:
-        _die(5, "driver_missing", "psycopg2 is not installed",
-             "reinstall or update the capabilities manager")
-    try:
-        conn = psycopg2.connect(store.store_setting_url(setting, sslmode=sslmode),
-                                connect_timeout=10)
-    except psycopg2.Error as exc:
+        conn = _store_connect(setting, sslmode)
+    except psycopg.Error as exc:
         return None, _store_scrub(exc, setting)
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT current_setting('server_version'), s.ssl, s.version, "
                         "s.cipher FROM pg_stat_ssl s WHERE s.pid = pg_backend_pid()")
             row = cur.fetchone()
-    except psycopg2.Error as exc:
+    except psycopg.Error as exc:
         return {}, _store_scrub(exc, setting)
     finally:
         conn.close()
@@ -6140,17 +6135,16 @@ def _store_probe(setting: dict, sslmode: str | None = None) -> tuple[dict | None
             "tls": {"version": row[2], "cipher": row[3]}}, None
 
 
-def _store_schema_check(setting: dict) -> dict:
+def _store_schema_check(setting) -> dict:
     """Whether the setting's role may use its schema: USAGE and CREATE on it
     when it exists, CREATE on the database when it does not yet, because the
     first migration creates it there."""
-    import psycopg2
-    name = setting["db_schema"]
+    import psycopg
+    name = setting.schema
     out = {"ok": False, "name": name, "exists": None}
     try:
-        conn = psycopg2.connect(_store_module().store_setting_url(setting),
-                                connect_timeout=10)
-    except psycopg2.Error as exc:
+        conn = _store_connect(setting)
+    except psycopg.Error as exc:
         out["reason"] = f"not checked: {_store_scrub(exc, setting)}"
         return out
     try:
@@ -6163,7 +6157,7 @@ def _store_schema_check(setting: dict) -> dict:
                 "FROM (SELECT 1) one LEFT JOIN pg_namespace n ON n.nspname = %s",
                 (name,))
             user, database, exists, usage, create, create_db = cur.fetchone()
-    except psycopg2.Error as exc:
+    except psycopg.Error as exc:
         out["reason"] = f"not checked: {_store_scrub(exc, setting)}"
         return out
     finally:
@@ -6183,17 +6177,34 @@ def _store_schema_check(setting: dict) -> dict:
     return out
 
 
-def cmd_store_doctor() -> None:
-    store = _store_module()
-    setting = _store_setting()
+def _host_is_local(host: object) -> bool:
+    """Whether the host is this machine, as the library judges it for the TLS
+    rule: a Unix socket directory, `localhost` or a loopback address."""
+    from capabilities_contract.db._setting import host_is_local
+    return host_is_local(host)
+
+
+def cmd_store_doctor(project: str | None) -> None:
+    root = _db_store_project(project)
+    report, setting, refused = _store_report(root)
+    if setting is None and refused is None:
+        _die(3, "no_store_setting",
+             "no database is configured for this project or this machine",
+             "set AGENTKIT_DB_URL or the AGENTKIT_DB_* keys in the project's .env.local "
+             "or the process environment, or record the machine's with "
+             "`capabilities store set`")
     if setting is None:
-        _die(3, "no_store_setting", "this machine has no store setting",
-             "record one with `capabilities store set`")
-    # A store on this machine is not reached across a network, so whether its
-    # server refuses plain text is not asked of it, and one set to sslmode
-    # disable is proven by a working connection rather than by TLS.
-    local = store.store_host_is_local(setting["host"])
-    plain_allowed = setting["sslmode"] == store.STORE_SSLMODE_LOCAL
+        _die(6, refused["code"], refused["message"], refused["hint"])
+    shown = setting.report()
+    params = shown.get("url") if setting.url is not None else shown
+    host = (params or {}).get("host")
+    sslmode = (params or {}).get("sslmode")
+    # A database on this machine is not reached across a network, so whether
+    # its server refuses plain text is not asked of it, and one set to sslmode
+    # disable is proven by a working connection rather than by TLS. A URL
+    # naming no host reaches the local socket.
+    local = True if not host else _host_is_local(host)
+    plain_allowed = sslmode == "disable"
     tls: dict = {"ok": False}
     found, error = _store_probe(setting)
     if found:
@@ -6201,7 +6212,7 @@ def cmd_store_doctor() -> None:
         tls["ok"] = (found["ssl"] or plain_allowed) and error is None
         if not found["ssl"]:
             if plain_allowed:
-                tls["reason"] = ("sslmode disable: a store on this machine is "
+                tls["reason"] = ("sslmode disable: a database on this machine is "
                                  "reached without TLS")
             else:
                 tls["error"] = "the connection was opened without TLS"
@@ -6209,8 +6220,8 @@ def cmd_store_doctor() -> None:
         tls["error"] = error
     if local:
         plain = {"ok": True, "skipped": True,
-                 "reason": "not checked: the store is on this machine "
-                           f"({setting['host']}), not reached across a network"}
+                 "reason": "not checked: the database is on this machine "
+                           f"({host or 'local socket'}), not reached across a network"}
     else:
         plain_found, plain_error = _store_probe(setting, sslmode="disable")
         if plain_found is not None:
@@ -6226,18 +6237,16 @@ def cmd_store_doctor() -> None:
     if tls["ok"]:
         schema = _store_schema_check(setting)
     else:
-        schema = {"ok": False, "name": setting["db_schema"], "exists": None,
-                  "reason": "not checked: no connection to the store"
-                  if plain_allowed else "not checked: no TLS connection to the store"}
-    _, source = _store_resolution()
-    report = {"ok": tls["ok"] and plain["ok"] and schema["ok"],
-              "store": _shown_store(store.store_setting_url(setting)),
-              "sslmode": setting["sslmode"],
-              "db_schema": setting["db_schema"],
-              "checks": {"tls": tls, "plain_text_refused": plain, "schema": schema},
-              "overridden_by": source if source in store.STORE_URL_OVERRIDES else None}
-    _emit(report)
-    if not report["ok"]:
+        schema = {"ok": False, "name": setting.schema, "exists": None,
+                  "reason": "not checked: no connection to the database"
+                  if plain_allowed else "not checked: no TLS connection to the database"}
+    out = {"ok": tls["ok"] and plain["ok"] and schema["ok"],
+           "project": report["project"], "in_force": report["in_force"],
+           "setting": report["setting"], "levels": report["levels"],
+           "sslmode": sslmode, "db_schema": setting.schema,
+           "checks": {"tls": tls, "plain_text_refused": plain, "schema": schema}}
+    _emit(out)
+    if not out["ok"]:
         sys.exit(7)
 
 
@@ -6278,9 +6287,7 @@ def _gate_scope(project: bool, global_: bool) -> str:
 
 
 def _gate_source(adapter, root: Path, scope: str) -> str:
-    """Name the exact policy file, or the database that owns the rows."""
-    if adapter.mode != "files":
-        return adapter.source
+    """Name the exact policy file."""
     return str(_gate_file(root) if scope == "project" else GLOBAL_GATE_FILE)
 
 
@@ -7178,8 +7185,7 @@ def cmd_doctor() -> None:
         records = None
         store = _store_module()
         try:
-            url = _setting_store_url() if store.records_mode(envelope)[0] == "db" else None
-            records = store.open_records(envelope, _CONFIG_HOME, url=url)
+            records = store.open_records(envelope, _CONFIG_HOME)
             _check_record_connections(findings, records, _installed())
         except store.StoreError as exc:
             findings.append(f"project: records unavailable: {exc.message}")
@@ -10184,8 +10190,6 @@ def main() -> None:
         cmd_list()
     elif cmd == "inventory":
         cmd_inventory(flag("--detail"), flag("--network"), pos)
-    elif cmd == "path" and pos and pos[0] == "store":
-        cmd_path_store()
     elif cmd == "store":
         sub = rest[0] if rest else None
         if sub == "set":
@@ -10195,14 +10199,28 @@ def main() -> None:
                 _die(6, "input", "store unset takes no arguments")
             cmd_store_unset()
         elif sub in ("show", "doctor"):
-            extra = [a for a in rest[1:] if a != "--json"]
+            project, extra, i = None, [], 1
+            while i < len(rest):
+                arg = rest[i]
+                if arg == "--json":
+                    i += 1
+                elif arg == "--project" and i + 1 < len(rest) and project is None:
+                    project, i = rest[i + 1], i + 2
+                elif arg.startswith("--project=") and project is None:
+                    project, i = arg.split("=", 1)[1], i + 1
+                else:
+                    extra.append(arg)
+                    i += 1
             if extra:
-                _die(6, "input", f"store {sub} takes only --json")
-            cmd_store_doctor() if sub == "doctor" else _emit(_store_report())
+                _die(6, "input", f"store {sub} takes only --project PATH and --json")
+            cmd_store_doctor(project) if sub == "doctor" else cmd_store_show(project)
         else:
             _die(6, "input", "store needs a subcommand: set, show, doctor or unset",
                  "run `capabilities help`")
     elif cmd == "path":
+        if pos:
+            _die(6, "input", f"unknown path argument {pos[0]!r}",
+                 "run `capabilities help` for the path verb")
         cmd_path(flag("--json"), flag("--identity"))
     elif cmd == "search":
         cmd_search(pos[0] if pos else None, opt("--source"))

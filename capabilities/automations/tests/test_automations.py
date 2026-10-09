@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import ast
 import contextlib
 import importlib.util
 import json
@@ -701,29 +700,6 @@ args = ["--apply"]
             "0 3 * * *")
         self.assertEqual(set(RUNTIME.AUTOMATION_KEYS), set(declared) | {"schedule"})
 
-    def test_the_importer_reads_exactly_the_keys_the_runtime_accepts(self) -> None:
-        # Two surfaces read an `[[automations]]` block, and drift between them is
-        # silent in both directions: a key the importer carries and the runtime
-        # refuses cannot be authored at all, and a key the runtime accepts and
-        # the importer drops is lost the moment a project moves into the store.
-        importer = CAPABILITY.parents[1] / "tools" / "import_envelope.py"
-        if not importer.is_file():
-            self.skipTest("the importer ships with the repository, not the bundle")
-        block = next(
-            node for node in ast.walk(ast.parse(importer.read_text()))
-            if isinstance(node, ast.FunctionDef) and node.name == "plan_automations")
-        read: set[str] = set()
-        for node in ast.walk(block):
-            if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
-                    and node.value.id == "item" and isinstance(node.slice, ast.Constant)):
-                read.add(node.slice.value)
-            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "get" and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "item" and node.args
-                    and isinstance(node.args[0], ast.Constant)):
-                read.add(node.args[0].value)
-        self.assertEqual(read, set(RUNTIME.AUTOMATION_KEYS))
-
     def test_a_labelled_automation_reaches_the_listing(self) -> None:
         # `name` and `description` have one consumer, a person reading the
         # listing, so a value that loads and is then dropped between the config
@@ -1381,28 +1357,6 @@ every_seconds = 30
         self.assertEqual(stopped["daemon"]["reloaded"], False)
         self.assertEqual(stopped["changed"], ["name"])
 
-    def test_set_refuses_a_project_that_keeps_its_automations_in_the_store(self) -> None:
-        sys.path.insert(0, str(CAPABILITY / "service"))
-        try:
-            import store as store_mod
-        finally:
-            sys.path.pop(0)
-        st = store_mod.SQLiteStore.open(str(self.store_path))
-        st.migrate()
-        st.project_register(self.project_id, self.project_slug)
-        st.config_set("capabilities", "policy", "automations", {"enabled": True},
-                      ("project", self.project_slug))
-        st.close()
-        identity = self.root / "capabilities" / "project.json"
-        identity.write_text(json.dumps({**json.loads(identity.read_text()),
-                                        "store": "db"}) + "\n")
-        self.env["CAPABILITIES_STORE_URL"] = str(self.store_path)
-        path = self._set_config()
-        proc = self.cli("set", "job", "--name", "x", check=False)
-        self.assertEqual(proc.returncode, 6, proc.stderr)
-        self.assertIn("config_in_store", proc.stderr)
-        self.assertEqual(path.read_text(), self.SET_CONFIG)
-
     def test_without_a_store_the_service_refuses_and_says_why(self) -> None:
         """Runtime state has no local default: with no store configured nothing
         that would keep a run starts, and each answer names the fix."""
@@ -1679,45 +1633,6 @@ if __name__ == "__main__":
 
 
 # --- the ledger on a shared store --------------------------------------------
-
-def test_the_store_rebuild_carries_the_labels_a_person_wrote(tmp_path, monkeypatch):
-    """The same config has to read the same way from either source. A label the
-    file keeps and the store rebuild drops is the same defect wearing a mode."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
-    import store as store_mod
-    import runtime as rt
-
-    project_id = "11111111-2222-3333-4444-555555555555"
-    root = tmp_path / "project"
-    (root / "capabilities").mkdir(parents=True)
-    (root / "capabilities" / "project.json").write_text(json.dumps(
-        {"schema": "capabilities.project.v1", "id": project_id,
-         "slug": "labelled", "store": "db"}))
-    monkeypatch.setenv("CAPABILITIES_STORE_URL", str(tmp_path / "shared.db"))
-
-    st = store_mod.SQLiteStore.open(str(tmp_path / "shared.db"))
-    st.migrate()
-    st.project_register(project_id, "labelled")
-    st.migrate(rt.STORE_NAMESPACE, rt.STORE_VERSION, rt.STORE_MIGRATIONS)
-    st.context_put("automations", "script.nightly", "print('done')\n",
-                   ("project", "labelled"), author="test", activate=True)
-    rt.store_upsert(st, "project", st._project_id("labelled"), {
-        "slug": "nightly", "name": "Nightly digest",
-        "description": "Why it exists, for whoever reads the listing.",
-        "enabled": 1, "script_key": "script.nightly", "schedule": "0 3 * * *",
-        "every_seconds": None, "timeout_seconds": 300.0, "max_parallel": 1,
-        "max_pending": 1, "overlap": "skip", "retries": 0,
-        "arguments": [], "environments": [],
-    })
-    st._conn.commit()
-    st.close()
-
-    item = rt.load_effective_config(
-        root, root / "absent.toml", tmp_path / "state")["automations"][0]
-    assert item["name"] == "Nightly digest"
-    assert item["description"] == "Why it exists, for whoever reads the listing."
-
 
 @pytest.fixture
 def ledger_env(tmp_path, monkeypatch):

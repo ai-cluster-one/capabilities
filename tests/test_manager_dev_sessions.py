@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import os
 import shutil
@@ -562,44 +561,22 @@ def test_dev_run_executes_only_the_session_payload_against_attached_project(tmp_
     _run(env, "dev", "stop", "deployment-test")
 
 
-def test_dev_run_projects_the_attached_projects_database(tmp_path):
+def test_dev_run_hands_the_child_no_database_of_its_own_choosing(tmp_path):
+    """Which database the child uses is the child's to resolve from the project
+    it stands in; `dev run` passes no store variable down."""
     source = _source_repo(tmp_path)
     consumer = _consumer_repo(tmp_path)
-    identity = {
-        "schema": "capabilities.project.v1",
-        "id": "project-db-fixture",
-        "slug": "db-fixture",
-        "store": "db",
-    }
-    (consumer / "capabilities" / "project.json").write_text(
-        json.dumps(identity) + "\n")
-    db_path = tmp_path / "project-store.db"
-    probe = subprocess.run(
-        [str(MANAGER), "path", "store"],
-        env={**_env(tmp_path), "CAPABILITIES_STORE_URL": str(db_path)},
-        text=True, capture_output=True, check=False,
-    )
-    assert probe.returncode == 0, probe.stderr
-    store_spec = importlib.util.spec_from_file_location(
-        "dev_test_store", REPO / "contract" / "store.py")
-    assert store_spec is not None and store_spec.loader is not None
-    store_module = importlib.util.module_from_spec(store_spec)
-    store_spec.loader.exec_module(store_module)
-    with store_module.SQLiteStore.open(str(db_path)) as db:
-        db.migrate()
-        db.project_register(identity["id"], identity["slug"])
-        db.config_set("capabilities", "policy", "deployment",
-                      {"enabled": True}, ("project", identity["slug"]))
-
     env = _env(tmp_path)
-    env["CAPABILITIES_STORE_URL"] = str(db_path)
+    env["CAPABILITIES_STORE_URL"] = "postgresql://parent.invalid/db"
+    env["AGENTKIT_DB_URL"] = "postgresql://parent.invalid/db"
     started = _start(env, source, consumer, session="db-run")
     script = Path(started["source_worktree"]) / "capabilities" / "deployment" / "bin" / "deployment"
     original = script.read_text()
     script.write_text(original.replace(
         'if __name__ == "__main__":',
         'if len(sys.argv) > 1 and sys.argv[1] == "store-probe":\n'
-        '    print(os.environ.get("CAPABILITIES_STORE_URL"))\n'
+        '    print(json.dumps({key: value for key, value in os.environ.items()\n'
+        '                      if "STORE" in key or key.startswith("AGENTKIT_DB_")}))\n'
         '    raise SystemExit(0)\n\n\n'
         'if __name__ == "__main__":',
     ))
@@ -607,7 +584,7 @@ def test_dev_run_projects_the_attached_projects_database(tmp_path):
     result = _run(
         env, "dev", "run", "db-run", "deployment",
         "--project-only", "--", "store-probe")
-    assert result.stdout.strip() == str(db_path)
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {}
     script.write_text(original)
     _run(env, "dev", "stop", "db-run")
 

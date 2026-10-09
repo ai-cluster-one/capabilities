@@ -3,48 +3,39 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import uuid
 from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[1]
 MANAGER = REPO / "bin" / "capabilities"
-DEPLOYMENT = REPO / "capabilities" / "deployment" / "bin" / "deployment"
-TELEGRAM = REPO / "capabilities" / "telegram" / "bin" / "telegram"
-
-sys.path.insert(0, str(REPO / "contract"))
-import store as S  # noqa: E402
 
 
-def _project(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
+def _project(tmp_path: Path, store: str | None = None) -> tuple[Path, dict[str, str]]:
     root = tmp_path / "consumer"
     envelope = root / "capabilities"
     envelope.mkdir(parents=True)
     project_id = str(uuid.uuid4())
     slug = "fixture-" + project_id[:8]
-    (envelope / "project.json").write_text(json.dumps({
-        "schema": "capabilities.project.v1", "id": project_id,
-        "slug": slug, "store": "db",
-    }))
-    store_path = tmp_path / "store.db"
-    with S.SQLiteStore.open(str(store_path)) as store:
-        store.migrate()
-        store.project_register(project_id, slug)
-        store.config_set("capabilities", "policy", "deployment",
-                         {"enabled": True}, ("project", slug))
-        store.config_set("capabilities", "policy", "telegram",
-                         {"enabled": True}, ("project", slug))
+    identity = {"schema": "capabilities.project.v1", "id": project_id, "slug": slug}
+    if store is not None:
+        identity["store"] = store
+    (envelope / "project.json").write_text(json.dumps(identity))
+    (envelope / "settings.json").write_text(json.dumps(
+        {"capabilities": {"deployment": {"enabled": True}, "telegram": {"enabled": True}}}))
     env = dict(os.environ)
+    for key in ("CAPABILITIES_READ_ONLY", "CAPABILITIES_PROJECT_ID",
+                "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_PROJECT_ENVELOPE_ROOT"):
+        env.pop(key, None)
     env.update({
         "CLAUDE_PROJECT_DIR": str(root),
         "CAPABILITIES_PROJECT_ENVELOPE": str(envelope),
-        "CAPABILITIES_STORE_URL": str(store_path),
         "CAPABILITIES_HOME": str(tmp_path / "registry"),
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
         "XDG_STATE_HOME": str(tmp_path / "state"),
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
     })
-    return root, env, store_path
+    return root, env
 
 
 def _run(argv: list[str], root: Path, env: dict[str, str], check: bool = True):
@@ -56,43 +47,47 @@ def _run(argv: list[str], root: Path, env: dict[str, str], check: bool = True):
     return result
 
 
-def test_manager_get_and_set_use_the_project_records_adapter(tmp_path):
-    root, env, _store_path = _project(tmp_path)
+def _no_database_file(tmp_path: Path) -> None:
+    assert not list(tmp_path.rglob("*.db"))
+
+
+def test_manager_get_and_set_use_the_project_records_files(tmp_path):
+    root, env = _project(tmp_path)
     written = json.loads(_run(
         [str(MANAGER), "set", "telegram", "setting", "tail_size", "40"],
         root, env).stdout)
-    assert written["records"]["mode"] == "db"
+    assert written["records"]["mode"] == "files"
     value = json.loads(_run(
         [str(MANAGER), "get", "telegram", "setting", "tail_size"],
         root, env).stdout)
     assert value == 40
+    settings = root / "capabilities" / "telegram" / "service" / "settings.json"
+    assert json.loads(settings.read_text())["tail_size"] == 40
+    _no_database_file(tmp_path)
 
 
-def test_manager_lists_database_policy_without_a_settings_file(tmp_path):
-    root, env, _store_path = _project(tmp_path)
-    assert not (root / "capabilities" / "settings.json").exists()
+def test_a_project_declaring_files_keeps_working(tmp_path):
+    root, env = _project(tmp_path, store="files")
     listed = json.loads(_run([str(MANAGER), "list"], root, env).stdout)
     assert listed["enabled_not_installed"] == ["deployment", "telegram"]
 
 
-def test_manager_policy_verbs_write_the_database_not_settings_json(tmp_path):
-    root, env, store_path = _project(tmp_path)
-    _run([str(MANAGER), "enable", "slack", "--project"], root, env)
-    assert not (root / "capabilities" / "settings.json").exists()
-    identity = json.loads((root / "capabilities" / "project.json").read_text())
-    with S.SQLiteStore.open(str(store_path)) as store:
-        assert store.config_get(
-            "capabilities", "policy", "slack",
-            S.Scopes(identity["slug"], include_global=False)) == {"enabled": True}
-    _run([str(MANAGER), "inherit", "slack", "--project"], root, env)
-    with S.SQLiteStore.open(str(store_path)) as store:
-        assert store.config_get(
-            "capabilities", "policy", "slack",
-            S.Scopes(identity["slug"], include_global=False)) is None
+def test_a_project_declaring_its_records_in_a_database_is_refused(tmp_path):
+    """Records are kept only in files; a declaration pointing elsewhere is
+    refused rather than read as files, which would answer from records it
+    does not mean."""
+    root, env = _project(tmp_path, store="db")
+    refused = _run([str(MANAGER), "get", "telegram", "setting", "tail_size"],
+                   root, env, check=False)
+    assert refused.returncode == 6
+    error = json.loads(refused.stderr.strip().splitlines()[-1])["error"]
+    assert error["code"] == "bad_store_mode"
+    assert "files" in error["message"]
+    _no_database_file(tmp_path)
 
 
 def test_manager_does_not_take_another_writers_collection(tmp_path):
-    root, env, _store_path = _project(tmp_path)
+    root, env = _project(tmp_path)
     refused = _run(
         [str(MANAGER), "set", "telegram", "identifier", "chat", "1"],
         root, env, check=False)
@@ -100,103 +95,36 @@ def test_manager_does_not_take_another_writers_collection(tmp_path):
     assert json.loads(refused.stderr)["error"]["code"] == "record_writer"
 
 
-def test_relabel_moves_the_label_on_both_sides(tmp_path):
-    root, env, store_path = _project(tmp_path)
+def test_relabel_writes_the_identity_and_nothing_else(tmp_path):
+    root, env = _project(tmp_path)
     identity = json.loads((root / "capabilities" / "project.json").read_text())
-    with S.SQLiteStore.open(str(store_path)) as store:
-        store.state_set("deployment", "cursor", 42, ("project", identity["slug"]))
     payload = json.loads(_run([str(MANAGER), "relabel", "fixture-renamed"], root, env).stdout)
-    assert payload["store_registry"] == "relabelled"
-    assert payload["previous_slug"] == identity["slug"]
-    assert json.loads(
-        (root / "capabilities" / "project.json").read_text())["slug"] == "fixture-renamed"
-    with S.SQLiteStore.open(str(store_path)) as store:
-        assert store.project_get("fixture-renamed")["id"] == identity["id"]
-        assert store.state_get("deployment", "cursor",
-                               ("project", "fixture-renamed")) == 42
-
-
-def test_relabel_completes_on_a_store_nothing_has_prepared(tmp_path):
-    """The registry is created by whoever opens the store first, so where no
-    service ever has there are no tables to ask about. The rename is still a
-    rename with one side to write, not the driver's complaint about a missing
-    table."""
-    root, env, _store_path = _project(tmp_path)
-    identity = json.loads((root / "capabilities" / "project.json").read_text())
-    unprepared = tmp_path / "unprepared.db"
-    env = dict(env, CAPABILITIES_STORE_URL=str(unprepared))
-    assert not unprepared.exists()
-    renamed = _run([str(MANAGER), "relabel", "fixture-renamed"], root, env)
-    assert "Traceback" not in renamed.stderr
-    payload = json.loads(renamed.stdout)
     assert payload["ok"] is True
-    assert payload["store_registry"] == "no row to move"
     assert payload["previous_slug"] == identity["slug"]
-    assert json.loads(
-        (root / "capabilities" / "project.json").read_text())["slug"] == "fixture-renamed"
-    with S.SQLiteStore.open(str(unprepared)) as store:
-        assert store.project_list() == []
+    assert payload["id"] == identity["id"]
+    assert "store_registry" not in payload
+    written = json.loads((root / "capabilities" / "project.json").read_text())
+    assert written["slug"] == "fixture-renamed"
+    assert written["id"] == identity["id"]
+    _no_database_file(tmp_path)
+    again = json.loads(_run([str(MANAGER), "relabel", "fixture-renamed"], root, env).stdout)
+    assert again["unchanged"] is True
 
 
-def test_manager_ids_renders_identifiers_from_the_store(tmp_path):
-    root, env, store_path = _project(tmp_path)
-    identity = json.loads((root / "capabilities" / "project.json").read_text())
-    with S.SQLiteStore.open(str(store_path)) as store:
-        store.config_set("deployment", "identifier", "target", "local",
-                         ("project", identity["slug"]), note="the active target")
+def test_relabel_refuses_a_label_that_is_not_one(tmp_path):
+    root, env = _project(tmp_path)
+    before = (root / "capabilities" / "project.json").read_text()
+    refused = _run([str(MANAGER), "relabel", "Not A Label"], root, env, check=False)
+    assert refused.returncode == 6
+    assert json.loads(refused.stderr)["error"]["code"] == "bad_name"
+    assert (root / "capabilities" / "project.json").read_text() == before
+
+
+def test_manager_ids_renders_identifiers_from_the_files(tmp_path):
+    root, env = _project(tmp_path)
+    (root / "capabilities" / "deployment").mkdir()
+    (root / "capabilities" / "deployment" / "identifiers.json").write_text(json.dumps(
+        {"target": {"value": "local", "note": "the active target"}}))
     rendered = _run([str(MANAGER), "ids", "deployment"], root, env).stdout
     assert "**target**: `local`" in rendered
     assert "the active target" in rendered
-
-
-def test_capability_context_edit_put_round_trips_a_store_document(tmp_path):
-    root, env, store_path = _project(tmp_path)
-    identity = json.loads((root / "capabilities" / "project.json").read_text())
-    with S.SQLiteStore.open(str(store_path)) as store:
-        store.context_put("deployment", "context", "before\n",
-                          ("project", identity["slug"]), activate=True)
-    checkout = json.loads(_run(
-        [str(DEPLOYMENT), "context", "edit", "context"], root, env).stdout)
-    path = Path(checkout["path"])
-    assert path.read_text() == "before\n"
-    path.write_text("after\n")
-    landed = json.loads(_run(
-        [str(DEPLOYMENT), "context", "put", "context"], root, env).stdout)
-    assert landed["put"] == "context"
-    with S.SQLiteStore.open(str(store_path)) as store:
-        doc = store.context_read("deployment", "context", S.Scopes(identity["slug"]))
-    assert doc is not None and doc["body"] == "after\n"
-
-
-def test_telegram_service_status_is_initialized_from_store_records(tmp_path):
-    root, env, store_path = _project(tmp_path)
-    identity = json.loads((root / "capabilities" / "project.json").read_text())
-    scope = ("project", identity["slug"])
-    settings = {
-        "connection": "local",
-        "assistant_name": "Marvin",
-        "direct_messages": {"mode": "allowed_users", "default_role": "direct_user"},
-        "allowed_users": {},
-        "allowed_groups": {},
-        "defaults": {"worker": "stub"},
-    }
-    with S.SQLiteStore.open(str(store_path)) as store:
-        for key, value in settings.items():
-            store.config_set("telegram", "setting", key, value, scope)
-        store.config_set("telegram", "setting", "connection.default", "local", scope)
-        store.config_set("telegram", "connection", "local", {
-            "api_id": 12345,
-            "expected_account_id": 42,
-        }, scope)
-        store.config_set("telegram", "grant", "local", {
-            "enabled": True,
-            "allow_write": True,
-        }, scope)
-        store.context_put("telegram", "context", "test context\n", scope,
-                          activate=True)
-    status = json.loads(_run(
-        [str(TELEGRAM), "service", "status", "--connection", "local"],
-        root, env).stdout)
-    assert status["initialized"] is True
-    assert status["connection"] == "local"
-    assert status["expected_account_id"] == 42

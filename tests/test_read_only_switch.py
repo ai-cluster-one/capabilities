@@ -69,40 +69,7 @@ def test_the_switch_is_off_unset_zero_or_false(monkeypatch, value):
     assert S.read_only_switch() is False
 
 
-def _store(tmp_path: Path):
-    store = S.SQLiteStore.open(str(tmp_path / "store.db"))
-    store.migrate()
-    store.project_register(str(uuid.uuid4()), "lab")
-    return store
-
-
-def test_a_record_write_refuses_while_state_and_reads_keep_working(tmp_path, monkeypatch):
-    scope = ("project", "lab")
-    with _store(tmp_path) as store:
-        store.config_set("thing", "identifier", "kept", "before", scope)
-        store.context_put("thing", "reference.kept", "body", scope, activate=True)
-        monkeypatch.setenv(SWITCH, "1")
-        writes = {
-            "config_set": lambda: store.config_set("thing", "setting", "k", 1, scope),
-            "config_delete": lambda: store.config_delete("thing", "identifier", "kept", scope),
-            "context_put": lambda: store.context_put("thing", "reference.new", "x", scope),
-            "context_activate": lambda: store.context_activate(
-                "thing", "reference.kept", "000000000000", scope),
-        }
-        for name, write in writes.items():
-            with pytest.raises(S.StoreError) as refused:
-                write()
-            assert refused.value.slug == "read_only_switch", name
-            assert SWITCH in refused.value.message
-        # Operational state is the capability's own, not a record.
-        store.state_set("thing", "cursor", {"at": 7}, scope)
-        assert store.state_get("thing", "cursor", scope) == {"at": 7}
-        lab = S.Scopes("lab", include_global=False)
-        assert store.config_get("thing", "identifier", "kept", lab) == "before"
-        assert store.context_read("thing", "reference.kept", lab)["body"] == "body"
-
-
-def test_files_mode_record_writes_refuse_and_leave_the_file_as_it_was(tmp_path, monkeypatch):
+def test_record_writes_refuse_and_leave_the_file_as_it_was(tmp_path, monkeypatch):
     envelope = tmp_path / "capabilities"
     envelope.mkdir()
     (envelope / "project.json").write_text(json.dumps({"slug": "lab", "id": "p"}))
@@ -207,8 +174,8 @@ def lab(tmp_path, instance):
         "COOLIFY_TOKEN": "test-token",
     })
     for leaked in (SWITCH, "COOLIFY_BASE_URL", "VIRTUAL_ENV",
-                   "CAPABILITIES_PROJECT_ENVELOPE", "CAPABILITIES_STORE_URL",
-                   "CAPABILITIES_STORE_MODE"):
+                   "CAPABILITIES_PROJECT_ENVELOPE", "AGENTKIT_DB_URL",
+                   "AGENTKIT_DB_HOST"):
         env.pop(leaked, None)
     return {"project": project, "envelope": envelope, "env": env, "seen": seen}
 

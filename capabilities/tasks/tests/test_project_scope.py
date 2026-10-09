@@ -78,15 +78,13 @@ def test_the_slug_is_never_the_key(declares):
 
 
 def test_reading_the_identity_asks_the_records_backend_nothing(declares, monkeypatch):
-    """A project keeping its records on files declares itself the same way one
-    keeping them in the store does, so the reader may not go near either."""
+    """The project declares itself in project.json, which is read directly, so
+    the reader may not go near the records layer."""
     def never(*a, **k):
         raise AssertionError("identity was read through the records backend")
 
     monkeypatch.setattr(mod, "_records", never)
     monkeypatch.setattr(mod, "open_records", never)
-    monkeypatch.setattr(mod, "open_store", never)
-    monkeypatch.setattr(mod, "records_mode", never)
     declares({"id": HERE, "slug": "a-project"})
     assert mod._declared_project() == HERE
 

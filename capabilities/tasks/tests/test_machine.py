@@ -239,7 +239,9 @@ def test_join_refuses_in_order_and_answers_with_the_project(joining, capsys):
     assert "capabilities init" in error["hint"]
     identity.write_text(json.dumps({**found, "id": "prj_k1ln00000001", "store": "db"}))
     code, error = join(root, capsys)
-    assert (code, error["code"]) == (6, "database_mode_unsupported")
+    # Records are kept only in files, so a project declaring them elsewhere is
+    # refused by the records layer before anything is read.
+    assert (code, error["code"]) == (6, "bad_store_mode")
     identity.write_text(json.dumps({**found, "id": "prj_k1ln00000001"}))
     code, error = join(root, capsys)
     assert (code, error["code"]) == (6, "store_in_connection")

@@ -16,7 +16,6 @@ import http.server
 import json
 import os
 import subprocess
-import sys
 import threading
 import uuid
 from contextlib import contextmanager
@@ -26,8 +25,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 MANAGER = REPO / "bin" / "capabilities"
 
-sys.path.insert(0, str(REPO / "contract"))
-import store as S  # noqa: E402
 
 
 def _manager_module():
@@ -65,21 +62,14 @@ def _project(tmp_path: Path, enabled: list[str]) -> tuple[Path, dict[str, str]]:
     project_id = str(uuid.uuid4())
     slug = "fixture-" + project_id[:8]
     (envelope / "project.json").write_text(json.dumps({
-        "schema": "capabilities.project.v1", "id": project_id,
-        "slug": slug, "store": "db",
+        "schema": "capabilities.project.v1", "id": project_id, "slug": slug,
     }))
-    store_path = tmp_path / "store.db"
-    with S.SQLiteStore.open(str(store_path)) as store:
-        store.migrate()
-        store.project_register(project_id, slug)
-        for name in enabled:
-            store.config_set("capabilities", "policy", name,
-                             {"enabled": True}, ("project", slug))
+    (envelope / "settings.json").write_text(json.dumps(
+        {"capabilities": {name: {"enabled": True} for name in enabled}}))
     env = dict(os.environ)
     env.update({
         "CLAUDE_PROJECT_DIR": str(root),
         "CAPABILITIES_PROJECT_ENVELOPE": str(envelope),
-        "CAPABILITIES_STORE_URL": str(store_path),
         "CAPABILITIES_HOME": str(tmp_path / "registry"),
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
         "XDG_STATE_HOME": str(tmp_path / "state"),
@@ -207,7 +197,7 @@ def _machine_env(tmp_path: Path, source: str) -> dict[str, str]:
     for key in ("CAPABILITIES_READ_ONLY", "CLAUDE_PROJECT_DIR",
                 "CAPABILITIES_AUTH_CONTEXT", "CAPABILITIES_PROJECT_ENVELOPE",
                 "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "CAPABILITIES_PROJECT_ID",
-                "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_STORE_URL",
+                "CAPABILITIES_PROJECT_ID_ROOT", "AGENTKIT_DB_URL",
                 "CAPABILITIES_DEV_SESSION", "CAPABILITIES_WORKSPACE"):
         env.pop(key, None)
     env.update({
