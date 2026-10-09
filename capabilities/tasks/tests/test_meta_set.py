@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
 # ///
 """`meta set` with several keys: one write that lands whole or not at all.
 
@@ -14,7 +14,8 @@ unset; every run works in a schema of its own and drops it. The last of them
 runs the CLI as a project would, so the write gate and the read-only switch are
 met where the command applies them.
 
-    uv run --with pytest --with 'psycopg[binary]>=3.2' python -m pytest capabilities/tasks/tests -q
+    uv run --with pytest --with 'psycopg[binary]>=3.2' \\
+        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -182,7 +183,7 @@ class FakeCursor:
 
     def execute(self, sql, params=None):
         text = sql.strip()
-        if "task_executions" in text:
+        if "tasks_executions" in text:
             self.answer = [dict(OPEN)]
         elif text.startswith("select id, project_id"):
             self.answer = [{"id": params[0], "project_id": HERE}]
@@ -264,29 +265,24 @@ DSN = os.environ.get("TASKS_TEST_DSN")
 needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 
 
-def _entry(schema: str, info: dict, allow_write: bool = True) -> dict:
-    return {"db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-            "db_user": info.get("user"), "db_name": info.get("dbname"),
-            "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-            "secret_env": "TASKS_TEST_PASSWORD", "allow_write": allow_write}
+def _entry(allow_write: bool = True) -> dict:
+    return {"allow_write": allow_write}
 
 
 @pytest.fixture
 def store(monkeypatch):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
 
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
-    monkeypatch.setenv("TASKS_TEST_PASSWORD", info.get("password") or "")
+    _cli.bind_store(mod, monkeypatch, schema)
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.delenv("TASKS_ACTOR", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
     monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(mod._schema_ddl(schema))
+        _cli.make_tables(mod, schema)
         try:
-            yield _entry(schema, info), schema, conn
+            yield _entry(), schema, conn
         finally:
             conn.execute(f"drop schema {schema} cascade")
 
@@ -442,9 +438,6 @@ def lab(tmp_path):
     """A project of its own with two connections to one schema: `local` writes and
     `reader` does not."""
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
-
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
@@ -457,8 +450,9 @@ def lab(tmp_path):
         "id": "prj_" + uuid.uuid4().hex[:12], "slug": "lab"}))
     (envelope / "tasks" / "connections.json").write_text(json.dumps({
         "default": "local",
-        "connections": {"local": _entry(schema, info),
-                        "reader": _entry(schema, info, allow_write=False)}}))
+        "connections": {"local": _entry(),
+                        "reader": _entry(allow_write=False)}}))
+    _cli.write_store_setting(tmp_path / "config", schema)
     env = os.environ.copy()
     env.update({
         "HOME": str(tmp_path / "home"),
@@ -466,15 +460,14 @@ def lab(tmp_path):
         "XDG_STATE_HOME": str(tmp_path / "state"),
         "CAPABILITIES_HOME": str(tmp_path / "registry"),
         "CLAUDE_PROJECT_DIR": str(project),
-        "TASKS_TEST_PASSWORD": info.get("password") or "",
     })
     for leaked in ("CAPABILITIES_READ_ONLY", "TASKS_EXECUTION", "TASKS_ACTOR",
                    "CAPABILITIES_PROJECT_ENVELOPE", "CAPABILITIES_PROJECT_ENVELOPE_ROOT",
                    "CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT",
-                   "CAPABILITIES_STORE_URL", "CAPABILITIES_STORE_MODE"):
+                   "CAPABILITIES_STORE_URL", "AGENTKIT_STORE_URL", "CAPABILITIES_STORE_MODE"):
         env.pop(leaked, None)
-    lab = {"project": project, "env": env}
-    assert _tasks(lab, "migrate", "--apply").returncode == 0
+    lab = {"project": project, "env": env, "schema": schema, "tmp": tmp_path}
+    assert _tasks(lab, "migrate").returncode == 0
     try:
         yield lab
     finally:

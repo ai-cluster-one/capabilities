@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
 # ///
 """Reading a store in one page: the order a scan answers in, how a search pages,
 how many tasks hold each status, and the inputs that reach no answer.
@@ -10,7 +10,8 @@ The parsing half is checked without a store. The store-backed half reads
 TASKS_TEST_DSN and skips when it is unset; every run works in a schema of its
 own and drops it.
 
-    uv run --with pytest --with 'psycopg[binary]>=3.2' python -m pytest capabilities/tasks/tests -q
+    uv run --with pytest --with 'psycopg[binary]>=3.2' \\
+        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -146,7 +147,7 @@ def test_the_connection_flag_is_not_looked_for_past_the_end_of_the_flags(
         return "c", {}
 
     monkeypatch.setattr(mod, "_select_connection", select)
-    monkeypatch.setattr(mod, "_schema", lambda entry: "tasks")
+    monkeypatch.setattr(mod, "_store_setting", lambda raising=False: _cli.store_setting("tasks"))
     monkeypatch.setattr(mod, "_declared_project", lambda: HERE)
     monkeypatch.setattr(mod, "cmd_search",
                         lambda entry, rest: seen.setdefault("rest", rest))
@@ -182,22 +183,17 @@ needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 @pytest.fixture
 def store(monkeypatch):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
 
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
-    entry = {"db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-             "db_user": info.get("user"), "db_name": info.get("dbname"),
-             "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-             "secret_env": "TASKS_TEST_PASSWORD", "allow_write": True,
+    entry = {"allow_write": True,
              "timezone": "UTC"}
-    monkeypatch.setenv("TASKS_TEST_PASSWORD", info.get("password") or "")
+    _cli.bind_store(mod, monkeypatch, schema)
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.delenv("TASKS_ACTOR", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
     monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(mod._schema_ddl(schema))
+        _cli.make_tables(mod, schema)
         try:
             yield entry, schema, conn
         finally:
@@ -235,13 +231,13 @@ def seeded(store, monkeypatch, capsys):
     keys = [f"h-{n}" for n in range(5)] + ["t-0", "t-1"]
     # The store stamps every update with the moment it ran; the moments here are
     # chosen, so that stamp is held off while they are written.
-    conn.execute(f"alter table {schema}.tasks disable trigger tasks_touch_updated_at")
+    conn.execute(f"alter table {schema}.tasks_tasks disable trigger tasks_touch_updated_at")
     for n, key in enumerate(keys):
-        conn.execute(f"update {schema}.tasks set created_at = %s::timestamptz, "
+        conn.execute(f"update {schema}.tasks_tasks set created_at = %s::timestamptz, "
                      f"updated_at = %s::timestamptz where unique_key = %s",
                      (f"2026-02-{n + 1:02d}T00:00Z", f"2026-03-{20 - n:02d}T00:00Z",
                       key))
-    conn.execute(f"alter table {schema}.tasks enable trigger tasks_touch_updated_at")
+    conn.execute(f"alter table {schema}.tasks_tasks enable trigger tasks_touch_updated_at")
     return entry, schema, conn
 
 
@@ -414,10 +410,10 @@ def _at(value) -> "datetime.datetime":
 def test_last_touched_is_the_latest_of_its_three_sources(store, capsys, monkeypatch):
     entry, schema, conn = store
     _add(monkeypatch, entry, capsys, HERE, "k-1")
-    tid = conn.execute(f"select id from {schema}.tasks where unique_key = 'k-1'"
+    tid = conn.execute(f"select id from {schema}.tasks_tasks where unique_key = 'k-1'"
                        ).fetchone()[0]
-    conn.execute(f"alter table {schema}.tasks disable trigger tasks_touch_updated_at")
-    conn.execute(f"update {schema}.tasks set updated_at = '2026-01-01T00:00Z' "
+    conn.execute(f"alter table {schema}.tasks_tasks disable trigger tasks_touch_updated_at")
+    conn.execute(f"update {schema}.tasks_tasks set updated_at = '2026-01-01T00:00Z' "
                  f"where id = %s", (tid,))
 
     # A field moving, and nothing else yet.
@@ -426,7 +422,7 @@ def test_last_touched_is_the_latest_of_its_three_sources(store, capsys, monkeypa
     assert row["last_activity_at"] is None and row["activities_count"] == 0
 
     # The trail growing.
-    conn.execute(f"insert into {schema}.task_activities (task_id, description, "
+    conn.execute(f"insert into {schema}.tasks_activities (task_id, description, "
                  f"created_at) values (%s, 'did a thing', '2026-01-02T00:00Z')", (tid,))
     row = _row(entry, capsys, "k-1")
     assert _at(row["last_touched_at"]) == _at("2026-01-02T00:00Z")
@@ -434,12 +430,12 @@ def test_last_touched_is_the_latest_of_its_three_sources(store, capsys, monkeypa
     assert row["activities_count"] == 1
 
     # A raise starting, then ending.
-    eid = conn.execute(f"insert into {schema}.task_executions (task_id, attempt, "
+    eid = conn.execute(f"insert into {schema}.tasks_executions (task_id, attempt, "
                        f"started_at) values (%s, 1, '2026-01-03T00:00Z') returning id",
                        (tid,)).fetchone()[0]
     assert _at(_row(entry, capsys, "k-1")["last_touched_at"]) == \
         _at("2026-01-03T00:00Z")
-    conn.execute(f"update {schema}.task_executions set status = 'ok', "
+    conn.execute(f"update {schema}.tasks_executions set status = 'ok', "
                  f"ended_at = '2026-01-04T00:00Z' where id = %s", (eid,))
     row = _row(entry, capsys, "k-1", "--full")
     assert _at(row["last_touched_at"]) == _at("2026-01-04T00:00Z")
@@ -448,12 +444,12 @@ def test_last_touched_is_the_latest_of_its_three_sources(store, capsys, monkeypa
     assert row["activities_count"] == 1
 
     # And a field moving after all of it wins again.
-    conn.execute(f"update {schema}.tasks set updated_at = '2026-01-05T00:00Z' "
+    conn.execute(f"update {schema}.tasks_tasks set updated_at = '2026-01-05T00:00Z' "
                  f"where id = %s", (tid,))
     mod.cmd_search(entry, ["k-1"])
     assert _at(_answer(capsys)["tasks"][0]["last_touched_at"]) == \
         _at("2026-01-05T00:00Z")
-    conn.execute(f"alter table {schema}.tasks enable trigger tasks_touch_updated_at")
+    conn.execute(f"alter table {schema}.tasks_tasks enable trigger tasks_touch_updated_at")
 
 
 @pytest.fixture
@@ -465,19 +461,19 @@ def four_orders(seeded):
     entry, schema, conn = seeded
     pickups = {"h-0": "2026-01-03", "h-1": None, "h-2": "2026-01-01",
                "h-3": "2026-01-02", "h-4": None}
-    conn.execute(f"alter table {schema}.tasks disable trigger tasks_touch_updated_at")
+    conn.execute(f"alter table {schema}.tasks_tasks disable trigger tasks_touch_updated_at")
     for key, pickup in pickups.items():
-        conn.execute(f"update {schema}.tasks set pickup_at = %s::timestamptz "
+        conn.execute(f"update {schema}.tasks_tasks set pickup_at = %s::timestamptz "
                      f"where unique_key = %s", (pickup, key))
-    conn.execute(f"update {schema}.tasks set pickup_at = null where project_id = %s",
+    conn.execute(f"update {schema}.tasks_tasks set pickup_at = null where project_id = %s",
                  (THERE,))
-    conn.execute(f"alter table {schema}.tasks enable trigger tasks_touch_updated_at")
+    conn.execute(f"alter table {schema}.tasks_tasks enable trigger tasks_touch_updated_at")
     ids = {r[0]: str(r[1]) for r in conn.execute(
-        f"select unique_key, id from {schema}.tasks")}
-    conn.execute(f"insert into {schema}.task_activities (task_id, description, "
+        f"select unique_key, id from {schema}.tasks_tasks")}
+    conn.execute(f"insert into {schema}.tasks_activities (task_id, description, "
                  f"created_at) values (%s, 'late word', '2026-03-25T00:00Z')",
                  (ids["h-3"],))
-    conn.execute(f"insert into {schema}.task_executions (task_id, attempt, "
+    conn.execute(f"insert into {schema}.tasks_executions (task_id, attempt, "
                  f"started_at) values (%s, 1, '2026-03-24T00:00Z')", (ids["h-1"],))
     return entry, ids
 
@@ -635,16 +631,16 @@ def ties(four_orders):
     import psycopg
     schema = mod.SCHEMA
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(f"alter table {schema}.tasks disable trigger tasks_touch_updated_at")
-        conn.execute(f"update {schema}.tasks set created_at = (select created_at from "
-                     f"{schema}.tasks where unique_key = 'h-2') where unique_key = 'h-1'")
-        conn.execute(f"update {schema}.tasks set updated_at = (select updated_at from "
-                     f"{schema}.tasks where unique_key = 'h-3') where unique_key = 'h-4'")
-        conn.execute(f"update {schema}.tasks set updated_at = '2026-03-24T00:00Z' "
+        conn.execute(f"alter table {schema}.tasks_tasks disable trigger tasks_touch_updated_at")
+        conn.execute(f"update {schema}.tasks_tasks set created_at = (select created_at from "
+                     f"{schema}.tasks_tasks where unique_key = 'h-2') where unique_key = 'h-1'")
+        conn.execute(f"update {schema}.tasks_tasks set updated_at = (select updated_at from "
+                     f"{schema}.tasks_tasks where unique_key = 'h-3') where unique_key = 'h-4'")
+        conn.execute(f"update {schema}.tasks_tasks set updated_at = '2026-03-24T00:00Z' "
                      f"where unique_key = 'h-2'")
-        conn.execute(f"update {schema}.tasks set pickup_at = (select pickup_at from "
-                     f"{schema}.tasks where unique_key = 'h-2') where unique_key = 'h-3'")
-        conn.execute(f"alter table {schema}.tasks enable trigger tasks_touch_updated_at")
+        conn.execute(f"update {schema}.tasks_tasks set pickup_at = (select pickup_at from "
+                     f"{schema}.tasks_tasks where unique_key = 'h-2') where unique_key = 'h-3'")
+        conn.execute(f"alter table {schema}.tasks_tasks enable trigger tasks_touch_updated_at")
     return entry, ids
 
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.8.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0",
+#                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
 """One turn of the conveyor: what is declared, what is claimed, what is settled.
@@ -14,6 +15,7 @@ TASKS_TEST_DSN and skip when it is unset; every run works in a schema of its own
 and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
+        --with 'capabilities-contract==0.3.0' \\
         --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -1195,22 +1197,17 @@ needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 @pytest.fixture
 def store(monkeypatch):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
 
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
-    entry = {"db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-             "db_user": info.get("user"), "db_name": info.get("dbname"),
-             "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-             "secret_env": "TASKS_TEST_PASSWORD", "allow_write": True}
-    monkeypatch.setenv("TASKS_TEST_PASSWORD", info.get("password") or "")
+    entry = {"allow_write": True}
+    _cli.bind_store(mod, monkeypatch, schema)
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
     # The ledger is scoped by project, so a verb called straight has to stand
     # somewhere the way `main` makes it stand somewhere.
     monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(mod._schema_ddl(schema))
+        _cli.make_tables(mod, schema)
         try:
             yield entry, schema, conn
         finally:
@@ -1529,7 +1526,7 @@ def test_a_refused_profile_claims_nothing(project, store, monkeypatch, capsys):
     assert "'fence' was removed in 0.2.0" in error["message"]
     mod.cmd_show(entry, ["t-probe"])
     assert _answer(capsys)["task"]["status"] == "todo"
-    assert conn.execute(f"select count(*) from {schema}.task_executions").fetchone()[0] == 0
+    assert conn.execute(f"select count(*) from {schema}.tasks_executions").fetchone()[0] == 0
 
 
 @needs_store
@@ -1653,7 +1650,7 @@ def test_a_disabled_worker_never_claims(project, store, monkeypatch, capsys):
             mod.cmd_run(entry, args)
         assert exit_info.value.code == 4
         assert json.loads(capsys.readouterr().err)["error"]["code"] == "worker_disabled"
-    assert conn.execute(f"select count(*) from {schema}.task_executions").fetchone()[0] == 0
+    assert conn.execute(f"select count(*) from {schema}.tasks_executions").fetchone()[0] == 0
 
 
 @needs_store
@@ -1731,7 +1728,7 @@ def test_an_unparseable_worker_file_stops_the_default_entirely(project, store,
         error = json.loads(capsys.readouterr().err)["error"]
         assert error["code"] == "worker_invalid" and str(path) in error["message"]
     assert recorder.prompts == []
-    assert conn.execute(f"select count(*) from {schema}.task_executions").fetchone()[0] == 0
+    assert conn.execute(f"select count(*) from {schema}.tasks_executions").fetchone()[0] == 0
     mod.cmd_show(entry, ["t-chore"])
     assert _answer(capsys)["task"]["status"] == "todo"
 
@@ -1752,7 +1749,7 @@ def test_a_disabled_workers_types_never_fall_to_the_default(project, store,
     assert exit_info.value.code == 6
     capsys.readouterr()
     assert recorder.prompts == []
-    assert conn.execute(f"select count(*) from {schema}.task_executions").fetchone()[0] == 0
+    assert conn.execute(f"select count(*) from {schema}.tasks_executions").fetchone()[0] == 0
 
 
 # --- Handoff by assignee, and a cut-off session resumed ----------------------
@@ -1990,13 +1987,13 @@ def test_a_waiting_task_whose_turn_returned_unspent_is_held_and_stays_waiting(
     assert _answer(capsys)["claimed"] is None
     assert len(_raises(entry, capsys, "t-spent")) == 1
 
-    conn.execute(f"""update {schema}.task_executions
+    conn.execute(f"""update {schema}.tasks_executions
                         set metrics = jsonb_set(metrics, '{{lane_hold,until}}',
                                                 to_jsonb((now() - interval '1 second')::text))""")
     conn.commit()
     mod.cmd_run(entry, ["decider", "--apply"])
     assert _answer(capsys)["claimed"] is None
-    conn.execute(f"""update {schema}.task_executions
+    conn.execute(f"""update {schema}.tasks_executions
                         set ended_at = now() - interval '61 seconds'""")
     conn.commit()
     mod.cmd_run(entry, ["decider", "--apply"])
@@ -2110,7 +2107,7 @@ def _abandoned_raise(entry, conn, schema, worker, ref):
     killed turn leaves one, long enough ago that its task's cool-down is over."""
     held = mod._claim(entry, {"lease": "600", "worker": worker, "handler": "h",
                               "run": ("claude", ref), "type": "defect"})
-    conn.execute(f"""update {schema}.task_executions
+    conn.execute(f"""update {schema}.tasks_executions
                         set lease_until = now() - interval '1 second'
                       where id = %s""", (held["execution"]["id"],))
     mod._sweep(entry)
@@ -2120,7 +2117,7 @@ def _abandoned_raise(entry, conn, schema, worker, ref):
 
 def _cooled(conn, schema):
     """Every raise ended two hours earlier than it did, so no task still cools."""
-    conn.execute(f"""update {schema}.task_executions
+    conn.execute(f"""update {schema}.tasks_executions
                         set ended_at = ended_at - interval '2 hours'
                       where ended_at is not null""")
 

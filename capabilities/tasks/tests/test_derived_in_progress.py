@@ -1,7 +1,8 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.8.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0",
+#                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
 """`in_progress` is derived from the open raise and never stored, and each raise
@@ -18,6 +19,7 @@ rows from before is returned to where each rests by `migrate --apply`.
 The store-backed checks read TASKS_TEST_DSN and skip when it is unset.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
+        --with 'capabilities-contract==0.3.0' \\
         --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -50,7 +52,7 @@ add, answer, shown, raises_of = hooks.add, hooks.answer, hooks.shown, hooks.rais
 def stored(conn, schema: str, key: str) -> dict:
     """The task as the store holds it, read past every verb."""
     row = conn.execute(f"""select status, assignee, pickup_at, blocked_by, updated_at
-                             from {schema}.tasks where unique_key = %s""", (key,)).fetchone()
+                             from {schema}.tasks_tasks where unique_key = %s""", (key,)).fetchone()
     return dict(zip(("status", "assignee", "pickup_at", "blocked_by", "updated_at"), row))
 
 
@@ -88,7 +90,7 @@ def test_a_claim_writes_nothing_to_the_task_and_every_reader_shows_in_progress(
     entry, schema, conn = store
     rested = resting_pair(entry, capsys, conn, schema)
     add(entry, capsys, "t-free")
-    changes_before = conn.execute(f"select count(*) from {schema}.task_changes").fetchone()[0]
+    changes_before = conn.execute(f"select count(*) from {schema}.tasks_changes").fetchone()[0]
 
     claim(entry, capsys, "t-todo")
     claim_wait = mod._claim(entry, {"key": "t-wait", "worker": "alpha", "lease": "600",
@@ -98,7 +100,7 @@ def test_a_claim_writes_nothing_to_the_task_and_every_reader_shows_in_progress(
     # Stored exactly where they rested, and no move recorded.
     for key in ("t-todo", "t-wait"):
         assert stored(conn, schema, key) == rested[key]
-    assert conn.execute(f"select count(*) from {schema}.task_changes").fetchone()[0] \
+    assert conn.execute(f"select count(*) from {schema}.tasks_changes").fetchone()[0] \
         == changes_before
 
     assert shown(entry, capsys, "t-todo")["task"]["status"] == "in_progress"
@@ -143,7 +145,7 @@ def test_a_raise_whose_lease_ran_out_holds_nothing_before_it_is_swept(store, cap
     add(entry, capsys, "t-lapsed")
     execution = claim(entry, capsys, "t-lapsed")
     assert listed(entry, capsys, "--status", "in_progress") == ["t-lapsed"]
-    conn.execute(f"""update {schema}.task_executions
+    conn.execute(f"""update {schema}.tasks_executions
                         set lease_until = now() - interval '1 second' where id = %s""",
                  (execution,))
     # Still running in the store, and no longer shown as holding the task.
@@ -181,7 +183,7 @@ def test_a_raise_ending_without_a_move_leaves_the_task_where_it_rested(
             mod.cmd_release(entry, [execution, "--outcome", ending])
             assert answer(capsys)["moved"] == []
         elif ending == "lapsed":
-            conn.execute(f"""update {schema}.task_executions
+            conn.execute(f"""update {schema}.tasks_executions
                                 set lease_until = now() - interval '1 second'
                               where id = %s""", (execution,))
             assert mod._claim(entry, {"type": "nothing", "lease": "60"})["swept"] \
@@ -243,7 +245,7 @@ def test_a_waiting_task_a_raise_holds_is_not_returned_by_the_sweep(store, capsys
     capsys.readouterr()
     held = mod._claim(entry, {"key": "t-wait", "worker": "alpha", "lease": "600",
                               "accept": [{"status": ["waiting"], "type": None}]})
-    conn.execute(f"update {schema}.tasks set pickup_at = now() - interval '1 minute' "
+    conn.execute(f"update {schema}.tasks_tasks set pickup_at = now() - interval '1 minute' "
                  "where unique_key = 't-wait'")
     assert mod._claim(entry, {"type": "nothing", "lease": "60"})["returned"] == []
     assert stored(conn, schema, "t-wait")["status"] == "waiting"
@@ -255,7 +257,7 @@ def test_a_waiting_task_a_raise_holds_is_not_returned_by_the_sweep(store, capsys
 # --- One lease writer per raise -----------------------------------------------
 
 def lease_of(conn, schema: str, execution: str):
-    return conn.execute(f"select lease_until from {schema}.task_executions where id = %s",
+    return conn.execute(f"select lease_until from {schema}.tasks_executions where id = %s",
                         (execution,)).fetchone()[0]
 
 
@@ -307,7 +309,7 @@ def test_the_service_renews_by_the_cap_its_turn_reported(project, store, capsys)
         own.commit()
     assert renewed["renewed"] == [execution]
     span = conn.execute(f"""select extract(epoch from lease_until - started_at)::float8
-                              from {schema}.task_executions where id = %s""",
+                              from {schema}.tasks_executions where id = %s""",
                         (execution,)).fetchone()[0]
     # Never shorter than what is written: the claim's 5s stands over the 3s cap.
     assert 4 < span <= 5.5
@@ -319,8 +321,7 @@ def test_a_run_the_service_started_renews_nothing_and_ends_when_unrenewed(lab, t
     no lease of its own. With no service renewing it, the lease the claim wrote
     runs out and the turn ends itself, its task where it rested."""
     import psycopg
-    schema = json.loads((lab["project"] / "capabilities" / "tasks" / "connections.json")
-                        .read_text())["connections"]["local"]["db_schema"]
+    schema = lab["schema"]
     lab["env"]["FAKE_ENGINE_SLEEP"] = "120"
     lab["env"]["TASKS_STORE_RETRY_SECONDS"] = "3"    # a beat every 2s, a lease of 9s
     service.answer_of(service.tasks_cli(lab, "add", "--type", "alpha", "--title", "t",
@@ -350,101 +351,15 @@ def test_a_run_the_service_started_renews_nothing_and_ends_when_unrenewed(lab, t
     assert task["status"] == "todo"
 
 
-# --- The migration ------------------------------------------------------------
-
-def stored_in_progress(conn, schema: str, key: str, *, came_from: str | None,
-                       by: str | None, execution: bool = False) -> None:
-    """Put the task in `in_progress` the way a version that stored it did: a
-    claim's move stamped with its raise, or a person's move by hand."""
-    tid = conn.execute(f"select id from {schema}.tasks where unique_key = %s",
-                       (key,)).fetchone()[0]
-    raise_id = None
-    if execution:
-        raise_id = conn.execute(f"""insert into {schema}.task_executions
-                                      (task_id, attempt, worker, lease_until)
-                                    values (%s, 1, 'alpha', now() + interval '1 hour')
-                                    returning id""", (tid,)).fetchone()[0]
-    conn.execute(f"alter table {schema}.tasks disable trigger tasks_touch_updated_at")
-    conn.execute(f"update {schema}.tasks set status = 'in_progress' where id = %s", (tid,))
-    conn.execute(f"alter table {schema}.tasks enable trigger tasks_touch_updated_at")
-    if came_from is not None:
-        conn.execute(f"""insert into {schema}.task_changes
-                           (task_id, field, old_value, new_value, execution_id, actor)
-                         values (%s, 'status', %s, 'in_progress', %s, %s)""",
-                     (tid, came_from, raise_id, by))
-
-
-@needs_store
-def test_migrate_returns_every_stored_in_progress_to_where_it_rests(project, store, capsys,
-                                                                   monkeypatch):
-    entry, schema, conn = store
-    monkeypatch.setattr(mod, "_schema", lambda entry: schema)
-    monkeypatch.setattr(mod, "_writing_project", lambda: hooks.HERE)
-    for key in ("m-claimed", "m-from-wait", "m-hand", "m-none", "m-nobody", "m-other"):
-        add(entry, capsys, key)
-    mod.cmd_set(entry, ["m-from-wait", "--status", "waiting", "--assignee", "decider"])
-    capsys.readouterr()
-    stored_in_progress(conn, schema, "m-claimed", came_from="todo", by="alpha", execution=True)
-    stored_in_progress(conn, schema, "m-from-wait", came_from="waiting", by="decider",
-                       execution=True)
-    # A person put it there by hand from todo, with no raise.
-    stored_in_progress(conn, schema, "m-hand", came_from="todo", by="a-person")
-    stored_in_progress(conn, schema, "m-none", came_from=None, by=None)
-    stored_in_progress(conn, schema, "m-nobody", came_from="waiting", by="a-person")
-    conn.execute(f"update {schema}.tasks set project_id = 'prj_other' "
-                 "where unique_key = 'm-other'")
-    stored_in_progress(conn, schema, "m-other", came_from="todo", by="a-person")
-    before = {key: stored(conn, schema, key)["updated_at"]
-              for key in ("m-claimed", "m-hand")}
-
-    mod.cmd_migrate(entry, [])
-    dry = answer(capsys)["would_rest"]
-    assert dry["tasks"] == 6
-    mine = dry["by_project"][hooks.HERE]
-    assert mine["tasks"] == 5 and mine["to"] == {"todo": 3, "waiting": 1, "draft": 1}
-    assert {one["task"]: one["by"] for one in mine["by_hand"]} == {"m-hand": "a-person"}
-    assert {one["task"]: one["to"] for one in mine["without_record"]} == {
-        "m-none": "todo", "m-nobody": "draft"}
-    assert dry["by_project"]["prj_other"]["tasks"] == 1
-    # A dry run writes nothing.
-    assert stored(conn, schema, "m-claimed")["status"] == "in_progress"
-
-    mod.cmd_migrate(entry, ["--apply"])
-    rested = answer(capsys)["rested"]
-    assert rested["tasks"] == 6
-    assert {key: stored(conn, schema, key)["status"] for key in
-            ("m-claimed", "m-from-wait", "m-hand", "m-none", "m-nobody", "m-other")} == {
-        "m-claimed": "todo", "m-from-wait": "waiting", "m-hand": "todo",
-        "m-none": "todo", "m-nobody": "draft", "m-other": "todo"}
-    # Nobody moved them: updated_at stands, and the move reads as the migration's.
-    for key, moment in before.items():
-        assert stored(conn, schema, key)["updated_at"] == moment
-    row = conn.execute(f"""select c.old_value, c.new_value, c.actor, c.execution_id
-                             from {schema}.task_changes c join {schema}.tasks t
-                               on t.id = c.task_id
-                            where t.unique_key = 'm-hand' order by c.changed_at desc
-                            limit 1""").fetchone()
-    assert row == ("in_progress", "todo", mod.MIGRATE_ACTOR, None)
-    # A raise still open shows it in progress, as the open raise says.
-    assert shown(entry, capsys, "m-claimed")["task"]["status"] == "in_progress"
-    assert shown(entry, capsys, "m-hand")["task"]["status"] == "todo"
-
-    mod.cmd_migrate(entry, ["--apply"])
-    assert answer(capsys)["rested"] == {"tasks": 0, "by_project": {}}
-
-
 # --- The contract --------------------------------------------------------------
 
-def test_help_states_the_derivation_the_one_lease_writer_and_the_migration():
+def test_help_states_the_derivation_and_the_one_lease_writer():
     said = " ".join(mod.__doc__.split())
     for needle in ("`in_progress` is never stored, and no verb writes it.",
                    "Each raise has exactly one lease writer:",
                    "the turn's `run` writes nothing and reads the lease on the same beat",
                    "The daemon is the one writer of its turns' leases",
                    "a claim announces `run_started` with the task shown `in_progress`",
-                   "`migrate --apply` returns each, in the same transaction and "
-                   "store-wide, to the status it rests in",
-                   "under `would_rest`",
                    "`--outcome ok` alone, the one landing kept for a claim worked by "
                    "hand, completes the task"):
         assert needle in said, needle

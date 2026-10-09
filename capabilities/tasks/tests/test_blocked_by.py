@@ -1,7 +1,8 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.8.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0",
+#                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
 """`blocked_by` as a field of its own: a column of task ids, validated when it is
@@ -14,6 +15,7 @@ real store with the harness replaced. The store-backed checks read
 TASKS_TEST_DSN and skip when it is unset.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
+        --with 'capabilities-contract==0.3.0' \\
         --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -35,7 +37,6 @@ mod = hooks.mod
 needs_store = hooks.needs_store
 add, answer, shown = hooks.add, hooks.answer, hooks.shown
 HERE, THERE = hooks.HERE, "prj_elsewhere"
-SCHEMA_SQL = (Path(_cli.CAPABILITY_DIR) / "schema.sql").read_text()
 NOWHERE = "00000000-0000-4000-8000-000000000000"
 
 
@@ -67,17 +68,11 @@ def theirs(entry, capsys, monkeypatch, key: str, status: str = "todo") -> str:
 
 # --- The typed home ----------------------------------------------------------
 
-def test_the_schema_declares_the_column_for_a_new_store_and_an_old_one():
-    assert "  blocked_by   uuid[]      not null default '{}'," in SCHEMA_SQL
-    assert ("alter table tasks.tasks add column if not exists blocked_by uuid[] "
-            "not null default '{}';") in SCHEMA_SQL
-    # A store without it reads as behind, and adding it is additive: the next
-    # command brings the store up to it on its own.
-    assert ("tasks", "blocked_by") in mod._COLUMNS
-    assert "tasks.blocked_by" not in mod._NOT_ADDITIVE
+def test_the_tables_declare_the_column():
+    assert "  blocked_by   uuid[]      not null default '{}'," in mod._TABLES_SHAPE
 
 
-def test_the_help_states_the_field_and_its_migration():
+def test_the_help_states_the_field():
     said = " ".join(mod.__doc__.split())
     for needle in ("--blocked-by TASK[,TASK...]",
                    "Clearable: objective, description, assignee, pickup, unique-key, "
@@ -85,46 +80,8 @@ def test_the_help_states_the_field_and_its_migration():
                    "No task is claimable while its `blocked_by` lists a task that has "
                    "not ended, in `todo` as much as in `waiting`",
                    "`blocked_by` is no metadata key",
-                   "both stop taking the key in the next release",
-                   "`migrate --apply` moves into it",
-                   "`would_backfill`"):
+                   "both stop taking the key in the next release"):
         assert needle in said, needle
-
-
-@needs_store
-def test_migrate_adds_the_column_to_an_older_store(store, capsys, monkeypatch):
-    entry, schema, conn = store
-    conn.execute(f"alter table {schema}.tasks drop column blocked_by")
-    monkeypatch.setattr(mod, "BLOCKED_BY_KEPT", None)
-    mod.cmd_migrate(entry, [])
-    report = answer(capsys)
-    assert report["would_add"] == ["tasks.blocked_by"] and report["applied"] is False
-    mod.cmd_migrate(entry, ["--apply"])
-    report = answer(capsys)
-    assert report["added"] == ["tasks.blocked_by"] and report["applied"] is True
-    column = conn.execute(
-        """select data_type, is_nullable, column_default from information_schema.columns
-            where table_schema = %s and table_name = 'tasks' and column_name = 'blocked_by'""",
-        (schema,)).fetchone()
-    assert column == ("ARRAY", "NO", "'{}'::uuid[]")
-
-
-@needs_store
-def test_a_store_without_the_column_is_read_as_before(store, capsys, monkeypatch):
-    """A connection that cannot bring the store up to date is served as it would
-    have been: every task blocked by nothing, and a write of blockers refused."""
-    entry, schema, conn = store
-    add(entry, capsys, "b-old")
-    conn.execute(f"alter table {schema}.tasks drop column blocked_by")
-    monkeypatch.setattr(mod, "BLOCKED_BY_KEPT", None)
-    for flags in ([], ["--full"]):
-        mod.cmd_list(entry, flags)
-        [row] = answer(capsys)["tasks"]
-        assert row["blocked_by"] == [] and row["blocked_by_status"] == {}
-    assert claim(entry, capsys)["task"]["unique_key"] == "b-old"
-    add(entry, capsys, "b-other")
-    error = refused(capsys, mod.cmd_set, entry, ["b-other", "--blocked-by", "b-old"], 6)
-    assert error["code"] == "schema_behind"
 
 
 # --- Writing it --------------------------------------------------------------
@@ -259,7 +216,7 @@ def test_a_waiting_task_returns_on_its_own_when_its_blockers_end(store, capsys,
     set_(entry, capsys, "b-here", "--status", "complete")
     assert claim(entry, capsys)["returned"] == []
     # Another project's blocker, named by id, ends the wait as well.
-    conn.execute(f"update {schema}.tasks set status = 'complete' where id = %s",
+    conn.execute(f"update {schema}.tasks_tasks set status = 'complete' where id = %s",
                  (elsewhere,))
     returned = claim(entry, capsys)
     assert returned["returned"] == ["b-wait"]
@@ -287,79 +244,6 @@ def test_a_todo_task_blocked_by_a_draft_is_escalated(project, store, turns, caps
     assert (task["status"], task["blocked_by"]) == ("waiting", [])
 
 
-# --- The backfill ------------------------------------------------------------
-
-@needs_store
-def test_the_backfill_moves_what_resolves_and_reports_the_rest(store, capsys,
-                                                               monkeypatch):
-    entry, schema, conn = store
-    first = add(entry, capsys, "f-first")
-    second = add(entry, capsys, "f-second")
-    elsewhere = theirs(entry, capsys, monkeypatch, "f-there")
-
-    def old(key: str, kept, project: str = HERE) -> str:
-        return str(conn.execute(
-            f"""insert into {schema}.tasks (project_id, type, title, unique_key, status,
-                                            metadata, updated_at)
-                values (%s, 'alpha', %s, %s, 'waiting', %s::jsonb, '2026-01-01T00:00:00Z')
-                returning id""",
-            (project, key, key, json.dumps({"blocked_by": kept, "cost_total": 1}))
-        ).fetchone()[0])
-
-    mixed = old("f-mixed", ["f-first", second, elsewhere, "f-there", "f-gone", " "])
-    whole = old("f-whole", ["f-second"])
-    junk = old("f-junk", "not a list")
-    gone = old("f-gone-only", ["f-gone"])
-    keyed_there = old("f-their", ["f-there"], project=THERE)
-
-    mod.cmd_migrate(entry, [])
-    dry = answer(capsys)["would_backfill"]
-    assert (dry["tasks"], dry["moved"], dry["tasks_written"], dry["unresolvable"]) == \
-        (5, 5, 3, 3)
-    assert dry["by_project"][HERE]["unresolvable"] == [
-        {"task": "f-mixed", "task_id": mixed, "names": ["f-there", "f-gone"],
-         "why": "names no task"},
-        {"task": "f-junk", "task_id": junk, "names": "not a list",
-         "why": "not a list of tasks"},
-        {"task": "f-gone-only", "task_id": gone, "names": ["f-gone"],
-         "why": "names no task"}]
-    assert dry["by_project"][THERE] == {"tasks": 1, "moved": 1, "unresolvable": []}
-    # The dry run wrote nothing.
-    assert conn.execute(f"select blocked_by from {schema}.tasks where id = %s",
-                        (mixed,)).fetchone()[0] == []
-
-    mod.cmd_migrate(entry, ["--apply"])
-    applied = answer(capsys)
-    assert applied["backfilled"]["moved"] == 5 and "warning" in applied
-
-    def row(tid):
-        return conn.execute(f"""select blocked_by, metadata, updated_at::text
-                                  from {schema}.tasks where id = %s""", (tid,)).fetchone()
-
-    ids, meta, touched = row(mixed)
-    assert [str(one) for one in ids] == [first, second, elsewhere]
-    assert meta == {"blocked_by": ["f-there", "f-gone"], "cost_total": 1}
-    assert touched.startswith("2026-01-01")
-    ids, meta, _ = row(whole)
-    assert [str(one) for one in ids] == [second] and meta == {"cost_total": 1}
-    ids, meta, _ = row(junk)
-    assert ids == [] and meta == {"blocked_by": "not a list", "cost_total": 1}
-    ids, meta, _ = row(keyed_there)
-    assert [str(one) for one in ids] == [elsewhere] and meta == {"cost_total": 1}
-
-    # Again: nothing moves, the same names are reported.
-    mod.cmd_migrate(entry, ["--apply"])
-    again = answer(capsys)["backfilled"]
-    assert (again["moved"], again["tasks_written"], again["unresolvable"]) == (0, 0, 3)
-    assert [str(one) for one in row(mixed)[0]] == [first, second, elsewhere]
-
-    # doctor names what is left for this project.
-    from psycopg.rows import dict_row
-    with conn.cursor(row_factory=dict_row) as cur:
-        left = mod._blocked_by_backfill(cur, schema, apply=False, project=HERE)
-    assert (left["tasks"], left["moved"], left["unresolvable"]) == (3, 0, 3)
-
-
 # --- Compatibility for one release -------------------------------------------
 
 @needs_store
@@ -374,7 +258,7 @@ def test_meta_set_writes_the_field_and_says_it_is_deprecated(store, capsys):
     assert said["metadata"] == {"note": "kept", "blocked_by": [first]}
     assert "set <task> --blocked-by" in said["deprecated"][0]
     assert json.loads(out.err)["deprecated"] == said["deprecated"]
-    stored = conn.execute(f"select blocked_by, metadata from {schema}.tasks "
+    stored = conn.execute(f"select blocked_by, metadata from {schema}.tasks_tasks "
                           f"where unique_key = 'c-task'").fetchone()
     assert [str(one) for one in stored[0]] == [first] and stored[1] == {"note": "kept"}
     # The same refusals as `set --blocked-by`.
@@ -407,7 +291,7 @@ def test_the_metadata_mirrors_the_field_for_one_release(store, capsys):
     assert rows["c-task"]["blocked_by_status"] == {first: "todo"}
     assert rows["c-first"]["metadata"] == {}
     # Names a backfill could not move are shown as stored, not hidden.
-    conn.execute(f"""update {schema}.tasks set metadata = '{{"blocked_by": ["c-gone"]}}'
+    conn.execute(f"""update {schema}.tasks_tasks set metadata = '{{"blocked_by": ["c-gone"]}}'
                       where unique_key = 'c-task'""")
     assert shown(entry, capsys, "c-task")["task"]["metadata"] == {"blocked_by": ["c-gone"]}
 
@@ -426,7 +310,7 @@ def test_a_worker_writes_blockers_under_the_metadata_scope(store, capsys, projec
                        "writes: {held: {status: [todo]}, other: {metadata: [blocked_by]}}")
     mod.cmd_claim(entry, ["--worker", "alpha", "--key", "w-held"])
     execution = answer(capsys)["execution"]["id"]
-    conn.execute(f"""update {schema}.task_executions
+    conn.execute(f"""update {schema}.tasks_executions
                         set metrics = jsonb_build_object('worker_writes', %s::jsonb)
                       where id = %s""",
                  (json.dumps({"held": {"status": ["todo"]},
@@ -436,53 +320,13 @@ def test_a_worker_writes_blockers_under_the_metadata_scope(store, capsys, projec
     assert set_(entry, capsys, "w-other", "--blocked-by", "w-gate-2")["task"]["blocked_by"]
     assert set_(entry, capsys, "w-other", "--clear", "blocked-by")["task"]["blocked_by"] == []
     # Without it, a worker may add blockers to a task that has none, and no more.
-    conn.execute(f"""update {schema}.task_executions set metrics = '{{}}'::jsonb
+    conn.execute(f"""update {schema}.tasks_executions set metrics = '{{}}'::jsonb
                       where id = %s""", (execution,))
     assert set_(entry, capsys, "w-other", "--blocked-by", "w-gate")["task"]["blocked_by"]
     error = refused(capsys, mod.cmd_set, entry, ["w-other", "--blocked-by", "w-gate-2"])
     assert "write over a metadata key" in error["message"]
     error = refused(capsys, mod.cmd_set, entry, ["w-other", "--clear", "blocked-by"])
     assert "remove metadata" in error["message"]
-
-
-# --- Through the CLI ---------------------------------------------------------
-
-import test_service as service  # noqa: E402
-from test_service import lab  # noqa: E402,F401  (fixture)
-
-
-@needs_store
-def test_through_the_cli_doctor_names_what_migrate_moves(lab):
-    import psycopg
-
-    cli = service.tasks_cli
-    schema = json.loads((lab["project"] / "capabilities" / "tasks" / "connections.json")
-                        .read_text())["connections"]["local"]["db_schema"]
-    gate = service.answer_of(cli(lab, "add", "--type", "alpha", "--title", "gate",
-                                 "--key", "l-gate", "--status", "todo"))["created"]
-    service.answer_of(cli(lab, "add", "--type", "alpha", "--title", "old",
-                          "--key", "l-old", "--status", "todo"))
-    with psycopg.connect(hooks.DSN, autocommit=True) as conn:
-        conn.execute(f"""update {schema}.tasks
-                            set metadata = '{{"blocked_by": ["l-gate", "l-gone"]}}'
-                          where unique_key = 'l-old'""")
-    doctor = service.answer_of(cli(lab, "doctor"))
-    assert doctor["blocked_by_in_metadata"]["moved"] == 1
-    assert doctor["blocked_by_in_metadata"]["unresolvable"] == 1
-    assert "still keep blocked_by in their metadata" in doctor["warning"]
-    applied = service.answer_of(cli(lab, "migrate", "--apply"))
-    assert applied["backfilled"]["moved"] == 1
-    shown_ = service.answer_of(cli(lab, "show", "l-old"))["task"]
-    assert shown_["blocked_by"] == [gate]
-    assert shown_["metadata"] == {"blocked_by": ["l-gone"]}
-    # The task is now held by its gate, through the CLI's own claim.
-    ran = service.answer_of(cli(lab, "run", "alpha"))
-    assert ran["would_claim"] == "l-gate"
-    # The deprecated write says so on stderr and still lands in the field.
-    proc = cli(lab, "meta", "set", "l-old", "blocked_by", '["l-gate"]')
-    assert proc.returncode == 0 and '"deprecated"' in proc.stderr
-    doctor = service.answer_of(cli(lab, "doctor"))
-    assert "blocked_by_in_metadata" not in doctor
 
 
 def test_a_frame_that_lets_a_turn_write_blockers_says_how(project):

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
 # ///
 """Who a write is attributed to, and where that lands.
 
@@ -9,7 +9,8 @@ The resolver is pure and is checked without a store. The store-backed checks
 read TASKS_TEST_DSN, a libpq URL for a database the run may create a schema in,
 and skip when it is unset; every run works in a schema of its own and drops it.
 
-    uv run --with pytest --with 'psycopg[binary]>=3.2' python -m pytest capabilities/tasks/tests -q
+    uv run --with pytest --with 'psycopg[binary]>=3.2' \\
+        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -89,15 +90,10 @@ needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 @pytest.fixture
 def store(monkeypatch):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
 
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
-    entry = {"db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-             "db_user": info.get("user"), "db_name": info.get("dbname"),
-             "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-             "secret_env": "TASKS_TEST_PASSWORD", "allow_write": True}
-    monkeypatch.setenv("TASKS_TEST_PASSWORD", info.get("password") or "")
+    entry = {"allow_write": True}
+    _cli.bind_store(mod, monkeypatch, schema)
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.delenv("TASKS_ACTOR", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
@@ -105,8 +101,7 @@ def store(monkeypatch):
     # somewhere the way `main` makes it stand somewhere.
     monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(mod._schema_ddl(schema))
-        conn.execute(mod._schema_ddl(schema))  # additive, so twice is once
+        _cli.make_tables(mod, schema)
         try:
             yield entry, schema, conn
         finally:
@@ -115,21 +110,6 @@ def store(monkeypatch):
 
 def _answer(capsys) -> dict:
     return json.loads(capsys.readouterr().out)
-
-
-@needs_store
-def test_migrate_adds_the_columns_a_store_lacks(store):
-    from psycopg.rows import dict_row
-    entry, schema, conn = store
-    with conn.cursor(row_factory=dict_row) as cur:
-        assert mod._catalog(cur, schema)["tables"] == sorted(mod._TABLES)
-        assert mod._columns_absent(mod._catalog(cur, schema)) == []
-        conn.execute(f"alter table {schema}.tasks drop column created_by")
-        conn.execute(f"alter table {schema}.task_activities drop column actor")
-        assert mod._columns_absent(mod._catalog(cur, schema)) == [
-            "tasks.created_by", "task_activities.actor"]
-        conn.execute(mod._schema_ddl(schema))
-        assert mod._columns_absent(mod._catalog(cur, schema)) == []
 
 
 @needs_store

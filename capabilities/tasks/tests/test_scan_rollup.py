@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
 # ///
 """A scan row carries its task's runs, what they cost, and what blocks it, so a
 consumer judges a row without a second call.
@@ -9,7 +9,8 @@ consumer judges a row without a second call.
 The store-backed half seeds tasks, raises and blockers into a schema of its own,
 reads TASKS_TEST_DSN, skips when it is unset, and drops the schema.
 
-    uv run --with pytest --with 'psycopg[binary]>=3.2' python -m pytest capabilities/tasks/tests -q
+    uv run --with pytest --with 'psycopg[binary]>=3.2' \\
+        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -52,20 +53,15 @@ needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 @pytest.fixture
 def store(monkeypatch):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
 
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
-    entry = {"db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-             "db_user": info.get("user"), "db_name": info.get("dbname"),
-             "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-             "secret_env": "TASKS_TEST_PASSWORD", "allow_write": False}
-    monkeypatch.setenv("TASKS_TEST_PASSWORD", info.get("password") or "")
+    entry = {"allow_write": False}
+    _cli.bind_store(mod, monkeypatch, schema)
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
     monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(mod._schema_ddl(schema))
+        _cli.make_tables(mod, schema)
         try:
             yield entry, schema, conn
         finally:
@@ -75,7 +71,7 @@ def store(monkeypatch):
 def _task(conn, schema, key, status="todo", project=HERE, metadata=None,
           blocked_by=()) -> str:
     return str(conn.execute(
-        f"""insert into {schema}.tasks (project_id, type, unique_key, title, status,
+        f"""insert into {schema}.tasks_tasks (project_id, type, unique_key, title, status,
                                         metadata, blocked_by)
             values (%s, 'change', %s, %s, %s, %s::jsonb, %s::uuid[]) returning id""",
         (project, key, f"title of {key}", status,
@@ -87,7 +83,7 @@ NOBODY = "00000000-0000-4000-8000-000000000000"
 
 def _raise(conn, schema, task, attempt, worker, metrics=None) -> None:
     conn.execute(
-        f"""insert into {schema}.task_executions (task_id, attempt, worker, status,
+        f"""insert into {schema}.tasks_executions (task_id, attempt, worker, status,
                                                   metrics)
             values (%s, %s, %s, 'ok', %s::jsonb)""",
         (task, attempt, worker, json.dumps(metrics or {})))

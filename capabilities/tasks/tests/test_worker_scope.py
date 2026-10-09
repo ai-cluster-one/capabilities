@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
 # ///
 """What a worker may write, and where the refusal falls.
 
@@ -12,7 +12,8 @@ checks then prove the same rules where they matter - through the verbs, on a
 real claim - and read TASKS_TEST_DSN, skipping when it is unset; every run works
 in a schema of its own and drops it.
 
-    uv run --with pytest --with 'psycopg[binary]>=3.2' python -m pytest capabilities/tasks/tests -q
+    uv run --with pytest --with 'psycopg[binary]>=3.2' \\
+        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -219,7 +220,7 @@ class FakeCursor:
         return False
 
     def execute(self, sql, params=None):
-        if "task_executions" in sql:
+        if "tasks_executions" in sql:
             self.answer = [dict(self.row)] if self.row else []
         elif sql.strip().startswith("select id, project_id"):
             # Every task the fake holds is this project's, so what is proven
@@ -331,15 +332,10 @@ needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 @pytest.fixture
 def store(monkeypatch):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
 
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
-    entry = {"db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-             "db_user": info.get("user"), "db_name": info.get("dbname"),
-             "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-             "secret_env": "TASKS_TEST_PASSWORD", "allow_write": True}
-    monkeypatch.setenv("TASKS_TEST_PASSWORD", info.get("password") or "")
+    entry = {"allow_write": True}
+    _cli.bind_store(mod, monkeypatch, schema)
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.delenv("TASKS_ACTOR", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
@@ -347,7 +343,7 @@ def store(monkeypatch):
     # somewhere the way `main` makes it stand somewhere.
     monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(mod._schema_ddl(schema))
+        _cli.make_tables(mod, schema)
         try:
             yield entry, schema, conn
         finally:

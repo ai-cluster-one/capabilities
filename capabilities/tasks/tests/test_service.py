@@ -1,7 +1,8 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.8.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0",
+#                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
 """The service: its declaration, its lanes, how it wakes, reloads and stops.
@@ -18,6 +19,7 @@ between the daemon and the store being closed and opened again, so no test
 stops a server it did not start.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
+        --with 'capabilities-contract==0.3.0' \\
         --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -252,11 +254,11 @@ def test_inventory_names_what_the_doctor_finds_wrong_with_what_serves_it(project
         "ok": False, "problem": "connections_required: this project holds no connection"}
 
 
-def test_the_notification_is_part_of_the_schema():
-    ddl = mod._schema_ddl("elsewhere")
-    assert "create trigger tasks_notify_claimable after insert or update on elsewhere.tasks" in ddl
+def test_the_notification_is_part_of_the_tables():
+    ddl = mod._TABLES_SHAPE
+    assert "create trigger tasks_notify_claimable after insert or update on tasks_tasks" in ddl
     assert "pg_notify('tasks_claimable'" in ddl
-    assert "elsewhere.notify_claimable()" in ddl
+    assert "execute function tasks_notify_claimable()" in ddl
 
 
 class _AwayListener:
@@ -297,7 +299,7 @@ class _AwayHost:
         return None
 
     def store_key(self):
-        return ("away", "5432", "tasks", "tasks", "prefer", "TASKS_DB_PASSWORD")
+        return ("away:5432/tasks", "tasks", "agentkit")
 
     def store_name(self):
         return "away:5432/tasks"
@@ -382,20 +384,15 @@ needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 @pytest.fixture
 def store(monkeypatch):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
 
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
-    entry = {"db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-             "db_user": info.get("user"), "db_name": info.get("dbname"),
-             "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-             "secret_env": "TASKS_TEST_PASSWORD", "allow_write": True}
-    monkeypatch.setenv("TASKS_TEST_PASSWORD", info.get("password") or "")
+    entry = {"allow_write": True}
+    _cli.bind_store(mod, monkeypatch, schema)
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
     monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(mod._schema_ddl(schema))
+        _cli.make_tables(mod, schema)
         try:
             yield entry, schema, conn
         finally:
@@ -440,7 +437,7 @@ class Harness:
     """A dispatcher over one slot on the real host, with each turn replaced by
     FAKE_TURN. `daemon` is the slot."""
 
-    def __init__(self, project: Path, entry: dict):
+    def __init__(self, project: Path, entry: dict, setting=None):
         self.project = project
         self.claims = project / "claims"
         self.claims.mkdir(exist_ok=True)
@@ -451,6 +448,10 @@ class Harness:
         service = mod._service_module()
         self.service = service
         self.host = mod._ServiceHost(entry, None)
+        if setting is not None:
+            # The store reached another way - through a relay - than the
+            # verbs the test calls reach it.
+            self.host.setting = setting
         self.host.turn_command = lambda worker: [sys.executable, str(script), worker,
                                                  str(self.claims), str(self.release)]
         self.dispatcher = service.Dispatcher(tick=0.2)
@@ -548,63 +549,12 @@ def test_a_task_moved_to_todo_or_given_a_new_pickup_is_announced(project, store,
     assert heard() == []
 
 
-# The check a store created before `waiting` existed carries. Behind on it, the
-# store is behind by something that is not additive, so nothing brings it up to
-# this version on its own.
-OLD_CHECK = ("check (status in ('draft','todo','in_progress','complete','closed'))")
-
-
-@needs_store
-def test_the_daemon_brings_a_store_a_trigger_behind_up_to_date_and_logs_it(
-        project, store, capsys):
-    entry, schema, conn = store
-    conn.execute(f"drop trigger tasks_notify_claimable on {schema}.tasks")
-    write_settings(project, "version = 1\npoll_seconds = 3600\n")
-    with Harness(project, entry) as h:
-        h.dispatcher.step()
-        assert h.daemon.status()["wake_by"] == "notification"
-        log = (h.daemon.state_dir / h.service.LOG_FILE).read_text()
-        assert (f"brought schema {schema} up to this version: "
-                "tasks.tasks_notify_claimable") in log
-        add(entry, capsys, "beta")
-        h.steps(lambda: h.running("beta") == 1, seconds=4)
-        assert "notify" in h.daemon.last_wake["reasons"]
-    mod.cmd_migrate(entry, [])
-    assert json.loads(capsys.readouterr().out)["would_add"] == []
-
-
-@needs_store
-def test_without_the_notification_the_daemon_wakes_by_the_poll(project, store, capsys):
-    entry, schema, conn = store
-    conn.execute(f"drop trigger tasks_notify_claimable on {schema}.tasks")
-    conn.execute(f"alter table {schema}.tasks drop constraint tasks_status_check")
-    conn.execute(f"alter table {schema}.tasks add constraint tasks_status_check {OLD_CHECK}")
-    write_settings(project, "version = 1\npoll_seconds = 1\n")
-    from psycopg.rows import dict_row
-    with conn.cursor(row_factory=dict_row) as cur:
-        assert mod._notify_behind(mod._catalog(cur, schema)) == [
-            "tasks.tasks_notify_claimable"]
-    mod.cmd_migrate(entry, [])
-    assert "tasks.tasks_notify_claimable" in json.loads(capsys.readouterr().out)["would_add"]
-    with Harness(project, entry) as h:
-        h.dispatcher.step()
-        assert h.daemon.status()["wake_by"] == "poll"
-        assert h.daemon.status()["notification"]["installed"] is False
-        add(entry, capsys, "beta")
-        h.steps(lambda: h.running("beta") == 1, seconds=4)
-        assert "poll" in h.daemon.last_wake["reasons"]
-        assert "notify" not in h.daemon.last_wake["reasons"]
-        assert "brought schema" not in (h.daemon.state_dir / h.service.LOG_FILE).read_text()
-    mod.cmd_migrate(entry, ["--apply"])
-    assert "tasks.tasks_notify_claimable" in json.loads(capsys.readouterr().out)["added"]
-
-
 @needs_store
 def test_the_daemon_wakes_at_the_earliest_pickup_still_ahead(project, store, capsys):
     entry, schema, conn = store
     write_settings(project, "version = 1\npoll_seconds = 3600\n")
     tid = add(entry, capsys, "alpha")
-    conn.execute(f"update {schema}.tasks set pickup_at = now() + interval '2 seconds' "
+    conn.execute(f"update {schema}.tasks_tasks set pickup_at = now() + interval '2 seconds' "
                  "where id = %s", (tid,))
     with Harness(project, entry) as h:
         h.dispatcher.step()
@@ -703,10 +653,10 @@ def test_a_stop_ending_turns_waits_then_ends_them_and_settles_like_a_lapsed_leas
         assert h.daemon.turns == {} and turn.process.poll() is not None
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
-    row = conn.execute(f"select status, detail from {schema}.task_executions where id = %s",
+    row = conn.execute(f"select status, detail from {schema}.tasks_executions where id = %s",
                        (execution,)).fetchone()
     assert row == ("abandoned", "cut off when the service stopped")
-    status = conn.execute(f"select status from {schema}.tasks where id = %s",
+    status = conn.execute(f"select status from {schema}.tasks_tasks where id = %s",
                           (tid,)).fetchone()[0]
     assert status == "todo"
     log = (h.daemon.state_dir / "daemon.log").read_text()
@@ -725,7 +675,7 @@ def held_raise(entry, schema, conn, capsys, h: Harness, lease: int) -> tuple[str
 
     def left() -> float:
         return conn.execute(f"""select extract(epoch from lease_until - now())::float8
-                                  from {schema}.task_executions where id = %s""",
+                                  from {schema}.tasks_executions where id = %s""",
                             (execution,)).fetchone()[0]
     return execution, left
 
@@ -751,7 +701,7 @@ def test_the_service_keeps_a_live_turns_lease_and_lets_a_gone_ones_lapse(
         h.settle(7)
         assert 0 < left() <= 3.5
         assert execution not in swept_by_a_claim(entry)
-        status = conn.execute(f"select status from {schema}.task_executions where id = %s",
+        status = conn.execute(f"select status from {schema}.tasks_executions where id = %s",
                               (execution,)).fetchone()[0]
         assert status == "running"
         turn.process.kill()
@@ -759,7 +709,7 @@ def test_the_service_keeps_a_live_turns_lease_and_lets_a_gone_ones_lapse(
         h.steps(lambda: h.running() == 0)
         poll_for(lambda: left() < 0, 6)
         assert execution in swept_by_a_claim(entry)
-    status = conn.execute(f"select status from {schema}.task_executions where id = %s",
+    status = conn.execute(f"select status from {schema}.tasks_executions where id = %s",
                           (execution,)).fetchone()[0]
     assert status == "abandoned"
 
@@ -794,7 +744,7 @@ def test_a_closed_raise_is_never_revived(project, store, capsys):
     serve(project, entry)
     host = mod._ServiceHost(entry, None)
     receipt = {"task": "t-closed", "task_id": tid, "execution": execution, "attempt": 1}
-    conn.execute(f"""update {schema}.task_executions
+    conn.execute(f"""update {schema}.tasks_executions
                         set status = 'abandoned', ended_at = now(),
                             lease_until = now() - interval '1 second' where id = %s""",
                  (execution,))
@@ -809,7 +759,7 @@ def test_a_closed_raise_is_never_revived(project, store, capsys):
             again["execution"]["id"])})])["renewed"] == []
         assert host.renew_leases(own, [("alpha", {**receipt, "task_id": other, "execution": str(
             again["execution"]["id"])})])["renewed"] == [str(again["execution"]["id"])]
-    row = conn.execute(f"select status, lease_until < now() from {schema}.task_executions "
+    row = conn.execute(f"select status, lease_until < now() from {schema}.tasks_executions "
                        "where id = %s", (execution,)).fetchone()
     assert row == ("abandoned", True)
 
@@ -1008,9 +958,9 @@ def test_the_daemon_outlives_the_store_going_away_and_listens_again(
     write_worker(project, "gamma", "takes: [gamma]\nprofile: plain")
     write_settings(project, "version = 1\npoll_seconds = 3600\nmax_parallel = 3\n")
     # The daemon reaches the store through the relay; the test writes directly.
-    through = {**entry, "db_host": "127.0.0.1", "db_port": str(relay.port)}
+    through = _cli.store_setting(schema, host="127.0.0.1", port=relay.port)
     add(entry, capsys, "alpha")
-    with Harness(project, through) as h:
+    with Harness(project, entry, through) as h:
         h.steps(lambda: h.running("alpha") == 1 and all(
             t.phase == "working" for t in h.daemon.turns.values()))
         assert h.daemon.status()["wake_by"] == "notification"
@@ -1097,7 +1047,9 @@ def test_every_question_goes_on_one_held_connection_beside_the_listener(
         assert len(asked) >= 6 and set(asked) == {backend(store_.query)}
         assert "poll" in h.daemon.last_wake["reasons"]
         [row] = h.daemon.status()["stores"]
-        assert row["store"] == f"{entry['db_host']}:{entry['db_port']}/{entry['db_name']}"
+        from psycopg.conninfo import conninfo_to_dict
+        info = conninfo_to_dict(DSN)
+        assert row["store"] == f"{info['host']}:{info['port']}/{info['dbname']}"
         assert (row["listening"], row["connections_opened"], row["error"]) == (True, 2, None)
         assert row["last_opened_at"]
         live = conn.execute("select count(*) from pg_stat_activity where pid = any(%s)",
@@ -1114,8 +1066,8 @@ def test_a_lost_question_connection_is_asked_for_again_on_the_doubling_interval(
     missed."""
     entry, schema, conn = store
     write_settings(project, "version = 1\npoll_seconds = 3600\n")
-    through = {**entry, "db_host": "127.0.0.1", "db_port": str(relay.port)}
-    h = quick(Harness(project, through))
+    through = _cli.store_setting(schema, host="127.0.0.1", port=relay.port)
+    h = quick(Harness(project, entry, through))
     attempts = []
     open_query = h.host.open_query
     h.host.open_query = lambda seconds: attempts.append(time.monotonic()) or open_query(seconds)
@@ -1159,8 +1111,8 @@ def test_connections_the_path_dropped_are_severed_and_asked_for_again(
     longer, and both connections are opened again and the work is taken."""
     entry, schema, conn = store
     write_settings(project, "version = 1\npoll_seconds = 1\n")
-    through = {**entry, "db_host": "127.0.0.1", "db_port": str(relay.port)}
-    h = quick(Harness(project, through), ROUND_TRIP_SECONDS=1.0, PING_SECONDS=0.5)
+    through = _cli.store_setting(schema, host="127.0.0.1", port=relay.port)
+    h = quick(Harness(project, entry, through), ROUND_TRIP_SECONDS=1.0, PING_SECONDS=0.5)
     with h:
         h.dispatcher.step()
         store_ = h.daemon.store
@@ -1187,8 +1139,8 @@ def test_a_lost_listener_is_asked_for_again_on_the_doubling_interval(
         project, store, relay, capsys):
     entry, schema, conn = store
     write_settings(project, "version = 1\npoll_seconds = 3600\n")
-    through = {**entry, "db_host": "127.0.0.1", "db_port": str(relay.port)}
-    h = quick(Harness(project, through))
+    through = _cli.store_setting(schema, host="127.0.0.1", port=relay.port)
+    h = quick(Harness(project, entry, through))
     attempts = []
     listen = h.host.listen
     h.host.listen = lambda: attempts.append(time.monotonic()) or listen()
@@ -1232,7 +1184,7 @@ def test_a_question_that_hangs_is_cut_off_and_the_daemon_carries_on(project, sto
         store_ = h.daemon.store
         blocker = psycopg.connect(DSN)
         try:
-            blocker.execute(f"lock table {schema}.tasks in access exclusive mode")
+            blocker.execute(f"lock table {schema}.tasks_tasks in access exclusive mode")
             h.daemon.wakes.add("notify")
             started = time.monotonic()
             h.dispatcher.step(wait=False)
@@ -1280,9 +1232,7 @@ def lab(tmp_path):
     """A project the CLI runs in as a consuming project would, with the envelope
     handed down so no manager is asked."""
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
 
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
@@ -1296,12 +1246,8 @@ def lab(tmp_path):
         "schema": "capabilities.project.v1",
         "id": "prj_" + uuid.uuid4().hex[:12], "slug": "lab-" + secrets.token_hex(3)}))
     (tasks / "connections.json").write_text(json.dumps({
-        "default": "local",
-        "connections": {"local": {
-            "db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-            "db_user": info.get("user"), "db_name": info.get("dbname"),
-            "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-            "secret_env": "TASKS_TEST_PASSWORD", "allow_write": True}}}))
+        "default": "local", "connections": {"local": {"allow_write": True}}}))
+    _cli.write_store_setting(tmp_path / "config", schema)
     (tasks / "profiles" / "plain.toml").write_text(
         PROFILE + f'cli_path = "{FAKE_CLAUDE}"\n')
     write_worker(project, "alpha", "takes: [alpha]\nprofile: plain")
@@ -1314,16 +1260,15 @@ def lab(tmp_path):
         "CAPABILITIES_HOME": str(tmp_path / "registry"),
         "CLAUDE_PROJECT_DIR": str(project),
         "CAPABILITIES_PROJECT_ENVELOPE": str(envelope),
-        "TASKS_TEST_PASSWORD": info.get("password") or "",
         "FAKE_ENGINE_TASKS": str(_cli.CLI_PATH),
     })
     for leaked in ("CAPABILITIES_READ_ONLY", "TASKS_EXECUTION", "TASKS_ACTOR",
                    "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "CAPABILITIES_PROJECT_ID",
                    "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_STORE_URL",
-                   "CAPABILITIES_STORE_MODE"):
+                   "AGENTKIT_STORE_URL", "CAPABILITIES_STORE_MODE"):
         env.pop(leaked, None)
-    lab = {"project": project, "env": env, "tmp": tmp_path}
-    assert tasks_cli(lab, "migrate", "--apply").returncode == 0
+    lab = {"project": project, "env": env, "tmp": tmp_path, "schema": schema}
+    assert tasks_cli(lab, "migrate").returncode == 0
     try:
         yield lab
     finally:
@@ -1522,12 +1467,9 @@ def test_service_doctor_warns_while_the_daemon_waits_out_the_store(lab, relay):
     daemon it fails. The daemon lives through it and works when the store is
     back."""
     project = lab["project"]
-    connections = project / "capabilities" / "tasks" / "connections.json"
-    registry = json.loads(connections.read_text())
-    registry["connections"]["relayed"] = {**registry["connections"]["local"],
-                                          "db_host": "127.0.0.1", "db_port": str(relay.port)}
-    registry["default"] = "relayed"
-    connections.write_text(json.dumps(registry))
+    # The machine's store is reached through the relay.
+    _cli.write_store_setting(lab["tmp"] / "config", lab["schema"], host="127.0.0.1",
+                             port=relay.port)
     assert answer_of(tasks_cli(lab, "service", "init"))["written"]
     write_settings(project, "version = 1\npoll_seconds = 3600\nshutdown_grace_seconds = 5\n")
 
@@ -1585,7 +1527,6 @@ def test_a_turn_starts_with_the_projects_env_files_over_the_daemons_environment(
     project = lab["project"]
     record = lab["tmp"] / "engine.jsonl"
     (project / ".env").write_text(
-        f"TASKS_TEST_PASSWORD={lab['env']['TASKS_TEST_PASSWORD']}\n"
         f"FAKE_ENGINE_TASKS={lab['env']['FAKE_ENGINE_TASKS']}\n"
         "TURN_PROBE_OVER_PROCESS=dotenv\n"
         "TURN_PROBE_LAYERED=dotenv\n"
@@ -1627,30 +1568,19 @@ def test_a_turn_starts_with_the_projects_env_files_over_the_daemons_environment(
     said = "\n".join(answer_of(tasks_cli(lab, "service", "logs", "--tail", "500"))["lines"])
     said += (lab["tmp"] / "supervised.log").read_text()
     assert "a quoted value" not in said
-    if lab["env"]["TASKS_TEST_PASSWORD"]:
-        assert lab["env"]["TASKS_TEST_PASSWORD"] not in said
 
 
 @needs_store
 def test_each_turn_reads_the_env_files_as_they_are_when_it_starts(lab):
     """The daemon reads no env file of the project: each turn reads .env and
     .env.local itself, so an edit reaches the next turn of the same daemon with
-    no restart. The connection here leaves its host and port to .env.local and
-    the store's secret is in the project's .env, so the daemon itself resolves
-    through the whole cascade, project files included."""
+    no restart."""
     project = lab["project"]
     record = lab["tmp"] / "engine.jsonl"
-    connections = project / "capabilities" / "tasks" / "connections.json"
-    registry = json.loads(connections.read_text())
-    local = registry["connections"]["local"]
-    host, port = local.pop("db_host"), local.pop("db_port")
-    connections.write_text(json.dumps(registry))
-    (project / ".env.local").write_text(
-        f"db_host={host}\ndb_port={port}\nFAKE_ENGINE_RECORD={record}\n")
+    (project / ".env.local").write_text(f"FAKE_ENGINE_RECORD={record}\n")
 
     def dotenv(probe: str) -> None:
         (project / ".env").write_text(
-            f"TASKS_TEST_PASSWORD={lab['env']['TASKS_TEST_PASSWORD']}\n"
             f"FAKE_ENGINE_TASKS={lab['env']['FAKE_ENGINE_TASKS']}\n"
             f"TURN_PROBE_EDITED={probe}\n")
 

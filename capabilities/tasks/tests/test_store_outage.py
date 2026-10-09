@@ -1,7 +1,8 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.8.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0",
+#                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
 """A store that goes away for a while, a turn that dies, and a raise left open:
@@ -19,6 +20,7 @@ run` children on the stand-in harness. The store-backed checks read
 TASKS_TEST_DSN and skip when it is unset.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
+        --with 'capabilities-contract==0.3.0' \\
         --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -52,21 +54,14 @@ def add(lab, key: str, kind: str = "alpha") -> None:
 
 
 def schema_of(lab) -> str:
-    registry = json.loads((lab["project"] / "capabilities" / "tasks"
-                           / "connections.json").read_text())
-    return registry["connections"]["local"]["db_schema"]
+    return lab["schema"]
 
 
 def relayed(lab, relay, window: int) -> None:
     """Every command of the lab reaches the store through the relay, and waits
     a store that is away out for `window` seconds."""
-    connections = lab["project"] / "capabilities" / "tasks" / "connections.json"
-    registry = json.loads(connections.read_text())
-    registry["connections"]["relayed"] = {**registry["connections"]["local"],
-                                          "db_host": "127.0.0.1",
-                                          "db_port": str(relay.port)}
-    registry["default"] = "relayed"
-    connections.write_text(json.dumps(registry))
+    _cli.write_store_setting(lab["tmp"] / "config", lab["schema"], host="127.0.0.1",
+                             port=relay.port)
     lab["env"]["TASKS_STORE_RETRY_SECONDS"] = str(window)
 
 
@@ -82,8 +77,8 @@ def raise_of(schema: str, key: str) -> dict | None:
                        extract(epoch from e.lease_until - now())::float8 as left,
                        extract(epoch from e.lease_until - e.started_at)::float8 as span,
                        t.status as task_status
-                  from {schema}.task_executions e
-                  join {schema}.tasks t on t.id = e.task_id
+                  from {schema}.tasks_executions e
+                  join {schema}.tasks_tasks t on t.id = e.task_id
                  where t.unique_key = %s
                  order by e.started_at desc limit 1""", (key,)).fetchone()
 
@@ -198,10 +193,8 @@ def test_a_command_waits_out_a_store_that_is_away_and_gives_up_after_its_window(
 
 @needs_store
 def test_a_store_that_answers_and_refuses_is_not_waited_for(lab):
-    connections = lab["project"] / "capabilities" / "tasks" / "connections.json"
-    registry = json.loads(connections.read_text())
-    registry["connections"]["local"]["db_name"] = "no_such_database_here"
-    connections.write_text(json.dumps(registry))
+    _cli.write_store_setting(lab["tmp"] / "config", lab["schema"],
+                             database="no_such_database_here")
     lab["env"]["TASKS_STORE_RETRY_SECONDS"] = "120"
     started = time.monotonic()
     refused = cli(lab, "list")
@@ -366,12 +359,12 @@ def closed_under(schema: str, execution: str) -> None:
     and put its task back."""
     import psycopg
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(f"""update {schema}.task_executions
+        conn.execute(f"""update {schema}.tasks_executions
                             set status = 'abandoned', ended_at = now(),
                                 detail = 'lease lapsed before release'
                           where id::text = %s""", (execution,))
-        conn.execute(f"""update {schema}.tasks set status = 'todo'
-                          where id = (select task_id from {schema}.task_executions
+        conn.execute(f"""update {schema}.tasks_tasks set status = 'todo'
+                          where id = (select task_id from {schema}.tasks_executions
                                        where id::text = %s)""", (execution,))
 
 

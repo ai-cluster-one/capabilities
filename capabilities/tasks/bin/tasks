@@ -2,6 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
+#     "capabilities-contract==0.3.0",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.8.0",
 #     "pyyaml>=6",
@@ -62,12 +63,6 @@ WRITING  (needs allow_write on the connection; exit 4 otherwise)
                                                 leaving the rest as they were
   tasks meta rm <task> <key> [key...]           remove keys by name
   tasks activity <task> "what happened"          record real work done
-  tasks migrate [--apply]                       create what this connection's
-                                                schema is missing; reports and
-                                                touches nothing without --apply,
-                                                and then needs no allow_write.
-                                                The only way a change that is not
-                                                additive is applied. See STORE
 
 EXECUTION  (also needs allow_write)
   tasks claim [filters | --key KEY] [--lease 3h] [--worker NAME] [--handler CMD]
@@ -726,21 +721,20 @@ SERVICE
   It wakes when the store notifies that a task of this project became
   claimable - inserted in todo, moved to todo, or its pickup changed while in
   todo; a task handed to a worker in `waiting` is noticed at the poll - at every poll, at the earliest pickup or lease still ahead, and when
-  one of its turns claims or ends. The notification is a trigger the store
-  gains when it is brought up to this version, which the daemon does itself
-  when it starts listening and at every poll, as STORE describes, and logs; one
-  channel serves the whole database, and its payload names the schema and the
-  project, so a daemon acts only on its own. A store without it leaves the
-  daemon the poll, and `service doctor` says so. A lapsed
+  one of its turns claims or ends. The notification is a trigger among the
+  tables STORE describes, which the service brings up to this version once as
+  it starts; one channel serves the whole database, and its payload names the
+  schema and the project, so a daemon acts only on its own. A service with no
+  store configured refuses to run, exit 6 `store_not_configured` naming
+  `capabilities store set`, and `service doctor` says the same. A lapsed
   lease and an ended wait are put back by a claim and nothing else, so on the
   poll, with nothing else to start, a daemon that sees one due starts a turn
   whose claim puts it back.
 
   The daemon holds two connections to the store for as long as it runs: one
   it listens on, and one every question it asks the store goes on - whether a
-  lane would take something, whether a claim would put something back, the
-  next pickup, whether the store notifies, and bringing it up to this version.
-  Idle, it opens no other. The store cuts off any question that runs past 30s,
+  lane would take something, whether a claim would put something back, and the
+  next pickup. Idle, it opens no other. The store cuts off any question that runs past 30s,
   and the daemon counts that connection lost. Every 2 minutes the listener
   carries a `select 1`, and so does the other when nothing else went over it
   for as long, so a proxy in front of the store does not close either as idle.
@@ -877,11 +871,9 @@ SERVICE
   refuses, in this order and each with exit 6: a project without a durable id
   in project.json (`capabilities init` gives it one), `no_project_identity`;
   one whose records are in the store, `database_mode_unsupported`; one whose
-  .env or .env.local sets the secret of the connection it selects by default,
-  `project_secret_set`, or whose connection entry leaves any of db_host,
-  db_port, db_name, db_user, db_sslmode and db_schema to the environment,
-  `connection_incomplete`; and a project whose slug another joined project
-  has, `slug_taken`, since the two would share a state root. It answers
+  default connection still names a store of its own, `store_in_connection`
+  (STORE); and a project whose slug another joined project has, `slug_taken`,
+  since the two would share a state root. It answers
   `{"joined", "project": {"id", "slug", "root"}, "list"}`, `joined` false
   with a reason when the project is already on the list, and starts nothing.
   `leave` answers `{"left", "project", "list"}`; `leave --machine --project
@@ -893,14 +885,10 @@ SERVICE
   runs, or `start --machine`. Exactly one runs per machine, by the lock in its
   state root `$XDG_STATE_HOME/capabilities/machine/tasks/`, which is also its
   working directory and holds its pid, its status `daemon.json` and its log.
-  It loads no project's environment: it connects to each store it reaches
-  with the secret the process environment or the user tier,
-  `$XDG_CONFIG_HOME/tasks/credentials.env`, holds, so one secret key has one
-  value per machine and a project on another store or role names another key
-  as its connection's `secret_env`. It holds one listener and one question
-  connection per distinct store across every project, a store being its host,
-  port, database, user, sslmode and secret key, and hands each notification to
-  the project whose store, schema and id it names.
+  It loads no project's environment. Every project it serves is on the
+  machine's one store, the one its store setting names, so it holds one
+  listener and one question connection across every project, and hands each
+  notification to the project whose schema and id it names.
 
   It follows the list without a reload: a project that joins is served from
   the first pass at which it can be, and one that leaves is let go at once,
@@ -910,8 +898,7 @@ SERVICE
   `reload`, `doctor`, `logs`, `pause`, `resume` and `init` in a joined project
   work as before and speak of the machine process. Before every action for a
   project it checks, besides what project mode checks, that the project is
-  still on the list, that its connection entry states every value above and
-  that its env files do not set the secret. Each project's turns are its own:
+  still on the list. Each project's turns are its own:
   `tasks run <worker> --apply` with the project as its cwd and no
   `--connection`, so the project's default selects it, reading the project's
   .env and .env.local itself, its workers the project's and only those.
@@ -919,8 +906,8 @@ SERVICE
   A project the machine process cannot serve is reported in `status --machine`
   with the reason and the others are served: `refused` while it is not on the
   list, does not enable tasks for itself, its connection is withheld or
-  read-only, its env files set the secret, its entry leaves a value to the
-  environment, its records are in the store, or its lock is held by a
+  read-only or still names a store, its records are in the store, or its lock
+  is held by a
   project-mode daemon ("a project-mode daemon, pid N, serves this project;
   stop it there"), tried again every second; `error` while its folder is gone,
   its declaration does not load, or its store is away. A project whose
@@ -1116,8 +1103,7 @@ METADATA VALUES
   release. For the same release every task row whose metadata carries no
   `blocked_by` of its own shows the field's ids there as well, so a reader of
   `metadata.blocked_by` still finds them; read the top-level `blocked_by`
-  instead. A metadata `blocked_by` still stored is one `migrate --apply` could
-  not move (STORE): nothing reads it, and `doctor` names it.
+  instead.
 
 ACTOR
   Every write carries who made it. `add` keeps it as the task's `created_by`,
@@ -1442,8 +1428,7 @@ WATCH
         what happened while the watch was away is known only up to this line.
 
   Tasks are never deleted, so no line removes one. Notifications come from
-  triggers on the three tables, which the store gains when it is brought up to
-  this version, as STORE describes; they fire on
+  triggers on the three tables STORE describes; they fire on
   every write whichever path made it, and only when it commits, so work that
   rolls back prints nothing.
 
@@ -1455,86 +1440,59 @@ WATCH
   whatever reads its stdout goes away. A reader therefore keeps a pipe open on
   its stdin and closes it to stop the watch; stdin at /dev/null ends it right
   after `ready`. A store that cannot be reached before `ready` exits 5 and is
-  not asked again, and so does a store without the triggers, before `ready` or
-  on reconnecting. A policy refusal exits 4, as every verb's does.
+  not asked again. A policy refusal exits 4, as every verb's does.
 
 CONTRACT
   tasks help | doctor | connections | stub | manifest --json
   tasks guide [topic] | ids list|get|set|rm | refs | inventory [--network]
+  tasks migrate [status]          bring the tables in the machine's store up to
+                                  this version, or report where they stand.
+                                  See STORE
 
 STORE
-  The two tables live in the schema the connection names as `db_schema`,
-  defaulting to `tasks`. Several projects may share one schema and are kept
-  apart inside it by the project each task carries; naming different schemas
-  keeps them apart outright, for the case where one store must not see another
-  at all. `doctor` reports which schema it looked in and refuses when either
-  table is absent from it.
+  The store is the machine's: the PostgreSQL its store setting names, set with
+  `capabilities store set` and proved with `capabilities store doctor`, or the
+  one AGENTKIT_STORE_URL or CAPABILITIES_STORE_URL names for a test or a
+  development session. tasks reaches it through the shared database library
+  and keeps its tables in the schema the setting binds, each named `tasks_*` -
+  tasks_tasks, tasks_activities, tasks_changes and tasks_executions - under its
+  own migration ledger, beside the tables of every other tool that uses the
+  store. Several projects share them and are kept apart by the project each
+  task carries. With no store configured every command, `doctor` and the
+  service refuse with exit 6 `store_not_configured`, naming `capabilities store
+  set`. A connection names no store: one that still carries db_host, db_port,
+  db_user, db_name, db_sslmode, db_schema or secret_env is refused with exit 6
+  `store_in_connection`, naming the keys to remove; it keeps what else it
+  carries, its timezone, allow_write and grants.
+
+  `tasks migrate` applies the steps the tables lack, under the library's lock,
+  and `tasks migrate status` reports where they stand - `pending`, `current`,
+  or one `migrate` would refuse - without a lock and changing nothing. The
+  manager runs `migrate` when it installs or updates tasks, and the service
+  runs it once as it starts. Any other command that finds the tables missing or
+  older than this version brings them up to it once, and says so on stderr
+  before its answer,
+    {"migrated": {"schema": S, "applied": [STEP...]}}
+  and takes no lock when they are current. `doctor` reports the store - where
+  its setting was read, and the schema - and where the tables stand, and
+  changes nothing.
+
+  A store an earlier release kept in a schema of its own, `tasks`, is moved by
+  the first step into the schema the setting binds: its four tables and the
+  three functions their triggers run, renamed to the `tasks_` names, so every
+  id, trail entry, recorded move and open raise is the one it was, and the
+  emptied schema `tasks` is dropped. It is moved only from the previous
+  release's shape - every column it added, no task stored as `in_progress` and
+  no `blocked_by` left in a task's metadata - and only into a schema that does
+  not already hold tasks_tasks; otherwise `migrate` refuses, changes nothing,
+  and names the previous release's `tasks migrate --apply`. Run it with the
+  tasks service stopped.
 
   `list` and `search` carry `store`, an opaque digest of the database and schema
   that answered, equal for two callers reaching the same store and different
   otherwise, so a reader surveying several projects asks each store once; it is
   null when the connection's role may not read the cluster's identifier, which
   proves nothing either way.
-
-  A schema is an identifier, not a value, so it is validated as one: anything but
-  letters, digits and underscore is refused rather than quoted.
-
-  A store behind this version is brought up to it by the first command that
-  reaches it, read or write, and by the service when it starts listening and at
-  every poll, when everything it lacks is additive: a table, a column that is
-  empty or defaulted, an index, a trigger and the function it runs. It is
-  applied under a lock the store holds for the schema, and the store is read
-  again once the lock is held, so of several clients that find it behind
-  together one applies it and the rest are served as soon as it has. A command reports it as one
-  line on stderr before its answer,
-    {"migrated": {"schema": S, "created": [TABLE...], "added": [TABLE.THING...]}}
-  and the service writes it to its log.
-
-  No backup is taken for that, and none is needed: it writes no row and
-  removes nothing, so dropping what it added puts the store back as it was.
-  A change that is not additive - filling a column into the rows that predate
-  it, replacing a constraint, dropping the store-wide key - is never applied on
-  its own, and nothing else is either while one is pending. Only `migrate
-  --apply` applies it, run deliberately after taking a backup of the schema
-  (`pg_dump --schema S`). Until then the store answers what it can as before,
-  `doctor` and `migrate` name what it lacks, and `watch` on a store without
-  its triggers refuses with exit 5 `schema_behind`.
-
-  `blocked_by` became a field of its own: a store gains the empty column like
-  any additive change, and `migrate --apply` moves into it, in the same
-  transaction, the blockers tasks kept in their metadata before - store-wide,
-  each name an id of any project or a key of the task's own, the touch trigger
-  held off so no task reads as having moved. A name that resolves to no task
-  stays in the metadata, where nothing reads it, and is listed under
-  `backfilled` by project and named by `doctor`; running it again moves
-  nothing more. `migrate` without --apply reports the same under
-  `would_backfill`. Until it runs, a blocker left in the metadata holds
-  nothing.
-
-  `in_progress` stopped being stored: a store may still hold tasks a claim or
-  a person put there before, which no claim takes. `migrate --apply` returns
-  each, in the same transaction and store-wide, to the status it rests in -
-  the one it stood in before its latest move into `in_progress`, as its
-  history records: where a claim took it from, or where a person moved it
-  from by hand - with a status row by actor `tasks:migrate` and the touch
-  trigger held off. A task whose history records no such move rests in
-  `todo`, and one that would wait on nobody in `draft`. It answers `rested`,
-  by project: how many, to which status, the ones moved there by hand under
-  `by_hand` with who moved them, and those without a record under
-  `without_record`; a task a raise still holds goes on showing `in_progress`.
-  Running it again moves nothing. `migrate` without --apply reports the same
-  under `would_rest`, and `doctor` names the project's own as
-  `in_progress_stored` with a warning. Run it while no turn of the old version
-  is running, since such a turn still scores and lands its task by the status
-  it finds.
-
-  A connection without allow_write, a process under the read-only switch, and a
-  role the store does not let create objects are never brought up to date: a
-  command over one is served as it would have been, reading as before - a store
-  without the `blocked_by` field reads every task as blocked by nothing, and a
-  write of blockers is refused with exit 6 `schema_behind` - and `doctor`
-  reports the store behind. So is a command that waits 10s for the
-  lock, or for the tables to be free, without getting it.
 
   A command that cannot reach the store does not give up at once. It asks
   again after 1s, then at a doubling interval of at most 30s, for
@@ -1561,12 +1519,13 @@ EXIT CODES
     the worker is switched off, worker scope or project scope refuses the
     write, or the write would leave a task where it can never move - see
     ESCALATION; ask the user, never lift the gate yourself
-  5 store - unreachable once the retry window STORE describes is spent, or the
-    schema is not present; `tasks doctor` proves both.
-    For `watch`, also a store that does not announce changes
+  5 store - unreachable once the retry window STORE describes is spent, or its
+    tables cannot be brought up to this version; `tasks doctor` proves both.
+    For `watch`, unreachable before `ready`
   6 input - a malformed argument, an unknown flag, a value outside its set, a
-    worker file this capability cannot read, or a command run outside a
-    project that needs one to know whose tasks it means
+    worker file this capability cannot read, a command run outside a
+    project that needs one to know whose tasks it means, no store configured,
+    or a connection that still names a store
 """
 import json
 import os
@@ -1580,30 +1539,17 @@ SUMMARY = ("Task tracker over a PostgreSQL store - tasks with a goal and the "
            "picked up now surfaces on its own.")
 SCOPE = "project"
 CRED_KEYS = [
-    {"key": "db_host", "secret": False, "required": True,
-     "note": "Reachable host. Differs per machine, so it resolves from .env.local."},
-    {"key": "db_port", "secret": False, "required": False,
-     "note": "Defaults to 5432."},
-    {"key": "db_user", "secret": False, "required": True, "note": ""},
-    {"key": "db_name", "secret": False, "required": True, "note": ""},
-    {"key": "db_sslmode", "secret": False, "required": False,
-     "note": "libpq sslmode. Defaults to prefer."},
-    {"key": "db_schema", "secret": False, "required": False,
-     "note": "Schema holding the two tables. Defaults to tasks. Two projects on "
-             "one database keep separate stores by naming different schemas."},
     {"key": "timezone", "secret": False, "required": False,
      "note": "IANA zone a bare date is read in, and the zone `ready` asks the "
              "clock in. Defaults to UTC."},
-    {"key": "TASKS_DB_PASSWORD", "secret": True, "required": True,
-     "note": "Default name. A connection may name its own key with `secret_env`."},
 ]
-DEFAULT_SECRET_ENV = "TASKS_DB_PASSWORD"
 WRITE_VERBS = {"add", "set", "tag", "untag", "meta", "activity", "claim",
-               "release", "run", "migrate"}
+               "release", "run"}
 WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/tasks/guides/")
 STATE = True        # the service's pid, fingerprint, status and log, per project
+TABLES = True       # tasks_* tables in the machine's store, built by _tables()
 INVENTORY = {"network": "none"}   # the service's state on this machine; the queue is the store's
 POST_INSTALL: list[dict] = []
 SERVICE = {
@@ -1632,7 +1578,10 @@ SERVICE = {
         "command": ["tasks", "service", "run"],
         "environment": {
             "required": [],
-            "optional": [{"key": "TASKS_DB_PASSWORD"}],
+            "optional": [
+                {"key": "CAPABILITIES_STORE_URL"},
+                {"key": "CAPABILITIES_STORE_PASSWORD"},
+            ],
         },
         "mounts": [
             # The project state root automations keeps its state under too. One
@@ -5513,8 +5462,6 @@ def _connections_report() -> dict:
         rows = []
         for spec in CRED_KEYS:
             key = spec["key"]
-            if key == DEFAULT_SECRET_ENV:
-                key = entry.get("secret_env") or key
             if entry.get(key) not in (None, ""):
                 value, tier, source = str(entry[key]), "connection", _reg_file
             else:
@@ -5542,17 +5489,104 @@ def _conf(entry: dict | None, key: str, default: str | None = None) -> str | Non
     return value if value else default
 
 
-def _secret_key(entry: dict | None) -> str:
-    return (entry or {}).get("secret_env") or DEFAULT_SECRET_ENV
+# The keys a connection carried while it named the store itself. The store is
+# the machine's, named by its store setting, so a connection that still carries
+# one is refused rather than read: the store it names is not the one used.
+_RETIRED_STORE_KEYS = ("db_host", "db_port", "db_user", "db_name", "db_sslmode",
+                       "db_schema", "secret_env")
 
 
-# What every store connection asks of TCP, so a path that dropped under it fails
-# the call in about a minute rather than leaving it waiting as long as the
-# operating system would: keepalives prove the peer while nothing is
-# outstanding, and where the platform has it, data left unacknowledged for a
-# minute closes the connection.
-_STORE_LIBPQ = {"keepalives": 1, "keepalives_idle": 30, "keepalives_interval": 10,
-                "keepalives_count": 3, "tcp_user_timeout": 60000}
+def _retired_store_keys(conn_id: str | None, entry: dict | None) -> "Refusal | None":
+    """The refusal for a connection entry that still carries a store key, or
+    None for one that carries none."""
+    carried = [key for key in _RETIRED_STORE_KEYS if key in (entry or {})]
+    if not carried:
+        return None
+    return Refusal(6, "store_in_connection",
+                   f"connection {conn_id!r} carries {', '.join(carried)}, and {NAME} "
+                   "reaches its store through the machine's store setting, never "
+                   "through a connection",
+                   f"name the store with `capabilities store set`, then remove "
+                   f"{', '.join(carried)} from the connection in {NAME}'s "
+                   "connections.json")
+
+
+def _store_keys_gate(conn_id: str | None, entry: dict | None) -> None:
+    refusal = _retired_store_keys(conn_id, entry)
+    if refusal:
+        _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
+
+
+def _db():
+    """The shared database library, which reads the machine's store setting,
+    connects bound to its schema and migrates this capability's tables."""
+    try:
+        from capabilities_contract import db
+    except ImportError:  # pragma: no cover - the shebang installs it
+        _die(6, "driver_missing",
+             "the shared database library capabilities-contract is not installed",
+             f"run {NAME} through its own script header, which pins it")
+    return db
+
+
+def _store_refusal(exc) -> "Refusal":
+    """The library's refusal as this capability states it: a store setting that
+    cannot be used exits 6, a store that cannot be reached, is busy or refuses
+    the migration exits 5, and a store that is not reached is `unreachable`."""
+    return Refusal(6 if exc.slug in _STORE_SETTING_SLUGS else 5,
+                   "unreachable" if exc.slug == "store_unreachable" else exc.slug,
+                   exc.message, exc.hint)
+
+
+def _store_setting(raising: bool = False):
+    """The store in force on this machine - its store setting, or the override
+    a test or a development session names - read and never written. With none,
+    `store_not_configured`, exit 6, naming `capabilities store set`."""
+    db = _db()
+    try:
+        return db.read_setting()
+    except db.DbError as exc:
+        refusal = _store_refusal(exc)
+        if raising:
+            raise refusal from exc
+        _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
+
+
+# The settings whose tables this process has found current, or brought there,
+# so the library is asked once per store a process reaches.
+_TABLES_SETTLED: set = set()
+
+
+def _tables_ready(conn, setting) -> None:
+    """Bring this capability's tables in the store up to this version, on `conn`.
+    The library takes no lock when they are already current and migrates on its
+    locked path when they are missing or older; what it applied is said once on
+    stderr."""
+    if setting in _TABLES_SETTLED:
+        return
+    db = _db()
+    steps, major, minor = _tables()
+    done = db.migrate(conn, NAME, steps, major=major, minor=minor)
+    if done.applied:
+        sys.stderr.write(json.dumps({"migrated": {"schema": done.schema,
+                                                  "applied": done.applied}},
+                                    ensure_ascii=False) + "\n")
+    for warning in done.warnings:
+        sys.stderr.write(json.dumps({"store_warning": warning}, ensure_ascii=False) + "\n")
+    _TABLES_SETTLED.add(setting)
+
+
+def _tables_status(conn):
+    """Where this capability's tables stand in the store `conn` reaches, read
+    by the library without a lock and changing nothing."""
+    from psycopg.rows import dict_row, tuple_row
+    steps, major, minor = _tables()
+    conn.row_factory = tuple_row
+    try:
+        return _db().status(conn, NAME, steps, major=major, minor=minor)
+    finally:
+        conn.row_factory = dict_row
+
 
 # How long a command goes on asking for a store it cannot reach before it gives
 # up with exit 5, in seconds, and the name a project or a machine changes it by.
@@ -5604,12 +5638,14 @@ def _store_away(exc: BaseException) -> bool:
 
 
 def _connect(entry: dict | None, *, raising: bool = False, waiting: bool | None = None,
-             **libpq):
-    """A connection to the store, or exit 5 saying why there is none. A caller
-    that outlives an unreachable store passes `raising` and is handed the same
-    refusal as a Refusal instead. `libpq` carries connection parameters a
-    caller holding its connection open needs, over `_STORE_LIBPQ` and libpq's
-    own defaults.
+             application_name: str = NAME, setting=None, migrating: bool = True):
+    """A connection to the machine's store, bound to its schema with this
+    capability's tables in it, or exit 5 saying why there is none - exit 6 when
+    no store is configured or its setting cannot be used. A caller that
+    outlives an unreachable store passes `raising` and is handed the same
+    refusal as a Refusal instead. `setting` is the store a caller holding its
+    connections already resolved, else the one in force now. A caller that
+    only reports where the tables stand passes `migrating` False.
 
     A store that is away is asked for again, after 1s and then at a doubling
     interval of at most 30s, until the window `_store_retry_seconds` gives is
@@ -5619,80 +5655,54 @@ def _connect(entry: dict | None, *, raising: bool = False, waiting: bool | None 
     when it would otherwise exit: a caller passing `raising` keeps asking on a
     schedule of its own and is told at once."""
     try:
-        import psycopg
         from psycopg.rows import dict_row
     except ImportError:  # pragma: no cover - the shebang installs it
         _die(1, "dependency_missing", "psycopg is not available",
              "this script runs under `uv run --script`; invoke it through its shebang")
     import time
-    password, _t, _s = _resolve_env_key(_secret_key(entry))
+    db = _db()
+    setting = setting if setting is not None else _store_setting(raising)
     window = _store_retry_seconds() if (not raising if waiting is None else waiting) else 0
     deadline = time.monotonic() + window
     delay = _STORE_RETRY_FIRST
     said = False
     while True:
         try:
-            conn = psycopg.connect(
-                host=_conf(entry, "db_host"), port=int(_conf(entry, "db_port", "5432")),
-                user=_conf(entry, "db_user"), dbname=_conf(entry, "db_name"),
-                password=password, sslmode=_conf(entry, "db_sslmode", "prefer"),
-                connect_timeout=10, row_factory=dict_row, **{**_STORE_LIBPQ, **libpq})
+            conn = db.connect(application_name=application_name, setting=setting)
             break
-        except Exception as exc:
+        except db.DbError as exc:
             remaining = deadline - time.monotonic()
-            if (isinstance(exc, psycopg.OperationalError) and _store_away(exc)
+            if (exc.slug == "store_unreachable" and _store_away(exc.__cause__ or exc)
                     and remaining > 0):
                 if not said:
                     said = True
                     sys.stderr.write(json.dumps({"store_away": {
-                        "error": str(exc).strip(), "asking_again_for_seconds": window}},
+                        "error": str(exc.__cause__ or exc).strip(),
+                        "asking_again_for_seconds": window}},
                         ensure_ascii=False) + "\n")
                     sys.stderr.flush()
                 # The last ask is at the end of the window rather than before it.
                 time.sleep(min(delay, remaining))
                 delay = min(delay * 2, _STORE_RETRY_LONGEST)
                 continue
-            refusal = Refusal(5, "unreachable", f"cannot reach the store: {exc}",
-                              f"`{NAME} connections` shows where every value resolves")
+            refusal = _store_refusal(exc)
             if raising:
                 raise refusal from exc
             _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
-    if CATCH_UP:
-        # On the first connection a command opens, so bringing the store up to
-        # this version costs one query on a store that is current and no second
-        # connection on any. Disarmed before it runs: it is asked once per run.
-        globals()["CATCH_UP"] = False
-        applied = _catch_up(conn, SCHEMA, PROJECT)
-        if applied:
-            sys.stderr.write(json.dumps({"migrated": applied}, ensure_ascii=False) + "\n")
-    if BLOCKED_BY_KEPT is None:
-        # Asked once per run, after any catch-up, so a store this command could
-        # not bring up to date - a read-only connection, a role that may not
-        # create - is still read as it would have been, its tasks blocked by
-        # nothing, rather than refused for a column it does not have yet.
-        with conn.cursor() as cur:
-            cur.execute("""select exists (select 1 from information_schema.columns
-                                           where table_schema = %s and table_name = 'tasks'
-                                             and column_name = 'blocked_by') as kept""",
-                        (SCHEMA,))
-            globals()["BLOCKED_BY_KEPT"] = bool(cur.fetchone()["kept"])
-        conn.rollback()
+    try:
+        if migrating:
+            _tables_ready(conn, setting)
+    except db.DbError as exc:
+        conn.close()
+        refusal = _store_refusal(exc)
+        if raising:
+            raise refusal from exc
+        _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
+    except BaseException:
+        conn.close()
+        raise
+    conn.row_factory = dict_row
     return conn
-
-
-def _blocked_by_field(alias: str = "") -> str:
-    """The `blocked_by` field as a query reads it from `alias`: the column, or
-    an empty list on a store that has not gained it yet."""
-    return f"{alias}blocked_by" if BLOCKED_BY_KEPT is not False else "'{}'::uuid[]"
-
-
-def _blocked_by_writable() -> None:
-    """Refuse a write of `blocked_by` to a store that has no field for it."""
-    if BLOCKED_BY_KEPT is False:
-        _die(6, "schema_behind",
-             "this store has no blocked_by field yet, so the blockers would be "
-             "written nowhere a claim reads them",
-             f"run `{NAME} migrate --apply` against this store")
 
 
 def _sever_after(conn, seconds: float):
@@ -5730,24 +5740,7 @@ def _sever_after(conn, seconds: float):
     return bounded()
 
 
-SCHEMA = "tasks"          # replaced per run from the selected connection
-CATCH_UP = False          # armed per run for a command whose connection may write
-BLOCKED_BY_KEPT = None    # whether the store's tasks have a blocked_by field, asked once per run
-_IDENT = __import__("re").compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-def _schema(entry) -> str:
-    """Which schema holds the two tables.
-
-    A schema is an identifier, not a value, so it cannot travel as a query
-    parameter and has to be interpolated. That makes validating it the only
-    thing standing between a config file and SQL injection, so anything that is
-    not a plain identifier is refused rather than quoted and hoped for."""
-    name = _conf(entry, "db_schema", "tasks")
-    if not _IDENT.match(name or ""):
-        _die(6, "input", f"{name!r} is not a usable schema name",
-             "letters, digits and underscore, not starting with a digit")
-    return name
+SCHEMA = "agentkit"       # replaced per run by the schema the store setting binds
 
 
 def _zone(entry) -> "ZoneInfo":
@@ -5848,8 +5841,8 @@ def _mirrored(row: dict) -> dict:
     `blocked_by` lived in the metadata before it had a column, and readers of a
     task's metadata found it there. Every row that carries both the column and
     the metadata shows the column's ids under the metadata's key as well, unless
-    the metadata still holds names of its own - ones `migrate --apply` could not
-    resolve - which are shown as stored. Deprecated: the mirror goes in the
+    the metadata still holds names of its own - ones that named no task - which
+    are shown as stored. Deprecated: the mirror goes in the
     next release, and the top-level `blocked_by` is the field to read."""
     meta, named = row.get("metadata"), row.get("blocked_by")
     if isinstance(meta, dict) and isinstance(named, list) and named \
@@ -5974,7 +5967,7 @@ def _task_id(cur, ref: str, *, writing: bool = False, answering: bool = False) -
         # A write outside a project is refused for that before anything is
         # looked up, whichever way the task is named.
         _writing_project()
-    cur.execute(f"select id, project_id, assignee from {SCHEMA}.tasks "
+    cur.execute(f"select id, project_id, assignee from {SCHEMA}.tasks_tasks "
                 f"where id::text = %s or (unique_key = %s and project_id = %s)",
                 (ref, ref, PROJECT))
     hit = cur.fetchall()
@@ -5988,15 +5981,7 @@ def _task_id(cur, ref: str, *, writing: bool = False, answering: bool = False) -
              "address a task by its uuid, or by a unique_key of the project the "
              "command runs in")
     if writing:
-        if answering and _assigned_here(hit[0]):
-            # An entry another project writes must say so. A store that cannot
-            # record whose it is would pass it off as the task's own.
-            if not _origin_kept(cur):
-                _die(6, "schema_behind",
-                     "this store does not record which project wrote an entry yet, "
-                     "so another project's entry would read as the task's own",
-                     f"run `{NAME} migrate --apply` against this store")
-        else:
+        if not (answering and _assigned_here(hit[0])):
             _project_gate(ref, hit[0]["project_id"], hit[0].get("assignee"))
     return str(hit[0]["id"])
 
@@ -6035,7 +6020,7 @@ def _project_gate(ref: str, owner: str | None, assignee: str | None = None) -> N
 def _task_row(cur, tid: str) -> dict:
     """The task as stored: the status it rests in, which every rule deciding
     where a task goes reads. What a reader is shown is `_task_shown`."""
-    cur.execute(f"select * from {SCHEMA}.tasks where id = %s", (tid,))
+    cur.execute(f"select * from {SCHEMA}.tasks_tasks where id = %s", (tid,))
     return _rows(cur)[0]
 
 
@@ -6049,7 +6034,7 @@ def _shown_columns(table: str) -> str:
 def _task_shown(cur, tid: str) -> dict:
     """The task as a reader is shown it: `in_progress` while an open raise
     holds it."""
-    cur.execute(f"select {_shown_columns('t')} from {SCHEMA}.tasks t where t.id = %s", (tid,))
+    cur.execute(f"select {_shown_columns('t')} from {SCHEMA}.tasks_tasks t where t.id = %s", (tid,))
     return _rows(cur)[0]
 
 
@@ -6153,17 +6138,16 @@ def _scan_columns(opts: dict) -> str:
     runs and their cost, and what it is blocked by. They are subqueries of the
     same statement, so a page costs one query however many rows it holds."""
     touched = (f"greatest(t.updated_at, "
-               f"(select max(a.created_at) from {SCHEMA}.task_activities a "
+               f"(select max(a.created_at) from {SCHEMA}.tasks_activities a "
                f"where a.task_id = t.id), "
                f"(select max(greatest(e.started_at, e.ended_at)) "
-               f"from {SCHEMA}.task_executions e where e.task_id = t.id "
+               f"from {SCHEMA}.tasks_executions e where e.task_id = t.id "
                f"and {_a_raise()}))")
-    lean = (_LEAN.replace("blocked_by", f"{_blocked_by_field('t.')} as blocked_by")
+    lean = (_LEAN.replace("blocked_by", "t.blocked_by as blocked_by")
             .replace(" status,", f" {_shown_status('t')} as status,"))
     # The whole row, with the status a reader is shown in place of the stored
     # one: a later column of the same name is the one a row carries.
-    full = ("t.*" if BLOCKED_BY_KEPT is not False else "t.*, '{}'::uuid[] as blocked_by") \
-        + f", {_shown_status('t')} as status"
+    full = f"t.*, {_shown_status('t')} as status"
     return (f"{full if opts.get('full') else lean}, {touched} as last_touched_at, "
             f"{_rollup_columns()}")
 
@@ -6188,12 +6172,12 @@ def _rollup_columns() -> str:
             f"from (select coalesce(e.worker, '') as worker, count(*) as n, "
             f"sum(({cost})::text::float8) filter (where jsonb_typeof({cost}) = 'number') as cost, "
             f"count(*) filter (where jsonb_typeof({cost}) is distinct from 'number') as uncosted "
-            f"from {SCHEMA}.task_executions e where e.task_id = t.id "
+            f"from {SCHEMA}.tasks_executions e where e.task_id = t.id "
             f"and {_a_raise()} group by 1) g) as runs")
     blockers = (f"(select coalesce(jsonb_object_agg(n.id::text, "
-                f"(select b.status from {SCHEMA}.tasks b where b.id = n.id)), "
+                f"(select b.status from {SCHEMA}.tasks_tasks b where b.id = n.id)), "
                 f"'{{}}'::jsonb) "
-                f"from unnest({_blocked_by_field('t.')}) as n(id)) as blocked_by_status")
+                f"from unnest(t.blocked_by) as n(id)) as blocked_by_status")
     return f"{runs}, {blockers}"
 
 
@@ -6296,9 +6280,9 @@ def _attach_activities(cur, tasks: list[dict], opts: dict, *, embed: bool) -> li
     # say that: rows[-0:] is the whole list, which is the opposite of the ask.
     embed = (embed if want is None else True) and depth != 0
     ids = [t["id"] for t in tasks]
-    cur.execute(f"""select id, task_id, description, actor, {_origin_column(cur)},
+    cur.execute(f"""select id, task_id, description, actor, origin_project,
                            created_at
-                      from {SCHEMA}.task_activities where task_id = any(%s::uuid[])
+                      from {SCHEMA}.tasks_activities where task_id = any(%s::uuid[])
                      order by created_at asc""", (ids,))
     trail: dict = {}
     for row in _rows(cur):
@@ -6339,10 +6323,10 @@ def cmd_list(entry, args: list[str]) -> None:
     where, params = _where(opts, _zone(entry))
     with _connect(entry) as conn, conn.cursor() as cur:
         store = _store_identity(cur)
-        cur.execute(f"select count(*) as n from {SCHEMA}.tasks t{where}", params)
+        cur.execute(f"select count(*) as n from {SCHEMA}.tasks_tasks t{where}", params)
         total = cur.fetchone()["n"]
         per, offset, pagination = _page(opts, total)
-        cur.execute(f"""select {_scan_columns(opts)} from {SCHEMA}.tasks t{where}
+        cur.execute(f"""select {_scan_columns(opts)} from {SCHEMA}.tasks_tasks t{where}
                          order by {order}
                          limit %s offset %s""", params + [per, offset])
         tasks = _attach_activities(cur, _rows(cur), opts, embed=False)
@@ -6367,10 +6351,10 @@ def cmd_ready(entry, args: list[str]) -> None:
     where = (where + joiner + f"{_shown_status('t')} in ('todo','in_progress') "
              f"and (pickup_at is null or pickup_at <= now()) and not {_holds('t')}")
     with _connect(entry) as conn, conn.cursor() as cur:
-        cur.execute(f"select count(*) as n from {SCHEMA}.tasks t{where}", params)
+        cur.execute(f"select count(*) as n from {SCHEMA}.tasks_tasks t{where}", params)
         total = cur.fetchone()["n"]
         per, offset, pagination = _page(opts, total)
-        cur.execute(f"""select {_shown_columns('t')} from {SCHEMA}.tasks t{where}
+        cur.execute(f"""select {_shown_columns('t')} from {SCHEMA}.tasks_tasks t{where}
                          order by pickup_at asc nulls last, created_at asc
                          limit %s offset %s""", params + [per, offset])
         _emit({"pagination": pagination,
@@ -6386,8 +6370,8 @@ def cmd_show(entry, args: list[str]) -> None:
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, opts["_loose"][0])
         task = _task_shown(cur, tid)
-        cur.execute(f"""select id, description, actor, {_origin_column(cur)}, created_at
-                          from {SCHEMA}.task_activities where task_id = %s
+        cur.execute(f"""select id, description, actor, origin_project, created_at
+                          from {SCHEMA}.tasks_activities where task_id = %s
                          order by created_at asc""", (tid,))
         trail = _rows(cur)
         want = opts.get("activities")
@@ -6422,10 +6406,10 @@ def cmd_search(entry, args: list[str]) -> None:
     params = params + [q] * 6
     with _connect(entry) as conn, conn.cursor() as cur:
         store = _store_identity(cur)
-        cur.execute(f"select count(*) as n from {SCHEMA}.tasks t{where}", params)
+        cur.execute(f"select count(*) as n from {SCHEMA}.tasks_tasks t{where}", params)
         total = cur.fetchone()["n"]
         per, offset, pagination = _page(opts, total, default=max(total, 1))
-        cur.execute(f"""select {_scan_columns(opts)} from {SCHEMA}.tasks t{where}
+        cur.execute(f"""select {_scan_columns(opts)} from {SCHEMA}.tasks_tasks t{where}
                          order by {order}
                          limit %s offset %s""", params + [per, offset])
         _emit({"store": store, "query": opts["_loose"][0], "pagination": pagination,
@@ -6832,7 +6816,7 @@ def _execution_lookup(cur):
     def lookup(execution_id: str) -> dict | None:
         if execution_id not in seen:
             cur.execute(f"""select id, task_id, status, to_jsonb(e) -> 'metrics' as metrics
-                              from {SCHEMA}.task_executions e
+                              from {SCHEMA}.tasks_executions e
                              where id::text = %s""", (execution_id,))
             rows = _rows(cur)
             seen[execution_id] = rows[0] if rows else None
@@ -6866,7 +6850,7 @@ def cmd_add(entry, args: list[str]) -> None:
     with _connect(entry) as conn, conn.cursor() as cur:
         key = values.get("unique_key")
         if key:
-            cur.execute(f"select id from {SCHEMA}.tasks "
+            cur.execute(f"select id from {SCHEMA}.tasks_tasks "
                         f"where unique_key = %s and project_id = %s",
                         (key, values["project_id"]))
             found = cur.fetchall()
@@ -6896,7 +6880,7 @@ def cmd_add(entry, args: list[str]) -> None:
             values["blocked_by"] = _blockers_given(
                 cur, values["project_id"], None, _blocked_by_flag(opts["blocked-by"]))
         cols = list(values)
-        cur.execute(f"""insert into {SCHEMA}.tasks ({', '.join(cols)})
+        cur.execute(f"""insert into {SCHEMA}.tasks_tasks ({', '.join(cols)})
                         values ({', '.join(_PLACEHOLDER.get(c, '%s') for c in cols)})
                         returning id, type, unique_key, title, status""",
                     [values[c] for c in cols])
@@ -6970,7 +6954,6 @@ def cmd_set(entry, args: list[str]) -> None:
             _die(4, "policy", _IN_PROGRESS_REFUSAL, _IN_PROGRESS_HINT)
         before = _task_row(cur, tid)
         if "blocked_by" in values:
-            _blocked_by_writable()
             # Resolved against the task as it stands, so a key is read in its
             # project and a cycle through its own blockers is seen.
             if values["blocked_by"]:
@@ -6993,7 +6976,7 @@ def cmd_set(entry, args: list[str]) -> None:
         cols = list(values)
         assignments = ([f"{c} = {_PLACEHOLDER.get(c, '%s')}" for c in cols] + settled
                        + ["updated_at = now()"])
-        cur.execute(f"""update {SCHEMA}.tasks set {', '.join(assignments)}
+        cur.execute(f"""update {SCHEMA}.tasks_tasks set {', '.join(assignments)}
                          where id = %s returning *""", [values[c] for c in cols] + [tid])
         row = _rows(cur)[0]
         # A write that moves where a task stands - its status, its assignee or
@@ -7039,11 +7022,11 @@ def cmd_tag(entry, args: list[str], remove: bool = False) -> None:
         else:
             _worker_gate("tag", tid, lookup)
         if remove:
-            cur.execute(f"""update {SCHEMA}.tasks
+            cur.execute(f"""update {SCHEMA}.tasks_tasks
                                set tags = array(select unnest(tags) except select unnest(%s::text[]))
                              where id = %s returning tags""", (names, tid))
         else:
-            cur.execute(f"""update {SCHEMA}.tasks
+            cur.execute(f"""update {SCHEMA}.tasks_tasks
                                set tags = array(select distinct unnest(tags || %s::text[]))
                              where id = %s returning tags""", (names, tid))
         tags = _rows(cur)[0]["tags"]
@@ -7138,7 +7121,6 @@ def cmd_meta(entry, args: list[str]) -> None:
                         _die(6, "input", "blocked_by takes a list of tasks, each by its "
                              "key in this project or by its id",
                              f"`{NAME} set <task> --blocked-by <task>[,<task>...]`")
-                    _blocked_by_writable()
                     task = _task_row(cur, tid)
                     blockers = (_blockers_given(cur, task["project_id"], task, value)
                                 if any(one.strip() for one in value) else [])
@@ -7159,19 +7141,19 @@ def cmd_meta(entry, args: list[str]) -> None:
             if blockers is not None:
                 assignments.append("blocked_by = %s::uuid[]")
                 params.append(blockers)
-            cur.execute(f"""update {SCHEMA}.tasks set {', '.join(assignments)}
+            cur.execute(f"""update {SCHEMA}.tasks_tasks set {', '.join(assignments)}
                              where id = %s
-                         returning metadata, {_blocked_by_field()} as blocked_by""",
+                         returning metadata, blocked_by""",
                         (*params, tid))
         else:
             removed = rest[1:]
             emptied = ""
             if "blocked_by" in removed:
                 deprecated.append(_META_BLOCKED_BY)
-                emptied = ", blocked_by = '{}'" if BLOCKED_BY_KEPT is not False else ""
-            cur.execute(f"""update {SCHEMA}.tasks set metadata = metadata - %s::text[]{emptied}
+                emptied = ", blocked_by = '{}'"
+            cur.execute(f"""update {SCHEMA}.tasks_tasks set metadata = metadata - %s::text[]{emptied}
                              where id = %s
-                         returning metadata, {_blocked_by_field()} as blocked_by""",
+                         returning metadata, blocked_by""",
                         (removed, tid))
         row = _rows(cur)[0]
         conn.commit()
@@ -7191,46 +7173,10 @@ _META_BLOCKED_BY = ("blocked_by is no metadata key any more: it was written to t
                     "<task>[,<task>...]` or `--clear blocked-by`")
 
 
-# Whether the store keeps `origin_project`, asked once per connection. A store
-# that has not been migrated since the column arrived still answers every read,
-# with no origin, and takes every write of its own project, recording none.
-_ORIGIN_KEPT = __import__("weakref").WeakKeyDictionary()
-
-
-def _origin_kept(cur) -> bool:
-    """Whether both trail tables carry `origin_project`, from one catalog query
-    per connection."""
-    holder = getattr(cur, "connection", None) or cur
-    try:
-        return _ORIGIN_KEPT[holder]
-    except (KeyError, TypeError):
-        pass
-    cur.execute("""select count(*) as n from information_schema.columns
-                    where table_schema = %s and column_name = 'origin_project'
-                      and table_name in ('task_activities', 'task_changes')""",
-                (SCHEMA,))
-    kept = _rows(cur)[0]["n"] == 2
-    try:
-        _ORIGIN_KEPT[holder] = kept
-    except TypeError:
-        pass
-    return kept
-
-
-def _origin_column(cur) -> str:
-    """The origin as a trail read selects it: the column, or null where the store
-    does not keep one yet, so every answer has the same shape either way."""
-    return "origin_project" if _origin_kept(cur) else "null::text as origin_project"
-
-
 def _add_activity(cur, tid: str, text: str, actor: str) -> dict:
     """One entry on the trail. Every caller writes it the same way, so what an
     entry is - a moment, a sentence and who recorded it - stays one fact."""
-    if not _origin_kept(cur):
-        cur.execute(f"""insert into {SCHEMA}.task_activities (task_id, description, actor)
-                        values (%s, %s, %s) returning id, created_at""", (tid, text, actor))
-        return {**_rows(cur)[0], "origin_project": None}
-    cur.execute(f"""insert into {SCHEMA}.task_activities
+    cur.execute(f"""insert into {SCHEMA}.tasks_activities
                       (task_id, description, actor, origin_project)
                     values (%s, %s, %s, %s) returning id, created_at, origin_project""",
                 (tid, text, actor, _writing_project()))
@@ -7308,13 +7254,7 @@ def _record_change(cur, tid: str, field: str, old, new,
     after = None if new is None else str(new)
     if before == after:
         return False
-    if not _origin_kept(cur):
-        cur.execute(f"""insert into {SCHEMA}.task_changes
-                          (task_id, field, old_value, new_value, execution_id, actor)
-                        values (%s, %s, %s, %s, %s, %s)""",
-                    (tid, field, before, after, execution_id, actor))
-        return True
-    cur.execute(f"""insert into {SCHEMA}.task_changes
+    cur.execute(f"""insert into {SCHEMA}.tasks_changes
                       (task_id, field, old_value, new_value, execution_id, actor,
                        origin_project)
                     values (%s, %s, %s, %s, %s, %s, %s)""",
@@ -7355,12 +7295,12 @@ def _sweep_leases(cur, project: str) -> list[dict]:
 
     It is still a write, so it reaches no further than the project it runs in: a
     claim looking for its own work never closes somebody else's raise."""
-    cur.execute(f"""update {SCHEMA}.task_executions e
+    cur.execute(f"""update {SCHEMA}.tasks_executions e
                        set status = 'abandoned', ended_at = now(),
                            detail = coalesce(detail, 'lease lapsed before release')
                      where status = 'running' and lease_until is not null
                        and lease_until < now()
-                       and task_id in (select id from {SCHEMA}.tasks
+                       and task_id in (select id from {SCHEMA}.tasks_tasks
                                         where project_id = %s)
                  returning id, task_id, attempt, to_jsonb(e) -> 'metrics' as metrics""",
                 (project,))
@@ -7388,7 +7328,7 @@ def _ended_among(cur, ids: list[str]) -> set:
     read, a blocker that names no task holds the wait rather than freeing it."""
     if not ids:
         return set()
-    cur.execute(f"""select id from {SCHEMA}.tasks
+    cur.execute(f"""select id from {SCHEMA}.tasks_tasks
                      where status in ('complete','closed') and id::text = any(%s)""",
                 (list(ids),))
     return {str(row["id"]) for row in _rows(cur)}
@@ -7400,8 +7340,8 @@ def _holds(task: str) -> str:
     that names no task. The one test the claim's selection and a task named
     with --key apply to every open status, so a task with an open blocker is
     offered to no claim, in `todo` as much as in `waiting`."""
-    return (f"exists (select 1 from unnest({_blocked_by_field(task + '.')}) as held_by(id) "
-            f"where not exists (select 1 from {SCHEMA}.tasks ended "
+    return (f"exists (select 1 from unnest({task}.blocked_by) as held_by(id) "
+            f"where not exists (select 1 from {SCHEMA}.tasks_tasks ended "
             f"where ended.id = held_by.id and ended.status in ('complete','closed')))")
 
 
@@ -7440,7 +7380,7 @@ def _sweep_waiting(cur, project: str) -> list[dict]:
     It is still a write, so it returns only this project's waits: a claim
     looking for its own work never moves somebody else's task."""
     cur.execute(f"""select *, (pickup_at is not null and pickup_at <= now()) as due
-                      from {SCHEMA}.tasks
+                      from {SCHEMA}.tasks_tasks
                      where status = 'waiting' and project_id = %s
                        and {_open_raise_clause(False)}
                      for update skip locked""", (project,))
@@ -7455,25 +7395,20 @@ def _sweep_waiting(cur, project: str) -> list[dict]:
         if not why:
             continue
         tid = str(task["id"])
-        cur.execute(f"""update {SCHEMA}.tasks set status = 'todo', updated_at = now()
+        cur.execute(f"""update {SCHEMA}.tasks_tasks set status = 'todo', updated_at = now()
                          where id = %s returning *""", (tid,))
         after = _rows(cur)[0]
         _record_moves(cur, tid, task, after, actor=SWEEP_ACTOR, origin=project)
         said = f"Returned to the queue from waiting: {why}."
-        if _origin_kept(cur):
-            cur.execute(f"""insert into {SCHEMA}.task_activities
-                              (task_id, description, actor, origin_project)
-                            values (%s, %s, %s, %s)""", (tid, said, SWEEP_ACTOR, project))
-        else:
-            cur.execute(f"""insert into {SCHEMA}.task_activities
-                              (task_id, description, actor)
-                            values (%s, %s, %s)""", (tid, said, SWEEP_ACTOR))
+        cur.execute(f"""insert into {SCHEMA}.tasks_activities
+                          (task_id, description, actor, origin_project)
+                        values (%s, %s, %s, %s)""", (tid, said, SWEEP_ACTOR, project))
         returned.append(after)
     return returned
 
 
 def _open_execution(cur, tid: str) -> dict | None:
-    cur.execute(f"""select * from {SCHEMA}.task_executions
+    cur.execute(f"""select * from {SCHEMA}.tasks_executions
                      where task_id = %s and status = 'running'""", (tid,))
     rows = _rows(cur)
     return rows[0] if rows else None
@@ -7524,7 +7459,7 @@ def _not_cooling() -> str:
     the task already."""
     return (f"not coalesce((select e.status in ('failed', 'abandoned') "
             f"and e.ended_at > now() - make_interval(secs => %s) "
-            f"from {SCHEMA}.task_executions e where e.task_id = {SCHEMA}.tasks.id "
+            f"from {SCHEMA}.tasks_executions e where e.task_id = {SCHEMA}.tasks_tasks.id "
             f"and e.status <> 'running' and {_a_raise()} "
             f"order by e.started_at desc limit 1), false)")
 
@@ -7537,7 +7472,7 @@ def _open_raise(table: str) -> str:
     every filter on status reads it from there, and a claim passes over what it
     names. A raise whose lease ran out holds nothing, and the next claim closes
     it as abandoned."""
-    return (f"exists (select 1 from {SCHEMA}.task_executions h "
+    return (f"exists (select 1 from {SCHEMA}.tasks_executions h "
             f"where h.task_id = {table}.id and h.status = 'running' "
             f"and (h.lease_until is null or h.lease_until >= now()))")
 
@@ -7556,7 +7491,7 @@ def _open_raise_clause(held: bool) -> str:
     `_open_raise` answers it for a query reading the tasks table unaliased. The
     store refuses a second open raise on one task, so a claim that met such a
     task would fail rather than take it."""
-    return f"{'' if held else 'not '}{_open_raise(f'{SCHEMA}.tasks')}"
+    return f"{'' if held else 'not '}{_open_raise(f'{SCHEMA}.tasks_tasks')}"
 
 
 def _selection(opts: dict, project: str, tz, held: bool = False) -> tuple[str, list]:
@@ -7589,7 +7524,7 @@ def _selection(opts: dict, project: str, tz, held: bool = False) -> tuple[str, l
     # A task an open blocker holds waits on it, in whatever open status: a
     # waiting one returns to todo on its own when they end, and a todo one is
     # taken then. One whose pickup is still ahead is held by the moment.
-    clauses.append(f"not {_holds(f'{SCHEMA}.tasks')}")
+    clauses.append(f"not {_holds(f'{SCHEMA}.tasks_tasks')}")
     clauses.append("(pickup_at is null or pickup_at <= now())")
     if opts.get("cool_down"):
         clauses.append(_not_cooling())
@@ -7607,10 +7542,10 @@ def _held_over(cur, opts: dict, project: str, tz) -> list[dict]:
     cur.execute(f"""select id, unique_key,
                            (select jsonb_build_object('execution', h.id, 'worker', h.worker,
                                                       'until', h.lease_until)
-                              from {SCHEMA}.task_executions h
-                             where h.task_id = {SCHEMA}.tasks.id
+                              from {SCHEMA}.tasks_executions h
+                             where h.task_id = {SCHEMA}.tasks_tasks.id
                                and h.status = 'running' limit 1) as held
-                      from {SCHEMA}.tasks{where}
+                      from {SCHEMA}.tasks_tasks{where}
                      order by pickup_at asc nulls last, created_at asc
                      limit 20""", params)
     passed = []
@@ -7749,7 +7684,7 @@ def _claim(entry, opts: dict) -> dict:
             # and a second opinion computed here would disagree with it the one
             # time the two machines differ.
             cur.execute(f"""select *, (pickup_at is null or pickup_at <= now()) as due
-                              from {SCHEMA}.tasks where id = %s
+                              from {SCHEMA}.tasks_tasks where id = %s
                             for update skip locked""", (tid,))
             rows = _rows(cur)
             if not rows:
@@ -7786,7 +7721,7 @@ def _claim(entry, opts: dict) -> dict:
                 return answer
             passed = _held_over(cur, opts, project, _zone(entry))
             while True:
-                cur.execute(f"""select * from {SCHEMA}.tasks{where}
+                cur.execute(f"""select * from {SCHEMA}.tasks_tasks{where}
                                 order by pickup_at asc nulls last, created_at asc
                                 limit 1 for update skip locked""", params)
                 rows = _rows(cur)
@@ -7813,7 +7748,7 @@ def _claim(entry, opts: dict) -> dict:
                 return answer
         before = rows[0]
         tid = str(before["id"])
-        cur.execute(f"""select count(*) as n from {SCHEMA}.task_executions e
+        cur.execute(f"""select count(*) as n from {SCHEMA}.tasks_executions e
                          where task_id = %s and {_a_raise()}""", (tid,))
         attempt = cur.fetchone()["n"] + 1
         # What the claim fixes for the life of the raise: the writes its worker
@@ -7836,14 +7771,14 @@ def _claim(entry, opts: dict) -> dict:
         previous = None
         if opts.get("run") and opts.get("worker"):
             cur.execute(f"""select id, status, run_system, run_ref, metrics, detail
-                              from {SCHEMA}.task_executions e
+                              from {SCHEMA}.tasks_executions e
                              where task_id = %s and worker = %s and {_a_raise()}
                              order by started_at desc limit 1""",
                         (tid, opts["worker"]))
             found = _rows(cur)
             previous = found[0] if found else None
         if fixed:
-            cur.execute(f"""insert into {SCHEMA}.task_executions
+            cur.execute(f"""insert into {SCHEMA}.tasks_executions
                               (task_id, attempt, worker, handler, lease_until, metrics,
                                run_system, run_ref)
                             values (%s, %s, %s, %s, now() + make_interval(secs => %s),
@@ -7852,7 +7787,7 @@ def _claim(entry, opts: dict) -> dict:
                         (tid, attempt, opts.get("worker"), opts.get("handler"), lease,
                          json.dumps(fixed), run_system, run_ref))
         else:
-            cur.execute(f"""insert into {SCHEMA}.task_executions
+            cur.execute(f"""insert into {SCHEMA}.tasks_executions
                               (task_id, attempt, worker, handler, lease_until,
                                run_system, run_ref)
                             values (%s, %s, %s, %s, now() + make_interval(secs => %s),
@@ -7865,8 +7800,8 @@ def _claim(entry, opts: dict) -> dict:
         # its status, assignee and pickup untouched, no move recorded - and is
         # shown `in_progress` for as long as this raise holds it.
         after = _task_shown(cur, tid)
-        cur.execute(f"""select id, description, actor, {_origin_column(cur)}, created_at
-                          from {SCHEMA}.task_activities where task_id = %s
+        cur.execute(f"""select id, description, actor, origin_project, created_at
+                          from {SCHEMA}.tasks_activities where task_id = %s
                          order by created_at asc""", (tid,))
         trail = _rows(cur)
         conn.commit()
@@ -7977,7 +7912,7 @@ def _release(entry, ref: str, outcome: str, status: str | None, detail: str | No
     trail is the last useful thing that turn can do. A refusal that ended the
     process would take that with it."""
     with _connect(entry) as conn, conn.cursor() as cur:
-        cur.execute(f"""select * from {SCHEMA}.task_executions where id::text = %s""", (ref,))
+        cur.execute(f"""select * from {SCHEMA}.tasks_executions where id::text = %s""", (ref,))
         found = _rows(cur)
         if not found:
             raise Refusal(3, "not_found", f"no raise for {ref!r}",
@@ -7987,7 +7922,7 @@ def _release(entry, ref: str, outcome: str, status: str | None, detail: str | No
         # every other write is held to, refused in the same words, and asked
         # before the raise's own state so that a foreign raise is never told
         # whether it is still open.
-        cur.execute(f"select project_id from {SCHEMA}.tasks where id = %s",
+        cur.execute(f"select project_id from {SCHEMA}.tasks_tasks where id = %s",
                     (execution["task_id"],))
         owner = _rows(cur)[0]["project_id"]
         here = _writing_project()
@@ -8005,7 +7940,7 @@ def _release(entry, ref: str, outcome: str, status: str | None, detail: str | No
         tid = str(execution["task_id"])
         # A release naming no run keeps the one the claim recorded; an empty
         # one clears it, for a raise that never started the run it was given.
-        cur.execute(f"""update {SCHEMA}.task_executions
+        cur.execute(f"""update {SCHEMA}.tasks_executions
                            set status = %s, ended_at = now(), detail = %s,
                                run_system = case when %s::text is null then run_system
                                                  else nullif(%s::text, '') end,
@@ -8038,7 +7973,7 @@ def _release(entry, ref: str, outcome: str, status: str | None, detail: str | No
             settled, spent = _settle_the_wait(cur, status if status is not None
                                               and status != before["status"] else None,
                                               before, False)
-            cur.execute(f"""update {SCHEMA}.tasks set {", ".join(moves + settled)},
+            cur.execute(f"""update {SCHEMA}.tasks_tasks set {", ".join(moves + settled)},
                                    updated_at = now()
                              where id = %s returning *""", (*values, tid))
             after = _rows(cur)[0]
@@ -8337,7 +8272,7 @@ def _in_place_sql() -> str:
                   reaching past it. Null when the task is in none - never held
                   in this place, or taken, moved or behind a lane hold since -
                   so a claim that holds it next begins a new one."""
-    changes, raises = f"{SCHEMA}.task_changes", f"{SCHEMA}.task_executions"
+    changes, raises = f"{SCHEMA}.tasks_changes", f"{SCHEMA}.tasks_executions"
     place = f"""coalesce((select max(c.changed_at) from {changes} c
                            where c.task_id = t.id
                              and (c.field = 'assignee'
@@ -8374,7 +8309,7 @@ def _in_place_sql() -> str:
                                              where r.task_id = t.id and {_a_raise('r')}
                                                and r.started_at >= h.started_at)
                             and not exists (select 1 from {raises} l
-                                              join {SCHEMA}.tasks lt on lt.id = l.task_id
+                                              join {SCHEMA}.tasks_tasks lt on lt.id = l.task_id
                                              where lt.project_id = t.project_id
                                                and l.worker is not distinct from h.worker
                                                and l.metrics ? 'lane_hold'
@@ -8391,7 +8326,7 @@ def _in_place(cur, tid: str) -> dict:
                            rf.held_since,
                            extract(epoch from now() - rf.held_since)::bigint
                              as held_seconds
-                      from {SCHEMA}.tasks t {_in_place_sql()}
+                      from {SCHEMA}.tasks_tasks t {_in_place_sql()}
                      where t.id::text = %s""", (tid,))
     return _rows(cur)[0]
 
@@ -8449,11 +8384,11 @@ def _escalate(cur, task: dict, target: str, why: str, facts: dict,
     extra = ", blocked_by = '{}'" if named else ""
     still = _holding(cur, before) if named else []
     if still:
-        cur.execute(f"select id, unique_key from {SCHEMA}.tasks where id::text = any(%s)",
+        cur.execute(f"select id, unique_key from {SCHEMA}.tasks_tasks where id::text = any(%s)",
                     (still,))
         keys = {str(row["id"]): row["unique_key"] for row in _rows(cur)}
         labels = [keys.get(one) or one for one in still]
-    cur.execute(f"""update {SCHEMA}.tasks
+    cur.execute(f"""update {SCHEMA}.tasks_tasks
                        set status = 'waiting', assignee = %s, pickup_at = null{extra},
                            updated_at = now()
                      where id = %s returning *""", (target, tid))
@@ -8481,7 +8416,7 @@ def _still_where_seen(cur, task: dict, write: bool) -> dict | None:
     """The task row while it still stands where its claim saw it - same status
     and assignee, due, no raise open on it - locked when `write` says so; None
     once anything moved it, which leaves it to whoever did."""
-    cur.execute(f"""select * from {SCHEMA}.tasks
+    cur.execute(f"""select * from {SCHEMA}.tasks_tasks
                      where id::text = %s and status = %s
                        and assignee is not distinct from %s
                        and (pickup_at is null or pickup_at <= now())
@@ -8571,7 +8506,7 @@ def _held_back(entry, escalation: dict, task: dict, said: str | None, how: str, 
             # The first hold of this episode: never escalated, and recorded so
             # every claim from now on, by hand or by any service, counts from it.
             if write:
-                cur.execute(f"""insert into {SCHEMA}.task_executions
+                cur.execute(f"""insert into {SCHEMA}.tasks_executions
                                   (task_id, attempt, worker, status, metrics,
                                    started_at, ended_at)
                                 values (%s, 0, %s, 'handback', %s::jsonb, now(), now())""",
@@ -8703,7 +8638,7 @@ class _Blockers:
             if not pending:
                 return
             self.cur.execute(f"""select id, unique_key, status, blocked_by
-                                   from {SCHEMA}.tasks where id::text = any(%s)""",
+                                   from {SCHEMA}.tasks_tasks where id::text = any(%s)""",
                              (sorted(pending),))
             for row in _rows(self.cur):
                 self.keep(row)
@@ -8780,10 +8715,9 @@ def _blockers_given(cur, project: str, task: dict | None, refs) -> list[str]:
         one = str(ref).strip()
         if one and one not in names:
             names.append(one)
-    _blocked_by_writable()
     if not names:
         return []
-    cur.execute(f"""select id, unique_key, project_id from {SCHEMA}.tasks
+    cur.execute(f"""select id, unique_key, project_id from {SCHEMA}.tasks_tasks
                      where id::text = any(%s) or (unique_key = any(%s) and project_id = %s)""",
                 (names, names, project))
     found = _rows(cur)
@@ -8859,8 +8793,8 @@ def _dead_ends(cur, project: str, structure: dict, spare=()) -> list[tuple[dict,
     person is none: the chain ends at one, and a person moves it. `spare` names
     tasks to leave alone - the one a run was asked to take by --key."""
     cur.execute(f"""select id, unique_key, project_id, status, type, assignee, tags,
-                           pickup_at, {_blocked_by_field()} as blocked_by
-                      from {SCHEMA}.tasks
+                           pickup_at, blocked_by
+                      from {SCHEMA}.tasks_tasks
                      where project_id = %s and status in ('todo', 'waiting')
                        and {_open_raise_clause(False)}
                      order by created_at asc""", (project,))
@@ -8899,7 +8833,7 @@ def _scan(cur, escalation: dict | None, structure: dict, project: str, *,
             continue
         # Moved only while it still stands where the scan saw it, and only by
         # the one claim that locks it.
-        cur.execute(f"""select * from {SCHEMA}.tasks
+        cur.execute(f"""select * from {SCHEMA}.tasks_tasks
                          where id = %s and status = %s
                            and assignee is not distinct from %s
                            and {_open_raise_clause(False)}
@@ -10044,8 +9978,8 @@ def _lane_held(cur, worker: str, project: str) -> dict | None:
     so it holds for a run by hand and across a service restart."""
     cur.execute(f"""select e.id as execution, e.metrics -> 'lane_hold' as hold,
                            {_lane_until()} as until
-                      from {SCHEMA}.task_executions e
-                      join {SCHEMA}.tasks t on t.id = e.task_id
+                      from {SCHEMA}.tasks_executions e
+                      join {SCHEMA}.tasks_tasks t on t.id = e.task_id
                      where t.project_id = %s and e.worker = %s
                        and e.metrics ? 'lane_hold' and {_lane_until()} > now()
                      order by until desc limit 1""", (project, worker))
@@ -10168,7 +10102,7 @@ def _next_candidate(cur, worker: dict, project: str, tz,
     claim asks in and writing nothing, or two Nones when nothing is there."""
     for ask in _asks(worker):
         where, params = _selection({**ask, "not_ids": list(exclude)}, project, tz)
-        cur.execute(f"""select * from {SCHEMA}.tasks{where}
+        cur.execute(f"""select * from {SCHEMA}.tasks_tasks{where}
                         order by pickup_at asc nulls last, created_at asc
                         limit 1""", params)
         rows = _rows(cur)
@@ -10183,7 +10117,7 @@ def _key_candidate(entry, worker: dict, key: str) -> dict | None:
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, key, writing=True)
         cur.execute(f"""select *, (pickup_at is null or pickup_at <= now()) as due
-                          from {SCHEMA}.tasks where id = %s""", (tid,))
+                          from {SCHEMA}.tasks_tasks where id = %s""", (tid,))
         row = _rows(cur)[0]
         held = _open_execution(cur, tid)
         holding = _holding(cur, row)
@@ -10310,7 +10244,7 @@ def _would_take(entry, worker: dict, key: str | None, exclude: tuple = (),
         if key:
             tid = _task_id(cur, key, writing=True)
             cur.execute(f"""select *, (pickup_at is null or pickup_at <= now()) as due
-                              from {SCHEMA}.tasks where id = %s""", (tid,))
+                              from {SCHEMA}.tasks_tasks where id = %s""", (tid,))
             row = _rows(cur)[0]
             due = row.pop("due")
             take = (row if _key_refusal(row, due, {"key": key, "worker": worker["name"],
@@ -10711,7 +10645,7 @@ def _after_hook(entry, worker: dict, tid: str, execution: str, report: dict,
         return
     with _connect(entry) as conn, conn.cursor() as cur:
         task = _task_row(cur, tid)
-        cur.execute(f"""select status, detail, metrics from {SCHEMA}.task_executions
+        cur.execute(f"""select status, detail, metrics from {SCHEMA}.tasks_executions
                          where id::text = %s""", (execution,))
         row = cur.fetchone() or {}
     harness = {"TASKS_HARNESS_EXIT": "", "TASKS_HARNESS_FAILURE": "",
@@ -10756,7 +10690,7 @@ def _after_hook(entry, worker: dict, tid: str, execution: str, report: dict,
     if not noted:
         return
     with _connect(entry) as conn, conn.cursor() as cur:
-        cur.execute(f"""update {SCHEMA}.task_executions
+        cur.execute(f"""update {SCHEMA}.tasks_executions
                            set metrics = coalesce(metrics, '{{}}'::jsonb) || %s::jsonb
                          where id::text = %s""", (json.dumps(noted), execution))
         conn.commit()
@@ -10784,7 +10718,7 @@ def _escalate_after(entry, escalation: dict, task: dict, why: str) -> dict | Non
         # An ending is a person's to reopen; no handler reopens one.
         return None
     with _connect(entry) as conn, conn.cursor() as cur:
-        cur.execute(f"""select * from {SCHEMA}.tasks
+        cur.execute(f"""select * from {SCHEMA}.tasks_tasks
                          where id::text = %s and status = %s
                            and assignee is not distinct from %s
                            and {_open_raise_clause(False)}
@@ -10816,7 +10750,7 @@ def _spent_attempts(entry, tid: str) -> int:
     """The attempts spent of the kind the open raise is: taken from `waiting`, or
     taken from the queue."""
     with _connect(entry) as conn, conn.cursor() as cur:
-        cur.execute(f"""select metrics, status from {SCHEMA}.task_executions
+        cur.execute(f"""select metrics, status from {SCHEMA}.tasks_executions
                          where task_id = %s""", (tid,))
         rows = _rows(cur)
     from_waiting = any(_claimed_from_waiting(row) for row in rows
@@ -10828,7 +10762,7 @@ def _state(entry, tid: str) -> tuple[dict, int]:
     """Where the task stands and how long its trail is, in one look."""
     with _connect(entry) as conn, conn.cursor() as cur:
         task = _task_row(cur, tid)
-        cur.execute(f"select count(*) as n from {SCHEMA}.task_activities where task_id = %s",
+        cur.execute(f"select count(*) as n from {SCHEMA}.tasks_activities where task_id = %s",
                     (tid,))
         grown = cur.fetchone()["n"]
     return task, grown
@@ -10847,7 +10781,7 @@ def _accumulate_cost(entry, tid: str, cost: float) -> float:
     with _connect(entry) as conn, conn.cursor() as cur:
         prior = (_task_row(cur, tid)["metadata"] or {}).get("cost_total") or 0
         total = round(float(prior) + float(cost), 4)
-        cur.execute(f"""update {SCHEMA}.tasks
+        cur.execute(f"""update {SCHEMA}.tasks_tasks
                            set metadata = metadata || jsonb_build_object('cost_total', %s::jsonb)
                          where id = %s""", (json.dumps(total), tid))
         conn.commit()
@@ -10973,7 +10907,7 @@ def _record_run(entry, execution: str, system: str, ref: str) -> None:
     """Name the run an open raise is about to start, when it is not the one the
     claim recorded."""
     with _connect(entry) as conn, conn.cursor() as cur:
-        cur.execute(f"""update {SCHEMA}.task_executions
+        cur.execute(f"""update {SCHEMA}.tasks_executions
                            set run_system = %s, run_ref = %s
                          where id::text = %s and status = 'running'""",
                     (system, ref, execution))
@@ -11088,13 +11022,13 @@ class _Beat:
                                             then coalesce(extract(epoch from
                                                      lease_until - now())::float8, %s)
                                        end as left, status
-                                  from {SCHEMA}.task_executions where id::text = %s""",
+                                  from {SCHEMA}.tasks_executions where id::text = %s""",
                             (self.lease, self.execution))
                 row = cur.fetchone() or {"left": None, "status": None}
                 conn.commit()
                 return row
             cur.execute(f"""with renewed as (
-                               update {SCHEMA}.task_executions
+                               update {SCHEMA}.tasks_executions
                                   set lease_until = least(
                                       started_at + make_interval(secs => %s),
                                       now() + make_interval(secs => %s))
@@ -11102,7 +11036,7 @@ class _Beat:
                             returning lease_until)
                             select (select extract(epoch from lease_until - now())::float8
                                       from renewed) as left,
-                                   (select status from {SCHEMA}.task_executions
+                                   (select status from {SCHEMA}.tasks_executions
                                      where id::text = %s) as status""",
                         (self.cap, self.lease, self.execution, self.execution))
             row = cur.fetchone()
@@ -11468,7 +11402,7 @@ def cmd_runs(entry, args: list[str]) -> None:
              f"{NAME} runs <uuid|unique_key> | {NAME} runs --run <system>:<handle>")
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, opts["_loose"][0])
-        cur.execute(f"""select * from {SCHEMA}.task_executions e where task_id = %s
+        cur.execute(f"""select * from {SCHEMA}.tasks_executions e where task_id = %s
                            and {_a_raise()}
                          order by started_at asc""", (tid,))
         rows = _rows(cur)
@@ -11504,8 +11438,8 @@ def _runs_by_ref(entry, opts: dict) -> None:
         cur.execute(f"""select e.id as execution, t.id as task_id, t.project_id,
                                t.unique_key, t.title, e.worker, e.status,
                                e.started_at, e.ended_at, e.run_system, e.run_ref
-                          from {SCHEMA}.task_executions e
-                          join {SCHEMA}.tasks t on t.id = e.task_id
+                          from {SCHEMA}.tasks_executions e
+                          join {SCHEMA}.tasks_tasks t on t.id = e.task_id
                          where {" and ".join(clauses)}
                          order by e.started_at asc, e.id asc""", params)
         rows = _rows(cur)
@@ -11526,7 +11460,7 @@ def cmd_history(entry, args: list[str]) -> None:
         params = [opts["field"]]
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, opts["_loose"][0])
-        cur.execute(f"""select * from {SCHEMA}.task_changes
+        cur.execute(f"""select * from {SCHEMA}.tasks_changes
                          where task_id = %s{clause} order by changed_at asc""",
                     [tid] + params)
         rows = _rows(cur)
@@ -11545,7 +11479,7 @@ def cmd_history(entry, args: list[str]) -> None:
 # they reach.
 _WATCH_PING_SECONDS = 30.0
 _WATCH_ROUND_TRIP_SECONDS = 15.0
-_WATCH_LIBPQ = {"application_name": "tasks-watch"}
+_WATCH_APPLICATION = "tasks-watch"
 # A lost connection is asked for again after this long, doubling to the longest.
 _WATCH_RETRY_FIRST = 1.0
 _WATCH_RETRY_LONGEST = 30.0
@@ -11555,7 +11489,6 @@ _WATCH_RETRY_LONGEST = 30.0
 # an earlier moment than the one it was missed after.
 _WATCH_CATCH_UP_GRACE = "2 minutes"
 _WATCH_KINDS = ("task_changed", "activity_added", "run_started", "run_ended")
-_WATCH_TABLES = ("tasks", "task_activities", "task_executions")
 
 
 class _WatchStop(BaseException):
@@ -11575,7 +11508,7 @@ def _tally(cur, where: str, params: list) -> dict:
     tallies = ", ".join(f"count(*) filter (where s.status = '{s}') as \"{s}\""
                         for s in STATUSES)
     cur.execute(f"select {tallies}, count(*) as total "
-                f"from (select {_shown_status('t')} as status from {SCHEMA}.tasks t{where}) s",
+                f"from (select {_shown_status('t')} as status from {SCHEMA}.tasks_tasks t{where}) s",
                 params)
     row = cur.fetchone()
     return {"counts": {s: row[s] for s in STATUSES}, "total": row["total"]}
@@ -11624,26 +11557,18 @@ class _Watch:
             return call()
 
     def open(self) -> str | None:
-        """Connect, check the store announces what a watch reports, and listen.
-        Answers the store's digest."""
-        conn = _connect(self.entry, raising=True, **_WATCH_LIBPQ)
+        """Connect, with the store's tables and the triggers that announce what a
+        watch reports in place, and listen. Answers the store's digest."""
+        conn = _connect(self.entry, raising=True, application_name=_WATCH_APPLICATION)
         try:
             conn.autocommit = True
             self.conn = conn
 
             def check():
                 with conn.cursor() as cur:
-                    catalog = _catalog(cur, SCHEMA)
-                    behind = ([t for t in _WATCH_TABLES if t not in catalog["tables"]]
-                              + _watch_behind(catalog))
-                    return behind, _store_identity(cur)
+                    return _store_identity(cur)
 
-            behind, store = self.bounded(check)
-            if behind:
-                raise Refusal(5, "schema_behind",
-                              f"schema {SCHEMA} does not announce changes: missing "
-                              f"{', '.join(behind)}",
-                              f"`{NAME} migrate --apply` adds it")
+            store = self.bounded(check)
             self.bounded(lambda: conn.execute(f"listen {WATCH_CHANNEL}"))
             self.prove()
         except BaseException:
@@ -11702,7 +11627,7 @@ class _Watch:
             return
         joiner = " and " if self.where else " where "
         found = {str(row["id"]): row for row in self.rows(
-            f"select {_scan_columns({})} from {SCHEMA}.tasks t{self.where}"
+            f"select {_scan_columns({})} from {SCHEMA}.tasks_tasks t{self.where}"
             f"{joiner}t.id = any(%s::uuid[])",
             self.params + [sorted({task for _kind, task in wanted})])}
         printed = False
@@ -11718,7 +11643,7 @@ class _Watch:
         the line that tells the reader the gap is closed."""
         since = self.owed
         rows = self.rows(
-            f"""select * from (select {_scan_columns({})} from {SCHEMA}.tasks t{self.where}) s
+            f"""select * from (select {_scan_columns({})} from {SCHEMA}.tasks_tasks t{self.where}) s
                  where last_touched_at >= %s::timestamptz - interval '{_WATCH_CATCH_UP_GRACE}'
                  order by last_touched_at asc, id asc""",
             self.params + [since])
@@ -11853,14 +11778,10 @@ _LANE_DEFAULTS = {"max_parallel": 1}
 # channel for the whole database, so the payload says which schema and which
 # project the task belongs to, and a daemon acts only on its own.
 CLAIMABLE_CHANNEL = "tasks_claimable"
-_NOTIFY_TRIGGER = ("tasks", "tasks_notify_claimable")
 
 # The store notifies this channel on every change `watch` reports, one trigger
 # per table a change can land in, and names the kind of change in the payload.
 WATCH_CHANNEL = "tasks_watch"
-_WATCH_TRIGGERS = (("tasks", "tasks_notify_watch"),
-                   ("task_activities", "task_activities_notify_watch"),
-                   ("task_executions", "task_executions_notify_watch"))
 
 # Where `run` writes what it claimed, when the service that started it asks, and
 # the tasks the service tells it not to claim.
@@ -12138,23 +12059,6 @@ def _lane_rows(declaration: dict) -> list[dict]:
             for lane in declaration["lanes"]]
 
 
-def _triggers_absent(catalog: dict, triggers) -> list[str]:
-    """Each of `triggers` the store lacks, as table.trigger. A table that is
-    absent is reported as a table, not as its triggers."""
-    return [f"{table}.{trigger}" for table, trigger in triggers
-            if table in catalog["tables"] and (table, trigger) not in catalog["triggers"]]
-
-
-def _notify_behind(catalog: dict) -> list[str]:
-    """The claimable notification, as table.trigger, when the store lacks it."""
-    return _triggers_absent(catalog, (_NOTIFY_TRIGGER,))
-
-
-def _watch_behind(catalog: dict) -> list[str]:
-    """The watch notifications, as table.trigger, that the store lacks."""
-    return _triggers_absent(catalog, _WATCH_TRIGGERS)
-
-
 def _service_sweep_due(conn) -> bool:
     """Whether a claim in this project would put something back: a raise whose
     lease has passed, a waiting task whose wait is over, or a dead end it would
@@ -12162,15 +12066,15 @@ def _service_sweep_due(conn) -> bool:
     the service starts one. Asked on the service's connection, `conn`."""
     project = _writing_project()
     with conn.cursor() as cur:
-        cur.execute(f"""select 1 from {SCHEMA}.task_executions e
-                          join {SCHEMA}.tasks t on t.id = e.task_id
+        cur.execute(f"""select 1 from {SCHEMA}.tasks_executions e
+                          join {SCHEMA}.tasks_tasks t on t.id = e.task_id
                          where t.project_id = %s and e.status = 'running'
                            and e.lease_until is not null and e.lease_until < now()
                          limit 1""", (project,))
         if cur.fetchone():
             return True
         cur.execute(f"""select *, (pickup_at is not null and pickup_at <= now()) as due
-                          from {SCHEMA}.tasks
+                          from {SCHEMA}.tasks_tasks
                          where status = 'waiting' and project_id = %s
                            and {_open_raise_clause(False)}""", (project,))
         waiting = _rows(cur)
@@ -12191,19 +12095,19 @@ def _service_next_moment(conn, cool_downs: dict | None = None) -> float | None:
                        (%s::jsonb ->> l.worker)::int, %s))""")
     with conn.cursor() as cur:
         cur.execute(f"""select extract(epoch from (min(at) - now()))::float8 as seconds
-                          from (select pickup_at as at from {SCHEMA}.tasks
+                          from (select pickup_at as at from {SCHEMA}.tasks_tasks
                                  where project_id = %s and status in ('todo', 'waiting')
                                    and pickup_at > now()
                                 union all
-                                select e.lease_until from {SCHEMA}.task_executions e
-                                  join {SCHEMA}.tasks t on t.id = e.task_id
+                                select e.lease_until from {SCHEMA}.tasks_executions e
+                                  join {SCHEMA}.tasks_tasks t on t.id = e.task_id
                                  where t.project_id = %s and e.status = 'running'
                                    and e.lease_until > now()
                                 union all
-                                select {cooling} from {SCHEMA}.tasks t
+                                select {cooling} from {SCHEMA}.tasks_tasks t
                                   cross join lateral (
                                     select e.worker, e.status, e.ended_at
-                                      from {SCHEMA}.task_executions e
+                                      from {SCHEMA}.tasks_executions e
                                      where e.task_id = t.id and e.status <> 'running'
                                        and {_a_raise()}
                                      order by e.started_at desc limit 1) l
@@ -12211,8 +12115,8 @@ def _service_next_moment(conn, cool_downs: dict | None = None) -> float | None:
                                    and l.status in ('failed', 'abandoned')
                                    and {cooling} > now()
                                 union all
-                                select {_lane_until()} from {SCHEMA}.task_executions e
-                                  join {SCHEMA}.tasks t on t.id = e.task_id
+                                select {_lane_until()} from {SCHEMA}.tasks_executions e
+                                  join {SCHEMA}.tasks_tasks t on t.id = e.task_id
                                  where t.project_id = %s and e.metrics ? 'lane_hold'
                                    and {_lane_until()} > now()) as moments""",
                     (project, project, json.dumps(cool_downs or {}), _COOL_DOWN_DEFAULT,
@@ -12255,7 +12159,7 @@ def _service_renew_leases(conn, held: list) -> dict:
     renewed = []
     if executions:
         with conn.cursor() as cur:
-            cur.execute(f"""update {SCHEMA}.task_executions e
+            cur.execute(f"""update {SCHEMA}.tasks_executions e
                                set lease_until = greatest(e.lease_until, least(
                                    e.started_at + make_interval(secs => h.cap),
                                    now() + make_interval(secs => %s)))
@@ -12263,7 +12167,7 @@ def _service_renew_leases(conn, held: list) -> dict:
                                    as h(execution, task_id, cap)
                              where e.id::text = h.execution and e.task_id::text = h.task_id
                                and e.status = 'running'
-                               and e.task_id in (select id from {SCHEMA}.tasks
+                               and e.task_id in (select id from {SCHEMA}.tasks_tasks
                                                   where project_id = %s)
                          returning e.id""", (short, executions, tasks, caps, project))
             renewed = [str(row["id"]) for row in _rows(cur)]
@@ -12277,7 +12181,7 @@ def _settle_cut_off(conn, execution: str) -> list[str]:
     service's connection, `conn`."""
     project = _writing_project()
     with conn.cursor() as cur:
-        cur.execute(f"""update {SCHEMA}.task_executions
+        cur.execute(f"""update {SCHEMA}.tasks_executions
                            set lease_until = now() - interval '1 second',
                                detail = coalesce(detail, 'cut off when the service stopped')
                          where id::text = %s and status = 'running'""", (execution,))
@@ -12304,8 +12208,8 @@ class ProjectScope:
     On entry it puts the process environment back to `environment`, the start
     environment the dispatcher took before any scope opened, and points
     CLAUDE_PROJECT_DIR at `root`, which `_project_root` honours before the cwd;
-    it drops the cached records adapter, disarms CATCH_UP, and sets SCHEMA,
-    PROJECT and PROJECT_IDENTITY to the project's own. On exit it puts the
+    it drops the cached records adapter, and sets SCHEMA, PROJECT and
+    PROJECT_IDENTITY to the project's own. On exit it puts the
     environment back to the same snapshot and every one of those globals back
     to what it was. A scope opened with no schema or project, to resolve them,
     starts from the values this module starts with.
@@ -12315,11 +12219,10 @@ class ProjectScope:
     from the snapshot, never from what a scope left. Scopes do not nest; the
     dispatcher is single-threaded and opens one at a time."""
 
-    _GLOBALS = ("SCHEMA", "PROJECT", "PROJECT_IDENTITY", "CATCH_UP", "_RECORDS",
-                "BLOCKED_BY_KEPT")
+    _GLOBALS = ("SCHEMA", "PROJECT", "PROJECT_IDENTITY", "_RECORDS")
     current = None   # the scope open now, if any
 
-    def __init__(self, root: Path, environment: Mapping[str, str], *, schema: str = "tasks",
+    def __init__(self, root: Path, environment: Mapping[str, str], *, schema: str = "agentkit",
                  project: str | None = None, identity: dict | None = None):
         self.root = Path(root)
         self.environment = environment
@@ -12332,8 +12235,7 @@ class ProjectScope:
         self._saved = {name: globals()[name] for name in self._GLOBALS}
         _environ_to(self.environment)
         os.environ["CLAUDE_PROJECT_DIR"] = str(self.root)
-        globals().update(_RECORDS=None, CATCH_UP=False, BLOCKED_BY_KEPT=None,
-                         SCHEMA=self.schema,
+        globals().update(_RECORDS=None, SCHEMA=self.schema,
                          PROJECT=self.project, PROJECT_IDENTITY=self.identity)
         ProjectScope.current = self
         return self
@@ -12343,30 +12245,6 @@ class ProjectScope:
         _environ_to(self.environment)
         globals().update(self._saved)
         return False
-
-
-# The connection values a machine service reads from the connection entry alone:
-# it reads no project's environment, so one left to the cascade has no answer.
-_STORE_KEYS = ("db_host", "db_port", "db_name", "db_user", "db_sslmode", "db_schema")
-
-
-def _env_file_keys(path: Path) -> set[str]:
-    """The names an env file sets, read the way `_parse_env_file` reads them,
-    keeping no value."""
-    keys: set[str] = set()
-    try:
-        text = path.read_text()
-    except OSError:
-        return keys
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key = line.split("=", 1)[0].strip()
-        if key.startswith("export "):
-            key = key[len("export "):].strip()
-        keys.add(key)
-    return keys
 
 
 def _refusal_said(stderr: str) -> str:
@@ -12392,21 +12270,18 @@ class _ServiceHost:
     def __init__(self, entry, connection: str | None, machine: bool = False):
         self.entry = entry
         self.connection = connection
-        # Made for the machine service: its connections are the machine's, and
-        # are opened only where no project tier can answer for their secret.
+        # Made for the machine service, which adds the refusals only a machine
+        # process needs.
         self.machine = machine
         self.root = _project_here()
         self.slug = _service_state_key(self.root)
         self.state_dir = _service_state_dir()
         self.project = _writing_project()
         self.identity = PROJECT_IDENTITY
-        self.schema = SCHEMA
-        # Which store the connection reaches, as the pool tells stores apart:
-        # host, port, database, user, sslmode and the name of the secret's key.
-        # Every value here is non-secret.
-        self._store_key = (_conf(entry, "db_host"), _conf(entry, "db_port", "5432"),
-                           _conf(entry, "db_name"), _conf(entry, "db_user"),
-                           _conf(entry, "db_sslmode", "prefer"), _secret_key(entry))
+        # The machine's store, resolved once: the listener and the questions
+        # reach it, and so does every project the machine service serves.
+        self.setting = _store_setting()
+        self.schema = self.setting.schema
 
     def scope(self, environment: Mapping[str, str]) -> ProjectScope:
         return ProjectScope(self.root, environment, schema=self.schema,
@@ -12434,12 +12309,10 @@ class _ServiceHost:
         the store anything for it, and again before every turn: the folder and
         its project.json with the id this daemon serves are there, tasks is
         enabled for the project itself, and the connection is still one the
-        project may use and write through, outside the read-only switch - the
-        decision `tasks run` will make. In machine mode, also that the
-        connection entry states every value the machine reads and that the
-        project's own env files do not set its secret. It reads a few small
-        files and no secret, and what a refusal would write to stderr is kept
-        for the reason instead."""
+        project may use and write through, outside the read-only switch, and
+        carries no store of its own - the decision `tasks run` will make. It
+        reads a few small files and no secret, and what a refusal would write
+        to stderr is kept for the reason instead."""
         import contextlib
         import io
 
@@ -12470,54 +12343,31 @@ class _ServiceHost:
         _require_project_enabled_for_service()
         reg, _source = _connections_registry()
         conn_id, entry = _select_connection(reg, self.connection)
+        refusal = _retired_store_keys(conn_id, entry)
+        if refusal:
+            return "refused", f"{refusal.code}: {refusal.message}"
         _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), "run")
-        if not machine:
-            return None
-        missing = [key for key in _STORE_KEYS if (entry or {}).get(key) in (None, "")]
-        if missing:
-            return "refused", (f"connection_incomplete: connection {conn_id!r} leaves "
-                               f"{', '.join(missing)} to the environment, and the machine "
-                               "service reads no project's environment")
-        secret = _secret_key(entry)
-        for name in (".env", ".env.local"):
-            if secret in _env_file_keys(self.root / name):
-                return "refused", (f"project_secret_set: {self.root / name} sets {secret}, "
-                                   "and the machine service connects with the machine's "
-                                   "own; remove it there")
         return None
 
     def store_key(self) -> tuple:
-        return self._store_key
+        """Which store this host reaches, as the pool tells stores apart: the
+        machine's one store, so every project shares its connections."""
+        return (_store_name(self.setting), _store_user(self.setting), self.setting.schema)
 
     def store_name(self) -> str:
-        host, port, database = self._store_key[:3]
-        return f"{host}:{port}/{database}"
+        return _store_name(self.setting)
 
     def store_identity(self) -> dict:
-        """What tells this store from another on the same database, for the
-        machine status: every value non-secret, the secret named by its key."""
-        return dict(zip(("host", "port", "database", "user", "sslmode", "secret_env"),
-                        self._store_key))
-
-    def _outside_every_project(self) -> None:
-        """A machine connection resolves its secret from the process
-        environment and the user tier only: it is opened outside every scope,
-        from a working directory no project contains."""
-        if not self.machine:
-            return
-        here = _project_root() if ProjectScope.current is None else ProjectScope.current.root
-        if ProjectScope.current is not None or here is not None:
-            raise Refusal(5, "machine_in_a_project",
-                          f"the machine service would open a store connection standing in "
-                          f"the project at {here}, whose own tier could answer for its secret",
-                          f"run `{NAME} service run --machine` from its machine state root")
+        """Where the store is named and which store and schema it is, for the
+        machine status: every value non-secret."""
+        return {"source": self.setting.source, "store": _store_name(self.setting),
+                "user": _store_user(self.setting), "schema": self.setting.schema}
 
     def listen(self):
         """A connection listening on the channel. The daemon keeps asking while
         the store is away, so a store it cannot reach is raised to it rather
         than written to the log on every attempt."""
-        self._outside_every_project()
-        conn = _connect(self.entry, raising=True)
+        conn = _connect(self.entry, raising=True, setting=self.setting)
         try:
             conn.autocommit = True
             conn.execute(f"listen {CLAIMABLE_CHANNEL}")
@@ -12530,8 +12380,7 @@ class _ServiceHost:
         """The connection the daemon's questions go on, each statement on it cut
         off by the store after `timeout_seconds`. Raised to the daemon, like the
         listener, when the store cannot be reached."""
-        self._outside_every_project()
-        conn = _connect(self.entry, raising=True)
+        conn = _connect(self.entry, raising=True, setting=self.setting)
         try:
             conn.execute("select set_config('statement_timeout', %s, false)",
                          (str(int(timeout_seconds * 1000)),))
@@ -12560,16 +12409,11 @@ class _ServiceHost:
         import psycopg
         return bool(conn.closed or conn.broken or isinstance(exc, psycopg.OperationalError))
 
-    def notification_installed(self, conn) -> bool:
-        with conn.cursor() as cur:
-            catalog = _catalog(cur, SCHEMA)
-            return "tasks" in catalog["tables"] and not _notify_behind(catalog)
-
-    def catch_up(self, conn) -> dict | None:
-        """Bring the store up to this version when it is behind by additive
-        changes only, as a command does before it is served; what was applied,
-        or None."""
-        return _catch_up(conn, SCHEMA, self.project)
+    @staticmethod
+    def notification_installed(_conn) -> bool:
+        """The store notifies: the trigger is one of this capability's tables'
+        steps, which every connection a host opens has in place."""
+        return True
 
     def lane_has_work(self, conn, worker: dict, exclude: tuple = ()) -> bool:
         # The store's answer alone: a worker's `before` hook is asked by the turn
@@ -12615,12 +12459,43 @@ class _ServiceHost:
         return kill_tree(pids)
 
 
+def _store_name(setting) -> str:
+    """The store a setting names, as host:port/database, with nothing secret."""
+    if setting.url is not None:
+        from urllib.parse import urlparse
+        found = urlparse(setting.url)
+        return f"{found.hostname}:{found.port or 5432}/{found.path.lstrip('/')}"
+    return f"{setting.host}:{setting.port}/{setting.database}"
+
+
+def _store_user(setting) -> str | None:
+    if setting.url is not None:
+        from urllib.parse import urlparse
+        return urlparse(setting.url).username
+    return setting.user
+
+
+def _service_store() -> None:
+    """Resolve the store before the service takes any work, and bring this
+    capability's tables up to this version once, as it starts. With no store
+    configured, or one whose setting cannot be used or whose tables cannot be
+    migrated, it refuses; a store that is away or busy is left to the daemon,
+    which asks for it again and migrates on its first connection."""
+    setting = _store_setting()
+    try:
+        _connect(None, raising=True, setting=setting).close()
+    except Refusal as refused:
+        if refused.code not in ("unreachable", "store_busy"):
+            _die(refused.exit_code, refused.code, refused.message, refused.hint)
+
+
 def _service_connection(wanted: str | None) -> tuple[str, dict | None]:
     """The connection the service works on, and the schema and project every
     query it makes is bounded by, resolved the way `main` resolves them."""
     reg, _f = _connections_registry()
     conn_id, entry = _select_connection(reg, wanted)
-    globals()["SCHEMA"] = _schema(entry)
+    _store_keys_gate(conn_id, entry)
+    globals()["SCHEMA"] = _store_setting().schema
     globals()["PROJECT_IDENTITY"] = _project_id_state()
     globals()["PROJECT"] = _declared_project()
     return conn_id, entry
@@ -13035,9 +12910,8 @@ def _project_answer(project: str, entry: dict) -> dict:
 
 def cmd_service_join(wanted: str | None, args: list[str]) -> None:
     """Put this project on the machine service's opt-in list. It refuses, in
-    this order: no durable id; records in the store; the store secret set in
-    the project's own env files, or a connection entry that leaves a
-    non-secret value to the environment; and a slug another joined project
+    this order: no durable id; records in the store; a connection entry that
+    still carries a store of its own; and a slug another joined project
     already has, since the two would share a state root. It operates no
     daemon."""
     _flags(args, ())
@@ -13064,22 +12938,7 @@ def cmd_service_join(wanted: str | None, args: list[str]) -> None:
              f"keep the project in files mode, or serve it with `{NAME} service start`")
     reg, _f = _connections_registry()
     conn_id, entry = _select_connection(reg, None)
-    secret = _secret_key(entry)
-    for name in (".env", ".env.local"):
-        if secret in _env_file_keys(root / name):
-            _die(6, "project_secret_set",
-                 f"{root / name} sets {secret}, the secret of connection {conn_id!r}; the "
-                 "machine service connects with the machine's own value, so the project's "
-                 "turns would connect with a different one",
-                 f"remove {secret} from {name} and keep it in the user tier, "
-                 f"{CREDENTIALS_ENV}")
-    missing = [key for key in _STORE_KEYS if (entry or {}).get(key) in (None, "")]
-    if missing:
-        _die(6, "connection_incomplete",
-             f"connection {conn_id!r} leaves {', '.join(missing)} to the environment, and "
-             "the machine service reads no project's environment",
-             f"state {', '.join(missing)} in the connection entry in "
-             f"{_project_capabilities_dir(root) / NAME / 'connections.json'}")
+    _store_keys_gate(conn_id, entry)
     slug = _service_state_key(root)
     path = _machine_projects_path()
     with _MachineListLock():
@@ -13197,6 +13056,7 @@ def cmd_service_run_machine(args: list[str]) -> None:
     except Refusal as refused:
         _die(refused.exit_code, refused.code, refused.message, refused.hint)
     _machine_ready(module)
+    _service_store()
     dispatcher = module.MachineDispatcher(_MachineHost())
     try:
         dispatcher.run()
@@ -13215,6 +13075,9 @@ def cmd_service_start_machine(args: list[str]) -> None:
         _read_machine_settings()
     except Refusal as refused:
         _die(refused.exit_code, refused.code, refused.message, refused.hint)
+    # The process it starts refuses to run with no store configured; said here,
+    # before anything is started.
+    _store_setting()
     state = _machine_state_dir()
     state.mkdir(parents=True, exist_ok=True)
     if _machine_pid(module):
@@ -13566,8 +13429,8 @@ def _oldest_due(cur, worker: dict, project: str, tz) -> dict:
         cur.execute(f"""select t.id, t.unique_key, rf.refused_since,
                                extract(epoch from now() - rf.refused_since)::bigint
                                  as waited_seconds
-                          from {SCHEMA}.tasks t {_in_place_sql()}
-                         where t.id in (select id from {SCHEMA}.tasks{where})
+                          from {SCHEMA}.tasks_tasks t {_in_place_sql()}
+                         where t.id in (select id from {SCHEMA}.tasks_tasks{where})
                          order by rf.refused_since asc limit 1""", params)
         found = _rows(cur)
         if found and (oldest is None or found[0]["waited_seconds"] > oldest["waited_seconds"]):
@@ -13692,34 +13555,38 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
     answer["connection"] = conn_id
     answer["schema"] = SCHEMA
     status = _service_status(module)
+    db = _db()
     try:
-        with _connect(entry, raising=True) as conn, conn.cursor() as cur:
-            catalog = _catalog(cur, SCHEMA)
-            missing = [t for t in _TABLES if t not in catalog["tables"]]
-            silent = _notify_behind(catalog)
-    except Refusal as unreachable:
+        with _connect(entry, raising=True, migrating=False) as conn:
+            found = _tables_status(conn)
+    except db.DbError as exc:
+        found = _store_refusal(exc)
+    except Refusal as refused:
+        found = refused
+    if isinstance(found, Refusal) and found.code in ("unreachable", "store_busy"):
         # A running daemon outlives the store being away and picks up where it
         # was when the store answers again, so for it this is a warning. With
         # no daemon, nothing here can be told apart from a store that is wrong.
         if not status["running"]:
-            _die(unreachable.exit_code, unreachable.code, unreachable.message,
-                 unreachable.hint)
-        answer["store"] = {"reachable": False, "error": unreachable.message}
+            _die(found.exit_code, found.code, found.message, found.hint)
+        answer["store"] = {"reachable": False, "error": found.message}
         answer["notification"] = {"channel": CLAIMABLE_CHANNEL, "installed": None}
-        answer["warning"] = ("the store is unreachable, so its schema and notification "
+        answer["warning"] = ("the store is unreachable, so its tables and notification "
                              "are not checked; the running daemon keeps its turns and "
                              "waits for the store, listening again as soon as it answers")
+    elif isinstance(found, Refusal):
+        _die(found.exit_code, found.code, found.message, found.hint)
     else:
         answer["store"] = {"reachable": True}
-        if missing:
-            problems.append(f"schema {SCHEMA} is missing {', '.join(missing)}; "
-                            f"`{NAME} migrate --apply` creates them")
         answer["notification"] = {"channel": CLAIMABLE_CHANNEL,
-                                  "installed": not missing and not silent}
-        if silent:
-            answer["warning"] = (f"the store has no claimable notification ({silent[0]}), "
-                                 "so the service wakes by its poll alone; "
-                                 f"`{NAME} migrate --apply` adds it")
+                                  "installed": found.state == "current"}
+        if found.state == "pending" and not status["running"]:
+            answer["warning"] = (f"the store's {NAME} tables in schema {found.schema} are "
+                                 "behind this release; the service brings them up to it "
+                                 f"when it starts, and `{NAME} migrate` does now")
+        elif found.state != "current":
+            problems.append(f"the store's {NAME} tables in schema {found.schema} read "
+                            f"{found.state}; `{NAME} migrate status` says where they stand")
     answer["service"] = status
     retired = _deprecations([])
     if retired:
@@ -13749,6 +13616,7 @@ def cmd_service_run(wanted: str | None, args: list[str]) -> None:
     declaration = _loaded_declaration()
     conn_id, entry = _service_connection(wanted)
     _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), "run")
+    _service_store()
     # Project mode: a dispatcher over one slot, the project this runs in. Its
     # start environment is taken here, before the slot's scope first opens.
     dispatcher = module.Dispatcher()
@@ -14113,492 +13981,436 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
         cmd_service_logs(rest)
 
 
-# --- Store schema ------------------------------------------------------------
+# --- Store tables ------------------------------------------------------------
 
-_TABLES = ("tasks", "task_activities", "task_executions", "task_changes")
+# The tables live in the schema the machine's store setting binds, each named
+# `tasks_*`, and the shared database library applies these steps once each under
+# the `tasks` ledger. An applied step is never edited: a change is a new step.
+#
+# A store an earlier release kept in a schema of its own, `tasks`, is moved by
+# the first step - its tables, their rows, and the functions their triggers run
+# - into the bound schema and renamed there, so every id, trail entry, recorded
+# move and open raise is the one it was. The second creates what is absent and
+# states the shape both kinds of store end in, so a store created here and one
+# moved here hold the same tables, columns, indexes, constraints, triggers and
+# functions.
+STORE_MAJOR = 1
+STORE_MINOR = 0
 
-# Columns a later version added to a table an earlier one created. `migrate`
-# names the ones a store lacks, so a store that has every table and is still a
-# column behind reads as behind rather than as current.
-_COLUMNS = (("task_executions", "metrics"), ("tasks", "created_by"),
-            ("tasks", "project_id"), ("task_activities", "actor"),
-            ("task_activities", "origin_project"), ("task_changes", "origin_project"),
-            ("tasks", "blocked_by"))
+_MOVE_FROM_SCHEMA_TASKS = r"""
+DO $move$
+DECLARE
+    target  text := current_schema();
+    lacking text[] := '{}';
+    held    bigint;
+    kept    bigint;
+    one     record;
+BEGIN
+    IF to_regclass('tasks.tasks') IS NULL THEN
+        RETURN;
+    END IF;
+    IF to_regclass(format('%I.tasks_tasks', target)) IS NOT NULL THEN
+        RAISE EXCEPTION 'schema tasks holds the tables of an earlier release of tasks, and schema % already holds tasks_tasks beside them, so neither is moved over the other; keep the store you mean to use, drop the other, and run `tasks migrate` again', target;
+    END IF;
 
-# Values a later version added to a check constraint an earlier one created.
-# `create table if not exists` never revisits the constraint it created, so a
-# store with every table and every column can still refuse a status this version
-# writes. Named the way a missing column is, so a store one value behind reads as
-# behind rather than as current.
-_CONSTRAINTS = (("tasks", "tasks_status_check", "waiting"),)
+    -- The shape the previous release's `tasks migrate --apply` leaves: every
+    -- column, the status check that admits waiting, the key unique within its
+    -- project, the run index, no task stored in_progress and no blocker left
+    -- in a task's metadata.
+    SELECT coalesce(array_agg(format('%s.%s', want.t, want.c) ORDER BY want.t, want.c), '{}')
+      INTO lacking
+      FROM (VALUES ('tasks', 'project_id'), ('tasks', 'blocked_by'), ('tasks', 'created_by'),
+                   ('task_activities', 'actor'), ('task_activities', 'origin_project'),
+                   ('task_changes', 'origin_project'), ('task_executions', 'metrics'))
+           AS want(t, c)
+     WHERE NOT EXISTS (SELECT 1 FROM pg_attribute a
+                        WHERE a.attrelid = to_regclass(format('tasks.%I', want.t))
+                          AND a.attname = want.c AND NOT a.attisdropped);
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                    WHERE conrelid = 'tasks.tasks'::regclass AND conname = 'tasks_status_check'
+                      AND pg_get_constraintdef(oid) LIKE '%''waiting''%') THEN
+        lacking := lacking || 'tasks.tasks_status_check'::text;
+    END IF;
+    IF to_regclass('tasks.tasks_project_unique_key_idx') IS NULL
+       OR EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conrelid = 'tasks.tasks'::regclass
+                     AND conname = 'tasks_unique_key_key') THEN
+        lacking := lacking || 'tasks.tasks_project_unique_key_idx'::text;
+    END IF;
+    IF to_regclass('tasks.task_executions_run_idx') IS NULL THEN
+        lacking := lacking || 'task_executions.task_executions_run_idx'::text;
+    END IF;
+    SELECT count(*) FILTER (WHERE status = 'in_progress'),
+           count(*) FILTER (WHERE metadata ? 'blocked_by')
+      INTO held, kept FROM tasks.tasks;
+    IF held > 0 THEN
+        lacking := lacking || format('%s task(s) stored as in_progress', held);
+    END IF;
+    IF kept > 0 THEN
+        lacking := lacking || format('%s task(s) keeping blocked_by in their metadata', kept);
+    END IF;
+    IF lacking <> '{}' THEN
+        RAISE EXCEPTION 'the tables in schema tasks are not at the shape of the previous release of tasks (%), so they are not moved; run the previous release''s `tasks migrate --apply` against this store, then `tasks migrate` again', array_to_string(lacking, '; ');
+    END IF;
 
-# A key is unique within its project. A store created while it was unique across
-# the store carries that constraint and lacks this index, and reads as behind
-# until both have changed, the way a store a column behind does.
-_KEY_INDEX = ("tasks", "tasks_project_unique_key_idx")
-_STORE_WIDE_KEY = "tasks_unique_key_key"
+    -- Renamed in place first, then moved: every constraint and index of the
+    -- three trail tables, and every trigger, takes the tasks_ prefix, and a
+    -- not-null constraint a server names after its table is named after the
+    -- table's new name.
+    FOR one IN SELECT c.conname, c.contype, t.relname
+                 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+                WHERE t.relnamespace = 'tasks'::regnamespace
+                  AND t.relname IN ('tasks', 'task_activities', 'task_executions', 'task_changes')
+    LOOP
+        IF one.conname LIKE 'task\_%' THEN
+            EXECUTE format('ALTER TABLE tasks.%I RENAME CONSTRAINT %I TO %I',
+                           one.relname, one.conname, 'tasks_' || substr(one.conname, 6));
+        ELSIF one.relname = 'tasks' AND one.contype = 'n' THEN
+            EXECUTE format('ALTER TABLE tasks.tasks RENAME CONSTRAINT %I TO %I',
+                           one.conname, 'tasks_tasks_' || substr(one.conname, 7));
+        END IF;
+    END LOOP;
+    FOR one IN SELECT i.relname
+                 FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid
+                 JOIN pg_class t ON t.oid = x.indrelid
+                WHERE t.relnamespace = 'tasks'::regnamespace
+                  AND t.relname IN ('tasks', 'task_activities', 'task_executions', 'task_changes')
+                  AND i.relname LIKE 'task\_%'
+    LOOP
+        EXECUTE format('ALTER INDEX tasks.%I RENAME TO %I',
+                       one.relname, 'tasks_' || substr(one.relname, 6));
+    END LOOP;
+    FOR one IN SELECT g.tgname, t.relname
+                 FROM pg_trigger g JOIN pg_class t ON t.oid = g.tgrelid
+                WHERE t.relnamespace = 'tasks'::regnamespace AND NOT g.tgisinternal
+                  AND t.relname IN ('tasks', 'task_activities', 'task_executions', 'task_changes')
+                  AND g.tgname LIKE 'task\_%'
+    LOOP
+        EXECUTE format('ALTER TRIGGER %I ON tasks.%I RENAME TO %I',
+                       one.tgname, one.relname, 'tasks_' || substr(one.tgname, 6));
+    END LOOP;
+    FOR one IN SELECT p.oid::regprocedure AS signature, p.proname
+                 FROM pg_proc p
+                WHERE p.pronamespace = 'tasks'::regnamespace
+                  AND p.proname IN ('touch_updated_at', 'notify_claimable', 'notify_watch')
+    LOOP
+        EXECUTE format('ALTER FUNCTION %s RENAME TO %I', one.signature, 'tasks_' || one.proname);
+        IF target <> 'tasks' THEN
+            EXECUTE format('ALTER FUNCTION tasks.%I() SET SCHEMA %I',
+                           'tasks_' || one.proname, target);
+        END IF;
+    END LOOP;
+    ALTER TABLE tasks.tasks RENAME TO tasks_tasks;
+    ALTER TABLE tasks.task_activities RENAME TO tasks_activities;
+    ALTER TABLE tasks.task_executions RENAME TO tasks_executions;
+    ALTER TABLE tasks.task_changes RENAME TO tasks_changes;
+    IF target <> 'tasks' THEN
+        EXECUTE format('ALTER TABLE tasks.tasks_tasks SET SCHEMA %I', target);
+        EXECUTE format('ALTER TABLE tasks.tasks_activities SET SCHEMA %I', target);
+        EXECUTE format('ALTER TABLE tasks.tasks_executions SET SCHEMA %I', target);
+        EXECUTE format('ALTER TABLE tasks.tasks_changes SET SCHEMA %I', target);
+        -- The emptied schema goes with them, unless it holds something else
+        -- or belongs to another role.
+        BEGIN
+            DROP SCHEMA tasks;
+        EXCEPTION WHEN dependent_objects_still_exist OR insufficient_privilege THEN
+            NULL;
+        END;
+    END IF;
+END
+$move$;
+"""
 
-# Indexes a later version added to a table an earlier one created, each added
-# beside what is there, so a store without one reads as behind and catches up.
-_INDEXES = (("task_executions", "task_executions_run_idx"),)
+_TABLES_SHAPE = r"""
+create table if not exists tasks_tasks (
+  id           uuid        not null default gen_random_uuid(),
+  project_id   text        not null,
+  type         text        not null,
+  unique_key   text,
+  title        text        not null,
+  objective    text,
+  description  text,
+  status       text        not null default 'draft',
+  assignee     text,
+  tags         text[]      not null default '{}',
+  metadata     jsonb       not null default '{}'::jsonb,
+  pickup_at    timestamptz,
+  blocked_by   uuid[]      not null default '{}',
+  created_by   text,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  constraint tasks_pkey primary key (id),
+  constraint tasks_status_check
+    check (status in ('draft','todo','in_progress','waiting','complete','closed'))
+);
 
-# Trigger functions a later version changed, each named with text its body now
-# carries. `create or replace` revisits a function on every apply, but nothing
-# applies the schema to a store that reads as current, so a store whose function
-# predates the change reads as behind and catches up, the way a store a column
-# behind does: the watch function stopped announcing a hold episode's row.
-_FUNCTIONS = (("notify_watch", "metrics ? 'hold'"),)
+comment on column tasks_tasks.project_id is
+  'Which project the task belongs to, as that project declares its own id. The '
+  'only key: a readable name for a project lives in the project, and a copy of '
+  'it here would be a second source of one fact. Reads may name another '
+  'project; a write only ever reaches the project it runs in, with one '
+  'exception: the project a task is assigned to may add to its trail and set '
+  'its assignee.';
+comment on column tasks_tasks.type is
+  'Which pipeline this task belongs to. Extended by decision, not in passing.';
+comment on column tasks_tasks.unique_key is
+  'Idempotency handle computed by whoever seeds the row, unique within its '
+  'project. Nullable: many nulls coexist.';
+comment on column tasks_tasks.objective is
+  'Why the task exists and what counts as done. Does not go stale while the task lives.';
+comment on column tasks_tasks.description is
+  'What was seen when the task was raised. A snapshot, and says so.';
+comment on column tasks_tasks.assignee is
+  'Who carries the task. Free text - a name, not a key into any directory.';
+comment on column tasks_tasks.metadata is
+  'Only what code filters on. Anything a person reads belongs in description.';
+comment on column tasks_tasks.status is
+  'draft is unreleased, todo is releasable, in_progress is held by a claim, '
+  'waiting is over to the assignee it names and returns to todo at its pickup '
+  'moment or when every task blocked_by names has ended, '
+  'complete is done, closed is over without having been done - superseded, '
+  'obsolete, or answered somewhere else. Both terminal states leave the queue; '
+  'only one of them claims the work happened.';
+comment on column tasks_tasks.pickup_at is
+  'Do not raise the task before this moment. Empty means no appointed moment, not permission.';
+comment on column tasks_tasks.blocked_by is
+  'The tasks this one waits on, by id, in any project. Every id names a task '
+  'when it is written and none leads back to this task through blockers still '
+  'open. While one of them has not ended the task is offered to no claim, '
+  'whatever its open status; a blocker that ended stays listed and holds nothing.';
+comment on column tasks_tasks.created_by is
+  'Who created the task, as the CLI resolved it: the raise it ran under, the '
+  'actor it was told, or the account it ran as.';
+
+-- A key is unique within its project, so several projects sharing one store
+-- each own their keys. Nulls are distinct, so many unkeyed tasks coexist.
+create unique index if not exists tasks_project_unique_key_idx
+  on tasks_tasks (project_id, unique_key);
+create index if not exists tasks_project_idx       on tasks_tasks (project_id);
+create index if not exists tasks_status_pickup_idx on tasks_tasks (status, pickup_at);
+create index if not exists tasks_assignee_idx      on tasks_tasks (assignee);
+create index if not exists tasks_metadata_gin      on tasks_tasks using gin (metadata jsonb_path_ops);
+create index if not exists tasks_tags_gin          on tasks_tasks using gin (tags);
+
+create table if not exists tasks_activities (
+  id             uuid not null default gen_random_uuid(),
+  task_id        uuid not null,
+  description    text not null,
+  actor          text,
+  origin_project text,
+  created_at     timestamptz not null default now(),
+  constraint tasks_activities_pkey primary key (id),
+  constraint tasks_activities_task_id_fkey foreign key (task_id)
+    references tasks_tasks (id) on delete cascade
+);
+
+comment on table tasks_activities is
+  'Work that actually happened, in plain words: at this moment, this occurred. '
+  'Creating a task or editing a field is not activity. Entries carry no shape yet - '
+  'a kind will be added once we can see from real entries what kinds there are.';
+comment on column tasks_activities.actor is
+  'Who recorded the entry, as the CLI resolved it: the raise it ran under, the '
+  'actor it was told, or the account it ran as.';
+comment on column tasks_activities.origin_project is
+  'The project that wrote the entry, stamped by the CLI from the writer''s own '
+  'declared id and never from anything it was given. Null on an entry written '
+  'before origins were kept, which is the task''s own project.';
+
+create index if not exists tasks_activities_task_idx
+  on tasks_activities (task_id, created_at desc);
+
+create table if not exists tasks_executions (
+  id           uuid        not null default gen_random_uuid(),
+  task_id      uuid        not null,
+  attempt      integer     not null,
+  worker       text,
+  handler      text,
+  status       text        not null default 'running',
+  lease_until  timestamptz,
+  run_system   text,
+  run_ref      text,
+  detail       text,
+  metrics      jsonb       not null default '{}'::jsonb,
+  started_at   timestamptz not null default now(),
+  ended_at     timestamptz,
+  constraint tasks_executions_pkey primary key (id),
+  constraint tasks_executions_task_id_fkey foreign key (task_id)
+    references tasks_tasks (id) on delete cascade,
+  constraint tasks_executions_status_check
+    check (status in ('running','ok','failed','handback','abandoned'))
+);
+
+comment on table tasks_executions is
+  'One row per raise: opened when the task is claimed, closed when it is released. '
+  'Immutable once closed, except that a worker''s after hook adds to metrics its '
+  'note when it fails and the lane hold it answers, so nothing here is ever '
+  'read-modify-written, and the attempt number is the count of these rows rather '
+  'than a counter to keep in step. A row whose metrics carry hold is no raise: it '
+  'records when a worker''s before hook first held the task back in its place, and '
+  'every reader of raises leaves it out.';
+comment on column tasks_executions.lease_until is
+  'When the claim lapses. A worker that dies stops renewing nothing - the moment '
+  'simply passes, the next claim closes the row as abandoned, and the task is free.';
+comment on column tasks_executions.metrics is
+  'What the runner measured about this raise, in its own vocabulary - a duration, '
+  'a token count, a price. The tracker stores it and reads none of it: a number '
+  'that means something only to the thing that produced it does not belong in a '
+  'column every consumer inherits.';
+comment on column tasks_executions.run_ref is
+  'Opaque handle of the run in whatever system executed it, named by run_system. '
+  'A pointer and never a copy: the cost, the log and the duration stay with their owner.';
+
+create index if not exists tasks_executions_task_idx
+  on tasks_executions (task_id, started_at desc);
+-- A run is looked up by the handle its own system knows it by, to find the task
+-- it ran for.
+create index if not exists tasks_executions_run_idx
+  on tasks_executions (run_system, run_ref);
+-- Two workers cannot hold one task, because the store refuses the second row
+-- rather than because a dispatcher promised to take one at a time.
+create unique index if not exists tasks_executions_one_open_idx
+  on tasks_executions (task_id) where status = 'running';
+
+create table if not exists tasks_changes (
+  id             uuid        not null default gen_random_uuid(),
+  task_id        uuid        not null,
+  field          text        not null,
+  old_value      text,
+  new_value      text,
+  execution_id   uuid,
+  actor          text,
+  origin_project text,
+  changed_at     timestamptz not null default now(),
+  constraint tasks_changes_pkey primary key (id),
+  constraint tasks_changes_task_id_fkey foreign key (task_id)
+    references tasks_tasks (id) on delete cascade,
+  constraint tasks_changes_execution_id_fkey foreign key (execution_id)
+    references tasks_executions (id) on delete set null
+);
+
+comment on table tasks_changes is
+  'Status, pickup, type and assignee moves, written by the CLI under whatever verb made them, '
+  'never by whoever remembered to. Extended to another field by decision, and '
+  'never by recording everything that can change.';
+comment on column tasks_changes.execution_id is
+  'The raise that caused the move, where one did. Null for a move a person made.';
+comment on column tasks_changes.origin_project is
+  'The project that made the move, stamped by the CLI from the writer''s own '
+  'declared id. Null on a move recorded before origins were kept, which is the '
+  'task''s own project.';
+comment on column tasks_changes.actor is
+  'Who made the move: the worker holding the raise for claim and release, and '
+  'otherwise the identity the CLI resolved - a raise, a named actor, or the account it ran as.';
+
+create index if not exists tasks_changes_task_idx
+  on tasks_changes (task_id, changed_at desc);
+
+create or replace function tasks_touch_updated_at() returns trigger as $$
+begin
+    new.updated_at = now();
+    return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists tasks_touch_updated_at on tasks_tasks;
+create trigger tasks_touch_updated_at before update on tasks_tasks
+    for each row execute function tasks_touch_updated_at();
+
+-- Tell whoever listens that a task became claimable: inserted in todo, moved to
+-- todo, or given a different pickup while in todo. One channel serves the whole
+-- database, so the payload names the schema and the project and a listener acts
+-- only on its own. Notifications are delivered when the writing transaction
+-- commits, so a listener never hears of a task it cannot yet see.
+create or replace function tasks_notify_claimable() returns trigger as $$
+begin
+    if new.status = 'todo' and (tg_op = 'INSERT'
+            or old.status is distinct from new.status
+            or old.pickup_at is distinct from new.pickup_at) then
+        perform pg_notify('tasks_claimable', json_build_object(
+            'schema', tg_table_schema, 'project', new.project_id,
+            'task', new.id, 'pickup_at', new.pickup_at)::text);
+    end if;
+    return null;
+end;
+$$ language plpgsql;
+
+drop trigger if exists tasks_notify_claimable on tasks_tasks;
+create trigger tasks_notify_claimable after insert or update on tasks_tasks
+    for each row execute function tasks_notify_claimable();
+
+-- Tell whoever watches that something a reader of the queue shows has changed:
+-- a task's fields, its trail, or a raise starting or ending. One channel serves
+-- the whole database, so the payload names the schema, the project, the task
+-- and the kind of change, and carries ids only: a watcher reads what it prints
+-- through its own scope. Fired by the store on every write, whichever path made
+-- it, and delivered when the writing transaction commits, so work that rolls
+-- back is never announced; the same payload twice in one transaction arrives
+-- once.
+create or replace function tasks_notify_watch() returns trigger as $$
+declare
+    task    uuid;
+    project text;
+    kind    text;
+begin
+    if tg_table_name = 'tasks_tasks' then
+        task := new.id;
+        project := new.project_id;
+        kind := 'task_changed';
+    else
+        -- A hold episode's row is no raise: it records when a worker's before
+        -- hook first held the task back, and nothing a reader shows changed.
+        if tg_table_name = 'tasks_executions' then
+            if new.metrics ? 'hold' then
+                return null;
+            end if;
+        end if;
+        task := new.task_id;
+        execute format('select project_id from %I.tasks_tasks where id = $1', tg_table_schema)
+           into project using task;
+        if tg_table_name = 'tasks_activities' then
+            kind := 'activity_added';
+        elsif tg_op = 'INSERT' then
+            kind := 'run_started';
+        elsif old.ended_at is null and new.ended_at is not null then
+            kind := 'run_ended';
+        else
+            return null;
+        end if;
+    end if;
+    perform pg_notify('tasks_watch', json_build_object(
+        'schema', tg_table_schema, 'project', project,
+        'task', task, 'kind', kind)::text);
+    return null;
+end;
+$$ language plpgsql;
+
+drop trigger if exists tasks_notify_watch on tasks_tasks;
+create trigger tasks_notify_watch after insert or update on tasks_tasks
+    for each row execute function tasks_notify_watch();
+drop trigger if exists tasks_activities_notify_watch on tasks_activities;
+create trigger tasks_activities_notify_watch after insert on tasks_activities
+    for each row execute function tasks_notify_watch();
+drop trigger if exists tasks_executions_notify_watch on tasks_executions;
+create trigger tasks_executions_notify_watch after insert or update on tasks_executions
+    for each row execute function tasks_notify_watch();
+"""
+
+STORE_STEPS = [
+    ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
+    ("0002-tables", _TABLES_SHAPE),
+]
+
+
+def _tables():
+    """The steps and version of this capability's tables, for the contract's
+    `migrate` and for every call that finds them missing or older."""
+    return STORE_STEPS, STORE_MAJOR, STORE_MINOR
 
 
 def _bundle_dir() -> Path:
     executable = Path(__file__).resolve()
     return (executable.parent.parent
             if executable.parent.name == "bin" else executable.parent)
-
-
-def _schema_ddl(target: str) -> str:
-    """The packaged schema, addressed to the schema this connection names.
-
-    `schema.sql` is written against the default name so that it stays runnable
-    by hand through psql, which is why the name is rewritten here rather than
-    carried as a placeholder. Only the leading qualifier moves: `tasks.` in
-    `comment on column tasks.tasks.type` occurs twice and the second one is a
-    table, not a schema."""
-    path = _bundle_dir() / "schema.sql"
-    if not path.is_file():
-        _die(3, "not_found", f"the packaged schema is missing at {path}",
-             "reinstall the capability, or apply the schema from its source repository")
-    sql = path.read_text()
-    if target == "tasks":
-        return sql
-    sql = re.sub(r"(?<![.\w])tasks\.", f"{target}.", sql)
-    return sql.replace("create schema if not exists tasks;",
-                       f"create schema if not exists {target};")
-
-
-def _catalog(cur, schema: str) -> dict:
-    """What the store holds in `schema` that this version checks for, read in
-    one round trip: the tables, their columns, constraints with their
-    definitions, indexes and triggers. Every check of how far a store is behind
-    is asked of this reading, so asking all of them costs one query, which is
-    what lets every command ask before it is served."""
-    cur.execute("""select 'table' as kind, table_name::text as tbl,
-                          null::text as name, null::text as definition
-                     from information_schema.tables where table_schema = %(s)s
-                   union all
-                   select 'column', table_name::text, column_name::text, null
-                     from information_schema.columns where table_schema = %(s)s
-                   union all
-                   select 'constraint', t.relname::text, c.conname::text,
-                          pg_get_constraintdef(c.oid)
-                     from pg_constraint c
-                     join pg_class t on t.oid = c.conrelid
-                     join pg_namespace n on n.oid = t.relnamespace
-                    where n.nspname = %(s)s
-                   union all
-                   select 'index', tablename::text, indexname::text, null
-                     from pg_indexes where schemaname = %(s)s
-                   union all
-                   select 'trigger', t.relname::text, g.tgname::text, null
-                     from pg_trigger g
-                     join pg_class t on t.oid = g.tgrelid
-                     join pg_namespace n on n.oid = t.relnamespace
-                    where n.nspname = %(s)s and not g.tgisinternal
-                   union all
-                   select 'function', null, p.proname::text, p.prosrc
-                     from pg_proc p
-                     join pg_namespace n on n.oid = p.pronamespace
-                    where n.nspname = %(s)s""", {"s": schema})
-    catalog: dict = {"tables": [], "columns": set(), "constraints": {},
-                     "indexes": set(), "triggers": set(), "functions": {}}
-    for row in cur.fetchall():
-        kind, table, name = row["kind"], row["tbl"], row["name"]
-        if kind == "table":
-            catalog["tables"].append(table)
-        elif kind == "constraint":
-            catalog["constraints"][(table, name)] = row["definition"]
-        elif kind == "function":
-            catalog["functions"][name] = row["definition"] or ""
-        else:
-            catalog[{"column": "columns", "index": "indexes",
-                     "trigger": "triggers"}[kind]].add((table, name))
-    catalog["tables"].sort()
-    return catalog
-
-
-def _columns_absent(catalog: dict) -> list[str]:
-    """Later columns missing from tables that are present, as table.column. A
-    table that is absent is reported as a table, not as each of its columns."""
-    return [f"{t}.{c}" for t, c in _COLUMNS
-            if t in catalog["tables"] and (t, c) not in catalog["columns"]]
-
-
-def _constraints_behind(catalog: dict) -> list[str]:
-    """Check constraints on tables that are present which do not admit a value a
-    later version added, as table.constraint. A table that is absent is reported
-    as a table, not as its constraints; a constraint that is absent outright is
-    behind too, since applying the schema is what creates it."""
-    defined = catalog["constraints"]
-    return [f"{table}.{name}" for table, name, value in _CONSTRAINTS
-            if table in catalog["tables"]
-            and f"'{value}'" not in (defined.get((table, name)) or "")]
-
-
-def _indexes_absent(catalog: dict) -> list[str]:
-    """Later indexes missing from tables that are present, as table.index."""
-    return [f"{t}.{i}" for t, i in _INDEXES
-            if t in catalog["tables"] and (t, i) not in catalog["indexes"]]
-
-
-def _functions_behind(catalog: dict) -> list[str]:
-    """Trigger functions the store holds whose body predates a change this
-    version made, as name(). One the store lacks outright comes with its
-    trigger, which is reported as the trigger."""
-    held = catalog.get("functions") or {}
-    return [f"{name}()" for name, carries in _FUNCTIONS
-            if name in held and carries not in held[name]]
-
-
-def _key_scope_behind(catalog: dict) -> list[str]:
-    """The per-project key index, as table.index, when the store still keys
-    tasks across the whole store or does not yet key them per project."""
-    table, index = _KEY_INDEX
-    if table not in catalog["tables"]:
-        return []
-    has_index = (table, index) in catalog["indexes"]
-    store_wide = (table, _STORE_WIDE_KEY) in catalog["constraints"]
-    return [] if has_index and not store_wide else [f"{table}.{index}"]
-
-
-def _behind(catalog: dict) -> tuple[list[str], list[str]]:
-    """What applying the schema would create - the tables a store lacks - and
-    what it would add to the tables it has, as table.thing."""
-    missing = [t for t in _TABLES if t not in catalog["tables"]]
-    lacking = (_columns_absent(catalog) + _constraints_behind(catalog)
-               + _indexes_absent(catalog)
-               + _key_scope_behind(catalog) + _notify_behind(catalog)
-               + _watch_behind(catalog) + _functions_behind(catalog))
-    return missing, lacking
-
-
-# What `migrate` names that nothing applies on its own, because applying it
-# changes what the store already holds rather than adding beside it: the project
-# column is filled into every row that predates it and then required, the status
-# check is replaced, and the store-wide key is dropped. Everything else it names -
-# a table, a column that is empty or defaulted, an index, a trigger and the
-# function it runs - is added beside what is there, writes no row, and is undone
-# by dropping it. A later change that fills, replaces or drops is named here as it lands.
-_NOT_ADDITIVE = frozenset(["tasks.project_id",
-                           *(f"{t}.{n}" for t, n, _value in _CONSTRAINTS),
-                           f"{_KEY_INDEX[0]}.{_KEY_INDEX[1]}"])
-
-# How long a command waits for another to finish bringing the store up to this
-# version, or for the tables it alters to be free, before it leaves the store as
-# it found it and is served as it would have been.
-_CATCH_UP_WAIT = "10s"
-
-
-def _schema_lock(cur, schema: str) -> None:
-    """Hold, until this transaction ends, the lock every change to `schema`'s
-    shape is made under, so two clients never apply it at once."""
-    cur.execute("select pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                (f"tasks.schema:{schema}",))
-
-
-def _catch_up(conn, schema: str, project: str | None) -> dict | None:
-    """Bring a store that is behind this version by additive changes only up to
-    it, on `conn`, and answer what was applied, or None when nothing was.
-
-    Nothing is applied when anything the store lacks is not additive: that is
-    `migrate --apply`'s alone. What is applied is the whole schema, as `migrate
-    --apply` applies it; on a store whose only gaps are additive, every
-    statement in it that fills, replaces or drops finds nothing to change.
-
-    The store is read again once the schema's lock is held, so of clients that
-    found it behind together the first applies it and the rest find it current.
-    A lock not had within `_CATCH_UP_WAIT`, a role that may not create, or any
-    other refusal from the store rolls back whatever was begun, and the store
-    is left exactly as it was found. The connection is handed back with no
-    transaction open either way."""
-    import psycopg
-
-    def gap(cur) -> tuple[list[str], list[str]] | None:
-        missing, lacking = _behind(_catalog(cur, schema))
-        if not (missing or lacking) or _NOT_ADDITIVE.intersection(lacking):
-            return None
-        return missing, lacking
-
-    try:
-        with conn.cursor() as cur:
-            if gap(cur) is None:
-                conn.rollback()
-                return None
-            cur.execute("select set_config('lock_timeout', %s, true)", (_CATCH_UP_WAIT,))
-            _schema_lock(cur, schema)
-            found = gap(cur)
-            if found is None:
-                conn.rollback()
-                return None
-            if project:
-                cur.execute("select set_config('tasks_migration.project_id', %s, true)",
-                            (project,))
-            cur.execute(_schema_ddl(schema))
-            missing, lacking = _behind(_catalog(cur, schema))
-            if missing or lacking:
-                conn.rollback()
-                return None
-        conn.commit()
-    except psycopg.Error:
-        with __import__("contextlib").suppress(psycopg.Error):
-            conn.rollback()
-        return None
-    return {"schema": schema, "created": found[0], "added": found[1]}
-
-
-def _blocked_by_backfill(cur, schema: str, *, apply: bool, project: str | None = None,
-                        migrating: str | None = None) -> dict:
-    """Move every `blocked_by` a task still keeps in its metadata into its
-    `blocked_by` field, and answer what moved and what could not, by project.
-
-    A name is resolved as the metadata key was read: an id names its task in any
-    project, and a key names a task of the task's own project. Each one resolved
-    joins the field after the ids it already lists, once; a name that resolves
-    to nothing stays in the metadata, alone under the key, and is reported
-    rather than dropped, and a value that is not a list of names stays as it is.
-    So a second run moves nothing and reports the same names again.
-
-    Without `apply` it only reads, and it reads a store whose tasks have no
-    `blocked_by` field yet as if every field were empty, and one that predates
-    the project column as holding only the tasks of `migrating`, the project
-    the migration fills it with. With `apply` the moves are written in the
-    caller's transaction, with the touch trigger held off so that no task reads
-    as having moved: nothing about where it stands changed. `project` narrows
-    the answer to one project's tasks."""
-    columns = _catalog(cur, schema)["columns"]
-    field = ("blocked_by" if ("tasks", "blocked_by") in columns
-             else "'{}'::uuid[] as blocked_by")
-    home = "project_id" if ("tasks", "project_id") in columns else "%(migrating)s::text"
-    narrow = f" and {home} = %(project)s" if project else ""
-    cur.execute(f"""select id, {home} as project_id, unique_key,
-                           metadata -> 'blocked_by' as kept, {field}
-                      from {schema}.tasks where metadata ? 'blocked_by'{narrow}
-                     order by 2, created_at""",
-                {"migrating": migrating, "project": project})
-    rows = _rows(cur)
-    names_of = {str(row["id"]): ([str(one).strip() for one in row["kept"]
-                                  if str(one).strip()]
-                                 if isinstance(row["kept"], list) else None)
-                for row in rows}
-    every = sorted({name for names in names_of.values() for name in names or []})
-    found: list[dict] = []
-    if every:
-        cur.execute(f"""select id, unique_key, {home} as project_id from {schema}.tasks
-                         where id::text = any(%(every)s) or unique_key = any(%(every)s)""",
-                    {"every": every, "migrating": migrating})
-        found = _rows(cur)
-    by_project: dict = {}
-    writes: list[tuple] = []
-    for row in rows:
-        tid, home = str(row["id"]), row["project_id"]
-        names = names_of[tid]
-        one = by_project.setdefault(home, {"tasks": 0, "moved": 0, "unresolvable": []})
-        one["tasks"] += 1
-        if names is None:
-            one["unresolvable"].append({"task": _address(row), "task_id": tid,
-                                        "names": row["kept"],
-                                        "why": "not a list of tasks"})
-            continue
-        ids = list(_blocked_by(row))
-        left: list[str] = []
-        moved = 0
-        for name in names:
-            hit = next((r for r in found if str(r["id"]) == name), None) or next(
-                (r for r in found if r["unique_key"] == name and r["project_id"] == home),
-                None)
-            if hit is None:
-                left.append(name)
-                continue
-            moved += 1
-            if str(hit["id"]) not in ids:
-                ids.append(str(hit["id"]))
-        one["moved"] += moved
-        if left:
-            one["unresolvable"].append({"task": _address(row), "task_id": tid,
-                                        "names": left, "why": "names no task"})
-        if moved or not names:
-            writes.append((ids, left, tid))
-    if apply and writes:
-        cur.execute(f"alter table {schema}.tasks disable trigger tasks_touch_updated_at")
-        for ids, left, tid in writes:
-            cur.execute(f"""update {schema}.tasks
-                               set blocked_by = %s::uuid[],
-                                   metadata = case when %s::jsonb is null
-                                                   then metadata - 'blocked_by'
-                                                   else jsonb_set(metadata, '{{blocked_by}}', %s::jsonb)
-                                              end
-                             where id = %s""",
-                        (ids, json.dumps(left) if left else None,
-                         json.dumps(left) if left else None, tid))
-        cur.execute(f"alter table {schema}.tasks enable trigger tasks_touch_updated_at")
-    unresolvable = sum(len(one["unresolvable"]) for one in by_project.values())
-    return {"tasks": len(rows), "moved": sum(one["moved"] for one in by_project.values()),
-            "tasks_written": len(writes), "unresolvable": unresolvable,
-            "by_project": by_project}
-
-
-# Who the migration's moves are recorded as: no person and no raise made them.
-MIGRATE_ACTOR = "tasks:migrate"
-
-
-def _in_progress_rested(cur, schema: str, *, apply: bool,
-                        project: str | None = None) -> dict:
-    """Return every task still stored `in_progress` to the status it rests in,
-    and answer what moved, by project.
-
-    `in_progress` is derived from the open raise and is no longer stored; a
-    store keeps it only where a claim or a person wrote it before. Each such
-    task rests where it stood before its latest move into `in_progress`, which
-    its history records: the status a claim took it from, or the one a person
-    moved it from by hand - those are listed as `by_hand`, with who moved it. A
-    task whose history records no such move rests in `todo`, and one that
-    would rest in `waiting` on nobody rests in `draft`, each listed with why. A
-    task an open raise holds still shows `in_progress` once it rests.
-
-    Without `apply` it only reads. With `apply` each move is written in the
-    caller's transaction as a status row by `tasks:migrate`, with the touch
-    trigger held off, since nobody moved the task, so a second run finds
-    nothing. `project` narrows it to one project's tasks."""
-    columns = _catalog(cur, schema)["columns"]
-    if ("tasks", "project_id") not in columns:
-        return {"tasks": 0, "by_project": {}}
-    narrow = " and t.project_id = %(project)s" if project else ""
-    cur.execute(f"""select t.id, t.project_id, t.unique_key, t.assignee,
-                           c.old_value as before, c.execution_id, c.actor, c.changed_at,
-                           exists (select 1 from {schema}.task_executions h
-                                    where h.task_id = t.id and h.status = 'running') as held
-                      from {schema}.tasks t
-                      left join lateral (
-                        select old_value, execution_id, actor, changed_at
-                          from {schema}.task_changes c
-                         where c.task_id = t.id and c.field = 'status'
-                           and c.new_value = 'in_progress'
-                         order by c.changed_at desc limit 1) c on true
-                     where t.status = 'in_progress'{narrow}
-                     order by t.project_id, t.created_at""", {"project": project})
-    rows = _rows(cur)
-    by_project: dict = {}
-    writes: list[tuple] = []
-    for row in rows:
-        one = by_project.setdefault(row["project_id"], {"tasks": 0, "to": {},
-                                                        "by_hand": [], "without_record": []})
-        one["tasks"] += 1
-        rests, why = row.get("before"), None
-        if rests not in STATUSES or rests == "in_progress":
-            rests, why = "todo", "its history records no move into in_progress"
-        if rests == "waiting" and not (row.get("assignee") or "").strip():
-            rests, why = "draft", "it would wait on nobody"
-        one["to"][rests] = one["to"].get(rests, 0) + 1
-        named = {"task": _address(row), "task_id": str(row["id"]), "to": rests,
-                 "held": bool(row["held"])}
-        if why:
-            one["without_record"].append({**named, "why": why})
-        elif row.get("execution_id") is None:
-            one["by_hand"].append({**named, "by": row.get("actor"),
-                                   "at": row.get("changed_at")})
-        writes.append((str(row["id"]), rests, row["project_id"]))
-    if apply and writes:
-        origin = ("task_changes", "origin_project") in columns
-        cur.execute(f"alter table {schema}.tasks disable trigger tasks_touch_updated_at")
-        for tid, rests, home in writes:
-            cur.execute(f"""update {schema}.tasks set status = %s
-                             where id = %s and status = 'in_progress'""", (rests, tid))
-            cur.execute(f"""insert into {schema}.task_changes
-                              (task_id, field, old_value, new_value, actor
-                               {', origin_project' if origin else ''})
-                            values (%s, 'status', 'in_progress', %s, %s
-                                    {', %s' if origin else ''})""",
-                        (tid, rests, MIGRATE_ACTOR, *((home,) if origin else ())))
-        cur.execute(f"alter table {schema}.tasks enable trigger tasks_touch_updated_at")
-    return {"tasks": len(rows), "by_project": by_project}
-
-
-def cmd_migrate(entry, args: list[str]) -> None:
-    """Create what this connection's schema is missing, and nothing else.
-
-    Every statement either says `if not exists` or replaces what it writes with
-    the same thing, so a store that is already current is left exactly as it is
-    and running this again costs a round trip. That is
-    what makes it safe to run on a consumer that has been live for months, and
-    it is how a consumer picks up tables a later version of the capability adds.
-
-    Without `--apply` it reports what it would create and touches nothing.
-
-    What is created is verified by reading the schema back afterwards rather
-    than by trusting that the statements ran, because a partially applied
-    schema and a fully applied one both return without error from a batch of
-    `if not exists`."""
-    opts = _flags(args, **_FORM_ARGS["migrate"])
-    schema = _schema(entry)
-    ddl = _schema_ddl(schema)
-    # Asked before anything is read, because it is also the value the backfill
-    # below needs and there is no sense reporting on a store this command has no
-    # standing to change.
-    project = _writing_project()
-    with _connect(entry) as conn, conn.cursor() as cur:
-        catalog = _catalog(cur, schema)
-        before = catalog["tables"]
-        missing, lacking = _behind(catalog)
-        if not opts.get("apply"):
-            answer = {"schema": schema, "project": project, "present": before,
-                      "would_create": missing, "would_add": lacking, "applied": False}
-            if "tasks" in before:
-                answer["would_backfill"] = _blocked_by_backfill(cur, schema, apply=False,
-                                                                migrating=project)
-                answer["would_rest"] = _in_progress_rested(cur, schema, apply=False)
-            _emit(answer)
-            return
-        # What the schema backfills a row that predates the project column with.
-        # Passed as a value rather than written into the file, because a project
-        # id in the file would be right for exactly one store; a store that
-        # predates the column holds one project's tasks, and the project running
-        # the migration is that project. `set_config` binds it, so nothing the
-        # project declares is interpolated into SQL.
-        cur.execute("select set_config('tasks_migration.project_id', %s, false)",
-                    (project,))
-        # Applied whole even when every table is present. The file carries
-        # additive `alter ... add column if not exists` for columns a later
-        # version introduced, and a constraint that replaces itself for values a
-        # later version admits; running only when a table is missing would leave
-        # a store that has all four tables a column or a status behind forever.
-        # Under the lock a command takes to bring the store up to this version
-        # itself, so the two never apply the schema at once.
-        _schema_lock(cur, schema)
-        cur.execute(ddl)
-        # The blockers tasks kept in their metadata before the field existed,
-        # moved in the same transaction as the field is created, so no reader
-        # ever sees one without the other.
-        backfilled = _blocked_by_backfill(cur, schema, apply=True)
-        # The tasks a claim or a person stored in `in_progress` before it was
-        # derived, returned to where they rest in the same transaction.
-        rested = _in_progress_rested(cur, schema, apply=True)
-        conn.commit()
-        catalog = _catalog(cur, schema)
-        after = catalog["tables"]
-        still = [item for gap in _behind(catalog) for item in gap]
-    if still:
-        _die(5, "schema_incomplete",
-             f"schema {schema} is still missing {', '.join(still)} after applying",
-             "the connection's role may not be allowed to create objects in that schema")
-    answer = {"schema": schema, "project": project, "present": after,
-              "created": missing, "added": lacking, "applied": True,
-              "backfilled": backfilled, "rested": rested}
-    if backfilled["unresolvable"]:
-        answer["warning"] = (f"{backfilled['unresolvable']} task(s) keep a blocked_by in "
-                             "their metadata that names no task, which nothing reads; "
-                             f"`backfilled.by_project` lists them: give each its blockers "
-                             f"with `{NAME} set <task> --blocked-by` or drop the key with "
-                             f"`{NAME} meta rm <task> blocked_by`")
-    _emit(answer)
 
 
 # --- Doctor ------------------------------------------------------------------
@@ -14608,40 +14420,29 @@ def cmd_doctor(wanted: str | None) -> None:
     _doctor_gate(report, wanted)
     reg, _f = _connections_registry()
     conn_id, entry = _select_connection(reg, wanted)
-    schema = _schema(entry)
-    # A probe answers for the store as it is now, so it never waits one out.
-    with _connect(entry, waiting=False) as conn, conn.cursor() as cur:
-        cur.execute("select version() as v")
-        server = cur.fetchone()["v"].split(" (")[0]
-        # What `migrate` would add, asked the way `migrate` asks it. A store a
-        # column behind still answers, so it is a warning rather than a failure.
-        # Doctor proves and changes nothing, so it reports a gap the next
-        # command would close rather than closing it.
-        catalog = _catalog(cur, schema)
-        tables = catalog["tables"]
-        missing, behind = _behind(catalog)
-        # Blockers still kept where nothing reads them since the field holds
-        # them: moved by `migrate --apply`, or named for a person to settle.
-        here = _declared_project()
-        left = (_blocked_by_backfill(cur, schema, apply=False, project=here)
-                if "tasks" in tables and here else None)
-        left = left if left and left["tasks"] else None
-        # Tasks still stored in_progress, which no claim takes and no lease
-        # frees: returned to where they rest by `migrate --apply`.
-        stored = (_in_progress_rested(cur, schema, apply=False, project=here)
-                  if "tasks" in tables and here else None)
-        stored = stored if stored and stored["tasks"] else None
-    # Who closes the gap: the next command, when all of it is additive, and
-    # otherwise only `migrate --apply`.
-    closes = (f"`{NAME} migrate --apply` adds it, and nothing else does: it is not "
-              f"additive, so take a backup first (`{NAME} help` STORE)"
-              if _NOT_ADDITIVE.intersection(behind) else
-              f"the next command over a connection that allows writes applies it "
-              f"itself, and `{NAME} migrate --apply` applies it now")
-    if missing:
-        _die(5, "schema_missing",
-             f"schema {schema} is incomplete: missing {', '.join(missing)}",
-             closes)
+    _store_keys_gate(conn_id, entry)
+    setting = _store_setting()
+    _steps, major, minor = _tables()
+    # A probe answers for the store as it is now, so it never waits one out,
+    # and it changes nothing: where the tables stand is read without a lock.
+    with _connect(entry, waiting=False, setting=setting, migrating=False) as conn:
+        server = conn.execute("select version() as v").fetchone()["v"].split(" (")[0]
+        conn.commit()
+        db = _db()
+        try:
+            found = _tables_status(conn)
+        except db.DbError as exc:
+            refusal = _store_refusal(exc)
+            _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
+    if found.state in ("checksum_mismatch", "schema_too_new"):
+        _die(5, found.state,
+             f"the store's {NAME} tables in schema {found.schema} are "
+             + ("at a schema version newer than this release knows"
+                if found.state == "schema_too_new" else
+                f"migrated with steps this release states differently: "
+                f"{', '.join(found.changed)}"),
+             f"`{NAME} migrate status` reports where they stand; update {NAME} to the "
+             "release that migrated them")
     # A worker that cannot be read is a turn that will not run, and finding that
     # out here costs nothing while finding it out from a claim costs a task
     # sitting in `in_progress` holding a raise.
@@ -14657,31 +14458,21 @@ def cmd_doctor(wanted: str | None) -> None:
         _die(6, "conveyor_invalid",
              f"{len(wrong)} problem(s) in the escalation settings: " + "; ".join(wrong),
              f"`{NAME} help` ESCALATION states the file")
+    stored = (None if found.stored_major is None
+              else {"major": found.stored_major, "minor": found.stored_minor})
     answer = {"ok": True, "connection": conn_id, "server": server,
-              "schema": schema, "tables": tables, "workers": workers,
-              "escalation": escalation}
-    warnings = []
-    if behind:
-        answer["behind"] = behind
-        warnings.append(f"schema {schema} is behind this version: "
-                        f"{', '.join(behind)}; {closes}")
+              "store": {"source": setting.source, "schema": setting.schema},
+              "tables": {"state": found.state, "code": {"major": major, "minor": minor},
+                         "store": stored, "pending": found.pending},
+              "workers": workers, "escalation": escalation}
+    warnings = list(found.warnings)
+    if found.state == "pending":
+        warnings.append(f"the store's {NAME} tables in schema {found.schema} are behind "
+                        f"this release ({', '.join(found.pending) or 'version'} pending); "
+                        f"the next command brings them up to it, and `{NAME} migrate` "
+                        "does now")
     if unescalated:
         warnings.append(unescalated)
-    if left:
-        answer["blocked_by_in_metadata"] = left
-        warnings.append(
-            f"{left['tasks']} task(s) of this project still keep blocked_by in their "
-            f"metadata, which nothing reads: {left['moved']} name(s) "
-            f"`{NAME} migrate --apply` moves to the blocked_by field"
-            + (f", and {left['unresolvable']} task(s) naming no task, which stay "
-               f"until someone sets their blockers or removes the key"
-               if left["unresolvable"] else ""))
-    if stored:
-        answer["in_progress_stored"] = stored
-        warnings.append(
-            f"{stored['tasks']} task(s) of this project are still stored in_progress, "
-            "which is derived from the open raise and no longer stored, so no claim "
-            f"takes them; `{NAME} migrate --apply` returns each to where it rests")
     # Every place a worker may land the task it holds that nobody takes there:
     # the write would be refused, and the turn stopped short of its ending.
     warnings += _coverage(workers)
@@ -14727,14 +14518,13 @@ def _guarded(handler, entry, rest) -> None:
 # so the two cannot read one call as different forms.
 _FORM_ARGS = {
     "meta": {"names": ("actor",), "takes": 99},
-    "migrate": {"names": (), "bools": ("apply",)},
     "run": {"names": ("key",), "bools": ("apply",), "takes": 1},
 }
 
 
 def _reads_only(verb: str, rest: list[str]) -> bool:
     """Whether this call of a write verb is its form that writes nothing: `meta
-    show`, or `migrate` or `run` without `--apply`. That form answers whatever
+    show`, or `run` without `--apply`. That form answers whatever
     the connection grants, so a read-only grant or the read-only switch leaves it
     reading.
 
@@ -14780,7 +14570,8 @@ def main() -> None:
                "docs": {"base": DOCS_BASE,
                         "topics": [entry["topic"] for entry in _guide_menu()]},
                "state": STATE, "inventory": _inventory_declaration(),
-               "post_install": POST_INSTALL, "service": SERVICE})
+               "post_install": POST_INSTALL, "tables": _tables_declared(),
+               "service": SERVICE})
         return
     _contract(argv)
     wanted = None
@@ -14805,33 +14596,31 @@ def main() -> None:
         cmd_service(wanted, rest); return
     reg, _f = _connections_registry()
     conn_id, entry = _select_connection(reg, wanted)
-    globals()["SCHEMA"] = _schema(entry)
+    _store_keys_gate(conn_id, entry)
     # Read once per run, from the project and not from the command line, so
     # every verb below asks the same question of the same answer.
     globals()["PROJECT_IDENTITY"] = _project_id_state()
     globals()["PROJECT"] = _declared_project()
     if verb in WRITE_VERBS and not _reads_only(verb, rest):
         _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), verb)
-    # A store behind this version by additive changes only is brought up to it
-    # before the command is served, read or write alike, over any connection that
-    # allows writes. `migrate` is the explicit path and does its own applying.
-    globals()["CATCH_UP"] = (verb != "migrate" and not read_only_switch()
-                             and bool((entry or {}).get("allow_write", WRITE_DEFAULT)))
     handlers = {
         "list": cmd_list, "ready": cmd_ready, "show": cmd_show, "search": cmd_search,
         "counts": cmd_counts,
         "add": cmd_add, "set": cmd_set, "meta": cmd_meta, "activity": cmd_activity,
         "claim": cmd_claim, "release": cmd_release, "run": cmd_run,
-        "runs": cmd_runs, "history": cmd_history, "migrate": cmd_migrate,
+        "runs": cmd_runs, "history": cmd_history,
         "watch": cmd_watch,
     }
+    handler = handlers.get(verb)
+    if not handler and verb not in ("tag", "untag"):
+        _die(6, "input", f"unknown command {verb!r}", f"run `{NAME} help`")
+    # The schema every query names is the one the machine's store setting binds,
+    # and with no store configured nothing is served.
+    globals()["SCHEMA"] = _store_setting().schema
     if verb == "tag":
         cmd_tag(entry, rest); return
     if verb == "untag":
         cmd_tag(entry, rest, remove=True); return
-    handler = handlers.get(verb)
-    if not handler:
-        _die(6, "input", f"unknown command {verb!r}", f"run `{NAME} help`")
     _guarded(handler, entry, rest)
 
 

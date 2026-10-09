@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
 # ///
 """A task that is over to somebody, and what brings it back.
 
@@ -14,7 +14,8 @@ store-backed checks prove the same rules where they matter: they read
 TASKS_TEST_DSN and skip when it is unset, and every run works in a schema of its
 own and drops it.
 
-    uv run --with pytest --with 'psycopg[binary]>=3.2' python -m pytest capabilities/tasks/tests -q
+    uv run --with pytest --with 'psycopg[binary]>=3.2' \\
+        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -32,7 +33,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _cli  # noqa: E402
 
 mod = _cli.load()
-SCHEMA_SQL = (Path(_cli.CAPABILITY_DIR) / "schema.sql").read_text()
 
 
 def _answer(capsys) -> dict:
@@ -51,12 +51,10 @@ def _refused(capsys, call, *args) -> dict:
 
 def test_waiting_is_declared_everywhere_the_set_is():
     assert "waiting" in mod.STATUSES
-    # The store keeps its own copy of the set twice: once for a store being
-    # created, and once for one being brought forward. A declaration left behind
-    # is a store that refuses a status the CLI writes.
-    assert SCHEMA_SQL.count(
-        "check (status in ('draft','todo','in_progress','waiting','complete','closed'))") == 2
-    assert mod._CONSTRAINTS == (("tasks", "tasks_status_check", "waiting"),)
+    # The store keeps its own copy of the set. A declaration left behind is a
+    # store that refuses a status the CLI writes.
+    assert mod._TABLES_SHAPE.count(
+        "check (status in ('draft','todo','in_progress','waiting','complete','closed'))") == 1
 
 
 def test_the_help_says_what_waiting_means():
@@ -221,10 +219,6 @@ class SweepCursor:
 
     def execute(self, sql, params=None):
         text = " ".join(sql.split())
-        if "information_schema.columns" in text:
-            # The store keeps the origin of every entry and move.
-            self.answer = [{"n": 2}]
-            return
         if "status = 'waiting'" in text:
             assert "for update skip locked" in text
             # The sweep is a write and names the project it may reach.
@@ -237,10 +231,10 @@ class SweepCursor:
             row = next(t for t in self.waiting if str(t["id"]) == params[0])
             moved = {k: v for k, v in row.items() if k != "due"}
             self.answer = [{**moved, "status": "todo"}]
-        elif "task_changes" in text:
+        elif "tasks_changes" in text:
             self.changes.append(params)
             self.answer = []
-        elif "task_activities" in text:
+        elif "tasks_activities" in text:
             self.activities.append(params)
             self.answer = []
         else:
@@ -320,17 +314,13 @@ class ReleaseCursor:
 
     def execute(self, sql, params=None):
         text = " ".join(sql.split())
-        if "information_schema.columns" in text:
-            # The store keeps the origin of every entry and move.
-            self.answer = [{"n": 2}]
-            return
-        if "task_executions where id::text" in text:
+        if "tasks_executions where id::text" in text:
             self.answer = [dict(EXECUTION)]
         elif text.startswith("select project_id from"):
             self.answer = [{"project_id": HERE}]
-        elif text.startswith("update") and "task_executions" in text:
+        elif text.startswith("update") and "tasks_executions" in text:
             self.answer = [{**EXECUTION, "status": params[0], "ended_at": "now"}]
-        elif text.startswith("select * from") and "tasks where id" in text:
+        elif text.startswith("select * from") and "tasks_tasks where id" in text:
             self.answer = [dict(self.task)]
         elif "tasks t where t.id" in text:
             # The task as a reader is shown it: the raise is closed by now.
@@ -345,7 +335,7 @@ class ReleaseCursor:
                 self.task[column] = value
             landed(self, body)
             self.answer = [dict(self.task)]
-        elif "task_changes" in text:
+        elif "tasks_changes" in text:
             self.changes.append(params)
             self.answer = []
         else:
@@ -373,15 +363,11 @@ class SetCursor:
 
     def execute(self, sql, params=None):
         text = " ".join(sql.split())
-        if "information_schema.columns" in text:
-            # The store keeps the origin of every entry and move.
-            self.answer = [{"n": 2}]
-            return
         if "where id::text = %s or (unique_key" in text:
             self.answer = [{"id": self.task["id"], "project_id": HERE}]
         elif "status in ('complete','closed')" in text:
             self.answer = [dict(r) for r in self.ended]
-        elif text.startswith("select * from") and "tasks where id" in text:
+        elif text.startswith("select * from") and "tasks_tasks where id" in text:
             self.answer = [dict(self.task)]
         elif text.startswith("update") and "tasks set" in text:
             self.written = text
@@ -391,9 +377,9 @@ class SetCursor:
                 self.task[column] = value
             landed(self, body)
             self.answer = [dict(self.task)]
-        elif "task_executions" in text:
+        elif "tasks_executions" in text:
             self.answer = []
-        elif "task_changes" in text:
+        elif "tasks_changes" in text:
             self.changes.append(params)
             self.answer = []
         else:
@@ -605,21 +591,15 @@ needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 HERE = "prj_waiting"
 
 OLD_CHECK = "check (status in ('draft','todo','in_progress','complete','closed'))"
-NEW_CHECK = "check (status in ('draft','todo','in_progress','waiting','complete','closed'))"
 
 
 @pytest.fixture
 def store(monkeypatch):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
 
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
-    entry = {"db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-             "db_user": info.get("user"), "db_name": info.get("dbname"),
-             "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-             "secret_env": "TASKS_TEST_PASSWORD", "allow_write": True}
-    monkeypatch.setenv("TASKS_TEST_PASSWORD", info.get("password") or "")
+    entry = {"allow_write": True}
+    _cli.bind_store(mod, monkeypatch, schema)
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.delenv("TASKS_ACTOR", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
@@ -627,7 +607,7 @@ def store(monkeypatch):
     # somewhere the way `main` makes it stand somewhere.
     monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(mod._schema_ddl(schema))
+        _cli.make_tables(mod, schema)
         try:
             yield entry, schema, conn
         finally:
@@ -925,40 +905,10 @@ def test_list_reports_who_is_waited_on(store, capsys):
 
 
 @needs_store
-def test_migrate_reports_the_constraint_a_store_is_behind_on(store, capsys, monkeypatch):
-    from psycopg.rows import dict_row
-    entry, schema, conn = store
-    # A store created before the status existed: the check it was created with.
-    conn.execute(f"alter table {schema}.tasks drop constraint tasks_status_check")
-    conn.execute(f"alter table {schema}.tasks add constraint tasks_status_check "
-                 f"{OLD_CHECK}")
-    with conn.cursor(row_factory=dict_row) as cur:
-        catalog = mod._catalog(cur, schema)
-        assert mod._constraints_behind(catalog) == ["tasks.tasks_status_check"]
-        # A table that is absent is reported as a table, not as its constraints.
-        assert mod._constraints_behind({**catalog, "tables": []}) == []
-
-    mod.cmd_migrate(entry, [])
-    reported = _answer(capsys)
-    assert reported["would_add"] == ["tasks.tasks_status_check"]
-    assert reported["applied"] is False
-
-    mod.cmd_migrate(entry, ["--apply"])
-    applied = _answer(capsys)
-    assert applied["added"] == ["tasks.tasks_status_check"]
-    assert applied["applied"] is True
-
-    # Applied, the store takes the status; and running it again reports nothing.
-    seed(entry, capsys, "m-1", status="waiting", assignee="the owner")
-    mod.cmd_migrate(entry, [])
-    assert _answer(capsys)["would_add"] == []
-
-
-@needs_store
 def test_a_store_that_predates_the_status_refuses_it_legibly(store, capsys):
     entry, schema, conn = store
-    conn.execute(f"alter table {schema}.tasks drop constraint tasks_status_check")
-    conn.execute(f"alter table {schema}.tasks add constraint tasks_status_check {OLD_CHECK}")
+    conn.execute(f"alter table {schema}.tasks_tasks drop constraint tasks_status_check")
+    conn.execute(f"alter table {schema}.tasks_tasks add constraint tasks_status_check {OLD_CHECK}")
     seed(entry, capsys, "m-2", status="todo")
     error = _refused(capsys, mod._guarded, mod.cmd_set, entry,
                      ["m-2", "--status", "waiting", "--assignee", "the owner"])

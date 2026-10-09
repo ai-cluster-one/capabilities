@@ -1,7 +1,8 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.8.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0",
+#                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
 """The two handler points and their one vocabulary: a worker's `before` hook
@@ -17,6 +18,7 @@ store with the harness replaced, and the service once through the CLI across a
 restart. The store-backed checks read TASKS_TEST_DSN and skip when it is unset.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
+        --with 'capabilities-contract==0.3.0' \\
         --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -183,22 +185,22 @@ def test_the_cool_down_is_read_from_the_old_keys_and_doctor_names_them(project):
 
 def frozen(conn, schema: str, key: str) -> dict:
     """What a hold must leave as it was: the task row and its history."""
-    tid = conn.execute(f"select id from {schema}.tasks where unique_key = %s",
+    tid = conn.execute(f"select id from {schema}.tasks_tasks where unique_key = %s",
                        (key,)).fetchone()[0]
-    row = conn.execute(f"select pickup_at, updated_at, status, assignee from {schema}.tasks "
+    row = conn.execute(f"select pickup_at, updated_at, status, assignee from {schema}.tasks_tasks "
                        "where id = %s", (tid,)).fetchone()
-    changes = conn.execute(f"select count(*) from {schema}.task_changes where task_id = %s",
+    changes = conn.execute(f"select count(*) from {schema}.tasks_changes where task_id = %s",
                            (tid,)).fetchone()[0]
-    trail = conn.execute(f"select count(*) from {schema}.task_activities where task_id = %s",
+    trail = conn.execute(f"select count(*) from {schema}.tasks_activities where task_id = %s",
                          (tid,)).fetchone()[0]
     return {"row": row, "changes": changes, "trail": trail}
 
 
 def episodes(conn, schema: str, key: str) -> int:
     return conn.execute(
-        f"""select count(*) from {schema}.task_executions
+        f"""select count(*) from {schema}.tasks_executions
              where metrics ? 'hold'
-               and task_id = (select id from {schema}.tasks where unique_key = %s)""",
+               and task_id = (select id from {schema}.tasks_tasks where unique_key = %s)""",
         (key,)).fetchone()[0]
 
 
@@ -315,7 +317,7 @@ def test_the_clock_errs_toward_later(project, store, turns, capsys):
     def held_twice_past_the_ceiling(between) -> list:
         mod.cmd_run(entry, ["alpha", "--apply"])
         assert "escalated" not in answer(capsys)
-        conn.execute(f"""update {schema}.task_executions
+        conn.execute(f"""update {schema}.tasks_executions
                             set started_at = now() - interval '2 hours',
                                 ended_at = now() - interval '2 hours'
                           where metrics ? 'hold' and task_id = %s""", (tid,))
@@ -325,18 +327,18 @@ def test_the_clock_errs_toward_later(project, store, turns, capsys):
 
     # A raise started after the first hold: the task was taken, the episode ended.
     def a_raise():
-        conn.execute(f"""insert into {schema}.task_executions
+        conn.execute(f"""insert into {schema}.tasks_executions
                            (task_id, attempt, worker, status, started_at, ended_at)
                          values (%s, 1, 'alpha', 'ok', now() - interval '90 minutes',
                                  now() - interval '89 minutes')""", (tid,))
     assert held_twice_past_the_ceiling(a_raise) == []
-    conn.execute(f"delete from {schema}.task_executions where task_id = %s", (tid,))
+    conn.execute(f"delete from {schema}.tasks_executions where task_id = %s", (tid,))
 
     # Its lane was held after the first hold: that time is not refusal.
     other = add(entry, capsys, "t-other", kind="beta")
 
     def a_lane_hold():
-        conn.execute(f"""insert into {schema}.task_executions
+        conn.execute(f"""insert into {schema}.tasks_executions
                            (task_id, attempt, worker, status, metrics, started_at, ended_at)
                          values (%s, 1, 'alpha', 'failed', %s::jsonb,
                                  now() - interval '100 minutes', now() - interval '100 minutes')""",
@@ -345,12 +347,12 @@ def test_the_clock_errs_toward_later(project, store, turns, capsys):
                                    - datetime.timedelta(minutes=30)).isoformat(),
                          "by": "claude usage limit"}})))
     assert held_twice_past_the_ceiling(a_lane_hold) == []
-    conn.execute(f"delete from {schema}.task_executions where task_id in (%s, %s)",
+    conn.execute(f"delete from {schema}.tasks_executions where task_id in (%s, %s)",
                  (tid, other))
 
     # The record of the first hold is lost: the next hold starts the clock again.
     def lost():
-        conn.execute(f"delete from {schema}.task_executions where task_id = %s", (tid,))
+        conn.execute(f"delete from {schema}.tasks_executions where task_id = %s", (tid,))
     assert held_twice_past_the_ceiling(lost) == []
     assert shown(entry, capsys, "t-reset")["task"]["status"] == "todo"
 
@@ -392,8 +394,8 @@ def ends(store, monkeypatch, capsys):
         def run(self, prompt, profile, cwd, *, session=None, environ=None, **kw):
             execution = kw["extra_env"]["TASKS_EXECUTION"]
             with mod._connect(entry) as conn, conn.cursor() as cur:
-                cur.execute(f"""select t.unique_key from {mod.SCHEMA}.task_executions e
-                                  join {mod.SCHEMA}.tasks t on t.id = e.task_id
+                cur.execute(f"""select t.unique_key from {mod.SCHEMA}.tasks_executions e
+                                  join {mod.SCHEMA}.tasks_tasks t on t.id = e.task_id
                                  where e.id::text = %s""", (execution,))
                 key = cur.fetchone()["unique_key"]
             told["ran"].append(key)
@@ -418,15 +420,15 @@ def ends(store, monkeypatch, capsys):
 
 def lane_until(conn, schema: str, key: str) -> datetime.datetime:
     return conn.execute(
-        f"""select (metrics -> 'lane_hold' ->> 'until')::timestamptz from {schema}.task_executions
+        f"""select (metrics -> 'lane_hold' ->> 'until')::timestamptz from {schema}.tasks_executions
              where metrics ? 'lane_hold'
-               and task_id = (select id from {schema}.tasks where unique_key = %s)""",
+               and task_id = (select id from {schema}.tasks_tasks where unique_key = %s)""",
         (key,)).fetchone()[0]
 
 
 def lift_lane(conn, schema: str) -> None:
     """Let every lane hold's moment pass."""
-    conn.execute(f"""update {schema}.task_executions
+    conn.execute(f"""update {schema}.tasks_executions
                         set metrics = jsonb_set(metrics, '{{lane_hold,until}}',
                                                 to_jsonb((now() - interval '1 second')::text))
                       where metrics ? 'lane_hold'""")
@@ -593,7 +595,7 @@ def test_a_failed_raise_cools_its_task_for_a_run_by_hand_too(project, store, cap
     hooks.write_worker(project, "alpha", "takes: [alpha]\nprofile: plain\n"
                        "limits: {cool_down_seconds: 2}")
     tid = add(entry, capsys, "t-cool")
-    conn.execute(f"""insert into {schema}.task_executions
+    conn.execute(f"""insert into {schema}.tasks_executions
                        (task_id, attempt, worker, status, started_at, ended_at)
                      values (%s, 1, 'alpha', 'failed', now(), now())""", (tid,))
     mod.cmd_run(entry, ["alpha"])
@@ -605,12 +607,12 @@ def test_a_failed_raise_cools_its_task_for_a_run_by_hand_too(project, store, cap
     mod.cmd_run(entry, ["alpha"])
     assert answer(capsys)["would_claim"] == "t-cool"
     # A raise that moved its task cools nothing.
-    conn.execute(f"""update {schema}.task_executions set status = 'ok', ended_at = now()
+    conn.execute(f"""update {schema}.tasks_executions set status = 'ok', ended_at = now()
                       where task_id = %s""", (tid,))
     mod.cmd_run(entry, ["alpha"])
     assert answer(capsys)["would_claim"] == "t-cool"
     # A task named with --key is taken whatever cools it.
-    conn.execute(f"""update {schema}.task_executions set status = 'failed', ended_at = now()
+    conn.execute(f"""update {schema}.tasks_executions set status = 'failed', ended_at = now()
                       where task_id = %s""", (tid,))
     mod.cmd_run(entry, ["alpha", "--key", "t-cool"])
     assert answer(capsys)["would_claim"] == "t-cool"
@@ -691,16 +693,15 @@ def test_the_service_escalates_a_held_task_by_the_clock_kept_across_a_restart(la
     answer_of(tasks_cli(lab, "service", "stop"))
     shown_ = answer_of(tasks_cli(lab, "show", "t-gate"))["task"]
     assert shown_["status"] == "todo" and shown_["pickup_at"] is None
-    schema = json.loads((project / "capabilities" / "tasks" / "connections.json")
-                        .read_text())["connections"]["local"]["db_schema"]
+    schema = lab["schema"]
     with psycopg.connect(hooks.DSN, autocommit=True) as conn:
-        [count] = conn.execute(f"""select count(*) from {schema}.task_executions
+        [count] = conn.execute(f"""select count(*) from {schema}.tasks_executions
                                      where metrics ? 'hold'""").fetchone()
         assert count == 1
         # The task has stood in its place for three hours, held for two of them.
-        conn.execute(f"update {schema}.tasks set created_at = now() - interval '3 hours'")
-        conn.execute(f"update {schema}.task_changes set changed_at = now() - interval '3 hours'")
-        conn.execute(f"""update {schema}.task_executions
+        conn.execute(f"update {schema}.tasks_tasks set created_at = now() - interval '3 hours'")
+        conn.execute(f"update {schema}.tasks_changes set changed_at = now() - interval '3 hours'")
+        conn.execute(f"""update {schema}.tasks_executions
                             set started_at = now() - interval '2 hours',
                                 ended_at = now() - interval '2 hours'
                           where metrics ? 'hold'""")

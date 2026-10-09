@@ -832,18 +832,7 @@ class ProjectSlot:
         """Put one question about this project to its store, inside its scope."""
         return self.dispatcher.ask(self.store, question, scope=self.scope, at_once=at_once)
 
-    def check_notification(self, catch_up: bool = True) -> None:
-        # The store is brought up to this version first, when all it lacks is
-        # additive, so a store that lacked the notification gains it here. A
-        # store that cannot be asked is said by the check below. When a
-        # listener opens, a schema several slots share is brought up once.
-        try:
-            applied = self.ask(self.host.catch_up) if catch_up else None
-        except (Exception, SystemExit):
-            applied = None
-        if applied:
-            self.log(f"brought schema {applied['schema']} up to this version: "
-                     + ", ".join(applied["created"] + applied["added"]))
+    def check_notification(self) -> None:
         try:
             installed = bool(self.ask(self.host.notification_installed))
         except (Exception, SystemExit) as exc:
@@ -856,7 +845,7 @@ class ProjectSlot:
             elif not installed:
                 self.log("the store has no claimable notification, so this daemon "
                          f"wakes by the poll every {self.settings()['poll_seconds']}s; "
-                         "`tasks migrate --apply` adds it")
+                         "`tasks migrate` adds it")
         self.notification_installed = installed
 
     def heard(self, payload) -> bool:
@@ -1553,8 +1542,8 @@ class Dispatcher:
         """Open the listener. A failure is said once, not on every attempt, and
         the next attempt is planned; a listener opened after one was lost or
         refused is a wake, since what the store announced meanwhile was lost.
-        It is opened outside every scope: the secret it needs is resolved
-        here, never inside a project's."""
+        It is opened outside every scope, on the store the machine's store
+        setting names."""
         self._drop_listener(store)
         try:
             store.listener = store.host.listen()
@@ -1585,11 +1574,9 @@ class Dispatcher:
             # The store answers, so the questions need not wait out their own
             # interval: the next one asks for its connection at once.
             store.requery_at = None
-        caught_up: set = set()
         for slot in self.on(store):
             if slot.served():
-                slot.check_notification(catch_up=slot.host.schema not in caught_up)
-                caught_up.add(slot.host.schema)
+                slot.check_notification()
 
     def _relisten_later(self, store: Store) -> None:
         store.relisten_at = time.monotonic() + store.relisten_delay
@@ -1782,9 +1769,10 @@ class MachineDispatcher(Dispatcher):
     holds its lock, is `error` with the reason and serves nothing until a
     reload takes one; the others are untouched.
 
-    It loads no project's environment or secret. Its connections are opened
-    outside every scope, from its own environment and the machine's tiers, and
-    its turns start from the environment it was started with."""
+    It loads no project's environment. Every project it serves is on the one
+    store the machine's store setting names, so it holds one listener and one
+    question connection, opened outside every scope, and its turns start from
+    the environment it was started with."""
 
     def __init__(self, machine, *, tick: float = TICK_SECONDS, pool: StorePool | None = None,
                  environment=None):

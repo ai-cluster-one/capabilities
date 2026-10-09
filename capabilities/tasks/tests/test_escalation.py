@@ -1,7 +1,8 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.8.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0",
+#                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
 """Escalation: a task its worker's claim cannot move goes over to the next name
@@ -15,6 +16,7 @@ paused lane's wait once through the CLI. The store-backed checks read
 TASKS_TEST_DSN and skip when it is unset.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
+        --with 'capabilities-contract==0.3.0' \\
         --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -61,10 +63,10 @@ def supervised(project: Path, hooked: bool = False) -> None:
 def aged(conn, schema: str, key: str, hours: float) -> None:
     """Make a task's place older: it was created that long ago, and every move
     it made happened then too."""
-    conn.execute(f"""update {schema}.tasks set created_at = now() - make_interval(hours => %s)
+    conn.execute(f"""update {schema}.tasks_tasks set created_at = now() - make_interval(hours => %s)
                       where unique_key = %s""", (hours, key))
-    conn.execute(f"""update {schema}.task_changes set changed_at = now() - make_interval(hours => %s)
-                      where task_id = (select id from {schema}.tasks where unique_key = %s)""",
+    conn.execute(f"""update {schema}.tasks_changes set changed_at = now() - make_interval(hours => %s)
+                      where task_id = (select id from {schema}.tasks_tasks where unique_key = %s)""",
                  (hours, key))
 
 
@@ -77,11 +79,11 @@ def raised(conn, schema: str, key: str, n: int, *, exhausted: int = 0,
     for at in range(n):
         metrics = json.dumps({"exhausted": True} if at < exhausted else {})
         row = conn.execute(
-            f"""insert into {schema}.task_executions
+            f"""insert into {schema}.tasks_executions
                   (task_id, attempt, worker, status, metrics, started_at, ended_at)
                 select id, %s, 'alpha', 'failed', %s::jsonb,
                        now() - make_interval(hours => %s), now() - make_interval(hours => %s)
-                  from {schema}.tasks where unique_key = %s returning id""",
+                  from {schema}.tasks_tasks where unique_key = %s returning id""",
             (at + 1, metrics, hours_ago, hours_ago, key)).fetchone()
         ids.append(str(row[0]))
     return ids
@@ -94,11 +96,11 @@ def trail(entry, capsys, key: str) -> list[dict]:
 def held_for(conn, schema: str, key: str, hours: float) -> None:
     """Make the task's hold episode begin `hours` ago: its first hold was then."""
     moved = conn.execute(
-        f"""update {schema}.task_executions
+        f"""update {schema}.tasks_executions
                set started_at = started_at - make_interval(secs => %s),
                    ended_at = ended_at - make_interval(secs => %s)
              where metrics ? 'hold'
-               and task_id = (select id from {schema}.tasks where unique_key = %s)""",
+               and task_id = (select id from {schema}.tasks_tasks where unique_key = %s)""",
         (hours * 3600, hours * 3600, key)).rowcount
     assert moved == 1, moved
 
@@ -285,10 +287,10 @@ def test_an_appointment_that_passed_restarts_the_clock(project, store, turns, ca
     capsys.readouterr()
     aged(conn, schema, "t-booked", 30)
     # The appointment came an hour ago.
-    conn.execute(f"""update {schema}.task_changes
+    conn.execute(f"""update {schema}.tasks_changes
                         set new_value = (now() - interval '1 hour')::text
                       where field = 'pickup'""")
-    conn.execute(f"update {schema}.tasks set pickup_at = now() - interval '1 hour'")
+    conn.execute(f"update {schema}.tasks_tasks set pickup_at = now() - interval '1 hour'")
     tell(project, "before", "t-booked", exit=3, print="not yet")
     mod.cmd_run(entry, ["alpha", "--apply"])
     report = answer(capsys)
@@ -400,8 +402,8 @@ def stubborn(store, monkeypatch, capsys):
             execution = kw["extra_env"]["TASKS_EXECUTION"]
             monkeypatch.setenv("TASKS_EXECUTION", execution)
             with mod._connect(entry) as conn, conn.cursor() as cur:
-                cur.execute(f"""select t.unique_key from {mod.SCHEMA}.task_executions e
-                                  join {mod.SCHEMA}.tasks t on t.id = e.task_id
+                cur.execute(f"""select t.unique_key from {mod.SCHEMA}.tasks_executions e
+                                  join {mod.SCHEMA}.tasks_tasks t on t.id = e.task_id
                                  where e.id::text = %s""", (execution,))
                 key = cur.fetchone()["unique_key"]
             ran.append(key)
@@ -460,12 +462,12 @@ def test_raises_that_moved_it_or_were_exhausted_do_not_count(project, store, tur
     aged(conn, schema, "t-moved", 3)
     _first, _second, third = raised(conn, schema, "t-moved", 3, hours_ago=2)
     # The third raise handed the task to someone: a move, stamped with the raise.
-    conn.execute(f"""insert into {schema}.task_changes
+    conn.execute(f"""insert into {schema}.tasks_changes
                        (task_id, field, old_value, new_value, execution_id, actor, changed_at)
                      select id, 'assignee', null, 'alpha', %s, 'alpha',
                             now() - interval '90 minutes'
-                       from {schema}.tasks where unique_key = 't-moved'""", (third,))
-    conn.execute(f"update {schema}.tasks set assignee = 'alpha' where unique_key = 't-moved'")
+                       from {schema}.tasks_tasks where unique_key = 't-moved'""", (third,))
+    conn.execute(f"update {schema}.tasks_tasks set assignee = 'alpha' where unique_key = 't-moved'")
     for _ in range(3):
         mod.cmd_run(entry, ["alpha", "--apply"])
         report = answer(capsys)
@@ -484,11 +486,11 @@ def test_claim_bookkeeping_is_no_move(project, store, turns, capsys):
     aged(conn, schema, "t-books", 3)
     for at in (1, 2, 3):
         execution = conn.execute(
-            f"""insert into {schema}.task_executions
+            f"""insert into {schema}.tasks_executions
                   (task_id, attempt, worker, status, started_at, ended_at)
                 values (%s, %s, 'alpha', 'failed', now() - interval '1 hour',
                         now() - interval '50 minutes') returning id""", (tid, at)).fetchone()[0]
-        conn.execute(f"""insert into {schema}.task_changes
+        conn.execute(f"""insert into {schema}.tasks_changes
                            (task_id, field, old_value, new_value, execution_id, changed_at)
                          values (%s, 'status', 'todo', 'in_progress', %s,
                                  now() - interval '1 hour'),
@@ -576,7 +578,7 @@ def test_a_task_on_the_person_is_never_escalated(project, store, turns, capsys):
                        "hooks:\n" + HOOK_LINE)
     conveyor(project)
     add(entry, capsys, "t-person")
-    conn.execute(f"""update {schema}.tasks set status = 'waiting', assignee = 'owner'
+    conn.execute(f"""update {schema}.tasks_tasks set status = 'waiting', assignee = 'owner'
                       where unique_key = 't-person'""")
     aged(conn, schema, "t-person", 30)
     tell(project, "before", "t-person", exit=3, print="still thinking")

@@ -1,7 +1,8 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.8.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0",
+#                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
 """Machine mode: one process serving every project that joined it.
@@ -10,13 +11,13 @@ The opt-in list, the machine settings and `join`'s refusals are checked with
 no store. The machine process itself runs through the CLI, as a supervisor
 runs it, over three fixture projects written into a temp directory - an
 orchard identified by a UUID, a kiln whose folder is the pottery-shed, and a
-mill - each with a worker of its own; the orchard and the mill share one
-schema and store, and the kiln has a schema and a store of its own, reached
-through a secret held in the user tier. Turns are real `tasks run` children on
-the stand-in harness. The store-backed checks read TASKS_TEST_DSN and skip
-when it is unset; every run works in schemas of its own and drops them.
+mill - each with a worker of its own, all three on the machine's one store.
+Turns are real `tasks run` children on the stand-in harness. The store-backed
+checks read TASKS_TEST_DSN and skip when it is unset; every run works in a
+schema of its own and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
+        --with 'capabilities-contract==0.3.0' \\
         --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -191,16 +192,10 @@ def write_project(root: Path, *, project_id: str | None, slug: str, worker: str,
     return root
 
 
-def entry_for(schema: str, secret_env: str = "TASKS_TEST_PASSWORD", **over) -> dict:
-    from psycopg.conninfo import conninfo_to_dict
-
-    info = conninfo_to_dict(DSN or "postgresql://nobody@127.0.0.1:5432/none")
-    entry = {"db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-             "db_user": info.get("user"), "db_name": info.get("dbname"),
-             "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-             "secret_env": secret_env, "allow_write": True}
-    entry.update(over)
-    return {key: value for key, value in entry.items() if value is not None}
+def entry_for(**over) -> dict:
+    """A connection the service may write through. It names no store: the store
+    is the machine's."""
+    return {"allow_write": True, **over}
 
 
 @pytest.fixture
@@ -233,8 +228,7 @@ def join(root: Path, capsys) -> tuple[int, dict]:
 def test_join_refuses_in_order_and_answers_with_the_project(joining, capsys):
     root = joining / "pottery-shed"
     write_project(root, project_id=None, slug="kiln", worker="potter", kind="clay",
-                  entry=entry_for("tasks_kiln", db_port=None))
-    (root / ".env").write_text("TASKS_TEST_PASSWORD=from-the-project\n")
+                  entry=entry_for(db_host="db.example", db_port="5432"))
     identity = root / "capabilities" / "project.json"
     found = json.loads(identity.read_text())
 
@@ -248,19 +242,16 @@ def test_join_refuses_in_order_and_answers_with_the_project(joining, capsys):
     assert (code, error["code"]) == (6, "database_mode_unsupported")
     identity.write_text(json.dumps({**found, "id": "prj_k1ln00000001"}))
     code, error = join(root, capsys)
-    assert (code, error["code"]) == (6, "project_secret_set")
-    assert "TASKS_TEST_PASSWORD" in error["message"] and "from-the-project" not in error["message"]
-    (root / ".env").write_text("OTHER=1\n")
-    code, error = join(root, capsys)
-    assert (code, error["code"]) == (6, "connection_incomplete")
-    assert "leaves db_port to the environment" in error["message"]
+    assert (code, error["code"]) == (6, "store_in_connection")
+    assert "db_host, db_port" in error["message"]
+    assert "capabilities store set" in error["hint"]
     connections = root / "capabilities" / "tasks" / "connections.json"
     connections.write_text(json.dumps({"default": "farm",
-                                       "connections": {"farm": entry_for("tasks_kiln")}}))
+                                       "connections": {"farm": entry_for()}}))
     # Another project already joined under the same slug.
     other = joining / "kiln-copy"
     write_project(other, project_id="prj_k1ln00000002", slug="kiln", worker="potter",
-                  kind="clay", entry=entry_for("tasks_kiln"))
+                  kind="clay", entry=entry_for())
     code, answer = join(other, capsys)
     assert code == 0 and answer["joined"] is True
     code, error = join(root, capsys)
@@ -310,7 +301,7 @@ def test_leave_in_the_project_and_from_anywhere(joining, capsys):
                                 ("pottery-shed", "prj_k1ln00000001", "kiln"),
                                 ("mill", "prj_m1ll00000001", "mill")):
         roots[slug] = write_project(joining / name, project_id=project, slug=slug,
-                                    worker="w", kind=slug, entry=entry_for("tasks_x"))
+                                    worker="w", kind=slug, entry=entry_for())
         assert join(roots[slug], capsys)[1]["joined"] is True
     # In the project.
     code, answer = leave(roots["orchard"], capsys)
@@ -342,30 +333,21 @@ def plot(joining, monkeypatch):
     if not DSN:
         pytest.skip("TASKS_TEST_DSN is unset")
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
-
-    password = conninfo_to_dict(DSN).get("password") or ""
-    monkeypatch.setenv("TASKS_TEST_PASSWORD", password)
-    (joining / "config" / "tasks").mkdir(parents=True)
-    mod.CREDENTIALS_ENV.write_text(f"TASKS_TEST_PASSWORD_KILN={password}\n")
-    suffix = secrets.token_hex(3)
-    schemas = [f"tasks_test_orchard_{suffix}", f"tasks_test_kiln_{suffix}"]
+    schema = "tasks_test_plot_" + secrets.token_hex(3)
+    _cli.bind_store(mod, monkeypatch, schema)
     roots = {
         "orchard": write_project(joining / "orchard", project_id=ORCHARD_ID, slug="orchard",
-                                 worker="picker", kind="fruit", entry=entry_for(schemas[0])),
+                                 worker="picker", kind="fruit", entry=entry_for()),
         "kiln": write_project(joining / "pottery-shed", project_id="prj_k1ln00000001",
-                              slug="kiln", worker="potter", kind="clay",
-                              entry=entry_for(schemas[1], "TASKS_TEST_PASSWORD_KILN")),
+                              slug="kiln", worker="potter", kind="clay", entry=entry_for()),
     }
     for name, root in roots.items():
         (root / ".env").write_text(f"{name.upper()}_ONLY=1\n")
-    with psycopg.connect(DSN, autocommit=True) as conn:
-        for schema in schemas:
-            conn.execute(mod._schema_ddl(schema))
+    _cli.make_tables(mod, schema)
     state = mod._machine_state_dir()
     state.mkdir(parents=True)
     monkeypatch.chdir(state)
-    found = {"roots": roots, "schemas": schemas, "dispatcher": None}
+    found = {"roots": roots, "schema": schema, "dispatcher": None}
     try:
         yield found
     finally:
@@ -380,24 +362,13 @@ def plot(joining, monkeypatch):
                 slot.turns.clear()
             dispatcher.close()
         with psycopg.connect(DSN, autocommit=True) as conn:
-            for schema in schemas:
-                conn.execute(f"drop schema if exists {schema} cascade")
+            conn.execute(f"drop schema if exists {schema} cascade")
 
 
-def test_the_machine_process_resolves_no_secret_inside_a_scope_and_keeps_no_project_env(
+def test_the_machine_process_holds_one_store_and_keeps_no_project_env(
         plot, capsys, monkeypatch):
     for root in plot["roots"].values():
         assert join(root, capsys)[1]["joined"] is True
-    resolve = mod._resolve_env_key
-    resolved = []
-    tracking = {"on": True}
-
-    def resolving(key):
-        if tracking["on"] and key.startswith("TASKS_TEST_PASSWORD"):
-            resolved.append((key, mod.ProjectScope.current is not None))
-        return resolve(key)
-
-    monkeypatch.setattr(mod, "_resolve_env_key", resolving)
     spawned = []
     service = mod._service_module()
 
@@ -417,16 +388,14 @@ def test_the_machine_process_resolves_no_secret_inside_a_scope_and_keeps_no_proj
         dispatcher.step()
     assert sorted(slot.slug for slot in dispatcher.slots) == ["kiln", "orchard"]
     assert all(slot.state() == "served" for slot in dispatcher.slots)
-    # Two distinct stores, one listener and one question connection each.
-    assert len(dispatcher.stores()) == 2
-    assert [store.connections_opened for store in dispatcher.stores()] == [2, 2]
+    # The machine's one store, one listener and one question connection for both.
+    assert len(dispatcher.stores()) == 1
+    assert [store.connections_opened for store in dispatcher.stores()] == [2]
     # A turn, so the start of one is seen too.
     slot = next(slot for slot in dispatcher.slots if slot.slug == "kiln")
     slot.host.turn_command = lambda worker: [sys.executable, "-c", "pass"]
-    tracking["on"] = False  # the test's own write, not the machine process's
     with slot.scope():
         mod.cmd_add(slot.host.entry, ["--type", "clay", "--title", "a pot", "--status", "todo"])
-    tracking["on"] = True
     capsys.readouterr()
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline and not spawned:
@@ -434,24 +403,11 @@ def test_the_machine_process_resolves_no_secret_inside_a_scope_and_keeps_no_proj
     assert spawned and spawned[0]["close_fds"] is True
     assert Path(spawned[0]["cwd"]).resolve() == plot["roots"]["kiln"].resolve()
     assert "--connection" not in slot.host.turn_command("potter")
-    # The secrets were resolved, and never inside a scope; the environment
-    # the process and its turns start from holds nothing of either project.
-    assert {key for key, _ in resolved} == {"TASKS_TEST_PASSWORD", "TASKS_TEST_PASSWORD_KILN"}
-    assert not [key for key, scoped in resolved if scoped]
+    # The environment the process and its turns start from holds nothing of
+    # either project.
     assert dispatcher.environment == start
     assert not {"ORCHARD_ONLY", "KILN_ONLY", "CLAUDE_PROJECT_DIR"} & set(dispatcher.environment)
     assert not {"ORCHARD_ONLY", "KILN_ONLY"} & set(os.environ)
-
-
-def test_a_machine_connection_is_never_opened_standing_in_a_project(plot, capsys, monkeypatch):
-    root = plot["roots"]["orchard"]
-    host = mod._service_host(root, None, dict(os.environ), machine=True)
-    monkeypatch.chdir(root)
-    with pytest.raises(mod.Refusal) as caught:
-        host.open_query(5)
-    assert caught.value.code == "machine_in_a_project"
-    with host.scope(dict(os.environ)), pytest.raises(mod.Refusal):
-        host.listen()
 
 
 # --- The machine process, through the CLI -------------------------------------
@@ -460,42 +416,32 @@ class Farm:
     """Three projects and the homes a machine process and their CLIs share."""
 
     def __init__(self, tmp: Path):
-        from psycopg.conninfo import conninfo_to_dict
-
-        info = conninfo_to_dict(DSN)
         self.tmp = tmp
         self.record = tmp / "engine.jsonl"
-        suffix = secrets.token_hex(3)
-        self.schemas = {"a": f"tasks_test_farm_a_{suffix}", "b": f"tasks_test_farm_b_{suffix}"}
+        self.schema = "tasks_test_farm_" + secrets.token_hex(3)
         self.ids = {"orchard": str(uuid.uuid4()), "kiln": "prj_" + uuid.uuid4().hex[:12],
                     "mill": "prj_" + uuid.uuid4().hex[:12]}
         self.workers = {"orchard": ("picker", "fruit"), "kiln": ("potter", "clay"),
                         "mill": ("miller", "grain")}
         folders = {"orchard": "orchard", "kiln": "pottery-shed", "mill": "mill"}
-        stores = {"orchard": ("a", "TASKS_TEST_PASSWORD"),
-                  "kiln": ("b", "TASKS_TEST_PASSWORD_KILN"),
-                  "mill": ("a", "TASKS_TEST_PASSWORD")}
         self.roots = {}
         for name in ("orchard", "kiln", "mill"):
             worker, kind = self.workers[name]
-            schema, secret = stores[name]
             root = write_project(tmp / folders[name], project_id=self.ids[name], slug=name,
-                                 worker=worker, kind=kind,
-                                 entry=entry_for(self.schemas[schema], secret))
+                                 worker=worker, kind=kind, entry=entry_for())
             (root / ".git").mkdir()
             (root / ".env").write_text(f"{name.upper()}_ONLY=1\n")
             self.roots[name] = root.resolve()
         config = tmp / "config"
-        (config / "tasks").mkdir(parents=True)
-        (config / "tasks" / "credentials.env").write_text(
-            f"TASKS_TEST_PASSWORD_KILN={info.get('password') or ''}\n")
+        # The machine's one store, which every project here reaches.
+        _cli.write_store_setting(config, self.schema)
         self.env = {key: value for key, value in os.environ.items()
-                    if not key.startswith(("CAPABILITIES_", "TASKS_", "CLAUDE_", "FAKE_"))}
+                    if not key.startswith(("CAPABILITIES_", "AGENTKIT_", "TASKS_", "CLAUDE_",
+                                           "FAKE_"))}
         self.env.update({
             "HOME": str(tmp / "home"), "XDG_CONFIG_HOME": str(config),
             "XDG_STATE_HOME": str(tmp / "state"), "XDG_CACHE_HOME": str(tmp / "cache"),
             "CAPABILITIES_HOME": str(tmp / "registry"),
-            "TASKS_TEST_PASSWORD": info.get("password") or "",
             "TASKS_ACTOR": "ops-person",
             "FAKE_ENGINE_TASKS": str(_cli.CLI_PATH), "FAKE_ENGINE_RECORD": str(self.record),
             "FAKE_ENGINE_SLEEP": "1",
@@ -571,9 +517,7 @@ def farm(tmp_path):
     if not DSN:
         pytest.skip("TASKS_TEST_DSN is unset")
     found = Farm(tmp_path)
-    with psycopg.connect(DSN, autocommit=True) as conn:
-        for schema in found.schemas.values():
-            conn.execute(mod._schema_ddl(schema))
+    _cli.make_tables(mod, found.schema)
     try:
         yield found
     finally:
@@ -583,8 +527,7 @@ def farm(tmp_path):
             if found.roots[name].is_dir():
                 found.cli(name, "service", "stop", "--end-turns", "--timeout", "20", "--force")
         with psycopg.connect(DSN, autocommit=True) as conn:
-            for schema in found.schemas.values():
-                conn.execute(f"drop schema if exists {schema} cascade")
+            conn.execute(f"drop schema if exists {found.schema} cascade")
 
 
 def started_in(farm: Farm) -> list[str]:
@@ -648,11 +591,11 @@ def test_one_machine_process_serves_three_projects_each_as_itself(farm):
         farm.roots["kiln"].name == "pottery-shed"
     assert all(row["present"] and row["enabled_explicitly"] and row["current"]
                for row in status["projects"])
-    # Two distinct stores: one listener and one question connection each.
-    assert sorted((store["listening"], store["connections_opened"])
-                  for store in status["stores"]) == [(True, 2), (True, 2)]
-    assert sorted(sorted(store["projects"]) for store in status["stores"]) == [
-        ["kiln"], ["mill", "orchard"]]
+    # The machine's one store: one listener and one question connection.
+    assert [(store["listening"], store["connections_opened"])
+            for store in status["stores"]] == [(True, 2)]
+    assert [sorted(store["projects"]) for store in status["stores"]] == [
+        ["kiln", "mill", "orchard"]]
 
     for name in ("orchard", "kiln", "mill"):
         farm.add(name, f"t-{name}")
@@ -676,7 +619,7 @@ def test_one_machine_process_serves_three_projects_each_as_itself(farm):
             Path(turn["env"]["CLAUDE_PROJECT_DIR"]).resolve() == farm.roots[name]
     # Still the same connections, after turns started and ended.
     status = farm.machine()
-    assert sorted(store["connections_opened"] for store in status["stores"]) == [2, 2]
+    assert [store["connections_opened"] for store in status["stores"]] == [2]
     # The log: one line per thing, each naming its project, and each project's
     # lines in its own daemon.log too.
     lines = farm.log()

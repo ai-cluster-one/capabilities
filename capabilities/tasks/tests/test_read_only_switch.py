@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
 # ///
 """Under CAPABILITIES_READ_ONLY the task tracker reads and records nothing.
 
@@ -12,7 +12,8 @@ answer under the switch and under a read-only grant alike. These run the CLI as
 a project would, against TASKS_TEST_DSN in a schema of their own that they
 drop, and skip when it is unset.
 
-    uv run --with pytest --with 'psycopg[binary]>=3.2' python -m pytest capabilities/tasks/tests -q
+    uv run --with pytest --with 'psycopg[binary]>=3.2' \\
+        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -38,9 +39,6 @@ SWITCH = "CAPABILITIES_READ_ONLY"
 @pytest.fixture()
 def lab(tmp_path):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
-
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
@@ -51,15 +49,12 @@ def lab(tmp_path):
     (envelope / "project.json").write_text(json.dumps({
         "schema": "capabilities.project.v1",
         "id": "prj_" + uuid.uuid4().hex[:12], "slug": "lab"}))
-    store = {
-        "db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-        "db_user": info.get("user"), "db_name": info.get("dbname"),
-        "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-        "secret_env": "TASKS_TEST_PASSWORD"}
+    store: dict = {}
     (envelope / "tasks" / "connections.json").write_text(json.dumps({
         "default": "local",
         "connections": {"local": {**store, "allow_write": True},
                         "reader": {**store, "allow_write": False}}}))
+    _cli.write_store_setting(tmp_path / "config", schema)
     env = os.environ.copy()
     env.update({
         "HOME": str(tmp_path / "home"),
@@ -67,14 +62,13 @@ def lab(tmp_path):
         "XDG_STATE_HOME": str(tmp_path / "state"),
         "CAPABILITIES_HOME": str(tmp_path / "registry"),
         "CLAUDE_PROJECT_DIR": str(project),
-        "TASKS_TEST_PASSWORD": info.get("password") or "",
     })
     for leaked in (SWITCH, "TASKS_EXECUTION", "TASKS_ACTOR",
                    "CAPABILITIES_PROJECT_ENVELOPE", "CAPABILITIES_PROJECT_ID",
-                   "CAPABILITIES_STORE_URL", "CAPABILITIES_STORE_MODE"):
+                   "CAPABILITIES_STORE_URL", "AGENTKIT_STORE_URL", "CAPABILITIES_STORE_MODE"):
         env.pop(leaked, None)
-    lab = {"project": project, "env": env}
-    assert _tasks(lab, "migrate", "--apply").returncode == 0
+    lab = {"project": project, "env": env, "schema": schema, "tmp": tmp_path}
+    assert _tasks(lab, "migrate").returncode == 0
     try:
         yield lab
     finally:
@@ -111,7 +105,7 @@ def test_reads_work_and_every_write_verb_is_refused(lab, value):
                  ("activity", task, "did something"),
                  ("tag", task, "t"),
                  ("claim", "--key", "none"),
-                 ("migrate", "--apply")):
+                 ("migrate",)):
         refused = _tasks(lab, *args, switch=value)
         assert refused.returncode == 4, (args, refused.stdout, refused.stderr)
         error = json.loads(refused.stderr.strip().splitlines()[-1])["error"]
@@ -126,9 +120,10 @@ def test_reads_work_and_every_write_verb_is_refused(lab, value):
 
 @pytest.mark.parametrize("gate", ["1", "true", "reader"])
 def test_the_forms_that_write_nothing_answer_and_their_writes_stay_refused(lab, gate):
-    """`meta show`, and `migrate` and `run` without `--apply`, answer behind the
-    gate exactly as they do in front of it, while every form of those verbs that
-    writes - however its flags are placed - is still refused before the store."""
+    """`meta show`, `migrate status`, and `run` without `--apply`, answer behind
+    the gate exactly as they do in front of it, while every form of those verbs
+    that writes - however its flags are placed - is still refused before the
+    store."""
     made = _tasks(lab, "add", "--type", "proposal", "--title", "forms", "--key", "f-1")
     assert made.returncode == 0, made.stdout + made.stderr
     assert _tasks(lab, "meta", "set", "f-1", "a", "1").returncode == 0
@@ -137,9 +132,11 @@ def test_the_forms_that_write_nothing_answer_and_their_writes_stay_refused(lab, 
     else:
         switch, connection, code = gate, (), "read_only_switch"
 
-    for args in (("meta", "show", "f-1"), ("migrate",), ("run", "default")):
+    for args in (("meta", "show", "f-1"), ("migrate", "status"), ("run", "default")):
         open_ = _tasks(lab, *args)
-        gated = _tasks(lab, *connection, *args, switch=switch)
+        # `migrate` acts on the machine's store, through no connection.
+        gated = _tasks(lab, *(connection if args[0] != "migrate" else ()), *args,
+                       switch=switch)
         assert gated.returncode == 0, (args, gated.stdout, gated.stderr)
         assert gated.stdout == open_.stdout, args
 
@@ -147,8 +144,6 @@ def test_the_forms_that_write_nothing_answer_and_their_writes_stay_refused(lab, 
     for args in (("meta", "set", "f-1", "a", "2"),
                  ("meta", "rm", "f-1", "a"),
                  ("meta", "--actor", "show", "set", "f-1", "a", "2"),
-                 ("migrate", "--apply"),
-                 ("migrate", "--apply="),
                  ("run", "default", "--apply"),
                  ("run", "--apply", "default")):
         refused = _tasks(lab, *connection, *args, switch=switch)

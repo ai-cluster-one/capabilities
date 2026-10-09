@@ -1,7 +1,8 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.8.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0",
+#                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
 """Structural dead ends: a task that can never move as things stand is caught by
@@ -15,6 +16,7 @@ refuses are driven against a real store with the harness replaced. The
 store-backed checks read TASKS_TEST_DSN and skip when it is unset.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
+        --with 'capabilities-contract==0.3.0' \\
         --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -51,7 +53,7 @@ def raw_task(conn, schema: str, key: str, *, kind: str = "alpha", status: str = 
     """A task written straight into the store, as drift leaves one: the CLI
     refuses to write it. Its blockers are ids."""
     return str(conn.execute(
-        f"""insert into {schema}.tasks
+        f"""insert into {schema}.tasks_tasks
               (project_id, type, title, unique_key, status, assignee, blocked_by)
             values (%s, %s, %s, %s, %s, %s, %s::uuid[]) returning id""",
         (hooks.HERE, kind, f"a {kind}", key, status, assignee,
@@ -280,7 +282,7 @@ def test_blockers_that_can_never_all_end_are_escalated(project, store, turns, ca
                            assignee="supervisor")
         other = raw_task(conn, schema, "t-other", status="waiting", assignee="the owner",
                          blocked_by=[blocked])
-        conn.execute(f"update {schema}.tasks set blocked_by = %s::uuid[] where id = %s",
+        conn.execute(f"update {schema}.tasks_tasks set blocked_by = %s::uuid[] where id = %s",
                      ([other], blocked))
         said = "t-blocked -> t-other -> t-blocked"
     mod.cmd_run(entry, ["alpha", "--apply"])

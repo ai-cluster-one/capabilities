@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
 # ///
 """Which project a task belongs to, and how far a command may reach.
 
@@ -15,7 +15,8 @@ The store-backed half seeds two projects into one schema and reads
 TASKS_TEST_DSN, skipping when it is unset; every run works in a schema of its
 own and drops it.
 
-    uv run --with pytest --with 'psycopg[binary]>=3.2' python -m pytest capabilities/tasks/tests -q
+    uv run --with pytest --with 'psycopg[binary]>=3.2' \\
+        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -257,7 +258,6 @@ WRITE_VERBS = {
     "claim": (mod.cmd_claim, []),
     "release": (mod.cmd_release, ["exec-1", "--outcome", "ok"]),
     "run": (mod.cmd_run, ["a-worker"]),
-    "migrate": (mod.cmd_migrate, []),
 }
 
 
@@ -376,42 +376,13 @@ def test_all_projects_drops_the_project_clause_and_nothing_else(monkeypatch):
     assert "project_id" not in where and params == ["todo"]
 
 
-# --- The migration -----------------------------------------------------------
+# --- The tables ---------------------------------------------------------------
 
-def test_the_store_can_be_behind_on_the_column():
-    assert ("tasks", "project_id") in mod._COLUMNS
-
-
-def test_the_schema_adds_then_fills_then_tightens():
-    ddl = mod._schema_ddl("tasks")
-    steps = [ddl.index("add column if not exists project_id"),
-             ddl.index("set project_id = current_setting"),
-             ddl.index("alter column project_id set not null")]
-    assert steps == sorted(steps)
-    assert "create index if not exists tasks_project_idx" in ddl
-    # Nothing is dropped or emptied to make the column fit. Read past the
-    # commentary, which says so in prose and would answer for itself.
-    statements = "\n".join(line for line in ddl.splitlines()
-                           if not line.lstrip().startswith("--"))
-    assert "drop column" not in statements
-    assert "truncate" not in statements.lower()
-    assert "delete from" not in statements.lower()
-
-
-def test_the_schema_names_no_project_of_its_own():
-    """The value existing rows are filled with arrives from the project running
-    the migration. A project id written into the file would be right for exactly
-    one store, and would be one consumer's identity shipped to every other."""
-    ddl = mod._schema_ddl("tasks")
-    assert "prj_" not in ddl
-
-
-def test_the_schema_rewrite_leaves_the_migration_setting_alone():
-    """The whole file is re-addressed to whichever schema the connection names,
-    and the setting the backfill reads is not a schema."""
-    ddl = mod._schema_ddl("tasks_elsewhere")
-    assert "current_setting('tasks_migration.project_id')" in ddl
-    assert "tasks_elsewhere.tasks" in ddl
+def test_the_tables_name_no_project_of_their_own():
+    """A project id written into the steps would be right for exactly one store,
+    and would be one consumer's identity shipped to every other."""
+    steps, _major, _minor = mod._tables()
+    assert all("prj_" not in sql for _id, sql in steps)
 
 
 # --- Store: two projects in one schema ---------------------------------------
@@ -423,21 +394,16 @@ needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 @pytest.fixture
 def store(monkeypatch):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
 
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
-    entry = {"db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-             "db_user": info.get("user"), "db_name": info.get("dbname"),
-             "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-             "secret_env": "TASKS_TEST_PASSWORD", "allow_write": True}
-    monkeypatch.setenv("TASKS_TEST_PASSWORD", info.get("password") or "")
+    entry = {"allow_write": True}
+    _cli.bind_store(mod, monkeypatch, schema)
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.delenv("TASKS_ACTOR", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
     monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(mod._schema_ddl(schema))
+        _cli.make_tables(mod, schema)
         try:
             yield entry, schema, conn
         finally:
@@ -471,7 +437,7 @@ def seed(monkeypatch, entry, capsys, project: str, key: str, **fields) -> None:
 def task_uuid(conn, schema: str, project: str, key: str) -> str:
     """A task's uuid, which names it wherever it is; a key names it only in its
     own project."""
-    row = conn.execute(f"select id from {schema}.tasks where project_id = %s "
+    row = conn.execute(f"select id from {schema}.tasks_tasks where project_id = %s "
                        f"and unique_key = %s", (project, key)).fetchone()
     return str(row[0])
 
@@ -579,16 +545,17 @@ def test_the_store_is_named_the_same_for_the_same_store_and_not_for_another(
     assert _answer(capsys)["store"] == first
     # Another schema in the same database is another store.
     other = schema + "_other"
-    conn.execute(mod._schema_ddl(other))
+    _cli.make_tables(mod, other)
     try:
-        monkeypatch.setattr(mod, "SCHEMA", other)
-        mod.cmd_list({**entry, "db_schema": other}, ["--all-projects"])
+        _cli.bind_store(mod, monkeypatch, other)
+        mod.cmd_list(entry, ["--all-projects"])
         second = _answer(capsys)["store"]
     finally:
         conn.execute(f"drop schema {other} cascade")
     assert second != first
     # Nothing secret is in it: it is a digest, and the password is not.
-    password = os.environ.get("TASKS_TEST_PASSWORD") or ""
+    from psycopg.conninfo import conninfo_to_dict
+    password = conninfo_to_dict(DSN).get("password") or ""
     for identity in (first, second):
         assert len(identity) == 16 and int(identity, 16) >= 0
         assert not password or password not in identity
@@ -651,7 +618,7 @@ def test_two_projects_each_own_the_same_key(two_projects, capsys, monkeypatch):
         monkeypatch.setattr(mod, "PROJECT", project)
         mod.cmd_add(entry, ["--type", "probe", "--title", "again", "--key", "t-1"])
         assert _answer(capsys) == {"exists": holder, "unique_key": "t-1"}
-    count = conn.execute(f"select count(*) from {schema}.tasks "
+    count = conn.execute(f"select count(*) from {schema}.tasks_tasks "
                          f"where unique_key = 't-1'").fetchone()[0]
     assert count == 2
     # The store itself refuses a second holder inside one project.
@@ -771,7 +738,7 @@ def test_a_claim_sweeps_nothing_of_another_projects(two_projects, capsys,
                         "--pickup", "2020-01-01"])
     capsys.readouterr()
     # Their lease has already passed and their wait is already over.
-    conn.execute(f"update {schema}.task_executions set lease_until = now() - "
+    conn.execute(f"update {schema}.tasks_executions set lease_until = now() - "
                  f"interval '1 hour' where id = %s", (execution,))
 
     monkeypatch.setattr(mod, "PROJECT", HERE)
@@ -781,7 +748,7 @@ def test_a_claim_sweeps_nothing_of_another_projects(two_projects, capsys,
     assert answer["swept"] == [] and answer["returned"] == []
     # Their raise is still running, swept by nobody here; its lease ran out, so
     # it holds nothing and the task shows where it rests.
-    assert conn.execute(f"select status from {schema}.task_executions where id = %s",
+    assert conn.execute(f"select status from {schema}.tasks_executions where id = %s",
                         (execution,)).fetchone()[0] == "running"
     mod.cmd_show(entry, [task_uuid(conn, schema, THERE, "t-1")])
     assert _answer(capsys)["task"]["status"] == "todo"
@@ -824,91 +791,11 @@ def test_outside_a_project_a_read_names_one_and_a_write_is_refused(
 
     # Nothing was written, and above all no row belonging to nobody.
     with _conn.cursor() as cur:
-        cur.execute(f"select count(*) from {_schema}.tasks "
+        cur.execute(f"select count(*) from {_schema}.tasks_tasks "
                     f"where project_id is null or project_id = ''")
         assert cur.fetchone()[0] == 0
-        cur.execute(f"select count(*) from {_schema}.tasks")
+        cur.execute(f"select count(*) from {_schema}.tasks_tasks")
         assert cur.fetchone()[0] == 3
-
-
-@needs_store
-def test_the_migration_fills_a_store_that_predates_the_column(
-        two_projects, capsys, monkeypatch):
-    """A store from before the column holds one project's tasks, and the project
-    running the migration is that project - so every row it finds is filled with
-    the id that project declares, and only then is the column tightened."""
-    from psycopg.rows import dict_row
-    entry, schema, conn = two_projects
-    # A store from before the column also keyed its tasks across the whole store.
-    conn.execute(f"alter table {schema}.tasks drop column project_id")
-    conn.execute(f"alter table {schema}.tasks add constraint tasks_unique_key_key "
-                 f"unique (unique_key)")
-
-    with conn.cursor(row_factory=dict_row) as cur:
-        assert mod._columns_absent(mod._catalog(cur, schema)) == ["tasks.project_id"]
-
-    mod.cmd_migrate(entry, [])
-    reported = _answer(capsys)
-    assert reported["would_add"] == ["tasks.project_id",
-                                     "tasks.tasks_project_unique_key_idx"]
-    assert reported["project"] == HERE and reported["applied"] is False
-
-    # What each task's moment was before the column arrived. Filling a column is
-    # not the task moving, and a migration that says otherwise leaves a ledger
-    # where everything last happened at once.
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(f"select unique_key, updated_at from {schema}.tasks")
-        before = {r["unique_key"]: r["updated_at"] for r in cur.fetchall()}
-    assert len(before) == 3
-
-    mod.cmd_migrate(entry, ["--apply"])
-    applied = _answer(capsys)
-    assert applied["added"] == ["tasks.project_id",
-                                "tasks.tasks_project_unique_key_idx"]
-    assert applied["applied"] is True
-
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(f"select project_id, count(*) as n from {schema}.tasks "
-                    f"group by project_id")
-        assert _cli and [dict(r) for r in cur.fetchall()] == [{"project_id": HERE,
-                                                              "n": 3}]
-        cur.execute("""select is_nullable from information_schema.columns
-                        where table_schema = %s and table_name = 'tasks'
-                          and column_name = 'project_id'""", (schema,))
-        assert cur.fetchone()["is_nullable"] == "NO"
-        cur.execute("""select indexname from pg_indexes
-                        where schemaname = %s and indexname = 'tasks_project_idx'""",
-                    (schema,))
-        assert cur.fetchone() is not None
-
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(f"select unique_key, updated_at from {schema}.tasks")
-        after = {r["unique_key"]: r["updated_at"] for r in cur.fetchall()}
-    assert after == before
-
-    # Repeatable: running it again reports nothing and moves no row.
-    mod.cmd_migrate(entry, [])
-    assert _answer(capsys)["would_add"] == []
-    mod.cmd_migrate(entry, ["--apply"])
-    assert _answer(capsys)["added"] == []
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(f"select count(*) as n from {schema}.tasks "
-                    f"where project_id = %s", (HERE,))
-        assert cur.fetchone()["n"] == 3
-
-    # The migrated store keys per project: the store-wide constraint is gone, and
-    # another project may now hold a key this one already holds.
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute("""select count(*) as n from pg_constraint c
-                         join pg_namespace n on n.oid = c.connamespace
-                        where n.nspname = %s and c.conname = 'tasks_unique_key_key'""",
-                    (schema,))
-        assert cur.fetchone()["n"] == 0
-    seed(monkeypatch, entry, capsys, THERE, "h-1")
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(f"select project_id from {schema}.tasks where unique_key = 'h-1' "
-                    f"order by project_id")
-        assert [r["project_id"] for r in cur.fetchall()] == [HERE, THERE]
 
 
 if __name__ == "__main__":

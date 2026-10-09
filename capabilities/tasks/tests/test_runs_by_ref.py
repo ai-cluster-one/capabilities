@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
 # ///
 """From a run a harness knows by its own handle to the raise it was and the task
 it ran for, for many runs in one call.
@@ -10,7 +10,8 @@ The store-backed half seeds raises naming runs into two projects in one schema
 and reads TASKS_TEST_DSN, skipping when it is unset; every run works in a schema
 of its own and drops it.
 
-    uv run --with pytest --with 'psycopg[binary]>=3.2' python -m pytest capabilities/tasks/tests -q
+    uv run --with pytest --with 'psycopg[binary]>=3.2' \\
+        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -56,16 +57,6 @@ def test_a_call_that_cannot_be_read_is_refused_before_the_store(args, capsys):
     assert error["exit"] == 6 and error["code"] == "input"
 
 
-def test_the_run_index_is_additive_and_a_store_without_it_is_behind():
-    named = [f"{t}.{i}" for t, i in mod._INDEXES]
-    assert named == ["task_executions.task_executions_run_idx"]
-    assert not mod._NOT_ADDITIVE.intersection(named)
-    catalog = {"tables": ["task_executions"], "indexes": set()}
-    assert mod._indexes_absent(catalog) == named
-    assert mod._indexes_absent({**catalog, "indexes": set(mod._INDEXES)}) == []
-    assert mod._indexes_absent({"tables": [], "indexes": set()}) == []
-
-
 def test_the_help_states_the_contract():
     runs = " ".join(mod.__doc__.split("\nRUNS\n")[1].split("\nWATCH\n")[0].split())
     for said in ("--run SYSTEM:REF", "--since WHEN", "--all-projects",
@@ -85,20 +76,15 @@ needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 @pytest.fixture
 def store(monkeypatch):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
 
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
-    entry = {"db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-             "db_user": info.get("user"), "db_name": info.get("dbname"),
-             "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-             "secret_env": "TASKS_TEST_PASSWORD", "allow_write": False}
-    monkeypatch.setenv("TASKS_TEST_PASSWORD", info.get("password") or "")
+    entry = {"allow_write": False}
+    _cli.bind_store(mod, monkeypatch, schema)
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
     monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(mod._schema_ddl(schema))
+        _cli.make_tables(mod, schema)
         try:
             yield entry, schema, conn
         finally:
@@ -107,7 +93,7 @@ def store(monkeypatch):
 
 def _task(conn, schema, project, key) -> str:
     return str(conn.execute(
-        f"""insert into {schema}.tasks (project_id, type, unique_key, title, status)
+        f"""insert into {schema}.tasks_tasks (project_id, type, unique_key, title, status)
             values (%s, 'change', %s, %s, 'todo') returning id""",
         (project, key, f"title of {key}")).fetchone()[0])
 
@@ -115,7 +101,7 @@ def _task(conn, schema, project, key) -> str:
 def _raise(conn, schema, task, attempt, started, system=None, ref=None,
            status="ok", worker="executor") -> None:
     conn.execute(
-        f"""insert into {schema}.task_executions
+        f"""insert into {schema}.tasks_executions
               (task_id, attempt, worker, status, run_system, run_ref, started_at,
                ended_at)
             values (%s, %s, %s, %s, %s, %s, %s::timestamptz,
@@ -251,15 +237,3 @@ def test_a_read_only_connection_answers_it(raises, capsys):
     assert len(_runs(capsys, entry, "--all-projects", "--run", "claude:sess-a")) == 1
 
 
-@needs_store
-def test_a_store_without_the_run_index_catches_up_to_it(store):
-    import psycopg
-    _entry, schema, conn = store
-    conn.execute(f"drop index {schema}.task_executions_run_idx")
-    with psycopg.connect(DSN, row_factory=psycopg.rows.dict_row) as fresh:
-        applied = mod._catch_up(fresh, schema, HERE)
-    assert applied == {"schema": schema, "created": [],
-                       "added": ["task_executions.task_executions_run_idx"]}
-    assert conn.execute("select 1 from pg_indexes where schemaname = %s and "
-                        "indexname = 'task_executions_run_idx'",
-                        (schema,)).fetchone()

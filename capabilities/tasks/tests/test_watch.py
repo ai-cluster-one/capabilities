@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
 # ///
 """`watch` holds one connection and prints one JSON line per change a scope
 reads, catches up after a lost connection, and ends cleanly.
@@ -9,7 +9,8 @@ reads, catches up after a lost connection, and ends cleanly.
 These run the CLI as a project would, against TASKS_TEST_DSN in a schema of
 their own that they drop, and skip when it is unset.
 
-    uv run --with pytest --with 'psycopg[binary]>=3.2' python -m pytest capabilities/tasks/tests -q
+    uv run --with pytest --with 'psycopg[binary]>=3.2' \\
+        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -67,14 +68,17 @@ def test_watch_takes_the_project_scope_and_nothing_that_shapes_rows(monkeypatch,
     assert exit_info.value.code == 6
 
 
-def test_the_schema_announces_each_kind_and_migrate_names_the_triggers():
-    schema = (mod._bundle_dir() / "schema.sql").read_text()
+def test_the_tables_announce_each_kind_from_every_table_a_change_lands_in():
+    shape = mod._TABLES_SHAPE
     for kind in mod._WATCH_KINDS:
-        assert f"'{kind}'" in schema, kind
-    for table, trigger in mod._WATCH_TRIGGERS:
-        assert f"create trigger {trigger} after" in schema
-        assert f"on tasks.{table}" in schema
-    assert f"pg_notify('{mod.WATCH_CHANNEL}'" in schema
+        assert f"'{kind}'" in shape, kind
+    for table, trigger, when in (("tasks_tasks", "tasks_notify_watch", "insert or update"),
+                                 ("tasks_activities", "tasks_activities_notify_watch",
+                                  "insert"),
+                                 ("tasks_executions", "tasks_executions_notify_watch",
+                                  "insert or update")):
+        assert f"create trigger {trigger} after {when} on {table}" in shape
+    assert f"pg_notify('{mod.WATCH_CHANNEL}'" in shape
 
 
 # --- Against a store ---------------------------------------------------------
@@ -82,9 +86,6 @@ def test_the_schema_announces_each_kind_and_migrate_names_the_triggers():
 @pytest.fixture()
 def lab(tmp_path):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
-
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
@@ -97,11 +98,8 @@ def lab(tmp_path):
         "schema": "capabilities.project.v1", "id": here, "slug": "lab"}))
     (envelope / "tasks" / "connections.json").write_text(json.dumps({
         "default": "local",
-        "connections": {"local": {
-            "db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-            "db_user": info.get("user"), "db_name": info.get("dbname"),
-            "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-            "secret_env": "TASKS_TEST_PASSWORD", "allow_write": True}}}))
+        "connections": {"local": {"allow_write": True}}}))
+    _cli.write_store_setting(tmp_path / "config", schema)
     env = os.environ.copy()
     env.update({
         "HOME": str(tmp_path / "home"),
@@ -109,15 +107,14 @@ def lab(tmp_path):
         "XDG_STATE_HOME": str(tmp_path / "state"),
         "CAPABILITIES_HOME": str(tmp_path / "registry"),
         "CLAUDE_PROJECT_DIR": str(project),
-        "TASKS_TEST_PASSWORD": info.get("password") or "",
     })
     for leaked in ("CAPABILITIES_READ_ONLY", "TASKS_EXECUTION", "TASKS_ACTOR",
                    "CAPABILITIES_PROJECT_ENVELOPE", "CAPABILITIES_PROJECT_ID",
-                   "CAPABILITIES_STORE_URL", "CAPABILITIES_STORE_MODE"):
+                   "CAPABILITIES_STORE_URL", "AGENTKIT_STORE_URL", "CAPABILITIES_STORE_MODE"):
         env.pop(leaked, None)
     lab = {"project": project, "env": env, "schema": schema, "here": here,
            "watches": []}
-    migrated = _tasks(lab, "migrate", "--apply")
+    migrated = _tasks(lab, "migrate")
     assert migrated.returncode == 0, migrated.stdout + migrated.stderr
     try:
         yield lab
@@ -254,10 +251,10 @@ def test_a_write_from_any_path_is_announced_and_a_rollback_is_not(lab):
     task = _answer(_tasks(lab, "add", "--type", "change", "--title", "raw"))["created"]
     watch.until(lambda l: l["event"] == "counts")
     with psycopg.connect(DSN) as conn:
-        conn.execute(f"update {lab['schema']}.tasks set title = 'rolled back' where id = %s",
+        conn.execute(f"update {lab['schema']}.tasks_tasks set title = 'rolled back' where id = %s",
                      (task,))
         conn.rollback()
-        conn.execute(f"update {lab['schema']}.tasks set title = 'by hand' where id = %s",
+        conn.execute(f"update {lab['schema']}.tasks_tasks set title = 'by hand' where id = %s",
                      (task,))
         conn.commit()
     seen = watch.until(lambda l: l["event"] == "counts")
@@ -272,7 +269,7 @@ def test_what_is_printed_is_what_the_scope_reads(lab):
     mine = _answer(_tasks(lab, "add", "--type", "change", "--title", "mine"))["created"]
     with psycopg.connect(DSN) as conn:
         theirs = str(conn.execute(
-            f"insert into {lab['schema']}.tasks (project_id, type, title) "
+            f"insert into {lab['schema']}.tasks_tasks (project_id, type, title) "
             "values (%s, 'change', 'theirs') returning id", (OTHER,)).fetchone()[0])
         conn.commit()
     seen_here = here.until(lambda l: l["event"] == "counts") + here.quiet()
@@ -293,7 +290,7 @@ def test_a_dropped_connection_catches_up_then_resyncs(lab):
     with psycopg.connect(DSN) as conn:
         # The change commits after the watch's backend is gone, so its
         # notification reaches nobody and only the catch-up can carry it.
-        conn.execute(f"update {lab['schema']}.tasks set title = 'while away' where id = %s",
+        conn.execute(f"update {lab['schema']}.tasks_tasks set title = 'while away' where id = %s",
                      (task,))
         killed = conn.execute(
             "select pg_terminate_backend(pid, 5000) from pg_stat_activity "
@@ -330,48 +327,6 @@ def test_sigterm_ends_it_with_exit_0(lab):
 
 
 @needs_store
-def test_a_store_without_a_trigger_gains_it_before_ready(lab):
-    """The store a release of `watch` left behind: it lacks a trigger, which is
-    additive, so the watch brings the store up to this version and listens."""
-    import psycopg
-    with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(f"drop trigger task_activities_notify_watch "
-                     f"on {lab['schema']}.task_activities")
-    watch, ready = _ready(lab)
-    assert ready["event"] == "ready"
-    watch.proc.stdin.close()
-    assert watch.proc.wait(timeout=30) == 0
-    [line] = watch.proc.stderr.read().splitlines()
-    assert json.loads(line) == {"migrated": {
-        "schema": lab["schema"], "created": [],
-        "added": ["task_activities.task_activities_notify_watch"]}}
-    assert _answer(_tasks(lab, "migrate"))["would_add"] == []
-
-
-@needs_store
-def test_a_store_without_the_triggers_is_refused_before_ready(lab):
-    """Behind on something that is not additive as well, the store is brought
-    up to date by nothing but `migrate --apply`, so the watch refuses."""
-    import psycopg
-    with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(f"drop trigger task_activities_notify_watch "
-                     f"on {lab['schema']}.task_activities")
-        conn.execute(f"alter table {lab['schema']}.tasks "
-                     f"drop constraint tasks_status_check")
-        conn.execute(f"alter table {lab['schema']}.tasks add constraint tasks_status_check "
-                     "check (status in ('draft','todo','in_progress','complete','closed'))")
-    proc = subprocess.run([str(_cli.CLI_PATH), "watch"], cwd=lab["project"],
-                          env=lab["env"], text=True, capture_output=True, timeout=120,
-                          stdin=subprocess.DEVNULL)
-    assert proc.returncode == 5 and proc.stdout == ""
-    error = json.loads(proc.stderr.strip().splitlines()[-1])["error"]
-    assert error["code"] == "schema_behind" and "migrate --apply" in error["hint"]
-    assert "migrated" not in proc.stderr
-    behind = _answer(_tasks(lab, "migrate"))
-    assert "task_activities.task_activities_notify_watch" in behind["would_add"]
-
-
-@needs_store
 def test_a_disabled_capability_is_refused_with_exit_4(lab):
     settings = lab["project"] / "capabilities" / "settings.json"
     settings.write_text(json.dumps({"capabilities": {"tasks": {"enabled": False}}}))
@@ -389,7 +344,7 @@ def test_a_hold_episode_row_announces_nothing_and_a_raise_still_does(lab):
                           "--key", "k-hold", "--status", "todo"))["created"]
     watch.until(lambda l: l["event"] == "counts")
     with psycopg.connect(DSN) as conn:
-        conn.execute(f"""insert into {lab['schema']}.task_executions
+        conn.execute(f"""insert into {lab['schema']}.tasks_executions
                            (task_id, attempt, worker, status, metrics, started_at, ended_at)
                          values (%s, 0, 'w', 'handback', %s::jsonb, now(), now())""",
                      (task, json.dumps({"hold": {"said": "not now", "how": "held"}})))
@@ -401,23 +356,3 @@ def test_a_hold_episode_row_announces_nothing_and_a_raise_still_does(lab):
     assert _changes(seen, task) == ["run_started"]
 
 
-@needs_store
-def test_a_store_whose_watch_function_announces_holds_catches_up(lab):
-    import psycopg
-    from psycopg.rows import dict_row
-    schema = lab["schema"]
-    ddl = mod._schema_ddl(schema)
-    start = ddl.index(f"create or replace function {schema}.notify_watch()")
-    end = ddl.index("$$ language plpgsql;", start) + len("$$ language plpgsql;")
-    function = ddl[start:end]
-    skip = function[function.index("        -- A hold episode"):
-                    function.index("        task := new.task_id;")]
-    with psycopg.connect(DSN, autocommit=True, row_factory=dict_row) as conn:
-        conn.execute(function.replace(skip, ""))
-        with conn.cursor() as cur:
-            _missing, behind = mod._behind(mod._catalog(cur, schema))
-        assert behind == ["notify_watch()"]
-        _answer(_tasks(lab, "list"))
-        with conn.cursor() as cur:
-            _missing, behind = mod._behind(mod._catalog(cur, schema))
-        assert behind == []

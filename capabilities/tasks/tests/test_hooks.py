@@ -1,7 +1,8 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "callva-harness-runner==0.8.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0",
+#                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
 """A worker's hooks: the project's own commands `run` starts around a turn.
@@ -15,6 +16,7 @@ The store-backed checks read TASKS_TEST_DSN and skip when it is unset; every run
 works in a schema of its own and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
+        --with 'capabilities-contract==0.3.0' \\
         --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -169,20 +171,15 @@ needs_store = pytest.mark.skipif(not DSN, reason="TASKS_TEST_DSN is unset")
 @pytest.fixture
 def store(monkeypatch):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
 
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
-    entry = {"db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-             "db_user": info.get("user"), "db_name": info.get("dbname"),
-             "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-             "secret_env": "TASKS_TEST_PASSWORD", "allow_write": True}
-    monkeypatch.setenv("TASKS_TEST_PASSWORD", info.get("password") or "")
+    entry = {"allow_write": True}
+    _cli.bind_store(mod, monkeypatch, schema)
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
     monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(mod._schema_ddl(schema))
+        _cli.make_tables(mod, schema)
         try:
             yield entry, schema, conn
         finally:
@@ -205,8 +202,8 @@ def turns(store, monkeypatch, capsys):
             execution = kw["extra_env"]["TASKS_EXECUTION"]
             monkeypatch.setenv("TASKS_EXECUTION", execution)
             with mod._connect(entry) as conn, conn.cursor() as cur:
-                cur.execute(f"""select t.unique_key from {mod.SCHEMA}.task_executions e
-                                  join {mod.SCHEMA}.tasks t on t.id = e.task_id
+                cur.execute(f"""select t.unique_key from {mod.SCHEMA}.tasks_executions e
+                                  join {mod.SCHEMA}.tasks_tasks t on t.id = e.task_id
                                  where e.id::text = %s""", (execution,))
                 key = cur.fetchone()["unique_key"]
             ran.append(key)
@@ -391,7 +388,7 @@ def test_key_asks_the_hook_about_a_task_whose_wait_ended(project, store, turns, 
     entry, schema, conn = store
     hooked(project)
     add(entry, capsys, "t-waited")
-    conn.execute(f"""update {schema}.tasks set status = 'waiting', assignee = 'someone',
+    conn.execute(f"""update {schema}.tasks_tasks set status = 'waiting', assignee = 'someone',
                             pickup_at = now() - interval '1 minute'
                       where unique_key = 't-waited'""")
     tell(project, "before", "t-waited", exit=3, print="not yet")
@@ -413,7 +410,7 @@ def test_key_asks_the_hook_about_a_task_whose_lease_lapsed(project, store, turns
     entry, schema, conn = store
     hooked(project)
     tid = add(entry, capsys, "t-lapsed")
-    conn.execute(f"""insert into {schema}.task_executions
+    conn.execute(f"""insert into {schema}.tasks_executions
                        (task_id, attempt, worker, status, lease_until)
                      values ('{tid}', 1, 'alpha', 'running', now() - interval '1 minute')""")
     tell(project, "before", "t-lapsed", exit=3, print="not yet")
@@ -478,9 +475,6 @@ def test_after_runs_on_a_park_and_a_quiet_success_leaves_the_metrics_alone(
 @pytest.fixture()
 def lab(tmp_path):
     import psycopg
-    from psycopg.conninfo import conninfo_to_dict
-
-    info = conninfo_to_dict(DSN)
     schema = "tasks_test_" + secrets.token_hex(4)
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
@@ -495,17 +489,14 @@ def lab(tmp_path):
         "id": "prj_" + uuid.uuid4().hex[:12], "slug": "lab-" + secrets.token_hex(3)}))
     (tasks / "connections.json").write_text(json.dumps({
         "default": "local",
-        "connections": {"local": {
-            "db_host": info.get("host"), "db_port": str(info.get("port") or 5432),
-            "db_user": info.get("user"), "db_name": info.get("dbname"),
-            "db_sslmode": info.get("sslmode") or "prefer", "db_schema": schema,
-            "secret_env": "TASKS_TEST_PASSWORD", "allow_write": True}}}))
+        "connections": {"local": {"allow_write": True}}}))
     (tasks / "profiles" / "plain.toml").write_text(PROFILE + f'cli_path = "{FAKE_CLAUDE}"\n')
     for which in ("before", "after"):
         (project / "hooks" / which).mkdir(parents=True)
     (project / "hooks" / "hook.py").write_text(HOOK)
     hooked(project)
     write_worker(project, "default", "enabled: false")
+    _cli.write_store_setting(tmp_path / "config", schema)
     env = os.environ.copy()
     env.update({
         "HOME": str(tmp_path / "home"),
@@ -514,16 +505,15 @@ def lab(tmp_path):
         "CAPABILITIES_HOME": str(tmp_path / "registry"),
         "CLAUDE_PROJECT_DIR": str(project),
         "CAPABILITIES_PROJECT_ENVELOPE": str(envelope),
-        "TASKS_TEST_PASSWORD": info.get("password") or "",
         "FAKE_ENGINE_TASKS": str(_cli.CLI_PATH),
     })
     for leaked in ("CAPABILITIES_READ_ONLY", "TASKS_EXECUTION", "TASKS_ACTOR",
                    "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "CAPABILITIES_PROJECT_ID",
                    "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_STORE_URL",
-                   "CAPABILITIES_STORE_MODE"):
+                   "AGENTKIT_STORE_URL", "CAPABILITIES_STORE_MODE"):
         env.pop(leaked, None)
-    lab = {"project": project, "env": env}
-    assert tasks_cli(lab, "migrate", "--apply").returncode == 0
+    lab = {"project": project, "env": env, "schema": schema, "tmp": tmp_path}
+    assert tasks_cli(lab, "migrate").returncode == 0
     try:
         yield lab
     finally:
