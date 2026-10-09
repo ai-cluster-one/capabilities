@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "callva-harness-runner==0.8.0",
-#     "capabilities-contract==0.2.0",
+#     "capabilities-contract==0.2.1",
 # ]
 # ///
 """
