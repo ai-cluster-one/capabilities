@@ -35,7 +35,7 @@ Every script implements the same contract verbs alongside its domain verbs. This
 | `ids list\|get\|set\|rm` | The project identifiers envelope, managed. |
 | `refs` | The menu of the project's reference files, from front-matter. |
 | `inventory` | What the capability holds in this project: headline metrics and the things inside. Local only by default — no network, no writes. |
-| `migrate` / `migrate status` | Only for a capability that declares `TABLES`: apply its pending migration steps to its tables in the machine's store / report where they stand, without a lock, changing nothing (see [runtime state in the store](#runtime-state-in-the-store)). |
+| `migrate` / `migrate status` | Only for a capability that declares `TABLES`: apply its pending migration steps to its tables in the project's database / report where they stand, without a lock, changing nothing (see [runtime state in the store](#runtime-state-in-the-store)). |
 
 The declaration facts feed the contract from **constants at the top of the script** — one home each. Guide topics are the exception: their one home is the set of shipped Markdown filenames. Contract verbs render from these sources so they cannot disagree with one another:
 
@@ -50,7 +50,7 @@ WRITE_VERBS = {"create", "comment", "complete"}   # domain verbs that mutate the
 WRITE_DEFAULT = True    # a connection's allow_write when its entry is silent; False when writes leave the system
 DOCS_BASE = "https://raw.githubusercontent.com/<org>/capabilities/main/capabilities/asana/guides/"
 STATE = False       # True when the capability writes session/cache state
-TABLES = False      # True when it keeps tables in the machine's store, with a _tables() builder
+TABLES = False      # True when it keeps tables in the project's database, with a _tables() builder
 INVENTORY = None    # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
 POST_INSTALL = []   # [{"cmd": …, "note": …}] steps the manager offers at install
 SERVICE = None      # or {"name", "summary", "verbs", ...} when a bundled service ships
@@ -139,7 +139,7 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 | `state` | `true` declares the capability writes session/cache state (see [state](#state)). |
 | `inventory` | `null` when the capability reports nothing of its own; otherwise `{ "network": "none" \| "optional" \| "required" }` — how much of its report needs the remote system (see [inventory](#inventory--what-the-capability-holds-here)). |
 | `post_install[]` | `{ "cmd", "note" }` steps the manager **offers** at install — idempotent, never auto-run. |
-| `tables` | `true` declares the capability keeps tables in the machine's store and answers `migrate`; the manager runs `<name> migrate` where the payload arrives (see [runtime state in the store](#runtime-state-in-the-store)). |
+| `tables` | `true` declares the capability keeps tables in the project's database and answers `migrate`; the manager runs `<name> migrate` where the payload arrives (see [runtime state in the store](#runtime-state-in-the-store)). |
 | `service` *(optional)* | Metadata for a bundled service: at minimum `name`, `summary`, and `verbs[]`. The CLI owns its lifecycle contract under `<name> service ...`. |
 | `service.deploy` *(optional)* | Versioned, provider-neutral deploy descriptor. Its v1 contract declares an argv `command`, service-only `environment.required[]` and optional `{key, default?}` entries, named `state`/`shared` mounts, Compose restart policy, optional doctor argv, and `default_policy` (`auto` or `disabled`). Mount targets are absolute or start with `{agent_home}` / `{project_root}` and are resolved by the consuming runtime. Generic CLI credentials do not become service requirements unless the descriptor declares them. |
 | `service.machine` *(optional)* | Declares that the service also runs once per machine for every project that opted in to it (see [machine mode](#machine-mode)). Its v1 contract (`capabilities.service.machine.v1`) names the argv `command` that runs it in the foreground and the argv `doctor` that proves it, each starting with the capability's name and carrying `--machine`; `projects`, the file under the capability's own config home where it lists the projects that opted in; and optionally `config` and `state`, the machine homes of its settings and its runtime files. Any other key is refused. A capability declaring it lists `join` and `leave` among its service verbs. The manager validates it during audit, source check, and install. |
@@ -227,28 +227,28 @@ The envelope, the flag parsing and the empty answer are vendored in the contract
 
 ## Project records and the envelope
 
-Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its slug, holds its durable id (resolved as described below), and selects where live configuration is kept with `"store": "files"` or `"store": "db"`; absence preserves files mode. The project identity is the bootstrap fact that selects the records adapter, and the policy gate then comes through that adapter with every other live record. `CAPABILITIES_STORE_MODE` is a diagnostic override, not project doctrine.
+Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its slug and holds its durable id (resolved as described below). Live configuration is kept in files, and the policy gate comes through the records adapter with every other live record.
 
-All runtime readers open the same records adapter. Files mode maps logical collections onto the established envelope and `$XDG_CONFIG_HOME` layout. Database mode reads the same collections from the configured store (local SQLite by default, selected by the manager's store URL resolution). Project records resolve before global records; merge collections compose by key, and a connection identity is always taken whole from one scope rather than assembled field by field. A call site asks for a collection and never branches on the backend.
+All runtime readers open the same records adapter, which maps logical collections onto the established envelope and `$XDG_CONFIG_HOME` layout. Project records resolve before global records; merge collections compose by key, and a connection identity is always taken whole from one scope rather than assembled field by field. A call site asks for a collection, never for a path.
 
-In files mode, project material has this layout:
+Project material has this layout:
 
 ```
 capabilities/
-  project.json        # durable project identity and files/db selection
-  settings.json       # policy records in files mode
+  project.json        # durable project identity
+  settings.json       # policy records
   <name>/
     connections.json  # connection, grant, and default-setting records
     identifiers.json  # identifier records, managed by the ids verbs
-    reference/        # one front-matter .md per reference in files mode
+    reference/        # one front-matter .md per reference
       *.md
-    service/          # project-local service settings/context in files mode
+    service/          # project-local service settings/context
     state/            # capability-written; never committed
 ```
 
-In database mode those logical records and document bodies, including the policy gate, live in the store; the envelope still holds project identity, the state guard, and source-owned project material that is not a live record.
+Configuration - settings, the gate, identifiers, references, connections and state - stays in these files. The database holds only the tables capabilities design and migrate for themselves ([runtime state in the store](#runtime-state-in-the-store)).
 
-**The machine's store setting is the one store pointer.** The manager's records in database mode resolve their store from it, and its file, format and writers are [the store setting](#the-store-setting).
+**A project resolves its database through one cascade** - the project's env files, then the process environment, then the machine's store setting file - and its levels, keys and file are [the store setting](#the-store-setting).
 
 `capabilities/` is canonical and intentionally visible so the project's context
 owner and humans share one project body. The runtime also reads a legacy
@@ -289,7 +289,7 @@ reconstructible from nothing, so deleting it costs one resolution.
 
 **The project id is resolved beside the envelope.** In a project bound by `.contextkit/config.toml` the id belongs to ContextKit: `contextkit identity show --json --project <root>` answers it, a non-null `config` saying the project is bound and a non-null `id` being authoritative; a ContextKit that has no `identity` verb holds no id, which reads as a null one. There `project.json` holds at most a copy of that id: the manager fills a missing copy from ContextKit, never mints or rewrites one, and writes no `project.json` at all while ContextKit has no id, because `contextkit identity adopt` reads an absent file as no id yet and refuses one that carries none. Without the binding the id is `project.json`'s own, minted once by `capabilities init`. The answer is in one of four states: `unbound` (project.json's id), `pending` (bound, and ContextKit has no id yet, so an existing project.json id is used, which is the id `contextkit identity adopt` takes), `adopted` (ContextKit's id) and `mismatch` (project.json holds a different id, and ContextKit's is used). A write that stamps the id, such as a record a capability attributes to the project or a store registration, takes it only when it is verified for that invocation and otherwise exits 6: a mismatch names both ids, a bound project with no id anywhere names `contextkit identity adopt`, and a ContextKit that cannot answer is named as such. Reads never refuse over the id: they take it in every state, a ContextKit that cannot answer leaving them on project.json's id, and a read path that would register the project leaves the registration out where the id may not be stamped. The manager never runs `contextkit identity adopt`. `capabilities doctor` reports the state and fails on a mismatch, which is reconciled by hand. The manager records ContextKit's answer the way it records the envelope, one entry per root at `$XDG_CACHE_HOME/capabilities/identity/`, against the same inputs, the binding where ContextKit keeps the id and the program that answered, and never records a failed answer; `capabilities path --json --identity` answers on a miss. A capability reads that record through the contract and asks the manager when the record does not stand. An id a write may stamp is handed down beside the envelope, as `$CAPABILITIES_PROJECT_ID` scoped by `$CAPABILITIES_PROJECT_ID_ROOT` exactly as the envelope handoff is scoped, by every process that resolves the envelope, which resolves the id with it at read level, and by every process the manager launches into a project; in an unresolved, mismatched or id-less state nothing is handed down, and the child resolves on its own; a live handoff for the root outranks ContextKit, so a descendant uses it without asking again.
 
-- **Identifiers** — discoverable, non-secret, structural lookup (DOCTRINE rule 4). In files mode `identifiers.json` is a thin standard envelope — label → `{ value, note }`; in database mode the same entries are identifier records. Any reader renders the same menu without understanding the capability, and capability-specific structure lives inside values:
+- **Identifiers** — discoverable, non-secret, structural lookup (DOCTRINE rule 4). `identifiers.json` is a thin standard envelope — label → `{ value, note }`. Any reader renders the same menu without understanding the capability, and capability-specific structure lives inside values:
 
   ```json
   {
@@ -300,7 +300,7 @@ reconstructible from nothing, so deleting it costs one resolution.
 
   Connections vs identifiers is a **provenance split**: connection entries hold values someone *chose* (wiring, per-connection behavioural keys); identifiers hold values the CLI *discovered*. Different writer, different cadence, different git-diff meaning — never merged.
 
-- **References and service context** — prose by nature (a model, treatment, taxonomy, or prompt), exposed as versioned documents through `<name> context`. Files mode keeps them as `.md` under their established envelope paths; database mode keeps immutable bodies plus the active project/global pin. `<name> context edit <key>` yields an editable path and `<name> context put <key>` publishes it with an optimistic base-version check. `<name> refs` remains the compact reference menu and `<name> context show <key>` returns a body without exposing which backend answered.
+- **References and service context** — prose by nature (a model, treatment, taxonomy, or prompt), exposed as versioned documents through `<name> context`. They are kept as `.md` under their established envelope paths. `<name> context edit <key>` yields an editable path and `<name> context put <key>` publishes it with an optimistic base-version check. `<name> refs` remains the compact reference menu and `<name> context show <key>` returns a body.
 
   ```markdown
   ---
@@ -309,7 +309,7 @@ reconstructible from nothing, so deleting it costs one resolution.
   ---
   ```
 
-  `<name> refs` emits the menu — `[{ "name", "description", "path" }]` — reading front matter without loading unrelated bodies. In files mode `path` is the document path; in database mode it is the corresponding `<name> refs show <key>` command.
+  `<name> refs` emits the menu — `[{ "name", "description", "path" }]` — reading front matter without loading unrelated bodies. `path` is the document path.
 
 The `ids` verbs manage the identifier collection through the adapter:
 
@@ -320,13 +320,21 @@ The `ids` verbs manage the identifier collection through the adapter:
 | `ids set <label> <value> [--note <text>]` | Upsert: `<value>` parses as JSON, a non-JSON argument stores as a string; `--note` sets the annotation. |
 | `ids rm <label>` | Removes the label. Unknown label → exit 3. |
 
-`ids set` writes the project scope selected by `project.json`; in files mode it creates `capabilities/<name>/` on demand inside an existing envelope. In a project with no envelope it exits 6, naming `capabilities init` as the remediation.
+`ids set` writes the project scope, creating `capabilities/<name>/` on demand inside an existing envelope. In a project with no envelope it exits 6, naming `capabilities init` as the remediation.
 
 ## The store setting
 
-A machine has one store setting, shared by every tool of the family that reaches its database — the capabilities, ContextKit and AgentKit — whether or not the others are installed. It is a file each tool reads and writes with its own code, never a library one tool takes from another.
+Which database a process uses is resolved per project, through one cascade shared by every tool of the family that reaches a database - the capabilities, ContextKit and AgentKit - whether or not the others are installed. Three levels are asked in order, and the first that answers is used whole, never completed from a lower level:
 
-**Path.** `$XDG_CONFIG_HOME/agentkit/store.json` when `XDG_CONFIG_HOME` is set; `~/.config/agentkit/store.json` only when it is unset. No other place is looked in. A reader reports the absolute path it resolved, since a process started outside a shell, such as an app opened from the Finder or a launchd agent, does not see an `XDG_CONFIG_HOME` a shell profile exports.
+1. **Project** - the `AGENTKIT_DB_*` keys in the project's `.env.local` and `.env`, `.env.local` winning key by key.
+2. **Process environment** - the same keys in the environment of the process. On a server this is the source.
+3. **Machine** - the machine's store setting file, below. On a workstation this is usually the source.
+
+**Keys.** `AGENTKIT_DB_URL`, `AGENTKIT_DB_HOST`, `AGENTKIT_DB_PORT` (default 5432), `AGENTKIT_DB_NAME`, `AGENTKIT_DB_USER`, `AGENTKIT_DB_PASSWORD`, `AGENTKIT_DB_SCHEMA` (default `agentkit`), `AGENTKIT_DB_SSLMODE` (default `require`) and `AGENTKIT_DB_SSLROOTCERT`, the same in a project's env files and in the process environment. A level answers when it sets any of them. Within one level `AGENTKIT_DB_URL`, a `postgresql://` URL, wins and that level's separate fields are ignored; `AGENTKIT_DB_SCHEMA` still applies beside it.
+
+**One resolver.** The database is PostgreSQL. Each tool of the family resolves the cascade with its own code; inside this package that code is the shared database library alone ([runtime state in the store](#runtime-state-in-the-store)), and no second copy of the order exists. A status or doctor surface reports which level answered and the file or variable each value came from, its secrets redacted. With no level answering, a tool that needs the database refuses with `store_not_configured`.
+
+**The machine file.** `$XDG_CONFIG_HOME/agentkit/store.json` when `XDG_CONFIG_HOME` is set; `~/.config/agentkit/store.json` only when it is unset. A reader reports the absolute path it resolved, since a process started outside a shell, such as an app opened from the Finder or a launchd agent, does not see an `XDG_CONFIG_HOME` a shell profile exports.
 
 **Format, version 1.** One JSON object, at mode 0600, the password inside it:
 
@@ -344,28 +352,24 @@ A machine has one store setting, shared by every tool of the family that reaches
 
 `host`, `database` and `user` carry no whitespace. A version 1 file carries these fields and no others.
 
-**Where each tool's tables live.** Every tool keeps its tables inside `db_schema`, each under its own prefix, with its own migrations and ledger, and refers to another tool's rows by value only, never by a foreign key.
+**Where each tool's tables live.** Every tool keeps its tables inside the schema the resolved setting names - `db_schema` in the file, `AGENTKIT_DB_SCHEMA` at the levels above it - each under its own prefix, with its own migrations and ledger, and refers to another tool's rows by value only, never by a foreign key.
 
-**TLS.** A store reached across a network is reached over TLS: `sslmode` is `require` or stronger. `disable` is allowed only when `host` is a local host — `localhost`, a loopback address, or a Unix socket directory — and `allow` and `prefer` never.
+**TLS.** A database reached across a network is reached over TLS: `sslmode` is `require` or stronger, at every level and in a URL. `disable` is allowed only when the host is a local host — `localhost`, a loopback address, or a Unix socket directory — and `allow` and `prefer` never.
 
 **Versions.** A reader refuses a version it does not know with a clear error rather than guessing at it. A writer never replaces or removes a file of a version it does not know, and writes the lowest version that expresses what it holds.
 
-**Writes.** Any tool of the family may write the file. A write replaces the whole file atomically — a temporary file in the same directory, renamed over it — at mode 0600. In this package the manager is the writer: `capabilities store set` and `capabilities store unset`, taking the password from stdin, a file or a named environment variable and never from argv; `capabilities store show` reports the setting and the path without its secret, and `capabilities store doctor` proves it.
+**Writes.** Any tool of the family may write the machine file. A write replaces the whole file atomically — a temporary file in the same directory, renamed over it — at mode 0600. In this package the manager is the writer: `capabilities store set` and `capabilities store unset`, taking the password from stdin, a file or a named environment variable and never from argv; `capabilities store show` reports the setting and the path without its secret, and `capabilities store doctor` proves it. A project's env files and a server's environment are written by whoever configures that project or server, never by a tool.
 
-**Override.** `AGENTKIT_STORE_URL`, a `postgresql://` URL, replaces the setting for the process that carries it, for tests and development sessions; it binds `agentkit`. In this package `CAPABILITIES_STORE_URL` overrides the same way after it.
-
-**Legacy files.** While the file is absent, this package's readers read the setting where the manager kept it before: the non-secret values in `$XDG_CONFIG_HOME/capabilities/store.json` and the password as `CAPABILITIES_STORE_PASSWORD` in `$XDG_CONFIG_HOME/capabilities/credentials.env`. Nothing writes them any more, and `capabilities store unset` removes them with the file.
-
-A capability reads the setting through the store tier's `read_store_setting()`, which writes nothing, and its runtime state reaches the store through the shared database library ([runtime state in the store](#runtime-state-in-the-store)).
+A capability resolves the setting, and reaches its runtime state, through the shared database library ([runtime state in the store](#runtime-state-in-the-store)).
 
 ## The capability policy gate
 
-Operational verbs and `doctor` pass an effective two-scope policy gate before dispatch. Safe discovery verbs — `help`, `stub`, `manifest`, and the local-only `connections` report — remain available so a disabled capability can be understood and configured. The manager owns the policy collection. Files mode maps it to:
+Operational verbs and `doctor` pass an effective two-scope policy gate before dispatch. Safe discovery verbs — `help`, `stub`, `manifest`, and the local-only `connections` report — remain available so a disabled capability can be understood and configured. The manager owns the policy collection, kept at:
 
 1. Project: `capabilities/settings.json`.
 2. Global machine default: `$XDG_CONFIG_HOME/capabilities/settings.json`.
 
-Database mode keeps both scopes as policy rows in the configured store. An explicit project entry wins. An absent project entry inherits the global entry. Absence at both scopes is disabled by default. Policy mutations require explicit `--project` or `--global`; the agent asks the user which scope they mean rather than guessing.
+An explicit project entry wins. An absent project entry inherits the global entry. Absence at both scopes is disabled by default. Policy mutations require explicit `--project` or `--global`; the agent asks the user which scope they mean rather than guessing.
 
 Above both scopes sits the machine ceiling, `$XDG_CONFIG_HOME/capabilities/machine.json`, which only the manager writes and which is never kept in a store, because it answers for this machine alone. Each installed capability is `allowed` or `quarantined` there; a capability without an entry is allowed. Quarantined is effective-disabled in every project and outside any, whatever the project or global entry says: `_gate()` refuses its operational verbs and `doctor` with exit 4 (`quarantined`) before it resolves a project or a policy row, a `--machine` call included, while safe discovery stays available. Allowed leaves the two scopes deciding exactly as below. `capabilities install` writes `quarantined` for a capability new to the machine and `allowed` when given `--allow`; reinstalling or updating keeps the state, and uninstalling drops it. `capabilities allow` and `capabilities quarantine` change it, and lifting a quarantine is the user's decision, never an agent's.
 
@@ -520,7 +524,7 @@ A capability whose secret is not a flat token resolves it in its own shape — k
 
 Every connection-bearing capability resolves its configuration as **explicit named connections**. A registry is required even when there is only one connection; environment variables resolve values for that declared connection but never create an identity implicitly. Core-only capabilities omit the connections tier and report an empty connections map.
 
-Endpoints and identities are declared as **connection records**, written at configuration time by whoever configures and read through the shared adapter. The two scopes are project then global. They compose by connection id: the highest scope declaring an id supplies that entire identity, while other ids inherit from the lower scope. A separate grant record carries `enabled` and `allow_write`, so project permission can change without restating identity. In files mode the compatible representation stores identities and grants together in `connections.json`; in database mode they remain separate collections.
+Endpoints and identities are declared as **connection records**, written at configuration time by whoever configures and read through the shared adapter. The two scopes are project then global. They compose by connection id: the highest scope declaring an id supplies that entire identity, while other ids inherit from the lower scope. A separate grant record carries `enabled` and `allow_write`, so project permission can change without restating identity. `connections.json` stores identities and grants together.
 
 ```json
 {
@@ -671,13 +675,13 @@ Known limitation, recorded for fast diagnosis: two projects driving the *same* a
 
 ## Runtime state in the store
 
-Runtime state is what a capability's own processes coordinate through — a service's run ledger, its job tables, the session a capability resumes from one call to the next — and it lives in the PostgreSQL the machine's store setting names ([the store setting](#the-store-setting); DOCTRINE rule 22).
+Runtime state is what a capability's own processes coordinate through — a service's run ledger, its job tables, the session a capability resumes from one call to the next — and it lives in the PostgreSQL its project's database setting resolves to ([the store setting](#the-store-setting); DOCTRINE rule 22).
 
-A capability reaches it through the shared database library, `capabilities-contract` on PyPI, imported as `capabilities_contract.db` and pinned to an exact version in the script's PEP-723 dependencies. The library reads the store setting and writes nothing, connects bound to the schema the setting names, and applies each owner's migration steps once under that owner's ledger; the library's own documentation carries its call surface and error codes. The capability is the owner of its tables: the owner is its name, every object a migration step creates is named `<name>_…` inside the setting's schema, and its steps are recorded in the ledger under that name, so tools at different releases share one database and each changes only its own tables.
+A capability reaches it through the shared database library, `capabilities-contract` on PyPI, imported as `capabilities_contract.db` and pinned to an exact version in the script's PEP-723 dependencies. The library resolves the database setting for a project root through the cascade and writes nothing, connects bound to the schema that setting names, and applies each owner's migration steps once under that owner's ledger; the library's own documentation carries its call surface and error codes. The capability is the owner of its tables: the owner is its name, every object a migration step creates is named `<name>_…` inside the setting's schema, and its steps are recorded in the ledger under that name, so tools at different releases share one database and each changes only its own tables.
 
 **Migrations run when asked.** A capability that keeps tables declares `TABLES = True` beside `STATE`, and a `_tables()` builder returning its steps and its schema version `(steps, major, minor)`; the vendored contract then answers `<name> migrate`, which applies the pending steps under the library's lock, and `<name> migrate status`, which reports where the tables stand without a lock and changes nothing. Three callers ask for it: the manager runs `<name> migrate` when it installs or updates the payload, so the tables reach the code where the code arrives, and reports a refusal without undoing the payload; a service runs it once when it starts; and an ordinary call that finds its tables missing or older than its code migrates once on the library's locked fallback path. Every other call takes no lock and applies nothing. The library bounds each wait - a connect, a lock - and reports one that runs out as `store_unreachable` or `store_busy`, so `doctor` answers within a watchdog's timeout rather than hanging, and both ends of a connection probe an idle peer so the store drops a client that died; the bounds are the library's to state.
 
-A service that keeps runtime state resolves the store before it takes any work. With no store configured it refuses to run with the error code `store_not_configured` and a hint naming `capabilities store set`, and its `service doctor` reports the same. The library finds a store only through an override, `AGENTKIT_STORE_URL` then `CAPABILITIES_STORE_URL`, for tests and development sessions, or the store setting, and each names a PostgreSQL.
+A service that keeps runtime state resolves the store before it takes any work. With no store configured it refuses to run with the error code `store_not_configured` and a hint naming the `AGENTKIT_DB_*` keys and `capabilities store set`, and its `service doctor` reports the same. The library finds a store only through the cascade of [the store setting](#the-store-setting), and every level names a PostgreSQL.
 
 ## The I/O contract
 
