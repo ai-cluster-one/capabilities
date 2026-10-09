@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 import uuid
 from pathlib import Path
@@ -1900,3 +1901,247 @@ def test_a_read_with_no_id_to_read_under_reads_as_empty(tmp_path, ledger_env, mo
         assert ledger.list(limit=10) == []
     with pytest.raises(RUNTIME.ConfigError):
         RUNTIME.open_ledger(root, {"engine": {"environment": "development"}})
+
+
+# --- supervising jobs while the store is gone ---------------------------------
+#
+# The daemon's own table of the processes it started is the truth about its
+# jobs; the ledger is written from it afterwards. These cases hold a ledger
+# whose every statement fails as a dropped connection would, so nothing about
+# stopping, timing out or killing a job can wait on a write.
+
+class _StoreGone(Exception):
+    pass
+
+
+class DownLedger:
+    """A ledger whose store is gone: every statement raises."""
+
+    environment = "test"
+    warnings: list[str] = []
+
+    def lost(self) -> bool:
+        return True
+
+    def reopen(self) -> None:
+        raise RUNTIME.StoreUnavailable("store_unreachable", "cannot reach the store")
+
+    def close(self) -> None:
+        pass
+
+    def __getattr__(self, name):
+        def fail(*_args, **_kwargs):
+            raise _StoreGone(f"{name}: server closed the connection unexpectedly")
+        return fail
+
+
+class UpLedger:
+    """A ledger whose store answers: it keeps the columns written per run."""
+
+    environment = "test"
+    warnings: list[str] = []
+
+    def __init__(self, cancel: set[str] = frozenset()):
+        self.rows: dict[str, dict] = {}
+        self.cancel = set(cancel)
+
+    def lost(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        pass
+
+    def get(self, run_id):
+        return {**self.rows.get(run_id, {}), "cancel_requested": int(run_id in self.cancel),
+                "automation_slug": "job", "attempt": 1, "parent_run_id": None}
+
+    def update(self, run_id, **columns):
+        self.rows.setdefault(run_id, {}).update(columns)
+
+
+STUBBORN = "trap '' TERM\necho ready\nwhile :; do sleep 0.1; done"
+
+
+def _scheduler(tmp_path, *, grace=0.5, timeout=60):
+    """A daemon over a scratch project with two automations: `job` ends on
+    SIGTERM, `stubborn` ignores it and ends only when killed."""
+    root = tmp_path / "project"
+    (root / "jobs").mkdir(parents=True)
+    declared = "version = 1\n[engine]\nmax_parallel = 8\n" \
+               f"shutdown_grace_seconds = {grace}\nenvironment = \"test\"\n"
+    for slug, body in (("job", "exec sleep 60"), ("stubborn", STUBBORN)):
+        job = root / "jobs" / f"{slug}.sh"
+        job.write_text(f"#!/bin/sh\n{body}\n")
+        job.chmod(0o755)
+        declared += f"\n[[automations]]\nid = \"{slug}\"\nscript = \"jobs/{slug}.sh\"\n" \
+                    f"timeout_seconds = {timeout}\nmax_parallel = 8\n"
+    config_path = root / "config.toml"
+    config_path.write_text(declared)
+    said: list[str] = []
+    daemon = RUNTIME.Daemon(root, config_path, tmp_path / "state", slug="scratch",
+                            loader=lambda: RUNTIME.load_config(root, config_path),
+                            runs=DownLedger(), log=said.append)
+    return daemon, said
+
+
+def _start(daemon, run_id, slug="job"):
+    """Start a run of `slug`; a `stubborn` one is returned once its trap is set."""
+    log_path = daemon.state_dir / "runs" / f"{run_id}.log"
+    row = {"id": run_id, "automation_slug": slug, "attempt": 1, "trigger": "manual",
+           "environment": "test", "log_path": str(log_path)}
+    with contextlib.suppress(_StoreGone):
+        daemon._start(row)
+    until = time.monotonic() + 10
+    while slug == "stubborn" and "ready" not in (
+            log_path.read_text() if log_path.exists() else ""):
+        assert time.monotonic() < until, "the stubborn job never set its trap"
+        time.sleep(0.02)
+    return daemon.children[run_id].process
+
+
+def _alive(process) -> bool:
+    """Whether anything in the job's process group still runs. A group whose
+    leader is an unreaped zombie answers EPERM on macOS, and runs nothing."""
+    try:
+        os.killpg(process.pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+@pytest.fixture
+def reaped():
+    """Every job group a case starts is gone after it, whatever the case did."""
+    started: list = []
+    yield started
+    for process in started:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            process.wait(timeout=2)
+
+
+def test_a_job_started_as_the_store_drops_is_still_the_daemons(tmp_path, reaped):
+    daemon, _ = _scheduler(tmp_path)
+    with pytest.raises(_StoreGone):
+        daemon._start({"id": "r1", "automation_slug": "job", "attempt": 1,
+                       "trigger": "manual", "environment": "test",
+                       "log_path": str(daemon.state_dir / "runs" / "r1.log")})
+    child = daemon.children["r1"]
+    reaped.append(child.process)
+    assert _alive(child.process) and not child.started
+
+    daemon.runs = UpLedger()
+    daemon.reap()
+    assert daemon.runs.rows["r1"]["status"] == "running"
+    assert daemon.runs.rows["r1"]["pid"] == child.process.pid
+    assert child.started and "r1" in daemon.children
+
+
+def test_a_job_that_overruns_is_stopped_while_the_store_is_gone(tmp_path, reaped):
+    daemon, said = _scheduler(tmp_path, timeout=1)
+    process = _start(daemon, "r1")
+    reaped.append(process)
+    until = time.monotonic() + 4
+    while _alive(process) and time.monotonic() < until:
+        daemon.tick()
+        time.sleep(0.05)
+    daemon.tick()
+    assert not _alive(process)
+    assert any("lost the store connection" in line for line in said)
+    held = daemon.children["r1"].outcome
+    assert held["status"] == "failed" and "timed out" in held["summary"]
+
+    daemon.runs = UpLedger()
+    daemon.reap()
+    assert daemon.runs.rows["r1"]["status"] == "failed"
+    assert daemon.runs.rows["r1"]["started_at"]
+    assert "timed out" in daemon.runs.rows["r1"]["summary"]
+    assert daemon.children == {}
+
+
+def test_a_cancel_the_store_cannot_be_asked_for_waits_and_is_then_taken(tmp_path, reaped):
+    daemon, _ = _scheduler(tmp_path)
+    process = _start(daemon, "r1")
+    reaped.append(process)
+    with pytest.raises(_StoreGone):
+        daemon.reap()
+    assert _alive(process)
+
+    daemon.runs = UpLedger(cancel={"r1"})
+    until = time.monotonic() + 4
+    while "r1" in daemon.children and time.monotonic() < until:
+        daemon.reap()
+        time.sleep(0.05)
+    assert not _alive(process)
+    assert daemon.runs.rows["r1"]["status"] == "canceled"
+
+
+def test_a_stop_with_the_store_gone_ends_every_job_and_names_what_it_could_not_record(
+        tmp_path, reaped):
+    daemon, said = _scheduler(tmp_path, grace=0.5)
+    honours = _start(daemon, "r1")
+    ignore_a, ignore_b = _start(daemon, "r2", "stubborn"), _start(daemon, "r3", "stubborn")
+    reaped.extend([honours, ignore_a, ignore_b])
+    time.sleep(0.3)
+
+    began = time.monotonic()
+    daemon.shutdown()
+    assert time.monotonic() - began < 0.5 + 2 * 3 + 1
+    assert not any(_alive(p) for p in (honours, ignore_a, ignore_b))
+    assert daemon.children == {}
+    for run_id in ("r1", "r2", "r3"):
+        assert any(line.startswith(f"run {run_id} ended with exit code") for line in said)
+
+
+def test_a_stop_with_the_store_up_records_every_job_interrupted(tmp_path, reaped):
+    daemon, _ = _scheduler(tmp_path, grace=0.5)
+    daemon.runs = UpLedger()
+    honours = _start(daemon, "r1")
+    ignores = _start(daemon, "r2", "stubborn")
+    reaped.extend([honours, ignores])
+    time.sleep(0.3)
+    daemon.shutdown("stopping for the test")
+    rows = daemon.runs.rows
+    assert {rows[r]["status"] for r in ("r1", "r2")} == {"interrupted"}
+    assert rows["r1"]["exit_code"] == -signal.SIGTERM
+    assert rows["r2"].get("exit_code") in (None, -signal.SIGKILL)
+    assert rows["r2"]["summary"] == "stopping for the test"
+    assert not _alive(honours) and not _alive(ignores)
+
+
+def test_the_machine_service_ends_every_projects_jobs_with_the_store_gone(tmp_path, reaped):
+    daemons = []
+    for name in ("one", "two"):
+        daemon, _ = _scheduler(tmp_path / name, grace=0.3)
+        reaped.extend([_start(daemon, f"{name}-a", "stubborn"),
+                       _start(daemon, f"{name}-b", "stubborn")])
+        daemons.append(daemon)
+    time.sleep(0.3)
+    machine = RUNTIME.MachineService.__new__(RUNTIME.MachineService)
+    slots = [types.SimpleNamespace(daemon=d, release=lambda said: None) for d in daemons]
+    machine.slots = lambda: slots
+    machine.draining, machine.entries = [], {}
+    RUNTIME.MachineService.shutdown(machine)
+    assert not any(_alive(p) for p in reaped)
+    assert all(d.children == {} for d in daemons)
+
+
+def test_the_machine_service_times_out_jobs_while_its_store_link_is_lost(tmp_path, reaped):
+    daemon, _ = _scheduler(tmp_path, timeout=1)
+    process = _start(daemon, "r1")
+    reaped.append(process)
+    machine = RUNTIME.MachineService.__new__(RUNTIME.MachineService)
+    slots = [types.SimpleNamespace(daemon=daemon)]
+    machine.slots = lambda: slots
+    machine.draining, machine.entries = [], {}
+    machine._take_list = machine.publish = lambda: None
+    machine._reconnect = lambda why: None
+    machine.link = types.SimpleNamespace(lost=lambda: True)
+    until = time.monotonic() + 4
+    while _alive(process) and time.monotonic() < until:
+        machine.step()
+        time.sleep(0.05)
+    machine.step()
+    assert not _alive(process)
+    assert daemon.children["r1"].outcome["status"] == "failed"

@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-09 — Jobs stop and time out whether or not the store answers
+
+The scheduler stops, times out and kills its jobs from its own table of the processes it started, and writes their outcomes to the store afterwards, each on its own. With the store unreachable, a stop now ends every running job within the project's shutdown grace in both modes, a job that overruns its timeout is stopped, and a job started as the connection drops is still watched; before, the first failed write left the remaining jobs running unsupervised. An outcome the store does not take is kept and written once it answers. One still unwritten when the scheduler stops is named in the service log with its run id and exit code, and the next start records it `interrupted` as before, which re-runs it under `engine.recovery = "retry"`. A cancel requested during an outage takes effect once the store answers. A job killed at the end of the shutdown grace may now record exit code -9.
+
 ## 2026-10-09 — `automations migrate` brings the run ledger's tables up to date when asked
 
 `automations migrate` applies the pending steps to the run ledger's tables in the machine's store, and `automations migrate status` reports where they stand without a lock and changes nothing. The manager runs `automations migrate` when it installs or updates automations, and the service runs it when it starts; every other call takes no lock and migrates only when it finds its tables missing or older than its code. `automations` now uses `capabilities-contract` 0.3.0: a store that does not answer a connect within 10 seconds is reported as `store_unreachable`, and both ends of a connection send TCP keepalives, so the store drops a client that died without closing.

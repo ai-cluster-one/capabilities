@@ -1242,6 +1242,9 @@ class Child:
     stop_reason: str | None = None
     kill_at: float | None = None
     stop_summary: str | None = None
+    started_at: str = ""
+    started: bool = False
+    outcome: dict[str, Any] | None = None
 
 
 class Daemon:
@@ -1471,8 +1474,9 @@ class Daemon:
             log_handle.close()
             self._finish_without_child(row, "failed", None, f"spawn failed: {exc}")
             return
-        self.runs.update(row["id"], status="running", started_at=iso(), pid=proc.pid)
-        self.children[row["id"]] = Child(
+        # Held before it is recorded: a job whose running write fails is still
+        # this daemon's to time out and stop, and `reap` writes it again.
+        child = self.children[row["id"]] = Child(
             run_id=row["id"],
             automation_id=row["automation_slug"],
             process=proc,
@@ -1480,7 +1484,9 @@ class Daemon:
             log_path=log_path,
             timeout_seconds=item["timeout_seconds"],
             started_monotonic=time.monotonic(),
+            started_at=iso(),
         )
+        self._record(child)
 
     def _finish_without_child(
         self, row: dict[str, Any], status: str, exit_code: int | None, summary: str
@@ -1490,10 +1496,41 @@ class Daemon:
         self._maybe_retry(row["id"])
 
     def reap(self) -> None:
+        """Stop what overran or was canceled, then record what ended.
+
+        Only the cancel flags come from the store, and a read that fails defers
+        cancels and nothing else. An outcome the store does not take stays held
+        and is written again on the next reap; the first failure is raised once
+        every job has been seen to, so a tick still learns its store is gone."""
+        failure: Exception | None = None
+        cancels: set[str] = set()
+        for run_id, child in self.children.items():
+            if child.outcome is not None or child.stopping_at is not None:
+                continue
+            try:
+                row = self.runs.get(run_id)
+            except Exception as exc:
+                failure = exc
+                break
+            if row and row["cancel_requested"]:
+                cancels.add(run_id)
+        self.supervise(cancels)
+        for child in list(self.children.values()):
+            try:
+                self._record(child)
+            except Exception as exc:
+                failure = failure or exc
+        if failure is not None:
+            raise failure
+
+    def supervise(self, cancels: set[str] = frozenset()) -> None:
+        """Signal, time out and kill from this process's own table of jobs, and
+        note how each that ended did. It asks the store nothing."""
         now_mono = time.monotonic()
-        for run_id, child in list(self.children.items()):
-            row = self.runs.get(run_id)
-            cancel = bool(row and row["cancel_requested"])
+        for run_id, child in self.children.items():
+            if child.outcome is not None:
+                continue
+            cancel = run_id in cancels
             timed_out = now_mono - child.started_monotonic >= child.timeout_seconds
             if child.process.poll() is None and child.stopping_at is None and (cancel or timed_out):
                 child.stop_reason = "canceled" if cancel else "timeout"
@@ -1520,11 +1557,29 @@ class Daemon:
                 status, summary = "succeeded", _summary(child.log_path)
             else:
                 status, summary = "failed", _summary(child.log_path) or f"exited {code}"
-            self.runs.update(run_id, status=status, finished_at=iso(), exit_code=code,
-                             summary=summary, pid=None)
-            del self.children[run_id]
-            if status == "failed":
-                self._maybe_retry(run_id)
+            child.outcome = {"status": status, "finished_at": iso(), "exit_code": code,
+                             "summary": summary}
+
+    def live(self) -> bool:
+        """Whether a job this daemon started may still be running."""
+        return any(child.outcome is None for child in self.children.values())
+
+    def _record(self, child: Child) -> None:
+        """Write what the ledger has not yet taken about one job: that it runs,
+        or how it ended, after which the daemon lets go of it."""
+        if child.outcome is None:
+            if not child.started:
+                self.runs.update(child.run_id, status="running", started_at=child.started_at,
+                                 pid=child.process.pid)
+                child.started = True
+            return
+        columns = dict(child.outcome, pid=None)
+        if not child.started:
+            columns["started_at"] = child.started_at
+        self.runs.update(child.run_id, **columns)
+        del self.children[child.run_id]
+        if columns["status"] == "failed":
+            self._maybe_retry(child.run_id)
 
     def _maybe_retry(self, run_id: str) -> None:
         row = self.runs.get(run_id)
@@ -1544,7 +1599,7 @@ class Daemon:
         now = time.monotonic()
         grace = self.config["engine"]["shutdown_grace_seconds"]
         for child in self.children.values():
-            if child.stop_reason == "interrupted":
+            if child.stop_reason == "interrupted" or child.outcome is not None:
                 continue
             child.stop_reason = "interrupted"
             child.stop_summary = summary
@@ -1553,27 +1608,35 @@ class Daemon:
             _signal_group(child.process.pid, signal.SIGTERM)
 
     def shutdown(self, summary: str = "daemon stopped") -> None:
+        """Stop every running job within the grace, killing what outlives it,
+        and only then record how each ended, each record on its own. The store
+        is not asked anything until every job has stopped, so a store that is
+        gone cannot leave one running. An outcome the store does not take is
+        logged with its run and exit code; the next start finds that run still
+        open and records it interrupted."""
         self.interrupt(summary)
-        deadline = max([child.kill_at or 0.0 for child in self.children.values()],
-                       default=0.0)
-        while self.children and time.monotonic() < deadline:
-            for run_id, child in list(self.children.items()):
-                code = child.process.poll()
-                if code is None:
-                    continue
-                child.log_handle.close()
-                self.runs.update(run_id, status="interrupted", finished_at=iso(),
-                                 exit_code=code, summary=summary, pid=None)
-                del self.children[run_id]
+        deadline = max([child.kill_at or 0.0 for child in self.children.values()
+                        if child.outcome is None], default=0.0)
+        while self.live() and time.monotonic() < deadline:
+            self.supervise()
             time.sleep(0.05)
-        for run_id, child in list(self.children.items()):
+        for child in self.children.values():
+            if child.outcome is not None:
+                continue
             _signal_group(child.process.pid, signal.SIGKILL)
             with contextlib.suppress(Exception):
                 child.process.wait(timeout=2)
             child.log_handle.close()
-            self.runs.update(run_id, status="interrupted", finished_at=iso(),
-                             summary=summary, pid=None)
-            del self.children[run_id]
+            child.outcome = {"status": "interrupted", "finished_at": iso(),
+                             "summary": summary}
+        for child in list(self.children.values()):
+            try:
+                self._record(child)
+            except Exception as exc:
+                if self.children.pop(child.run_id, None) is not None:
+                    self.log(f"run {child.run_id} ended with exit code "
+                             f"{child.process.returncode} and its outcome is not "
+                             f"recorded, so the next start records it interrupted: {_why(exc)}")
 
     def reload_declaration(self, fingerprint_path: Path) -> bool:
         """Take up a declaration edited since start, without dropping work.
@@ -2047,6 +2110,11 @@ class MachineService:
         if self.link.lost():
             self._reconnect("the store connection is closed")
         if self.link.lost():
+            # Without the store nothing is registered, started or recorded,
+            # but every running job is still timed out and stopped.
+            for slot in (*self.draining, *self.slots()):
+                if slot.daemon is not None:
+                    slot.daemon.supervise()
             self.publish()
             return
         try:
@@ -2231,11 +2299,11 @@ class MachineService:
                 slot.daemon.interrupt()
         deadline = max([child.kill_at or 0.0 for slot in slots if slot.daemon is not None
                         for child in slot.daemon.children.values()], default=0.0) + 2.0
-        while self.running() and time.monotonic() < deadline:
+        while time.monotonic() < deadline and any(
+                slot.daemon.live() for slot in slots if slot.daemon is not None):
             for slot in slots:
                 if slot.daemon is not None:
-                    with contextlib.suppress(Exception):
-                        slot.daemon.reap()
+                    slot.daemon.supervise()
             time.sleep(0.05)
         for slot in slots:
             if slot.daemon is not None:
