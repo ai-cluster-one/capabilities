@@ -1,5 +1,9 @@
 # mailbox — change log
 
+## 2026-10-19 — `mailbox send` takes blind-copy recipients and names the sender
+
+`mailbox send --bcc ADDR`, repeatable, puts blind recipients on the SMTP envelope only: no Bcc header is ever written, so no copy of the message, the saved Sent copy included, names them, and the result reports them under `bcc`. A connection's optional `display_name`, or `send --from-name NAME` over it, puts a name in front of the address in the From header, rendered with `formataddr`; the envelope sender stays the bare address, and the result reports the `from` header sent. The envelope no longer carries an empty recipient when a message has no Cc, where `getaddresses` of an empty header read as one blank address.
+
 ## 2026-10-13 — Outside any project, `mailbox connections` and `mailbox doctor` read the machine's own connections
 
 `mailbox` declares `connections` and `doctor` as machine reads. Run outside any project, `mailbox connections` lists the connections declared globally whose grant is not switched off, each under `machine_reads` with the scope `machine`, and `mailbox doctor` checks their health, where both used to refuse with `connection_not_granted`. Each such connection is read-only there: a write through it exits 4 `read_only`, and every other verb outside a project is refused the machine's connections as before. Inside a project nothing changes; its grants alone decide.
