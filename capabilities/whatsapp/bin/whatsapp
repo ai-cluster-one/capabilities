@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract==0.3.0",
+#     "capabilities-contract==0.4.0",
 #     "httpx>=0.27",
 #     "puremagic>=1.28",
 #     "qrcode>=7.4",
@@ -13,7 +13,7 @@
 whatsapp — WhatsApp CLI carrying its own engine: one linked device, one store.
 
 Agent-invoked. Links a WhatsApp account as a companion device, keeps the account's
-chats and messages in the machine's Postgres store, reads from it, deepens it
+chats and messages in the project's Postgres database, reads from it, deepens it
 on demand, downloads and transcribes voice notes, and renders an export a project
 can commit to. Run `whatsapp doctor` first to confirm the chain.
 
@@ -94,14 +94,15 @@ Credentials (4-tier cascade; first non-empty wins)
 
 Store
   Chats, messages, identities, enrichment and capture provenance live in the
-  machine's Postgres store, in whatsapp_* tables keyed by the account, created
-  and migrated on first use. The store is the one `capabilities store set`
-  configures (`capabilities store show` reports it); CAPABILITIES_STORE_URL
-  overrides it for a process. Without either, every verb that reads or writes
-  the capture exits 6 store_not_configured; help, contract, connections and
-  the other contract commands still answer. History an earlier version kept in
-  a messages.db file in the state home is not read by any verb until
-  `whatsapp import-legacy` carries it into the store, once.
+  project's Postgres database, in whatsapp_* tables keyed by the account,
+  created and migrated on first use. The database is the first that answers
+  for the project: AGENTKIT_DB_* in its .env.local / .env, then the process
+  environment, then the machine's store setting (`capabilities store set`);
+  `capabilities store show` shows which answers. With none, every verb that
+  reads or writes the capture exits 6 store_not_configured; help, contract,
+  connections and the other contract commands still answer. History an
+  earlier version kept in a messages.db file in the state home is not read by
+  any verb until `whatsapp import-legacy` carries it into the store, once.
 
 State
   $XDG_STATE_HOME/whatsapp/<account>/     named for the account, not for the
@@ -476,7 +477,7 @@ from pathlib import Path
 from typing import NoReturn
 
 import httpx
-from capabilities_contract.db import DbError, Step, connect, migrate, read_setting
+from capabilities_contract.db import DbError, Step, connect, migrate, resolve_setting
 
 DEFAULT_SESSION = "default"
 
@@ -497,7 +498,7 @@ WRITE_DEFAULT = False    # a WhatsApp send leaves the system — granted per con
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/whatsapp/guides/")
 STATE = True        # True when the capability writes session/cache state
-TABLES = True       # whatsapp_* tables in the machine's store, built by _tables()
+TABLES = True       # whatsapp_* tables in the project's database, built by _tables()
 INVENTORY = {"network": "none"}   # the assistant service's state is files on this machine
 POST_INSTALL: list = []
 SERVICE = {
@@ -516,10 +517,7 @@ SERVICE = {
         "command": ["whatsapp", "service", "run"],
         "environment": {
             "required": [],
-            "optional": [
-                {"key": "CAPABILITIES_STORE_URL"},
-                {"key": "CAPABILITIES_STORE_PASSWORD"},
-            ],
+            "optional": [],
         },
         "mounts": [
             {"name": "whatsapp_state", "kind": "state",
@@ -3575,10 +3573,10 @@ def _is_group(chat_id: str) -> bool:
 #
 # The engine is transport: whatsmeow's own session file holds the device, its
 # keys, contacts and the LID map, and no messages at all. What arrives is ours to
-# keep, and it is kept in the machine's Postgres store, in tables owned by this
-# capability and keyed by the account: an account has one history whichever
-# project reads it. Raw chunks land on disk before anything parses them, so a
-# parser fault costs a re-ingest and never the data.
+# keep, and it is kept in the project's Postgres database, in tables owned by
+# this capability and keyed by the account: an account has one history in a
+# database, whichever project on it reads it. Raw chunks land on disk before
+# anything parses them, so a parser fault costs a re-ingest and never the data.
 
 # Each step is applied once, in order, under the store's migration ledger. An
 # applied step is never edited: a change to the tables is a new step.
@@ -3841,11 +3839,12 @@ class _Store:
     statement from the other thread never lands inside a transaction it is not
     part of, and each write is whole."""
 
-    def __init__(self, conn, account: str, schema: str):
+    def __init__(self, conn, account: str, setting):
         import psycopg
         self.conn = conn
         self.account = account
-        self.schema = schema
+        self.setting = setting
+        self.schema = setting.schema
         self.write_lock = threading.RLock()
         self.write_depth = 0
         self._error = psycopg.Error
@@ -3888,13 +3887,14 @@ class _Store:
                     or getattr(self.conn, "broken", False))
 
     def reconnect(self) -> None:
-        """Replace a connection the store dropped. The tables were migrated
-        when this store was first opened; a new connection needs none of that."""
+        """Replace a connection the store dropped, on the database this store
+        was first opened on. The tables were migrated then; a new connection
+        needs none of that."""
         with self.write_lock:
             with contextlib.suppress(Exception):
                 self.conn.close()
             try:
-                conn = connect(application_name=NAME, setting=read_setting())
+                conn = connect(application_name=NAME, setting=self.setting)
             except DbError as exc:
                 _store_refusal(exc)
             conn.autocommit = True
@@ -4047,6 +4047,33 @@ def _store_account(cfg: dict) -> str:
     return str(cfg.get("account_key") or Path(cfg["home"]).expanduser().name)
 
 
+# The database a long-lived process keeps for its whole life. The listener pins
+# what the cascade answered for its project at launch, so every store it opens
+# after that - a rebuilt session, the job runner, the outbox listener - lands on
+# that database rather than on whatever the cascade says by then.
+_STORE_SETTING_PINNED = None
+
+
+def _store_setting(root: Path | None = None):
+    """The database this project uses, as the shared library resolves it for
+    the project root (this invocation's when none is named): the project's
+    .env.local / .env, then the process environment, then the machine file.
+    A process that pinned one keeps it."""
+    if _STORE_SETTING_PINNED is not None:
+        return _STORE_SETTING_PINNED
+    try:
+        return resolve_setting(root if root is not None else _project_root())
+    except DbError as exc:
+        _store_refusal(exc)
+
+
+def _pin_store_setting(root: Path) -> None:
+    """Resolve the project's database once, refusing where there is none, and
+    keep it for the rest of this process."""
+    global _STORE_SETTING_PINNED
+    _STORE_SETTING_PINNED = _store_setting(root)
+
+
 def _open_store(cfg: dict) -> "_Store":
     """The store for one connection's account, its tables migrated and its rows
     brought up to the shipping parser version.
@@ -4054,8 +4081,8 @@ def _open_store(cfg: dict) -> "_Store":
     Rows written by an older parser are rebuilt from the chunks it kept, which
     is the whole reason they are kept."""
     home = _connection_home(cfg)
+    setting = _store_setting()
     try:
-        setting = read_setting()
         conn = connect(application_name=NAME, setting=setting)
     except DbError as exc:
         _store_refusal(exc)
@@ -4073,7 +4100,7 @@ def _open_store(cfg: dict) -> "_Store":
                 "prove the store with `capabilities store doctor`, then retry")
     for warning in result.warnings:
         _log(warning)
-    db = _Store(conn, _store_account(cfg), setting.schema)
+    db = _Store(conn, _store_account(cfg), setting)
     version = _get_meta(db, "schema")
     if version is None:
         # No version and no rows is a store that has just been created. No
@@ -8597,13 +8624,6 @@ def _service_cfg(settings: dict, connection_flag: str | None) -> dict:
     return cfg
 
 
-def _require_store_setting() -> None:
-    try:
-        read_setting()
-    except DbError as exc:
-        _store_refusal(exc)
-
-
 # ── The dialogue's prerequisites ─────────────────────────────────────────────
 #
 # A dialogue turn runs on callva-harness-runner. The CLI does not carry the
@@ -8753,7 +8773,7 @@ def _service_prepare(connection_flag: str | None) -> tuple[Path, dict, dict]:
     _require_service_envelope(root)
     settings = _checked_service_settings()
     cfg = _service_cfg(settings, connection_flag)
-    _require_store_setting()
+    _pin_store_setting(root)
     _require_linked(cfg)
     return root, settings, cfg
 
@@ -9669,7 +9689,7 @@ class _ServiceDaemon:
             try:
                 if conn is None:
                     conn = connect(application_name=f"{NAME}-outbox",
-                                   setting=read_setting())
+                                   setting=_store_setting(self.root))
                     conn.autocommit = True
                     conn.execute(f"LISTEN {OUTBOX_CHANNEL}")
                     reported = False

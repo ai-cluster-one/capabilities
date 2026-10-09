@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-09 — `service/store.py` is no longer shipped
+
+The service never read the copy of the records layer the bundle carried as `service/store.py`, and it is gone. Nothing the service does changes.
+
 ## 2026-10-09 — Automations are read from config.toml only
 
 The scheduler no longer reads automations from records kept in a database: the `automations` table, its migration and the configuration rebuilt from it are gone, and `config.toml` is the one source. `service status` drops `records_mode`, `set` no longer refuses with `config_in_store`, and `service join` no longer refuses with `database_mode_unsupported`; a `project.json` declaring `"store": "db"` is refused by the records layer with `bad_store_mode`.

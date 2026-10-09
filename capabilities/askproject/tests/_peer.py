@@ -8,12 +8,14 @@ The script imports callva-harness-runner when a profile or a peer is needed, so
 the suite runs where that library is importable:
 
     uv run --with pytest --with 'callva-harness-runner==0.8.0' \\
-        --with 'capabilities-contract==0.3.0' \\
+        --with 'capabilities-contract==0.4.0' \\
         python -m pytest capabilities/askproject/tests -q
 
-Every ask records its session in the machine's store, so a test that asks
-needs a PostgreSQL: ASKPROJECT_TEST_DSN names a throwaway database, and such a
-test is skipped while it is unset.
+Every ask records its session in the calling project's database, so a test
+that asks needs a PostgreSQL: ASKPROJECT_TEST_DSN names a throwaway database,
+given to the script as AGENTKIT_DB_URL, and such a test is skipped while it is
+unset. Every AGENTKIT_DB_* key the suite inherits is cleared and the config
+home is the lab's own, so no database of the machine running it is ever read.
 """
 
 import json
@@ -23,6 +25,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from capabilities_contract.db import KEYS as DB_KEYS
 
 STORE_DSN = os.environ.get("ASKPROJECT_TEST_DSN", "")
 
@@ -42,11 +45,21 @@ CHAIN_KEYS = ("ASKPROJECT_ENGINE", "ASKPROJECT_MODEL", "ASKPROJECT_EFFORT",
               "ASKPROJECT_TIMEOUT")
 
 
+def clear_db_env(env: dict) -> dict:
+    """`env` without any AGENTKIT_DB_* key, so no level above the project's
+    files and the lab's own config home answers."""
+    for key in DB_KEYS:
+        env.pop(key, None)
+    return env
+
+
 def store_env(env: dict) -> dict:
-    """`env` pointed at the test store; skips the calling test without one."""
+    """`env` pointed at the test store, and at nothing else; skips the calling
+    test without one."""
     if not STORE_DSN:
         pytest.skip("ASKPROJECT_TEST_DSN is unset")
-    env["CAPABILITIES_STORE_URL"] = STORE_DSN
+    clear_db_env(env)
+    env["AGENTKIT_DB_URL"] = STORE_DSN
     return env
 
 
@@ -93,9 +106,10 @@ class Lab:
         self.config = root / "config"
         self.env = os.environ.copy()
         for key in (*CHAIN_KEYS, "CLAUDE_PROJECT_DIR", "CAPABILITIES_READ_ONLY",
-                    "CAPABILITIES_STORE_URL", "CAPABILITIES_PROJECT_ENVELOPE",
+                    "CAPABILITIES_PROJECT_ENVELOPE",
                     "CAPABILITIES_PROJECT_ENVELOPE_ROOT"):
             self.env.pop(key, None)
+        clear_db_env(self.env)
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env.get("PATH", "")
         self.env["XDG_CONFIG_HOME"] = str(self.config)
         self.env["XDG_STATE_HOME"] = str(root / "state")

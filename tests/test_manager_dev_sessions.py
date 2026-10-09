@@ -567,8 +567,8 @@ def test_dev_run_hands_the_child_no_database_of_its_own_choosing(tmp_path):
     source = _source_repo(tmp_path)
     consumer = _consumer_repo(tmp_path)
     env = _env(tmp_path)
-    env["CAPABILITIES_STORE_URL"] = "postgresql://parent.invalid/db"
     env["AGENTKIT_DB_URL"] = "postgresql://parent.invalid/db"
+    env["AGENTKIT_DB_PASSWORD"] = "parent-secret"
     started = _start(env, source, consumer, session="db-run")
     script = Path(started["source_worktree"]) / "capabilities" / "deployment" / "bin" / "deployment"
     original = script.read_text()

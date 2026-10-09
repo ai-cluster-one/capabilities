@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import json
 import os
 import sys
@@ -31,6 +32,7 @@ from test_assistant_service import (  # noqa: E402
     FakeClient,
     Message,
     import_daemon,
+    machine_store_file,
     settings,
     successful_result,
     wait_until,
@@ -104,6 +106,42 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                     await daemon.main()
             self.assertIn("store_not_configured", str(stopped.exception.code))
             self.assertIn("capabilities store set", str(stopped.exception.code))
+
+    async def test_without_a_project_database_the_machine_file_answers(self):
+        if not STORE_DSN:
+            self.skipTest("TELEGRAM_TEST_DSN is unset")
+        with tempfile.TemporaryDirectory() as td:
+            machine = machine_store_file(Path(td) / "config")
+            daemon = import_daemon(Path(td), job_settings())
+            self.assertIsNone(daemon.STORE_REFUSAL)
+            self.assertEqual(
+                (daemon.STORE_SETTING.level, daemon.STORE_SETTING.sources),
+                ("machine", (str(machine),)))
+
+    async def test_a_database_in_the_project_env_wins_over_the_machine_file(self):
+        """The daemon resolves for its own project: the project's .env.local
+        answers before a machine file that names a database nobody reaches,
+        and the register opens there."""
+        if not STORE_DSN:
+            self.skipTest("TELEGRAM_TEST_DSN is unset")
+        with tempfile.TemporaryDirectory() as td:
+            machine_store_file(Path(td) / "config", port=1)
+            envelope = Path(td) / "project" / "capabilities"
+            envelope.mkdir(parents=True)
+            (envelope / "project.json").write_text(json.dumps(
+                {"id": f"prj_test_{time.time_ns()}", "slug": "testproject"}))
+            daemon = import_daemon(Path(td), job_settings(),
+                                   project_env={"AGENTKIT_DB_URL": STORE_DSN})
+            self.assertEqual(
+                (daemon.STORE_SETTING.level, daemon.STORE_SETTING.sources),
+                ("project", (str(daemon.PROJECT_ROOT / ".env.local"),)))
+            daemon.STORE_SETTING = dataclasses.replace(
+                daemon.STORE_SETTING, schema=f"tgtest_{time.time_ns()}")
+            self.addCleanup(daemon.close_job_register)
+            row = queued(daemon.job_register(), channel_key="123",
+                         requested_by="777", description="on the project's database",
+                         engine="stub")
+            self.assertEqual(row["description"], "on the project's database")
 
     async def test_the_daemon_opens_its_register_scoped_to_its_environment(self):
         with tempfile.TemporaryDirectory() as td:
@@ -207,12 +245,12 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                          if key.startswith("TELEGRAM_AUTHORIZED_")
                          or key == "TELEGRAM_DAEMON_CHILD"}
                 child.update({"CLAUDE_PROJECT_DIR": str(daemon.PROJECT_ROOT),
-                              "CAPABILITIES_STORE_URL": daemon.STORE_SETTING.url,
+                              "AGENTKIT_DB_URL": daemon.STORE_SETTING.url,
                               "TELEGRAM_ENVIRONMENT": daemon.ENVIRONMENT})
                 # The CLI reads the same store, bound to this case's schema.
                 with mock.patch.dict(os.environ, child, clear=False), \
                         mock.patch.object(cli._jobs_module(), "store_setting",
-                                          lambda: daemon.STORE_SETTING):
+                                          lambda root: daemon.STORE_SETTING):
                     os.environ.pop("TELEGRAM_AUTHORIZED_TOPIC_ID", None)
                     chat, topic, actor = cli._job_scope(asked)
                     answer = cli.cmd_jobs_list(

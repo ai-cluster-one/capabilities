@@ -254,9 +254,9 @@ class Process(unittest.TestCase):
         spec = {"cfg": self.cfg, "root": tempfile.mkdtemp(), "stall": stall,
                 "grace": grace, "constants": {"SERVICE_WATCH_EVERY": 0.2,
                                               "SERVICE_HEARTBEAT": 0.5}}
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("CAPABILITIES_STORE_URL", wa.SERVICE_STALL_SEAM_ENV)}
-        env.update(WA_TESTS_DIR=str(TESTS_DIR), XDG_CONFIG_HOME=tempfile.mkdtemp())
+        env = {k: v for k, v in _cli.without_db_env().items()
+               if k != wa.SERVICE_STALL_SEAM_ENV}
+        env.update(WA_TESTS_DIR=str(TESTS_DIR))
         if seam:
             env[wa.SERVICE_STALL_SEAM_ENV] = "1"
         self.stderr_path = Path(tempfile.mkdtemp()) / "stderr"

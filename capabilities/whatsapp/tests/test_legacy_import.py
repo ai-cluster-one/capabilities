@@ -302,9 +302,7 @@ class NoStore(unittest.TestCase):
     def test_no_store_setting_is_refused_before_the_file_is_read(self):
         home = Path(tempfile.mkdtemp())
         build_legacy(home / "messages.db")
-        env = {k: v for k, v in os.environ.items() if k != "CAPABILITIES_STORE_URL"}
-        env["XDG_CONFIG_HOME"] = tempfile.mkdtemp()
-        with mock.patch.dict(os.environ, env, clear=True):
+        with mock.patch.dict(os.environ, _cli.without_db_env(), clear=True):
             with self.assertRaises(wa._Refusal) as caught:
                 wa._wm_import_legacy({"id": "test", "home": str(home)},
                                      types.SimpleNamespace(file=None))

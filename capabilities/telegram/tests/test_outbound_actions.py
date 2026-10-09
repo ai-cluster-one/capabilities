@@ -25,6 +25,7 @@ TELEGRAM_DIR = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _cli import CLI_PATH  # noqa: E402
+from capabilities_contract.db import KEYS as DB_KEYS  # noqa: E402
 
 WORKER_SHIM_PATH = TELEGRAM_DIR / "service" / "worker-bin" / "telegram"
 
@@ -1350,7 +1351,8 @@ class ServiceDoctorExitTests(unittest.TestCase):
     consuming project already reads; only the exit code answers for `ok`."""
 
     PAYLOAD_KEYS = {"ok", "service", "workers", "store", "connection", "note"}
-    STORE_OK = {"ok": True, "source": "CAPABILITIES_STORE_URL", "schema": "agentkit"}
+    STORE_OK = {"ok": True, "level": "environment", "sources": ["AGENTKIT_DB_URL"],
+                "schema": "agentkit"}
 
     def _run_doctor(self, cli, tmp, health, store=None):
         """Drive the real dispatch for one runtime-health shape and return
@@ -1444,14 +1446,49 @@ class ServiceDoctorExitTests(unittest.TestCase):
         gates on says so rather than passing a service that cannot start."""
         cli = import_cli()
         with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
-            os.environ.pop("CAPABILITIES_STORE_URL", None)
+                mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp,
+                                             **{key: "" for key in DB_KEYS}}):
             store = cli._service_store_check(Path(tmp))
             code, payload = self._run_doctor(cli, tmp, health=None, store=store)
         self.assertEqual(payload["store"]["code"], "store_not_configured")
         self.assertIn("capabilities store set", payload["store"]["hint"])
         self.assertFalse(payload["ok"])
         self.assertEqual(code, 5)
+
+    def _project_store_check(self, *, project_env: bool):
+        """The real store check for a project whose machine file names the test
+        database, or names one nobody reaches while the project's .env names
+        the test database."""
+        dsn = os.environ.get("TELEGRAM_TEST_DSN")
+        if not dsn:
+            self.skipTest("TELEGRAM_TEST_DSN is unset")
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from test_assistant_service import machine_store_file
+        sys.path.pop(0)
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve() / "project"
+            (root / "capabilities").mkdir(parents=True)
+            (root / "capabilities" / "project.json").write_text(json.dumps(
+                {"id": f"prj_test_{time.time_ns()}", "slug": "testproject"}))
+            machine = machine_store_file(Path(tmp) / "config",
+                                         port=1 if project_env else None)
+            if project_env:
+                (root / ".env").write_text(f"AGENTKIT_DB_URL={dsn}\n")
+            env = {"XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+                   "CLAUDE_PROJECT_DIR": str(root), **{key: "" for key in DB_KEYS}}
+            with mock.patch.dict(os.environ, env):
+                return cli._service_store_check(root), root, machine
+
+    def test_the_store_check_names_the_machine_file_when_the_project_names_none(self):
+        store, _root, machine = self._project_store_check(project_env=False)
+        self.assertEqual(store, {"ok": True, "level": "machine",
+                                 "sources": [str(machine)], "schema": "agentkit"})
+
+    def test_a_database_in_the_project_env_wins_over_the_machine_file(self):
+        store, root, _machine = self._project_store_check(project_env=True)
+        self.assertEqual(store, {"ok": True, "level": "project",
+                                 "sources": [str(root / ".env")], "schema": "agentkit"})
 
     def test_the_inventory_verdict_is_the_doctor_s_without_the_workers(self):
         """`inventory` judges by the doctor's local checks and never makes the

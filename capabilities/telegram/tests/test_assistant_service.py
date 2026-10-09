@@ -222,6 +222,26 @@ class AudioParameters:
 # TELEGRAM_TEST_DSN, a throwaway database's URL, and skips without one; each
 # case's daemon binds a schema of its own, so cases never see each other's rows.
 STORE_DSN = os.environ.get("TELEGRAM_TEST_DSN")
+# Every key the database cascade reads, so the daemon is handed none it
+# inherits.
+from capabilities_contract.db import KEYS as DB_KEYS  # noqa: E402
+
+
+def machine_store_file(config_home: Path, *, port: int | None = None) -> Path:
+    """A machine store setting under `config_home` naming the test database by
+    its fields, or the same host on a port nothing listens on."""
+    from urllib.parse import parse_qs, urlparse
+    url = urlparse(STORE_DSN)
+    body = {"schema": "agentkit.store.v1", "host": url.hostname,
+            "port": port or url.port or 5432, "database": url.path.lstrip("/"),
+            "user": url.username,
+            "sslmode": (parse_qs(url.query).get("sslmode") or ["require"])[-1]}
+    if url.password:
+        body["password"] = url.password
+    path = Path(config_home) / "agentkit" / "store.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body))
+    return path
 
 
 def import_daemon(tmp: Path, service_settings: dict, *,
@@ -310,10 +330,13 @@ def import_daemon(tmp: Path, service_settings: dict, *,
             "TELEGRAM_SERVICE_SETTINGS": str(settings_file),
             "TELEGRAM_SERVICE_STATE_DIR": str(tmp / "service-state"),
         })
+        # No database key the suite inherits reaches the daemon, and its config
+        # home is the case's own, so the only database it can find is the
+        # throwaway one handed to it here.
+        for key in DB_KEYS:
+            os.environ.pop(key, None)
         if store:
-            os.environ["CAPABILITIES_STORE_URL"] = STORE_DSN
-        else:
-            os.environ.pop("CAPABILITIES_STORE_URL", None)
+            os.environ["AGENTKIT_DB_URL"] = STORE_DSN
         os.environ.pop("TELEGRAM_SERVICE_VOICE_CONTEXT", None)
         if voice_context is not None:
             os.environ["TELEGRAM_SERVICE_VOICE_CONTEXT"] = str(voice_context_file)

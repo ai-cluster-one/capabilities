@@ -264,11 +264,9 @@ class StartRefusals(unittest.TestCase):
     """Each reason start will not go ahead is its own code."""
 
     def test_no_store_setting(self):
-        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tempfile.mkdtemp()}), \
-                mock.patch.dict(os.environ, {}, clear=False) as env:
-            env.pop("CAPABILITIES_STORE_URL", None)
+        with mock.patch.dict(os.environ, _cli.no_db_env()):
             with self.assertRaises(wa._Refusal) as caught:
-                wa._require_store_setting()
+                wa._pin_store_setting(Path(tempfile.mkdtemp()))
         self.assertEqual((caught.exception.exit_code, caught.exception.code),
                          (6, "store_not_configured"))
 

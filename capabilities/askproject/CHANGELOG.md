@@ -1,5 +1,9 @@
 # askproject — change log
 
+## 2026-10-09 — The session map follows the calling project's database
+
+Breaking. `askproject` now uses `capabilities-contract` 0.4.0 and keeps its session map in the database the calling project resolves: the `AGENTKIT_DB_*` keys in the project's `.env.local` and `.env`, then the process environment, then the machine's store setting; `capabilities store show` shows which answers. `CAPABILITIES_STORE_URL` is no longer read. One ask reads and records its session on the same database even when the peer runs for an hour. `doctor`'s `store` is now the setting in force with its secrets redacted - `level`, `sources`, `schema` and where the database is - in place of the label `CAPABILITIES_STORE_URL` or `setting`.
+
 ## 2026-10-09 — `askproject migrate` brings the session map's tables up to date when asked
 
 `askproject migrate` applies the pending steps to the session map's tables in the machine's store, and `askproject migrate status` reports where they stand without a lock and changes nothing. The manager runs `askproject migrate` when it installs or updates askproject; every other call takes no lock and migrates only when it finds its tables missing or older than its code. `askproject` now uses `capabilities-contract` 0.3.0: a store that does not answer a connect within 10 seconds is reported as `store_unreachable`, and both ends of a connection send TCP keepalives, so the store drops a client that died without closing.

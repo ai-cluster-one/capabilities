@@ -2,7 +2,7 @@
 
 How a WhatsApp identity is linked, what arrives when, and what each of those arrivals costs.
 
-A connection is one WhatsApp identity, driven by the engine the CLI carries: whatsmeow, compiled into the installed wheel and run in-process, so a consuming project needs nothing beyond the CLI. The credential is the linked-device session itself, minted by pairing into the user state home, under a folder named for the account rather than for the connection that reached it. What the account hands over is captured into the machine's Postgres store, keyed by the same account; the store must be configured before any verb that reads or writes the capture will run. A connection may instead name a self-hosted WAHA bridge, in which case the identity is that instance's session and the bridge's own wiring lives on the entry; the verb surface is the same either way.
+A connection is one WhatsApp identity, driven by the engine the CLI carries: whatsmeow, compiled into the installed wheel and run in-process, so a consuming project needs nothing beyond the CLI. The credential is the linked-device session itself, minted by pairing into the user state home, under a folder named for the account rather than for the connection that reached it. What the account hands over is captured into the project's Postgres database, keyed by the same account; a database must be configured before any verb that reads or writes the capture will run. A connection may instead name a self-hosted WAHA bridge, in which case the identity is that instance's session and the bridge's own wiring lives on the entry; the verb surface is the same either way.
 
 ## The device
 

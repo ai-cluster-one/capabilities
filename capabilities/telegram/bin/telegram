@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract==0.3.0",
+#     "capabilities-contract==0.4.0",
 #     "httpx>=0.27",
 #     "qrcode>=7.4",
 #     "telethon==1.43.2",
@@ -179,15 +179,18 @@ Commands:
                                                own verdict is `ok: false`, so a
                                                script can gate on it.
                                                The job register lives in the
-                                               machine's Postgres store, in
+                                               project's Postgres database, in
                                                telegram_* tables migrated on
                                                first use; `doctor` reports
-                                               whether it opens. The store is
-                                               the one `capabilities store set`
-                                               configures, and
-                                               CAPABILITIES_STORE_URL overrides
-                                               it for a process. With neither,
-                                               `start`, `run` and `jobs` exit 6
+                                               whether it opens and which level
+                                               named it. The database is the
+                                               first that answers: the
+                                               project's .env.local / .env,
+                                               then the environment, then the
+                                               machine's store setting
+                                               (`capabilities store show` shows
+                                               which). With none, `start`, `run`
+                                               and `jobs` exit 6
                                                store_not_configured.
 
 Chat references:
@@ -303,7 +306,7 @@ WRITE_DEFAULT = False    # outbound messages and reactions need an explicit conn
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/telegram/guides/")
 STATE = True       # True when the capability writes session/cache state
-TABLES = True      # telegram_* tables in the machine's store, built by _tables()
+TABLES = True      # telegram_* tables in the project's database, built by _tables()
 INVENTORY = {"network": "none"}   # the daemon's state is pid and health files on this machine
 SERVICE_STATE_VERSION = 1
 POST_INSTALL: list = []
@@ -326,7 +329,6 @@ SERVICE = {
                 {"key": "DEEPGRAM_API_KEY"},
                 {"key": "TELEGRAM_CHANNEL_ENABLED", "default": "true"},
                 {"key": "TG_WORKER"},
-                {"key": "CAPABILITIES_STORE_URL"},
             ],
         },
         "mounts": [
@@ -4500,35 +4502,38 @@ def _job_environment(root: Path) -> str:
 
 
 def _open_job_register(root: Path, write: bool = True):
-    """The job register, in the machine's store. A write is keyed by the project
-    id verified for this invocation; a read takes the id in every state."""
+    """The job register, in the project's database. A write is keyed by the
+    project id verified for this invocation; a read takes the id in every
+    state."""
     module = _jobs_module()
     project_id = _project_id(write=True) if write else _project_id()
     try:
         _store, register = module.open_register(
             _project_capabilities_dir(root), _job_environment(root),
-            project_id=project_id)
+            project_id=project_id, project_root=root)
         return module, register
     except module.JobError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
 
 
-def _require_service_store():
-    """The store the service's job register lives in. The service resolves it
-    before it takes any work and refuses to run on a machine that has none."""
+def _require_service_store(root: Path):
+    """The database the service's job register lives in, resolved for the
+    project. The service resolves it before it takes any work and refuses to
+    run in a project that has none."""
     module = _jobs_module()
     try:
-        return module.store_setting()
+        return module.store_setting(root)
     except module.JobError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
 
 
 def _service_store_check(root: Path) -> dict:
-    """Whether the job register opens in the machine's store: the setting is
-    read, the store is reached and the register's tables are migrated."""
+    """Whether the job register opens in the project's database: the setting is
+    resolved, the database is reached and the register's tables are migrated.
+    Where the setting came from is the library's level and sources."""
     module = _jobs_module()
     try:
-        setting = module.store_setting()
+        setting = module.store_setting(root)
         store, _register = module.open_register(
             _project_capabilities_dir(root), _job_environment(root),
             project_id=_project_id(), setting=setting)
@@ -4536,7 +4541,8 @@ def _service_store_check(root: Path) -> dict:
         return {"ok": False, "code": exc.slug, "error": exc.message,
                 "hint": exc.hint}
     store.close()
-    return {"ok": True, "source": setting.source, "schema": setting.schema}
+    return {"ok": True, "level": setting.level, "sources": list(setting.sources),
+            "schema": setting.schema}
 
 
 def _job_channel_key(chat: str | None, topic_id: str | None) -> str | None:
@@ -5388,7 +5394,7 @@ def _service_start_result(connection_flag: str | None, session_flag: str | None)
                  json.dumps(status["owner"], sort_keys=True))
         status["already_running"] = True
         return status
-    _require_service_store()
+    _require_service_store(root)
     daemon = _service_daemon()
     if not daemon.is_file():
         _die(3, "service_bundle_missing", f"bundled daemon not found: {daemon}",
@@ -5688,7 +5694,7 @@ def cmd_service_run(connection_flag: str | None, session_flag: str | None) -> No
     account_id = _service_account_id(cfg)
     _require_ownership_marker(account_id)
     _write_gate(cfg["id"], cfg["allow_write"], "send")
-    _require_service_store()
+    _require_service_store(root)
     daemon = _service_daemon()
     if not daemon.is_file():
         _die(3, "service_bundle_missing", f"bundled daemon not found: {daemon}",

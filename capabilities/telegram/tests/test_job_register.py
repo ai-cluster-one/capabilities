@@ -23,6 +23,8 @@ from unittest import mock
 TELEGRAM_DIR = Path(__file__).resolve().parents[1]
 SERVICE_DIR = TELEGRAM_DIR / "service"
 STORE_DSN = os.environ.get("TELEGRAM_TEST_DSN")
+# Every key the database cascade reads, so a case can hide each one it inherits.
+from capabilities_contract.db import KEYS as DB_KEYS  # noqa: E402
 
 
 def _module(name: str, path: Path):
@@ -39,11 +41,20 @@ def project_id() -> str:
     return f"prj_test_{uuid.uuid4().hex}"
 
 
+def no_db_env(config_home: str) -> dict:
+    """The process environment without any database key, under `config_home`,
+    so no database of the machine running the suite answers."""
+    env = {k: v for k, v in os.environ.items() if k not in DB_KEYS}
+    env["XDG_CONFIG_HOME"] = config_home
+    return env
+
+
 def store_setting():
-    """The throwaway database as the store in force, as a service reads it,
-    bound to a schema of this case's own."""
-    with mock.patch.dict(os.environ, {"CAPABILITIES_STORE_URL": STORE_DSN}):
-        setting = jobs.store_setting()
+    """The throwaway database as the store in force, as a service resolves it
+    for a project that names none, bound to a schema of this case's own."""
+    env = {**no_db_env(tempfile.mkdtemp()), "AGENTKIT_DB_URL": STORE_DSN}
+    with mock.patch.dict(os.environ, env, clear=True):
+        setting = jobs.store_setting(Path(tempfile.mkdtemp()))
     return dataclasses.replace(setting, schema=f"tgtest_{uuid.uuid4().hex}")
 
 
@@ -104,12 +115,10 @@ class RegisterCase(unittest.TestCase):
         """No local default stands in: a queue nobody else can see is work
         that silently goes nowhere."""
         with tempfile.TemporaryDirectory() as config:
-            env = {k: v for k, v in os.environ.items()
-                   if k != "CAPABILITIES_STORE_URL"}
-            env["XDG_CONFIG_HOME"] = config
-            with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.dict(os.environ, no_db_env(config), clear=True):
                 with self.assertRaises(jobs.JobError) as caught:
-                    jobs.open_register(self.envelope, "development")
+                    jobs.open_register(self.envelope, "development",
+                                       project_root=self.envelope.parent)
         self.assertEqual(caught.exception.slug, "store_not_configured")
 
     def test_the_tables_are_the_capabilitys_own_under_its_ledger(self):

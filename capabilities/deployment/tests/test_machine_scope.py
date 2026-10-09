@@ -115,9 +115,11 @@ def _env(base: Path) -> dict[str, str]:
     for key in ("CAPABILITIES_READ_ONLY", "CLAUDE_PROJECT_DIR", "CAPABILITIES_AUTH_CONTEXT",
                 "CAPABILITIES_PROJECT_ENVELOPE", "CAPABILITIES_PROJECT_ENVELOPE_ROOT",
                 "CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT",
-                "CAPABILITIES_STORE_URL", "CAPABILITIES_MANAGER_BIN",
+                "CAPABILITIES_MANAGER_BIN",
                 "CAPABILITIES_DEV_SESSION", "CAPABILITIES_WORKSPACE"):
         env.pop(key, None)
+    for key in [key for key in env if key.startswith("AGENTKIT_DB_")]:
+        env.pop(key)
     env.update({
         "HOME": str(base / "home"),
         "XDG_CONFIG_HOME": str(base / "config"),

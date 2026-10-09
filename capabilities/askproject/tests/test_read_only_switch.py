@@ -52,7 +52,7 @@ def lab(tmp_path):
     env["XDG_CONFIG_HOME"] = str(tmp_path / "config")
     env["XDG_STATE_HOME"] = str(tmp_path / "state")
     env["PEER_MARKER"] = str(tmp_path / "peer-saw")
-    for leaked in ("CLAUDE_PROJECT_DIR", SWITCH, "CAPABILITIES_STORE_URL"):
+    for leaked in ("CLAUDE_PROJECT_DIR", SWITCH):
         env.pop(leaked, None)
     store_env(env)
     return {"caller": _project(tmp_path / "caller"),

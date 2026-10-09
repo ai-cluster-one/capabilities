@@ -157,23 +157,88 @@ class StoreConfiguration(unittest.TestCase):
     a configuration answer, not an empty one."""
 
     def test_no_setting_and_no_override_refuses_as_configuration(self):
-        env = {k: v for k, v in os.environ.items()
-               if k != "CAPABILITIES_STORE_URL"}
-        env["XDG_CONFIG_HOME"] = tempfile.mkdtemp()
-        with mock.patch.dict(os.environ, env, clear=True):
+        with mock.patch.dict(os.environ, _cli.without_db_env(), clear=True):
             with self.assertRaises(wa._Refusal) as caught:
                 wa._open_store({"id": "test", "home": tempfile.mkdtemp()})
         self.assertEqual(caught.exception.exit_code, 6)
         self.assertEqual(caught.exception.code, "store_not_configured")
         self.assertTrue(caught.exception.hint)
 
-    def test_a_file_store_override_is_refused(self):
-        with mock.patch.dict(os.environ,
-                             {"CAPABILITIES_STORE_URL": "sqlite:///tmp/x.db"}):
+    def test_a_file_database_is_refused_as_configuration(self):
+        # The library refuses a URL that is not PostgreSQL; this is the
+        # capability carrying that refusal out as a configuration answer.
+        with mock.patch.dict(os.environ, {**_cli.no_db_env(),
+                                          "AGENTKIT_DB_URL": "sqlite:///tmp/x.db"}):
             with self.assertRaises(wa._Refusal) as caught:
                 wa._open_store({"id": "test", "home": tempfile.mkdtemp()})
         self.assertEqual(caught.exception.exit_code, 6)
         self.assertEqual(caught.exception.code, "store_not_postgres")
+
+
+def _machine_file(config_home: str, *, port: int | None = None) -> Path:
+    """A machine store setting naming the test database by its fields, or the
+    same host on a port nothing listens on."""
+    import json
+    from urllib.parse import parse_qs, urlparse
+    url = urlparse(_cli.STORE_DSN)
+    body = {"schema": "agentkit.store.v1", "host": url.hostname,
+            "port": port or url.port or 5432, "database": url.path.lstrip("/"),
+            "user": url.username,
+            "sslmode": (parse_qs(url.query).get("sslmode") or ["require"])[-1]}
+    if url.password:
+        body["password"] = url.password
+    path = Path(config_home) / "agentkit" / "store.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body))
+    return path
+
+
+@_cli.needs_store
+class ProjectDatabase(unittest.TestCase):
+    """The capture follows the project's database: its .env answers before the
+    machine file, and a listener keeps what it resolved at launch."""
+
+    def setUp(self):
+        env = _cli.no_db_env()
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.config_home = env["XDG_CONFIG_HOME"]
+        self.root = Path(tempfile.mkdtemp())
+        rooted = mock.patch.object(wa, "_project_root", return_value=self.root)
+        rooted.start()
+        self.addCleanup(rooted.stop)
+        self.addCleanup(setattr, wa, "_STORE_SETTING_PINNED", None)
+
+    def open(self):
+        db = wa._open_store(_cli.store_cfg())
+        self.addCleanup(db.close)
+        return db
+
+    def test_without_a_project_database_the_machine_file_answers(self):
+        machine = _machine_file(self.config_home)
+        db = self.open()
+        self.assertEqual((db.setting.level, db.setting.sources),
+                         ("machine", (str(machine),)))
+
+    def test_a_database_in_the_project_env_wins_over_the_machine_file(self):
+        _machine_file(self.config_home, port=1)
+        (self.root / ".env").write_text(f"AGENTKIT_DB_URL={_cli.STORE_DSN}\n")
+        db = self.open()
+        self.assertEqual((db.setting.level, db.setting.sources),
+                         ("project", (str(self.root / ".env"),)))
+        db.execute("SELECT 1")
+
+    def test_a_listener_keeps_the_database_it_resolved_at_launch(self):
+        _machine_file(self.config_home, port=1)
+        (self.root / ".env").write_text(f"AGENTKIT_DB_URL={_cli.STORE_DSN}\n")
+        wa._pin_store_setting(self.root)
+        (self.root / ".env").unlink()
+        db = self.open()
+        self.assertEqual(db.setting.level, "project")
+        db.conn.close()
+        db.reconnect()
+        self.assertEqual(db.execute("SELECT 1").fetchone()[0], 1)
 
 
 @_cli.needs_store

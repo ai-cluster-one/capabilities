@@ -8,7 +8,7 @@ has minutes or hours left, and a correction arriving meanwhile is an amendment
 to work already in flight rather than a second request. That second class is
 what this module records.
 
-The machine's store is the home, not a private database beside it: the
+The project's database is the home, not a private one beside it: the
 capability owns its `telegram_*` tables there and migrates them itself, through
 the shared database library and under its own ledger, and nothing else knows
 these columns. The reason it is a table rather than a JSON blob is that the
@@ -111,7 +111,7 @@ def holds_slot(owner_id: Any) -> bool:
     """Whether an attempt owned by this id holds one of the runner's slots."""
     return not str(owner_id or "").endswith(DIRECT_OWNER_MARKER)
 
-# The register's tables, owned by this capability in the machine's store and
+# The register's tables, owned by this capability in the project's database and
 # migrated through the shared database library under the owner `telegram`: each
 # step is applied once and recorded in that owner's ledger, and never edited once
 # released - a change is a new step. The columns are the ones the register has
@@ -310,21 +310,22 @@ def handed_project_id(root: Path) -> str:
         return ""
 
 
-def store_setting():
-    """The store this machine names for runtime state, read through the shared
-    database library: `CAPABILITIES_STORE_URL`, else the manager's store setting.
+def store_setting(project_root: Path | None):
+    """The database the project at `project_root` uses for runtime state, as the
+    shared database library resolves it: the project's `.env.local` / `.env`,
+    then the process environment, then the machine's store setting.
 
     There is no local default. A register nobody else can see is a queue whose
-    work silently goes nowhere, so a machine with no store is told so -
+    work silently goes nowhere, so a project with no database is told so -
     `store_not_configured`, with the library's hint - rather than handed one."""
     try:
-        from capabilities_contract.db import DbError, read_setting
+        from capabilities_contract.db import DbError, resolve_setting
     except ImportError as exc:
         raise JobError("store_library_missing",
                        "the shared database library capabilities-contract is not installed",
                        "run the capability through its own script header, which pins it") from exc
     try:
-        return read_setting()
+        return resolve_setting(project_root)
     except DbError as exc:
         raise JobError(exc.slug, exc.message, exc.hint) from exc
 
@@ -349,19 +350,20 @@ class JobStore:
 
 
 def open_register(envelope: Path, environment: str, surface: str = "telegram",
-                  project_id: str | None = None, setting=None):
+                  project_id: str | None = None, setting=None,
+                  project_root: Path | None = None):
     """The store this project's jobs live in, and the register onto it.
 
     There is no file-mode register and no local database. A queue, a slot count
     and a cancellation flag are what every process serving the project
-    coordinates through, so they live in the machine's store, in this
+    coordinates through, so they live in the project's database, in this
     capability's own tables, migrated here under its own ledger. The caller
     closes the store.
 
     The project id is the one the launching CLI resolved and passes in;
     project.json's own id stands in only where no launcher resolved one.
-    `setting` is the store already resolved by a caller that reads it once;
-    otherwise it is read now.
+    `setting` is the database already resolved by a caller that reads it once;
+    otherwise it is resolved now for `project_root`.
     """
     identity = project_identity(envelope)
     project_id = project_id or identity.get("id")
@@ -370,7 +372,7 @@ def open_register(envelope: Path, environment: str, surface: str = "telegram",
                        f"{Path(envelope) / 'project.json'} declares no id",
                        "run `capabilities init` in the project")
     if setting is None:
-        setting = store_setting()
+        setting = store_setting(project_root)
     from capabilities_contract.db import DbError, connect, migrate
     try:
         conn = connect(application_name=STORE_OWNER, setting=setting)

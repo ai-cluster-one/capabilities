@@ -46,7 +46,6 @@ from register import Register
 from validation import require_valid_settings
 from watermark import Watermark
 from workers import WORKERS, WorkerTimeout, sanitized_worker_env
-import store as records_store
 
 
 def event_key(evt: dict) -> str:
@@ -145,13 +144,24 @@ def _load_settings(path: Path) -> dict:
                     or root / "capabilities").resolve()
     config_home = Path(os.environ.get("XDG_CONFIG_HOME")
                        or (Path.home() / ".config"))
-    try:
-        with records_store.open_records(envelope, config_home) as adapter:
-            return {key: row["value"] for key, row in
-                    adapter.resolve("slack", "setting").items()
-                    if key != "connection.default"}
-    except records_store.StoreError as exc:
-        raise RuntimeError(f"Slack service records are unavailable: {exc.message}") from exc
+    # The project's envelope, then the user's config home: key by key, the
+    # project's value wins.
+    settings: dict = {}
+    for scope in (envelope, config_home):
+        settings_file = scope / "slack" / "service" / "settings.json"
+        try:
+            body = json.loads(settings_file.read_text())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"Slack service records are unavailable: cannot read {settings_file}: {exc}"
+            ) from exc
+        if isinstance(body, dict):
+            for key, value in body.items():
+                settings.setdefault(key, value)
+    settings.pop("connection.default", None)
+    return settings
 
 
 def _log(log_path, msg: str) -> None:

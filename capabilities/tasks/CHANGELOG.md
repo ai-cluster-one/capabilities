@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-09 — `service/store.py` is no longer shipped
+
+The service never read the copy of the records layer the bundle carried as `service/store.py`, and it is gone. Nothing the service does changes.
+
 ## 2026-10-09 — `service join` no longer refuses database-mode records
 
 `tasks service join` and the machine service no longer refuse a project with `database_mode_unsupported`: records are kept in files only, and a `project.json` declaring `"store": "db"` is refused by the records layer with `bad_store_mode`.

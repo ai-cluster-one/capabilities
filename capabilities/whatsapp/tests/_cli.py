@@ -7,8 +7,9 @@ so everything below the network — the store, the parser, the envelope — is
 reachable with no engine present and no dependency to install.
 
 The capture lives in Postgres. The store-backed cases read WHATSAPP_TEST_DSN, a
-throwaway database's URL, and skip when it is unset; each case writes under an
-account of its own, so cases never see each other's rows.
+throwaway database's URL, given to the capability as AGENTKIT_DB_URL, and skip
+when it is unset; each case writes under an account of its own, so cases never
+see each other's rows.
 
 A source checkout keeps that file under `bin/` and an installed bundle keeps
 it at the bundle root, so the path is resolved rather than named: naming one
@@ -78,17 +79,35 @@ def engine_available(module) -> bool:
 
 STORE_DSN = os.environ.get("WHATSAPP_TEST_DSN")
 
+# Every key the database cascade reads, so a case can hide each one it inherits.
+from capabilities_contract.db import KEYS as DB_KEYS  # noqa: E402
+
 
 def needs_store(case):
     """Skip a store-backed case where no throwaway database is named."""
     return unittest.skipUnless(STORE_DSN, "WHATSAPP_TEST_DSN is unset")(case)
 
 
+def no_db_env() -> dict:
+    """Every database key emptied, which the cascade reads as unset, and a
+    config home of the case's own, so no database of the machine running the
+    suite answers."""
+    return {**{key: "" for key in DB_KEYS}, "XDG_CONFIG_HOME": tempfile.mkdtemp()}
+
+
+def without_db_env() -> dict:
+    """The process environment without any database key, and a config home of
+    the case's own: a whole environment for `mock.patch.dict(..., clear=True)`
+    or a child process."""
+    env = {k: v for k, v in os.environ.items() if k not in DB_KEYS}
+    env["XDG_CONFIG_HOME"] = tempfile.mkdtemp()
+    return env
+
+
 def store_env() -> dict:
     """The environment a store-backed case runs under: the throwaway database
-    as the store override, and no machine setting reachable behind it."""
-    return {"CAPABILITIES_STORE_URL": STORE_DSN or "",
-            "XDG_CONFIG_HOME": tempfile.mkdtemp()}
+    as the environment's database, and nothing reachable behind it."""
+    return {**no_db_env(), "AGENTKIT_DB_URL": STORE_DSN or ""}
 
 
 def store_cfg(**extra) -> dict:

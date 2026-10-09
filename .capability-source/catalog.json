@@ -7,12 +7,12 @@
     },
     "askproject": {
       "path": "capabilities/askproject",
-      "payload_sha256": "a02a91df1865cf1310c9801c69dccb5865844b1ba86d0cfefd67d0788889654f",
+      "payload_sha256": "815f10587a3badb381114078d72acecd16cc26fd63383ebf567400367fd782c4",
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project under a read or act profile, and return its answer with cost, token, and files-changed traceability."
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "8e585fb10c6e3bd7e6436f334698177356026b8503b0826b95bff841ee088378",
+      "payload_sha256": "cff46fe264ad8e4a17e315ff9a9c88ca9b9c31a783fe9270c990f4e2344c18b1",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {
@@ -37,17 +37,17 @@
     },
     "clickup": {
       "path": "capabilities/clickup",
-      "payload_sha256": "edb4b46db87637e059c72fa7e4a37588bdd2677b3e38202c72463cd3bd408088",
+      "payload_sha256": "f7ddbd9bbbbd4a5195febfd5370b7dff7f9bd55e495263a83ddeb9fa70c398e9",
       "summary": "ClickUp CLI over the REST API — read/create/update/comment-on tasks and subtasks, complete via status, manage assignees, tags, dependencies, custom fields, attachments, and webhooks across spaces and lists."
     },
     "coolify": {
       "path": "capabilities/coolify",
-      "payload_sha256": "939675d0decac6bdcb52a0d2a3dc7249d44eec2766b8503856bec3cc118d4feb",
+      "payload_sha256": "84ee7a7697e176bb98f429d93f20b4475f6e2f312932ee60ef7e3813ffdc45d6",
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance."
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "e529b7d5b3e59e41b79c5863c35894a374544cc31912d4206962114760d39f17",
+      "payload_sha256": "c7fd07b14e871d3f59f8123c333a1ed0b2940f9bdb4b2154549222f204dd111c",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into launchd-supervised processes on a Mac, and describe the targets they deploy to."
     },
     "directo": {
@@ -132,7 +132,7 @@
     },
     "slack": {
       "path": "capabilities/slack",
-      "payload_sha256": "397440fbac86088659468a33fbd10d843aaaae99bda592e964c51616771e3094",
+      "payload_sha256": "fca100610c548a2c036647e0c0c19e2a1503fb83356633d94e4eeac122dfb576",
       "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy."
     },
     "stripe": {
@@ -142,12 +142,12 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "c6f4779dd554cfb09271b5cf3cf133930bb816c262d831a50167eae33a9f7e87",
+      "payload_sha256": "909a4fb2064984d81d132ea63ba796f0676dc0a611acdd342183aca828a640a4",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "e71336840d7bf1f984d39bd1351c4d8d3a5d9114ffc0507195817791fdce5a83",
+      "payload_sha256": "056722510061537f14470c45755a8fb7f0455a9a6fffaa54ca9b69af6ffb5382",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {
@@ -157,7 +157,7 @@
     },
     "whatsapp": {
       "path": "capabilities/whatsapp",
-      "payload_sha256": "0572011570cd27e38eed87c7bef654f407d05f7d7f6cdc316aa642c4f82daf85",
+      "payload_sha256": "af65cbac965fda2f1d612a658e9a7fff266f9561dd5debd9262749f483de0ac8",
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON."
     },
     "windmill": {

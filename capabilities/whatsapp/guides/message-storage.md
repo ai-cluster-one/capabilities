@@ -2,13 +2,13 @@
 
 How a WhatsApp history is kept, and what a consuming project reads.
 
-Two places hold messages, and the split between them is the point. The **store** is where capture writes: the machine's Postgres store, holding every chat and message each account has handed over, the material that lets an attachment be fetched later, and the enrichment derived from them. The **export** is what a project reads: a folder per conversation, written on request, holding the messages a project registered and the attachments that came with them.
+Two places hold messages, and the split between them is the point. The **store** is where capture writes: the project's Postgres database, holding every chat and message each account has handed over, the material that lets an attachment be fetched later, and the enrichment derived from them. The **export** is what a project reads: a folder per conversation, written on request, holding the messages a project registered and the attachments that came with them.
 
 ## The store
 
-The store is the Postgres database the machine's store setting names (`capabilities store set` writes it, `capabilities store show` reports it, and `CAPABILITIES_STORE_URL` overrides it for one process). The capability keeps its capture there in tables of its own, every one named `whatsapp_*` and created on first use, and they are never edited by hand. Without a store setting there is nowhere to capture to, so every verb that reads or writes the capture refuses as a configuration error; `help` and `contract` still answer.
+The store is the Postgres database the project resolves: the `AGENTKIT_DB_*` keys in the project's `.env.local` / `.env`, else those in the process environment, else the machine's store setting (`capabilities store set` writes it); `capabilities store show` shows which one answers. The capability keeps its capture there in tables of its own, every one named `whatsapp_*` and created on first use, and they are never edited by hand. Without a database there is nowhere to capture to, so every verb that reads or writes the capture refuses as a configuration error; `help` and `contract` still answer.
 
-The capture is keyed by the account, not by the project or the connection, because it is minted by one human's linked device: several projects consuming the same account share one capture rather than each building their own, and two accounts never mix.
+The capture is keyed by the account, not by the project or the connection, because it is minted by one human's linked device: several projects on one database consuming the same account share one capture rather than each building their own, and two accounts never mix.
 
 The user state home keeps what is not rows: the engine's own login session, the raw history chunks, and the attachments fetched so far, in a folder named for the account.
 

@@ -10,6 +10,7 @@ import json
 import os
 import socket
 from importlib.machinery import SourceFileLoader
+from pathlib import Path
 
 import pytest
 
@@ -98,6 +99,46 @@ def test_without_a_store_an_ask_refuses_before_any_peer_starts(lab):
     report = json.loads(doctor.stdout)
     assert (report["ok"], report["store"], report["store_error"]["code"]) == (
         False, None, "store_not_configured")
+
+
+def _machine_file(lab, *, port: int | None = None) -> Path:
+    """The lab's machine store setting, naming the test database by its fields,
+    or the same host on a port nothing listens on."""
+    from urllib.parse import parse_qs, urlparse
+    store_env({})  # skips without a test database
+    url = urlparse(STORE_DSN)
+    body = {"schema": "agentkit.store.v1", "host": url.hostname,
+            "port": port or url.port or 5432, "database": url.path.lstrip("/"),
+            "user": url.username,
+            "sslmode": (parse_qs(url.query).get("sslmode") or ["require"])[-1]}
+    if url.password:
+        body["password"] = url.password
+    path = lab.config / "agentkit" / "store.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(body))
+    return path
+
+
+def test_without_a_project_database_the_machine_file_answers(lab):
+    machine = _machine_file(lab)
+    report = json.loads(lab.run("doctor").stdout)
+    assert report["store_error"] is None, report
+    assert (report["store"]["level"], report["store"]["sources"]) == (
+        "machine", [str(machine)])
+
+
+def test_a_database_in_the_project_env_wins_over_the_machine_file(lab):
+    _machine_file(lab, port=1)
+    lab.dotenv(".env", {"AGENTKIT_DB_URL": STORE_DSN})
+    report = json.loads(lab.run("doctor").stdout)
+    assert report["store_error"] is None, report
+    assert (report["store"]["level"], report["store"]["sources"]) == (
+        "project", [str(lab.caller.resolve() / ".env")])
+
+    proc = lab.run(str(lab.target), "what is here?", "--engine", "codex", "--quiet")
+    assert proc.returncode == 0, proc.stderr
+    [row] = _stored(lab)
+    assert row[3] == "codex"
 
 
 def test_codex_progress_is_concise_and_stdout_stays_json(lab):

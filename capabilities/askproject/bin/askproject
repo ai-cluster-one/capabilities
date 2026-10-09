@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "callva-harness-runner==0.8.0",
-#     "capabilities-contract==0.3.0",
+#     "capabilities-contract==0.4.0",
 # ]
 # ///
 """
@@ -176,11 +176,13 @@ OVERRIDES
 ────────────────────────────────────────────────────────────────────────────
 SESSION CONTINUITY  (state belongs to the project you call from)
   The map of "which target → which session" lives in the table
-  askproject_sessions of the PostgreSQL the machine's store setting names
-  (`capabilities store set`), or the one CAPABILITIES_STORE_URL names: one row
-  per calling project, machine and target. A project without an id is keyed by
-  its root. With no store askproject refuses with exit 6 store_not_configured
-  before a peer starts, and exits 5 when the store cannot be reached.
+  askproject_sessions of the calling project's PostgreSQL database: the first
+  that answers among the project's .env.local / .env, the process environment
+  and the machine's store setting (`capabilities store show` shows which). One
+  row per calling project, machine and target. A project without an id is
+  keyed by its root. With no store askproject refuses with exit 6
+  store_not_configured before a peer starts, and exits 5 when the store cannot
+  be reached.
 
   This state belongs to YOUR project on this machine, not to the targets.
   `-c/--continue` resumes the last session for that target with its original
@@ -2609,6 +2611,27 @@ def _caller_key() -> str:
     return project_id or f"path:{root or Path.cwd().resolve()}"
 
 
+def _db():
+    try:
+        from capabilities_contract import db
+    except ImportError as exc:
+        raise SessionStoreError(
+            "driver_missing", "the shared database library is not installed",
+            "reinstall askproject, whose script header pins capabilities-contract") from exc
+    return db
+
+
+def _store_setting():
+    """The database the calling project uses, as the shared library resolves it
+    for the project root: its .env.local / .env, then the process environment,
+    then the machine's store setting."""
+    db = _db()
+    try:
+        return db.resolve_setting(_project_root())
+    except db.DbError as exc:
+        raise SessionStoreError(exc.slug, exc.message, exc.hint) from exc
+
+
 class SessionMap:
     """This caller's sessions on this machine, read and written a row at a time.
 
@@ -2619,18 +2642,24 @@ class SessionMap:
     def __init__(self):
         self.project_id = _caller_key()
         self.host = socket.gethostname()
+        self.setting = None
+
+    def _open(self):
+        """A connection to the database this map first resolved, so a read and
+        the write an hour later land on the same one."""
+        if self.setting is None:
+            self.setting = _store_setting()
+        return self._connect(self.setting)
 
     @staticmethod
-    def _connect():
-        try:
-            from capabilities_contract import db
-        except ImportError as exc:
-            raise SessionStoreError(
-                "driver_missing", "the shared database library is not installed",
-                "reinstall askproject, whose script header pins capabilities-contract") from exc
+    def _connect(setting=None):
+        """A connection to the calling project's database, its table migrated;
+        `setting` when already resolved, else resolved now."""
+        db = _db()
+        setting = setting if setting is not None else _store_setting()
         conn = None
         try:
-            conn = db.connect(application_name=NAME)
+            conn = db.connect(application_name=NAME, setting=setting)
             db.migrate(conn, NAME, SESSIONS_STEPS,
                        major=SESSIONS_MAJOR, minor=SESSIONS_MINOR)
         except db.DbError as exc:
@@ -2647,7 +2676,7 @@ class SessionMap:
         return entry
 
     def _select(self, where: str = "", params: tuple = ()) -> list:
-        conn = self._connect()
+        conn = self._open()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -2674,7 +2703,7 @@ class SessionMap:
         import datetime
         used = entry.get("last_used_at")
         values = [entry.get(column) for column in SESSION_COLUMNS[:6]]
-        conn = self._connect()
+        conn = self._open()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -3602,10 +3631,9 @@ def cmd_doctor():
     default = _default_engine()
     store, store_error = None, None
     try:
-        SessionMap._connect().close()
-        from capabilities_contract import db
-        store = ("CAPABILITIES_STORE_URL" if db.read_setting().url is not None
-                 else "setting")
+        setting = _store_setting()
+        SessionMap._connect(setting).close()
+        store = setting.report()
     except SessionStoreError as exc:
         store_error = {"code": exc.slug, "message": exc.message}
         if exc.hint:

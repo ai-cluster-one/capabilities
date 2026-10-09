@@ -10,7 +10,7 @@ The service is one long-running process per account. It opens the account's link
 
 - The project enables the capability explicitly: `capabilities enable whatsapp --project`. Global availability grants CLI use, not a project daemon.
 - `whatsapp service init` seeds the service settings records (`capabilities/whatsapp/service/settings.json` in files mode) from the bundle's template, which names every key with its default and admits nobody, and the service's prose where the project has none: the dialogue's `context` document, the `delegation` document a turn is given when it may hand work to a job, and the `job-worker` document that is the whole of a job's prompt (`capabilities/whatsapp/service/context.md`, `delegation.md` and `job-worker.md` in files mode). The prose is the project's to edit and is never overwritten; `init` on a project whose settings already exist seeds only the documents it lacks. The settings keys are listed under Settings; any other key is refused by `start`, `run`, `doctor` and `reload`, naming its path.
-- The machine's store is configured (`capabilities store show`). Without it the service refuses to start and `service doctor` reports `store_not_configured`.
+- The project has a database: its `.env.local` / `.env`, the process environment or the machine's store setting names one (`capabilities store show` shows which answers). Without one the service refuses to start and `service doctor` reports `store_not_configured`. The listener keeps the database it resolved at launch for its whole run.
 - The connection is an in-house one with a linked device.
 
 ## Operating it

@@ -70,7 +70,9 @@ def place(tmp_path, monkeypatch):
                         lambda r: r / "capabilities")
     monkeypatch.setattr(coolify_module, "_gate", lambda: None)
     monkeypatch.delenv("CAPABILITIES_READ_ONLY", raising=False)
-    monkeypatch.delenv("CAPABILITIES_STORE_MODE", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config))
+    for key in [key for key in os.environ if key.startswith("AGENTKIT_DB_")]:
+        monkeypatch.delenv(key)
     return types.SimpleNamespace(root=root, config=config,
                                  registry=root / "capabilities" / "coolify" / "connections.json",
                                  env_local=root / ".env.local",

@@ -8,7 +8,7 @@
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract==0.3.0",
+#     "capabilities-contract==0.4.0",
 # ]
 # ///
 # The 3.x line is what carries conference calls: joining one needs
@@ -91,7 +91,6 @@ import contextlib
 import fcntl
 import hashlib
 import html
-import importlib.util
 import json
 import logging
 import os
@@ -389,42 +388,69 @@ JOB_WORKER_FILE = Path(os.environ.get("TELEGRAM_SERVICE_JOB_WORKER")
                        or SERVICE_DIR / "job-worker.md")
 
 
-_RECORDS = None
-_RECORDS_MODULE = None
+# The service's records are files, read the way the CLI reads them: the
+# project's envelope first, then the user's config home. Settings merge key by
+# key, the project's winning; a document is the first file, in that order, that
+# answers to its key.
+RECORD_ROOTS = (PROJECT_CAPABILITIES_DIR, CONFIG_HOME)
+# Where a document key's file may sit under a scope's `telegram/` folder, and
+# the prefix its key carries there.
+DOCUMENT_FOLDERS = (("reference", "reference"), ("context", "service/context"),
+                    (None, "service"))
 
 
-def _records_module():
-    global _RECORDS_MODULE
-    if _RECORDS_MODULE is None:
-        path = Path(__file__).with_name("store.py")
-        spec = importlib.util.spec_from_file_location("telegram_service_store", path)
-        if spec is None or spec.loader is None:
-            raise SettingsError(f"cannot load records adapter from {path}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        _RECORDS_MODULE = module
-    return _RECORDS_MODULE
+def _read_record_settings():
+    """The service settings the project's envelope and the config home hold,
+    merged key by key with the project's winning."""
+    merged = {}
+    for root in RECORD_ROOTS:
+        path = root / "telegram" / "service" / "settings.json"
+        try:
+            body = json.loads(path.read_text())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            raise SettingsError(
+                f"Telegram service records are unavailable: cannot read {path}: {exc}") from exc
+        if isinstance(body, dict):
+            for key, value in body.items():
+                merged.setdefault(key, value)
+    merged.pop("connection.default", None)
+    return merged
 
 
-def _records():
-    """The same adapter the CLIs read through, opened once here as well."""
-    global _RECORDS
-    if _RECORDS is None:
-        _store = _records_module()
-        _RECORDS = _store.open_records(PROJECT_CAPABILITIES_DIR, CONFIG_HOME)
-    return _RECORDS
+def _document_file(key):
+    """The file a document key names: the first, project before config home,
+    whose name folds to the key the way the records layer folds it."""
+    for root in RECORD_ROOTS:
+        for prefix, folder in DOCUMENT_FOLDERS:
+            directory = root / "telegram" / folder
+            if not directory.is_dir():
+                continue
+            for path in sorted(directory.glob("*.md")):
+                slug = path.stem.replace("_", "-").lower()
+                if path.is_file() and (f"{prefix}.{slug}" if prefix else slug) == key:
+                    return path
+    return None
 
 
-# Where the register lives, read once at launch. Every other location this
-# daemon uses is resolved at import and then fixed for the life of the process,
-# and the store is no different: a value re-read on each open is a value that
-# can change under a running daemon, which is how a queue ends up split across
-# two databases nobody chose. A machine with no store keeps the refusal instead,
-# and `main` refuses to run on it: delegation with nowhere to record the work
-# would be lost without anybody being told.
+def _read_document(key):
+    """A document's text, or None where neither scope keeps one by that key."""
+    path = _document_file(key)
+    return path.read_text() if path is not None else None
+
+
+# Where the register lives, resolved once at launch for this daemon's project.
+# Every other location this daemon uses is resolved at import and then fixed
+# for the life of the process, and the database is no different: a value
+# re-read on each open is a value that can change under a running daemon, which
+# is how a queue ends up split across two databases nobody chose. A project
+# with no database keeps the refusal instead, and `main` refuses to run on it:
+# delegation with nowhere to record the work would be lost without anybody
+# being told.
 def _resolve_store_setting():
     try:
-        return jobs.store_setting(), None
+        return jobs.store_setting(PROJECT_ROOT), None
     except jobs.JobError as exc:
         return None, exc
 
@@ -528,16 +554,10 @@ CHANNEL_ENABLED = os.environ.get(
 
 
 def _read_settings():
-    try:
-        settings = {key: row["value"] for key, row in
-                    _records().resolve("telegram", "setting").items()
-                    if key != "connection.default"}
-    except _records_module().StoreError as exc:
-        raise SettingsError(
-            f"Telegram service records are unavailable: {exc.message}") from exc
+    settings = _read_record_settings()
     if not settings:
         raise SettingsError(
-            f"Telegram service settings not found in {_records().source}")
+            f"Telegram service settings not found in {PROJECT_CAPABILITIES_DIR}")
     if not isinstance(settings, dict):
         raise SettingsError(f"{SETTINGS_FILE} must contain a JSON object")
     try:
@@ -2063,19 +2083,18 @@ def read_service_document(path):
     """Prose the daemon serves at request time — the soft-gate context, a
     project's worker extension, a channel's own context, the voice prompt.
 
-    The adapter answers from wherever this project keeps its records, and the
-    daemon is not told which. Nothing falls back between them: a project on the
-    store that cannot reach it raises rather than serving an empty prompt, and
-    the dispatch loop turns that into a failed job the requester hears about.
-    A prompt the daemon could not read is not a prompt that is empty."""
-    doc = _service_document(path)
-    return (doc["body"] if doc else "").strip()
+    It is read from the project's envelope, else the user's config home. A
+    file that exists and cannot be read raises rather than serving an empty
+    prompt, and the dispatch loop turns that into a failed job the requester
+    hears about. A prompt the daemon could not read is not a prompt that is
+    empty."""
+    return (_service_document(path) or "").strip()
 
 
 def _service_document(path):
-    """One document as the records surface holds it, or None where the project
+    """One document's text as the records hold it, or None where the project
     keeps no such document."""
-    return _records().document_read(NAME, _document_key(path))
+    return _read_document(_document_key(path))
 
 
 def read_voice_document(kind, provider):
@@ -2085,11 +2104,10 @@ def read_voice_document(kind, provider):
     instructions are addressed to: `gptlive-voice-agent` is written for the
     model that speaks. The incumbent falls back to the unsuffixed `voice-agent`,
     which is what a project that predates the split wrote and still owns."""
-    adapter = _records()
-    doc = adapter.document_read(NAME, f"{provider}-{kind}")
+    doc = _read_document(f"{provider}-{kind}")
     if not doc and provider == VOICE_PROVIDER_INCUMBENT and kind == "voice-agent":
-        doc = adapter.document_read(NAME, kind)
-    return (doc["body"] if doc else "").strip()
+        doc = _read_document(kind)
+    return (doc or "").strip()
 
 
 def read_voice_mechanism(provider):
@@ -4087,11 +4105,11 @@ def _channel_context_from_policy(policy):
         # Held apart deliberately: a document that exists and says nothing is
         # not the same as one the project does not have, and only the second
         # is worth telling the room about.
-        if (doc["body"] or "").strip():
-            parts.append(doc["body"].strip())
+        if doc.strip():
+            parts.append(doc.strip())
     elif path and path.is_file():
         # `context_file` historically accepted any Markdown path under the
-        # service directory. The records adapter has canonical locations of
+        # service directory. The records layout has canonical locations of
         # its own; keep the schema's wider, already-published promise for
         # file-backed projects instead of calling an existing file "missing".
         try:
