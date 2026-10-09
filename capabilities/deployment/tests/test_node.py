@@ -92,9 +92,9 @@ print(json.dumps(fixtures[key]))
     key = tmp_path / "private-node-key"
     key.write_text("fixture-private-material")
     monkeypatch.setattr(m, "_node_prepare_repo", lambda *a: ("git@192.0.2.10:/srv/git/body.git", key))
-    monkeypatch.setattr(m, "find_store_setting", lambda: ({"host": "store.example.invalid", "port": 5432,
-        "database": "fixture", "user": "fixture", "sslmode": "require", "db_schema": "fixture_schema",
-        "password": "fixture-store-secret"}, {"read": "family", "db_schema_named": True}))
+    # This machine has a database of its own; none of it may reach the node.
+    monkeypatch.setenv("AGENTKIT_DB_URL", "postgresql://mac:fixture-store-secret@store.example.invalid/mac")
+    monkeypatch.setenv("AGENTKIT_DB_PASSWORD", "fixture-store-secret")
     calls = []
     def ssh(r, host, script, **kw):
         calls.append((script, kw.get("stdin")))
@@ -102,8 +102,9 @@ print(json.dumps(fixtures[key]))
         if script.startswith("docker ps"): return "aabbccddeeff"
         if 'test -s' in script: return "logged_out"
         if 'supervisorctl' in script: return "body-sync RUNNING pid 1\n"
-        if 'store show' in script: return json.dumps({"configured": True})
-        if 'store doctor' in script: return json.dumps({"checks": {"tls": {"ok": True}, "plain_text_refused": {"ok": True}}})
+        if 'capabilities-contract==' in script: return json.dumps({"configured": True,
+            "setting": {"level": "environment", "sources": ["AGENTKIT_DB_URL"], "schema": "agentkit"},
+            "reachable": True, "tls_enforced": True})
         return ""
     monkeypatch.setattr(m, "_node_ssh", ssh)
     monkeypatch.setattr(m, "_launchd_status", lambda label: {"loaded": False})
@@ -130,23 +131,31 @@ def test_deploy_fixture_sets_env_off_argv_and_waits(node, capsys):
     requests = rows(node)
     assert [r["argv"][0] for r in requests][-3:] == ["env", "deploy", "wait"]
     env = next(r["stdin"] for r in requests if r["argv"][:2] == ["env", "bulk"])
-    assert "AGENT_STORE_PASSWORD=fixture-store-secret" in env
-    assert "AGENT_STORE_DB_SCHEMA=fixture_schema" in env
     assert "AGENT_REPO_URL=git@host.docker.internal:/srv/git/body.git" in env
+    assert "AGENT_STORE_" not in env and "AGENTKIT_DB_" not in env
+    assert "fixture-store-secret" not in env
     assert "fixture-store-secret" not in json.dumps([r["argv"] for r in requests]) + json.dumps(result)
     assert "fixture-private-material" not in json.dumps(result)
 
 
-def test_deploy_carries_no_schema_the_setting_does_not_name(node, monkeypatch, capsys):
-    monkeypatch.setattr(node.m, "find_store_setting", lambda: ({"host": "store.example.invalid",
-        "port": 5432, "database": "fixture", "user": "fixture", "sslmode": "require",
-        "db_schema": "agentkit", "password": "fixture-store-secret"},
-        {"read": "legacy", "db_schema_named": False}))
+def test_deploy_never_fills_a_database_key_a_service_declares(node, monkeypatch, capsys):
+    service = next(svc for svc in node.runtime["services"].values() if svc.get("placement") != "local")
+    service.setdefault("optional_env", []).extend(["AGENTKIT_DB_URL", "AGENTKIT_DB_PASSWORD"])
+    monkeypatch.setattr(node.m, "_project_env", lambda: {
+        "AGENTKIT_DB_URL": "postgresql://project:fixture-store-secret@project.example.invalid/p"})
     node.m.cmd_deploy(node.args)
     capsys.readouterr()
     env = next(r["stdin"] for r in rows(node) if r["argv"][:2] == ["env", "bulk"])
-    assert "AGENT_STORE_HOST=store.example.invalid" in env
-    assert "AGENT_STORE_DB_SCHEMA" not in env
+    assert "AGENTKIT_DB_" not in env and "fixture-store-secret" not in env
+
+
+def test_compose_passes_every_database_key_through_from_the_server(node):
+    from capabilities_contract import db
+    compose = node.m._compose_template("fixture", node.runtime, {}, "../../..",
+                                       "deployment/targets/test/Dockerfile")
+    for key in db.KEYS:
+        assert f"  {key}: ${{{key}:-}}" in compose
+    assert "AGENT_STORE_" not in compose
 
 
 def test_first_deploy_records_app_and_disables_auto_deploy(node, monkeypatch, capsys):
@@ -202,7 +211,11 @@ def test_status_reports_actual_fixture_facts(node, capsys):
     assert data["server"]["address"] == "192.0.2.10"
     assert data["application"]["status"] == "running:healthy"
     assert data["harness"] == {"claude": "logged_out", "codex": "logged_out"}
-    assert data["store"] == {"configured": True, "reachable": True, "tls_enforced": True}
+    assert data["store"] == {"configured": True, "reachable": True, "tls_enforced": True,
+        "setting": {"level": "environment", "sources": ["AGENTKIT_DB_URL"], "schema": "agentkit"}}
+    probe = next(script for script, _ in node.ssh if "capabilities-contract==" in script)
+    assert probe.startswith("docker exec aabbccddeeff uv run ")
+    assert "store show" not in " ".join(script for script, _ in node.ssh)
     assert data["services"][0]["placement"] == "node"
     assert data["errors"] == []
 
@@ -288,13 +301,10 @@ def test_memory_path_outside_body_refused(node, monkeypatch):
         node.m._memory_attributes(node.root)
 
 
-def test_entrypoint_pins_node_host_and_sets_store_without_password_argv(node):
+def test_entrypoint_pins_node_host_and_writes_no_store_setting(node):
     script = node.m._entrypoint_template("fixture", checkout=True)
     assert 'AGENT_GIT_KNOWN_HOSTS_B64' in script
-    assert '--password-stdin' in script
-    assert 'printf \'%s\' "$AGENT_STORE_PASSWORD"' in script
-    assert '--schema "$AGENT_STORE_DB_SCHEMA"' in script
-    assert '--password "$' not in script
+    assert 'store set' not in script and 'AGENT_STORE_' not in script
     assert subprocess.run(["bash", "-n"], input=script, text=True).returncode == 0
 
 
@@ -567,3 +577,27 @@ def test_container_discovery_without_numeric_api_id(node, monkeypatch):
     host = {"connection": "fixture"}
     assert node.m._node_container(node.root, host, "application-fixture") == "aabbccddeeff"
     assert "label=com.docker.compose.project=application-fixture" in node.ssh[-1][0]
+
+
+def test_database_probe_resolves_the_node_environment_through_the_library(tmp_path):
+    loader = importlib.machinery.SourceFileLoader("probe_deployment", str(SCRIPT))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    m = importlib.util.module_from_spec(spec)
+    loader.exec_module(m)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AGENTKIT_DB_")}
+    env.update(XDG_CONFIG_HOME=str(tmp_path / "config"), AGENTKIT_DB_HOST="127.0.0.1",
+               AGENTKIT_DB_PORT="1", AGENTKIT_DB_NAME="node", AGENTKIT_DB_USER="node",
+               AGENTKIT_DB_PASSWORD="fixture-node-secret")
+    import sys
+    done = subprocess.run([sys.executable, "-c", m._NODE_DATABASE_PROBE], cwd=tmp_path, env=env,
+                          capture_output=True, text=True, check=True)
+    assert "fixture-node-secret" not in done.stdout
+    out = json.loads(done.stdout)
+    assert out["configured"] is True and out["reachable"] is False
+    assert out["setting"]["level"] == "environment" and out["setting"]["host"] == "127.0.0.1"
+    assert out["error"]["code"] == "store_unreachable"
+    del env["AGENTKIT_DB_HOST"], env["AGENTKIT_DB_PORT"], env["AGENTKIT_DB_NAME"]
+    del env["AGENTKIT_DB_USER"], env["AGENTKIT_DB_PASSWORD"]
+    out = json.loads(subprocess.run([sys.executable, "-c", m._NODE_DATABASE_PROBE], cwd=tmp_path,
+                                    env=env, capture_output=True, text=True, check=True).stdout)
+    assert out["configured"] is False and out["error"]["code"] == "store_not_configured"

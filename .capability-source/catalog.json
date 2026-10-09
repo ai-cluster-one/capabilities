@@ -47,7 +47,7 @@
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "8c3c02232b8fe9ea709e65f514bde120b9f9290cf007b3c7c11d0ea11edbddf2",
+      "payload_sha256": "be1826003aadcd7b66facdba5eed91600ce9ff7b7809b7c17c60ca77b8812a73",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into launchd-supervised processes on a Mac, and describe the targets they deploy to."
     },
     "directo": {

@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-09 — A node takes its database only from its server's environment
+
+`deployment deploy` no longer sends the deploying machine's store setting: the `AGENT_STORE_*` values are gone from the bulk environment, a service's declared environment never fills an `AGENTKIT_DB_*` key from the Mac, and the entrypoint no longer runs `capabilities store set`, so no setting file is written in the container. The Compose file passes `AGENTKIT_DB_URL` and the other `AGENTKIT_DB_*` keys through from the server's environment, and a deploy leaves the values set there standing. `deployment node status` reports `store` from a probe run in the container through `capabilities-contract`: `configured`, the redacted `setting` with its level and sources, `reachable`, `tls_enforced`, and an `error` when one stops it. Set the variables on each existing node's server before its next deploy: a deploy no longer carries them there.
+
 ## 2026-10-08 — A node's store setting carries its schema
 
 `deployment deploy` sends the schema the machine's store setting names as `AGENT_STORE_DB_SCHEMA` beside the other `AGENT_STORE_*` values, and the node's entrypoint passes it to `capabilities store set --schema`, so the node's store setting file binds the same schema as this machine's. A setting that names no schema sends none, and the node binds `agentkit` as before. The setting is read from the machine's store setting file, or from the manager's former files while it is absent.

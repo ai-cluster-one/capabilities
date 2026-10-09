@@ -1,7 +1,9 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = [
+#     "capabilities-contract==0.4.0",
+# ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
 
@@ -131,6 +133,8 @@ USAGE
       <project>-<target> after the project's ContextKit name or recorded
       slug, and set that name, its base directory and its Compose location
       (the target's bundle) on every deploy, set environment through bulk stdin, deploy and wait for healthy.
+      The database is never sent: the node takes AGENTKIT_DB_* from the
+      server's environment, and a deploy leaves those values standing.
       On failure request the previous release. Requires agent-box-checkout, a
       committed branch and a granted connection.
   deployment rollback [--target <name>] [--to <commit>]
@@ -146,6 +150,9 @@ USAGE
       an interval job (target.sync_interval, default 60 seconds).
   deployment node status [--target <name>] [--json]
       JSON host, release, Git sync, harness, store and per-service placement.
+      store is the node's database in force, resolved in its container through
+      the shared library: level, sources and setting redacted, reachable,
+      tls_enforced.
       runtime service_policy.placement maps service names to node|local|both;
       services.<name>.placement applies to custom services.
 
@@ -4986,17 +4993,6 @@ if [ -n "${{GIT_DEPLOY_KEY_B64:-}}" ]; then
   fi
 fi
 {rebuild}
-if [ -n "${{AGENT_STORE_HOST:-}}" ]; then
-  store_args=(--host "$AGENT_STORE_HOST" --port "${{AGENT_STORE_PORT:-5432}}" --database "$AGENT_STORE_DATABASE" --user "$AGENT_STORE_USER" --sslmode "${{AGENT_STORE_SSLMODE:-require}}" --password-stdin)
-  if [ -n "${{AGENT_STORE_SSLROOTCERT:-}}" ]; then
-    store_args+=(--sslrootcert "$AGENT_STORE_SSLROOTCERT")
-  fi
-  if [ -n "${{AGENT_STORE_DB_SCHEMA:-}}" ]; then
-    store_args+=(--schema "$AGENT_STORE_DB_SCHEMA")
-  fi
-  printf '%s' "$AGENT_STORE_PASSWORD" | capabilities store set "${{store_args[@]}}" >/dev/null
-  unset AGENT_STORE_PASSWORD
-fi
 {checkout_block}
 if [ -f "$HOME/.claude/.credentials.json" ] || [ -d "$HOME/.claude/projects" ]; then
   claude_auth="claude state present"
@@ -5260,6 +5256,13 @@ priority={priority}""")
     return "\n\n".join(sections) + "\n"
 
 
+def _database_keys() -> tuple[str, ...]:
+    """The keys a project's database is resolved from, as the shared database
+    library names them."""
+    from capabilities_contract import db
+    return db.KEYS
+
+
 def _compose_template(project_name: str, runtime: dict,
                       descriptors: dict[str, dict], build_context: str,
                       dockerfile_rel: str, has_contextkit: bool = False) -> str:
@@ -5269,9 +5272,10 @@ def _compose_template(project_name: str, runtime: dict,
         "x-agent-env: &agent-env",
         "  GIT_DEPLOY_KEY_B64: ${GIT_DEPLOY_KEY_B64:-}",
         "  AGENT_GIT_KNOWN_HOSTS_B64: ${AGENT_GIT_KNOWN_HOSTS_B64:-}",
-        *[f"  AGENT_STORE_{key}: ${{AGENT_STORE_{key}:-}}" for key in
-          ("HOST", "PORT", "DATABASE", "USER", "SSLMODE", "SSLROOTCERT", "DB_SCHEMA",
-           "PASSWORD")],
+        # The database is the server's: each key passes through from the
+        # target's environment, and one left unset there is empty, which the
+        # resolver reads as not set.
+        *[f"  {key}: ${{{key}:-}}" for key in _database_keys()],
     ]
     build_args = _compiler_config(runtime)["build_args"]
     runtime_services = runtime.get("services") if isinstance(runtime.get("services"), dict) else {}
@@ -8314,6 +8318,10 @@ done
 
 
 def _node_environment(root, runtime, target, host, repo_url, key, branch):
+    # A node takes its database only from its server's environment, so no
+    # database key is filled from this machine, and the bulk update leaves the
+    # server's own values standing.
+    database_keys = set(_database_keys())
     project_values = _project_env()
     env = {}
     for service in runtime.get("services", {}).values():
@@ -8328,20 +8336,12 @@ def _node_environment(root, runtime, target, host, repo_url, key, branch):
                     if value:
                         machine_values.setdefault(k, value)
         for k in service.get("required_env", []) + service.get("optional_env", []):
+            if k in database_keys:
+                continue
             value = project_values.get(k) or machine_values.get(k) or os.environ.get(k) or defaults.get(k, "")
             if k in service.get("required_env", []) and not value and k != REPO_URL_ENV:
                 raise NodeFailure("environment_missing", f"required environment key {k} is missing", 6)
             env[k] = value
-    # The node's manager writes its own copy of the store setting from these at
-    # start, so the schema travels only when the setting names one.
-    setting, where = find_store_setting()
-    if setting:
-        if not where["db_schema_named"]:
-            setting = {k: v for k, v in setting.items() if k != "db_schema"}
-        for k in ("host", "port", "database", "user", "sslmode", "sslrootcert",
-                  "db_schema", "password"):
-            if setting.get(k) is not None:
-                env["AGENT_STORE_" + k.upper()] = str(setting[k])
     import base64
     env.update({REPO_URL_ENV: repo_url.replace(host["address"], "host.docker.internal"),
                 REPO_BRANCH_ENV: branch, "GIT_DEPLOY_KEY_B64": base64.b64encode(key.read_bytes()).decode(),
@@ -8554,6 +8554,42 @@ def cmd_node_sync(args):
     _emit({"target": target["name"], "sync": _node_sync(root, target)})
 
 
+# Run inside the node's container, in its project root, through the same library
+# and cascade every capability there resolves its database with: the setting in
+# force with its secrets redacted, whether it connects, and whether the server
+# refuses the same connection without TLS.
+_NODE_DATABASE_PROBE = """
+import json, os
+import psycopg
+from capabilities_contract import db
+out = {"configured": False, "reachable": False, "tls_enforced": False}
+try:
+    setting = db.resolve_setting(os.getcwd())
+except db.DbError as exc:
+    out["error"] = {"code": exc.slug, "message": exc.message}
+else:
+    out.update(configured=True, setting=setting.report())
+    try:
+        db.connect(application_name="deployment-node-status", setting=setting).close()
+        out["reachable"] = True
+    except db.DbError as exc:
+        out["error"] = {"code": exc.slug, "message": exc.message}
+    try:
+        psycopg.connect(**{**setting.connect_kwargs(), "sslmode": "disable"},
+                        connect_timeout=10).close()
+    except psycopg.OperationalError as exc:
+        out["tls_enforced"] = any(m in str(exc) for m in ("no encryption", "SSL off"))
+print(json.dumps(out))
+"""
+
+
+def _node_database(root, host, container):
+    from capabilities_contract import __version__
+    return json.loads(_node_exec(root, host, container, [
+        "uv", "run", "--quiet", "--no-project", "--with", f"capabilities-contract=={__version__}",
+        "python", "-c", _NODE_DATABASE_PROBE]))
+
+
 def cmd_node_status(args):
     root = _root()
     target = _node_target(root, args.target)
@@ -8588,13 +8624,7 @@ def cmd_node_status(args):
             "label=" + owner) + " --format " + shlex.quote(
             '{{.Label "com.docker.compose.service"}} {{.State}}'))
         node_services.update({line.split()[0]: line.split()[1] for line in containers.splitlines() if len(line.split()) == 2})
-        store = json.loads(_node_exec(root, host, container, ["capabilities", "store", "show", "--json"]))
-        report["store"]["configured"] = bool(store.get("configured"))
-        if report["store"]["configured"]:
-            probe = json.loads(_node_exec(root, host, container, ["capabilities", "store", "doctor", "--json"]))
-            checks = probe.get("checks") or {}
-            report["store"].update({"reachable": bool((checks.get("tls") or {}).get("ok")),
-                "tls_enforced": bool((checks.get("plain_text_refused") or {}).get("ok"))})
+        report["store"].update(_node_database(root, host, container))
     except NodeFailure as e:
         report["errors"].append({"code": e.code, "message": e.message})
     services = dict(runtime.get("services") or {})
