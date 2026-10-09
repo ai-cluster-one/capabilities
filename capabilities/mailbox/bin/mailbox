@@ -31,10 +31,15 @@ CONNECTIONS
           "imap_host":  "mail.example.com", "imap_port": 993,
           "smtp_host":  "mail.example.com", "smtp_port": 587,
           "secret_env": "MAILBOX_<ID>_APP_PASSWORD",
+          "display_name": "Jane Doe",
           "allow_write": true
         }
       }
     }
+  "display_name" is optional: the name `send` puts in front of the address
+  in the From header ("Jane Doe" <user@example.com>); without it the From
+  header is the bare address.
+
   The registry resolves project envelope first, else the machine-level
   ~/.config/mailbox/connections.json; first found wins, never merged.
 
@@ -111,6 +116,13 @@ Commands:
                                               with neither flag, reads stdin;
                                               a missing --body-file path is
                                               refused rather than sent).
+        [--bcc A ...] [--from-name NAME]      --bcc adds a blind recipient to the
+                                              SMTP envelope only: no Bcc header is
+                                              written, so no copy - To, Cc, the
+                                              Bcc copy or the Sent copy - names it.
+                                              --from-name sets the From display
+                                              name, over the connection's
+                                              "display_name".
         [--html MARKUP|F|- | --html-file F]   --html/--html-file adds an HTML
         [--in-reply-to MESSAGE-ID]            alternative beside that body, so
                                               the message carries both and each
@@ -178,7 +190,7 @@ import sys
 from datetime import date, datetime
 from email.message import EmailMessage
 from email.policy import SMTP
-from email.utils import format_datetime, getaddresses, make_msgid
+from email.utils import format_datetime, formataddr, getaddresses, make_msgid
 from pathlib import Path
 from typing import NoReturn
 
@@ -4032,6 +4044,7 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
     return {
         "id": cid, "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
         "user": entry["address"],
+        "display_name": str(entry.get("display_name") or "").strip() or None,
         "password": password,
         "imap_host": entry["imap_host"],
         "imap_port": int(entry.get("imap_port", PORT_DEFAULTS["imap_port"])),
@@ -4657,10 +4670,14 @@ def _folder_has_message_id(mb: MailBox, folder: str, message_id: str) -> bool:
 
 def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
              body: str, attach: list[str], in_reply_to: str | None,
-             html: str | None = None) -> dict:
+             html: str | None = None, bcc: list[str] | None = None,
+             from_name: str | None = None) -> dict:
     sent_at = datetime.now().astimezone()
     msg = EmailMessage()
-    msg["From"] = cfg["user"]
+    # The From display name: --from-name, else the connection's "display_name",
+    # else the bare address. The envelope sender is always the bare address.
+    name = (from_name if from_name is not None else cfg.get("display_name")) or ""
+    msg["From"] = formataddr((name.strip(), cfg["user"])) if name.strip() else cfg["user"]
     msg["To"] = ", ".join(to)
     if cc:
         msg["Cc"] = ", ".join(cc)
@@ -4685,11 +4702,18 @@ def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
         msg.add_attachment(p.read_bytes(), maintype=maintype, subtype=subtype, filename=p.name)
 
     from_addr = getaddresses([str(msg["From"])])[0][1]
+    # Bcc recipients are SMTP envelope recipients only: no Bcc header is ever
+    # written into the message, so no copy of it - the To and Cc copies, the
+    # Bcc copy itself, or the saved Sent copy - names them.
+    bcc_addrs = [addr for _, addr in getaddresses(list(bcc or [])) if addr]
+    if bcc and len(bcc_addrs) != len(bcc):
+        _die(6, "bad_bcc", f"cannot read a --bcc address from: {', '.join(bcc)}",
+             "message was not sent")
     recipient_addrs = [
         addr for _, addr in getaddresses(
             [str(msg["To"]), str(msg["Cc"] or "")]
-        )
-    ]
+        ) if addr
+    ] + bcc_addrs
     try:
         "".join([from_addr, *recipient_addrs]).encode("ascii")
         international = False
@@ -4749,7 +4773,8 @@ def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
             # an apparent failure that invites the caller to resend it.
             pass
 
-    result = {"sent": True, "to": to, "cc": cc, "subject": subject,
+    result = {"sent": True, "to": to, "cc": cc, "bcc": bcc_addrs,
+              "from": str(msg["From"]), "subject": subject,
               "html": html is not None,
               "message_id": str(msg["Message-ID"]),
               "attachments": [Path(f).name for f in attach],
@@ -4871,6 +4896,10 @@ def main() -> None:
     sp = sub.add_parser("send", parents=[conn_parent], help="send a message")
     sp.add_argument("--to", action="append", required=True)
     sp.add_argument("--cc", action="append", default=[])
+    sp.add_argument("--bcc", action="append", default=[],
+                    help="blind recipient: SMTP envelope only, never a header")
+    sp.add_argument("--from-name", default=None,
+                    help="From display name; overrides the connection's display_name")
     sp.add_argument("--subject", required=True)
     sp.add_argument("--body", default=None, help="body text, or '-' for stdin")
     sp.add_argument("--body-file", default=None, help="file path or '-' for stdin")
@@ -4930,7 +4959,7 @@ def main() -> None:
         elif args.html_file is not None:
             html = _read_body(args.html_file)
         _emit(cmd_send(cfg, args.to, args.cc, args.subject, body, args.attach,
-                       args.in_reply_to, html))
+                       args.in_reply_to, html, bcc=args.bcc, from_name=args.from_name))
 
 
 if __name__ == "__main__":
