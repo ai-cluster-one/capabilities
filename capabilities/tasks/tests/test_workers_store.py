@@ -201,6 +201,40 @@ def test_a_save_over_a_version_already_replaced_is_refused(lab):
 
 
 @needs_store
+def test_the_store_refuses_any_writer_editing_deleting_or_truncating_a_version(lab):
+    import psycopg
+    first = ok(save(lab, "alpha", ALPHA))
+    table = f"{lab['schema']}.tasks_workers"
+
+    def refusal(sql: str, *params) -> psycopg.Error:
+        with psycopg.connect(DSN) as conn:
+            with pytest.raises(psycopg.Error) as raised:
+                conn.execute(sql, params)
+        return raised.value
+
+    version = first["version"]
+    for sql, params in ((f"update {table} set body = 'rewritten' where id = %s", (version,)),
+                        (f"update {table} set active = false, spec = '{{}}' where id = %s",
+                         (version,)),
+                        (f"delete from {table} where id = %s", (version,)),
+                        # A plain truncate is already refused by the raises' foreign key.
+                        (f"truncate {table} cascade", ())):
+        error = refusal(sql, *params)
+        assert error.sqlstate == "23001" and error.diag.constraint_name == "tasks_workers_history"
+        assert "never edited or deleted" in str(error)
+    shown = ok(cli(lab, "workers", "show", "alpha"))
+    assert shown["version"] == version and shown["body"] == "Do the alpha work."
+
+    # Moving active is the one write a version takes, either way.
+    with psycopg.connect(DSN) as conn:
+        conn.execute(f"update {table} set active = false where id = %s", (version,))
+    assert [active for _p, active, _v in rows(lab, "alpha")] == [False]
+    with psycopg.connect(DSN) as conn:
+        conn.execute(f"update {table} set active = true where id = %s", (version,))
+    assert [active for _p, active, _v in rows(lab, "alpha")] == [True]
+
+
+@needs_store
 def test_a_worker_the_capability_would_refuse_is_never_saved(lab):
     error = refused(save(lab, "alpha", ALPHA.replace("profile: plain", "profile: plain\nfence: x")), 6)
     assert error["code"] == "worker_invalid" and "'fence', which nothing reads" in error["message"]

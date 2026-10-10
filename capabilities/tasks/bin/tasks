@@ -14181,7 +14181,7 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 # callva-harness-runner owns and ships as steps of its own, applied under its own
 # ledger before these, everywhere these are: `_profile_tables` names them.
 STORE_MAJOR = 1
-STORE_MINOR = 2
+STORE_MINOR = 3
 
 _MOVE_FROM_SCHEMA_TASKS = r"""
 DO $move$
@@ -14633,11 +14633,34 @@ comment on column tasks_executions.profile_id is
   'profile the harness library ships, and for a claim that named no worker.';
 """
 
+_WORKERS_HISTORY_GUARD = r"""
+-- A worker version is history: the store refuses every write to it but moving
+-- active, whoever the writer is, so a raise's worker_id keeps meaning the role
+-- and fence it ran under.
+create or replace function tasks_workers_keep_history() returns trigger as $$
+begin
+  if tg_op = 'UPDATE' and (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') then
+    return new;
+  end if;
+  raise exception 'a worker version is never edited or deleted: % on tasks_workers is refused, and only active may move; save a new version instead', lower(tg_op)
+    using errcode = 'restrict_violation', constraint = 'tasks_workers_history';
+end;
+$$ language plpgsql;
+
+drop trigger if exists tasks_workers_keep_history_row on tasks_workers;
+create trigger tasks_workers_keep_history_row before update or delete on tasks_workers
+    for each row execute function tasks_workers_keep_history();
+drop trigger if exists tasks_workers_keep_history_truncate on tasks_workers;
+create trigger tasks_workers_keep_history_truncate before truncate on tasks_workers
+    for each statement execute function tasks_workers_keep_history();
+"""
+
 STORE_STEPS = [
     ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
     ("0002-tables", _TABLES_SHAPE),
     ("0003-workers", _WORKERS_TABLE),
     ("0004-profiles", _PROFILE_COLUMN),
+    ("0005-workers-history", _WORKERS_HISTORY_GUARD),
 ]
 
 

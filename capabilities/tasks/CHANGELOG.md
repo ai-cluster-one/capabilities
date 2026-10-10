@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-11 — The store refuses editing, deleting or truncating a worker version
+
+`tasks_workers` keeps every version as history for every writer, not only the CLI: the store refuses an `UPDATE` that changes any column but `active`, a `DELETE`, and a `TRUNCATE ... CASCADE` of the table, with SQLSTATE `23001` and the constraint name `tasks_workers_history`; a plain `TRUNCATE` stays refused by the raises' foreign key. Moving `active` either way still succeeds, so `workers save` and `workers remove` are unchanged. The store step `0005-workers-history` adds the guard; the tables' version is 1.3.
+
 ## 2026-10-10 — A task goes to another project only by that project's grant
 
 A worker's `takes` filter may name `accepts_from`, a list of other projects' ids: a grant, which takes the tasks those projects raised and assigned to this one - their assignee this project's id - by status, type and tags, and none of this project's own. A filter without it takes only the project's own tasks, as before. A grant names no `assignee` and no `${VAR}`, and its types are not taken away from `default`.
