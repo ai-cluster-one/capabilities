@@ -1,0 +1,12 @@
+# Profile "agentrooms-claude": an agent's turn in a room, on claude.
+#
+# The turn answers from the project it runs in: every tool without a
+# permission prompt, and the user's, project's and local settings, as
+# `claude -p` loads them. A turn is ended sooner by the agent's turn_timeout;
+# this deadline is only the ceiling.
+
+harness = "claude"
+model = "opus"
+permission_mode = "bypassPermissions"
+setting_sources = ["user", "project", "local"]
+timeout_seconds = 3600

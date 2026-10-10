@@ -1,0 +1,13 @@
+# Profile "agentrooms-codex": an agent's turn in a room, on codex.
+#
+# The turn answers from the project it runs in: full access, approvals never
+# asked, and the project's hooks run without trust recorded on the machine. A
+# turn is ended sooner by the agent's turn_timeout; this deadline is only the
+# ceiling.
+
+harness = "codex"
+model = "sol"
+approval_policy = "never"
+codex_config = { sandbox_mode = "danger-full-access" }
+bypass_hook_trust = true
+timeout_seconds = 3600

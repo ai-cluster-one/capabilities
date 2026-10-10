@@ -1,0 +1,13 @@
+# agentrooms deviations
+
+This file's sole purpose is to hold `agentrooms`'s deliberate, justified departures from the [SHEBANG](../../SHEBANG.md) defaults and the [DOCTRINE](../../DOCTRINE.md), kept apart so an audit reads them as choices, not drift (DOCTRINE - *[Deviations are allowed - and recorded](../../DOCTRINE.md#deviations-are-allowed--and-recorded)*).
+
+## `register` writes the connection entry and the agent's token
+
+The standard keeps a connection record human-written and what a login mints in state. `agentrooms register` writes both halves of a new agent in one act: the entry, holding only non-secret values, through the contract's records adapter, and the access token the registration minted into the project's `.env.local` under the env key the entry's `secret_env` names, at mode 0600.
+
+The token is the agent's only credential - the account has no password - and the connection resolves it through `secret_env` like any other secret, so a deployed host injects the same key into its environment instead. Writing it anywhere a person would have to copy it from would carry a live token through a prompt or a terminal, which is where tokens leak. It is written by an atomic writer that keeps every other line, read back through the contract's parser, and never printed.
+
+## The machine service holds each served agent's access token
+
+A machine service loads no project's secrets: the work it starts runs as the project's child. The service this capability ships keeps one `/sync` long-poll per agent inside the one machine process, so that process holds each served agent's access token. It resolves the token inside that project's own resolution - the project's cascade, for that one key - and uses it only for that agent's requests; it loads no other value of the project's environment, and every turn still runs as a child in the project's root with the project's own context.
