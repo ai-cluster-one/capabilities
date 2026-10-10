@@ -78,6 +78,13 @@ whose claim sweeps lapsed leases, the daemon renews the lease of the raise
 each of its live turns reported. A turn whose daemon is gone keeps its raise
 only until that lease runs out, unless a daemon serving the project adopts it
 first, and then ends itself.
+
+On a Mac every turn keeps the machine out of idle sleep for as long as it
+runs, and nothing else here does: beside each turn it starts, and each it
+adopts, the daemon starts `caffeinate -i -w` on the turn's pid, which holds the
+assertion until that process ends. The holder runs in a session of its own, so
+it outlives the daemon as the turn does, and the daemon lets go of it when the
+turn ends. Elsewhere no assertion is taken.
 """
 
 from __future__ import annotations
@@ -153,6 +160,12 @@ PING_SECONDS = 120.0
 _SWEEP_WAKES = {"start", "poll", "pickup", "reload", "relisten", "reconnect", "resume"}
 
 
+# Whether turns keep the machine awake, and the command that does it: an
+# idle-sleep assertion `caffeinate` holds until the pid it is given ends.
+HOLD_AWAKE = sys.platform == "darwin"
+AWAKE_COMMAND = ("/usr/bin/caffeinate", "-i", "-w")
+
+
 def now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
@@ -173,6 +186,30 @@ def pid_alive(pid: int | None) -> bool:
         return False
     except PermissionError:
         return True
+
+
+def hold_awake(pid: int | None) -> subprocess.Popen | None:
+    """Keep the machine out of idle sleep until the process `pid` ends, and
+    return what holds it: on a Mac only, and nothing when it cannot start. It
+    runs in a session of its own, so it outlives the daemon that started it."""
+    if not HOLD_AWAKE or not pid or pid <= 0:
+        return None
+    try:
+        return subprocess.Popen([*AWAKE_COMMAND, str(int(pid))], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True, close_fds=True)
+    except (OSError, ValueError):
+        return None
+
+
+def let_sleep(holder: subprocess.Popen | None) -> None:
+    """Release what `hold_awake` took, and reap it."""
+    if holder is None:
+        return
+    with contextlib.suppress(OSError):
+        holder.terminate()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        holder.wait(timeout=5)
 
 
 def read_pid(state_dir: Path) -> int | None:
@@ -465,6 +502,8 @@ class Turn:
         # the task that child is about to take.
         self.phase = "claiming"
         self.claim: dict | None = None
+        # What keeps the machine awake while this turn runs, on a Mac.
+        self.awake: subprocess.Popen | None = None
 
     def ended(self) -> tuple[bool, int | None]:
         """Whether the turn's process has ended, and its exit code: always None
@@ -750,6 +789,7 @@ class ProjectSlot:
                  + (f"; paused, starting no turn on {', '.join(held)}" if held else ""))
         for turn in adopted:
             self.turns[turn.id] = turn
+            turn.awake = hold_awake(turn.pid)
             turn.read_receipt()
             self.log(f"turn {turn.id} adopted: worker {turn.worker}, pid {turn.pid}, "
                      f"started {turn.started_at}"
@@ -1019,6 +1059,7 @@ class ProjectSlot:
         turn = Turn(turn_id, worker, process, receipt, output, errors, reason, self.slug,
                     lstart=process_started(process.pid),
                     record=self.turns_dir / f"{turn_id}.json")
+        turn.awake = hold_awake(process.pid)
         # The record is what lets the next daemon adopt this turn if this one
         # stops first; one that cannot be written leaves the turn unadoptable.
         with contextlib.suppress(OSError):
@@ -1051,6 +1092,7 @@ class ProjectSlot:
         from its output file either way."""
         turn.read_receipt()
         del self.turns[turn.id]
+        let_sleep(turn.awake)
         said = self._said(turn)
         remembered = self._remember_holds(turn)
         self.log(f"turn {turn.id} ended: worker {turn.worker}, "
@@ -1230,6 +1272,7 @@ class ProjectSlot:
                 while not turn.ended()[0] and time.monotonic() < deadline:
                     time.sleep(0.1)
             del self.turns[turn.id]
+            let_sleep(turn.awake)
             task = (turn.claim or {}).get("task")
             if turn.claim and turn.claim.get("execution"):
                 try:
