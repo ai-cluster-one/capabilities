@@ -95,10 +95,13 @@ def project(tmp_path, monkeypatch):
     for name in ("development", "reachability", "evaluation"):
         (tmp_path / "routines" / f"{name}.md").write_text(f"# {name}\n")
     envelope = tmp_path / "capabilities" / "tasks"
-    (envelope / "workers").mkdir(parents=True)
-    (envelope / "workers" / "implementation.md").write_text(IMPLEMENTATION)
-    (envelope / "workers" / "evaluation.md").write_text(EVALUATION)
-    (envelope / "profiles").mkdir()
+    # The project's workers are the store's; a case keeps their documents
+    # beside the project and they are served as the active versions.
+    _cli.worker_docs(tmp_path).mkdir()
+    worker_file(tmp_path, "implementation").write_text(IMPLEMENTATION)
+    worker_file(tmp_path, "evaluation").write_text(EVALUATION)
+    _cli.serve_workers(mod, monkeypatch, tmp_path)
+    (envelope / "profiles").mkdir(parents=True)
     (envelope / "profiles" / "implementation.toml").write_text(IMPLEMENTATION_PROFILE)
     (envelope / "profiles" / "evaluation.toml").write_text(EVALUATION_PROFILE)
     monkeypatch.setattr(mod, "_project_root", lambda: tmp_path)
@@ -111,7 +114,8 @@ def project(tmp_path, monkeypatch):
 
 
 def worker_file(project: Path, name: str) -> Path:
-    return project / "capabilities" / "tasks" / "workers" / f"{name}.md"
+    """The document of a worker of `project`, as the store keeps it."""
+    return _cli.worker_docs(project) / f"{name}.md"
 
 
 def profile_file(project: Path, name: str) -> Path:
@@ -160,7 +164,7 @@ def test_a_worker_is_read_whole(project):
     assert worker["handler"] == "claude --model claude-opus-5 --effort max"
     assert worker["park_hint"].startswith("Check the lane")
     assert worker["body"] == "HOW TO RUN IT\n\nimplementation text."
-    assert worker["source"] == "project" and worker["missing"] == []
+    assert worker["source"] == "store" and worker["missing"] == []
 
 
 def test_the_front_matter_is_yaml_and_the_body_is_everything_after_it(project):
@@ -175,13 +179,15 @@ profile: implementation
     assert worker["body"] == "line one\n\n---\n\nline two"
 
 
-def test_a_file_without_front_matter_is_refused(project):
-    worker_file(project, "probe").write_text("takes: [chore]\n\nbody\n")
-    [said] = problems_of("probe")
-    assert "first line is `---`" in said
-    worker_file(project, "probe").write_text("---\ntakes: [chore]\n\nbody\n")
-    [said] = problems_of("probe")
-    assert "never closed" in said
+def test_a_document_without_front_matter_is_refused(project):
+    with pytest.raises(mod.Refusal) as refused:
+        mod._parse_worker("takes: [chore]\n\nbody\n", "probe.md")
+    assert refused.value.code == "worker_invalid"
+    assert "first line is `---`" in refused.value.message
+    with pytest.raises(mod.Refusal) as refused:
+        mod._parse_worker("---\ntakes: [chore]\n\nbody\n", "probe.md")
+    assert refused.value.code == "worker_invalid"
+    assert "never closed" in refused.value.message
 
 
 def test_an_unknown_key_is_refused(project):
@@ -288,7 +294,7 @@ def test_an_unknown_worker_is_refused_and_the_known_ones_named(project, capsys):
         mod._worker("nobody")
     assert exit_code.value.code == 3
     error = json.loads(capsys.readouterr().err)["error"]
-    assert "nobody" in error["message"] and "workers" in error["message"]
+    assert "nobody" in error["message"] and "in this project" in error["message"]
     assert "default, evaluation, implementation" in error["hint"]
 
 
@@ -318,7 +324,7 @@ def test_the_report_says_what_each_profile_sets_and_no_fence(project):
     assert all("fence" not in row for row in rows)
     assert by_name["implementation"]["profile"]["permission_mode"] == "bypassPermissions"
     assert by_name["evaluation"]["profile"]["add_dirs"] == ["/srv/a-checkout"]
-    assert by_name["implementation"]["source"] == "project"
+    assert by_name["implementation"]["source"] == "store"
     assert by_name["implementation"]["routines"] == ["development", "reachability"]
 
 
@@ -387,16 +393,16 @@ def test_the_shipped_default_ships_inside_the_bundle():
     assert mod._shipped_workers_dir() == mod._bundle_dir() / "workers"
 
 
-def test_a_project_file_replaces_the_shipped_default_whole(project):
-    path = write_worker(project, "default", "takes: [chore]\nprofile: implementation",
-                        body="the project's own.")
+def test_a_stored_worker_replaces_the_shipped_default_whole(project):
+    write_worker(project, "default", "takes: [chore]\nprofile: implementation",
+                 body="the project's own.")
     worker = mod._worker("default")
-    assert worker["source"] == "project" and worker["body"] == "the project's own."
+    assert worker["source"] == "store" and worker["body"] == "the project's own."
     assert worker["catch_all"] is False and worker["types"] == ["chore"]
     rows, _broken = mod._workers_report()
     row = next(row for row in rows if row["worker"] == "default")
-    assert row["path"] == str(path)
-    assert row["shadows"].endswith("workers/default.md") and row["shadows"] != str(path)
+    assert "path" not in row and row["version"] == worker["version"]
+    assert row["shadows"] == str(mod._shipped_workers_dir() / "default.md")
 
 
 def test_enabled_false_switches_the_default_off(project, capsys):
@@ -416,7 +422,7 @@ def test_enabled_false_alone_is_a_whole_file(project):
     rows, broken = mod._workers_report()
     assert broken == []
     row = next(r for r in rows if r["worker"] == "default")
-    assert row["enabled"] is False and row["source"] == "project"
+    assert row["enabled"] is False and row["source"] == "store"
 
 
 def test_a_disabled_worker_still_owns_its_types(project):
@@ -426,7 +432,7 @@ def test_a_disabled_worker_still_owns_its_types(project):
 
 
 def test_a_worker_that_cannot_be_read_still_owns_the_types_it_names(project):
-    """One typo in a worker file must not send its types to the catch-all."""
+    """One typo in a worker must not send its types to the catch-all."""
     for broken in ("takes:", ):
         rewrite(worker_file(project, "implementation"), broken, "instructions: [a.md]\ntakes:")
     assert problems_of("implementation")
@@ -437,18 +443,26 @@ def test_a_worker_that_cannot_be_read_still_owns_the_types_it_names(project):
     assert mod._worker("default")["not_types"] == ["change", "defect", "proposal"]
 
 
-def test_a_file_whose_types_cannot_be_read_stops_the_default(project, capsys):
-    path = worker_file(project, "implementation")
-    path.write_text("---\ntakes: [defect, change\nprofile: implementation\n---\n\nbody\n")
+def test_a_worker_whose_types_cannot_be_read_stops_the_default(project, capsys):
+    # A document whose front matter is not YAML never becomes a version.
+    with pytest.raises(mod.Refusal) as refused:
+        mod._parse_worker("---\ntakes: [defect, change\nprofile: implementation\n---\n\n"
+                          "body\n", "implementation.md")
+    assert refused.value.code == "worker_invalid"
+    # A version whose `takes` names no types anyone can know stops the default.
+    write_worker(project, "implementation", "takes: [defect, [change]]\n"
+                 "profile: implementation", body="body")
+    where = mod._declarations()["implementation"]["where"]
+    assert where.startswith("worker 'implementation' version ")
     with pytest.raises(SystemExit) as exit_info:
         mod._worker("default")
     assert exit_info.value.code == 6
     error = json.loads(capsys.readouterr().err)["error"]
     assert error["code"] == "worker_invalid"
-    assert "takes nothing while a worker file's types cannot be read" in error["message"]
-    assert str(path) in error["message"]
+    assert "takes nothing while a worker's types cannot be read" in error["message"]
+    assert where in error["message"]
     [said] = problems_of("default")
-    assert str(path) in said
+    assert where in said
     # Switched off, the default has nothing to be stopped from.
     write_worker(project, "default", "enabled: false")
     assert problems_of("default") == []
@@ -456,9 +470,9 @@ def test_a_file_whose_types_cannot_be_read_stops_the_default(project, capsys):
 
 def test_types_that_are_not_names_cannot_be_known(project):
     write_worker(project, "probe", "takes: {defect: 1}\nprofile: implementation")
-    assert isinstance(mod._types_named(worker_file(project, "probe")), str)
+    assert isinstance(mod._types_named(mod._declarations()["probe"]), str)
     write_worker(project, "probe", "takes: defect\nprofile: implementation")
-    assert mod._types_named(worker_file(project, "probe")) == {"defect"}
+    assert mod._types_named(mod._declarations()["probe"]) == {"defect"}
 
 
 def test_a_type_run_on_request_is_left_alone_by_the_default(project):
@@ -539,7 +553,7 @@ def test_a_project_still_carrying_workers_toml_is_refused_and_told_where_workers
         assert exit_info.value.code == 6
         error = json.loads(capsys.readouterr().err)["error"]
         assert "workers.toml is no longer read" in error["message"]
-        assert str(project / "capabilities" / "tasks" / "workers") in error["message"]
+        assert "kept in the store" in error["message"]
 
 
 def test_nothing_reads_an_instructions_folder(project):
@@ -701,7 +715,7 @@ def test_a_named_task_of_a_type_the_worker_does_not_take_is_refused():
     assert "does not take the type 'triage'" in said
     said = mod._type_refusal({"type": "defect"},
                              {"worker": "default", "refuse_types": ["defect"]})
-    assert "another worker file names 'defect'" in said
+    assert "another worker names 'defect'" in said
     assert mod._type_refusal({"type": "chore"},
                              {"worker": "default", "refuse_types": ["defect"]}) is None
 
@@ -1206,6 +1220,9 @@ def store(monkeypatch):
     # The ledger is scoped by project, so a verb called straight has to stand
     # somewhere the way `main` makes it stand somewhere.
     monkeypatch.setattr(mod, "PROJECT", HERE)
+    # The workers a case writes are saved in this store, so a raise names a
+    # version it holds.
+    _cli.keep_served_workers_in_store(mod, monkeypatch, schema)
     with psycopg.connect(DSN, autocommit=True) as conn:
         _cli.make_tables(mod, schema)
         try:
@@ -1610,7 +1627,7 @@ def test_the_default_takes_only_what_no_other_worker_takes(project, store, monke
     with pytest.raises(SystemExit) as exit_info:
         mod.cmd_run(entry, ["default", "--key", "t-defect", "--apply"])
     assert exit_info.value.code == 6
-    assert "another worker file names 'defect'" in json.loads(
+    assert "another worker names 'defect'" in json.loads(
         capsys.readouterr().err)["error"]["message"]
     mod.cmd_show(entry, ["t-defect"])
     assert _answer(capsys)["task"]["status"] == "todo"
@@ -1686,7 +1703,7 @@ def test_a_type_run_on_request_is_taken_only_when_named(project, store, monkeypa
 @needs_store
 def test_a_broken_worker_file_leaves_its_types_to_nobody(project, store, monkeypatch,
                                                          capsys):
-    """A worker file whose front matter parses but is invalid still owns the
+    """A worker whose settings are read but are invalid still owns the
     types it names: the defect is claimed by nobody rather than by the default."""
     entry, schema, conn = store
     rewrite(worker_file(project, "implementation"), "takes:", "instructions: [a.md]\ntakes:")
@@ -1711,11 +1728,12 @@ def test_a_broken_worker_file_leaves_its_types_to_nobody(project, store, monkeyp
 
 
 @needs_store
-def test_an_unparseable_worker_file_stops_the_default_entirely(project, store,
-                                                               monkeypatch, capsys):
+def test_a_worker_whose_types_cannot_be_read_stops_the_default_entirely(
+        project, store, monkeypatch, capsys):
     entry, schema, conn = store
-    path = worker_file(project, "implementation")
-    path.write_text("---\ntakes: [defect, change\nprofile: implementation\n---\n\nbody\n")
+    write_worker(project, "implementation", "takes: [defect, [change]]\n"
+                 "profile: implementation", body="body")
+    where = mod._declarations()["implementation"]["where"]
     mod.cmd_add(entry, ["--type", "chore", "--title", "A probe", "--key", "t-chore",
                         "--status", "todo"])
     capsys.readouterr()
@@ -1726,7 +1744,7 @@ def test_an_unparseable_worker_file_stops_the_default_entirely(project, store,
             mod.cmd_run(entry, args)
         assert exit_info.value.code == 6
         error = json.loads(capsys.readouterr().err)["error"]
-        assert error["code"] == "worker_invalid" and str(path) in error["message"]
+        assert error["code"] == "worker_invalid" and where in error["message"]
     assert recorder.prompts == []
     assert conn.execute(f"select count(*) from {schema}.tasks_executions").fetchone()[0] == 0
     mod.cmd_show(entry, ["t-chore"])

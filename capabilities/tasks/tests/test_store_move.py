@@ -135,7 +135,11 @@ def fresh_schema():
 
 
 def rows(conn, schema: str, table: str) -> list[tuple]:
-    return conn.execute(f"select * from {schema}.{table} order by id").fetchall()
+    """Every row of `table`, without the worker version a raise records, which
+    the previous store never held."""
+    found = conn.execute(f"select * from {schema}.{table} order by id")
+    kept = [at for at, column in enumerate(found.description) if column.name != "worker_id"]
+    return [tuple(row[at] for at in kept) for row in found.fetchall()]
 
 
 def tables_in(conn, schema: str) -> list[str]:
@@ -193,7 +197,7 @@ def test_the_tables_are_declared_for_the_contracts_migrate():
     assert mod.TABLES is True and mod._tables_declared()
     steps, major, minor = mod._tables()
     assert [step_id for step_id, _sql in steps] == ["0001-move-from-schema-tasks",
-                                                    "0002-tables"]
+                                                    "0002-tables", "0003-workers"]
     assert (major, minor) == (mod.STORE_MAJOR, mod.STORE_MINOR)
     names = [key["key"] for key in mod.CRED_KEYS]
     assert names == ["timezone"]
@@ -204,11 +208,11 @@ def test_the_tables_are_declared_for_the_contracts_migrate():
 @needs_store
 def test_a_fresh_store_gets_every_table_under_the_tasks_prefix(fresh_schema):
     done = migrate(fresh_schema)
-    assert done.applied == ["0001-move-from-schema-tasks", "0002-tables"]
+    assert done.applied == ["0001-move-from-schema-tasks", "0002-tables", "0003-workers"]
     with raw() as conn:
         assert tables_in(conn, fresh_schema) == [
             "schema_ledger", "schema_version", "tasks_activities", "tasks_changes",
-            "tasks_executions", "tasks_tasks"]
+            "tasks_executions", "tasks_tasks", "tasks_workers"]
         assert conn.execute("select to_regnamespace('tasks')").fetchone()[0] is None
     assert migrate(fresh_schema).applied == []
 
@@ -222,11 +226,15 @@ def test_the_previous_store_is_moved_whole_into_the_bound_schema(old_store):
     assert len(before["tasks"]) == 3 and len(before["task_executions"]) == 2
 
     done = migrate(old_store)
-    assert done.applied == ["0001-move-from-schema-tasks", "0002-tables"]
+    assert done.applied == ["0001-move-from-schema-tasks", "0002-tables", "0003-workers"]
 
     with raw() as conn:
         for old, new in TABLES.items():
             assert rows(conn, old_store, new) == before[old], new
+        # The raises moved gain the worker version a raise records from now
+        # on, and name none.
+        assert conn.execute(f"""select count(*) from {old_store}.tasks_executions
+                                 where worker_id is not null""").fetchone()[0] == 0
         # The running raise holds its task as it did, its lease untouched.
         [held] = conn.execute(f"""select status, lease_until > now() from
                                   {old_store}.tasks_executions where ended_at is null""").fetchall()
@@ -424,13 +432,13 @@ def test_migrate_status_then_migrate_then_status(tmp_path, fresh_schema):
     first = json.loads(cli(lab, "migrate", "status").stdout)
     assert (first["owner"], first["schema"], first["state"]) == ("tasks", fresh_schema,
                                                                  "pending")
-    assert first["pending"] == ["0001-move-from-schema-tasks", "0002-tables"]
+    assert first["pending"] == ["0001-move-from-schema-tasks", "0002-tables", "0003-workers"]
     with raw() as conn:
         assert tables_in(conn, fresh_schema) == []
     done = cli(lab, "migrate")
     assert done.returncode == 0, done.stderr
     assert json.loads(done.stdout)["applied"] == ["0001-move-from-schema-tasks",
-                                                  "0002-tables"]
+                                                  "0002-tables", "0003-workers"]
     then = json.loads(cli(lab, "migrate", "status").stdout)
     assert then["state"] == "current" and then["pending"] == []
     assert then["store"] == {"major": mod.STORE_MAJOR, "minor": mod.STORE_MINOR}
@@ -449,7 +457,8 @@ def test_an_ordinary_call_brings_missing_tables_up_once(tmp_path, fresh_schema):
     assert done.returncode == 0, done.stderr
     said = [json.loads(line) for line in done.stderr.splitlines() if line.strip()]
     assert said == [{"migrated": {"schema": fresh_schema,
-                                  "applied": ["0001-move-from-schema-tasks", "0002-tables"]}}]
+                                  "applied": ["0001-move-from-schema-tasks", "0002-tables",
+                                              "0003-workers"]}}]
     again = cli(lab, "list")
     assert again.returncode == 0 and again.stderr == ""
 

@@ -298,7 +298,7 @@ def test_a_watched_lease_that_runs_out_ends_the_turn(store, capsys):
 @needs_store
 def test_the_service_renews_by_the_cap_its_turn_reported(project, store, capsys):
     """The receipt carries the turn's `limits.lease_seconds`, so the service
-    renews it without reading the worker file, and never past that cap."""
+    renews it without reading the worker, and never past that cap."""
     entry, schema, conn = store
     tid = add(entry, capsys, "t-cap")
     execution = claim(entry, capsys, "t-cap", lease="5")

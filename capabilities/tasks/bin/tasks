@@ -50,6 +50,12 @@ READING
                                   stay connected and print one JSON line per
                                   change to a task that scope reads, as it
                                   happens, until stopped. See WATCH
+  tasks workers list              this project's workers: each stored one's
+                                  active version, and the shipped ones
+  tasks workers show <name> [--version ID]
+                                  one worker whole - its settings, its body,
+                                  and `text`, the document a save takes
+  tasks workers history <name>    every version of it, oldest first
 
 WRITING  (needs allow_write on the connection; exit 4 otherwise)
   tasks add --type T --title TEXT [fields]      create one
@@ -64,6 +70,10 @@ WRITING  (needs allow_write on the connection; exit 4 otherwise)
   tasks meta rm <task> <key> [key...]           remove keys by name
   tasks activity <task> "what happened"          record real work done,
                                                  written in Markdown
+  tasks workers save <name> <file|-> [--base ID]  save a worker's new version;
+                                                see WORKERS
+  tasks workers remove <name> [--base ID]       take a worker out of the project
+  tasks workers import [--apply]                move worker files into the store
 
 EXECUTION  (also needs allow_write)
   tasks claim [filters | --key KEY] [--lease 3h] [--worker NAME] [--handler CMD]
@@ -252,11 +262,12 @@ ONE TURN OF THE CONVEYOR
   for the turn names both.
 
 WORKERS
-  A worker is one file in the consuming project's capability envelope,
-  `capabilities/tasks/workers/<name>.md`: Markdown whose YAML front matter is
-  its settings and whose body is its instruction. The shape of the file is this
-  capability's contract; everything in it is the project's. A worker is run by
-  its name, which is the file's name without `.md`.
+  A worker is kept in the store, in the project it belongs to, as versions:
+  one row per version and one active version per name. It is written as a
+  Markdown document whose YAML front matter is its settings and whose body is
+  its instruction, and saved by its name with `tasks workers save <name>
+  <file>`. The shape of the document is this capability's contract;
+  everything in it is the project's. A worker is run by its name.
 
     ---
     enabled: true                 # default true; false and it never claims
@@ -287,7 +298,7 @@ WORKERS
     What this worker is and how it carries the work: its role, how it works,
     and what done means for it.
 
-  Any other key is refused. `description` is shown by `doctor` beside the
+  Any other key is refused, at the save as at every read. `description` is shown by `doctor` beside the
   worker and is the first paragraph of the frame its turn receives, before
   anything else in it. `limits.hold_seconds_on_exhaustion` is still read, as
   `cool_down_seconds`, and `doctor` names it; a worker that names neither
@@ -338,18 +349,18 @@ WORKERS
   runs on request; the narrowing by assignee and tags does not apply to a task
   named. Any other is refused before anything is claimed.
 
-  This capability ships two workers. `default` takes every todo task of a type
-  no project worker file names in `takes` or `on_request` - enabled or not, readable or
-  not, so switching a worker off or breaking its file never hands its types to
+  This capability ships two workers, as files of its own. `default` takes every todo task of a type
+  no project worker names in `takes` or `on_request` - enabled or not, readable or
+  not, so switching a worker off or breaking it never hands its types to
   `default` - on the library's `claude-act` profile, with no routines. While a
-  worker file's types cannot be read at all, `default` takes nothing: `run`
-  refuses it naming the file, and `doctor` says so. Its body tells the turn to treat the task as an
+  worker's types cannot be read at all, `default` takes nothing: `run`
+  refuses it naming the worker, and `doctor` says so. Its body tells the turn to treat the task as an
   assignment given within the project's own authority: work out from the task,
   its trail and the project's own context what is asked, act inside what the
   project's doctrine lets an unattended turn do, and hand the task to a named
-  person in `waiting` with the question when one is needed. A project file
-  `workers/default.md` replaces it whole, and `enabled: false` in that file
-  switches it off. Like every worker it claims only its own project's tasks, so
+  person in `waiting` with the question when one is needed. A project worker
+  named `default` replaces it whole, and `enabled: false` in it switches it
+  off. Like every worker it claims only its own project's tasks, so
   it never takes one another project created.
 
   `supervisor` ships switched off. It acts on behalf of the project's owner on
@@ -360,7 +371,8 @@ WORKERS
   waiting, complete or closed and assign it to anyone; move another task to
   todo or waiting, assign it, and write or remove its `blocked_by`; and create
   defects and changes in todo or waiting, assigned to anyone. A project switches it on with its own
-  `workers/supervisor.md`, which replaces the shipped file whole.
+  worker named `supervisor`, which replaces the shipped one whole: `tasks
+  workers show supervisor` gives the shipped document to start from.
 
   A worker's profile is one callva-harness-runner profile, named and found the
   way the library finds one: `capabilities/tasks/profiles/NAME.toml` in this
@@ -395,7 +407,9 @@ WORKERS
 
   `${VAR}` inside a front-matter string is read from the environment, then from
   the project's `.env` and `.env.local`, and a name nothing answers for is
-  refused. Machine-local paths belong there rather than in a versioned file.
+  refused. Machine-local paths belong there rather than in a worker every
+  machine reads. The store keeps the string as written, and each machine
+  substitutes it where the worker runs.
 
   The prompt is this capability's fixed frame with two slots, and a project
   cannot edit the frame. In order: the worker's `description`, when its file
@@ -418,9 +432,40 @@ WORKERS
   the markers the frame names the task only by its uuid, and its stage only
   when that is a plain name.
 
+  SAVING. `tasks workers save <name> <file>` reads the document from the file,
+  or from stdin for `-`, judges it whole as `doctor` and `run` read it, and
+  refuses anything they would refuse, exit 6 `worker_invalid`; a profile or
+  routine this machine does not have is only a warning, since every machine
+  reads the store. A save identical to the active version creates none and
+  answers `created: false`. Otherwise one transaction inserts the new version
+  and clears `active` on the version the writer read: `--base ID` names it,
+  as `show` gave it, and without it the version active at the save is the one
+  replaced. When another save came first, the save is refused, exit 6
+  `conflict`, and the writer reads again. `remove` clears the active version,
+  and a name with no active version is no worker: a shipped worker of that
+  name is in force again. No version is ever edited or deleted, so `history`
+  shows every one, and every raise records under `worker_id` the version it
+  was claimed under (`tasks runs <task>`); a raise of a shipped worker or a
+  claim by hand records none. A project reads and writes only its own
+  workers, and nothing working under a raise saves, removes or imports one,
+  exit 4 `policy`: what a turn may write is declared there.
+
+  `tasks workers show <name>` answers the version as `spec`, `body` and
+  `text`, the whole document, so an edit is `show`, change `text`, `save
+  --base` the version shown. Saved versions take effect at the next claim; a
+  running service takes them at `tasks service reload`.
+
+  MOVING IN. A project's worker files, `capabilities/tasks/workers/<name>.md`,
+  are no longer read: while any is there, `doctor`, `run` and the service
+  refuse, exit 6 `workers_not_imported`, naming them. `tasks workers import`
+  says what it would do; `--apply` saves each file as its worker's first
+  version, or finds the store already holding that exact version, and then
+  removes the files. It is all or none: a file that cannot be read, or one
+  that differs from the version the store already holds for that name, is
+  saved over nothing and refuses the import, naming it.
+
   A project still carrying `capabilities/tasks/workers.toml` is refused by
-  `doctor` and `run`: that file is no longer read, and its workers belong in
-  `workers/`.
+  `doctor` and `run`: that file is no longer read either.
 
   A worker's cadence is not declared in its file. The service below runs it
   whenever the store holds work it takes; anything else may run `tasks run
@@ -435,7 +480,7 @@ HOOKS
   "task" on stdin and these added to the environment: TASKS_TASK_ID,
   TASKS_TASK_KEY, TASKS_TASK_TYPE, TASKS_TASK_ASSIGNEE, TASKS_WORKER and
   TASKS_PROJECT_ROOT. `doctor` shows them, and the service fingerprints them
-  with the worker file. Any other key under `hooks` is refused.
+  with the worker's version. Any other key under `hooks` is refused.
 
   Both answer in one vocabulary, by their exit:
 
@@ -515,7 +560,7 @@ ESCALATION
     escalate_to = ["supervisor", "owner"]   # in order; the last is a person
     stall_after = "6h"                      # 45m, 6h, 2d or seconds; 6h unsaid
 
-  A name that is no worker file of the project is a person. Every name but the
+  A name that is no worker of the project is a person. Every name but the
   last must be a worker that is switched on and takes waiting tasks assigned
   to it; the last must be a person. Any other key is refused, and a file that
   cannot be read refuses `run` with exit 6 `conveyor_invalid`. `doctor` refuses
@@ -587,7 +632,7 @@ ESCALATION
   will: a dead end. A run's first claim - the claim of any worker of the
   project, by hand or by the service - scans the project's open tasks for them
   in one read, after the sweeps and before it takes anything, and decides from
-  the store and the worker files alone. A task on a person or on nobody is
+  the store and the workers alone. A task on a person or on nobody is
   never one, and neither is one an open raise holds. A task in `todo` or
   `waiting` is a dead end when:
 
@@ -623,7 +668,7 @@ ESCALATION
   `todo` or `waiting` on a name that is a worker here which no enabled worker
   takes there, naming the rule and what that worker takes; `set` judges a
   write that moves the task's status, assignee or type, as it stands once
-  written. A person's name is any name that is no worker file, and is always
+  written. A person's name is any name that is no worker, and is always
   taken. A task of another project is not judged here, since its workers are
   that project's. `add`, `set` and `meta set` refuse blockers that can never
   all end, as FIELDS states for `--blocked-by`, and `in_progress` is never
@@ -775,7 +820,7 @@ SERVICE
     max_parallel = 1              # turns of this worker at once; default 1
 
   Any other key is refused, and so is a lane naming no worker declared here. A
-  worker file this capability cannot read refuses the whole declaration, as
+  worker this capability cannot read refuses the whole declaration, as
   `doctor` does. A lane whose turn takes nothing, or fails before claiming,
   waits for the next poll rather than being asked again at once.
 
@@ -791,14 +836,16 @@ SERVICE
   on it, it is read as the cool-down of every worker that names none, and
   `doctor` and `service doctor` name it.
 
-  The daemon publishes a fingerprint of what it loaded - the settings, every
-  worker file and every profile a worker names - beside its pid, and `service
-  doctor` fails while that differs from the files on disk. `service reload`
-  validates the files first and refuses what does not load, then signals the
-  daemon alone and waits until it publishes the new fingerprint; a daemon that
-  rejects them keeps what it had and says why in its log. Running turns are
-  never touched by a reload, and each turn reads its worker file and profile
-  afresh anyway. What a reload cannot change needs `stop` and `start`: the
+  The daemon publishes a fingerprint of what it loaded - the settings, the
+  active version of every worker and every profile a worker names - beside
+  its pid, and `service doctor` fails while that differs from what the files
+  and the store hold now; while the store cannot be read, which declaration
+  stands cannot be told, and `service doctor` does not call the daemon stale
+  for it. `service reload` validates them first and refuses
+  what does not load, then signals the daemon alone and waits until it
+  publishes the new fingerprint; a daemon that rejects them keeps what it had
+  and says why in its log. Running turns are never touched by a reload, and
+  each turn reads its worker and profile afresh anyway. What a reload cannot change needs `stop` and `start`: the
   connection and the store and schema it reaches, the project the daemon
   stands in, its state directory, the environment the daemon was started with,
   and the executable itself.
@@ -1194,7 +1241,7 @@ WORKER SCOPE
   process is a worker holding one raise, and what it may write is decided by
   that raise rather than by what the connection would otherwise allow.
 
-  What that is, a worker file declares under `writes`, in three scopes: `held`,
+  What that is, a worker declares under `writes`, in three scopes: `held`,
   the task its raise holds; `other`, any other task; and `new`, a task it
   creates with `add`. Each maps a field to the values it may write:
 
@@ -1238,8 +1285,8 @@ WORKER SCOPE
   judged the same way.
 
   What a raise may write is fixed when it is claimed: `run` records the writes
-  the worker file declared on the raise itself, and every write is judged by
-  that record, never by the file as it stands now. Editing a worker file during
+  the worker declared on the raise itself, and every write is judged by
+  that record, never by the worker as it stands now. Saving a worker during
   a turn changes the next claim, not the turn already running.
 
   A raise that has been closed or swept holds nothing, so a worker whose raise
@@ -1554,7 +1601,7 @@ EXIT CODES
     tables cannot be brought up to this version; `tasks doctor` proves both.
     For `watch`, unreachable before `ready`
   6 input - a malformed argument, an unknown flag, a value outside its set, a
-    worker file this capability cannot read, a command run outside a
+    worker this capability cannot read, a command run outside a
     project that needs one to know whose tasks it means, no store configured,
     or a connection that still names a store
 """
@@ -1575,7 +1622,7 @@ CRED_KEYS = [
              "clock in. Defaults to UTC."},
 ]
 WRITE_VERBS = {"add", "set", "tag", "untag", "meta", "activity", "claim",
-               "release", "run"}
+               "release", "run", "workers"}
 WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/tasks/guides/")
@@ -5176,7 +5223,7 @@ _WORKER_HINT = ("a worker records what it found on the task - an activity, a tag
                 "or a metadata key not already there - and leaves the rest to "
                 "whoever released the work")
 
-# What a worker file's `writes` may name: the three places a write lands - the
+# What a worker's `writes` may name: the three places a write lands - the
 # task its raise holds, any other task, and a task it creates - and the fields
 # worker scope answers for in each. `add` creates, so it removes nothing, and
 # names no tags or metadata to take away.
@@ -5199,7 +5246,7 @@ DEFAULT_WRITES = {
 
 # Where a raise keeps what its claim fixed: the writes its worker declared, and
 # that the task was taken from `waiting`. Both sit in the raise's own metrics,
-# written by the claim and kept by the release, so editing a worker file during
+# written by the claim and kept by the release, so saving a worker during
 # a turn cannot widen what that turn may write, and no column was added for it.
 _BOUND_WRITES = "worker_writes"
 _CLAIMED_FROM = "claimed_from"
@@ -5262,7 +5309,7 @@ def _default_refusal(kind: str, scope: str, value: str | None) -> str:
 
 def _declared_refusal(kind: str, scope: str, value: str | None, allowed) -> str:
     """The sentence a declared `writes` refuses with: what was attempted, and the
-    entry of the worker file that does not allow it."""
+    entry of the worker that does not allow it."""
     where = {"held": "its own task", "other": "another task",
              "new": "a task it creates"}[scope]
     field = _OP_FIELDS[kind]
@@ -5278,9 +5325,9 @@ def _declared_refusal(kind: str, scope: str, value: str | None, allowed) -> str:
         "meta-overwrite": (f"write over the metadata key {value} on {where}" if value
                            else f"write over metadata on {where}"),
     }[kind]
-    rule = (f"its worker file's `writes.{scope}.{field}` allows only "
+    rule = (f"its worker's `writes.{scope}.{field}` allows only "
             f"{', '.join(allowed)}" if isinstance(allowed, list) and allowed
-            else f"its worker file's `writes.{scope}` does not list {field}")
+            else f"its worker's `writes.{scope}` does not list {field}")
     return f"a worker may not {act}; {rule}"
 
 
@@ -5340,7 +5387,7 @@ def _worker_refusal(op: str, target: str, lookup,
 def _worker_gate(op: str, target: str, lookup) -> None:
     """Refuse, with the policy code, a write worker scope does not permit. The
     writes are the ones the raise was bound to at its claim, read from the raise
-    itself and never from the worker file as it stands now."""
+    itself and never from the worker as it stands now."""
     execution = _worker_execution()
     writes = (_bound_writes(lookup(execution))
               if execution and op not in _WORKER_ADDITIVE else None)
@@ -6206,7 +6253,7 @@ def _type_refusal(task: dict, opts: dict) -> str | None:
                 f"takes {', '.join(accept) or 'none'}")
     if refuse and kind in refuse:
         return (f"worker {opts.get('worker')!r} takes only types no other worker "
-                f"file names, and another worker file names {kind!r}")
+                f"names, and another worker names {kind!r}")
     return None
 
 
@@ -6356,22 +6403,22 @@ def _claim(entry, opts: dict) -> dict:
             previous = found[0] if found else None
         if fixed:
             cur.execute(f"""insert into {SCHEMA}.tasks_executions
-                              (task_id, attempt, worker, handler, lease_until, metrics,
-                               run_system, run_ref)
-                            values (%s, %s, %s, %s, now() + make_interval(secs => %s),
+                              (task_id, attempt, worker, worker_id, handler, lease_until,
+                               metrics, run_system, run_ref)
+                            values (%s, %s, %s, %s, %s, now() + make_interval(secs => %s),
                                     %s::jsonb, %s, %s)
                             returning *""",
-                        (tid, attempt, opts.get("worker"), opts.get("handler"), lease,
-                         json.dumps(fixed), run_system, run_ref))
+                        (tid, attempt, opts.get("worker"), opts.get("worker_id"),
+                         opts.get("handler"), lease, json.dumps(fixed), run_system, run_ref))
         else:
             cur.execute(f"""insert into {SCHEMA}.tasks_executions
-                              (task_id, attempt, worker, handler, lease_until,
+                              (task_id, attempt, worker, worker_id, handler, lease_until,
                                run_system, run_ref)
-                            values (%s, %s, %s, %s, now() + make_interval(secs => %s),
+                            values (%s, %s, %s, %s, %s, now() + make_interval(secs => %s),
                                     %s, %s)
                             returning *""",
-                        (tid, attempt, opts.get("worker"), opts.get("handler"), lease,
-                         run_system, run_ref))
+                        (tid, attempt, opts.get("worker"), opts.get("worker_id"),
+                         opts.get("handler"), lease, run_system, run_ref))
         execution = _rows(cur)[0]
         # The raise is the whole of the claim. The task stays where it rests -
         # its status, assignee and pickup untouched, no move recorded - and is
@@ -6728,7 +6775,7 @@ def _read_conveyor() -> tuple[dict | None, list[str]]:
 
 def _conveyor() -> dict | None:
     """The conveyor settings a claim decides by, or None when the project sets
-    none. A file that cannot be read refuses the run, as a worker file does:
+    none. A file that cannot be read refuses the run, as a worker does:
     the claim cannot tell what it is asked to escalate."""
     settings, problems = _read_conveyor()
     if problems:
@@ -6757,7 +6804,7 @@ def _conveyor_report() -> tuple[dict | None, list[str], str | None]:
 
     Every name but the last must be a worker here that is switched on and takes
     waiting tasks assigned to it, or a task escalated to it would stand still
-    again; the last must be a person, a name that is no worker file, because a
+    again; the last must be a person, a name that is no worker, because a
     chain ending at a worker can end at nobody."""
     settings, problems = _read_conveyor()
     declared = _declarations()
@@ -6783,7 +6830,7 @@ def _conveyor_report() -> tuple[dict | None, list[str], str | None]:
         if last:
             if name in declared:
                 problems.append(f"{where}: `escalate_to` ends at {name!r}, which is a worker "
-                                "here; its last entry is a person, a name no worker file has")
+                                "here; its last entry is a person, a name no worker has")
             continue
         if name not in declared:
             problems.append(f"{where}: `escalate_to` names {name!r}, which is no worker "
@@ -6808,7 +6855,7 @@ def _conveyor_report() -> tuple[dict | None, list[str], str | None]:
 
 
 def _is_person(name, escalation: dict) -> bool:
-    """A name that is no worker file of this project. The chain ends at one, and
+    """A name that is no worker of this project. The chain ends at one, and
     a task assigned to one is never escalated by the clock or by attempts."""
     name = (name or "").strip()
     return bool(name) and name not in escalation["workers"]
@@ -7120,9 +7167,9 @@ def _structure() -> dict | None:
     that are workers here, the ones read whole and the ones that cannot be,
     and each filter an enabled, readable worker selects by - its `takes`, the
     catch-all's, and its `on_request` types, which a person takes by naming
-    the task. None while the retired workers.toml stands, which `run` and
-    `doctor` refuse on their own."""
-    if _retired_workers_file():
+    the task. None while the retired workers.toml stands, or worker files wait
+    to be imported, which `run` and `doctor` refuse on their own."""
+    if _retired_workers_file() or _unimported_worker_files():
         return None
     declared = _declarations()
     read, unreadable, filters = {}, {}, []
@@ -7332,7 +7379,7 @@ def _blocked_by_flag(raw: str) -> list[str]:
 
 
 def _blocked_by_gate(tid: str, before: dict, ids: list[str], lookup) -> None:
-    """Worker scope for giving a task blockers, in the words a worker file
+    """Worker scope for giving a task blockers, in the words a worker
     already uses for them: `writes.<scope>.metadata` naming `blocked_by`.
     Giving blockers to a task that carries none adds to it, which any worker
     may; replacing blockers it carries writes over them, which only a scope
@@ -7344,7 +7391,7 @@ def _blocked_by_gate(tid: str, before: dict, ids: list[str], lookup) -> None:
 
 def _structural(structure: dict, task: dict, blockers: _Blockers) -> str | None:
     """Why this open task can never move as things stand, decided from the
-    store and the worker files alone, or None. Asked of a task no person holds
+    store and the workers alone, or None. Asked of a task no person holds
     and no raise holds: on a name that is a worker here that no enabled worker
     takes, a task whose worker cannot run, and a task whose blockers can never
     all end."""
@@ -7449,7 +7496,8 @@ def _landing_refusal(task: dict) -> str | None:
     name = (task.get("assignee") or "").strip()
     if not name or task.get("project_id") != _writing_project():
         return None
-    if _project_root() is None or _retired_workers_file() or name not in _declarations():
+    if (_project_root() is None or _retired_workers_file() or _unimported_worker_files()
+            or name not in _declarations()):
         return None
     structure = _structure()
     if structure is None or _takers(structure, task):
@@ -7610,36 +7658,94 @@ def _retired_workers_file() -> Path | None:
 
 def _retired_refusal(path: Path) -> tuple:
     return (6, "worker_invalid",
-            f"{path} is no longer read: a worker is one file, "
-            f"{_workers_dir()}/<name>.md, whose YAML front matter is its settings and "
-            "whose body is its instruction",
-            f"move each worker to {_workers_dir()}/<name>.md and remove workers.toml; "
-            f"`{NAME} help` states the shape")
+            f"{path} is no longer read: a worker is kept in the store, saved as a "
+            "Markdown document whose YAML front matter is its settings and whose body "
+            "is its instruction",
+            f"save each worker with `{NAME} workers save <name> <file>` and remove "
+            f"workers.toml; `{NAME} help` WORKERS states the shape")
 
 
-def _declarations() -> dict:
-    """Every worker this project can run, by name: the project's own files, then
-    the shipped `default` unless a project file of that name replaces it whole.
+def _unimported_worker_files() -> list[Path]:
+    """The worker files a project still carries in its envelope. Nothing reads
+    them as workers: a project's workers live in the store, and these wait for
+    `workers import`."""
+    folder = _workers_dir()
+    return sorted(folder.glob("*.md")) if folder.is_dir() else []
+
+
+def _unimported_refusal(files: list[Path]) -> tuple:
+    return (6, "workers_not_imported",
+            f"{_workers_dir()} still holds worker files ({', '.join(p.name for p in files)}), "
+            "and they are no longer read: a project's workers live in the store, one "
+            "row per version",
+            f"`{NAME} workers import --apply` moves them into the store and removes the "
+            "files; `--apply` left off shows what it would do")
+
+
+# The active worker rows this process read, per schema and project. A command
+# reads them once; the service reads them again whenever it fingerprints or
+# loads its declaration, so a reload takes the versions saved since.
+_WORKER_ROWS: dict = {}
+
+
+def _stored_workers(fresh: bool = False, waiting: bool | None = None) -> list[dict]:
+    """Every active worker version of this project, by name. A process outside
+    any project, or in one that declares no id, has none, and so does a store
+    whose tables do not hold workers yet. Reading changes nothing, so `doctor`
+    may ask; a command waits out a store that is away as every command does,
+    and the service, which keeps its own schedule, is told at once, as is a
+    caller passing `waiting` False. Raises Refusal."""
+    import psycopg
+    project = PROJECT
+    if not project:
+        return []
+    key = (SCHEMA, project)
+    if fresh or key not in _WORKER_ROWS:
+        if waiting is None:
+            waiting = ProjectScope.current is None
+        with _connect(None, raising=True, waiting=waiting,
+                      migrating=False) as conn, conn.cursor() as cur:
+            try:
+                cur.execute(f"""select id, name, spec, body, created_at, created_by
+                                  from {SCHEMA}.tasks_workers
+                                 where project_id = %s and active
+                                 order by name""", (project,))
+                rows = [dict(row) for row in cur.fetchall()]
+            except psycopg.errors.UndefinedTable:
+                rows = []
+            conn.rollback()
+        _WORKER_ROWS[key] = rows
+    return _WORKER_ROWS[key]
+
+
+def _forget_workers() -> None:
+    _WORKER_ROWS.pop((SCHEMA, PROJECT), None)
+
+
+def _stored_entry(row: dict) -> dict:
+    """One active row as `_declarations` answers a worker."""
+    return {"source": "store", "version": str(row["id"]), "spec": row["spec"],
+            "body": row["body"], "created_at": row["created_at"],
+            "created_by": row["created_by"], "path": None,
+            "where": f"worker {row['name']!r} version {row['id']}"}
+
+
+def _declarations(fresh: bool = False) -> dict:
+    """Every worker this project can run, by name: the active version of each
+    worker the project keeps in the store, then the shipped `default` unless a
+    stored worker of that name replaces it whole.
 
     A project that declares none still has `default`. A project still carrying
-    the retired workers.toml is refused, because the workers it declares there
-    no longer run and nothing should run in their place without it knowing."""
+    the retired workers.toml, or worker files not yet imported, is refused,
+    because the workers it declares there no longer run and nothing should run
+    in their place without it knowing."""
     retired = _retired_workers_file()
     if retired:
         _die(*_retired_refusal(retired))
-    found: dict = {}
-    shipped = _shipped_workers_dir()
-    if shipped.is_dir():
-        for path in sorted(shipped.glob("*.md")):
-            found[path.stem] = {"path": path, "source": "shipped"}
-    folder = _workers_dir()
-    if folder.is_dir():
-        for path in sorted(folder.glob("*.md")):
-            entry = {"path": path, "source": "project"}
-            if path.stem in found:
-                entry["shadows"] = str(found[path.stem]["path"])
-            found[path.stem] = entry
-    return found
+    files = _unimported_worker_files()
+    if files:
+        _die(*_unimported_refusal(files))
+    return _declarations_unjudged(fresh)
 
 
 def _split_front_matter(text: str) -> tuple[str, str]:
@@ -7907,20 +8013,14 @@ def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
     def wrong(sentence: str) -> None:
         problems.append((6, "worker_invalid", sentence))
 
-    path = found["path"]
+    where = found["where"]
     if not _WORKER_NAME.fullmatch(name):
         return None, [(6, "worker_invalid",
-                       f"{path.name} is not a worker name: lowercase letters, digits, "
+                       f"{name!r} is not a worker name: lowercase letters, digits, "
                        "`-` and `_`, starting with a letter or digit")]
-    import yaml
-    try:
-        head, body = _split_front_matter(path.read_text())
-        settings = yaml.safe_load(head) if head.strip() else {}
-    except (OSError, ValueError, yaml.YAMLError) as exc:
-        return None, [(6, "worker_invalid", f"{path} could not be read: {exc}")]
-    if not isinstance(settings, dict):
-        return None, [(6, "worker_invalid",
-                       f"{path}: its front matter is not a mapping of settings")]
+    settings, body, unread = _worker_document(found)
+    if unread:
+        return None, [(6, "worker_invalid", unread)]
     try:
         settings = _expanded(settings, f"worker {name!r}")
     except Refusal as refused:
@@ -8037,7 +8137,9 @@ def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
 
     if problems:
         return None, problems
-    return {"name": name, "enabled": enabled, "path": str(path),
+    return {"name": name, "enabled": enabled,
+            "path": str(found["path"]) if found.get("path") else None, "where": where,
+            "version": found.get("version"),
             "source": found["source"], "shadows": found.get("shadows"),
             "catch_all": catch_all, "types": takes, "on_request": on_request,
             "tags": tags, "assignee": assignee, "filters": filters,
@@ -8048,22 +8150,37 @@ def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
             "handler": _handler(profile) if profile is not None else None}, []
 
 
-def _types_named(path: Path) -> set | str:
-    """Every type one worker file names in `takes` or `on_request`, read from its
-    front matter alone, or why that cannot be known.
+def _worker_document(found: dict) -> tuple[dict, str, str | None]:
+    """A worker's settings and body as written, and why they cannot be read,
+    from the version the store keeps or from a file this capability ships."""
+    if found["source"] == "store":
+        spec = found["spec"]
+        if not isinstance(spec, dict):
+            return {}, "", f"{found['where']}: its settings are not a mapping"
+        return dict(spec), found["body"] or "", None
+    import yaml
+    path = found["path"]
+    try:
+        head, body = _split_front_matter(path.read_text())
+        settings = yaml.safe_load(head) if head.strip() else {}
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        return {}, "", f"{path} could not be read: {exc}"
+    if not isinstance(settings, dict):
+        return {}, "", f"{path}: its front matter is not a mapping of settings"
+    return settings, body, None
+
+
+def _types_named(found: dict) -> set | str:
+    """Every type one worker names in `takes` or `on_request`, read from its
+    settings alone, or why that cannot be known.
 
     This reads less than `_read_worker` on purpose. Whether the worker is
     enabled, readable in every other key, or able to find its profile and
     routines does not change which types it claims to own, and a type a project
-    file names is never the catch-all's to take."""
-    import yaml
-    try:
-        head, _body = _split_front_matter(path.read_text())
-        settings = yaml.safe_load(head) if head.strip() else {}
-    except (OSError, ValueError, yaml.YAMLError) as exc:
-        return f"its front matter cannot be read: {exc}"
-    if not isinstance(settings, dict):
-        return "its front matter is not a mapping of settings"
+    worker names is never the catch-all's to take."""
+    settings, _body, unread = _worker_document(found)
+    if unread:
+        return f"its settings cannot be read: {unread}"
     named: set = set()
     for key in ("takes", "on_request"):
         value = settings.get(key)
@@ -8095,16 +8212,16 @@ def _types_named(path: Path) -> set | str:
             return f"its `{key}` is not a list of type names"
         for one in values:
             try:
-                named.add(_expand(one, f"{path.name} `{key}`").strip())
+                named.add(_expand(one, f"{found['where']} `{key}`").strip())
             except Refusal as refused:
                 return refused.message
     return named
 
 
 def _others_take(name: str, declared: dict) -> tuple[set, list[str]]:
-    """What the catch-all leaves alone: every type any other project worker file
+    """What the catch-all leaves alone: every type any other project worker
     names in `takes` or `on_request`, whether that worker is enabled or readable,
-    and every file whose types cannot be known at all.
+    and every worker whose types cannot be known at all.
 
     A worker switched off, or broken by a typo, still owns the types it names:
     handing them to the catch-all would let one edit widen what a turn may do.
@@ -8113,11 +8230,11 @@ def _others_take(name: str, declared: dict) -> tuple[set, list[str]]:
     taken: set = set()
     unknowable: list[str] = []
     for other, found in declared.items():
-        if other == name or found["source"] != "project":
+        if other == name or found["source"] != "store":
             continue
-        named = _types_named(found["path"])
+        named = _types_named(found)
         if isinstance(named, str):
-            unknowable.append(f"{found['path']}: {named}")
+            unknowable.append(f"{found['where']}: {named}")
         else:
             taken |= named
     return taken, unknowable
@@ -8125,7 +8242,7 @@ def _others_take(name: str, declared: dict) -> tuple[set, list[str]]:
 
 def _unknowable_refusal(name: str, unknowable: list[str]) -> str:
     return (f"worker {name!r} takes every type no other worker names, and it takes "
-            "nothing while a worker file's types cannot be read: "
+            "nothing while a worker's types cannot be read: "
             + "; ".join(unknowable))
 
 
@@ -8133,7 +8250,7 @@ def _worker(name: str) -> dict:
     """The named worker, or the refusal that says why there is no turn to run."""
     declared = _declarations()
     if name not in declared:
-        _die(3, "not_found", f"no worker named {name!r} in {_workers_dir()}",
+        _die(3, "not_found", f"no worker named {name!r} in this project",
              f"available here: {', '.join(sorted(declared)) or 'none'}")
     worker, problems = _read_worker(name, declared[name])
     if problems:
@@ -8142,7 +8259,7 @@ def _worker(name: str) -> dict:
              f"`{NAME} doctor` reports every worker this project can run")
     if not worker["enabled"]:
         _die(4, "worker_disabled", f"worker {name!r} is switched off by `enabled: false` "
-             f"in {worker['path']}",
+             f"in {worker['where']}",
              "a disabled worker never claims; a person switches it back on")
     if worker["catch_all"]:
         taken, unknowable = _others_take(name, declared)
@@ -8201,7 +8318,7 @@ def _filter_words(one: dict) -> str:
 
 def _worker_filters(worker: dict, declared: dict) -> list[dict]:
     """What a worker selects, as filters: its own, or for the catch-all one filter
-    taking todo of any type no other project worker file names."""
+    taking todo of any type no other project worker names."""
     if not worker["catch_all"]:
         return worker["filters"]
     taken, unknowable = _others_take(worker["name"], declared)
@@ -8246,8 +8363,12 @@ def _workers_report() -> tuple[list[dict], list[str]]:
     read: dict = {}
     for name, found in sorted(declared.items()):
         worker, problems = _read_worker(name, found)
-        row = {"worker": name, "ok": not problems, "source": found["source"],
-               "path": str(found["path"])}
+        row = {"worker": name, "ok": not problems, "source": found["source"]}
+        if found.get("version"):
+            row["version"] = found["version"]
+            row["updated_at"] = _stamp(found["created_at"])
+        else:
+            row["path"] = str(found["path"])
         if found.get("shadows"):
             row["shadows"] = found["shadows"]
         if worker:
@@ -8298,6 +8419,344 @@ def _workers_report() -> tuple[list[dict], list[str]]:
                 row["ok"] = False
                 row.setdefault("problems", []).append(sentence)
     return rows, broken
+
+
+# --- Workers in the store ------------------------------------------------------
+
+# A worker is kept as versions: a save inserts one and moves `active` to it in
+# the same transaction, clearing it only on the version the writer read, so two
+# writers can never both believe they replaced the same version. A project
+# reads and writes only its own workers.
+
+def _worker_text(spec: dict, body: str) -> str:
+    """A worker as the Markdown document it is written as."""
+    import yaml
+    head = yaml.safe_dump(spec, sort_keys=False, allow_unicode=True) if spec else ""
+    return f"---\n{head}---\n\n{body.strip()}\n"
+
+
+def _parse_worker(text: str, where: str) -> tuple[dict, str]:
+    """The settings and body of a worker document. Raises Refusal saying why it
+    is none."""
+    import yaml
+    try:
+        head, body = _split_front_matter(text)
+        spec = yaml.safe_load(head) if head.strip() else {}
+    except (ValueError, yaml.YAMLError) as exc:
+        raise Refusal(6, "worker_invalid", f"{where} could not be read: {exc}")
+    if not isinstance(spec, dict):
+        raise Refusal(6, "worker_invalid",
+                      f"{where}: its front matter is not a mapping of settings")
+    try:
+        spec = json.loads(json.dumps(spec))
+    except (TypeError, ValueError) as exc:
+        raise Refusal(6, "worker_invalid",
+                      f"{where}: its front matter holds a value that is not plain "
+                      f"text, a number, a list or a mapping: {exc}")
+    return spec, body.strip()
+
+
+def _judged(name: str, spec: dict, body: str, where: str) -> list[str]:
+    """Judge a worker whole, as `doctor` and `run` read it, before it is saved,
+    and answer what this machine cannot find - a profile, a routine - which is
+    only a warning, because the store is read by every machine and another may
+    have it. Anything `doctor` and `run` would refuse raises Refusal."""
+    found = {"source": "store", "spec": spec, "body": body, "where": where,
+             "path": None, "version": None}
+    worker, problems = _read_worker(name, found)
+    if problems:
+        raise Refusal(6, "worker_invalid",
+                      f"{where}: " + "; ".join(sentence for _c, _s, sentence in problems),
+                      f"`{NAME} help` WORKERS states the shape")
+    return list(worker["missing"])
+
+
+def _workers_write_gate(action: str) -> None:
+    """A turn is fenced by what its worker declares, so nothing working under a
+    raise changes any worker's declaration."""
+    if _worker_execution():
+        _die(4, "policy",
+             f"`workers {action}` is refused under a raise: a turn is fenced by what "
+             "its worker declares, and a fence the fenced can rewrite is none",
+             "a person saves workers, outside any turn")
+
+
+def _active_row(cur, project: str, name: str, lock: bool = False) -> dict | None:
+    cur.execute(f"""select * from {SCHEMA}.tasks_workers
+                     where project_id = %s and name = %s and active
+                     {"for update" if lock else ""}""", (project, name))
+    rows = _rows(cur)
+    return rows[0] if rows else None
+
+
+def _save_version(cur, project: str, name: str, spec: dict, body: str,
+                  base: str | None) -> tuple[dict, bool]:
+    """Save one version inside the caller's transaction, and whether one was
+    created. `base` is the version the writer read; without it the version
+    active now is the one replaced. A save identical to the active version
+    creates none."""
+    import psycopg
+    active = _active_row(cur, project, name, lock=True)
+    if base is not None and (active is None or str(active["id"]) != base):
+        _die(6, "conflict",
+             f"worker {name!r} is no longer at version {base}: "
+             + (f"{active['id']} is active" if active else "it has no active version"),
+             f"read it again with `{NAME} workers show {name}` and save over that")
+    if active and active["spec"] == spec and (active["body"] or "") == body:
+        return active, False
+    if active:
+        cur.execute(f"""update {SCHEMA}.tasks_workers set active = false
+                         where id = %s and active""", (str(active["id"]),))
+        if cur.rowcount != 1:
+            _die(6, "conflict", f"worker {name!r} was saved by someone else first",
+                 f"read it again with `{NAME} workers show {name}`")
+    try:
+        cur.execute(f"""insert into {SCHEMA}.tasks_workers
+                          (project_id, name, spec, body, active, created_by)
+                        values (%s, %s, %s::jsonb, %s, true, %s)
+                        returning *""",
+                    (project, name, json.dumps(spec), body, _actor()))
+    except psycopg.errors.UniqueViolation:
+        _die(6, "conflict", f"worker {name!r} was saved by someone else first",
+             f"read it again with `{NAME} workers show {name}`")
+    return _rows(cur)[0], True
+
+
+def _version_answer(row: dict, *, whole: bool = True) -> dict:
+    answer = {"worker": row["name"], "source": "store", "version": str(row["id"]),
+              "active": row["active"], "created_at": _stamp(row["created_at"]),
+              "created_by": row["created_by"]}
+    if whole:
+        answer.update(spec=row["spec"], body=row["body"],
+                      text=_worker_text(row["spec"], row["body"]))
+    return answer
+
+
+def _read_input(source: str) -> str:
+    if source == "-":
+        return sys.stdin.read()
+    try:
+        return Path(source).read_text()
+    except OSError as exc:
+        _die(6, "input", f"{source} could not be read: {exc}")
+
+
+def cmd_workers(entry, args: list[str]) -> None:
+    """The project's workers as the store keeps them: read, save a version,
+    list a worker's history, remove it, and move a project's worker files in."""
+    opts = _flags(args, **_FORM_ARGS["workers"])
+    loose = opts["_loose"]
+    usage = (f"{NAME} workers list | show <name> [--version ID] | history <name> | "
+             "save <name> <file|-> [--base ID] | remove <name> [--base ID] | "
+             "import [--apply]")
+    if not loose or loose[0] not in ("list", "show", "history", "save", "remove", "import"):
+        _die(6, "input", "workers needs an action" if not loose
+             else f"unknown workers action {loose[0]!r}", usage)
+    action, rest = loose[0], loose[1:]
+    wants = {"list": 0, "import": 0, "show": 1, "history": 1, "remove": 1, "save": 2}[action]
+    if len(rest) != wants:
+        _die(6, "input", f"workers {action} takes {wants} argument(s)", usage)
+    if action in ("save", "remove") or (action == "import" and opts.get("apply")):
+        _workers_write_gate(action)
+    project = _writing_project()
+    if action == "import":
+        _workers_import(entry, project, bool(opts.get("apply")))
+        return
+    if action == "list":
+        _workers_list()
+        return
+    name = rest[0]
+    if not _WORKER_NAME.fullmatch(name):
+        _die(6, "input", f"{name!r} is not a worker name: lowercase letters, digits, "
+             "`-` and `_`, starting with a letter or digit")
+    if action == "save":
+        try:
+            spec, body = _parse_worker(_read_input(rest[1]), rest[1])
+            missing = _judged(name, spec, body, f"worker {name!r}")
+        except Refusal as refused:
+            _die(refused.exit_code, refused.code, refused.message, refused.hint)
+        with _connect(entry) as conn, conn.cursor() as cur:
+            row, created = _save_version(cur, project, name, spec, body, opts.get("base"))
+            conn.commit()
+        answer = {**_version_answer(row, whole=False), "created": created}
+        if missing:
+            answer["warning"] = "; ".join(missing)
+        _emit(answer)
+        return
+    with _connect(entry) as conn, conn.cursor() as cur:
+        if action == "remove":
+            active = _active_row(cur, project, name, lock=True)
+            if active is None or (opts.get("base") and str(active["id"]) != opts["base"]):
+                conn.rollback()
+                _die(3 if active is None else 6, "not_found" if active is None else "conflict",
+                     f"worker {name!r} has no active version" if active is None
+                     else f"worker {name!r} is no longer at version {opts['base']}",
+                     f"`{NAME} workers list` shows this project's workers")
+            cur.execute(f"""update {SCHEMA}.tasks_workers set active = false
+                             where id = %s and active""", (str(active["id"]),))
+            conn.commit()
+            _emit({"worker": name, "removed": str(active["id"])})
+            return
+        if action == "history":
+            cur.execute(f"""select * from {SCHEMA}.tasks_workers
+                             where project_id = %s and name = %s
+                             order by created_at asc, id asc""", (project, name))
+            rows = _rows(cur)
+            conn.commit()
+            if not rows:
+                _die(3, "not_found", f"no worker named {name!r} was ever saved here",
+                     f"`{NAME} workers list` shows this project's workers")
+            _emit({"worker": name,
+                   "versions": [_version_answer(r, whole=False) for r in rows]})
+            return
+        if opts.get("version"):
+            cur.execute(f"""select * from {SCHEMA}.tasks_workers
+                             where project_id = %s and name = %s and id::text = %s""",
+                        (project, name, opts["version"]))
+            rows = _rows(cur)
+            row = rows[0] if rows else None
+        else:
+            row = _active_row(cur, project, name)
+        conn.commit()
+    if row is not None:
+        _emit(_version_answer(row))
+        return
+    shipped = _shipped_workers_dir() / f"{name}.md"
+    if not opts.get("version") and shipped.is_file():
+        text = shipped.read_text()
+        try:
+            spec, body = _parse_worker(text, str(shipped))
+        except Refusal as refused:
+            _die(refused.exit_code, refused.code, refused.message, refused.hint)
+        _emit({"worker": name, "source": "shipped", "path": str(shipped),
+               "spec": spec, "body": body, "text": text})
+        return
+    _die(3, "not_found", f"no worker named {name!r}"
+         + (f" at version {opts['version']}" if opts.get("version") else "") + " here",
+         f"`{NAME} workers list` shows this project's workers")
+
+
+def _workers_list() -> None:
+    """Every worker this project can run, by where it comes from; `doctor`
+    judges them."""
+    files = _unimported_worker_files()
+    rows = []
+    for name, found in sorted(_declarations_unjudged().items()):
+        settings, _body, _unread = _worker_document(found)
+        row = {"worker": name, "source": found["source"]}
+        if found["source"] == "store":
+            row.update(version=found["version"], updated_at=_stamp(found["created_at"]),
+                       updated_by=found["created_by"])
+        else:
+            row["path"] = str(found["path"])
+        if found.get("shadows"):
+            row["shadows"] = found["shadows"]
+        row["enabled"] = settings.get("enabled", True)
+        if isinstance(settings.get("description"), str):
+            row["description"] = settings["description"].strip()
+        rows.append(row)
+    answer: dict = {"workers": rows}
+    if files:
+        answer["unimported"] = [str(p) for p in files]
+        answer["warning"] = _unimported_refusal(files)[2]
+    _emit(answer)
+
+
+def _declarations_unjudged(fresh: bool = False) -> dict:
+    """`_declarations` without the refusals that stop a project from running,
+    for the verbs that show what is declared."""
+    found: dict = {}
+    shipped = _shipped_workers_dir()
+    if shipped.is_dir():
+        for path in sorted(shipped.glob("*.md")):
+            found[path.stem] = {"path": path, "source": "shipped", "where": str(path)}
+    try:
+        rows = _stored_workers(fresh)
+    except Refusal as refused:
+        _die(refused.exit_code, refused.code, refused.message, refused.hint)
+    for row in rows:
+        entry = _stored_entry(row)
+        if row["name"] in found:
+            entry["shadows"] = str(found[row["name"]]["path"])
+        found[row["name"]] = entry
+    return found
+
+
+def _workers_import(entry, project: str, apply: bool) -> None:
+    """Move this project's worker files into the store, all of them or none, and
+    remove each file once the store holds it.
+
+    A file whose worker the store does not hold yet becomes its first version;
+    one identical to the version the store holds is already there. One that
+    differs from it is never saved over it - the store's is what runs - and,
+    like a file that cannot be read, refuses the import, naming it."""
+    files = _unimported_worker_files()
+    plan, refused = [], []
+    for path in files:
+        name = path.stem
+        if not _WORKER_NAME.fullmatch(name):
+            refused.append(f"{path.name} is not a worker name")
+            continue
+        try:
+            text = path.read_text()
+        except OSError as exc:
+            refused.append(f"{path} could not be read: {exc}")
+            continue
+        try:
+            spec, body = _parse_worker(text, str(path))
+            missing = _judged(name, spec, body, str(path))
+        except Refusal as wrong:
+            refused.append(wrong.message)
+            continue
+        plan.append({"name": name, "path": path, "spec": spec, "body": body,
+                     "missing": missing})
+    with _connect(entry) as conn, conn.cursor() as cur:
+        for one in plan:
+            active = _active_row(cur, project, one["name"], lock=apply)
+            if active is None:
+                one["outcome"] = "imported"
+            elif active["spec"] == one["spec"] and (active["body"] or "") == one["body"]:
+                one["outcome"] = "already"
+                one["version"] = str(active["id"])
+            else:
+                refused.append(f"{one['path']} differs from version {active['id']} the "
+                               f"store holds for {one['name']!r}, which is what runs; save "
+                               f"the file over it with `{NAME} workers save {one['name']} "
+                               f"{one['path']}`, or remove the file")
+        if refused:
+            conn.rollback()
+            _die(6, "worker_invalid",
+                 f"{len(refused)} worker file(s) cannot be imported, so none is: "
+                 + "; ".join(refused),
+                 "repair or remove them, then import again")
+        if apply:
+            for one in plan:
+                if one["outcome"] == "imported":
+                    row, _created = _save_version(cur, project, one["name"], one["spec"],
+                                                  one["body"], None)
+                    one["version"] = str(row["id"])
+        conn.commit()
+    removed = []
+    if apply:
+        for one in plan:
+            one["path"].unlink()
+            removed.append(str(one["path"]))
+        folder = _workers_dir()
+        if folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
+        _forget_workers()
+    answer: dict = {"applied": apply,
+                    "workers": [{"worker": one["name"], "file": str(one["path"]),
+                                 "outcome": one["outcome"] if apply
+                                 else f"would_be_{one['outcome']}",
+                                 **({"version": one["version"]} if one.get("version") else {})}
+                                for one in plan]}
+    if apply:
+        answer["removed"] = removed
+    warnings = [f"{one['name']}: {sentence}" for one in plan for sentence in one["missing"]]
+    if warnings:
+        answer["warning"] = "; ".join(warnings)
+    _emit(answer)
 
 
 # --- What the turn is told ---------------------------------------------------
@@ -8372,7 +8831,7 @@ That entry is read by a person deciding, not by a worker resuming, so it obeys t
 
 
 # What the store lets a worker write, as the frame says it: the default fence in
-# the words it has always had, or what the worker file's `writes` declares.
+# the words it has always had, or what the worker's `writes` declares.
 _DEFAULT_SCOPE = """On this task, the one your raise holds, you write as anyone does, with two limits: you land it on `draft`, `todo`, `waiting`, `complete` or `closed` and nowhere else, and you never change its type.
 
 On every other task you add and never take away: an activity, a tag, a metadata key that is not already there. You cannot remove a tag or a key, write over a key already present, or move another task's status. A task you create is created in `draft` whatever you asked for."""
@@ -8599,7 +9058,8 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
     passed over because an open raise holds it is carried forward like a
     sweep."""
     base = {"lease": str(worker["limits"]["lease_seconds"]),
-            "worker": worker["name"], "handler": worker["handler"]}
+            "worker": worker["name"], "handler": worker["handler"],
+            "worker_id": worker.get("version")}
     if run is not None:
         base["run"] = run
     if beat is not None:
@@ -10536,14 +10996,37 @@ def _read_service_settings(path: Path) -> dict:
     return settings
 
 
-def _service_fingerprint() -> str:
-    """Which declaration the files hold right now: the settings file, every
-    worker file, and every profile a worker names, by path and content.
+def _service_reads_here(scoped: bool = False) -> None:
+    """Bound the store reads a declaration makes to the project the command
+    stands in and the schema its store setting binds, as `main` and the service
+    host bound every other read: outside a project scope when nothing has, and
+    inside one opened without them when `scoped`. A store that cannot be
+    resolved leaves the read to refuse when it is made."""
+    if not scoped and (ProjectScope.current is not None or PROJECT):
+        return
+    globals()["PROJECT_IDENTITY"] = _project_id_state()
+    globals()["PROJECT"] = _declared_project()
+    try:
+        globals()["SCHEMA"] = _store_setting(True, root=_project_here()).schema
+    except Refusal:
+        pass
+
+
+def _service_fingerprint() -> str | None:
+    """Which declaration stands right now: the settings file, every worker -
+    the version the store holds active for each of this project's, and each
+    shipped file by its content - and every profile a worker names, by path
+    and content. Worker files still waiting to be imported are part of it, so
+    importing them moves it.
 
     The daemon publishes this for what it loaded and every command that asks
-    whether it is current computes it again, the same way, from the disk. It
-    never refuses: a file that cannot be read is part of the answer."""
+    whether it is current computes it again, the same way, reading the store
+    afresh, without waiting for it. It never refuses: a file that cannot be read
+    is part of the answer, and a store that cannot be read now makes the answer
+    None - the declaration cannot be told, which is not the same as changed."""
     import yaml
+
+    _service_reads_here()
 
     def seen(path: Path) -> str:
         try:
@@ -10558,16 +11041,27 @@ def _service_fingerprint() -> str:
     files = [_shipped_workers_dir() / f"{DEFAULT_WORKER}.md"]
     if _shipped_workers_dir().is_dir():
         files = sorted(_shipped_workers_dir().glob("*.md"))
-    if _workers_dir().is_dir():
-        files += sorted(_workers_dir().glob("*.md"))
-    profiles: set = set()
+    files += _unimported_worker_files()
+    documents: list = []
     for path in files:
         parts.append(["worker", str(path), seen(path)])
         try:
             head, _body = _split_front_matter(path.read_text())
-            named = (yaml.safe_load(head) or {}).get("profile")
+            documents.append((path.name, yaml.safe_load(head) or {}))
+        except Exception:
+            continue
+    try:
+        for row in _stored_workers(fresh=True, waiting=False):
+            parts.append(["worker", row["name"], "store", str(row["id"])])
+            documents.append((f"worker {row['name']!r}", row["spec"]))
+    except Exception:
+        return None
+    profiles: set = set()
+    for where, front in documents:
+        try:
+            named = front.get("profile")
             if isinstance(named, str) and named.strip():
-                profiles.add(_expand(named.strip(), path.name))
+                profiles.add(_expand(named.strip(), where))
         except Exception:
             continue
     runner = _harness_runner()
@@ -10596,14 +11090,20 @@ def _service_declaration() -> dict:
     retired = _retired_workers_file()
     if retired:
         raise Refusal(*_retired_refusal(retired))
+    files = _unimported_worker_files()
+    if files:
+        raise Refusal(*_unimported_refusal(files))
+    # Read by the fingerprint above, so what is loaded is what it answers for;
+    # when it could not read them, the store is away and is not waited for.
+    _stored_workers(waiting=False)
     declared = _declarations()
     unknown = sorted(set(settings["lanes"]) - set(declared))
     if unknown:
         raise Refusal(6, "service_invalid",
                       f"{path}: its lanes name {', '.join(map(repr, unknown))}, and no "
                       "worker of that name is declared here",
-                      f"a lane is a worker in {_workers_dir()}; remove the table or add "
-                      "the worker")
+                      f"a lane is a worker of this project; remove the table or save "
+                      f"the worker with `{NAME} workers save`")
     lanes, idle, problems = [], [], []
     for name, found in sorted(declared.items()):
         worker, wrong = _read_worker(name, found)
@@ -10627,7 +11127,7 @@ def _service_declaration() -> dict:
         lanes.append({"worker": name, "max_parallel": cap, "spec": worker})
     if problems:
         raise Refusal(6, "worker_invalid",
-                      f"{len(problems)} problem(s) among the workers in {_workers_dir()}: "
+                      f"{len(problems)} problem(s) among the workers of this project: "
                       + "; ".join(problems),
                       f"`{NAME} doctor` reports every worker this project can run")
     return {"settings": settings, "lanes": lanes, "idle": idle, "fingerprint": fingerprint}
@@ -10709,7 +11209,7 @@ def _service_renew_leases(conn, held: list) -> dict:
     a turn the service started renews nothing itself and only watches its
     lease. Renews the lease of each raise such a turn still holds to the short
     lease from the store's now, never past `limits.lease_seconds` from the
-    claim - as the turn's receipt states it, or as its worker file does for a
+    claim - as the turn's receipt states it, or as its worker does for a
     receipt that does not - and never shorter than the lease already written.
     `held` is (worker, receipt) for each turn whose process is alive, the
     receipt the turn wrote when it claimed. Only a raise still running, opened
@@ -11430,6 +11930,7 @@ def _machine_entry_now(module, project: str, entry: dict) -> dict:
         try:
             with ProjectScope(root, _without_project_pointers()):
                 found["enabled_explicitly"] = _project_enabled_explicitly()
+                _service_reads_here(scoped=True)
                 found["declared"] = _service_fingerprint()
         except (Exception, SystemExit):
             pass
@@ -12099,7 +12600,9 @@ def _service_status(module) -> dict:
                     "lanes", "idle", "turns", "deferred", "next_wake", "last_wake",
                     "reload_error", "stopping"):
             answer[key] = published.get(key)
-        answer["current"] = module.read_fingerprint(state) == _service_fingerprint()
+        current = _service_fingerprint()
+        answer["current"] = (None if current is None
+                             else module.read_fingerprint(state) == current)
         answer["pause"] = _pause_block(module, state, _workers_of(answer.get("lanes")),
                                        published)
         return answer
@@ -12237,11 +12740,13 @@ def _service_serving_problems(module, status: dict) -> tuple[list[str], dict | N
                             f"{overdue:.0f}s overdue; it may hang")
         loaded = module.read_fingerprint(_service_state_dir())
         current = _service_fingerprint()
-        if loaded != current:
+        # A store that cannot be read now leaves the declaration untold; the
+        # store's own problem is reported where the store is.
+        if current is not None and loaded != current:
             stale = {"loaded": loaded, "current": current}
             problems.append("the running daemon loaded a declaration that has changed "
-                            "since: settings, a worker file or a profile it names; "
-                            f"`{NAME} service reload` hands it the one on disk")
+                            "since: settings, a worker or a profile it names; "
+                            f"`{NAME} service reload` hands it the one standing now")
     machine = status.get("machine")
     if machine is not None:
         # A joined project is well while the machine process serves it, paused
@@ -12268,7 +12773,10 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
         answer["lanes"] = _lane_rows(declaration)
         answer["idle"] = declaration["idle"]
     except Refusal as refused:
-        problems.append(refused.message)
+        # The workers are read from the store, and a store that is away is
+        # judged below with the store itself: a warning while a daemon runs.
+        if refused.code not in ("unreachable", "store_busy"):
+            problems.append(refused.message)
     conn_id, entry = _service_connection(wanted)
     answer["connection"] = conn_id
     answer["schema"] = SCHEMA
@@ -12713,7 +13221,7 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 # moved here hold the same tables, columns, indexes, constraints, triggers and
 # functions.
 STORE_MAJOR = 1
-STORE_MINOR = 0
+STORE_MINOR = 1
 
 _MOVE_FROM_SCHEMA_TASKS = r"""
 DO $move$
@@ -13113,9 +13621,52 @@ create trigger tasks_executions_notify_watch after insert or update on tasks_exe
     for each row execute function tasks_notify_watch();
 """
 
+_WORKERS_TABLE = r"""
+create table if not exists tasks_workers (
+  id          uuid        not null default gen_random_uuid(),
+  project_id  text        not null,
+  name        text        not null,
+  spec        jsonb       not null,
+  body        text        not null,
+  active      boolean     not null default true,
+  created_at  timestamptz not null default now(),
+  created_by  text,
+  constraint tasks_workers_pkey primary key (id)
+);
+
+comment on table tasks_workers is
+  'One row is one version of a worker. A change never edits a row: it inserts '
+  'a new version and clears active on the version the writer read, in one '
+  'transaction. History is every version of a name by created_at; a name with '
+  'no active version is no worker.';
+comment on column tasks_workers.spec is
+  'The worker''s settings as written, its front matter, validated whole by tasks '
+  'on write. Substitutions are left as written and read where the worker runs.';
+comment on column tasks_workers.body is
+  'The worker''s instruction, the body of its file.';
+comment on column tasks_workers.created_by is
+  'Who saved this version, as the CLI resolved it.';
+
+-- One active version of a name per project, enforced by the store rather than
+-- by every writer agreeing.
+create unique index if not exists tasks_workers_one_active_idx
+  on tasks_workers (project_id, name) where active;
+create index if not exists tasks_workers_name_idx
+  on tasks_workers (project_id, name, created_at);
+
+alter table tasks_executions add column if not exists worker_id uuid;
+alter table tasks_executions drop constraint if exists tasks_executions_worker_id_fkey;
+alter table tasks_executions add constraint tasks_executions_worker_id_fkey
+  foreign key (worker_id) references tasks_workers (id);
+comment on column tasks_executions.worker_id is
+  'The worker version the raise was claimed under. Null for a claim that named '
+  'no stored worker: one by hand, or one by a worker this capability ships.';
+"""
+
 STORE_STEPS = [
     ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
     ("0002-tables", _TABLES_SHAPE),
+    ("0003-workers", _WORKERS_TABLE),
 ]
 
 
@@ -13139,6 +13690,9 @@ def cmd_doctor(wanted: str | None) -> None:
     reg, _f = _connections_registry()
     conn_id, entry = _select_connection(reg, wanted)
     setting = _store_setting()
+    # The workers judged below are the ones this project keeps in this store.
+    globals().update(SCHEMA=setting.schema, PROJECT_IDENTITY=_project_id_state(),
+                     PROJECT=_declared_project())
     _steps, major, minor = _tables()
     # A probe answers for the store as it is now, so it never waits one out,
     # and it changes nothing: where the tables stand is read without a lock.
@@ -13166,10 +13720,10 @@ def cmd_doctor(wanted: str | None) -> None:
     workers, broken = _workers_report()
     if broken:
         _die(6, "worker_invalid",
-             f"{len(broken)} problem(s) among the workers in {_workers_dir()}: "
+             f"{len(broken)} problem(s) among the workers of this project: "
              + "; ".join(broken),
-             "a worker file's shape is this capability's contract; `tasks help` "
-             "states it")
+             "a worker's shape is this capability's contract; `tasks help` "
+             "states it, and `tasks workers save` saves a repaired version")
     escalation, wrong, unescalated = _conveyor_report()
     if wrong:
         _die(6, "conveyor_invalid",
@@ -13236,12 +13790,14 @@ def _guarded(handler, entry, rest) -> None:
 _FORM_ARGS = {
     "meta": {"names": ("actor",), "takes": 99},
     "run": {"names": ("key",), "bools": ("apply",), "takes": 1},
+    "workers": {"names": ("version", "base"), "bools": ("apply",), "takes": 3},
 }
 
 
 def _reads_only(verb: str, rest: list[str]) -> bool:
     """Whether this call of a write verb is its form that writes nothing: `meta
-    show`, or `run` without `--apply`. That form answers whatever
+    show`, `run` without `--apply`, `workers list`, `show` and `history`, or
+    `workers import` without `--apply`. That form answers whatever
     the connection grants, so a read-only grant or the read-only switch leaves it
     reading.
 
@@ -13257,6 +13813,10 @@ def _reads_only(verb: str, rest: list[str]) -> bool:
         return False
     if verb == "meta":
         return opts["_loose"][:1] == ["show"]
+    if verb == "workers":
+        action = opts["_loose"][:1]
+        return action in (["list"], ["show"], ["history"]) or (
+            action == ["import"] and not opts.get("apply"))
     return not opts.get("apply")
 
 
@@ -13325,7 +13885,7 @@ def main() -> None:
         "add": cmd_add, "set": cmd_set, "meta": cmd_meta, "activity": cmd_activity,
         "claim": cmd_claim, "release": cmd_release, "run": cmd_run,
         "runs": cmd_runs, "history": cmd_history,
-        "watch": cmd_watch,
+        "watch": cmd_watch, "workers": cmd_workers,
     }
     handler = handlers.get(verb)
     if not handler and verb not in ("tag", "untag"):

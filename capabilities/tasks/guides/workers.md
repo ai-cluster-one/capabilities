@@ -1,18 +1,18 @@
 # Workers
 
-A worker is one role in a project's conveyor: one lane that claims the tasks it is declared to take and runs one agent turn on each. Read this to write a worker file, to change or switch off a shipped worker, and to know what `doctor` will say about one.
+A worker is one role in a project's conveyor: one lane that claims the tasks it is declared to take and runs one agent turn on each. Read this to write and save a worker, to change or switch off a shipped worker, and to know what `doctor` will say about one.
 
 ## What a worker is
 
-A worker is a role, not a process. It is one file in the project's capability envelope, `capabilities/tasks/workers/<name>.md`, and it is run by its name, the file's name without `.md`.
+A worker is a role, not a process. The project keeps it in the store, as versions of one name - one row per version, one of them active - and it is run by its name. Every machine that reaches the store reads the same workers.
 
 One turn of a worker is `tasks run <worker> --apply`: claim the next task the worker's `takes` selects, hold it under a lease, start one headless agent turn on it with the worker's profile, and settle the raise from where the turn left the task. The turn moves the task's status and writes its trail itself, through the same verbs anyone uses; `run` never reads the turn's answer, so a turn that reports success and moved nothing is not believed. The service runs every enabled worker that takes something as a lane, starting a turn whenever the store holds work that worker takes; without the service, anything may run `tasks run <worker> --apply` on its own schedule, and a worker nothing runs never runs.
 
 Because the role is the unit, a worker does one kind of job. Work that needs several kinds - doing it, judging it, deciding about it - moves between several workers, and `tasks guide loops` is about that movement.
 
-## Anatomy of a worker file
+## Anatomy of a worker
 
-A worker file is Markdown. Its YAML front matter is the worker's settings and its body is the role. The shape is this capability's contract and the content is the project's; any key the contract does not name is refused rather than ignored. `tasks help` WORKERS states every key with its default; this section says what each one is for.
+A worker is written as a Markdown document. Its YAML front matter is the worker's settings and its body is the role. The shape is this capability's contract and the content is the project's; any key the contract does not name is refused rather than ignored. `tasks help` WORKERS states every key with its default; this section says what each one is for.
 
 - `enabled` switches the worker on or off, and defaults to on.
 - `description` is one sentence saying what the worker is and does. `doctor` shows it beside the worker, and it opens the frame every turn of the worker receives, so it is the first thing the agent reads about its role.
@@ -25,7 +25,7 @@ A worker file is Markdown. Its YAML front matter is the worker's settings and it
 - `park_hint` is one sentence the project adds to the handback when a task is parked at the `attempts` ceiling, and only then: it is what a person about to read a task the work kept failing on should check first.
 - `hooks` names the project's own commands that run around a turn, described below.
 
-A string in the front matter may carry `${VAR}`, read from the environment and then from the project's `.env` and `.env.local`; a name nothing answers for is refused. Machine-local paths belong there rather than in a versioned file.
+A string in the front matter may carry `${VAR}`, read from the environment and then from the project's `.env` and `.env.local`; a name nothing answers for is refused. Machine-local paths belong there rather than in a worker every machine reads: the store keeps the string as written, and each machine substitutes it where the worker runs.
 
 ### What a turn may write
 
@@ -35,7 +35,7 @@ Two rules read it, and only two. A field a scope does not list may not be writte
 
 A worker with no `writes` is held to a default fence: on its own task it lands any status but `in_progress` and never changes the type, on every other task it only adds, and what it creates lands in `draft`. A declared `writes` replaces that fence whole, so it has to name everything the role needs: `held.status` lists every status the role ends its task on, and a `new` that allows no type refuses every task the worker tries to create, since a task always has a type. The exact default and the refusal rules are `tasks help` WORKER SCOPE.
 
-What a raise may write is fixed when it is claimed. Editing a worker file changes the next claim, never the turn already running, and a worker whose raise has ended may write no field on any task, its own former task included.
+What a raise may write is fixed when it is claimed. Saving a worker changes the next claim, never the turn already running, and a worker whose raise has ended may write no field on any task, its own former task included.
 
 ### The body
 
@@ -76,7 +76,7 @@ escalate_to = ["supervisor", "owner"]
 stall_after = "6h"
 ```
 
-`escalate_to` is the chain a stuck task goes along, in order, and its last name is a person - a name no worker file of the project has. Every name before it is a worker that is switched on and takes the waiting tasks assigned to it, as the supervisor does. `stall_after` is how long a task may be held back before it is escalated, 6h when unsaid.
+`escalate_to` is the chain a stuck task goes along, in order, and its last name is a person - a name no worker of the project has. Every name before it is a worker that is switched on and takes the waiting tasks assigned to it, as the supervisor does. `stall_after` is how long a task may be held back before it is escalated, 6h when unsaid.
 
 The claim decides it, for the tasks the claiming worker would take. A task whose raises in place - the raises since it last changed status or assignee, apart from those that never got to the work - have reached the worker's `limits.attempts` is escalated instead of claimed, before its `before` hook is asked. A task its `before` hook has held back for longer than `stall_after` is escalated instead of held again; the clock starts at the first hold in its place, so time spent waiting its turn never counts, and that first hold is the one thing the claim records, as a row among the task's raises that is no raise. A hook answering escalate sends the task on at once. Escalating moves it to `waiting` on the next name in the chain, with one trail entry by `tasks:scan` saying why, since when it stood where it was, and how many raises it had there. If that name cannot move it either, the next escalation goes on, ending at the person. A task assigned to a person is never escalated this way.
 
@@ -90,15 +90,33 @@ Some tasks cannot move however long anyone waits, and the configuration alone sa
 
 Writes do not make them in the first place. `add`, `set` and `release` refuse with exit 4 a write that would leave a task in `todo` or `waiting` on a worker's name nobody takes there, `add`, `set` and the deprecated `meta set` refuse a `blocked_by` naming no task, the task itself or a cycle, and `in_progress` is never written: it is shown while an open raise holds the task. A turn refused this way stops on a named person, as its frame tells it. So a worker's `writes.held.assignee` should name only workers that take the task where the worker may land it, or people: `doctor` lists every other place as `lands_untaken` on the worker and warns of it.
 
-## Shipped workers and project files
+## Saving a worker
 
-The capability ships two workers. `default` takes every `todo` task of a type no project worker file names in `takes` or `on_request`, so a project with no workers of its own still has its queue worked; its body treats each task as an assignment given within the project's own authority, to act on inside what the project's doctrine lets an unattended turn do. `supervisor` ships switched off; `tasks guide loops` explains its role.
+`tasks workers save <name> <file>` saves the document in the file - or on stdin, with `-` - as the worker's new version. It is judged whole first, as `doctor` and `run` read it, and anything they would refuse is refused with nothing saved; a profile or routine this machine does not have is only a warning, because another machine may have it. A save identical to the active version creates none. Otherwise the new version becomes the active one in the same transaction that retires the version the writer read, so two people saving at once never both replace the same version: the second is refused with `conflict` and reads again.
 
-A project file with the name of a shipped worker replaces the shipped file whole. Nothing is merged: to change one setting of a shipped worker, copy the whole shipped file - `doctor` names its path - into the project's `workers/` and edit it there. `doctor` reports the project file as the worker's source and names the shipped file it shadows. A project switches the supervisor on this way, with its own `workers/supervisor.md`.
+To change a worker, start from what is active:
+
+```sh
+tasks workers show alpha | jq -r .text > alpha.md     # note its "version"
+# edit alpha.md
+tasks workers save alpha alpha.md --base <version>
+```
+
+`tasks workers list` lists the project's workers, `tasks workers history <name>` every version of one, and `tasks workers show <name> --version <id>` any of them. No version is ever edited or deleted, and every raise records under `worker_id` the version it was claimed under, so `tasks runs <task>` shows exactly which role and fence each turn ran with. A project reads and writes only its own workers, and nothing working under a raise saves one, since what a turn may write is declared there.
+
+## Moving worker files into the store
+
+A project that kept its workers as files in `capabilities/tasks/workers/` moves them once. While any file is there, `doctor`, `run` and the service refuse with `workers_not_imported`, naming the files, rather than run without them. `tasks workers import` says what it would do; `tasks workers import --apply` saves each file as its worker's first version - or finds the store already holding that exact version, as it does on a second machine sharing the store - and removes the files. It moves all of them or none: a file that cannot be read, or one that differs from a version the store already holds for its name, refuses the import and is named, because the store's version is what runs. Commit the removed files, then `tasks service reload` a running service.
+
+## Shipped workers and project workers
+
+The capability ships two workers, as files of its own. `default` takes every `todo` task of a type no project worker names in `takes` or `on_request`, so a project with no workers of its own still has its queue worked; its body treats each task as an assignment given within the project's own authority, to act on inside what the project's doctrine lets an unattended turn do. `supervisor` ships switched off; `tasks guide loops` explains its role.
+
+A project worker with the name of a shipped worker replaces the shipped one whole. Nothing is merged: to change one setting of a shipped worker, take its whole document - `tasks workers show supervisor` gives it - edit it, and save it under the same name. `doctor` reports the project's worker as the source and names the shipped file it shadows, and removing it with `tasks workers remove <name>` brings the shipped one back.
 
 ## Switching a worker off
 
-Set `enabled: false` in its file. A switched-off worker never claims, is not a lane, and `tasks run` refuses it with exit 4. The front matter alone is a whole file for a worker that is off, so `workers/default.md` holding only
+Save it with `enabled: false`. A switched-off worker never claims, is not a lane, and `tasks run` refuses it with exit 4. The front matter alone is a whole worker when it is off, so a `default` saved as only
 
 ```markdown
 ---
@@ -108,19 +126,19 @@ enabled: false
 
 switches the shipped catch-all off.
 
-A worker that is off still owns the types it names: `default` never takes them, so switching a worker off, or breaking its file, never hands its work to the catch-all. Removing the file is what gives those types back.
+A worker that is off still owns the types it names: `default` never takes them, so switching a worker off never hands its work to the catch-all. Removing it is what gives those types back.
 
 ## How doctor judges workers
 
-`tasks doctor`, once it has proved the store, reads every worker this project can run and refuses with exit 6, naming every problem in one pass, when any of them is wrong. It refuses a file it cannot read, a key nothing reads, an enabled worker that takes nothing, an enabled worker with an empty body, a profile the library refuses, a profile knob carrying `${`, a profile with no timeout when the worker sets no `lease_seconds`, and a profile or routine the worker names that is not there. It refuses two enabled workers whose filters could select the same task, because a task is taken by exactly one enabled worker; filters are kept apart by status, type or assignee, or by tag sets where neither contains the other. It refuses an escalation chain whose last name is a worker, that names before its end a name no worker here has, or a worker that is off or takes no waiting task assigned to it, and it warns a project with enabled workers and no chain, and of every place a worker may land the task it holds where no enabled worker takes it.
+`tasks doctor`, once it has proved the store, reads every worker this project can run and refuses with exit 6, naming every problem in one pass, when any of them is wrong. It refuses a worker it cannot read, a key nothing reads, an enabled worker that takes nothing, an enabled worker with an empty body, a profile the library refuses, a profile knob carrying `${`, a profile with no timeout when the worker sets no `lease_seconds`, and a profile or routine the worker names that is not there. It refuses two enabled workers whose filters could select the same task, because a task is taken by exactly one enabled worker; filters are kept apart by status, type or assignee, or by tag sets where neither contains the other. It refuses an escalation chain whose last name is a worker, that names before its end a name no worker here has, or a worker that is off or takes no waiting task assigned to it, and it warns a project with enabled workers and no chain, and of every place a worker may land the task it holds where no enabled worker takes it.
 
-Two judgements reach past `doctor` into `run`. A worker naming a missing profile or routine has nothing whole to give a turn, so `run` parks the task it takes, saying what is missing, without starting a turn and without spending an attempt. While any project worker file's types cannot be read at all, `default` takes nothing, because it cannot know which types are someone else's.
+Two judgements reach past `doctor` into `run`. A worker naming a missing profile or routine has nothing whole to give a turn, so `run` parks the task it takes, saying what is missing, without starting a turn and without spending an attempt. While any project worker's types cannot be read at all, `default` takes nothing, because it cannot know which types are someone else's.
 
 When it passes, `doctor` lists each worker with its source, what it shadows, whether it is enabled, its description, what it takes, its `writes`, its profile, its routines, its limits and its hooks. `tasks run <worker>` without `--apply` says which task a claim would take and writes nothing; for a worker with a `before` hook it asks the hook and names what the hook would hold back, and for a held lane it names the hold. `doctor` also names every key a project still sets that is read as another now, such as `hold_seconds_on_exhaustion` or the service's `retry_delay_seconds`.
 
 ## Changing a worker while the service runs
 
-Run `tasks service reload` right after editing a worker file, a profile a worker names, or the service settings. The running daemon publishes a fingerprint of the declaration it loaded, and `tasks service doctor` fails while that differs from the files on disk, so whatever watches the service sees that the daemon is not running the declaration on disk. `reload` validates the files first and refuses what does not load, then hands the daemon the declaration on disk and waits until it reports the new one; running turns are never touched. What a reload cannot change, such as the connection or the environment turns start with, needs `stop` and `start`, and `tasks help` SERVICE lists it. In a project joined to the machine service the same `tasks service reload` reaches the machine process, which takes up this project's files and leaves the other projects as they are.
+Run `tasks service reload` right after saving a worker, or editing a profile a worker names or the service settings. The running daemon publishes a fingerprint of the declaration it loaded - the active version of each worker among it - and `tasks service doctor` fails while that differs from what stands now, so whatever watches the service sees that the daemon is not running the current declaration. `reload` validates it first and refuses what does not load, then hands the daemon the current declaration and waits until it reports the new one; running turns are never touched. What a reload cannot change, such as the connection or the environment turns start with, needs `stop` and `start`, and `tasks help` SERVICE lists it. In a project joined to the machine service the same `tasks service reload` reaches the machine process, which takes up this project's declaration and leaves the other projects as they are.
 
 Stopping or restarting the service leaves running turns running: each settles its own task, and the next daemon to serve the project adopts them. The service is the one writer of its turns' leases, so a turn no daemon adopts before its lease runs out loses its raise and ends itself. `tasks service stop --end-turns` is the one act that ends them at once, after `shutdown_grace_seconds`, settling what they held.
 

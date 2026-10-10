@@ -7,7 +7,7 @@
 # ///
 """The service: its declaration, its lanes, how it wakes, reloads and stops.
 
-What the settings and the worker files declare is checked with no store. The
+What the settings and the workers declare is checked with no store. The
 daemon itself is driven one step at a time over a project written into a temp
 directory and a real store, with each turn replaced by a small process that
 reports a claim and waits, so a lane's cap, a wake and a stop are observed
@@ -55,7 +55,11 @@ TEMPLATE = (_cli.CAPABILITY_DIR / "service" / "templates" / "config.toml")
 
 
 def write_worker(project: Path, name: str, front: str, body: str = "the body.") -> Path:
-    path = project / "capabilities" / "tasks" / "workers" / f"{name}.md"
+    """A worker document of `project`, kept beside it as the store's version of
+    that worker: served to this process by `serve_workers`, saved for a child
+    by `tasks_cli`."""
+    path = _cli.worker_docs(project) / f"{name}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"---\n{textwrap.dedent(front).strip()}\n---\n\n{body}\n")
     return path
 
@@ -72,9 +76,9 @@ def project(tmp_path, monkeypatch):
     """A project with two workers taking one type each, one that runs only on
     request, and the shipped `default` switched off."""
     envelope = tmp_path / "capabilities" / "tasks"
-    (envelope / "workers").mkdir(parents=True)
-    (envelope / "profiles").mkdir()
+    (envelope / "profiles").mkdir(parents=True)
     (envelope / "profiles" / "plain.toml").write_text(PROFILE)
+    _cli.serve_workers(mod, monkeypatch, tmp_path)
     write_worker(tmp_path, "alpha", "takes: [alpha]\nprofile: plain")
     write_worker(tmp_path, "beta", "takes: [beta]\nprofile: plain")
     write_worker(tmp_path, "triage", "on_request: [triage]\nprofile: plain")
@@ -127,7 +131,7 @@ def test_every_enabled_worker_that_takes_something_is_a_lane(project):
 
 
 def test_the_shipped_default_is_a_lane_taking_what_nobody_names(project):
-    (project / "capabilities" / "tasks" / "workers" / "default.md").unlink()
+    (_cli.worker_docs(project) / "default.md").unlink()
     lanes = {lane["worker"]: lane for lane in mod._service_declaration()["lanes"]}
     assert set(lanes) == {"alpha", "beta", "default"}
     assert lanes["default"]["spec"]["not_types"] == ["alpha", "beta", "triage"]
@@ -199,7 +203,7 @@ def test_init_writes_the_template_and_keeps_an_edited_file(project, capsys):
 def test_the_fingerprint_moves_with_settings_workers_and_profiles(project):
     first = mod._service_fingerprint()
     assert mod._service_fingerprint() == first
-    worker = project / "capabilities" / "tasks" / "workers" / "alpha.md"
+    worker = _cli.worker_docs(project) / "alpha.md"
     worker.write_text(worker.read_text() + "\nmore.\n")
     second = mod._service_fingerprint()
     assert second != first
@@ -391,6 +395,9 @@ def store(monkeypatch):
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
     monkeypatch.setattr(mod, "PROJECT", HERE)
+    # The workers a case writes are saved in this store, so a raise names a
+    # version it holds.
+    _cli.keep_served_workers_in_store(mod, monkeypatch, schema)
     with psycopg.connect(DSN, autocommit=True) as conn:
         _cli.make_tables(mod, schema)
         try:
@@ -1032,8 +1039,10 @@ def test_every_question_goes_on_one_held_connection_beside_the_listener(
         opened.append(time.monotonic())
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(mod, "_connect", counted)
+    # Loading the declaration reads the project's workers from the store; what
+    # is counted is what the daemon opens once it holds that declaration.
     h = Harness(project, entry)
+    monkeypatch.setattr(mod, "_connect", counted)
     asked = []
     lane_has_work = h.host.lane_has_work
     h.host.lane_has_work = lambda c, worker, exclude=(): (
@@ -1238,8 +1247,7 @@ def lab(tmp_path):
     (project / ".git").mkdir(parents=True)
     envelope = project / "capabilities"
     tasks = envelope / "tasks"
-    (tasks / "workers").mkdir(parents=True)
-    (tasks / "profiles").mkdir()
+    (tasks / "profiles").mkdir(parents=True)
     (envelope / "settings.json").write_text(
         json.dumps({"capabilities": {"tasks": {"enabled": True}}}))
     (envelope / "project.json").write_text(json.dumps({
@@ -1278,6 +1286,10 @@ def lab(tmp_path):
 
 
 def tasks_cli(lab, *args: str) -> subprocess.CompletedProcess:
+    if args[:1] != ("migrate",):
+        # The lab's worker documents as the store's workers of its project,
+        # for the child about to read them.
+        _cli.save_declared_workers(mod, lab["project"], lab["schema"])
     return subprocess.run([str(_cli.CLI_PATH), *args], cwd=lab["project"], env=lab["env"],
                           text=True, capture_output=True, timeout=180)
 
@@ -1336,8 +1348,8 @@ def test_the_daemon_end_to_end_through_the_cli(lab):
     assert log and all(f" tasks service [{slug}]: " in line for line in log), log
     assert made["created"]
 
-    # A worker file edited: doctor says the daemon is behind, reload catches it up.
-    worker = project / "capabilities" / "tasks" / "workers" / "alpha.md"
+    # A worker edited: doctor says the daemon is behind, reload catches it up.
+    worker = _cli.worker_docs(project) / "alpha.md"
     worker.write_text(worker.read_text() + "\nedited.\n")
     stale = tasks_cli(lab, "service", "doctor")
     assert stale.returncode == 6 and "declaration_stale" in json.loads(stale.stdout)
@@ -1463,9 +1475,9 @@ def test_service_doctor_fails_a_daemon_whose_planned_wake_is_long_overdue(lab):
 @needs_store
 def test_service_doctor_warns_while_the_daemon_waits_out_the_store(lab, relay):
     """The probe a supervisor runs: with a daemon running, the store being away
-    is a warning and exit 0, and a stale declaration still fails; with no
-    daemon it fails. The daemon lives through it and works when the store is
-    back."""
+    is a warning and exit 0; with no daemon it fails. The daemon lives through
+    it and works when the store is back, and a stale declaration still fails
+    the probe until a reload."""
     project = lab["project"]
     # The machine's store is reached through the relay.
     _cli.write_store_setting(lab["tmp"] / "config", lab["schema"], host="127.0.0.1",
@@ -1492,13 +1504,6 @@ def test_service_doctor_warns_while_the_daemon_waits_out_the_store(lab, relay):
     assert "cannot reach the store" in away["store"]["error"]
     assert "unreachable" in away["warning"]
     assert away["service"]["running"] is True
-    # A daemon behind the files on disk fails the probe, store or no store.
-    worker = project / "capabilities" / "tasks" / "workers" / "alpha.md"
-    kept = worker.read_text()
-    worker.write_text(kept + "\nedited.\n")
-    stale = tasks_cli(lab, "service", "doctor")
-    assert stale.returncode == 6 and "declaration_stale" in json.loads(stale.stdout)
-    worker.write_text(kept)
     time.sleep(3)
     os.kill(pid, 0)
     assert answer_of(tasks_cli(lab, "service", "status"))["notification"]["listening"] is False
@@ -1515,6 +1520,14 @@ def test_service_doctor_warns_while_the_daemon_waits_out_the_store(lab, relay):
     assert back["service"]["pid"] == pid
     log = "\n".join(answer_of(tasks_cli(lab, "service", "logs", "--tail", "200"))["lines"])
     assert "listening on tasks_claimable again" in log
+    # A worker saved since the daemon loaded fails the probe until it reloads.
+    worker = _cli.worker_docs(project) / "alpha.md"
+    worker.write_text(worker.read_text() + "\nedited.\n")
+    _cli.save_declared_workers(mod, project, lab["schema"])
+    stale = tasks_cli(lab, "service", "doctor")
+    assert stale.returncode == 6 and "declaration_stale" in json.loads(stale.stdout)
+    assert answer_of(tasks_cli(lab, "service", "reload"))["reloaded"] is True
+    assert answer_of(tasks_cli(lab, "service", "doctor"))["ok"]
     assert answer_of(tasks_cli(lab, "service", "stop"))["stopped"] is True
 
 

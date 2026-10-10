@@ -60,8 +60,7 @@ def write_project(root: Path, *, project_id: str, slug: str, worker: str, takes:
     for it, one connection, one worker, and the service settings."""
     envelope = root / "capabilities"
     tasks = envelope / "tasks"
-    (tasks / "workers").mkdir(parents=True)
-    (tasks / "profiles").mkdir()
+    (tasks / "profiles").mkdir(parents=True)
     (tasks / "profiles" / "plain.toml").write_text(base.PROFILE)
     (envelope / "project.json").write_text(json.dumps(
         {"schema": "capabilities.project.v1", "id": project_id, "slug": slug}))
@@ -173,6 +172,9 @@ def pair(machine, monkeypatch):
     _cli.bind_store(mod, monkeypatch, found.schema)
     if DSN:
         _cli.make_tables(mod, found.schema)
+        # Each project's worker documents as its workers in the store.
+        for root in found.roots.values():
+            _cli.save_declared_workers(mod, root, found.schema)
     try:
         yield found
     finally:

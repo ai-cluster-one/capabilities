@@ -7,7 +7,7 @@
 # ///
 """A worker's hooks: the project's own commands `run` starts around a turn.
 
-What a worker file declares is checked with no store. What `before` decides
+What a worker declares is checked with no store. What `before` decides
 about a claim and what `after` is told about a settled raise are driven against
 a real store, with the harness replaced by one that finishes the task the way a
 worker would, and with each hook a small script that records what it was given
@@ -71,7 +71,10 @@ sys.exit(told.get("exit", 0))
 
 
 def write_worker(project: Path, name: str, front: str, body: str = "the body.") -> Path:
-    path = project / "capabilities" / "tasks" / "workers" / f"{name}.md"
+    """A worker document of `project`, kept beside it as the store's version of
+    that worker."""
+    path = _cli.worker_docs(project) / f"{name}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"---\n{textwrap.dedent(front).strip()}\n---\n\n{body}\n")
     return path
 
@@ -100,9 +103,9 @@ def seen(project: Path, which: str) -> list[dict]:
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     envelope = tmp_path / "capabilities" / "tasks"
-    (envelope / "workers").mkdir(parents=True)
-    (envelope / "profiles").mkdir()
+    (envelope / "profiles").mkdir(parents=True)
     (envelope / "profiles" / "plain.toml").write_text(PROFILE)
+    _cli.serve_workers(mod, monkeypatch, tmp_path)
     write_worker(tmp_path, "alpha", "takes: [alpha]\nprofile: plain")
     write_worker(tmp_path, "default", "enabled: false")
     for which in ("before", "after"):
@@ -178,6 +181,9 @@ def store(monkeypatch):
     monkeypatch.delenv("TASKS_EXECUTION", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
     monkeypatch.setattr(mod, "PROJECT", HERE)
+    # The workers a case writes are saved in this store, so a raise names a
+    # version it holds.
+    _cli.keep_served_workers_in_store(mod, monkeypatch, schema)
     with psycopg.connect(DSN, autocommit=True) as conn:
         _cli.make_tables(mod, schema)
         try:
@@ -480,8 +486,7 @@ def lab(tmp_path):
     (project / ".git").mkdir(parents=True)
     envelope = project / "capabilities"
     tasks = envelope / "tasks"
-    (tasks / "workers").mkdir(parents=True)
-    (tasks / "profiles").mkdir()
+    (tasks / "profiles").mkdir(parents=True)
     (envelope / "settings.json").write_text(
         json.dumps({"capabilities": {"tasks": {"enabled": True}}}))
     (envelope / "project.json").write_text(json.dumps({
@@ -523,6 +528,8 @@ def lab(tmp_path):
 
 
 def tasks_cli(lab, *args: str) -> subprocess.CompletedProcess:
+    if args[:1] != ("migrate",):
+        _cli.save_declared_workers(mod, lab["project"], lab["schema"])
     return subprocess.run([str(_cli.CLI_PATH), *args], cwd=lab["project"], env=lab["env"],
                           text=True, capture_output=True, timeout=180)
 

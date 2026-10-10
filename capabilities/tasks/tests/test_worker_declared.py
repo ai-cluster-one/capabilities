@@ -5,7 +5,7 @@
 #                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
-"""What a worker file declares about itself: its description, what it takes and
+"""What a worker declares about itself: its description, what it takes and
 what its turn may write.
 
 The reading and the decisions are pure and are checked over a project written
@@ -45,9 +45,10 @@ HERE = "prj_worker_declared"
 def project(tmp_path, monkeypatch):
     """A project with one profile and no workers of its own yet."""
     envelope = tmp_path / "capabilities" / "tasks"
-    (envelope / "workers").mkdir(parents=True)
-    (envelope / "profiles").mkdir()
+    (envelope / "profiles").mkdir(parents=True)
     (envelope / "profiles" / "plain.toml").write_text(PROFILE)
+    _cli.worker_docs(tmp_path).mkdir()
+    _cli.serve_workers(mod, monkeypatch, tmp_path)
     monkeypatch.setattr(mod, "_project_root", lambda: tmp_path)
     monkeypatch.setattr(mod, "_project_capabilities_dir", lambda root: root / "capabilities")
     monkeypatch.setattr(mod, "_project_env", dict)
@@ -56,7 +57,8 @@ def project(tmp_path, monkeypatch):
 
 
 def write_worker(project: Path, name: str, front: str, body: str = "the body.") -> Path:
-    path = project / "capabilities" / "tasks" / "workers" / f"{name}.md"
+    """A worker document of `project`, served as the store's version of it."""
+    path = _cli.worker_docs(project) / f"{name}.md"
     path.write_text(f"---\n{front.strip()}\n---\n\n{body}\n")
     return path
 
@@ -175,9 +177,9 @@ def test_a_filter_that_cannot_be_read_is_refused(project, takes, said):
 
 def test_a_filter_without_a_type_names_no_type_to_the_default(project):
     write_worker(project, "probe", SUPERVISOR)
-    assert mod._types_named(project / "capabilities/tasks/workers/probe.md") == set()
+    assert mod._types_named(mod._declarations()["probe"]) == set()
     write_worker(project, "probe", "takes: [{type: [a]}, {type: [b], status: [waiting]}]")
-    assert mod._types_named(project / "capabilities/tasks/workers/probe.md") == {"a", "b"}
+    assert mod._types_named(mod._declarations()["probe"]) == {"a", "b"}
 
 
 def test_a_named_task_is_accepted_by_status_and_type(project):
@@ -263,7 +265,7 @@ def test_the_shipped_supervisor_is_there_switched_off(project):
 
 
 def test_the_shipped_supervisor_switched_on_beside_the_default_is_clean(project):
-    path = project / "capabilities" / "tasks" / "workers" / "supervisor.md"
+    path = _cli.worker_docs(project) / "supervisor.md"
     path.write_text(SHIPPED.read_text().replace("enabled: false", "enabled: true"))
     rows, broken = mod._workers_report()
     assert broken == []
@@ -304,7 +306,7 @@ def test_a_listed_value_is_allowed_on_the_held_task_and_another_refused(op, allo
     assert judged(f"{op}:{allowed}", HELD) is None
     said = judged(f"{op}:{refused}", HELD)
     assert said and said.startswith("a worker may not ")
-    assert "its worker file's `writes.held." in said and refused in said
+    assert "its worker's `writes.held." in said and refused in said
 
 
 @pytest.mark.parametrize("op", ["status:todo", "type:x", "assignee:x", "pickup",
@@ -437,6 +439,9 @@ def store(project, monkeypatch):
     monkeypatch.delenv("TASKS_ACTOR", raising=False)
     monkeypatch.setattr(mod, "SCHEMA", schema)
     monkeypatch.setattr(mod, "PROJECT", HERE)
+    # The workers a case writes are saved in this store, so a raise names a
+    # version it holds.
+    _cli.keep_served_workers_in_store(mod, monkeypatch, schema)
     with psycopg.connect(DSN, autocommit=True) as conn:
         _cli.make_tables(mod, schema)
         try:
@@ -619,7 +624,7 @@ def test_attempts_from_waiting_and_from_the_queue_are_counted_apart():
 def test_the_shipped_supervisor_creates_a_task_waiting_on_a_name(project, store, capsys,
                                                                  monkeypatch):
     entry = store
-    path = project / "capabilities" / "tasks" / "workers" / "supervisor.md"
+    path = _cli.worker_docs(project) / "supervisor.md"
     path.write_text(SHIPPED.read_text().replace("enabled: false", "enabled: true"))
     add(entry, capsys, "held", status="waiting", assignee="supervisor")
     execution = mod._take(entry, mod._worker("supervisor"), None)["execution"]["id"]

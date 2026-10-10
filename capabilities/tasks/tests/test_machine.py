@@ -175,8 +175,7 @@ def write_project(root: Path, *, project_id: str | None, slug: str, worker: str,
                   entry: dict, connection: str = "farm") -> Path:
     envelope = root / "capabilities"
     tasks = envelope / "tasks"
-    (tasks / "workers").mkdir(parents=True)
-    (tasks / "profiles").mkdir()
+    (tasks / "profiles").mkdir(parents=True)
     (tasks / "profiles" / "plain.toml").write_text(
         base.PROFILE + f'cli_path = "{base.FAKE_CLAUDE}"\n')
     identity = {"schema": "capabilities.project.v1", "slug": slug}
@@ -334,6 +333,11 @@ def plot(joining, monkeypatch):
     import psycopg
     schema = "tasks_test_plot_" + secrets.token_hex(3)
     _cli.bind_store(mod, monkeypatch, schema)
+    # Each project's worker documents, answered as its stored workers by the
+    # project the module stands in, and saved in this store for it so a raise
+    # names a version the store holds.
+    _cli.serve_workers(mod, monkeypatch)
+    _cli.keep_served_workers_in_store(mod, monkeypatch, schema)
     roots = {
         "orchard": write_project(joining / "orchard", project_id=ORCHARD_ID, slug="orchard",
                                  worker="picker", kind="fruit", entry=entry_for()),
@@ -447,12 +451,25 @@ class Farm:
             "FAKE_ENGINE_SLEEP": "1",
         })
         self.machine_state = tmp / "state" / "capabilities" / "machine" / "tasks"
+        # The store a project resolves when it is not the machine's.
+        self.schemas: dict[str, str] = {}
+
+    def save(self) -> None:
+        """Every project's worker documents as its stored workers, in the store
+        it resolves, for the child about to read them - the machine process
+        reads every joined project's. A project whose folder is gone keeps
+        what it had."""
+        for name, root in self.roots.items():
+            if root.is_dir():
+                _cli.save_workers(mod, root, self.schemas.get(name, self.schema),
+                                  self.ids[name])
 
     def state(self, name: str) -> Path:
         return self.tmp / "state" / "capabilities" / "projects" / name / "tasks"
 
     def cli(self, name: str | None, *args: str, **env) -> subprocess.CompletedProcess:
         """A tasks command in the project `name`, or outside every project."""
+        self.save()
         run_env = {**self.env, **env}
         if name is not None:
             root = self.roots[name]
@@ -692,9 +709,11 @@ def test_the_machine_cap_deals_turns_round_the_projects_in_turn(farm):
 @needs_store
 def test_a_project_that_does_not_load_is_error_and_the_others_are_served(farm):
     farm.join("orchard", "kiln", "mill")
-    miller = farm.roots["mill"] / "capabilities" / "tasks" / "workers" / "miller.md"
+    miller = _cli.worker_docs(farm.roots["mill"]) / "miller.md"
     good = miller.read_text()
-    miller.write_text("---\ntakes: [grain\nprofile: plain\n---\n\nbroken.\n")
+    # The store keeps no document that does not parse, so the broken worker is
+    # one whose settings the store holds and no reader accepts.
+    miller.write_text("---\ntakes: grain\nprofile: plain\n---\n\nbroken.\n")
     for name in ("orchard", "kiln", "mill"):
         farm.add(name, f"t-{name}")
     farm.start()
@@ -890,8 +909,8 @@ def test_turns_outlive_the_machine_process_and_move_between_modes(farm):
 @needs_store
 def test_machine_status_and_doctor_with_and_without_a_process(farm):
     farm.join("orchard", "kiln", "mill")
-    (farm.roots["mill"] / "capabilities" / "tasks" / "workers" / "miller.md").write_text(
-        "---\ntakes: grain: [\n---\n")
+    (_cli.worker_docs(farm.roots["mill"]) / "miller.md").write_text(
+        "---\ntakes: {grain: 1}\n---\n")
     status = farm.machine()
     assert (status["running"], status["pid"], status["mode"]) == (False, None, "machine")
     assert status["projects_file"] == {"path": str(farm.tmp / "config" / "tasks" / "service"
@@ -1128,6 +1147,7 @@ def test_two_projects_on_two_stores_each_keep_their_tasks_in_their_own(farm):
     decoy = "tasks_test_decoy_" + secrets.token_hex(3)
     env_file = farm.roots["kiln"] / ".env"
     env_file.write_text(f"KILN_ONLY=1\nAGENTKIT_DB_URL={DSN}\nAGENTKIT_DB_SCHEMA={own}\n")
+    farm.schemas["kiln"] = own
     try:
         farm.join("orchard", "kiln")
         farm.start()
@@ -1163,6 +1183,7 @@ def test_two_projects_on_two_stores_each_keep_their_tasks_in_their_own(farm):
     finally:
         farm.cli(None, "service", "stop", "--machine", "--end-turns", "--timeout", "20",
                  "--force")
+        farm.schemas.pop("kiln", None)
         with psycopg.connect(DSN, autocommit=True) as conn:
             for schema in (own, decoy):
                 conn.execute(f"drop schema if exists {schema} cascade")

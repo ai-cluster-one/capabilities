@@ -299,7 +299,7 @@ def test_the_metadata_mirrors_the_field_for_one_release(store, capsys):
 @needs_store
 def test_a_worker_writes_blockers_under_the_metadata_scope(store, capsys, project,
                                                            monkeypatch):
-    """A worker file that lets a turn write `blocked_by` on another task names it
+    """A worker that lets a turn write `blocked_by` on another task names it
     under `metadata`, as it did when blockers were a metadata key."""
     entry, schema, conn = store
     add(entry, capsys, "w-held")

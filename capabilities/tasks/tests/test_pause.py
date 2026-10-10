@@ -121,7 +121,7 @@ def test_a_name_that_is_not_a_lane_is_refused(project, capsys, named):
 
 def test_a_lane_no_longer_declared_can_still_be_resumed(project, capsys):
     pause(capsys, "beta")
-    (project / "capabilities" / "tasks" / "workers" / "beta.md").unlink()
+    (base._cli.worker_docs(project) / "beta.md").unlink()
     assert refusal(capsys, mod.cmd_service_pause, "beta")["code"] == "lane_unknown"
     assert resume(capsys, "beta")["pause"]["paused"] is False
 
