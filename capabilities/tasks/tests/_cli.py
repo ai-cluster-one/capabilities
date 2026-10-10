@@ -46,9 +46,11 @@ def load() -> object:
 
 DSN = os.environ.get("TASKS_TEST_DSN")
 
-# What would name another store to a child: the overrides the shared library
-# reads before the setting file.
-STORE_OVERRIDES = ("AGENTKIT_STORE_URL", "CAPABILITIES_STORE_URL")
+# What would name another store to a child: the environment level the shared
+# library reads before the setting file.
+STORE_OVERRIDES = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTKIT_DB_NAME",
+                   "AGENTKIT_DB_USER", "AGENTKIT_DB_PASSWORD", "AGENTKIT_DB_SCHEMA",
+                   "AGENTKIT_DB_SSLMODE", "AGENTKIT_DB_SSLROOTCERT")
 
 
 def _where(host: str | None = None, port: int | None = None) -> dict:
@@ -69,14 +71,15 @@ def store_setting(schema: str, *, host: str | None = None, port: int | None = No
     at `host` and `port` when a case puts a relay in front of it."""
     from capabilities_contract import db
 
-    return db.Setting(schema=schema, source="TASKS_TEST_DSN", **_where(host, port))
+    return db.Setting(schema=schema, level="machine", sources=("TASKS_TEST_DSN",),
+                      **_where(host, port))
 
 
 def bind_store(mod, monkeypatch, schema: str, **where):
     """Make `schema` of the throwaway database the store every verb called in
     this process reaches, as `main` makes the machine's store the one it does."""
     setting = store_setting(schema, **where)
-    monkeypatch.setattr(mod, "_store_setting", lambda raising=False: setting)
+    monkeypatch.setattr(mod, "_store_setting", lambda raising=False, root=None: setting)
     monkeypatch.setattr(mod, "SCHEMA", schema)
     return setting
 

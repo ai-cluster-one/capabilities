@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0"]
 # ///
 """From a run a harness knows by its own handle to the raise it was and the task
 it ran for, for many runs in one call.
@@ -11,7 +11,7 @@ and reads TASKS_TEST_DSN, skipping when it is unset; every run works in a schema
 of its own and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' \\
-        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
+        --with 'capabilities-contract==0.4.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations

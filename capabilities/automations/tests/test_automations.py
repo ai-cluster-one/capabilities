@@ -71,12 +71,12 @@ class AutomationsTests(unittest.TestCase):
         # out of reach either way.
         self.store_path = Path(self.tmp.name) / "store.db"
         self._env_before = {key: os.environ.get(key)
-                            for key in ("CAPABILITIES_STORE_URL", "XDG_CONFIG_HOME")}
+                            for key in ("AGENTKIT_DB_URL", "XDG_CONFIG_HOME")}
         os.environ["XDG_CONFIG_HOME"] = str(Path(self.tmp.name) / "xdg-config")
         if DSN:
-            os.environ["CAPABILITIES_STORE_URL"] = DSN
+            os.environ["AGENTKIT_DB_URL"] = DSN
         else:
-            os.environ.pop("CAPABILITIES_STORE_URL", None)
+            os.environ.pop("AGENTKIT_DB_URL", None)
         self.env = dict(os.environ)
         self.env.update(
             {
@@ -1360,7 +1360,7 @@ every_seconds = 30
     def test_without_a_store_the_service_refuses_and_says_why(self) -> None:
         """Runtime state has no local default: with no store configured nothing
         that would keep a run starts, and each answer names the fix."""
-        self.env.pop("CAPABILITIES_STORE_URL", None)
+        self.env.pop("AGENTKIT_DB_URL", None)
         for args in (("service", "start"), ("service", "run"), ("service", "doctor"),
                      ("doctor",), ("run", "job")):
             proc = self.cli(*args, check=False)
@@ -1378,7 +1378,8 @@ every_seconds = 30
     def test_a_manual_run_is_a_row_of_the_run_ledger(self) -> None:
         import socket
         status = json.loads(self.cli("service", "status").stdout)
-        self.assertEqual(status["store"], "CAPABILITIES_STORE_URL")
+        self.assertEqual(status["store"], "environment")
+        self.assertEqual(status["store_sources"], ["AGENTKIT_DB_URL"])
         self.assertEqual(status["schema"], "agentkit")
         run = json.loads(self.cli("run", "job").stdout)["run"]
         conn = RUNTIME._database().connect(application_name="automations-test")
@@ -1639,7 +1640,7 @@ def ledger_env(tmp_path, monkeypatch):
     """The throwaway database as the store, and the machine's setting out of reach."""
     if not DSN:
         pytest.skip("AUTOMATIONS_TEST_DSN is unset")
-    monkeypatch.setenv("CAPABILITIES_STORE_URL", DSN)
+    monkeypatch.setenv("AGENTKIT_DB_URL", DSN)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     (tmp_path / "runs").mkdir(exist_ok=True)
     opened = []
@@ -1764,7 +1765,7 @@ def test_a_dropped_connection_is_noticed_and_reopened(tmp_path, ledger_env):
 def test_the_ledger_refuses_without_a_store(tmp_path, monkeypatch):
     """Runtime state has no local default: with no store configured the ledger
     does not open, and says so in the library's words."""
-    monkeypatch.delenv("CAPABILITIES_STORE_URL", raising=False)
+    monkeypatch.delenv("AGENTKIT_DB_URL", raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     root = tmp_path / "project"
     (root / "capabilities").mkdir(parents=True)
@@ -2047,12 +2048,14 @@ def test_the_machine_service_times_out_jobs_while_its_store_link_is_lost(tmp_pat
     process = _start(daemon, "r1")
     reaped.append(process)
     machine = RUNTIME.MachineService.__new__(RUNTIME.MachineService)
-    slots = [types.SimpleNamespace(daemon=daemon)]
+    link = types.SimpleNamespace(lost=lambda: True)
+    slots = [types.SimpleNamespace(daemon=daemon, link=link)]
     machine.slots = lambda: slots
     machine.draining, machine.entries = [], {}
     machine._take_list = machine.publish = lambda: None
-    machine._reconnect = lambda why: None
-    machine.link = types.SimpleNamespace(lost=lambda: True)
+    machine._reconnect = lambda link, why: None
+    machine.links = {"the store": link}
+    machine.settings = {}
     until = time.monotonic() + 4
     while _alive(process) and time.monotonic() < until:
         machine.step()

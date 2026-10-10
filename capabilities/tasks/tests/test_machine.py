@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0",
 #                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
@@ -11,13 +11,14 @@ The opt-in list, the machine settings and `join`'s refusals are checked with
 no store. The machine process itself runs through the CLI, as a supervisor
 runs it, over three fixture projects written into a temp directory - an
 orchard identified by a UUID, a kiln whose folder is the pottery-shed, and a
-mill - each with a worker of its own, all three on the machine's one store.
+mill - each with a worker of its own, all three on the store the machine's
+setting names unless a case gives one a store of its own.
 Turns are real `tasks run` children on the stand-in harness. The store-backed
 checks read TASKS_TEST_DSN and skip when it is unset; every run works in a
 schema of its own and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
-        --with 'capabilities-contract==0.3.0' \\
+        --with 'capabilities-contract==0.4.0' \\
         --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -33,6 +34,7 @@ import subprocess
 import sys
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -194,7 +196,7 @@ def write_project(root: Path, *, project_id: str | None, slug: str, worker: str,
 
 def entry_for(**over) -> dict:
     """A connection the service may write through. It names no store: the store
-    is the machine's."""
+    is the one the project resolves."""
     return {"allow_write": True, **over}
 
 
@@ -242,14 +244,9 @@ def test_join_refuses_in_order_and_answers_with_the_project(joining, capsys):
     # Records are kept only in files, so a project declaring them elsewhere is
     # refused by the records layer before anything is read.
     assert (code, error["code"]) == (6, "bad_store_mode")
+    # The store keys its connection still carries are not read, and refuse
+    # nothing.
     identity.write_text(json.dumps({**found, "id": "prj_k1ln00000001"}))
-    code, error = join(root, capsys)
-    assert (code, error["code"]) == (6, "store_in_connection")
-    assert "db_host, db_port" in error["message"]
-    assert "capabilities store set" in error["hint"]
-    connections = root / "capabilities" / "tasks" / "connections.json"
-    connections.write_text(json.dumps({"default": "farm",
-                                       "connections": {"farm": entry_for()}}))
     # Another project already joined under the same slug.
     other = joining / "kiln-copy"
     write_project(other, project_id="prj_k1ln00000002", slug="kiln", worker="potter",
@@ -390,7 +387,7 @@ def test_the_machine_process_holds_one_store_and_keeps_no_project_env(
         dispatcher.step()
     assert sorted(slot.slug for slot in dispatcher.slots) == ["kiln", "orchard"]
     assert all(slot.state() == "served" for slot in dispatcher.slots)
-    # The machine's one store, one listener and one question connection for both.
+    # One store for both, so one listener and one question connection.
     assert len(dispatcher.stores()) == 1
     assert [store.connections_opened for store in dispatcher.stores()] == [2]
     # A turn, so the start of one is seen too.
@@ -435,7 +432,8 @@ class Farm:
             (root / ".env").write_text(f"{name.upper()}_ONLY=1\n")
             self.roots[name] = root.resolve()
         config = tmp / "config"
-        # The machine's one store, which every project here reaches.
+        # The machine's store setting, which every project here resolves unless
+        # its own .env names another.
         _cli.write_store_setting(config, self.schema)
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(("CAPABILITIES_", "AGENTKIT_", "TASKS_", "CLAUDE_",
@@ -593,7 +591,7 @@ def test_one_machine_process_serves_three_projects_each_as_itself(farm):
         farm.roots["kiln"].name == "pottery-shed"
     assert all(row["present"] and row["enabled_explicitly"] and row["current"]
                for row in status["projects"])
-    # The machine's one store: one listener and one question connection.
+    # Every project on one store: one listener and one question connection.
     assert [(store["listening"], store["connections_opened"])
             for store in status["stores"]] == [(True, 2)]
     assert [sorted(store["projects"]) for store in status["stores"]] == [
@@ -1102,3 +1100,69 @@ def test_the_machine_process_records_the_job_launchd_started_it_as(launchd, monk
     assert (written["label"], written["pid"]) == (JOB, os.getppid())
     assert mod._launchd_supervisor(launchd["state"]) == {
         "label": JOB, "pid": os.getppid(), "last_exit_code": None}
+
+
+def _rows(schema: str) -> dict[str, str]:
+    """Every task in `schema` of the throwaway database, key to status; none
+    when the schema holds no tasks table."""
+    import psycopg
+
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        found = conn.execute("select to_regclass(%s)", (f"{schema}.tasks_tasks",)).fetchone()[0]
+        if found is None:
+            return {}
+        return dict(conn.execute(f"select unique_key, status from {schema}.tasks_tasks"
+                                 ).fetchall())
+
+
+@needs_store
+def test_two_projects_on_two_stores_each_keep_their_tasks_in_their_own(farm):
+    """One machine process serves the orchard on the machine's store setting and
+    the kiln on the store its own .env names: each project's tasks, turns and
+    trail are in its own store, the process holds one listener and question
+    connection per store, and a kiln turn stays on the store its daemon resolved
+    after the kiln's .env is pointed elsewhere."""
+    import psycopg
+
+    own = "tasks_test_kiln_" + secrets.token_hex(3)
+    decoy = "tasks_test_decoy_" + secrets.token_hex(3)
+    env_file = farm.roots["kiln"] / ".env"
+    env_file.write_text(f"KILN_ONLY=1\nAGENTKIT_DB_URL={DSN}\nAGENTKIT_DB_SCHEMA={own}\n")
+    try:
+        farm.join("orchard", "kiln")
+        farm.start()
+        for name in ("orchard", "kiln"):
+            farm.until(name, "served")
+        stores = farm.machine()["stores"]
+        assert sorted((store["identity"]["level"], store["identity"]["schema"],
+                       tuple(store["projects"])) for store in stores) == sorted([
+            ("machine", farm.schema, ("orchard",)), ("project", own, ("kiln",))])
+        assert all((store["listening"], store["connections_opened"]) == (True, 2)
+                   for store in stores)
+
+        farm.add("orchard", "t-orchard")
+        farm.add("kiln", "t-kiln")
+        farm.complete("orchard", "t-orchard")
+        farm.complete("kiln", "t-kiln")
+        assert _rows(farm.schema) == {"t-orchard": "complete"}
+        assert _rows(own) == {"t-kiln": "complete"}
+        handed = {Path(turn["cwd"]).resolve(): turn["env"].get("AGENTKIT_DB_SCHEMA")
+                  for turn in farm.turns_seen()}
+        assert handed == {farm.roots["orchard"]: farm.schema, farm.roots["kiln"]: own}
+
+        # A task due shortly, then the kiln's .env names another store before it
+        # is due: the turn, after it has let its receipt go, and the engine's own
+        # commands stay on the store the daemon listens on.
+        due = (datetime.now(timezone.utc) + timedelta(seconds=20)).isoformat()
+        farm.ok("kiln", "add", "--type", "clay", "--title", "late", "--key", "t-kiln-late",
+                "--status", "todo", "--pickup", due)
+        env_file.write_text(f"KILN_ONLY=1\nAGENTKIT_DB_URL={DSN}\n"
+                            f"AGENTKIT_DB_SCHEMA={decoy}\n")
+        poll_for(lambda: _rows(own).get("t-kiln-late") == "complete", 90)
+        assert "t-kiln-late" not in _rows(decoy)
+    finally:
+        farm.cli(None, "service", "stop", "--machine", "--end-turns", "--timeout", "20",
+                 "--force")
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            for schema in (own, decoy):
+                conn.execute(f"drop schema if exists {schema} cascade")

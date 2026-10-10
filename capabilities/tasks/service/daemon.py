@@ -1542,8 +1542,8 @@ class Dispatcher:
         """Open the listener. A failure is said once, not on every attempt, and
         the next attempt is planned; a listener opened after one was lost or
         refused is a wake, since what the store announced meanwhile was lost.
-        It is opened outside every scope, on the store the machine's store
-        setting names."""
+        It is opened outside every scope, on the store the host resolved for
+        its project."""
         self._drop_listener(store)
         try:
             store.listener = store.host.listen()
@@ -1769,10 +1769,11 @@ class MachineDispatcher(Dispatcher):
     holds its lock, is `error` with the reason and serves nothing until a
     reload takes one; the others are untouched.
 
-    It loads no project's environment. Every project it serves is on the one
-    store the machine's store setting names, so it holds one listener and one
-    question connection, opened outside every scope, and its turns start from
-    the environment it was started with."""
+    It loads no project's environment. Each project it serves is on the store
+    its host resolved for the project's root, and it holds one listener and one
+    question connection for each distinct store, shared by every project on
+    it and opened outside every scope. Its turns start from the environment it
+    was started with, carrying their project's store."""
 
     def __init__(self, machine, *, tick: float = TICK_SECONDS, pool: StorePool | None = None,
                  environment=None):

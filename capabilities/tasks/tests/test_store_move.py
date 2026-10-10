@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0"]
 # ///
 """The store is the machine's: tasks reaches it through the store setting and
 keeps its tables in the setting's schema under its own ledger.
@@ -18,7 +18,7 @@ schema the previous release used is one name, `tasks`, so the cases that build
 it drop it before and after; each case binds a schema of its own.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' \\
-        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
+        --with 'capabilities-contract==0.4.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -408,17 +408,14 @@ def test_with_no_store_configured_every_call_is_refused(tmp_path):
     {"secret_env": "TASKS_DB_PASSWORD"},
     {"db_sslmode": "require"},
 ])
-def test_a_connection_that_still_names_a_store_is_refused(tmp_path, carried):
-    lab = project_at(tmp_path, entry={"allow_write": True, **carried},
-                     schema="tasks_test_unused")
+def test_a_connection_naming_a_store_names_none(tmp_path, carried):
+    """The store keys a connection once carried are not read: the store is the
+    one the project resolves, and with none resolved that is the refusal."""
+    lab = project_at(tmp_path, entry={"allow_write": True, **carried})
     for args in (("list",), ("doctor",), ("service", "doctor")):
         done = cli(lab, *args)
         assert done.returncode == 6, (args, done.stdout, done.stderr)
-        error = error_of(done)
-        assert error["code"] == "store_in_connection", args
-        assert all(key in error["message"] for key in carried), args
-        assert "capabilities store set" in error["hint"]
-        assert all(key in error["hint"] for key in carried)
+        assert error_of(done)["code"] == "store_not_configured", args
 
 
 @needs_store

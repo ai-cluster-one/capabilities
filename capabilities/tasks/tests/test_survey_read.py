@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0"]
 # ///
 """Reading a store in one page: the order a scan answers in, how a search pages,
 how many tasks hold each status, and the inputs that reach no answer.
@@ -11,7 +11,7 @@ TASKS_TEST_DSN and skips when it is unset; every run works in a schema of its
 own and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' \\
-        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
+        --with 'capabilities-contract==0.4.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -148,6 +148,8 @@ def test_the_connection_flag_is_not_looked_for_past_the_end_of_the_flags(
 
     monkeypatch.setattr(mod, "_select_connection", select)
     monkeypatch.setattr(mod, "_store_setting", lambda raising=False: _cli.store_setting("tasks"))
+    # What main pins for the rest of its process is put back after the case.
+    monkeypatch.setattr(mod, "_STORE_PINNED", None)
     monkeypatch.setattr(mod, "_declared_project", lambda: HERE)
     monkeypatch.setattr(mod, "cmd_search",
                         lambda entry, rest: seen.setdefault("rest", rest))

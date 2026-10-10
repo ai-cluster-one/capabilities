@@ -1,25 +1,24 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0",
 #                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
 """The service as a dispatcher over project slots: the scope every question
 about a project runs in, two projects served by one process with nothing
-crossing between them, the check before every action, and the refusal of a
-connection that still names a store.
+crossing between them, and the check before every action.
 
 Projects are written into a temp directory and found the way the executable
 finds one, from CLAUDE_PROJECT_DIR, so each scope really points the resolver at
 its own project. One is identified by a UUID and one carries a slug that is not
-its folder's name; both are on the machine's one store. Turns are replaced by a
+its folder's name; both are on one store. Turns are replaced by a
 small process that records where it ran and with what environment. The
 store-backed checks read TASKS_TEST_DSN and skip when it is unset; every run
 works in a schema of its own and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
-        --with 'capabilities-contract==0.3.0' \\
+        --with 'capabilities-contract==0.4.0' \\
         --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -83,7 +82,7 @@ def machine(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "_project_capabilities_dir", lambda root: root / "capabilities")
     monkeypatch.setattr(mod, "_STATE_HOME", tmp_path / "state")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-machine"))
-    # The machine's one store, every project here reaching it.
+    # One store, every project here reaching it.
     _cli.bind_store(mod, monkeypatch, "tasks_test_" + secrets.token_hex(4))
     for leaked in ("TASKS_EXECUTION", "CAPABILITIES_READ_ONLY", "CAPABILITIES_PROJECT_ID",
                    "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_PROJECT_ENVELOPE",
@@ -95,14 +94,14 @@ def machine(tmp_path, monkeypatch):
 
 def entry_for(**over) -> dict:
     """A connection the service may write through. It names no store: the store
-    is the machine's."""
+    is the one the project resolves."""
     return {"allow_write": True, **over}
 
 
 class Pair:
     """Two projects - an orchard identified by a UUID, and a kiln whose slug is
     not its folder's name - each with its own worker and connection, on the
-    machine's one store, served by one dispatcher."""
+    same store, served by one dispatcher."""
 
     def __init__(self, tmp: Path):
         self.tmp = tmp
@@ -264,9 +263,13 @@ def test_a_turn_starts_from_the_start_environment_not_from_a_scope(machine, monk
     with host.scope(snapshot):
         os.environ["SCOPE_ONLY"] = "inside"
         env = host.turn_env(snapshot)
-    assert env == {key: value for key, value in snapshot.items()
-                   if key not in ("TASKS_EXECUTION", "TASKS_TURN_RECEIPT", "TASKS_TURN_EXCLUDE",
-                                  "CLAUDE_PROJECT_DIR")}
+    # The start environment, less what is meant for another turn, and with the
+    # store the host resolved for the project as its only AGENTKIT_DB_* keys.
+    assert env == {**{key: value for key, value in snapshot.items()
+                      if key not in ("TASKS_EXECUTION", "TASKS_TURN_RECEIPT",
+                                     "TASKS_TURN_EXCLUDE", "CLAUDE_PROJECT_DIR")
+                      and not key.startswith("AGENTKIT_DB_")},
+                   **mod._setting_env(host.setting)}
     assert env["KEPT_PROBE"] == "kept" and "SCOPE_ONLY" not in env
 
 
@@ -538,19 +541,11 @@ def store_case(machine, *, entry_over=None):
 
 
 @pytest.mark.parametrize("carried", [
-    {"db_host": "db.example"}, {"db_schema": "tasks"}, {"secret_env": "TASKS_DB_PASSWORD"},
+    {}, {"db_host": "db.example"}, {"db_schema": "tasks"},
+    {"secret_env": "TASKS_DB_PASSWORD"},
 ])
-def test_a_slot_refuses_a_project_whose_connection_still_names_a_store(machine, carried):
+def test_a_slot_serves_a_project_whatever_store_keys_its_connection_carries(machine, carried):
     host, environment = store_case(machine, entry_over=carried)
-    with host.scope(environment):
-        for on_machine in (True, False):
-            state, reason = host.recheck(machine=on_machine)
-            assert state == "refused" and reason.startswith("store_in_connection:")
-            assert next(iter(carried)) in reason
-
-
-def test_a_slot_serves_a_project_whose_connection_names_no_store(machine):
-    host, environment = store_case(machine)
     with host.scope(environment):
         assert host.recheck(machine=True) is None
         assert host.recheck(machine=False) is None

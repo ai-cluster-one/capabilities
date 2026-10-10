@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0",
 #                 "callva-harness-runner==0.8.0",
 #                 "pyyaml>=6"]
 # ///
@@ -19,7 +19,7 @@ between the daemon and the store being closed and opened again, so no test
 stops a server it did not start.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
-        --with 'capabilities-contract==0.3.0' \\
+        --with 'capabilities-contract==0.4.0' \\
         --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -1264,8 +1264,8 @@ def lab(tmp_path):
     })
     for leaked in ("CAPABILITIES_READ_ONLY", "TASKS_EXECUTION", "TASKS_ACTOR",
                    "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "CAPABILITIES_PROJECT_ID",
-                   "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_STORE_URL",
-                   "AGENTKIT_STORE_URL", "CAPABILITIES_STORE_MODE"):
+                   "CAPABILITIES_PROJECT_ID_ROOT",
+                   "CAPABILITIES_STORE_MODE", *_cli.STORE_OVERRIDES):
         env.pop(leaked, None)
     lab = {"project": project, "env": env, "tmp": tmp_path, "schema": schema}
     assert tasks_cli(lab, "migrate").returncode == 0

@@ -490,7 +490,7 @@ def applies(item: dict[str, Any], environment: str) -> bool:
 # --- the run ledger -------------------------------------------------------------
 
 # The ledger is what every daemon of a project coordinates through, so it lives
-# in the machine's store, reached through the shared database library, in this
+# in the project's store, reached through the shared database library, in this
 # capability's own table and migration ledger (DOCTRINE rule 22). The owner the
 # library records the steps under is the capability's name, and every object a
 # step creates is named after it.
@@ -562,17 +562,42 @@ def _database():
     return db
 
 
-def store_in_force() -> dict[str, str]:
-    """Which store the ledger uses, read and never written: the machine's store
-    setting, or the `CAPABILITIES_STORE_URL` override, and the schema it binds.
-    Raises StoreUnavailable when there is none to use."""
+def resolve_store(root: Path | None):
+    """The store setting the project at `root` uses, as the shared library
+    resolves it: the project's .env.local / .env, then the process environment,
+    then the machine's store setting file. Read and never written; raises
+    StoreUnavailable when no level answers or the one that does cannot be used."""
     db = _database()
     try:
-        setting = db.read_setting()
+        return db.resolve_setting(root)
     except db.DbError as exc:
         raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
-    return {"store": "CAPABILITIES_STORE_URL" if setting.url is not None else "setting",
+
+
+def store_in_force(root: Path | None) -> dict[str, Any]:
+    """Which store the project's ledger uses, named without reaching it: the
+    level that answered as `store`, the files or variables it came from as
+    `store_sources`, and the schema it binds. Raises StoreUnavailable when there
+    is none to use."""
+    setting = resolve_store(root)
+    return {"store": setting.level, "store_sources": list(setting.sources),
             "schema": setting.schema}
+
+
+def store_name(setting) -> str:
+    """Where a store setting points, as host:port/database, with nothing secret."""
+    if setting.url is not None:
+        from urllib.parse import urlparse
+        found = urlparse(setting.url)
+        return f"{found.hostname}:{found.port or 5432}/{found.path.lstrip('/')}"
+    return f"{setting.host}:{setting.port}/{setting.database}"
+
+
+def store_key(setting) -> tuple:
+    """What tells two stores apart: where the connection goes, as whom, and the
+    schema it binds, whichever level named it."""
+    return (tuple(sorted((key, str(value)) for key, value in
+                         setting.connect_kwargs().items())), setting.schema)
 
 
 def open_ledger(root: Path, config: dict[str, Any], strict: bool = True) -> "RunLedger":
@@ -588,27 +613,41 @@ def open_ledger(root: Path, config: dict[str, Any], strict: bool = True) -> "Run
         project_id = project_id or _handed_project_id(root) or identity.get("id") or ""
     elif not project_id:
         raise ConfigError("this project declares no id to record its runs under")
-    return RunLedger(project_id, config["engine"]["environment"]).open()
+    return RunLedger(project_id, config["engine"]["environment"], root=root).open()
 
 
 class StoreLink:
     """One held connection to the store the ledger lives in, migrated on open.
 
     A project's daemon holds one for its own ledger. The machine service holds
-    one for every project it serves: each project's ledger is a view onto it,
-    so the projects on a machine cost the store one connection rather than one
-    each. The scheduler is single-threaded, so a transaction on the link is the
-    only one open on it, whichever project's ledger opened it."""
+    one for each distinct store the projects it serves resolve: each project's
+    ledger is a view onto its store's link, so the projects on one store cost
+    it one connection rather than one each. The scheduler is single-threaded,
+    so a transaction on a link is the only one open on it, whichever project's
+    ledger opened it.
 
-    def __init__(self):
+    `setting` is the store, as `resolve_store` gives it; without one the link
+    resolves the store for `root` when it first opens. `error` is why the link
+    is down, while it is."""
+
+    def __init__(self, setting=None, root: Path | None = None):
+        self.setting = setting
+        self.root = root
         self.conn = None
         self.warnings: list[str] = []
         self.in_transaction = False
+        self.error: str | None = None
+
+    @property
+    def name(self) -> str:
+        return store_name(self.setting) if self.setting is not None else "unresolved"
 
     def open(self) -> "StoreLink":
         db = _database()
+        if self.setting is None:
+            self.setting = resolve_store(self.root)
         try:
-            conn = db.connect(application_name=LEDGER_OWNER)
+            conn = db.connect(application_name=LEDGER_OWNER, setting=self.setting)
         except db.DbError as exc:
             raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
         try:
@@ -651,19 +690,20 @@ class RunLedger:
     fifteen callers are trusted to remember — it is the reason this boundary
     exists, and it is applied here once rather than at each call.
 
-    A ledger opens a link of its own unless it is handed one; a handed link is
-    its owner's to open, reopen and close.
+    A ledger opens a link of its own, to the store resolved for `root`, unless
+    it is handed one; a handed link is its owner's to open, reopen and close.
 
     Rows come back as they always have: times as the ISO text they were written
     as, and the cancel flag as 0 or 1, so what `runs` and `show` print does not
     depend on how the store keeps them."""
 
-    def __init__(self, project_id: str, environment: str, link: StoreLink | None = None):
+    def __init__(self, project_id: str, environment: str, link: StoreLink | None = None,
+                 root: Path | None = None):
         self.project_id = project_id
         self.environment = environment
         self.host = socket.gethostname()
         self._owns_link = link is None
-        self.link = link if link is not None else StoreLink()
+        self.link = link if link is not None else StoreLink(root=root)
 
     @property
     def conn(self):
@@ -1074,7 +1114,7 @@ class Daemon:
     `reap`, `take_pause`, `schedule_due`, `dispatch`, `reload_declaration`,
     `shutdown` - so what is registered, how a job starts and how it ends are one
     code in both modes. What the machine service hands in is what is the
-    machine's to hand: the project's ledger on its one shared store link, the
+    machine's to hand: the project's ledger on its store's shared link, the
     loader that reads the project's declaration as the project itself resolves
     it, the launcher that starts each job inside the project's own environment,
     and the log, which names the project on every line."""
@@ -1557,10 +1597,6 @@ class Daemon:
 
 # --- machine mode ----------------------------------------------------------------
 
-class _StoreLost(Exception):
-    """The machine's one store link went away under a project's work."""
-
-
 class ProjectSlot:
     """A project on the opt-in list that the machine process holds: the
     project's own lock, its scheduler once its declaration loads, and why it is
@@ -1573,6 +1609,9 @@ class ProjectSlot:
         self.entry = entry
         self.host = host
         self.lock = lock
+        # The link to the store the project resolves, shared with every
+        # project on that store.
+        self.link = machine.link_for(host.setting)
         self.state_dir = Path(host.state_dir)
         self.daemon: Daemon | None = None
         self.recovered = False
@@ -1606,7 +1645,7 @@ class ProjectSlot:
         try:
             daemon = Daemon(self.host.root, self.host.config_path, self.state_dir,
                             slug=self.slug, loader=self.host.load,
-                            runs=RunLedger(self.project_id, "", link=self.machine.link),
+                            runs=RunLedger(self.project_id, "", link=self.link),
                             launcher=self.host.launcher, log=self.log)
         except Exception as exc:
             reason = _why(exc)
@@ -1714,8 +1753,9 @@ class MachineService:
     """The scheduler once per machine, for every project on its opt-in list.
 
     It decides when work starts and nothing about what the work is. It holds
-    what is the machine's: one store link every project's ledger is a view
-    onto, an optional cap on jobs running at once across every project, and
+    what is the machine's: one store link for each distinct store its projects
+    resolve, which the ledger of every project on that store is a view onto,
+    an optional cap on jobs running at once across every project, and
     the order projects are dealt starts in under that cap. Everything it knows
     about the machine and its projects arrives through `host`, the executable's
     answer for the list, the machine settings, and each project. It loads no
@@ -1731,7 +1771,8 @@ class MachineService:
     def __init__(self, host):
         self.host = host
         self.state_dir = Path(host.state_dir)
-        self.link = StoreLink()
+        # One link per distinct store, by `store_key`.
+        self.links: dict[tuple, StoreLink] = {}
         # Every project on the list by its id: what the list says of it, why it
         # is not served while it is not, and its slot once it is.
         self.entries: dict[str, dict] = {}
@@ -1740,7 +1781,6 @@ class MachineService:
         self.list_error: str | None = None
         self.settings: dict = {}
         self.settings_error: str | None = None
-        self.store_error: str | None = None
         self.reloads = 0
         self.turn: str | None = None
         self.binding = False
@@ -1806,7 +1846,9 @@ class MachineService:
                               "joined": len(self.entries), "error": self.list_error},
             "cap": {"max_parallel": cap, "running": self.running(),
                     "binding": self.binding},
-            "store": {"connected": not self.link.lost(), "error": self.store_error},
+            "stores": [{"store": link.name, "schema": link.setting.schema,
+                        "connected": not link.lost(), "error": link.error}
+                       for link in self.links.values()],
             "projects": [self._entry_row(entry) for entry in
                          sorted(self.entries.values(), key=lambda e: (e["slug"], e["id"]))],
             "stopping": self.stop_requested,
@@ -1853,12 +1895,9 @@ class MachineService:
                                + (f" (pid {holder})" if pid_alive(holder) else ""))
         try:
             self.settings = self.host.load_settings()
-            self.link.open()
         except BaseException:
             self._lock.close()
             raise
-        for warning in self.link.warnings:
-            self.log(warning)
         write_atomic(self.state_dir / PID_FILE, f"{os.getpid()}\n")
         write_atomic(self.state_dir / DAEMON_FINGERPRINT_FILE, self.settings["fingerprint"] + "\n")
 
@@ -1882,7 +1921,8 @@ class MachineService:
                 time.sleep(self.sleep_seconds())
         finally:
             self.shutdown()
-            self.link.close()
+            for link in self.links.values():
+                link.close()
             for name in (PID_FILE, DAEMON_FINGERPRINT_FILE, STATUS_FILE):
                 with contextlib.suppress(OSError):
                     (self.state_dir / name).unlink()
@@ -1926,39 +1966,41 @@ class MachineService:
                     and not self.stop_requested:
                 entry["next_try"] = now + ADMIT_SECONDS
                 self._admit(entry)
-        if self.link.lost():
-            self._reconnect("the store connection is closed")
-        if self.link.lost():
-            # Without the store nothing is registered, started or recorded,
-            # but every running job is still timed out and stopped.
-            for slot in (*self.draining, *self.slots()):
+        for link in self.links.values():
+            if link.lost():
+                self._reconnect(link, "the store connection is closed")
+        due = []
+        for slot in (*self.draining, *self.slots()):
+            if slot.link.lost():
+                # Without its store nothing is registered, started or recorded
+                # for the project, but every running job is still timed out
+                # and stopped.
                 if slot.daemon is not None:
                     slot.daemon.supervise()
-            self.publish()
-            return
-        try:
-            due = []
-            for slot in (*self.draining, *self.slots()):
-                if now < slot.next_tick:
-                    continue
-                slot.next_tick = now + slot.tick_seconds()
-                if self._guard(slot, slot.prepare) is not False:
-                    due.append(slot)
-            self.deal([slot for slot in due if slot.can_start()])
-        except _StoreLost as lost:
-            self._reconnect(lost)
+                continue
+            if now < slot.next_tick:
+                continue
+            slot.next_tick = now + slot.tick_seconds()
+            if self._guard(slot, slot.prepare) is not False:
+                due.append(slot)
+        self.deal([slot for slot in due if slot.can_start()])
         self._release_drained()
+        self._drop_unused_links()
         self.publish()
 
     def _guard(self, slot: ProjectSlot, action):
         """Run one project's action; a fault of the project's stays the
-        project's, and a lost store link is the machine's."""
+        project's, and a lost store link is its store's, reconnected at once and
+        otherwise every pass. A project whose link is down is asked nothing."""
+        if slot.link.lost():
+            return False
         try:
             return action()
         except Exception as exc:
-            if self.link.lost():
-                raise _StoreLost(exc) from exc
-            slot.fail(exc)
+            if slot.link.lost():
+                self._reconnect(slot.link, exc)
+            else:
+                slot.fail(exc)
             return False
 
     def deal(self, candidates: list[ProjectSlot]) -> None:
@@ -1988,18 +2030,48 @@ class MachineService:
                     self.turn = slot.project_id
         self.binding = self.running() >= cap
 
-    def _reconnect(self, why) -> None:
-        if self.store_error is None:
-            self.log(f"lost the store connection, reconnecting every pass: {why}")
+    # --- the stores -----------------------------------------------------------
+
+    def link_for(self, setting) -> StoreLink:
+        """The link to `setting`'s store, opened the first time a project on it
+        is served. A store that does not answer then is asked again every pass."""
+        key = store_key(setting)
+        link = self.links.get(key)
+        if link is None:
+            link = self.links[key] = StoreLink(setting)
+            try:
+                link.open()
+            except StoreUnavailable as exc:
+                link.error = exc.message
+                self.log(f"the store {link.name} is unavailable, asking again every "
+                         f"pass: {exc.slug}: {exc.message}")
+            else:
+                for warning in link.warnings:
+                    self.log(warning)
+        return link
+
+    def _reconnect(self, link: StoreLink, why) -> None:
+        if link.error is None:
+            self.log(f"lost the store connection to {link.name}, reconnecting every "
+                     f"pass: {why}")
         try:
-            self.link.reopen()
+            link.reopen()
         except StoreUnavailable as again:
-            if again.message != self.store_error:
-                self.log(f"the store is unavailable: {again.slug}: {again.message}")
-            self.store_error = again.message
+            if again.message != link.error:
+                self.log(f"the store {link.name} is unavailable: {again.slug}: "
+                         f"{again.message}")
+            link.error = again.message
             return
-        self.log("the store answers again")
-        self.store_error = None
+        self.log(f"the store {link.name} answers again")
+        link.error = None
+
+    def _drop_unused_links(self) -> None:
+        """Close the link of a store no project served or letting go is on."""
+        used = {id(slot.link) for slot in (*self.slots(), *self.draining)}
+        for key, link in list(self.links.items()):
+            if id(link) not in used:
+                link.close()
+                del self.links[key]
 
     # --- the list --------------------------------------------------------------
 

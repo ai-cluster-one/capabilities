@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract==0.3.0",
+#     "capabilities-contract==0.4.0",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.8.0",
 #     "pyyaml>=6",
@@ -728,9 +728,9 @@ SERVICE
   one of its turns claims or ends. The notification is a trigger among the
   tables STORE describes, which the service brings up to this version once as
   it starts; one channel serves the whole database, and its payload names the
-  schema and the project, so a daemon acts only on its own. A service with no
-  store configured refuses to run, exit 6 `store_not_configured` naming
-  `capabilities store set`, and `service doctor` says the same. A lapsed
+  schema and the project, so a daemon acts only on its own. A service whose
+  project resolves no database (STORE) refuses to run, exit 6
+  `store_not_configured`, and `service doctor` says the same. A lapsed
   lease and an ended wait are put back by a claim and nothing else, so on the
   poll, with nothing else to start, a daemon that sees one due starts a turn
   whose claim puts it back.
@@ -874,8 +874,7 @@ SERVICE
   under a lock in the machine state root; do not edit it by hand. `join`
   refuses, in this order and each with exit 6: a project without a durable id
   in project.json (`capabilities init` gives it one), `no_project_identity`;
-  one whose default connection still names a store of its own, `store_in_connection`
-  (STORE); and a project whose slug another joined project has, `slug_taken`,
+  and a project whose slug another joined project has, `slug_taken`,
   since the two would share a state root. It answers
   `{"joined", "project": {"id", "slug", "root"}, "list"}`, `joined` false
   with a reason when the project is already on the list, and starts nothing.
@@ -888,10 +887,13 @@ SERVICE
   runs, or `start --machine`. Exactly one runs per machine, by the lock in its
   state root `$XDG_STATE_HOME/capabilities/machine/tasks/`, which is also its
   working directory and holds its pid, its status `daemon.json` and its log.
-  It loads no project's environment. Every project it serves is on the
-  machine's one store, the one its store setting names, so it holds one
-  listener and one question connection across every project, and hands each
-  notification to the project whose schema and id it names.
+  It loads no project's environment. Each project it serves is on the
+  database resolved for that project's root (STORE), read once as the project
+  is admitted. It holds one listener and one question connection for each
+  distinct database, shared by every project on it, and hands each
+  notification to the project whose schema and id it names. A turn it starts
+  is handed its project's database in the environment and uses exactly it
+  (STORE).
 
   Under launchd, the machine process writes the job launchd started it as
   into `launchd.json` in its state root: the label XPC_SERVICE_NAME names,
@@ -1462,25 +1464,33 @@ WATCH
 CONTRACT
   tasks help | doctor | connections | stub | manifest --json
   tasks guide [topic] | ids list|get|set|rm | refs | inventory [--network]
-  tasks migrate [status]          bring the tables in the machine's store up to
+  tasks migrate [status]          bring the tables in this project's store up to
                                   this version, or report where they stand.
                                   See STORE
 
 STORE
-  The store is the machine's: the PostgreSQL its store setting names, set with
-  `capabilities store set` and proved with `capabilities store doctor`, or the
-  one AGENTKIT_STORE_URL or CAPABILITIES_STORE_URL names for a test or a
-  development session. tasks reaches it through the shared database library
-  and keeps its tables in the schema the setting binds, each named `tasks_*` -
-  tasks_tasks, tasks_activities, tasks_changes and tasks_executions - under its
-  own migration ledger, beside the tables of every other tool that uses the
+  The store is the PostgreSQL the shared database library resolves for the
+  project: the AGENTKIT_DB_* keys in its .env.local / .env, then the same keys
+  in the process environment, then the machine's store setting file that
+  `capabilities store set` writes; the first level that answers is used whole.
+  `capabilities store show` names the level in force. tasks keeps its tables
+  in the schema the setting binds, each named `tasks_*` - tasks_tasks,
+  tasks_activities, tasks_changes and tasks_executions - under its own
+  migration ledger, beside the tables of every other tool that uses the
   store. Several projects share them and are kept apart by the project each
-  task carries. With no store configured every command, `doctor` and the
-  service refuse with exit 6 `store_not_configured`, naming `capabilities store
-  set`. A connection names no store: one that still carries db_host, db_port,
-  db_user, db_name, db_sslmode, db_schema or secret_env is refused with exit 6
-  `store_in_connection`, naming the keys to remove; it keeps what else it
-  carries, its timezone, allow_write and grants.
+  task carries. With no level answering, every command, `doctor` and the
+  service refuse with exit 6 `store_not_configured`, naming the AGENTKIT_DB_*
+  keys and `capabilities store set`. `doctor` reports the setting in force as
+  `store`: the level that answered, the files or variables it came from, and
+  where it points, secrets redacted.
+
+  A turn reaches the store its raise lives in, whatever the project's env
+  files say by then. The service hands each turn it starts the store it
+  resolved for the project, and `tasks run` hands its engine and hooks its
+  own, each as the AGENTKIT_DB_* keys of the environment with every other one
+  removed; a process carrying a receipt from the service or a TASKS_EXECUTION
+  resolves that environment level alone, and a turn reading the project's
+  .env and .env.local takes every key but AGENTKIT_DB_* from them.
 
   `tasks migrate` applies the steps the tables lack, under the library's lock,
   and `tasks migrate status` reports where they stand - `pending`, `current`,
@@ -1566,7 +1576,7 @@ WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/tasks/guides/")
 STATE = True        # the service's pid, fingerprint, status and log, per project
-TABLES = True       # tasks_* tables in the machine's store, built by _tables()
+TABLES = True       # tasks_* tables in the project's store, built by _tables()
 INVENTORY = {"network": "none"}   # the service's state on this machine; the queue is the store's
 POST_INSTALL: list[dict] = []
 SERVICE = {
@@ -1595,10 +1605,12 @@ SERVICE = {
         "command": ["tasks", "service", "run"],
         "environment": {
             "required": [],
-            "optional": [
-                {"key": "CAPABILITIES_STORE_URL"},
-                {"key": "CAPABILITIES_STORE_PASSWORD"},
-            ],
+            # The database is the server's own environment level (SHEBANG.md,
+            # "The store setting").
+            "optional": [{"key": key} for key in (
+                "AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT",
+                "AGENTKIT_DB_NAME", "AGENTKIT_DB_USER", "AGENTKIT_DB_PASSWORD",
+                "AGENTKIT_DB_SCHEMA", "AGENTKIT_DB_SSLMODE", "AGENTKIT_DB_SSLROOTCERT")],
         },
         "mounts": [
             # The project state root automations keeps its state under too. One
@@ -4054,36 +4066,8 @@ def _conf(entry: dict | None, key: str, default: str | None = None) -> str | Non
     return value if value else default
 
 
-# The keys a connection carried while it named the store itself. The store is
-# the machine's, named by its store setting, so a connection that still carries
-# one is refused rather than read: the store it names is not the one used.
-_RETIRED_STORE_KEYS = ("db_host", "db_port", "db_user", "db_name", "db_sslmode",
-                       "db_schema", "secret_env")
-
-
-def _retired_store_keys(conn_id: str | None, entry: dict | None) -> "Refusal | None":
-    """The refusal for a connection entry that still carries a store key, or
-    None for one that carries none."""
-    carried = [key for key in _RETIRED_STORE_KEYS if key in (entry or {})]
-    if not carried:
-        return None
-    return Refusal(6, "store_in_connection",
-                   f"connection {conn_id!r} carries {', '.join(carried)}, and {NAME} "
-                   "reaches its store through the machine's store setting, never "
-                   "through a connection",
-                   f"name the store with `capabilities store set`, then remove "
-                   f"{', '.join(carried)} from the connection in {NAME}'s "
-                   "connections.json")
-
-
-def _store_keys_gate(conn_id: str | None, entry: dict | None) -> None:
-    refusal = _retired_store_keys(conn_id, entry)
-    if refusal:
-        _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
-
-
 def _db():
-    """The shared database library, which reads the machine's store setting,
+    """The shared database library, which resolves a project's store setting,
     connects bound to its schema and migrates this capability's tables."""
     try:
         from capabilities_contract import db
@@ -4103,13 +4087,28 @@ def _store_refusal(exc) -> "Refusal":
                    exc.message, exc.hint)
 
 
-def _store_setting(raising: bool = False):
-    """The store in force on this machine - its store setting, or the override
-    a test or a development session names - read and never written. With none,
-    `store_not_configured`, exit 6, naming `capabilities store set`."""
+# The store this invocation resolved for itself, kept by `main` for the rest of
+# the process: a turn removes the receipt it was started with before it claims,
+# and what it reaches after that is still the store it was handed.
+_STORE_PINNED = None
+
+
+def _store_setting(raising: bool = False, root: Path | None = None):
+    """The store `root` uses (this invocation's project when none is named, and
+    then the one `main` pinned once it has), as the shared library resolves it:
+    the project's .env.local / .env, then the process environment, then the
+    machine's store setting file; read and never written. A turn the service
+    started, and everything a turn starts under its raise, asks no project
+    level: the process that started it handed it the store the raise lives in,
+    in the environment (`_hand_store`). With none, `store_not_configured`,
+    exit 6."""
+    if root is None and _STORE_PINNED is not None:
+        return _STORE_PINNED
     db = _db()
+    if root is None and not (os.environ.get(_RECEIPT_ENV) or _worker_execution()):
+        root = _project_root()
     try:
-        return db.read_setting()
+        return db.resolve_setting(root)
     except db.DbError as exc:
         refusal = _store_refusal(exc)
         if raising:
@@ -4204,7 +4203,7 @@ def _store_away(exc: BaseException) -> bool:
 
 def _connect(entry: dict | None, *, raising: bool = False, waiting: bool | None = None,
              application_name: str = NAME, setting=None, migrating: bool = True):
-    """A connection to the machine's store, bound to its schema with this
+    """A connection to the project's store, bound to its schema with this
     capability's tables in it, or exit 5 saying why there is none - exit 6 when
     no store is configured or its setting cannot be used. A caller that
     outlives an unreachable store passes `raising` and is handed the same
@@ -10843,9 +10842,9 @@ class _ServiceHost:
         self.state_dir = _service_state_dir()
         self.project = _writing_project()
         self.identity = PROJECT_IDENTITY
-        # The machine's store, resolved once: the listener and the questions
-        # reach it, and so does every project the machine service serves.
-        self.setting = _store_setting()
+        # The project's store, resolved once for its root: the listener, the
+        # questions and every turn this host starts reach it.
+        self.setting = _store_setting(root=self.root)
         self.schema = self.setting.schema
 
     def scope(self, environment: Mapping[str, str]) -> ProjectScope:
@@ -10874,8 +10873,8 @@ class _ServiceHost:
         the store anything for it, and again before every turn: the folder and
         its project.json with the id this daemon serves are there, tasks is
         enabled for the project itself, and the connection is still one the
-        project may use and write through, outside the read-only switch, and
-        carries no store of its own - the decision `tasks run` will make. It
+        project may use and write through, outside the read-only switch - the
+        decision `tasks run` will make. It
         reads a few small files and no secret, and what a refusal would write
         to stderr is kept for the reason instead."""
         import contextlib
@@ -10904,15 +10903,13 @@ class _ServiceHost:
         _require_project_enabled_for_service()
         reg, _source = _connections_registry()
         conn_id, entry = _select_connection(reg, self.connection)
-        refusal = _retired_store_keys(conn_id, entry)
-        if refusal:
-            return "refused", f"{refusal.code}: {refusal.message}"
         _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), "run")
         return None
 
     def store_key(self) -> tuple:
-        """Which store this host reaches, as the pool tells stores apart: the
-        machine's one store, so every project shares its connections."""
+        """Which store this host reaches, as the pool tells stores apart, so
+        every project on one database shares its connections whichever level
+        named it."""
         return (_store_name(self.setting), _store_user(self.setting), self.setting.schema)
 
     def store_name(self) -> str:
@@ -10921,8 +10918,9 @@ class _ServiceHost:
     def store_identity(self) -> dict:
         """Where the store is named and which store and schema it is, for the
         machine status: every value non-secret."""
-        return {"source": self.setting.source, "store": _store_name(self.setting),
-                "user": _store_user(self.setting), "schema": self.setting.schema}
+        return {"level": self.setting.level, "sources": list(self.setting.sources),
+                "store": _store_name(self.setting), "user": _store_user(self.setting),
+                "schema": self.setting.schema}
 
     def listen(self):
         """A connection listening on the channel. The daemon keeps asking while
@@ -11006,10 +11004,13 @@ class _ServiceHost:
         the raise that bounds it - without a receipt or exclusions meant for
         another turn, and without CLAUDE_PROJECT_DIR, since the turn stands in
         its project by its cwd. The turn reads the project's .env and .env.local
-        over it itself."""
+        over it itself, all but the store: the store this host resolved is
+        handed to it as the environment level, every other AGENTKIT_DB_* key
+        removed, so the turn reaches the database its daemon listens on."""
         env = dict(environment)
         for key in ("TASKS_EXECUTION", _RECEIPT_ENV, _EXCLUDE_ENV, "CLAUDE_PROJECT_DIR"):
             env.pop(key, None)
+        _hand_store(env, self.setting)
         return env
 
     def settle_cut_off(self, conn, execution: str) -> list[str]:
@@ -11018,6 +11019,32 @@ class _ServiceHost:
     def kill_tree(self, pids) -> set:
         from callva.harness_runner.tree import kill_tree
         return kill_tree(pids)
+
+
+def _hand_store(env: dict, setting) -> None:
+    """Put `setting` into `env` as the environment level of the cascade, and
+    nothing else there: every other AGENTKIT_DB_* key is removed."""
+    for key in _db().KEYS:
+        env.pop(key, None)
+    env.update(_setting_env(setting))
+
+
+def _setting_env(setting) -> dict:
+    """A resolved store as the AGENTKIT_DB_* keys that name it again at the
+    environment level."""
+    env = {"AGENTKIT_DB_SCHEMA": setting.schema}
+    if setting.url is not None:
+        env["AGENTKIT_DB_URL"] = setting.url
+        return env
+    for key, value in (("AGENTKIT_DB_HOST", setting.host), ("AGENTKIT_DB_PORT", setting.port),
+                       ("AGENTKIT_DB_NAME", setting.database),
+                       ("AGENTKIT_DB_USER", setting.user),
+                       ("AGENTKIT_DB_SSLMODE", setting.sslmode),
+                       ("AGENTKIT_DB_SSLROOTCERT", setting.sslrootcert),
+                       ("AGENTKIT_DB_PASSWORD", setting.password)):
+        if value not in (None, ""):
+            env[key] = str(value)
+    return env
 
 
 def _store_name(setting) -> str:
@@ -11037,11 +11064,13 @@ def _store_user(setting) -> str | None:
 
 
 def _service_store() -> None:
-    """Resolve the store before the service takes any work, and bring this
-    capability's tables up to this version once, as it starts. With no store
-    configured, or one whose setting cannot be used or whose tables cannot be
-    migrated, it refuses; a store that is away or busy is left to the daemon,
-    which asks for it again and migrates on its first connection."""
+    """Resolve the project's store before the service takes any work, and
+    bring this capability's tables up to this version once, as it starts. With
+    no store configured, or one whose setting cannot be used or whose tables
+    cannot be migrated, it refuses; a store that is away or busy is left to the
+    daemon, which asks for it again and migrates on its first connection. The
+    machine process asks none: each project's store is resolved and migrated
+    as the project is admitted."""
     setting = _store_setting()
     try:
         _connect(None, raising=True, setting=setting).close()
@@ -11055,8 +11084,7 @@ def _service_connection(wanted: str | None) -> tuple[str, dict | None]:
     query it makes is bounded by, resolved the way `main` resolves them."""
     reg, _f = _connections_registry()
     conn_id, entry = _select_connection(reg, wanted)
-    _store_keys_gate(conn_id, entry)
-    globals()["SCHEMA"] = _store_setting().schema
+    globals()["SCHEMA"] = _store_setting(root=_project_here()).schema
     globals()["PROJECT_IDENTITY"] = _project_id_state()
     globals()["PROJECT"] = _declared_project()
     return conn_id, entry
@@ -11488,9 +11516,10 @@ def cmd_service_join(wanted: str | None, args: list[str]) -> None:
              f"this project has no durable id in {envelope / 'project.json'}, and the "
              "machine service's list names a project by it",
              "run `capabilities init` in the project")
+    # The connection the machine service will serve the project on, read as it
+    # will read it, so a project whose records cannot be read does not join.
     reg, _f = _connections_registry()
-    conn_id, entry = _select_connection(reg, None)
-    _store_keys_gate(conn_id, entry)
+    _select_connection(reg, None)
     slug = _service_state_key(root)
     path = _machine_projects_path()
     with _MachineListLock():
@@ -11715,7 +11744,7 @@ def _machine_ready(module) -> None:
     if root is not None:
         _die(6, "machine_in_a_project",
              f"the machine state root {state} lies inside the project at {root}, whose own "
-             "tier would answer for the machine's store secrets",
+             "tier would answer for the machine process's secrets and store",
              "point XDG_STATE_HOME at a state home no project contains")
 
 
@@ -11728,7 +11757,6 @@ def cmd_service_run_machine(args: list[str]) -> None:
     except Refusal as refused:
         _die(refused.exit_code, refused.code, refused.message, refused.hint)
     _machine_ready(module)
-    _service_store()
     _record_launchd_supervisor(_machine_state_dir())
     dispatcher = module.MachineDispatcher(_MachineHost())
     try:
@@ -11750,9 +11778,6 @@ def cmd_service_start_machine(args: list[str]) -> None:
         _read_machine_settings()
     except Refusal as refused:
         _die(refused.exit_code, refused.code, refused.message, refused.hint)
-    # The process it starts refuses to run with no store configured; said here,
-    # before anything is started.
-    _store_setting()
     state = _machine_state_dir()
     state.mkdir(parents=True, exist_ok=True)
     if _machine_pid(module):
@@ -12661,7 +12686,7 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 
 # --- Store tables ------------------------------------------------------------
 
-# The tables live in the schema the machine's store setting binds, each named
+# The tables live in the schema the project's store setting binds, each named
 # `tasks_*`, and the shared database library applies these steps once each under
 # the `tasks` ledger. An applied step is never edited: a change is a new step.
 #
@@ -13098,7 +13123,6 @@ def cmd_doctor(wanted: str | None) -> None:
     _doctor_gate(report, wanted)
     reg, _f = _connections_registry()
     conn_id, entry = _select_connection(reg, wanted)
-    _store_keys_gate(conn_id, entry)
     setting = _store_setting()
     _steps, major, minor = _tables()
     # A probe answers for the store as it is now, so it never waits one out,
@@ -13139,7 +13163,7 @@ def cmd_doctor(wanted: str | None) -> None:
     stored = (None if found.stored_major is None
               else {"major": found.stored_major, "minor": found.stored_minor})
     answer = {"ok": True, "connection": conn_id, "server": server,
-              "store": {"source": setting.source, "schema": setting.schema},
+              "store": setting.report(),
               "tables": {"state": found.state, "code": {"major": major, "minor": minor},
                          "store": stored, "pending": found.pending},
               "workers": workers, "escalation": escalation}
@@ -13227,13 +13251,13 @@ def _turn_reads_project_env() -> None:
     here reads the environment - what the service once read for it when it
     started, read afresh by every turn, so an edit reaches the next one. A turn
     of the service is the one command carrying a receipt to write. The raise,
-    the receipt and the exclusions are the service's to hand it, and no env
-    file replaces them."""
+    the receipt, the exclusions and the store are the service's to hand it,
+    and no env file replaces them."""
     if not os.environ.get(_RECEIPT_ENV):
         return
     kept = ("TASKS_EXECUTION", _RECEIPT_ENV, _EXCLUDE_ENV)
     os.environ.update({key: str(value) for key, value in _project_env().items()
-                       if key not in kept})
+                       if key not in kept and not key.startswith("AGENTKIT_DB_")})
     globals().update(zip(("_CONFIG_HOME", "CREDENTIALS_ENV", "_STATE_HOME"), _homes()))
 
 
@@ -13274,7 +13298,6 @@ def main() -> None:
         cmd_service(wanted, rest); return
     reg, _f = _connections_registry()
     conn_id, entry = _select_connection(reg, wanted)
-    _store_keys_gate(conn_id, entry)
     # Read once per run, from the project and not from the command line, so
     # every verb below asks the same question of the same answer.
     globals()["PROJECT_IDENTITY"] = _project_id_state()
@@ -13292,9 +13315,14 @@ def main() -> None:
     handler = handlers.get(verb)
     if not handler and verb not in ("tag", "untag"):
         _die(6, "input", f"unknown command {verb!r}", f"run `{NAME} help`")
-    # The schema every query names is the one the machine's store setting binds,
+    # The schema every query names is the one the project's store setting binds,
     # and with no store configured nothing is served.
-    globals()["SCHEMA"] = _store_setting().schema
+    setting = _store_setting()
+    globals().update(SCHEMA=setting.schema, _STORE_PINNED=setting)
+    if verb == "run":
+        # The engine and the hooks of a turn act under its raise, which lives in
+        # this store, so they are handed it as the service hands it to a turn.
+        _hand_store(os.environ, setting)
     if verb == "tag":
         cmd_tag(entry, rest); return
     if verb == "untag":

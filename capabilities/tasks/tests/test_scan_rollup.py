@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.3.0"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0"]
 # ///
 """A scan row carries its task's runs, what they cost, and what blocks it, so a
 consumer judges a row without a second call.
@@ -10,7 +10,7 @@ The store-backed half seeds tasks, raises and blockers into a schema of its own,
 reads TASKS_TEST_DSN, skips when it is unset, and drops the schema.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' \\
-        --with 'capabilities-contract==0.3.0' python -m pytest capabilities/tasks/tests -q
+        --with 'capabilities-contract==0.4.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations

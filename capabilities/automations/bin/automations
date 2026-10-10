@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract==0.3.0",
+#     "capabilities-contract==0.4.0",
 # ]
 # ///
 """automations — project-local scheduler and subprocess runner.
@@ -95,9 +95,11 @@ Commands:
   automations service doctor|run|start|stop|status|logs
       Manage the bundled scheduler service. `run` stays in the foreground for
       Docker Compose; `start` is the local background convenience. `run` and
-      `start` refuse with exit 6 `store_not_configured` while the machine has
-      no store, and `status` names the store in force as `store`: `setting`,
-      `CAPABILITIES_STORE_URL`, or null with `store_error`.
+      `start` refuse with exit 6 `store_not_configured` while the project
+      resolves no store (Run ledger), and `status` names the store in force:
+      `store`, the level that answered (`project`, `environment` or
+      `machine`), `store_sources`, the files or variables it came from, and
+      `schema`; or `store` null with `store_error`.
   automations service reload [--timeout SEC]
       Publish an edited configuration to the daemon already running, without
       stopping the jobs it is running. The configuration is validated first, and
@@ -122,7 +124,8 @@ Commands:
 Machine mode:
   The same scheduler also runs once per machine, serving every project that
   joined it, so the projects on one machine share one process, one store
-  connection and an optional cap on the jobs they run at once. A project that
+  connection per distinct store and an optional cap on the jobs they run at
+  once. A project that
   does not join keeps its own daemon exactly as above.
 
   automations service init --machine [--force]
@@ -134,7 +137,7 @@ Machine mode:
       when there is one, else detached; --detached starts a copy by hand even
       then.
   automations service status --machine
-      The process, its cap and store, and every project on the list with its
+      The process, its cap and stores, and every project on the list with its
       state.
   automations service doctor --machine
       The supervision probe; a project's own trouble is reported and fails
@@ -161,19 +164,22 @@ Machine mode:
   with its root, its slug and when and by whom it joined; `leave` takes it off.
   Only these verbs write the list, atomically and under a lock in the machine
   state root. `join` refuses with exit 6 a project with no durable id it may
-  write under (`no_project_identity`), one whose .env or .env.local sets
-  CAPABILITIES_STORE_URL or CAPABILITIES_STORE_PASSWORD (`project_store_set`),
-  since the machine process keeps every project's runs in the machine's store,
-  and one whose slug another joined project has (`slug_taken`), since the two
+  write under (`no_project_identity`) and one whose slug another joined
+  project has (`slug_taken`), since the two
   would share a state root. It answers {"joined", "project": {"id", "slug",
   "root"}, "list"}, `joined` false when already on the list, and starts
   nothing.
 
   Exactly one machine process runs per machine, by the lock in its state root
   $XDG_STATE_HOME/capabilities/machine/automations/, which is also its working
-  directory and holds its pid, its status daemon.json and its log. It refuses
-  to run while no store is configured, holds one store connection for every
-  project, and follows the list without a reload: a project that joins is
+  directory and holds its pid, its status daemon.json and its log. Each
+  project it serves keeps its runs in the store resolved for that project's
+  root (Run ledger), resolved as it is admitted; a project that resolves none
+  is refused with the reason and asked again. It holds one store connection
+  for each distinct store, shared by every project on it, reconnects a lost
+  one every pass while the projects on other stores go on, and lists them in
+  `status --machine` as `stores`. It follows the list without a reload: a
+  project that joins is
   served from the first pass at which it can be. For each project it serves it
   holds the project's own daemon.lock and writes the project's daemon.pid and
   daemon.fingerprint, so `service status`, `doctor`, `reload`, `logs`,
@@ -222,18 +228,19 @@ Machine mode:
   lines to that project's daemon.log too. `status --machine` answers `mode`,
   `running`, `pid`, `started_at`, `published_at`, `fingerprint` and
   `current`, `projects_file` (its path and how many joined), `cap`
-  (`max_parallel`, `running`, `binding`), `store` (which store is in force),
-  `store_connection` while it runs, and `projects`: for every project on the
-  list its slug as `project`, `project_id`, `root`, `joined_at`, `joined_by`,
+  (`max_parallel`, `running`, `binding`), `stores` while it runs (for each
+  store its projects resolve: `store`, `schema`, `connected`, `error`), and
+  `projects`: for every project on the list its slug as `project`,
+  `project_id`, `root`, `joined_at`, `joined_by`,
   `present`, `enabled_explicitly`, `state` (`served`, `paused`, `refused`,
   `error`, or null with no machine process) and `reason`, and while it is held
   its `environment`, `fingerprint`, `reload_error`, `automations`, `running`
   and `pause`. `service status` in a joined project answers `mode` "machine"
   and the machine's word on it under `machine`. `doctor --machine` exits 0
   while the process holds its lock, published its status within twice its
-  publish interval, runs the machine settings on disk and holds its store
-  connection; a project in `error` or `refused` fails it not, since restarting
-  the process cannot repair a project.
+  publish interval, runs the machine settings on disk and holds a connection
+  to every store it opened; a project in `error` or `refused` fails it not,
+  since restarting the process cannot repair a project.
 
   Under launchd, the machine process writes the job launchd started it as
   into `launchd.json` in its state root: the label XPC_SERVICE_NAME names,
@@ -273,9 +280,11 @@ Environment:
 
 Run ledger:
   Runs, the queue and their history live in the table automations_runs of
-  the PostgreSQL the machine's store setting names (`capabilities store set`),
-  or of the one `CAPABILITIES_STORE_URL` names, reached through the shared
-  capabilities-contract library. Each run carries its project's id and the
+  the PostgreSQL the shared capabilities-contract library resolves for the
+  project: the AGENTKIT_DB_* keys in its .env.local / .env, then the same keys
+  in the process environment, then the machine's store setting file that
+  `capabilities store set` writes; the first level that answers is used
+  whole. Each run carries its project's id and the
   host it was recorded on; its log stays a file on that host.
 
 Scheduling:
@@ -348,7 +357,6 @@ import shutil
 import socket
 import stat
 import tempfile
-import sqlite3
 import subprocess
 import sys
 import time
@@ -372,7 +380,7 @@ DOCS_BASE = (
     "main/capabilities/automations/guides/"
 )
 STATE = True
-TABLES = True       # automations_* tables in the machine's store, built by _tables()
+TABLES = True       # automations_* tables in the project's store, built by _tables()
 INVENTORY = {"network": "none"}   # config and daemon state are both local
 POST_INSTALL: list = []
 SERVICE = {
@@ -401,8 +409,13 @@ SERVICE = {
             "optional": [
                 {"key": "AUTOMATIONS_ENVIRONMENT", "default": "production"},
                 {"key": "AUTOMATIONS_NAMESPACE"},
-                {"key": "CAPABILITIES_STORE_URL"},
-                {"key": "CAPABILITIES_STORE_PASSWORD"},
+                # The database is the server's own environment level
+                # (SHEBANG.md, "The store setting").
+                *({"key": key} for key in (
+                    "AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT",
+                    "AGENTKIT_DB_NAME", "AGENTKIT_DB_USER", "AGENTKIT_DB_PASSWORD",
+                    "AGENTKIT_DB_SCHEMA", "AGENTKIT_DB_SSLMODE",
+                    "AGENTKIT_DB_SSLROOTCERT")),
             ],
         },
         "mounts": [
@@ -3274,7 +3287,7 @@ def service_status(root: Path) -> dict[str, Any]:
         # there is none, because an envelope that refuses the file makes that
         # `false` wrong in a way no directory listing explains.
         **({"state_record_error": record_error} if record_error else {}),
-        **_store_named(runtime),
+        **_store_named(runtime, root),
         "pid_file": str(pid_file),
         "log_file": str(state / "daemon.log"),
         "counts": counts,
@@ -3282,10 +3295,10 @@ def service_status(root: Path) -> dict[str, Any]:
     }
 
 
-def _store_named(runtime) -> dict[str, Any]:
-    """Which store the run ledger is kept in, named without reaching it."""
+def _store_named(runtime, root: Path) -> dict[str, Any]:
+    """Which store the project's run ledger is kept in, named without reaching it."""
     try:
-        return runtime.store_in_force()
+        return runtime.store_in_force(root)
     except runtime.StoreUnavailable as exc:
         error = {"code": exc.slug, "message": exc.message}
         if exc.hint:
@@ -4127,10 +4140,6 @@ def cmd_service_run() -> NoReturn:
 _PROJECT_POINTERS = ("CLAUDE_PROJECT_DIR", "CAPABILITIES_PROJECT_ID",
                      "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_PROJECT_ENVELOPE",
                      "CAPABILITIES_PROJECT_ENVELOPE_ROOT", *_SELECTOR_KEYS)
-# The run ledger is kept in the machine's store. A project whose own env files
-# name a store would keep its runs there under its own daemon and in the
-# machine's under the machine service, so it does not join.
-_STORE_ENV_KEYS = ("CAPABILITIES_STORE_URL", "CAPABILITIES_STORE_PASSWORD")
 _PROJECTS_HEADER = ("# Projects served by the machine automations service. Written by "
                     "`automations service join|leave`; do not edit by hand.")
 _PROJECT_ENTRY_KEYS = ("root", "slug", "joined_at", "joined_by")
@@ -4355,17 +4364,10 @@ def _ask_in_project(root: Path, question):
                        error.get("hint")) from None
 
 
-def _project_store_set(root: Path) -> list[str]:
-    """Which of the store's keys the project's own env files set, by name."""
-    return [f"{root / name} sets {key}" for name in (".env", ".env.local")
-            for key in _env_file_entries(root / name) if key in _STORE_ENV_KEYS]
-
-
 def _servable_here() -> tuple[str, str]:
     """This project's id and slug, if the machine service may serve it, or the
-    refusal that says why not: no durable id it may write under, or a store
-    named in its own env files. Asked by `join`, and by the
-    machine service before it serves a project."""
+    refusal that says why not: no durable id it may write under. Asked by
+    `join`, and by the machine service before it serves a project."""
     root = _project_root()
     envelope = _project_capabilities_dir(root)
     project = _project_id(write=True, refuse=False)
@@ -4374,25 +4376,21 @@ def _servable_here() -> tuple[str, str]:
                        f"this project has no durable id it may write under in "
                        f"{envelope / 'project.json'}, and the machine service's list "
                        "names a project by it", "run `capabilities init` in the project")
-    found = _project_store_set(root)
-    if found:
-        raise _Refusal(6, "project_store_set",
-                       f"{'; '.join(found)}, and the machine service keeps every project's "
-                       "runs in the machine's store",
-                       "remove it from the project's env files; the machine's store "
-                       "setting names the store (`capabilities store show`)")
     return project, _state_project_key(root)
 
 
 class _ProjectHost:
     """One joined project as the machine process sees it: where it stands, and
     the questions the machine asks of it, each answered inside the project's
-    own resolution."""
+    own resolution. `setting` is the store resolved for its root as it was
+    admitted, which its runs are kept in."""
 
-    def __init__(self, runtime, entry: dict, root: Path, config_path: Path, state_dir: Path):
+    def __init__(self, runtime, entry: dict, root: Path, config_path: Path, state_dir: Path,
+                 setting):
         self.runtime = runtime
         self.entry = entry
         self.root, self.config_path, self.state_dir = root, config_path, state_dir
+        self.setting = setting
 
     def load(self) -> dict[str, Any]:
         try:
@@ -4454,8 +4452,9 @@ class _MachineHost:
     def admit(self, entry: dict):
         """(host, None) for a project on the list that can be served now, or
         (None, (state, reason)): `error` for a folder that is gone or a question
-        that failed, `refused` for what the checks refuse and for a project whose
-        id, slug or root moved since it joined."""
+        that failed, `refused` for what the checks refuse, for a project that
+        resolves no store it can use, and for one whose id, slug or root moved
+        since it joined."""
         root = Path(entry["root"])
         if not root.is_dir():
             return None, ("error", f"the project folder {root} is gone")
@@ -4477,15 +4476,19 @@ class _MachineHost:
                                "service join` there take the new one")
             if not _project_enabled_explicitly():
                 raise _Refusal(4, *_NOT_ENABLED.split(": ", 1))
-            return _config_path(root), _state_path(root)
+            try:
+                setting = self.runtime.resolve_store(root)
+            except self.runtime.StoreUnavailable as exc:
+                raise _Refusal(6, exc.slug, exc.message, exc.hint) from None
+            return _config_path(root), _state_path(root), setting
 
         try:
-            config_path, state_dir = _ask_in_project(root, probe)
+            config_path, state_dir, setting = _ask_in_project(root, probe)
         except _Refusal as refused:
             return None, ("refused", f"{refused.code}: {refused.message}")
         except Exception as exc:
             return None, ("error", f"{type(exc).__name__}: {exc}")
-        return _ProjectHost(self.runtime, entry, root, config_path, state_dir), None
+        return _ProjectHost(self.runtime, entry, root, config_path, state_dir, setting), None
 
 
 def _machine_pid(runtime) -> int | None:
@@ -4539,7 +4542,7 @@ def _enabled_at(root: Path) -> bool:
 
 def _machine_status(runtime) -> dict:
     """The machine service as its status file and the list say: whether it
-    runs, its settings, its cap and store, and every project on the list with
+    runs, its settings, its cap and stores, and every project on the list with
     what is true of it now. With no process running, every entry still answers
     `present` and `enabled_explicitly`."""
     state = _machine_state_dir()
@@ -4570,7 +4573,6 @@ def _machine_status(runtime) -> dict:
         "cap": published.get("cap") or {
             "max_parallel": (settings or {}).get("max_parallel"), "running": 0,
             "binding": False},
-        **_store_named(runtime),
     }
     supervisor = _launchd_supervisor(state)
     answer["supervisor"] = ({"launchd": supervisor["label"], "pid": supervisor["pid"],
@@ -4579,7 +4581,7 @@ def _machine_status(runtime) -> dict:
     if not running:
         answer["hint"] = _machine_start_hint(supervisor)
     if running:
-        answer["store_connection"] = published.get("store")
+        answer["stores"] = published.get("stores") or []
     if settings_error:
         answer["settings_error"] = settings_error
     rows = {row.get("project_id"): row for row in published.get("projects") or []
@@ -4925,10 +4927,6 @@ def cmd_service_start_machine(detached: bool = False) -> dict[str, Any]:
     supervisor = None if detached else _launchd_supervisor(state)
     if supervisor:
         return _start_through_launchd(runtime, supervisor)
-    try:
-        runtime.StoreLink().open().close()
-    except runtime.StoreUnavailable as exc:
-        _store_refusal(exc)
     log_path = state / runtime.LOG_FILE
     with log_path.open("a", encoding="utf-8") as log:
         process = subprocess.Popen(
@@ -4981,10 +4979,10 @@ def cmd_service_doctor_machine() -> dict[str, Any]:
         if not status["current"]:
             problems.append("the machine process runs machine settings that have changed "
                             f"since; `{NAME} service reload --machine` hands it the file on disk")
-        connection = status.get("store_connection") or {}
-        if not connection.get("connected"):
-            problems.append(f"the machine process holds no store connection: "
-                            f"{connection.get('error') or 'reconnecting'}")
+        for store in status.get("stores") or []:
+            if not store.get("connected"):
+                problems.append(f"the machine process holds no connection to the store "
+                                f"{store.get('store')}: {store.get('error') or 'reconnecting'}")
     if status.get("settings_error"):
         problems.append(status["settings_error"])
     answer = {"ok": not problems, "mode": "machine", "machine": status,

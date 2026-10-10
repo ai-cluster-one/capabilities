@@ -33,11 +33,15 @@ RUNTIME_PATH = CAPABILITY / "service" / "runtime.py"
 DSN = os.environ.get("AUTOMATIONS_TEST_DSN")
 needs_store = pytest.mark.skipif(not DSN, reason="AUTOMATIONS_TEST_DSN is unset")
 
+# The environment level of the store cascade.
+STORE_KEYS = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTKIT_DB_NAME",
+              "AGENTKIT_DB_USER", "AGENTKIT_DB_PASSWORD", "AGENTKIT_DB_SCHEMA",
+              "AGENTKIT_DB_SSLMODE", "AGENTKIT_DB_SSLROOTCERT")
 # What points a process at a project or a store; a fixture starts from none.
 POINTERS = ("CLAUDE_PROJECT_DIR", "CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT",
             "CAPABILITIES_PROJECT_ENVELOPE", "CAPABILITIES_PROJECT_ENVELOPE_ROOT",
             "AUTOMATIONS_ENVIRONMENT", "AUTOMATIONS_NAMESPACE", "AUTOMATIONS_CONFIG",
-            "AUTOMATIONS_STATE_DIR", "CAPABILITIES_STORE_URL", "CAPABILITIES_READ_ONLY")
+            "AUTOMATIONS_STATE_DIR", "CAPABILITIES_READ_ONLY", *STORE_KEYS)
 
 PROBE = """import json, os, time
 print(json.dumps({"secret": os.environ.get("PROJECT_SECRET"), "cwd": os.getcwd(),
@@ -117,7 +121,7 @@ class Farm:
         self.env = {key: value for key, value in os.environ.items() if key not in POINTERS}
         self.env.update(XDG_CONFIG_HOME=str(tmp / "config"), XDG_STATE_HOME=str(tmp / "state"))
         if store and DSN:
-            self.env["CAPABILITIES_STORE_URL"] = DSN
+            self.env["AGENTKIT_DB_URL"] = DSN
         self.projects: dict[str, dict] = {}
 
     @property
@@ -183,7 +187,8 @@ class Farm:
 
     def runs(self, name: str) -> list[dict]:
         runtime = load_runtime()
-        with runtime.RunLedger(self.projects[name]["id"], "").open() as ledger:
+        with runtime.RunLedger(self.projects[name]["id"], "",
+                               root=self.projects[name]["root"]).open() as ledger:
             return ledger.list(limit=500)
 
     def finished(self, name: str, *, trigger: str, status: str = "succeeded") -> list[dict]:
@@ -203,7 +208,9 @@ class Farm:
 def farm(tmp_path, monkeypatch):
     if not DSN:
         pytest.skip("AUTOMATIONS_TEST_DSN is unset")
-    monkeypatch.setenv("CAPABILITIES_STORE_URL", DSN)
+    for key in STORE_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("AGENTKIT_DB_URL", DSN)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     built = Farm(tmp_path)
     yield built
@@ -213,7 +220,8 @@ def farm(tmp_path, monkeypatch):
 @pytest.fixture
 def bare(tmp_path, monkeypatch):
     """Projects and homes with no store at all."""
-    monkeypatch.delenv("CAPABILITIES_STORE_URL", raising=False)
+    for key in STORE_KEYS:
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     return Farm(tmp_path, store=False)
 
@@ -263,11 +271,11 @@ def test_the_list_and_the_machine_settings_read_back_and_refuse_saying_why(bare,
 def test_join_refuses_what_the_machine_cannot_serve_and_leave_takes_off(bare):
     bare.project("plain")
     bare.project("global-only", enabled=False)
-    bare.project("own-store", env_text="CAPABILITIES_STORE_URL=postgresql://elsewhere/db\n")
+    bare.project("own-store", env_text="AGENTKIT_DB_URL=postgresql://elsewhere/db\n")
     code, error = bare.refused("global-only", "service", "join")
     assert (code, error["code"]) == (4, "project_enable_required")
-    code, error = bare.refused("own-store", "service", "join")
-    assert (code, error["code"]) == (6, "project_store_set")
+    # A project naming its own store joins: the machine serves it on that store.
+    assert bare.ok("own-store", "service", "join")["joined"] is True
     code, error = bare.refused("plain", "service", "join", CAPABILITIES_READ_ONLY="1")
     assert (code, error["code"]) == (4, "read_only_switch")
     joined = bare.ok("plain", "service", "join")
@@ -295,11 +303,19 @@ def test_join_refuses_what_the_machine_cannot_serve_and_leave_takes_off(bare):
     assert bare.ok("plain", "service", "leave")["left"] is False
 
 
-def test_the_machine_refuses_to_run_without_a_store(bare):
-    code, error = bare.refused(None, "service", "run", "--machine")
-    assert (code, error["code"]) == (6, "store_not_configured")
-    code, error = bare.refused(None, "service", "start", "--machine")
-    assert (code, error["code"]) == (6, "store_not_configured")
+def test_the_machine_runs_without_a_store_and_refuses_a_project_that_resolves_none(bare):
+    """The machine process stands in no project and needs no store of its own;
+    a joined project that resolves none is refused with the reason, and asked
+    again."""
+    bare.project("plain")
+    assert bare.ok("plain", "service", "join")["joined"] is True
+    try:
+        assert bare.ok(None, "service", "start", "--machine")["started"] is True
+        row = bare.until_state("plain", "refused")
+        assert row["reason"].startswith("store_not_configured:")
+        assert bare.machine()["stores"] == []
+    finally:
+        bare.cli(None, "service", "stop", "--machine", "--force", "--timeout", "10")
 
 
 def test_the_machine_process_reads_no_project_environment(bare, monkeypatch):
@@ -307,7 +323,9 @@ def test_the_machine_process_reads_no_project_environment(bare, monkeypatch):
     action read its selectors and the names its env files set, and never a
     value of the rest; the process environment is left as it was."""
     root = bare.project("quiet", env_text="PROJECT_SECRET=never-read\n"
-                                          "AUTOMATIONS_ENVIRONMENT=staging\n")
+                                          "AUTOMATIONS_ENVIRONMENT=staging\n"
+                                          "AGENTKIT_DB_URL=postgresql://quiet@127.0.0.1:1/"
+                                          "quiet?sslmode=disable\n")
     cli = load_cli()
     monkeypatch.setattr(cli, "_CONFIG_HOME", bare.tmp / "config")
     monkeypatch.setattr(cli, "_STATE_HOME", bare.tmp / "state")
@@ -321,6 +339,9 @@ def test_the_machine_process_reads_no_project_environment(bare, monkeypatch):
              "root": str(root)}
     host, refusal = cli._MachineHost(load_runtime()).admit(entry)
     assert refusal is None
+    # The store is resolved for the project, which names its own.
+    assert (host.setting.level, host.setting.database) == ("project", None)
+    assert host.setting.url.startswith("postgresql://quiet@")
     config = host.load()
     assert config["engine"]["environment"] == "staging"
     assert host.check() is None
@@ -614,7 +635,7 @@ def launchd(bare, monkeypatch):
             pass
 
     monkeypatch.setattr(runtime, "StoreLink", Link)
-    monkeypatch.setattr(runtime, "store_in_force", lambda: {"store": "test"})
+    monkeypatch.setattr(runtime, "store_in_force", lambda root=None: {"store": "test"})
     monkeypatch.setattr(cli, "_runtime_module", lambda: runtime)
     spawned = []
     real_popen = subprocess.Popen
@@ -715,3 +736,43 @@ def test_detached_without_machine_is_refused(bare):
     bare.project("plain")
     code, error = bare.refused("plain", "service", "start", "--detached")
     assert (code, error["code"]) == (6, "input")
+
+
+@needs_store
+def test_two_projects_on_two_stores_each_keep_their_runs_in_their_own(farm):
+    """One machine process serves alpha on the store its environment names and
+    beta on the store beta's own .env names, with one link per store: each
+    project's runs are recorded in its own store and nowhere else."""
+    import psycopg
+
+    own = "automations_test_" + uuid.uuid4().hex[:8]
+    farm.project("alpha")
+    farm.project("beta", env_text=f"PROJECT_SECRET=beta-secret\nAGENTKIT_DB_URL={DSN}\n"
+                                  f"AGENTKIT_DB_SCHEMA={own}\n")
+    try:
+        for name in ("alpha", "beta"):
+            assert farm.ok(name, "service", "join")["joined"] is True
+        farm.ok(None, "service", "start", "--machine")
+        for name in ("alpha", "beta"):
+            farm.until_state(name, "served")
+        stores = until(lambda: (found := farm.machine()["stores"]) and len(found) == 2 and found,
+                       30, "two stores")
+        assert sorted(store["schema"] for store in stores) == sorted(["agentkit", own])
+        assert all(store["connected"] and store["error"] is None for store in stores)
+        for name in ("alpha", "beta"):
+            farm.ok(name, "run", "probe")
+        for name in ("alpha", "beta"):
+            until(lambda: farm.finished(name, trigger="manual"), 30, f"{name} manual run")
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            def ids(schema):
+                return {row[0] for row in conn.execute(
+                    f"select distinct project_id from {schema}.automations_runs")}
+            assert farm.projects["beta"]["id"] in ids(own)
+            assert farm.projects["alpha"]["id"] not in ids(own)
+            assert farm.projects["beta"]["id"] not in ids("agentkit")
+        assert farm.ok("beta", "service", "status")["store"] == "project"
+    finally:
+        farm.stop_all()
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(f"drop schema if exists {own} cascade")
+
