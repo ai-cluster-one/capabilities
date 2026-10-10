@@ -64,6 +64,10 @@ READING
                                   takes
   tasks profiles history <name> [--global]
                                   every version of it, oldest first
+  tasks accepts <project id>      what that project takes from this one: each
+                                  grant of its enabled workers naming this
+                                  project, and whether its service runs. See
+                                  PROJECT SCOPE
 
 WRITING  (needs allow_write on the connection; exit 4 otherwise)
   tasks add --type T --title TEXT [fields]      create one
@@ -186,6 +190,8 @@ ONE TURN OF THE CONVEYOR
                                 whoever is assigned next; the next turn
                                 continues from there
     moved from waiting to todo  ok - released, which is what it was taken for
+    another project's task,     ok, marked `taken_in` with that task - it is
+    taken in by a task here     carried on there, as PROJECT SCOPE states
     where it rested             failed, marked `cut_off` - the turn never
                                 reached an ending of its own, and the task is
                                 still where it rested, its assignee and `stage`
@@ -335,6 +341,17 @@ WORKERS
   top-level `tags` and `assignee` mean the same as naming them inside every
   filter; naming one in both places is refused.
 
+  A filter may also name `accepts_from`, a list of other projects' ids: a
+  grant. It takes the tasks those projects raised and assigned to this one -
+  their assignee is this project's id - by its status, type and tags, and none
+  of this project's own; a filter without it takes only this project's tasks.
+  It names no `assignee`, inside it or at the top, no `${VAR}`, since other
+  projects read it, and not this project's own id. A grant is the project's
+  standing consent to be handed such tasks, read by every project that hands
+  one, and PROJECT SCOPE states what it changes there. Its types are no
+  other worker's to leave alone: `default` still takes this project's tasks of
+  those types.
+
   A worker takes a task in `todo`, or in `waiting` when its filter names
   `waiting` - and only a worker whose filter names it ever claims a waiting
   task. No task is claimable while its `blocked_by` lists a task that has not
@@ -374,8 +391,8 @@ WORKERS
   project's doctrine lets an unattended turn do, and hand the task to a named
   person in `waiting` with the question when one is needed. A project worker
   named `default` replaces it whole, and `enabled: false` in it switches it
-  off. Like every worker it claims only its own project's tasks, so
-  it never takes one another project created.
+  off. It names no grant, so it claims only its own project's tasks and
+  never takes one another project created.
 
   `supervisor` ships switched off. It acts on behalf of the project's owner on
   the tasks handed to it - `takes: {status: [waiting], assignee: [supervisor]}`
@@ -1277,9 +1294,38 @@ PROJECT SCOPE
 
   A task stays in the project that raised it and may be assigned to another
   project's agent: set its assignee to that project's id, exactly as that
-  project declares it. Any other assignee is a person or a name, as always.
-  That project finds what is assigned to it across the store with
+  project declares it. A name is a project's id when that project keeps a task
+  or a worker in this store; any other assignee is a person or a name, as
+  always. That project finds what is assigned to it across the store with
   `tasks list --all-projects --assigned-here`.
+
+  A project takes such a task only by a grant: a worker of its own, enabled,
+  whose `takes` names the raising project in `accepts_from` (WORKERS). So
+  `add`, `set` and `release` judge, in the write's own transaction, a write
+  that leaves a task in `todo` or `waiting` on another project's id - `set`
+  one that moves its status, assignee or type, as it stands once written - by
+  that project's grants, against the task's own project, its status, type and
+  tags; a waiting task whose wait ends on its own counts in `todo` too. No grant
+  taking it there refuses the write with exit 4 `not_accepted`, saying what
+  that project accepts and from whom, and nothing is written. Otherwise the
+  answer names `accepted_by`, the project and the worker whose grant takes it,
+  and carries `warnings` when no service of that project is running: a stopped
+  or paused conveyor is that project's to restart, never a refusal. A running
+  service says so by a lock it holds on the store for each project it serves,
+  which any project reads. `tasks accepts <project id>` answers ahead of time
+  what that project takes from this one, and whether its service runs.
+
+  A grant's claim takes the task while it stands assigned there, and passes
+  over every one the project has taken in: one a task of its own names in its
+  metadata as `origin` `tasks` and `origin_ref` the task's id. Its turn is told
+  so, and decides by its own project's doctrine: it takes the task in - creates
+  a task of its own and links it, which ends the raise `ok` marked `taken_in` -
+  or hands it back saying why. The work goes on in the task that took it in,
+  and whoever brings that to an outcome answers on the origin's trail and hands
+  its assignee back. Another project's task is never escalated, scanned for a
+  dead end, or landed by such a raise: parked, it is handed back; its cost stays
+  on the raise; and the raise, opened by a worker of the project it is
+  assigned to, is that project's to close, sweep, renew and hold its lane by.
 
   On such a task the project it is assigned to makes exactly two writes, each
   addressed by uuid: `tasks activity <uuid> "..."`, and `tasks set <uuid>
@@ -5607,6 +5653,12 @@ def cmd_add(entry, args: list[str]) -> None:
         if "blocked-by" in opts:
             values["blocked_by"] = _blockers_given(
                 cur, values["project_id"], None, _blocked_by_flag(opts["blocked-by"]))
+        # Nor open on another project that takes nothing of it there, judged in
+        # this same transaction.
+        judged = _acceptance(cur, {**values, "tags": [], "metadata": {}})
+        if judged and judged.get("refused"):
+            _die(4, "not_accepted", judged["refused"],
+                 _acceptance_hint(values["assignee"].strip()))
         cols = list(values)
         cur.execute(f"""insert into {SCHEMA}.tasks_tasks ({', '.join(cols)})
                         values ({', '.join(_PLACEHOLDER.get(c, '%s') for c in cols)})
@@ -5617,7 +5669,7 @@ def cmd_add(entry, args: list[str]) -> None:
         answer = {"created": row["id"], **{k: row[k] for k in ("type", "title", "status")}}
         if coerced:
             answer["coerced"] = coerced
-        _emit(answer)
+        _emit(_accepted(answer, judged))
 
 
 def cmd_set(entry, args: list[str]) -> None:
@@ -5711,11 +5763,17 @@ def cmd_set(entry, args: list[str]) -> None:
         # its type - may not leave it open on a worker that does not take it
         # there. Judged on the row as written, so a wait's dropped pickup and
         # spent blockers count, and nothing is kept when it is refused.
+        judged = None
         if handed_back or {"status", "assignee", "type"} & set(values):
             landing = _landing_refusal(row)
             if landing:
                 conn.rollback()
                 _die(4, "policy", landing, _LANDING_HINT)
+            judged = _acceptance(cur, row)
+            if judged and judged.get("refused"):
+                conn.rollback()
+                _die(4, "not_accepted", judged["refused"],
+                     _acceptance_hint(row["assignee"].strip()))
         # The move is recorded here, under the verb that made it, rather than by
         # whoever remembered to write it down afterwards.
         moved = _record_moves(cur, tid, before, row,
@@ -5727,7 +5785,7 @@ def cmd_set(entry, args: list[str]) -> None:
             answer["handed_back"] = True
         if spent:
             answer["blocked_by_spent"] = spent
-        _emit(answer)
+        _emit(_accepted(answer, judged))
 
 
 def cmd_tag(entry, args: list[str], remove: bool = False) -> None:
@@ -6022,16 +6080,18 @@ def _sweep_leases(cur, project: str) -> list[dict]:
     died, and nothing here decides where to put it back.
 
     It is still a write, so it reaches no further than the project it runs in: a
-    claim looking for its own work never closes somebody else's raise."""
+    claim looking for its own work never closes somebody else's raise. A raise
+    one of its workers opened on a task another project assigned to it is its
+    own, and closed here too."""
     cur.execute(f"""update {SCHEMA}.tasks_executions e
                        set status = 'abandoned', ended_at = now(),
                            detail = coalesce(detail, 'lease lapsed before release')
-                     where status = 'running' and lease_until is not null
-                       and lease_until < now()
-                       and task_id in (select id from {SCHEMA}.tasks_tasks
-                                        where project_id = %s)
-                 returning id, task_id, attempt, to_jsonb(e) -> 'metrics' as metrics""",
-                (project,))
+                      from {SCHEMA}.tasks_tasks t
+                     where t.id = e.task_id and e.status = 'running'
+                       and e.lease_until is not null and e.lease_until < now()
+                       and {_ours_clause('e', 't')}
+                 returning e.id, e.task_id, e.attempt, to_jsonb(e) -> 'metrics' as metrics""",
+                (project, project))
     return _rows(cur)
 
 
@@ -6228,13 +6288,23 @@ def _selection(opts: dict, project: str, tz, held: bool = False) -> tuple[str, l
     come, and no open raise holding it. `claim` and `run --apply` take from it
     and `run` without --apply reports from it, so what is reported is what would
     be taken. With `held`, the tasks the same ask passes over because an open
-    raise still holds them."""
+    raise still holds them.
+
+    An ask carrying `accepts_from` is a grant's: it selects the tasks those
+    projects raised and assigned to this one, by this project's id, and passes
+    over every one this project has already taken in."""
+    granted = opts.get("accepts_from")
     where, params = _where({**{k: v for k, v in opts.items()
                                if k in ("type", "assignee", "tag")},
-                            "project": project}, tz)
+                            **({"all-projects": True} if granted is not None
+                               else {"project": project})}, tz)
     where, params = _not_types(where, params, opts.get("not_types"))
     where, params = _not_ids(where, params, opts.get("not_ids"))
     clauses: list[str] = []
+    if granted is not None:
+        clauses += ["project_id = any(%s)", "assignee = %s",
+                    f"not {_taken_in_clause(f'{SCHEMA}.tasks_tasks')}"]
+        params = [*params, list(granted), project, project]
     if opts.get("only_id"):
         # The one task a worker's `before` hook let through: the claim takes it
         # only while every other condition of the ask still holds.
@@ -6260,6 +6330,50 @@ def _selection(opts: dict, project: str, tz, held: bool = False) -> tuple[str, l
     clauses.append(_open_raise_clause(held))
     joiner = " and " if where else " where "
     return f"{where}{joiner}" + " and ".join(clauses), params
+
+
+# A task another project assigned to this one is taken in by a task of this
+# project's own that names it: `origin` is `tasks` and `origin_ref` its id, as a
+# task seeded from a report names the report. While one does, no grant here
+# takes the origin again; the answer goes back on its trail and by its assignee.
+_ORIGIN_TASKS = "tasks"
+
+
+def _taken_in_clause(table: str) -> str:
+    """SQL, one parameter - the project: whether that project holds a task
+    taking in the task `table` names."""
+    return (f"exists (select 1 from {SCHEMA}.tasks_tasks l "
+            f"where l.project_id = %s and l.metadata ->> 'origin' = '{_ORIGIN_TASKS}' "
+            f"and l.metadata ->> 'origin_ref' = {table}.id::text)")
+
+
+def _taken_in(cur, tid: str, project: str) -> str | None:
+    """The task of `project` that takes in the task `tid`, or None."""
+    cur.execute(f"""select id from {SCHEMA}.tasks_tasks
+                     where project_id = %s and metadata ->> 'origin' = %s
+                       and metadata ->> 'origin_ref' = %s
+                     order by created_at limit 1""", (project, _ORIGIN_TASKS, tid))
+    row = cur.fetchone()
+    return str(row["id"]) if row else None
+
+
+def _ours_clause(execution: str, task: str) -> str:
+    """SQL, two parameters - the project, twice: whether the raise `execution`
+    names is this project's: on a task of its own, or opened by one of its
+    workers on a task another project assigned to it."""
+    return (f"({task}.project_id = %s or {execution}.worker_id in "
+            f"(select w.id from {SCHEMA}.tasks_workers w where w.project_id = %s))")
+
+
+def _raised_here_clause(execution: str, task: str) -> str:
+    """SQL, two parameters - the project, twice: whether a worker of this
+    project opened the raise `execution` names - a stored worker, by its
+    version, or a shipped one, which records none, on a task of its own. A
+    lane is this project's, so another project's worker of the same name holds
+    none of it."""
+    return (f"({execution}.worker_id in (select w.id from {SCHEMA}.tasks_workers w "
+            f"where w.project_id = %s) or ({execution}.worker_id is null "
+            f"and {task}.project_id = %s))")
 
 
 def _held_over(cur, opts: dict, project: str, tz) -> list[dict]:
@@ -6303,14 +6417,34 @@ def _holding(cur, task: dict) -> list[str]:
 
 def _key_refusal(task: dict, due: bool, opts: dict,
                  held: dict | None = None,
-                 holding: list[str] | None = None) -> tuple[str, str] | None:
+                 holding: list[str] | None = None,
+                 taken: str | None = None) -> tuple[str, str] | None:
     """Why the task named with --key cannot be taken by the worker these options
     name, as a sentence and its hint, or None when it can. A named task reaches
     past the order a worker claims in and past the narrowing of its filters,
     never past the statuses and types it takes, never past `held`, the raise
-    still open on it, and never past `holding`, the blockers still holding it."""
+    still open on it, and never past `holding`, the blockers still holding it.
+
+    A task another project assigned here is taken only by a filter whose grant
+    names that project, and never once `taken`, the task of this project that
+    took it in, exists; a task of this project only by a filter without one."""
     key = opts["key"]
     accept = opts.get("accept")
+    owner = task.get("project_id")
+    if accept is not None and owner and PROJECT and owner != PROJECT:
+        accept = [entry for entry in accept
+                  if owner in (entry.get("accepts_from") or [])]
+        if not accept:
+            return (f"{key} belongs to {owner}, and worker {opts.get('worker')!r} "
+                    f"accepts no task from it",
+                    "a worker takes another project's task only by a grant naming that "
+                    "project in its `takes`, as `accepts_from`")
+        if taken:
+            return (f"{key} is taken in already, as {taken}",
+                    "the task that took it in carries the work; the answer goes back "
+                    "on this one's trail and by handing its assignee back")
+    elif accept is not None:
+        accept = [entry for entry in accept if entry.get("accepts_from") is None]
     statuses = (sorted({one for entry in accept for one in entry["status"]})
                 if accept else ["todo"])
     if task["status"] not in statuses:
@@ -6396,7 +6530,9 @@ def _claim(entry, opts: dict) -> dict:
             # A run's first claim scans the project for dead ends, after the
             # sweeps so a wait they ended on a name nobody takes in todo is
             # caught by this same claim. A task named with --key is that run's.
-            spare = (_task_id(cur, opts["key"], writing=True),) if opts.get("key") else ()
+            spare = ((_task_id(cur, opts["key"], writing=True,
+                               answering=bool(opts.get("grants"))),)
+                     if opts.get("key") else ())
             scanned = _scan(cur, escalation, opts["structure"], project, write=True,
                             spare=spare)
             escalated += scanned["escalated"]
@@ -6406,7 +6542,8 @@ def _claim(entry, opts: dict) -> dict:
             # it deserves a different answer. Finding nothing is the ordinary
             # reply to "is there anything"; it is never the reply to "take this
             # one", where silence would leave the caller believing it ran.
-            tid = _task_id(cur, opts["key"], writing=True)
+            tid = _task_id(cur, opts["key"], writing=True,
+                           answering=bool(opts.get("grants")))
             # The store decides whether the moment has come, not this process:
             # a pickup is compared against the database clock everywhere else,
             # and a second opinion computed here would disagree with it the one
@@ -6421,7 +6558,7 @@ def _claim(entry, opts: dict) -> dict:
             task = rows.pop()
             due = task.pop("due")
             refused = _key_refusal(task, due, opts, _open_execution(cur, tid),
-                                   _holding(cur, task))
+                                   _holding(cur, task), _taken_in(cur, tid, project))
             if refused:
                 _die(6, "conflict", *refused)
             moved = _escalated_instead(cur, escalation, task, project)
@@ -6555,7 +6692,7 @@ def _escalated_instead(cur, escalation: dict | None, task: dict,
     """Inside a claim, escalate the task it was about to take when its raises
     in place have reached the worker's attempts, and answer the move; None
     takes it as always."""
-    if not escalation:
+    if not escalation or _foreign(task):
         return None
     facts = _in_place(cur, str(task["id"]))
     why = _attempts_reason(escalation, task, facts)
@@ -6563,6 +6700,14 @@ def _escalated_instead(cur, escalation: dict | None, task: dict,
     if target is None:
         return None
     return _escalate(cur, task, target, why, facts, project)
+
+
+def _foreign(task: dict) -> bool:
+    """Whether this is another project's task, which a grant brought here. It
+    is never escalated or scanned here: moving it is its own project's, and
+    this one writes only its trail and its assignee."""
+    owner = task.get("project_id")
+    return bool(owner) and owner != _writing_project()
 
 
 def cmd_release(entry, args: list[str]) -> None:
@@ -6656,11 +6801,25 @@ def _release(entry, ref: str, outcome: str, status: str | None, detail: str | No
                     (execution["task_id"],))
         owner = _rows(cur)[0]["project_id"]
         here = _writing_project()
-        if owner != here:
+        # A raise one of this project's workers opened under its grant, on a
+        # task another project assigned here, is this project's to close; on
+        # that task it moves the assignee alone, as `set` would.
+        guest = False
+        if owner != here and execution.get("worker_id"):
+            cur.execute(f"""select 1 from {SCHEMA}.tasks_workers
+                             where id = %s and project_id = %s""",
+                        (execution["worker_id"], here))
+            guest = cur.fetchone() is not None
+        if owner != here and not guest:
             raise Refusal(4, "policy",
                           f"that raise holds a task of {owner}, and a write "
                           f"reaches only the project it runs in, which is {here}",
                           _PROJECT_HINT)
+        if guest and status is not None:
+            raise Refusal(4, "policy",
+                          f"that raise holds a task of {owner}, assigned to {here}, which "
+                          f"may only add to its trail or set its assignee",
+                          "release it without --status; --assignee hands it back or on")
         if execution["status"] != "running":
             hint = ("the lease lapsed and this claim was swept, so the task may "
                     "already be with someone else - claim it again to continue"
@@ -6685,6 +6844,17 @@ def _release(entry, ref: str, outcome: str, status: str | None, detail: str | No
         closed = _rows(cur)[0]
         before = _task_row(cur, tid)
         moves, values, spent = [], [], []
+        if guest and assignee is not None and before.get("assignee") != here:
+            conn.rollback()
+            raise Refusal(4, "policy",
+                          f"that raise holds a task of {owner} that is no longer assigned "
+                          f"to {here}, so {here} has no write on it",
+                          "release it without --assignee")
+        if (guest and assignee is not None and assignee != here
+                and before["status"] == "waiting"):
+            # Handed back or on from here, a waiting task returns to todo, so the
+            # project that raised it picks it up - as `set` hands it.
+            status = "todo"
         if status is not None and status != before["status"]:
             moves.append("status = %s"); values.append(status)
         if assignee is not None and assignee != (before.get("assignee") or ""):
@@ -6712,17 +6882,22 @@ def _release(entry, ref: str, outcome: str, status: str | None, detail: str | No
                 conn.rollback()
                 raise Refusal(4, "policy", landing, _LANDING_HINT
                               + "; --status lands it elsewhere")
+            accepted = _acceptance(cur, after) if judged else None
+            if accepted and accepted.get("refused"):
+                conn.rollback()
+                raise Refusal(4, "not_accepted", accepted["refused"],
+                              _acceptance_hint(after["assignee"].strip()))
             moved = _record_moves(cur, tid, before, after, execution_id=str(closed["id"]),
                                   actor=execution.get("worker"))
         else:
-            moved = []
+            moved, accepted = [], None
         after = _task_shown(cur, tid)
         conn.commit()
         answer = {"released": tid, "outcome": outcome, "moved": moved,
                   "execution": closed, "task": after}
         if spent:
             answer["blocked_by_spent"] = spent
-        return answer
+        return _accepted(answer, accepted)
 
 
 # --- The conveyor ------------------------------------------------------------
@@ -6807,8 +6982,10 @@ _LANE_HOLD_MARGIN = 60
 
 # What one filter of `takes` may name, each as a list of the values it allows,
 # and the statuses a worker may take a task in: todo, the queue, and waiting,
-# which only a filter that names it takes.
-_TAKE_KEYS = ("status", "type", "assignee", "tags")
+# which only a filter that names it takes. `accepts_from` is a grant: the
+# filter takes tasks those projects raised and assigned to this one, and none
+# of this project's own.
+_TAKE_KEYS = ("status", "type", "assignee", "tags", "accepts_from")
 _TAKE_STATUSES = ("todo", "waiting")
 
 _WORKER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
@@ -7190,7 +7367,7 @@ def _escalate_asked(entry, escalation: dict, task: dict, why: str, *,
     handler's words as the reason; None when it cannot go anywhere - it is
     assigned to a person, or to the chain's last name - or no longer stands
     where the handler saw it."""
-    if _is_person(task.get("assignee"), escalation):
+    if _foreign(task) or _is_person(task.get("assignee"), escalation):
         return None
     target = _escalation_target(escalation, task.get("assignee"))
     if target is None:
@@ -7221,7 +7398,7 @@ def _held_back(entry, escalation: dict, task: dict, said: str | None, how: str, 
     holds: the first hold of an episode writes one hold row among the task's
     raises, the claim's alone, and every later hold reads it. A task not where
     the hook saw it is left as it is, and without `write` nothing is written."""
-    if _is_person(task.get("assignee"), escalation):
+    if _foreign(task) or _is_person(task.get("assignee"), escalation):
         return None
     target = _escalation_target(escalation, task.get("assignee"))
     if target is None:
@@ -7299,6 +7476,9 @@ def _selects(one: dict, task: dict, status: str) -> bool:
     """Whether one filter selects this task were it in `status`, by type,
     assignee and tags. Its pickup and its blockers are when, not who."""
     if status not in one["status"]:
+        return False
+    if (one.get("accepts_from") is not None
+            and task.get("project_id") not in one["accepts_from"]):
         return False
     kind = task.get("type")
     if one.get("type") is not None and kind not in one["type"]:
@@ -7615,6 +7795,154 @@ def _landing_refusal(task: dict) -> str | None:
 _LANDING_HINT = (f"assign it to a worker that takes it there, or to a person; "
                  f"`{NAME} doctor` shows what each worker takes")
 
+
+# --- Assigning a task to another project -------------------------------------
+
+# A project takes another project's tasks only by a grant: a `takes` filter of
+# one of its enabled workers naming `accepts_from`. A write that leaves a task
+# open on another project's id is judged against those grants in the write's
+# own transaction, so no task stands assigned to a project that will never
+# consider it.
+
+# The advisory lock a running service holds for each project it serves, on
+# the connection it listens on. `pg_locks` shows it to every session of the
+# database, so any project, on any machine, can tell whether one runs; it goes
+# with the connection, so a service that died holds nothing.
+_PRESENCE_CLASS = 31324
+
+
+def _presence_key(schema: str, project: str) -> str:
+    return f"{schema}:{project}"
+
+
+def _serving(cur, project: str) -> bool:
+    """Whether a tasks service serving `project` on this store is running."""
+    cur.execute("""select exists (
+                       select 1 from pg_locks
+                        where locktype = 'advisory' and objsubid = 2
+                          and database = (select oid from pg_database
+                                           where datname = current_database())
+                          and classid = %s::oid
+                          and objid::bigint = (hashtext(%s)::bigint & 4294967295)) as serving""",
+                (_PRESENCE_CLASS, _presence_key(SCHEMA, project)))
+    return bool(cur.fetchone()["serving"])
+
+
+def _is_project(cur, name: str) -> bool:
+    """Whether `name` is a project of this store: one that keeps a task or a
+    worker in it. Any other name is a person or a name."""
+    cur.execute(f"""select exists (select 1 from {SCHEMA}.tasks_workers where project_id = %s)
+                           or exists (select 1 from {SCHEMA}.tasks_tasks where project_id = %s)
+                           as known""", (name, name))
+    return bool(_rows(cur)[0]["known"])
+
+
+def _grants(cur, project: str) -> list[tuple[str, dict]]:
+    """Every grant `project` declares, as (worker, filter): each filter naming
+    `accepts_from` of each enabled worker it keeps in the store, read as
+    written. A worker whose `takes` that project could not read takes nothing,
+    so it grants nothing."""
+    cur.execute(f"""select name, spec from {SCHEMA}.tasks_workers
+                     where project_id = %s and active order by name""", (project,))
+    found: list[tuple[str, dict]] = []
+    for row in _rows(cur):
+        spec = row["spec"]
+        if not isinstance(spec, dict) or spec.get("enabled", True) is not True:
+            continue
+        problems: list[str] = []
+        tags = _names(spec.get("tags"), "tags", problems.append)
+        assignee = spec.get("assignee") or None
+        if assignee is not None and not isinstance(assignee, str):
+            continue
+        filters, _shorthand = _take_filters(spec.get("takes"), tags, assignee,
+                                            problems.append)
+        if problems or _grant_problems(spec.get("takes"), project):
+            continue
+        found += [(row["name"], one) for one in filters
+                  if one.get("accepts_from") is not None]
+    return found
+
+
+def _acceptance(cur, task: dict) -> dict | None:
+    """Whether the project an open task is assigned to takes it there: None for
+    a task that is not open, or whose assignee names no other project of this
+    store; otherwise `accepted_by`, the project and the worker whose grant
+    takes it, with `warnings` when no service of that project runs - a paused
+    or stopped conveyor is that project's to restart, never a refusal - or
+    `refused`, the sentence saying what that project accepts and from whom.
+
+    Judged against the task's own project, which is what a grant names. A
+    waiting task whose wait ends on its own is returned to todo when it does,
+    so a grant taking it there takes it too."""
+    if task.get("status") not in _OPEN:
+        return None
+    name = (task.get("assignee") or "").strip()
+    owner = task.get("project_id")
+    if not name or name == owner or not _is_project(cur, name):
+        return None
+    statuses = [task["status"]]
+    if task["status"] == "waiting" and (task.get("pickup_at") or _blocked_by(task)):
+        statuses.append("todo")
+    grants = _grants(cur, name)
+    for worker, one in grants:
+        if any(_selects(one, task, status) for status in statuses):
+            warnings = ([] if _serving(cur, name) else
+                        [f"no tasks service of {name} is running, so nothing there takes "
+                         f"the task until one runs, or `{NAME} run {worker} --apply` is run "
+                         f"there"])
+            return {"accepted_by": {"project": name, "worker": worker},
+                    "warnings": warnings}
+    where = (f"status {task.get('status')}, type {task.get('type')}, tags "
+             f"{', '.join(task.get('tags') or []) or 'none'}")
+    if not grants:
+        return {"refused": f"{name} takes no task from another project: none of its "
+                           f"enabled workers names `accepts_from` in its `takes`, so a "
+                           f"task of {owner} assigned to it ({where}) would stand where "
+                           "nobody takes it"}
+    return {"refused": f"{name} takes no task of {owner} in {where}; it accepts "
+                       + "; ".join(f"by worker {worker!r} {_filter_words(one)}"
+                                   for worker, one in grants)}
+
+
+def _acceptance_hint(name: str) -> str:
+    return (f"`{NAME} accepts {name}` says what it takes from this project; assign it in "
+            "a status, type and tags a grant takes, or to a person or a worker here")
+
+
+def _accepted(answer: dict, judged: dict | None) -> dict:
+    """An answer carrying who takes the task, when it went to another project."""
+    if judged and judged.get("accepted_by"):
+        answer["accepted_by"] = judged["accepted_by"]
+        if judged["warnings"]:
+            answer["warnings"] = judged["warnings"]
+    return answer
+
+
+def cmd_accepts(entry, args: list[str]) -> None:
+    """What another project accepts from this one: each grant of its enabled
+    workers that names this project, with the statuses, types and tags it
+    takes, and whether a service of that project is running. A read: a write
+    assigning a task there is judged by exactly these grants."""
+    opts = _flags(args, (), takes=1)
+    if not opts["_loose"]:
+        _die(6, "input", "accepts needs a project", f"{NAME} accepts <project id>")
+    target = opts["_loose"][0].strip()
+    here = _reading_project(None)
+    with _connect(entry) as conn, conn.cursor() as cur:
+        known = _is_project(cur, target)
+        grants = _grants(cur, target)
+        serving = _serving(cur, target)
+    takes = [{"worker": worker, "status": one["status"], "type": one["type"],
+              "tags": one["tags"]}
+             for worker, one in grants if here in one["accepts_from"]]
+    answer = {"project": target, "from": here, "known": known, "accepts": takes,
+              "service_running": serving}
+    if not takes:
+        answer["why"] = (f"{target} is no project of this store: it keeps no task and no "
+                         "worker in it" if not known else
+                         f"no enabled worker of {target} names {here} in `accepts_from`")
+    _emit(answer)
+
 _IN_PROGRESS_REFUSAL = ("in_progress is not stored: a task is shown in_progress while an "
                         "open raise holds it, and only a claim opens one; written by hand "
                         "it would have no raise, so no claim would take it and no lease "
@@ -7654,6 +7982,9 @@ def _coverage(rows: list[dict]) -> list[str]:
                     continue
                 kinds = []
                 for one in _worker_filters(worker, structure["declared"]):
+                    if one.get("accepts_from") is not None:
+                        # Another project's task is landed by its own project.
+                        continue
                     for kind in one.get("type") or [None]:
                         task = {"status": status, "type": kind, "assignee": who,
                                 "tags": list(one.get("tags") or [])}
@@ -8015,9 +8346,42 @@ def _take_filters(raw, tags: list[str], assignee: str | None,
                 wrong(f"it names `{key}` both at the top and inside `takes`")
             else:
                 taken[key] = top
+        if taken["accepts_from"] is not None and taken["assignee"] is not None:
+            # A grant takes what another project assigned to this one, so its
+            # assignee is this project's id and nothing else.
+            wrong(f"{where}: a filter naming `accepts_from` takes only tasks assigned "
+                  "to this project, so it names no `assignee`, here or at the top")
         taken["tags"] = taken["tags"] or []
+        if taken["accepts_from"] is None:
+            # Only a grant carries the key, so a filter reads as it always has.
+            del taken["accepts_from"]
         filters.append(taken)
     return filters, False
+
+
+def _grant_problems(raw, own: str | None) -> list[str]:
+    """What is wrong with the grants a worker's `takes` declares, read as
+    written. A grant is read by every project that assigns a task here, on
+    whatever machine, with none of this project's environment, so it names
+    project ids as they are and never a `${VAR}`; and it names other projects,
+    since a filter without one is what takes this project's own tasks: `own`,
+    the id of the project the worker belongs to."""
+    maps = [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []
+    said: list[str] = []
+    for one in maps:
+        granted = one.get("accepts_from") if isinstance(one, dict) else None
+        if not isinstance(granted, list):
+            continue
+        for value in granted:
+            if isinstance(value, str) and "${" in value:
+                said.append(f"its `accepts_from` names {value!r}: a grant is read by "
+                            "other projects, which cannot substitute it, so it names "
+                            "each project id as written")
+            elif isinstance(value, str) and own and value.strip() == own:
+                said.append(f"its `accepts_from` names this project, {own}: a "
+                            "filter without `accepts_from` takes this project's own "
+                            "tasks")
+    return said
 
 
 def _read_writes(raw, wrong) -> dict | None:
@@ -8211,6 +8575,8 @@ def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
     settings, body, unread = _worker_document(found)
     if unread:
         return None, [(6, "worker_invalid", unread)]
+    for sentence in _grant_problems(settings.get("takes"), PROJECT):
+        wrong(sentence)
     try:
         settings = _expanded(settings, f"worker {name!r}")
     except Refusal as refused:
@@ -8391,6 +8757,10 @@ def _types_named(found: dict) -> set | str:
             for one in maps:
                 if set(map(str, one)) - set(_TAKE_KEYS):
                     return f"its `{key}` names a key no filter carries"
+                if one.get("accepts_from") is not None:
+                    # A grant takes other projects' tasks, and the catch-all
+                    # takes only this project's: it owns no type here.
+                    continue
                 kinds = one.get("type")
                 if kinds is None:
                     continue
@@ -8487,6 +8857,13 @@ def _could_share(one: dict, other: dict) -> bool:
     in type and in assignee, and their tags do not split them."""
     if not set(one["status"]) & set(other["status"]):
         return False
+    # A grant takes other projects' tasks and a filter without one this
+    # project's, so the two never meet; two grants meet in a project both name.
+    granted, theirs = one.get("accepts_from"), other.get("accepts_from")
+    if (granted is None) != (theirs is None):
+        return False
+    if granted is not None and not set(granted) & set(theirs):
+        return False
     if not _types_meet(one, other):
         return False
     a, b = one.get("assignee"), other.get("assignee")
@@ -8504,6 +8881,9 @@ def _filter_words(one: dict) -> str:
              "assignee " + (", ".join(one["assignee"]) if one.get("assignee") else "any")]
     if one.get("tags"):
         parts.append(f"tags {', '.join(one['tags'])}")
+    if one.get("accepts_from") is not None:
+        parts[2] = "assignee this project"
+        parts.append(f"from {', '.join(one['accepts_from'])}")
     return "{" + "; ".join(parts) + "}"
 
 
@@ -9265,6 +9645,16 @@ This project's own doctrine governs how you work and where you stop, including t
 
 Do not operate the runtime you are running inside: do not stop, restart or reload the scheduler or the service that started this turn, or move its state. A scheduler may end its running jobs when it stops, and the job it is running is you; the tasks service keeps the lease of every turn it started, so a turn whose service stops and is not back before that lease runs out ends there, and the service ends its turns at once only on `tasks service stop --end-turns`. This applies to every long-lived process here, not only the scheduler: a running daemon belongs to whoever started it."""
 
+# What a turn on another project's task is told, after how it was started: the
+# two writes it has there, and how a task is taken in and answered.
+_GUEST = """ANOTHER PROJECT'S TASK
+
+This task belongs to project `{owner}`, which assigned it to this project, and this worker takes it under its grant. It stays that project's: on it you write exactly two things, entries on its trail and its assignee. Its status, its other fields and its metadata are refused to you, whatever this frame says further down.
+
+Decide by this project's own doctrine what happens to it. To take it in, create a task of this project's own and link it to this one: `{cli} meta set <new task> origin {origin} origin_ref {key}`. Once a task here carries that link no claim here takes this one again, and this turn is done when the link exists. The work goes on in the task that took it in, and whoever brings that task to an outcome answers here: an entry on this trail, then `{cli} set {key} --clear assignee`, or `--assignee <who>` to hand it on.
+
+To decline it, or to stop because only `{owner}` can answer, say why in an entry on this trail and hand it back the same way. A waiting task handed back returns to `todo` in `{owner}`, where it is picked up."""
+
 _LOAD_ROUTINES = """LOAD THESE ROUTINES
 
 Load each of these from this project's `routines/` and follow it. Do not work from memory of them and do not ask for them. Each says when it applies; the first is the procedure for this work, and the rest apply at the moments they name."""
@@ -9406,10 +9796,14 @@ def _prompt(worker: dict, task: dict, trail: list, attempt: int,
                              if _PLAIN_STAGE.fullmatch(stage) else _AT_UNNAMED_STAGE)
     procedure = ([_LOAD_ROUTINES, "\n".join(f"- `{one}`" for one in worker["routines"])]
                  if worker["routines"] else [_NO_ROUTINES])
+    guest = ([_GUEST.format(owner=task["project_id"], cli=NAME, key=key,
+                            origin=_ORIGIN_TASKS)]
+             if _foreign(task) else [])
     return "\n\n".join([
         *([worker["description"]] if worker.get("description") else []),
         opening,
         _SITUATION,
+        *guest,
         worker["body"].strip(),
         *procedure,
         _DATA_BOUNDARY.format(begin=begin, end=end),
@@ -9450,12 +9844,16 @@ def _key_types(worker: dict) -> dict:
     or for the catch-all todo and any type no other enabled worker does."""
     if worker["catch_all"]:
         return {"refuse_types": list(worker.get("not_types") or [])}
-    accept = [{"status": list(one["status"]), "type": one["type"]}
+    accept = [{"status": list(one["status"]), "type": one["type"],
+               "accepts_from": one.get("accepts_from")}
               for one in worker["filters"]]
     if worker["on_request"]:
-        accept.append({"status": ["todo"], "type": list(worker["on_request"])})
+        accept.append({"status": ["todo"], "type": list(worker["on_request"]),
+                       "accepts_from": None})
+    granted = sorted({project for one in worker["filters"]
+                      for project in one.get("accepts_from") or []})
     return {"accept_types": list(worker["types"]) + list(worker["on_request"]),
-            "accept": accept}
+            "accept": accept, **({"grants": granted} if granted else {})}
 
 
 def _asks(worker: dict) -> list[dict]:
@@ -9476,6 +9874,8 @@ def _asks(worker: dict) -> list[dict]:
             narrowing["assignees"] = list(one["assignee"])
         if one["status"] != ["todo"]:
             narrowing["statuses"] = list(one["status"])
+        if one.get("accepts_from") is not None:
+            narrowing["accepts_from"] = list(one["accepts_from"])
         narrowing["cool_down"] = worker["limits"]["cool_down_seconds"]
         for kind in one["type"] or [None]:
             asks.append({**narrowing, **({"type": kind} if kind else {})})
@@ -9492,9 +9892,9 @@ def _lane_held(cur, worker: str, project: str) -> dict | None:
                            {_lane_until()} as until
                       from {SCHEMA}.tasks_executions e
                       join {SCHEMA}.tasks_tasks t on t.id = e.task_id
-                     where t.project_id = %s and e.worker = %s
+                     where {_raised_here_clause('e', 't')} and e.worker = %s
                        and e.metrics ? 'lane_hold' and {_lane_until()} > now()
-                     order by until desc limit 1""", (project, worker))
+                     order by until desc limit 1""", (project, project, worker))
     rows = _rows(cur)
     if not rows:
         return None
@@ -9628,16 +10028,18 @@ def _next_candidate(cur, worker: dict, project: str, tz,
 def _key_candidate(entry, worker: dict, key: str) -> dict | None:
     """The task named with --key when this worker's claim would take it, or None
     when the claim would refuse it."""
+    types = _key_types(worker)
     with _connect(entry) as conn, conn.cursor() as cur:
-        tid = _task_id(cur, key, writing=True)
+        tid = _task_id(cur, key, writing=True, answering=bool(types.get("grants")))
         cur.execute(f"""select *, (pickup_at is null or pickup_at <= now()) as due
                           from {SCHEMA}.tasks_tasks where id = %s""", (tid,))
         row = _rows(cur)[0]
         held = _open_execution(cur, tid)
         holding = _holding(cur, row)
+        taken = _taken_in(cur, tid, _writing_project())
     due = row.pop("due")
-    refused = _key_refusal(row, due, {"key": key, "worker": worker["name"],
-                                      **_key_types(worker)}, held, holding)
+    refused = _key_refusal(row, due, {"key": key, "worker": worker["name"], **types},
+                           held, holding, taken)
     return row if refused is None else None
 
 
@@ -9653,7 +10055,9 @@ def _sweep(entry, worker: dict | None = None,
         swept = _sweep_leases(cur, project)
         returned = _sweep_waiting(cur, project)
         if worker is not None and worker.get("structure") is not None:
-            spare = (_task_id(cur, key, writing=True),) if key else ()
+            spare = ((_task_id(cur, key, writing=True,
+                               answering=bool(_key_types(worker).get("grants"))),)
+                     if key else ())
             scanned = _scan(cur, worker.get("escalation"), worker["structure"], project,
                             write=True, spare=spare)
         conn.commit()
@@ -9737,10 +10141,11 @@ def _would_take(entry, worker: dict, key: str | None, exclude: tuple = (),
     dead_ends: list = []
     with held as conn, conn.cursor() as cur:
         take = None
+        grants = bool(_key_types(worker).get("grants"))
         if conn_given is None and worker.get("structure") is not None:
             # Asked by `run` without --apply, never by the service: the dead ends
             # the claim's scan would escalate are named, and are not candidates.
-            spare = (_task_id(cur, key, writing=True),) if key else ()
+            spare = (_task_id(cur, key, writing=True, answering=grants),) if key else ()
             scanned = _scan(cur, worker.get("escalation"), worker["structure"], project,
                             write=False, spare=spare)
             would += scanned["escalated"]
@@ -9756,7 +10161,7 @@ def _would_take(entry, worker: dict, key: str | None, exclude: tuple = (),
                 answer["dead_ends"] = dead_ends
             return answer
         if key:
-            tid = _task_id(cur, key, writing=True)
+            tid = _task_id(cur, key, writing=True, answering=grants)
             cur.execute(f"""select *, (pickup_at is null or pickup_at <= now()) as due
                               from {SCHEMA}.tasks_tasks where id = %s""", (tid,))
             row = _rows(cur)[0]
@@ -9764,7 +10169,8 @@ def _would_take(entry, worker: dict, key: str | None, exclude: tuple = (),
             take = (row if _key_refusal(row, due, {"key": key, "worker": worker["name"],
                                                    **_key_types(worker)},
                                         _open_execution(cur, tid),
-                                        _holding(cur, row)) is None
+                                        _holding(cur, row),
+                                        _taken_in(cur, tid, project)) is None
                     else None)
             moved = (take is not None and conn_given is None and worker.get("escalation")
                      and _would_escalate(cur, worker["escalation"], take))
@@ -9795,6 +10201,8 @@ def _would_take(entry, worker: dict, key: str | None, exclude: tuple = (),
 
 def _would_escalate(cur, escalation: dict, task: dict) -> dict | None:
     """What `_escalated_instead` would do with this task, writing nothing."""
+    if _foreign(task):
+        return None
     facts = _in_place(cur, str(task["id"]))
     why = _attempts_reason(escalation, task, facts)
     target = _escalation_target(escalation, task.get("assignee")) if why else None
@@ -9830,7 +10238,9 @@ def _would_take_past_hooks(entry, worker: dict, key: str | None,
         # The dead ends the claim's scan would escalate are named, and are not
         # candidates; their hook is never asked about them.
         with _connect(entry) as conn, conn.cursor() as cur:
-            spare = (_task_id(cur, key, writing=True),) if key else ()
+            spare = ((_task_id(cur, key, writing=True,
+                               answering=bool(_key_types(worker).get("grants"))),)
+                     if key else ())
             scanned = _scan(cur, worker.get("escalation"), worker["structure"],
                             _writing_project(), write=False, spare=spare)
         would += scanned["escalated"]
@@ -10223,7 +10633,7 @@ def _later(one, other) -> bool:
 def _escalate_after(entry, escalation: dict, task: dict, why: str) -> dict | None:
     """Escalate a task the `after` hook answered escalate for, while it stands
     where the raise left it: same status and assignee, no raise open on it."""
-    if _is_person(task.get("assignee"), escalation):
+    if _foreign(task) or _is_person(task.get("assignee"), escalation):
         return None
     target = _escalation_target(escalation, task.get("assignee"))
     if target is None:
@@ -10639,10 +11049,16 @@ def _park(entry, tid: str, execution: str, why: str,
     resting, _grown = _state(entry, tid)
     landing = ("draft" if resting.get("status") == "waiting" or not _assignee_of(resting)
                else "waiting")
+    # A task another project assigned here is not this project's to land: it
+    # is handed back, which returns a waiting one to todo there.
+    handed = None
+    if _foreign(resting):
+        landing, handed = None, ""
     try:
         # No turn was started, so the session the claim named was never written.
         _release(entry, execution, "handback", landing,
-                 why[:200], "", "", json.dumps(marks or {}))
+                 why[:200], "", "", json.dumps(marks or {}),
+                 **({"assignee": handed} if handed is not None else {}))
     except Refusal as refused:
         _note(entry, tid, f"This raise could not be closed: {refused.message}")
 
@@ -10830,6 +11246,14 @@ def cmd_run(entry, args: list[str]) -> None:
         unspent = idle or limit is not None
 
         outcome, marks = _settle(rested, landing, unspent)
+        if outcome == "failed" and not unspent and _foreign(landing):
+            # A task another project assigned here stays where it rests while the
+            # task that took it in carries the work, so taking it in is the ending.
+            with _connect(entry) as conn, conn.cursor() as cur:
+                taken = _taken_in(cur, tid, _writing_project())
+            if taken:
+                outcome, marks = "ok", {"taken_in": taken}
+                report["taken_in"] = taken
         # What the turn cost is kept whenever the harness reported it, on every path:
         # a turn stopped by the account's limit after real work still spent that.
         measured = (("cost_usd", result.cost_usd), ("duration_ms", result.duration_ms),
@@ -10871,7 +11295,9 @@ def cmd_run(entry, args: list[str]) -> None:
                          if one)
         _close(entry, execution, outcome, said or None,
                result.harness, pointer, metrics, tid, report)
-        if result.cost_usd is not None:
+        if result.cost_usd is not None and not _foreign(landing):
+            # Another project's task keeps its own metadata; what this turn cost
+            # stays on the raise.
             report["cost_total"] = _accumulate_cost(entry, tid, result.cost_usd)
         # Every raise leaves exactly one entry, including a raise that did nothing. A
         # task picked up that left no trace is indistinguishable from one never
@@ -11656,9 +12082,9 @@ def _service_sweep_due(conn) -> bool:
     with conn.cursor() as cur:
         cur.execute(f"""select 1 from {SCHEMA}.tasks_executions e
                           join {SCHEMA}.tasks_tasks t on t.id = e.task_id
-                         where t.project_id = %s and e.status = 'running'
+                         where {_ours_clause('e', 't')} and e.status = 'running'
                            and e.lease_until is not null and e.lease_until < now()
-                         limit 1""", (project,))
+                         limit 1""", (project, project))
         if cur.fetchone():
             return True
         cur.execute(f"""select *, (pickup_at is not null and pickup_at <= now()) as due
@@ -11689,7 +12115,7 @@ def _service_next_moment(conn, cool_downs: dict | None = None) -> float | None:
                                 union all
                                 select e.lease_until from {SCHEMA}.tasks_executions e
                                   join {SCHEMA}.tasks_tasks t on t.id = e.task_id
-                                 where t.project_id = %s and e.status = 'running'
+                                 where {_ours_clause('e', 't')} and e.status = 'running'
                                    and e.lease_until > now()
                                 union all
                                 select {cooling} from {SCHEMA}.tasks_tasks t
@@ -11705,10 +12131,11 @@ def _service_next_moment(conn, cool_downs: dict | None = None) -> float | None:
                                 union all
                                 select {_lane_until()} from {SCHEMA}.tasks_executions e
                                   join {SCHEMA}.tasks_tasks t on t.id = e.task_id
-                                 where t.project_id = %s and e.metrics ? 'lane_hold'
+                                 where {_ours_clause('e', 't')} and e.metrics ? 'lane_hold'
                                    and {_lane_until()} > now()) as moments""",
-                    (project, project, json.dumps(cool_downs or {}), _COOL_DOWN_DEFAULT,
-                     project, json.dumps(cool_downs or {}), _COOL_DOWN_DEFAULT, project))
+                    (project, project, project, json.dumps(cool_downs or {}),
+                     _COOL_DOWN_DEFAULT, project, json.dumps(cool_downs or {}),
+                     _COOL_DOWN_DEFAULT, project, project))
         row = cur.fetchone()
     return row["seconds"] if row and row["seconds"] is not None else None
 
@@ -11755,9 +12182,11 @@ def _service_renew_leases(conn, held: list) -> dict:
                                    as h(execution, task_id, cap)
                              where e.id::text = h.execution and e.task_id::text = h.task_id
                                and e.status = 'running'
-                               and e.task_id in (select id from {SCHEMA}.tasks_tasks
-                                                  where project_id = %s)
-                         returning e.id""", (short, executions, tasks, caps, project))
+                               and (e.task_id in (select id from {SCHEMA}.tasks_tasks
+                                                   where project_id = %s)
+                                    or e.worker_id in (select w.id from {SCHEMA}.tasks_workers w
+                                                        where w.project_id = %s))
+                         returning e.id""", (short, executions, tasks, caps, project, project))
             renewed = [str(row["id"]) for row in _rows(cur)]
     return {"renewed": renewed, "every": every}
 
@@ -11972,6 +12401,16 @@ class _ServiceHost:
             conn.close()
             raise
         return conn
+
+    def present(self, conn, on: bool = True) -> None:
+        """Say on `conn`, the connection the daemon listens on, that a service
+        serves this project, or no longer does: the advisory lock any project
+        reads from `pg_locks` before it assigns a task here. Taken, never waited
+        for, so a second service serving the same project elsewhere blocks
+        nothing."""
+        function = "pg_try_advisory_lock" if on else "pg_advisory_unlock"
+        conn.execute(f"select {function}(%s, hashtext(%s))",
+                     (_PRESENCE_CLASS, _presence_key(self.schema, self.project)))
 
     @staticmethod
     def ping(conn) -> None:
@@ -14443,6 +14882,7 @@ def main() -> None:
         "claim": cmd_claim, "release": cmd_release, "run": cmd_run,
         "runs": cmd_runs, "history": cmd_history,
         "watch": cmd_watch, "workers": cmd_workers, "profiles": cmd_profiles,
+        "accepts": cmd_accepts,
     }
     handler = handlers.get(verb)
     if not handler and verb not in ("tag", "untag"):

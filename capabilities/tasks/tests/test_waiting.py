@@ -338,6 +338,9 @@ class ReleaseCursor:
         elif "tasks_changes" in text:
             self.changes.append(params)
             self.answer = []
+        elif text.endswith("as known"):
+            # Whether the assignee names another project: these name people.
+            self.answer = [{"known": False}]
         else:
             raise AssertionError(f"unexpected query: {text}")
 
@@ -382,6 +385,9 @@ class SetCursor:
         elif "tasks_changes" in text:
             self.changes.append(params)
             self.answer = []
+        elif text.endswith("as known"):
+            # Whether the assignee names another project: these name people.
+            self.answer = [{"known": False}]
         else:
             raise AssertionError(f"unexpected query: {text}")
 

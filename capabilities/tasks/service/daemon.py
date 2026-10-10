@@ -30,6 +30,10 @@ It wakes when the store notifies that a task became claimable, at every poll,
 at the earliest moment a pickup or a lease falls due, and when one of its own
 turns claims or ends. A store without the notification leaves it the poll.
 
+On the connection it listens on it holds, for each project it serves, the
+lock that says a service serves that project, which another project reads
+before it assigns a task there; it goes with the connection.
+
 It holds its connections to the store rather than opening one per question:
 one it listens on, and one every question it asks is put to, each question cut
 off by the store when it runs past `QUESTION_TIMEOUT_SECONDS`. A question or a
@@ -1605,6 +1609,8 @@ class Dispatcher:
             return
         store.opened()
         store.listener_pinged = time.monotonic()
+        for slot in self.on(store):
+            self._present(store, slot)
         if store.listen_error is not None:
             self.store_log(store, f"listening on {store.host.channel} again; asking the "
                                   "store for work")
@@ -1620,6 +1626,18 @@ class Dispatcher:
         for slot in self.on(store):
             if slot.served():
                 slot.check_notification()
+
+    def _present(self, store: Store, slot: ProjectSlot, on: bool = True) -> None:
+        """Say on the store's listener that this daemon serves the slot's
+        project, or no longer does. A listener lost takes it along, and the
+        next one says it again."""
+        present = getattr(slot.host, "present", None)
+        if store.listener is None or present is None:
+            return
+        try:
+            present(store.listener, on)
+        except Exception as exc:
+            slot.log(f"cannot say on the store that this project is served: {_why(exc)}")
 
     def _relisten_later(self, store: Store) -> None:
         store.relisten_at = time.monotonic() + store.relisten_delay
@@ -2070,6 +2088,7 @@ class MachineDispatcher(Dispatcher):
             self.project_log(entry, "left the machine service's opt-in list")
             return
         running = len(slot.turns)
+        self._present(slot.store, slot, on=False)
         self.slots.remove(slot)
         slot.unpublish()
         slot.release("left the machine service's opt-in list; let go of its lock"
@@ -2151,8 +2170,10 @@ class MachineDispatcher(Dispatcher):
         slot.next_poll = time.monotonic() + slot.settings()["poll_seconds"]
         if new_store:
             self._connect_listener(slot.store)
-        elif slot.store.listener is not None and slot.served():
-            slot.check_notification()
+        else:
+            self._present(slot.store, slot)
+            if slot.store.listener is not None and slot.served():
+                slot.check_notification()
         slot.publish()
 
     # --- stopping --------------------------------------------------------------

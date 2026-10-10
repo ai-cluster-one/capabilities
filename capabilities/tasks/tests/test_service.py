@@ -538,6 +538,25 @@ def test_the_store_notifies_and_the_daemon_wakes_for_its_own_project_only(
 
 
 @needs_store
+def test_a_running_daemon_is_seen_as_serving_its_project(project, store):
+    """Another project reads whether a service serves this one, before it
+    assigns a task here: the daemon says so on the connection it listens on,
+    and says nothing once it is gone."""
+    entry, _schema, _conn = store
+    write_settings(project, "version = 1\npoll_seconds = 3600\n")
+
+    def serving() -> bool:
+        with mod._connect(entry) as conn, conn.cursor() as cur:
+            return mod._serving(cur, HERE)
+
+    assert serving() is False
+    with Harness(project, entry) as h:
+        h.dispatcher.step()
+        assert serving() is True
+    assert serving() is False
+
+
+@needs_store
 def test_a_task_moved_to_todo_or_given_a_new_pickup_is_announced(project, store, capsys):
     entry, schema, conn = store
     tid = add(entry, capsys, "alpha", status="draft")

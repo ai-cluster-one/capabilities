@@ -10,6 +10,10 @@ init event and a result document. It does no work.
   FAKE_ENGINE_TASKS    a tasks executable: finish the task the prompt names the
                        way a worker does, with an activity and `complete`, under
                        the raise the turn was started with
+  FAKE_ENGINE_INTAKE   with FAKE_ENGINE_TASKS: take the task the prompt names in,
+                       as a guest intake does - add a task of this project,
+                       link it with `origin` tasks and `origin_ref`, and say so
+                       on the named task's trail
   FAKE_ENGINE_SLEEP    seconds to hold the turn open before answering
   FAKE_ENGINE_FAIL     `idle`: answer with an error at once, having written
                        nothing; `ordinary`: write an activity through
@@ -66,7 +70,15 @@ for line in sys.stdin:
     tasks = os.environ.get("FAKE_ENGINE_TASKS")
     named = re.search(r"tasks activity ([0-9a-f-]{36})", prompt)
     failing = os.environ.get("FAKE_ENGINE_FAIL")
-    if tasks and named and failing == "ordinary":
+    if tasks and named and os.environ.get("FAKE_ENGINE_INTAKE"):
+        added = subprocess.run([tasks, "add", "--type", "change", "--title", "taken in"],
+                               capture_output=True, text=True, timeout=120)
+        created = json.loads(added.stdout)["created"]
+        subprocess.run([tasks, "meta", "set", created, "origin", "tasks",
+                        "origin_ref", named.group(1)], capture_output=True, timeout=120)
+        subprocess.run([tasks, "activity", named.group(1), f"taken in as {created}"],
+                       capture_output=True, timeout=120)
+    elif tasks and named and failing == "ordinary":
         subprocess.run([tasks, "activity", named.group(1), "tried and failed"],
                        capture_output=True, timeout=120)
     elif tasks and named and not failing:
