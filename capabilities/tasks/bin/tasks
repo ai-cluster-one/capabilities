@@ -1271,6 +1271,9 @@ FILTERS  (list, ready, search, counts)
   --pickup-before WHEN  pickup_at strictly before it
   --created-after WHEN  --created-before WHEN
   --updated-after WHEN  --updated-before WHEN
+  --touched-after WHEN  --touched-before WHEN
+                        last_touched_at, so a task the trail or a raise moved
+                        without a field moving still counts as touched
   --pickup-set          only tasks that have an appointed moment
   --pickup-unset        only tasks that have none
 
@@ -4660,6 +4663,7 @@ _DATE_FILTERS = {
     "pickup-after": ("pickup_at", ">="), "pickup-before": ("pickup_at", "<"),
     "created-after": ("created_at", ">="), "created-before": ("created_at", "<"),
     "updated-after": ("updated_at", ">="), "updated-before": ("updated_at", "<"),
+    "touched-after": ("last_touched_at", ">="), "touched-before": ("last_touched_at", "<"),
 }
 _LIST_FLAGS = (("project", "type", "status", "tag", "assignee", "per-page",
                 "page", "limit", "activities") + tuple(_DATE_FILTERS))
@@ -4701,19 +4705,25 @@ def _scan_columns(opts: dict) -> str:
     A row also carries what it needs to be judged without a second call: its
     runs and their cost, and what it is blocked by. They are subqueries of the
     same statement, so a page costs one query however many rows it holds."""
-    touched = (f"greatest(t.updated_at, "
-               f"(select max(a.created_at) from {SCHEMA}.tasks_activities a "
-               f"where a.task_id = t.id), "
-               f"(select max(greatest(e.started_at, e.ended_at)) "
-               f"from {SCHEMA}.tasks_executions e where e.task_id = t.id "
-               f"and {_a_raise()}))")
     lean = (_LEAN.replace("blocked_by", "t.blocked_by as blocked_by")
             .replace(" status,", f" {_shown_status('t')} as status,"))
     # The whole row, with the status a reader is shown in place of the stored
     # one: a later column of the same name is the one a row carries.
     full = f"t.*, {_shown_status('t')} as status"
-    return (f"{full if opts.get('full') else lean}, {touched} as last_touched_at, "
+    return (f"{full if opts.get('full') else lean}, {_touched()} as last_touched_at, "
             f"{_rollup_columns()}")
+
+
+def _touched() -> str:
+    """`last_touched_at` of `t`, the tasks table: the latest of its last move,
+    its newest trail entry, and the newest start or end of one of its raises.
+    A row carries it and a filter narrows by it, so both read this one."""
+    return (f"greatest(t.updated_at, "
+            f"(select max(a.created_at) from {SCHEMA}.tasks_activities a "
+            f"where a.task_id = t.id), "
+            f"(select max(greatest(e.started_at, e.ended_at)) "
+            f"from {SCHEMA}.tasks_executions e where e.task_id = t.id "
+            f"and {_a_raise()}))")
 
 
 def _rollup_columns() -> str:
@@ -4793,6 +4803,8 @@ def _where(opts: dict, tz=None) -> tuple[str, list]:
         params = [_reading_project(opts.get("project"))]
     for flag, (column, op) in _DATE_FILTERS.items():
         if opts.get(flag):
+            if column == "last_touched_at":
+                column = _touched()
             clauses.append(f"{column} {op} %s")
             params.append(_moment(opts[flag], tz) if tz else opts[flag])
     if opts.get("pickup-set"):

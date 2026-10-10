@@ -695,5 +695,33 @@ def test_the_help_files_order_beside_sort():
     assert "no pickup stay last both ways" in order
 
 
+@needs_store
+def test_touched_filters_narrow_list_search_and_counts_by_last_touch(four_orders,
+                                                                     capsys):
+    """A trail entry and a raise lift h-3 and h-1 above every last move, so a
+    window after the last move finds them by touch and nothing by update."""
+    entry, _ids = four_orders
+    late, early = ["--touched-after", "2026-03-21"], ["--touched-before", "2026-03-19"]
+    mod.cmd_list(entry, ["--updated-after", "2026-03-21"])
+    assert _keys(_answer(capsys)) == []
+    mod.cmd_list(entry, [*late, "--sort", "touched"])
+    assert _keys(_answer(capsys)) == ["h-3", "h-1"]
+    mod.cmd_search(entry, ["title", *late, "--sort", "touched"])
+    assert _keys(_answer(capsys)) == ["h-3", "h-1"]
+    mod.cmd_counts(entry, late)
+    assert _answer(capsys)["total"] == 2
+    mod.cmd_list(entry, [*early, "--sort", "touched"])
+    assert _keys(_answer(capsys)) == ["h-2", "h-4"]
+    mod.cmd_counts(entry, [*late, *early])
+    assert _answer(capsys)["total"] == 0
+
+
+def test_the_help_documents_the_touched_filters_beside_updated():
+    filters = mod.__doc__.split("FILTERS  (list, ready, search, counts)")[1] \
+        .split("ORDER  (list, search)")[0]
+    assert "--updated-after WHEN  --updated-before WHEN\n  --touched-after WHEN  " \
+        "--touched-before WHEN" in filters and "last_touched_at" in filters
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
