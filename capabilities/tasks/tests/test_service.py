@@ -1475,9 +1475,10 @@ def test_service_doctor_fails_a_daemon_whose_planned_wake_is_long_overdue(lab):
 @needs_store
 def test_service_doctor_warns_while_the_daemon_waits_out_the_store(lab, relay):
     """The probe a supervisor runs: with a daemon running, the store being away
-    is a warning and exit 0; with no daemon it fails. The daemon lives through
-    it and works when the store is back, and a stale declaration still fails
-    the probe until a reload."""
+    is a warning and exit 0, and a daemon behind the settings on disk still
+    fails it; with no daemon it fails. The daemon lives through it and works
+    when the store is back, and a stale declaration still fails the probe until
+    a reload."""
     project = lab["project"]
     # The machine's store is reached through the relay.
     _cli.write_store_setting(lab["tmp"] / "config", lab["schema"], host="127.0.0.1",
@@ -1504,6 +1505,16 @@ def test_service_doctor_warns_while_the_daemon_waits_out_the_store(lab, relay):
     assert "cannot reach the store" in away["store"]["error"]
     assert "unreachable" in away["warning"]
     assert away["service"]["running"] is True
+    assert away["settings"]["poll_seconds"] == 3600
+    # A daemon behind the files on disk fails the probe, store or no store.
+    settings = project / "capabilities" / "tasks" / "service" / "config.toml"
+    kept = settings.read_text()
+    settings.write_text(kept.replace("poll_seconds = 3600", "poll_seconds = 1800"))
+    stale = tasks_cli(lab, "service", "doctor")
+    assert stale.returncode == 6 and "declaration_stale" in json.loads(stale.stdout)
+    assert answer_of(tasks_cli(lab, "service", "status"))["current"] is False
+    settings.write_text(kept)
+    assert answer_of(tasks_cli(lab, "service", "status"))["current"] is None
     time.sleep(3)
     os.kill(pid, 0)
     assert answer_of(tasks_cli(lab, "service", "status"))["notification"]["listening"] is False

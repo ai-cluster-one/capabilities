@@ -839,9 +839,12 @@ SERVICE
   The daemon publishes a fingerprint of what it loaded - the settings, the
   active version of every worker and every profile a worker names - beside
   its pid, and `service doctor` fails while that differs from what the files
-  and the store hold now; while the store cannot be read, which declaration
-  stands cannot be told, and `service doctor` does not call the daemon stale
-  for it. `service reload` validates them first and refuses
+  and the store hold now. While the store cannot be read, the part the files
+  hold - the settings, the shipped and not yet imported worker files and the
+  profiles they name - is still compared, and a change there still fails it;
+  what the store holds, the stored workers and the profiles they name, cannot
+  be told then, and `service doctor` does not call the daemon stale for it.
+  `service reload` validates them first and refuses
   what does not load, then signals the daemon alone and waits until it
   publishes the new fingerprint; a daemon that rejects them keeps what it had
   and says why in its log. Running turns are never touched by a reload, and
@@ -11012,18 +11015,16 @@ def _service_reads_here(scoped: bool = False) -> None:
         pass
 
 
-def _service_fingerprint() -> str | None:
-    """Which declaration stands right now: the settings file, every worker -
-    the version the store holds active for each of this project's, and each
-    shipped file by its content - and every profile a worker names, by path
-    and content. Worker files still waiting to be imported are part of it, so
-    importing them moves it.
+def _service_fingerprint_parts() -> tuple[str, str | None]:
+    """Which declaration stands right now, in its two halves: what the files
+    hold - the settings file, each shipped worker file by its content, the
+    worker files still waiting to be imported, and every profile those files
+    name, by path and content - and what the store holds: the version it holds
+    active for each of this project's workers, and every profile those name.
 
-    The daemon publishes this for what it loaded and every command that asks
-    whether it is current computes it again, the same way, reading the store
-    afresh, without waiting for it. It never refuses: a file that cannot be read
-    is part of the answer, and a store that cannot be read now makes the answer
-    None - the declaration cannot be told, which is not the same as changed."""
+    The store is read afresh and never waited for, and its half is None while
+    it cannot be read: which profile a stored worker names is held there too.
+    Nothing here refuses; a file that cannot be read is part of the answer."""
     import yaml
 
     _service_reads_here()
@@ -11034,45 +11035,77 @@ def _service_fingerprint() -> str | None:
         except OSError:
             return "absent"
 
+    runner = _harness_runner()
+
+    def profiles(documents: list) -> list:
+        named: set = set()
+        for where, front in documents:
+            try:
+                name = front.get("profile")
+                if isinstance(name, str) and name.strip():
+                    named.add(_expand(name.strip(), where))
+            except Exception:
+                continue
+        parts: list = []
+        for name in sorted(named):
+            try:
+                found = runner.find_profile_file(name, [_profiles_dir()])
+                parts.append(["profile", name, str(found.path),
+                              hashlib.sha256(found.text.encode()).hexdigest()])
+            except Exception:
+                parts.append(["profile", name, "absent"])
+        return parts
+
     settings = _service_settings_path()
     retired = _envelope_dir() / "workers.toml"
-    parts: list = [["settings", str(settings), seen(settings)],
-                   ["retired", str(retired), seen(retired)]]
+    disk: list = [["settings", str(settings), seen(settings)],
+                  ["retired", str(retired), seen(retired)]]
     files = [_shipped_workers_dir() / f"{DEFAULT_WORKER}.md"]
     if _shipped_workers_dir().is_dir():
         files = sorted(_shipped_workers_dir().glob("*.md"))
     files += _unimported_worker_files()
     documents: list = []
     for path in files:
-        parts.append(["worker", str(path), seen(path)])
+        disk.append(["worker", str(path), seen(path)])
         try:
             head, _body = _split_front_matter(path.read_text())
             documents.append((path.name, yaml.safe_load(head) or {}))
         except Exception:
             continue
+    disk += profiles(documents)
+    held = hashlib.sha256(json.dumps(disk).encode()).hexdigest()
     try:
-        for row in _stored_workers(fresh=True, waiting=False):
-            parts.append(["worker", row["name"], "store", str(row["id"])])
-            documents.append((f"worker {row['name']!r}", row["spec"]))
+        rows = _stored_workers(fresh=True, waiting=False)
     except Exception:
+        return held, None
+    store: list = [["worker", row["name"], "store", str(row["id"])] for row in rows]
+    store += profiles([(f"worker {row['name']!r}", row["spec"]) for row in rows])
+    return held, hashlib.sha256(json.dumps(store).encode()).hexdigest()
+
+
+def _service_fingerprint() -> str | None:
+    """Which declaration stands right now, as the daemon publishes it for what
+    it loaded: the half the files hold and the half the store holds, joined by
+    a dot. None while the store cannot be read - the whole cannot be told then,
+    which is not the same as changed."""
+    disk, store = _service_fingerprint_parts()
+    return None if store is None else f"{disk}.{store}"
+
+
+def _fingerprint_current(loaded: str | None, parts: tuple[str, str | None] | None) -> bool | None:
+    """Whether a daemon that published `loaded` serves the declaration whose
+    halves are `parts`. While the store cannot be read, the half the files hold
+    is still compared: a file changed since is stale, and otherwise the answer
+    is None, cannot be told. A fingerprint published in any other shape is a
+    declaration that is not the one standing."""
+    if parts is None:
         return None
-    profiles: set = set()
-    for where, front in documents:
-        try:
-            named = front.get("profile")
-            if isinstance(named, str) and named.strip():
-                profiles.add(_expand(named.strip(), where))
-        except Exception:
-            continue
-    runner = _harness_runner()
-    for name in sorted(profiles):
-        try:
-            found = runner.find_profile_file(name, [_profiles_dir()])
-            parts.append(["profile", name, str(found.path),
-                           hashlib.sha256(found.text.encode()).hexdigest()])
-        except Exception:
-            parts.append(["profile", name, "absent"])
-    return hashlib.sha256(json.dumps(parts).encode()).hexdigest()
+    disk, store = parts
+    if store is not None:
+        return loaded == f"{disk}.{store}"
+    if (loaded or "").split(".")[0] != disk:
+        return False
+    return None
 
 
 def _service_declaration() -> dict:
@@ -11931,7 +11964,7 @@ def _machine_entry_now(module, project: str, entry: dict) -> dict:
             with ProjectScope(root, _without_project_pointers()):
                 found["enabled_explicitly"] = _project_enabled_explicitly()
                 _service_reads_here(scoped=True)
-                found["declared"] = _service_fingerprint()
+                found["declared"] = _service_fingerprint_parts()
         except (Exception, SystemExit):
             pass
     return found
@@ -11995,8 +12028,10 @@ def _machine_status(module) -> dict:
         if seen:
             for key, value in seen.items():
                 row.setdefault(key, value)
-            row["current"] = (seen.get("fingerprint") is not None
-                              and seen.get("fingerprint") == now["declared"])
+            row["current"] = (False if seen.get("fingerprint") is None
+                              or now["declared"] is None
+                              else _fingerprint_current(seen["fingerprint"],
+                                                        now["declared"]))
         else:
             row.update(state=None, reason=("the machine service is not running" if not running
                                            else "not yet taken up by the machine service"))
@@ -12600,9 +12635,8 @@ def _service_status(module) -> dict:
                     "lanes", "idle", "turns", "deferred", "next_wake", "last_wake",
                     "reload_error", "stopping"):
             answer[key] = published.get(key)
-        current = _service_fingerprint()
-        answer["current"] = (None if current is None
-                             else module.read_fingerprint(state) == current)
+        answer["current"] = _fingerprint_current(module.read_fingerprint(state),
+                                                 _service_fingerprint_parts())
         answer["pause"] = _pause_block(module, state, _workers_of(answer.get("lanes")),
                                        published)
         return answer
@@ -12739,11 +12773,13 @@ def _service_serving_problems(module, status: dict) -> tuple[list[str], dict | N
             problems.append(f"the daemon's wake planned for {status['next_wake']['at']} is "
                             f"{overdue:.0f}s overdue; it may hang")
         loaded = module.read_fingerprint(_service_state_dir())
-        current = _service_fingerprint()
-        # A store that cannot be read now leaves the declaration untold; the
-        # store's own problem is reported where the store is.
-        if current is not None and loaded != current:
-            stale = {"loaded": loaded, "current": current}
+        parts = _service_fingerprint_parts()
+        # A store that cannot be read now leaves its half of the declaration
+        # untold, and the half the files hold is still compared; the store's
+        # own problem is reported where the store is.
+        if _fingerprint_current(loaded, parts) is False:
+            stale = {"loaded": loaded,
+                     "current": None if parts[1] is None else ".".join(parts)}
             problems.append("the running daemon loaded a declaration that has changed "
                             "since: settings, a worker or a profile it names; "
                             f"`{NAME} service reload` hands it the one standing now")
@@ -12775,8 +12811,13 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
     except Refusal as refused:
         # The workers are read from the store, and a store that is away is
         # judged below with the store itself: a warning while a daemon runs.
+        # The settings are a file, read before the store was asked, so they
+        # still show; the lanes are the store's workers and wait for it.
         if refused.code not in ("unreachable", "store_busy"):
             problems.append(refused.message)
+        else:
+            settings = _read_service_settings(_service_settings_path())
+            answer["settings"] = {k: v for k, v in settings.items() if k != "lanes"}
     conn_id, entry = _service_connection(wanted)
     answer["connection"] = conn_id
     answer["schema"] = SCHEMA
