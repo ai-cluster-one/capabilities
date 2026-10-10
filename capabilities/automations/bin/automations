@@ -239,8 +239,9 @@ Machine mode:
   and the machine's word on it under `machine`. `doctor --machine` exits 0
   while the process holds its lock, published its status within twice its
   publish interval, runs the machine settings on disk and holds a connection
-  to every store it opened; a project in `error` or `refused` fails it not,
-  since restarting the process cannot repair a project.
+  to at least one of the stores it opened; a store that is not connected
+  while another is, and a project in `error` or `refused`, fail it not, since
+  restarting the process cannot repair a project.
 
   Under launchd, the machine process writes the job launchd started it as
   into `launchd.json` in its state root: the label XPC_SERVICE_NAME names,
@@ -4952,9 +4953,11 @@ def cmd_service_start_machine(detached: bool = False) -> dict[str, Any]:
 
 def cmd_service_doctor_machine() -> dict[str, Any]:
     """The supervision probe: ok while the machine process holds its lock,
-    published its status lately, runs the machine settings on disk and holds
-    its store connection. A project in `error` or `refused` is reported and
-    fails nothing: restarting the process cannot repair a project."""
+    published its status lately, runs the machine settings on disk and holds a
+    connection to at least one of its stores. A store some project resolves
+    that is not connected, while another is, is reported under `stores` and
+    fails nothing, nor does a project in `error` or `refused`: restarting the
+    process cannot repair a project."""
     import datetime as _dt
 
     runtime = _runtime_module()
@@ -4979,10 +4982,11 @@ def cmd_service_doctor_machine() -> dict[str, Any]:
         if not status["current"]:
             problems.append("the machine process runs machine settings that have changed "
                             f"since; `{NAME} service reload --machine` hands it the file on disk")
-        for store in status.get("stores") or []:
-            if not store.get("connected"):
-                problems.append(f"the machine process holds no connection to the store "
-                                f"{store.get('store')}: {store.get('error') or 'reconnecting'}")
+        stores = status.get("stores") or []
+        if stores and not any(store.get("connected") for store in stores):
+            problems.append("the machine process holds no store connection: " + "; ".join(
+                f"{store.get('store')}: {store.get('error') or 'reconnecting'}"
+                for store in stores))
     if status.get("settings_error"):
         problems.append(status["settings_error"])
     answer = {"ok": not problems, "mode": "machine", "machine": status,

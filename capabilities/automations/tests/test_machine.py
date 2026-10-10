@@ -11,6 +11,7 @@ other's runs.
 
 from __future__ import annotations
 
+import datetime
 import importlib.machinery
 import importlib.util
 import json
@@ -776,3 +777,49 @@ def test_two_projects_on_two_stores_each_keep_their_runs_in_their_own(farm):
         with psycopg.connect(DSN, autocommit=True) as conn:
             conn.execute(f"drop schema if exists {own} cascade")
 
+
+
+@needs_store
+def test_one_projects_store_away_is_reported_and_fails_not_the_machine_probe(farm):
+    """While alpha's store answers and beta's own .env names one that does not,
+    the supervision probe passes and lists beta's store as not connected:
+    restarting the shared process cannot repair one project's store."""
+    with socket.socket() as spare:
+        spare.bind(("127.0.0.1", 0))
+        port = spare.getsockname()[1]
+    farm.project("alpha")
+    farm.project("beta", env_text=f"PROJECT_SECRET=beta-secret\n"
+                                  f"AGENTKIT_DB_URL=postgresql://nobody@127.0.0.1:{port}/away\n")
+    try:
+        for name in ("alpha", "beta"):
+            assert farm.ok(name, "service", "join")["joined"] is True
+        farm.ok(None, "service", "start", "--machine")
+        farm.until_state("alpha", "served")
+        stores = until(lambda: (found := farm.machine()["stores"]) and len(found) == 2 and found,
+                       30, "two stores")
+        assert sorted(store["connected"] for store in stores) == [False, True]
+        probe = farm.ok(None, "service", "doctor", "--machine")
+        assert probe["ok"] is True and "problems" not in probe
+        assert any(not store["connected"] for store in probe["machine"]["stores"])
+    finally:
+        farm.stop_all()
+
+
+@pytest.mark.parametrize("connected, ok", [((False,), False), ((True, False), True),
+                                           ((False, False), False), ((), True)])
+def test_the_machine_probe_fails_only_while_no_store_is_connected(monkeypatch, connected, ok):
+    cli = load_cli("automations_cli_probe_test")
+    runtime = load_runtime()
+    stores = [{"store": f"db{i}", "schema": "agentkit", "connected": up, "error": None}
+              for i, up in enumerate(connected)]
+    status = {"running": True, "pid": 4242, "current": True, "projects": [], "stores": stores}
+    published = {"pid": 4242, "publish_seconds": 5,
+                 "published_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    monkeypatch.setattr(cli, "_runtime_module", lambda: runtime)
+    monkeypatch.setattr(cli, "_machine_status", lambda _runtime: status)
+    monkeypatch.setattr(cli, "_machine_lock_held", lambda: True)
+    monkeypatch.setattr(runtime, "read_status", lambda _state: published)
+    answer = cli.cmd_service_doctor_machine()
+    assert answer["ok"] is ok
+    if not ok:
+        assert "holds no store connection" in answer["problems"][0]
