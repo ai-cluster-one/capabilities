@@ -389,6 +389,23 @@ def _last_json(text: str) -> dict | None:
     return found if isinstance(found, dict) else None
 
 
+def _trouble_words(line: str) -> str:
+    """A turn's last error line as the log says it. A refusal the executable
+    wrote, `{"error": ...}`, is said by its code, its message cut to 300
+    characters and its hint, so the fix it names survives however long the
+    message runs; any other line is cut to 300 characters."""
+    try:
+        error = json.loads(line).get("error")
+    except (ValueError, AttributeError):
+        error = None
+    if not isinstance(error, dict) or not error.get("message"):
+        return f"said {line[:300]}"
+    words = f"said {error.get('code')}: {str(error['message'])[:300]}"
+    if error.get("hint"):
+        words += f"; hint: {str(error['hint'])[:300]}"
+    return words
+
+
 def _why(exc: BaseException) -> str:
     """What went wrong, in the words the executable used. A refusal carries its
     own sentence; an exit raised by the executable has already written its
@@ -1199,7 +1216,7 @@ class ProjectSlot:
                             + (f", said {str(after['said'])[:200]}" if after.get("said")
                                else ""))
         if trouble:
-            said.append(f"said {trouble.splitlines()[-1][:300]}")
+            said.append(_trouble_words(trouble.splitlines()[-1]))
         return said
 
     # --- reload and stop -------------------------------------------------------

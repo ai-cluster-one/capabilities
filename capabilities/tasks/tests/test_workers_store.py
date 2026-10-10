@@ -317,6 +317,140 @@ def test_the_import_never_saves_a_file_over_a_different_version(lab):
     assert len(rows(lab, "alpha")) == 1 and not folder.exists()
 
 
+def test_a_failed_turns_refusal_is_logged_with_its_code_and_hint(tmp_path):
+    """However many files the message names, the hint naming the fix survives
+    in the service log."""
+    from types import SimpleNamespace
+    output, errors = tmp_path / "turn.out", tmp_path / "turn.err"
+    output.write_text("")
+    names = ", ".join(f"worker-{n}.md" for n in range(60))
+    errors.write_text(json.dumps({"error": {
+        "code": "workers_not_imported", "message": f"/p/workers still holds ({names})",
+        "hint": "`tasks workers import --apply` moves them into the store"}}) + "\n")
+    said = mod._service_module().ProjectSlot._said(SimpleNamespace(output=output, errors=errors))
+    [words] = [one for one in said if one.startswith("said ")]
+    assert words.startswith("said workers_not_imported: /p/workers still holds")
+    assert words.endswith("; hint: `tasks workers import --apply` moves them into the store")
+    errors.write_text("Traceback, then a plain line " + "x" * 400 + "\n")
+    said = mod._service_module().ProjectSlot._said(SimpleNamespace(output=output, errors=errors))
+    assert ("said Traceback, then a plain line " + "x" * 400)[:305] in said
+
+
+def test_nothing_is_imported_unasked_under_a_raise_or_the_read_only_switch(tmp_path,
+                                                                        monkeypatch):
+    monkeypatch.setattr(mod, "_unimported_worker_files", lambda: [tmp_path / "alpha.md"])
+    monkeypatch.setattr(mod, "_retired_workers_file", lambda: None)
+    monkeypatch.setattr(mod, "PROJECT", "prj_lab")
+    monkeypatch.setattr(mod, "_import_worker_files",
+                        lambda *a, **k: pytest.fail("imported under a fence"))
+    monkeypatch.setenv("TASKS_EXECUTION", str(uuid.uuid4()))
+    mod._import_workers_unasked()
+    monkeypatch.delenv("TASKS_EXECUTION")
+    monkeypatch.setenv("CAPABILITIES_READ_ONLY", "1")
+    mod._import_workers_unasked()
+
+
+@needs_store
+def test_a_run_imports_clean_worker_files_on_its_own_before_it_claims(lab):
+    ok(save(lab, "default", "---\nenabled: false\n---\n"))
+    folder = lab["here"] / "capabilities" / "tasks" / "workers"
+    folder.mkdir()
+    (folder / "alpha.md").write_text(ALPHA)
+    (folder / "default.md").write_text("---\nenabled: false\n---\n")
+    ok(cli(lab, "add", "--type", "alpha", "--title", "one", "--key", "t-1", "--status", "todo"))
+    # Looking changes nothing.
+    assert refused(cli(lab, "run", "alpha"), 6)["code"] == "workers_not_imported"
+    assert (folder / "alpha.md").is_file() and rows(lab, "alpha") == []
+    proc = cli(lab, "run", "alpha", "--apply")
+    ran = ok(proc)
+    assert ran["claimed"]
+    said = [json.loads(line) for line in proc.stderr.splitlines()
+            if line.startswith('{"workers_imported"')]
+    [[imported]] = [[one["workers_imported"]] for one in said]
+    assert set(imported["workers"]) == {"alpha", "default"}
+    assert not folder.exists()
+    [(_p, active, version)] = rows(lab, "alpha")
+    assert active and imported["workers"]["alpha"] == version
+    # default was already held exactly so, and is not stored twice.
+    assert len(rows(lab, "default")) == 1
+    [raised] = ok(cli(lab, "runs", "t-1"))["executions"]
+    assert raised["worker_id"] == version
+
+
+@needs_store
+def test_a_file_that_would_refuse_the_import_imports_nothing_unasked(lab):
+    held = ok(save(lab, "alpha", ALPHA))
+    folder = lab["here"] / "capabilities" / "tasks" / "workers"
+    folder.mkdir()
+    (folder / "alpha.md").write_text(ALPHA.replace("alpha work", "stale work"))
+    (folder / "beta.md").write_text(ALPHA.replace("[alpha]", "[beta]"))
+    error = refused(cli(lab, "run", "alpha", "--apply"), 6)
+    assert error["code"] == "workers_not_imported" and "import --apply" in error["hint"]
+    assert (folder / "alpha.md").is_file() and (folder / "beta.md").is_file()
+    assert rows(lab, "beta") == [] and [v for _p, _a, v in rows(lab, "alpha")] == [held["version"]]
+    (folder / "alpha.md").write_text("no front matter")
+    assert refused(cli(lab, "run", "alpha", "--apply"), 6)["code"] == "workers_not_imported"
+    assert rows(lab, "beta") == []
+
+
+@needs_store
+def test_first_turns_starting_together_import_once_and_none_fails(lab):
+    ok(save(lab, "default", "---\nenabled: false\n---\n"))
+    folder = lab["here"] / "capabilities" / "tasks" / "workers"
+    folder.mkdir()
+    (folder / "alpha.md").write_text(ALPHA)
+    (folder / "beta.md").write_text(ALPHA.replace("[alpha]", "[beta]"))
+    project = lab["here"]
+    env = {**lab["env"], "CLAUDE_PROJECT_DIR": str(project),
+           "CAPABILITIES_PROJECT_ENVELOPE": str(project / "capabilities")}
+    turns = [subprocess.Popen([str(_cli.CLI_PATH), "run", "alpha", "--apply"], cwd=project,
+                              env=env, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE) for _ in range(4)]
+    for turn in turns:
+        out, err = turn.communicate(timeout=180)
+        assert turn.returncode == 0, out + err
+    assert not folder.exists()
+    assert len(rows(lab, "alpha")) == 1 and len(rows(lab, "beta")) == 1
+
+
+@needs_store
+def test_the_service_imports_clean_worker_files_as_it_loads(lab, monkeypatch, capsys):
+    ok(save(lab, "default", "---\nenabled: false\n---\n"))
+    assert ok(cli(lab, "service", "init"))["written"]
+    folder = lab["here"] / "capabilities" / "tasks" / "workers"
+    folder.mkdir()
+    (folder / "alpha.md").write_text(ALPHA)
+    # Neither doctor reads them in.
+    assert refused(cli(lab, "doctor"), 6)["code"] == "workers_not_imported"
+    doctor = cli(lab, "service", "doctor")
+    assert doctor.returncode == 6 and "still holds worker files" in doctor.stdout
+    assert (folder / "alpha.md").is_file() and rows(lab, "alpha") == []
+    project = lab["here"]
+    monkeypatch.setattr(mod, "_project_root", lambda: project)
+    monkeypatch.setattr(mod, "_project_capabilities_dir", lambda root: root / "capabilities")
+    monkeypatch.setattr(mod, "_project_env", dict)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(lab["tmp"] / "config"))
+    for leaked in ("TASKS_EXECUTION", "CAPABILITIES_READ_ONLY"):
+        monkeypatch.delenv(leaked, raising=False)
+    _cli.bind_store(mod, monkeypatch, lab["schema"])
+    monkeypatch.setattr(mod, "PROJECT", lab["ids"]["here"])
+    declaration = mod._ServiceHost.load(None)
+    assert "alpha" in [lane["worker"] for lane in declaration["lanes"]]
+    assert '"workers_imported"' in capsys.readouterr().err
+    assert not folder.exists() and len(rows(lab, "alpha")) == 1
+
+
+def test_service_run_start_and_reload_load_through_the_import(monkeypatch):
+    """`service run`, `start` and `reload` load by `_loaded_declaration`, which
+    imports before it reads the declaration."""
+    called = []
+    monkeypatch.setattr(mod, "_import_workers_unasked", lambda: called.append("import"))
+    monkeypatch.setattr(mod, "_service_declaration",
+                        lambda: called.append("load") or {"lanes": []})
+    assert mod._loaded_declaration() == {"lanes": []}
+    assert called == ["import", "load"]
+
+
 @needs_store
 def test_a_raise_records_the_worker_version_it_was_claimed_under(lab):
     ok(save(lab, "default", "---\nenabled: false\n---\n"))

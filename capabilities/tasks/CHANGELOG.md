@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-11 — Worker files left by an update move into the store on their own
+
+`tasks run --apply` and the tasks service, as it loads its declaration (`service run`, `start`, `reload` and the daemon's own loads), perform the import `tasks workers import --apply` performs before anything is claimed, whenever every worker file in `capabilities/tasks/workers/` reads cleanly and each is new or identical to the version the store holds; the files are removed as that verb removes them and show as deletions in the project's git, for the project to commit. Imports in one project take a lock in the store, so first turns starting together store one version of each worker and none fails. What was imported is said on stderr as `workers_imported`. Where any file is unreadable, invalid or differs from a stored version, the store is away, or the process runs under a raise or the read-only switch, nothing is imported and the refusal `workers_not_imported` / `worker_invalid` is unchanged. `doctor` imports nothing. `service run` and `service start` now check the connection's write grant before loading the declaration. The service log line for a turn that failed says a refusal by its code, its message cut to 300 characters and its hint, so a `workers_not_imported` refusal shows `tasks workers import --apply` however many files it names.
+
 ## 2026-10-11 — The store refuses editing, deleting or truncating a worker version
 
 `tasks_workers` keeps every version as history for every writer, not only the CLI: the store refuses an `UPDATE` that changes any column but `active`, a `DELETE`, and a `TRUNCATE ... CASCADE` of the table, with SQLSTATE `23001` and the constraint name `tasks_workers_history`; a plain `TRUNCATE` stays refused by the raises' foreign key. Moving `active` either way still succeeds, so `workers save` and `workers remove` are unchanged. The store step `0005-workers-history` adds the guard; the tables' version is 1.3.

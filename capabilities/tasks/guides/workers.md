@@ -106,7 +106,9 @@ tasks workers save alpha alpha.md --base <version>
 
 ## Moving worker files into the store
 
-A project that kept its workers as files in `capabilities/tasks/workers/` moves them once. While any file is there, `doctor`, `run` and the service refuse with `workers_not_imported`, naming the files, rather than run without them. `tasks workers import` says what it would do; `tasks workers import --apply` saves each file as its worker's first version - or finds the store already holding that exact version, as it does on a second machine sharing the store - and removes the files. It moves all of them or none: a file that cannot be read, or one that differs from a version the store already holds for its name, refuses the import and is named, because the store's version is what runs. Commit the removed files, then `tasks service reload` a running service.
+A project that kept its workers as files in `capabilities/tasks/workers/` moves them once. `tasks workers import` says what it would do; `tasks workers import --apply` saves each file as its worker's first version - or finds the store already holding that exact version, as it does on a second machine sharing the store - and removes the files. It moves all of them or none: a file that cannot be read, or one that differs from a version the store already holds for its name, refuses the import and is named, because the store's version is what runs.
+
+A project that updates tasks while still carrying the files needs no step of its own: `tasks run --apply` and the service, as it loads its declaration, perform that same import before they claim anything, one at a time across turns starting together, and say on stderr - in the service's log - what they imported. The removed files then show as deletions in the project's git; commit them. Where the import would be refused, `run` and the service refuse with `workers_not_imported`, naming the files, rather than run without them, and the service log names the fix; `doctor` imports nothing and reports the files while any is there. Repair or remove the file named, or run `tasks workers import --apply` to see why it refuses.
 
 ## Profiles
 

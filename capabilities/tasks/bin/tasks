@@ -487,13 +487,20 @@ WORKERS
   running service takes them at `tasks service reload`.
 
   MOVING IN. A project's worker files, `capabilities/tasks/workers/<name>.md`,
-  are no longer read: while any is there, `doctor`, `run` and the service
-  refuse, exit 6 `workers_not_imported`, naming them. `tasks workers import`
-  says what it would do; `--apply` saves each file as its worker's first
-  version, or finds the store already holding that exact version, and then
-  removes the files. It is all or none: a file that cannot be read, or one
-  that differs from the version the store already holds for that name, is
-  saved over nothing and refuses the import, naming it.
+  are no longer read as workers. `tasks workers import` says what it would
+  do; `--apply` saves each file as its worker's first version, or finds the
+  store already holding that exact version, and then removes the files. It is
+  all or none: a file that cannot be read, or one that differs from the
+  version the store already holds for that name, is saved over nothing and
+  refuses the import, naming it. `run --apply` and the service, as it loads
+  its declaration (`service run`, `start`, `reload` and the daemon's own
+  reloads), perform that same import on their own before anything is
+  claimed, and say on stderr what they imported; the removed files are
+  deletions for the project to commit. Where the import would be refused, or
+  the store is away, or it runs under a raise or the read-only switch,
+  nothing is imported and they refuse, exit 6 `workers_not_imported`, naming
+  the files, as `doctor`, which imports nothing, always does while any is
+  there.
 
   A project still carrying `capabilities/tasks/workers.toml` is refused by
   `doctor` and `run`: that file is no longer read either.
@@ -9253,35 +9260,47 @@ def _declarations_unjudged(fresh: bool = False) -> dict:
     return found
 
 
-def _workers_import(entry, project: str, apply: bool) -> None:
-    """Move this project's worker files into the store, all of them or none, and
-    remove each file once the store holds it.
+# Imports of one project's worker files are taken one at a time: the lock is
+# held while the files are read, saved and removed, so turns starting together
+# store one version of each worker and none of them fails - the later finds the
+# files gone, or the store holding exactly what they say.
+_IMPORT_CLASS = 31325
+
+
+def _import_worker_files(entry, project: str, apply: bool,
+                         raising: bool = False) -> tuple[list[dict], list[str]]:
+    """Each of this project's worker files as an import would take it, and
+    every reason the import is refused; with `apply` and nothing refusing, each
+    is saved and its file removed, all of them or none.
 
     A file whose worker the store does not hold yet becomes its first version;
     one identical to the version the store holds is already there. One that
     differs from it is never saved over it - the store's is what runs - and,
-    like a file that cannot be read, refuses the import, naming it."""
-    files = _unimported_worker_files()
-    plan, refused = [], []
-    for path in files:
-        name = path.stem
-        if not _WORKER_NAME.fullmatch(name):
-            refused.append(f"{path.name} is not a worker name")
-            continue
-        try:
-            text = path.read_text()
-        except OSError as exc:
-            refused.append(f"{path} could not be read: {exc}")
-            continue
-        try:
-            spec, body = _parse_worker(text, str(path))
-            missing = _judged(name, spec, body, str(path))
-        except Refusal as wrong:
-            refused.append(wrong.message)
-            continue
-        plan.append({"name": name, "path": path, "spec": spec, "body": body,
-                     "missing": missing})
-    with _connect(entry) as conn, conn.cursor() as cur:
+    like a file that cannot be read, refuses the import, naming it. Raises
+    Refusal when `raising` and the store cannot be reached."""
+    with _connect(entry, raising=raising) as conn, conn.cursor() as cur:
+        if apply:
+            cur.execute("select pg_advisory_lock(%s, hashtext(%s))",
+                        (_IMPORT_CLASS, _presence_key(SCHEMA, project)))
+        plan, refused = [], []
+        for path in _unimported_worker_files():
+            name = path.stem
+            if not _WORKER_NAME.fullmatch(name):
+                refused.append(f"{path.name} is not a worker name")
+                continue
+            try:
+                text = path.read_text()
+            except OSError as exc:
+                refused.append(f"{path} could not be read: {exc}")
+                continue
+            try:
+                spec, body = _parse_worker(text, str(path))
+                missing = _judged(name, spec, body, str(path))
+            except Refusal as wrong:
+                refused.append(wrong.message)
+                continue
+            plan.append({"name": name, "path": path, "spec": spec, "body": body,
+                         "missing": missing})
         for one in plan:
             active = _active_row(cur, project, one["name"], lock=apply)
             if active is None:
@@ -9296,10 +9315,7 @@ def _workers_import(entry, project: str, apply: bool) -> None:
                                f"{one['path']}`, or remove the file")
         if refused:
             conn.rollback()
-            _die(6, "worker_invalid",
-                 f"{len(refused)} worker file(s) cannot be imported, so none is: "
-                 + "; ".join(refused),
-                 "repair or remove them, then import again")
+            return plan, refused
         if apply:
             for one in plan:
                 if one["outcome"] == "imported":
@@ -9307,15 +9323,25 @@ def _workers_import(entry, project: str, apply: bool) -> None:
                                                   one["body"], None)
                     one["version"] = str(row["id"])
         conn.commit()
-    removed = []
-    if apply:
-        for one in plan:
-            one["path"].unlink()
-            removed.append(str(one["path"]))
-        folder = _workers_dir()
-        if folder.is_dir() and not any(folder.iterdir()):
-            folder.rmdir()
-        _forget_workers()
+        if apply:
+            for one in plan:
+                one["path"].unlink()
+            folder = _workers_dir()
+            if folder.is_dir() and not any(folder.iterdir()):
+                folder.rmdir()
+            _forget_workers()
+    return plan, refused
+
+
+def _workers_import(entry, project: str, apply: bool) -> None:
+    """Move this project's worker files into the store, all of them or none, and
+    remove each file once the store holds it."""
+    plan, refused = _import_worker_files(entry, project, apply)
+    if refused:
+        _die(6, "worker_invalid",
+             f"{len(refused)} worker file(s) cannot be imported, so none is: "
+             + "; ".join(refused),
+             "repair or remove them, then import again")
     answer: dict = {"applied": apply,
                     "workers": [{"worker": one["name"], "file": str(one["path"]),
                                  "outcome": one["outcome"] if apply
@@ -9323,11 +9349,38 @@ def _workers_import(entry, project: str, apply: bool) -> None:
                                  **({"version": one["version"]} if one.get("version") else {})}
                                 for one in plan]}
     if apply:
-        answer["removed"] = removed
+        answer["removed"] = [str(one["path"]) for one in plan]
     warnings = [f"{one['name']}: {sentence}" for one in plan for sentence in one["missing"]]
     if warnings:
         answer["warning"] = "; ".join(warnings)
     _emit(answer)
+
+
+def _import_workers_unasked() -> None:
+    """Import this project's worker files on its own, where `run` and the service
+    would otherwise refuse them as not imported: the same import `workers
+    import --apply` performs, taken only when nothing refuses it. Anything that
+    would refuse it - a file that cannot be read or judged, one that differs
+    from the version the store holds, a store that is away - imports nothing
+    and leaves the refusal standing. Nothing working under a raise or under the
+    read-only switch imports, as it could not by asking. What was imported is
+    said on stderr, one line, so the service log carries it."""
+    if (not _unimported_worker_files() or _retired_workers_file() or not PROJECT
+            or _worker_execution() or read_only_switch()):
+        return
+    import psycopg
+    try:
+        plan, refused = _import_worker_files(None, PROJECT, True, raising=True)
+    except (Refusal, psycopg.Error):
+        return
+    if refused or not plan:
+        return
+    sys.stderr.write(json.dumps({"workers_imported": {
+        "workers": {one["name"]: one["version"] for one in plan},
+        "removed": [str(one["path"]) for one in plan],
+        "commit": "the removed files are deletions for this project to commit"}},
+        ensure_ascii=False) + "\n")
+    sys.stderr.flush()
 
 
 # --- Profiles in the store ----------------------------------------------------
@@ -11090,6 +11143,11 @@ def cmd_run(entry, args: list[str]) -> None:
     if not opts["_loose"]:
         _die(6, "input", "run needs a worker",
              f"{NAME} run <worker> [--key KEY] [--apply]")
+    # Worker files left in the envelope by an update move into the store here,
+    # before anything is claimed, when nothing refuses their import; a run that
+    # only looks changes nothing and is refused as before.
+    if opts.get("apply"):
+        _import_workers_unasked()
     worker = _worker(opts["_loose"][0])
     # The project's chain and ceiling, when it sets them: with them the claim
     # escalates what cannot move and counts attempts in place, and without them
@@ -12305,6 +12363,7 @@ class _ServiceHost:
                             project=self.project, identity=self.identity)
 
     def load(self) -> dict:
+        _import_workers_unasked()
         return _service_declaration()
 
     def fingerprint(self) -> str:
@@ -13513,6 +13572,10 @@ def _machine_entry_of(module, project: str) -> dict | None:
 
 
 def _loaded_declaration(hint: str | None = None) -> dict:
+    """The declaration `service run`, `start` and `reload` load, after the worker
+    files an update left in the envelope have moved into the store wherever
+    nothing refuses it. Exits on a declaration that does not load."""
+    _import_workers_unasked()
     try:
         return _service_declaration()
     except Refusal as refused:
@@ -13795,9 +13858,10 @@ def cmd_service_run(wanted: str | None, args: list[str]) -> None:
     _flags(args, ())
     _joined_refusal("run")
     module = _service_module()
-    declaration = _loaded_declaration()
+    # The gate first: loading may import worker files, which is a write.
     conn_id, entry = _service_connection(wanted)
     _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), "run")
+    declaration = _loaded_declaration()
     _service_store()
     # Project mode: a dispatcher over one slot, the project this runs in. Its
     # start environment is taken here, before the slot's scope first opens.
@@ -13817,9 +13881,9 @@ def cmd_service_start(wanted: str | None, args: list[str]) -> None:
     _flags(args, ())
     _joined_refusal("start")
     module = _service_module()
-    _loaded_declaration()
     conn_id, entry = _service_connection(wanted)
     _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), "run")
+    _loaded_declaration()
     state = _service_state_dir()
     state.mkdir(parents=True, exist_ok=True)
     status = _service_status(module)
