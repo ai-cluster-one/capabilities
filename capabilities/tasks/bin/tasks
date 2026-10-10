@@ -62,7 +62,8 @@ WRITING  (needs allow_write on the connection; exit 4 otherwise)
                                                 set the keys named, all or none,
                                                 leaving the rest as they were
   tasks meta rm <task> <key> [key...]           remove keys by name
-  tasks activity <task> "what happened"          record real work done
+  tasks activity <task> "what happened"          record real work done,
+                                                 written in Markdown
 
 EXECUTION  (also needs allow_write)
   tasks claim [filters | --key KEY] [--lease 3h] [--worker NAME] [--handler CMD]
@@ -8342,6 +8343,8 @@ No procedure is named for this work. Choose one from this project's `routines/` 
 _WRITE_BACK = """THE TRAIL IS HOW YOU REPORT
 
 Write to the task's trail with `{cli} activity {key} "..."` as work happens, not once at the end. If this turn dies, the trail is all that survives, and the next turn reads it to continue.
+
+Write each entry in Markdown - paragraphs, lists, code spans for names and commands - so it reads well where it is shown.
 
 Write for that next agent, not for a person reading a story. Name the session, the commit, the verdict, the file and the line. "Investigated and found problems" is worthless to the reader it is for.
 
