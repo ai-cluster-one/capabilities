@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0",
-#                 "callva-harness-runner==0.8.0", "pyyaml>=6"]
+#                 "callva-harness-runner==0.9.0", "pyyaml>=6"]
 # ///
 """A project's workers kept in the store as versions.
 
@@ -16,7 +16,7 @@ checks skip when it is unset.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
         --with 'capabilities-contract==0.4.0' \\
-        --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
+        --with 'callva-harness-runner==0.9.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -71,6 +71,7 @@ def test_a_document_is_judged_whole_and_an_unknown_key_refused(tmp_path, monkeyp
     monkeypatch.setattr(mod, "_project_capabilities_dir", lambda root: root / "capabilities")
     monkeypatch.setattr(mod, "_project_env", dict)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-machine"))
+    monkeypatch.setattr(mod, "_stored_profiles", lambda *a, **k: [])
     spec, body = mod._parse_worker(ALPHA.replace("takes:", "taks: [x]\ntakes:"), "doc")
     with pytest.raises(mod.Refusal) as refused:
         mod._judged("alpha", spec, body, "doc")
@@ -95,7 +96,7 @@ def _project(root: Path, project_id: str) -> Path:
     (root / ".git").mkdir(parents=True)
     envelope = root / "capabilities"
     tasks = envelope / "tasks"
-    (tasks / "profiles").mkdir(parents=True)
+    tasks.mkdir(parents=True)
     (envelope / "settings.json").write_text(
         json.dumps({"capabilities": {"tasks": {"enabled": True}}}))
     (envelope / "project.json").write_text(json.dumps({
@@ -103,7 +104,6 @@ def _project(root: Path, project_id: str) -> Path:
         "slug": "lab-" + secrets.token_hex(3)}))
     (tasks / "connections.json").write_text(json.dumps({
         "default": "local", "connections": {"local": {"allow_write": True}}}))
-    (tasks / "profiles" / "plain.toml").write_text(PROFILE)
     return root
 
 
@@ -127,6 +127,8 @@ def lab(tmp_path):
     lab = {"here": _project(tmp_path / "here", here), "there": _project(tmp_path / "there", there),
            "ids": {"here": here, "there": there}, "env": env, "schema": schema, "tmp": tmp_path}
     assert cli(lab, "migrate").returncode == 0
+    for where in ("here", "there"):
+        ok(cli(lab, "profiles", "save", "plain", "-", where=where, stdin=PROFILE))
     try:
         yield lab
     finally:

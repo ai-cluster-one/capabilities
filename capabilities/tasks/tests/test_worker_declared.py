@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0",
-#                 "callva-harness-runner==0.8.0",
+#                 "callva-harness-runner==0.9.0",
 #                 "pyyaml>=6"]
 # ///
 """What a worker declares about itself: its description, what it takes and
@@ -15,7 +15,7 @@ is unset; every run works in a schema of its own and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
         --with 'capabilities-contract==0.4.0' \\
-        --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
+        --with 'callva-harness-runner==0.9.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -45,8 +45,9 @@ HERE = "prj_worker_declared"
 def project(tmp_path, monkeypatch):
     """A project with one profile and no workers of its own yet."""
     envelope = tmp_path / "capabilities" / "tasks"
-    (envelope / "profiles").mkdir(parents=True)
-    (envelope / "profiles" / "plain.toml").write_text(PROFILE)
+    envelope.mkdir(parents=True)
+    _cli.profile_docs(tmp_path).mkdir()
+    (_cli.profile_docs(tmp_path) / "plain.toml").write_text(PROFILE)
     _cli.worker_docs(tmp_path).mkdir()
     _cli.serve_workers(mod, monkeypatch, tmp_path)
     monkeypatch.setattr(mod, "_project_root", lambda: tmp_path)

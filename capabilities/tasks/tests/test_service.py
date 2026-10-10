@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0",
-#                 "callva-harness-runner==0.8.0",
+#                 "callva-harness-runner==0.9.0",
 #                 "pyyaml>=6"]
 # ///
 """The service: its declaration, its lanes, how it wakes, reloads and stops.
@@ -20,7 +20,7 @@ stops a server it did not start.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
         --with 'capabilities-contract==0.4.0' \\
-        --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
+        --with 'callva-harness-runner==0.9.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -76,8 +76,9 @@ def project(tmp_path, monkeypatch):
     """A project with two workers taking one type each, one that runs only on
     request, and the shipped `default` switched off."""
     envelope = tmp_path / "capabilities" / "tasks"
-    (envelope / "profiles").mkdir(parents=True)
-    (envelope / "profiles" / "plain.toml").write_text(PROFILE)
+    envelope.mkdir(parents=True)
+    _cli.profile_docs(tmp_path).mkdir()
+    (_cli.profile_docs(tmp_path) / "plain.toml").write_text(PROFILE)
     _cli.serve_workers(mod, monkeypatch, tmp_path)
     write_worker(tmp_path, "alpha", "takes: [alpha]\nprofile: plain")
     write_worker(tmp_path, "beta", "takes: [beta]\nprofile: plain")
@@ -207,7 +208,7 @@ def test_the_fingerprint_moves_with_settings_workers_and_profiles(project):
     worker.write_text(worker.read_text() + "\nmore.\n")
     second = mod._service_fingerprint()
     assert second != first
-    profile = project / "capabilities" / "tasks" / "profiles" / "plain.toml"
+    profile = _cli.profile_docs(project) / "plain.toml"
     profile.write_text(PROFILE.replace("600", "900"))
     third = mod._service_fingerprint()
     assert third != second
@@ -1247,7 +1248,8 @@ def lab(tmp_path):
     (project / ".git").mkdir(parents=True)
     envelope = project / "capabilities"
     tasks = envelope / "tasks"
-    (tasks / "profiles").mkdir(parents=True)
+    tasks.mkdir(parents=True)
+    _cli.profile_docs(project).mkdir()
     (envelope / "settings.json").write_text(
         json.dumps({"capabilities": {"tasks": {"enabled": True}}}))
     (envelope / "project.json").write_text(json.dumps({
@@ -1256,7 +1258,7 @@ def lab(tmp_path):
     (tasks / "connections.json").write_text(json.dumps({
         "default": "local", "connections": {"local": {"allow_write": True}}}))
     _cli.write_store_setting(tmp_path / "config", schema)
-    (tasks / "profiles" / "plain.toml").write_text(
+    (_cli.profile_docs(project) / "plain.toml").write_text(
         PROFILE + f'cli_path = "{FAKE_CLAUDE}"\n')
     write_worker(project, "alpha", "takes: [alpha]\nprofile: plain")
     write_worker(project, "default", "enabled: false")

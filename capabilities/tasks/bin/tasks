@@ -4,7 +4,7 @@
 # dependencies = [
 #     "capabilities-contract==0.4.0",
 #     "psycopg[binary]>=3.2",
-#     "callva-harness-runner==0.8.0",
+#     "callva-harness-runner==0.9.0",
 #     "pyyaml>=6",
 # ]
 # ///
@@ -56,6 +56,14 @@ READING
                                   one worker whole - its settings, its body,
                                   and `text`, the document a save takes
   tasks workers history <name>    every version of it, oldest first
+  tasks profiles list             the harness profiles this project's workers
+                                  can name, each as it resolves
+  tasks profiles show <name> [--version ID] [--global]
+                                  one profile whole - where it resolves from,
+                                  its settings, and `text`, the file a save
+                                  takes
+  tasks profiles history <name> [--global]
+                                  every version of it, oldest first
 
 WRITING  (needs allow_write on the connection; exit 4 otherwise)
   tasks add --type T --title TEXT [fields]      create one
@@ -74,6 +82,12 @@ WRITING  (needs allow_write on the connection; exit 4 otherwise)
                                                 see WORKERS
   tasks workers remove <name> [--base ID]       take a worker out of the project
   tasks workers import [--apply]                move worker files into the store
+  tasks profiles save <name> <file|-> [--base ID] [--global]
+                                                save a profile's new version;
+                                                see PROFILES
+  tasks profiles remove <name> [--base ID] [--global]
+                                                take a profile out of its scope
+  tasks profiles import [--apply]               move profile files into the store
 
 EXECUTION  (also needs allow_write)
   tasks claim [filters | --key KEY] [--lease 3h] [--worker NAME] [--handler CMD]
@@ -374,21 +388,21 @@ WORKERS
   worker named `supervisor`, which replaces the shipped one whole: `tasks
   workers show supervisor` gives the shipped document to start from.
 
-  A worker's profile is one callva-harness-runner profile, named and found the
-  way the library finds one: `capabilities/tasks/profiles/NAME.toml` in this
-  project's envelope first, then the machine's profile folder, then the
-  profiles the library ships. The first file found is used whole: its
-  top-level `harness = "claude"` (or `"codex"`) is the harness the turn runs,
-  and its knobs decide what the turn may run, on which model, at what effort and
-  for how long; a knob it leaves out leaves the harness's own default. The
-  knobs and what each does on each harness are the library's, listed in its
-  README. A worker names no harness.
+  A worker's profile is one callva-harness-runner profile, named and resolved
+  the way the library resolves one kept in the store: this project's own
+  active version first, then the global one, then the profiles the library
+  ships. PROFILES says how one is saved. The version found is used whole: its
+  `harness = "claude"` (or `"codex"`) is the harness the turn runs, and its
+  knobs decide what the turn may run, on which model, at what effort and for
+  how long; a knob it leaves out leaves the harness's own default. The knobs
+  and what each does on each harness are the library's, listed in its README.
+  A worker names no harness.
 
-  Profile files are read as the library reads them: the knobs go to it exactly
-  as written, and nothing in them is substituted. A knob carrying `${` is
-  refused by `doctor` and `run`, naming the knob, because a profile that
+  A profile is read as the library reads it: the knobs go to it exactly as
+  saved, and nothing in them is substituted. A knob carrying `${` is refused by
+  `profiles save`, `doctor` and `run`, naming the knob, because a profile that
   depended on a substitution would mean something else to every other reader of
-  the same file. A profile the library refuses is reported with the library's
+  the same store. A profile the library refuses is reported with the library's
   own message, and no task is claimed for its worker. A lease is derived from
   the profile's `timeout_seconds`; a profile without one needs
   `limits.lease_seconds`.
@@ -471,6 +485,54 @@ WORKERS
   whenever the store holds work it takes; anything else may run `tasks run
   <worker> --apply` on whatever schedule it keeps, and a worker nothing runs
   never runs.
+
+PROFILES
+  A harness profile is kept in the store, in the table callva-harness-runner
+  owns, as versions: one row per version, at this project's scope or at the
+  global scope every project reads, and one active version per scope and
+  name. It is written as a flat profile file - TOML with a top-level `harness`
+  and that harness's knobs beside it - and saved by its name with `tasks
+  profiles save <name> <file>`. A name resolves to this project's active
+  version, else the global one, else the profile the library ships; the
+  library's own rules do all of it, and `tasks` decides only who may write.
+
+  SAVING. `tasks profiles save <name> <file>` reads the file, or stdin for
+  `-`, and the library judges it whole as `doctor` and `run` read it: any knob
+  it would refuse, an unknown key included, and a knob carrying `${`, is
+  refused, exit 6 `profile_invalid`. It saves at this project's scope;
+  `--global` saves at the global one. A save identical to the active version
+  creates none and answers `created: false`. Otherwise one transaction inserts
+  the new version and clears `active` on the version the writer read: `--base
+  ID` names it, as `show` gave it, and without it the version active at the
+  save is the one replaced. When another save came first, the save is refused,
+  exit 6 `conflict`, and the writer reads again. `remove` clears the active
+  version at its scope, and the name resolves to the next layer down. No
+  version is ever edited or deleted, so `history` shows every one, and every
+  raise records under `profile_id` the version it ran on (`tasks runs
+  <task>`); a raise on a profile the library ships records none. A project
+  writes only its own project-scope profiles and the global ones, never
+  another project's, and nothing working under a raise saves, removes or
+  imports one, exit 4 `policy`.
+
+  `tasks profiles show <name>` answers the version the name resolves to - its
+  `layer` (`project`, `global` or `shipped`), `version` (none for a shipped
+  profile), the layers it `shadows`, `spec` and `text`, the file - so an edit
+  is `show`, change `text`, `save --base` the version shown. With `--global`
+  it answers the global version, and with `--version ID` any version of this
+  project or the global scope. `tasks profiles list` lists every name a worker
+  here can resolve, each with the layer it resolves from. Saved versions take
+  effect at the next claim; a running service takes them at `tasks service
+  reload`.
+
+  MOVING IN. A project's profile files, `capabilities/tasks/profiles/NAME.toml`,
+  are no longer read, and neither is the machine's profile folder: while any
+  file is in the envelope, `doctor`, `run` and the service refuse, exit 6
+  `profiles_not_imported`, naming them. `tasks profiles import` says what it
+  would do; `--apply` saves each file as its profile's first version at this
+  project's scope, or finds the store already holding that exact version, and
+  then removes the files. It is all or none: a file that cannot be read, or
+  one that differs from the version the project already holds for that name,
+  is saved over nothing and refuses the import, naming it.
 
 HOOKS
   A worker's `hooks` names commands of the project's own that `run` starts
@@ -837,8 +899,8 @@ SERVICE
   `doctor` and `service doctor` name it.
 
   The daemon publishes a fingerprint of what it loaded - the settings, the
-  active version of every worker and every profile a worker names - beside
-  its pid, and `service doctor` fails while that differs from what the files
+  active version of every worker and the version every profile a worker names
+  resolves to - beside its pid, and `service doctor` fails while that differs from what the files
   and the store hold now. While the store cannot be read, the part the files
   hold - the settings, the shipped and not yet imported worker files and the
   profiles they name - is still compared, and a change there still fails it;
@@ -1554,6 +1616,11 @@ STORE
   older than this version brings them up to it once, and says so on stderr
   before its answer,
     {"migrated": {"schema": S, "applied": [STEP...]}}
+  The harness profiles workers run on live in `harness_profiles`, the table
+  callva-harness-runner owns under its own ledger, `harness`; tasks applies
+  the library's steps before its own wherever it migrates, since
+  `tasks_executions.profile_id` references it, and says so the same way, with
+  `"owner": "harness"`. `doctor` reports where it stands as `profile_tables`.
   and takes no lock when they are current. `doctor` reports the store - where
   its setting was read, and the schema - and where the tables stand, and
   changes nothing.
@@ -1595,7 +1662,8 @@ I/O
 EXIT CODES
   0 success, and a `watch` stopped by a signal, by its stdin closing, or by its
     reader going away
-  3 not found - no task for that uuid or unique key, or no worker of that name
+  3 not found - no task for that uuid or unique key, or no worker or profile of
+    that name
   4 policy - the capability is disabled, the connection does not allow writes,
     the worker is switched off, worker scope or project scope refuses the
     write, or the write would leave a task where it can never move - see
@@ -1604,7 +1672,7 @@ EXIT CODES
     tables cannot be brought up to this version; `tasks doctor` proves both.
     For `watch`, unreachable before `ready`
   6 input - a malformed argument, an unknown flag, a value outside its set, a
-    worker this capability cannot read, a command run outside a
+    worker or profile this capability cannot read, a command run outside a
     project that needs one to know whose tasks it means, no store configured,
     or a connection that still names a store
 """
@@ -1625,7 +1693,7 @@ CRED_KEYS = [
              "clock in. Defaults to UTC."},
 ]
 WRITE_VERBS = {"add", "set", "tag", "untag", "meta", "activity", "claim",
-               "release", "run", "workers"}
+               "release", "run", "workers", "profiles"}
 WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/tasks/guides/")
@@ -4184,24 +4252,57 @@ def _tables_ready(conn, setting) -> None:
         return
     db = _db()
     steps, major, minor = _tables()
-    done = db.migrate(conn, NAME, steps, major=major, minor=minor)
-    if done.applied:
-        sys.stderr.write(json.dumps({"migrated": {"schema": done.schema,
-                                                  "applied": done.applied}},
-                                    ensure_ascii=False) + "\n")
-    for warning in done.warnings:
-        sys.stderr.write(json.dumps({"store_warning": warning}, ensure_ascii=False) + "\n")
+    owner, profile_steps, profile_major, profile_minor = _profile_tables()
+    # The harness library's profile table first: this capability's own steps
+    # reference it.
+    for done in (db.migrate(conn, owner, profile_steps, major=profile_major,
+                            minor=profile_minor),
+                 db.migrate(conn, NAME, steps, major=major, minor=minor)):
+        _said_migrated(done)
     _TABLES_SETTLED.add(setting)
 
 
-def _tables_status(conn):
-    """Where this capability's tables stand in the store `conn` reaches, read
-    by the library without a lock and changing nothing."""
+def _said_migrated(done) -> None:
+    """What one ledger's migration applied, and what it warned of, on stderr."""
+    if done.applied:
+        moved = {"schema": done.schema, "applied": done.applied}
+        if done.owner != NAME:
+            moved = {"owner": done.owner, **moved}
+        sys.stderr.write(json.dumps({"migrated": moved}, ensure_ascii=False) + "\n")
+    for warning in done.warnings:
+        sys.stderr.write(json.dumps({"store_warning": warning}, ensure_ascii=False) + "\n")
+
+
+def _migrate_profile_tables() -> None:
+    """`migrate`, before the contract's own: the contract applies this
+    capability's steps under its ledger, and those reference the harness
+    library's profile table, so the library's steps are applied first, under
+    its ledger, on the same store."""
+    owner, steps, major, minor = _profile_tables()
+    db = _db()
+    conn = None
+    try:
+        conn = db.connect(application_name=NAME)
+        _said_migrated(db.migrate(conn, owner, steps, major=major, minor=minor))
+    except db.DbError as exc:
+        _die(6 if exc.slug in _STORE_SETTING_SLUGS else 5, exc.slug, exc.message, exc.hint)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _tables_status(conn, owner: str = NAME):
+    """Where this capability's tables stand in the store `conn` reaches, or
+    the harness library's profile table for its `owner`, read by the library
+    without a lock and changing nothing."""
     from psycopg.rows import dict_row, tuple_row
-    steps, major, minor = _tables()
+    if owner == NAME:
+        steps, major, minor = _tables()
+    else:
+        owner, steps, major, minor = _profile_tables()
     conn.row_factory = tuple_row
     try:
-        return _db().status(conn, NAME, steps, major=major, minor=minor)
+        return _db().status(conn, owner, steps, major=major, minor=minor)
     finally:
         conn.row_factory = dict_row
 
@@ -6406,22 +6507,24 @@ def _claim(entry, opts: dict) -> dict:
             previous = found[0] if found else None
         if fixed:
             cur.execute(f"""insert into {SCHEMA}.tasks_executions
-                              (task_id, attempt, worker, worker_id, handler, lease_until,
-                               metrics, run_system, run_ref)
-                            values (%s, %s, %s, %s, %s, now() + make_interval(secs => %s),
-                                    %s::jsonb, %s, %s)
+                              (task_id, attempt, worker, worker_id, profile_id, handler,
+                               lease_until, metrics, run_system, run_ref)
+                            values (%s, %s, %s, %s, %s, %s,
+                                    now() + make_interval(secs => %s), %s::jsonb, %s, %s)
                             returning *""",
                         (tid, attempt, opts.get("worker"), opts.get("worker_id"),
-                         opts.get("handler"), lease, json.dumps(fixed), run_system, run_ref))
+                         opts.get("profile_id"), opts.get("handler"), lease,
+                         json.dumps(fixed), run_system, run_ref))
         else:
             cur.execute(f"""insert into {SCHEMA}.tasks_executions
-                              (task_id, attempt, worker, worker_id, handler, lease_until,
-                               run_system, run_ref)
-                            values (%s, %s, %s, %s, %s, now() + make_interval(secs => %s),
-                                    %s, %s)
+                              (task_id, attempt, worker, worker_id, profile_id, handler,
+                               lease_until, run_system, run_ref)
+                            values (%s, %s, %s, %s, %s, %s,
+                                    now() + make_interval(secs => %s), %s, %s)
                             returning *""",
                         (tid, attempt, opts.get("worker"), opts.get("worker_id"),
-                         opts.get("handler"), lease, run_system, run_ref))
+                         opts.get("profile_id"), opts.get("handler"), lease, run_system,
+                         run_ref))
         execution = _rows(cur)[0]
         # The raise is the whole of the claim. The task stays where it rests -
         # its status, assignee and pickup untouched, no move recorded - and is
@@ -7170,9 +7273,9 @@ def _structure() -> dict | None:
     that are workers here, the ones read whole and the ones that cannot be,
     and each filter an enabled, readable worker selects by - its `takes`, the
     catch-all's, and its `on_request` types, which a person takes by naming
-    the task. None while the retired workers.toml stands, or worker files wait
-    to be imported, which `run` and `doctor` refuse on their own."""
-    if _retired_workers_file() or _unimported_worker_files():
+    the task. None while the retired workers.toml stands, or worker or profile
+    files wait to be imported, which `run` and `doctor` refuse on their own."""
+    if _retired_workers_file() or _unimported_files():
         return None
     declared = _declarations()
     read, unreadable, filters = {}, {}, []
@@ -7499,7 +7602,7 @@ def _landing_refusal(task: dict) -> str | None:
     name = (task.get("assignee") or "").strip()
     if not name or task.get("project_id") != _writing_project():
         return None
-    if (_project_root() is None or _retired_workers_file() or _unimported_worker_files()
+    if (_project_root() is None or _retired_workers_file() or _unimported_files()
             or name not in _declarations()):
         return None
     structure = _structure()
@@ -7584,6 +7687,21 @@ def _harness_runner():
     return harness_runner
 
 
+def _profile_store():
+    """The harness library as the keeper of profiles: its table, the versions
+    kept in it and how a name resolves among them. Imported where a profile is
+    read, saved or migrated, apart from `_harness_runner`, which is what starts
+    a turn."""
+    try:
+        from callva import harness_runner
+    except ImportError as exc:  # pragma: no cover - a broken install, not a path
+        _die(5, "harness_library_missing",
+             f"the harness library is not importable: {exc}",
+             "reinstall the capability; its script header declares "
+             "callva-harness-runner and uv resolves it")
+    return harness_runner
+
+
 def _project_here() -> Path:
     """The project whose queue and declarations this is. A worker belongs to a
     project; there is nowhere else for one to be declared."""
@@ -7609,8 +7727,8 @@ def _shipped_workers_dir() -> Path:
 
 
 def _profiles_dir() -> Path:
-    """This project's own profile files, searched before the machine's and the
-    library's."""
+    """Where a project kept its profile files, which nothing reads as profiles
+    now: they wait there for `profiles import`."""
     return _envelope_dir() / "profiles"
 
 
@@ -7725,6 +7843,71 @@ def _forget_workers() -> None:
     _WORKER_ROWS.pop((SCHEMA, PROJECT), None)
 
 
+def _unimported_profile_files() -> list[Path]:
+    """The profile files a project still carries in its envelope. Nothing reads
+    them as profiles: a project's profiles live in the store, and these wait
+    for `profiles import`."""
+    folder = _profiles_dir()
+    return sorted(folder.glob("*.toml")) if folder.is_dir() else []
+
+
+def _unimported_profiles_refusal(files: list[Path]) -> tuple:
+    return (6, "profiles_not_imported",
+            f"{_profiles_dir()} still holds profile files "
+            f"({', '.join(p.name for p in files)}), and they are no longer read: a "
+            "project's profiles live in the store, one row per version",
+            f"`{NAME} profiles import --apply` moves them into the store and removes the "
+            "files; `--apply` left off shows what it would do")
+
+
+def _unimported_files() -> list[Path]:
+    """Every worker or profile file a project still carries in its envelope."""
+    return _unimported_worker_files() + _unimported_profile_files()
+
+
+def _unimported_files_refusal() -> tuple | None:
+    """The refusal for the first kind of file waiting to be imported, or None."""
+    files = _unimported_worker_files()
+    if files:
+        return _unimported_refusal(files)
+    files = _unimported_profile_files()
+    if files:
+        return _unimported_profiles_refusal(files)
+    return None
+
+
+# The active profile versions this process read, per schema and project: the
+# global ones and the project's. Read once by a command, and again by the
+# service whenever it fingerprints or loads its declaration, as workers are.
+_PROFILE_ROWS: dict = {}
+
+
+def _stored_profiles(fresh: bool = False, waiting: bool | None = None) -> list:
+    """Every active profile version a worker of this project can resolve to:
+    the global ones and the project's own, as the harness library reads them.
+    A store whose tables hold no profiles yet holds none. Waits out a store
+    that is away as `_stored_workers` does. Raises Refusal."""
+    import psycopg
+    project = PROJECT or None
+    key = (SCHEMA, project)
+    if fresh or key not in _PROFILE_ROWS:
+        if waiting is None:
+            waiting = ProjectScope.current is None
+        runner = _profile_store()
+        with _connect(None, raising=True, waiting=waiting, migrating=False) as conn:
+            try:
+                rows = runner.stored_profiles(conn, project=project, schema=SCHEMA)
+            except psycopg.errors.UndefinedTable:
+                rows = []
+            conn.rollback()
+        _PROFILE_ROWS[key] = rows
+    return _PROFILE_ROWS[key]
+
+
+def _forget_profiles() -> None:
+    _PROFILE_ROWS.pop((SCHEMA, PROJECT or None), None)
+
+
 def _stored_entry(row: dict) -> dict:
     """One active row as `_declarations` answers a worker."""
     return {"source": "store", "version": str(row["id"]), "spec": row["spec"],
@@ -7739,15 +7922,15 @@ def _declarations(fresh: bool = False) -> dict:
     stored worker of that name replaces it whole.
 
     A project that declares none still has `default`. A project still carrying
-    the retired workers.toml, or worker files not yet imported, is refused,
-    because the workers it declares there no longer run and nothing should run
-    in their place without it knowing."""
+    the retired workers.toml, or worker or profile files not yet imported, is
+    refused, because what it declares there no longer runs and nothing should
+    run in its place without it knowing."""
     retired = _retired_workers_file()
     if retired:
         _die(*_retired_refusal(retired))
-    files = _unimported_worker_files()
-    if files:
-        _die(*_unimported_refusal(files))
+    unimported = _unimported_files_refusal()
+    if unimported:
+        _die(*unimported)
     return _declarations_unjudged(fresh)
 
 
@@ -7951,29 +8134,33 @@ def _substitution_in(value, where: str = "") -> str | None:
     return next((one for one in found if one), None)
 
 
+def _substitution_refusal(where: str, knob: str) -> Refusal:
+    return Refusal(6, "worker_invalid",
+                   f"{where}: its `{knob}` carries `${{`, and a profile is read as the "
+                   "library reads it, with nothing substituted",
+                   "write the value itself into the profile, or save a profile of the "
+                   f"project's own with `{NAME} profiles save`")
+
+
 def _resolve_profile(name: str) -> tuple[object, dict, dict]:
     """The worker's profile, the knobs it sets and where it came from.
 
-    The profile is found the way the library's `find_profile` finds one - this
-    project's profiles folder, then the machine's, then the shipped set - and
-    read the way the library reads it, so the file means the same to `tasks` as
-    to every other reader of it. The file names its harness; a file that is not
-    one flat profile is refused by the library's own `ProfileFile.knobs`, in its
-    words. A `${` sequence is refused rather than passed on, because the
+    The profile is resolved the way the harness library resolves a stored one:
+    this project's active version, then the global one, then the profile the
+    library ships, so a profile means the same to `tasks` as to every other
+    reader of the store. Its spec names its harness and is judged whole by the
+    library. A `${` sequence is refused rather than passed on, because the
     library would take it literally where its author meant a substitution."""
-    runner = _harness_runner()
-    found = runner.find_profile_file(name, [_profiles_dir()])
-    knobs = found.knobs()
+    runner = _profile_store()
+    found = runner.resolve_among(name, _stored_profiles(), project=PROJECT or None)
+    knobs = dict(found.spec)
     where = _substitution_in(knobs)
     if where:
-        raise Refusal(6, "worker_invalid",
-                      f"profile {name!r} at {found.path}: its `{where}` carries `${{`, "
-                      "and profile files are read as the library reads them, with "
-                      "nothing substituted",
-                      "write the value itself into the profile, or keep a "
-                      "machine-local profile in the machine's profile folder")
-    origin = {"name": name, "source": found.source, "path": found.path}
-    return runner.Profile.from_dict(knobs), knobs, origin
+        raise _substitution_refusal(found.where, where)
+    origin = {"name": name, "layer": found.layer, "version": found.id}
+    if found.shadows:
+        origin["shadows"] = list(found.shadows)
+    return found.profile(), knobs, origin
 
 
 def _cool_down_unsaid(declared_limits: dict) -> int:
@@ -8078,10 +8265,11 @@ def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
         pass
     elif not isinstance(declared, str) or not declared.strip():
         wrong("it names no profile: `profile: NAME`, a callva-harness-runner profile "
-              f"found in {_profiles_dir()} first")
+              f"this project saved with `{NAME} profiles save`, a global one, or one "
+              "the library ships")
     else:
         declared = declared.strip()
-        runner = _harness_runner()
+        runner = _profile_store()
         try:
             profile, knobs, origin = _resolve_profile(declared)
         except Refusal as refused:
@@ -8762,6 +8950,289 @@ def _workers_import(entry, project: str, apply: bool) -> None:
     _emit(answer)
 
 
+# --- Profiles in the store ----------------------------------------------------
+
+# A profile is kept as versions in the harness library's table, at this
+# project's scope or at the global one, and every rule of the versions - a save
+# guarded on the version the writer read, an identical save creating none, a
+# name resolving to the project's version, then the global one, then the
+# shipped profile - is the library's. This capability decides who may write
+# which scope: a project writes only its own project-scope profiles, and
+# nothing running under a raise writes any.
+
+def _profile_scope(opts: dict) -> tuple[str, str | None]:
+    """The scope a profiles verb acts on: the global one with --global, else
+    this project's."""
+    if opts.get("global"):
+        return "global", None
+    return "project", _writing_project()
+
+
+def _profile_answer(version, *, whole: bool = True) -> dict:
+    answer = {"profile": version.name, "scope": version.scope, "version": version.id,
+              "active": version.active, "harness": version.harness,
+              "created_at": _stamp(version.created_at), "created_by": version.created_by}
+    if whole:
+        answer.update(spec=version.spec, text=version.text())
+    return answer
+
+
+def _profiles_write_gate(action: str) -> None:
+    """A turn runs on its profile, so nothing working under a raise changes any
+    profile."""
+    if _worker_execution():
+        _die(4, "policy",
+             f"`profiles {action}` is refused under a raise: a turn runs on what its "
+             "profile allows, and a fence the fenced can rewrite is none",
+             "a person saves profiles, outside any turn")
+
+
+def _parse_profile(text: str, name: str, where: str) -> dict:
+    """The knobs of a profile file, judged whole as the library judges a stored
+    spec, and as `doctor` and `run` read it: a `${` sequence is refused.
+    Raises Refusal saying why it is no profile."""
+    runner = _profile_store()
+    try:
+        knobs = runner.ProfileFile(name, "file", where, text).knobs()
+        spec = runner.check_spec(knobs, where)
+    except runner.ProfileError as refused:
+        raise Refusal(6, "profile_invalid", str(refused),
+                      f"`{NAME} help` PROFILES states the shape; the library's "
+                      "`python -m callva.harness_runner knobs` lists every knob")
+    knob = _substitution_in(spec)
+    if knob:
+        refused = _substitution_refusal(f"profile {name!r} in {where}", knob)
+        raise Refusal(6, "profile_invalid", refused.message, refused.hint)
+    return spec
+
+
+def _profile_refusal(exc: Exception, name: str) -> NoReturn:
+    runner = _profile_store()
+    if isinstance(exc, runner.ProfileConflict):
+        _die(6, "conflict", str(exc),
+             f"read it again with `{NAME} profiles show {name}` and save over that")
+    if isinstance(exc, runner.ProfileNotFound):
+        _die(3, "not_found", str(exc), f"`{NAME} profiles list` shows this project's profiles")
+    _die(6, "profile_invalid", str(exc), f"`{NAME} help` PROFILES states the shape")
+
+
+def cmd_profiles(entry, args: list[str]) -> None:
+    """The harness profiles this project's workers run on, as the store keeps
+    them: read one as it resolves, save a version at this project's scope or
+    the global one, list a profile's history, remove it, and move a project's
+    profile files in."""
+    opts = _flags(args, **_FORM_ARGS["profiles"])
+    loose = opts["_loose"]
+    usage = (f"{NAME} profiles list | show <name> [--version ID] [--global] | "
+             "history <name> [--global] | save <name> <file|-> [--base ID] [--global] | "
+             "remove <name> [--base ID] [--global] | import [--apply]")
+    if not loose or loose[0] not in ("list", "show", "history", "save", "remove", "import"):
+        _die(6, "input", "profiles needs an action" if not loose
+             else f"unknown profiles action {loose[0]!r}", usage)
+    action, rest = loose[0], loose[1:]
+    wants = {"list": 0, "import": 0, "show": 1, "history": 1, "remove": 1, "save": 2}[action]
+    if len(rest) != wants:
+        _die(6, "input", f"profiles {action} takes {wants} argument(s)", usage)
+    if opts.get("global") and action in ("list", "import"):
+        _die(6, "input", f"profiles {action} takes no --global", usage)
+    if action in ("save", "remove") or (action == "import" and opts.get("apply")):
+        _profiles_write_gate(action)
+    runner = _profile_store()
+    if action == "import":
+        _profiles_import(entry, _writing_project(), bool(opts.get("apply")))
+        return
+    if action == "list":
+        _profiles_list(_writing_project())
+        return
+    name = rest[0]
+    try:
+        runner.check_profile_name(name)
+    except runner.ProfileError as refused:
+        _die(6, "input", str(refused))
+    scope, scope_id = _profile_scope(opts)
+    if action == "save":
+        try:
+            spec = _parse_profile(_read_input(rest[1]), name,
+                                  "stdin" if rest[1] == "-" else rest[1])
+        except Refusal as refused:
+            _die(refused.exit_code, refused.code, refused.message, refused.hint)
+        with _connect(entry) as conn:
+            try:
+                version, created = runner.save_profile(
+                    conn, name, spec, scope=scope, scope_id=scope_id, base=opts.get("base"),
+                    created_by=_actor(), schema=SCHEMA)
+            except runner.ProfileError as refused:
+                conn.rollback()
+                _profile_refusal(refused, name)
+            conn.commit()
+        _emit({**_profile_answer(version, whole=False), "created": created})
+        return
+    with _connect(entry) as conn:
+        if action == "remove":
+            try:
+                version = runner.remove_profile(conn, name, scope=scope, scope_id=scope_id,
+                                                base=opts.get("base"), schema=SCHEMA)
+            except runner.ProfileError as refused:
+                conn.rollback()
+                _profile_refusal(refused, name)
+            conn.commit()
+            _emit({"profile": name, "scope": scope, "removed": version.id})
+            return
+        if action == "history":
+            versions = runner.profile_history(conn, name, scope=scope, scope_id=scope_id,
+                                              schema=SCHEMA)
+            conn.commit()
+            if not versions:
+                _die(3, "not_found", f"no profile named {name!r} was ever saved at the "
+                     f"{scope} scope" + ("" if scope == "global" else " of this project"),
+                     f"`{NAME} profiles list` shows this project's profiles")
+            _emit({"profile": name, "scope": scope,
+                   "versions": [_profile_answer(v, whole=False) for v in versions]})
+            return
+        if opts.get("version"):
+            version = runner.profile_version(conn, opts["version"], schema=SCHEMA)
+            conn.commit()
+            # A project reads its own profiles and the global ones, never
+            # another project's.
+            if (version is None or version.name != name
+                    or (version.scope == "project" and version.scope_id != PROJECT)):
+                _die(3, "not_found", f"no profile named {name!r} at version "
+                     f"{opts['version']} here",
+                     f"`{NAME} profiles history {name}` lists its versions")
+            _emit(_profile_answer(version))
+            return
+        if scope == "global":
+            version = runner.active_profile(conn, name, scope="global", schema=SCHEMA)
+            conn.commit()
+            if version is None:
+                _die(3, "not_found", f"no global profile named {name!r}",
+                     f"`{NAME} profiles list` shows this project's profiles")
+            _emit(_profile_answer(version))
+            return
+        try:
+            found = runner.resolve_profile(conn, name, project=scope_id, schema=SCHEMA)
+        except runner.ProfileError as refused:
+            conn.rollback()
+            _profile_refusal(refused, name)
+        conn.commit()
+    answer = {"profile": name, "layer": found.layer, "version": found.id,
+              "harness": found.harness, "shadows": list(found.shadows)}
+    if found.version is not None:
+        answer.update(scope=found.version.scope, active=found.version.active,
+                      created_at=_stamp(found.version.created_at),
+                      created_by=found.version.created_by)
+    answer.update(spec=found.spec, text=found.text())
+    _emit(answer)
+
+
+def _profiles_list(project: str) -> None:
+    """Every profile a worker of this project can name, each as it resolves:
+    this project's own, the global ones, and the ones the library ships."""
+    runner = _profile_store()
+    files = _unimported_profile_files()
+    try:
+        active = _stored_profiles()
+    except Refusal as refused:
+        _die(refused.exit_code, refused.code, refused.message, refused.hint)
+    rows = []
+    for found in runner.resolve_profiles(active, project=project):
+        row = {"profile": found.name, "layer": found.layer, "version": found.id,
+               "harness": found.harness}
+        if found.version is not None:
+            row.update(updated_at=_stamp(found.version.created_at),
+                       updated_by=found.version.created_by)
+        if found.shadows:
+            row["shadows"] = list(found.shadows)
+        rows.append(row)
+    answer: dict = {"profiles": rows}
+    if files:
+        answer["unimported"] = [str(p) for p in files]
+        answer["warning"] = _unimported_profiles_refusal(files)[2]
+    _emit(answer)
+
+
+def _profiles_import(entry, project: str, apply: bool) -> None:
+    """Move this project's profile files into the store at its own scope, all of
+    them or none, and remove each file once the store holds it.
+
+    A file whose profile the project does not hold yet becomes its first
+    version; one identical to the version the project holds is already there.
+    One that differs from it is never saved over it - the store's is what runs
+    - and, like a file that cannot be read, refuses the import, naming it."""
+    runner = _profile_store()
+    files = _unimported_profile_files()
+    plan, refused = [], []
+    for path in files:
+        name = path.stem
+        try:
+            runner.check_profile_name(name)
+        except runner.ProfileError:
+            refused.append(f"{path.name} is not a profile name")
+            continue
+        try:
+            text = path.read_text()
+        except OSError as exc:
+            refused.append(f"{path} could not be read: {exc}")
+            continue
+        try:
+            spec = _parse_profile(text, name, str(path))
+        except Refusal as wrong:
+            refused.append(wrong.message)
+            continue
+        plan.append({"name": name, "path": path, "spec": spec})
+    with _connect(entry) as conn:
+        for one in plan:
+            active = runner.active_profile(conn, one["name"], scope="project",
+                                           scope_id=project, schema=SCHEMA, lock=apply)
+            if active is None:
+                one["outcome"] = "imported"
+            elif active.spec == one["spec"]:
+                one["outcome"] = "already"
+                one["version"] = active.id
+            else:
+                refused.append(f"{one['path']} differs from version {active.id} the store "
+                               f"holds for {one['name']!r}, which is what runs; save the "
+                               f"file over it with `{NAME} profiles save {one['name']} "
+                               f"{one['path']}`, or remove the file")
+        if refused:
+            conn.rollback()
+            _die(6, "profile_invalid",
+                 f"{len(refused)} profile file(s) cannot be imported, so none is: "
+                 + "; ".join(refused),
+                 "repair or remove them, then import again")
+        if apply:
+            for one in plan:
+                if one["outcome"] == "imported":
+                    try:
+                        version, _created = runner.save_profile(
+                            conn, one["name"], one["spec"], scope="project",
+                            scope_id=project, created_by=_actor(), schema=SCHEMA)
+                    except runner.ProfileError as wrong:
+                        conn.rollback()
+                        _profile_refusal(wrong, one["name"])
+                    one["version"] = version.id
+        conn.commit()
+    removed = []
+    if apply:
+        for one in plan:
+            one["path"].unlink()
+            removed.append(str(one["path"]))
+        folder = _profiles_dir()
+        if folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
+        _forget_profiles()
+    answer: dict = {"applied": apply,
+                    "profiles": [{"profile": one["name"], "file": str(one["path"]),
+                                  "outcome": one["outcome"] if apply
+                                  else f"would_be_{one['outcome']}",
+                                  **({"version": one["version"]} if one.get("version")
+                                     else {})}
+                                 for one in plan]}
+    if apply:
+        answer["removed"] = removed
+    _emit(answer)
+
+
 # --- What the turn is told ---------------------------------------------------
 
 # The frame this capability puts around the worker's instruction. It carries
@@ -9062,7 +9533,8 @@ def _take(entry, worker: dict, key: str | None, exclude: tuple = (),
     sweep."""
     base = {"lease": str(worker["limits"]["lease_seconds"]),
             "worker": worker["name"], "handler": worker["handler"],
-            "worker_id": worker.get("version")}
+            "worker_id": worker.get("version"),
+            "profile_id": (worker.get("profile_source") or {}).get("version")}
     if run is not None:
         base["run"] = run
     if beat is not None:
@@ -11017,14 +11489,15 @@ def _service_reads_here(scoped: bool = False) -> None:
 
 def _service_fingerprint_parts() -> tuple[str, str | None]:
     """Which declaration stands right now, in its two halves: what the files
-    hold - the settings file, each shipped worker file by its content, the
-    worker files still waiting to be imported, and every profile those files
-    name, by path and content - and what the store holds: the version it holds
-    active for each of this project's workers, and every profile those name.
+    hold - the settings file, each shipped worker file by its content, and the
+    worker and profile files still waiting to be imported - and what the store
+    holds: the version it holds active for each of this project's workers, and
+    the version every profile a worker names resolves to, the project's, the
+    global one, or the shipped profile by its content.
 
     The store is read afresh and never waited for, and its half is None while
-    it cannot be read: which profile a stored worker names is held there too.
-    Nothing here refuses; a file that cannot be read is part of the answer."""
+    it cannot be read: which profile a worker names resolves to is held there
+    too. Nothing here refuses; a file that cannot be read is part of the answer."""
     import yaml
 
     _service_reads_here()
@@ -11035,9 +11508,9 @@ def _service_fingerprint_parts() -> tuple[str, str | None]:
         except OSError:
             return "absent"
 
-    runner = _harness_runner()
+    runner = _profile_store()
 
-    def profiles(documents: list) -> list:
+    def profiles(documents: list, active: list) -> list:
         named: set = set()
         for where, front in documents:
             try:
@@ -11049,9 +11522,9 @@ def _service_fingerprint_parts() -> tuple[str, str | None]:
         parts: list = []
         for name in sorted(named):
             try:
-                found = runner.find_profile_file(name, [_profiles_dir()])
-                parts.append(["profile", name, str(found.path),
-                              hashlib.sha256(found.text.encode()).hexdigest()])
+                found = runner.resolve_among(name, active, project=PROJECT or None)
+                parts.append(["profile", name, found.layer,
+                              found.id or hashlib.sha256(found.text().encode()).hexdigest()])
             except Exception:
                 parts.append(["profile", name, "absent"])
         return parts
@@ -11072,14 +11545,16 @@ def _service_fingerprint_parts() -> tuple[str, str | None]:
             documents.append((path.name, yaml.safe_load(head) or {}))
         except Exception:
             continue
-    disk += profiles(documents)
+    disk += [["profile file", str(path), seen(path)] for path in _unimported_profile_files()]
     held = hashlib.sha256(json.dumps(disk).encode()).hexdigest()
     try:
         rows = _stored_workers(fresh=True, waiting=False)
+        active = _stored_profiles(fresh=True, waiting=False)
     except Exception:
         return held, None
     store: list = [["worker", row["name"], "store", str(row["id"])] for row in rows]
-    store += profiles([(f"worker {row['name']!r}", row["spec"]) for row in rows])
+    store += profiles(documents + [(f"worker {row['name']!r}", row["spec"]) for row in rows],
+                      active)
     return held, hashlib.sha256(json.dumps(store).encode()).hexdigest()
 
 
@@ -11123,12 +11598,13 @@ def _service_declaration() -> dict:
     retired = _retired_workers_file()
     if retired:
         raise Refusal(*_retired_refusal(retired))
-    files = _unimported_worker_files()
-    if files:
-        raise Refusal(*_unimported_refusal(files))
+    unimported = _unimported_files_refusal()
+    if unimported:
+        raise Refusal(*unimported)
     # Read by the fingerprint above, so what is loaded is what it answers for;
     # when it could not read them, the store is away and is not waited for.
     _stored_workers(waiting=False)
+    _stored_profiles(waiting=False)
     declared = _declarations()
     unknown = sorted(set(settings["lanes"]) - set(declared))
     if unknown:
@@ -13261,8 +13737,12 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 # states the shape both kinds of store end in, so a store created here and one
 # moved here hold the same tables, columns, indexes, constraints, triggers and
 # functions.
+#
+# The harness profiles a raise runs on are kept in `harness_profiles`, a table
+# callva-harness-runner owns and ships as steps of its own, applied under its own
+# ledger before these, everywhere these are: `_profile_tables` names them.
 STORE_MAJOR = 1
-STORE_MINOR = 1
+STORE_MINOR = 2
 
 _MOVE_FROM_SCHEMA_TASKS = r"""
 DO $move$
@@ -13704,10 +14184,21 @@ comment on column tasks_executions.worker_id is
   'no stored worker: one by hand, or one by a worker this capability ships.';
 """
 
+_PROFILE_COLUMN = r"""
+alter table tasks_executions add column if not exists profile_id uuid;
+alter table tasks_executions drop constraint if exists tasks_executions_profile_id_fkey;
+alter table tasks_executions add constraint tasks_executions_profile_id_fkey
+  foreign key (profile_id) references harness_profiles (id);
+comment on column tasks_executions.profile_id is
+  'The stored harness profile version the raise ran on. Null for a raise on a '
+  'profile the harness library ships, and for a claim that named no worker.';
+"""
+
 STORE_STEPS = [
     ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
     ("0002-tables", _TABLES_SHAPE),
     ("0003-workers", _WORKERS_TABLE),
+    ("0004-profiles", _PROFILE_COLUMN),
 ]
 
 
@@ -13715,6 +14206,15 @@ def _tables():
     """The steps and version of this capability's tables, for the contract's
     `migrate` and for every call that finds them missing or older."""
     return STORE_STEPS, STORE_MAJOR, STORE_MINOR
+
+
+def _profile_tables():
+    """The ledger, steps and version of the harness library's profile table,
+    which this capability's own steps reference: every place that migrates the
+    `tasks` tables applies these first, under the library's ledger."""
+    runner = _profile_store()
+    return (runner.PROFILE_STORE_OWNER, runner.PROFILE_STORE_STEPS,
+            runner.PROFILE_STORE_MAJOR, runner.PROFILE_STORE_MINOR)
 
 
 def _bundle_dir() -> Path:
@@ -13741,20 +14241,25 @@ def cmd_doctor(wanted: str | None) -> None:
         server = conn.execute("select version() as v").fetchone()["v"].split(" (")[0]
         conn.commit()
         db = _db()
+        profile_owner = _profile_tables()[0]
         try:
             found = _tables_status(conn)
+            profile_tables = _tables_status(conn, profile_owner)
         except db.DbError as exc:
             refusal = _store_refusal(exc)
             _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
-    if found.state in ("checksum_mismatch", "schema_too_new"):
-        _die(5, found.state,
-             f"the store's {NAME} tables in schema {found.schema} are "
-             + ("at a schema version newer than this release knows"
-                if found.state == "schema_too_new" else
-                f"migrated with steps this release states differently: "
-                f"{', '.join(found.changed)}"),
-             f"`{NAME} migrate status` reports where they stand; update {NAME} to the "
-             "release that migrated them")
+    for one, whose, release in ((profile_tables, "harness profile",
+                                 "callva-harness-runner, which " + NAME + " pins,"),
+                                (found, NAME, NAME)):
+        if one.state in ("checksum_mismatch", "schema_too_new"):
+            _die(5, one.state,
+                 f"the store's {whose} tables in schema {one.schema} are "
+                 + ("at a schema version newer than this release knows"
+                    if one.state == "schema_too_new" else
+                    f"migrated with steps this release states differently: "
+                    f"{', '.join(one.changed)}"),
+                 f"`{NAME} migrate status` reports where they stand; update {release} to "
+                 "the release that migrated them")
     # A worker that cannot be read is a turn that will not run, and finding that
     # out here costs nothing while finding it out from a claim costs a task
     # sitting in `in_progress` holding a raise.
@@ -13776,13 +14281,21 @@ def cmd_doctor(wanted: str | None) -> None:
               "store": setting.report(),
               "tables": {"state": found.state, "code": {"major": major, "minor": minor},
                          "store": stored, "pending": found.pending},
+              "profile_tables": {
+                  "owner": profile_owner, "state": profile_tables.state,
+                  "code": {"major": profile_tables.major, "minor": profile_tables.minor},
+                  "store": (None if profile_tables.stored_major is None
+                            else {"major": profile_tables.stored_major,
+                                  "minor": profile_tables.stored_minor}),
+                  "pending": profile_tables.pending},
               "workers": workers, "escalation": escalation}
-    warnings = list(found.warnings)
-    if found.state == "pending":
-        warnings.append(f"the store's {NAME} tables in schema {found.schema} are behind "
-                        f"this release ({', '.join(found.pending) or 'version'} pending); "
-                        f"the next command brings them up to it, and `{NAME} migrate` "
-                        "does now")
+    warnings = list(profile_tables.warnings) + list(found.warnings)
+    for one, whose in ((profile_tables, "harness profile"), (found, NAME)):
+        if one.state == "pending":
+            warnings.append(f"the store's {whose} tables in schema {one.schema} are behind "
+                            f"this release ({', '.join(one.pending) or 'version'} pending); "
+                            f"the next command brings them up to it, and `{NAME} migrate` "
+                            "does now")
     if unescalated:
         warnings.append(unescalated)
     # Every place a worker may land the task it holds that nobody takes there:
@@ -13832,13 +14345,14 @@ _FORM_ARGS = {
     "meta": {"names": ("actor",), "takes": 99},
     "run": {"names": ("key",), "bools": ("apply",), "takes": 1},
     "workers": {"names": ("version", "base"), "bools": ("apply",), "takes": 3},
+    "profiles": {"names": ("version", "base"), "bools": ("apply", "global"), "takes": 3},
 }
 
 
 def _reads_only(verb: str, rest: list[str]) -> bool:
     """Whether this call of a write verb is its form that writes nothing: `meta
-    show`, `run` without `--apply`, `workers list`, `show` and `history`, or
-    `workers import` without `--apply`. That form answers whatever
+    show`, `run` without `--apply`, `workers` or `profiles` `list`, `show` and
+    `history`, or their `import` without `--apply`. That form answers whatever
     the connection grants, so a read-only grant or the read-only switch leaves it
     reading.
 
@@ -13854,7 +14368,7 @@ def _reads_only(verb: str, rest: list[str]) -> bool:
         return False
     if verb == "meta":
         return opts["_loose"][:1] == ["show"]
-    if verb == "workers":
+    if verb in ("workers", "profiles"):
         action = opts["_loose"][:1]
         return action in (["list"], ["show"], ["history"]) or (
             action == ["import"] and not opts.get("apply"))
@@ -13891,6 +14405,8 @@ def main() -> None:
                "post_install": POST_INSTALL, "tables": _tables_declared(),
                "service": SERVICE})
         return
+    if argv == ["migrate"]:
+        _migrate_profile_tables()
     _contract(argv)
     wanted = None
     cleaned = []
@@ -13926,7 +14442,7 @@ def main() -> None:
         "add": cmd_add, "set": cmd_set, "meta": cmd_meta, "activity": cmd_activity,
         "claim": cmd_claim, "release": cmd_release, "run": cmd_run,
         "runs": cmd_runs, "history": cmd_history,
-        "watch": cmd_watch, "workers": cmd_workers,
+        "watch": cmd_watch, "workers": cmd_workers, "profiles": cmd_profiles,
     }
     handler = handlers.get(verb)
     if not handler and verb not in ("tag", "untag"):

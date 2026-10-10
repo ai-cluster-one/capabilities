@@ -44,6 +44,7 @@ def load() -> object:
     # The store's own read of workers, kept for when a case serves its worker
     # documents through a store it binds.
     module._REAL_STORED_WORKERS = module.__dict__.get("_stored_workers")
+    module._REAL_STORED_PROFILES = module.__dict__.get("_stored_profiles")
     return module
 
 
@@ -88,12 +89,15 @@ def bind_store(mod, monkeypatch, schema: str, **where):
 
 
 def make_tables(mod, schema: str) -> None:
-    """Create the capability's tables in `schema`, through its own steps."""
+    """Create the capability's tables in `schema`, through its own steps, after
+    the harness library's profile table they reference, through the library's."""
     from capabilities_contract import db
 
     steps, major, minor = mod._tables()
+    owner, profile_steps, profile_major, profile_minor = mod._profile_tables()
     conn = db.connect(application_name="tasks-test", setting=store_setting(schema))
     try:
+        db.migrate(conn, owner, profile_steps, major=profile_major, minor=profile_minor)
         db.migrate(conn, mod.NAME, steps, major=major, minor=minor)
     finally:
         conn.close()
@@ -131,6 +135,85 @@ def worker_docs(root: Path | str) -> Path:
     return Path(root) / "worker-docs"
 
 
+# A project's profiles live in the store too, kept by the same tests the same
+# way: as files in a folder of their own beside the project, served or saved at
+# the project's scope with its workers.
+
+def profile_docs(root: Path | str) -> Path:
+    """Where a test keeps the profile files of the project at `root`."""
+    return Path(root) / "profile-docs"
+
+
+def _profiles(mod, root: Path | str) -> list[tuple[str, dict, str]]:
+    import tomllib
+
+    # Read as written, not judged: what the store holds is judged again where it
+    # is read, and a case may serve a spec the library refuses to show that.
+    folder = profile_docs(root)
+    found = []
+    for path in sorted(folder.glob("*.toml")) if folder.is_dir() else []:
+        text = path.read_text()
+        found.append((path.stem, tomllib.loads(text), text))
+    return found
+
+
+def _served_profiles(mod, root) -> list:
+    """The profile files at `root`, as the active versions a save of each would
+    leave: at the project's scope, or the global one for a module standing in
+    no project with an id, which reads only those."""
+    import datetime
+    import uuid
+
+    from callva import harness_runner
+
+    project = mod.PROJECT or None
+    return [harness_runner.StoredProfile(
+                id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"profile\n{name}\n{text}")),
+                scope="project" if project else "global", scope_id=project, name=name,
+                spec=spec,
+                active=True,
+                created_at=datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc),
+                created_by="test")
+            for name, spec, text in _profiles(mod, root)]
+
+
+def save_profiles(mod, root: Path | str, schema: str, project: str) -> dict:
+    """Make the store's active profiles of `project` in `schema` the files in
+    `profile_docs(root)`, as `save_workers` does for workers: written straight
+    into the library's table, so a case can hold a spec the library would refuse
+    and see how it is read. Answers each name's active version id."""
+    from capabilities_contract import db
+
+    make_tables(mod, schema)
+    docs = {name: spec for name, spec, _text in _profiles(mod, root)}
+    conn = db.connect(application_name="tasks-test", setting=store_setting(schema))
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""select id, name, spec from "{schema}".harness_profiles
+                             where scope = 'project' and scope_id = %s and active""",
+                        (project,))
+            active = {row[1]: row for row in cur.fetchall()}
+            for name, row in active.items():
+                if name not in docs or row[2] != docs[name]:
+                    cur.execute(f'update "{schema}".harness_profiles set active = false '
+                                "where id = %s", (row[0],))
+            versions = {}
+            for name, spec in docs.items():
+                row = active.get(name)
+                if row is not None and row[2] == spec:
+                    versions[name] = str(row[0])
+                    continue
+                cur.execute(f"""insert into "{schema}".harness_profiles
+                                  (scope, scope_id, name, spec, active, created_by)
+                                values ('project', %s, %s, %s::jsonb, true, 'test')
+                                returning id""", (project, name, json.dumps(spec)))
+                versions[name] = str(cur.fetchone()[0])
+        conn.commit()
+    finally:
+        conn.close()
+    return versions
+
+
 def _documents(mod, root: Path | str) -> list[tuple[str, dict, str, str]]:
     folder = worker_docs(root)
     found = []
@@ -162,15 +245,27 @@ def serve_workers(mod, monkeypatch, root=None) -> None:
 
     monkeypatch.setattr(mod, "_stored_workers", rows)
 
+    def profiles(fresh: bool = False, **how) -> list:
+        where = root if root is not None else mod._project_root()
+        schema = getattr(mod, "_TEST_WORKERS_SCHEMA", None)
+        if schema is not None:
+            _saved_rows(mod, where, schema, fresh, **how)
+            return mod._REAL_STORED_PROFILES(fresh=True, **how)
+        return _served_profiles(mod, where)
+
+    monkeypatch.setattr(mod, "_stored_profiles", profiles)
+
 
 def save_workers(mod, root: Path | str, schema: str, project: str) -> dict:
     """Make the store's active workers of `project` in `schema` the documents in
     `worker_docs(root)`: a document whose active version differs gets a new one,
-    and an active worker with no document is removed. Answers each name's
-    active version id."""
+    and an active worker with no document is removed. The profiles in
+    `profile_docs(root)` are saved first, the same way. Answers each name's
+    active worker version id."""
     from capabilities_contract import db
 
     make_tables(mod, schema)
+    save_profiles(mod, root, schema, project)
     docs = {name: (spec, body) for name, spec, body, _text in _documents(mod, root)}
     conn = db.connect(application_name="tasks-test", setting=store_setting(schema))
     try:
@@ -211,11 +306,18 @@ def keep_served_workers_in_store(mod, monkeypatch, schema: str) -> None:
     monkeypatch.setattr(mod, "_TEST_WORKERS_SCHEMA", schema, raising=False)
 
 
+def _texts(mod, root) -> tuple:
+    """What a project's workers and profiles are written as, to tell whether
+    they changed since this process last saved them."""
+    return (tuple((name, text) for name, _spec, _body, text in _documents(mod, root)),
+            tuple((name, text) for name, _spec, text in _profiles(mod, root)))
+
+
 def _saved_rows(mod, root, schema: str, fresh: bool, **how) -> list[dict]:
     project = mod.PROJECT
     if not project:
         return []
-    texts = tuple((name, text) for name, _spec, _body, text in _documents(mod, root))
+    texts = _texts(mod, root)
     key = (schema, project)
     saved = _LAST_SAVED.get(key) != texts
     if saved:
@@ -235,7 +337,7 @@ def save_declared_workers(mod, project: Path | str, schema: str) -> dict:
         found = None
     if not found:
         return {}
-    texts = tuple((name, text) for name, _spec, _body, text in _documents(mod, project))
+    texts = _texts(mod, project)
     key = (schema, found)
     if _LAST_SAVED.get(key) == texts:
         return {}

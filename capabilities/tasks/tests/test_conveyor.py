@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0",
-#                 "callva-harness-runner==0.8.0",
+#                 "callva-harness-runner==0.9.0",
 #                 "pyyaml>=6"]
 # ///
 """One turn of the conveyor: what is declared, what is claimed, what is settled.
@@ -16,7 +16,7 @@ and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
         --with 'capabilities-contract==0.4.0' \\
-        --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
+        --with 'callva-harness-runner==0.9.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -101,14 +101,15 @@ def project(tmp_path, monkeypatch):
     worker_file(tmp_path, "implementation").write_text(IMPLEMENTATION)
     worker_file(tmp_path, "evaluation").write_text(EVALUATION)
     _cli.serve_workers(mod, monkeypatch, tmp_path)
-    (envelope / "profiles").mkdir(parents=True)
-    (envelope / "profiles" / "implementation.toml").write_text(IMPLEMENTATION_PROFILE)
-    (envelope / "profiles" / "evaluation.toml").write_text(EVALUATION_PROFILE)
+    # So are its profiles, kept and served the same way.
+    envelope.mkdir(parents=True)
+    _cli.profile_docs(tmp_path).mkdir()
+    profile_file(tmp_path, "implementation").write_text(IMPLEMENTATION_PROFILE)
+    profile_file(tmp_path, "evaluation").write_text(EVALUATION_PROFILE)
     monkeypatch.setattr(mod, "_project_root", lambda: tmp_path)
     monkeypatch.setattr(mod, "_project_capabilities_dir", lambda root: root / "capabilities")
     monkeypatch.setattr(mod, "_project_env", dict)
     monkeypatch.setenv("A_CHECKOUT", str(tmp_path / "elsewhere"))
-    # No machine profile folder answers for any name here.
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-machine"))
     return tmp_path
 
@@ -119,7 +120,8 @@ def worker_file(project: Path, name: str) -> Path:
 
 
 def profile_file(project: Path, name: str) -> Path:
-    return project / "capabilities" / "tasks" / "profiles" / f"{name}.toml"
+    """The file of a profile of `project`, as the store keeps it."""
+    return _cli.profile_docs(project) / f"{name}.toml"
 
 
 def rewrite(path: Path, old: str, new: str) -> None:
@@ -135,8 +137,8 @@ def write_worker(project: Path, name: str, front: str, body: str = "the body.") 
 
 
 def names(project: Path, worker: str, profile: str, text: str | None = None) -> Path:
-    """Point a worker at the profile of that name, and write the file into the
-    project's own profiles folder when text is given."""
+    """Point a worker at the profile of that name, and keep the file among the
+    project's own profiles when text is given."""
     path = worker_file(project, worker)
     body = re.sub(r"^profile: .*$", f"profile: {profile}", path.read_text(), flags=re.M)
     path.write_text(body)
@@ -271,16 +273,16 @@ def test_a_worker_name_is_a_plain_name(project):
      "mcp_config.mcpServers.a.command"),
 ])
 def test_a_profile_knob_carrying_a_substitution_is_refused(project, old, new, knob):
-    """Profile files are read as the library reads them. A `${` is refused even
-    where the environment would answer for it, because no other reader of the
-    file would substitute it."""
+    """A profile is read as the library reads it. A `${` is refused even where
+    the environment would answer for it, because no other reader of the store
+    would substitute it."""
     rewrite(profile_file(project, "evaluation"), old, new)
     with pytest.raises(SystemExit) as exit_code:
         mod._worker("evaluation")
     assert exit_code.value.code == 6
     [said] = problems_of("evaluation")
-    assert f"its `{knob}` carries `${{`" in said and "evaluation.toml" in said
-    assert "profile files are read as the library reads them" in said
+    assert f"its `{knob}` carries `${{`" in said and "profile 'evaluation' version" in said
+    assert "a profile is read as the library reads it" in said
 
 
 def test_a_front_matter_variable_is_read_the_same_way(project, monkeypatch):
@@ -369,7 +371,8 @@ def test_the_shipped_default_takes_what_nothing_else_does(project):
     assert worker["catch_all"] is True and worker["types"] == []
     assert worker["routines"] == []
     assert worker["profile_source"]["name"] == "claude-act"
-    assert worker["profile_source"]["source"] == "shipped"
+    assert worker["profile_source"]["layer"] == "shipped"
+    assert worker["profile_source"]["version"] is None
     assert worker["profile"].permission_mode == "bypassPermissions"
     assert worker["not_types"] == ["change", "defect", "proposal"]
     # The lease follows the shipped profile's own timeout.
@@ -566,18 +569,18 @@ def test_nothing_reads_an_instructions_folder(project):
 
 # --- A profile by name ---------------------------------------------------------
 
-def test_a_named_profile_is_read_from_the_projects_own_folder(project):
-    path = profile_file(project, "implementation")
+def test_a_named_profile_is_read_from_the_store(project):
     worker = mod._worker("implementation")
     assert worker["profile"].harness == "claude"
     assert worker["profile"].permission_mode == "bypassPermissions"
     assert worker["handler"] == "claude --model claude-opus-5 --effort max"
-    assert worker["profile_source"] == {"name": "implementation", "source": "folder",
-                                        "path": str(path)}
+    [served] = [one for one in mod._stored_profiles() if one.name == "implementation"]
+    assert worker["profile_source"] == {"name": "implementation", "layer": served.scope,
+                                        "version": served.id}
     rows, broken = mod._workers_report()
     assert broken == []
     by_worker = {row["worker"]: row for row in rows}
-    assert by_worker["implementation"]["profile_source"]["source"] == "folder"
+    assert by_worker["implementation"]["profile_source"]["version"] == served.id
     assert by_worker["implementation"]["harness"] == "claude"
 
 
@@ -588,28 +591,34 @@ def test_a_named_profile_goes_to_the_library_as_written(project):
         tomllib.loads(EVALUATION_PROFILE))
 
 
-def test_the_projects_file_comes_before_the_machines_and_the_shipped_one(
+def test_the_projects_version_comes_before_the_global_and_the_shipped_one(
         project, tmp_path, monkeypatch):
-    machine = tmp_path / "xdg" / "callva-harness-runner" / "profiles"
-    machine.mkdir(parents=True)
-    (machine / "claude-act.toml").write_text('harness = "claude"\nmodel = "machine-model"\n')
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     names(project, "implementation", "claude-act")
-    # No file of that name in the project: the machine's comes first.
+    monkeypatch.setattr(mod, "PROJECT", "prj_mine")
+
+    def version(scope: str, model: str):
+        return harness_runner.StoredProfile(
+            id=f"v-{scope}", scope=scope, scope_id="prj_mine" if scope == "project" else None,
+            name="claude-act", spec={"harness": "claude", "model": model}, active=True,
+            created_at=None, created_by=None)
+
+    held = [version("global", "global-model"), version("project", "project-model")]
+    monkeypatch.setattr(mod, "_stored_profiles", lambda *a, **k: list(held))
     worker = mod._worker("implementation")
-    assert worker["profile_source"]["source"] == "machine"
-    assert worker["profile"].model == "machine-model"
-    # A file in the project hides it.
-    folder = project / "capabilities" / "tasks" / "profiles"
-    (folder / "claude-act.toml").write_text('harness = "claude"\nmodel = "project-model"\n')
+    assert worker["profile_source"] == {"name": "claude-act", "layer": "project",
+                                        "version": "v-project",
+                                        "shadows": ["global", "shipped"]}
+    assert worker["profile"].model == "project-model"
+    # Without the project's own, the global one answers.
+    held.pop()
     worker = mod._worker("implementation")
-    assert (worker["profile_source"]["source"], worker["profile"].model) == (
-        "folder", "project-model")
-    # With neither, the library's own shipped profile answers.
-    (folder / "claude-act.toml").unlink()
-    (machine / "claude-act.toml").unlink()
+    assert (worker["profile_source"]["layer"], worker["profile"].model) == (
+        "global", "global-model")
+    # With neither, the library's own shipped profile answers, and no version.
+    held.clear()
     worker = mod._worker("implementation")
-    assert worker["profile_source"]["source"] == "shipped"
+    assert worker["profile_source"] == {"name": "claude-act", "layer": "shipped",
+                                        "version": None}
     assert worker["profile"].harness == "claude"
     assert worker["profile"].permission_mode == "bypassPermissions"
 
@@ -624,18 +633,19 @@ def test_the_file_names_the_harness_the_turn_runs(project):
     assert broken == []
     row = next(row for row in rows if row["worker"] == "implementation")
     assert row["harness"] == "codex"
-    assert row["profile_source"] == {"name": "codex-own", "source": "folder",
-                                     "path": str(path)}
+    assert row["profile_source"]["name"] == "codex-own" and path.is_file()
+    assert row["profile_source"]["version"]
 
 
-def test_a_file_that_is_not_one_flat_profile_is_refused_in_the_librarys_words(project):
-    names(project, "implementation", "tables", text='[claude]\nmodel = "claude-opus-5"\n')
-    [said] = problems_of("implementation")
-    assert "refused by callva-harness-runner" in said
-    assert "[claude] is a harness table, which 0.5.0 no longer reads" in said
-    names(project, "evaluation", "unnamed", text='model = "claude-opus-5"\n')
-    [said] = problems_of("evaluation")
-    assert "no top-level `harness`" in said
+def test_a_file_that_is_not_one_flat_profile_is_never_saved_and_says_why(project):
+    for text, words in (('[claude]\nmodel = "claude-opus-5"\n',
+                         "[claude] is a harness table, which 0.5.0 no longer reads"),
+                        ('model = "claude-opus-5"\n', "no top-level `harness`"),
+                        ('harness = "claude"\nmodle = "x"\n', "unknown key 'modle'"),
+                        ('harness = "claude"\nmodel = "${MODEL}"\n', "carries `${`")):
+        with pytest.raises(mod.Refusal) as refused:
+            mod._parse_profile(text, "tables", "tables.toml")
+        assert refused.value.code == "profile_invalid" and words in refused.value.message
 
 
 def test_a_profile_the_library_refuses_names_its_worker_and_the_librarys_words(project):

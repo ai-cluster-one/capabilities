@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0",
-#                 "callva-harness-runner==0.8.0",
+#                 "callva-harness-runner==0.9.0",
 #                 "pyyaml>=6"]
 # ///
 """Machine mode: one process serving every project that joined it.
@@ -19,7 +19,7 @@ schema of its own and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
         --with 'capabilities-contract==0.4.0' \\
-        --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
+        --with 'callva-harness-runner==0.9.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -175,8 +175,9 @@ def write_project(root: Path, *, project_id: str | None, slug: str, worker: str,
                   entry: dict, connection: str = "farm") -> Path:
     envelope = root / "capabilities"
     tasks = envelope / "tasks"
-    (tasks / "profiles").mkdir(parents=True)
-    (tasks / "profiles" / "plain.toml").write_text(
+    tasks.mkdir(parents=True)
+    _cli.profile_docs(root).mkdir()
+    (_cli.profile_docs(root) / "plain.toml").write_text(
         base.PROFILE + f'cli_path = "{base.FAKE_CLAUDE}"\n')
     identity = {"schema": "capabilities.project.v1", "slug": slug}
     if project_id:

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0",
-#                 "callva-harness-runner==0.8.0",
+#                 "callva-harness-runner==0.9.0",
 #                 "pyyaml>=6"]
 # ///
 """The service as a dispatcher over project slots: the scope every question
@@ -19,7 +19,7 @@ works in a schema of its own and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
         --with 'capabilities-contract==0.4.0' \\
-        --with 'callva-harness-runner==0.8.0' python -m pytest capabilities/tasks/tests -q
+        --with 'callva-harness-runner==0.9.0' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
@@ -60,8 +60,9 @@ def write_project(root: Path, *, project_id: str, slug: str, worker: str, takes:
     for it, one connection, one worker, and the service settings."""
     envelope = root / "capabilities"
     tasks = envelope / "tasks"
-    (tasks / "profiles").mkdir(parents=True)
-    (tasks / "profiles" / "plain.toml").write_text(base.PROFILE)
+    tasks.mkdir(parents=True)
+    _cli.profile_docs(root).mkdir()
+    (_cli.profile_docs(root) / "plain.toml").write_text(base.PROFILE)
     (envelope / "project.json").write_text(json.dumps(
         {"schema": "capabilities.project.v1", "id": project_id, "slug": slug}))
     (envelope / "settings.json").write_text(

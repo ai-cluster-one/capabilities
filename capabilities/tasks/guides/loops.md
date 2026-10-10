@@ -79,7 +79,7 @@ Running turns outlive the process in both modes, and a project moving between th
 
 ## A worked example
 
-A project runs two kinds of work: `defect` and `change`, carried by a `builder` role, and `proposal`, judged by an `evaluator` role. Both stop for decisions at the `supervisor`, which passes what the record does not settle to `<owner>`, the person who decides. The project raises no other types, so the shipped `default` is switched off. The profiles `builder`, `evaluator` and `supervisor` are the project's own files in `capabilities/tasks/profiles/`, and `develop`, `review` and `evaluate` are its routines. Each worker below is a document saved by its name, `tasks workers save <name> <name>.md`.
+A project runs two kinds of work: `defect` and `change`, carried by a `builder` role, and `proposal`, judged by an `evaluator` role. Both stop for decisions at the `supervisor`, which passes what the record does not settle to `<owner>`, the person who decides. The project raises no other types, so the shipped `default` is switched off. The profiles `builder`, `evaluator` and `supervisor` are the project's own, saved with `tasks profiles save <name> <name>.toml`, and `develop`, `review` and `evaluate` are its routines. Each worker below is a document saved by its name, `tasks workers save <name> <name>.md`.
 
 `default`:
 
