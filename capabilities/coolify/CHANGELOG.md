@@ -1,5 +1,9 @@
 # coolify — change log
 
+## 2026-10-10 — The bootstrap guide never switches the Mac's store on its own
+
+Step 6 of `coolify guide bootstrap` still creates the Postgres, but no longer ends by running `capabilities store set`. It reads `capabilities store show` first: when a store is already in force at any level of the cascade, the setting is left as it is and the user is told that the new Postgres can take over later and that the data does not move by itself; when none is, the user is told a database is needed and chooses between this Postgres and a Supabase project, and `capabilities store set` runs only on the answer for this Postgres. Continuing without a database is never offered. No verb changes.
+
 ## 2026-10-05 — `app rollback` and `app rollback-images`
 
 `app rollback <uuid> --to <commit|image-tag>` queues a rollback deployment through Coolify's rollback endpoint and returns the deployment UUID that `wait --deployment` takes; a Docker Compose application is built again from that commit, and an application whose images Coolify tags per commit starts that image again. A ref Coolify would refuse is refused before any request, and the verb is a write. `app rollback-images <uuid>` reads the image tags a rollback can return to and the current one; Coolify lists only images named after the application, so a Compose application that names its own images lists none and rolls back by commit.

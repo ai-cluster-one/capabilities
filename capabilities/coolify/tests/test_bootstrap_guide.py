@@ -95,9 +95,21 @@ def test_step_five_takes_the_first_identity_ssh_would_use():
     assert "a missing file would append a line without a key" in step
 
 
-def test_step_six_ends_with_the_store_pointer():
-    paragraphs = [p for p in _steps()[6].strip().split("\n\n") if p.strip()]
-    assert "`capabilities store set`" in paragraphs[-1]
+def test_step_six_ends_with_the_store_decision():
+    step = _steps()[6]
+    decision = step[step.index("For the central store"):]
+    # the Postgres is created whatever the decision
+    assert step.index("coolify database create") < step.index("For the central store")
+    # the store in force is read before anything is set
+    assert decision.index("`capabilities store show`") < decision.index("`capabilities store set`")
+    # a store in force is left alone, and the user is told
+    assert "When a store is in force at any level, do not run `capabilities store set`" in decision
+    assert "can take over as the store later" in decision
+    assert "does not move to it by itself" in decision
+    # with none in force the user chooses, and only this Postgres is set here
+    assert "ask whether it should be this new Postgres or a Supabase project" in decision
+    assert "Only on the answer for this Postgres run `capabilities store set`" in decision
+    assert "Never offer to continue without a database" in decision
 
 
 def test_step_six_names_where_the_project_and_server_uuids_come_from():

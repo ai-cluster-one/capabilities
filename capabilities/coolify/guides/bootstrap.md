@@ -308,7 +308,12 @@ psql -w "host=<server-ip> port=<port> user=<user> dbname=<db> sslmode=require" -
 
 The first is refused for having no encryption; the second gets as far as asking for the password over TLS. Both checks go over IPv4, which is all `<server-ip>` is: the public Postgres answers over IPv4 only and refuses a connection over IPv6 outright, unlike the proxy in step 4, so there is no IPv6 form of this check to run.
 
-For the central store, the last act of this step is `capabilities store set`, giving it the host, port, database, user, `sslmode=require` and the password from `~/.cache/coolify-bootstrap/pg-password` through standard input or the file, never on a command line; `capabilities help` gives its exact flags. Remove `~/.cache/coolify-bootstrap` once the store's doctor answers ok.
+For the central store, this step ends at a decision rather than a command, because the store is shared by every project on this Mac and is never switched without the user knowing. Read `capabilities store show` first: its `in_force` names the level of the cascade that answers, and is null when none does.
+
+- When a store is in force at any level, do not run `capabilities store set`. Leave the setting as it is, and tell the user that this Postgres can take over as the store later and that the data already in the store does not move to it by itself.
+- When none is in force, tell the user that a database is needed and ask whether it should be this new Postgres or a Supabase project. This Postgres runs on their own server and needs no outside account, but it lives and fails with the server and its backups are theirs to keep; a Supabase project is an outside service that stands apart from the server, and its free plan has limits of its own. Never offer to continue without a database. Only on the answer for this Postgres run `capabilities store set`, giving it the host, port, database, user, `sslmode=require` and the password from `~/.cache/coolify-bootstrap/pg-password` through standard input or the file, never on a command line; `capabilities help` gives its exact flags. On the answer for Supabase this step sets nothing; the store is set with the same verb once the user has the Supabase project.
+
+Remove `~/.cache/coolify-bootstrap` once the store's doctor answers ok, or at the end of this step when this Postgres did not become the store; Coolify keeps the database's password either way.
 
 ## 7. Point application health checks at 127.0.0.1
 
