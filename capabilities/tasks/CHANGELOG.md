@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-10 — The machine service starts through launchd when launchd supervises it
+
+`tasks service start --machine` hands the start to the launchd job that supervises the machine service when launchd has one loaded, instead of spawning a copy beside it: it runs `launchctl kickstart gui/$UID/<label>`, waits until the process launchd started reports itself running, and answers `"started_by": "launchd"` with the `label`. The machine process learns its job from launchd itself: started by launchd, `service run --machine` writes `launchd.json` into its machine state root with the label `XPC_SERVICE_NAME` names, when launchd reports that job's pid as the process, its parent or its process group, so the label is never composed from a naming convention. `service start --machine --detached` starts a copy by hand even while the job is loaded. Where no job is recorded or loaded - no `launchd.json`, no `launchctl`, or the job booted out - `start --machine` starts a detached copy as before. `service status --machine` carries `supervisor` (`launchd`, `pid`, `last_exit_code`, or null) and, while no machine process runs, a `hint` naming how to start it, which `service doctor --machine` repeats in its problem. `stop --machine` is unchanged and stops whichever process runs.
+
 ## 2026-10-09 — `service/store.py` is no longer shipped
 
 The service never read the copy of the records layer the bundle carried as `service/store.py`, and it is gone. Nothing the service does changes.

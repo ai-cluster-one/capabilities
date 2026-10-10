@@ -12,7 +12,7 @@
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "cff46fe264ad8e4a17e315ff9a9c88ca9b9c31a783fe9270c990f4e2344c18b1",
+      "payload_sha256": "6309f9ee8ce514d8bc977604eb8e62a609473c8f7bb090a9ffcc723a1cf5ef9c",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {
@@ -47,7 +47,7 @@
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "c7fd07b14e871d3f59f8123c333a1ed0b2940f9bdb4b2154549222f204dd111c",
+      "payload_sha256": "03df213f74c32aede5623b96f027022b53cbf7b165393545cf49a2ea0b621a63",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into launchd-supervised processes on a Mac, and describe the targets they deploy to."
     },
     "directo": {
@@ -142,7 +142,7 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "909a4fb2064984d81d132ea63ba796f0676dc0a611acdd342183aca828a640a4",
+      "payload_sha256": "cd09c3b9c6ed7d4b577efaed6d5384762587b0b713b4f37c6688fa14f722fec2",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {

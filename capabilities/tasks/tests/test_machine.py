@@ -948,3 +948,157 @@ def test_machine_status_and_doctor_with_and_without_a_process(farm):
     farm.ok(None, "service", "stop", "--machine")
     assert farm.cli(None, "service", "doctor", "--machine").returncode == 6
     assert farm.machine()["running"] is False
+
+
+# --- Starting through launchd -------------------------------------------------
+# launchd itself is stood in for by a `launchctl` on PATH that answers `print`
+# from a file per job, records every call, and on `kickstart` writes what the
+# machine process launchd starts would write: its pid and its status. No real
+# job is asked anything.
+
+FAKE_LAUNCHCTL = """#!/bin/sh
+echo "$@" >> "$FAKE_LAUNCHD/calls"
+case "$1" in
+  print)
+    label="${2##*/}"
+    if [ -f "$FAKE_LAUNCHD/$label.print" ]; then cat "$FAKE_LAUNCHD/$label.print"; exit 0; fi
+    echo "Could not find service \\"$label\\" in domain" >&2; exit 113 ;;
+  kickstart)
+    if [ -n "$FAKE_LAUNCHD_STATE" ]; then
+      echo "$FAKE_LAUNCHD_PID" > "$FAKE_LAUNCHD_STATE/daemon.pid"
+      echo "{\\"pid\\": $FAKE_LAUNCHD_PID}" > "$FAKE_LAUNCHD_STATE/daemon.json"
+    fi
+    exit 0 ;;
+esac
+"""
+JOB = "test.supervisor.tasks"
+
+
+@pytest.fixture
+def launchd(homes, monkeypatch):
+    """A fake launchd that knows the job JOB, loaded and not running after a
+    clean exit, and a machine state root that recorded it."""
+    fake = homes / "launchd"
+    fake.mkdir()
+    script = fake / "launchctl"
+    script.write_text(FAKE_LAUNCHCTL)
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(fake), os.environ.get("PATH", "")]))
+    monkeypatch.setenv("FAKE_LAUNCHD", str(fake))
+    monkeypatch.setenv("FAKE_LAUNCHD_PID", str(os.getpid()))
+    state = mod._machine_state_dir()
+    state.mkdir(parents=True)
+    monkeypatch.setenv("FAKE_LAUNCHD_STATE", str(state))
+    (fake / f"{JOB}.print").write_text(
+        f"gui/501/{JOB} = {{\n\tstate = not running\n\tlast exit code = 0\n}}\n")
+    (state / "launchd.json").write_text(json.dumps({"label": JOB, "pid": 1}))
+    monkeypatch.setattr(mod, "_store_setting", lambda raising=False: None)
+    spawned = []
+    real_popen = subprocess.Popen
+
+    class HandCopy:
+        """The detached copy `start --machine` spawns, standing in as itself."""
+
+        def __init__(self, command, **kwargs):
+            if command[-3:] != ["service", "run", "--machine"]:
+                raise AssertionError(command)
+            spawned.append(command)
+            self.pid, self.returncode = os.getpid(), None
+            (state / "daemon.pid").write_text(f"{self.pid}\n")
+            (state / "daemon.json").write_text(json.dumps({"pid": self.pid}))
+
+        def poll(self):
+            return None
+
+    def popen(command, *args, **kwargs):
+        if isinstance(command, list) and command[-3:] == ["service", "run", "--machine"]:
+            return HandCopy(command, **kwargs)
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    return {"fake": fake, "state": state, "spawned": spawned}
+
+
+def launchctl_calls(launchd) -> list[str]:
+    calls = launchd["fake"] / "calls"
+    return calls.read_text().splitlines() if calls.exists() else []
+
+
+def start_answer(capsys, *args) -> dict:
+    mod.cmd_service_start_machine(list(args))
+    return json.loads(capsys.readouterr().out)
+
+
+def test_start_hands_the_start_to_the_loaded_launchd_job_and_spawns_nothing(launchd, capsys):
+    answer = start_answer(capsys)
+    assert (answer["started"], answer["started_by"], answer["label"]) == (True, "launchd", JOB)
+    assert (answer["running"], answer["pid"]) == (True, os.getpid())
+    assert f"kickstart gui/{os.getuid()}/{JOB}" in launchctl_calls(launchd)
+    assert launchd["spawned"] == []
+
+
+def test_detached_starts_a_copy_by_hand_while_the_job_is_loaded(launchd, capsys):
+    answer = start_answer(capsys, "--detached")
+    assert answer["started"] is True and "started_by" not in answer
+    assert len(launchd["spawned"]) == 1
+    assert not [call for call in launchctl_calls(launchd) if call.startswith("kickstart")]
+
+
+@pytest.mark.parametrize("where", ["no record", "job not loaded", "no launchctl"])
+def test_with_no_loaded_job_start_starts_a_detached_copy_as_before(launchd, capsys,
+                                                                   monkeypatch, where):
+    if where == "no record":
+        (launchd["state"] / "launchd.json").unlink()
+    elif where == "job not loaded":
+        (launchd["fake"] / f"{JOB}.print").unlink()
+    else:
+        monkeypatch.setenv("PATH", str(launchd["fake"] / "empty"))
+    answer = start_answer(capsys)
+    assert answer["started"] is True and "started_by" not in answer
+    assert len(launchd["spawned"]) == 1
+    assert not [call for call in launchctl_calls(launchd) if call.startswith("kickstart")]
+
+
+def test_status_and_doctor_name_the_supervisor_and_how_to_start(launchd, capsys):
+    mod.cmd_service_status_machine([])
+    status = json.loads(capsys.readouterr().out)
+    assert status["running"] is False
+    assert status["supervisor"] == {"launchd": JOB, "pid": None, "last_exit_code": "0"}
+    assert f"launchctl kickstart gui/$UID/{JOB}" in status["hint"]
+    assert "service start --machine" in status["hint"]
+    with pytest.raises(SystemExit) as stopped:
+        mod.cmd_service_doctor_machine([])
+    assert stopped.value.code == 6
+    doctor = json.loads(capsys.readouterr().out)
+    assert doctor["machine"]["supervisor"]["launchd"] == JOB
+    assert any(status["hint"] in problem for problem in doctor["problems"])
+    (launchd["state"] / "launchd.json").unlink()
+    mod.cmd_service_status_machine([])
+    bare = json.loads(capsys.readouterr().out)
+    assert bare["supervisor"] is None
+    assert bare["hint"] == ("`tasks service start --machine`, or `tasks service run "
+                            "--machine` under a supervisor")
+    start_answer(capsys, "--detached")
+    mod.cmd_service_status_machine([])
+    assert "hint" not in json.loads(capsys.readouterr().out)
+
+
+def test_the_machine_process_records_the_job_launchd_started_it_as(launchd, monkeypatch):
+    record = launchd["state"] / "launchd.json"
+    record.unlink()
+    print_file = launchd["fake"] / f"{JOB}.print"
+    # Not launchd's: a terminal names job 0, and a job whose pid is some other
+    # process is not the one running this.
+    monkeypatch.setenv("XPC_SERVICE_NAME", "0")
+    mod._record_launchd_supervisor(launchd["state"])
+    assert not record.exists() and launchctl_calls(launchd) == []
+    monkeypatch.setenv("XPC_SERVICE_NAME", JOB)
+    print_file.write_text(f"gui/501/{JOB} = {{\n\tpid = 999999\n}}\n")
+    mod._record_launchd_supervisor(launchd["state"])
+    assert not record.exists()
+    print_file.write_text(f"gui/501/{JOB} = {{\n\tpid = {os.getppid()}\n}}\n")
+    mod._record_launchd_supervisor(launchd["state"])
+    written = json.loads(record.read_text())
+    assert (written["label"], written["pid"]) == (JOB, os.getppid())
+    assert mod._launchd_supervisor(launchd["state"]) == {
+        "label": JOB, "pid": os.getppid(), "last_exit_code": None}

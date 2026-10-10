@@ -523,3 +523,62 @@ def test_a_declared_state_expands_against_the_machine_homes(machine_watchdog):
     assert module._expand_machine_path("~/x") == Path(os.environ["HOME"]) / "x"
     assert module._expand_machine_path("$UNKNOWN/x") is None
     assert module._expand_machine_path("relative/x") is None
+
+
+def _agent_without_pid(module, monkeypatch, last_exit: str | None) -> None:
+    monkeypatch.setattr(module, "_launchd_status", lambda label: {
+        "label": label, "loaded": True, "pid": None, "last_exit_status": last_exit})
+
+
+def test_a_machine_agent_that_exited_cleanly_is_reported_stopped_not_restarted(
+        machine_watchdog, monkeypatch):
+    """KeepAlive restarts a machine agent only after a failure, so one with no
+    pid after a clean exit is stopped, and stays left alone pass after pass."""
+    module = machine_watchdog
+    _agent_without_pid(module, monkeypatch, "0")
+    for moment in (1000.0, 1060.0, 1120.0, 1180.0):
+        report = module.cmd_machine_watchdog(False, now=moment)
+    entries = {entry["service"]: entry for entry in report["services"]}
+    for name in ("sick", "well"):
+        assert entries[name]["action"] == "none"
+        assert entries[name]["state"] == "stopped"
+        assert entries[name]["last_exit_status"] == "0"
+        assert "restarting" not in entries[name]["detail"]
+        assert f"launchctl kickstart gui/$UID/capabilities.machine.{name}" in (
+            entries[name]["detail"])
+    assert _kicks(module) == []
+
+
+def test_a_copy_running_outside_launchd_is_reported_with_its_pid_and_left_alone(
+        machine_watchdog, monkeypatch, tmp_path):
+    module = machine_watchdog
+    _agent_without_pid(module, monkeypatch, "0")
+    outside = tmp_path / "stubs" / "outside-doctor"
+    outside.write_text("#!/bin/sh\necho '{\"ok\": true, \"mode\": \"machine\", "
+                       "\"machine\": {\"running\": true, \"pid\": 4242}}'\n")
+    outside.chmod(0o755)
+    services = module._machine_services()[0]
+    services["well"]["doctor"] = [str(outside)]
+    for dry_run in (True, False):
+        entries = {entry["service"]: entry
+                   for entry in module.cmd_machine_watchdog(dry_run, now=1000.0)["services"]}
+        well = entries["well"]
+        assert (well["action"], well["state"], well["outside_pid"]) == (
+            "none", "outside_launchd", 4242)
+        assert "pid 4242" in well["detail"] and "restarting" not in well["detail"]
+        assert "well service stop --machine" in well["detail"]
+        assert "launchctl kickstart gui/$UID/capabilities.machine.well" in well["detail"]
+        assert entries["sick"]["state"] == "stopped"
+    assert _kicks(module) == []
+
+
+def test_a_machine_agent_that_failed_is_still_left_to_launchd_to_restart(
+        machine_watchdog, monkeypatch):
+    module = machine_watchdog
+    _agent_without_pid(module, monkeypatch, "1")
+    entries = {entry["service"]: entry
+               for entry in module.cmd_machine_watchdog(False, now=1000.0)["services"]}
+    assert {name: (entry["action"], entry["state"]) for name, entry in entries.items()} == {
+        "sick": ("none", "restarting"), "well": ("none", "restarting")}
+    assert entries["sick"]["detail"] == "no pid; launchd is already restarting it"
+    assert _kicks(module) == []

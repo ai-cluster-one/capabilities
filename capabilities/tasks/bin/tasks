@@ -679,7 +679,11 @@ SERVICE
                                   write the machine settings from the template
   tasks service run --machine     the machine process in the foreground, for a
                                   supervisor
-  tasks service start --machine   the machine process detached
+  tasks service start --machine [--detached]
+                                  start the machine process: through the
+                                  launchd job that supervises it when there is
+                                  one, else detached; --detached starts a copy
+                                  by hand even then
   tasks service status --machine  the process, its cap and stores, and every
                                   project on the list with its state
   tasks service doctor --machine  the supervision probe; a project's own trouble
@@ -888,6 +892,20 @@ SERVICE
   machine's one store, the one its store setting names, so it holds one
   listener and one question connection across every project, and hands each
   notification to the project whose schema and id it names.
+
+  Under launchd, the machine process writes the job launchd started it as
+  into `launchd.json` in its state root: the label XPC_SERVICE_NAME names,
+  when launchd reports that job's pid as the process, its parent or its
+  process group. While launchd still has that job loaded, `start --machine`
+  hands the start to it with `launchctl kickstart` and spawns nothing,
+  answering `"started_by": "launchd"` and the `label`, so the process that
+  runs is the supervised one; `start --machine --detached` starts a copy by
+  hand even then. Where no such job is loaded, `start --machine` starts a
+  detached copy. `status --machine` carries `supervisor` (`launchd`, `pid`,
+  `last_exit_code`, or null) and, while no machine process runs, a `hint`
+  naming how to start it, which `doctor --machine` repeats. `stop --machine`
+  stops whichever process runs, and launchd restarts none that exits cleanly,
+  so a stopped service stays stopped until it is started again.
 
   It follows the list without a reload: a project that joins is served from
   the first pass at which it can be, and one that leaves is let go at once,
@@ -11411,6 +11429,12 @@ def _machine_status(module) -> dict:
             "binding": False},
         "stores": published.get("stores") or [],
     }
+    supervisor = _launchd_supervisor(state)
+    answer["supervisor"] = ({"launchd": supervisor["label"], "pid": supervisor["pid"],
+                             "last_exit_code": supervisor["last_exit_code"]}
+                            if supervisor else None)
+    if not running:
+        answer["hint"] = _machine_start_hint(supervisor)
     if settings_error:
         answer["settings_error"] = settings_error
     if published.get("projects_file", {}).get("error"):
@@ -11537,6 +11561,126 @@ def cmd_service_leave(args: list[str]) -> None:
     _emit({"left": True, "project": _project_answer(project, entry), "list": str(path)})
 
 
+# --- launchd supervision -------------------------------------------------------
+# A machine process that launchd started learns it from launchd itself: launchd
+# names the job in XPC_SERVICE_NAME, and the job's pid is the process, its
+# parent or the group it leads. The process writes that label into its state
+# root when it starts, where it outlives the process, so `start --machine` and
+# the hints hand a start to the job that supervises the service rather than
+# starting a copy beside it. The label is launchd's answer; this capability
+# composes none.
+
+_LAUNCHD_RECORD = "launchd.json"
+
+
+def _launchd_job(label: str) -> dict | None:
+    """What launchd says of one job in this user's domain, or None when it
+    knows none by that label: no launchctl, as off a Mac, or the job not loaded."""
+    import subprocess
+
+    if not label:
+        return None
+    try:
+        result = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    job = {"label": label, "pid": None, "last_exit_code": None}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.strip().partition(" = ")
+        if not sep:
+            continue
+        if key == "pid" and job["pid"] is None and value.strip().isdigit():
+            job["pid"] = int(value.strip())
+        elif key == "last exit code" and job["last_exit_code"] is None:
+            job["last_exit_code"] = value.strip()
+    return job
+
+
+def _record_launchd_supervisor(state: Path) -> None:
+    """Write the launchd job that started this process into the state root,
+    when launchd started it: the job XPC_SERVICE_NAME names runs this process,
+    its parent or its process group. A process started any other way writes
+    nothing and leaves an earlier record standing."""
+    label = os.environ.get("XPC_SERVICE_NAME", "").strip()
+    if not label or label == "0":
+        return
+    job = _launchd_job(label)
+    if not job or job["pid"] not in {os.getpid(), os.getppid(), os.getpgrp()}:
+        return
+    import datetime as _dt
+
+    record = state / _LAUNCHD_RECORD
+    staged = state / f".{_LAUNCHD_RECORD}.{os.getpid()}"
+    try:
+        staged.write_text(json.dumps({
+            "label": label, "pid": job["pid"],
+            "recorded_at": _utc_moment(_dt.datetime.now(_dt.timezone.utc))}) + "\n")
+        os.replace(staged, record)
+    except OSError:
+        staged.unlink(missing_ok=True)
+
+
+def _launchd_supervisor(state: Path | None = None) -> dict | None:
+    """The launchd job that supervises the machine service, as launchd answers
+    for it now: the job the machine process last recorded, while launchd still
+    has it loaded. None when no such job is recorded or loaded."""
+    try:
+        recorded = json.loads(((state or _machine_state_dir()) / _LAUNCHD_RECORD).read_text())
+    except (OSError, ValueError):
+        return None
+    label = recorded.get("label") if isinstance(recorded, dict) else None
+    return _launchd_job(label) if isinstance(label, str) and label else None
+
+
+def _machine_start_hint(supervisor: dict | None) -> str:
+    if supervisor:
+        return (f"launchd supervises it as {supervisor['label']}: `{NAME} service start "
+                f"--machine` hands the start to it, as `launchctl kickstart "
+                f"gui/$UID/{supervisor['label']}` does")
+    return (f"`{NAME} service start --machine`, or `{NAME} service run --machine` "
+            "under a supervisor")
+
+
+def _start_through_launchd(module, supervisor: dict) -> dict:
+    """Ask launchd to start the job that supervises the machine service, and
+    wait until the process it starts reports itself running."""
+    import subprocess
+    import time as _time
+
+    label = supervisor["label"]
+    state = _machine_state_dir()
+    try:
+        result = subprocess.run(["launchctl", "kickstart", f"gui/{os.getuid()}/{label}"],
+                                capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        result = None
+        said = f"{type(exc).__name__}: {exc}"
+    if result is None or result.returncode != 0:
+        if result is not None:
+            said = (result.stderr or result.stdout).strip() or f"exit {result.returncode}"
+        _die(5, "service_start_failed", f"launchd did not start {label}: {said}"[:400],
+             f"`launchctl print gui/$UID/{label}` says what launchd knows of it; "
+             f"`{NAME} service start --machine --detached` starts a copy by hand instead")
+    deadline = _time.monotonic() + 60
+    while True:
+        pid = _machine_pid(module)
+        if pid and (module.read_status(state) or {}).get("pid") == pid:
+            break
+        if _time.monotonic() > deadline:
+            _die(5, "service_start_failed",
+                 f"launchd was asked to start {label}, and no machine process reported "
+                 "itself running within 60s",
+                 f"`{NAME} service logs --machine`, and `launchctl print gui/$UID/{label}` "
+                 "for what launchd saw")
+        _time.sleep(0.1)
+    answer = _machine_status(module)
+    answer.update(started=True, started_by="launchd", label=label)
+    return answer
+
+
 def cmd_service_init_machine(args: list[str]) -> None:
     opts = _flags(args, (), bools=("force",))
     template = _machine_template()
@@ -11585,6 +11729,7 @@ def cmd_service_run_machine(args: list[str]) -> None:
         _die(refused.exit_code, refused.code, refused.message, refused.hint)
     _machine_ready(module)
     _service_store()
+    _record_launchd_supervisor(_machine_state_dir())
     dispatcher = module.MachineDispatcher(_MachineHost())
     try:
         dispatcher.run()
@@ -11594,10 +11739,12 @@ def cmd_service_run_machine(args: list[str]) -> None:
 
 
 def cmd_service_start_machine(args: list[str]) -> None:
+    """Start the machine process: through the launchd job that supervises it
+    when there is one, else, or with `--detached`, as a detached copy."""
     import subprocess
     import time as _time
 
-    _flags(args, ())
+    opts = _flags(args, (), bools=("detached",))
     module = _service_module()
     try:
         _read_machine_settings()
@@ -11612,6 +11759,10 @@ def cmd_service_start_machine(args: list[str]) -> None:
         answer = _machine_status(module)
         answer["already_running"] = True
         _emit(answer)
+        return
+    supervisor = None if opts.get("detached") else _launchd_supervisor(state)
+    if supervisor:
+        _emit(_start_through_launchd(module, supervisor))
         return
     log_path = state / module.LOG_FILE
     with log_path.open("a", encoding="utf-8") as log:
@@ -11658,8 +11809,7 @@ def cmd_service_doctor_machine(args: list[str]) -> None:
     status = _machine_status(module)
     problems = []
     if not status["running"]:
-        problems.append(f"no machine process runs; `{NAME} service start --machine`, or "
-                        f"`{NAME} service run --machine` under a supervisor")
+        problems.append(f"no machine process runs; {status['hint']}")
     else:
         published = module.read_status(_machine_state_dir()) or {}
         limit = 2 * float(published.get("publish_seconds") or module.PUBLISH_SECONDS)

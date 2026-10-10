@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-10 — The machine watchdog tells a stopped agent and a copy outside launchd from a restart
+
+`deployment machine watchdog` no longer reads every loaded machine agent with no pid as a restart in progress. A machine agent's `KeepAlive` restarts its process only after a failure, so the pass now asks the service's declared doctor: when it reports a machine process running while launchd holds no pid, the entry is `state: outside_launchd` with `outside_pid` and a detail naming the remedy (`<name> service stop --machine`, then `launchctl kickstart gui/$UID/<label>`); when the agent exited cleanly (last exit code 0) it is `state: stopped`, with the `kickstart` that starts it; otherwise it is `state: restarting` as before. Each such entry carries `last_exit_status`, and none of them is kickstarted. The project-scope `deployment watchdog` is unchanged.
+
 ## 2026-10-09 — A node takes its database only from its server's environment
 
 `deployment deploy` no longer sends the deploying machine's store setting: the `AGENT_STORE_*` values are gone from the bulk environment, a service's declared environment never fills an `AGENTKIT_DB_*` key from the Mac, and the entrypoint no longer runs `capabilities store set`, so no setting file is written in the container. The Compose file passes `AGENTKIT_DB_URL` and the other `AGENTKIT_DB_*` keys through from the server's environment, and a deploy leaves the values set there standing. `deployment node status` reports `store` from a probe run in the container through `capabilities-contract`: `configured`, the redacted `setting` with its level and sources, `reachable`, `tls_enforced`, and an `error` when one stops it. Set the variables on each existing node's server before its next deploy: a deploy no longer carries them there.

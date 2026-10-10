@@ -112,8 +112,12 @@ USAGE
       `deployment machine watchdog`: one pass asking each machine service's
       `service.machine.doctor`, with the project watchdog's failure count,
       timeout and cooldown, and `launchctl kickstart -k` after repeated
-      failures. Every other installed capability is listed as skipped with the
-      reason. A machine service with no joined project is still compiled; it
+      failures. A loaded machine agent with no pid is never kickstarted: it is
+      reported as `outside_launchd` with the pid when its doctor says the
+      service runs as a copy started outside launchd, as `stopped` when it
+      exited cleanly (last exit code 0), since its KeepAlive restarts only a
+      failure, and otherwise as `restarting`. Every other installed capability
+      is listed as skipped with the reason. A machine service with no joined project is still compiled; it
       idles. The declaration is `$XDG_CONFIG_HOME/deployment/machine.json`,
       {"watchdog": {...}, "services": {"<name>": {"disabled": true}}}, and a
       missing file means defaults; agents and logs land in
@@ -4778,12 +4782,54 @@ def cmd_watchdog(dry_run: bool, now: float | None = None) -> dict:
     return report
 
 
+def _doctor_body(command: list[str], cwd: Path, timeout: int) -> dict | None:
+    """The JSON body a service's declared doctor answers with, whatever its
+    exit status, or None when it does not run, answer in time or answer JSON."""
+    if not command:
+        return None
+    try:
+        result = subprocess.run(command, cwd=str(cwd), capture_output=True,
+                                text=True, timeout=timeout)
+        body = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _machine_agent_without_pid(name: str, label: str, doctor: list[str], cwd: Path,
+                               launchd: dict, timeout: int) -> dict:
+    """What a loaded machine agent with no pid is. A machine agent's KeepAlive
+    restarts its process only after a failure, so one that exited cleanly is
+    stopped rather than restarting, and its service may still run as a copy a
+    person started outside launchd, which its declared doctor names."""
+    body = _doctor_body(doctor, cwd, timeout) or {}
+    machine = body.get("machine") if isinstance(body.get("machine"), dict) else {}
+    pid = machine.get("pid") if machine.get("running") is True else None
+    if isinstance(pid, int) and pid > 0 and not _launchd_status(label)["pid"]:
+        return {"state": "outside_launchd", "outside_pid": pid,
+                "detail": (f"no pid under launchd, while the service runs as pid {pid} "
+                           f"outside it, so nothing supervises it; `{name} service stop "
+                           f"--machine`, then `launchctl kickstart gui/$UID/{label}`, "
+                           f"hands it back to launchd")}
+    if str(launchd.get("last_exit_status") or "").strip() == "0":
+        return {"state": "stopped",
+                "detail": (f"stopped: it exited cleanly (last exit code 0), and launchd "
+                           f"restarts it only after a failure; `launchctl kickstart "
+                           f"gui/$UID/{label}` starts it")}
+    # Between restarts. launchd owns that, and stepping in would race it.
+    return {"state": "restarting", "detail": "no pid; launchd is already restarting it"}
+
+
 def _watchdog_check(name: str, label: str, doctor: list[str], cwd: Path,
-                    config: dict, state: dict, stamp: float, dry_run: bool) -> dict:
+                    config: dict, state: dict, stamp: float, dry_run: bool,
+                    machine: bool = False) -> dict:
     """One service's turn in a watchdog pass, recording its count in `state`.
 
     The project and the machine scope watch their agents by this one decision,
-    so a failure count, a timeout and a cooldown mean the same thing in both."""
+    so a failure count, a timeout and a cooldown mean the same thing in both.
+    They differ only in what a loaded agent with no pid is: in the machine
+    scope it is read for a clean stop and for a copy running outside launchd,
+    and neither is restarted."""
     entry = {"service": name, "label": label, "action": "none"}
     launchd = _launchd_status(label)
     entry["loaded"] = launchd["loaded"]
@@ -4791,8 +4837,13 @@ def _watchdog_check(name: str, label: str, doctor: list[str], cwd: Path,
         entry["detail"] = "not loaded; a person has not started this agent"
         return entry
     if not launchd["pid"]:
-        # Between restarts. launchd owns that, and stepping in would race it.
-        entry["detail"] = "no pid; launchd is already restarting it"
+        if machine:
+            entry["last_exit_status"] = launchd.get("last_exit_status")
+            entry.update(_machine_agent_without_pid(
+                name, label, doctor, cwd, launchd, config["probe_timeout_seconds"]))
+        else:
+            # Between restarts. launchd owns that, and stepping in would race it.
+            entry["detail"] = "no pid; launchd is already restarting it"
         state.pop(name, None)
         return entry
 
@@ -6481,7 +6532,7 @@ def cmd_machine_watchdog(dry_run: bool, now: float | None = None) -> dict:
         report["services"].append(_watchdog_check(
             name, _machine_label(name), services[name]["doctor"],
             working if working.is_dir() else Path.home(),
-            config, state, stamp, dry_run))
+            config, state, stamp, dry_run, machine=True))
     _save_watchdog_state(report, state_path, state, dry_run)
     return report
 
