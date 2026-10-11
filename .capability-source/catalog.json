@@ -2,7 +2,7 @@
   "capabilities": {
     "agentrooms": {
       "path": "capabilities/agentrooms",
-      "payload_sha256": "9e62778bc0f2587e19459de31b89825f00fd835fb2b9e520f7642ee545690dd0",
+      "payload_sha256": "41053498d3e2f8629ed0ed03e786125e84ae0d28da269f2ff3149c9280d0208c",
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, and a machine service that wakes opted-in agents on a mention, a direct message, an invite or a marked room, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room."
     },
     "asana": {
@@ -12,12 +12,12 @@
     },
     "askproject": {
       "path": "capabilities/askproject",
-      "payload_sha256": "815f10587a3badb381114078d72acecd16cc26fd63383ebf567400367fd782c4",
+      "payload_sha256": "a78a8bf63288ec1a110dc9aba7f90f24c4ff8151e7e8d3c41bd9dac5ec3d8ac2",
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project under a read or act profile, and return its answer with cost, token, and files-changed traceability."
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "8829aa6f0d524c44f5eaafd535837d794c843343a500ba914f4fb7f2a5cc5a78",
+      "payload_sha256": "d46e2a388e07645a719954525f8775e22fc9ef196643d6254163f9791634957b",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {
@@ -52,7 +52,7 @@
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "03df213f74c32aede5623b96f027022b53cbf7b165393545cf49a2ea0b621a63",
+      "payload_sha256": "d16adecb80ee0ae82ceaf36e7772b792c7b5a0ba44bba41f0a3de823891a2bc4",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into launchd-supervised processes on a Mac, and describe the targets they deploy to."
     },
     "directo": {
@@ -147,12 +147,12 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "3e9560a6eb0eaedb9da02ea51f044289e9b1afe901ff7c46a5bda5ac7be74513",
+      "payload_sha256": "1b66a0c536cd156aa24acf479b7f3c5fd6ab32788d8ef631167c0d9c7b34cef1",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "8d9696b0457b69deab891cbc0543e81fd07f734e8397f9632ee7f9fb899e63df",
+      "payload_sha256": "c3b19a0d26b8eef187eebe46a65cae76cb213b07cc74fd5e51801b47dcdeb38c",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {
@@ -162,7 +162,7 @@
     },
     "whatsapp": {
       "path": "capabilities/whatsapp",
-      "payload_sha256": "af65cbac965fda2f1d612a658e9a7fff266f9561dd5debd9262749f483de0ac8",
+      "payload_sha256": "ca24c915c3a3f0e6f737859650081e03d4f4e450df674c75e1a095481a10ff68",
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON."
     },
     "windmill": {

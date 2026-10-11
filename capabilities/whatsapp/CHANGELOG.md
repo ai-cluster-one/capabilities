@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-10-11 — A store behind Supabase's transaction pooler is refused at connect
+
+`whatsapp` now uses `capabilities-contract` 0.4.1. A transaction-mode pooler keeps no session between transactions, so the schema binding, prepared statements and notifications a connection relies on are lost through one, and it is not supported. A database setting that points at Supabase's transaction pooler - a host under `pooler.supabase.com` on port 6543 - is refused before anything is sent to it, as `transaction_pooler`, with a hint naming the session pooler: the same host on port 5432. Every other database, the session pooler included, is reached as before.
+
 ## 2026-10-09 — The capture follows the project's database
 
 Breaking. `whatsapp` now uses `capabilities-contract` 0.4.0 and keeps its capture in the database the project resolves: the `AGENTKIT_DB_*` keys in the project's `.env.local` and `.env`, then the process environment, then the machine's store setting; `capabilities store show` shows which answers. `CAPABILITIES_STORE_URL` and `CAPABILITIES_STORE_PASSWORD` are no longer read, and the service's deploy descriptor no longer declares them: a deployed node takes `AGENTKIT_DB_*` from its server's environment. The assistant service resolves its database once at launch and keeps it for its whole run, so a rebuilt session, the job runner, a reconnect and the outbox listener all stay on the database it started on. A project that names no database, with none in the environment or on the machine, is refused with exit 6 `store_not_configured` as before. `service/store.py` is no longer shipped; nothing read it.

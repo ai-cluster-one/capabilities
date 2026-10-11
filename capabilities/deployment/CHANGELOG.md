@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-11 — A store behind Supabase's transaction pooler is refused at connect
+
+`deployment` now uses `capabilities-contract` 0.4.1. A transaction-mode pooler keeps no session between transactions, so the schema binding, prepared statements and notifications a connection relies on are lost through one, and it is not supported. A database setting that points at Supabase's transaction pooler - a host under `pooler.supabase.com` on port 6543 - is refused before anything is sent to it, as `transaction_pooler`, with a hint naming the session pooler: the same host on port 5432. Every other database, the session pooler included, is reached as before.
+
 ## 2026-10-10 — The machine watchdog tells a stopped agent and a copy outside launchd from a restart
 
 `deployment machine watchdog` no longer reads every loaded machine agent with no pid as a restart in progress. A machine agent's `KeepAlive` restarts its process only after a failure, so the pass now asks the service's declared doctor: when it reports a machine process running while launchd holds no pid, the entry is `state: outside_launchd` with `outside_pid` and a detail naming the remedy (`<name> service stop --machine`, then `launchctl kickstart gui/$UID/<label>`); when the agent exited cleanly (last exit code 0) it is `state: stopped`, with the `kickstart` that starts it; otherwise it is `state: restarting` as before. Each such entry carries `last_exit_status`, and none of them is kickstarted. The project-scope `deployment watchdog` is unchanged.

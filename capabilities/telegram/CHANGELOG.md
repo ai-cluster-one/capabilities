@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-11 — A store behind Supabase's transaction pooler is refused at connect
+
+`telegram` now uses `capabilities-contract` 0.4.1. A transaction-mode pooler keeps no session between transactions, so the schema binding, prepared statements and notifications a connection relies on are lost through one, and it is not supported. A database setting that points at Supabase's transaction pooler - a host under `pooler.supabase.com` on port 6543 - is refused before anything is sent to it, as `transaction_pooler`, with a hint naming the session pooler: the same host on port 5432. Every other database, the session pooler included, is reached as before.
+
 ## 2026-10-11 — The service reopens the job register's store connection after losing it
 
 When the store or the network ends the job register's database connection while the Telegram session stays up, the service's next job tick opens a new connection and the queue keeps draining, rather than retrying the dead connection every tick until the Telegram session ends or the service restarts. The log says `jobs: lost the store connection, reopening it on the next tick` for it, and a session that loses its connection to Telegram is logged as `session lost its connection to Telegram` rather than as likely protocol drift.

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.0"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.1"]
 # ///
 """Which store a process resolves, and how a turn is handed its daemon's.
 
@@ -12,7 +12,7 @@ environment level, which whoever started it filled with the store the raise
 lives in. Nothing here reaches a store: the settings are resolved and compared.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' \\
-        --with 'capabilities-contract==0.4.0' python -m pytest capabilities/tasks/tests -q
+        --with 'capabilities-contract==0.4.1' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations

@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-11 — A store behind Supabase's transaction pooler is refused at connect
+
+The manager now uses `capabilities-contract` 0.4.1. A transaction-mode pooler keeps no session between transactions, so the schema binding, prepared statements and notifications a connection relies on are lost through one, and it is not supported. A database setting that points at Supabase's transaction pooler - a host under `pooler.supabase.com` on port 6543 - is refused before anything is sent to it, as `transaction_pooler`, with a hint naming the session pooler: the same host on port 5432. Every other database, the session pooler included, is reached as before.
+
 ## 2026-10-09 — `sync-contract` no longer writes a service's records module
 
 `capabilities sync-contract` no longer writes `service/store.py` into a bundled service, and `sync-contract --check` no longer reports a `service_module` drift. A service that reads its settings or documents reads the files itself.
