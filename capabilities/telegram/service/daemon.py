@@ -471,9 +471,13 @@ def job_register():
 
     The connection belongs to the thread that opened it, which is the event
     loop: every read and write below happens there, and the workers that do the
-    long work never touch it.
+    long work never touch it. A connection the store or the network has ended
+    is dropped here and a new one opened, so a store that comes back is used
+    again without waiting for the Telegram session to end.
     """
     global _JOB_STORE, _JOB_REGISTER
+    if _JOB_STORE is not None and _JOB_STORE.lost():
+        close_job_register()
     if _JOB_REGISTER is None:
         if STORE_REFUSAL is not None:
             raise STORE_REFUSAL
@@ -7349,7 +7353,12 @@ async def run_session(client):
                     job_tasks[task] = claimed["id"]
                     task.add_done_callback(lambda t: job_tasks.pop(t, None))
             except Exception as exc:
-                log(f"jobs: runner tick failed: {_short_error(exc)}")
+                if _JOB_STORE is not None and _JOB_STORE.lost():
+                    close_job_register()
+                    log(f"jobs: lost the store connection, reopening it on the "
+                        f"next tick: {_short_error(exc)}")
+                else:
+                    log(f"jobs: runner tick failed: {_short_error(exc)}")
             await asyncio.sleep(JOB_POLL_INTERVAL)
 
     async def echo_voice_message(message, chat_id, key, is_direct, group_policy=None,
@@ -9795,6 +9804,12 @@ async def main():
                              expected_account_id=EXPECTED_ACCOUNT_ID)
                 log(str(e))
                 raise
+            except ConnectionError as e:
+                write_health("unhealthy", last_error=_short_error(e))
+                log(f"session lost its connection to Telegram "
+                    f"({_short_error(e, 120)}); reconnecting in {backoff}s")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
             except Exception as e:
                 write_health("unhealthy", last_error=_short_error(e))
                 log(f"session crashed ({_short_error(e, 120)}) — "

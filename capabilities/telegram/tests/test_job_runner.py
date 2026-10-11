@@ -460,6 +460,54 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(started, ["first", "second", "third"])
             await self.stop_session(client, task)
 
+    async def test_a_store_connection_ended_under_the_runner_is_reopened(self):
+        """The store or the network ends the register's connection while the
+        Telegram session stays up. The next tick opens a new one and the queue
+        drains, rather than the runner retrying a dead connection until the
+        session happens to end."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.addCleanup(daemon.close_job_register)
+            seen = []
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                seen.append((state or {}).get("registered_job", {}).get("description"))
+                return successful_result("done")
+
+            daemon.WORKERS["stub"] = worker
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            dead = daemon._JOB_STORE
+            store, cli = self.as_cli(daemon)
+            try:
+                store._execute("select pg_terminate_backend(?)",
+                               (dead.conn.info.backend_pid,))
+                await wait_until(lambda: any(
+                    "jobs: lost the store connection" in line
+                    for line in daemon._test_logs), timeout=6)
+                self.assertTrue(dead.lost())
+                self.assertIsNot(daemon.job_register(), None)
+                self.assertIsNot(daemon._JOB_STORE, dead,
+                                 "a lost connection is replaced, not reused")
+                queued(cli, channel_key="123", requested_by="777",
+                       description="after the drop", engine="stub")
+            finally:
+                store.close()
+            await wait_until(lambda: seen, timeout=6)
+            self.assertEqual(seen, ["after the drop"])
+            self.assertFalse(any("runner tick failed" in line
+                                 for line in daemon._test_logs))
+            await self.stop_session(client, task)
+
+    def test_a_lost_telegram_connection_is_not_called_protocol_drift(self):
+        source = DAEMON_SOURCE.read_text()
+        handler = source.index("            except ConnectionError as e:")
+        self.assertLess(handler, source.index("likely Telegram TL-layer drift"),
+                        "a dropped connection is caught before the drift catch-all")
+        self.assertIn("lost its connection to Telegram",
+                      source[handler:handler + 400])
+
     async def test_a_job_runs_on_the_engine_its_row_records(self):
         """A job registered under one engine is continued under that engine.
         Resumption is engine-specific, so following the channel's current

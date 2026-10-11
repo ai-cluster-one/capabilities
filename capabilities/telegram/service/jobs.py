@@ -348,6 +348,12 @@ class JobStore:
     def close(self) -> None:
         self.conn.close()
 
+    def lost(self) -> bool:
+        """Whether the connection is gone, so the next statement cannot succeed
+        on it whatever it is: the store or the network ended it, or it was
+        closed."""
+        return bool(self.conn.closed or self.conn.broken)
+
 
 def open_register(envelope: Path, environment: str, surface: str = "telegram",
                   project_id: str | None = None, setting=None,

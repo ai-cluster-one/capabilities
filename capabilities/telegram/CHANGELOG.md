@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-11 — The service reopens the job register's store connection after losing it
+
+When the store or the network ends the job register's database connection while the Telegram session stays up, the service's next job tick opens a new connection and the queue keeps draining, rather than retrying the dead connection every tick until the Telegram session ends or the service restarts. The log says `jobs: lost the store connection, reopening it on the next tick` for it, and a session that loses its connection to Telegram is logged as `session lost its connection to Telegram` rather than as likely protocol drift.
+
 ## 2026-10-09 — The job register follows the project's database, and the service reads its settings from files
 
 Breaking. `telegram` now uses `capabilities-contract` 0.4.0 and keeps its job register in the database the project resolves: the `AGENTKIT_DB_*` keys in the project's `.env.local` and `.env`, then the process environment, then the machine's store setting; `capabilities store show` shows which answers. `CAPABILITIES_STORE_URL` is no longer read, and the service's deploy descriptor no longer declares it: a deployed node takes `AGENTKIT_DB_*` from its server's environment. The daemon resolves the database for its own project once at launch and keeps it. `service doctor`'s `store` reports `level` and `sources` - which level of the cascade answered and the files or variables it came from - in place of `source`. The daemon reads its settings and documents straight from the project's `capabilities/telegram/` and then the config home's, with the same values as before, and `service/store.py` is no longer shipped.
