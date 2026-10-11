@@ -10,6 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from callva.harness_runner import Profile
+from callva.harness_runner import claude as claude_harness
+from callva.harness_runner import codex as codex_harness
 
 from _cli import load_engine
 
@@ -77,13 +80,15 @@ def test_prompt_marks_what_woke_the_agent():
     events = [message("$1", "@b:example.org", "first"),
               message("$2", "@b:example.org", "second", **{"m.relates_to": {
                   "rel_type": "m.thread", "event_id": "$1"}})]
-    prompt = engine.build_prompt(TEMPLATE, agent=agent, room_id="!r", room_name="lab",
+    rules = engine.room_rules(TEMPLATE, agent=agent, room_id="!r", room_name="lab")
+    assert rules == f"You are {ME} in lab; stay quiet with [silent]; use --connection alpha."
+    prompt = engine.build_prompt(room_id="!r", room_name="lab",
                                  wakes=[{"kind": "mention", "event_id": "$2"}], events=events,
                                  primed=True)
-    assert f"You are {ME} in lab" in prompt and "[silent]" in prompt and "--connection alpha" in prompt
+    assert prompt.startswith("=== This turn ===\n") and "You are" not in prompt
     assert "=== Room history ===" in prompt
     assert "in thread $1, WOKE YOU" in prompt
-    resumed = engine.build_prompt(TEMPLATE, agent=agent, room_id="!r", room_name=None,
+    resumed = engine.build_prompt(room_id="!r", room_name=None,
                                   wakes=[{"kind": "invite", "event_id": None,
                                           "sender": "@b:example.org"}], events=[], primed=False)
     assert "invited to this room by @b:example.org" in resumed
@@ -195,7 +200,7 @@ class FakeRunner:
         self.hold = hold
 
     def run(self, prompt, profile, cwd, *, session, environ, extra_env, cancel):
-        self.calls.append({"prompt": prompt, "session": session, "cwd": cwd,
+        self.calls.append({"prompt": prompt, "profile": profile, "session": session, "cwd": cwd,
                            "extra_env": extra_env})
         if self.hold is not None:
             self.hold.wait(5)
@@ -207,8 +212,9 @@ class FakeRunner:
 
 
 class FakeHost:
-    def __init__(self, matrix, runner, refusal=None):
+    def __init__(self, matrix, runner, refusal=None, template=TEMPLATE):
         self._matrix, self._runner, self.refusal = matrix, runner, refusal
+        self._template = template
 
     def node(self):
         return "node-1"
@@ -226,14 +232,19 @@ class FakeHost:
         return self._runner
 
     def template(self, entry):
-        return TEMPLATE
+        return self._template
 
     def turn_env(self, entry):
         return {}
 
 
-def make_engine(tmp_path, matrix, runner, refusal=None, max_turns=2):
-    host = FakeHost(matrix, runner, refusal)
+CLAUDE_PROFILE = Profile(harness="claude", model="opus", permission_mode="bypassPermissions")
+RULES = f"You are {ME} in lab; stay quiet with [silent]; use --connection alpha."
+
+
+def make_engine(tmp_path, matrix, runner, refusal=None, max_turns=2, profile=CLAUDE_PROFILE,
+                harness="claude", host=None):
+    host = host or FakeHost(matrix, runner, refusal)
     eng = engine.Engine(host, mode="project", state_dir=tmp_path, echo=False)
     eng.settings = {"max_turns": max_turns}
     slot = engine.Slot(eng, "prj", {"root": str(tmp_path), "slug": "project"})
@@ -241,8 +252,8 @@ def make_engine(tmp_path, matrix, runner, refusal=None, max_turns=2):
     slot.state = "served"
     slot.plan = {"agents": {"alpha": {
         "connection": "alpha", "homeserver": "https://matrix.example.org", "user_id": ME,
-        "token": "t", "profile": object(), "profile_name": "agentrooms-claude",
-        "harness": "claude", "turn_timeout": 30, "history": 30}}}
+        "token": "t", "profile": profile, "profile_name": f"agentrooms-{harness}",
+        "harness": harness, "turn_timeout": 30, "history": 30}}}
     slot.agents["alpha"] = SimpleNamespace(lease=True, row=lambda: {})
     eng.slots["prj"] = slot
     return eng, slot
@@ -273,6 +284,67 @@ def test_first_turn_is_primed_and_the_next_resumes(tmp_path):
     assert second["session"].kind == "resume" and second["session"].id == "sess1"
     assert "=== New in the room since your last turn ===" in second["prompt"]
     assert "again" in second["prompt"] and "hello" not in second["prompt"]
+
+
+def test_the_room_rules_ride_in_the_system_prompt_of_every_turn(tmp_path):
+    events = [message("$1", "@b:example.org", "hello"),
+              message("$2", "@b:example.org", f"{ME} question")]
+    matrix = FakeMatrix(events)
+    runner = FakeRunner(["first answer", "second answer"])
+    eng, slot = make_engine(tmp_path, matrix, runner)
+    slot.store.add("!r", "$2")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    first = runner.calls[0]
+    assert first["session"].kind == "fresh"
+    assert first["profile"].append_system_prompt == RULES
+    assert first["profile"] == engine.dataclasses.replace(CLAUDE_PROFILE, append_system_prompt=RULES)
+    assert first["prompt"].startswith("=== This turn ===\n")
+    assert "You are" not in first["prompt"] and "stay quiet" not in first["prompt"]
+    assert "=== Room history ===" in first["prompt"] and "hello" in first["prompt"]
+    # A resumed turn carries the same rules in its system prompt, and its message
+    # only the turn block and what is new.
+    events.append({**message("$3", "@b:example.org", f"{ME} again"),
+                   "origin_server_ts": 1_800_000_000_000})
+    slot.store.add("!r", "$3")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    second = runner.calls[1]
+    assert second["session"].kind == "resume"
+    assert second["profile"].append_system_prompt == RULES
+    assert second["prompt"] == engine.build_prompt(
+        room_id="!r", room_name="lab", wakes=[{"kind": "mention", "event_id": "$3"}],
+        events=[events[2]], primed=False)
+    assert second["prompt"].startswith("=== This turn ===\n")
+    assert "You are" not in second["prompt"] and "hello" not in second["prompt"]
+    assert "=== New in the room since your last turn ===" in second["prompt"]
+
+
+def test_a_profiles_own_system_prompt_append_comes_first(tmp_path):
+    claude = Profile(harness="claude", permission_mode="bypassPermissions",
+                     append_system_prompt="Claude profile text.")
+    codex = Profile(harness="codex", approval_policy="never",
+                    codex_config={"sandbox_mode": "danger-full-access"},
+                    append_system_prompt="Codex profile text.")
+    for profile, own in ((claude, "Claude profile text."), (codex, "Codex profile text.")):
+        matrix = FakeMatrix([message("$1", "@b:example.org", f"{ME} hi")])
+        runner = FakeRunner(["answer"])
+        eng, slot = make_engine(tmp_path, matrix, runner, profile=profile,
+                                harness=profile.harness)
+        slot.store.add("!r", "$1")
+        eng.turn(engine.Turn(slot, "alpha", "!r"))
+        sent = runner.calls[0]["profile"]
+        assert sent.append_system_prompt == f"{own}\n\n{RULES}"
+        assert sent == engine.dataclasses.replace(profile, append_system_prompt=f"{own}\n\n{RULES}")
+        assert "You are" not in runner.calls[0]["prompt"]
+    # What each harness is handed: claude's system-prompt append, codex's
+    # developer instructions.
+    sent_claude = engine.with_rules(claude, RULES)
+    options = claude_harness.options(sent_claude, cli_path="claude", cwd=str(tmp_path), env={},
+                                     session_id=None, resume_id=None, stderr=lambda line: None)
+    assert options.system_prompt == {"type": "preset", "preset": "claude_code",
+                                     "append": f"Claude profile text.\n\n{RULES}"}
+    sent_codex = engine.with_rules(codex, RULES)
+    assert codex_harness.thread_options(sent_codex, cwd=str(tmp_path))[
+        "developer_instructions"] == f"Codex profile text.\n\n{RULES}"
 
 
 def test_a_session_from_another_node_starts_fresh_primed(tmp_path):

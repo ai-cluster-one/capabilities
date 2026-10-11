@@ -143,10 +143,12 @@ SERVICE
   profiles/ shadows either). A session not recorded on this node starts fresh,
   primed from the room's recent messages. One turn per agent per room at a
   time: what arrives during a turn is carried into the next one. The turn runs
-  in the project's root as the project would run it; its prompt is the bundled
-  room prompt (capabilities/agentrooms/service/room.md in the project shadows
-  it) and the room's messages since the agent's last turn. Its final answer is
-  posted to the room as the agent, in the thread that woke it; an answer of
+  in the project's root as the project would run it. On every turn the
+  bundled room prompt (capabilities/agentrooms/service/room.md in the project
+  shadows it) is appended to the harness's system prompt, after any
+  append_system_prompt the profile carries; the turn's message holds only what
+  woke the agent and the room's messages since its last turn. Its final answer
+  is posted to the room as the agent, in the thread that woke it; an answer of
   exactly [silent] posts nothing. The agent may also act itself with
   `agentrooms --connection <id> ...`.
 

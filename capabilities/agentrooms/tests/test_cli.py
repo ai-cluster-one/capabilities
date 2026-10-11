@@ -346,3 +346,30 @@ def test_inventory_is_local_and_changes_nothing(cli, project, homeserver, capsys
     assert out["service"]["state"] == "stopped"
     assert sorted(p.as_posix() for p in project.rglob("*")) == before
     assert not homeserver.requests
+
+
+def test_the_room_prompt_a_project_shadows_is_the_system_prompt_append(cli, project, tmp_path):
+    from test_engine import FakeHost, FakeMatrix, FakeRunner, ME, engine, make_engine, message
+
+    def turn_rules(where):
+        host_template = cli._Host("project").template
+        matrix = FakeMatrix([message("$1", "@b:example.org", f"{ME} hi")])
+        runner = FakeRunner(["answer"])
+        host = FakeHost(matrix, runner, template=host_template({"root": str(project)}))
+        eng, slot = make_engine(tmp_path / where, matrix, runner, host=host)
+        slot.store.add("!r", "$1")
+        eng.turn(engine.Turn(slot, "alpha", "!r"))
+        return runner.calls[0]
+
+    (tmp_path / "bundled").mkdir()
+    bundled = turn_rules("bundled")
+    assert bundled["profile"].append_system_prompt.startswith("# You are an agent in a shared room")
+    assert f"You are {ME}," in bundled["profile"].append_system_prompt
+    assert "shared room" not in bundled["prompt"]
+    service = project / "capabilities" / "agentrooms" / "service"
+    service.mkdir(parents=True)
+    (service / "room.md").write_text("Project rules for $user_id in $room_name; quiet is $silent.\n")
+    (tmp_path / "shadowed").mkdir()
+    shadowed = turn_rules("shadowed")
+    assert shadowed["profile"].append_system_prompt == f"Project rules for {ME} in lab; quiet is [silent]."
+    assert "Project rules" not in shadowed["prompt"] and "shared room" not in shadowed["prompt"]

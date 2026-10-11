@@ -20,6 +20,7 @@ No message text is kept: a turn reads the room live.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime as _dt
 import hashlib
 import json
@@ -526,13 +527,28 @@ def message_line(event: dict, wake_ids: set[str]) -> str:
     return f"{parts[0]} ({', '.join(meta)}):\n{body}"
 
 
-def build_prompt(template: str, *, agent: dict, room_id: str, room_name: str | None,
-                 wakes: list[dict], events: list[dict], primed: bool) -> str:
-    kinds = sorted({w["kind"] for w in wakes})
-    head = Template(template).safe_substitute(
+def room_rules(template: str, *, agent: dict, room_id: str, room_name: str | None) -> str:
+    """The room prompt filled for this agent and room: the turn's standing rules,
+    handed to the harness as its system-prompt append rather than as a message."""
+    return Template(template).safe_substitute(
         user_id=agent["user_id"], connection=agent["connection"], room_id=room_id,
-        room_name=room_name or room_id, silent=SILENT)
-    lines = [head.rstrip(), "", "=== This turn ===",
+        room_name=room_name or room_id, silent=SILENT).strip()
+
+
+def with_rules(profile, rules: str):
+    """The agent's profile with the room rules appended to its system prompt. A
+    profile's own append_system_prompt comes first and is kept."""
+    own = (getattr(profile, "append_system_prompt", None) or "").strip()
+    return dataclasses.replace(profile, append_system_prompt="\n\n".join(
+        part for part in (own, rules) if part))
+
+
+def build_prompt(*, room_id: str, room_name: str | None, wakes: list[dict],
+                 events: list[dict], primed: bool) -> str:
+    """The turn's user prompt: what woke the agent and the room's messages. The
+    room's rules travel in the system prompt (`room_rules`), not here."""
+    kinds = sorted({w["kind"] for w in wakes})
+    lines = ["=== This turn ===",
              f"Room: {room_id}" + (f" ({room_name})" if room_name else ""),
              f"Woken by: {', '.join(kinds)}"]
     for wake in wakes:
@@ -1138,9 +1154,11 @@ class Engine:
             shown = events
             if resumable and row.get("seen_ts"):
                 shown = [e for e in events if (e.get("origin_server_ts") or 0) > row["seen_ts"]]
-            template = self.host.template(slot.entry)
-            prompt = build_prompt(template, agent=agent, room_id=room_id, room_name=room_name,
-                                  wakes=wakes, events=shown, primed=not resumable)
+            profile = with_rules(agent["profile"], room_rules(
+                self.host.template(slot.entry), agent=agent, room_id=room_id,
+                room_name=room_name))
+            prompt = build_prompt(room_id=room_id, room_name=room_name, wakes=wakes,
+                                  events=shown, primed=not resumable)
             runner = self.host.runner()
             session = (runner.Session.resume(row["session_id"]) if resumable
                        else runner.Session.fresh())
@@ -1148,13 +1166,14 @@ class Engine:
                    else f"fresh session primed with {len(shown)} message(s)")
             slot.log(f"{cid}: turn in {room_id} ({', '.join(sorted({w['kind'] for w in wakes}))})"
                      f" started on {agent['profile_name']} ({harness}), {how}, cwd {slot.entry['root']}")
-            result = self.call_runner(turn, agent, prompt, session, runner)
+            result = self.call_runner(turn, agent, profile, prompt, session, runner)
             if resumable and missing_session(result):
                 slot.log(f"{cid}: session {row['session_id']} is not on this node; "
                          "starting a fresh one primed from the room")
-                prompt = build_prompt(template, agent=agent, room_id=room_id, room_name=room_name,
-                                      wakes=wakes, events=events, primed=True)
-                result = self.call_runner(turn, agent, prompt, runner.Session.fresh(), runner)
+                prompt = build_prompt(room_id=room_id, room_name=room_name, wakes=wakes,
+                                      events=events, primed=True)
+                result = self.call_runner(turn, agent, profile, prompt, runner.Session.fresh(),
+                                          runner)
             session_id = getattr(result, "session_id", None)
             seen = max([e.get("origin_server_ts") or 0 for e in events] or [0]) or None
             if session_id and harness_ran(result):
@@ -1188,12 +1207,12 @@ class Engine:
             with contextlib.suppress(Exception):
                 matrix.close()
 
-    def call_runner(self, turn: Turn, agent: dict, prompt: str, session, runner):
+    def call_runner(self, turn: Turn, agent: dict, profile, prompt: str, session, runner):
         timer = threading.Timer(float(agent["turn_timeout"]), turn.cancel.set)
         timer.daemon = True
         timer.start()
         try:
-            return runner.run(prompt, agent["profile"], turn.slot.entry["root"], session=session,
+            return runner.run(prompt, profile, turn.slot.entry["root"], session=session,
                               environ=self.host.turn_env(turn.slot.entry),
                               extra_env={"CLAUDE_PROJECT_DIR": turn.slot.entry["root"]},
                               cancel=turn.cancel)
