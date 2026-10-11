@@ -13,8 +13,14 @@ machine's opt-in list, through the same code.
 Runtime state lives in the PostgreSQL the project resolves to, under the
 `agentrooms_` prefix and the `agentrooms` migration ledger: the sync position of
 each agent, the wakes not yet answered, the harness session of each agent in each
-room, the lease that keeps a second process off an agent, and a project's pause.
-No message text is kept: a turn reads the room live.
+room, the lease that keeps a second process off an agent, a project's pause, the
+project's workers as versions, and the record of the turns run, which the limits
+count. No message text is kept: a turn reads the room live.
+
+A worker admits and limits an agent's turns. Which worker answers an agent in a
+room is read from the agent's connection at every turn, and the worker and its
+profile from the store, so a saved worker or a new binding holds from the next
+turn on.
 """
 
 from __future__ import annotations
@@ -22,11 +28,15 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime as _dt
+import fnmatch
 import hashlib
 import json
 import os
+import re
+import shlex
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -37,7 +47,7 @@ from typing import Any, Callable
 
 LEDGER_OWNER = "agentrooms"
 LEDGER_MAJOR = 1
-LEDGER_MINOR = 0
+LEDGER_MINOR = 1
 LEDGER_STEPS = [
     ("0001-sync", """
     CREATE TABLE agentrooms_sync (
@@ -97,6 +107,52 @@ LEDGER_STEPS = [
         reason      text
     )
     """),
+    ("0006-workers", """
+    CREATE TABLE agentrooms_workers (
+        id          uuid        NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+        project_id  text        NOT NULL,
+        name        text        NOT NULL,
+        spec        jsonb       NOT NULL,
+        body        text        NOT NULL,
+        active      boolean     NOT NULL DEFAULT true,
+        created_at  timestamptz NOT NULL DEFAULT clock_timestamp(),
+        created_by  text
+    );
+    CREATE UNIQUE INDEX agentrooms_workers_one_active_idx
+        ON agentrooms_workers (project_id, name) WHERE active;
+    CREATE INDEX agentrooms_workers_name_idx
+        ON agentrooms_workers (project_id, name, created_at);
+    CREATE FUNCTION agentrooms_workers_keep_history() RETURNS trigger AS $$
+    BEGIN
+      IF tg_op = 'UPDATE' AND (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') THEN
+        RETURN new;
+      END IF;
+      RAISE EXCEPTION 'a worker version is never edited or deleted: % on agentrooms_workers is refused, and only active may move; save a new version instead', lower(tg_op)
+        USING errcode = 'restrict_violation', constraint = 'agentrooms_workers_history';
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE TRIGGER agentrooms_workers_keep_history_row BEFORE UPDATE OR DELETE
+        ON agentrooms_workers FOR EACH ROW EXECUTE FUNCTION agentrooms_workers_keep_history();
+    CREATE TRIGGER agentrooms_workers_keep_history_truncate BEFORE TRUNCATE
+        ON agentrooms_workers FOR EACH STATEMENT EXECUTE FUNCTION agentrooms_workers_keep_history();
+    """),
+    ("0007-turns", """
+    CREATE TABLE agentrooms_turns (
+        id          text        PRIMARY KEY,
+        project_id  text        NOT NULL,
+        agent       text        NOT NULL,
+        room_id     text        NOT NULL,
+        worker      text        NOT NULL,
+        worker_id   uuid,
+        senders     text[]      NOT NULL DEFAULT '{}',
+        kinds       text[]      NOT NULL DEFAULT '{}',
+        started_at  timestamptz NOT NULL DEFAULT now(),
+        outcome     text
+    );
+    CREATE INDEX agentrooms_turns_agent_idx ON agentrooms_turns (project_id, agent, started_at);
+    CREATE INDEX agentrooms_turns_room_idx
+        ON agentrooms_turns (project_id, agent, room_id, started_at);
+    """),
 ]
 
 # How long a lease outlives its last renewal, and how often it is renewed. A
@@ -124,6 +180,10 @@ INVITE_GAP_EVENTS = 50
 MARK_TYPE = "agentrooms.marked"
 # Where custom data rides in a message's content.
 DATA_KEY = "agentrooms.data"
+# Set in the environment of every turn the service starts, so what the agent
+# runs knows it runs under a worker, and a worker's fence cannot be rewritten
+# from inside the turn it fences.
+TURN_ENV = "AGENTROOMS_TURN"
 
 LOG_FILE = "daemon.log"
 PID_FILE = "daemon.pid"
@@ -140,6 +200,272 @@ SYNC_FILTER = {
         "account_data": {"types": [MARK_TYPE]},
     },
 }
+
+# ── workers ──────────────────────────────────────────────────────────────────
+#
+# A worker is a Markdown document: YAML front matter is its settings, the body
+# its role. The shape is this capability's contract (`agentrooms help` WORKERS)
+# and the content is the project's; a key the contract does not name is refused.
+
+WORKER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+DEFAULT_WORKER = "default"
+DEFAULT_WORKER_PATH = Path(__file__).resolve().parent / "workers" / "default.md"
+WAKE_KINDS = ("mention", "direct", "invite", "marked")
+# The kinds the default worker can answer: a signal addressed to the agent. A
+# message in a room the agent marked is addressed to nobody.
+ADDRESSED_KINDS = ("mention", "direct", "invite")
+WORKER_KEYS = ("enabled", "description", "profile", "history", "accepts_from",
+               "invites_from", "wakes_on", "limits", "hooks")
+DEFAULT_KEYS = ("description", "limits")
+DEFAULT_PROFILE = "agentrooms-claude"
+DEFAULT_HISTORY = 30
+# Each limit: its default, its least and its greatest value.
+LIMITS = {
+    "debounce_seconds": (0, 0, 3600),
+    "turn_timeout": (900, 30, 86400),
+    "window_seconds": (3600, 60, 7 * 86400),
+    "turns_per_agent": (120, 1, 100000),
+    "turns_per_sender": (30, 1, 100000),
+    "turns_per_room": (30, 1, 100000),
+    "quiet_seconds": (900, 1, 7 * 86400),
+}
+DEFAULT_LIMITS = {"window_seconds": (86400, 60, 30 * 86400)}
+# A worker's hooks, the seconds each may take, and what each answers by its exit
+# - the tasks hook contract: 0 go; 75 hold, until the moment on its last stdout
+# line; 76 escalate, its last line the reason. Any other ending is a hold with
+# no moment, which lasts HOLD_SECONDS.
+HOOK_KEYS = ("before", "after")
+HOOK_TIMEOUTS = {"before": 30, "after": 60}
+HOOK_HOLD = 75
+HOOK_ESCALATE = 76
+HOLD_SECONDS = 60
+# What the default worker's answer carries in `agentrooms.data`, and what the
+# service never wakes on, so two agents' default workers never answer each other.
+DEFAULT_MARK = {"agentrooms.worker": DEFAULT_WORKER}
+
+
+class WorkerInvalid(Exception):
+    """A worker document the contract refuses; the message names every problem."""
+
+
+def split_document(text: str, where: str) -> tuple[dict, str]:
+    """A worker document's front matter and body. Raises WorkerInvalid."""
+    import yaml
+    if not text.startswith("---"):
+        raise WorkerInvalid(f"{where}: a worker opens with YAML front matter between `---` lines")
+    parts = text.split("\n")
+    end = next((i for i, line in enumerate(parts[1:], 1) if line.strip() == "---"), None)
+    if parts[0].strip() != "---" or end is None:
+        raise WorkerInvalid(f"{where}: its front matter is not closed by a `---` line")
+    try:
+        spec = yaml.safe_load("\n".join(parts[1:end])) or {}
+    except yaml.YAMLError as exc:
+        raise WorkerInvalid(f"{where}: its front matter is not YAML: {exc}") from None
+    if not isinstance(spec, dict):
+        raise WorkerInvalid(f"{where}: its front matter is a mapping of settings")
+    return json.loads(json.dumps(spec, default=str)), "\n".join(parts[end + 1:]).strip()
+
+
+def worker_text(spec: dict, body: str) -> str:
+    """A stored version as the document it was saved from."""
+    import yaml
+    head = yaml.safe_dump(spec, sort_keys=False, allow_unicode=True).strip() if spec else ""
+    return f"---\n{head}\n---\n" + (f"\n{body.strip()}\n" if body.strip() else "")
+
+
+def _patterns(value, key: str, wrong: Callable[[str], None]) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+        wrong(f"`{key}` is a list of Matrix user ids or patterns, such as `@*:example.org` or `*`")
+        return []
+    return [v.strip() for v in value]
+
+
+def _limits(raw, table: dict, wrong: Callable[[str], None]) -> dict:
+    out = {key: spec[0] for key, spec in table.items()}
+    if raw is None:
+        return out
+    if not isinstance(raw, dict):
+        wrong("`limits` is a mapping")
+        return out
+    for key in sorted(set(map(str, raw)) - set(table)):
+        wrong(f"`limits` names {key!r}, which nothing reads: the limits are {', '.join(table)}")
+    for key, (_default, low, high) in table.items():
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            wrong(f"`limits.{key}` is whole seconds or a whole number, {low}-{high}")
+            continue
+        out[key] = value
+    return out
+
+
+def read_worker(name: str, spec: dict, body: str, where: str) -> dict:
+    """A worker's settings, whole and checked, with every default filled in.
+    Raises WorkerInvalid naming every problem at once."""
+    problems: list[str] = []
+    wrong = problems.append
+    if not isinstance(spec, dict):
+        raise WorkerInvalid(f"{where}: its front matter is a mapping of settings")
+    for key in sorted(set(map(str, spec)) - set(WORKER_KEYS)):
+        wrong(f"it names {key!r}, which nothing reads: the keys are {', '.join(WORKER_KEYS)}")
+    enabled = spec.get("enabled", True)
+    if not isinstance(enabled, bool):
+        wrong("`enabled` is true or false")
+    description = spec.get("description")
+    if description is not None and not isinstance(description, str):
+        wrong("`description` is one sentence")
+    profile = spec.get("profile", DEFAULT_PROFILE)
+    if not isinstance(profile, str) or not profile.strip():
+        wrong("`profile` names a harness profile")
+    history = spec.get("history", DEFAULT_HISTORY)
+    if isinstance(history, bool) or not isinstance(history, int) or not 1 <= history <= 100:
+        wrong("`history` is a whole number of messages, 1-100")
+    accepts = _patterns(spec.get("accepts_from", []), "accepts_from", wrong)
+    invites = (_patterns(spec["invites_from"], "invites_from", wrong)
+               if "invites_from" in spec else list(accepts))
+    wakes_on = spec.get("wakes_on", list(WAKE_KINDS))
+    if (not isinstance(wakes_on, list) or not wakes_on
+            or not all(isinstance(k, str) and k in WAKE_KINDS for k in wakes_on)):
+        wrong(f"`wakes_on` lists one or more of {', '.join(WAKE_KINDS)}")
+        wakes_on = []
+    limits = _limits(spec.get("limits"), LIMITS, wrong)
+    hooks: dict = {}
+    raw_hooks = spec.get("hooks")
+    if raw_hooks is not None:
+        if not isinstance(raw_hooks, dict):
+            wrong("`hooks` is a mapping of before and after, each one command line")
+        else:
+            for key in sorted(set(map(str, raw_hooks)) - set(HOOK_KEYS)):
+                wrong(f"`hooks` names {key!r}, which nothing reads: the hooks are "
+                      f"{', '.join(HOOK_KEYS)}")
+            for which in HOOK_KEYS:
+                command = raw_hooks.get(which)
+                if command is None:
+                    continue
+                try:
+                    argv = shlex.split(command) if isinstance(command, str) else []
+                except ValueError as exc:
+                    wrong(f"`hooks.{which}` does not split into a command: {exc}")
+                    continue
+                if not argv:
+                    wrong(f"`hooks.{which}` is one command line, run without a shell from "
+                          "the project root")
+                    continue
+                hooks[which] = command.strip()
+    if enabled is True and not accepts and not problems:
+        wrong("it is enabled and admits nobody: `accepts_from` names who may wake the agent")
+    if problems:
+        raise WorkerInvalid(f"{where}: " + "; ".join(problems))
+    return {"name": name, "enabled": enabled, "description": (description or "").strip(),
+            "profile": profile.strip(), "history": history, "accepts_from": accepts,
+            "invites_from": invites, "wakes_on": wakes_on, "limits": limits, "hooks": hooks,
+            "body": (body or "").strip()}
+
+
+def read_default(spec: dict, body: str, where: str) -> dict:
+    """The shipped default worker: its window and its answer. It runs no turn, so
+    it carries no profile, no role and no hooks."""
+    problems: list[str] = []
+    wrong = problems.append
+    for key in sorted(set(map(str, spec)) - set(DEFAULT_KEYS)):
+        wrong(f"it names {key!r}, which the default worker does not read")
+    limits = _limits(spec.get("limits"), DEFAULT_LIMITS, wrong)
+    if not (body or "").strip():
+        wrong("its body is the answer it posts, and it is empty")
+    if problems:
+        raise WorkerInvalid(f"{where}: " + "; ".join(problems))
+    return {"name": DEFAULT_WORKER, "description": str(spec.get("description") or "").strip(),
+            "limits": limits, "body": body.strip(), "wakes_on": list(ADDRESSED_KINDS)}
+
+
+def load_default() -> dict:
+    spec, body = split_document(DEFAULT_WORKER_PATH.read_text(), str(DEFAULT_WORKER_PATH))
+    return read_default(spec, body, str(DEFAULT_WORKER_PATH))
+
+
+def admits(patterns: list[str], sender: str | None) -> bool:
+    return bool(sender) and any(fnmatch.fnmatchcase(sender, p) for p in patterns)
+
+
+def is_default_answer(content: dict) -> bool:
+    data = content.get(DATA_KEY)
+    return isinstance(data, dict) and all(data.get(k) == v for k, v in DEFAULT_MARK.items())
+
+
+def default_answer(template: str, *, user_id: str, sender: str | None,
+                   supervisor: str | None) -> str:
+    return Template(template).safe_substitute(
+        user_id=user_id, sender=sender or "someone",
+        supervisor=f"its supervisor, {supervisor}," if supervisor
+        else "the person who runs it").strip()
+
+
+# ── hooks ────────────────────────────────────────────────────────────────────
+
+
+def _last_line(text: str | None) -> str | None:
+    lines = [one.strip() for one in (text or "").splitlines() if one.strip()]
+    return lines[-1][:500] if lines else None
+
+
+def run_hook(command: str, *, cwd: str, env: dict, payload: dict, seconds: int) -> dict:
+    """Run one hook command line without a shell, from `cwd`, with `payload` as
+    JSON on stdin: its exit, or why it has none, and the last line it printed. A
+    hook that outlives its seconds is ended with everything it started."""
+    try:
+        child = subprocess.Popen(shlex.split(command), cwd=cwd, env=env, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                 start_new_session=True)
+    except (OSError, ValueError) as exc:
+        return {"exit": None, "why": f"could not start: {exc}", "said": None}
+    try:
+        out, _err = child.communicate(json.dumps(payload, ensure_ascii=False) + "\n",
+                                      timeout=seconds)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            os.killpg(child.pid, signal.SIGKILL)
+        try:
+            out, _err = child.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            out = None
+        return {"exit": None, "why": f"timed out after {seconds}s", "said": _last_line(out)}
+    code = child.returncode
+    return {"exit": code, "why": None if code == 0 else f"exited {code}", "said": _last_line(out)}
+
+
+def hook_moment(text: str | None) -> _dt.datetime | None:
+    """The moment a holding hook named on its last line: ISO 8601 with its
+    offset, or a bare date, read as midnight UTC."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        if len(text) == 10:
+            day = _dt.date.fromisoformat(text)
+            return _dt.datetime(day.year, day.month, day.day, tzinfo=_dt.timezone.utc)
+        stamp = _dt.datetime.fromisoformat(text.replace(" ", "T", 1))
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else None
+
+
+def verdict(ran: dict) -> dict:
+    """What a hook's ending says: `go`; `hold`, with `until` when its last line
+    names a moment; or `escalate`, its last line the reason."""
+    said = ran["said"]
+    if ran["exit"] == 0:
+        return {"verdict": "go", "said": said}
+    if ran["exit"] == HOOK_ESCALATE:
+        return {"verdict": "escalate", "said": said,
+                "why": said or f"its hook exited {HOOK_ESCALATE} and said nothing"}
+    if ran["exit"] == HOOK_HOLD:
+        moment = hook_moment(said)
+        if moment:
+            return {"verdict": "hold", "until": moment, "said": said}
+        return {"verdict": "hold", "said": said,
+                "why": f"exited {HOOK_HOLD} without a moment on its last line"}
+    return {"verdict": "hold", "said": said, "why": ran["why"]}
 
 
 class StoreUnavailable(Exception):
@@ -334,10 +660,18 @@ class Store:
         self.execute("DELETE FROM agentrooms_wakes WHERE project_id = %s AND agent = %s "
                      "AND room_id = %s AND claimed_by = %s", (project, agent, room_id, turn))
 
-    def restore(self, project: str, agent: str, room_id: str, turn: str) -> None:
+    def restore(self, project: str, agent: str, room_id: str, turn: str,
+                keys: list[str] | None = None) -> None:
+        """Hand claimed wakes back for a later turn: all the turn claimed, or the
+        ones `keys` names."""
+        if keys is None:
+            self.execute("UPDATE agentrooms_wakes SET claimed_by = NULL WHERE project_id = %s "
+                         "AND agent = %s AND room_id = %s AND claimed_by = %s",
+                         (project, agent, room_id, turn))
+            return
         self.execute("UPDATE agentrooms_wakes SET claimed_by = NULL WHERE project_id = %s "
-                     "AND agent = %s AND room_id = %s AND claimed_by = %s",
-                     (project, agent, room_id, turn))
+                     "AND agent = %s AND room_id = %s AND claimed_by = %s "
+                     "AND wake_key = ANY(%s)", (project, agent, room_id, turn, list(keys)))
 
     # -- sessions -------------------------------------------------------------
 
@@ -386,6 +720,155 @@ class Store:
 
     def resume(self, project: str) -> bool:
         return bool(self.execute("DELETE FROM agentrooms_pauses WHERE project_id = %s", (project,)))
+
+    # -- workers --------------------------------------------------------------
+    #
+    # One row is one version of a worker. A save never edits a row: it inserts
+    # a new version and clears `active` on the version the writer read, in one
+    # transaction, so two writers never both replace the same version.
+
+    WORKER_COLUMNS = "id, name, spec, body, active, created_at, created_by"
+
+    @staticmethod
+    def _worker_row(row) -> dict:
+        spec = row[2] if isinstance(row[2], dict) else json.loads(row[2])
+        return {"id": str(row[0]), "name": row[1], "spec": spec, "body": row[3] or "",
+                "active": row[4], "created_at": row[5].isoformat() if row[5] else None,
+                "created_by": row[6]}
+
+    def worker(self, project: str, name: str, version: str | None = None) -> dict | None:
+        """The worker's active version, or the version named."""
+        if version is None:
+            row = self.execute(f"SELECT {self.WORKER_COLUMNS} FROM agentrooms_workers "
+                               "WHERE project_id = %s AND name = %s AND active",
+                               (project, name), fetch="one")
+        else:
+            row = self.execute(f"SELECT {self.WORKER_COLUMNS} FROM agentrooms_workers "
+                               "WHERE project_id = %s AND name = %s AND id::text = %s",
+                               (project, name, version), fetch="one")
+        return self._worker_row(row) if row else None
+
+    def workers(self, project: str) -> list[dict]:
+        rows = self.execute(f"SELECT {self.WORKER_COLUMNS} FROM agentrooms_workers "
+                            "WHERE project_id = %s AND active ORDER BY name", (project,),
+                            fetch="all")
+        return [self._worker_row(r) for r in rows]
+
+    def worker_history(self, project: str, name: str) -> list[dict]:
+        rows = self.execute(f"SELECT {self.WORKER_COLUMNS} FROM agentrooms_workers "
+                            "WHERE project_id = %s AND name = %s ORDER BY created_at, id",
+                            (project, name), fetch="all")
+        return [self._worker_row(r) for r in rows]
+
+    def save_worker(self, project: str, name: str, spec: dict, body: str, *,
+                    base: str | None, by: str) -> tuple[dict, bool]:
+        """Save a version and say whether one was created: a save identical to
+        the active version creates none. `base` is the version the writer read;
+        a save over any other is refused with WorkerConflict."""
+        with self.transaction() as cur:
+            cur.execute(f"SELECT {self.WORKER_COLUMNS} FROM agentrooms_workers "
+                        "WHERE project_id = %s AND name = %s AND active FOR UPDATE",
+                        (project, name))
+            found = cur.fetchone()
+            active = self._worker_row(found) if found else None
+            if base is not None and (active is None or active["id"] != base):
+                raise WorkerConflict(
+                    f"worker {name!r} is no longer at version {base}: "
+                    + (f"{active['id']} is active" if active else "it has no active version"))
+            if active and active["spec"] == spec and active["body"] == body:
+                return active, False
+            if active:
+                cur.execute("UPDATE agentrooms_workers SET active = false WHERE id = %s AND active",
+                            (active["id"],))
+                if cur.rowcount != 1:
+                    raise WorkerConflict(f"worker {name!r} was saved by someone else first")
+            cur.execute(f"INSERT INTO agentrooms_workers (project_id, name, spec, body, active, "
+                        f"created_by) VALUES (%s, %s, %s::jsonb, %s, true, %s) "
+                        f"RETURNING {self.WORKER_COLUMNS}",
+                        (project, name, json.dumps(spec), body, by))
+            return self._worker_row(cur.fetchone()), True
+
+    def remove_worker(self, project: str, name: str, *, base: str | None) -> str | None:
+        """Clear the active version, leaving every version as history. None when
+        the worker has no active version."""
+        with self.transaction() as cur:
+            cur.execute("SELECT id FROM agentrooms_workers WHERE project_id = %s AND name = %s "
+                        "AND active FOR UPDATE", (project, name))
+            found = cur.fetchone()
+            if found is None:
+                return None
+            if base is not None and str(found[0]) != base:
+                raise WorkerConflict(f"worker {name!r} is no longer at version {base}")
+            cur.execute("UPDATE agentrooms_workers SET active = false WHERE id = %s", (found[0],))
+            return str(found[0])
+
+    # -- turns ----------------------------------------------------------------
+
+    def start_turn(self, turn: str, project: str, agent: str, room_id: str, worker: str,
+                   worker_id: str | None, senders: list[str], kinds: list[str]) -> None:
+        self.execute("INSERT INTO agentrooms_turns (id, project_id, agent, room_id, worker, "
+                     "worker_id, senders, kinds) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                     "ON CONFLICT (id) DO NOTHING",
+                     (turn, project, agent, room_id, worker, worker_id, senders, kinds))
+
+    def end_turn(self, turn: str, outcome: str) -> None:
+        self.execute("UPDATE agentrooms_turns SET outcome = %s WHERE id = %s", (outcome, turn))
+
+    def turn_counts(self, project: str, agent: str, room_id: str, senders: list[str], *,
+                    window: int, quiet: int, room_cap: int) -> dict:
+        """What the limits count, over the turns a worker ran (never the default
+        worker's answers): the agent's turns and each sender's in the window, and
+        the room's since it was last quiet for `quiet` seconds - at most
+        `room_cap`, since that is all the room limit asks."""
+        agent_n = self.execute(
+            "SELECT count(*) FROM agentrooms_turns WHERE project_id = %s AND agent = %s "
+            "AND worker <> %s AND started_at > now() - make_interval(secs => %s)",
+            (project, agent, DEFAULT_WORKER, window), fetch="one")[0]
+        per_sender = {}
+        for sender in senders:
+            per_sender[sender] = self.execute(
+                "SELECT count(*) FROM agentrooms_turns WHERE project_id = %s AND agent = %s "
+                "AND worker <> %s AND %s = ANY(senders) "
+                "AND started_at > now() - make_interval(secs => %s)",
+                (project, agent, DEFAULT_WORKER, sender, window), fetch="one")[0]
+        rows = self.execute(
+            "SELECT extract(epoch FROM now() - started_at) FROM agentrooms_turns "
+            "WHERE project_id = %s AND agent = %s AND room_id = %s AND worker <> %s "
+            "ORDER BY started_at DESC LIMIT %s",
+            (project, agent, room_id, DEFAULT_WORKER, room_cap), fetch="all")
+        room_n, since = 0, 0.0
+        for (age,) in rows:
+            if float(age) - since >= quiet:
+                break
+            room_n, since = room_n + 1, float(age)
+        return {"agent": int(agent_n), "room": room_n,
+                "senders": {s: int(n) for s, n in per_sender.items()}}
+
+    def default_answered(self, project: str, agent: str, room_id: str, sender: str,
+                         window: int) -> bool:
+        return self.execute(
+            "SELECT 1 FROM agentrooms_turns WHERE project_id = %s AND agent = %s "
+            "AND room_id = %s AND worker = %s AND %s = ANY(senders) "
+            "AND started_at > now() - make_interval(secs => %s) LIMIT 1",
+            (project, agent, room_id, DEFAULT_WORKER, sender, window), fetch="one") is not None
+
+    def stored_profiles(self, library, project: str) -> list:
+        """Every active harness profile a lookup from the project reaches, read
+        from the table the harness library owns. A store whose tables hold no
+        profiles yet holds none."""
+        with self.lock:
+            self._reopen_if_lost()
+            try:
+                return library.stored_profiles(self.conn, project=project,
+                                               schema=self.setting.schema)
+            except Exception as exc:
+                if type(exc).__name__ == "UndefinedTable":
+                    return []
+                raise
+
+
+class WorkerConflict(Exception):
+    """Another save came first: the version the writer read is no longer active."""
 
 
 # ── reading a sync ───────────────────────────────────────────────────────────
@@ -505,7 +988,8 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
     passed over. `rooms` is updated in place. An initial sync wakes only for the
     invites waiting; history before the agent was first served wakes nothing. A
     sync that brings the agent's join also wakes on what arrived between its
-    invite and its join, read back through `before_join(room_id, prev_batch)`."""
+    invite and its join, read back through `before_join(room_id, prev_batch)`.
+    A default worker's answer, by its mark in `agentrooms.data`, wakes nothing."""
     wakes: list[dict] = []
     notes: list[str] = []
     groups = response.get("rooms") or {}
@@ -544,6 +1028,8 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
                 notes.append(f"{room_id}: a message in an encrypted room is passed over")
                 continue
             content = event.get("content") or {}
+            if is_default_answer(content):
+                continue
             kind = None
             if mentions(content, user_id):
                 kind = "mention"
@@ -606,12 +1092,16 @@ def message_line(event: dict, wake_ids: set[str]) -> str:
     return f"{parts[0]} ({', '.join(meta)}):\n{body}"
 
 
-def room_rules(template: str, *, agent: dict, room_id: str, room_name: str | None) -> str:
-    """The room prompt filled for this agent and room: the turn's standing rules,
-    handed to the harness as its system-prompt append rather than as a message."""
-    return Template(template).safe_substitute(
+def room_rules(template: str, *, agent: dict, room_id: str, room_name: str | None,
+               role: str = "") -> str:
+    """The room frame filled for this agent and room, with the worker's role
+    after it: the turn's standing rules, handed to the harness as its
+    system-prompt append rather than as a message."""
+    frame = Template(template).safe_substitute(
         user_id=agent["user_id"], connection=agent["connection"], room_id=room_id,
         room_name=room_name or room_id, silent=SILENT).strip()
+    role = (role or "").strip()
+    return f"{frame}\n\n## Your role\n\n{role}" if role else frame
 
 
 def with_rules(profile, rules: str):
@@ -717,7 +1207,7 @@ class Agent:
     def row(self) -> dict:
         return {"connection": self.cid, "user_id": self.plan["user_id"], "state": self.state,
                 "reason": self.reason, "lease": self.lease, "rooms_seen": len(self.rooms),
-                "last_sync_at": self.last_sync, "profile": self.plan["profile_name"]}
+                "last_sync_at": self.last_sync}
 
     def take_lease(self) -> bool:
         store = self.slot.store
@@ -1006,6 +1496,11 @@ class Engine:
         self.reload_error: str | None = None
         self.fingerprint: str | None = None
         self.log_lock = threading.Lock()
+        # When a room's next turn may start, keyed (project, agent, room), and an
+        # agent's in every room, keyed (project, agent, None): a debounce still
+        # waiting, or a hook's hold.
+        self.holds: dict[tuple, float] = {}
+        self._default: dict | None = None
 
     # -- small parts ----------------------------------------------------------
 
@@ -1175,6 +1670,8 @@ class Engine:
                 agent = slot.agents.get(cid)
                 if agent is None or not agent.lease:
                     continue
+                if self.held(slot.project_id, cid, room_id):
+                    continue
                 candidates.append((slot, cid, room_id, since))
         if not candidates:
             return
@@ -1193,6 +1690,26 @@ class Engine:
             turn.thread = threading.Thread(target=self.turn, args=(turn,),
                                            name=f"turn-{slot.slug}-{cid}", daemon=True)
             turn.thread.start()
+
+    # -- holds ----------------------------------------------------------------
+
+    def held(self, project_id: str, cid: str, room_id: str) -> bool:
+        now = time.monotonic()
+        for key in ((project_id, cid, room_id), (project_id, cid, None)):
+            until = self.holds.get(key)
+            if until is not None:
+                if until > now:
+                    return True
+                self.holds.pop(key, None)
+        return False
+
+    def hold(self, key: tuple, seconds: float) -> None:
+        self.holds[key] = max(self.holds.get(key, 0.0), time.monotonic() + max(seconds, 0.0))
+
+    def default_worker(self) -> dict:
+        if self._default is None:
+            self._default = load_default()
+        return self._default
 
     # -- one turn -------------------------------------------------------------
 
@@ -1217,7 +1734,7 @@ class Engine:
                 store.restore(slot.project_id, cid, room_id, turn.id)
                 finished = True
                 return
-            self.run_turn(turn, agent_plan, wakes)
+            self.serve(turn, agent_plan, wakes)
         except Exception as exc:
             slot.log(f"{cid}: turn in {room_id} failed: {type(exc).__name__}: {exc}")
         finally:
@@ -1226,9 +1743,230 @@ class Engine:
                     store.finish(slot.project_id, cid, room_id, turn.id)
             self.poke()
 
-    def run_turn(self, turn: Turn, agent: dict, wakes: list[dict]) -> None:
+    def bound_worker(self, slot: Slot, cid: str, room_id: str,
+                     binding: dict) -> tuple[dict | None, str]:
+        """The worker that answers this agent in this room - the room's binding,
+        else the agent's - or None and why there is none."""
+        rooms = binding.get("rooms") if isinstance(binding.get("rooms"), dict) else {}
+        name = rooms.get(room_id) or binding.get("worker")
+        if not name:
+            return None, "no worker is bound to this agent"
+        row = slot.store.worker(slot.project_id, name)
+        if row is None:
+            return None, f"its bound worker {name!r} has no active version"
+        try:
+            worker = read_worker(name, row["spec"], row["body"],
+                                 f"worker {name!r} version {row['id']}")
+        except WorkerInvalid as exc:
+            return None, f"its bound worker is refused: {exc}"
+        if not worker["enabled"]:
+            return None, f"its bound worker {name!r} is switched off"
+        worker["version"] = row["id"]
+        return worker, ""
+
+    def serve(self, turn: Turn, agent: dict, wakes: list[dict]) -> None:
+        """Admit the claimed wakes and answer them, in order: the bound worker and
+        whether it is on, each sender against who it admits, the kinds it wakes
+        on; what it does not admit goes to the default worker. Then, for what it
+        admits, the debounce, the limits and the `before` hook; then the turn and
+        the `after` hook. Every refusal is logged with its reason. Wakes a hold or
+        the debounce puts off are handed back; every other claimed wake is done."""
+        slot, cid, room_id = turn.slot, turn.cid, turn.room_id
+        binding = self.host.binding(slot.entry, cid) or {}
+        worker, why_none = self.bound_worker(slot, cid, room_id, binding)
+        default = self.default_worker()
+        admitted: list[dict] = []
+        defaulted: dict[str, tuple[dict, str]] = {}
+        for wake in wakes:
+            kind, sender = wake["kind"], wake.get("sender")
+            if worker is not None and kind not in worker["wakes_on"]:
+                slot.log(f"{cid}: {kind} in {room_id} from {sender} refused: worker "
+                         f"{worker['name']!r} does not wake on {kind}")
+                continue
+            if worker is not None:
+                patterns = worker["invites_from"] if kind == "invite" else worker["accepts_from"]
+                if admits(patterns, sender):
+                    admitted.append(wake)
+                    continue
+                reason = (f"worker {worker['name']!r} does not admit "
+                          f"{'invites from ' if kind == 'invite' else ''}{sender}")
+            else:
+                reason = why_none
+            if kind not in default["wakes_on"]:
+                slot.log(f"{cid}: {kind} in {room_id} from {sender} refused: {reason}; the "
+                         "default worker answers only what is addressed to the agent")
+                continue
+            if sender and sender not in defaulted:
+                defaulted[sender] = (wake, reason)
+        for sender, (wake, reason) in defaulted.items():
+            slot.log(f"{cid}: {wake['kind']} in {room_id} from {sender} refused: {reason}; "
+                     "the default worker answers")
+            self.answer_default(turn, agent, binding, wake, default)
+        if not admitted or worker is None:
+            return
+        self.admit_and_run(turn, agent, worker, admitted)
+
+    def answer_default(self, turn: Turn, agent: dict, binding: dict, wake: dict,
+                       default: dict) -> None:
+        """The default worker's answer to one sender: a fixed text and no turn, at
+        most once per sender per room per window. An invite is declined with the
+        text as its reason, since the agent cannot post where it has not joined."""
         slot, cid, room_id = turn.slot, turn.cid, turn.room_id
         store = slot.store
+        sender = wake.get("sender")
+        window = default["limits"]["window_seconds"]
+        if store.default_answered(slot.project_id, cid, room_id, sender, window):
+            slot.log(f"{cid}: default worker already answered {sender} in {room_id} within "
+                     f"{window}s; nothing sent")
+            return
+        text = default_answer(default["body"], user_id=agent["user_id"], sender=sender,
+                              supervisor=binding.get("supervisor"))
+        mark = f"default:{turn.id}:{sender}"
+        store.start_turn(mark, slot.project_id, cid, room_id, DEFAULT_WORKER, None,
+                         [sender], [wake["kind"]])
+        matrix = self.host.matrix(agent["homeserver"], agent["token"], timeout=60.0)
+        try:
+            if wake["kind"] == "invite":
+                matrix.call("POST", f"/_matrix/client/v3/rooms/{quote(room_id)}/leave",
+                            body={"reason": text})
+                store.end_turn(mark, "declined")
+                slot.log(f"{cid}: default worker declined the invite to {room_id} from {sender}")
+                return
+            thread = thread_root(self.wake_content(matrix, room_id, wake.get("event_id")))
+            event_id = self.post(matrix, room_id, text, thread, data=dict(DEFAULT_MARK))
+            store.end_turn(mark, "answered")
+            slot.log(f"{cid}: default worker answered {sender} in {room_id} as {event_id}")
+        except Exception as exc:
+            store.end_turn(mark, "failed")
+            slot.log(f"{cid}: default worker's answer to {sender} in {room_id} not sent: "
+                     f"{getattr(exc, 'code', type(exc).__name__)}: {exc}")
+        finally:
+            with contextlib.suppress(Exception):
+                matrix.close()
+
+    @staticmethod
+    def wake_content(matrix, room_id: str, event_id: str | None) -> dict:
+        if not event_id:
+            return {}
+        with contextlib.suppress(Exception):
+            found = matrix.call("GET", f"/_matrix/client/v3/rooms/{quote(room_id)}/event/"
+                                       f"{quote(event_id)}")
+            return (found or {}).get("content") or {}
+        return {}
+
+    def admit_and_run(self, turn: Turn, agent: dict, worker: dict, wakes: list[dict]) -> None:
+        slot, cid, room_id = turn.slot, turn.cid, turn.room_id
+        store = slot.store
+        limits = worker["limits"]
+        name = worker["name"]
+        keys = [w["key"] for w in wakes]
+        debounce = limits["debounce_seconds"]
+        if debounce:
+            newest = max(w["received_at"] for w in wakes)
+            if isinstance(newest, _dt.datetime):
+                waited = (_dt.datetime.now(_dt.timezone.utc) - newest).total_seconds()
+            else:
+                waited = time.time() - float(newest)
+            if waited < debounce:
+                store.restore(slot.project_id, cid, room_id, turn.id, keys)
+                self.hold((slot.project_id, cid, room_id), debounce - waited)
+                return
+        senders = sorted({w.get("sender") for w in wakes if w.get("sender")})
+        counts = store.turn_counts(slot.project_id, cid, room_id, senders,
+                                   window=limits["window_seconds"],
+                                   quiet=limits["quiet_seconds"],
+                                   room_cap=limits["turns_per_room"])
+        refused = None
+        if counts["agent"] >= limits["turns_per_agent"]:
+            refused = (f"the agent ran {counts['agent']} turns in {limits['window_seconds']}s, "
+                       f"its turns_per_agent")
+        elif counts["room"] >= limits["turns_per_room"]:
+            refused = (f"the room had {counts['room']} turns without {limits['quiet_seconds']}s "
+                       "of quiet, its turns_per_room")
+        if refused:
+            slot.log(f"{cid}: turn in {room_id} for {', '.join(senders)} refused by worker "
+                     f"{name!r}: {refused}")
+            return
+        over = {s for s, n in counts["senders"].items() if n >= limits["turns_per_sender"]}
+        for sender in sorted(over):
+            slot.log(f"{cid}: {sender} in {room_id} refused by worker {name!r}: "
+                     f"{counts['senders'][sender]} turns in {limits['window_seconds']}s, "
+                     "its turns_per_sender")
+        wakes = [w for w in wakes if w.get("sender") not in over]
+        if not wakes:
+            return
+        senders = sorted({w.get("sender") for w in wakes if w.get("sender")})
+        payload = {"agent": cid, "user_id": agent["user_id"], "room_id": room_id,
+                   "worker": name, "version": worker.get("version"),
+                   "wakes": [{"kind": w["kind"], "sender": w.get("sender"),
+                              "event_id": w.get("event_id")} for w in wakes]}
+        env = {**self.host.turn_env(slot.entry), "CLAUDE_PROJECT_DIR": slot.entry["root"],
+               "AGENTROOMS_PROJECT_ROOT": slot.entry["root"], "AGENTROOMS_AGENT": cid,
+               "AGENTROOMS_USER_ID": agent["user_id"], "AGENTROOMS_ROOM_ID": room_id,
+               "AGENTROOMS_WORKER": name, "AGENTROOMS_SENDERS": " ".join(senders),
+               "AGENTROOMS_KINDS": " ".join(sorted({w["kind"] for w in wakes}))}
+        before = worker["hooks"].get("before")
+        if before:
+            said = verdict(run_hook(before, cwd=slot.entry["root"], env=env, payload=payload,
+                                    seconds=HOOK_TIMEOUTS["before"]))
+            if said["verdict"] == "hold":
+                seconds = ((said["until"] - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+                           if said.get("until") else HOLD_SECONDS)
+                store.restore(slot.project_id, cid, room_id, turn.id, [w["key"] for w in wakes])
+                self.hold((slot.project_id, cid, room_id), seconds)
+                slot.log(f"{cid}: turn in {room_id} held by worker {name!r}'s before hook "
+                         + (f"until {said['until'].isoformat()}" if said.get("until")
+                            else f"for {HOLD_SECONDS}s ({said.get('why')})")
+                         + (f": {said['said']}" if said.get("said") else ""))
+                return
+            if said["verdict"] == "escalate":
+                slot.log(f"{cid}: turn in {room_id} escalated by worker {name!r}'s before hook: "
+                         f"{said['why']}")
+                return
+        store.start_turn(turn.id, slot.project_id, cid, room_id, name, worker.get("version"),
+                         senders, sorted({w["kind"] for w in wakes}))
+        ended = {"outcome": "failed"}
+        try:
+            ended = self.run_turn(turn, agent, worker, wakes)
+        finally:
+            with contextlib.suppress(Exception):
+                store.end_turn(turn.id, ended["outcome"])
+        after = worker["hooks"].get("after")
+        if after:
+            said = verdict(run_hook(after, cwd=slot.entry["root"], env={
+                **env, "AGENTROOMS_OUTCOME": ended["outcome"],
+                "AGENTROOMS_EVENT_ID": ended.get("event_id") or "",
+                "AGENTROOMS_SESSION": ended.get("session_id") or "",
+                "AGENTROOMS_HARNESS_FAILURE": ended.get("failure") or "",
+                "AGENTROOMS_HARNESS_SAID": (ended.get("said") or "")[:4000]},
+                payload={**payload, "outcome": ended["outcome"],
+                         "event_id": ended.get("event_id")},
+                seconds=HOOK_TIMEOUTS["after"]))
+            if said["verdict"] == "hold":
+                seconds = ((said["until"] - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+                           if said.get("until") else HOLD_SECONDS)
+                self.hold((slot.project_id, cid, None), seconds)
+                slot.log(f"{cid}: held in every room by worker {name!r}'s after hook "
+                         + (f"until {said['until'].isoformat()}" if said.get("until")
+                            else f"for {HOLD_SECONDS}s ({said.get('why')})")
+                         + (f": {said['said']}" if said.get("said") else ""))
+            elif said["verdict"] == "escalate":
+                slot.log(f"{cid}: turn in {room_id} escalated by worker {name!r}'s after hook: "
+                         f"{said['why']}")
+
+    def run_turn(self, turn: Turn, agent: dict, worker: dict, wakes: list[dict]) -> dict:
+        """One harness turn for the admitted wakes, on the worker's profile with
+        its role in the system prompt. Answers how it ended: `outcome` (answered,
+        silent, failed, not_posted, refused), and the posted event, the session
+        and the harness's failure where there are."""
+        slot, cid, room_id = turn.slot, turn.cid, turn.room_id
+        store = slot.store
+        try:
+            profile, harness, origin = self.host.profile(slot.entry, store, worker["profile"])
+        except Exception as exc:
+            slot.log(f"{cid}: turn in {room_id} refused: worker {worker['name']!r} names "
+                     f"profile {worker['profile']!r}: {getattr(exc, 'message', exc)}")
+            return {"outcome": "refused"}
         matrix = self.host.matrix(agent["homeserver"], agent["token"], timeout=60.0)
         try:
             invite_only = all(w["kind"] == "invite" for w in wakes)
@@ -1237,19 +1975,18 @@ class Engine:
             if not invite_only:
                 if self.room_encrypted(matrix, room_id):
                     slot.log(f"{cid}: {room_id} is encrypted; the wake is dropped")
-                    return
+                    return {"outcome": "refused"}
                 room_name = self.room_name(matrix, room_id)
-                events = self.history(matrix, room_id, agent["history"])
+                events = self.history(matrix, room_id, worker["history"])
             row = store.session(slot.project_id, cid, room_id)
-            harness = agent["harness"]
             resumable = bool(row and row.get("session_id") and row.get("node") == self.node
                              and row.get("harness") == harness)
             shown = events
             if resumable and row.get("seen_ts"):
                 shown = [e for e in events if (e.get("origin_server_ts") or 0) > row["seen_ts"]]
-            profile = with_rules(agent["profile"], room_rules(
+            profile = with_rules(profile, room_rules(
                 self.host.template(slot.entry), agent=agent, room_id=room_id,
-                room_name=room_name))
+                room_name=room_name, role=worker["body"]))
             prompt = build_prompt(room_id=room_id, room_name=room_name, wakes=wakes,
                                   events=shown, primed=not resumable)
             runner = self.host.runner()
@@ -1257,15 +1994,17 @@ class Engine:
                        else runner.Session.fresh())
             how = (f"resuming session {row['session_id']}" if resumable
                    else f"fresh session primed with {len(shown)} message(s)")
+            timeout = worker["limits"]["turn_timeout"]
             slot.log(f"{cid}: turn in {room_id} ({', '.join(sorted({w['kind'] for w in wakes}))})"
-                     f" started on {agent['profile_name']} ({harness}), {how}, cwd {slot.entry['root']}")
-            result = self.call_runner(turn, agent, profile, prompt, session, runner)
+                     f" started by worker {worker['name']!r} on {origin.get('name')} ({harness}), "
+                     f"{how}, cwd {slot.entry['root']}")
+            result = self.call_runner(turn, timeout, profile, prompt, session, runner)
             if resumable and missing_session(result):
                 slot.log(f"{cid}: session {row['session_id']} is not on this node; "
                          "starting a fresh one primed from the room")
                 prompt = build_prompt(room_id=room_id, room_name=room_name, wakes=wakes,
                                       events=events, primed=True)
-                result = self.call_runner(turn, agent, profile, prompt, runner.Session.fresh(),
+                result = self.call_runner(turn, timeout, profile, prompt, runner.Session.fresh(),
                                           runner)
             session_id = getattr(result, "session_id", None)
             seen = max([e.get("origin_server_ts") or 0 for e in events] or [0]) or None
@@ -1273,41 +2012,47 @@ class Engine:
                 store.save_session(slot.project_id, cid, room_id, harness=harness,
                                    session_id=session_id, node=self.node, seen_ts=seen)
             slot.turns += 1
+            ended = {"session_id": session_id}
             if not getattr(result, "ok", False):
                 failure = getattr(result, "failure", None)
                 kind = getattr(getattr(failure, "kind", None), "value", None) or str(
                     getattr(failure, "kind", "error"))
+                message = str(getattr(failure, "message", ""))
                 slot.log(f"{cid}: turn in {room_id} ended without an answer ({kind}): "
-                         f"{str(getattr(failure, 'message', ''))[:400]}")
-                return
+                         f"{message[:400]}")
+                return {**ended, "outcome": "failed", "failure": kind,
+                        "said": " ".join(part for part in (
+                            message, str(getattr(result, "stderr_tail", "") or "")) if part)}
             answer = cut_answer(getattr(result, "answer", "") or "")
             if not answer:
                 slot.log(f"{cid}: turn in {room_id} stayed silent (session {session_id})")
-                return
+                return {**ended, "outcome": "silent", "said": getattr(result, "answer", "")}
             refusal = self.host.check(slot.entry, cid)
             if refusal:
                 slot.log(f"{cid}: answer in {room_id} not posted: {refusal[0]}: {refusal[1]}")
-                return
+                return {**ended, "outcome": "not_posted", "said": answer}
             thread = self.answer_thread(events, wakes)
             try:
                 event_id = self.post(matrix, room_id, answer, thread)
             except Exception as exc:
                 slot.log(f"{cid}: answer in {room_id} not posted: "
                          f"{getattr(exc, 'code', type(exc).__name__)}: {exc}")
-                return
+                return {**ended, "outcome": "not_posted", "said": answer}
             slot.log(f"{cid}: answered in {room_id} as {event_id} (session {session_id})")
+            return {**ended, "outcome": "answered", "event_id": event_id, "said": answer}
         finally:
             with contextlib.suppress(Exception):
                 matrix.close()
 
-    def call_runner(self, turn: Turn, agent: dict, profile, prompt: str, session, runner):
-        timer = threading.Timer(float(agent["turn_timeout"]), turn.cancel.set)
+    def call_runner(self, turn: Turn, timeout: int, profile, prompt: str, session, runner):
+        timer = threading.Timer(float(timeout), turn.cancel.set)
         timer.daemon = True
         timer.start()
         try:
             return runner.run(prompt, profile, turn.slot.entry["root"], session=session,
                               environ=self.host.turn_env(turn.slot.entry),
-                              extra_env={"CLAUDE_PROJECT_DIR": turn.slot.entry["root"]},
+                              extra_env={"CLAUDE_PROJECT_DIR": turn.slot.entry["root"],
+                                         TURN_ENV: turn.id},
                               cancel=turn.cancel)
         finally:
             timer.cancel()
@@ -1349,8 +2094,11 @@ class Engine:
         return None
 
     @staticmethod
-    def post(matrix, room_id: str, text: str, thread: str | None) -> str | None:
+    def post(matrix, room_id: str, text: str, thread: str | None,
+             data: dict | None = None) -> str | None:
         content: dict = {"msgtype": "m.text", "body": text}
+        if data is not None:
+            content[DATA_KEY] = data
         if thread:
             content["m.relates_to"] = {"rel_type": "m.thread", "event_id": thread,
                                        "is_falling_back": True,

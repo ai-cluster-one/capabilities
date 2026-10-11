@@ -4,6 +4,7 @@ resumes, what is posted, and that a room has one turn at a time."""
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -110,17 +111,52 @@ def test_answers_cut_and_endings_judged():
 # ── one turn, with fakes ─────────────────────────────────────────────────────
 
 
+WORKER = {"description": "Answers in rooms.", "accepts_from": ["@b:example.org"],
+          "profile": "agentrooms-claude"}
+
+
 class FakeStore:
-    def __init__(self):
+    def __init__(self, workers=None):
         self.wakes: list[dict] = []
         self.sessions: dict = {}
         self.lock = threading.Lock()
+        self.workers = {"w": (WORKER, "")} if workers is None else workers
+        self.turn_log: list[dict] = []
 
-    def add(self, room, event_id, kind="mention"):
+    def add(self, room, event_id, kind="mention", sender="@b:example.org", received_at=None):
         with self.lock:
             self.wakes.append({"agent": "alpha", "room_id": room, "key": event_id or "invite",
-                               "kind": kind, "event_id": event_id, "sender": "@b:example.org",
-                               "received_at": time.time(), "claimed_by": None})
+                               "kind": kind, "event_id": event_id, "sender": sender,
+                               "received_at": received_at or time.time(), "claimed_by": None})
+
+    def worker(self, project, name, version=None):
+        if name not in self.workers:
+            return None
+        spec, body = self.workers[name]
+        return {"id": f"v-{name}", "name": name, "spec": spec, "body": body, "active": True}
+
+    def start_turn(self, turn, project, agent, room, worker, worker_id, senders, kinds):
+        self.turn_log.append({"id": turn, "room": room, "worker": worker, "senders": senders,
+                              "kinds": kinds, "at": time.time(), "outcome": None})
+
+    def end_turn(self, turn, outcome):
+        for row in self.turn_log:
+            if row["id"] == turn:
+                row["outcome"] = outcome
+
+    def turn_counts(self, project, agent, room, senders, *, window, quiet, room_cap):
+        ran = [r for r in self.turn_log if r["worker"] != "default"]
+        room_n, since = 0, time.time()
+        for row in sorted((r for r in ran if r["room"] == room), key=lambda r: -r["at"]):
+            if since - row["at"] >= quiet:
+                break
+            room_n, since = room_n + 1, row["at"]
+        return {"agent": len(ran), "room": room_n,
+                "senders": {s: sum(1 for r in ran if s in r["senders"]) for s in senders}}
+
+    def default_answered(self, project, agent, room, sender, window):
+        return any(r["worker"] == "default" and r["room"] == room and sender in r["senders"]
+                   for r in self.turn_log)
 
     def ready(self, project):
         with self.lock:
@@ -141,10 +177,10 @@ class FakeStore:
         with self.lock:
             self.wakes = [w for w in self.wakes if w["claimed_by"] != turn]
 
-    def restore(self, project, agent, room, turn):
+    def restore(self, project, agent, room, turn, keys=None):
         with self.lock:
             for w in self.wakes:
-                if w["claimed_by"] == turn:
+                if w["claimed_by"] == turn and (keys is None or w["key"] in keys):
                     w["claimed_by"] = None
 
     def session(self, project, agent, room):
@@ -163,8 +199,16 @@ class FakeMatrix:
     def __init__(self, room_events):
         self.room_events = room_events
         self.posted: list[tuple[str, dict]] = []
+        self.left: list[tuple[str, dict]] = []
 
     def call(self, method, path, params=None, body=None):
+        from urllib.parse import unquote
+        if path.endswith("/leave"):
+            self.left.append((unquote(path.split("/rooms/")[1].split("/")[0]), body))
+            return {}
+        if "/event/" in path:
+            wanted = unquote(path.rsplit("/", 1)[1])
+            return next((e for e in self.room_events if e["event_id"] == wanted), {})
         if path.endswith("/state/m.room.encryption/"):
             raise NotFound("none")
         if path.endswith("/state/m.room.name/"):
@@ -212,9 +256,21 @@ class FakeRunner:
 
 
 class FakeHost:
-    def __init__(self, matrix, runner, refusal=None, template=TEMPLATE):
+    def __init__(self, matrix, runner, refusal=None, template=TEMPLATE, profile=None,
+                 harness="claude", binding=None):
         self._matrix, self._runner, self.refusal = matrix, runner, refusal
         self._template = template
+        self._profile = profile or CLAUDE_PROFILE
+        self._harness = harness
+        self._binding = {"worker": "w"} if binding is None else binding
+        self.profiles_asked: list[str] = []
+
+    def binding(self, entry, cid):
+        return dict(self._binding)
+
+    def profile(self, entry, store, name):
+        self.profiles_asked.append(name)
+        return self._profile, self._harness, {"name": name}
 
     def node(self):
         return "node-1"
@@ -243,17 +299,17 @@ RULES = f"You are {ME} in lab; stay quiet with [silent]; use --connection alpha.
 
 
 def make_engine(tmp_path, matrix, runner, refusal=None, max_turns=2, profile=CLAUDE_PROFILE,
-                harness="claude", host=None):
-    host = host or FakeHost(matrix, runner, refusal)
+                harness="claude", host=None, workers=None, binding=None):
+    host = host or FakeHost(matrix, runner, refusal, profile=profile, harness=harness,
+                            binding=binding)
     eng = engine.Engine(host, mode="project", state_dir=tmp_path, echo=False)
     eng.settings = {"max_turns": max_turns}
-    slot = engine.Slot(eng, "prj", {"root": str(tmp_path), "slug": "project"})
-    slot.store = FakeStore()
+    slot = engine.Slot(eng, "prj", {"id": "prj", "root": str(tmp_path), "slug": "project"})
+    slot.store = FakeStore(workers)
     slot.state = "served"
     slot.plan = {"agents": {"alpha": {
         "connection": "alpha", "homeserver": "https://matrix.example.org", "user_id": ME,
-        "token": "t", "profile": profile, "profile_name": f"agentrooms-{harness}",
-        "harness": harness, "turn_timeout": 30, "history": 30}}}
+        "token": "t"}}}
     slot.agents["alpha"] = SimpleNamespace(lease=True, row=lambda: {})
     eng.slots["prj"] = slot
     return eng, slot
@@ -271,7 +327,11 @@ def test_first_turn_is_primed_and_the_next_resumes(tmp_path):
     assert runner.calls[0]["session"].kind == "fresh"
     assert "=== Room history ===" in runner.calls[0]["prompt"]
     assert runner.calls[0]["cwd"] == str(tmp_path)
-    assert runner.calls[0]["extra_env"] == {"CLAUDE_PROJECT_DIR": str(tmp_path)}
+    turn_id = runner.calls[0]["extra_env"]["AGENTROOMS_TURN"]
+    assert runner.calls[0]["extra_env"] == {"CLAUDE_PROJECT_DIR": str(tmp_path),
+                                            "AGENTROOMS_TURN": turn_id}
+    assert slot.store.turn_log[0]["id"] == turn_id and slot.store.turn_log[0]["worker"] == "w"
+    assert slot.store.turn_log[0]["outcome"] == "answered"
     room, content = matrix.posted[0]
     assert room == "!r" and content["body"] == "first answer"
     assert content["m.relates_to"]["rel_type"] == "m.thread" and content["m.relates_to"]["event_id"] == "$1"
@@ -604,3 +664,211 @@ def test_a_profile_change_reads_nothing_back(tmp_path):
     wakes, _notes = engine.read_sync(renamed, ME, {}, initial=False, member_count=lambda r: 3,
                                      before_join=lambda room, token: asked.append(token) or [])
     assert wakes == [] and asked == []
+
+
+# ── workers: who is admitted, what the default worker answers, the limits ────
+
+STRANGER = "@stranger:example.org"
+
+
+def test_worker_documents_are_checked_whole():
+    spec, body = engine.split_document(
+        "---\naccepts_from: ['@*:example.org']\nlimits:\n  debounce_seconds: 5\n---\nBe brief.\n",
+        "w.md")
+    worker = engine.read_worker("w", spec, body, "w.md")
+    assert worker["enabled"] and worker["profile"] == "agentrooms-claude"
+    assert worker["invites_from"] == ["@*:example.org"] and worker["wakes_on"] == list(engine.WAKE_KINDS)
+    assert worker["limits"]["debounce_seconds"] == 5 and worker["limits"]["turns_per_room"] == 30
+    assert worker["body"] == "Be brief." and worker["history"] == 30
+    assert engine.read_worker("off", {"enabled": False}, "", "off")["enabled"] is False
+    for bad, said in (({"accepts_from": ["*"], "nope": 1}, "'nope'"),
+                      ({}, "admits nobody"),
+                      ({"accepts_from": "*"}, "accepts_from"),
+                      ({"accepts_from": ["*"], "wakes_on": ["shout"]}, "wakes_on"),
+                      ({"accepts_from": ["*"], "limits": {"turn_timeout": 5}}, "turn_timeout"),
+                      ({"accepts_from": ["*"], "limits": {"later": 1}}, "'later'"),
+                      ({"accepts_from": ["*"], "hooks": {"during": "x"}}, "'during'"),
+                      ({"accepts_from": ["*"], "hooks": {"before": "'open"}}, "hooks.before")):
+        with pytest.raises(engine.WorkerInvalid, match=said):
+            engine.read_worker("w", bad, "", "w")
+    with pytest.raises(engine.WorkerInvalid):
+        engine.split_document("no front matter", "x")
+    text = engine.worker_text({"accepts_from": ["*"]}, "Role.")
+    assert engine.split_document(text, "t") == ({"accepts_from": ["*"]}, "Role.")
+    default = engine.load_default()
+    assert default["limits"]["window_seconds"] == 86400 and "$supervisor" in default["body"]
+
+
+def test_a_default_answer_never_wakes_an_agent():
+    marked = message("$1", "@other:example.org", f"{ME} not yet",
+                     **{engine.DATA_KEY: dict(engine.DEFAULT_MARK)})
+    plain = message("$2", "@other:example.org", f"{ME} hi")
+    wakes, _ = engine.read_sync(sync(join={"!r": {"summary": {"m.joined_member_count": 2},
+                                                  "timeline": {"events": [marked, plain]}}}),
+                                ME, {}, initial=False, member_count=lambda r: 2)
+    assert [w["event_id"] for w in wakes] == ["$2"]
+
+
+def test_an_agent_with_no_worker_gets_only_the_default_answer_once(tmp_path):
+    events = [message("$1", STRANGER, f"{ME} hello"), message("$2", STRANGER, f"{ME} again")]
+    matrix = FakeMatrix(events)
+    runner = FakeRunner([])
+    eng, slot = make_engine(tmp_path, matrix, runner, binding={"supervisor": "@boss:example.org"})
+    slot.store.add("!r", "$1", sender=STRANGER)
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert runner.calls == []
+    room, content = matrix.posted[0]
+    assert room == "!r" and content[engine.DATA_KEY] == engine.DEFAULT_MARK
+    assert ME in content["body"] and STRANGER in content["body"]
+    assert "its supervisor, @boss:example.org," in content["body"]
+    assert slot.store.wakes == []
+    slot.store.add("!r", "$2", sender=STRANGER)
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert len(matrix.posted) == 1 and slot.store.wakes == []
+    log = (tmp_path / engine.LOG_FILE).read_text()
+    assert "no worker is bound to this agent" in log and "already answered" in log
+
+
+def test_a_worker_admits_its_senders_and_the_default_answers_the_rest(tmp_path):
+    events = [message("$1", "@b:example.org", f"{ME} hi"), message("$2", STRANGER, f"{ME} me too")]
+    matrix = FakeMatrix(events)
+    runner = FakeRunner(["for b"])
+    eng, slot = make_engine(tmp_path, matrix, runner)
+    slot.store.add("!r", "$1")
+    slot.store.add("!r", "$2", sender=STRANGER)
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert len(runner.calls) == 1 and "WOKE YOU" in runner.calls[0]["prompt"]
+    bodies = [b for _r, b in matrix.posted]
+    assert bodies[0][engine.DATA_KEY] == engine.DEFAULT_MARK and "the person who runs it" in bodies[0]["body"]
+    assert bodies[1]["body"] == "for b"
+    assert slot.store.turn_log[-1]["senders"] == ["@b:example.org"]
+    assert f"worker 'w' does not admit {STRANGER}" in (tmp_path / engine.LOG_FILE).read_text()
+
+
+def test_an_invite_no_worker_admits_is_declined_with_the_answer(tmp_path):
+    matrix = FakeMatrix([])
+    runner = FakeRunner([])
+    eng, slot = make_engine(tmp_path, matrix, runner)
+    slot.store.add("!inv", None, kind="invite", sender=STRANGER)
+    eng.turn(engine.Turn(slot, "alpha", "!inv"))
+    assert runner.calls == [] and matrix.posted == []
+    room, body = matrix.left[0]
+    assert room == "!inv" and "does not take messages from you" in body["reason"]
+
+
+def test_what_a_worker_does_not_wake_on_and_strangers_in_marked_rooms_are_only_logged(tmp_path):
+    matrix = FakeMatrix([message("$1", STRANGER, "chatter"), message("$2", "@b:example.org", "x")])
+    runner = FakeRunner([])
+    workers = {"w": ({**WORKER, "wakes_on": ["mention", "direct"]}, "")}
+    eng, slot = make_engine(tmp_path, matrix, runner, workers=workers)
+    slot.store.add("!m", "$1", kind="marked", sender=STRANGER)
+    slot.store.add("!m", "$2", kind="marked")
+    eng.turn(engine.Turn(slot, "alpha", "!m"))
+    assert runner.calls == [] and matrix.posted == [] and slot.store.wakes == []
+    log = (tmp_path / engine.LOG_FILE).read_text()
+    assert "does not wake on marked" in log
+
+
+def test_a_worker_switched_off_or_missing_leaves_the_default_worker(tmp_path):
+    for workers, said in (({"w": ({"enabled": False}, "")}, "is switched off"),
+                          ({}, "has no active version")):
+        matrix = FakeMatrix([message("$1", "@b:example.org", f"{ME} hi")])
+        runner = FakeRunner([])
+        (tmp_path / said[:5]).mkdir()
+        eng, slot = make_engine(tmp_path / said[:5], matrix, runner, workers=workers)
+        slot.store.add("!r", "$1")
+        eng.turn(engine.Turn(slot, "alpha", "!r"))
+        assert runner.calls == [] and matrix.posted[0][1][engine.DATA_KEY] == engine.DEFAULT_MARK
+        assert said in (tmp_path / said[:5] / engine.LOG_FILE).read_text()
+
+
+def test_a_room_binding_overrides_the_agents_and_the_role_rides_in_the_frame(tmp_path):
+    matrix = FakeMatrix([message("$1", "@b:example.org", f"{ME} hi")])
+    runner = FakeRunner(["ok"])
+    workers = {"w": (WORKER, "General role."),
+               "lab": ({**WORKER, "profile": "agentrooms-codex"}, "Lab role.")}
+    eng, slot = make_engine(tmp_path, matrix, runner, workers=workers,
+                            binding={"worker": "w", "rooms": {"!r": "lab"}})
+    slot.store.add("!r", "$1")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert eng.host.profiles_asked == ["agentrooms-codex"]
+    assert runner.calls[0]["profile"].append_system_prompt == f"{RULES}\n\n## Your role\n\nLab role."
+    assert "Lab role" not in runner.calls[0]["prompt"]
+
+
+def test_limits_refuse_a_room_until_it_has_been_quiet_and_a_sender_over_its_count(tmp_path):
+    matrix = FakeMatrix([message("$1", "@b:example.org", f"{ME} hi")])
+    runner = FakeRunner(["1", "2", "3"])
+    workers = {"w": ({**WORKER, "accepts_from": ["*"],
+                      "limits": {"turns_per_room": 2, "turns_per_sender": 5}}, "")}
+    eng, slot = make_engine(tmp_path, matrix, runner, workers=workers)
+    for n in range(3):
+        slot.store.add("!r", f"$r{n}")
+        eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert len(runner.calls) == 2 and slot.store.wakes == []
+    assert "its turns_per_room" in (tmp_path / engine.LOG_FILE).read_text()
+    for row in slot.store.turn_log:  # the room has been quiet long enough
+        row["at"] -= 901
+    slot.store.add("!r", "$r3")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert len(runner.calls) == 3
+    workers["w"] = ({**WORKER, "accepts_from": ["*"], "limits": {"turns_per_sender": 3}}, "")
+    slot.store.add("!s", "$s1")
+    slot.store.add("!s", "$s2", sender=STRANGER)
+    runner.answers.append("for the stranger")
+    eng.turn(engine.Turn(slot, "alpha", "!s"))
+    assert "@b:example.org in !s refused" in (tmp_path / engine.LOG_FILE).read_text()
+    assert slot.store.turn_log[-1]["senders"] == [STRANGER]
+
+
+def test_debounce_hands_the_wakes_back_until_the_room_settles(tmp_path):
+    matrix = FakeMatrix([message("$1", "@b:example.org", f"{ME} hi")])
+    runner = FakeRunner(["ok"])
+    workers = {"w": ({**WORKER, "limits": {"debounce_seconds": 30}}, "")}
+    eng, slot = make_engine(tmp_path, matrix, runner, workers=workers)
+    slot.store.add("!r", "$1")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert runner.calls == [] and slot.store.wakes[0]["claimed_by"] is None
+    assert eng.held("prj", "alpha", "!r") and not eng.held("prj", "alpha", "!other")
+    eng.schedule()
+    assert eng.turns == {}
+    slot.store.wakes[0]["received_at"] -= 31
+    eng.holds.clear()
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert len(runner.calls) == 1
+
+
+def hook(tmp_path, name, code, said=""):
+    path = tmp_path / name
+    path.write_text(f"#!/bin/sh\ncat > {tmp_path}/{name}.stdin\nenv > {tmp_path}/{name}.env\n"
+                    f"echo '{said}'\nexit {code}\n")
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_hooks_hold_escalate_and_follow_a_turn(tmp_path):
+    matrix = FakeMatrix([message("$1", "@b:example.org", f"{ME} hi")])
+    runner = FakeRunner(["ok", "ok"])
+    later = "2999-01-01T00:00:00+00:00"
+    workers = {"w": ({**WORKER, "hooks": {"before": hook(tmp_path, "before", 75, later)}}, "")}
+    eng, slot = make_engine(tmp_path, matrix, runner, workers=workers)
+    slot.store.add("!r", "$1")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert runner.calls == [] and slot.store.wakes[0]["claimed_by"] is None
+    assert eng.held("prj", "alpha", "!r")
+    sent = json.loads((tmp_path / "before.stdin").read_text())
+    assert sent["room_id"] == "!r" and sent["wakes"][0]["sender"] == "@b:example.org"
+    assert "AGENTROOMS_WORKER=w" in (tmp_path / "before.env").read_text()
+    eng.holds.clear()
+    workers["w"] = ({**WORKER, "hooks": {"before": hook(tmp_path, "esc", 76, "ask a person")}}, "")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert runner.calls == [] and slot.store.wakes == []
+    assert "escalated by worker 'w'" in (tmp_path / engine.LOG_FILE).read_text()
+    workers["w"] = ({**WORKER, "hooks": {"before": hook(tmp_path, "go", 0),
+                                         "after": hook(tmp_path, "after", 75)}}, "")
+    slot.store.add("!r", "$2")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert len(runner.calls) == 1
+    env = (tmp_path / "after.env").read_text()
+    assert "AGENTROOMS_OUTCOME=answered" in env and "AGENTROOMS_EVENT_ID=$posted1" in env
+    assert eng.held("prj", "alpha", "!elsewhere")

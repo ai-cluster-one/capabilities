@@ -5,7 +5,8 @@
 #     "capabilities-contract==0.4.0",
 #     "psycopg[binary]>=3.2",
 #     "httpx>=0.27",
-#     "callva-harness-runner==0.8.0",
+#     "callva-harness-runner==0.9.0",
+#     "pyyaml>=6",
 # ]
 # ///
 """agentrooms — agents talking in rooms on one shared Matrix homeserver.
@@ -128,6 +129,52 @@ COMMANDS
   ROOM is a room id (!abc...) or an alias (#name:example.org) on this
   homeserver; WHO is a user id (@agent:example.org) on this homeserver.
 
+  Workers (WORKERS states the document)
+    workers list
+        The project's workers - each one's active version, and the shipped
+        default - and what each connection binds: {workers: [{worker, source,
+        version, enabled, description}], bindings: {<id>: {user_id, worker,
+        rooms, supervisor}}}.
+    workers show NAME [--version ID]
+        A worker's active version, or the one named: {worker, source,
+        version, active, created_at, created_by, spec, body, text}. `text` is
+        the document; save an edited copy of it to change the worker.
+    workers history NAME
+        Every version of a worker, oldest first.
+    workers save NAME FILE|- [--base ID]
+        Save the document in FILE (- reads stdin) as the worker's new active
+        version. It is judged whole first and anything WORKERS refuses is
+        refused (exit 6 worker_invalid) with nothing saved; a profile this
+        machine cannot resolve or that does not fit a turn is only a warning.
+        A save identical to the active version creates none. --base names the
+        version the writer read; a save over another is refused (exit 6
+        conflict). NAME is lowercase letters, digits, - and _; `default` is
+        the shipped worker's and is refused.
+    workers remove NAME [--base ID]
+        Clear the active version; every version stays as history, and a
+        binding that names the worker binds nothing until it is saved again.
+    workers bind NAME [--room ROOM]
+        Bind the worker to the selected connection's agent, or, with --room,
+        to that agent in that room only, overriding the agent's. NAME must
+        have an active version. Writes the connection's `worker` or
+        `rooms.<room id>` key.
+    workers unbind [--room ROOM]
+        Take the agent's binding off, or the room's.
+    workers supervisor [USER_ID] [--clear]
+        The selected agent's supervisor - the address the default worker
+        names to a sender it does not admit: show it, set it, or clear it.
+        Writes the connection's `supervisor` key.
+    workers import [--apply]
+        Move a project's service/settings.json agents map into workers: one
+        worker per listed connection, named after it, with its profile,
+        turn_timeout and history, admitting every sender as the map did,
+        bound on the connection; the map is then removed. Without --apply,
+        says what it would do. The service does this itself when it takes up
+        a project that still carries the map.
+  save, remove, bind, unbind, supervisor and import --apply are refused
+  (exit 4 policy) inside a turn the service started, which carries
+  AGENTROOMS_TURN: a fence the fenced can rewrite is none.
+
 SERVICE
   One process per machine serves every agent of every project that joined it
   (`service run --machine`); `service run` in a project not joined serves that
@@ -139,15 +186,43 @@ SERVICE
   What was posted between its invite and its join wakes it once it joins;
   what came before the invite does not.
 
-  Each agent has one harness session per room, resumed on every wake through
-  callva-harness-runner on the agent's profile (bundled agentrooms-claude, the
-  default, and agentrooms-codex; a file in capabilities/agentrooms/service/
-  profiles/ shadows either). A session not recorded on this node starts fresh,
-  primed from the room's recent messages. One turn per agent per room at a
-  time: what arrives during a turn is carried into the next one. The turn runs
-  in the project's root as the project would run it. On every turn the
-  bundled room prompt (capabilities/agentrooms/service/room.md in the project
-  shadows it) is appended to the harness's system prompt, after any
+  An agent is answered by a worker. Its connection binds one (`workers
+  bind`), and a room may bind another that answers the agent there; an agent
+  no worker is bound to is answered only by the shipped `default` worker. On
+  each turn the service reads, in order: the worker bound to the agent in
+  this room and whether it is enabled; each wake's sender against the
+  worker's accepts_from (an invite's against invites_from) and its kind
+  against wakes_on; then, for what the worker admits, its debounce, its
+  limits and its `before` hook; then it runs the turn and the `after` hook.
+  A wake of a kind the worker does not wake on is dropped. A mention, a
+  direct message or an invite the worker does not admit - or that no enabled
+  worker answers - goes to the default worker. Every refusal is logged with
+  its reason. A saved worker, a profile and a binding hold from the next turn;
+  nothing needs a reload.
+
+  The default worker runs no turn. It posts its fixed answer - this agent does
+  not take messages from you yet; contact its supervisor (the connection's
+  `supervisor`, else "the person who runs it") and say who is writing - in
+  the thread that woke it, at most once per sender per room per day, and
+  declines an invite with that answer as the reason. Its message carries
+  {"agentrooms.worker": "default"} under agentrooms.data, and the service never
+  wakes on a message that does, so two agents' default workers never answer
+  each other. A marked-room message from a sender no worker admits is only
+  logged.
+
+  Each agent has one harness session per room, resumed on every turn through
+  callva-harness-runner on the worker's profile. A profile name resolves to
+  the project's version in the store, then the global one (the
+  harness_profiles table the harness library owns, which `tasks profiles`
+  writes), then the library's shipped profiles, then the two this capability
+  ships: agentrooms-claude (the default) and agentrooms-codex. A profile must
+  fit a turn: free text out, claude's permission_mode bypassPermissions or
+  codex's approval_policy never. A session not recorded on this node starts
+  fresh, primed from the room's recent messages. One turn per agent per room
+  at a time: what arrives during a turn is carried into the next one. The turn
+  runs in the project's root as the project would run it, with AGENTROOMS_TURN
+  set. On every turn the bundled room frame, with the worker's body after it
+  as the agent's role, is appended to the harness's system prompt, after any
   append_system_prompt the profile carries; the turn's message holds only what
   woke the agent and the room's messages since its last turn. Its final answer
   is posted to the room as the agent, in the thread that woke it; an answer of
@@ -155,30 +230,20 @@ SERVICE
   `agentrooms --connection <id> ...`.
 
   The service needs a store: the sync position, the wakes not yet answered,
-  the room-to-session map, the agent leases and a project's pause live in the
-  project's PostgreSQL (the AGENTKIT_DB_* keys, else `capabilities store
-  set`), under the agentrooms_ tables; with none configured it refuses to run
+  the room-to-session map, the agent leases, a project's pause, the workers
+  and the record of turns the limits count live in the project's PostgreSQL
+  (the AGENTKIT_DB_* keys, else `capabilities store set`), under the
+  agentrooms_ tables; with none configured it refuses to run
   (store_not_configured). A lease per agent keeps a second process off it.
-  An agent is served while the project explicitly enables agentrooms, the
-  project is on the machine list (machine mode), and the agent's connection is
-  granted writes - checked again before every sync and every turn.
+  Every connection the project declares and grants writes is served - checked
+  again before every sync and every turn - while the project explicitly
+  enables agentrooms and is on the machine list (machine mode).
 
-  Project settings, capabilities/agentrooms/service/settings.json:
-    {"version": 1,
-     "agents": {"<connection-id>": {"profile": "agentrooms-claude",
-                                    "turn_timeout": 900, "history": 30}}}
-  Only the agents listed are served. profile: a harness-runner profile name;
-  turn_timeout: seconds, 30-86400 (default 900); history: messages a fresh
-  session is primed with and a turn reads, 1-100 (default 30). Any other key
-  is refused.
   Machine settings, ~/.config/agentrooms/service/config.json (XDG_CONFIG_HOME):
     {"version": 1, "max_turns": 2}
   max_turns caps concurrent turns across every project (default 2); the
   project running fewest turns goes first.
 
-    service init [--agent ID ...] [--force]
-        Write the project settings, serving the named connections (default:
-        every connection this project declares).
     service init --machine [--force]
         Write the machine settings template.
     service join / service leave
@@ -193,19 +258,84 @@ SERVICE
         Validate the declaration, signal the running process (SIGHUP to it
         alone) and wait until it publishes the new fingerprint. A declaration
         that does not load is refused before signalling and the running one
-        stays. Reload takes up changed settings, profiles, prompts and agent
-        connections; a project that now resolves another store, and the
-        process's own state root, take a restart.
+        stays. Reload takes up the machine settings and which connections are
+        served; workers, profiles and bindings are read at every turn and need
+        none. A project that now resolves another store, and the process's own
+        state root, take a restart.
     service status [--machine]
         Process, fingerprint, cap, and per project served|paused|refused|error
         with the reason and each agent's state. Local only.
     service logs [--machine] [--tail N]
     service doctor [--machine]
-        Settings, store, profiles, each agent's token and grant, and whether
-        the running process is current.
+        Store, each served agent's token, grant, bound workers and their
+        profiles, and whether the running process is current.
     service pause [--reason TEXT] / service resume
         Hold this project's agents: no new sync starts and no turn runs; what
         arrives waits on the homeserver or as a recorded wake / release them.
+
+WORKERS
+  A worker is a Markdown document: its YAML front matter is the settings, its
+  body the agent's role. Any key not named here is refused. A worker saved
+  with `enabled: false` and nothing else is whole.
+
+    enabled       true (default) or false. A worker that is off admits nobody.
+    description   one sentence: what the worker is for.
+    profile       the harness profile a turn runs on (default
+                  agentrooms-claude); SERVICE says how a name resolves.
+    history       messages a fresh session is primed with and a turn reads,
+                  1-100 (default 30).
+    accepts_from  who may wake the agent: Matrix user ids or shell-style
+                  patterns (`@*:example.org`, `*` for everyone). An enabled
+                  worker that admits nobody is refused.
+    invites_from  who may invite it, the same way (default: accepts_from).
+    wakes_on      the kinds that wake it, any of mention, direct, invite,
+                  marked (default: all four).
+    limits        debounce_seconds   start a turn only once no wake has
+                                     arrived for this long, 0-3600 (default
+                                     0); what arrives meanwhile joins the turn
+                  turn_timeout       seconds a turn may run, 30-86400 (900)
+                  window_seconds     the window the agent and sender counts
+                                     run over, 60-604800 (3600)
+                  turns_per_agent    turns of the agent in the window (120)
+                  turns_per_sender   turns one sender's wakes started in the
+                                     window (30)
+                  turns_per_room     turns in one room before it has been
+                                     quiet - no turn - for quiet_seconds (30)
+                  quiet_seconds      1-604800 (900): no person ever resets a
+                                     room's count, so quiet does
+                  A wake over a limit is dropped and logged; the room's
+                  messages still reach the next turn the worker admits.
+    hooks         before, after: each one command line of the project's,
+                  split as a shell splits it and run without one from the
+                  project root, with the turn as JSON on stdin ({agent,
+                  user_id, room_id, worker, version, wakes: [{kind, sender,
+                  event_id}]}, plus outcome and event_id for after) and
+                  AGENTROOMS_PROJECT_ROOT, AGENTROOMS_AGENT,
+                  AGENTROOMS_USER_ID, AGENTROOMS_ROOM_ID, AGENTROOMS_WORKER,
+                  AGENTROOMS_SENDERS and AGENTROOMS_KINDS in its environment;
+                  after also gets AGENTROOMS_OUTCOME (answered, silent,
+                  failed, not_posted, refused), AGENTROOMS_EVENT_ID,
+                  AGENTROOMS_SESSION, AGENTROOMS_HARNESS_FAILURE and
+                  AGENTROOMS_HARNESS_SAID. before has 30 seconds, after 60.
+
+  The hooks answer as the tasks hooks do, by their exit: 0 go; 75 hold, until
+  the moment its last stdout line names (ISO 8601 with its offset, or a date)
+  - without one, for 60 seconds; 76 escalate, its last stdout line the
+  reason. Any other ending is a hold of 60 seconds. before's hold hands the
+  wakes back and starts no turn in that room until the moment; after's hold
+  starts no turn of the agent in any room until then. An escalation is logged
+  and its wakes dropped: where it goes is the project's, through what its
+  hook does.
+
+  The body is the agent's role. It reaches the turn inside the room frame the
+  capability owns - how to stay silent, how to act through this CLI, never to
+  post secrets - in the system prompt, under "Your role". A worker may leave
+  it empty, and the role is then the project's own context alone.
+
+  The store keeps each worker as versions of one name, one of them active; a
+  version is never edited or deleted. The capability ships `default`
+  (service/workers/default.md), whose body is the answer it posts; it cannot
+  be replaced.
 
 CONTRACT VERBS
   agentrooms help | stub | manifest --json | guide [<topic>]
@@ -249,8 +379,9 @@ NAME = "agentrooms"
 SUMMARY = ("Agents talking in rooms on one shared Matrix homeserver - register an "
            "agent, open, join, read and post in rooms over the client-server API, and "
            "a machine service that wakes opted-in agents on a mention, a direct "
-           "message, an invite or a marked room and answers through one resumed "
-           "harness session per room.")
+           "message, an invite or a marked room, admits and limits each turn through "
+           "the worker bound to the agent, and answers through one resumed harness "
+           "session per room.")
 SCOPE = "user"   # the declared keys are the machine's; each agent's token is its project's
 CRED_KEYS = [
     {"key": "AGENTROOMS_HOMESERVER", "secret": False, "required": False,
@@ -275,7 +406,6 @@ SERVICE = {
                 "projects that join it."),
     "verbs": ["init", "doctor", "run", "reload", "stop", "status", "logs", "pause",
               "resume", "join", "leave"],
-    "config": "capabilities/agentrooms/service/settings.json",
     "state": "$XDG_STATE_HOME/capabilities/projects/<project-slug>/agentrooms",
     "machine": {
         "schema": "capabilities.service.machine.v1",
@@ -3401,13 +3531,11 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
 
 # ── the service: files, settings, the opt-in list ────────────────────────────
 
-SETTINGS_KEYS = ("version", "agents")
-AGENT_KEYS = ("profile", "turn_timeout", "history")
 MACHINE_KEYS = ("version", "max_turns")
-DEFAULT_PROFILE = "agentrooms-claude"
-DEFAULT_TURN_TIMEOUT = 900
-DEFAULT_HISTORY = 30
 DEFAULT_MAX_TURNS = 2
+# What a connection carries beyond its identity: the worker bound to the agent,
+# the workers bound to it per room, and its supervisor's address.
+BINDING_KEYS = ("worker", "rooms", "supervisor")
 _PROJECT_POINTERS = ("CLAUDE_PROJECT_DIR", "CAPABILITIES_PROJECT_ID",
                      "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_PROJECT_ENVELOPE",
                      "CAPABILITIES_PROJECT_ENVELOPE_ROOT")
@@ -3475,6 +3603,8 @@ def _service_dir(root: Path) -> Path:
 
 
 def _settings_path(root: Path) -> Path:
+    """Where an earlier release kept the project's agents map, which `workers
+    import` and the service move into workers."""
     return _service_dir(root) / "settings.json"
 
 
@@ -3482,8 +3612,8 @@ def _template_path() -> Path:
     return _bundle_dir() / "service" / "templates" / "room.md"
 
 
-def _profile_folders(root: Path) -> list[str]:
-    return [str(_service_dir(root) / "profiles"), str(_bundle_dir() / "service" / "profiles")]
+def _shipped_profiles_dir() -> Path:
+    return _bundle_dir() / "service" / "profiles"
 
 
 def _read_bytes(path: Path) -> bytes:
@@ -3493,52 +3623,28 @@ def _read_bytes(path: Path) -> bytes:
         return b"absent"
 
 
-def _load_settings(root: Path) -> dict:
-    """The project's service settings, whole and checked, or the refusal that
-    says what is wrong with them."""
+def _legacy_agents(root: Path) -> dict | None:
+    """The agents map an earlier release's service/settings.json declared, each
+    agent's profile, turn_timeout and history; None when there is none."""
     path = _settings_path(root)
-
-    def refuse(sentence: str) -> NoReturn:
-        raise _Refusal(6, "settings_invalid", f"{path}: {sentence}",
-                       f"`{NAME} help` states the settings; `{NAME} service init --force` "
-                       "writes them anew")
-
     if not path.is_file():
-        raise _Refusal(6, "service_not_initialized", f"{path} does not exist",
-                       f"run `{NAME} service init` in the project")
+        return None
     try:
         raw = json.loads(path.read_text())
     except (OSError, ValueError) as exc:
-        refuse(f"it does not read as JSON: {exc}")
-    if not isinstance(raw, dict):
-        refuse("it is one JSON object")
-    unknown = sorted(set(raw) - set(SETTINGS_KEYS))
-    if unknown:
-        refuse(f"it names {', '.join(map(repr, unknown))}, which nothing reads")
-    if raw.get("version") != 1 or isinstance(raw.get("version"), bool):
-        refuse("its `version` is 1")
-    agents = raw.get("agents")
+        raise _Refusal(6, "settings_invalid", f"{path}: it does not read as JSON: {exc}",
+                       f"its agents map is moved into workers; repair it, or remove it and "
+                       f"bind workers with `{NAME} workers bind`") from None
+    agents = raw.get("agents") if isinstance(raw, dict) else None
     if not isinstance(agents, dict):
-        refuse("its `agents` maps connection ids to their settings")
+        return None
     out: dict = {}
     for cid, conf in agents.items():
-        conf = {} if conf is None else conf
-        if not isinstance(conf, dict):
-            refuse(f"agents.{cid} is an object")
-        extra = sorted(set(conf) - set(AGENT_KEYS))
-        if extra:
-            refuse(f"agents.{cid} names {', '.join(map(repr, extra))}, which nothing reads")
-        profile = conf.get("profile", DEFAULT_PROFILE)
-        if not isinstance(profile, str) or not profile.strip():
-            refuse(f"agents.{cid}.profile is a profile name")
-        timeout = conf.get("turn_timeout", DEFAULT_TURN_TIMEOUT)
-        if isinstance(timeout, bool) or not isinstance(timeout, int) or not 30 <= timeout <= 86400:
-            refuse(f"agents.{cid}.turn_timeout is whole seconds, 30-86400")
-        history = conf.get("history", DEFAULT_HISTORY)
-        if isinstance(history, bool) or not isinstance(history, int) or not 1 <= history <= 100:
-            refuse(f"agents.{cid}.history is a whole number, 1-100")
-        out[cid] = {"profile": profile, "turn_timeout": timeout, "history": history}
-    return {"version": 1, "agents": out}
+        conf = conf if isinstance(conf, dict) else {}
+        out[str(cid)] = {"profile": conf.get("profile", _engine().DEFAULT_PROFILE),
+                         "turn_timeout": conf.get("turn_timeout", 900),
+                         "history": conf.get("history", 30)}
+    return out
 
 
 def _load_machine_settings() -> dict:
@@ -3575,13 +3681,14 @@ def _machine_fingerprint() -> str:
 
 
 def _project_fingerprint(root: Path) -> str:
-    """Which declaration the project holds: its settings, its room prompt and its
-    profiles."""
-    service = _service_dir(root)
-    profiles = sorted((service / "profiles").glob("*.toml")) if (service / "profiles").is_dir() else []
-    return _engine().fingerprint_of(
-        _read_bytes(_settings_path(root)), _read_bytes(service / "room.md"),
-        *[p.name.encode() + _read_bytes(p) for p in profiles])
+    """Which declaration the project holds: the connections it serves, each by
+    its identity and grant. Workers, profiles and bindings are read at every
+    turn, so they are no part of it."""
+    conns = _inventory_connections().get("connections") or {}
+    served = sorted((cid, str(e.get("homeserver")), str(e.get("user_id")),
+                     str(e.get("secret_env")), bool(e.get("allow_write")))
+                    for cid, e in conns.items() if e.get("granted"))
+    return _engine().fingerprint_of(json.dumps(served).encode())
 
 
 def _actor() -> str:
@@ -3741,30 +3848,53 @@ def _profile_fit(knobs: dict) -> list[str]:
     return problems
 
 
-def _resolve_profile(root: Path, name: str):
-    """(Profile, harness, origin) for a name, or raise _Refusal naming why not."""
+def _harness_library():
     try:
         from callva import harness_runner as lib
     except ImportError:
         raise _Refusal(5, "harness_library_missing",
                        "callva-harness-runner is not importable",
                        f"run {NAME} through its own script header, which pins it") from None
+    return lib
+
+
+def _resolve_profile(store, project_id: str, name: str):
+    """(Profile, harness, origin) for a name, or raise _Refusal naming why not.
+
+    A name resolves as tasks resolves it, among the harness profiles the store
+    keeps: the project's active version, then the global one, then the
+    library's shipped profiles; then the two this capability ships."""
+    lib = _harness_library()
     try:
-        found = lib.find_profile_file(name, _profile_folders(root))
-        knobs = found.knobs()
-        profile = found.profile()
+        found = lib.resolve_among(name, store.stored_profiles(lib, project_id),
+                                  project=project_id)
+        knobs, where = dict(found.spec), found.where
+        origin = {"name": name, "layer": found.layer, "version": found.id}
     except lib.ProfileNotFound as exc:
-        raise _Refusal(6, "profile_not_found", f"profile {name!r} is not found: {exc}") from None
+        shipped = _shipped_profiles_dir() / f"{name}.toml"
+        if not shipped.is_file():
+            raise _Refusal(6, "profile_not_found", f"profile {name!r} is not found: {exc}; nor "
+                           f"does {NAME} ship one") from None
+        try:
+            knobs = lib.ProfileFile(name, "shipped", str(shipped), shipped.read_text()).knobs()
+        except Exception as exc:
+            raise _Refusal(6, "profile_invalid", f"profile {name!r} at {shipped} is refused by "
+                           f"the harness runner: {exc}") from None
+        where = str(shipped)
+        origin = {"name": name, "layer": "capability", "version": None, "path": where}
     except Exception as exc:
         raise _Refusal(6, "profile_invalid",
                        f"profile {name!r} is refused by the harness runner: {exc}") from None
+    try:
+        profile = lib.Profile.from_dict(knobs)
+    except Exception as exc:
+        raise _Refusal(6, "profile_invalid", f"{where}: {exc}") from None
     problems = _profile_fit(knobs)
     if problems:
-        raise _Refusal(6, "profile_unfit", f"profile {name!r} at {found.path} does not fit a "
-                       "room turn: " + "; ".join(problems))
-    return profile, knobs.get("harness"), {"name": name, "path": str(found.path),
-                                           "source": found.source, "harness": knobs.get("harness"),
-                                           "model": knobs.get("model")}
+        raise _Refusal(6, "profile_unfit", f"profile {name!r} ({where}) does not fit a room "
+                       "turn: " + "; ".join(problems))
+    origin.update(harness=knobs.get("harness"), model=knobs.get("model"))
+    return profile, knobs.get("harness"), origin
 
 
 def _agent_refusal(cid: str, reg: dict) -> tuple | None:
@@ -3798,16 +3928,19 @@ def _plan_here(root: Path, expected_id: str | None) -> dict:
         raise _Refusal(4, "project_enable_required",
                        f"{NAME} is not enabled explicitly for this project",
                        f"`capabilities enable {NAME} --project`")
-    settings = _load_settings(root)
     engine = _engine()
     try:
         setting = engine.resolve_store(root)
     except engine.StoreUnavailable as exc:
         raise _Refusal(6, exc.slug, exc.message, exc.hint) from None
+    declared = (_inventory_connections().get("connections") or {})
+    if not declared:
+        raise _Refusal(6, "no_agent_served", "no agent can be served: this project declares no "
+                       f"{NAME} connection", f"`{NAME} register NAME` declares one")
     reg = _connections_composed()
     agents: dict = {}
     skipped: dict = {}
-    for cid, conf in settings["agents"].items():
+    for cid in sorted(declared):
         refusal = _agent_refusal(cid, reg)
         if refusal:
             skipped[cid] = refusal[1]
@@ -3816,23 +3949,14 @@ def _plan_here(root: Path, expected_id: str | None) -> dict:
         if problem:
             skipped[cid] = problem["message"]
             continue
-        try:
-            profile, harness, origin = _resolve_profile(root, conf["profile"])
-        except _Refusal as exc:
-            skipped[cid] = exc.message
-            continue
         token_print = engine.fingerprint_of(cfg["token"].encode())
         agents[cid] = {"connection": cid, "homeserver": cfg["homeserver"],
                        "user_id": cfg["user_id"], "token": cfg["token"],
                        "token_fingerprint": token_print,
-                       "identity": (cfg["homeserver"], cfg["user_id"], token_print),
-                       "profile": profile, "profile_name": conf["profile"], "harness": harness,
-                       "origin": origin, "turn_timeout": conf["turn_timeout"],
-                       "history": conf["history"]}
+                       "identity": (cfg["homeserver"], cfg["user_id"], token_print)}
     if not agents:
-        detail = "; ".join(f"{c}: {r}" for c, r in sorted(skipped.items())) or \
-            "the settings list no agent"
-        raise _Refusal(4 if skipped else 6, "no_agent_served", f"no agent can be served: {detail}")
+        detail = "; ".join(f"{c}: {r}" for c, r in sorted(skipped.items()))
+        raise _Refusal(4, "no_agent_served", f"no agent can be served: {detail}")
     if setting.url is None:
         name = f"{setting.host}:{setting.port}/{setting.database}"
     else:
@@ -3887,11 +4011,16 @@ class _Host:
             return None, ("error", f"the project folder {root} is gone")
         with self.lock:
             try:
+                moved = _ask_in_project(root, lambda: _import_agents_map(root, apply=True))
                 plan = _ask_in_project(root, lambda: _plan_here(root, project_id))
             except _Refusal as exc:
                 return None, ("refused", f"{exc.code}: {exc.message}")
             except Exception as exc:
                 return None, ("error", f"{type(exc).__name__}: {exc}")
+        if moved and moved.get("moved"):
+            self.log(entry, "moved service/settings.json into workers: " + "; ".join(
+                f"{cid} bound to worker {w}" for cid, w in sorted(moved["moved"].items()))
+                + (f"; dropped {', '.join(moved['dropped'])}" if moved.get("dropped") else ""))
         for cid, why in plan["skipped"].items():
             self.log(entry, f"{cid}: not served: {why}")
         return plan, None
@@ -3926,6 +4055,21 @@ class _Host:
             except Exception as exc:
                 return ("error", f"{type(exc).__name__}: {exc}")
 
+    def binding(self, entry: dict, cid: str) -> dict:
+        """What the agent's connection binds, read inside the project now: its
+        worker, its rooms' workers and its supervisor."""
+        root = Path(entry["root"])
+
+        def question():
+            found = (_connections_composed().get("connections") or {}).get(cid) or {}
+            return {key: found.get(key) for key in BINDING_KEYS}
+
+        with self.lock:
+            return _ask_in_project(root, question)
+
+    def profile(self, entry: dict, store, name: str):
+        return _resolve_profile(store, entry["id"], name)
+
     def matrix(self, homeserver: str, token: str, timeout: float = TIMEOUT) -> Matrix:
         return Matrix(homeserver, token, timeout)
 
@@ -3934,14 +4078,321 @@ class _Host:
         return harness_runner
 
     def template(self, entry: dict) -> str:
-        override = _project_capabilities_dir(Path(entry["root"])) / NAME / "service" / "room.md"
-        if override.is_file():
-            return override.read_text()
         return _template_path().read_text()
 
     def turn_env(self, entry: dict) -> dict:
         with self.lock:
             return {k: v for k, v in os.environ.items() if k not in _PROJECT_POINTERS}
+
+
+# ── workers ──────────────────────────────────────────────────────────────────
+
+
+def _turn_gate(action: str) -> None:
+    """A turn is fenced by the worker that admitted it, so nothing working
+    inside a turn the service started changes a worker or what is bound."""
+    if os.environ.get(_engine().TURN_ENV):
+        _die(4, "policy", f"`workers {action}` is refused inside a turn the {NAME} service "
+             "started: a turn is fenced by its worker, and a fence the fenced can rewrite is "
+             "none", "a person changes workers and bindings, outside any turn")
+
+
+def _open_store(root: Path):
+    engine = _engine()
+    try:
+        return engine.Store(engine.resolve_store(root)).open()
+    except engine.StoreUnavailable as exc:
+        raise _Refusal(5 if exc.slug in ("store_unreachable", "store_busy") else 6,
+                       exc.slug, exc.message, exc.hint) from None
+
+
+def _worker_name_for(cid: str) -> str:
+    """The worker an agents-map entry is moved into: named after its connection."""
+    name = re.sub(r"[^a-z0-9_-]+", "-", cid.lower()).strip("-_")[:64] or "agent"
+    return f"{name}-agent" if name == _engine().DEFAULT_WORKER else name
+
+
+def _write_binding(cid: str, changes: dict) -> tuple[dict, str]:
+    """Write binding keys onto a connection this project declares: a value of
+    None takes the key off. Raises _Refusal."""
+    adapter = _records()
+    try:
+        ident = adapter.resolve(NAME, "connection").get(cid)
+        if ident is None or not ident.get("value"):
+            raise _Refusal(3, "unknown_connection", f"no connection {cid!r} is declared here")
+        if ident.get("scope") != "project":
+            raise _Refusal(6, "connection_not_in_project",
+                           f"connection {cid!r} is declared at the {ident.get('scope')} scope, "
+                           "and a binding is this project's",
+                           "declare the agent's connection in this project to bind its workers")
+        value = dict(ident["value"])
+        for key, wanted in changes.items():
+            if wanted is None or wanted == {}:
+                value.pop(key, None)
+            else:
+                value[key] = wanted
+        adapter.set(NAME, "connection", cid, value, scope="project")
+        return value, adapter.scope_source(NAME, "connection", "project")
+    except StoreError as e:
+        raise _Refusal(4 if e.slug == "read_only_switch" else 6, e.slug, e.message,
+                       e.hint) from None
+
+
+def _import_agents_map(root: Path, apply: bool) -> dict | None:
+    """Move an earlier release's service/settings.json agents map into workers:
+    one worker per listed connection, named after it, with the profile,
+    turn_timeout and history the map gave it, admitting every sender as the
+    service did, bound on the connection; then the map is taken out of the
+    file, and the file removed when nothing else is left in it. A connection
+    the project no longer declares is dropped. A connection that already binds
+    a worker keeps it. None when there is no map."""
+    agents = _legacy_agents(root)
+    if agents is None:
+        return None
+    engine = _engine()
+    path = _settings_path(root)
+    try:
+        identities = _records().resolve(NAME, "connection")
+    except StoreError as e:
+        raise _Refusal(6, e.slug, e.message, e.hint) from None
+    moves: dict = {}
+    dropped: list = []
+    for cid, conf in sorted(agents.items()):
+        ident = identities.get(cid)
+        if ident is None or not ident.get("value"):
+            dropped.append(cid)
+            continue
+        if ident["value"].get("worker"):
+            moves[cid] = (ident["value"]["worker"], None)
+            continue
+        name = _worker_name_for(cid)
+        spec = {"description": "Moved from service/settings.json: admits every sender, as the "
+                               "service did before workers.",
+                "profile": conf["profile"], "history": conf["history"],
+                "accepts_from": ["*"], "limits": {"turn_timeout": conf["turn_timeout"]}}
+        try:
+            engine.read_worker(name, spec, "", f"{path}: agents.{cid}")
+        except engine.WorkerInvalid as exc:
+            raise _Refusal(6, "settings_invalid", str(exc),
+                           f"repair agents.{cid} in {path}, or remove the file and bind a "
+                           f"worker with `{NAME} workers bind`") from None
+        moves[cid] = (name, spec)
+    answer = {"settings": str(path), "moved": {cid: name for cid, (name, _s) in moves.items()},
+              "dropped": dropped, "applied": bool(apply)}
+    if not apply:
+        return answer
+    if read_only_switch():
+        raise _Refusal(4, "read_only_switch", f"moving {path} into workers is refused: "
+                       f"{READ_ONLY_ENV} is set")
+    project, _slug = _identity_here()
+    store = _open_store(root)
+    try:
+        for cid, (name, spec) in moves.items():
+            if spec is None:
+                continue
+            if store.worker(project, name) is None:
+                store.save_worker(project, name, spec, "", base=None, by=_actor())
+            _write_binding(cid, {"worker": name})
+    finally:
+        store.close()
+    raw = json.loads(path.read_text())
+    raw.pop("agents", None)
+    if set(raw) <= {"version"}:
+        path.unlink()
+        answer["removed"] = str(path)
+    else:
+        path.write_text(json.dumps(raw, indent=2) + "\n")
+    return answer
+
+
+def _version_answer(row: dict, whole: bool = True) -> dict:
+    answer = {"worker": row["name"], "source": "store", "version": row["id"],
+              "active": row["active"], "created_at": row["created_at"],
+              "created_by": row["created_by"]}
+    if whole:
+        answer.update(spec=row["spec"], body=row["body"],
+                      text=_engine().worker_text(row["spec"], row["body"]))
+    return answer
+
+
+def _shipped_default() -> dict:
+    engine = _engine()
+    path = engine.DEFAULT_WORKER_PATH
+    text = path.read_text()
+    spec, body = engine.split_document(text, str(path))
+    return {"worker": engine.DEFAULT_WORKER, "source": "shipped", "path": str(path),
+            "spec": spec, "body": body, "text": text}
+
+
+def _read_input(source: str) -> str:
+    if source == "-":
+        return sys.stdin.read()
+    try:
+        return Path(source).read_text()
+    except OSError as exc:
+        _die(6, "input", f"{source} could not be read: {exc}")
+
+
+def _bindings() -> dict:
+    conns = _inventory_connections().get("connections") or {}
+    return {cid: {"user_id": e.get("user_id"), "worker": e.get("worker"),
+                  "rooms": e.get("rooms") or {}, "supervisor": e.get("supervisor"),
+                  "granted": bool(e.get("granted")), "allow_write": bool(e.get("allow_write"))}
+            for cid, e in sorted(conns.items())}
+
+
+def cmd_workers(args, wanted: str | None) -> None:
+    engine = _engine()
+    action = args.action
+    root = _project_root()
+    if root is None:
+        _die(6, "input", "workers belong to a project, and this is not one",
+             "run this where the project whose agents they answer is")
+    if action in ("save", "remove", "bind", "unbind", "import") or \
+            (action == "supervisor" and (args.user_id or args.clear)):
+        if action != "import" or args.apply:
+            _turn_gate(action)
+            _read_only_gate(f"`{NAME} workers {action}`")
+    name = getattr(args, "name", None)
+    if name is not None and not engine.WORKER_NAME.fullmatch(name):
+        _die(6, "input", f"{name!r} is not a worker name: lowercase letters, digits, - and _, "
+             "starting with a letter or digit")
+    try:
+        if action == "import":
+            found = _import_agents_map(root, bool(args.apply))
+            _emit(found or {"settings": str(_settings_path(root)), "moved": {},
+                            "reason": "there is no agents map to move"})
+            return
+        if action in ("bind", "unbind", "supervisor"):
+            _emit(_cmd_binding(args, wanted))
+            return
+        project, _slug = _identity_here()
+        if action == "show" and name == engine.DEFAULT_WORKER and not args.version:
+            _emit(_shipped_default())
+            return
+        if action in ("save", "remove") and name == engine.DEFAULT_WORKER:
+            _die(6, "input", f"`{engine.DEFAULT_WORKER}` is the shipped worker that answers "
+                 "senders no worker admits; it is not saved or removed",
+                 "save the worker under another name and bind it")
+        store = _open_store(root)
+    except _Refusal as exc:
+        _refused(exc)
+    try:
+        if action == "list":
+            rows = [{"worker": r["name"], "source": "store", "version": r["id"],
+                     "enabled": r["spec"].get("enabled", True),
+                     "description": str(r["spec"].get("description") or "").strip(),
+                     "updated_at": r["created_at"], "updated_by": r["created_by"]}
+                    for r in store.workers(project)]
+            shipped = _shipped_default()
+            rows.append({"worker": shipped["worker"], "source": "shipped",
+                         "path": shipped["path"], "enabled": True,
+                         "description": str(shipped["spec"].get("description") or "").strip()})
+            _emit({"workers": rows, "bindings": _bindings()})
+        elif action == "show":
+            row = store.worker(project, name, args.version)
+            if row is None:
+                _die(3, "not_found", f"no worker named {name!r}"
+                     + (f" at version {args.version}" if args.version else "") + " here",
+                     f"`{NAME} workers list` shows this project's workers")
+            _emit(_version_answer(row))
+        elif action == "history":
+            rows = store.worker_history(project, name)
+            if not rows:
+                _die(3, "not_found", f"no worker named {name!r} was ever saved here",
+                     f"`{NAME} workers list` shows this project's workers")
+            _emit({"worker": name, "versions": [_version_answer(r, whole=False) for r in rows]})
+        elif action == "save":
+            text = _read_input(args.file)
+            try:
+                spec, body = engine.split_document(text, args.file)
+                worker = engine.read_worker(name, spec, body, f"worker {name!r}")
+            except engine.WorkerInvalid as exc:
+                _die(6, "worker_invalid", str(exc), f"`{NAME} help` WORKERS states the shape")
+            try:
+                row, created = store.save_worker(project, name, spec, body, base=args.base,
+                                                 by=_actor())
+            except engine.WorkerConflict as exc:
+                _die(6, "conflict", str(exc),
+                     f"read it again with `{NAME} workers show {name}` and save over that")
+            answer = {**_version_answer(row, whole=False), "created": created}
+            if worker["enabled"]:
+                try:
+                    _resolve_profile(store, project, worker["profile"])
+                except _Refusal as exc:
+                    answer["warning"] = exc.message
+            _emit(answer)
+        elif action == "remove":
+            try:
+                gone = store.remove_worker(project, name, base=args.base)
+            except engine.WorkerConflict as exc:
+                _die(6, "conflict", str(exc), f"`{NAME} workers show {name}` reads it again")
+            if gone is None:
+                _die(3, "not_found", f"worker {name!r} has no active version",
+                     f"`{NAME} workers list` shows this project's workers")
+            _emit({"worker": name, "removed": gone})
+    finally:
+        store.close()
+
+
+def _cmd_binding(args, wanted: str | None) -> dict:
+    """bind, unbind and supervisor: the keys the selected agent's connection
+    carries. Raises _Refusal."""
+    engine = _engine()
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    entry = entry or {}
+    room_id = None
+    if getattr(args, "room", None):
+        room_id = args.room
+        if not room_id.startswith("!"):
+            cfg = _cfg(cid, "workers")
+            with _matrix(cfg) as m:
+                room_id = _resolve_room(m, cfg, args.room)
+    if args.action == "supervisor":
+        if not args.user_id and not args.clear:
+            return {"connection": cid, "user_id": entry.get("user_id"),
+                    "supervisor": entry.get("supervisor")}
+        if args.user_id and args.clear:
+            raise _Refusal(6, "input", "supervisor takes a user id or --clear, not both")
+        if args.user_id and not USER_RE.fullmatch(args.user_id):
+            raise _Refusal(6, "input", f"{args.user_id!r} is not a Matrix user id (@name:server)")
+        value, where = _write_binding(cid, {"supervisor": None if args.clear else args.user_id})
+        return {"connection": cid, "supervisor": value.get("supervisor"), "registry": where}
+    rooms = dict(entry.get("rooms") or {}) if isinstance(entry.get("rooms"), dict) else {}
+    if args.action == "bind":
+        if args.name == engine.DEFAULT_WORKER:
+            raise _Refusal(6, "input", f"`{engine.DEFAULT_WORKER}` answers every agent no worker "
+                           "admits a sender for, and is never bound")
+        project, _slug = _identity_here()
+        store = _open_store(_project_root())
+        try:
+            if store.worker(project, args.name) is None:
+                raise _Refusal(3, "not_found", f"worker {args.name!r} has no active version",
+                               f"save it first with `{NAME} workers save {args.name} <file>`")
+        finally:
+            store.close()
+        if room_id:
+            rooms[room_id] = args.name
+            changes = {"rooms": rooms}
+        else:
+            changes = {"worker": args.name}
+    else:
+        if room_id:
+            if rooms.pop(room_id, None) is None:
+                return {"connection": cid, "room_id": room_id, "unbound": False,
+                        "reason": "no worker is bound to this agent in that room"}
+            changes = {"rooms": rooms}
+        else:
+            if not entry.get("worker"):
+                return {"connection": cid, "unbound": False,
+                        "reason": "no worker is bound to this agent"}
+            changes = {"worker": None}
+    value, where = _write_binding(cid, changes)
+    return {"connection": cid, "user_id": entry.get("user_id"), "worker": value.get("worker"),
+            "rooms": value.get("rooms") or {}, "registry": where,
+            "next": "the service reads it at the agent's next turn"}
+
 
 
 # ── the service verbs ────────────────────────────────────────────────────────
@@ -4002,28 +4453,11 @@ def _serving_state(entry: dict) -> tuple[Path, bool]:
     return (_machine_state_dir(), True) if joined else (_project_state_dir(entry["slug"]), False)
 
 
-def cmd_service_init(connections: list[str], force: bool) -> dict:
-    root = _project_root()
-    path = _settings_path(root)
-    if path.exists() and not force:
-        _die(6, "settings_exist", f"{path} exists", f"`{NAME} service init --force` rewrites it")
-    declared = sorted((_inventory_connections()["connections"] or {}).keys())
-    chosen = connections or declared
-    unknown = sorted(set(chosen) - set(declared))
-    if unknown:
-        _die(6, "unknown_connection", f"no connection {', '.join(unknown)} in this project",
-             f"known: {', '.join(declared) or 'none - run `agentrooms register NAME`'}")
-    if not chosen:
-        _die(6, "no_connection", "this project declares no agentrooms connection to serve",
-             f"`{NAME} register NAME` declares one")
-    settings = {"version": 1, "agents": {cid: {"profile": DEFAULT_PROFILE,
-                                               "turn_timeout": DEFAULT_TURN_TIMEOUT,
-                                               "history": DEFAULT_HISTORY} for cid in chosen}}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(settings, indent=2) + "\n")
-    return {"written": str(path), "agents": chosen,
-            "next": f"`{NAME} service join` to be served by the machine service, or "
-                    f"`{NAME} service run` to serve this project alone"}
+def cmd_service_init() -> dict:
+    _die(6, "input", "a project's service takes no settings file: it serves every connection "
+         "the project declares and grants writes, each answered by the worker bound to it",
+         f"`{NAME} workers save` and `{NAME} workers bind` give an agent its worker; "
+         f"`{NAME} service init --machine` writes the machine settings")
 
 
 def cmd_service_init_machine(force: bool) -> dict:
@@ -4039,7 +4473,6 @@ def cmd_service_join() -> dict:
     root = _require_project_enabled_for_service()
     try:
         project, slug = _identity_here()
-        _load_settings(root)
     except _Refusal as exc:
         _refused(exc)
     with _list_lock():
@@ -4113,7 +4546,6 @@ def cmd_service_run(machine: bool) -> None:
                  f"`{NAME} service leave` takes it back to project mode first")
         entry = _project_entry_here()
         try:
-            _load_settings(root)
             _load_machine_settings()
         except _Refusal as exc:
             _refused(exc)
@@ -4174,7 +4606,6 @@ def cmd_service_reload(machine: bool, timeout: float) -> dict:
     else:
         root = Path(entry["root"])
         try:
-            _load_settings(root)
             _plan_here(root, None)
         except _Refusal as exc:
             _refused(exc)
@@ -4296,6 +4727,51 @@ def _doctor_store(root: Path | None) -> dict:
             "pending": found.pending}
 
 
+def _doctor_workers(store, project: str, binding: dict) -> dict:
+    """What one agent's bindings answer: each bound worker, whether it is there
+    and on, and the profile it names. An agent with none is answered by the
+    default worker alone, which is no fault."""
+    engine = _engine()
+    named = {"agent": binding.get("worker")}
+    named.update({f"room {room}": worker for room, worker in (binding.get("rooms") or {}).items()})
+    out: dict = {"ok": True, "supervisor": binding.get("supervisor")}
+    if not any(named.values()):
+        out["bound"] = None
+        out["note"] = "no worker is bound: only the default worker answers this agent"
+        return out
+    rows = {}
+    for where, name in named.items():
+        if not name:
+            continue
+        row: dict = {"worker": name}
+        if store is None:
+            row["state"] = "unknown: the store is not reachable"
+        else:
+            found = store.worker(project, name)
+            if found is None:
+                row.update(state="missing", error=f"worker {name!r} has no active version")
+                out["ok"] = False
+            else:
+                try:
+                    worker = engine.read_worker(name, found["spec"], found["body"],
+                                                f"worker {name!r}")
+                    row.update(state="enabled" if worker["enabled"] else "off",
+                               version=found["id"], profile=worker["profile"])
+                    if worker["enabled"]:
+                        try:
+                            row["profile"] = _resolve_profile(store, project,
+                                                              worker["profile"])[2]
+                        except _Refusal as exc:
+                            row["error"] = exc.message
+                            out["ok"] = False
+                except engine.WorkerInvalid as exc:
+                    row.update(state="invalid", error=str(exc))
+                    out["ok"] = False
+        rows[where] = row
+    out["bound"] = rows
+    return out
+
+
 def cmd_service_doctor(machine: bool) -> None:
     findings: dict = {}
     fail = 0
@@ -4327,21 +4803,46 @@ def cmd_service_doctor(machine: bool) -> None:
     else:
         root = _project_root()
         try:
-            _load_settings(root)
             plan = _plan_here(root, None)
-            note("settings", {"ok": True, "path": str(_settings_path(root)),
-                              "agents": sorted(plan["agents"]), "skipped": plan["skipped"]})
+            note("agents", {"ok": True, "served": sorted(plan["agents"]),
+                            "skipped": plan["skipped"]})
         except _Refusal as exc:
             plan = None
+            note("agents", {"ok": False, "category": exc.exit_code, "code": exc.code,
+                            "error": exc.message, **({"hint": exc.hint} if exc.hint else {})})
+        try:
+            legacy = _legacy_agents(root)
+        except _Refusal as exc:
+            legacy = None
             note("settings", {"ok": False, "category": exc.exit_code, "code": exc.code,
-                              "error": exc.message, **({"hint": exc.hint} if exc.hint else {})})
-        note("store", _doctor_store(root))
+                              "error": exc.message})
+        if legacy is not None:
+            findings["settings"] = {
+                "ok": True, "path": str(_settings_path(root)), "agents_map": sorted(legacy),
+                "warning": "an earlier release's agents map; the service moves it into workers "
+                           f"when it takes the project up, or `{NAME} workers import --apply` "
+                           "moves it now"}
+        store_row = _doctor_store(root)
+        note("store", store_row)
         if plan:
-            for cid, agent in plan["agents"].items():
-                row = _check_connection({"homeserver": agent["homeserver"], "token": agent["token"],
-                                         "user_id": agent["user_id"], "allow_write": True})
-                row["profile"] = agent["origin"]
-                note(f"agent:{cid}", row)
+            store = None
+            if store_row.get("ok"):
+                with contextlib.suppress(_Refusal):
+                    store = _open_store(root)
+            try:
+                bindings = _bindings()
+                for cid, agent in plan["agents"].items():
+                    row = _check_connection({"homeserver": agent["homeserver"],
+                                             "token": agent["token"],
+                                             "user_id": agent["user_id"], "allow_write": True})
+                    row["workers"] = _doctor_workers(store, plan["project_id"],
+                                                     bindings.get(cid) or {})
+                    if not row["workers"].get("ok", True) and row.get("ok"):
+                        row.update(ok=False, category=6)
+                    note(f"agent:{cid}", row)
+            finally:
+                if store is not None:
+                    store.close()
         view = _status_view(False)
         if not view["running"]:
             note("process", {"ok": False, "category": 7, "error": "no process serves this project",
@@ -4367,23 +4868,15 @@ def _inventory(_network: bool) -> dict:
     and the service as its files on this machine say."""
     conns = (_inventory_connections().get("connections") or {})
     root = _project_root()
-    served: list = []
-    settings_ok = None
-    problem = None
-    if root is not None:
-        try:
-            served = sorted(_load_settings(root)["agents"])
-            settings_ok = True
-        except _Refusal as exc:
-            settings_ok = exc.code == "service_not_initialized"
-            problem = None if settings_ok else f"{exc.code}: {exc.message}"
+    served = sorted(cid for cid, e in conns.items() if e.get("granted") and e.get("allow_write"))
     items = []
     for cid, entry in sorted(conns.items()):
         items.append({"group": "agents", "name": cid, "state": "granted" if entry.get("granted")
                       else "withheld", "detail": entry.get("user_id"),
                       "attributes": [{"label": "homeserver", "value": entry.get("homeserver")},
                                      {"label": "writes", "value": bool(entry.get("allow_write"))},
-                                     {"label": "served", "value": cid in served}]})
+                                     {"label": "served", "value": cid in served},
+                                     {"label": "worker", "value": entry.get("worker")}]})
     service: dict = {"state": "stopped"}
     try:
         identity = json.loads((_project_capabilities_dir(root) / "project.json").read_text()) \
@@ -4400,9 +4893,7 @@ def _inventory(_network: bool) -> dict:
         if _pid_alive(pid):
             service = {"state": "running", "detail": f"pid {pid}"
                        + (" (machine service)" if joined else "")}
-    if problem:
-        service.update(ok=False, problem=problem)
-    elif settings_ok is not None:
+    if root is not None:
         service["ok"] = True
     return {"metrics": [{"label": "agents", "value": len(conns)},
                         {"label": "served", "value": len(served)}],
@@ -4465,10 +4956,31 @@ def _parser() -> _Parser:
     post.add_argument("--data")
     post.add_argument("--file")
     post.add_argument("--txn-id", dest="txn_id")
+    workers = sub.add_parser("workers")
+    wsub = workers.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    wsub.add_parser("list")
+    shown = wsub.add_parser("show")
+    shown.add_argument("name")
+    shown.add_argument("--version")
+    wsub.add_parser("history").add_argument("name")
+    saved = wsub.add_parser("save")
+    saved.add_argument("name")
+    saved.add_argument("file")
+    saved.add_argument("--base")
+    removed = wsub.add_parser("remove")
+    removed.add_argument("name")
+    removed.add_argument("--base")
+    bind = wsub.add_parser("bind")
+    bind.add_argument("name")
+    bind.add_argument("--room")
+    wsub.add_parser("unbind").add_argument("--room")
+    supervisor = wsub.add_parser("supervisor")
+    supervisor.add_argument("user_id", nargs="?")
+    supervisor.add_argument("--clear", action="store_true")
+    wsub.add_parser("import").add_argument("--apply", action="store_true")
     service = sub.add_parser("service")
     ssub = service.add_subparsers(dest="action", required=True, parser_class=_Parser)
     init = ssub.add_parser("init")
-    init.add_argument("--agent", action="append", default=[])
     init.add_argument("--force", action="store_true")
     init.add_argument("--machine", action="store_true")
     for verb in ("run", "status", "doctor"):
@@ -4502,8 +5014,7 @@ def _service(args) -> None:
     action = args.action
     machine = bool(getattr(args, "machine", False))
     if action == "init":
-        _emit(cmd_service_init_machine(args.force) if machine
-              else cmd_service_init(args.agent, args.force))
+        _emit(cmd_service_init_machine(args.force) if machine else cmd_service_init())
     elif action == "join":
         _emit(cmd_service_join())
     elif action == "leave":
@@ -4558,6 +5069,9 @@ def main() -> None:
         return
     if cmd == "service":
         _service(args)
+        return
+    if cmd == "workers":
+        cmd_workers(args, wanted)
         return
     cfg = _cfg(wanted, cmd)
     if cmd == "rooms":

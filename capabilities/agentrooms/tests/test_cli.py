@@ -283,29 +283,27 @@ def test_connections_masks_the_token_and_doctor_checks_identity(cli, project, ho
     assert code == 0 and out["connections"]["alpha"]["user_id"] == f"@alpha:{SERVER}"
 
 
-def test_settings_are_checked_whole(cli, project):
+def test_an_earlier_agents_map_is_read_for_its_move(cli, project):
     service = project / "capabilities" / "agentrooms" / "service"
     service.mkdir(parents=True)
-    with pytest.raises(cli._Refusal) as missing:
-        cli._load_settings(project)
-    assert missing.value.code == "service_not_initialized"
-    for bad in ({"version": 1, "agents": {"a": {"history": 0}}},
-                {"version": 1, "agents": {"a": {"nope": 1}}},
-                {"version": 2, "agents": {}},
-                {"version": 1, "agents": {}, "extra": True}):
-        (service / "settings.json").write_text(json.dumps(bad))
-        with pytest.raises(cli._Refusal):
-            cli._load_settings(project)
-    (service / "settings.json").write_text(json.dumps({"version": 1, "agents": {"a": {}}}))
-    assert cli._load_settings(project)["agents"]["a"] == {
-        "profile": "agentrooms-claude", "turn_timeout": 900, "history": 30}
+    assert cli._legacy_agents(project) is None
+    (service / "settings.json").write_text(json.dumps({"version": 1, "agents": {
+        "a": {}, "b": {"profile": "agentrooms-codex", "turn_timeout": 60, "history": 5}}}))
+    assert cli._legacy_agents(project) == {
+        "a": {"profile": "agentrooms-claude", "turn_timeout": 900, "history": 30},
+        "b": {"profile": "agentrooms-codex", "turn_timeout": 60, "history": 5}}
+    (service / "settings.json").write_text("{nope")
+    with pytest.raises(cli._Refusal):
+        cli._legacy_agents(project)
+
+
+def test_a_project_service_takes_no_settings_file(cli, project, capsys):
+    code, _out, err = run(cli, capsys, "service", "init")
+    assert code == 6 and "workers bind" in err["error"]["hint"]
 
 
 def test_service_run_refuses_without_a_store(cli, project, capsys):
     connect(project, allow_write=True)
-    service = project / "capabilities" / "agentrooms" / "service"
-    service.mkdir(parents=True)
-    (service / "settings.json").write_text(json.dumps({"version": 1, "agents": {"alpha": {}}}))
     code, _out, err = run(cli, capsys, "service", "run")
     assert code == 6 and err["error"]["code"] == "store_not_configured"
     code, _out, err = run(cli, capsys, "service", "run", "--machine")
@@ -324,9 +322,6 @@ def test_service_activation_needs_an_explicit_project_enable(cli, project, capsy
 
 def test_join_and_leave_write_the_machine_list(cli, project, capsys):
     connect(project, allow_write=True)
-    service = project / "capabilities" / "agentrooms" / "service"
-    service.mkdir(parents=True)
-    (service / "settings.json").write_text(json.dumps({"version": 1, "agents": {"alpha": {}}}))
     code, out, err = run(cli, capsys, "service", "join")
     assert code == 0 and out["joined"] is True, err
     listed = json.loads(cli._machine_projects_path().read_text())
@@ -348,28 +343,128 @@ def test_inventory_is_local_and_changes_nothing(cli, project, homeserver, capsys
     assert not homeserver.requests
 
 
-def test_the_room_prompt_a_project_shadows_is_the_system_prompt_append(cli, project, tmp_path):
+def test_the_room_frame_is_the_capabilitys_and_the_role_follows_it(cli, project, tmp_path):
     from test_engine import FakeHost, FakeMatrix, FakeRunner, ME, engine, make_engine, message
 
-    def turn_rules(where):
-        host_template = cli._Host("project").template
-        matrix = FakeMatrix([message("$1", "@b:example.org", f"{ME} hi")])
-        runner = FakeRunner(["answer"])
-        host = FakeHost(matrix, runner, template=host_template({"root": str(project)}))
-        eng, slot = make_engine(tmp_path / where, matrix, runner, host=host)
-        slot.store.add("!r", "$1")
-        eng.turn(engine.Turn(slot, "alpha", "!r"))
-        return runner.calls[0]
-
-    (tmp_path / "bundled").mkdir()
-    bundled = turn_rules("bundled")
-    assert bundled["profile"].append_system_prompt.startswith("# You are an agent in a shared room")
-    assert f"You are {ME}," in bundled["profile"].append_system_prompt
-    assert "shared room" not in bundled["prompt"]
     service = project / "capabilities" / "agentrooms" / "service"
     service.mkdir(parents=True)
-    (service / "room.md").write_text("Project rules for $user_id in $room_name; quiet is $silent.\n")
-    (tmp_path / "shadowed").mkdir()
-    shadowed = turn_rules("shadowed")
-    assert shadowed["profile"].append_system_prompt == f"Project rules for {ME} in lab; quiet is [silent]."
-    assert "Project rules" not in shadowed["prompt"] and "shared room" not in shadowed["prompt"]
+    (service / "room.md").write_text("Project rules for $user_id.\n")
+    template = cli._Host("project").template({"root": str(project)})
+    matrix = FakeMatrix([message("$1", "@b:example.org", f"{ME} hi")])
+    runner = FakeRunner(["answer"])
+    host = FakeHost(matrix, runner, template=template)
+    eng, slot = make_engine(tmp_path, matrix, runner, host=host,
+                            workers={"w": ({"accepts_from": ["*"]}, "Keep the lab tidy.")})
+    slot.store.add("!r", "$1")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    sent = runner.calls[0]["profile"].append_system_prompt
+    assert sent.startswith("# You are an agent in a shared room") and f"You are {ME}," in sent
+    assert sent.endswith("## Your role\n\nKeep the lab tidy.") and "Project rules" not in sent
+    assert "shared room" not in runner.calls[0]["prompt"]
+
+
+# ── workers in the store ─────────────────────────────────────────────────────
+
+DSN = os.environ.get("AGENTROOMS_TEST_DSN")
+needs_store = pytest.mark.skipif(not DSN, reason="AGENTROOMS_TEST_DSN is not set")
+
+
+@pytest.fixture()
+def stored(project, monkeypatch):
+    import uuid as _uuid
+    schema = f"ar_cli_{_uuid.uuid4().hex[:8]}"
+    url = DSN if "sslmode=" in DSN else DSN + ("&" if "?" in DSN else "?") + "sslmode=disable"
+    monkeypatch.setenv("AGENTKIT_DB_URL", url)
+    monkeypatch.setenv("AGENTKIT_DB_SCHEMA", schema)
+    yield schema
+    import psycopg
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+
+
+ROLE = """---
+description: Answers the lab.
+accepts_from: ["@b:example.org"]
+limits:
+  turns_per_room: 10
+---
+Keep the lab tidy.
+"""
+
+
+@needs_store
+def test_workers_are_saved_as_versions_and_bound_on_the_connection(cli, project, stored, capsys,
+                                                                    tmp_path):
+    connect(project, allow_write=True)
+    doc = tmp_path / "lab.md"
+    doc.write_text(ROLE)
+    code, out, err = run(cli, capsys, "workers", "save", "lab", str(doc))
+    assert code == 0 and out["created"] is True, err
+    first = out["version"]
+    code, out, _err = run(cli, capsys, "workers", "save", "lab", str(doc))
+    assert out["created"] is False and out["version"] == first
+    doc.write_text(ROLE.replace("10", "12"))
+    code, _out, err = run(cli, capsys, "workers", "save", "lab", str(doc), "--base", "nope")
+    assert code == 6 and err["error"]["code"] == "conflict"
+    code, out, _err = run(cli, capsys, "workers", "save", "lab", str(doc), "--base", first)
+    assert code == 0 and out["created"] is True
+    code, out, _err = run(cli, capsys, "workers", "show", "lab")
+    assert out["spec"]["limits"]["turns_per_room"] == 12 and out["body"] == "Keep the lab tidy."
+    assert out["text"].startswith("---\n")
+    code, out, _err = run(cli, capsys, "workers", "history", "lab")
+    assert [v["active"] for v in out["versions"]] == [False, True]
+    doc.write_text("---\naccepts_from: []\n---\n")
+    code, _out, err = run(cli, capsys, "workers", "save", "bad", str(doc))
+    assert code == 6 and err["error"]["code"] == "worker_invalid"
+    code, _out, err = run(cli, capsys, "workers", "save", "default", str(doc))
+    assert code == 6
+    code, _out, err = run(cli, capsys, "workers", "bind", "ghost")
+    assert code == 3
+    code, out, err = run(cli, capsys, "workers", "bind", "lab")
+    assert code == 0 and out["worker"] == "lab", err
+    code, out, _err = run(cli, capsys, "workers", "bind", "lab", "--room", "!lab:example.org")
+    assert out["rooms"] == {"!lab:example.org": "lab"}
+    code, out, _err = run(cli, capsys, "workers", "supervisor", "@boss:example.org")
+    assert out["supervisor"] == "@boss:example.org"
+    entry = json.loads((project / "capabilities" / "agentrooms" / "connections.json").read_text())
+    alpha = entry["connections"]["alpha"]
+    assert alpha["worker"] == "lab" and alpha["supervisor"] == "@boss:example.org"
+    assert alpha["allow_write"] is True and alpha["secret_env"] == "AGENTROOMS_ALPHA_TOKEN"
+    code, out, _err = run(cli, capsys, "workers", "list")
+    names = {w["worker"]: w for w in out["workers"]}
+    assert names["lab"]["source"] == "store" and names["default"]["source"] == "shipped"
+    assert out["bindings"]["alpha"]["rooms"] == {"!lab:example.org": "lab"}
+    code, out, _err = run(cli, capsys, "workers", "unbind", "--room", "!lab:example.org")
+    assert out["rooms"] == {}
+    os.environ["AGENTROOMS_TURN"] = "t1"
+    try:
+        code, _out, err = run(cli, capsys, "workers", "unbind")
+    finally:
+        del os.environ["AGENTROOMS_TURN"]
+    assert code == 4 and err["error"]["code"] == "policy"
+    code, out, _err = run(cli, capsys, "workers", "remove", "lab")
+    assert code == 0 and out["removed"]
+    code, _out, _err = run(cli, capsys, "workers", "show", "lab")
+    assert code == 3
+
+
+@needs_store
+def test_an_agents_map_moves_into_a_bound_worker_that_admits_everyone(cli, project, stored, capsys):
+    connect(project, allow_write=True)
+    service = project / "capabilities" / "agentrooms" / "service"
+    service.mkdir(parents=True)
+    settings = service / "settings.json"
+    settings.write_text(json.dumps({"version": 1, "agents": {
+        "alpha": {"profile": "agentrooms-claude", "turn_timeout": 600, "history": 20},
+        "gone": {}}}))
+    code, out, _err = run(cli, capsys, "workers", "import")
+    assert out["moved"] == {"alpha": "alpha"} and out["dropped"] == ["gone"]
+    assert settings.is_file() and out["applied"] is False
+    code, out, err = run(cli, capsys, "workers", "import", "--apply")
+    assert code == 0 and out["removed"] == str(settings), err
+    assert not settings.exists()
+    code, out, _err = run(cli, capsys, "workers", "show", "alpha")
+    assert out["spec"]["accepts_from"] == ["*"] and out["spec"]["history"] == 20
+    assert out["spec"]["limits"] == {"turn_timeout": 600}
+    entry = json.loads((project / "capabilities" / "agentrooms" / "connections.json").read_text())
+    assert entry["connections"]["alpha"]["worker"] == "alpha"

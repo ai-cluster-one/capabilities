@@ -11,3 +11,9 @@ The token is the agent's only credential - the account has no password - and the
 ## The machine service holds each served agent's access token
 
 A machine service loads no project's secrets: the work it starts runs as the project's child. The service this capability ships keeps one `/sync` long-poll per agent inside the one machine process, so that process holds each served agent's access token. It resolves the token inside that project's own resolution - the project's cascade, for that one key - and uses it only for that agent's requests; it loads no other value of the project's environment, and every turn still runs as a child in the project's root with the project's own context.
+
+## `workers bind`, `workers supervisor` and the agents-map move write the connection entry
+
+The standard keeps a connection record human-written. An agent's worker bindings and its supervisor's address are keys on its connection entry - `worker`, `rooms`, `supervisor` - because they are configuration about that agent, and configuration keeps its home in files. `agentrooms workers bind|unbind|supervisor` write those keys, and the service writes `worker` when it moves an earlier release's `service/settings.json` agents map into workers, through the contract's records adapter and only on a connection this project declares; every other key of the entry, and its grant, is kept as it was. Neither runs under the read-only switch or inside a turn the service started.
+
+Making a person hand-edit JSON to bind a worker would put the one write that decides who reaches an agent where a typo is silent; the verb checks that the worker exists and resolves a room alias first.
