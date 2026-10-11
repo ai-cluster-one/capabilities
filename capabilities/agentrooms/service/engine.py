@@ -116,6 +116,10 @@ PUBLISH_SECONDS = 15.0
 
 # A turn's final answer that says the agent stays silent.
 SILENT = "[silent]"
+# How far a sync that brings an agent's join reads back for what arrived while
+# the agent was only invited: pages of room messages, each of this many events.
+INVITE_GAP_PAGES = 4
+INVITE_GAP_EVENTS = 50
 # The room account data an agent marks a room with, to be woken by every message.
 MARK_TYPE = "agentrooms.marked"
 # Where custom data rides in a message's content.
@@ -430,11 +434,78 @@ def reply_to(content: dict) -> str | None:
     return None
 
 
+def own_membership(event: dict, user_id: str) -> str | None:
+    if event.get("type") == "m.room.member" and event.get("state_key") == user_id:
+        return (event.get("content") or {}).get("membership")
+    return None
+
+
+def joined_now(timeline: list[dict], user_id: str) -> bool:
+    """Whether a timeline holds the agent's own join, as opposed to a profile
+    change of an agent that was already a member."""
+    for event in timeline:
+        if own_membership(event, user_id) == "join":
+            prev = ((event.get("unsigned") or {}).get("prev_content") or {}).get("membership")
+            if prev != "join":
+                return True
+    return False
+
+
+def since_invite(page: Callable[[str], dict], token: str, user_id: str, *,
+                 pages: int = INVITE_GAP_PAGES) -> list[dict] | None:
+    """Reading back from `token` (a joined timeline's start), the events that
+    arrived after the agent's invite, oldest first. None when the invite is not
+    reached: another membership of the agent's own comes first, the room's
+    start is reached, or the pages run out."""
+    collected: list[dict] = []
+    for _ in range(pages):
+        found = page(token) or {}
+        chunk = found.get("chunk") or []
+        for event in chunk:  # newest first
+            membership = own_membership(event, user_id)
+            if membership == "invite":
+                return list(reversed(collected))
+            if membership is not None:
+                return None
+            collected.append(event)
+        token = found.get("end")
+        if not chunk or not token:
+            return None
+    return None
+
+
+def joined_events(room_id: str, block: dict, user_id: str,
+                  before_join: Callable[[str, str], list[dict] | None] | None,
+                  notes: list[str]) -> list[dict]:
+    """What a sync that brings the agent's join may wake on: the events after its
+    invite. A homeserver may start the timeline at the join and leave what
+    arrived while the agent was invited behind it; that is read back to the
+    invite. Nothing older than the invite wakes."""
+    timeline = block.get("events") or []
+    cut = [i for i, e in enumerate(timeline) if own_membership(e, user_id) == "invite"]
+    if cut:
+        return timeline[cut[-1] + 1:]
+    prev_batch = block.get("prev_batch")
+    if not prev_batch or before_join is None:
+        return timeline
+    earlier = before_join(room_id, prev_batch)
+    if earlier is None:
+        notes.append(f"{room_id}: what arrived before the join wakes nothing; it could "
+                     "not be read back to the invite")
+        return timeline
+    seen = {e.get("event_id") for e in timeline}
+    return [e for e in earlier if e.get("event_id") not in seen] + timeline
+
+
 def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
-              initial: bool, member_count: Callable[[str], int | None]) -> tuple[list[dict], list[str]]:
+              initial: bool, member_count: Callable[[str], int | None],
+              before_join: Callable[[str, str], list[dict] | None] | None = None,
+              ) -> tuple[list[dict], list[str]]:
     """The wakes one sync response brings for `user_id`, and notes about what it
     passed over. `rooms` is updated in place. An initial sync wakes only for the
-    invites waiting; history before the agent was first served wakes nothing."""
+    invites waiting; history before the agent was first served wakes nothing. A
+    sync that brings the agent's join also wakes on what arrived between its
+    invite and its join, read back through `before_join(room_id, prev_batch)`."""
     wakes: list[dict] = []
     notes: list[str] = []
     groups = response.get("rooms") or {}
@@ -457,8 +528,15 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
                 view.marked = (event.get("content") or {}).get("marked") is True
         if initial:
             continue
-        for event in timeline:
+        events = timeline
+        if not view.encrypted and joined_now(timeline, user_id):
+            events = joined_events(room_id, room.get("timeline") or {}, user_id, before_join,
+                                   notes)
+        woken: set = set()
+        for event in events:
             if event.get("type") != "m.room.message" or event.get("sender") == user_id:
+                continue
+            if event.get("event_id") in woken:
                 continue
             if "state_key" in event:
                 continue
@@ -477,6 +555,7 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
                 elif view.marked:
                     kind = "marked"
             if kind:
+                woken.add(event.get("event_id"))
                 wakes.append({"room_id": room_id, "key": event.get("event_id"), "kind": kind,
                               "event_id": event.get("event_id"), "sender": event.get("sender")})
     for room_id, room in (groups.get("invite") or {}).items():
@@ -725,8 +804,22 @@ class Agent:
                 return len((found or {}).get("joined") or {})
             return None
 
+        def before_join(room_id: str, prev_batch: str) -> list[dict] | None:
+            def page(token: str) -> dict:
+                return matrix.call("GET", f"/_matrix/client/v3/rooms/{quote(room_id)}/messages",
+                                   params={"dir": "b", "from": token,
+                                           "limit": str(INVITE_GAP_EVENTS),
+                                           "filter": json.dumps({"types": ["m.room.message",
+                                                                           "m.room.member"]})})
+            try:
+                return since_invite(page, prev_batch, self.plan["user_id"])
+            except Exception as exc:
+                self.log(f"{room_id}: what arrived before the join is not read: "
+                         f"{getattr(exc, 'code', type(exc).__name__)}: {exc}")
+                return None
+
         wakes, notes = read_sync(response, self.plan["user_id"], self.rooms, initial=initial,
-                                 member_count=member_count)
+                                 member_count=member_count, before_join=before_join)
         for note in notes:
             self.log(note)
         next_batch = response.get("next_batch")

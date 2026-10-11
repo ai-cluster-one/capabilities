@@ -444,3 +444,163 @@ def test_the_cap_bounds_turns_across_rooms(tmp_path):
     hold.set()
     for turn in list(eng.turns.values()):
         turn.thread.join(5)
+
+
+# ── a message posted between an invite and the join ──────────────────────────
+#
+# The shapes below are what the homeserver answered an invitee in a recorded
+# run, ids anonymized: while the agent is invited, a sync brings the invite and
+# then nothing of the room; the first sync after the join holds the room with a
+# timeline limited to the agent's own join, and what was posted while it was
+# invited lies behind the timeline's prev_batch.
+
+INVITER = "@inviter:example.org"
+ROOM = "!pre-join:example.org"
+
+
+def member(event_id, state_key, membership, sender, ts, prev=None):
+    event = {"type": "m.room.member", "event_id": event_id, "sender": sender,
+             "state_key": state_key, "origin_server_ts": ts,
+             "content": {"membership": membership}, "unsigned": {}}
+    if prev:
+        event["unsigned"]["prev_content"] = {"membership": prev}
+    return event
+
+
+def said(event_id, body, ts, sender=INVITER, **content):
+    return {**message(event_id, sender, body, **content), "origin_server_ts": ts}
+
+
+INVITE_SYNC = {"next_batch": "s1", "rooms": {"invite": {ROOM: {"invite_state": {"events": [
+    {"type": "m.room.create", "state_key": "", "sender": INVITER, "content": {}},
+    {"type": "m.room.member", "state_key": ME, "sender": INVITER,
+     "content": {"membership": "invite"}}]}}}}}
+QUIET_SYNC = {"next_batch": "s2"}
+JOIN_SYNC = {"next_batch": "s3", "rooms": {"join": {ROOM: {
+    "summary": {"m.heroes": [INVITER], "m.joined_member_count": 2, "m.invited_member_count": 0},
+    "state": {"events": [
+        {"type": "m.room.create", "state_key": "", "sender": INVITER, "content": {}},
+        {"type": "m.room.history_visibility", "state_key": "", "sender": INVITER,
+         "content": {"history_visibility": "shared"}},
+        member("$inv", ME, "invite", INVITER, 1_000),
+        member("$creator", INVITER, "join", INVITER, 100)]},
+    "timeline": {"events": [member("$join", ME, "join", ME, 8_000, prev="invite")],
+                 "limited": True, "prev_batch": "p646"},
+    "account_data": {"events": []}, "ephemeral": {"events": []}}}}}
+NEXT_SYNC = {"next_batch": "s4"}
+
+
+class SyncMatrix:
+    """Answers the agent's syncs from a list, and its reads of the room from
+    pages keyed by their `from` token, as the homeserver did."""
+
+    def __init__(self, syncs, pages):
+        self.syncs, self.pages = list(syncs), pages
+        self.reads: list[dict] = []
+
+    def call(self, method, path, params=None, body=None):
+        if path == "/_matrix/client/v3/sync":
+            return self.syncs.pop(0)
+        if path.endswith("/messages"):
+            self.reads.append(dict(params))
+            return self.pages[params["from"]]
+        if path.endswith("/joined_members"):
+            return {"joined": {INVITER: {}, ME: {}}}
+        raise AssertionError(path)
+
+
+class SyncStore:
+    def __init__(self):
+        self.position = None
+        self.wakes: dict = {}
+
+    def next_batch(self, project, agent, user_id):
+        return self.position
+
+    def save_sync(self, project, agent, user_id, holder, next_batch, wakes):
+        for wake in wakes:  # the table's key, ON CONFLICT DO NOTHING
+            self.wakes.setdefault((wake["room_id"], wake["key"]), wake)
+        self.position = next_batch
+        return True
+
+    def execute(self, *args, **kwargs):
+        return 1
+
+
+def serve(tmp_path, pages, syncs=None):
+    eng, slot = make_engine(tmp_path, None, FakeRunner([]))
+    slot.store = SyncStore()
+    agent = engine.Agent(slot, slot.plan["agents"]["alpha"])
+    matrix = SyncMatrix(syncs or [{"next_batch": "s0"}, INVITE_SYNC, QUIET_SYNC, JOIN_SYNC,
+                                  NEXT_SYNC], pages)
+    seen = []
+    for _ in range(len(matrix.syncs)):
+        agent.sync_once(matrix)
+        seen.append(sorted((k[1], w["kind"]) for k, w in slot.store.wakes.items()))
+    return seen, matrix
+
+
+def test_a_mention_posted_before_the_join_wakes_the_agent_once_it_joins(tmp_path):
+    mention = said("$mention", f"{ME} are you there?", 6_000, **{"m.mentions": {"user_ids": [ME]}})
+    pages = {"p646": {"start": "p646", "end": "p636", "chunk": [
+        mention, member("$inv", ME, "invite", INVITER, 1_000),
+        member("$creator", INVITER, "join", INVITER, 100)]}}
+    seen, matrix = serve(tmp_path, pages)
+    # Nothing but the invite until the join; the mention once the join is seen,
+    # and nothing new after it.
+    assert seen == [[], [("invite", "invite")], [("invite", "invite")],
+                    [("$mention", "mention"), ("invite", "invite")],
+                    [("$mention", "mention"), ("invite", "invite")]]
+    assert [r["from"] for r in matrix.reads] == ["p646"] and matrix.reads[0]["dir"] == "b"
+
+
+def test_history_from_before_the_invite_wakes_nothing_after_the_join(tmp_path):
+    pages = {"p646": {"start": "p646", "end": "p640", "chunk": [
+        said("$after", f"{ME} now that you are invited", 6_000),
+        member("$inv", ME, "invite", INVITER, 5_000),
+        said("$old-mention", f"{ME} said before the invite", 3_000),
+        said("$old", "chatter before the invite", 2_000)]}}
+    seen, _matrix = serve(tmp_path, pages)
+    assert seen[3] == [("$after", "mention"), ("invite", "invite")]
+    # The invite not found behind the timeline (another membership of the
+    # agent's own comes first): nothing from before the join wakes.
+    rejoined = {"p646": {"start": "p646", "end": "p640", "chunk": [
+        said("$x", f"{ME} while you were away", 6_000),
+        member("$left", ME, "leave", ME, 5_000)]}}
+    seen, _matrix = serve(tmp_path / "rejoined", rejoined)
+    assert seen[3] == [("invite", "invite")]
+
+
+def test_a_pre_join_mention_also_in_the_timeline_wakes_once(tmp_path):
+    mention = said("$mention", f"hey {ME}", 6_000)
+    join = JOIN_SYNC["rooms"]["join"][ROOM]
+    unlimited = {"next_batch": "s3", "rooms": {"join": {ROOM: {
+        **join, "timeline": {"events": [member("$inv2", ME, "invite", INVITER, 1_000), mention,
+                                        member("$join", ME, "join", ME, 8_000, prev="invite")],
+                             "limited": False, "prev_batch": "p600"}}}}}
+    seen, matrix = serve(tmp_path, {}, [{"next_batch": "s0"}, INVITE_SYNC, QUIET_SYNC,
+                                        unlimited, NEXT_SYNC])
+    assert seen[3] == [("$mention", "mention"), ("invite", "invite")] and matrix.reads == []
+    limited_overlap = {"next_batch": "s3", "rooms": {"join": {ROOM: {
+        **join, "timeline": {"events": [mention,
+                                        member("$join", ME, "join", ME, 8_000, prev="invite")],
+                             "limited": True, "prev_batch": "p646"}}}}}
+    pages = {"p646": {"start": "p646", "end": "p636", "chunk": [
+        mention, member("$inv", ME, "invite", INVITER, 1_000)]}}
+    reads = []
+    wakes, _notes = engine.read_sync(limited_overlap, ME, {}, initial=False,
+                                     member_count=lambda r: 2,
+                                     before_join=lambda room, token: engine.since_invite(
+                                         lambda t: reads.append(t) or pages[t], token, ME))
+    assert [(w["event_id"], w["kind"]) for w in wakes] == [("$mention", "mention")]
+
+
+def test_a_profile_change_reads_nothing_back(tmp_path):
+    renamed = {"next_batch": "s9", "rooms": {"join": {ROOM: {
+        "summary": {"m.joined_member_count": 3},
+        "timeline": {"events": [member("$rename", ME, "join", ME, 9_000, prev="join")],
+                     "limited": True, "prev_batch": "p700"}}}}}
+    asked = []
+    wakes, _notes = engine.read_sync(renamed, ME, {}, initial=False, member_count=lambda r: 3,
+                                     before_join=lambda room, token: asked.append(token) or [])
+    assert wakes == [] and asked == []

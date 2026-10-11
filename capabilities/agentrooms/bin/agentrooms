@@ -136,6 +136,8 @@ SERVICE
   mention (its user id in a message or its m.mentions), a direct message (a
   room of two members), an invite, or a message in a room it marked; never by
   its own messages, and history from before it was first served wakes nothing.
+  What was posted between its invite and its join wakes it once it joins;
+  what came before the invite does not.
 
   Each agent has one harness session per room, resumed on every wake through
   callva-harness-runner on the agent's profile (bundled agentrooms-claude, the
