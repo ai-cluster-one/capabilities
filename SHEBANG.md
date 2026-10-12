@@ -28,7 +28,7 @@ Every script implements the same contract verbs alongside its domain verbs. This
 |---|---|
 | `help` | The full usage contract (the module docstring), verbatim. |
 | `doctor` | The cheapest authenticated round-trip, per connection; proves credentials, reachability, identity. |
-| `connections` | The resolution report: every connection, every value, its winning tier and source, secrets masked. Local only — no network. |
+| `connections` | The resolution report: every connection, every value, its winning tier and source, secrets masked. Local only — no call to any system a connection names; in store mode reading the store is the resolution. |
 | `stub` | The one-line awareness text. |
 | `manifest --json` | The machine-readable declaration (schema below). |
 | `guide` / `guide <topic>` | The shipped guide menu with previews / one guide's body, fetched live from the docs base. |
@@ -775,14 +775,15 @@ A 429 honours the server's `Retry-After` header (falling back to the linear sche
 
 Every CLI has a `doctor` subcommand: the cheapest authenticated round-trip that proves the whole chain — credentials resolved, endpoint reachable, identity confirmed. It examines **every connection**: bare, it round-trips each configured connection and reports per id — `{"ok": <all healthy>, "connections": {"<id>": {…}}}` — exiting `0` only when every connection is healthy, else with the first failure's category; `doctor --connection <id>` checks one. Per connection it carries a few cheap facts (the service version, the authenticated identity, a reachability flag) and rides the same exit-code taxonomy — `0` healthy, `2` if credentials are missing or rejected, `5` if the service is unreachable. It is the first thing an agent runs against a tool, and for a stateful CLI it is also the recovery point: `doctor` detects an expired session and attempts re-authentication before reporting, so a healthy exit means *ready to work*, not merely *configured*.
 
-Credential resolution is the **first gate, and it is network-free**: before any round-trip, `doctor` resolves the connection(s) under test through the cascade — the *same* resolution [`connections`](#connections--the-resolution-report) reports — and refuses with exit `2` when any **required** key is unset, naming the remediation from the credential scope and `CRED_KEYS`. The verdict is the cascade's, read across its resolution tiers (`connection` literal, `project`, `user`, `env`) from the connection's own report rows — **never the presence of any single file**. One resolver, two consumers: `doctor`'s readiness gate and `connections`' report answer *"are the credentials here?"* through the same per-key resolution, so they cannot diverge — the failure mode where a `doctor` preflight checks one tier while the real commands resolve through all of them is structurally precluded.
+Credential resolution is the **first gate, and it calls no system a connection names**: before any round-trip, `doctor` resolves the connection(s) under test through the cascade — the *same* resolution [`connections`](#connections--the-resolution-report) reports — and refuses with exit `2` when any **required** key is unset, naming the remediation from the credential scope and `CRED_KEYS`. The verdict is the cascade's, read across its resolution tiers (`connection` literal, `project`, `user`, `env`) from the connection's own report rows — **never the presence of any single file**. One resolver, two consumers: `doctor`'s readiness gate and `connections`' report answer *"are the credentials here?"* through the same per-key resolution, so they cannot diverge — the failure mode where a `doctor` preflight checks one tier while the real commands resolve through all of them is structurally precluded.
 
 ```python
 def _missing_required(keys: list[dict]) -> list[str]:
     """Required report rows (from `_key_report`) that did not resolve through the
-    cascade — empty ⇒ credentials present. `doctor`'s network-free gate, derived
-    from the same per-key resolution `connections` prints, so the readiness gate
-    and the resolution report can never disagree."""
+    cascade — empty ⇒ credentials present. `doctor`'s first gate, which calls no
+    system a connection names, derived from the same per-key resolution
+    `connections` prints, so the readiness gate and the resolution report can
+    never disagree."""
     return [k["key"] for k in keys if k["required"] and not k["set"]]
 ```
 
