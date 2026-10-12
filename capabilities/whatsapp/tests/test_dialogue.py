@@ -19,6 +19,7 @@ import threading
 import time
 import types
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -646,15 +647,65 @@ class Turn(DialogueCase):
         self.assertEqual(self.run.calls[-1]["profile"].harness, "claude")
         self.assertEqual(self.run.calls[-1]["profile"].model, "opus")
 
-    def test_a_project_profile_shadows_the_bundles(self):
-        folder = self.root / "capabilities" / "whatsapp" / "service" / "profiles"
-        folder.mkdir(parents=True)
-        (folder / "whatsapp-claude.toml").write_text(
-            'harness = "claude"\nmodel = "sonnet"\npermission_mode = "bypassPermissions"\n')
-        d = self.make()
+    SONNET = 'harness = "claude"\nmodel = "sonnet"\npermission_mode = "bypassPermissions"\n'
+
+    def project_files(self, **files):
+        folder = profiles.project_folder(self.root)
+        folder.mkdir(parents=True, exist_ok=True)
+        for name, text in files.items():
+            (folder / f"{name}.toml").write_text(text)
+        return folder
+
+    def test_a_project_version_in_the_store_shadows_the_bundles(self):
+        project = f"prj_{uuid.uuid4().hex[:12]}"
+        self.project_files(**{"whatsapp-claude": self.SONNET})
+        with mock.patch.object(wa, "_service_project_id", return_value=project):
+            wa._profiles_import(self.root, True)
+        d = self.make(project_id=project)
         _profile, origin = d.profile("whatsapp-claude")
-        self.assertEqual((origin["source"], origin["model"]), ("folder", "sonnet"))
-        self.assertTrue(origin["path"].startswith(str(folder)))
+        self.assertEqual((origin["layer"], origin["model"]), ("project", "sonnet"))
+        self.assertIsNotNone(origin["version"])
+        self.assertIn("capability", origin["shadows"])
+        _profile, origin = self.make().profile("whatsapp-claude")
+        self.assertEqual((origin["layer"], origin["model"]), ("capability", "opus"))
+
+    def test_a_project_profile_file_is_refused_until_it_is_imported(self):
+        self.project_files(**{"whatsapp-claude": self.SONNET})
+        with self.assertRaises(ValueError) as caught:
+            self.make()
+        self.assertIn("profiles import --apply", str(caught.exception))
+        with self.assertRaises(wa._Refusal) as caught:
+            wa._require_profiles(self.root, _settings())
+        self.assertEqual(caught.exception.code, "profiles_not_imported")
+
+    def test_import_carries_the_files_into_the_store_all_or_none(self):
+        project = f"prj_{uuid.uuid4().hex[:12]}"
+        codex = profiles.bundled_file("whatsapp-codex").read_text()
+        folder = self.project_files(**{"whatsapp-claude": self.SONNET, "mine": codex})
+        with mock.patch.object(wa, "_service_project_id", return_value=project):
+            plan = wa._profiles_import(self.root, False)
+            self.assertEqual(sorted((f["name"], f["action"]) for f in plan["files"]),
+                             [("mine", "save"), ("whatsapp-claude", "save")])
+            self.assertEqual(len(list(folder.glob("*.toml"))), 2)
+            done = wa._profiles_import(self.root, True)
+            self.assertEqual(sorted((r["name"], r["created"]) for r in done["imported"]),
+                             [("mine", True), ("whatsapp-claude", True)])
+            self.assertEqual(list(folder.glob("*.toml")), [])
+            self.project_files(**{"whatsapp-claude": self.SONNET.replace("sonnet", "haiku"),
+                                  "other": codex})
+            with self.assertRaises(wa._Refusal) as caught:
+                wa._profiles_import(self.root, True)
+            self.assertEqual(caught.exception.code, "profiles_import_refused")
+            self.assertIn("whatsapp-claude", caught.exception.message)
+            self.assertEqual(len(list(folder.glob("*.toml"))), 2)
+            self.project_files(**{"whatsapp-claude": self.SONNET})
+            plan = wa._profiles_import(self.root, False)
+            self.assertEqual(sorted((f["name"], f["action"]) for f in plan["files"]),
+                             [("other", "save"), ("whatsapp-claude", "held")])
+            wa._profiles_import(self.root, True)
+        d = self.make(project_id=project)
+        self.assertEqual(d.profile("other")[1]["layer"], "project")
+        self.assertEqual(d.profile("whatsapp-claude")[1]["model"], "sonnet")
 
     def test_a_profile_that_does_not_fit_is_refused_at_start(self):
         for name in ("claude-read-sandboxed", "codex-read-sandboxed", "no-such-profile"):
@@ -663,7 +714,8 @@ class Turn(DialogueCase):
                     self.make(_settings(defaults={"profile": name}))
                 self.assertIn("defaults.profile", str(caught.exception))
                 self.assertIn(name, str(caught.exception))
-        with mock.patch.object(wa, "_runner_importable", return_value=True):
+        with mock.patch.object(wa, "_runner_importable", return_value=True), \
+                mock.patch.object(wa, "_service_project_id", return_value="prj_test"):
             with self.assertRaises(wa._Refusal) as caught:
                 wa._require_profiles(self.root, _settings(
                     allowed_users={ALICE: {"profile": "claude-read-sandboxed"}}))
@@ -1186,28 +1238,28 @@ class Wiring(unittest.TestCase):
                 wa._service_project_id(Path("/p"))
         self.assertEqual(caught.exception.code, "project_id_missing")
 
-    def test_the_profiles_script_is_asked_where_the_runner_is_absent(self):
+    def test_profiles_list_is_asked_under_the_runner_where_it_is_absent(self):
         done = types.SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
             {"ok": True, "profiles": [{"name": "whatsapp-claude", "ok": True}]}))
         with mock.patch.object(wa, "_runner_importable", return_value=False), \
                 mock.patch.object(wa.shutil, "which", return_value="/usr/bin/uv"), \
-                mock.patch.object(wa.subprocess, "run", return_value=done) as ran, \
-                mock.patch.object(wa, "_project_capabilities_dir",
-                                  return_value=Path("/p/capabilities")):
+                mock.patch.object(wa.subprocess, "run", return_value=done) as ran:
             rows = wa._profile_check(Path("/p"), ["whatsapp-claude"])
         self.assertEqual(rows, [{"name": "whatsapp-claude", "ok": True}])
         command = ran.call_args[0][0]
-        self.assertEqual(command[:4], ["/usr/bin/uv", "run", "--quiet", "--script"])
-        self.assertTrue(command[4].endswith("service/profiles.py"))
-        self.assertEqual(command[5:7], ["check", "whatsapp-claude"])
-        self.assertIn("/p/capabilities/whatsapp/service/profiles", command)
+        self.assertEqual(command[:6], ["/usr/bin/uv", "run", "--quiet", "--with",
+                                       profiles.RUNNER_PIN, "--script"])
+        self.assertEqual(Path(command[6]), Path(_cli.CLI_PATH).resolve())
+        self.assertEqual(command[7:], ["profiles", "list", "whatsapp-claude"])
+        self.assertEqual(ran.call_args[1]["cwd"], "/p")
+        self.assertEqual(ran.call_args[1]["env"][wa.SERVICE_RUNNER_EXEC_ENV], "1")
 
     def test_doctor_reports_the_dialogue_and_each_profile(self):
         root = Path(tempfile.mkdtemp())
         cfg = {"id": "c1", "home": tempfile.mkdtemp(), "account_key": OWN_PHONE,
                "engine": wa.ENGINE_INHOUSE}
         rows = [{"name": "whatsapp-claude", "ok": True, "harness": "claude",
-                 "model": "opus", "source": "folder", "path": "/b/whatsapp-claude.toml"},
+                 "model": "opus", "layer": "project", "version": "v1"},
                 {"name": "claude-read-sandboxed", "ok": False, "error": "does not fit"}]
         settings = _settings(allowed_users={ALICE: {"profile": "claude-read-sandboxed"}})
         db = mock.Mock()
@@ -1227,6 +1279,8 @@ class Wiring(unittest.TestCase):
         checks = {c["item"]: c for c in report["checks"]}
         self.assertTrue(checks["dialogue"]["ok"])
         self.assertTrue(checks["profile whatsapp-claude"]["ok"])
+        self.assertIn("the store, project version v1",
+                      checks["profile whatsapp-claude"]["detail"])
         self.assertFalse(checks["profile claude-read-sandboxed"]["ok"])
         self.assertIn(f"allowed_users.{ALICE}.profile",
                       checks["profile claude-read-sandboxed"]["detail"])

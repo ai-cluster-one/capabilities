@@ -169,10 +169,11 @@ Assistant service
   composing, refreshed until the turn ends and paused when it ends without
   an answer. Turns run per chat in arrival order after
   `debounce`, at most `max_parallel_dialogue` at once, through
-  callva-harness-runner on a profile (bundled whatsapp-claude, the default,
-  and whatsapp-codex; a project file in
-  capabilities/whatsapp/service/profiles/ shadows either), fit-checked at
-  start, reload and in `service doctor`, ended at `worker_timeout`. The
+  callva-harness-runner on a profile kept in the store, as agentrooms and
+  tasks keep theirs (the project's version, then the global one, then the
+  runner's shipped profiles, then the bundled whatsapp-claude, the default,
+  and whatsapp-codex; see `whatsapp profiles`), fit-checked at start, reload
+  and in `service doctor`, ended at `worker_timeout`. The
   prompt is the context document, the chat's `context`, the channel state,
   the request and the last `tail_size` stored messages; the role's
   `authority` goes to the run as CAPABILITIES_AUTH_CONTEXT. The answer, cut
@@ -180,6 +181,12 @@ Assistant service
   group, split between paragraphs) and sent by the listener with no pause of
   its own, as is a job's result; an empty answer is silent. The listener resolves the runner itself (`uv run --with`); the
   CLI does not carry it.
+  Profiles are saved in the store with `tasks profiles save` (the table is
+  callva-harness-runner's, shared by the family) and taken at start and
+  `service reload`. A project's profile files in
+  capabilities/whatsapp/service/profiles/ are no longer read: while any is
+  there, start and doctor refuse, exit 6 `profiles_not_imported`, until
+  `whatsapp profiles import --apply` moves them into the store.
   Voice notes: `voice_transcription` (`/set voice-transcription`, else the
   group's or person's, else `defaults`, else `addressed`) decides which are
   transcribed before the turn: `off` none; `addressed` every admitted one in
@@ -351,6 +358,18 @@ Commands
                                        the store lacks. A second run imports
                                        nothing. Exit 3 when there is no file, 6
                                        when it is not a legacy store.
+  whatsapp profiles list [NAME ...]    Each profile the service settings reach
+                                       (or each NAME) as it resolves from this
+                                       project: its layer (project, global,
+                                       shipped, capability), stored version,
+                                       harness, model, and whether it fits.
+  whatsapp profiles import [--apply]   Move this project's profile files from
+                                       capabilities/whatsapp/service/profiles/
+                                       into the store at its scope, all or
+                                       none; --apply saves them and removes the
+                                       files. Exit 6 naming a file that cannot
+                                       be read or differs from the version the
+                                       project already holds.
   whatsapp send <chat_id> <text> [--reply-to MESSAGE_ID]
                 [--mention PHONE]... [--typing]
                                        Send one text message. Write-enabled
@@ -8345,6 +8364,79 @@ def cmd_import_legacy(args):
     return _wm_import_legacy(cfg, args)
 
 
+def cmd_profiles(args):
+    """`profiles list` and `profiles import`, both on the harness runner."""
+    if not _runner_importable():
+        _rerun_with_runner(sys.argv[1:])
+    root = _service_project_root()
+    if args.profiles_command == "import":
+        return _profiles_import(root, args.apply)
+    if args.names:
+        reached = {name: [] for name in args.names}
+    else:
+        reached = _settings_profiles(_service_settings())
+    rows = [{**row, "positions": reached.get(row["name"]) or []}
+            for row in _profile_rows(root, list(reached))]
+    return {"ok": all(r.get("ok") for r in rows), "project": str(root),
+            "profiles": rows}
+
+
+def _profiles_import(root: Path, apply: bool) -> dict:
+    """Carry the project's profile files into the store at its scope, all or
+    none, then remove them; without `apply`, say what that would do."""
+    profiles = _service_module("profiles")
+    lib = profiles.runner()
+    files = profiles.unimported(root)
+    if not files:
+        return {"project": str(root), "apply": apply, "files": [],
+                "detail": f"no profile files in {profiles.project_folder(root)}"}
+    project_id = _service_project_id(root)
+    if apply:
+        _read_only_gate(f"`{NAME} profiles import --apply`")
+    setting = _store_setting(root)
+    try:
+        conn = connect(application_name=NAME, setting=setting)
+    except DbError as exc:
+        _store_refusal(exc)
+    try:
+        plan = profiles.import_plan(root, profiles.stored(conn, project_id, setting.schema),
+                                    project_id)
+        shown = [{k: v for k, v in row.items() if k != "spec"} for row in plan]
+        refused = [row for row in plan if row["action"] == "refused"]
+        if refused:
+            _refuse(6, "profiles_import_refused",
+                    "; ".join(f"{row['file']}: {row['error']}" for row in refused),
+                    "nothing was saved; correct or remove the file named, then "
+                    "import again")
+        if not apply:
+            return {"project": str(root), "project_id": project_id, "apply": False,
+                    "files": shown,
+                    "next": f"`{NAME} profiles import --apply` saves them at this "
+                            "project's scope and removes the files"}
+        conn.rollback()
+        migrate(conn, lib.PROFILE_STORE_OWNER, lib.PROFILE_STORE_STEPS,
+                major=lib.PROFILE_STORE_MAJOR, minor=lib.PROFILE_STORE_MINOR)
+        try:
+            saved = profiles.import_apply(conn, plan, project_id, schema=setting.schema,
+                                          created_by=f"{NAME} profiles import")
+            conn.commit()
+        except ValueError as exc:
+            conn.rollback()
+            _refuse(6, "conflict", str(exc),
+                    f"nothing was saved; run `{NAME} profiles import` again")
+        except BaseException:
+            conn.rollback()
+            raise
+    except DbError as exc:
+        _store_refusal(exc)
+    finally:
+        conn.close()
+    for row in plan:
+        Path(row["file"]).unlink(missing_ok=True)
+    return {"project": str(root), "project_id": project_id, "apply": True,
+            "imported": saved, "removed": [row["file"] for row in plan]}
+
+
 def cmd_send(args):
     cfg = get_config(args)
     _refuse_foreign_flags(cfg, args, {"reply_to": "--reply-to",
@@ -8628,10 +8720,10 @@ def _service_cfg(settings: dict, connection_flag: str | None) -> dict:
 #
 # A dialogue turn runs on callva-harness-runner. The CLI does not carry the
 # runner in its dependency header: every `send` and `messages` resolves that
-# header, and the runner is large. The listener resolves it itself, by running
-# again under `uv run --with` the pinned runner when its settings admit anyone;
-# `start` and `doctor` ask the bundle's profiles script, which pins the same
-# runner in its own header.
+# header, and the runner is large. A process that needs it - the listener when
+# its settings admit anyone, and the `profiles` verbs - runs again under
+# `uv run --with` the runner pinned in the bundle's profiles module; `start`
+# and `doctor` ask `profiles list` that way when the runner is not in process.
 
 
 def _runner_importable() -> bool:
@@ -8655,37 +8747,71 @@ def _service_project_id(root: Path) -> str:
     return str(project_id)
 
 
+def _stored_profile_versions(root: Path, project_id: str) -> list:
+    """The active profile versions this project reaches, read from the
+    project's database by the harness runner. Needs the runner in process."""
+    setting = _store_setting(root)
+    try:
+        conn = connect(application_name=NAME, setting=setting)
+    except DbError as exc:
+        _store_refusal(exc)
+    try:
+        return _service_module("profiles").stored(conn, project_id, setting.schema)
+    finally:
+        conn.close()
+
+
+def _profile_rows(root: Path, names: list[str]) -> list[dict]:
+    """Each name's verdict, resolved from the store as the listener resolves
+    it, and fitted. Needs the runner in process."""
+    profiles = _service_module("profiles")
+    problem = profiles.unimported_problem(root)
+    if problem:
+        return [{"name": n, "ok": False, "code": "profiles_not_imported",
+                 "error": problem} for n in names]
+    project_id = _service_project_id(root)
+    return profiles.check(names, _stored_profile_versions(root, project_id), project_id)
+
+
 def _profile_check(root: Path, names: list[str]) -> list[dict]:
-    """Each profile name's verdict: resolved through the runner's discovery
-    with this project's and the bundle's folders first, and fitted. In-process
-    where the runner is importable, else through the bundle's profiles script."""
+    """Each profile name's verdict: resolved from the store - this project's
+    version, the global one, the runner's shipped profiles, then the bundle's -
+    and fitted. In-process where the runner is importable, else by asking
+    `profiles list` of this CLI run again under the runner's pin."""
     if not names:
         return []
     if _runner_importable():
-        profiles = _service_module("profiles")
-        return profiles.check(names, profiles.folders(root))
-    script = _service_bundle_dir() / "service" / "profiles.py"
+        return _profile_rows(root, names)
     uv = shutil.which("uv")
     if uv is None:
         return [{"name": n, "ok": False,
                  "error": "uv is not on PATH, so the harness runner cannot be "
                           "resolved to check the profile"} for n in names]
-    folders = [str(_project_capabilities_dir(root) / NAME / "service" / "profiles"),
-               str(script.parent / "profiles")]
-    command = [uv, "run", "--quiet", "--script", str(script), "check", *names]
-    for folder in folders:
-        command += ["--folder", folder]
+    command = [uv, "run", "--quiet", "--with", _service_module_pin(), "--script",
+               str(Path(__file__).resolve()), "profiles", "list", *names]
+    env = {**os.environ, SERVICE_RUNNER_EXEC_ENV: "1"}
     try:
-        done = subprocess.run(command, capture_output=True, text=True, timeout=600)
+        done = subprocess.run(command, capture_output=True, text=True, timeout=600,
+                              cwd=str(root), env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
         detail = str(exc)
     else:
         try:
-            return json.loads(done.stdout.strip().splitlines()[-1])["profiles"]
-        except (ValueError, KeyError, IndexError):
+            return json.loads(done.stdout)["profiles"]
+        except (ValueError, KeyError, TypeError):
             detail = (done.stderr or done.stdout).strip()[-400:] or f"exit {done.returncode}"
     return [{"name": n, "ok": False,
              "error": f"the profiles could not be checked: {detail}"} for n in names]
+
+
+def _profile_layer_text(row: dict) -> str:
+    """Where a resolved profile came from, as the doctor says it."""
+    layer = row.get("layer")
+    if layer in ("project", "global"):
+        return f"the store, {layer} version {row.get('version')}"
+    if layer == "shipped":
+        return "the harness runner's shipped profiles"
+    return f"the bundle, {row.get('path')}"
 
 
 def _settings_profiles(settings: dict) -> dict:
@@ -8697,6 +8823,11 @@ def _settings_profiles(settings: dict) -> dict:
 def _require_profiles(root: Path, settings: dict) -> None:
     """Refuse settings whose profiles do not resolve or do not fit, naming the
     position, the profile and the problem."""
+    problem = _service_module("profiles").unimported_problem(root)
+    if problem:
+        _refuse(6, "profiles_not_imported", problem,
+                f"run `{NAME} profiles import` to see what it would save, then "
+                "`--apply`")
     reached = _settings_profiles(settings)
     bad = [r for r in _profile_check(root, list(reached)) if not r.get("ok")]
     if bad:
@@ -8735,25 +8866,24 @@ def _build_dialogue(cfg: dict, root: Path, settings: dict, paths: dict, *,
     return dialogue
 
 
-def _rerun_with_runner(cfg: dict) -> NoReturn:
-    """Run this listener again with the harness runner beside the CLI's own
+def _rerun_with_runner(argv: list[str]) -> NoReturn:
+    """Run this CLI again on `argv` with the harness runner beside its own
     dependencies. The launch nonce and everything else in the environment go
     with it."""
     if os.environ.get(SERVICE_RUNNER_EXEC_ENV):
         _refuse(5, "harness_library_missing",
-                "the listener was started with the harness runner and still "
-                "cannot import it",
-                f"check that uv can resolve {_service_module_pin()}")
+                "this was started with the harness runner and still cannot "
+                "import it", f"check that uv can resolve {_service_module_pin()}")
     uv = shutil.which("uv")
     if uv is None:
         _refuse(5, "harness_library_missing",
-                "the dialogue runs on callva-harness-runner, and uv is not on PATH "
-                "to resolve it", "put uv on PATH, where the CLI's own shebang finds it")
+                "profiles and the dialogue run on callva-harness-runner, and uv is "
+                "not on PATH to resolve it",
+                "put uv on PATH, where the CLI's own shebang finds it")
     env = dict(os.environ)
     env[SERVICE_RUNNER_EXEC_ENV] = "1"
     command = [uv, "run", "--quiet", "--with", _service_module_pin(), "--script",
-               str(Path(__file__).resolve()), "service", "run", "--connection",
-               cfg["id"]]
+               str(Path(__file__).resolve()), *argv]
     sys.stdout.flush()
     sys.stderr.flush()
     os.execvpe(uv, command, env)
@@ -9043,7 +9173,7 @@ def _cmd_service_run(connection_flag: str | None) -> None:
     if _service_schema().dialogue_configured(settings):
         _service_project_id(root)
         if not _runner_importable():
-            _rerun_with_runner(cfg)
+            _rerun_with_runner(["service", "run", "--connection", cfg["id"]])
         try:
             dialogue = _build_dialogue(cfg, root, settings, paths)
         except ValueError as exc:
@@ -9190,13 +9320,15 @@ def _cmd_service_doctor(connection_flag: str | None,
         except _Refusal as refusal:
             check("dialogue", False, refusal.message, refusal.exit_code, refusal.code)
         reached = _settings_profiles(settings)
-        in_process = not local or _runner_importable()
-        for row in _profile_check(root, list(reached)) if in_process else []:
+        problem = _service_module("profiles").unimported_problem(root)
+        if problem:
+            check("profiles", False, problem, 6, "profiles_not_imported")
+        for row in _profile_check(root, list(reached)) if not (local or problem) else []:
             where = ", ".join(reached.get(row["name"]) or [])
             check(f"profile {row['name']}", bool(row.get("ok")),
                   (f"{where}: {row.get('harness')} "
                    f"(model {row.get('model') or 'the harness default'}) from "
-                   f"{row.get('source')} {row.get('path')}") if row.get("ok")
+                   f"{_profile_layer_text(row)}") if row.get("ok")
                   else f"{where}: {row.get('error')}", 6,
                   None if row.get("ok") else "service_profile_invalid")
         voice = _service_schema().voice_scopes(settings)
@@ -10508,6 +10640,15 @@ def main():
     pil.add_argument("--file", help="the legacy store to read (default: "
                      "messages.db in the account's state home)")
 
+    pprof = _sub("profiles", help="The harness profiles the assistant service runs on")
+    prof = pprof.add_subparsers(dest="profiles_command", required=True)
+    plist = prof.add_parser("list", help="Each profile as it resolves from the store")
+    plist.add_argument("names", nargs="*",
+                       help="profile names (default: every one the settings reach)")
+    pimport = prof.add_parser("import", help="Move the project's profile files into the store")
+    pimport.add_argument("--apply", action="store_true",
+                         help="save them and remove the files (default: say what it would do)")
+
     psend = _sub(
         "send", help="Send a text message (write-enabled connections only)")
     psend.add_argument("chat_id", nargs="?", help="recipient chat id")
@@ -10618,6 +10759,7 @@ def main():
         "transcribe": cmd_transcribe,
         "render": cmd_render,
         "import-legacy": cmd_import_legacy,
+        "profiles": cmd_profiles,
         "send": cmd_send,
         "service": cmd_service,
         "jobs": cmd_jobs,

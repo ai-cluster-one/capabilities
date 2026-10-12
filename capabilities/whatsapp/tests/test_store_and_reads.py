@@ -250,7 +250,9 @@ class StoreSchema(StoreCase):
             """SELECT c.relname FROM pg_class c
                  JOIN pg_namespace n ON n.oid = c.relnamespace
                 WHERE n.nspname = current_schema()""").fetchall()
-        platform = ("schema_ledger", "schema_version")
+        # The profile table is the harness library's, made under its own ledger
+        # by `profiles import`, and shared by every capability that reads it.
+        platform = ("schema_ledger", "schema_version", "harness_")
         names = sorted(r["relname"] for r in rows
                        if not r["relname"].startswith(platform))
         self.assertEqual([n for n in names if not n.startswith("whatsapp_")], [])

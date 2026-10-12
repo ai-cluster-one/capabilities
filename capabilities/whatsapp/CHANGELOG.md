@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-10-12 — Harness profiles are kept in the store
+
+Breaking. The assistant service resolves every profile its settings name - `profile` and `job_profile` at a person, a group and `defaults` - from the store, as agentrooms and tasks do: the project's active version in the `harness_profiles` table, then the global one, then callva-harness-runner's shipped profiles, then the four this bundle ships. The runner is now 0.9.0. A project's profile files in `capabilities/whatsapp/service/profiles/` are no longer read: while any is there, `service start` and `service doctor` refuse with exit 6 `profiles_not_imported`. Run `whatsapp profiles import` to see what moves, then `whatsapp profiles import --apply`, which saves each file at the project's scope and removes it. A profile is saved from then on with `tasks profiles save`. `whatsapp profiles list` shows each profile as it resolves, and `service doctor` names the layer each came from. Fit is checked as before, now on the resolved version.
+
 ## 2026-10-11 — A store behind Supabase's transaction pooler is refused at connect
 
 `whatsapp` now uses `capabilities-contract` 0.4.1. A transaction-mode pooler keeps no session between transactions, so the schema binding, prepared statements and notifications a connection relies on are lost through one, and it is not supported. A database setting that points at Supabase's transaction pooler - a host under `pooler.supabase.com` on port 6543 - is refused before anything is sent to it, as `transaction_pooler`, with a hint naming the session pooler: the same host on port 5432. Every other database, the session pooler included, is reached as before.

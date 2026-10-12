@@ -872,18 +872,32 @@ class Dialogue:
         """Every profile the settings name, resolved and fitted, or ValueError
         naming the first that is not."""
         from_schema = self.cli._service_schema()
+        active = self.stored_profiles()
         cache = {}
         for name, where in from_schema.profile_names(
                 settings, self.profiles.DEFAULT_PROFILE,
                 self.profiles.DEFAULT_JOB_PROFILE).items():
             try:
-                cache[name] = self.profiles.resolve(name, self.folders())
+                cache[name] = self.profiles.resolve(name, active, self.project_id)
             except ValueError as exc:
                 raise ValueError(f"{', '.join(where)}: {exc}") from None
         return cache
 
-    def folders(self) -> list[str]:
-        return self.profiles.folders(self.root)
+    def stored_profiles(self) -> list:
+        """The active profile versions this project reaches, read from the store
+        now, or ValueError saying why they cannot be."""
+        problem = self.profiles.unimported_problem(self.root)
+        if problem:
+            raise ValueError(problem)
+        try:
+            with self.db.write_lock:
+                return self.profiles.stored(self.db.conn, self.project_id, self.db.schema)
+        except Exception as exc:
+            raise ValueError(f"the profiles could not be read from the store: "
+                             f"{self.cli._error_line(exc)}") from None
+
+    def resolve_profile(self, name):
+        return self.profiles.resolve(name, self.stored_profiles(), self.project_id)
 
     def prepare(self) -> None:
         self.profile_cache = self.resolve_profiles(self.settings)
@@ -902,7 +916,7 @@ class Dialogue:
 
     def profile(self, name):
         if name not in self.profile_cache:
-            self.profile_cache[name] = self.profiles.resolve(name, self.folders())
+            self.profile_cache[name] = self.resolve_profile(name)
         return self.profile_cache[name]
 
     # -- the session the listener holds -------------------------------------
@@ -1252,7 +1266,7 @@ class Dialogue:
         counters = self.register.counters(chat)
         try:
             _profile, origin = self.profile(channel["profile"])
-            profile = f"{channel['profile']} ({origin['harness']}, {origin['source']})"
+            profile = f"{channel['profile']} ({origin['harness']}, {origin['layer']})"
         except ValueError as exc:
             profile = f"{channel['profile']} (unusable: {exc})"
         running = len(self.running.get(chat) or {})
@@ -1324,7 +1338,7 @@ class Dialogue:
             return f"ok, voice-transcription = {value}"
         if key == "profile":
             try:
-                self.profile_cache[value] = self.profiles.resolve(value, self.folders())
+                self.profile_cache[value] = self.resolve_profile(value)
             except ValueError as exc:
                 return f"nope: {exc}"
             self.register.set_override(job["chat_id"], key, value)
