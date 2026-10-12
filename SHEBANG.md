@@ -227,7 +227,7 @@ The envelope, the flag parsing and the empty answer are vendored in the contract
 
 ## Project records and the envelope
 
-Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its slug and holds its durable id (resolved as described below). Live configuration is kept in files, and the policy gate comes through the records adapter with every other live record.
+Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its slug and holds its durable id (resolved as described below). Live configuration is kept in files, apart from the connections and grants a project keeps in its store ([connections in the store](#connections-in-the-store)), and the policy gate comes through the records adapter with every other live record.
 
 All runtime readers open the same records adapter, which maps logical collections onto the established envelope and `$XDG_CONFIG_HOME` layout. Project records resolve before global records; merge collections compose by key, and a connection identity is always taken whole from one scope rather than assembled field by field. A call site asks for a collection, never for a path.
 
@@ -238,7 +238,7 @@ capabilities/
   project.json        # durable project identity
   settings.json       # policy records
   <name>/
-    connections.json  # connection, grant, and default-setting records
+    connections.json  # connection, grant, and default-setting records (files mode)
     identifiers.json  # identifier records, managed by the ids verbs
     reference/        # one front-matter .md per reference
       *.md
@@ -246,7 +246,7 @@ capabilities/
     state/            # capability-written; never committed
 ```
 
-Configuration - settings, the gate, identifiers, references, connections and state - stays in these files. The database holds only the tables capabilities design and migrate for themselves ([runtime state in the store](#runtime-state-in-the-store)).
+Configuration - settings, the gate, identifiers, references and state - stays in these files, and so do connections and grants in files mode. The database holds only the tables the package designs and migrates for itself: each capability's runtime state ([runtime state in the store](#runtime-state-in-the-store)) and, in store mode, the contract's connection tables ([connections in the store](#connections-in-the-store)).
 
 **A project resolves its database through one cascade** - the project's env files, then the process environment, then the machine's store setting file - and its levels, keys and file are [the store setting](#the-store-setting).
 
@@ -524,7 +524,7 @@ A capability whose secret is not a flat token resolves it in its own shape — k
 
 Every connection-bearing capability resolves its configuration as **explicit named connections**. A registry is required even when there is only one connection; environment variables resolve values for that declared connection but never create an identity implicitly. Core-only capabilities omit the connections tier and report an empty connections map.
 
-Endpoints and identities are declared as **connection records**, written at configuration time by whoever configures and read through the shared adapter. The two scopes are project then global. They compose by connection id: the highest scope declaring an id supplies that entire identity, while other ids inherit from the lower scope. A separate grant record carries `enabled` and `allow_write`, so project permission can change without restating identity. `connections.json` stores identities and grants together.
+Endpoints and identities are declared as **connection records**, written at configuration time by whoever configures and read through the shared adapter. The two scopes are project then global. They compose by connection id: the highest scope declaring an id supplies that entire identity, while other ids inherit from the lower scope. A separate grant record carries `enabled` and `allow_write`, so project permission can change without restating identity. An identity the project declares is the project's to use; one inherited from the global scope is withheld until a grant resolving at project scope says `enabled: true` - grant before use. In files mode `connections.json` stores identities and grants together.
 
 ```json
 {
@@ -544,6 +544,23 @@ The envelope is the standard's; the entry **interior** is the capability's (host
 - **`allow_write`** — the connection's write gate ([below](#the-write-gate)), represented logically as a grant. Absent falls to the capability's declared `WRITE_DEFAULT`.
 
 Non-secret values sit literally in the entry: chosen, committed, per-connection project config — both the wiring (endpoints, workspaces) and any behavioural per-connection keys the capability defines.
+
+### Connections in the store
+
+A project keeps its connections and grants in one of two homes: the files above, in files mode, or the project's store, in store mode, which serves a project whose agents run on more than one node. One mode owns a project at a time and the two never compose with each other. Either is read through the same records adapter, so `_connections_registry()` below and every verb above it behave the same in both.
+
+Store mode keeps two tables, owned by the contract and migrated under its own ledger in the schema the project's [store setting](#the-store-setting) names:
+
+| Table | Columns |
+|---|---|
+| `capabilities_connections` | `capability`, `name`, `spec` (jsonb); one row per connection, keyed by `capability` and `name` |
+| `capabilities_connection_grants` | `agent_id`, `capability`, `connection`, `node` (nullable), `enabled`, `allow_write`, `is_default` |
+
+`spec` is the entry interior, the same object a `connections.json` entry holds, and carries secret references only: each secret stays named by its `*_env` field and its value never enters the store. The value resolves on each node through that node's own cascade tiers 2–4, so one row serves every node while each node keeps its own values.
+
+`agent_id` is the project id, the `prj_<12hex>` value the project's identity carries, held as text and never as a foreign key, because the identity's home is outside these tables; `connection` refers to a connection row of the same capability inside them. `node` names the node a grant is for and is null for every node; a grant naming the running node is used before the grant for every node. `is_default` is the default pointer, held by at most one grant per agent, capability and node.
+
+Every rule of [connections](#connections) holds unchanged. A connection row is used whole, never assembled from two rows. A row belongs to no project, so it is withheld from a project until that project's grant enables it, as an identity inherited from the global scope is in files mode. `allow_write` resolves through [the write gate](#the-write-gate), the read-only switch closes every gate, and a grant that resolves to `enabled: false` leaves the connection out of the set. `<name> connections` reads the store to report a resolution and reaches nothing a connection names.
 
 ### Selection
 
@@ -609,7 +626,7 @@ Outside any project there is no scope a grant could be written in, so a capabili
 
 ### `connections` — the resolution report
 
-`<name> connections` prints where every value of every declared connection resolves from — the programmatic answer to *"which credentials is this using, and from where?"*. It is **purely local**: resolution only, no network, no authentication attempt (readiness stays `doctor`'s question). The report always carries the same shape, so a consumer never branches on cardinality:
+`<name> connections` prints where every value of every declared connection resolves from — the programmatic answer to *"which credentials is this using, and from where?"*. It is **purely local**: resolution only, no authentication attempt and no call to any system a connection names (readiness stays `doctor`'s question); in store mode reading the store is the resolution. The report always carries the same shape, so a consumer never branches on cardinality:
 
 ```json
 {
