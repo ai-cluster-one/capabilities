@@ -212,6 +212,11 @@ FILES
       the runtime on those declared paths instead of per-target bundles;
       compiler.compose_overlays declares untouched project-owned overlays;
       compiler.container supplies agent_home and project_root for portable mounts;
+      compiler.container.persistent_manager true (container profiles) keeps the
+      capabilities manager's whole home on named volumes, its launcher
+      directory first on PATH: the node keeps the tools it installs and
+      updates, a redeploy no longer upgrades them, and each boot installs only
+      lock entries the registry lacks;
       compiler.build_args is the only source of generated Compose build args.
       A service environment_defaults mapping overrides descriptor env defaults.
 
@@ -321,6 +326,26 @@ LAUNCHD_SPAWN_TYPES = {"Standard": "daemon", "Background": "background",
 CHECKOUT_PROFILES = ("agent-box-checkout",)
 BOOT_DIR = "/opt/agent"
 BODY_VOLUME = "agent_body"
+# compiler.container.persistent_manager: the capabilities manager's whole
+# writable home lives on named volumes, so a node keeps the tools it installs
+# and updates across redeploys. One volume per directory the manager writes,
+# keyed by its path under the agent home: every rename the manager makes stays
+# inside one of them (a temporary beside its target, a stage beside the
+# registry entry or release it becomes), and none overlaps a home a capability
+# or an agent CLI owns. The launcher directory is a volume of its own, first on
+# PATH, so the image's agent CLI links in ~/.local/bin stay in the image.
+MANAGER_BIN_REL = "/.capabilities-bin"
+MANAGER_VOLUMES = {
+    "capabilities_registry": ("/.capabilities",
+                              "The capabilities manager's registry, its staging and its releases."),
+    "capabilities_bin": (MANAGER_BIN_REL, "The capabilities manager's launcher directory."),
+    "capabilities_config": ("/.config/capabilities",
+                            "The capabilities manager's machine settings and source registrations."),
+    "capabilities_state": ("/.local/state/capabilities",
+                           "The capabilities manager's release records, mutation lock and dev sessions."),
+    "capabilities_data": ("/.local/share/capabilities", "The capabilities manager's dev worktrees."),
+    "capabilities_cache": ("/.cache/capabilities", "The capabilities manager's source and lookup caches."),
+}
 LOCK_REL = "deployment/capabilities.lock"
 REPO_URL_ENV = "AGENT_REPO_URL"
 REPO_BRANCH_ENV = "AGENT_REPO_BRANCH"
@@ -3379,6 +3404,8 @@ def _compiler_config(runtime: dict) -> dict:
         if isinstance(declared, list):
             container["system_packages"] = [
                 name for name in declared if _safe_package_name(name)]
+        if isinstance(raw_container.get("persistent_manager"), bool):
+            container["persistent_manager"] = raw_container["persistent_manager"]
     host = dict(defaults["host"])
     raw_host = raw.get("host")
     if isinstance(raw_host, dict):
@@ -3943,6 +3970,21 @@ def _body_sync_template(project_name: str, project_root: str) -> str:
             .replace("__QUIET__", SYNC_QUIET_ENV))
 
 
+_MANAGER_LOCK_BLOCK = """
+# --- Capabilities the lock names and the persisted registry lacks -------------
+if [ -f __LOCK__ ]; then
+  registry="${CAPABILITIES_HOME:-$HOME/.capabilities}"
+  while read -r name; do
+    case "$name" in ""|'#'*) continue ;; esac
+    if [ -f "$registry/$name/$name" ]; then continue; fi
+    echo "[entrypoint] installing $name: the lock names it and this node's registry lacks it"
+    if ! capabilities install "$name" --allow < /dev/null > /dev/null; then
+      echo "[entrypoint] WARN: could not install $name; the box runs without it" >&2
+    fi
+  done < __LOCK__
+fi
+"""
+
 _CHECKOUT_BLOCK = """
 # --- Project checkout --------------------------------------------------------
 # The image carries tools and this boot path and no project at all. The volume
@@ -4009,8 +4051,15 @@ _ENTRYPOINT_DOCTORS = {
 def _entrypoint_template(project_name: str, supervisor_config: str | None = None,
                          checkout: bool = False, project_root: str = "/app",
                          has_contextkit: bool = False,
-                         body_sync: str | None = None) -> str:
+                         body_sync: str | None = None,
+                         manager_lock: str | None = None) -> str:
     identity = _slug(project_name)
+    # With the manager's home on volumes the image seeds it once, and every
+    # later boot runs what the volumes hold. A capability added to the lock
+    # after that is installed here; one already installed is left as it is,
+    # so a redeploy never takes back a tool the node updated.
+    manager_block = "" if manager_lock is None else (
+        _MANAGER_LOCK_BLOCK.replace("__LOCK__", shlex.quote(manager_lock)))
     default_command = (
         f"exec /usr/bin/supervisord -c {shlex.quote(supervisor_config)}"
         if supervisor_config else
@@ -4061,7 +4110,7 @@ if [ -n "${{GIT_DEPLOY_KEY_B64:-}}" ]; then
     echo "[entrypoint] WARN: GIT_DEPLOY_KEY_B64 is set but not valid base64; git push identity skipped" >&2
   fi
 fi
-{rebuild}
+{manager_block}{rebuild}
 {checkout_block}
 if [ -f "$HOME/.claude/.credentials.json" ] || [ -d "$HOME/.claude/projects" ]; then
   claude_auth="claude state present"
@@ -4090,7 +4139,8 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
                          entrypoint_rel: str, with_supervisor: bool = False,
                          mounts: list[str] | None = None,
                          checkout: bool = False,
-                         boot_copy: list[str] | None = None) -> str:
+                         boot_copy: list[str] | None = None,
+                         persistent_manager: bool = False) -> str:
     agent_home = compiler["container"]["agent_home"]
     project_root = compiler["container"]["project_root"]
     username = Path(agent_home).name
@@ -4174,6 +4224,14 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
         if resolved not in state_dirs:
             state_dirs.append(resolved)
     state_mkdir = " ".join(f'"{d}"' for d in state_dirs)
+    search_path = f"ENV PATH={agent_home}/.local/bin:${{PATH}}"
+    if persistent_manager:
+        # The manager's launcher directory is a volume and comes first, so a
+        # capability the node installs or updates is the one that resolves;
+        # the agent CLIs keep their links in the image's ~/.local/bin.
+        launchers = agent_home + MANAGER_BIN_REL
+        search_path = (f"ENV CAPABILITIES_BIN={launchers}\n"
+                       f"ENV PATH={launchers}:{agent_home}/.local/bin:${{PATH}}")
     return f"""{header}
 FROM debian:bookworm-slim
 
@@ -4189,7 +4247,7 @@ RUN useradd --create-home --home-dir {agent_home} --shell /bin/bash ${{USERNAME}
 USER ${{USERNAME}}
 ENV HOME={agent_home}
 ENV XDG_STATE_HOME={agent_home}/.local/state
-ENV PATH={agent_home}/.local/bin:${{PATH}}
+{search_path}
 WORKDIR {project_root}
 
 RUN mkdir -p "$HOME/.local/bin" "$HOME/.local/state" "$HOME/.claude" "$HOME/.codex"
@@ -4504,6 +4562,12 @@ def _runtime_template(profile: str, project_name: str) -> dict:
     }
 
 
+def _persistent_manager(runtime: dict) -> bool:
+    """Whether a container runtime keeps the capabilities manager's home on volumes."""
+    return (runtime.get("profile") in CONTAINER_PROFILES
+            and _compiler_config(runtime)["container"].get("persistent_manager") is True)
+
+
 def _merged_strings(existing: object, required: list[str]) -> list[str]:
     values = [value for value in (existing if isinstance(existing, list) else [])
               if isinstance(value, str)]
@@ -4650,6 +4714,32 @@ def _compile_runtime(root: Path, runtime: dict,
         services[name] = entry
         if not host:
             _register_descriptor_volumes(volumes, deploy, compiler)
+    if _persistent_manager(runtime):
+        # Every container the image runs mounts the same manager home, so a tool
+        # one of them installs or updates is the tool all of them run.
+        for name, value in MANAGER_VOLUMES.items():
+            volumes.setdefault(name, {"description": value[1], "kind": "shared",
+                                      "mount": container["agent_home"] + value[0]})
+        # In the order runtime.json is read back in, so the image a first sync
+        # renders is the one every later sync renders.
+        volumes = dict(sorted(volumes.items()))
+        for name, entry in list(services.items()):
+            if isinstance(entry, dict) and entry.get("placement") != "local":
+                services[name] = {**entry, "state": _merged_strings(
+                    entry.get("state"), list(MANAGER_VOLUMES))}
+    else:
+        # Turning the option off takes back exactly what it added, so the
+        # runtime compiles as one that never declared it.
+        added = {name for name, value in MANAGER_VOLUMES.items()
+                 if isinstance(volumes.get(name), dict)
+                 and volumes[name].get("mount") == container["agent_home"] + value[0]
+                 and volumes[name].get("description") == value[1]}
+        for name in added:
+            del volumes[name]
+        for name, entry in list(services.items()):
+            if added and isinstance(entry, dict) and isinstance(entry.get("state"), list):
+                services[name] = {**entry, "state": [
+                    value for value in entry["state"] if value not in added]}
     policy, _migrated = _service_policy(runtime)
     serialized_policy = dict(policy)
     raw_policy = runtime.get("service_policy")
@@ -4881,11 +4971,15 @@ def _artifact_texts(root: Path, runtime: dict,
             has_contextkit, compiler, entrypoint_rel, bool(supervisor_config),
             mounts=[v["mount"] for v in (runtime.get("volumes") or {}).values()
                     if isinstance(v, dict) and isinstance(v.get("mount"), str)],
-            checkout=checkout, boot_copy=boot_copy),
+            checkout=checkout, boot_copy=boot_copy,
+            persistent_manager=_persistent_manager(runtime)),
         "entrypoint": _entrypoint_template(
             project_name, supervisor_config, checkout=checkout,
             project_root=project_root, has_contextkit=has_contextkit,
-            body_sync=body_sync_config),
+            body_sync=body_sync_config,
+            manager_lock=(((BOOT_DIR + "/capabilities.lock") if checkout
+                           else project_root.rstrip("/") + "/" + LOCK_REL)
+                          if _persistent_manager(runtime) else None)),
     }
     if supervisor_path is not None:
         candidates["supervisor"] = _supervisor_template(
@@ -5792,6 +5886,14 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
                     _safe_package_name(name) for name in packages)):
                 findings.append({"severity": "error", "path": _rel(root, path),
                                  "message": "compiler.container.system_packages must be a list of Debian package names"})
+            persistent = container.get("persistent_manager")
+            if persistent is not None and not isinstance(persistent, bool):
+                findings.append({"severity": "error", "path": _rel(root, path),
+                                 "message": "compiler.container.persistent_manager must be true or false"})
+            elif persistent and data.get("profile") not in CONTAINER_PROFILES:
+                findings.append({"severity": "warning", "path": _rel(root, path),
+                                 "message": "compiler.container.persistent_manager applies only to a "
+                                            "container profile and is ignored here"})
             declaration = artifacts.get("dockerfile") if isinstance(artifacts, dict) else None
             if packages and _artifact_declaration(declaration)[1] == "external":
                 findings.append({"severity": "warning", "path": _rel(root, path),

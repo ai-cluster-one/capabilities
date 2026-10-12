@@ -74,6 +74,39 @@ from the effective project gate on the workstation and copied into the image, so
 under both profiles adding a capability needs an image rebuild rather than a
 push. Only the project travels through Git.
 
+**Keeping the tools the box updates.** By default the capabilities manager's
+home is part of the image: a redeploy brings every capability back to what the
+image installed, and whatever a release or update run inside the box wrote is
+gone with the old container. Setting
+`compiler.container.persistent_manager` to `true` in `deployment/runtime.json`,
+on either container profile, puts the manager's whole writable home on named
+volumes that every container the image runs mounts: `capabilities_registry`
+(`~/.capabilities`: the registry, its staging and the manager's releases),
+`capabilities_bin` (`~/.capabilities-bin`, the launcher directory),
+`capabilities_config` (`~/.config/capabilities`), `capabilities_state`
+(`~/.local/state/capabilities`: release records, the mutation lock and dev
+sessions), `capabilities_data` (`~/.local/share/capabilities`, dev worktrees)
+and `capabilities_cache` (`~/.cache/capabilities`). Each directory the manager
+writes is one volume, so every rename it makes - a temporary beside its target,
+a stage beside the registry entry or release it becomes, a launcher swapped
+beside the old one - stays inside one volume. The Dockerfile sets
+`CAPABILITIES_BIN` to the launcher directory and puts it first on `PATH` in its
+own `ENV`, installs the lock there at build, and creates each mount point owned
+by the agent; the agent CLIs keep their links in the image's `~/.local/bin`.
+
+A fresh volume is seeded from the image, so the first deploy starts from the
+tools the image installed. From then on the volumes are what runs: a redeploy
+no longer upgrades a capability the box already has, and the box keeps its tools
+current through its own `capabilities update` and source releases. On every boot
+the entrypoint installs each capability the lock names and the registry lacks,
+so adding one to the lock still reaches a box on its next deploy, and it leaves
+an installed one exactly as it is, so a redeploy never takes back a tool the box
+updated. A capability service's own state mount under
+`~/.local/state/capabilities` - `~/.local/state/capabilities/projects` - sits
+inside `capabilities_state` as a volume of its own; Docker mounts the parent
+before the child, the manager never writes under `projects`, and the service
+keeps its own volume. The option changes nothing while it is unset.
+
 **When initialization runs.** Host bindings, capability wiring, and compiled
 context are build artifacts of a checkout. `agent-box` makes them at build time
 against the copy it holds. `agent-box-checkout` has nothing to make them against
