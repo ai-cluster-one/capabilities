@@ -2,9 +2,9 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "py-tgcalls==3.0.0.dev5",
-#     "ntgcalls==3.0.0b19",
-#     "telethon==1.43.2",
+#     "py-tgcalls==3.0.1b1",
+#     "ntgcalls==3.0.3",
+#     "telethon==1.45.0",
 # ]
 # ///
 # The 3.x line is what carries conference calls: joining one needs
@@ -612,7 +612,7 @@ async def active_group_call_from_history(client: TelegramClient, bridge, chat_id
                 return None
             cache = getattr(bridge, "_cache", None)
             if cache is not None:
-                cache.set_cache(chat_id, call_ref)
+                cache.set_call(chat_id, call_ref)
             emit_event(
                 "group_probe_fallback",
                 chat_id=chat_id,
@@ -705,7 +705,7 @@ async def watch_groups(
             schema_fallback_groups.discard(chat_id)
             cache = getattr(bridge, "_cache", None)
             if call_ref is not None and cache is not None:
-                cache.set_cache(chat_id, call_ref)
+                cache.set_call(chat_id, call_ref)
             return call_ref
         except TypeNotFoundError:
             if chat_id not in schema_fallback_groups:
@@ -836,7 +836,7 @@ async def watch_groups(
             write_metadata(metadata_path, metadata)
             cache = getattr(bridge, "_cache", None)
             if cache is not None:
-                cache.set_cache(chat_id, call_ref)
+                cache.set_call(chat_id, call_ref)
             try:
                 await asyncio.wait_for(
                     calls.record(

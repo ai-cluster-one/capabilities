@@ -2,9 +2,9 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "telethon==1.43.2",
-#     "py-tgcalls==3.0.0rc3",
-#     "ntgcalls==3.0.0rc5",
+#     "telethon==1.45.0",
+#     "py-tgcalls==3.0.1b1",
+#     "ntgcalls==3.0.3",
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
@@ -38,17 +38,20 @@
 # 2026-09-12 and 2026-09-22 with no fault, where b20's rate expected about
 # four. The issue was closed as completed on 2026-09-22.
 #
-# rc5 is here because it is the newest of the line and is where the maintainer
-# is heading for stable. py-tgcalls stays at rc3, which is its newest release
-# and accepts any ntgcalls 3.x. The pin moved only after a live probe of the
-# surface this daemon actually touches - the constructors, the filters, the
-# private participant cache and source map, and the media-stack log strings
-# the audio-map reconciler parses - because the tests stub the library and
-# cannot see a native change at all.
+# ntgcalls 3.0.3 and py-tgcalls 3.0.1b1 move together: from ntgcalls 3.0.2 the
+# participants request carries the ssrcs the media stack is missing, and 3.0.1b1
+# is the first py-tgcalls that accepts that second argument. 3.0.1b1 also keeps
+# each group call's participants current from Telegram's updates instead of an
+# hour-long cache, so the audio-map refresh reloads the call rather than
+# dropping a cache entry. The pin moved only after a live probe of the surface
+# this daemon actually touches - the constructors, the filters, the private
+# participant state and source map, and the media-stack log strings the
+# audio-map reconciler parses - because the tests stub the library and cannot
+# see a native change at all.
 #
-# Still open on rc3 and carried into rc5: ntgcalls#75, one SIGSEGV on ntg-work
-# shortly after a P2P-to-conference migration, faulting at 0x10 under six
-# frames rather than #61's four at 0x58. Seen once, on 2026-09-14.
+# Still open on rc3 and carried into 3.0.3: ntgcalls#75, one SIGSEGV on
+# ntg-work shortly after a P2P-to-conference migration, faulting at 0x10 under
+# six frames rather than #61's four at 0x58. Seen once, on 2026-09-14.
 """
 Telegram assistant daemon — the persistent MTProto process (push, not polling).
 
@@ -7901,6 +7904,17 @@ async def run_session(client):
                 f"{user}:{_unsigned_ssrc(ssrc)}"
                 for user, ssrc in sorted(audio.items()))
 
+        async def reload_call_participants(chat_id: int):
+            """Have the library ask Telegram who is in the call now.
+
+            The library keeps a call's participants from Telegram's updates and
+            answers from what it holds, so a reader that needs Telegram's own
+            answer reloads the call first. A call the library does not hold has
+            nothing to reload."""
+            group_call = calls._app._bind_client._cache.get_call(chat_id)
+            if group_call is not None:
+                await group_call.reload()
+
         async def refresh_conference_audio_map(chat_id: int, reason: str):
             """Rebuild the participant-to-audio-stream map for a live call.
 
@@ -7908,8 +7922,10 @@ async def run_session(client):
             what is left to cover is the join itself: anyone whose stream is not
             in the snapshot taken as this account joins is never decoded and
             never reaches the recording, and no update follows for someone who
-            was already there. Dropping the cached participants forces a real
-            answer rather than the hour-old one.
+            was already there. Reloading the call's participants forces a real
+            answer rather than the one the library already holds. The reload is
+            shielded, so a timeout stops the wait and never cuts the library's
+            own request off halfway.
 
             The library's own copy of the last map it sent goes with it. It
             skips the hand-off whenever a fresh answer equals that copy, which
@@ -7918,10 +7934,11 @@ async def run_session(client):
             that names anyone is always handed over; an empty answer still
             hands over nothing, because there is nothing to hand over."""
             try:
-                cache = calls._app._bind_client._cache
-                cache._call_participants_cache.pop(chat_id)
+                await asyncio.wait_for(
+                    asyncio.shield(reload_call_participants(chat_id)),
+                    CONFERENCE_AUDIO_MAP_TIMEOUT)
             except Exception as exc:
-                log(f"call: audio map — participant cache not cleared "
+                log(f"call: audio map — participant list not reloaded "
                     f"({type(exc).__name__}: {exc})")
             try:
                 calls._call_sources[chat_id].audio = {}
@@ -9070,18 +9087,17 @@ async def run_session(client):
         async def conference_others(chat_id: int):
             """Who Telegram still lists in this call, besides this account.
 
-            Asked fresh: the participant list is cached for an hour, which is
-            the same staleness the audio map has to work around, so the cache is
-            dropped before asking. Returns None when the question could not be
-            put, which is not the same answer as nobody.
+            Asked fresh: the library answers from the participants it already
+            holds, which is the same staleness the audio map has to work around,
+            so the call is reloaded before asking. Returns None when the
+            question could not be put, which is not the same answer as nobody.
 
             The public participants method refuses a chat id that is not
             negative, and a conference migrated from a p2p call is keyed by the
             caller's user id, so the client-level call is the one that answers.
             """
             try:
-                cache = calls._app._bind_client._cache
-                cache._call_participants_cache.pop(chat_id)
+                await reload_call_participants(chat_id)
             except Exception:
                 pass
             try:
@@ -9170,7 +9186,7 @@ async def run_session(client):
                 schema_fallback_groups.discard(chat_id)
                 cache = getattr(bridge, "_cache", None)
                 if call_ref is not None and cache is not None:
-                    cache.set_cache(chat_id, call_ref)
+                    cache.set_call(chat_id, call_ref)
                 return call_ref
             except TypeNotFoundError:
                 # Telegram schema updated before Telethon — skip probing for now
@@ -9269,7 +9285,7 @@ async def run_session(client):
                 write_metadata(metadata_path, metadata)
                 cache = getattr(bridge, "_cache", None)
                 if cache is not None:
-                    cache.set_cache(chat_id, call_ref)
+                    cache.set_call(chat_id, call_ref)
                 try:
                     await asyncio.wait_for(
                         calls.record(

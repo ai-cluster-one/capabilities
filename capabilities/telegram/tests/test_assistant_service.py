@@ -3288,7 +3288,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("TL decode failed", health["last_error"])
 
     async def test_telethon_compatibility_version_is_pinned_across_bundle(self):
-        expected = '"telethon==1.43.2"'
+        expected = '"telethon==1.45.0"'
         for path in (
             CLI_PATH,
             TELEGRAM_DIR / "service" / "daemon.py",
