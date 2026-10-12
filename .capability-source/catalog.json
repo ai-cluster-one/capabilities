@@ -52,7 +52,7 @@
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "de864d627407a0093a1d6bf7aabbffa33843885a90dc42ade69b412258215a77",
+      "payload_sha256": "d31b73ef6cfba0a0e3824848107de1412f609a68d8a5b71abe8aeae0f7d8c030",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into launchd-supervised processes on a Mac, and describe the targets they deploy to."
     },
     "directo": {
@@ -147,7 +147,7 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "e751b5993b45d50523d45be76061587ce7585d346689471d8d9b653ab9b0ff45",
+      "payload_sha256": "efc9580cc3ef8a17694951abc672cf5e1b5d1c827cad921e6199e6cbebf46738",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {
