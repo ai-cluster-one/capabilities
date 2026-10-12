@@ -14,6 +14,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -23,8 +24,9 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _harness import CODEX_EVENTS, FakeHarness, lib  # noqa: E402
 from test_assistant_service import (  # noqa: E402
-    CODEX_MODEL_REFUSAL_STDOUT,
+    CODEX_MODEL_REFUSAL,
     STORE_DSN,
     REFUSED_MODEL,
     Event,
@@ -42,6 +44,24 @@ sys.path.pop(0)
 
 TELEGRAM_DIR = Path(__file__).resolve().parents[1]
 DAEMON_SOURCE = TELEGRAM_DIR / "service" / "daemon.py"
+
+
+def opened_codex_session(state, thread_id, children):
+    """Report a codex harness running in `thread_id`, as the runner reports a
+    run's start: a real child in a session of its own stands in for the
+    harness, so the pid the register records is a real one."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                             start_new_session=True, stdin=subprocess.DEVNULL)
+    children.append(child)
+    state["on_worker_start"](lib.Started("codex", child.pid, thread_id))
+    return child
+
+
+def end_children(children):
+    for child in children:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
 
 
 def job_settings(**overrides):
@@ -152,18 +172,45 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(register.surface, "telegram")
             self.assertIsNotNone(register.project_id)
 
-    async def test_worker_popen_reports_pid_and_process_group_before_waiting(self):
+    async def test_a_runs_start_is_reported_with_the_harness_pid_before_it_ends(self):
+        """The runner reports the harness's pid, the leader of its own session
+        and group, once it runs; the daemon hands it to the run's start
+        callback and keeps it on the run handle `/stop` reaches."""
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
-            seen = []
-            procs = {}
-            rc, out, err = daemon.run_worker_proc(
-                "job:test", [sys.executable, "-c", "print('ok')"], procs,
-                on_start=lambda pid, pgid: seen.append((pid, pgid)))
-            self.assertEqual((rc, out.strip(), err), (0, "ok", ""))
+            self.addCleanup(daemon.close_job_register)
+            seen, procs = [], {}
+            fake = FakeHarness(answer="ok", seconds=0.2)
+            state = {"settings": {}, "proc_key": "job:test",
+                     "on_worker_start": seen.append}
+            state["profile"] = daemon.resolve_turn_profile("codex", {})
+            with mock.patch.object(daemon, "harness_run", fake):
+                result = daemon.worker_harness("job:test", [], state, procs)
+            self.assertEqual(result["reply"], "ok")
             self.assertEqual(len(seen), 1)
-            self.assertEqual(seen[0][0], seen[0][1])
-            self.assertGreater(seen[0][0], 0)
+            self.assertEqual(seen[0].pid, fake.children[0].pid)
+            self.assertEqual(procs["job:test"].pid, seen[0].pid)
+            self.assertTrue(procs["job:test"].ended)
+
+    async def test_a_start_the_register_refuses_ends_the_run(self):
+        """A callback never ends a runner's turn, so a start the daemon
+        refuses - the attempt lost its ownership - ends it through its cancel,
+        and the refusal is what the turn raises."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.addCleanup(daemon.close_job_register)
+            fake = FakeHarness(answer="never", seconds=30)
+
+            def refuse(_started):
+                raise RuntimeError("job attempt lost ownership before process start")
+
+            state = {"settings": {}, "proc_key": "job:test", "on_worker_start": refuse}
+            state["profile"] = daemon.resolve_turn_profile("codex", {})
+            with mock.patch.object(daemon, "harness_run", fake):
+                with self.assertRaisesRegex(RuntimeError, "lost ownership"):
+                    daemon.worker_harness("job:test", [], state, {})
+            self.assertTrue(fake.calls[0]["cancel"].is_set())
+            self.assertIsNotNone(fake.children[0].poll())
 
     async def test_a_project_without_a_store_keeps_answering(self):
         """A register that cannot be opened turns the job class off. It does not
@@ -600,24 +647,19 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             row = queued(register, channel_key="123", requested_by="777",
                                     description="send the table",
                                     engine="claude")
-            # The real engine worker, handed the document claude writes for a
-            # turn that ran to its end and chose to say nothing.
-            document = json.dumps({
-                "type": "result", "subtype": "success", "is_error": False,
-                "result": "", "session_id": "sess-job",
-                "usage": {"input_tokens": 8, "output_tokens": 0},
-            })
+            # The real claude worker, handed what the runner reports for a turn
+            # that ran to its end and chose to say nothing.
+            daemon.harness_run = FakeHarness(answer="", session_id="sess-job",
+                                             tokens={"input": 8, "output": 0})
             client = FakeClient([])
-            with mock.patch.object(daemon, "run_worker_proc",
-                                   return_value=(0, document, "")):
-                task = asyncio.create_task(daemon.run_session(client))
-                await client.started.wait()
-                await wait_until(
-                    lambda: register.get(row["id"])["state"] == daemon.jobs.STOPPED,
-                    timeout=8)
-                after = register.get(row["id"])
-                self.assertEqual(after["outcome"], daemon.jobs.SUCCEEDED,
-                                 after["error"])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(
+                lambda: register.get(row["id"])["state"] == daemon.jobs.STOPPED,
+                timeout=8)
+            after = register.get(row["id"])
+            self.assertEqual(after["outcome"], daemon.jobs.SUCCEEDED, after["error"])
+            self.assertEqual(after["session_id"], "sess-job")
 
             after = register.get(row["id"])
             self.assertTrue(after["result_silent"])
@@ -730,6 +772,8 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             hold = asyncio.Event()
             runs = []
             loop = asyncio.get_running_loop()
+            children = []
+            self.addCleanup(end_children, children)
 
             def worker(chat, tail, state=None, procs=None):
                 registered = (state or {}).get("registered_job")
@@ -744,10 +788,10 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                 runs.append({"text": state["current_request"]["text"],
                              "resume": state.get("resume_session")})
                 if len(runs) == 1:
-                    state["on_worker_line"](json.dumps({
-                        "type": "thread.started", "thread_id": "thread-1"}))
+                    child = opened_codex_session(state, "thread-1", children)
                     loop.call_soon_threadsafe(running.set)
                     state["cancel_event"].wait(timeout=8)
+                    child.kill()
                     raise RuntimeError("worker process group killed")
                 return successful_result("the ledger is reconciled")
 
@@ -866,15 +910,17 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             runs = []
             running = asyncio.Event()
             loop = asyncio.get_running_loop()
+            children = []
+            self.addCleanup(end_children, children)
 
             def worker(chat, tail, state=None, procs=None):
                 runs.append({"text": state["current_request"]["text"],
                              "resume": state.get("resume_session")})
                 if len(runs) == 1:
-                    state["on_worker_line"](json.dumps({
-                        "type": "thread.started", "thread_id": "thread-1"}))
+                    child = opened_codex_session(state, "thread-1", children)
                     loop.call_soon_threadsafe(running.set)
                     state["cancel_event"].wait(timeout=8)
+                    child.kill()
                     raise RuntimeError("worker process group killed")
                 return successful_result("done")
 
@@ -923,15 +969,13 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
             first = queued(register, channel_key="123", requested_by="777",
-                                      description="first", engine="stub")
+                                      description="first", engine="codex")
             second = queued(register, channel_key="123", requested_by="777",
-                                       description="second", engine="stub")
-
-            def worker(chat, tail, state=None, procs=None):
-                raise RuntimeError(
-                    "codex worker failed: You've hit your usage limit.")
-
-            daemon.WORKERS["stub"] = worker
+                                       description="second", engine="codex")
+            # The runner names the ending; the sentence is codex's own.
+            fake = FakeHarness(ok=False, kind="quota", answer="",
+                               message="You've hit your usage limit.")
+            daemon.harness_run = fake
             client = FakeClient([])
             task = asyncio.create_task(daemon.run_session(client))
             await client.started.wait()
@@ -941,6 +985,8 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.4)
             self.assertEqual(register.get(second["id"])["state"], daemon.jobs.WAITING,
                              "a paused queue waits; it is not retried into the wall")
+            self.assertEqual(len(fake.calls), 1)
+            self.assertIsNotNone(register.get(first["id"])["resume_at"])
             self.assertTrue(any("usage limit" in (item.get("text") or "")
                                 for item in client.sent))
             await self.stop_session(client, task)
@@ -962,14 +1008,9 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         register = daemon.job_register()
         row = queued(register, channel_key="123", requested_by="777",
                                 description="reconcile the ledger",
-                                engine="stub")
-
-        def refusing_worker(chat, tail, state=None, procs=None):
-            raise daemon.worker_failure(
-                "codex", REFUSED_MODEL,
-                daemon.codex_failure_reason(CODEX_MODEL_REFUSAL_STDOUT, "", 1))
-
-        daemon.WORKERS["stub"] = refusing_worker
+                                engine="codex", model=REFUSED_MODEL)
+        daemon.harness_run = FakeHarness(ok=False, kind="model_refused", answer="",
+                                         message=CODEX_MODEL_REFUSAL)
         client = FakeClient([])
         task = asyncio.create_task(daemon.run_session(client))
         await client.started.wait()
@@ -1004,14 +1045,12 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             # alike: the name of the ending, and under it the engine's own
             # sentence, which is what an operator acts on and what every
             # surface here carried before the ending had a name.
-            engine_said = daemon.codex_failure_reason(
-                CODEX_MODEL_REFUSAL_STDOUT, "", 1)
+            engine_said = CODEX_MODEL_REFUSAL
             for surface, text in (("row", stopped["error"]),
                                   ("chat", "\n".join(notices))):
-                self.assertIn(REFUSED_MODEL, text, surface)
+                self.assertIn(f'the model "{REFUSED_MODEL}"', text, surface)
                 self.assertIn("codex", text, surface)
                 self.assertIn(engine_said, text, surface)
-                self.assertIn("invalid_request_error", text, surface)
 
     async def test_a_refused_model_tells_a_non_supervisor_no_more_than_before(self):
         """The diagnosis is for whoever can act on it. Everyone else is told
@@ -1027,7 +1066,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             for text in notices:
                 self.assertNotIn(REFUSED_MODEL, text)
                 self.assertNotIn("codex", text)
-                self.assertNotIn("invalid_request_error", text)
+                self.assertNotIn("newer version", text)
 
     # -- restart --------------------------------------------------------------
 
@@ -1081,14 +1120,16 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             runs = []
             running = asyncio.Event()
             loop = asyncio.get_running_loop()
+            children = []
+            self.addCleanup(end_children, children)
 
             def worker(chat, tail, state=None, procs=None):
                 runs.append(state.get("resume_session"))
                 if len(runs) == 1:
-                    state["on_worker_line"](json.dumps({
-                        "type": "thread.started", "thread_id": "thread-1"}))
+                    child = opened_codex_session(state, "thread-1", children)
                     loop.call_soon_threadsafe(running.set)
                     state["cancel_event"].wait(timeout=8)
+                    child.kill()
                     raise RuntimeError("worker process group killed")
                 return successful_result("continued")
 
@@ -1213,29 +1254,23 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.left_behind(daemon), [])
 
 
-# Events in the shape a `codex exec --json` job worker emits them, as captured
-# from real runs: the engine's hook-trust notices and the thread opening first,
-# then each command as a start and an end, and a file change as it starts.
-HOOK_NOTICE = {"type": "item.completed", "item": {
-    "id": "item_0", "type": "error",
-    "message": "`--dangerously-bypass-hook-trust` is enabled. Enabled hooks "
-               "may run without review for this invocation."}}
-
-
+# Notifications in the shape codex app-server hands the runner's `on_event`, as
+# captured from live runs (`codex-app-server-events.json`): each command as a
+# start and an end, with the shell wrapper on its command and its exit code on
+# the end, and a file change as it starts with the paths it writes.
 def codex_command(item_id, command, phase, exit_code=None):
-    return {"type": f"item.{phase}", "item": {
-        "id": item_id, "type": "command_execution",
-        "command": f"/bin/zsh -lc \"{command}\"", "aggregated_output": "",
-        "exit_code": exit_code,
-        "status": "in_progress" if phase == "started" else "completed"}}
+    return {"method": f"item/{phase}", "params": {"item": {
+        "id": item_id, "type": "commandExecution",
+        "command": f"/bin/zsh -lc \"{command}\"", "cwd": "/work/ledger",
+        "exitCode": exit_code,
+        "status": "inProgress" if phase == "started" else "completed"}}}
 
 
 def codex_file_change(item_id, *paths):
-    return {"type": "item.started", "item": {
-        "id": item_id, "type": "file_change", "status": "in_progress",
-        "changes": [{"path": f"/work/ledger/{path}", "kind": "add"}
-                    for path in paths]}}
-
+    return {"method": "item/started", "params": {"item": {
+        "id": item_id, "type": "fileChange", "status": "inProgress",
+        "changes": [{"path": f"/work/ledger/{path}", "kind": {"type": "add"}}
+                    for path in paths]}}}
 
 
 class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
@@ -1255,13 +1290,15 @@ class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
                                                "voice_agent": {"mode": "enabled"}}}
         return base
 
-    async def answered_call(self, td, worker, **overrides):
+    async def answered_call(self, td, fake, **overrides):
+        """Ring the daemon; its call's task runs on the daemon's own codex
+        worker with `fake` as the harness, a real child the row records."""
         daemon = import_daemon(Path(td), self.call_settings(**overrides),
                                voice_context="Answer briefly.",
                                project_env={"GOOGLE_API_KEY": "test-key"},
                                store=True)
         self.addCleanup(daemon.close_job_register)
-        daemon.WORKERS["codex"] = worker
+        daemon.harness_run = fake
         captured = {}
 
         def capture_runner(run_task, *args, **kwargs):
@@ -1279,21 +1316,11 @@ class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
         await wait_until(lambda: "run" in captured, timeout=10)
         return daemon, client, session_task, captured["run"]
 
-    def child_worker(self, holder, seconds):
-        """A codex-shaped worker running a real child through the daemon's own
-        process runner, so the process the row records is a real one."""
-        def worker(chat, tail, state=None, procs=None):
-            holder["runs"] = holder.get("runs", 0) + 1
-            holder["procs"] = procs
-            rc, _out, _err = holder["daemon"].run_worker_proc(
-                state["proc_key"],
-                [sys.executable, "-c", f"import time; time.sleep({seconds})"],
-                procs, cancel_event=state.get("cancel_event"),
-                on_start=state.get("on_worker_start"))
-            if rc != 0:
-                raise RuntimeError(f"codex worker failed: exit {rc}")
-            return {"reply": "found it", "meta": {"session_id": "thread-9"}}
-        return worker
+    @staticmethod
+    def child_harness(seconds):
+        """A codex harness running a real child for `seconds`, answering
+        "found it" in thread-9."""
+        return FakeHarness(answer="found it", session_id="thread-9", seconds=seconds)
 
     @staticmethod
     def call_rows(register, caller="777"):
@@ -1306,10 +1333,8 @@ class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_call_task_is_a_row_its_caller_sees_and_nobody_else(self):
         with tempfile.TemporaryDirectory() as td:
-            holder = {}
-            daemon, client, session_task, run_task = await self.answered_call(
-                td, self.child_worker(holder, 1.5))
-            holder["daemon"] = daemon
+            fake = self.child_harness(1.5)
+            daemon, client, session_task, run_task = await self.answered_call(td, fake)
             store, cli = JobRunnerTests.as_cli(daemon)
             self.addCleanup(store.close)
             task = asyncio.create_task(run_task("look something up"))
@@ -1343,10 +1368,8 @@ class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_stop_from_the_chat_ends_the_call_task(self):
         with tempfile.TemporaryDirectory() as td:
-            holder = {}
-            daemon, client, session_task, run_task = await self.answered_call(
-                td, self.child_worker(holder, 30))
-            holder["daemon"] = daemon
+            fake = self.child_harness(30)
+            daemon, client, session_task, run_task = await self.answered_call(td, fake)
             store, cli = JobRunnerTests.as_cli(daemon)
             self.addCleanup(store.close)
             task = asyncio.create_task(run_task("look something up"))
@@ -1361,15 +1384,14 @@ class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
             stopped = cli.get(row["id"])
             self.assertEqual(stopped["state"], daemon.jobs.STOPPED)
             self.assertEqual(stopped["outcome"], daemon.jobs.CANCELLED)
-            self.assertEqual(holder["runs"], 1)
+            self.assertEqual(len(fake.calls), 1)
+            await wait_until(lambda: fake.children[0].poll() is not None)
             await self.finish(client, session_task)
 
     async def test_a_call_task_never_waits_for_a_job_slot(self):
         with tempfile.TemporaryDirectory() as td:
-            holder = {}
             daemon, client, session_task, run_task = await self.answered_call(
-                td, self.child_worker(holder, 0.2), max_parallel_jobs=1)
-            holder["daemon"] = daemon
+                td, self.child_harness(0.2), max_parallel_jobs=1)
             release = asyncio.Event()
             loop = asyncio.get_running_loop()
 
@@ -1446,7 +1468,7 @@ class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StreamProgressFactTests(unittest.TestCase):
-    """What one codex event says to a person reading the chat."""
+    """What one codex notification says to a person reading the chat."""
 
     def setUp(self):
         self._td = tempfile.TemporaryDirectory()
@@ -1454,7 +1476,7 @@ class StreamProgressFactTests(unittest.TestCase):
         self.daemon = import_daemon(Path(self._td.name), job_settings())
 
     def fact(self, event):
-        return self.daemon.codex_progress_fact(json.dumps(event))
+        return self.daemon.codex_progress_fact(event)
 
     def test_a_command_reads_as_what_ran_and_whether_it_worked(self):
         self.assertEqual(
@@ -1468,6 +1490,20 @@ class StreamProgressFactTests(unittest.TestCase):
                                     "completed", 1)),
             "ran `python3 -m pytest -q` - failed (exit 1)")
 
+    def test_live_notifications_read_as_the_same_facts(self):
+        """Fed what live codex runs handed the runner: the command and the file
+        change read as facts; the worker's own `telegram progress`, the web
+        search, the tool call, reasoning, the agent's message and the turn's
+        notifications say nothing."""
+        expected = {
+            "command_started": "running `ls -la`",
+            "command_completed": "ran `ls -la` - ok",
+            "file_change_started": "writing 1 file(s): note.txt",
+        }
+        for name, event in CODEX_EVENTS.items():
+            with self.subTest(name):
+                self.assertEqual(self.fact(event), expected.get(name))
+
     def test_a_file_change_names_the_files_being_written(self):
         self.assertEqual(
             self.fact(codex_file_change("item_4", "cli.py", "models.py")),
@@ -1479,18 +1515,12 @@ class StreamProgressFactTests(unittest.TestCase):
 
     def test_startup_reasoning_and_engine_notices_say_nothing(self):
         for event in (
-                {"type": "thread.started", "thread_id": "thread-1"},
-                {"type": "turn.started"},
-                {"type": "turn.completed", "usage": {}},
-                HOOK_NOTICE,
-                {"type": "item.completed", "item": {
-                    "id": "item_6", "type": "reasoning", "text": "**Planning**"}},
-                {"type": "item.completed", "item": {
-                    "id": "item_7", "type": "agent_message", "text": "Done."}},
-                codex_command("item_8", "telegram send 123 'half way'",
-                              "started")):
+                CODEX_EVENTS["turn_started"], CODEX_EVENTS["token_usage"],
+                CODEX_EVENTS["turn_completed"], CODEX_EVENTS["reasoning_completed"],
+                CODEX_EVENTS["agent_message_completed"],
+                codex_command("item_8", "telegram send 123 'half way'", "started")):
             self.assertIsNone(self.fact(event), event)
-        self.assertIsNone(self.daemon.codex_progress_fact("not json"))
+        self.assertIsNone(self.daemon.codex_progress_fact("not an event"))
 
     def test_a_finished_command_takes_the_place_of_its_own_start(self):
         window = []
@@ -1538,15 +1568,15 @@ class StreamProgressJobTests(unittest.IsolatedAsyncioTestCase):
                               encoding="utf-8") as fh:
                         fh.write(json.dumps({"text": note}) + "\n")
                 for event in events:
-                    state["on_worker_line"](json.dumps(event))
+                    state["on_worker_event"](event)
                 time.sleep(pause)
             return successful_result("the ledger is reconciled")
         return worker
 
     async def test_a_long_job_reports_what_its_stream_shows(self):
         worker = self.streaming_worker([
-            ([{"type": "thread.started", "thread_id": "thread-1"},
-              HOOK_NOTICE, HOOK_NOTICE, {"type": "turn.started"},
+            ([CODEX_EVENTS["turn_started"], CODEX_EVENTS["token_usage"],
+              CODEX_EVENTS["reasoning_started"],
               codex_command("item_2", "pwd && ls", "started"),
               codex_command("item_2", "pwd && ls", "completed", 0)], None, 2.5),
             ([codex_file_change("item_3", "cli.py", "models.py")], None, 2.5),
@@ -1594,8 +1624,7 @@ class StreamProgressJobTests(unittest.IsolatedAsyncioTestCase):
         """A line the worker declared a message is not a note about the work,
         so it does not wait in the window for a fold that would rank it."""
         def worker(_chat, _tail, state=None, _procs=None):
-            state["on_worker_line"](json.dumps(
-                codex_command("item_2", "pwd", "started")))
+            state["on_worker_event"](codex_command("item_2", "pwd", "started"))
             with open(state["progress_outbox"], "a", encoding="utf-8") as fh:
                 fh.write(json.dumps({"text": "looking at the ledger"}) + "\n")
                 fh.write(json.dumps({"text": "https://example/ledger",

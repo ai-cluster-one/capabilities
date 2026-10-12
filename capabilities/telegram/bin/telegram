@@ -162,21 +162,35 @@ Commands:
                                                Status follows the account-global
                                                owner record and reports actual code,
                                                project and state provenance.
-                                               `doctor` also spends one live
-                                               call on each worker binary per
-                                               distinct configured (worker,
-                                               model) pair — every
+                                               Every worker turn - dialogue,
+                                               job, voice task, call summary -
+                                               runs through callva-harness-
+                                               runner on telegram-<worker>,
+                                               with the worker's settings
+                                               (model, effort, reasoning_effort,
+                                               service_tier, context) laid over
+                                               it. `start` and `run` refuse with
+                                               exit 6 profile_refused when a
+                                               worker the settings reach has a
+                                               profile that does not resolve or
+                                               fit. `doctor` also spends one
+                                               live turn per distinct configured
+                                               (worker, model) pair — every
                                                `workers.<worker>.model` position
                                                in settings, `null` meaning the
-                                               binary's own default — each held
-                                               to `defaults.worker_timeout`, and
-                                               reports the binary's own verdict.
-                                               A model the binary refuses, a
-                                               binary missing from PATH, one
-                                               that cannot authenticate, or one
-                                               that gives no verdict in time is
-                                               not ok. `doctor` exits 5 when its
-                                               own verdict is `ok: false`, so a
+                                               profile's own model — on the
+                                               profile that pair runs on, each
+                                               held to `defaults.worker_timeout`,
+                                               and reports the harness's own
+                                               verdict with the profile, layer
+                                               and version. A model the harness
+                                               refuses, a harness missing from
+                                               PATH or older than the runner
+                                               supports, one that cannot
+                                               authenticate, or one that gives
+                                               no verdict in time is not ok.
+                                               `doctor` exits 5 when its own
+                                               verdict is `ok: false`, so a
                                                script can gate on it.
                                                The job register lives in the
                                                project's Postgres database, in
@@ -261,10 +275,11 @@ Exit codes:
      yourself
   5  server / network — Telegram unreachable, flood-wait, Deepgram 5xx, and
      `service doctor` reporting `ok: false` — a running daemon whose update
-     sync is not fresh, a configured (worker, model) pair its binary did
+     sync is not fresh, a configured (worker, model) pair its harness did
      not accept, or a job register the store did not open
   6  input / validation — a malformed argument, a bad date, a machine with
-     no store configured for the service or its jobs
+     no store configured for the service or its jobs, or a worker the
+     service settings reach whose profile does not resolve or fit
 
 Quirks worth knowing:
   - This is a full-account MTProto session — a personal user account, so it
@@ -4395,8 +4410,9 @@ _WORKERS_MODULE = None
 
 
 def _workers_module():
-    """The bundle's worker-binary knowledge, shared with the assistant service:
-    how each worker is invoked, how its answer is read, what a refusal is."""
+    """The bundle's worker knowledge, shared with the assistant service: how
+    long a turn may take when the project says nothing, and what a refusal is
+    called."""
     global _WORKERS_MODULE
     if _WORKERS_MODULE is not None:
         return _WORKERS_MODULE
@@ -4405,7 +4421,7 @@ def _workers_module():
     spec = importlib.util.spec_from_file_location("telegram_service_workers", path)
     if spec is None or spec.loader is None:
         _die(3, "service_bundle_missing",
-             f"cannot load the bundled worker-binary knowledge: {path}")
+             f"cannot load the bundled worker knowledge: {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     _WORKERS_MODULE = module
@@ -4442,22 +4458,62 @@ def _declared_worker_models(root: Path, settings: dict) -> list[dict]:
 
 
 def _service_worker_preflight(root: Path, settings: dict) -> dict:
-    """Ask each worker binary, once per distinct configured (worker, model)
-    pair, whether it runs that model — the binary's own answer to one minimal
-    round-trip, never a list held here. Each call is held to the same window a
-    turn is, `defaults.worker_timeout`, so the whole check is bounded."""
+    """Ask each harness, once per distinct configured (worker, model) pair,
+    whether it runs that model — the harness's own answer to one minimal live
+    turn on the profile that pair runs on, never a list held here. Each turn is
+    held to the same window a turn is, `defaults.worker_timeout`, so the whole
+    check is bounded. The turns run in the bundle's `service/profiles.py`,
+    which carries the runner; a pair on the stub is answered here."""
     workers = _workers_module()
     timeout = float((settings.get("defaults") or {}).get("worker_timeout")
                     or workers.DEFAULT_WORKER_TIMEOUT)
-    checked = []
     pairs = _declared_worker_models(root, settings) if settings else []
-    with tempfile.TemporaryDirectory(prefix="telegram-doctor-") as scratch:
-        for pair in pairs:
-            verdict = workers.probe_worker(pair["worker"], pair["model"],
-                                           timeout=timeout, cwd=scratch)
-            checked.append({**pair, **verdict})
-    return {"ok": all(row["ok"] for row in checked),
-            "timeout_seconds": timeout, "checked": checked}
+    answer = {"ok": True, "timeout_seconds": timeout, "checked": []}
+    if not any(pair["worker"] != "stub" for pair in pairs):
+        answer["checked"] = [{**pair, "ok": True, "verdict": "in_process", "binary": None,
+                              "reason": None, "notice": None, "seconds": 0.0,
+                              "profile": None, "layer": None, "version": None}
+                             for pair in pairs]
+        return answer
+    project_id = _project_id(write=False)
+    argv = ["probe", "--project-root", str(root)]
+    if project_id:
+        argv += ["--project-id", str(project_id)]
+    code, found = _profiles_call(argv, json.dumps({"pairs": pairs, "timeout": timeout}))
+    if code != 0:
+        reason = found.get("message") or "the profile module gave no answer"
+        answer["checked"] = [{**pair, "ok": pair["worker"] == "stub",
+                              "verdict": "in_process" if pair["worker"] == "stub" else "failed",
+                              "binary": None if pair["worker"] == "stub" else pair["worker"],
+                              "reason": None if pair["worker"] == "stub" else reason,
+                              "notice": None, "seconds": 0.0, "profile": None,
+                              "layer": None, "version": None} for pair in pairs]
+    else:
+        answer["checked"] = found.get("rows") or []
+        if found.get("store_error"):
+            answer["store_error"] = found["store_error"]
+    answer["ok"] = all(row["ok"] for row in answer["checked"])
+    return answer
+
+
+def _service_profile_preflight(root: Path, settings: dict) -> None:
+    """Refuse a start whose settings reach a worker with no profile a turn can
+    run on: `telegram-<worker>` must resolve and fit with that worker's settings
+    laid over it, at every position the settings reach. Without a harness
+    worker there is nothing to resolve and nothing is run."""
+    if not _profiles_module().reached(settings, os.environ):
+        return
+    project_id = _project_id(write=False)
+    argv = ["check", "--project-root", str(root)]
+    if project_id:
+        argv += ["--project-id", str(project_id)]
+    environ = {key: os.environ[key] for key in ("TELEGRAM_SERVICE_WORKER", "TG_WORKER")
+               if key in os.environ}
+    found = _profiles_answer(argv, json.dumps({"settings": settings, "environ": environ}))
+    if found.get("problems"):
+        _die(6, "profile_refused", _profiles_module().problems_sentence(found["problems"]),
+             "`telegram profiles list` shows how each telegram profile resolves; fix the "
+             "worker settings or the profile")
 
 
 def _service_wanted_connection(root: Path, connection_flag: str | None) -> str | None:
@@ -4597,33 +4653,45 @@ def _profiles_module():
     return module
 
 
-def _profiles_answer(argv: list[str], text: str = "") -> dict:
-    """What `service/profiles.py` answers to `argv`, run under its own header;
-    a refusal it gives is this CLI's refusal, with its exit code."""
+def _profiles_call(argv: list[str], text: str = "") -> tuple[int, dict]:
+    """What `service/profiles.py` answers to `argv`, run under its own header:
+    `(0, answer)`, or the exit code and the error it gave (code, message,
+    hint), a module that could not be run reading as exit 5."""
     path = _service_profiles()
     _require_service_bundle_files(path)
     uv = shutil.which("uv")
     if uv is None:
-        _die(5, "harness_runner_unavailable",
-             "uv is not on PATH, so the harness runner cannot be resolved",
-             "install uv, which runs every telegram script")
+        return 5, {"code": "harness_runner_unavailable",
+                   "message": "uv is not on PATH, so the harness runner cannot be resolved",
+                   "hint": "install uv, which runs every telegram script"}
     try:
         done = subprocess.run([uv, "run", "--quiet", "--script", str(path), *argv],
                               input=text, capture_output=True, text=True, timeout=600)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        _die(5, "harness_runner_unavailable", f"{path} did not answer: {exc}")
+        return 5, {"code": "harness_runner_unavailable",
+                   "message": f"{path} did not answer: {exc}"}
     if done.returncode == 0:
         try:
-            return json.loads(done.stdout)
+            return 0, json.loads(done.stdout)
         except ValueError:
             pass
     lines = done.stderr.strip().splitlines()
     try:
         error = json.loads(lines[-1])["error"]
+        return done.returncode or 5, error
     except (IndexError, ValueError, KeyError, TypeError):
-        _die(5, "harness_runner_unavailable",
-             f"{path} gave no answer it can be read by: {done.stderr.strip()[-800:]}")
-    _die(done.returncode, error["code"], error["message"], error.get("hint"))
+        return 5, {"code": "harness_runner_unavailable",
+                   "message": f"{path} gave no answer it can be read by: "
+                              f"{done.stderr.strip()[-800:]}"}
+
+
+def _profiles_answer(argv: list[str], text: str = "") -> dict:
+    """What `service/profiles.py` answers to `argv`; a refusal it gives is this
+    CLI's refusal, with its exit code."""
+    code, found = _profiles_call(argv, text)
+    if code == 0:
+        return found
+    _die(code, found["code"], found["message"], found.get("hint"))
 
 
 def _profile_tables() -> tuple:
@@ -5545,6 +5613,20 @@ def _service_owner_matches_launch(owner: object, *, launch_nonce: str,
     )
 
 
+def _resolve_daemon_environment(daemon: Path) -> None:
+    """Resolve the daemon's own environment before it is launched, so the
+    window a start waits for the daemon's provenance is spent starting it
+    rather than fetching its dependencies: the harness runner's SDKs make a
+    cold resolve take longer than that window. Best effort - a uv that cannot
+    do it leaves the daemon to resolve its environment as it starts."""
+    uv = shutil.which("uv")
+    if uv is None:
+        return
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run([uv, "sync", "--quiet", "--script", str(daemon)],
+                       stdin=subprocess.DEVNULL, capture_output=True, timeout=600)
+
+
 def _service_start_result(connection_flag: str | None, session_flag: str | None) -> dict:
     """Start only after cutover/version checks and wait for matching provenance."""
     import signal
@@ -5553,7 +5635,7 @@ def _service_start_result(connection_flag: str | None, session_flag: str | None)
 
     root = _service_project_root()
     _require_service_initialized(root)
-    _validate_service_settings(root)
+    settings = _validate_service_settings(root)
     wanted = _service_wanted_connection(root, connection_flag)
     cfg = _load_config(wanted, session_flag)
     account_id = _service_account_id(cfg)
@@ -5573,6 +5655,7 @@ def _service_start_result(connection_flag: str | None, session_flag: str | None)
         status["already_running"] = True
         return status
     _require_service_store(root)
+    _service_profile_preflight(root, settings)
     daemon = _service_daemon()
     if not daemon.is_file():
         _die(3, "service_bundle_missing", f"bundled daemon not found: {daemon}",
@@ -5597,6 +5680,7 @@ def _service_start_result(connection_flag: str | None, session_flag: str | None)
     paths["state"].mkdir(parents=True, exist_ok=True)
     _write_project_layout(paths["state"] / "project-layout.json",
                           _resolve_project_layout(root))
+    _resolve_daemon_environment(daemon)
     launch_nonce = secrets.token_hex(24)
     with paths["log"].open("a", encoding="utf-8") as log:
         proc = subprocess.Popen(
@@ -5859,20 +5943,21 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) ->
             "connection": cfg["id"],
             "note": ("`telegram doctor` performs the authenticated Telegram round-trip; "
                      "a running service is healthy only while its update sync stays fresh; "
-                     "`workers` is each configured (worker, model) pair's own binary "
-                     "answering one live call")}
+                     "`workers` is each configured (worker, model) pair's harness "
+                     "answering one live turn on the profile the pair runs on")}
 
 
 def cmd_service_run(connection_flag: str | None, session_flag: str | None) -> None:
     root = _service_project_root()
     _require_service_initialized(root)
-    _validate_service_settings(root)
+    settings = _validate_service_settings(root)
     wanted = _service_wanted_connection(root, connection_flag)
     cfg = _load_config(wanted, session_flag)
     account_id = _service_account_id(cfg)
     _require_ownership_marker(account_id)
     _write_gate(cfg["id"], cfg["allow_write"], "send")
     _require_service_store(root)
+    _service_profile_preflight(root, settings)
     daemon = _service_daemon()
     if not daemon.is_file():
         _die(3, "service_bundle_missing", f"bundled daemon not found: {daemon}",

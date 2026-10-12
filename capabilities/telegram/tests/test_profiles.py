@@ -125,6 +125,122 @@ class Fit(unittest.TestCase):
 
 
 @needs_runner
+class Implicit(unittest.TestCase):
+    """Today's worker settings laid over `telegram-<worker>`: one function,
+    which the migration that later names profiles maps them with."""
+
+    def knobs(self, worker, cfg):
+        return profiles.implicit(worker, cfg, [], None)["knobs"]
+
+    def test_nothing_set_runs_the_bundled_profile_as_it_is(self):
+        self.assertEqual(self.knobs("claude", {}), CLAUDE)
+        self.assertEqual(self.knobs("codex", {"model": None, "reasoning_effort": "default",
+                                              "service_tier": None}), CODEX)
+
+    def test_a_model(self):
+        self.assertEqual(self.knobs("claude", {"model": "sonnet"}), {**CLAUDE, "model": "sonnet"})
+        self.assertEqual(self.knobs("codex", {"model": "gpt-5.5"}), {**CODEX, "model": "gpt-5.5"})
+
+    def test_claude_effort(self):
+        self.assertEqual(self.knobs("claude", {"effort": "high"}), {**CLAUDE, "effort": "high"})
+
+    def test_codex_reasoning_effort_is_effort(self):
+        self.assertEqual(self.knobs("codex", {"reasoning_effort": "xhigh"}),
+                         {**CODEX, "effort": "xhigh"})
+
+    def test_codex_service_tier_fast_means_priority(self):
+        self.assertEqual(self.knobs("codex", {"service_tier": "fast"}),
+                         {**CODEX, "service_tier": "priority"})
+        self.assertEqual(self.knobs("codex", {"service_tier": "priority"}),
+                         {**CODEX, "service_tier": "priority"})
+
+    def test_claude_context_tools(self):
+        self.assertEqual(self.knobs("claude", {"context": {"tools": ["Read", "Grep"]}}),
+                         {**CLAUDE, "tools": ["Read", "Grep"]})
+        self.assertEqual(self.knobs("claude", {"context": {"tools": []}}),
+                         {**CLAUDE, "tools": []})
+
+    def test_claude_context_without_mcp(self):
+        self.assertEqual(self.knobs("claude", {"context": {"mcp": False}}),
+                         {**CLAUDE, "strict_mcp": True, "mcp_config": {"mcpServers": {}}})
+        self.assertEqual(self.knobs("claude", {"context": {"mcp": True}}), CLAUDE)
+
+    def test_a_job_row_runs_its_engine_with_its_model(self):
+        found = profiles.implicit("codex", {"model": "gpt-pinned"}, [], None)
+        self.assertEqual((found["name"], found["layer"], found["knobs"]["model"]),
+                         ("telegram-codex", "bundled", "gpt-pinned"))
+        self.assertEqual(found["overlay"], {"model": "gpt-pinned"})
+
+    def test_a_worker_that_is_not_a_harness_has_no_profile(self):
+        with self.assertRaises(profiles.Refusal) as caught:
+            profiles.implicit("stub", {}, [], None)
+        self.assertEqual(caught.exception.code, "profile_name_refused")
+
+    def test_the_positions_settings_reach(self):
+        settings = {"defaults": {
+            "worker": "claude",
+            "workers": {"claude": {"model": "opus"}, "codex": {"model": None}},
+            "voice_agent": {"worker": "codex",
+                            "workers": {"codex": {"model": "fast"}}}}}
+        reached = profiles.reached(settings, {})
+        self.assertEqual([(r["position"], r["worker"], r["settings"].get("model"))
+                          for r in reached],
+                         [("defaults", "claude", "opus"),
+                          ("defaults.voice_agent", "codex", "fast"),
+                          ("defaults.workers.codex", "codex", None)])
+        # The environment's worker wins over the settings', as the daemon reads it.
+        self.assertEqual(profiles.reached(settings, {"TG_WORKER": "codex"})[0]["worker"],
+                         "codex")
+        self.assertEqual(profiles.reached({"defaults": {"worker": "stub"}}, {}), [])
+
+    def test_a_check_of_the_seeded_settings_finds_nothing(self):
+        seed = json.loads((SERVICE_DIR / "templates" / "settings.json").read_text())
+        self.assertEqual(profiles.check(seed, {}, [], None), [])
+
+
+class Probe(unittest.TestCase):
+    """The doctor's verdict for each pair, read off the runner's Result."""
+
+    @needs_runner
+    def test_each_ending_is_the_verdict_the_doctor_names(self):
+        def failing(kind, message):
+            def run(prompt, profile, cwd, **_kwargs):
+                return lib.Result(ok=False, harness=profile.harness,
+                                  failure=lib.Failure(lib.FailureKind(kind), message))
+            return run
+
+        for kind, verdict in (("model_refused", "model_refused"),
+                              ("quota", "quota_exhausted"),
+                              ("not_authenticated", "not_authenticated"),
+                              ("binary_missing", "binary_missing"),
+                              ("timeout", "timed_out"),
+                              ("incompatible_harness", "incompatible_harness"),
+                              ("error", "failed"), ("crash", "failed")):
+            with self.subTest(kind), tempfile.TemporaryDirectory() as tmp:
+                [row] = profiles.probe([{"worker": "codex", "model": "m"}], 2, [], None,
+                                       tmp, run=failing(kind, f"said {kind}"))
+                self.assertEqual((row["ok"], row["verdict"], row["reason"]),
+                                 (False, verdict, f"said {kind}"))
+                self.assertEqual((row["profile"], row["layer"]), ("telegram-codex", "bundled"))
+                self.assertEqual(row["notice"] is not None, verdict == "model_refused")
+
+    @needs_runner
+    def test_a_probe_is_held_to_the_timeout_it_is_given(self):
+        seen = []
+
+        def run(prompt, profile, cwd, **_kwargs):
+            seen.append(profile.timeout_seconds)
+            return lib.Result(ok=True, harness=profile.harness, answer="OK")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = profiles.probe([{"worker": "claude", "model": None},
+                                   {"worker": "stub", "model": None}], 7, [], None, tmp,
+                                  run=run)
+        self.assertEqual(seen, [7.0])
+        self.assertEqual([r["verdict"] for r in rows], ["accepted", "in_process"])
+
+
+@needs_runner
 @needs_store
 class Store(unittest.TestCase):
     """Resolution and saving against the store the register tests use."""
@@ -218,6 +334,25 @@ class Store(unittest.TestCase):
         conn = connect(application_name="telegram", setting=bare)
         self.addCleanup(conn.close)
         self.assertEqual(profiles.stored(conn, self.project, bare.schema), [])
+
+    def test_a_turn_runs_on_the_project_version_with_its_settings_laid_over(self):
+        mine = self.save("telegram-codex", {**CODEX, "model": "gpt-5.5"}, scope="global")
+        found = profiles.implicit("codex", {"reasoning_effort": "high"}, self.active(),
+                                  self.project)
+        self.assertEqual((found["layer"], found["version"]), ("global", mine.id))
+        self.assertEqual((found["knobs"]["model"], found["knobs"]["effort"]),
+                         ("gpt-5.5", "high"))
+
+    def test_a_check_names_the_position_whose_profile_does_not_fit(self):
+        self.save("telegram-codex", {**CODEX, "approval_policy": "auto_review"},
+                  scope="global")
+        settings = {"defaults": {"worker": "codex", "workers": {"codex": {}}}}
+        [problem] = profiles.check(settings, {}, self.active(), self.project)
+        self.assertEqual((problem["position"], problem["profile"], problem["code"]),
+                         ("defaults", "telegram-codex", "profile_unfit"))
+        self.assertIn("approval_policy", problem["message"])
+        self.assertIn("settings.defaults runs on telegram-codex",
+                      profiles.problems_sentence([problem]))
 
     # -- list and show ----------------------------------------------------------
 

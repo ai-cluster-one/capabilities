@@ -30,6 +30,7 @@ DAEMON_PATH = TELEGRAM_DIR / "service" / "daemon.py"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _cli import CLI_PATH  # noqa: E402
+from _harness import CODEX_EVENTS, FakeHarness, harness_turn  # noqa: E402
 
 
 def settings(**default_overrides):
@@ -300,7 +301,7 @@ def import_daemon(tmp: Path, service_settings: dict, *,
                "telethon.errors", "telethon.errors.common", "pytgcalls",
                "pytgcalls.filters", "pytgcalls.exceptions", "pytgcalls.types",
                "pytgcalls.types.raw", "ntgcalls", "call_recording_helpers",
-               "voice_agent", "workers")
+               "voice_agent", "workers", "profiles")
 
     old_env = dict(os.environ)
     old_path = list(sys.path)
@@ -564,56 +565,23 @@ def successful_result(reply="done"):
     }
 
 
-# What the installed claude CLI actually prints when it fails with something to
-# say: the shape of the success document, `subtype` still "success", `is_error`
-# true, and the sentence a person can read in `result`. Measured against
-# `claude --model <nonexistent>`, which exits 1 with this on stdout and nothing
-# at all on stderr.
-CLAUDE_ERROR_DOCUMENT = {
-    "type": "result",
-    "subtype": "success",
-    "is_error": True,
-    "result": "There's an issue with the selected model (bogus-model-x). "
-              "It may not exist or you may not have access to it.",
-    "api_error_status": 404,
-    "stop_reason": None,
-    "terminal_reason": "error",
-    "session_id": "11111111-2222-3333-4444-555555555555",
-    "duration_ms": 1234,
-    "total_cost_usd": 0.0,
-    "usage": {"input_tokens": 3, "output_tokens": 0},
-    "modelUsage": {},
-    "permission_denials": [],
-    "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-}
-
-# The same shape carrying a failure that is not about the model, so the rule
-# that the document outranks whatever stderr carried is still read against an
-# ordinary failure now that a refused model is answered in its own words.
-CLAUDE_ORDINARY_ERROR_DOCUMENT = {
-    **CLAUDE_ERROR_DOCUMENT,
-    "result": "Credit balance is too low to run this request.",
-    "api_error_status": 400,
-}
-
-# The model the binary will not run, named the same way on both engines: it is
+# The model a harness will not run, named the same way on both harnesses: it is
 # the value a person configured and the one they have to change.
 REFUSED_MODEL = "bogus-model-x"
 
-# What codex prints when it will not run the model it was given — the provider's
-# own 400 forwarded verbatim as the turn's verdict, in a register that has
-# nothing in common with the sentence claude writes for the same refusal.
-CODEX_MODEL_REFUSAL = (
-    "unexpected status 400 Bad Request: "
-    + json.dumps({"error": {
-        "message": f"The '{REFUSED_MODEL}' model requires a newer version of "
-                   "Codex. Please update to the latest version.",
-        "type": "invalid_request_error", "param": None, "code": None}}))
-CODEX_MODEL_REFUSAL_STDOUT = "\n".join([
-    json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
-    json.dumps({"type": "error", "message": CODEX_MODEL_REFUSAL}),
-    json.dumps({"type": "turn.failed", "error": {"message": CODEX_MODEL_REFUSAL}}),
-])
+# What each harness says when it will not run that model, as the runner hands
+# the sentence over in `Result.failure.message`: claude writes a sentence,
+# codex forwards the provider's refusal, whose readable part the runner keeps.
+# Measured against `claude --model <nonexistent>` and a codex model too new for
+# the installed CLI.
+CLAUDE_MODEL_REFUSAL = (f"There's an issue with the selected model ({REFUSED_MODEL}). "
+                        "It may not exist or you may not have access to it.")
+CODEX_MODEL_REFUSAL = (f"The '{REFUSED_MODEL}' model requires a newer version of "
+                       "Codex. Please update to the latest version.")
+
+# A failure that is not about the model, so a refused model answered in its own
+# words is still read against an ordinary failure.
+CLAUDE_ORDINARY_FAILURE = "Credit balance is too low to run this request."
 
 
 class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -653,266 +621,145 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_codex_completed_empty_final_is_a_silent_success(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            stdout = "\n".join([
-                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
-                json.dumps({"type": "turn.completed", "usage": {
-                    "input_tokens": 10,
-                    "output_tokens": 0,
-                    "cached_input_tokens": 4,
-                }}),
-            ])
-            with mock.patch.object(
-                    daemon, "run_worker_proc", return_value=(0, stdout, "")):
-                result = daemon.worker_codex("123", [], {}, {})
+            fake = FakeHarness(answer="", session_id="thread-1",
+                               tokens={"input": 10, "output": 0, "cache_read": 4})
+            result = harness_turn(daemon, "codex", fake)
 
             self.assertTrue(result["silent"])
             self.assertEqual(result["reply"], "")
             self.assertEqual(result["meta"]["session_id"], "thread-1")
             self.assertEqual(result["meta"]["tokens"]["output"], 0)
+            self.assertEqual(result["meta"]["tokens"]["cache_read"], 4)
 
     async def test_claude_completed_empty_result_is_a_silent_success(self):
-        """Saying nothing has to mean one thing on both engines.
+        """Saying nothing has to mean one thing on both harnesses.
 
         A worker that sent its result into the chat itself returns nothing, and
-        that is a finished turn rather than a broken one. Codex reports the
-        completion through `turn.completed`; claude reports it in the one
-        document it reports everything else in, and the daemon used to throw
-        that report away and call the turn an error."""
+        that is a finished turn rather than a broken one: the runner reports
+        the turn completed with an empty answer, on claude as on codex."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            stdout = json.dumps({
-                "type": "result",
-                "subtype": "success",
-                "is_error": False,
-                "result": "",
-                "session_id": "sess-1",
-                "usage": {"input_tokens": 10, "output_tokens": 0},
-                "total_cost_usd": 0.02,
-            })
-            with mock.patch.object(
-                    daemon, "run_worker_proc", return_value=(0, stdout, "")):
-                result = daemon.worker_claude("123", [], {}, {})
+            fake = FakeHarness(answer="", session_id="sess-1", cost_usd=0.02,
+                               tokens={"input": 10, "output": 0})
+            result = harness_turn(daemon, "claude", fake)
 
             self.assertTrue(result["silent"])
             self.assertEqual(result["reply"], "")
             self.assertEqual(result["meta"]["session_id"], "sess-1")
             self.assertEqual(result["meta"]["tokens"]["output"], 0)
+            self.assertEqual(result["meta"]["cost_usd"], 0.02)
             self.assertFalse(result["meta"]["is_error"])
 
-    async def test_an_unconfirmed_claude_turn_fails_whatever_its_text(self):
-        """The distinction comes from what the engine reports, never from the
-        emptiness of the answer. A turn claude does not state as completed, and
-        a turn it states as an error, fail exactly as they failed before."""
+    async def test_a_turn_the_harness_did_not_complete_fails_whatever_its_text(self):
+        """The distinction comes from what the harness reports, never from the
+        emptiness of the answer. A turn the runner does not report completed
+        fails on either harness, with or without text, and an empty answer on
+        a failed turn is an error rather than silence."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            for label, document in (
-                    ("no verdict at all",
-                     {"result": "", "is_error": False, "subtype": None}),
-                    ("a verdict that is not a completion",
-                     {"result": "", "is_error": False,
-                      "subtype": "error_max_turns"}),
-                    ("a completed turn the engine calls an error",
-                     {"result": "", "is_error": True, "subtype": "success"}),
-                    ("an error that carried text",
-                     {"result": "it broke", "is_error": True,
-                      "subtype": "success"})):
-                with self.subTest(label):
-                    with mock.patch.object(
-                            daemon, "run_worker_proc",
-                            return_value=(0, json.dumps(document), "")):
-                        with self.assertRaisesRegex(RuntimeError,
-                                                    "claude worker error"):
-                            daemon.worker_claude("123", [], {}, {})
+            for worker in ("claude", "codex"):
+                for label, kind, answer, message in (
+                        ("no report at all", "crash", "", "the harness ended without a report"),
+                        ("a limit the harness ended on", "max_turns", "",
+                         "the turn ended with error_max_turns"),
+                        ("an error that carried text", "error", "it broke", "it broke")):
+                    with self.subTest(worker=worker, case=label):
+                        fake = FakeHarness(ok=False, kind=kind, answer=answer,
+                                           message=message)
+                        with self.assertRaisesRegex(daemon.WorkerFailed,
+                                                    f"{worker} worker failed: "):
+                            harness_turn(daemon, worker, fake)
 
-    async def test_codex_is_told_to_run_the_hooks_no_daemon_can_have_trusted(self):
+    async def test_codex_runs_the_hooks_no_daemon_can_have_trusted(self):
         """Hook trust is granted interactively, so a daemon never holds any, and
-        a project's session hook is skipped in silence without the bypass."""
+        a project's session hook is skipped in silence without the bypass. The
+        codex profile a turn runs on carries it; the claude one loads the
+        user's, the project's and the local settings, hooks with them."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            stdout = "\n".join([
-                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
-                json.dumps({"type": "turn.completed", "usage": {}}),
-            ])
-            seen = {}
+            codex, claude = FakeHarness(), FakeHarness()
+            harness_turn(daemon, "codex", codex)
+            harness_turn(daemon, "claude", claude)
 
-            def capture(_key, cmd, *_args, **_kwargs):
-                seen["cmd"] = cmd
-                return (0, stdout, "")
+            self.assertTrue(codex.calls[0]["profile"].bypass_hook_trust)
+            self.assertEqual(codex.calls[0]["profile"].approval_policy, "never")
+            self.assertEqual(list(claude.calls[0]["profile"].setting_sources),
+                             ["user", "project", "local"])
+            self.assertEqual(claude.calls[0]["profile"].permission_mode,
+                             "bypassPermissions")
 
-            with mock.patch.object(
-                    daemon.subprocess, "run",
-                    return_value=SimpleNamespace(
-                        stdout="  --dangerously-bypass-hook-trust\n")):
-                with mock.patch.object(daemon, "run_worker_proc", side_effect=capture):
-                    daemon.worker_codex("123", [], {}, {})
-
-            self.assertIn("--dangerously-bypass-hook-trust", seen["cmd"])
-
-    async def test_an_engine_that_never_heard_of_the_bypass_is_not_given_it(self):
-        """The flag reaches the model only on engines that know it; an older one
-        exits on an unknown argument and would take every turn with it."""
+    async def test_a_codex_failure_reads_as_the_sentence_codex_gave(self):
+        """The runner reads codex's own verdict, so the sentence a failure is
+        reported with is the one codex gave, and a spent quota is named by kind
+        rather than recognised in prose."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            stdout = "\n".join([
-                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
-                json.dumps({"type": "turn.completed", "usage": {}}),
-            ])
-            seen = {}
+            fake = FakeHarness(ok=False, kind="quota", answer="",
+                               message="You've hit your usage limit.")
+            with self.assertRaisesRegex(daemon.WorkerFailed, "hit your usage limit") \
+                    as caught:
+                harness_turn(daemon, "codex", fake)
+            self.assertEqual(caught.exception.kind, "quota")
+            self.assertNotIsInstance(caught.exception, daemon.WorkerModelRefused)
 
-            def capture(_key, cmd, *_args, **_kwargs):
-                seen["cmd"] = cmd
-                return (0, stdout, "")
-
-            with mock.patch.object(
-                    daemon.subprocess, "run",
-                    return_value=SimpleNamespace(stdout="  --skip-git-repo-check\n")):
-                with mock.patch.object(daemon, "run_worker_proc", side_effect=capture):
-                    daemon.worker_codex("123", [], {}, {})
-
-            self.assertNotIn("--dangerously-bypass-hook-trust", seen["cmd"])
-
-    async def test_the_reported_codex_failure_is_the_one_codex_gave(self):
-        """codex prints a routine line to stderr on every run and reports its
-        actual refusal as a protocol event. Reading the first stderr line named
-        stdin as the cause of every failure, including an exhausted quota."""
+    async def test_a_claude_failure_reads_as_the_sentence_claude_gave(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            api_error = json.dumps({
-                "type": "error", "status": 429,
-                "error": {"type": "usage_limit_reached",
-                          "message": "You've hit your usage limit."}})
-            stdout = "\n".join([
-                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
-                json.dumps({"type": "item.completed", "item": {
-                    "id": "item_0", "type": "error",
-                    "message": "Model metadata not found; using fallback."}}),
-                json.dumps({"type": "error", "message": api_error}),
-                json.dumps({"type": "turn.failed", "error": {"message": api_error}}),
-            ])
-            stderr = ("Reading additional input from stdin...\n"
-                      "2026-08-30T16:03:12Z ERROR codex_models_manager: cache miss\n")
-            with mock.patch.object(
-                    daemon, "run_worker_proc", return_value=(1, stdout, stderr)):
-                with self.assertRaisesRegex(RuntimeError, "hit your usage limit"):
-                    daemon.worker_codex("123", [], {}, {})
-            reason = daemon.codex_failure_reason(stdout, stderr, 1)
-            self.assertNotIn("stdin", reason)
-            self.assertTrue(daemon.is_quota_exhausted(reason))
-
-    async def test_a_codex_failure_with_no_events_still_skips_the_routine_line(self):
-        with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
-            reason = daemon.codex_failure_reason(
-                "", "Reading additional input from stdin...\nauth token expired\n", 1)
-            self.assertEqual(reason, "auth token expired")
-            self.assertEqual(
-                daemon.codex_failure_reason(
-                    "", "Reading additional input from stdin...\n", 7),
-                "exit 7")
-            self.assertFalse(daemon.is_quota_exhausted("auth token expired"))
-
-    async def test_the_reported_claude_failure_is_the_one_claude_gave(self):
-        """claude answers a failed run with the same document it answers a good
-        one with, and the reason a person can read is in `.result`. Reading the
-        document only on the successful path named the host's noise as the
-        cause whenever stderr had any, and handed the chat the raw blob when it
-        had none."""
-        with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
-            document = json.dumps(CLAUDE_ORDINARY_ERROR_DOCUMENT)
-            noise = ("node:internal/process/promises:288\n"
-                     "Warning: some noise on stderr\n")
-            for stderr in (noise, ""):
-                with mock.patch.object(
-                        daemon, "run_worker_proc",
-                        return_value=(1, document, stderr)):
-                    with self.assertRaises(RuntimeError) as caught:
-                        daemon.worker_claude("123", [], {}, {})
-                self.assertEqual(
-                    str(caught.exception),
-                    "claude worker failed: "
-                    + CLAUDE_ORDINARY_ERROR_DOCUMENT["result"])
-            reason = daemon.claude_failure_reason(document, noise, 1)
-            self.assertNotIn("promises:288", reason)
-            self.assertNotIn("{", reason)
-
-    async def test_a_claude_failure_names_the_reason_over_its_own_subtype(self):
-        """`subtype` reads "success" on the document of a failed run, so the
-        readable reason is `result` and nothing else."""
-        with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
-            self.assertEqual(CLAUDE_ERROR_DOCUMENT["subtype"], "success")
-            self.assertEqual(
-                daemon.claude_failure_reason(
-                    json.dumps(CLAUDE_ERROR_DOCUMENT), "", 1),
-                CLAUDE_ERROR_DOCUMENT["result"])
+            fake = FakeHarness(ok=False, kind="error", answer="",
+                               message=CLAUDE_ORDINARY_FAILURE)
+            with self.assertRaises(daemon.WorkerFailed) as caught:
+                harness_turn(daemon, "claude", fake)
+            self.assertEqual(str(caught.exception),
+                             "claude worker failed: " + CLAUDE_ORDINARY_FAILURE)
 
     async def test_a_refused_codex_model_is_named_rather_than_relayed(self):
-        """A binary that will not run the configured model answers with the
-        provider's invalid-request trace, which names no action a person can
-        take and reads like any other worker failure. The refusal is recognised
-        and reported as what it is: this binary, that model."""
+        """A harness that will not run the configured model answers in the
+        provider's register, which names no action a person can take. The
+        refusal is reported as what it is: this harness, that model."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            state = {"settings": {"model": REFUSED_MODEL}}
-            with mock.patch.object(
-                    daemon, "run_worker_proc",
-                    return_value=(1, CODEX_MODEL_REFUSAL_STDOUT,
-                                  "Reading additional input from stdin...\n")):
-                with self.assertRaises(daemon.WorkerModelRefused) as caught:
-                    daemon.worker_codex("123", [], state, {})
+            state = {"settings": {"worker_settings": {"model": REFUSED_MODEL}}}
+            fake = FakeHarness(ok=False, kind="model_refused", answer="",
+                               message=CODEX_MODEL_REFUSAL)
+            with self.assertRaises(daemon.WorkerModelRefused) as caught:
+                harness_turn(daemon, "codex", fake, state)
+            self.assertEqual(fake.calls[0]["profile"].model, REFUSED_MODEL)
             notice = str(caught.exception)
             self.assertIn(REFUSED_MODEL, notice)
             self.assertIn("codex", notice)
-            self.assertNotIn("invalid_request_error", notice)
-            self.assertNotIn("{", notice)
-            reason = daemon.codex_failure_reason(CODEX_MODEL_REFUSAL_STDOUT, "", 1)
-            self.assertTrue(daemon.is_model_refused(reason))
+            self.assertNotIn("newer version", notice)
+            self.assertEqual(caught.exception.reason, CODEX_MODEL_REFUSAL)
 
     async def test_a_refused_claude_model_is_named_rather_than_relayed(self):
-        """The same refusal from the other engine. claude writes a sentence
-        where codex forwards a trace, so nothing that recognised one of them
-        would recognise the other, and both have to be."""
+        """The same refusal from the other harness, named the same way."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            document = json.dumps(CLAUDE_ERROR_DOCUMENT)
-            state = {"settings": {"model": REFUSED_MODEL}}
-            with mock.patch.object(
-                    daemon, "run_worker_proc", return_value=(1, document, "")):
-                with self.assertRaises(daemon.WorkerModelRefused) as caught:
-                    daemon.worker_claude("123", [], state, {})
+            state = {"settings": {"worker_settings": {"model": REFUSED_MODEL}}}
+            fake = FakeHarness(ok=False, kind="model_refused", answer="",
+                               message=CLAUDE_MODEL_REFUSAL)
+            with self.assertRaises(daemon.WorkerModelRefused) as caught:
+                harness_turn(daemon, "claude", fake, state)
             notice = str(caught.exception)
             self.assertIn(REFUSED_MODEL, notice)
             self.assertIn("claude", notice)
-            self.assertNotIn("{", notice)
-            self.assertTrue(
-                daemon.is_model_refused(CLAUDE_ERROR_DOCUMENT["result"]))
+            self.assertNotIn("may not exist", notice)
 
     async def test_a_refused_model_is_not_read_as_a_spent_subscription(self):
-        """The two readings ask different questions and only one of them is a
-        pause the queue can wait out. A run that says both is the pause, because
-        waiting is what makes it right again; nothing waits out a setting."""
+        """The two endings ask different questions and only one of them is a
+        pause the queue can wait out. The runner names which it was - a quota
+        before a refusal, since a subscription spent on one model says both -
+        and the daemon reads the name."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            both = (f"The model {REFUSED_MODEL} is not available: "
-                    "you've hit your usage limit.")
-            self.assertTrue(daemon.MODEL_REFUSED_RE.search(both))
-            self.assertTrue(daemon.is_quota_exhausted(both))
-            self.assertFalse(daemon.is_model_refused(both))
-
-            quota_reason = daemon.codex_failure_reason(
-                json.dumps({"type": "turn.failed", "error": {
-                    "message": "You've hit your usage limit."}}), "", 1)
-            self.assertFalse(daemon.is_model_refused(quota_reason))
-
-            # An ordinary failure stays an ordinary failure, word for word.
-            for reason in ("auth token expired", "exit 7", "segmentation fault"):
-                self.assertFalse(daemon.is_model_refused(reason))
-            with mock.patch.object(
-                    daemon, "run_worker_proc", return_value=(7, "", "")):
-                with self.assertRaises(RuntimeError) as caught:
-                    daemon.worker_claude("123", [], {}, {})
-            self.assertNotIsInstance(caught.exception, daemon.WorkerModelRefused)
+            quota = daemon.worker_failure(
+                "codex", REFUSED_MODEL, "quota",
+                f"The model {REFUSED_MODEL} is not available: you've hit your usage limit.")
+            self.assertNotIsInstance(quota, daemon.WorkerModelRefused)
+            self.assertEqual(quota.kind, "quota")
+            for kind in ("error", "crash", "not_authenticated"):
+                ordinary = daemon.worker_failure("claude", REFUSED_MODEL, kind, "exit 7")
+                self.assertNotIsInstance(ordinary, daemon.WorkerModelRefused)
+                self.assertEqual(str(ordinary), "claude worker failed: exit 7")
 
     async def test_a_refusal_keeps_the_engines_own_words_for_an_operator(self):
         """Naming the ending is what was missing; it is not worth the engine's
@@ -921,13 +768,12 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         to whoever is on a call and the diagnosis is read by whoever can act."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            engine_said = daemon.codex_failure_reason(
-                CODEX_MODEL_REFUSAL_STDOUT, "", 1)
-            exc = daemon.worker_failure("codex", REFUSED_MODEL, engine_said)
+            engine_said = CODEX_MODEL_REFUSAL
+            exc = daemon.worker_failure("codex", REFUSED_MODEL, "model_refused", engine_said)
 
             self.assertEqual(exc.reason, engine_said)
             self.assertEqual(str(exc), exc.notice)
-            self.assertNotIn("invalid_request_error", str(exc))
+            self.assertNotIn("newer version", str(exc))
 
             diagnosis = daemon.worker_diagnosis(exc, "unused fallback")
             self.assertIn(exc.notice, diagnosis)
@@ -940,7 +786,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("until the configured model changes", exc.notice)
 
             # Nothing the daemon has not named reads any differently.
-            ordinary = daemon.worker_failure("codex", REFUSED_MODEL, "exit 7")
+            ordinary = daemon.worker_failure("codex", REFUSED_MODEL, "error", "exit 7")
             self.assertEqual(daemon.worker_diagnosis(ordinary, "the fallback"),
                              "the fallback")
 
@@ -954,14 +800,11 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 base = settings()
                 base["direct_messages"] = {"mode": "anyone", "default_role": role}
                 daemon = import_daemon(Path(td), base)
-                engine_said = daemon.codex_failure_reason(
-                    CODEX_MODEL_REFUSAL_STDOUT, "", 1)
+                engine_said = CODEX_MODEL_REFUSAL
 
                 def refusing_worker(_chat, _tail, state=None, _procs=None):
                     raise daemon.worker_failure(
-                        "codex", REFUSED_MODEL,
-                        daemon.codex_failure_reason(
-                            CODEX_MODEL_REFUSAL_STDOUT, "", 1))
+                        "codex", REFUSED_MODEL, "model_refused", engine_said)
 
                 daemon.WORKERS["stub"] = refusing_worker
                 message = Message(93, text="Assistant, answer this")
@@ -985,45 +828,39 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(engine_said, logged)
                 await self.stop_session(client, task)
 
-    async def test_a_failing_claude_with_no_document_falls_back(self):
-        """The common shape: four of the five ways the installed CLI exits
-        non-zero leave stdout empty and put one plain line on stderr, and one
-        leaves nothing anywhere. stderr, then the exit code, is the answer."""
+    async def test_a_turn_that_ended_without_a_report_says_what_the_harness_said(self):
+        """A harness that dies before it reports anything leaves the runner one
+        sentence - its own, or the last line the harness wrote - and that is
+        what the failure carries."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            with mock.patch.object(
-                    daemon, "run_worker_proc",
-                    return_value=(1, "", "Error: Invalid session ID: not-a-session\n")):
-                with self.assertRaises(RuntimeError) as caught:
-                    daemon.worker_claude("123", [], {}, {})
+            fake = FakeHarness(ok=False, kind="crash", answer="",
+                               message="Error: Invalid session ID: not-a-session")
+            with self.assertRaises(daemon.WorkerFailed) as caught:
+                harness_turn(daemon, "claude", fake)
             self.assertEqual(
                 str(caught.exception),
                 "claude worker failed: Error: Invalid session ID: not-a-session")
 
-            with mock.patch.object(
-                    daemon, "run_worker_proc", return_value=(7, "", "")):
-                with self.assertRaises(RuntimeError) as caught:
-                    daemon.worker_claude("123", [], {}, {})
-            self.assertEqual(str(caught.exception), "claude worker failed: exit 7")
-
-            # Unparseable stdout with nothing on stderr still reaches the chat
-            # as it always did, rather than being swallowed by the lookup.
-            with mock.patch.object(
-                    daemon, "run_worker_proc",
-                    return_value=(1, "segmentation fault\n", "")):
-                with self.assertRaises(RuntimeError) as caught:
-                    daemon.worker_claude("123", [], {}, {})
-            self.assertEqual(
-                str(caught.exception), "claude worker failed: segmentation fault")
-
-    async def test_codex_empty_final_without_completion_remains_an_error(self):
+    async def test_a_failed_codex_turn_with_no_final_message_remains_an_error(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            stdout = json.dumps({"type": "thread.started", "thread_id": "thread-1"})
-            with mock.patch.object(
-                    daemon, "run_worker_proc", return_value=(0, stdout, "")):
-                with self.assertRaisesRegex(RuntimeError, "produced no final message"):
-                    daemon.worker_codex("123", [], {}, {})
+            fake = FakeHarness(ok=False, kind="crash", answer="",
+                               message="the harness ended without a report")
+            with self.assertRaisesRegex(daemon.WorkerFailed, "codex worker failed"):
+                harness_turn(daemon, "codex", fake)
+
+    async def test_a_profile_timeout_reached_first_reads_as_the_rooms_timeout(self):
+        """A profile's `timeout_seconds` is a run's ceiling; reached before the
+        room's own wait, it ends the turn with the same words the room's wait
+        does."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            fake = FakeHarness(ok=False, kind="timeout", answer="",
+                               message="turn timed out after 86400s")
+            with self.assertRaisesRegex(daemon.WorkerFailed,
+                                        r"^codex worker timed out after 86400s$"):
+                harness_turn(daemon, "codex", fake)
 
     async def test_silent_worker_completion_marks_job_done_without_telegram_error(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2927,17 +2764,18 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_worker_step_is_named_past_the_shell_wrapper(self):
         """Codex wraps every command in `<shell> -lc "…"`, so the first word is
-        the shell and says nothing a waiting caller could use."""
+        the shell and says nothing a waiting caller could use. The command
+        keeps that wrapper in the app-server's `commandExecution` item, as the
+        live capture shows."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
 
             def stage(command):
-                return daemon.codex_event_stage(json.dumps(
-                    {"type": "item.started",
-                     "item": {"type": "command_execution", "command": command}}))
+                return daemon.codex_event_stage(
+                    {"method": "item/started",
+                     "params": {"item": {"type": "commandExecution", "command": command}}})
 
-            self.assertEqual(stage(["/bin/zsh", "-lc", "rg needle ."]),
-                             "searching for it")
+            self.assertEqual(stage("/bin/zsh -lc 'rg needle .'"), "searching for it")
             self.assertEqual(stage("/bin/bash -lc 'git status'"),
                              "checking the repository")
             # A capability the project happens to have is recognised without
@@ -2950,12 +2788,30 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(stage("/bin/zsh -lc 'telegram send 42 \"looking\"'"))
             self.assertIsNone(stage("/bin/zsh -lc 'telegram progress \"looking\"'"))
 
-            self.assertEqual(
-                daemon.codex_event_stage(json.dumps({"type": "thread.started"})),
-                "starting")
-            self.assertIsNone(daemon.codex_event_stage("not json"))
-            self.assertIsNone(daemon.codex_event_stage(json.dumps(
-                {"type": "item.started", "item": {"type": "agent_message"}})))
+            self.assertIsNone(daemon.codex_event_stage("not an event"))
+            self.assertIsNone(daemon.codex_event_stage(
+                {"method": "item/started", "params": {"item": {"type": "agentMessage"}}}))
+
+    async def test_each_live_codex_step_is_named_as_it_starts(self):
+        """Fed the notifications live codex runs handed the runner's `on_event`:
+        a command, a file change, a tool call, a web search and reasoning each
+        name what is happening once, as it starts, and the worker's own
+        progress command, the turn's notices and its completion name nothing."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            expected = {
+                "command_started": "searching for it",
+                "file_change_started": "changing files",
+                "tool_call_started": "using a tool",
+                "web_search_started": "searching the web",
+                "reasoning_started": "working it out",
+            }
+            for name, event in CODEX_EVENTS.items():
+                with self.subTest(name):
+                    self.assertEqual(daemon.codex_event_stage(event), expected.get(name))
+            self.assertIn("ls -la", CODEX_EVENTS["command_started"]["params"]["item"]["command"])
+            self.assertIn("/bin/zsh -lc",
+                          CODEX_EVENTS["command_started"]["params"]["item"]["command"])
 
     async def test_a_voice_task_reports_to_the_assistant_not_the_caller(self):
         """Worker progress reaching the caller's chat leaves the agent guessing
@@ -3157,32 +3013,6 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 policy,
             ))
 
-    async def test_worker_process_stdin_is_closed(self):
-        with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
-            captured = {}
-
-            class FakeProcess:
-                pid = 123
-                returncode = 0
-
-                def communicate(self):
-                    return "", ""
-
-            def fake_popen(*args, **kwargs):
-                captured.update(kwargs)
-                return FakeProcess()
-
-            original_popen = daemon.subprocess.Popen
-            try:
-                daemon.subprocess.Popen = fake_popen
-                rc, out, err = daemon.run_worker_proc("worker", ["worker"], {})
-            finally:
-                daemon.subprocess.Popen = original_popen
-
-            self.assertEqual((rc, out, err), (0, "", ""))
-            self.assertEqual(captured["stdin"], daemon.subprocess.DEVNULL)
-
     async def test_voice_is_reserved_before_transcription_and_live_duplicate_is_silent(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
@@ -3296,103 +3126,66 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertIn(expected, path.read_text(), path)
 
+    async def test_the_runner_pin_is_one_across_the_daemon_and_the_profiles(self):
+        """The daemon runs every turn on the runner `service/profiles.py`
+        resolves profiles with, so the two pin one version; the CLI, which
+        every worker `telegram send` resolves, pins none."""
+        def pins(path):
+            header = path.read_text().split("# ///")[1]
+            return [line.strip().strip('",') for line in header.splitlines()
+                    if "callva-harness-runner" in line]
+        daemon_pins = pins(TELEGRAM_DIR / "service" / "daemon.py")
+        self.assertEqual(len(daemon_pins), 1, daemon_pins)
+        self.assertEqual(daemon_pins, pins(TELEGRAM_DIR / "service" / "profiles.py"))
+        self.assertEqual(pins(Path(CLI_PATH)), [])
+
     async def test_cancelled_worker_is_killed_and_persisted_for_startup_retry(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(worker_timeout=30))
+            daemon = import_daemon(Path(td), settings(worker="codex", worker_timeout=30))
             client = FakeClient([Message(10)])
-            processes = []
-            original_popen = daemon.subprocess.Popen
-
-            def recording_popen(*args, **kwargs):
-                proc = original_popen(*args, **kwargs)
-                processes.append(proc)
-                return proc
-
-            daemon.subprocess.Popen = recording_popen
-
-            def blocking_worker(chat, tail, state, procs):
-                rc, _out, err = daemon.run_worker_proc(
-                    state["proc_key"],
-                    [sys.executable, "-c", "import time; time.sleep(30)"],
-                    procs,
-                    cancel_event=state["cancel_event"],
-                )
-                if rc:
-                    raise RuntimeError(err or f"worker exit {rc}")
-                return successful_result()
-
-            daemon.WORKERS["stub"] = blocking_worker
+            fake = FakeHarness(seconds=30)
+            daemon.harness_run = fake
             task = asyncio.create_task(daemon.run_session(client))
             await client.started.wait()
             await client.handler(Event(client.messages[0]))
-            await wait_until(lambda: processes and processes[0].poll() is None)
+            await wait_until(lambda: fake.children and fake.children[0].poll() is None)
             await wait_until(lambda: daemon.load_register()["123"]["jobs"]["10"]["status"] == "running")
 
             await self.stop_session(client, task)
-            daemon.subprocess.Popen = original_popen
 
-            await wait_until(lambda: processes[0].poll() is not None)
+            await wait_until(lambda: fake.children[0].poll() is not None)
+            self.assertTrue(fake.calls[0]["cancel"].is_set())
             job = daemon.load_register()["123"]["jobs"]["10"]
             self.assertEqual(job["status"], "queued")
             self.assertNotIn("started_at", job)
             self.assertIn("cancel", job["last_error"])
             self.assertEqual(client.send_attempts, 0)
 
-    async def test_timeout_kills_process_group_and_cleans_job(self):
+    async def test_timeout_ends_the_run_and_cleans_job(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(worker_timeout=0.05))
+            daemon = import_daemon(Path(td), settings(worker="codex", worker_timeout=0.3))
             client = FakeClient([Message(11)])
-            processes = []
-            original_popen = daemon.subprocess.Popen
-
-            def recording_popen(*args, **kwargs):
-                proc = original_popen(*args, **kwargs)
-                processes.append(proc)
-                return proc
-
-            daemon.subprocess.Popen = recording_popen
-
-            def slow_worker(chat, tail, state, procs):
-                rc, _out, err = daemon.run_worker_proc(
-                    state["proc_key"],
-                    [sys.executable, "-c", "import time; time.sleep(30)"],
-                    procs,
-                    cancel_event=state["cancel_event"],
-                )
-                if rc:
-                    raise RuntimeError(err or f"worker exit {rc}")
-                return successful_result()
-
-            daemon.WORKERS["stub"] = slow_worker
+            fake = FakeHarness(seconds=30)
+            daemon.harness_run = fake
             task = asyncio.create_task(daemon.run_session(client))
             await client.started.wait()
             await client.handler(Event(client.messages[0]))
             await wait_until(lambda: daemon.load_register()["123"]["last_processed_message_id"] == 11)
-            await wait_until(lambda: processes and processes[0].poll() is not None)
+            await wait_until(lambda: fake.children and fake.children[0].poll() is not None)
 
             row = daemon.load_register()["123"]
             self.assertEqual(row["jobs"], {})
             self.assertEqual(client.send_attempts, 1)
-            self.assertTrue(any("timed out" in line for line in daemon._test_logs))
+            self.assertTrue(any("worker timed out after 0.3s" in line
+                                for line in daemon._test_logs))
             await self.stop_session(client, task)
-            daemon.subprocess.Popen = original_popen
 
     async def test_disappeared_process_and_failed_final_send_cannot_orphan_running_job(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
-
-            def vanished_worker(chat, tail, state, procs):
-                rc, _out, err = daemon.run_worker_proc(
-                    state["proc_key"],
-                    [sys.executable, "-c", "raise SystemExit(7)"],
-                    procs,
-                    cancel_event=state["cancel_event"],
-                )
-                if rc:
-                    raise RuntimeError(err or f"worker process disappeared with exit {rc}")
-                return successful_result()
-
-            daemon.WORKERS["stub"] = vanished_worker
+            daemon = import_daemon(Path(td), settings(worker="codex"))
+            daemon.harness_run = FakeHarness(
+                ok=False, kind="crash", answer="",
+                message="worker process disappeared with exit 7")
             vanished_client = FakeClient([Message(12)])
             vanished_task = asyncio.create_task(daemon.run_session(vanished_client))
             await vanished_client.started.wait()
@@ -4902,33 +4695,6 @@ class VoicePromptIsolationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkerResultParsingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_claude_answer_survives_hook_documents_on_both_sides(self):
-        with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
-            answer = {"result": "finished", "usage": {}, "session_id": "abc"}
-            stdout = "\n".join((
-                json.dumps({"hook": "session-start"}),
-                json.dumps(answer),
-                json.dumps({"metrics": {"fire_index": 7}}),
-            ))
-
-            with mock.patch.object(
-                    daemon, "run_worker_proc", return_value=(0, stdout, "")):
-                result = daemon.worker_claude("123", [], {}, {})
-
-            self.assertEqual(result["reply"], "finished")
-            self.assertTrue(any("foreign output" in line
-                                for line in daemon._test_logs))
-
-    async def test_hook_output_without_an_answer_is_named(self):
-        with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
-
-            with self.assertRaisesRegex(RuntimeError, r"no answer document.*metrics"):
-                daemon._first_json_document(
-                    json.dumps({"metrics": {"fire_index": 7}}),
-                    ("result", "is_error", "subtype"))
-
     async def test_usage_summary_names_every_class_and_keeps_unknown_unknown(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
@@ -4948,17 +4714,11 @@ class WorkerResultParsingTests(unittest.IsolatedAsyncioTestCase):
     async def test_claude_error_logs_the_usage_that_was_still_billed(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            stdout = json.dumps({
-                "result": "", "is_error": True, "subtype": "failed",
-                "usage": {"input_tokens": 2, "output_tokens": 3,
-                          "cache_read_input_tokens": 5,
-                          "cache_creation_input_tokens": 7},
-            })
-
-            with mock.patch.object(
-                    daemon, "run_worker_proc", return_value=(0, stdout, "")):
-                with self.assertRaisesRegex(RuntimeError, "failed"):
-                    daemon.worker_claude("123", [], {}, {})
+            fake = FakeHarness(ok=False, kind="error", answer="", message="failed",
+                               tokens={"input": 2, "output": 3, "cache_read": 5,
+                                       "cache_creation": 7})
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                harness_turn(daemon, "claude", fake)
 
             self.assertTrue(any("in=2 out=3 cache_r=5 cache_w=7" in line
                                 for line in daemon._test_logs))
@@ -4993,59 +4753,31 @@ class WorkerSessionContinuityTests(unittest.IsolatedAsyncioTestCase):
     """A call keeps the worker session its last finished task ran in, so the
     next task builds on what that one found instead of rediscovering it."""
 
-    def captured_codex(self, daemon, state, stdout=None):
-        """Run the codex worker against a recorded command line."""
-        seen = {}
-        stdout = stdout or "\n".join([
-            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
-            json.dumps({"type": "turn.completed", "usage": {}}),
-        ])
-
-        def record(proc_key, cmd, procs, **kwargs):
-            seen["cmd"] = cmd
-            return (0, stdout, "")
-
-        with mock.patch.object(daemon, "run_worker_proc", side_effect=record):
-            result = daemon.worker_codex("123", [], state, {})
-        return seen["cmd"], result
-
-    async def test_a_resumed_run_continues_the_thread_without_color(self):
+    async def test_a_resumed_run_continues_the_thread(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            cmd, _ = self.captured_codex(daemon, {"resume_session": "thread-1"})
+            fake = FakeHarness()
+            harness_turn(daemon, "codex", fake, {"resume_session": "thread-1"})
 
-            self.assertEqual(cmd[:4], ["codex", "exec", "resume", "thread-1"])
-            # `resume` has no --color at all: passing it exits before the model
-            # is ever reached, and the run would look like a session that could
-            # not be opened.
-            self.assertNotIn("--color", cmd)
-            for flag in ("--json", "-o", "--skip-git-repo-check",
-                         "--dangerously-bypass-approvals-and-sandbox"):
-                self.assertIn(flag, cmd)
+            session = fake.calls[0]["session"]
+            self.assertEqual((session.kind, session.id), ("resume", "thread-1"))
 
-    async def test_a_fresh_run_is_left_exactly_as_it_was(self):
+    async def test_a_fresh_run_opens_a_new_thread(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            cmd, _ = self.captured_codex(daemon, {})
+            fake = FakeHarness()
+            harness_turn(daemon, "codex", fake, {})
 
-            self.assertEqual(cmd[:2], ["codex", "exec"])
-            self.assertNotIn("resume", cmd)
-            self.assertEqual(cmd[cmd.index("--color") + 1], "never")
+            self.assertEqual(fake.calls[0]["session"].kind, "fresh")
 
     async def test_claude_is_told_which_session_to_resume(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            seen = {}
+            fake = FakeHarness()
+            harness_turn(daemon, "claude", fake, {"resume_session": "abc"})
 
-            def record(proc_key, cmd, procs, **kwargs):
-                seen["cmd"] = cmd
-                return (0, json.dumps({"result": "done", "usage": {},
-                                       "session_id": "abc"}), "")
-
-            with mock.patch.object(daemon, "run_worker_proc", side_effect=record):
-                daemon.worker_claude("123", [], {"resume_session": "abc"}, {})
-
-            self.assertEqual(seen["cmd"][seen["cmd"].index("--resume") + 1], "abc")
+            session = fake.calls[0]["session"]
+            self.assertEqual((session.kind, session.id), ("resume", "abc"))
 
     async def test_a_resumed_prompt_carries_the_request_and_nothing_settled(self):
         with tempfile.TemporaryDirectory() as td:
@@ -5098,16 +4830,6 @@ class WorkerSessionContinuityTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertNotIn("Conversation", prompt)
             self.assertNotIn("something said earlier", prompt)
-
-    async def test_only_a_thread_start_event_yields_a_thread_id(self):
-        with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
-
-            self.assertEqual(daemon.codex_thread_started(json.dumps(
-                {"type": "thread.started", "thread_id": "thread-9"})), "thread-9")
-            self.assertIsNone(daemon.codex_thread_started(json.dumps(
-                {"type": "turn.completed"})))
-            self.assertIsNone(daemon.codex_thread_started("not json at all"))
 
     async def test_a_lane_adopts_a_session_and_counts_its_turns(self):
         with tempfile.TemporaryDirectory() as td:
@@ -5217,11 +4939,16 @@ class WorkerSessionContinuityTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
 
-            self.assertTrue(daemon.codex_context_compacted(json.dumps(
-                {"type": "item.completed",
-                 "item": {"type": "context_compaction"}})))
-            self.assertFalse(daemon.codex_context_compacted(json.dumps(
-                {"type": "item.completed", "item": {"type": "agent_message"}})))
+            # Read off a compaction forced in a live codex turn: the turn's own
+            # stream carries it as a `contextCompaction` item.
+            self.assertTrue(daemon.codex_context_compacted(CODEX_EVENTS["compaction_started"]))
+            self.assertTrue(daemon.codex_context_compacted(
+                CODEX_EVENTS["compaction_completed"]))
+            self.assertTrue(daemon.codex_context_compacted(
+                {"method": "thread/compacted", "params": {}}))
+            for name, event in CODEX_EVENTS.items():
+                if not name.startswith("compaction"):
+                    self.assertFalse(daemon.codex_context_compacted(event), name)
 
             # Re-anchoring survives the call it happened in, so a thread that
             # summarized itself at hangup still restates itself when rung back.
@@ -7704,13 +7431,32 @@ class ChannelStopTests(unittest.IsolatedAsyncioTestCase):
         return base
 
     def live_stand_in(self):
-        """A real process group, in its own session exactly as a worker's is —
-        /stop has to actually kill something for this to mean anything."""
+        """A real process group, in its own session exactly as a harness's is,
+        held by the run handle the daemon registers - /stop has to actually
+        end something for this to mean anything. As the runner does on a
+        cancel, the handle's cancel ends the group."""
         proc = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True)
         self.addCleanup(self.reap, proc)
+        run = SimpleNamespace(cancel=threading.Event(), pid=proc.pid, ended=False)
+
+        def stop():
+            live = not run.ended
+            run.cancel.set()
+            return live
+
+        def watch():
+            run.cancel.wait(30)
+            if run.cancel.is_set() and proc.poll() is None:
+                os.killpg(proc.pid, 9)
+                proc.wait()
+                run.ended = True
+
+        run.stop = stop
+        threading.Thread(target=watch, daemon=True).start()
+        proc.run = run
         return proc
 
     def reap(self, proc):
@@ -7729,7 +7475,7 @@ class ChannelStopTests(unittest.IsolatedAsyncioTestCase):
         def worker(_chat, _tail, state=None, procs=None):
             for run_key in run_keys:
                 running[run_key] = self.live_stand_in()
-                procs[run_key] = running[run_key]
+                procs[run_key] = running[run_key].run
             return successful_result("dispatched")
 
         daemon.WORKERS["stub"] = worker
@@ -7857,7 +7603,7 @@ class ChannelStopTests(unittest.IsolatedAsyncioTestCase):
 
         def worker(_chat, _tail, state=None, procs=None):
             proc = self.live_stand_in()
-            procs[state["proc_key"]] = proc
+            procs[state["proc_key"]] = proc.run
             running[state["proc_key"]] = proc
             proc.wait()
             if proc.returncode:
@@ -8050,37 +7796,19 @@ class StoppedVoiceTaskTests(unittest.IsolatedAsyncioTestCase):
                                          "voice_agent": {"mode": "enabled"}}}
         return base
 
-    def blocking_worker(self, holder, runs):
-        """A worker that behaves as codex does around a kill.
-
-        It runs a real child in its own process group through the daemon's own
-        `run_worker_proc`, and turns a non-zero return into the RuntimeError
-        codex raises. Whatever ends it — `/stop`, the timeout — ends it exactly
-        the way the shipped worker ends, which is the whole thing under test."""
-        def worker(chat, tail, state=None, procs=None):
-            daemon = holder["daemon"]
-            runs.append(state["proc_key"])
-            holder["procs"] = procs
-            rc, _out, _err = daemon.run_worker_proc(
-                state["proc_key"],
-                [sys.executable, "-c", "import time; time.sleep(30)"],
-                procs, cancel_event=state.get("cancel_event"))
-            if rc != 0:
-                raise RuntimeError(f"codex worker failed: exit {rc}")
-            return {"reply": "done", "meta": {"session_id": "thread-2"}}
-        return worker
-
-    async def answered_call(self, td, holder, runs, *, worker_timeout, carrying):
+    async def answered_call(self, td, fake, *, worker_timeout, carrying):
         """Ring the daemon as a caller and hand back its own task runner.
 
         The call is answered through the daemon's own handler, so the task this
         returns is the real closure over the real register, the real process
-        table and the real carried session — not a copy of the logic."""
+        table and the real carried session — not a copy of the logic. The task
+        runs on the daemon's own codex worker, with `fake` as the harness: a
+        real child that runs until it is cancelled, so whatever ends it ends it
+        the way the shipped worker ends."""
         daemon = import_daemon(Path(td), self.voice_settings(worker_timeout),
                                voice_context="Answer briefly.",
                                project_env={"GOOGLE_API_KEY": "test-key"})
-        holder["daemon"] = daemon
-        daemon.WORKERS["codex"] = self.blocking_worker(holder, runs)
+        daemon.harness_run = fake
         lane = daemon.WorkerLane()
         lane.pin(carrying)
         daemon.save_lane(777, lane)
@@ -8107,12 +7835,11 @@ class StoppedVoiceTaskTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_stopped_voice_task_is_not_run_again_in_a_new_session(self):
         with tempfile.TemporaryDirectory() as td:
-            holder, runs = {}, []
+            fake = FakeHarness(seconds=30, opens_thread=False)
             daemon, client, session_task, run_task = await self.answered_call(
-                td, holder, runs, worker_timeout=30, carrying="thread-1")
+                td, fake, worker_timeout=30, carrying="thread-1")
             task = asyncio.create_task(run_task("look something up"))
-            await wait_until(lambda: runs and runs[0] in holder.get("procs", {}),
-                             timeout=10)
+            await wait_until(fake.started.is_set, timeout=10)
 
             stop = Message(121, text="/stop")
             client.messages.append(stop)
@@ -8123,9 +7850,10 @@ class StoppedVoiceTaskTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(task, timeout=15)
             # The outcome, not the branch that produced it: the caller was told
             # the work was stopped, and no second run for them ever starts.
-            self.assertEqual(len(runs), 1, runs)
+            self.assertEqual(len(fake.calls), 1, fake.calls)
             self.assertIsInstance(caught.exception, daemon.WorkerStopped)
             self.assertIsNone(daemon.load_lane(777).session_id)
+            await wait_until(lambda: fake.children[0].poll() is not None)
             await self.finish(client, session_task)
 
     async def test_a_voice_task_whose_worker_timed_out_still_runs_again(self):
@@ -8136,9 +7864,9 @@ class StoppedVoiceTaskTests(unittest.IsolatedAsyncioTestCase):
         run again because nothing of it happened. Losing this retry would be a
         worse defect than the one that made `/stop` reach a voice task at all."""
         with tempfile.TemporaryDirectory() as td:
-            holder, runs = {}, []
+            fake = FakeHarness(seconds=30, opens_thread=False)
             daemon, client, session_task, run_task = await self.answered_call(
-                td, holder, runs, worker_timeout=1, carrying="thread-1")
+                td, fake, worker_timeout=1, carrying="thread-1")
 
             with self.assertRaises(Exception) as caught:
                 await asyncio.wait_for(run_task("look something up"), timeout=30)
@@ -8146,36 +7874,31 @@ class StoppedVoiceTaskTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("timed out", str(caught.exception))
             # Two runs, the second one its own: the lost session was run again
             # from a clean slate, and only then was the failure the caller's.
-            self.assertEqual(len(runs), 2)
-            self.assertNotEqual(runs[0], runs[1])
+            self.assertEqual(len(fake.calls), 2)
+            self.assertEqual(fake.calls[0]["session"].kind, "resume")
+            self.assertEqual(fake.calls[1]["session"].kind, "fresh")
+            self.assertIsNot(fake.calls[0]["cancel"], fake.calls[1]["cancel"])
             await self.finish(client, session_task)
 
     async def test_a_voice_task_whose_model_was_refused_is_not_run_again(self):
         """The same conditions as the retry above — a resumed session, no thread
-        ever opened — and the opposite answer. The binary refused the model
+        ever opened — and the opposite answer. The harness refused the model
         before it did anything, so it reads as a session that was lost; running
         it again in a fresh session hands over the same model, and the caller
         waits out the identical failure twice to be told it once."""
         with tempfile.TemporaryDirectory() as td:
-            holder, runs = {}, []
+            fake = FakeHarness(ok=False, kind="model_refused", answer="",
+                               message=CODEX_MODEL_REFUSAL, opens_thread=False)
             daemon, client, session_task, run_task = await self.answered_call(
-                td, holder, runs, worker_timeout=30, carrying="thread-1")
+                td, fake, worker_timeout=30, carrying="thread-1")
 
-            def refusing_worker(chat, tail, state=None, procs=None):
-                runs.append(state["proc_key"])
-                raise daemon.worker_failure(
-                    "codex", REFUSED_MODEL,
-                    daemon.codex_failure_reason(CODEX_MODEL_REFUSAL_STDOUT, "", 1))
-
-            daemon.WORKERS["codex"] = refusing_worker
             with self.assertRaises(daemon.WorkerModelRefused) as caught:
                 await asyncio.wait_for(run_task("look something up"), timeout=30)
 
-            self.assertEqual(len(runs), 1, runs)
+            self.assertEqual(len(fake.calls), 1, fake.calls)
             spoken = str(caught.exception)
-            self.assertIn(REFUSED_MODEL, spoken)
             self.assertIn("codex", spoken)
-            self.assertNotIn("invalid_request_error", spoken)
+            self.assertNotIn("newer version", spoken)
             # The carried session is let go, as it is on any other ending.
             self.assertIsNone(daemon.load_lane(777).session_id)
             await self.finish(client, session_task)
@@ -8397,7 +8120,7 @@ class ProgressOutboxLifetimeTests(unittest.IsolatedAsyncioTestCase):
 
     def stop_settings(self):
         # `/stop` is a supervisor command; a direct user could not reach it.
-        base = settings(worker_timeout=30)
+        base = settings(worker="codex", worker_timeout=30)
         base["direct_messages"] = {"mode": "anyone", "default_role": "supervisor"}
         return base
 
@@ -8408,25 +8131,18 @@ class ProgressOutboxLifetimeTests(unittest.IsolatedAsyncioTestCase):
         return sorted(path.name for path in daemon.PROGRESS_DIR.iterdir())
 
     def blocking_worker(self, daemon, seen):
-        """A worker holding a real child open until something kills it.
+        """The daemon's own codex worker, its harness holding a real child open
+        until something cancels it.
 
         The turn has to still be running when `/stop` or the session close
         arrives, and it has to have written its progress file first, or these
         endings would land on a run that had already finished cleaning up."""
-        def worker(_chat, _tail, state=None, procs=None):
-            outbox = Path(state["progress_outbox"])
+        def write(call):
+            outbox = Path(call["extra_env"]["TELEGRAM_PROGRESS_OUTBOX"])
             outbox.write_text(json.dumps({"text": "working on it"}) + "\n")
             seen.append(outbox)
-            rc, _out, err = daemon.run_worker_proc(
-                state["proc_key"],
-                [sys.executable, "-c", "import time; time.sleep(30)"],
-                procs,
-                cancel_event=state["cancel_event"],
-            )
-            if rc:
-                raise RuntimeError(err or f"worker exit {rc}")
-            return successful_result()
-        return worker
+        daemon.harness_run = FakeHarness(seconds=30, before_end=write)
+        return daemon.WORKERS["codex"]
 
     async def test_a_completed_turn_keeps_its_progress_file_only_while_it_runs(self):
         with tempfile.TemporaryDirectory() as td:
@@ -8484,7 +8200,7 @@ class ProgressOutboxLifetimeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), self.stop_settings())
             seen = []
-            daemon.WORKERS["stub"] = self.blocking_worker(daemon, seen)
+            self.blocking_worker(daemon, seen)
             message = Message(202, text="Assistant, do something slow")
             client = FakeClient([message])
             task = asyncio.create_task(daemon.run_session(client))
@@ -8505,7 +8221,7 @@ class ProgressOutboxLifetimeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), self.stop_settings())
             seen = []
-            daemon.WORKERS["stub"] = self.blocking_worker(daemon, seen)
+            self.blocking_worker(daemon, seen)
             message = Message(204, text="Assistant, do something slow")
             client = FakeClient([message])
             task = asyncio.create_task(daemon.run_session(client))
@@ -8606,88 +8322,65 @@ class ProgressOutboxLifetimeTests(unittest.IsolatedAsyncioTestCase):
 class ClaudeWorkerContextTests(unittest.IsolatedAsyncioTestCase):
     """The `context` block on the claude worker rule: which built-in tools and
     MCP servers a worker is launched holding. Declared in settings only, read
-    at the two positions the daemon reads worker policy from, and turned into
-    flags by the one command builder every claude launch goes through."""
+    at the two positions the daemon reads worker policy from, and laid over the
+    profile every claude turn runs on by the one function that builds it."""
 
     BASE = {"connection": "test", "assistant_name": "Assistant",
             "direct_messages": {"mode": "anyone", "default_role": "direct_user"},
             "allowed_users": {}, "allowed_groups": {}}
     BLOCK = {"tools": ["Read", "Grep"], "mcp": False}
-    NO_MCP = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+    NO_MCP = {"strict_mcp": True, "mcp_config": {"mcpServers": {}}}
 
     @staticmethod
-    def before(prompt, model, effort=None):
-        """The argv a claude launch had before the block existed."""
-        cmd = ["claude", "-p", prompt, "--output-format", "json",
-               "--dangerously-skip-permissions", "--model", model]
-        return cmd + (["--effort", effort] if effort else [])
+    def before(model, effort=None):
+        """The knobs a claude launch had before the block existed."""
+        return {"model": model, "effort": effort, "tools": None, "strict_mcp": False,
+                "mcp_config": None}
+
+    @staticmethod
+    def knobs(profile):
+        def plain(value):
+            if isinstance(value, (list, tuple)):
+                return [plain(one) for one in value]
+            if hasattr(value, "items"):
+                return {key: plain(one) for key, one in value.items()}
+            return value
+        return {key: plain(getattr(profile, key))
+                for key in ("model", "effort", "tools", "strict_mcp", "mcp_config")}
 
     def launched(self, daemon, state):
-        """The argv one claude turn is launched with, via `worker_claude`."""
-        seen = {}
-
-        def record(_key, cmd, *_args, **_kwargs):
-            seen["cmd"] = cmd
-            return (0, json.dumps({"result": "ok", "usage": {},
-                                   "session_id": "s"}), "")
-
-        with mock.patch.object(daemon, "run_worker_proc", side_effect=record):
-            daemon.worker_claude("123", [], state, {})
-        return seen["cmd"]
+        """The profile one claude turn is handed, via `worker_harness`."""
+        fake = FakeHarness()
+        harness_turn(daemon, "claude", fake, state)
+        return self.knobs(fake.calls[0]["profile"])
 
     def probed(self, td, model):
-        """The argv the doctor's probe launches, via the real `probe_worker`."""
+        """The profile the doctor's probe runs, via the real `probe`."""
         spec = importlib.util.spec_from_file_location(
-            f"telegram_workers_test_{time.time_ns()}",
-            TELEGRAM_DIR / "service" / "workers.py")
-        workers = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(workers)
-        bindir = Path(td) / "bin"
-        bindir.mkdir(exist_ok=True)
-        (bindir / "claude").write_text("#!/bin/sh\nexit 0\n")
-        (bindir / "claude").chmod(0o755)
-        seen = {}
-
-        class Started:
-            returncode = 0
-
-            def __init__(self, cmd, **_kwargs):
-                seen["cmd"] = cmd
-
-            def communicate(self, timeout=None):
-                return (json.dumps({"type": "result", "subtype": "success",
-                                    "is_error": False, "result": "OK"}), "")
-
-        with mock.patch.object(workers.subprocess, "Popen", Started):
-            verdict = workers.probe_worker(
-                "claude", model, timeout=1, cwd=Path(td),
-                environ={"PATH": str(bindir)})
-        self.assertEqual(verdict["verdict"], "accepted")
-        return seen["cmd"], workers.PROBE_PROMPT
-
-    def flags(self, cmd):
-        """The block's flags as they sit in `cmd`, and how often each appears."""
-        counts = {flag: cmd.count(flag)
-                  for flag in ("--tools", "--strict-mcp-config", "--mcp-config")}
-        tools = cmd[cmd.index("--tools") + 1] if "--tools" in cmd else None
-        mcp = (cmd[cmd.index("--strict-mcp-config"):][:3]
-               if "--strict-mcp-config" in cmd else None)
-        return counts, tools, mcp
+            f"telegram_profiles_test_{time.time_ns()}",
+            TELEGRAM_DIR / "service" / "profiles.py")
+        profiles = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(profiles)
+        fake = FakeHarness(answer="OK")
+        rows = profiles.probe([{"worker": "claude", "model": model}], 1, [], None, td,
+                              run=fake)
+        self.assertEqual(rows[0]["verdict"], "accepted")
+        self.assertEqual(fake.calls[0]["prompt"], profiles.PROBE_PROMPT)
+        return self.knobs(fake.calls[0]["profile"])
 
     async def test_without_the_block_every_launch_is_the_one_it_was(self):
-        """Element for element: the dialogue turn, the voice task and the
-        doctor's probe build the argv they built before the block existed."""
+        """Knob for knob: the dialogue turn, the voice task and the doctor's
+        probe run on the profile they ran on before the block existed."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings(
                 worker="claude",
                 workers={"claude": {"model": "text-model", "effort": "high"}},
                 voice_agent={"workers": {"claude": {"model": "fast-model"}}}))
             turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
-            self.assertEqual(turn, self.before(turn[2], "text-model", "high"))
+            self.assertEqual(turn, self.before("text-model", "high"))
             task = self.launched(daemon, {"settings": daemon.voice_agent_settings()})
-            self.assertEqual(task, self.before(task[2], "fast-model", "high"))
-            probe, prompt = self.probed(td, "text-model")
-            self.assertEqual(probe, self.before(prompt, "text-model"))
+            self.assertEqual(task, self.before("fast-model", "high"))
+            self.assertEqual(self.probed(td, "text-model"), self.before("text-model"))
 
         # `mcp: true`, and a block with nothing to say, are today's launch too.
         for block in ({"mcp": True}, {}):
@@ -8696,7 +8389,7 @@ class ClaudeWorkerContextTests(unittest.IsolatedAsyncioTestCase):
                     worker="claude",
                     workers={"claude": {"model": "text-model", "context": block}}))
                 turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
-                self.assertEqual(turn, self.before(turn[2], "text-model"))
+                self.assertEqual(turn, self.before("text-model"))
 
     async def test_the_block_reaches_the_launch_once_from_each_position(self):
         with tempfile.TemporaryDirectory() as td:
@@ -8708,14 +8401,9 @@ class ClaudeWorkerContextTests(unittest.IsolatedAsyncioTestCase):
             # worker policy.
             for state in ({"settings": daemon.channel_settings({}, "123")},
                           {"settings": daemon.voice_agent_settings()}):
-                cmd = self.launched(daemon, state)
-                counts, tools, mcp = self.flags(cmd)
-                self.assertEqual(counts, {"--tools": 1, "--strict-mcp-config": 1,
-                                          "--mcp-config": 1})
-                self.assertEqual(tools, "Read,Grep")
-                self.assertEqual(mcp, self.NO_MCP)
-                self.assertEqual(cmd[:cmd.index("--tools")],
-                                 self.before(cmd[2], "text-model", "high"))
+                self.assertEqual(self.launched(daemon, state),
+                                 {**self.before("text-model", "high"),
+                                  "tools": ["Read", "Grep"], **self.NO_MCP})
             # The durable job re-resolves the engine's policy through the same
             # lift the turn uses.
             self.assertEqual(
@@ -8728,13 +8416,10 @@ class ClaudeWorkerContextTests(unittest.IsolatedAsyncioTestCase):
                 workers={"claude": {"model": "text-model"}},
                 voice_agent={"workers": {"claude": {"context": self.BLOCK}}}))
             turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
-            self.assertEqual(turn, self.before(turn[2], "text-model"))
+            self.assertEqual(turn, self.before("text-model"))
             task = self.launched(daemon, {"settings": daemon.voice_agent_settings()})
-            counts, tools, mcp = self.flags(task)
-            self.assertEqual(counts, {"--tools": 1, "--strict-mcp-config": 1,
-                                      "--mcp-config": 1})
-            self.assertEqual(tools, "Read,Grep")
-            self.assertEqual(mcp, self.NO_MCP)
+            self.assertEqual(task, {**self.before("text-model"),
+                                    "tools": ["Read", "Grep"], **self.NO_MCP})
 
         # Each key stands on its own.
         with tempfile.TemporaryDirectory() as td:
@@ -8743,14 +8428,14 @@ class ClaudeWorkerContextTests(unittest.IsolatedAsyncioTestCase):
                 workers={"claude": {"model": "text-model",
                                     "context": {"tools": ["Read"]}}}))
             turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
-            self.assertEqual(turn, self.before(turn[2], "text-model") + ["--tools", "Read"])
+            self.assertEqual(turn, {**self.before("text-model"), "tools": ["Read"]})
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings(
                 worker="claude",
                 workers={"claude": {"model": "text-model",
                                     "context": {"mcp": False}}}))
             turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
-            self.assertEqual(turn, self.before(turn[2], "text-model") + self.NO_MCP)
+            self.assertEqual(turn, {**self.before("text-model"), **self.NO_MCP})
 
     async def test_the_schema_admits_the_block_for_claude_and_nothing_else_in_it(self):
         with tempfile.TemporaryDirectory() as td:
@@ -8796,6 +8481,256 @@ class ClaudeWorkerContextTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(
                     Exception, r"workers\.claude\.plugins: unsupported property"):
                 validated({"workers": {"claude": {"plugins": []}}})
+
+
+class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
+    """A worker turn through the harness runner, seen from the daemon: the call
+    it builds, the environment it hands over, what it does with the result, and
+    how a turn is ended."""
+
+    async def stop_session(self, client, task):
+        client.disconnected.set()
+        await asyncio.wait_for(task, timeout=10)
+
+    def state(self, daemon, **extra):
+        return {"settings": daemon.channel_settings({}, "123"), "chat_id": "123",
+                "chat_type": "private", "connection": "test",
+                "progress_outbox": "/tmp/outbox.jsonl", "worker_session": "/tmp/session",
+                "authority_context": "/tmp/authority.json",
+                "current_request": {"sender_id": "777", "message_id": 5, "reply_to": 5},
+                **extra}
+
+    async def test_the_harness_environment_is_the_worker_environment(self):
+        """The environment a turn starts from and what telegram sets on it add
+        up to exactly what a worker was handed before the runner, and every
+        variable telegram sets - the shim on PATH, the outbox, the session copy,
+        the authority, the register's scope - is set last, where no profile can
+        remove it."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(worker="codex"))
+            noisy = {"SSH_AUTH_SOCK": "/agent", "CLAUDE_CODE_ENTRYPOINT": "cli",
+                     "CLAUDECODE": "1", "VSCODE_PID": "9",
+                     "TELEGRAM_SERVICE_LAUNCH_NONCE": "nonce",
+                     "TELEGRAM_AUTHORIZED_TOPIC_ID": "4",
+                     "TELEGRAM_AUTHORIZED_JOB_MODEL": "old"}
+            with mock.patch.dict(os.environ, noisy):
+                for state in (self.state(daemon),
+                              self.state(daemon, project_dir=Path(td) / "routed")):
+                    environ, extra = daemon.worker_env_parts(state)
+                    self.assertEqual({**environ, **extra}, daemon.worker_env(state))
+                    fake = FakeHarness()
+                    harness_turn(daemon, "codex", fake, state)
+                    self.assertEqual(fake.calls[0]["environ"], environ)
+                    self.assertEqual(fake.calls[0]["extra_env"], extra)
+                    for name in noisy:
+                        self.assertNotIn(name, environ)
+                    self.assertTrue(extra["PATH"].startswith(str(daemon.WORKER_BIN)))
+                    self.assertEqual(extra["TELEGRAM_PROGRESS_OUTBOX"], "/tmp/outbox.jsonl")
+                    self.assertEqual(extra["TELEGRAM_WORKER_SESSION"], "/tmp/session")
+                    self.assertEqual(extra["CAPABILITIES_AUTH_CONTEXT"], "/tmp/authority.json")
+                    self.assertEqual(extra["TELEGRAM_DAEMON_CHILD"], "1")
+                    self.assertEqual(extra["TELEGRAM_AUTHORIZED_REQUESTER_ID"], "777")
+                    self.assertEqual(extra["TELEGRAM_AUTHORIZED_JOB_ENGINE"], "codex")
+                    self.assertNotIn("TELEGRAM_AUTHORIZED_JOB_MODEL", environ)
+                routed = self.state(daemon, project_dir=Path(td) / "routed")
+                environ, extra = daemon.worker_env_parts(routed)
+                for name in daemon.WORKER_ENV_DROP_WHEN_ROUTED:
+                    if name not in ("TELEGRAM_SERVICE_PROJECT_ROOT",
+                                    "TELEGRAM_SERVICE_PROJECT_ENVELOPE"):
+                        self.assertNotIn(name, environ)
+                        self.assertNotIn(name, extra)
+                self.assertEqual(extra["CLAUDE_PROJECT_DIR"], str(Path(td) / "routed"))
+                self.assertEqual(extra["TELEGRAM_SERVICE_PROJECT_ROOT"], str(daemon.PROJECT_ROOT))
+                fake = FakeHarness()
+                harness_turn(daemon, "codex", fake, routed)
+                self.assertEqual(fake.calls[0]["cwd"], str(Path(td) / "routed"))
+
+    async def test_a_dialogue_turn_runs_on_its_profile_and_delivers_the_answer(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(
+                worker="codex", workers={"codex": {"model": "gpt-5.5",
+                                                   "reasoning_effort": "high"}}))
+            fake = FakeHarness(answer="the answer", session_id="thread-3",
+                               tokens={"input": 11, "output": 7, "cache_read": 3})
+            daemon.harness_run = fake
+            images = []
+            daemon.discover_codex_images = lambda thread: images.append(thread) or []
+            message = Message(300, text="Assistant, a question")
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(lambda: any(item["text"] == "the answer" for item in client.sent),
+                             timeout=10)
+            call = fake.calls[0]
+            self.assertEqual((call["profile"].harness, call["profile"].model,
+                              call["profile"].effort), ("codex", "gpt-5.5", "high"))
+            self.assertEqual(call["cwd"], str(daemon.PROJECT_ROOT))
+            self.assertEqual(call["session"].kind, "fresh")
+            self.assertIn("Assistant, a question", call["prompt"])
+            # Codex's images are looked for in the thread the turn ran in.
+            self.assertEqual(images, ["thread-3"])
+            await wait_until(lambda: daemon.load_register()["123"].get("last_usage"))
+            self.assertEqual(daemon.load_register()["123"]["last_usage"],
+                             {"input": 11, "output": 7, "cache_read": 3,
+                              "cache_write": None})
+            self.assertIn("Previous turn usage: in=11 out=7 cache_r=3 cache_w=?",
+                          daemon.build_prompt([], {"prev_usage": daemon.load_register()[
+                              "123"]["last_usage"]}))
+            await self.stop_session(client, task)
+
+    async def test_stop_cancels_the_live_run_and_says_so_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = settings(worker="claude", worker_timeout=30)
+            base["direct_messages"] = {"mode": "anyone", "default_role": "supervisor"}
+            daemon = import_daemon(Path(td), base)
+            fake = FakeHarness(seconds=30)
+            daemon.harness_run = fake
+            message = Message(310, text="Assistant, something slow")
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(fake.started.is_set, timeout=10)
+
+            stop = Message(311, text="/stop")
+            client.messages.append(stop)
+            await client.handler(Event(stop))
+            self.assertEqual(client.sent[-1]["text"], "Stopped.")
+            self.assertTrue(fake.calls[0]["cancel"].is_set())
+            await wait_until(lambda: fake.children[0].poll() is not None, timeout=10)
+            await wait_until(lambda: not daemon.load_register()["123"]["jobs"], timeout=10)
+
+            again = Message(312, text="/stop")
+            client.messages.append(again)
+            await client.handler(Event(again))
+            self.assertEqual(client.sent[-1]["text"], "Nothing is running right now.")
+            await self.stop_session(client, task)
+
+    async def test_a_cancel_set_before_the_start_runs_no_harness(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            cancel = threading.Event()
+            cancel.set()
+            procs = {}
+            fake = FakeHarness()
+            with self.assertRaisesRegex(RuntimeError, "cancelled before process start"):
+                harness_turn(daemon, "claude", fake,
+                             {"cancel_event": cancel, "proc_key": "123:1"}, procs)
+            self.assertEqual(fake.calls, [])
+            # The run is registered before anything starts, so a `/stop` that
+            # arrives in that window reaches it.
+            self.assertIs(procs["123:1"].cancel, cancel)
+
+    async def test_a_profile_that_no_longer_resolves_fails_the_turn_naming_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            fake = FakeHarness()
+            refusal = daemon.profiles.Refusal(
+                6, "profile_unfit", "profile 'telegram-codex' (layer global, version v1) "
+                "does not fit a telegram turn: approval_policy must be never")
+            with mock.patch.object(daemon.profiles, "implicit", side_effect=refusal):
+                with self.assertRaises(daemon.WorkerModelRefused) as caught:
+                    harness_turn(daemon, "codex", fake)
+            self.assertIsInstance(caught.exception, daemon.WorkerProfileRefused)
+            self.assertIn("telegram-codex", str(caught.exception))
+            self.assertIn("approval_policy", str(caught.exception))
+            self.assertEqual(fake.calls, [])
+
+    async def test_a_reload_whose_profile_does_not_fit_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(worker="codex"))
+            problem = {"position": "defaults", "profile": "telegram-codex",
+                       "code": "profile_unfit", "message": "approval_policy must be never"}
+            generation = daemon.SETTINGS_GENERATION
+            with mock.patch.object(daemon.profiles, "check", return_value=[problem]):
+                refused = daemon.reload_runtime_settings()
+            self.assertFalse(refused["ok"])
+            self.assertEqual(refused["status"], "reload_refused")
+            self.assertIn("settings.defaults runs on telegram-codex", refused["error"])
+            self.assertEqual(daemon.SETTINGS_GENERATION, generation)
+            # The settings as they are pass, profiles included.
+            self.assertTrue(daemon.reload_runtime_settings()["ok"])
+
+
+class VoiceTaskHarnessTests(unittest.IsolatedAsyncioTestCase):
+    """A call's task on codex, read off the runner's start and its events: the
+    stages the caller hears, the thread the caller's lane carries, and a
+    compaction that makes the next turn restate its context."""
+
+    class Session(StubVoiceCallSession):
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.instances.append(self)
+
+    async def answered_call(self, td, fake):
+        base = settings(worker_timeout=30)
+        base["defaults"]["voice_agent"] = {"worker": "codex", "session": {"mode": "carry"}}
+        base["allowed_users"] = {"777": {"name": "Caller", "role": "supervisor",
+                                         "voice_agent": {"mode": "enabled"}}}
+        daemon = import_daemon(Path(td), base, voice_context="Answer briefly.",
+                               project_env={"GOOGLE_API_KEY": "test-key"})
+        daemon.harness_run = fake
+        captured = {}
+
+        def capture_runner(run_task, *args, **kwargs):
+            captured["run"] = run_task
+            return SimpleNamespace()
+
+        daemon.voice_agent.VoiceTaskRunner = capture_runner
+        daemon.voice_agent.VoiceCallSession = self.Session
+        client = FakeClient()
+        session_task = asyncio.create_task(daemon.run_session(client))
+        await client.started.wait()
+        calls = daemon.PyTgCalls.instances[-1]
+        await calls.handlers["incoming_p2p_call"](None, SimpleNamespace(chat_id=777))
+        await wait_until(lambda: "run" in captured, timeout=10)
+        return daemon, client, session_task, captured["run"]
+
+    async def test_stages_the_thread_and_a_compaction_come_from_the_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = FakeHarness(answer="found it", session_id="thread-7", seconds=1.0,
+                               events=[CODEX_EVENTS[name] for name in (
+                                   "turn_started", "command_started", "own_progress_started",
+                                   "own_send_started", "reasoning_started", "web_search_started",
+                                   "tool_call_started", "compaction_completed",
+                                   "agent_message_completed", "turn_completed")])
+            daemon, client, session_task, run_task = await self.answered_call(td, fake)
+            task = asyncio.create_task(run_task("look something up"))
+            # The thread is the caller's the moment the run reports it, not
+            # when the turn ends.
+            await wait_until(lambda: daemon.load_lane(777).session_id == "thread-7",
+                             timeout=10)
+            self.assertFalse(task.done())
+            self.assertEqual(await asyncio.wait_for(task, timeout=15), "found it")
+
+            session = self.Session.instances[-1]
+            heard = [note for note, source in session.progress if source == "stream"]
+            self.assertEqual(heard, ["starting", "searching for it", "working it out",
+                                     "searching the web", "using a tool"])
+            lane = daemon.load_lane(777)
+            self.assertEqual((lane.session_id, lane.turns), ("thread-7", 1))
+            self.assertTrue(lane.needs_reanchor)
+            client.disconnected.set()
+            await asyncio.wait_for(session_task, timeout=10)
+
+    async def test_a_carried_thread_is_resumed_on_the_next_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = FakeHarness(answer="again", session_id="thread-7")
+            daemon, client, session_task, run_task = await self.answered_call(td, fake)
+            lane = daemon.WorkerLane()
+            lane.pin("thread-7")
+            daemon.save_lane(777, lane)
+            self.assertEqual(await asyncio.wait_for(run_task("and the next"), timeout=15),
+                             "again")
+            self.assertEqual(await asyncio.wait_for(run_task("and one more"), timeout=15),
+                             "again")
+            sessions = [(call["session"].kind, call["session"].id) for call in fake.calls]
+            self.assertIn(("resume", "thread-7"), sessions)
+            client.disconnected.set()
+            await asyncio.wait_for(session_task, timeout=10)
 
 
 if __name__ == "__main__":

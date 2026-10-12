@@ -9,8 +9,13 @@
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
 #     "capabilities-contract==0.4.1",
+#     "callva-harness-runner==0.10.0",
 # ]
 # ///
+# callva-harness-runner launches every worker turn - dialogue, durable job,
+# voice task and post-call summary - and is pinned equal to service/profiles.py,
+# which resolves the profile a turn runs on; a test holds the two equal.
+#
 # The 3.x line is what carries conference calls: joining one needs
 # CallConfig(conference=<invite message id>), which 2.x does not accept.
 # ntgcalls is pinned explicitly because inbound audio arrives only from b15 on
@@ -78,10 +83,10 @@ Four gates, not to be conflated:
   2. control authority — who may run service control commands like /set and /stop    (HARD)
   3. tool authority — which built-in tools and MCP servers the claude worker is
                     launched holding: the `context` block on its worker rule,
-                    carried to the command `workers.claude_command` builds        (HARD)
+                    laid over the profile a claude turn runs on               (HARD)
   4. soft-gates   — behavioural guidance in context.md                              (SOFT)
 This file implements gates 1 and 2 and carries gate 3's declaration to the
-worker command; context.md carries gate 4. Gate 3 reaches built-in tools and
+worker's profile; context.md carries gate 4. Gate 3 reaches built-in tools and
 MCP servers only: skills, plugins and slash commands are not governed by it, and
 the codex worker has no such gate.
 
@@ -142,24 +147,16 @@ from call_recording_helpers import (
     write_metadata,
 )
 import jobs
+import profiles
 import voice_agent
 from forum import GENERAL_TOPIC_ID, message_topic_id
 from settings_schema import VOICE_PROVIDER_INCUMBENT, validate_settings
 from workers import (
     DEFAULT_WORKER_TIMEOUT,
-    MODEL_REFUSED_RE,
+    WorkerFailed,
     WorkerModelRefused,
-    _claude_turn_completed,
-    _codex_turn_completed,
-    _first_json_document,
+    WorkerProfileRefused,
     _kill_process_group,
-    claude_command,
-    claude_failure_reason,
-    codex_command,
-    codex_failure_reason,
-    codex_hook_trust,
-    is_model_refused,
-    is_quota_exhausted,
     model_refusal_notice,
     scrub_worker_env,
     worker_diagnosis,
@@ -1936,6 +1933,13 @@ def _require_hardened_state():
         sys.exit("service launch nonce is required")
 
 
+def reached_profile_problems(settings):
+    """Every worker `settings` reach whose profile does not resolve or fit,
+    each with its position; empty when every one does."""
+    active, project = turn_profiles()
+    return profiles.check(settings, os.environ, active, project)
+
+
 def reload_runtime_settings():
     """Replace live policy from settings.json without disconnecting Telegram.
 
@@ -1953,6 +1957,11 @@ def reload_runtime_settings():
             raise SettingsError("settings.connection changed; a daemon restart is required")
         project_layout = _read_project_layout(reload_file=True)
         runtime = _runtime_settings(candidate, project_layout)
+        # Every worker the new settings reach has to have a profile a turn can
+        # run on, or the settings are refused here rather than at a message.
+        problems = reached_profile_problems(candidate)
+        if problems:
+            raise SettingsError(profiles.problems_sentence(problems))
     except (SettingsError, ValueError) as exc:
         error = str(exc)
         write_health(
@@ -3281,76 +3290,61 @@ def _shell_stage(command):
     return f"asking {head} to {verb}" if verb else f"running {head}"
 
 
-def codex_thread_started(line):
-    """The thread id out of a `thread.started` event, None for any other line.
+# A codex turn's progress is read off the notifications the harness runner hands
+# `on_event`: codex app-server's `{"method", "params"}`, one per notification,
+# where an item's start and end arrive as `item/started` and `item/completed`
+# with the item itself under `params.item`. Claude's messages carry no stages
+# and no stream facts, so every reader below answers nothing for them.
 
-    Read live from the output pump rather than from the run's final stdout,
-    because the runs whose classification matters most are the ones that never
-    produce final stdout: a worker that is killed or times out is reported by its
-    stderr alone. Whether the thread ever opened is what separates a resume that
-    executed nothing — safe to run again — from a turn that may already have done
-    half of what it was asked.
-    """
-    try:
-        event = json.loads(line)
-    except (ValueError, TypeError):
+def _codex_item(event, *methods):
+    """The item a codex notification carries, when it is one of `methods`."""
+    if not isinstance(event, dict) or event.get("method") not in methods:
         return None
-    if isinstance(event, dict) and event.get("type") == "thread.started":
-        return event.get("thread_id")
-    return None
+    params = event.get("params")
+    item = params.get("item") if isinstance(params, dict) else None
+    return item if isinstance(item, dict) else None
 
 
-def codex_context_compacted(line):
-    """True when the event says codex just summarized the thread to fit.
+def codex_context_compacted(event):
+    """True when the notification says codex just summarized the thread to fit.
 
     A session nobody ever resets eventually fills its context window, and codex
     handles that by itself. What it cannot promise is that the summary keeps the
     instructions the session was opened with — so the one thing the daemon has to
-    know is that it happened."""
-    try:
-        event = json.loads(line)
-    except (ValueError, TypeError):
-        return False
-    if not isinstance(event, dict):
-        return False
-    item = event.get("item") if isinstance(event.get("item"), dict) else {}
-    return (item.get("type") or item.get("item_type")) == "context_compaction"
+    know is that it happened. The turn's stream carries it as a
+    `contextCompaction` item; `thread/compacted` is the same fact said once."""
+    if isinstance(event, dict) and event.get("method") == "thread/compacted":
+        return True
+    item = _codex_item(event, "item/started", "item/completed")
+    return bool(item) and item.get("type") == "contextCompaction"
 
 
-def codex_event_stage(line):
-    """Turn one codex `--json` event into a short, host-neutral phrase.
+# The item types a waiting caller hears about, by what each is doing.
+CODEX_ITEM_STAGES = {
+    "fileChange": "changing files",
+    "mcpToolCall": "using a tool",
+    "dynamicToolCall": "using a tool",
+    "webSearch": "searching the web",
+    "reasoning": "working it out",
+}
+
+
+def codex_event_stage(event):
+    """Turn one codex notification into a short, host-neutral phrase.
 
     Structural rather than narrated: the worker does not have to remember to
     report anything, because what it is doing is already in the event stream.
-    Returns None for events that say nothing a waiting caller would care about.
+    Each item is named once, as it starts. Returns None for notifications that
+    say nothing a waiting caller would care about, the turn's own completion
+    included: the result itself is a second away and says the same thing
+    truthfully. "starting" comes from the run's start, not from here.
     """
-    try:
-        event = json.loads(line)
-    except (ValueError, TypeError):
+    item = _codex_item(event, "item/started")
+    if item is None:
         return None
-    if not isinstance(event, dict):
-        return None
-    kind = event.get("type")
-    if kind == "thread.started":
-        return "starting"
-    if kind == "turn.completed":
-        # The turn is already over when this arrives, so anything it produces
-        # is a report about the past dressed as a report about now. The result
-        # itself is a second away and says the same thing truthfully.
-        return None
-    item = event.get("item") if isinstance(event.get("item"), dict) else {}
-    item_type = item.get("type") or item.get("item_type")
-    if item_type in ("command_execution", "local_shell_call", "shell_call"):
+    if item.get("type") == "commandExecution":
         return _shell_stage(item.get("command"))
-    if item_type in ("file_change", "patch_apply", "apply_patch"):
-        return "changing files"
-    if item_type in ("mcp_tool_call", "tool_call", "function_call"):
-        return "using a tool"
-    if item_type == "web_search":
-        return "searching the web"
-    if item_type == "reasoning":
-        return "working it out"
-    return None
+    return CODEX_ITEM_STAGES.get(item.get("type"))
 
 
 def _bare_command(command, limit=70):
@@ -3368,41 +3362,34 @@ def _bare_command(command, limit=70):
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-def codex_progress_fact(line):
-    """Turn one codex `--json` event into a fact a reader of the chat can use.
+def codex_progress_fact(event):
+    """Turn one codex notification into a fact a reader of the chat can use.
 
     The text-chat counterpart of `codex_event_stage`: a chat is read rather
-    than heard, so it gets what the event itself states - which command ran
+    than heard, so it gets what the item itself states - which command ran
     and whether it worked, which files are being written - instead of the
     phrase a caller on the line would want. Returns None for everything else:
-    the thread and turn events, reasoning, the engine's own notices, and the
-    worker's `telegram send`, whose words arrive through the outbox.
+    the thread and turn notifications, reasoning, the engine's own notices,
+    and the worker's `telegram send`, whose words arrive through the outbox.
     """
-    try:
-        event = json.loads(line)
-    except (ValueError, TypeError):
+    item = _codex_item(event, "item/started", "item/completed")
+    if item is None:
         return None
-    if not isinstance(event, dict):
-        return None
-    kind = event.get("type")
-    if kind not in ("item.started", "item.completed"):
-        return None
-    item = event.get("item") if isinstance(event.get("item"), dict) else {}
-    item_type = item.get("type") or item.get("item_type")
-    if item_type == "command_execution":
+    started = event.get("method") == "item/started"
+    if item.get("type") == "commandExecution":
         command = item.get("command")
         if _shell_stage(command) is None:
             return None
         shown = _bare_command(command)
         if not shown:
             return None
-        if kind == "item.started":
+        if started:
             return f"running `{shown}`"
-        code = item.get("exit_code")
+        code = item.get("exitCode")
         outcome = ("ok" if code == 0 else
                    "failed" if code is None else f"failed (exit {code})")
         return f"ran `{shown}` - {outcome}"
-    if item_type == "file_change" and kind == "item.started":
+    if item.get("type") == "fileChange" and started:
         names = [str(change.get("path") or "").rsplit("/", 1)[-1]
                  for change in item.get("changes") or []
                  if isinstance(change, dict)]
@@ -4448,9 +4435,19 @@ WORKER_ENV_DROP_WHEN_ROUTED = (
 )
 
 
-def worker_env(state=None):
+def worker_env_parts(state=None):
+    """The environment a worker turn starts from, and what telegram sets on it.
+
+    The first is this process's environment scrubbed of what no child should
+    hold, less the pins a routed turn must not carry and the scope variables
+    this turn does not set. The second is every variable telegram sets: the
+    shim first on PATH, the scope the register is asked with, the progress
+    outbox, the session copy and the authority context. The harness runner
+    applies the second last, after anything a profile removes, so no profile
+    can strip telegram's plumbing from a turn."""
     st = state or {}
     env = scrub_worker_env(os.environ)
+    extra = {}
     project_dir = st.get("project_dir")
     if project_dir is not None and Path(project_dir) != PROJECT_ROOT:
         # The launcher pins this daemon's own envelope, and a capability invoked
@@ -4459,55 +4456,62 @@ def worker_env(state=None):
         # resolves its project from CLAUDE_PROJECT_DIR before it falls back to cwd.
         for name in WORKER_ENV_DROP_WHEN_ROUTED:
             env.pop(name, None)
-        env["CLAUDE_PROJECT_DIR"] = str(project_dir)
+        extra["CLAUDE_PROJECT_DIR"] = str(project_dir)
         # Which project this service is does not change with the route. The job
         # register is the daemon's own, so a worker asked about the queue has to
         # be able to name the project that owns it, and it is told from what the
         # daemon resolved rather than from what its launcher happened to supply.
-        env["TELEGRAM_SERVICE_PROJECT_ROOT"] = str(PROJECT_ROOT)
-        env["TELEGRAM_SERVICE_PROJECT_ENVELOPE"] = str(PROJECT_CAPABILITIES_DIR)
+        extra["TELEGRAM_SERVICE_PROJECT_ROOT"] = str(PROJECT_ROOT)
+        extra["TELEGRAM_SERVICE_PROJECT_ENVELOPE"] = str(PROJECT_CAPABILITIES_DIR)
     real_telegram = env.get("TELEGRAM_REAL_TELEGRAM") or shutil.which("telegram")
     if real_telegram:
-        env["TELEGRAM_REAL_TELEGRAM"] = real_telegram
-    env["PATH"] = f"{WORKER_BIN}{os.pathsep}{env.get('PATH', '')}"
+        extra["TELEGRAM_REAL_TELEGRAM"] = real_telegram
+    extra["PATH"] = f"{WORKER_BIN}{os.pathsep}{env.get('PATH', '')}"
     # Stamped on every child, whether or not this launcher had a scope to hand
     # down. The job register answers unscoped to a maintainer at a terminal and
     # that is the intended answer; it must never be the answer to a process the
     # daemon started, and only the daemon can tell the two apart. Set outside
     # every conditional below so a launcher that forgets the scope is refused
     # rather than promoted.
-    env["TELEGRAM_DAEMON_CHILD"] = "1"
+    extra["TELEGRAM_DAEMON_CHILD"] = "1"
     if st.get("progress_outbox"):
-        env["TELEGRAM_PROGRESS_OUTBOX"] = st["progress_outbox"]
+        extra["TELEGRAM_PROGRESS_OUTBOX"] = st["progress_outbox"]
     if st.get("worker_session"):
-        env["TELEGRAM_WORKER_SESSION"] = st["worker_session"]
+        extra["TELEGRAM_WORKER_SESSION"] = st["worker_session"]
     if st.get("authority_context"):
-        env["CAPABILITIES_AUTH_CONTEXT"] = st["authority_context"]
+        extra["CAPABILITIES_AUTH_CONTEXT"] = st["authority_context"]
     if st.get("chat_type"):
-        env["TELEGRAM_PROGRESS_CHAT_TYPE"] = st["chat_type"]
+        extra["TELEGRAM_PROGRESS_CHAT_TYPE"] = st["chat_type"]
     if st.get("chat_id") is not None:
-        env["TELEGRAM_AUTHORIZED_CHAT_ID"] = str(st["chat_id"])
+        extra["TELEGRAM_AUTHORIZED_CHAT_ID"] = str(st["chat_id"])
     if st.get("topic_id") is not None:
-        env["TELEGRAM_AUTHORIZED_TOPIC_ID"] = str(st["topic_id"])
+        extra["TELEGRAM_AUTHORIZED_TOPIC_ID"] = str(st["topic_id"])
     else:
         env.pop("TELEGRAM_AUTHORIZED_TOPIC_ID", None)
     if st.get("connection") is not None:
-        env["TELEGRAM_AUTHORIZED_CONNECTION"] = str(st["connection"])
+        extra["TELEGRAM_AUTHORIZED_CONNECTION"] = str(st["connection"])
     req = st.get("current_request") or {}
     if req.get("sender_id") is not None:
-        env["TELEGRAM_AUTHORIZED_REQUESTER_ID"] = str(req["sender_id"])
+        extra["TELEGRAM_AUTHORIZED_REQUESTER_ID"] = str(req["sender_id"])
     if req.get("message_id") is not None:
-        env["TELEGRAM_AUTHORIZED_ORIGIN_MESSAGE_ID"] = str(req["message_id"])
+        extra["TELEGRAM_AUTHORIZED_ORIGIN_MESSAGE_ID"] = str(req["message_id"])
     settings = st.get("settings") or {}
     if settings.get("worker"):
-        env["TELEGRAM_AUTHORIZED_JOB_ENGINE"] = str(settings["worker"])
+        extra["TELEGRAM_AUTHORIZED_JOB_ENGINE"] = str(settings["worker"])
     if settings.get("model"):
-        env["TELEGRAM_AUTHORIZED_JOB_MODEL"] = str(settings["model"])
+        extra["TELEGRAM_AUTHORIZED_JOB_MODEL"] = str(settings["model"])
     else:
         env.pop("TELEGRAM_AUTHORIZED_JOB_MODEL", None)
     if req.get("reply_to"):
-        env["TELEGRAM_PROGRESS_REPLY_TO"] = str(req["reply_to"])
-    return env
+        extra["TELEGRAM_PROGRESS_REPLY_TO"] = str(req["reply_to"])
+    return env, extra
+
+
+def worker_env(state=None):
+    """The whole environment a child of this daemon runs with: the base and
+    telegram's plumbing on top, as `worker_env_parts` splits them."""
+    env, extra = worker_env_parts(state)
+    return {**env, **extra}
 
 
 def voice_capability_state(caller_id, authority_context):
@@ -4735,38 +4739,6 @@ async def run_capability_process(binary, args, env, timeout):
     return proc.returncode, out, err
 
 
-def _stream_worker_proc(proc, on_line):
-    """Drain both pipes concurrently, handing stdout lines over as they arrive.
-
-    Reading one pipe to completion before the other deadlocks as soon as the
-    unread one fills, so each gets its own thread."""
-    collected = {"out": [], "err": []}
-
-    def pump(stream, key, callback):
-        try:
-            for line in stream:
-                collected[key].append(line)
-                if callback is not None:
-                    try:
-                        callback(line)
-                    except Exception:
-                        pass
-        finally:
-            with contextlib.suppress(Exception):
-                stream.close()
-
-    threads = [
-        threading.Thread(target=pump, args=(proc.stdout, "out", on_line), daemon=True),
-        threading.Thread(target=pump, args=(proc.stderr, "err", None), daemon=True),
-    ]
-    for t in threads:
-        t.start()
-    proc.wait()
-    for t in threads:
-        t.join(timeout=5)
-    return "".join(collected["out"]), "".join(collected["err"])
-
-
 # Every worker run a channel owns — a dialogue turn, a voice task, whatever is
 # written next — is registered under the channel key, this separator, and
 # whatever identifies the run. The pair below is the only place that spelling
@@ -4794,38 +4766,26 @@ def worker_run_in_channel(run_key, channel_key):
             or run_key.startswith(f"{channel_key}{WORKER_RUN_SEPARATOR}"))
 
 
-def run_worker_proc(chat, cmd, procs, env=None, cancel_event=None, on_line=None,
-                    on_start=None, cwd=None):
-    """Run a worker subprocess in its own process group (start_new_session) and register it in
-    the caller's `procs` map until the async job finalizes, so /stop can SIGKILL the whole group —
-    claude/codex spawn children, so killing the group, not just the lone parent, is what stops
-    the run. Returns (returncode, stdout, stderr); a killed run comes back with a negative
-    returncode, which the caller raises on like any nonzero exit. With `on_line`, stdout is
-    handed over line by line while the run is still going, for a caller that cannot wait for
-    the end of it. `cwd` is the routed project for this request; without one the run
-    happens in the daemon's own project."""
-    if cancel_event is not None and cancel_event.is_set():
-        raise RuntimeError("worker cancelled before process start")
-    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, start_new_session=True,
-                            cwd=str(cwd or PROJECT_ROOT), env=env)
-    procs[chat] = proc
-    if on_start is not None:
-        try:
-            on_start(proc.pid, proc.pid)
-        except Exception:
-            _kill_process_group(proc)
-            proc.wait()
-            raise
-    # Cancellation can race with Popen. Register first, then honor a cancellation
-    # that arrived while the process was being created so no late process escapes.
-    if cancel_event is not None and cancel_event.is_set():
-        _kill_process_group(proc)
-    if on_line is not None:
-        out, err = _stream_worker_proc(proc, on_line)
-    else:
-        out, err = proc.communicate()
-    return proc.returncode, out, err
+class WorkerRun:
+    """One live harness run, as the daemon's process table holds it.
+
+    The runner owns the process tree: it starts the harness as the leader of
+    its own session and group, and on its cancel it finds the whole tree by
+    parentage, group and session and ends it. What the daemon holds is the
+    cancel, and the pid once the harness runs, so `/stop`, a timeout, the job
+    register and a closing session all end a run the same way: by setting the
+    cancel the run was started with."""
+
+    def __init__(self, cancel=None):
+        self.cancel = cancel if cancel is not None else threading.Event()
+        self.pid = None
+        self.ended = False
+
+    def stop(self):
+        """End the run; True when it was still live."""
+        live = not self.ended
+        self.cancel.set()
+        return live
 
 
 def worker_stub(chat, tail, state=None, procs=None):
@@ -4916,67 +4876,117 @@ async def _cancel_recording_task(task):
         await task
 
 
-def worker_claude(chat, tail, state=None, procs=None):
-    """One headless claude turn. The command is `claude_command`'s and the
-    answer is read the way `workers` reads it; this function owns the run, the
-    process registration and the reply's metadata."""
-    settings = (state or {}).get("settings") or {}
-    model = settings.get("model")
-    cmd = claude_command(build_prompt(tail, state), settings,
-                         resume_session=(state or {}).get("resume_session"))
-    proc_key = ((state or {}).get("proc_key") or chat)
-    rc, out, err = run_worker_proc(
-        proc_key, cmd, procs, env=worker_env(state),
-        cancel_event=(state or {}).get("cancel_event"),
-        on_start=(state or {}).get("on_worker_start"),
-        cwd=(state or {}).get("project_dir"))
-    if rc != 0:
-        raise worker_failure("claude", model, claude_failure_reason(out, err, rc))
-    obj = _first_json_document(out, ("result", "is_error", "subtype"), log=log)
-    reply = (obj.get("result") or "").strip()
-    if obj.get("is_error") or (not reply and not _claude_turn_completed(obj)):
-        log("claude worker produced no answer; "
-            + _usage_summary(obj.get("usage")))
-        raise RuntimeError(f"claude worker error: {str(obj.get('subtype') or obj.get('result'))[:160]}")
-    u = obj.get("usage") or {}
-    meta = {"harness": "claude",
-            "model": next(iter(obj.get("modelUsage") or {}), None) or model,
-            "is_error": False,
-            "tokens": {"input": u.get("input_tokens"), "output": u.get("output_tokens"),
-                       "cache_read": u.get("cache_read_input_tokens"),
-                       "cache_write": u.get("cache_creation_input_tokens")},
-            "cost_usd": obj.get("total_cost_usd"),
-            "duration_ms": obj.get("duration_ms"),
-            "session_id": obj.get("session_id")}
+def harness_run(prompt, profile, cwd, **kwargs):
+    """One turn through callva-harness-runner; the seam the suite replaces."""
+    return profiles.runner().run(prompt, profile, cwd, **kwargs)
+
+
+def turn_profiles():
+    """The profiles a turn may resolve against: every active version this
+    project reaches in the store, and the project id they were read for.
+
+    Read on the event loop, which owns the register's connection, once per
+    turn, so a profile saved a moment ago is the one the next turn runs on. A
+    store that cannot be read leaves the bundled profiles, which is what a
+    turn reaches without one."""
+    try:
+        register = job_register()
+        return (profiles.stored(_JOB_STORE.conn, register.project_id, STORE_SETTING.schema),
+                register.project_id)
+    except Exception as exc:
+        log(f"profiles: store not read, a turn resolves among the bundled profiles: "
+            f"{_short_error(exc)}")
+        return [], None
+
+
+def resolve_turn_profile(worker, settings):
+    """What a turn on `worker` with these settings runs on: its implicit
+    profile, or WorkerProfileRefused naming the profile and the problem."""
+    active, project = turn_profiles()
+    try:
+        return profiles.implicit(worker, (settings or {}).get("worker_settings") or {},
+                                 active, project)
+    except profiles.Refusal as refused:
+        return WorkerProfileRefused(refused.message)
+
+
+def harness_meta(result):
+    """The reply's metadata, from what the runner reports of the turn."""
+    tokens = result.tokens
+    return {"harness": result.harness, "model": result.model, "is_error": not result.ok,
+            "tokens": {"input": tokens.input, "output": tokens.output,
+                       "cache_read": tokens.cache_read, "cache_write": tokens.cache_creation},
+            "cost_usd": result.cost_usd, "duration_ms": result.duration_ms,
+            "session_id": result.session_id}
+
+
+def worker_harness(chat, tail, state=None, procs=None):
+    """One headless turn on claude or codex, through the harness runner.
+
+    The profile was resolved on the loop before dispatch (`worker_turn`); this
+    builds the call - prompt, working directory, session, environment, the
+    cancel and the callbacks - registers the run so `/stop` reaches it, and
+    reads the result into the reply the daemon delivers. A completed turn that
+    says nothing is silence on both harnesses; an incomplete one is an error,
+    named by the kind of ending the runner gave it."""
+    st = state or {}
+    found = st.get("profile")
+    if isinstance(found, BaseException):
+        raise found
+    lib = profiles.runner()
+    profile = lib.Profile.from_dict(found["knobs"])
+    harness, model = profile.harness, profile.model
+    run = WorkerRun(st.get("cancel_event"))
+    proc_key = st.get("proc_key") or chat
+    if procs is not None:
+        procs[proc_key] = run
+    if run.cancel.is_set():
+        raise RuntimeError("worker cancelled before process start")
+    environ, extra_env = worker_env_parts(st)
+    session = (lib.Session.resume(str(st["resume_session"])) if st.get("resume_session")
+               else lib.Session.fresh())
+    refused = {}
+    on_worker_start = st.get("on_worker_start")
+
+    def on_start(started):
+        run.pid = started.pid
+        if on_worker_start is None:
+            return
+        try:
+            on_worker_start(started)
+        except Exception as exc:
+            # The runner never lets a callback end its turn, so a start the
+            # daemon refuses is ended through the cancel the turn holds.
+            refused["error"] = exc
+            run.cancel.set()
+
+    try:
+        result = harness_run(
+            build_prompt(tail, st), profile, str(st.get("project_dir") or PROJECT_ROOT),
+            session=session, environ=environ, extra_env=extra_env,
+            on_event=st.get("on_worker_event"), cancel=run.cancel, on_start=on_start)
+    finally:
+        run.ended = True
+    if refused:
+        raise refused["error"]
+    for warning in result.warnings:
+        log(f"{proc_key}: {warning}")
+    meta = harness_meta(result)
+    if not result.ok:
+        kind = str(result.failure.kind)
+        if kind == "timeout":
+            raise WorkerFailed(f"{harness} worker timed out after "
+                               f"{profile.timeout_seconds:g}s", kind, result.failure.message)
+        log(f"{harness} worker produced no answer ({kind}); "
+            + _usage_summary(meta["tokens"]))
+        raise worker_failure(harness, model, kind, result.failure.message)
+    reply = (result.answer or "").strip()
     if not reply:
         # A completed turn that says nothing has already said it: the worker
         # sent its own result and returned nothing rather than have the daemon
-        # deliver it a second time. Codex has meant this since it learned to
-        # report a completed turn; claude means it here, from the same source.
+        # deliver it a second time.
         return {"reply": "", "silent": True, "meta": meta}
     return {"reply": reply, "meta": meta}
-
-
-def _codex_meta(stdout, model):
-    """Pull usage + thread id out of codex's --json JSONL event stream (codex gives no USD
-    cost under ChatGPT auth → cost_usd stays null)."""
-    usage, thread_id = {}, None
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            o = json.loads(line)
-        except ValueError:
-            continue
-        if o.get("type") == "turn.completed":
-            usage = o.get("usage") or {}
-        elif o.get("type") == "thread.started":
-            thread_id = o.get("thread_id")
-    return {"harness": "codex", "model": model, "is_error": False,
-            "tokens": {"input": usage.get("input_tokens"), "output": usage.get("output_tokens"),
-                       "cache_read": usage.get("cached_input_tokens"), "cache_write": None},
-            "cost_usd": None, "duration_ms": None, "session_id": thread_id}
 
 
 def discover_codex_images(thread_id):
@@ -5021,45 +5031,9 @@ def discover_codex_images(thread_id):
     return images
 
 
-def worker_codex(chat, tail, state=None, procs=None):
-    """One headless codex turn. The command is `codex_command`'s and the
-    answer is read the way `workers` reads it; this function owns the run, the
-    process registration, the final message file and the reply's metadata."""
-    fd, out = tempfile.mkstemp(prefix="tg-codex-", suffix=".txt")
-    os.close(fd)
-    try:
-        settings = (state or {}).get("settings") or {}
-        model = settings.get("model")
-        cmd = codex_command(build_prompt(tail, state), out, settings,
-                            resume_session=(state or {}).get("resume_session"))
-        proc_key = ((state or {}).get("proc_key") or chat)
-        rc, stdout_txt, err = run_worker_proc(
-            proc_key, cmd, procs, env=worker_env(state),
-            cwd=(state or {}).get("project_dir"),
-            cancel_event=(state or {}).get("cancel_event"),
-            on_line=(state or {}).get("on_worker_line"),
-            on_start=(state or {}).get("on_worker_start"))
-        if rc != 0:
-            raise worker_failure(
-                "codex", model, codex_failure_reason(stdout_txt, err, rc))
-        reply = Path(out).read_text().strip()
-        if not reply:
-            if _codex_turn_completed(stdout_txt):
-                return {
-                    "reply": "",
-                    "silent": True,
-                    "meta": _codex_meta(stdout_txt, model),
-                }
-            raise RuntimeError("codex worker produced no final message")
-        return {"reply": reply, "meta": _codex_meta(stdout_txt, model)}
-    finally:
-        try:
-            os.unlink(out)
-        except OSError:
-            pass
-
-
-WORKERS = {"stub": worker_stub, "claude": worker_claude, "codex": worker_codex}
+# The stub answers in process; every other worker is a harness turn on its
+# profile.
+WORKERS = {"stub": worker_stub, "claude": worker_harness, "codex": worker_harness}
 
 
 # The line a worker writes to declare where its message to the chat begins.
@@ -5111,6 +5085,10 @@ def worker_turn(loop, worker, key, tail, state, procs):
     The cut can never empty a reply, so a consumer that reads emptiness as
     silence reads exactly what it read before."""
     run_worker = WORKERS[worker]
+    if run_worker is worker_harness and "profile" not in state:
+        # Resolved here, on the loop, where the store's connection lives: a
+        # profile saved a moment ago is the one this turn runs on.
+        state["profile"] = resolve_turn_profile(worker, state.get("settings"))
 
     def turn():
         result = run_worker(key, tail, state, procs)
@@ -5888,19 +5866,16 @@ async def run_session(client):
     closing = False
 
     def kill_worker_proc(key, reason):
-        proc = procs.get(key)
-        if not proc:
+        """End the run registered under `key` through its cancel; True when a
+        live run was ended. The runner ends the harness's whole tree."""
+        run = procs.get(key)
+        if not run:
             return False
-        try:
-            killed = _kill_process_group(proc)
-            if not killed:
-                log(f"{key}: worker process group {proc.pid} already gone ({reason})")
-                return False
-            log(f"{key}: killed worker pgid {proc.pid} ({reason})")
-            return True
-        except PermissionError as e:
-            log(f"{key}: worker kill failed ({reason}): {e}")
+        if not run.stop():
+            log(f"{key}: worker run {run.pid or '(not started)'} already ended ({reason})")
             return False
+        log(f"{key}: cancelled worker run pid={run.pid or '(not started)'} ({reason})")
+        return True
 
     def kill_all_workers(reason):
         for key in list(procs):
@@ -5911,9 +5886,10 @@ async def run_session(client):
         # Every run comes through here however it finished, which is what keeps
         # the record from outliving the run it describes.
         stopping.discard(key)
-        proc = procs.pop(key, None)
-        if proc is not None and _kill_process_group(proc):
-            log(f"{key}: killed lingering worker pgid {proc.pid} during job cleanup")
+        run = procs.pop(key, None)
+        if run is not None and run.stop():
+            log(f"{key}: cancelled lingering worker run pid={run.pid or '(not started)'} "
+                "during job cleanup")
 
     def proc_key_for(chat_key, job):
         return worker_proc_key(chat_key, job.get("message_id"))
@@ -6313,7 +6289,10 @@ async def run_session(client):
         return tail, participants
 
     async def terminate_worker(proc_key, future, cancel_event, reason):
-        """Close the cancellation/Popen race, kill the whole group, and reap the worker future."""
+        """Set the run's cancel, which the runner answers by ending the harness's
+        whole tree, and reap the worker future. The cancel is set before the
+        run is looked up, so a run that has not registered yet is refused at
+        its start."""
         cancel_event.set()
         kill_worker_proc(proc_key, reason)
         if future is None:
@@ -7102,21 +7081,27 @@ async def run_session(client):
                 return register.attach_process(
                     job_id, attempt_token, JOB_OWNER_ID, pid=pid, pgid=pgid)
 
-            def remember_worker_process(pid, pgid):
+            def remember_worker_process(started):
+                """Record the harness the moment it runs: its pid, which leads
+                its own session and process group, so a daemon that restarts
+                after a crash can end the orphaned tree; and, for codex, the
+                thread it opened. A start the register refuses ends the run."""
                 accepted = asyncio.run_coroutine_threadsafe(
-                    persist_process(pid, pgid), loop).result(timeout=5)
+                    persist_process(started.pid, started.pid), loop).result(timeout=5)
                 if not accepted:
                     raise RuntimeError("job attempt lost ownership before process start")
+                if started.harness == "codex" and started.session_id:
+                    remember_worker_session(started.session_id)
 
-            def remember_worker_session(line):
+            def remember_worker_session(thread_id):
                 """Persist a Codex rollout as soon as it opens.
 
-                The output pump runs in the executor thread while the store
-                connection belongs to this event loop.  Schedule the write back
-                onto the loop so an amendment, stop, or daemon restart seconds
-                later already has the checkpoint it must continue.
+                The run reports its start from the executor thread while the
+                store connection belongs to this event loop.  Schedule the
+                write back onto the loop so an amendment, stop, or daemon
+                restart seconds later already has the checkpoint it must
+                continue.
                 """
-                thread_id = codex_thread_started(line)
                 if not thread_id or thread_id == opened_session["id"]:
                     return
                 opened_session["id"] = thread_id
@@ -7136,10 +7121,9 @@ async def run_session(client):
 
                 loop.call_soon_threadsafe(persist)
 
-            def on_worker_line(line):
-                remember_worker_session(line)
+            def on_worker_event(event):
                 if progress_window is not None:
-                    fact = codex_progress_fact(line)
+                    fact = codex_progress_fact(event)
                     if fact is not None:
                         loop.call_soon_threadsafe(
                             note_stream_fact, progress_window, fact)
@@ -7164,7 +7148,7 @@ async def run_session(client):
                      "authority_context": authority_context,
                      "progress_outbox": str(progress_outbox),
                      "worker_session": worker_session,
-                     "on_worker_line": on_worker_line,
+                     "on_worker_event": on_worker_event,
                      "on_worker_start": remember_worker_process,
                      "cancel_event": cancel_event,
                      "resume_session": resume_session,
@@ -7261,7 +7245,7 @@ async def run_session(client):
                 if current is not None and current["state"] == jobs.RUNNING:
                     register.finish_amendment(job_id, attempt_token, JOB_OWNER_ID)
                 log(f"{key}: job {job_id} stopped for an amendment")
-            elif is_quota_exhausted(reason):
+            elif getattr(exc, "kind", None) == "quota":
                 resume_at = enter_quota_pause(reason)
                 register.stop(job_id, jobs.QUOTA, error=reason,
                               attempt_token=attempt_token, owner_id=JOB_OWNER_ID,
@@ -8157,9 +8141,16 @@ async def run_session(client):
                 cancel_event = threading.Event()
                 progress_task = None
 
-                def _offer_stage(line):
-                    """Called from the worker's output pump, one JSONL event at a time."""
-                    thread_id = codex_thread_started(line)
+                def _on_start(started):
+                    """Called once the harness runs, with its pid and the
+                    session it runs in."""
+                    if row is not None:
+                        event_loop.call_soon_threadsafe(
+                            lambda: record_voice_attempt(
+                                row, pid=int(started.pid), pgid=int(started.pid)))
+                    if on_progress is None or started.harness != "codex":
+                        return
+                    thread_id = started.session_id
                     if thread_id and not seen["thread_id"]:
                         seen["thread_id"] = thread_id
                         if row is not None:
@@ -8171,9 +8162,13 @@ async def run_session(client):
                             # moment where a caller ringing back finds nothing.
                             lane.open(thread_id)
                             save_lane(caller_id, lane)
-                    if codex_context_compacted(line):
+                    on_progress("starting", "stream")
+
+                def _offer_stage(event):
+                    """Called from the run, one codex notification at a time."""
+                    if codex_context_compacted(event):
                         seen["compacted"] = True
-                    stage = codex_event_stage(line)
+                    stage = codex_event_stage(event)
                     if stage:
                         on_progress(stage, "stream")
 
@@ -8206,18 +8201,14 @@ async def run_session(client):
                              "voice_backend": read_voice_document(
                                  "backend", provider),
                              "progress_outbox": str(progress_outbox),
-                             "on_worker_line": (_offer_stage if on_progress is not None
-                                                else None),
+                             "on_worker_event": (_offer_stage if on_progress is not None
+                                                 else None),
+                             "on_worker_start": _on_start,
                              "worker_session": worker_session,
                              "resume_session": resume_session,
                              "resume_reanchor": reanchor,
                              "cancel_event": cancel_event,
                              "proc_key": proc_key}
-                    if row is not None:
-                        state["on_worker_start"] = (
-                            lambda pid, pgid: event_loop.call_soon_threadsafe(
-                                lambda: record_voice_attempt(
-                                    row, pid=int(pid), pgid=int(pgid or pid))))
                     log(f"voice: task {task_id} dispatched worker={s['worker']} "
                         f"model={s['model'] or 'default'} "
                         f"session={resume_session or 'new'} "
@@ -8259,10 +8250,10 @@ async def run_session(client):
                             Path(authority_context).unlink()
                     release_worker_proc(proc_key)
 
-            # Resuming is only safe while the event stream is being watched: the
-            # live `thread.started` is what separates a session that never opened
-            # from a turn that half-ran, and without it every failure would look
-            # retryable. No watcher, no resume — the coupling is real, so it is
+            # Resuming is only safe while the run is being watched: the thread
+            # the run reports opening as it starts is what separates a session
+            # that never opened from a turn that half-ran, and without it every
+            # failure would look retryable. No watcher, no resume — the coupling is real, so it is
             # spelled out here rather than left for a later caller to trip over.
             watching = lane is not None and on_progress is not None
             if watching:

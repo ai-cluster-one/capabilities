@@ -1555,68 +1555,34 @@ class ServiceDoctorExitTests(unittest.TestCase):
 
 GUIDE_PATH = TELEGRAM_DIR / "guides" / "assistant-service.md"
 
-# What the stubbed binaries answer, shaped on what the real ones printed on
-# 2026-09-18: claude 2.1.267 answers one result document and, on a model it
-# will not run, exits 1 with `is_error` and a 404 sentence in `result`; codex
-# 0.152.1 answers a JSONL stream and, on such a model, exits 1 after a local
-# metadata note, `turn.started`, and the provider's 400 on `error` and
-# `turn.failed`. The stubs record every invocation so a test can count them.
-FAKE_CLAUDE = """#!/usr/bin/env python3
-import json, os, sys
-args = sys.argv[1:]
-model = args[args.index("--model") + 1] if "--model" in args else None
-with open(os.environ["FAKE_WORKER_LOG"], "a") as log:
-    log.write(json.dumps({"binary": "claude", "model": model, "cwd": os.getcwd()}) + "\\n")
-if model in os.environ.get("FAKE_REFUSED_MODELS", "").split(","):
-    print(json.dumps({"type": "result", "subtype": "success", "is_error": True,
-                      "result": f"There's an issue with the selected model ({model}). "
-                                "It may not exist or you may not have access to it.",
-                      "api_error_status": 404}))
-    sys.stderr.write("[claude-code:unrecognized_model] {}\\n")
-    sys.exit(1)
-if os.environ.get("FAKE_HANG"):
-    import time
-    time.sleep(30)
-print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
-                  "result": "OK", "usage": {}}))
-"""
+# What the stand-in harness answers when it will not run a model, in the words
+# each harness used: claude's sentence, and the readable part of the provider's
+# refusal codex forwards, which the runner keeps.
+REFUSALS = {
+    "claude": "There's an issue with the selected model ({model}). It may not exist "
+              "or you may not have access to it.",
+    "codex": "The '{model}' model is not supported when using Codex with a ChatGPT "
+             "account.",
+}
 
-FAKE_CODEX = """#!/usr/bin/env python3
-import json, os, sys
-args = sys.argv[1:]
-if args[:2] == ["exec", "--help"]:
-    print("usage: codex exec")
-    sys.exit(0)
-model = args[args.index("-m") + 1] if "-m" in args else None
-out = args[args.index("-o") + 1] if "-o" in args else None
-with open(os.environ["FAKE_WORKER_LOG"], "a") as log:
-    log.write(json.dumps({"binary": "codex", "model": model, "cwd": os.getcwd()}) + "\\n")
-sys.stderr.write("Reading additional input from stdin...\\n")
-if model in os.environ.get("FAKE_REFUSED_MODELS", "").split(","):
-    refusal = "unexpected status 400 Bad Request: " + json.dumps({"error": {
-        "type": "invalid_request_error",
-        "message": f"The '{model}' model is not supported when using Codex "
-                   "with a ChatGPT account."}})
-    print(json.dumps({"type": "item.completed", "item": {
-        "id": "item_0", "type": "error",
-        "message": f"Model metadata for `{model}` not found. Defaulting to fallback metadata"}}))
-    print(json.dumps({"type": "turn.started"}))
-    print(json.dumps({"type": "error", "message": refusal}))
-    print(json.dumps({"type": "turn.failed", "error": {"message": refusal}}))
-    sys.exit(1)
-print(json.dumps({"type": "thread.started", "thread_id": "thread-1"}))
-print(json.dumps({"type": "turn.completed", "usage": {}}))
-if out:
-    open(out, "w").write("OK")
-"""
+
+def _profiles_module():
+    spec = importlib.util.spec_from_file_location(
+        f"telegram_profiles_doctor_{time.time_ns()}",
+        TELEGRAM_DIR / "service" / "profiles.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
-    """`service doctor` asks each configured worker binary, once per distinct
-    (worker, model) pair, whether it runs that model. The binaries on PATH here
-    are stubs written by the test: the real ones would spend money and need a
-    login, and the doctor's verdict has to come from the binary's own answer
-    rather than from anything this repository holds about models."""
+    """`service doctor` asks each configured worker's harness, once per
+    distinct (worker, model) pair, whether it runs that model, with one live
+    turn on the profile the pair runs on. The turns run in the bundle's
+    `service/profiles.py`, here in-process with the runner's `run` stood in
+    for: the real harnesses would spend money and need a login, and the
+    doctor's verdict has to come from the harness's own answer rather than
+    from anything this repository holds about models."""
 
     ALL_POSITIONS = (
         "settings.defaults.workers.{worker}.model",
@@ -1641,26 +1607,49 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
                                                      "workers": block(user)}}},
         }
 
+    @staticmethod
+    def _harness(calls, *, refused=(), binaries=("claude", "codex"), hang=False):
+        """The runner's `run`, answering as each harness would."""
+        from callva import harness_runner as lib
+
+        def run(prompt, profile, cwd, **_kwargs):
+            harness, model = profile.harness, profile.model
+            calls.append({"binary": harness, "model": model, "cwd": str(cwd)})
+
+            def failed(kind, message):
+                return lib.Result(ok=False, harness=harness,
+                                  failure=lib.Failure(lib.FailureKind(kind), message))
+            if harness not in binaries:
+                return failed("binary_missing",
+                              f"no {harness} executable on PATH or in the usual places")
+            if hang:
+                return failed("timeout", f"turn timed out after {profile.timeout_seconds:g}s")
+            if model in refused:
+                return failed("model_refused", REFUSALS[harness].format(model=model))
+            return lib.Result(ok=True, harness=harness, answer="OK", model=model)
+        return run
+
     def _run_doctor(self, cli, tmp, settings, *, refused=(), binaries=("claude", "codex"),
                     hang=False):
-        """Drive the real dispatch with the stub binaries on PATH. The verdict
-        is computed by the real `cmd_service_doctor`, the real schema walk and
-        the real `workers.probe_worker`; only the initialization, connection
-        and daemon-status plumbing is stood in for. Returns (exit_code,
-        payload, invocations)."""
-        bindir = Path(tmp) / "bin"
-        bindir.mkdir(exist_ok=True)
-        for name, body in (("claude", FAKE_CLAUDE), ("codex", FAKE_CODEX)):
-            if name in binaries:
-                (bindir / name).write_text(body)
-                (bindir / name).chmod(0o755)
-        log_path = Path(tmp) / "invocations.jsonl"
-        log_path.write_text("")
-        env = {"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}",
-               "FAKE_WORKER_LOG": str(log_path),
-               "FAKE_REFUSED_MODELS": ",".join(refused)}
-        if hang:
-            env["FAKE_HANG"] = "1"
+        """Drive the real dispatch. The verdict is computed by the real
+        `cmd_service_doctor`, the real schema walk and the real `probe` in
+        `service/profiles.py`; the harness, the initialization, connection and
+        daemon-status plumbing are stood in for. Returns (exit_code, payload,
+        invocations)."""
+        from callva import harness_runner as lib
+        calls = []
+        profiles = _profiles_module()
+        harness = self._harness(calls, refused=refused, binaries=binaries, hang=hang)
+
+        def profiles_call(argv, text=""):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(sys, "stdin", io.StringIO(text)), \
+                    mock.patch.object(lib, "run", harness), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = profiles.main(argv)
+            if code == 0:
+                return 0, json.loads(out.getvalue())
+            return code, json.loads(err.getvalue().splitlines()[-1])["error"]
 
         def fake_status(connection_flag, session_flag):
             return {"initialized": True, "running": False, "healthy": False,
@@ -1670,8 +1659,7 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
         cfg = {"id": "probe", "allow_write": True,
                "session": str(Path(tmp) / "probe")}
         captured = io.StringIO()
-        with mock.patch.dict(os.environ, env), \
-                mock.patch.object(cli, "_gate", lambda: None), \
+        with mock.patch.object(cli, "_gate", lambda: None), \
                 mock.patch.object(cli, "_contract", lambda argv: None), \
                 mock.patch.object(cli, "_service_project_root", lambda: Path(tmp)), \
                 mock.patch.object(cli, "_service_dir", lambda root: Path(tmp) / "service"), \
@@ -1684,6 +1672,8 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
                 mock.patch.object(cli, "cmd_service_status", fake_status), \
                 mock.patch.object(cli, "_service_store_check",
                                   lambda root: {"ok": True}), \
+                mock.patch.object(cli, "_project_id", lambda write=False: None), \
+                mock.patch.object(cli, "_profiles_call", profiles_call), \
                 mock.patch.object(sys, "argv", ["telegram", "service", "doctor"]), \
                 contextlib.redirect_stdout(captured):
             try:
@@ -1691,8 +1681,7 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
                 code = 0
             except SystemExit as stopped:
                 code = stopped.code
-        invocations = [json.loads(line) for line in log_path.read_text().splitlines()]
-        return code, json.loads(captured.getvalue()), invocations
+        return code, json.loads(captured.getvalue()), calls
 
     @staticmethod
     def _row(payload, worker, model):
@@ -1712,13 +1701,15 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
         for row in (default, pinned):
             self.assertTrue(row["ok"])
             self.assertEqual(row["verdict"], "accepted")
-        self.assertEqual(default["binary"], "claude")
-        self.assertEqual(pinned["binary"], "codex")
-        # The default pair is asked with no model flag at all — the binary's own
-        # default, not one this repository picked for it.
+            self.assertEqual(row["layer"], "bundled")
+            self.assertIsNone(row["version"])
+        self.assertEqual((default["binary"], default["profile"]), ("claude", "telegram-claude"))
+        self.assertEqual((pinned["binary"], pinned["profile"]), ("codex", "telegram-codex"))
+        # A pair with no model runs on the model its profile names, which is
+        # what a turn with no model runs on.
         self.assertEqual(
             sorted((c["binary"], c["model"]) for c in calls),
-            [("claude", None), ("codex", "fast-model")])
+            [("claude", "opus"), ("codex", "fast-model")])
 
     def test_a_pair_the_binary_refuses_fails_the_verdict_and_names_both(self):
         cli = import_cli()
@@ -1737,7 +1728,7 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
         self.assertEqual(refused["binary"], "codex")
         self.assertIn("bogus-model-x", refused["notice"])
         self.assertIn("codex", refused["notice"])
-        # The binary's own words travel with the verdict.
+        # The harness's own words travel with the verdict.
         self.assertIn("is not supported when using Codex", refused["reason"])
 
     def test_a_refusal_from_claude_is_read_the_same_way(self):
@@ -1848,21 +1839,91 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
         self.assertNotEqual(Path(calls[0]["cwd"]).resolve(), Path(tmp).resolve())
         self.assertIn("telegram-doctor-", calls[0]["cwd"])
 
+    def test_a_harness_older_than_the_runner_supports_is_named(self):
+        cli = import_cli()
+        profiles = _profiles_module()
+        from callva import harness_runner as lib
+
+        def too_old(prompt, profile, cwd, **_kwargs):
+            return lib.Result(ok=False, harness=profile.harness, failure=lib.Failure(
+                lib.FailureKind("incompatible_harness"),
+                "codex 0.100.0 is older than the tested 0.159.0"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            [row] = profiles.probe([{"worker": "codex", "model": None}], 1, [], None, tmp,
+                                   run=too_old)
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["verdict"], "incompatible_harness")
+        self.assertIn("0.159.0", row["reason"])
+
     def test_the_guide_states_that_null_is_the_stable_setting(self):
         guide = GUIDE_PATH.read_text()
         self.assertIn("A worker's `model` is `null` by default and `null` is the "
-                      "stable setting: it is the binary's own default", guide)
+                      "stable setting: it is the model of the profile the worker runs on",
+                      guide)
         self.assertIn("Every pin is an exception taken for a named reason", guide)
         self.assertIn("`telegram service doctor` verifies each distinct (worker, model) "
-                      "pair the settings declare against the binary itself", guide)
+                      "pair the settings declare against the harness itself", guide)
 
     def test_help_says_what_doctor_spends(self):
-        """An operator is told the cost before paying it: one live call per
+        """An operator is told the cost before paying it: one live turn per
         distinct pair, each held to the turn's own window."""
         help_text = " ".join(import_cli().__doc__.split())
-        self.assertIn("`doctor` also spends one live call on each worker binary per "
-                      "distinct configured (worker, model) pair", help_text)
+        self.assertIn("`doctor` also spends one live turn per distinct configured "
+                      "(worker, model) pair", help_text)
         self.assertIn("each held to `defaults.worker_timeout`", help_text)
+
+
+class ServiceStartProfileTests(unittest.TestCase):
+    """`service start` and `service run` refuse settings that reach a worker
+    whose profile does not resolve or fit, before any daemon is launched."""
+
+    def preflight(self, settings, answer=None):
+        cli = import_cli()
+        asked = []
+
+        def profiles_answer(argv, text=""):
+            asked.append((argv, json.loads(text)))
+            return answer
+
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(cli, "_project_id", lambda write=False: "prj_1"), \
+                mock.patch.object(cli, "_profiles_answer", profiles_answer), \
+                contextlib.redirect_stderr(err):
+            try:
+                cli._service_profile_preflight(Path(tmp), settings)
+                code = 0
+            except SystemExit as stopped:
+                code = stopped.code
+        return code, err.getvalue(), asked
+
+    def test_a_stub_service_asks_nothing(self):
+        code, _, asked = self.preflight({"defaults": {"worker": "stub"}})
+        self.assertEqual((code, asked), (0, []))
+
+    def test_a_profile_that_does_not_fit_refuses_the_start(self):
+        problem = {"position": "defaults", "profile": "telegram-codex",
+                   "code": "profile_unfit",
+                   "message": "profile 'telegram-codex' (layer global, version v1) does "
+                              "not fit a telegram turn: approval_policy must be never"}
+        code, err, asked = self.preflight(
+            {"defaults": {"worker": "codex"}}, {"ok": False, "problems": [problem]})
+        self.assertEqual(code, 6)
+        error = json.loads(err.strip().splitlines()[-1])["error"]
+        self.assertEqual(error["code"], "profile_refused")
+        self.assertIn("settings.defaults runs on telegram-codex", error["message"])
+        self.assertIn("approval_policy", error["message"])
+        argv, given = asked[0]
+        self.assertEqual(argv[0], "check")
+        self.assertIn("prj_1", argv)
+        self.assertEqual(given["settings"], {"defaults": {"worker": "codex"}})
+
+    def test_profiles_that_fit_let_the_start_go_on(self):
+        code, _, asked = self.preflight({"defaults": {"worker": "claude"}},
+                                        {"ok": True, "problems": []})
+        self.assertEqual(code, 0)
+        self.assertEqual(len(asked), 1)
 
 
 if __name__ == "__main__":

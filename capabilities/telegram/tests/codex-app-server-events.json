@@ -1,0 +1,341 @@
+{
+ "command_started": {
+  "method": "item/started",
+  "params": {
+   "item": {
+    "command": "/bin/zsh -lc 'ls -la'",
+    "cwd": "/work/project",
+    "id": "exec-fc28c1be-9995-49ae-9888-4d4a9512d584",
+    "processId": "1419",
+    "source": "unifiedExecStartup",
+    "status": "inProgress",
+    "type": "commandExecution"
+   },
+   "startedAtMs": 1791813399537,
+   "threadId": "01a13066-9bd9-71c0-bed3-d2e9408094d1",
+   "turnId": "01a13066-9d12-7892-b781-0cf451926040"
+  }
+ },
+ "command_completed": {
+  "method": "item/completed",
+  "params": {
+   "completedAtMs": 1791813399537,
+   "item": {
+    "command": "/bin/zsh -lc 'ls -la'",
+    "cwd": "/work/project",
+    "durationMs": 0,
+    "exitCode": 0,
+    "id": "exec-fc28c1be-9995-49ae-9888-4d4a9512d584",
+    "processId": "1419",
+    "source": "unifiedExecStartup",
+    "status": "completed",
+    "type": "commandExecution"
+   },
+   "threadId": "01a13066-9bd9-71c0-bed3-d2e9408094d1",
+   "turnId": "01a13066-9d12-7892-b781-0cf451926040"
+  }
+ },
+ "own_progress_started": {
+  "method": "item/started",
+  "params": {
+   "item": {
+    "command": "/bin/zsh -lc 'telegram progress \"checking the folder\"'",
+    "cwd": "/work/project",
+    "id": "exec-dee08e93-6efe-4fc2-9db4-09245f00efbf",
+    "processId": "12075",
+    "source": "unifiedExecStartup",
+    "status": "inProgress",
+    "type": "commandExecution"
+   },
+   "startedAtMs": 1791813401666,
+   "threadId": "01a13066-9bd9-71c0-bed3-d2e9408094d1",
+   "turnId": "01a13066-9d12-7892-b781-0cf451926040"
+  }
+ },
+ "own_progress_completed": {
+  "method": "item/completed",
+  "params": {
+   "completedAtMs": 1791813401751,
+   "item": {
+    "command": "/bin/zsh -lc 'telegram progress \"checking the folder\"'",
+    "cwd": "/work/project",
+    "durationMs": 84,
+    "exitCode": 4,
+    "id": "exec-dee08e93-6efe-4fc2-9db4-09245f00efbf",
+    "processId": "12075",
+    "source": "unifiedExecStartup",
+    "status": "failed",
+    "type": "commandExecution"
+   },
+   "threadId": "01a13066-9bd9-71c0-bed3-d2e9408094d1",
+   "turnId": "01a13066-9d12-7892-b781-0cf451926040"
+  }
+ },
+ "file_change_started": {
+  "method": "item/started",
+  "params": {
+   "item": {
+    "changes": [
+     {
+      "diff": "hi\n",
+      "kind": {
+       "type": "add"
+      },
+      "path": "/work/project/note.txt"
+     }
+    ],
+    "id": "exec-f5128ade-eff8-4627-967f-fe45ba709424",
+    "status": "inProgress",
+    "type": "fileChange"
+   },
+   "startedAtMs": 1791813404375,
+   "threadId": "01a13066-9bd9-71c0-bed3-d2e9408094d1",
+   "turnId": "01a13066-9d12-7892-b781-0cf451926040"
+  }
+ },
+ "file_change_completed": {
+  "method": "item/completed",
+  "params": {
+   "completedAtMs": 1791813404379,
+   "item": {
+    "changes": [
+     {
+      "diff": "hi\n",
+      "kind": {
+       "type": "add"
+      },
+      "path": "/work/project/note.txt"
+     }
+    ],
+    "id": "exec-f5128ade-eff8-4627-967f-fe45ba709424",
+    "status": "completed",
+    "type": "fileChange"
+   },
+   "threadId": "01a13066-9bd9-71c0-bed3-d2e9408094d1",
+   "turnId": "01a13066-9d12-7892-b781-0cf451926040"
+  }
+ },
+ "web_search_started": {
+  "method": "item/started",
+  "params": {
+   "item": {
+    "id": "exec-6514ad57-0a22-40c0-bcf2-cf7b852e4cbe",
+    "query": "",
+    "type": "webSearch"
+   },
+   "startedAtMs": 1791813407712,
+   "threadId": "01a13066-9bd9-71c0-bed3-d2e9408094d1",
+   "turnId": "01a13066-9d12-7892-b781-0cf451926040"
+  }
+ },
+ "web_search_completed": {
+  "method": "item/completed",
+  "params": {
+   "completedAtMs": 1791813409585,
+   "item": {
+    "action": {
+     "query": "python release schedule",
+     "type": "search"
+    },
+    "id": "exec-6514ad57-0a22-40c0-bcf2-cf7b852e4cbe",
+    "query": "python release schedule",
+    "type": "webSearch"
+   },
+   "threadId": "01a13066-9bd9-71c0-bed3-d2e9408094d1",
+   "turnId": "01a13066-9d12-7892-b781-0cf451926040"
+  }
+ },
+ "tool_call_started": {
+  "method": "item/started",
+  "params": {
+   "item": {
+    "arguments": {
+     "query": "streaming responses"
+    },
+    "id": "exec-4be3f92a-fdeb-4142-afc9-14de8815bc9f",
+    "readOnlyHint": true,
+    "server": "docs",
+    "status": "inProgress",
+    "tool": "search_docs",
+    "type": "mcpToolCall"
+   },
+   "startedAtMs": 1791813448144,
+   "threadId": "01a13067-394b-7f90-b072-396adc0339bc",
+   "turnId": "01a13067-3a8b-7c73-9b70-ca124c5bd278"
+  }
+ },
+ "tool_call_completed": {
+  "method": "item/completed",
+  "params": {
+   "completedAtMs": 1791813448429,
+   "item": {
+    "arguments": {
+     "query": "streaming responses"
+    },
+    "durationMs": 283,
+    "id": "exec-4be3f92a-fdeb-4142-afc9-14de8815bc9f",
+    "readOnlyHint": true,
+    "server": "docs",
+    "status": "completed",
+    "tool": "search_docs",
+    "type": "mcpToolCall"
+   },
+   "threadId": "01a13067-394b-7f90-b072-396adc0339bc",
+   "turnId": "01a13067-3a8b-7c73-9b70-ca124c5bd278"
+  }
+ },
+ "reasoning_started": {
+  "method": "item/started",
+  "params": {
+   "item": {
+    "id": "rs_00ca1142a1f2744a016acce74bde9887d2b2f027753cb8896f",
+    "summary": [],
+    "type": "reasoning"
+   },
+   "startedAtMs": 1791813451696,
+   "threadId": "01a13067-394b-7f90-b072-396adc0339bc",
+   "turnId": "01a13067-3a8b-7c73-9b70-ca124c5bd278"
+  }
+ },
+ "reasoning_completed": {
+  "method": "item/completed",
+  "params": {
+   "completedAtMs": 1791813452642,
+   "item": {
+    "id": "rs_00ca1142a1f2744a016acce74bde9887d2b2f027753cb8896f",
+    "summary": [],
+    "type": "reasoning"
+   },
+   "threadId": "01a13067-394b-7f90-b072-396adc0339bc",
+   "turnId": "01a13067-3a8b-7c73-9b70-ca124c5bd278"
+  }
+ },
+ "compaction_started": {
+  "method": "item/started",
+  "params": {
+   "item": {
+    "id": "01a13067-eb96-7191-bf10-dc2902394051",
+    "type": "contextCompaction"
+   },
+   "startedAtMs": 1791813479318,
+   "threadId": "01a13067-b57a-7fc0-813b-5d4379254d35",
+   "turnId": "01a13067-b720-7553-907d-0bea1a90b0a5"
+  }
+ },
+ "compaction_completed": {
+  "method": "item/completed",
+  "params": {
+   "completedAtMs": 1791813486128,
+   "item": {
+    "id": "01a13067-eb96-7191-bf10-dc2902394051",
+    "type": "contextCompaction"
+   },
+   "threadId": "01a13067-b57a-7fc0-813b-5d4379254d35",
+   "turnId": "01a13067-b720-7553-907d-0bea1a90b0a5"
+  }
+ },
+ "agent_message_completed": {
+  "method": "item/completed",
+  "params": {
+   "completedAtMs": 1791813412026,
+   "item": {
+    "id": "msg_0d0059b601d7ca7a016acce72436d08191b62ddac21b2413e1",
+    "phase": "final_answer",
+    "text": "DONE",
+    "type": "agentMessage"
+   },
+   "threadId": "01a13066-9bd9-71c0-bed3-d2e9408094d1",
+   "turnId": "01a13066-9d12-7892-b781-0cf451926040"
+  }
+ },
+ "turn_started": {
+  "method": "turn/started",
+  "params": {
+   "threadId": "01a13066-9bd9-71c0-bed3-d2e9408094d1",
+   "turn": {
+    "id": "01a13066-9d12-7892-b781-0cf451926040",
+    "items": [],
+    "itemsView": "notLoaded",
+    "startedAt": 1791813393,
+    "status": "inProgress"
+   }
+  }
+ },
+ "token_usage": {
+  "method": "thread/tokenUsage/updated",
+  "params": {
+   "threadId": "01a13066-9bd9-71c0-bed3-d2e9408094d1",
+   "tokenUsage": {
+    "last": {
+     "cacheWriteInputTokens": 0,
+     "cachedInputTokens": 12288,
+     "inputTokens": 15918,
+     "outputTokens": 39,
+     "reasoningOutputTokens": 0,
+     "totalTokens": 15957
+    },
+    "modelContextWindow": 475000,
+    "total": {
+     "cacheWriteInputTokens": 0,
+     "cachedInputTokens": 12288,
+     "inputTokens": 15918,
+     "outputTokens": 39,
+     "reasoningOutputTokens": 0,
+     "totalTokens": 15957
+    }
+   },
+   "turnId": "01a13066-9d12-7892-b781-0cf451926040"
+  }
+ },
+ "turn_completed": {
+  "method": "turn/completed",
+  "params": {
+   "threadId": "01a13066-9bd9-71c0-bed3-d2e9408094d1",
+   "turn": {
+    "completedAt": 1791813412,
+    "durationMs": 18413,
+    "id": "01a13066-9d12-7892-b781-0cf451926040",
+    "items": [],
+    "itemsView": "summary",
+    "startedAt": 1791813393,
+    "status": "completed"
+   }
+  }
+ },
+ "own_send_started": {
+  "method": "item/started",
+  "params": {
+   "item": {
+    "command": "/bin/zsh -lc '/opt/telegram/service/worker-bin/telegram send 123 \"half way\"'",
+    "cwd": "/work/project",
+    "id": "exec-fd7dd837-a4a7-4dc0-a975-d82b61cbb9d2",
+    "processId": "66048",
+    "source": "unifiedExecStartup",
+    "status": "inProgress",
+    "type": "commandExecution"
+   },
+   "startedAtMs": 1791814886299,
+   "threadId": "01a1307d-3215-7ed0-8288-b86161129435",
+   "turnId": "01a1307d-358c-7f12-9c37-4ad1949fba56"
+  }
+ },
+ "own_send_completed": {
+  "method": "item/completed",
+  "params": {
+   "completedAtMs": 1791814886363,
+   "item": {
+    "command": "/bin/zsh -lc '/opt/telegram/service/worker-bin/telegram send 123 \"half way\"'",
+    "cwd": "/work/project",
+    "durationMs": 64,
+    "exitCode": 0,
+    "id": "exec-fd7dd837-a4a7-4dc0-a975-d82b61cbb9d2",
+    "processId": "66048",
+    "source": "unifiedExecStartup",
+    "status": "completed",
+    "type": "commandExecution"
+   },
+   "threadId": "01a1307d-3215-7ed0-8288-b86161129435",
+   "turnId": "01a1307d-358c-7f12-9c37-4ad1949fba56"
+  }
+ }
+}
