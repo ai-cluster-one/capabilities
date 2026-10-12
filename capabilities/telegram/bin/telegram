@@ -5931,8 +5931,10 @@ def cmd_service_migrate_profiles(connection_flag: str | None, session_flag: str 
                                                          ("worker", "workers") if k in defaults},
                       "combo": combo(file_worker, _worker_block(defaults, file_worker))})
     default_combo = moves[-1]["combo"] if moves else None
+    # A call's task ran on the voice defaults' worker, else the default worker,
+    # which the environment named before the settings file did.
+    voice_worker = _old_worker(voice.get("worker"), effective_worker)
     if any(key in voice for key in ("worker", "workers")):
-        voice_worker = _old_worker(voice.get("worker"), file_worker)
         moves.append({"at": "settings.defaults.voice_agent",
                       "was": {k: voice[k] for k in ("worker", "workers") if k in voice},
                       "combo": combo(voice_worker, {**_worker_block(defaults, voice_worker),
@@ -5980,8 +5982,7 @@ def cmd_service_migrate_profiles(connection_flag: str | None, session_flag: str 
 
     carry("settings.defaults", defaults, None, {file_worker, env_worker})
     if any(key in voice for key in ("worker", "workers")):
-        carry("settings.defaults.voice_agent", voice, defaults,
-              {_old_worker(voice.get("worker"), file_worker)})
+        carry("settings.defaults.voice_agent", voice, defaults, {voice_worker})
     for key, row in channel_register.items():
         if isinstance(row, dict):
             row_settings = row.get("settings") if isinstance(row.get("settings"), dict) else {}
@@ -6028,7 +6029,9 @@ def cmd_service_migrate_profiles(connection_flag: str | None, session_flag: str 
             voice_move = next((m for m in moves if m["at"] == "settings.defaults.voice_agent"),
                               None)
             name = named(voice_move["combo"]) if voice_move else None
-            fallback = named(default_combo) if default_combo is not None else None
+            # What a call falls back to without its own profile: the
+            # environment's profile when it named a worker, else the default.
+            fallback = named(env_combo if env_combo is not None else default_combo)
             new_defaults["voice_agent"] = _with_profile(
                 new_defaults["voice_agent"],
                 name if name is not None and name != (fallback or "stub") else None)

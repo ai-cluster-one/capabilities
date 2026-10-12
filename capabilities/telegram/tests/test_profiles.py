@@ -892,6 +892,30 @@ class MigrateProfiles(unittest.TestCase):
         code, again = self.migrate(apply=True)
         self.assertEqual((code, again["changed"], again["carried"]), (0, False, []))
 
+    def test_a_call_falls_back_to_the_worker_the_environment_named(self):
+        # Before profiles a call without its own worker ran on the default
+        # worker, which TG_WORKER named before `defaults.worker` did.
+        base = {"worker": "codex", "workers": {"claude": {"model": "sonnet"}}}
+        self.register_path.write_text("{}")
+        self.settings = {"defaults": {**base, "voice_agent": {
+            "workers": {"claude": {"effort": "high"}}}}}
+        code, report = self.migrate(apply=True, environ={"TG_WORKER": "claude"})
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report["environment"]["replace_with"],
+                         {"TELEGRAM_SERVICE_PROFILE": "telegram-claude-sonnet"})
+        self.assertEqual(self.settings["defaults"]["voice_agent"],
+                         {"profile": "telegram-claude-sonnet-high"})
+        self.assertEqual(report["carried"], [])
+        # A block for a worker the call did not run stays off its position.
+        self.settings = {"defaults": {**base, "voice_agent": {
+            "workers": {"codex": {"model": "gpt-5.4"}}}}}
+        code, report = self.migrate(apply=True, environ={"TG_WORKER": "claude"})
+        self.assertEqual(code, 0, report)
+        self.assertEqual(self.settings["defaults"]["voice_agent"], {})
+        self.assertEqual(report["carried"], [
+            {"at": "settings.defaults.voice_agent.workers.codex",
+             "profile": "telegram-codex-gpt-5.4"}])
+
     def test_apply_is_refused_while_the_service_runs(self):
         code, error = self.migrate(apply=True, running=True)
         self.assertEqual((code, error["code"]), (6, "service_running"))
