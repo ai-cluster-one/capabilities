@@ -24,7 +24,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _harness import CODEX_EVENTS, FakeHarness, lib  # noqa: E402
+from _harness import CLAUDE_KNOBS, CODEX_EVENTS, CODEX_KNOBS, FakeHarness, held, lib  # noqa: E402
 from test_assistant_service import (  # noqa: E402
     CODEX_MODEL_REFUSAL,
     STORE_DSN,
@@ -183,7 +183,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             fake = FakeHarness(answer="ok", seconds=0.2)
             state = {"settings": {}, "proc_key": "job:test",
                      "on_worker_start": seen.append}
-            state["profile"] = daemon.resolve_turn_profile("codex", {})
+            state["profile"] = daemon.resolve_turn_profile("telegram-codex")
             with mock.patch.object(daemon, "harness_run", fake):
                 result = daemon.worker_harness("job:test", [], state, procs)
             self.assertEqual(result["reply"], "ok")
@@ -205,7 +205,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("job attempt lost ownership before process start")
 
             state = {"settings": {}, "proc_key": "job:test", "on_worker_start": refuse}
-            state["profile"] = daemon.resolve_turn_profile("codex", {})
+            state["profile"] = daemon.resolve_turn_profile("telegram-codex")
             with mock.patch.object(daemon, "harness_run", fake):
                 with self.assertRaisesRegex(RuntimeError, "lost ownership"):
                     daemon.worker_harness("job:test", [], state, {})
@@ -560,7 +560,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         Resumption is engine-specific, so following the channel's current
         setting would resume a session the new engine has never seen."""
         with tempfile.TemporaryDirectory() as td:
-            daemon = self.daemon_with_store(td, worker="codex")
+            daemon = self.daemon_with_store(td, profile="telegram-codex")
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
             queued(register, channel_key="123", requested_by="777",
@@ -585,7 +585,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_job_runs_on_the_model_its_row_records(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = self.daemon_with_store(td, worker="codex")
+            daemon = self.daemon_with_store(td, profile="telegram-codex")
             self.addCleanup(daemon.close_job_register)
             register = daemon.job_register()
             queued(register, channel_key="123", requested_by="777",
@@ -604,6 +604,71 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             await wait_until(lambda: seen, timeout=6)
             self.assertEqual(seen, ["gpt-pinned"])
             await self.stop_session(client, task)
+
+    async def run_row(self, td, specs, **row):
+        """Register and submit one job on a daemon whose store holds `specs`,
+        run it with a fake harness, and answer the row as it landed and the
+        calls the harness saw."""
+        daemon = self.daemon_with_store(td, profile="telegram-claude")
+        self.addCleanup(daemon.close_job_register)
+        self.enterContext(held(daemon, specs))
+        register = daemon.job_register()
+        job = queued(register, channel_key="123", requested_by="777",
+                     description="the work", **row)
+        fake = FakeHarness(answer="done", session_id="sess-1")
+        daemon.harness_run = fake
+        client = FakeClient([])
+        task = asyncio.create_task(daemon.run_session(client))
+        await client.started.wait()
+        await wait_until(lambda: register.get(job["id"])["state"] == daemon.jobs.STOPPED,
+                         timeout=8)
+        landed = register.get(job["id"])
+        await self.stop_session(client, task)
+        return landed, fake.calls
+
+    async def test_a_job_runs_on_the_profile_its_row_records(self):
+        """The row's profile, pinned at registration, not the channel's."""
+        with tempfile.TemporaryDirectory() as td:
+            landed, calls = await self.run_row(
+                td, {"telegram-fast": {**CODEX_KNOBS, "model": "fast-model"}},
+                engine="codex", profile="telegram-fast")
+        self.assertEqual(landed["outcome"], "succeeded", landed["error"])
+        self.assertEqual((calls[0]["profile"].harness, calls[0]["profile"].model),
+                         ("codex", "fast-model"))
+        extra = calls[0]["extra_env"]
+        self.assertEqual(extra["TELEGRAM_AUTHORIZED_JOB_PROFILE"], "telegram-fast")
+        self.assertIn("TELEGRAM_AUTHORIZED_REQUESTER_ROLE", extra)
+        self.assertIn("profile=telegram-fast", calls[0]["prompt"])
+
+    async def test_a_row_without_a_profile_runs_on_its_engines_profile(self):
+        """Registered before rooms named profiles: `telegram-<engine>` with the
+        row's model laid over it, as it ran before."""
+        with tempfile.TemporaryDirectory() as td:
+            landed, calls = await self.run_row(td, {}, engine="codex", model="gpt-pinned")
+        self.assertEqual(landed["outcome"], "succeeded", landed["error"])
+        self.assertIsNone(landed["profile"])
+        self.assertEqual((calls[0]["profile"].harness, calls[0]["profile"].model),
+                         ("codex", "gpt-pinned"))
+
+    async def test_a_profile_now_on_another_harness_fails_naming_both(self):
+        """A session continues only on the harness it began on, so a row whose
+        profile moved to the other harness does not run at all."""
+        with tempfile.TemporaryDirectory() as td:
+            landed, calls = await self.run_row(
+                td, {"telegram-moved": {**CLAUDE_KNOBS}}, engine="codex",
+                profile="telegram-moved")
+        self.assertEqual(calls, [])
+        self.assertEqual(landed["outcome"], "model_refused")
+        for part in ("codex", "claude", "'telegram-moved'"):
+            self.assertIn(part, landed["error"])
+
+    async def test_a_profile_that_no_longer_resolves_fails_the_job_naming_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            landed, calls = await self.run_row(td, {}, engine="codex",
+                                               profile="telegram-gone")
+        self.assertEqual(calls, [])
+        self.assertEqual(landed["outcome"], "model_refused")
+        self.assertIn("'telegram-gone'", landed["error"])
 
     async def test_a_stored_result_is_cut_at_the_workers_reply_marker(self):
         """The sink that keeps the text instead of sending it straight out.
@@ -1285,7 +1350,7 @@ class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
 
     def call_settings(self, **overrides):
         base = job_settings(**overrides)
-        base["defaults"]["voice_agent"] = {"worker": "codex"}
+        base["defaults"]["voice_agent"] = {"profile": "telegram-codex"}
         base["allowed_users"] = {self.CALLER: {"name": "Caller", "role": "owner",
                                                "voice_agent": {"mode": "enabled"}}}
         return base
@@ -1349,6 +1414,14 @@ class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
                              (self.CALLER, self.CALLER))
             self.assertEqual(row["attempt"], 1)
             self.assertEqual(row["engine"], "codex")
+            # The row carries the profile the task runs on, and the task is
+            # told who asked and in what role, as a dialogue turn is.
+            self.assertEqual(row["profile"], "telegram-codex")
+            extra = fake.calls[0]["extra_env"]
+            self.assertEqual(extra["TELEGRAM_AUTHORIZED_REQUESTER_ROLE"], "owner")
+            self.assertEqual((extra["TELEGRAM_AUTHORIZED_JOB_PROFILE"],
+                              extra["TELEGRAM_AUTHORIZED_JOB_ENGINE"]),
+                             ("telegram-codex", "codex"))
             # The same person's direct chat lists it; another person's does not,
             # and neither does that person's id.
             self.assertEqual([r["id"] for r in cli.open_jobs(

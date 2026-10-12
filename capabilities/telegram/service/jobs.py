@@ -121,7 +121,7 @@ def holds_slot(owner_id: Any) -> bool:
 # so every comparison and every reader below sees the values it always saw.
 STORE_OWNER = "telegram"
 STORE_SCHEMA_MAJOR = 1
-STORE_SCHEMA_MINOR = 0
+STORE_SCHEMA_MINOR = 1
 STORE_STEPS = (
     ("0001-jobs", """
     CREATE TABLE telegram_jobs (
@@ -216,6 +216,13 @@ STORE_STEPS = (
         CONSTRAINT telegram_job_slots_job_key
             UNIQUE (project_id, environment, surface, job_id)
     );
+    """),
+    # The harness profile a job runs on, pinned at registration from the
+    # profile the registering turn ran on. Nullable: a row registered before
+    # rooms named profiles has none and runs on `telegram-<engine>`. `engine`
+    # stays the harness, because a session continues only on its own harness.
+    ("0004-job-profile", """
+    ALTER TABLE telegram_jobs ADD COLUMN profile TEXT;
     """),
 )
 
@@ -668,7 +675,7 @@ class JobRegister:
 
     def register(self, *, channel_key: str, requested_by: str, description: str,
                  engine: str, origin_message_id: str | None = None,
-                 model: str | None = None) -> dict[str, Any]:
+                 model: str | None = None, profile: str | None = None) -> dict[str, Any]:
         """Enter one task into the queue. No duration is promised, because none
         can be honoured."""
         description = str(description or "").strip()
@@ -697,12 +704,12 @@ class JobRegister:
                 self.store._execute(
                     "INSERT INTO telegram_jobs (id, project_id, environment, surface, "
                     "channel_key, requested_by, origin_message_id, description, engine, "
-                    "model, state, attempt, amendments, stop_requested, "
+                    "model, profile, state, attempt, amendments, stop_requested, "
                     "created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)",
                     (job_id, self.project_id, self.environment, self.surface,
                      str(channel_key), str(requested_by), origin,
-                     description, engine, model, DRAFT, now, now))
+                     description, engine, model, profile, DRAFT, now, now))
         except Exception:
             # The unique origin index is the concurrent-delivery fence. If the
             # other registrar won, return that one durable identity; otherwise

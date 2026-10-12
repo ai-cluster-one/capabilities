@@ -139,7 +139,7 @@ def enforce_job_scope(argv):
              exit_code=4)
     for forbidden in ("--chat", "--channel", "--all-channels",
                       "--requested-by", "--origin-message-id", "--actor",
-                      "--engine", "--model"):
+                      "--profile", "--engine", "--model"):
         if forbidden in args or any(item.startswith(forbidden + "=") for item in args):
             fail("worker_scope_denied",
                  f"{forbidden} cannot be overridden inside a Telegram worker request",
@@ -147,7 +147,8 @@ def enforce_job_scope(argv):
 
 
 def pin_jobs_to_service_project(argv):
-    """A worker `jobs` call answers about the daemon's register, not the route's.
+    """A worker `jobs` or `profiles` call answers about the daemon's register
+    and profiles, not the route's.
 
     The queue belongs to the daemon: its slots, its leases, its delivery loop,
     and every read the runner does is partitioned by the daemon's project. Which
@@ -161,8 +162,12 @@ def pin_jobs_to_service_project(argv):
     from, for `jobs` alone, so every other capability call keeps reaching the
     routed project. On a turn that was not routed those names already name this
     project and setting them changes nothing.
+
+    A profile is the same: the settings that name the profile a room runs on
+    are the daemon's, so a profile a worker saves or lists is the daemon
+    project's, wherever the turn runs.
     """
-    if argv[1:2] != ["jobs"]:
+    if argv[1:2] not in (["jobs"], ["profiles"]):
         return
     root = os.environ.get("TELEGRAM_SERVICE_PROJECT_ROOT", "").strip()
     envelope = os.environ.get("TELEGRAM_SERVICE_PROJECT_ENVELOPE", "").strip()
@@ -219,12 +224,11 @@ def job_scope_arguments(argv):
             "TELEGRAM_AUTHORIZED_ORIGIN_MESSAGE_ID", "").strip()
         if origin:
             args += ["--origin-message-id", origin]
-        engine = os.environ.get("TELEGRAM_AUTHORIZED_JOB_ENGINE", "").strip()
-        model = os.environ.get("TELEGRAM_AUTHORIZED_JOB_MODEL", "").strip()
-        if engine:
-            args += ["--engine", engine]
-        if model:
-            args += ["--model", model]
+        # The job runs on the profile this turn runs on; the CLI reads the
+        # harness it keeps as the job's engine from the daemon's word too.
+        profile = os.environ.get("TELEGRAM_AUTHORIZED_JOB_PROFILE", "").strip()
+        if profile:
+            args += ["--profile", profile]
     return args
 
 

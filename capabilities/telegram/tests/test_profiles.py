@@ -177,21 +177,48 @@ class Implicit(unittest.TestCase):
         self.assertEqual(caught.exception.code, "profile_name_refused")
 
     def test_the_positions_settings_reach(self):
-        settings = {"defaults": {
-            "worker": "claude",
-            "workers": {"claude": {"model": "opus"}, "codex": {"model": None}},
-            "voice_agent": {"worker": "codex",
-                            "workers": {"codex": {"model": "fast"}}}}}
-        reached = profiles.reached(settings, {})
-        self.assertEqual([(r["position"], r["worker"], r["settings"].get("model"))
-                          for r in reached],
-                         [("defaults", "claude", "opus"),
-                          ("defaults.voice_agent", "codex", "fast"),
-                          ("defaults.workers.codex", "codex", None)])
-        # The environment's worker wins over the settings', as the daemon reads it.
-        self.assertEqual(profiles.reached(settings, {"TG_WORKER": "codex"})[0]["worker"],
-                         "codex")
-        self.assertEqual(profiles.reached({"defaults": {"worker": "stub"}}, {}), [])
+        settings = {
+            "defaults": {"profile": "telegram-claude",
+                         "voice_agent": {"profile": "telegram-voice"}},
+            "allowed_users": {"11": {"profile": "telegram-direct"}, "12": {}},
+            "allowed_groups": {"-21": {"profile": "telegram-group",
+                                       "topics": {"5": {"profile": "telegram-topic"},
+                                                  "6": {}}},
+                               "-22": True}}
+        self.assertEqual([(r["position"], r["profile"])
+                          for r in profiles.reached(settings, {})],
+                         [("settings.defaults.profile", "telegram-claude"),
+                          ("settings.defaults.voice_agent.profile", "telegram-voice"),
+                          ("settings.allowed_users.11.profile", "telegram-direct"),
+                          ("settings.allowed_groups.-21.profile", "telegram-group"),
+                          ("settings.allowed_groups.-21.topics.5.profile",
+                           "telegram-topic")])
+        # The environment's default wins over the settings', as the daemon reads it.
+        self.assertEqual(profiles.reached(settings, {"TELEGRAM_SERVICE_PROFILE":
+                                                     "telegram-codex"})[0],
+                         {"position": "TELEGRAM_SERVICE_PROFILE",
+                          "profile": "telegram-codex"})
+        self.assertEqual(profiles.reached({"defaults": {"profile": "stub"}}, {}),
+                         [{"position": "settings.defaults.profile", "profile": "stub"}])
+        self.assertEqual(profiles.reached({}, {}), [])
+
+    def test_the_default_is_the_environments_then_the_settings(self):
+        self.assertEqual(profiles.default_profile({}, {}), (None, "default"))
+        self.assertEqual(profiles.default_profile({"defaults": {"profile": "telegram-x"}}, {}),
+                         ("telegram-x", "settings.defaults.profile"))
+        self.assertEqual(profiles.default_profile({"defaults": {"profile": "telegram-x"}},
+                                                  {"TELEGRAM_SERVICE_PROFILE": "stub"}),
+                         ("stub", "TELEGRAM_SERVICE_PROFILE"))
+
+    @needs_runner
+    def test_the_stub_resolves_to_nothing_and_a_name_without_the_prefix_is_named(self):
+        self.assertIsNone(profiles.turn("stub", [], None))
+        [problem] = profiles.check({"allowed_users": {"11": {"profile": "claude-act"}}},
+                                   {}, [], None)
+        self.assertEqual((problem["position"], problem["code"]),
+                         ("settings.allowed_users.11.profile", "profile_name_refused"))
+        self.assertIn("settings.allowed_users.11.profile names claude-act",
+                      profiles.problems_sentence([problem]))
 
     def test_a_check_of_the_seeded_settings_finds_nothing(self):
         seed = json.loads((SERVICE_DIR / "templates" / "settings.json").read_text())
@@ -217,11 +244,15 @@ class Probe(unittest.TestCase):
                               ("incompatible_harness", "incompatible_harness"),
                               ("error", "failed"), ("crash", "failed")):
             with self.subTest(kind), tempfile.TemporaryDirectory() as tmp:
-                [row] = profiles.probe([{"worker": "codex", "model": "m"}], 2, [], None,
-                                       tmp, run=failing(kind, f"said {kind}"))
+                [row] = profiles.probe([{"profile": "telegram-codex",
+                                         "declared_at": ["settings.defaults.profile"]}],
+                                       2, [], None, tmp, run=failing(kind, f"said {kind}"))
                 self.assertEqual((row["ok"], row["verdict"], row["reason"]),
                                  (False, verdict, f"said {kind}"))
-                self.assertEqual((row["profile"], row["layer"]), ("telegram-codex", "bundled"))
+                self.assertEqual((row["profile"], row["layer"], row["worker"], row["model"],
+                                  row["declared_at"]),
+                                 ("telegram-codex", "bundled", "codex", "sol",
+                                  ["settings.defaults.profile"]))
                 self.assertEqual(row["notice"] is not None, verdict == "model_refused")
 
     @needs_runner
@@ -233,11 +264,12 @@ class Probe(unittest.TestCase):
             return lib.Result(ok=True, harness=profile.harness, answer="OK")
 
         with tempfile.TemporaryDirectory() as tmp:
-            rows = profiles.probe([{"worker": "claude", "model": None},
-                                   {"worker": "stub", "model": None}], 7, [], None, tmp,
+            rows = profiles.probe([{"profile": "telegram-claude"}, {"profile": "stub"},
+                                   {"profile": "telegram-nowhere"}], 7, [], None, tmp,
                                   run=run)
         self.assertEqual(seen, [7.0])
-        self.assertEqual([r["verdict"] for r in rows], ["accepted", "in_process"])
+        self.assertEqual([r["verdict"] for r in rows], ["accepted", "in_process", "failed"])
+        self.assertIn("'telegram-nowhere'", rows[2]["reason"])
 
 
 @needs_runner
@@ -346,13 +378,72 @@ class Store(unittest.TestCase):
     def test_a_check_names_the_position_whose_profile_does_not_fit(self):
         self.save("telegram-codex", {**CODEX, "approval_policy": "auto_review"},
                   scope="global")
-        settings = {"defaults": {"worker": "codex", "workers": {"codex": {}}}}
+        settings = {"defaults": {"profile": "telegram-codex"}}
         [problem] = profiles.check(settings, {}, self.active(), self.project)
         self.assertEqual((problem["position"], problem["profile"], problem["code"]),
-                         ("defaults", "telegram-codex", "profile_unfit"))
+                         ("settings.defaults.profile", "telegram-codex", "profile_unfit"))
         self.assertIn("approval_policy", problem["message"])
-        self.assertIn("settings.defaults runs on telegram-codex",
+        self.assertIn("settings.defaults.profile names telegram-codex",
                       profiles.problems_sentence([problem]))
+
+    # -- the migration's profiles ---------------------------------------------
+
+    def test_each_knob_moves_to_a_profile_named_from_its_values(self):
+        combos = [
+            {"worker": "claude", "settings": {}},
+            {"worker": "claude", "settings": {"model": "sonnet", "effort": "high"}},
+            {"worker": "claude", "settings": {"context": {"tools": ["Read", "Bash"],
+                                                          "mcp": False}}},
+            {"worker": "codex", "settings": {"model": "gpt-5.5", "reasoning_effort": "high",
+                                             "service_tier": "fast"}},
+            {"worker": "stub", "settings": {"model": None}},
+        ]
+        dry = profiles.materialize(self.conn, combos, self.project, apply=False,
+                                   schema=self.setting.schema)
+        self.assertEqual([(one["profile"], one["created"]) for one in dry], [
+            ("telegram-claude", False),
+            ("telegram-claude-sonnet-high", True),
+            ("telegram-claude-tools-read-bash-no-mcp", True),
+            ("telegram-codex-gpt-5.5-high-priority", True),
+            ("stub", False)])
+        self.assertEqual([one.name for one in self.active()], [])
+        done = profiles.materialize(self.conn, combos, self.project, apply=True,
+                                    created_by="migration", schema=self.setting.schema)
+        self.assertEqual([one["created"] for one in done], [False, True, True, True, False])
+        knobs = {found["name"]: found["knobs"] for found in
+                 (self.resolve(one["profile"]) for one in done[1:4])}
+        self.assertEqual(knobs["telegram-claude-sonnet-high"],
+                         {**CLAUDE, "model": "sonnet", "effort": "high"})
+        self.assertEqual(knobs["telegram-claude-tools-read-bash-no-mcp"],
+                         {**CLAUDE, "tools": ["Read", "Bash"], "strict_mcp": True,
+                          "mcp_config": {"mcpServers": {}}})
+        self.assertEqual(knobs["telegram-codex-gpt-5.5-high-priority"],
+                         {**CODEX, "model": "gpt-5.5", "effort": "high",
+                          "service_tier": "priority"})
+        # A rerun finds every one as it left it and creates nothing.
+        again = profiles.materialize(self.conn, combos, self.project, apply=True,
+                                     schema=self.setting.schema)
+        self.assertEqual([(one["profile"], one["created"]) for one in again],
+                         [(one["profile"], False) for one in done])
+
+    def test_a_derived_name_held_by_another_spec_takes_the_digest_form(self):
+        self.save("telegram-claude-haiku", {**CLAUDE, "model": "haiku", "effort": "low"})
+        [one] = profiles.materialize(self.conn, [{"worker": "claude",
+                                                  "settings": {"model": "haiku"}}],
+                                     self.project, apply=True, schema=self.setting.schema)
+        self.assertRegex(one["profile"], r"^telegram-claude-[0-9a-f]{10}$")
+        self.assertEqual(self.resolve("telegram-claude-haiku")["knobs"]["effort"], "low")
+        self.assertEqual(self.resolve(one["profile"])["knobs"]["model"], "haiku")
+
+    def test_a_combination_that_cannot_make_a_profile_is_refused_by_name(self):
+        self.save("telegram-codex", {**CODEX, "approval_policy": "auto_review"},
+                  scope="global")
+        [one] = profiles.materialize(self.conn, [{"worker": "codex",
+                                                  "settings": {"model": "gpt-5.5"}}],
+                                     self.project, apply=True, schema=self.setting.schema)
+        self.assertIsNone(one["profile"])
+        self.assertIn("does not fit a telegram turn", one["error"])
+        self.assertEqual([one.name for one in self.active() if one.scope == "project"], [])
 
     # -- list and show ----------------------------------------------------------
 
@@ -539,6 +630,236 @@ class Migrate(unittest.TestCase):
         self.assertEqual(seen, [("status", "harness"), ("contract", ("status",))])
         self.assertEqual((report["owner"], report["harness"]["state"]),
                          ("telegram", "current"))
+
+
+@needs_runner
+@needs_store
+class MigrateProfiles(unittest.TestCase):
+    """`telegram service migrate-profiles [--apply]` moves every old worker
+    setting - in settings, on the channel register and on open job rows - to a
+    profile name, writing the profiles it needs at the project's scope."""
+
+    SETTINGS = {
+        "connection": "probe",
+        "defaults": {
+            "tail_size": 40,
+            "worker": "codex",
+            "workers": {
+                "codex": {"model": "gpt-5.5", "reasoning_effort": "high",
+                          "service_tier": "fast"},
+                "claude": {"model": "sonnet", "effort": None,
+                           "context": {"tools": ["Read"], "mcp": False}},
+                "stub": {"model": None}},
+            "voice_agent": {"worker": "claude", "voice": "Calm",
+                            "workers": {"claude": {"effort": "low"}}}},
+        "allowed_users": {"11": {"name": "A caller",
+                                 "voice_agent": {"mode": "enabled",
+                                                 "workers": {"codex": {"model": "m"}}}}},
+        "allowed_groups": {"-100": {"name": "A room", "members": {
+            "12": {"voice_agent": {"worker": "claude"}}}}},
+    }
+    REGISTER = {
+        "11": {"last_processed_message_id": 5, "settings": {"worker": "claude"}},
+        "-100": {"settings": {"tail_size": 9},
+                 "workers": {"codex": {"model": "gpt-5.4"}}},
+        "12": {"settings": {"worker": "claude", "model": "opus"}},
+        "13": {"settings": {"debounce": 2}},
+        "14": {"settings": {"worker": "stub"}},
+    }
+
+    def setUp(self):
+        from capabilities_contract.db import connect
+        self.setting = store_setting()
+        self.project = project_id()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.envelope = self.root / "capabilities"
+        self.envelope.mkdir()
+        (self.envelope / "project.json").write_text(json.dumps(
+            {"id": self.project, "slug": "testproject"}))
+        self.register_path = self.root / "state" / "register.json"
+        self.register_path.parent.mkdir()
+        self.register_path.write_text(json.dumps(self.REGISTER))
+        self.settings = json.loads(json.dumps(self.SETTINGS))
+        self.cli = import_cli()
+        self.jobs = self.cli._jobs_module()
+        self.store, self.reg = self.jobs.open_register(
+            self.envelope, "production", project_id=self.project, setting=self.setting,
+            profile_tables=False)
+        self.addCleanup(self.store.close)
+        self.conn = connect(application_name="telegram", setting=self.setting)
+        self.addCleanup(self.conn.close)
+        waiting = self.reg.submit(self.reg.register(
+            channel_key="11", requested_by="11", description="waiting", engine="claude",
+            model="sonnet")["id"])
+        quota = self.reg.register(channel_key="11", requested_by="11",
+                                  description="paused", engine="codex")
+        self.reg.update(quota["id"], state="stopped", outcome="quota")
+        done = self.reg.register(channel_key="11", requested_by="11",
+                                 description="finished", engine="claude")
+        self.reg.update(done["id"], state="stopped", outcome="succeeded")
+        self.ids = {"waiting": waiting["id"], "quota": quota["id"], "done": done["id"]}
+
+    def migrate(self, apply=False, environ=None, running=False):
+        cli, test = self.cli, self
+        profiles_module = cli._profiles_module()
+
+        class Records:
+            def set(self, capability, collection, key, value, actor=None):
+                test.assertEqual((capability, collection), ("telegram", "setting"))
+                test.settings[key] = value
+
+        def profiles_answer(argv, text=""):
+            from capabilities_contract.db import connect
+            out, err = io.StringIO(), io.StringIO()
+            conn = connect(application_name="telegram", setting=self.setting)
+            with mock.patch.object(sys, "stdin", io.StringIO(text)), \
+                    mock.patch.object(profiles_module, "_connect",
+                                      lambda root: (conn, self.setting.schema)), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = profiles_module.main(argv)
+            if code:
+                error = json.loads(err.getvalue().splitlines()[-1])["error"]
+                cli._die(code, error["code"], error["message"])
+            return json.loads(out.getvalue())
+
+        def open_register(root, write=True):
+            return self.jobs, self.jobs.open_register(
+                self.envelope, "production", project_id=self.project,
+                setting=self.setting, profile_tables=False)[1]
+
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("TG_WORKER", "TELEGRAM_SERVICE_WORKER", "CAPABILITIES_READ_ONLY")}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {**clean, **(environ or {})}, clear=True), \
+                mock.patch.object(cli, "_service_project_root", lambda: self.root), \
+                mock.patch.object(cli, "_require_service_envelope", lambda root: None), \
+                mock.patch.object(cli, "_service_settings",
+                                  lambda root: json.loads(json.dumps(self.settings))), \
+                mock.patch.object(cli, "_service_state_dir",
+                                  lambda root, c, s: ("probe", {"register": self.register_path})), \
+                mock.patch.object(cli, "cmd_service_status",
+                                  lambda c, s: {"running": running}), \
+                mock.patch.object(cli, "_open_job_register", open_register), \
+                mock.patch.object(cli, "_project_id", lambda write=False: self.project), \
+                mock.patch.object(cli, "_profiles_answer", profiles_answer), \
+                mock.patch.object(cli, "_records", lambda: Records()), \
+                contextlib.redirect_stderr(err):
+            try:
+                return 0, cli.cmd_service_migrate_profiles(None, None, apply)
+            except SystemExit as stopped:
+                return stopped.code, json.loads(err.getvalue().splitlines()[-1])["error"]
+
+    def stored_names(self):
+        found = profiles.stored(self.conn, self.project, self.setting.schema)
+        self.conn.rollback()
+        return sorted(one.name for one in found if one.scope == "project")
+
+    def test_a_dry_run_reports_every_move_and_changes_nothing(self):
+        code, report = self.migrate(environ={"TG_WORKER": "claude"})
+        self.assertEqual(code, 0, report)
+        self.assertFalse(report["applied"])
+        self.assertTrue(report["changed"])
+        self.assertEqual(self.settings, self.SETTINGS)
+        self.assertEqual(json.loads(self.register_path.read_text()), self.REGISTER)
+        self.assertEqual(self.stored_names(), [])
+        self.assertIsNone(self.reg.get(self.ids["waiting"])["profile"])
+        names = {row["profile"]: row["would_create"] for row in report["profiles"]}
+        self.assertEqual(names, {
+            "telegram-codex-gpt-5.5-high-priority": True,
+            "telegram-claude-sonnet-low-tools-read-no-mcp": True,
+            "telegram-claude-sonnet-tools-read-no-mcp": True,
+            "telegram-claude-opus-tools-read-no-mcp": True,
+            "telegram-claude-sonnet": True,
+            "telegram-codex": False})
+        # Under the environment's worker a row without its own `/set worker`
+        # ran on claude, so its codex block is dropped rather than moved.
+        moved = {move["channel"]: move["profile"] for move in report["register"]["moves"]}
+        self.assertEqual(moved, {"11": "telegram-claude-sonnet-tools-read-no-mcp",
+                                 "-100": None,
+                                 "12": "telegram-claude-opus-tools-read-no-mcp",
+                                 "14": "stub"})
+        self.assertEqual({row["id"]: row["profile"] for row in report["jobs"]},
+                         {self.ids["waiting"]: "telegram-claude-sonnet",
+                          self.ids["quota"]: "telegram-codex"})
+        self.assertEqual(report["environment"]["set"], ["TG_WORKER"])
+        self.assertEqual(report["environment"]["replace_with"],
+                         {"TELEGRAM_SERVICE_PROFILE": "telegram-claude-sonnet-tools-read-no-mcp"})
+        self.assertEqual(sorted(report["settings"]["removed"]), [
+            "settings.allowed_groups.-100.members.12.voice_agent.worker",
+            "settings.allowed_users.11.voice_agent.workers"])
+
+    def test_apply_writes_every_move_and_a_rerun_changes_nothing(self):
+        code, report = self.migrate(apply=True)
+        self.assertEqual(code, 0, report)
+        self.assertTrue(report["applied"])
+        defaults = self.settings["defaults"]
+        self.assertEqual(defaults["profile"], "telegram-codex-gpt-5.5-high-priority")
+        self.assertEqual(defaults["voice_agent"],
+                         {"voice": "Calm",
+                          "profile": "telegram-claude-sonnet-low-tools-read-no-mcp"})
+        self.assertNotIn("worker", defaults)
+        self.assertNotIn("workers", defaults)
+        self.assertEqual(defaults["tail_size"], 40)
+        self.assertEqual(self.settings["allowed_users"]["11"]["voice_agent"],
+                         {"mode": "enabled"})
+        self.assertEqual(self.settings["allowed_groups"]["-100"]["members"]["12"],
+                         {"voice_agent": {}})
+        schema = self.cli._settings_schema_module()
+        self.assertEqual(schema.old_worker_keys(self.settings), [])
+        register = json.loads(self.register_path.read_text())
+        self.assertEqual(schema.old_register_fields(register), [])
+        self.assertEqual(register["11"], {"last_processed_message_id": 5, "settings": {
+            "profile": "telegram-claude-sonnet-tools-read-no-mcp"}})
+        self.assertEqual(register["-100"]["settings"],
+                         {"tail_size": 9, "profile": "telegram-codex-gpt-5.4-high-priority"})
+        self.assertEqual(register["12"]["settings"],
+                         {"profile": "telegram-claude-opus-tools-read-no-mcp"})
+        self.assertEqual(register["13"], self.REGISTER["13"])
+        self.assertEqual(register["14"]["settings"], {"profile": "stub"})
+        self.assertEqual(self.reg.get(self.ids["waiting"])["profile"], "telegram-claude-sonnet")
+        self.assertEqual(self.reg.get(self.ids["quota"])["profile"], "telegram-codex")
+        self.assertIsNone(self.reg.get(self.ids["done"])["profile"])
+        self.assertEqual(self.stored_names(), sorted([
+            "telegram-codex-gpt-5.5-high-priority",
+            "telegram-claude-sonnet-low-tools-read-no-mcp",
+            "telegram-claude-sonnet-tools-read-no-mcp",
+            "telegram-codex-gpt-5.4-high-priority",
+            "telegram-claude-opus-tools-read-no-mcp", "telegram-claude-sonnet"]))
+        # Each profile is the bundled one with the old values laid over it,
+        # and every one fits a turn.
+        active = profiles.stored(self.conn, self.project, self.setting.schema)
+        self.conn.rollback()
+        for name in self.stored_names():
+            profiles.resolve(name, active, self.project)
+        self.assertEqual(profiles.resolve("telegram-codex-gpt-5.5-high-priority", active,
+                                          self.project)["knobs"],
+                         {**CODEX, "model": "gpt-5.5", "effort": "high",
+                          "service_tier": "priority"})
+        self.assertEqual(profiles.resolve("telegram-claude-sonnet-low-tools-read-no-mcp",
+                                          active, self.project)["knobs"],
+                         {**CLAUDE, "model": "sonnet", "effort": "low", "tools": ["Read"],
+                          "strict_mcp": True, "mcp_config": {"mcpServers": {}}})
+
+        settings_after = json.loads(json.dumps(self.settings))
+        register_after = self.register_path.read_text()
+        code, again = self.migrate(apply=True)
+        self.assertEqual(code, 0, again)
+        self.assertFalse(again["changed"])
+        self.assertEqual(again["profiles"], [])
+        self.assertEqual(again["settings"]["keys_written"], [])
+        self.assertEqual(again["jobs"], [])
+        self.assertEqual(self.settings, settings_after)
+        self.assertEqual(self.register_path.read_text(), register_after)
+
+    def test_apply_is_refused_while_the_service_runs(self):
+        code, error = self.migrate(apply=True, running=True)
+        self.assertEqual((code, error["code"]), (6, "service_running"))
+        self.assertEqual(self.settings, self.SETTINGS)
+        self.assertEqual(self.stored_names(), [])
+        # A dry run is not.
+        self.assertEqual(self.migrate(running=True)[0], 0)
 
 
 class WhoMaySave(unittest.TestCase):

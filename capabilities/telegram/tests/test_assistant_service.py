@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import dataclasses
 import importlib.util
+import io
 import itertools
 import json
 import logging
@@ -30,12 +32,19 @@ DAEMON_PATH = TELEGRAM_DIR / "service" / "daemon.py"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _cli import CLI_PATH  # noqa: E402
-from _harness import CODEX_EVENTS, FakeHarness, harness_turn  # noqa: E402
+from _harness import (  # noqa: E402
+    CLAUDE_KNOBS,
+    CODEX_EVENTS,
+    CODEX_KNOBS,
+    FakeHarness,
+    harness_turn,
+    held,
+)
 
 
 def settings(**default_overrides):
     defaults = {
-        "worker": "stub",
+        "profile": "stub",
         "debounce": 0,
         "worker_timeout": 2,
         "progress_after": 60,
@@ -718,10 +727,11 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         refusal is reported as what it is: this harness, that model."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            state = {"settings": {"worker_settings": {"model": REFUSED_MODEL}}}
+            state = {"settings": {"profile": "telegram-refused"}}
             fake = FakeHarness(ok=False, kind="model_refused", answer="",
                                message=CODEX_MODEL_REFUSAL)
-            with self.assertRaises(daemon.WorkerModelRefused) as caught:
+            with held(daemon, {"telegram-refused": {**CODEX_KNOBS, "model": REFUSED_MODEL}}), \
+                    self.assertRaises(daemon.WorkerModelRefused) as caught:
                 harness_turn(daemon, "codex", fake, state)
             self.assertEqual(fake.calls[0]["profile"].model, REFUSED_MODEL)
             notice = str(caught.exception)
@@ -734,10 +744,11 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         """The same refusal from the other harness, named the same way."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
-            state = {"settings": {"worker_settings": {"model": REFUSED_MODEL}}}
+            state = {"settings": {"profile": "telegram-refused"}}
             fake = FakeHarness(ok=False, kind="model_refused", answer="",
                                message=CLAUDE_MODEL_REFUSAL)
-            with self.assertRaises(daemon.WorkerModelRefused) as caught:
+            with held(daemon, {"telegram-refused": {**CLAUDE_KNOBS, "model": REFUSED_MODEL}}), \
+                    self.assertRaises(daemon.WorkerModelRefused) as caught:
                 harness_turn(daemon, "claude", fake, state)
             notice = str(caught.exception)
             self.assertIn(REFUSED_MODEL, notice)
@@ -2695,16 +2706,18 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 member["allowed_capabilities"]["telegram"]["connections"],
                 ["personal"])
 
-    async def test_voice_task_worker_policy_falls_back_to_the_projects_own(self):
+    async def test_voice_task_profile_falls_back_to_the_projects_own(self):
+        """A call's task runs on `defaults.voice_agent.profile`, then on the
+        project's default, then on the stub; no per-user position is read."""
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(
-                worker="claude", workers={"claude": {"model": "text-model",
-                                                     "effort": "high"}}))
+            daemon = import_daemon(Path(td), settings(profile="telegram-claude"))
             inherited = daemon.voice_agent_settings()
+            resolved, found = daemon.settings_on_profile(inherited)
 
-        self.assertEqual(inherited["worker"], "claude")
-        self.assertEqual(inherited["model"], "text-model")
-        self.assertEqual(inherited["effort"], "high")
+        self.assertEqual((inherited["profile"], inherited["profile_position"]),
+                         ("telegram-claude", "settings.defaults.profile"))
+        self.assertEqual((resolved["worker"], resolved["model"], found["layer"]),
+                         ("claude", "opus", "bundled"))
         self.assertEqual(inherited["worker_timeout"], 2)
         # How many tasks a call may run is not part of the settings surface:
         # the bound is fixed at one in code.
@@ -2712,15 +2725,17 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings(
-                worker="claude",
-                workers={"claude": {"model": "text-model", "effort": "high"}},
-                voice_agent={"worker": "claude",
-                             "workers": {"claude": {"model": "fast-model"}}}))
+                profile="telegram-claude", voice_agent={"profile": "telegram-codex"}))
             tuned = daemon.voice_agent_settings()
-
-        self.assertEqual(tuned["model"], "fast-model")
-        self.assertEqual(tuned["effort"], "high")
+        self.assertEqual((tuned["profile"], tuned["profile_position"]),
+                         ("telegram-codex", "settings.defaults.voice_agent.profile"))
         self.assertEqual(tuned["worker_timeout"], 2)
+
+        nothing = settings()
+        nothing["defaults"].pop("profile")
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), nothing)
+            self.assertEqual(daemon.voice_agent_settings()["profile"], "stub")
 
     async def test_voice_defaults_resolve_per_user_then_project_then_built_in(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3141,7 +3156,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelled_worker_is_killed_and_persisted_for_startup_retry(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(worker="codex", worker_timeout=30))
+            daemon = import_daemon(Path(td), settings(profile="telegram-codex", worker_timeout=30))
             client = FakeClient([Message(10)])
             fake = FakeHarness(seconds=30)
             daemon.harness_run = fake
@@ -3163,7 +3178,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeout_ends_the_run_and_cleans_job(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(worker="codex", worker_timeout=0.3))
+            daemon = import_daemon(Path(td), settings(profile="telegram-codex", worker_timeout=0.3))
             client = FakeClient([Message(11)])
             fake = FakeHarness(seconds=30)
             daemon.harness_run = fake
@@ -3182,7 +3197,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disappeared_process_and_failed_final_send_cannot_orphan_running_job(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(worker="codex"))
+            daemon = import_daemon(Path(td), settings(profile="telegram-codex"))
             daemon.harness_run = FakeHarness(
                 ok=False, kind="crash", answer="",
                 message="worker process disappeared with exit 7")
@@ -7715,7 +7730,7 @@ class VoiceWorkerDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
     def settings_for(self):
         base = settings(worker_timeout=30)
-        base["defaults"]["voice_agent"] = {"worker": "codex"}
+        base["defaults"]["voice_agent"] = {"profile": "telegram-codex"}
         base["allowed_users"] = {"777": {"name": "Caller", "role": "owner",
                                          "voice_agent": {"mode": "enabled"}}}
         return base
@@ -7790,7 +7805,7 @@ class StoppedVoiceTaskTests(unittest.IsolatedAsyncioTestCase):
         # `/stop` is a supervisor command, and the caller is the one who stops
         # the task they asked for.
         base["direct_messages"] = {"mode": "anyone", "default_role": "supervisor"}
-        base["defaults"]["voice_agent"] = {"worker": "codex",
+        base["defaults"]["voice_agent"] = {"profile": "telegram-codex",
                                            "session": {"mode": "carry"}}
         base["allowed_users"] = {"777": {"name": "Caller", "role": "supervisor",
                                          "voice_agent": {"mode": "enabled"}}}
@@ -8065,7 +8080,7 @@ class VoiceReplyMarkerTests(unittest.IsolatedAsyncioTestCase):
     def voice_settings(self):
         base = settings()
         base["direct_messages"] = {"mode": "anyone", "default_role": "supervisor"}
-        base["defaults"]["voice_agent"] = {"worker": "stub"}
+        base["defaults"]["voice_agent"] = {"profile": "stub"}
         base["allowed_users"] = {"777": {"name": "Caller", "role": "supervisor",
                                          "voice_agent": {"mode": "enabled"}}}
         return base
@@ -8120,7 +8135,7 @@ class ProgressOutboxLifetimeTests(unittest.IsolatedAsyncioTestCase):
 
     def stop_settings(self):
         # `/stop` is a supervisor command; a direct user could not reach it.
-        base = settings(worker="codex", worker_timeout=30)
+        base = settings(profile="telegram-codex", worker_timeout=30)
         base["direct_messages"] = {"mode": "anyone", "default_role": "supervisor"}
         return base
 
@@ -8320,22 +8335,17 @@ class ProgressOutboxLifetimeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ClaudeWorkerContextTests(unittest.IsolatedAsyncioTestCase):
-    """The `context` block on the claude worker rule: which built-in tools and
-    MCP servers a worker is launched holding. Declared in settings only, read
-    at the two positions the daemon reads worker policy from, and laid over the
-    profile every claude turn runs on by the one function that builds it."""
+    """The claude worker's `context` block - which built-in tools and MCP
+    servers a worker is launched holding - is a profile's `tools`, `strict_mcp`
+    and `mcp_config` now. The migration writes the block into a profile; a turn
+    on that profile is launched holding exactly what the block said; and the
+    block in settings is refused, naming the migration."""
 
     BASE = {"connection": "test", "assistant_name": "Assistant",
             "direct_messages": {"mode": "anyone", "default_role": "direct_user"},
             "allowed_users": {}, "allowed_groups": {}}
     BLOCK = {"tools": ["Read", "Grep"], "mcp": False}
     NO_MCP = {"strict_mcp": True, "mcp_config": {"mcpServers": {}}}
-
-    @staticmethod
-    def before(model, effort=None):
-        """The knobs a claude launch had before the block existed."""
-        return {"model": model, "effort": effort, "tools": None, "strict_mcp": False,
-                "mcp_config": None}
 
     @staticmethod
     def knobs(profile):
@@ -8354,133 +8364,388 @@ class ClaudeWorkerContextTests(unittest.IsolatedAsyncioTestCase):
         harness_turn(daemon, "claude", fake, state)
         return self.knobs(fake.calls[0]["profile"])
 
-    def probed(self, td, model):
-        """The profile the doctor's probe runs, via the real `probe`."""
+    def profiles_module(self):
         spec = importlib.util.spec_from_file_location(
             f"telegram_profiles_test_{time.time_ns()}",
             TELEGRAM_DIR / "service" / "profiles.py")
         profiles = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(profiles)
-        fake = FakeHarness(answer="OK")
-        rows = profiles.probe([{"worker": "claude", "model": model}], 1, [], None, td,
-                              run=fake)
-        self.assertEqual(rows[0]["verdict"], "accepted")
-        self.assertEqual(fake.calls[0]["prompt"], profiles.PROBE_PROMPT)
-        return self.knobs(fake.calls[0]["profile"])
+        return profiles
 
-    async def test_without_the_block_every_launch_is_the_one_it_was(self):
-        """Knob for knob: the dialogue turn, the voice task and the doctor's
-        probe run on the profile they ran on before the block existed."""
+    async def test_the_block_a_migration_writes_reaches_the_launch(self):
+        profiles = self.profiles_module()
+        for block, expected in ((self.BLOCK, {"tools": ["Read", "Grep"], **self.NO_MCP}),
+                                ({"tools": ["Read"]}, {"tools": ["Read"]}),
+                                ({"mcp": False}, self.NO_MCP),
+                                ({"mcp": True}, {}), ({}, {})):
+            overlay = profiles.implicit_knobs("claude", {"model": "text-model",
+                                                         "context": block})
+            name = profiles.derived_name("claude", overlay)
+            with self.subTest(block=block), tempfile.TemporaryDirectory() as td:
+                daemon = import_daemon(Path(td), settings(profile=name))
+                with held(daemon, {name: {**CLAUDE_KNOBS, **overlay}}):
+                    turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
+                self.assertEqual(turn, {"model": "text-model", "effort": None, "tools": None,
+                                        "strict_mcp": False, "mcp_config": None, **expected})
+
+    async def test_without_the_block_every_launch_is_the_bundled_one(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(
-                worker="claude",
-                workers={"claude": {"model": "text-model", "effort": "high"}},
-                voice_agent={"workers": {"claude": {"model": "fast-model"}}}))
+            daemon = import_daemon(Path(td), settings(profile="telegram-claude"))
             turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
-            self.assertEqual(turn, self.before("text-model", "high"))
-            task = self.launched(daemon, {"settings": daemon.voice_agent_settings()})
-            self.assertEqual(task, self.before("fast-model", "high"))
-            self.assertEqual(self.probed(td, "text-model"), self.before("text-model"))
+        self.assertEqual(turn, {"model": "opus", "effort": None, "tools": None,
+                                "strict_mcp": False, "mcp_config": None})
 
-        # `mcp: true`, and a block with nothing to say, are today's launch too.
-        for block in ({"mcp": True}, {}):
-            with tempfile.TemporaryDirectory() as td:
-                daemon = import_daemon(Path(td), settings(
-                    worker="claude",
-                    workers={"claude": {"model": "text-model", "context": block}}))
-                turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
-                self.assertEqual(turn, self.before("text-model"))
-
-    async def test_the_block_reaches_the_launch_once_from_each_position(self):
+    async def test_the_block_in_settings_is_refused_naming_the_migration(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(
-                worker="claude",
-                workers={"claude": {"model": "text-model", "effort": "high",
-                                    "context": self.BLOCK}}))
-            # The dialogue turn, and the voice task that inherits the project's
-            # worker policy.
-            for state in ({"settings": daemon.channel_settings({}, "123")},
-                          {"settings": daemon.voice_agent_settings()}):
-                self.assertEqual(self.launched(daemon, state),
-                                 {**self.before("text-model", "high"),
-                                  "tools": ["Read", "Grep"], **self.NO_MCP})
-            # The durable job re-resolves the engine's policy through the same
-            # lift the turn uses.
-            self.assertEqual(
-                daemon._worker_flags("claude", daemon._worker_settings({}, "claude"))["context"],
-                self.BLOCK)
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td)
+            for defaults in ({"workers": {"claude": {"context": self.BLOCK}}},
+                             {"voice_agent": {"workers": {"claude": {"context": self.BLOCK}}}},
+                             {"worker": "claude"}, {"voice_agent": {"worker": "codex"}}):
+                with self.subTest(defaults=defaults), self.assertRaisesRegex(
+                        Exception, r"telegram service migrate-profiles"):
+                    daemon.validate_settings({**self.BASE, "defaults": defaults}, root, root)
 
-        with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(
-                worker="claude",
-                workers={"claude": {"model": "text-model"}},
-                voice_agent={"workers": {"claude": {"context": self.BLOCK}}}))
-            turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
-            self.assertEqual(turn, self.before("text-model"))
-            task = self.launched(daemon, {"settings": daemon.voice_agent_settings()})
-            self.assertEqual(task, {**self.before("text-model"),
-                                    "tools": ["Read", "Grep"], **self.NO_MCP})
 
-        # Each key stands on its own.
-        with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(
-                worker="claude",
-                workers={"claude": {"model": "text-model",
-                                    "context": {"tools": ["Read"]}}}))
-            turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
-            self.assertEqual(turn, {**self.before("text-model"), "tools": ["Read"]})
-        with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(
-                worker="claude",
-                workers={"claude": {"model": "text-model",
-                                    "context": {"mcp": False}}}))
-            turn = self.launched(daemon, {"settings": daemon.channel_settings({}, "123")})
-            self.assertEqual(turn, {**self.before("text-model"), **self.NO_MCP})
+class RoomProfileTests(unittest.IsolatedAsyncioTestCase):
+    """A room names the profile its turns run on: the channel's `/set profile`,
+    its forum topic's, its group's or its direct user's `profile`, then the
+    default, else the stub. `/profiles` lists them and `/set profile` picks one,
+    gated as `/status` and `/set` are; the settings that named a worker are
+    gone, and naming them stops the service with the migration named."""
 
-    async def test_the_schema_admits_the_block_for_claude_and_nothing_else_in_it(self):
+    def rooms(self, **defaults):
+        base = settings(**defaults)
+        base["allowed_users"] = {"777": {"name": "Owner", "role": "supervisor",
+                                         "profile": "telegram-user"},
+                                 "778": {"name": "Other"}}
+        base["allowed_groups"] = {"-100": {"name": "Room", "profile": "telegram-group",
+                                           "topics": {"7": {"profile": "telegram-topic"},
+                                                      "8": {}}},
+                                  "-200": {"name": "Plain"}}
+        return base
+
+    def test_the_schema_admits_a_profile_at_each_room_position_and_nowhere_else(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
             root = Path(td)
 
-            def validated(defaults):
-                return daemon.validate_settings(
-                    {**self.BASE, "defaults": defaults}, root, root)
+            def validated(document):
+                return daemon.validate_settings({"connection": "test", **document}, root, root)
 
-            positions = (
-                lambda rule: {"workers": {"claude": rule}},
-                lambda rule: {"voice_agent": {"workers": {"claude": rule}}},
-            )
-            for position in positions:
-                validated(position({"context": self.BLOCK}))
-                validated(position({"context": {"tools": []}}))
-                validated(position({"context": {"mcp": True}}))
-                validated(position({"context": {}}))
-                with self.assertRaisesRegex(
-                        Exception, r"claude\.context\.plugins: unsupported property"):
-                    validated(position({"context": {"plugins": ["x"]}}))
-                with self.assertRaisesRegex(
-                        Exception, r"claude\.context: must be a JSON object"):
-                    validated(position({"context": ["Read"]}))
-                with self.assertRaisesRegex(
-                        Exception, r"claude\.context\.tools: must be a JSON array"):
-                    validated(position({"context": {"tools": "Read"}}))
-                with self.assertRaisesRegex(
-                        Exception, r"claude\.context\.tools\[0\]: must be a string"):
-                    validated(position({"context": {"tools": [1]}}))
-                with self.assertRaisesRegex(
-                        Exception, r"claude\.context\.tools\[0\]: must not be empty"):
-                    validated(position({"context": {"tools": [" "]}}))
-                with self.assertRaisesRegex(
-                        Exception, r"claude\.context\.mcp: must be a boolean"):
-                    validated(position({"context": {"mcp": "no"}}))
-            for worker in ("codex", "stub"):
-                with self.assertRaisesRegex(
-                        Exception, rf"workers\.{worker}\.context: unsupported property"):
-                    validated({"workers": {worker: {"context": {"mcp": False}}}})
-            # The rule's own refusal of a key it never heard of stands.
-            with self.assertRaisesRegex(
-                    Exception, r"workers\.claude\.plugins: unsupported property"):
-                validated({"workers": {"claude": {"plugins": []}}})
+            validated({"defaults": {"profile": "telegram-x",
+                                    "voice_agent": {"profile": "telegram-y"}},
+                       "allowed_users": {"1": {"profile": "telegram-x"}},
+                       "allowed_groups": {"-1": {"profile": "telegram-x", "topics": {
+                           "5": {"profile": "telegram-x"}}}}})
+            for document, place in (
+                    ({"allowed_groups": {"-1": {"members": {"2": {"profile": "telegram-x"}}}}},
+                     r"members\.2\.profile: unsupported property"),
+                    ({"allowed_users": {"1": {"voice_agent": {"profile": "telegram-x"}}}},
+                     r"allowed_users\.1\.voice_agent\.profile: unsupported property"),
+                    ({"defaults": {"profile": ""}}, r"defaults\.profile: must not be empty"),
+                    ({"defaults": {"profile": 3}}, r"defaults\.profile: must be a string")):
+                with self.subTest(place=place), self.assertRaisesRegex(ValueError, place):
+                    validated(document)
+
+    def test_a_turn_runs_on_the_first_position_that_names_a_profile(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), self.rooms(profile="telegram-default"))
+            key = daemon._channel_key
+            reg = {}
+            cases = {
+                "777": ("telegram-user", "settings.allowed_users.777.profile"),
+                "778": ("telegram-default", "settings.defaults.profile"),
+                "-100": ("telegram-group", "settings.allowed_groups.-100.profile"),
+                key("-100", 7): ("telegram-topic",
+                                 "settings.allowed_groups.-100.topics.7.profile"),
+                key("-100", 8): ("telegram-group", "settings.allowed_groups.-100.profile"),
+                "-200": ("telegram-default", "settings.defaults.profile"),
+            }
+            for channel, expected in cases.items():
+                with self.subTest(channel=channel):
+                    self.assertEqual(daemon.channel_profile(reg, channel), expected)
+                    s = daemon.channel_settings(reg, channel)
+                    self.assertEqual((s["profile"], s["profile_position"]), expected)
+            # The channel's own /set wins over everything the settings name,
+            # and a forum topic's row does not inherit its group's.
+            reg = {"-100": {"settings": {"profile": "telegram-chosen"}},
+                   key("-100", 8): {"settings": {"profile": "telegram-topic-chosen"}}}
+            self.assertEqual(daemon.channel_profile(reg, "-100"),
+                             ("telegram-chosen", "/set profile"))
+            self.assertEqual(daemon.channel_profile(reg, key("-100", 7))[0], "telegram-topic")
+            self.assertEqual(daemon.channel_profile(reg, key("-100", 8)),
+                             ("telegram-topic-chosen", "/set profile"))
+
+        nothing = self.rooms()
+        nothing["defaults"].pop("profile")
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), nothing)
+            self.assertEqual(daemon.channel_profile({}, "778"), ("stub", "default"))
+            self.assertEqual(daemon.channel_profile({}, "777")[0], "telegram-user")
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {"TELEGRAM_SERVICE_PROFILE": "telegram-node"}):
+            daemon = import_daemon(Path(td), self.rooms(profile="telegram-default"))
+            self.assertEqual(daemon.channel_profile({}, "778"),
+                             ("telegram-node", "TELEGRAM_SERVICE_PROFILE"))
+            self.assertEqual(daemon.voice_profile(),
+                             ("telegram-node", "TELEGRAM_SERVICE_PROFILE"))
+            self.assertEqual(daemon.channel_profile({}, "777")[0], "telegram-user")
+
+    def test_the_prompt_states_the_profile_its_harness_model_and_effort(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(profile="telegram-fast"))
+            with held(daemon, {"telegram-fast": {**CODEX_KNOBS, "model": "fast-model",
+                                                 "effort": "low",
+                                                 "service_tier": "priority"}}):
+                s, found = daemon.settings_on_profile(daemon.channel_settings({}, "123"))
+            self.assertEqual(found["layer"], "global")
+            prompt = daemon.build_prompt([], {"settings": s, "chat_id": "123",
+                                              "harness": s["worker"]})
+        self.assertIn("profile=telegram-fast, worker=codex, model=fast-model", prompt)
+        self.assertIn("effort=low, service_tier=priority", prompt)
+        self.assertIn("harness=codex", prompt)
+
+    def test_profiles_lists_every_profile_and_what_the_chat_runs_on(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(profile="telegram-claude"))
+            specs = {"telegram-quiet": {**CODEX_KNOBS, "env_set": {"TOKEN": "s3cret"}},
+                     "telegram-boxed": {**CLAUDE_KNOBS, "tools": ["Read"],
+                                        "settings": {"sandbox": {"enabled": True},
+                                                     "permissions": {"deny": [
+                                                         "Read(./private-notes)"]}}},
+                     "telegram-asks": {**CLAUDE_KNOBS, "permission_mode": "default"}}
+            with held(daemon, specs):
+                reply = daemon.handle_command({}, "123", "/profiles")
+        lines = reply.splitlines()
+        self.assertEqual(lines[0], "profiles [123]:")
+        self.assertEqual(lines[1], "this chat runs on telegram-claude (bundled, from "
+                                   "settings.defaults.profile)")
+        listed = {line.split(" ", 2)[1]: line for line in lines if line.startswith("- ")}
+        self.assertEqual(sorted(listed), ["telegram-asks", "telegram-boxed",
+                                          "telegram-claude", "telegram-codex",
+                                          "telegram-quiet"])
+        self.assertIn("(bundled): claude opus, effort default, permission_mode "
+                      "bypassPermissions, every tool, timeout 86400s; fits",
+                      listed["telegram-claude"])
+        self.assertIn("service tier default", listed["telegram-codex"])
+        self.assertIn("(global v-telegram-quiet)", listed["telegram-quiet"])
+        self.assertIn("does not fit: permission_mode", listed["telegram-asks"])
+        self.assertIn("narrower: tools leaves out Bash", listed["telegram-boxed"])
+        for private in ("s3cret", "TOKEN", "env_set", "private-notes", "permissions",
+                        "{"):
+            self.assertNotIn(private, reply)
+        self.assertIn("/set profile <name>", lines[-1])
+
+    def test_profiles_passes_the_gate_as_status_and_a_choice_as_set(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.assertEqual(daemon._control_command_key("/profiles"), "status")
+            self.assertEqual(daemon._control_command_key("/profiles@SomeBot"), "status")
+            for role, may_list, may_choose in (("supervisor", True, True),
+                                               ("channel_admin", True, True),
+                                               ("direct_user", True, False),
+                                               ("group_member", True, False)):
+                profile = {"id": "1", "role": role}
+                with self.subTest(role=role):
+                    self.assertEqual(daemon._control_command_allowed("/profiles", profile),
+                                     may_list)
+                    self.assertEqual(daemon._control_command_allowed("/set", profile),
+                                     may_choose)
+            # The settings' control decides for both, as it does for /status and /set.
+            self.assertFalse(daemon._control_commands_allow(["help"], "/profiles"))
+            self.assertTrue(daemon._control_commands_allow(["status"], "/profiles"))
+
+    async def test_set_profile_is_gated_exactly_as_set_and_kept_only_when_it_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = settings(profile="telegram-claude")
+            base["allowed_users"] = {"777": {"name": "Owner", "role": "direct_user"}}
+            daemon = import_daemon(Path(td), base)
+            self.enterContext(held(daemon, {"telegram-asks": {
+                **CLAUDE_KNOBS, "permission_mode": "default"}}))
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+
+            async def say(message_id, text):
+                message = Message(message_id, text=text)
+                client.messages.append(message)
+                await client.handler(Event(message))
+                return client.sent[-1]["text"]
+
+            self.assertTrue((await say(400, "/profiles")).startswith("profiles [123]:"))
+            self.assertEqual(await say(401, "/set profile telegram-codex"),
+                             "nope: /set is not allowed for role direct_user")
+            self.assertNotIn("profile", daemon.load_register()["123"].get("settings", {}))
+
+            daemon.ALLOWED["777"]["role"] = "channel_admin"
+            self.assertEqual(await say(402, "/set profile telegram-codex"),
+                             "ok, profile = telegram-codex (bundled)")
+            self.assertEqual(daemon.load_register()["123"]["settings"]["profile"],
+                             "telegram-codex")
+            for number, (name, part) in enumerate((
+                    ("claude-act", "telegram-<something>"),
+                    ("telegram-nowhere", "'telegram-nowhere'"),
+                    ("telegram-asks", "does not fit a telegram turn"))):
+                reply = await say(420 + number, f"/set profile {name}")
+                self.assertTrue(reply.startswith("nope: "), reply)
+                self.assertIn(part, reply)
+                self.assertEqual(daemon.load_register()["123"]["settings"]["profile"],
+                                 "telegram-codex")
+            self.assertEqual(await say(430, "/set profile stub"),
+                             "ok, profile = stub (in process)")
+            self.assertEqual(await say(431, "/set profile default"),
+                             "ok, profile = default (telegram-claude from "
+                             "settings.defaults.profile)")
+            self.assertNotIn("profile", daemon.load_register()["123"]["settings"])
+            client.disconnected.set()
+            await asyncio.wait_for(task, timeout=10)
+
+    def test_the_set_settings_a_profile_replaced_point_to_profiles(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(profile="telegram-claude"))
+            reg = {}
+            for text in ("/set worker codex", "/set worker", "/set model opus",
+                         "/set effort high", "/set reasoning high", "/set speed fast",
+                         "/set service-tier fast", "/set service_tier priority",
+                         "/set codex.model gpt-5.5", "/set claude.effort high",
+                         "/set codex.speed fast", "/set codex.reasoning low"):
+                with self.subTest(text=text):
+                    reply = daemon.handle_command(reg, "123", text)
+                    self.assertTrue(reply.startswith(
+                        f"nope: /set {text.split()[1]} is gone;"), reply)
+                    self.assertIn("/profiles", reply)
+                    self.assertIn("/set profile", reply)
+            self.assertEqual(reg, {})
+            # The settings that stay are answered as they were.
+            self.assertEqual(daemon.handle_command(reg, "123", "/set tail 20"), "ok, tail = 20")
+            self.assertEqual(daemon.handle_command(reg, "123", "/set debounce 4"),
+                             "ok, debounce = 4s")
+
+    def test_status_and_help_name_the_profile_and_no_worker(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(profile="telegram-claude"))
+            status = daemon._status({}, "123")
+            self.assertIn("  profile = telegram-claude (bundled, from "
+                          "settings.defaults.profile)", status.splitlines())
+            for gone in ("worker =", ".model", "claude.effort", "codex.reasoning",
+                         "service_tier"):
+                self.assertNotIn(gone, status)
+            self.assertIn("  worker-timeout = 2s", status.splitlines())
+            reg = {"123": {"settings": {"profile": "stub"}}}
+            self.assertIn("  profile = stub (in process, from /set profile)",
+                          daemon._status(reg, "123").splitlines())
+            reg = {"123": {"settings": {"profile": "telegram-nowhere"}}}
+            self.assertIn("  profile = telegram-nowhere (does not resolve or fit, "
+                          "from /set profile)", daemon._status(reg, "123").splitlines())
+            help_text = daemon.handle_command({}, "123", "/set")
+            self.assertIn("  profile <name|default>  (/profiles lists them)",
+                          help_text.splitlines())
+            for gone in ("worker <", "model <", "reasoning <", "effort <", "speed <",
+                         "worker-specific"):
+                self.assertNotIn(gone, help_text)
+            for kept in ("tail <1..500>", "debounce <0..300>",
+                         "worker-timeout <1..3600|default>"):
+                self.assertIn(kept, help_text)
+            self.assertIn("usage: /set profile <name|default>",
+                          daemon.handle_command({}, "123", "/set profile"))
+
+    async def test_the_seed_settings_run_on_the_stub(self):
+        seed = json.loads((TELEGRAM_DIR / "service" / "templates" / "settings.json")
+                          .read_text())
+        self.assertEqual(seed["defaults"]["profile"], "stub")
+        seed["connection"] = "test"
+        seed["direct_messages"] = {"mode": "anyone", "default_role": "direct_user"}
+        seed["defaults"]["debounce"] = 0
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), seed)
+            self.assertEqual(daemon.channel_profile({}, "123"),
+                             ("stub", "settings.defaults.profile"))
+            harness = FakeHarness()
+            daemon.harness_run = harness
+            message = Message(410, text="Assistant, hello")
+            client = FakeClient([message])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await client.handler(Event(message))
+            await wait_until(lambda: any("[harness-stub]" in item["text"]
+                                         for item in client.sent), timeout=10)
+            self.assertEqual(harness.calls, [])
+            client.disconnected.set()
+            await asyncio.wait_for(task, timeout=10)
+
+    def test_old_worker_keys_stop_the_daemon_and_a_reload_refuses_them(self):
+        with tempfile.TemporaryDirectory() as td:
+            old = settings()
+            old["defaults"]["worker"] = "claude"
+            with self.assertRaises(SystemExit) as stopped:
+                import_daemon(Path(td), old)
+            self.assertIn("settings.defaults.worker", str(stopped.exception.code))
+            self.assertIn("telegram service migrate-profiles", str(stopped.exception.code))
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            path = (Path(td) / "project" / "capabilities" / "telegram" / "service"
+                    / "settings.json")
+            document = json.loads(path.read_text())
+            document["defaults"]["voice_agent"] = {"workers": {"codex": {"model": "x"}}}
+            path.write_text(json.dumps(document))
+            generation = daemon.SETTINGS_GENERATION
+            refused = daemon.reload_runtime_settings()
+            self.assertFalse(refused["ok"])
+            self.assertIn("settings.defaults.voice_agent.workers", refused["error"])
+            self.assertIn("telegram service migrate-profiles", refused["error"])
+            self.assertEqual(daemon.SETTINGS_GENERATION, generation)
+
+    def test_the_old_environment_names_stop_the_daemon(self):
+        for name in ("TG_WORKER", "TELEGRAM_SERVICE_WORKER"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td, \
+                    mock.patch.dict(os.environ, {name: "claude"}):
+                with self.assertRaises(SystemExit) as stopped:
+                    import_daemon(Path(td), settings())
+                self.assertIn(name, str(stopped.exception.code))
+                self.assertIn("telegram service migrate-profiles", str(stopped.exception.code))
+
+    def test_a_register_with_old_fields_stops_the_daemon(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            for row, place in (({"settings": {"worker": "codex"}}, "123.settings.worker"),
+                               ({"settings": {"model": "opus"}}, "123.settings.model"),
+                               ({"workers": {"codex": {}}}, "123.workers")):
+                with self.subTest(place=place), \
+                        self.assertRaisesRegex(daemon.SettingsError, place):
+                    daemon.refuse_old_register({"123": row})
+            daemon.refuse_old_register({"123": {"settings": {"profile": "telegram-x"}}})
+        source = DAEMON_PATH.read_text()
+        main = source[source.index("async def main():"):]
+        self.assertLess(main.index("refuse_old_register(load_register())"),
+                        main.index("lock_handle = acquire_daemon_lock()"))
+
+    def test_a_turn_saves_a_profile_only_for_a_role_that_may_set(self):
+        """The daemon states the requester's role on every child; the CLI's
+        save reads it there, so a supervisor's turn saves and a direct user's
+        is refused, whatever the model says."""
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from test_outbound_actions import import_cli
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(profile="telegram-claude"))
+            for role, saved in (("supervisor", True), ("channel_admin", True),
+                                ("direct_user", False), ("group_member", False)):
+                state = {"settings": daemon.settings_on_profile(
+                             daemon.channel_settings({}, "123"))[0],
+                         "chat_id": "123",
+                         "current_request": {"sender_id": "777", "sender_role": role}}
+                environ, extra = daemon.worker_env_parts(state)
+                with self.subTest(role=role), \
+                        mock.patch.dict(os.environ, {**environ, **extra}, clear=True), \
+                        mock.patch.object(cli, "_service_settings", return_value={}):
+                    if saved:
+                        self.assertEqual(cli._profile_saver(Path("/nowhere")), "telegram:777")
+                    else:
+                        with contextlib.redirect_stderr(io.StringIO()), \
+                                self.assertRaises(SystemExit) as stopped:
+                            cli._profile_saver(Path("/nowhere"))
+                        self.assertEqual(stopped.exception.code, 4)
 
 
 class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
@@ -8493,11 +8758,13 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(task, timeout=10)
 
     def state(self, daemon, **extra):
-        return {"settings": daemon.channel_settings({}, "123"), "chat_id": "123",
+        return {"settings": daemon.settings_on_profile(daemon.channel_settings({}, "123"))[0],
+                "chat_id": "123",
                 "chat_type": "private", "connection": "test",
                 "progress_outbox": "/tmp/outbox.jsonl", "worker_session": "/tmp/session",
                 "authority_context": "/tmp/authority.json",
-                "current_request": {"sender_id": "777", "message_id": 5, "reply_to": 5},
+                "current_request": {"sender_id": "777", "sender_role": "supervisor",
+                                    "message_id": 5, "reply_to": 5},
                 **extra}
 
     async def test_the_harness_environment_is_the_worker_environment(self):
@@ -8507,12 +8774,13 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
         the authority, the register's scope - is set last, where no profile can
         remove it."""
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(worker="codex"))
+            daemon = import_daemon(Path(td), settings(profile="telegram-codex"))
             noisy = {"SSH_AUTH_SOCK": "/agent", "CLAUDE_CODE_ENTRYPOINT": "cli",
                      "CLAUDECODE": "1", "VSCODE_PID": "9",
                      "TELEGRAM_SERVICE_LAUNCH_NONCE": "nonce",
                      "TELEGRAM_AUTHORIZED_TOPIC_ID": "4",
                      "TELEGRAM_AUTHORIZED_JOB_MODEL": "old"}
+            inherited = {"TELEGRAM_AUTHORIZED_REQUESTER_ROLE": "supervisor"}
             with mock.patch.dict(os.environ, noisy):
                 for state in (self.state(daemon),
                               self.state(daemon, project_dir=Path(td) / "routed")):
@@ -8530,8 +8798,18 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(extra["CAPABILITIES_AUTH_CONTEXT"], "/tmp/authority.json")
                     self.assertEqual(extra["TELEGRAM_DAEMON_CHILD"], "1")
                     self.assertEqual(extra["TELEGRAM_AUTHORIZED_REQUESTER_ID"], "777")
+                    self.assertEqual(extra["TELEGRAM_AUTHORIZED_REQUESTER_ROLE"], "supervisor")
+                    self.assertEqual(extra["TELEGRAM_AUTHORIZED_JOB_PROFILE"], "telegram-codex")
                     self.assertEqual(extra["TELEGRAM_AUTHORIZED_JOB_ENGINE"], "codex")
                     self.assertNotIn("TELEGRAM_AUTHORIZED_JOB_MODEL", environ)
+                    self.assertNotIn("TELEGRAM_AUTHORIZED_JOB_MODEL", extra)
+                # A request whose sender has no resolved role states none, and
+                # one inherited from the daemon's own environment is dropped.
+                with mock.patch.dict(os.environ, inherited):
+                    nobody = self.state(daemon, current_request={"sender_id": "777"})
+                    environ, extra = daemon.worker_env_parts(nobody)
+                    self.assertNotIn("TELEGRAM_AUTHORIZED_REQUESTER_ROLE", environ)
+                    self.assertNotIn("TELEGRAM_AUTHORIZED_REQUESTER_ROLE", extra)
                 routed = self.state(daemon, project_dir=Path(td) / "routed")
                 environ, extra = daemon.worker_env_parts(routed)
                 for name in daemon.WORKER_ENV_DROP_WHEN_ROUTED:
@@ -8547,12 +8825,12 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_dialogue_turn_runs_on_its_profile_and_delivers_the_answer(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(
-                worker="codex", workers={"codex": {"model": "gpt-5.5",
-                                                   "reasoning_effort": "high"}}))
+            daemon = import_daemon(Path(td), settings(profile="telegram-codex-high"))
             fake = FakeHarness(answer="the answer", session_id="thread-3",
                                tokens={"input": 11, "output": 7, "cache_read": 3})
             daemon.harness_run = fake
+            self.enterContext(held(daemon, {"telegram-codex-high": {
+                **CODEX_KNOBS, "model": "gpt-5.5", "effort": "high"}}))
             images = []
             daemon.discover_codex_images = lambda thread: images.append(thread) or []
             message = Message(300, text="Assistant, a question")
@@ -8581,7 +8859,7 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stop_cancels_the_live_run_and_says_so_once(self):
         with tempfile.TemporaryDirectory() as td:
-            base = settings(worker="claude", worker_timeout=30)
+            base = settings(profile="telegram-claude", worker_timeout=30)
             base["direct_messages"] = {"mode": "anyone", "default_role": "supervisor"}
             daemon = import_daemon(Path(td), base)
             fake = FakeHarness(seconds=30)
@@ -8624,14 +8902,13 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_profile_that_no_longer_resolves_fails_the_turn_naming_it(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
+            daemon = import_daemon(Path(td), settings(profile="telegram-codex"))
             fake = FakeHarness()
-            refusal = daemon.profiles.Refusal(
-                6, "profile_unfit", "profile 'telegram-codex' (layer global, version v1) "
-                "does not fit a telegram turn: approval_policy must be never")
-            with mock.patch.object(daemon.profiles, "implicit", side_effect=refusal):
+            with held(daemon, {"telegram-codex": {**CODEX_KNOBS,
+                                                  "approval_policy": "auto_review"}}):
                 with self.assertRaises(daemon.WorkerModelRefused) as caught:
-                    harness_turn(daemon, "codex", fake)
+                    harness_turn(daemon, "codex", fake,
+                                 {"settings": daemon.channel_settings({}, "123")})
             self.assertIsInstance(caught.exception, daemon.WorkerProfileRefused)
             self.assertIn("telegram-codex", str(caught.exception))
             self.assertIn("approval_policy", str(caught.exception))
@@ -8639,15 +8916,15 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_reload_whose_profile_does_not_fit_is_refused(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings(worker="codex"))
-            problem = {"position": "defaults", "profile": "telegram-codex",
+            daemon = import_daemon(Path(td), settings(profile="telegram-codex"))
+            problem = {"position": "settings.defaults.profile", "profile": "telegram-codex",
                        "code": "profile_unfit", "message": "approval_policy must be never"}
             generation = daemon.SETTINGS_GENERATION
             with mock.patch.object(daemon.profiles, "check", return_value=[problem]):
                 refused = daemon.reload_runtime_settings()
             self.assertFalse(refused["ok"])
             self.assertEqual(refused["status"], "reload_refused")
-            self.assertIn("settings.defaults runs on telegram-codex", refused["error"])
+            self.assertIn("settings.defaults.profile names telegram-codex", refused["error"])
             self.assertEqual(daemon.SETTINGS_GENERATION, generation)
             # The settings as they are pass, profiles included.
             self.assertTrue(daemon.reload_runtime_settings()["ok"])
@@ -8667,7 +8944,7 @@ class VoiceTaskHarnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def answered_call(self, td, fake):
         base = settings(worker_timeout=30)
-        base["defaults"]["voice_agent"] = {"worker": "codex", "session": {"mode": "carry"}}
+        base["defaults"]["voice_agent"] = {"profile": "telegram-codex", "session": {"mode": "carry"}}
         base["allowed_users"] = {"777": {"name": "Caller", "role": "supervisor",
                                          "voice_agent": {"mode": "enabled"}}}
         daemon = import_daemon(Path(td), base, voice_context="Answer briefly.",

@@ -983,7 +983,7 @@ class OutboundActionsTests(unittest.TestCase):
             "TELEGRAM_AUTHORIZED_REQUESTER_ID": "777",
             "TELEGRAM_AUTHORIZED_ORIGIN_MESSAGE_ID": "88",
             "TELEGRAM_AUTHORIZED_JOB_ENGINE": "codex",
-            "TELEGRAM_AUTHORIZED_JOB_MODEL": "gpt-test",
+            "TELEGRAM_AUTHORIZED_JOB_PROFILE": "telegram-codex-test",
         }
 
     def test_a_jobs_help_request_is_not_scoped(self):
@@ -1020,8 +1020,8 @@ class OutboundActionsTests(unittest.TestCase):
                                       ["telegram", "jobs", "register", "--", "-h"]),
                 ["jobs", "register", "--chat", "-1001", "--topic-id", "77",
                  "--actor", "777", "--requested-by", "777",
-                 "--origin-message-id", "88", "--engine", "codex",
-                 "--model", "gpt-test", "--", "-h"])
+                 "--origin-message-id", "88", "--profile", "telegram-codex-test",
+                 "--", "-h"])
             self.assertEqual(
                 shim.scoped_jobs_argv(["jobs", "show", "12"],
                                       ["telegram", "jobs", "show", "12"]),
@@ -1051,12 +1051,23 @@ class OutboundActionsTests(unittest.TestCase):
                                   "--actor", "777",
                                   "--requested-by", "777",
                                   "--origin-message-id", "88",
-                                  "--engine", "codex", "--model", "gpt-test"])
+                                  "--profile", "telegram-codex-test"])
                 for denied in (["telegram", "jobs", "active", "--chat", "-9999"],
                                ["telegram", "jobs", "list", "--all-channels"],
                                ["telegram", "jobs", "list", "--chat=-9999"],
                                ["telegram", "jobs", "register", "work",
-                                "--requested-by", "999"]):
+                                "--requested-by", "999"],
+                               # A job runs on the turn's profile; naming
+                               # another, or the old engine and model, is an
+                               # override.
+                               ["telegram", "jobs", "register", "work",
+                                "--profile", "telegram-other"],
+                               ["telegram", "jobs", "register", "work",
+                                "--profile=telegram-other"],
+                               ["telegram", "jobs", "register", "work",
+                                "--engine", "claude"],
+                               ["telegram", "jobs", "register", "work",
+                                "--model", "opus"]):
                     with self.assertRaises(SystemExit) as stopped:
                         shim.enforce_job_scope(denied)
                     self.assertEqual(stopped.exception.code, 4)
@@ -1108,6 +1119,21 @@ class OutboundActionsTests(unittest.TestCase):
             shim.pin_jobs_to_service_project(["telegram", "read", "-1001"])
             self.assertEqual(os.environ["CLAUDE_PROJECT_DIR"], "/home/routedproj")
             self.assertNotIn("CAPABILITIES_PROJECT_ENVELOPE", os.environ)
+
+    def test_a_routed_turn_saves_its_profile_into_the_daemons_project(self):
+        """The settings that name a room's profile are the daemon's, so a
+        profile a routed turn saves or lists is the daemon project's too."""
+        shim = import_worker_shim()
+        routed = {
+            "TELEGRAM_SERVICE_PROJECT_ROOT": "/home/daemonproj",
+            "TELEGRAM_SERVICE_PROJECT_ENVELOPE": "/home/daemonproj/capabilities",
+            "CLAUDE_PROJECT_DIR": "/home/routedproj",
+        }
+        with mock.patch.dict(os.environ, routed, clear=False):
+            shim.pin_jobs_to_service_project(["telegram", "profiles", "save", "telegram-x", "-"])
+            self.assertEqual(os.environ["CLAUDE_PROJECT_DIR"], "/home/daemonproj")
+            self.assertEqual(os.environ["CAPABILITIES_PROJECT_ENVELOPE"],
+                             "/home/daemonproj/capabilities")
 
     def _unscoped_jobs_call(self):
         return types.SimpleNamespace(chat=None, topic_id=None, actor=None,
@@ -1179,8 +1205,7 @@ class OutboundActionsTests(unittest.TestCase):
                 "/real/telegram", "jobs", "register",
                 "--chat", "-1001", "--topic-id", "77",
                 "--actor", "777", "--requested-by", "777",
-                "--origin-message-id", "88", "--engine", "codex",
-                "--model", "gpt-test",
+                "--origin-message-id", "88", "--profile", "telegram-codex-test",
                 "Count every topic",
             ])
             # Registering only opens a draft. The turn that wrote it still has
@@ -1576,35 +1601,40 @@ def _profiles_module():
 
 
 class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
-    """`service doctor` asks each configured worker's harness, once per
-    distinct (worker, model) pair, whether it runs that model, with one live
-    turn on the profile the pair runs on. The turns run in the bundle's
-    `service/profiles.py`, here in-process with the runner's `run` stood in
-    for: the real harnesses would spend money and need a login, and the
-    doctor's verdict has to come from the harness's own answer rather than
-    from anything this repository holds about models."""
+    """`service doctor` asks each harness, once per distinct profile the
+    settings name, whether it runs that profile, with one live turn on it. The
+    turns run in the bundle's `service/profiles.py`, here in-process with the
+    runner's `run` stood in for: the real harnesses would spend money and need
+    a login, and the doctor's verdict has to come from the harness's own answer
+    rather than from anything this repository holds about models. The store is
+    stood in for by global versions handed to the resolution directly."""
 
     ALL_POSITIONS = (
-        "settings.defaults.workers.{worker}.model",
-        "settings.defaults.voice_agent.workers.{worker}.model",
-        "settings.allowed_users.42.voice_agent.workers.{worker}.model",
+        "settings.defaults.profile",
+        "settings.defaults.voice_agent.profile",
+        "settings.allowed_users.42.profile",
+        "settings.allowed_groups.-100.profile",
+        "settings.allowed_groups.-100.topics.7.profile",
     )
+    CLAUDE = {"harness": "claude", "model": "opus", "permission_mode": "bypassPermissions",
+              "timeout_seconds": 86400}
+    CODEX = {"harness": "codex", "model": "sol", "approval_policy": "never",
+             "timeout_seconds": 86400}
 
     @staticmethod
-    def _settings(*, defaults=None, voice=None, user=None, timeout=5):
-        """A schema-valid document declaring worker models at the three
-        positions the schema admits them, each block given as
-        {worker: model}."""
-        def block(models):
-            return {worker: {"model": model} for worker, model in (models or {}).items()}
+    def _settings(*, defaults=None, voice=None, user=None, group=None, topic=None,
+                  timeout=5):
+        """A schema-valid document naming a profile at each of the positions a
+        turn resolves one at, each given as a name or left out."""
+        def named(name):
+            return {"profile": name} if name else {}
         return {
             "connection": "probe",
-            "defaults": {"worker": "claude", "worker_timeout": timeout,
-                         "workers": block(defaults),
-                         "voice_agent": {"workers": block(voice)}},
-            "allowed_users": {"42": {"name": "A caller",
-                                     "voice_agent": {"mode": "enabled",
-                                                     "workers": block(user)}}},
+            "defaults": {"worker_timeout": timeout, **named(defaults),
+                         "voice_agent": named(voice)},
+            "allowed_users": {"42": {"name": "A caller", **named(user)}},
+            "allowed_groups": {"-100": {"name": "A room", **named(group),
+                                        "topics": {"7": named(topic)}}},
         }
 
     @staticmethod
@@ -1629,22 +1659,29 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
             return lib.Result(ok=True, harness=harness, answer="OK", model=model)
         return run
 
-    def _run_doctor(self, cli, tmp, settings, *, refused=(), binaries=("claude", "codex"),
-                    hang=False):
+    def _run_doctor(self, cli, tmp, settings, *, held=None, refused=(),
+                    binaries=("claude", "codex"), hang=False):
         """Drive the real dispatch. The verdict is computed by the real
-        `cmd_service_doctor`, the real schema walk and the real `probe` in
-        `service/profiles.py`; the harness, the initialization, connection and
-        daemon-status plumbing are stood in for. Returns (exit_code, payload,
-        invocations)."""
+        `cmd_service_doctor`, the real reading of the settings and the real
+        `probe` in `service/profiles.py`; the harness, the store, the
+        initialization, connection and daemon-status plumbing are stood in
+        for. `held` is {name: spec}, global versions the resolution reaches.
+        Returns (exit_code, payload, invocations)."""
         from callva import harness_runner as lib
         calls = []
         profiles = _profiles_module()
         harness = self._harness(calls, refused=refused, binaries=binaries, hang=hang)
+        versions = [lib.StoredProfile(id=f"v-{name}", scope="global", scope_id=None,
+                                      name=name, spec=spec, active=True,
+                                      created_at=None, created_by=None)
+                    for name, spec in (held or {}).items()]
 
         def profiles_call(argv, text=""):
             out, err = io.StringIO(), io.StringIO()
             with mock.patch.object(sys, "stdin", io.StringIO(text)), \
                     mock.patch.object(lib, "run", harness), \
+                    mock.patch.object(profiles, "_reachable",
+                                      lambda *_a: (versions, None)), \
                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 code = profiles.main(argv)
             if code == 0:
@@ -1684,45 +1721,45 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
         return code, json.loads(captured.getvalue()), calls
 
     @staticmethod
-    def _row(payload, worker, model):
+    def _row(payload, profile):
         return next(row for row in payload["workers"]["checked"]
-                    if row["worker"] == worker and row["model"] == model)
+                    if row["profile"] == profile)
 
-    def test_a_pair_the_binary_accepts_is_ok(self):
+    def test_a_profile_the_harness_accepts_is_ok(self):
         cli = import_cli()
         with tempfile.TemporaryDirectory() as tmp:
             code, payload, calls = self._run_doctor(
-                cli, tmp, self._settings(defaults={"claude": None, "codex": "fast-model"}))
+                cli, tmp, self._settings(defaults="telegram-claude", voice="telegram-fast"),
+                held={"telegram-fast": {**self.CODEX, "model": "fast-model"}})
         self.assertEqual(code, 0)
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["workers"]["ok"])
-        default = self._row(payload, "claude", None)
-        pinned = self._row(payload, "codex", "fast-model")
-        for row in (default, pinned):
+        default = self._row(payload, "telegram-claude")
+        fast = self._row(payload, "telegram-fast")
+        for row in (default, fast):
             self.assertTrue(row["ok"])
             self.assertEqual(row["verdict"], "accepted")
-            self.assertEqual(row["layer"], "bundled")
-            self.assertIsNone(row["version"])
-        self.assertEqual((default["binary"], default["profile"]), ("claude", "telegram-claude"))
-        self.assertEqual((pinned["binary"], pinned["profile"]), ("codex", "telegram-codex"))
-        # A pair with no model runs on the model its profile names, which is
-        # what a turn with no model runs on.
-        self.assertEqual(
-            sorted((c["binary"], c["model"]) for c in calls),
-            [("claude", "opus"), ("codex", "fast-model")])
+        self.assertEqual((default["binary"], default["worker"], default["model"],
+                          default["layer"], default["version"]),
+                         ("claude", "claude", "opus", "bundled", None))
+        self.assertEqual((fast["binary"], fast["model"], fast["layer"], fast["version"]),
+                         ("codex", "fast-model", "global", "v-telegram-fast"))
+        self.assertEqual(default["declared_at"], ["settings.defaults.profile"])
+        self.assertEqual(sorted((c["binary"], c["model"]) for c in calls),
+                         [("claude", "opus"), ("codex", "fast-model")])
 
-    def test_a_pair_the_binary_refuses_fails_the_verdict_and_names_both(self):
+    def test_a_profile_whose_model_the_harness_refuses_fails_and_names_both(self):
         cli = import_cli()
         with tempfile.TemporaryDirectory() as tmp:
             code, payload, _ = self._run_doctor(
-                cli, tmp,
-                self._settings(defaults={"claude": None, "codex": "bogus-model-x"}),
+                cli, tmp, self._settings(defaults="telegram-claude", user="telegram-bogus"),
+                held={"telegram-bogus": {**self.CODEX, "model": "bogus-model-x"}},
                 refused=("bogus-model-x",))
         self.assertEqual(code, 5)
         self.assertFalse(payload["ok"])
         self.assertFalse(payload["workers"]["ok"])
-        self.assertTrue(self._row(payload, "claude", None)["ok"])
-        refused = self._row(payload, "codex", "bogus-model-x")
+        self.assertTrue(self._row(payload, "telegram-claude")["ok"])
+        refused = self._row(payload, "telegram-bogus")
         self.assertFalse(refused["ok"])
         self.assertEqual(refused["verdict"], "model_refused")
         self.assertEqual(refused["binary"], "codex")
@@ -1735,80 +1772,97 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
         cli = import_cli()
         with tempfile.TemporaryDirectory() as tmp:
             code, payload, _ = self._run_doctor(
-                cli, tmp, self._settings(defaults={"claude": "bogus-model-x"}),
+                cli, tmp, self._settings(defaults="telegram-bogus"),
+                held={"telegram-bogus": {**self.CLAUDE, "model": "bogus-model-x"}},
                 refused=("bogus-model-x",))
         self.assertEqual(code, 5)
-        refused = self._row(payload, "claude", "bogus-model-x")
+        refused = self._row(payload, "telegram-bogus")
         self.assertEqual(refused["verdict"], "model_refused")
         self.assertEqual(refused["binary"], "claude")
         self.assertIn("bogus-model-x", refused["notice"])
         self.assertIn("may not exist", refused["reason"])
 
-    def test_every_position_the_schema_admits_a_model_at_is_checked(self):
-        """A refusal planted only at the third position is found, and the
-        positions the doctor reports are exactly the three the schema admits —
-        read off the schema's own walk, not a list kept beside it."""
-        cli = import_cli()
-        with tempfile.TemporaryDirectory() as tmp:
-            code, payload, _ = self._run_doctor(
-                cli, tmp,
-                self._settings(defaults={"claude": None},
-                               voice={"claude": "fast-model"},
-                               user={"codex": "bogus-model-x"}),
-                refused=("bogus-model-x",))
-        self.assertEqual(code, 5)
-        refused = self._row(payload, "codex", "bogus-model-x")
-        self.assertFalse(refused["ok"])
-        self.assertEqual(refused["declared_at"],
-                         ["settings.allowed_users.42.voice_agent.workers.codex.model"])
-        with tempfile.TemporaryDirectory() as tmp:
-            _, payload, _ = self._run_doctor(
-                cli, tmp,
-                self._settings(defaults={"claude": "m"}, voice={"claude": "m"},
-                               user={"claude": "m"}))
-        self.assertEqual(
-            sorted(self._row(payload, "claude", "m")["declared_at"]),
-            sorted(position.format(worker="claude") for position in self.ALL_POSITIONS))
-
-    def test_an_identical_pair_declared_in_several_positions_is_asked_once(self):
+    def test_a_name_that_does_not_resolve_or_fit_is_not_ok_and_says_why(self):
         cli = import_cli()
         with tempfile.TemporaryDirectory() as tmp:
             code, payload, calls = self._run_doctor(
+                cli, tmp, self._settings(defaults="telegram-claude", group="telegram-gone",
+                                         topic="telegram-asks"),
+                held={"telegram-asks": {**self.CLAUDE, "permission_mode": "default"}})
+        self.assertEqual(code, 5)
+        gone, asks = self._row(payload, "telegram-gone"), self._row(payload, "telegram-asks")
+        self.assertEqual((gone["ok"], gone["verdict"]), (False, "failed"))
+        self.assertIn("'telegram-gone'", gone["reason"])
+        self.assertEqual(gone["declared_at"], ["settings.allowed_groups.-100.profile"])
+        self.assertEqual((asks["ok"], asks["verdict"]), (False, "failed"))
+        self.assertIn("permission_mode", asks["reason"])
+        self.assertEqual([c["binary"] for c in calls], ["claude"])
+
+    def test_every_position_a_turn_resolves_a_profile_at_is_checked(self):
+        """A refusal planted only at a forum topic is found, and the positions
+        the doctor reports for one name are every position naming it - read off
+        the profile module's own reading of the settings."""
+        cli = import_cli()
+        held = {"telegram-bogus": {**self.CODEX, "model": "bogus-model-x"},
+                "telegram-fast": {**self.CODEX, "model": "fast-model"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload, _ = self._run_doctor(
                 cli, tmp,
-                self._settings(defaults={"codex": "fast-model", "claude": None},
-                               voice={"codex": "fast-model"},
-                               user={"codex": "fast-model"}))
+                self._settings(defaults="telegram-claude", voice="telegram-fast",
+                               topic="telegram-bogus"),
+                held=held, refused=("bogus-model-x",))
+        self.assertEqual(code, 5)
+        refused = self._row(payload, "telegram-bogus")
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["declared_at"],
+                         ["settings.allowed_groups.-100.topics.7.profile"])
+        with tempfile.TemporaryDirectory() as tmp:
+            _, payload, calls = self._run_doctor(
+                cli, tmp,
+                self._settings(defaults="telegram-fast", voice="telegram-fast",
+                               user="telegram-fast", group="telegram-fast",
+                               topic="telegram-fast"), held=held)
+        self.assertEqual(self._row(payload, "telegram-fast")["declared_at"],
+                         list(self.ALL_POSITIONS))
+        # One name named at five positions is asked once.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(payload["workers"]["checked"]), 1)
+
+    def test_the_environments_default_is_checked_in_place_of_the_settings(self):
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"TELEGRAM_SERVICE_PROFILE": "telegram-codex"}):
+            code, payload, calls = self._run_doctor(
+                cli, tmp, self._settings(defaults="telegram-claude"))
         self.assertEqual(code, 0)
-        self.assertEqual([c for c in calls if c["binary"] == "codex"],
-                         [{"binary": "codex", "model": "fast-model",
-                           "cwd": mock.ANY}])
-        row = self._row(payload, "codex", "fast-model")
-        self.assertEqual(len(row["declared_at"]), 3)
-        self.assertEqual(len(payload["workers"]["checked"]), 2)
+        self.assertEqual([row["profile"] for row in payload["workers"]["checked"]],
+                         ["telegram-codex"])
+        self.assertEqual(self._row(payload, "telegram-codex")["declared_at"],
+                         ["TELEGRAM_SERVICE_PROFILE"])
+        self.assertEqual([c["binary"] for c in calls], ["codex"])
 
     def test_the_in_process_stub_is_reported_without_a_binary(self):
         cli = import_cli()
         with tempfile.TemporaryDirectory() as tmp:
             code, payload, calls = self._run_doctor(
-                cli, tmp, self._settings(defaults={"stub": None}))
+                cli, tmp, self._settings(defaults="stub"))
         self.assertEqual(code, 0)
-        row = self._row(payload, "stub", None)
+        row = self._row(payload, "stub")
         self.assertTrue(row["ok"])
-        self.assertEqual(row["verdict"], "in_process")
+        self.assertEqual((row["verdict"], row["worker"]), ("in_process", "stub"))
         self.assertIsNone(row["binary"])
         self.assertEqual(calls, [])
 
-    def test_a_binary_missing_from_path_cannot_accept_its_pair(self):
+    def test_a_binary_missing_from_path_cannot_accept_its_profile(self):
         cli = import_cli()
         with tempfile.TemporaryDirectory() as tmp:
             bare = Path(tmp) / "bare"
             bare.mkdir()
             with mock.patch.dict(os.environ, {"PATH": str(bare)}):
                 code, payload, _ = self._run_doctor(
-                    cli, tmp, self._settings(defaults={"codex": None}),
-                    binaries=())
+                    cli, tmp, self._settings(defaults="telegram-codex"), binaries=())
         self.assertEqual(code, 5)
-        row = self._row(payload, "codex", None)
+        row = self._row(payload, "telegram-codex")
         self.assertFalse(row["ok"])
         self.assertEqual(row["verdict"], "binary_missing")
         self.assertIn("codex", row["reason"])
@@ -1820,11 +1874,11 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             started = time.monotonic()
             code, payload, _ = self._run_doctor(
-                cli, tmp, self._settings(defaults={"claude": None}, timeout=0.5),
+                cli, tmp, self._settings(defaults="telegram-claude", timeout=0.5),
                 hang=True)
             elapsed = time.monotonic() - started
         self.assertEqual(code, 5)
-        row = self._row(payload, "claude", None)
+        row = self._row(payload, "telegram-claude")
         self.assertEqual(row["verdict"], "timed_out")
         self.assertIn("0.5s", row["reason"])
         self.assertLess(elapsed, 10)
@@ -1834,13 +1888,12 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
         cli = import_cli()
         with tempfile.TemporaryDirectory() as tmp:
             _, _, calls = self._run_doctor(
-                cli, tmp, self._settings(defaults={"claude": None}))
+                cli, tmp, self._settings(defaults="telegram-claude"))
         self.assertEqual(len(calls), 1)
         self.assertNotEqual(Path(calls[0]["cwd"]).resolve(), Path(tmp).resolve())
         self.assertIn("telegram-doctor-", calls[0]["cwd"])
 
     def test_a_harness_older_than_the_runner_supports_is_named(self):
-        cli = import_cli()
         profiles = _profiles_module()
         from callva import harness_runner as lib
 
@@ -1850,35 +1903,36 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
                 "codex 0.100.0 is older than the tested 0.159.0"))
 
         with tempfile.TemporaryDirectory() as tmp:
-            [row] = profiles.probe([{"worker": "codex", "model": None}], 1, [], None, tmp,
+            [row] = profiles.probe([{"profile": "telegram-codex"}], 1, [], None, tmp,
                                    run=too_old)
         self.assertFalse(row["ok"])
         self.assertEqual(row["verdict"], "incompatible_harness")
         self.assertIn("0.159.0", row["reason"])
 
-    def test_the_guide_states_that_null_is_the_stable_setting(self):
+    def test_the_guide_states_that_the_bundled_model_is_the_stable_setting(self):
         guide = GUIDE_PATH.read_text()
-        self.assertIn("A worker's `model` is `null` by default and `null` is the "
-                      "stable setting: it is the model of the profile the worker runs on",
+        self.assertIn("A profile's model is the stable setting when it is the bundled one's",
                       guide)
-        self.assertIn("Every pin is an exception taken for a named reason", guide)
-        self.assertIn("`telegram service doctor` verifies each distinct (worker, model) "
-                      "pair the settings declare against the harness itself", guide)
+        self.assertIn("Every profile on another model is an exception taken for a named "
+                      "reason", guide)
+        self.assertIn("`telegram service doctor` verifies each distinct profile the settings "
+                      "name against the harness itself", guide)
 
     def test_help_says_what_doctor_spends(self):
         """An operator is told the cost before paying it: one live turn per
-        distinct pair, each held to the turn's own window."""
+        distinct profile, each held to the turn's own window."""
         help_text = " ".join(import_cli().__doc__.split())
-        self.assertIn("`doctor` also spends one live turn per distinct configured "
-                      "(worker, model) pair", help_text)
-        self.assertIn("each held to `defaults.worker_timeout`", help_text)
+        self.assertIn("`doctor` also spends one live turn per distinct profile the "
+                      "settings name", help_text)
+        self.assertIn("held to `defaults.worker_timeout`", help_text)
 
 
 class ServiceStartProfileTests(unittest.TestCase):
-    """`service start` and `service run` refuse settings that reach a worker
-    whose profile does not resolve or fit, before any daemon is launched."""
+    """`service start` and `service run` refuse settings that name a profile
+    that does not resolve or fit, and anything still naming a worker, before
+    any daemon is launched."""
 
-    def preflight(self, settings, answer=None):
+    def preflight(self, settings, answer=None, environ=None):
         cli = import_cli()
         asked = []
 
@@ -1888,6 +1942,7 @@ class ServiceStartProfileTests(unittest.TestCase):
 
         err = io.StringIO()
         with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, environ or {}), \
                 mock.patch.object(cli, "_project_id", lambda write=False: "prj_1"), \
                 mock.patch.object(cli, "_profiles_answer", profiles_answer), \
                 contextlib.redirect_stderr(err):
@@ -1899,31 +1954,233 @@ class ServiceStartProfileTests(unittest.TestCase):
         return code, err.getvalue(), asked
 
     def test_a_stub_service_asks_nothing(self):
-        code, _, asked = self.preflight({"defaults": {"worker": "stub"}})
+        code, _, asked = self.preflight({"defaults": {"profile": "stub"}})
+        self.assertEqual((code, asked), (0, []))
+        code, _, asked = self.preflight({"defaults": {}})
         self.assertEqual((code, asked), (0, []))
 
     def test_a_profile_that_does_not_fit_refuses_the_start(self):
-        problem = {"position": "defaults", "profile": "telegram-codex",
-                   "code": "profile_unfit",
+        problem = {"position": "settings.allowed_groups.-100.topics.7.profile",
+                   "profile": "telegram-codex", "code": "profile_unfit",
                    "message": "profile 'telegram-codex' (layer global, version v1) does "
                               "not fit a telegram turn: approval_policy must be never"}
-        code, err, asked = self.preflight(
-            {"defaults": {"worker": "codex"}}, {"ok": False, "problems": [problem]})
+        settings = {"defaults": {"profile": "stub"},
+                    "allowed_groups": {"-100": {"topics": {"7": {
+                        "profile": "telegram-codex"}}}}}
+        code, err, asked = self.preflight(settings, {"ok": False, "problems": [problem]})
         self.assertEqual(code, 6)
         error = json.loads(err.strip().splitlines()[-1])["error"]
         self.assertEqual(error["code"], "profile_refused")
-        self.assertIn("settings.defaults runs on telegram-codex", error["message"])
+        self.assertIn("settings.allowed_groups.-100.topics.7.profile names telegram-codex",
+                      error["message"])
         self.assertIn("approval_policy", error["message"])
         argv, given = asked[0]
         self.assertEqual(argv[0], "check")
         self.assertIn("prj_1", argv)
-        self.assertEqual(given["settings"], {"defaults": {"worker": "codex"}})
+        self.assertEqual(given, {"settings": settings, "environ": {}})
 
     def test_profiles_that_fit_let_the_start_go_on(self):
-        code, _, asked = self.preflight({"defaults": {"worker": "claude"}},
+        code, _, asked = self.preflight({"defaults": {"profile": "telegram-claude"}},
                                         {"ok": True, "problems": []})
         self.assertEqual(code, 0)
         self.assertEqual(len(asked), 1)
+
+    def test_the_environments_default_profile_is_checked_too(self):
+        code, _, asked = self.preflight({"defaults": {"profile": "stub"}},
+                                        {"ok": True, "problems": []},
+                                        {"TELEGRAM_SERVICE_PROFILE": "telegram-codex"})
+        self.assertEqual(code, 0)
+        self.assertEqual(asked[0][1]["environ"], {"TELEGRAM_SERVICE_PROFILE": "telegram-codex"})
+
+
+class OldWorkerNamesTests(unittest.TestCase):
+    """Old keys in settings, old fields on a register row and the old
+    environment names stop a start with exit 6, naming the migration."""
+
+    def refusal(self, call, *args):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as stopped:
+            call(*args)
+        return stopped.exception.code, json.loads(err.getvalue().strip().splitlines()[-1])["error"]
+
+    def test_old_keys_in_settings_refuse_with_the_migration_named(self):
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "capabilities" / "telegram" / "service").mkdir(parents=True)
+            for settings, place in (
+                    ({"defaults": {"worker": "claude"}}, "settings.defaults.worker"),
+                    ({"defaults": {"workers": {"codex": {}}}}, "settings.defaults.workers"),
+                    ({"defaults": {"voice_agent": {"worker": "codex"}}},
+                     "settings.defaults.voice_agent.worker"),
+                    ({"allowed_users": {"1": {"voice_agent": {"workers": {}}}}},
+                     "settings.allowed_users.1.voice_agent.workers"),
+                    ({"allowed_groups": {"-1": {"members": {"2": {"voice_agent": {
+                        "worker": "claude"}}}}}},
+                     "settings.allowed_groups.-1.members.2.voice_agent.worker")):
+                with self.subTest(place=place), \
+                        mock.patch.object(cli, "_service_dir",
+                                          lambda root: root / "capabilities" / "telegram"
+                                          / "service"):
+                    code, error = self.refusal(cli._validate_service_settings, root, settings)
+                    self.assertEqual((code, error["code"]), (6, "profiles_migration_required"))
+                    self.assertIn(place, error["message"])
+                    self.assertIn("telegram service migrate-profiles", error["message"])
+
+    def test_the_old_environment_names_refuse_the_start(self):
+        cli = import_cli()
+        for name in ("TG_WORKER", "TELEGRAM_SERVICE_WORKER"):
+            with self.subTest(name=name), mock.patch.dict(os.environ, {name: "claude"}):
+                code, error = self.refusal(cli._service_old_names_preflight, None)
+                self.assertEqual((code, error["code"]), (6, "profiles_migration_required"))
+                self.assertIn(name, error["message"])
+                self.assertIn("telegram service migrate-profiles", error["message"])
+                self.assertIn("TELEGRAM_SERVICE_PROFILE", error["hint"])
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for name in ("TG_WORKER", "TELEGRAM_SERVICE_WORKER"):
+                os.environ.pop(name, None)
+            cli._service_old_names_preflight(None)
+
+    def test_old_fields_on_a_register_row_refuse_the_start(self):
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}):
+            for name in ("TG_WORKER", "TELEGRAM_SERVICE_WORKER"):
+                os.environ.pop(name, None)
+            path = Path(tmp) / "register.json"
+            for row, place in (({"settings": {"worker": "codex"}}, "123.settings.worker"),
+                               ({"settings": {"model": "opus"}}, "123.settings.model"),
+                               ({"workers": {"claude": {"effort": "high"}}}, "123.workers")):
+                path.write_text(json.dumps({"123": row, "456": {"settings": {"tail_size": 5}}}))
+                with self.subTest(place=place):
+                    code, error = self.refusal(cli._service_old_names_preflight, path)
+                    self.assertEqual((code, error["code"]), (6, "profiles_migration_required"))
+                    self.assertIn(place, error["message"])
+                    self.assertNotIn("456", error["message"])
+            path.write_text(json.dumps({"123": {"settings": {"profile": "telegram-claude"}}}))
+            cli._service_old_names_preflight(path)
+            cli._service_old_names_preflight(Path(tmp) / "absent.json")
+
+    def test_start_and_run_refuse_before_any_account_is_touched(self):
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}):
+            for name in ("TG_WORKER", "TELEGRAM_SERVICE_WORKER"):
+                os.environ.pop(name, None)
+            path = Path(tmp) / "register.json"
+            path.write_text(json.dumps({"123": {"settings": {"worker": "codex"}}}))
+            for call in (cli._service_start_result, cli.cmd_service_run):
+                with self.subTest(call=call.__name__), \
+                        mock.patch.object(cli, "_service_project_root", lambda: Path(tmp)), \
+                        mock.patch.object(cli, "_require_service_initialized",
+                                          lambda root: None), \
+                        mock.patch.object(cli, "_validate_service_settings",
+                                          lambda root: {"defaults": {"profile": "stub"}}), \
+                        mock.patch.object(cli, "_service_state_dir",
+                                          lambda root, c, s: ("probe", {"register": path})), \
+                        mock.patch.object(cli, "_load_config",
+                                          side_effect=AssertionError("reached the account")):
+                    code, error = self.refusal(call, None, None)
+                    self.assertEqual((code, error["code"]), (6, "profiles_migration_required"))
+                    self.assertIn("123.settings.worker", error["message"])
+
+    def test_the_deploy_declaration_names_the_profile_not_the_worker(self):
+        cli = import_cli()
+        optional = [entry["key"] for entry in
+                    cli.SERVICE["deploy"]["environment"]["optional"]]
+        self.assertIn("TELEGRAM_SERVICE_PROFILE", optional)
+        self.assertNotIn("TG_WORKER", optional)
+        self.assertNotIn("TELEGRAM_SERVICE_WORKER", optional)
+        self.assertIn("migrate-profiles", cli.SERVICE["verbs"])
+
+
+class JobRegisterProfileTests(unittest.TestCase):
+    """`jobs register --profile`: a terminal defaults to `defaults.profile`, the
+    old `--engine` and `--model` are refused naming it, and a worker's profile
+    is pinned by the daemon."""
+
+    def register(self, argv, env=None, settings=None, resolved=None):
+        cli = import_cli()
+        registered, asked = [], []
+
+        class Register:
+            store = mock.Mock()
+
+            def register(self, **row):
+                registered.append(row)
+                return {**row, "id": "job-1", "stop_requested": 0}
+
+        def profiles_answer(call, text=""):
+            asked.append(call)
+            if resolved is None:
+                cli._die(3, "profile_not_found", f"profile {call[1]!r} is in none")
+            return resolved
+
+        out, err = io.StringIO(), io.StringIO()
+        clean = {k: v for k, v in os.environ.items()
+                 if not k.startswith("TELEGRAM_AUTHORIZED_") and k != "TELEGRAM_DAEMON_CHILD"}
+        with mock.patch.dict(os.environ, {**clean, **(env or {})}, clear=True), \
+                mock.patch.object(cli, "_gate", lambda: None), \
+                mock.patch.object(cli, "_contract", lambda argv: None), \
+                mock.patch.object(cli, "_service_project_root", lambda: Path("/p")), \
+                mock.patch.object(cli, "_service_settings", lambda root: settings or {}), \
+                mock.patch.object(cli, "_project_id", lambda write=False: "prj_1"), \
+                mock.patch.object(cli, "_open_job_register",
+                                  lambda root, write=True: (cli._jobs_module(), Register())), \
+                mock.patch.object(cli, "_profiles_answer", profiles_answer), \
+                mock.patch.object(sys, "argv", ["telegram", "jobs", "register", *argv]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                cli.main()
+                code = 0
+            except SystemExit as stopped:
+                code = stopped.code
+        error = (json.loads(err.getvalue().strip().splitlines()[-1])["error"]
+                 if code else None)
+        return code, registered, asked, error
+
+    def test_a_terminal_registration_defaults_to_the_settings_profile(self):
+        code, rows, asked, _ = self.register(
+            ["work", "--chat", "123", "--requested-by", "777"],
+            settings={"defaults": {"profile": "telegram-fast"}},
+            resolved={"harness": "codex", "ok": True})
+        self.assertEqual(code, 0)
+        self.assertEqual((rows[0]["profile"], rows[0]["engine"]), ("telegram-fast", "codex"))
+        self.assertNotIn("model", rows[0])
+        self.assertEqual(asked[0][:2], ["resolve", "telegram-fast"])
+        code, rows, asked, _ = self.register(["work", "--chat", "123", "--requested-by", "777"])
+        self.assertEqual((code, rows[0]["profile"], rows[0]["engine"], asked),
+                         (0, "stub", "stub", []))
+
+    def test_a_named_profile_is_resolved_and_one_that_does_not_is_refused(self):
+        code, rows, _, _ = self.register(
+            ["work", "--chat", "123", "--requested-by", "777", "--profile", "telegram-claude"],
+            settings={"defaults": {"profile": "telegram-fast"}},
+            resolved={"harness": "claude", "ok": True})
+        self.assertEqual((code, rows[0]["profile"], rows[0]["engine"]),
+                         (0, "telegram-claude", "claude"))
+        code, rows, _, error = self.register(
+            ["work", "--chat", "123", "--requested-by", "777", "--profile", "telegram-gone"])
+        self.assertEqual((code, rows, error["code"]), (3, [], "profile_not_found"))
+
+    def test_the_old_engine_and_model_flags_are_refused_naming_the_profile(self):
+        for flags in (["--engine", "claude"], ["--model", "opus"]):
+            with self.subTest(flags=flags):
+                code, rows, _, error = self.register(
+                    ["work", "--chat", "123", "--requested-by", "777", *flags])
+                self.assertEqual((code, rows), (6, []))
+                self.assertIn("--profile", error["hint"])
+                self.assertIn("a job runs on a profile", error["message"])
+
+    def test_a_worker_registers_on_the_profile_its_daemon_pins(self):
+        child = {"TELEGRAM_DAEMON_CHILD": "1", "TELEGRAM_AUTHORIZED_REQUESTER_ID": "777",
+                 "TELEGRAM_AUTHORIZED_CHAT_ID": "123",
+                 "TELEGRAM_AUTHORIZED_JOB_PROFILE": "telegram-fast",
+                 "TELEGRAM_AUTHORIZED_JOB_ENGINE": "codex"}
+        code, rows, asked, _ = self.register(["work", "--profile", "telegram-fast"], child)
+        self.assertEqual((code, rows[0]["profile"], rows[0]["engine"], asked),
+                         (0, "telegram-fast", "codex", []))
+        self.assertEqual((rows[0]["channel_key"], rows[0]["requested_by"]), ("123", "777"))
+        code, rows, _, error = self.register(["work", "--profile", "telegram-claude"], child)
+        self.assertEqual((code, rows, error["code"]), (4, [], "job_scope_denied"))
 
 
 if __name__ == "__main__":

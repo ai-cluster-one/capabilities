@@ -57,34 +57,8 @@
     "job_poll_interval": 2,
     "job_recovery": "requeue",
     "group_aliases": ["Assistant"],
-    "worker": "stub",
-    "workers": {
-      "claude": {
-        "model": null,
-        "effort": null
-      },
-      "codex": {
-        "model": null,
-        "reasoning_effort": null,
-        "service_tier": null
-      },
-      "stub": {
-        "model": null
-      }
-    },
+    "profile": "stub",
     "voice_agent": {
-      "worker": null,
-      "workers": {
-        "claude": {
-          "model": null,
-          "effort": null
-        },
-        "codex": {
-          "model": null,
-          "reasoning_effort": null,
-          "service_tier": null
-        }
-      },
       "voice": null,
       "history": null,
       "timezone": null,

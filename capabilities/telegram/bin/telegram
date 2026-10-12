@@ -153,6 +153,20 @@ Commands:
             --confirm-all-legacy-daemons-stopped
                                                One-time fail-closed cutover to
                                                account-global daemon ownership.
+  telegram service migrate-profiles [--apply]
+                                               Move the old worker settings to
+                                               profile names: each distinct
+                                               worker and its model, effort,
+                                               speed and context becomes one
+                                               project profile named from the
+                                               values, and settings, the
+                                               channel register and open job
+                                               rows name it. A dry run unless
+                                               --apply; --apply needs the
+                                               service stopped. Prints the
+                                               TELEGRAM_SERVICE_PROFILE value
+                                               that replaces a set TG_WORKER or
+                                               TELEGRAM_SERVICE_WORKER.
   telegram service doctor|run|start|reload|stop|status|logs
                                                Manage the bundled Telegram assistant
                                                service for this project. The engine
@@ -165,22 +179,30 @@ Commands:
                                                Every worker turn - dialogue,
                                                job, voice task, call summary -
                                                runs through callva-harness-
-                                               runner on telegram-<worker>,
-                                               with the worker's settings
-                                               (model, effort, reasoning_effort,
-                                               service_tier, context) laid over
-                                               it. `start` and `run` refuse with
-                                               exit 6 profile_refused when a
-                                               worker the settings reach has a
-                                               profile that does not resolve or
-                                               fit. `doctor` also spends one
-                                               live turn per distinct configured
-                                               (worker, model) pair — every
-                                               `workers.<worker>.model` position
-                                               in settings, `null` meaning the
-                                               profile's own model — on the
-                                               profile that pair runs on, each
-                                               held to `defaults.worker_timeout`,
+                                               runner on the profile its room
+                                               names: the channel's /set
+                                               profile, a forum topic's,
+                                               group's or direct user's
+                                               `profile`, then
+                                               `defaults.profile` (over it,
+                                               TELEGRAM_SERVICE_PROFILE), else
+                                               `stub`; a call's task and the
+                                               call summary run on
+                                               `defaults.voice_agent.profile`,
+                                               then the default. `start` and
+                                               `run` refuse with exit 6
+                                               profile_refused when a name the
+                                               settings reach does not resolve
+                                               or fit, and with exit 6
+                                               profiles_migration_required while
+                                               settings, the channel register
+                                               or the environment still name a
+                                               worker (`worker`, `workers`,
+                                               TELEGRAM_SERVICE_WORKER,
+                                               TG_WORKER). `doctor` also spends
+                                               one live turn per distinct
+                                               profile the settings name, held
+                                               to `defaults.worker_timeout`,
                                                and reports the harness's own
                                                verdict with the profile, layer
                                                and version. A model the harness
@@ -275,11 +297,13 @@ Exit codes:
      yourself
   5  server / network — Telegram unreachable, flood-wait, Deepgram 5xx, and
      `service doctor` reporting `ok: false` — a running daemon whose update
-     sync is not fresh, a configured (worker, model) pair its harness did
-     not accept, or a job register the store did not open
+     sync is not fresh, a profile the settings name that its harness did
+     not accept or that does not resolve or fit, or a job register the
+     store did not open
   6  input / validation — a malformed argument, a bad date, a machine with
-     no store configured for the service or its jobs, or a worker the
-     service settings reach whose profile does not resolve or fit
+     no store configured for the service or its jobs, a profile the
+     service settings name that does not resolve or fit, or a worker still
+     named where a profile is (run `telegram service migrate-profiles`)
 
 Quirks worth knowing:
   - This is a full-account MTProto session — a personal user account, so it
@@ -355,7 +379,7 @@ SERVICE = {
     "name": "assistant",
     "summary": "Project-local Telegram assistant daemon using the bundled service engine.",
     "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs",
-              "migrate-ownership"],
+              "migrate-ownership", "migrate-profiles"],
     "config": "capabilities/telegram/service",
     "state": "<connection-state>/service",
     "deploy": {
@@ -369,7 +393,7 @@ SERVICE = {
                 {"key": "TELEGRAM_SESSION"},
                 {"key": "DEEPGRAM_API_KEY"},
                 {"key": "TELEGRAM_CHANNEL_ENABLED", "default": "true"},
-                {"key": "TG_WORKER"},
+                {"key": "TELEGRAM_SERVICE_PROFILE"},
             ],
         },
         "mounts": [
@@ -4938,60 +4962,66 @@ def _validate_service_settings(root: Path, data: dict | None = None) -> dict:
         if not data:
             _die(6, "service_settings_missing",
                  f"no Telegram service settings in {_records().source}")
+    schema = _settings_schema_module()
     try:
-        _settings_schema_module().validate_settings(
-            data, root.resolve(), _service_dir(root).resolve())
+        schema.validate_settings(data, root.resolve(), _service_dir(root).resolve())
+    except schema.OldWorkerSettings as exc:
+        _die(6, "profiles_migration_required", str(exc),
+             f"`{schema.MIGRATION_COMMAND}` reports every move; `--apply` makes them")
     except ValueError as exc:
         _die(6, "service_settings_invalid", str(exc),
              "fix the Telegram service settings record; unsupported properties are never ignored")
     return data
 
 
-def _declared_worker_models(root: Path, settings: dict) -> list[dict]:
-    """The distinct (worker, model) pairs the settings declare, each with every
-    position that declares it. The positions come from the schema's own walk,
-    so a place the schema admits a model at is a place this reports."""
-    schema = _settings_schema_module()
-    pairs: dict[tuple, dict] = {}
-    for item in schema.declared_worker_models(
-            settings, root.resolve(), _service_dir(root).resolve()):
-        row = pairs.setdefault((item["worker"], item["model"]), {
-            "worker": item["worker"], "model": item["model"], "declared_at": []})
-        row["declared_at"].append(item["path"])
-    return list(pairs.values())
+def _declared_profiles(settings: dict) -> list[dict]:
+    """The distinct profile names the settings reach, each with every position
+    naming it, from the profile module's own reading of the settings, so a
+    position a turn resolves a profile at is a position this reports."""
+    found: dict[str, dict] = {}
+    for item in _profiles_module().reached(settings, os.environ):
+        row = found.setdefault(item["profile"], {"profile": item["profile"],
+                                                 "declared_at": []})
+        row["declared_at"].append(item["position"])
+    return list(found.values())
+
+
+def _stub_row(entry: dict) -> dict:
+    return {"profile": entry["profile"], "declared_at": entry["declared_at"],
+            "worker": "stub", "model": None, "layer": None, "version": None,
+            "ok": True, "verdict": "in_process", "binary": None, "reason": None,
+            "notice": None, "seconds": 0.0}
 
 
 def _service_worker_preflight(root: Path, settings: dict) -> dict:
-    """Ask each harness, once per distinct configured (worker, model) pair,
-    whether it runs that model — the harness's own answer to one minimal live
-    turn on the profile that pair runs on, never a list held here. Each turn is
-    held to the same window a turn is, `defaults.worker_timeout`, so the whole
-    check is bounded. The turns run in the bundle's `service/profiles.py`,
-    which carries the runner; a pair on the stub is answered here."""
+    """Ask each harness, once per distinct profile the settings name, whether
+    it runs that profile - the harness's own answer to one minimal live turn on
+    it, never a list held here. Each turn is held to the same window a turn is,
+    `defaults.worker_timeout`, so the whole check is bounded. The turns run in
+    the bundle's `service/profiles.py`, which carries the runner; the stub is
+    answered here. A name that does not resolve or fit is reported as `failed`
+    with why."""
     workers = _workers_module()
     timeout = float((settings.get("defaults") or {}).get("worker_timeout")
                     or workers.DEFAULT_WORKER_TIMEOUT)
-    pairs = _declared_worker_models(root, settings) if settings else []
+    entries = _declared_profiles(settings) if settings else []
     answer = {"ok": True, "timeout_seconds": timeout, "checked": []}
-    if not any(pair["worker"] != "stub" for pair in pairs):
-        answer["checked"] = [{**pair, "ok": True, "verdict": "in_process", "binary": None,
-                              "reason": None, "notice": None, "seconds": 0.0,
-                              "profile": None, "layer": None, "version": None}
-                             for pair in pairs]
+    if not any(entry["profile"] != "stub" for entry in entries):
+        answer["checked"] = [_stub_row(entry) for entry in entries]
         return answer
     project_id = _project_id(write=False)
     argv = ["probe", "--project-root", str(root)]
     if project_id:
         argv += ["--project-id", str(project_id)]
-    code, found = _profiles_call(argv, json.dumps({"pairs": pairs, "timeout": timeout}))
+    code, found = _profiles_call(argv, json.dumps({"profiles": entries, "timeout": timeout}))
     if code != 0:
         reason = found.get("message") or "the profile module gave no answer"
-        answer["checked"] = [{**pair, "ok": pair["worker"] == "stub",
-                              "verdict": "in_process" if pair["worker"] == "stub" else "failed",
-                              "binary": None if pair["worker"] == "stub" else pair["worker"],
-                              "reason": None if pair["worker"] == "stub" else reason,
-                              "notice": None, "seconds": 0.0, "profile": None,
-                              "layer": None, "version": None} for pair in pairs]
+        answer["checked"] = [
+            _stub_row(entry) if entry["profile"] == "stub" else
+            {"profile": entry["profile"], "declared_at": entry["declared_at"],
+             "worker": None, "model": None, "layer": None, "version": None,
+             "ok": False, "verdict": "failed", "binary": None, "reason": reason,
+             "notice": None, "seconds": 0.0} for entry in entries]
     else:
         answer["checked"] = found.get("rows") or []
         if found.get("store_error"):
@@ -5001,23 +5031,43 @@ def _service_worker_preflight(root: Path, settings: dict) -> dict:
 
 
 def _service_profile_preflight(root: Path, settings: dict) -> None:
-    """Refuse a start whose settings reach a worker with no profile a turn can
-    run on: `telegram-<worker>` must resolve and fit with that worker's settings
-    laid over it, at every position the settings reach. Without a harness
-    worker there is nothing to resolve and nothing is run."""
-    if not _profiles_module().reached(settings, os.environ):
+    """Refuse a start whose settings name a profile a turn cannot run on: every
+    name the settings reach - the default, the voice default, every direct
+    user, group and topic that names one - must resolve and fit. With only the
+    stub there is nothing to resolve and nothing is run."""
+    if not any(row["profile"] != "stub"
+               for row in _profiles_module().reached(settings, os.environ)):
         return
     project_id = _project_id(write=False)
     argv = ["check", "--project-root", str(root)]
     if project_id:
         argv += ["--project-id", str(project_id)]
-    environ = {key: os.environ[key] for key in ("TELEGRAM_SERVICE_WORKER", "TG_WORKER")
-               if key in os.environ}
+    module = _profiles_module()
+    environ = {module.DEFAULT_ENV: os.environ[module.DEFAULT_ENV]} \
+        if os.environ.get(module.DEFAULT_ENV) else {}
     found = _profiles_answer(argv, json.dumps({"settings": settings, "environ": environ}))
     if found.get("problems"):
-        _die(6, "profile_refused", _profiles_module().problems_sentence(found["problems"]),
-             "`telegram profiles list` shows how each telegram profile resolves; fix the "
-             "worker settings or the profile")
+        _die(6, "profile_refused", module.problems_sentence(found["problems"]),
+             "`telegram profiles list` shows how each telegram profile resolves; name a "
+             "profile that resolves and fits, or fix the profile")
+
+
+def _service_old_names_preflight(register_path: Path | None = None) -> None:
+    """Refuse a start while the environment names a default worker, or the
+    channel register keeps the worker fields `/set worker` and `/set model`
+    wrote: what those ran on is the migration's to move."""
+    schema = _settings_schema_module()
+    places = schema.old_environment(os.environ)
+    if register_path is not None and register_path.is_file():
+        try:
+            register = json.loads(register_path.read_text())
+        except (OSError, ValueError) as exc:
+            _die(6, "register_unreadable", f"cannot read {register_path}: {exc}")
+        places += [f"{register_path}:{place}" for place in schema.old_register_fields(register)]
+    if places:
+        _die(6, "profiles_migration_required", schema.old_names_sentence(places),
+             f"`{schema.MIGRATION_COMMAND}` reports every move and the "
+             "TELEGRAM_SERVICE_PROFILE value to set; `--apply` makes them")
 
 
 def _service_wanted_connection(root: Path, connection_flag: str | None) -> str | None:
@@ -5356,16 +5406,16 @@ def _job_scope(args) -> tuple[str | None, str | None, str | None]:
             if args.origin_message_id and str(args.origin_message_id) != authorized_origin:
                 _die(4, "job_scope_denied", "worker job origin differs from its daemon scope")
             args.origin_message_id = authorized_origin or None
-            authorized_engine = os.environ.get(
-                "TELEGRAM_AUTHORIZED_JOB_ENGINE", "").strip()
-            authorized_model = os.environ.get(
-                "TELEGRAM_AUTHORIZED_JOB_MODEL", "").strip()
-            if args.engine and authorized_engine and args.engine != authorized_engine:
-                _die(4, "job_scope_denied", "worker job engine differs from its channel scope")
-            if args.model and authorized_model and args.model != authorized_model:
-                _die(4, "job_scope_denied", "worker job model differs from its channel scope")
-            args.engine = authorized_engine or args.engine
-            args.model = authorized_model or args.model
+            # The job runs on the profile the turn runs on, which the daemon
+            # states with the harness it keeps as the job's engine; naming
+            # another is an override, refused.
+            authorized_profile = os.environ.get(
+                "TELEGRAM_AUTHORIZED_JOB_PROFILE", "").strip()
+            if args.profile and authorized_profile and args.profile != authorized_profile:
+                _die(4, "job_scope_denied", "worker job profile differs from its channel scope")
+            args.profile = authorized_profile or args.profile
+            args.authorized_engine = os.environ.get(
+                "TELEGRAM_AUTHORIZED_JOB_ENGINE", "").strip() or None
     return chat, topic, actor
 
 
@@ -5435,10 +5485,32 @@ def cmd_jobs_show(job_id: str, chat: str | None, topic_id: str | None,
         register.store.close()
 
 
+def _job_profile(root: Path, profile: str | None,
+                 engine: str | None = None) -> tuple[str, str]:
+    """The profile a job registers on and the harness it keeps as its engine.
+
+    The profile named, else `defaults.profile`, else the stub. Inside a worker
+    the daemon states both; at a terminal the name is resolved and fitted as a
+    turn would, so a job is never registered on a profile it cannot run on."""
+    name = profile or str((_service_settings(root).get("defaults") or {}).get("profile")
+                          or "stub")
+    if name == "stub":
+        return name, "stub"
+    if engine:
+        return name, engine
+    project_id = _project_id(write=False)
+    if not project_id:
+        _die(6, "no_project_identity", "this project declares no id",
+             "run `capabilities init` in the project")
+    found = _profiles_answer(["resolve", name, "--project-id", str(project_id),
+                              "--project-root", str(root)])
+    return name, found["harness"]
+
+
 def cmd_jobs_register(description: str, chat: str | None, topic_id: str | None,
-                      engine: str | None, requested_by: str | None,
+                      profile: str | None, requested_by: str | None,
                       origin_message_id: str | None,
-                      model: str | None = None) -> dict:
+                      engine: str | None = None) -> dict:
     root = _service_project_root()
     key = _job_channel_key(chat, topic_id)
     if not key:
@@ -5448,13 +5520,12 @@ def cmd_jobs_register(description: str, chat: str | None, topic_id: str | None,
         _die(6, "no_requester",
              "a job needs the operator whose authority it carries",
              "pass --requested-by <telegram-user-id>")
+    profile, engine = _job_profile(root, profile, engine)
     module, register = _open_job_register(root)
     try:
-        settings = _service_settings(root) or {}
-        chosen = engine or (settings.get("defaults") or {}).get("worker") or "stub"
         return _job_row(register.register(
             channel_key=key, requested_by=requested_by, description=description,
-            engine=chosen, origin_message_id=origin_message_id, model=model))
+            engine=engine, origin_message_id=origin_message_id, profile=profile))
     except module.JobError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
     finally:
@@ -5648,7 +5719,7 @@ def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
     return {"initialized": NAME, "project": str(root), "service_dir": str(target),
             "written": written, "skipped": skipped,
             "next": [
-                "edit the Telegram service settings records for allowed users/groups and worker defaults",
+                "edit the Telegram service settings records for allowed users/groups and the default profile",
                 "ensure the selected connection has allow_write: true",
                 "run `telegram service doctor`, then `telegram service start`",
             ]}
@@ -5777,6 +5848,252 @@ def _telegram_daemon_processes() -> list[dict]:
         if uid == os.getuid() and pid != os.getpid() and "telegram/service/daemon.py" in command:
             found.append({"pid": pid, "command": command})
     return found
+
+
+# --- From worker settings to profile names --------------------------------------
+#
+# Settings, the channel register and the job rows used to name a worker and its
+# knobs. `service migrate-profiles` moves each to the profile name a room names
+# now: every distinct combination of a worker and its settings becomes one
+# project profile (`telegram-<worker>` with those settings laid over it, named
+# from the values), or `telegram-<worker>` itself when the settings change
+# nothing, and every position is rewritten to name it. It is a dry run unless
+# `--apply`; a rerun finds nothing left to move.
+
+_OPEN_JOB_STATES = ("draft", "waiting", "running", "stopped")
+
+
+def _old_worker(value, fallback: str = "stub") -> str:
+    """A worker setting as the daemon read it: an unknown name was the default."""
+    name = str(value or fallback).strip().lower()
+    return name if name in ("claude", "codex", "stub") else fallback
+
+
+def _worker_block(owner: Any, worker: str) -> dict:
+    workers = owner.get("workers") if isinstance(owner, dict) else None
+    found = workers.get(worker) if isinstance(workers, dict) else None
+    return dict(found) if isinstance(found, dict) else {}
+
+
+def _with_profile(owner: dict, name: str | None) -> dict:
+    """`owner` without its worker keys, naming `name` where they stood."""
+    out = {}
+    for key, value in owner.items():
+        if key in ("worker", "workers"):
+            if name is not None and "profile" not in out:
+                out["profile"] = name
+            continue
+        out[key] = value
+    if name is not None:
+        out["profile"] = name
+    return out
+
+
+def cmd_service_migrate_profiles(connection_flag: str | None, session_flag: str | None,
+                                 apply: bool) -> dict:
+    """Move the old worker settings to profile names; a dry run unless `apply`."""
+    root = _service_project_root()
+    _require_service_envelope(root)
+    schema = _settings_schema_module()
+    settings = _service_settings(root)
+    defaults = settings.get("defaults") if isinstance(settings.get("defaults"), dict) else {}
+    voice = (defaults.get("voice_agent")
+             if isinstance(defaults.get("voice_agent"), dict) else {})
+    cid, paths = _service_state_dir(root, connection_flag, session_flag)
+    register_path = paths["register"]
+    try:
+        channel_register = (json.loads(register_path.read_text())
+                            if register_path.is_file() else {})
+    except (OSError, ValueError) as exc:
+        _die(6, "register_unreadable", f"cannot read {register_path}: {exc}")
+    if apply:
+        _read_only_gate(f"`{NAME} service migrate-profiles --apply`")
+        if cmd_service_status(cid, session_flag).get("running"):
+            _die(6, "service_running",
+                 "the service is running: it keeps the channel register in memory and "
+                 "would write the old fields back",
+                 "stop it with `telegram service stop`, apply, then start it")
+    env_names = schema.old_environment(os.environ)
+    env_worker = (_old_worker(os.environ.get(env_names[0])) if env_names else None)
+    file_worker = _old_worker(defaults.get("worker"))
+    effective_worker = env_worker or file_worker
+
+    # Each position that moves, with the combination it moves to.
+    combos: list[dict] = []
+    moves: list[dict] = []
+
+    def combo(worker: str, cfg: dict) -> int:
+        combos.append({"worker": worker, "settings": cfg})
+        return len(combos) - 1
+
+    if any(key in defaults for key in ("worker", "workers")):
+        moves.append({"at": "settings.defaults", "was": {k: defaults[k] for k in
+                                                         ("worker", "workers") if k in defaults},
+                      "combo": combo(file_worker, _worker_block(defaults, file_worker))})
+    default_combo = moves[-1]["combo"] if moves else None
+    if any(key in voice for key in ("worker", "workers")):
+        voice_worker = _old_worker(voice.get("worker"), file_worker)
+        moves.append({"at": "settings.defaults.voice_agent",
+                      "was": {k: voice[k] for k in ("worker", "workers") if k in voice},
+                      "combo": combo(voice_worker, {**_worker_block(defaults, voice_worker),
+                                                    **_worker_block(voice, voice_worker)})})
+    env_combo = (combo(env_worker, _worker_block(defaults, env_worker))
+                 if env_worker else None)
+    removed = [place for place in schema.old_worker_keys(settings)
+               if not place.startswith("settings.defaults.")]
+    register_moves = []
+    for key, row in channel_register.items():
+        if not isinstance(row, dict):
+            continue
+        row_settings = row.get("settings") if isinstance(row.get("settings"), dict) else {}
+        if not ({"worker", "model"} & set(row_settings) or "workers" in row):
+            continue
+        worker = _old_worker(row_settings.get("worker"), effective_worker)
+        block = {**_worker_block(row, worker)}
+        legacy_model = row_settings.get("model")
+        if legacy_model not in (None, "", "default"):
+            # The oldest field: a channel's model before models were per worker,
+            # which the daemon moved onto the active worker as it loaded.
+            block["model"] = legacy_model
+        chosen = "worker" in row_settings or bool(block)
+        register_moves.append({
+            "channel": key,
+            "was": {**{f"settings.{k}": row_settings[k] for k in ("worker", "model")
+                       if k in row_settings},
+                    **({"workers": row["workers"]} if "workers" in row else {})},
+            "combo": (combo(worker, {**_worker_block(defaults, worker), **block})
+                      if chosen else None)})
+
+    module, register = _open_job_register(root, write=apply)
+    try:
+        job_rows = []
+        for state in _OPEN_JOB_STATES:
+            for row in register.list(state=state, limit=100000):
+                if row.get("profile"):
+                    continue
+                if state == "stopped" and row.get("outcome") not in module.SELF_RESUMING:
+                    continue
+                job_rows.append({"id": row["id"], "state": state, "engine": row["engine"],
+                                 "model": row.get("model"),
+                                 "combo": combo(_old_worker(row["engine"]),
+                                                {"model": row.get("model")})})
+        project_id = _project_id(write=apply)
+        if not project_id:
+            _die(6, "no_project_identity", "this project declares no id",
+                 "run `capabilities init` in the project")
+        argv = ["materialize", "--project-id", str(project_id), "--project-root", str(root),
+                "--created-by", "telegram service migrate-profiles"]
+        found = (_profiles_answer(argv + (["--apply"] if apply else []),
+                                  json.dumps({"combos": combos}))["profiles"]
+                 if combos else [])
+
+        def named(index):
+            return None if index is None else found[index].get("profile")
+
+        refused = [{**found[i], "worker": combos[i]["worker"]}
+                   for i in range(len(found)) if found[i].get("error")]
+        # Settings: each top-level key that changes is written whole, at the
+        # project's scope, which is the file the daemon reads first.
+        new_settings = json.loads(json.dumps(settings))
+        new_defaults = new_settings.get("defaults")
+        if default_combo is not None:
+            new_defaults = _with_profile(new_defaults, named(default_combo))
+        if isinstance(new_defaults, dict) and isinstance(new_defaults.get("voice_agent"), dict):
+            voice_move = next((m for m in moves if m["at"] == "settings.defaults.voice_agent"),
+                              None)
+            name = named(voice_move["combo"]) if voice_move else None
+            fallback = named(default_combo) if default_combo is not None else None
+            new_defaults["voice_agent"] = _with_profile(
+                new_defaults["voice_agent"],
+                name if name is not None and name != (fallback or "stub") else None)
+        if new_defaults is not None:
+            new_settings["defaults"] = new_defaults
+        for policy in (new_settings.get("allowed_users") or {}).values():
+            if isinstance(policy, dict) and isinstance(policy.get("voice_agent"), dict):
+                policy["voice_agent"] = _with_profile(policy["voice_agent"], None)
+        for group in (new_settings.get("allowed_groups") or {}).values():
+            for member in ((group or {}).get("members") or {}).values() \
+                    if isinstance(group, dict) else ():
+                if isinstance(member, dict) and isinstance(member.get("voice_agent"), dict):
+                    member["voice_agent"] = _with_profile(member["voice_agent"], None)
+        blocked = any(found[m["combo"]].get("error") for m in moves)
+        changed_keys = [key for key in new_settings
+                        if new_settings[key] != settings.get(key)] if not blocked else []
+        # The register: each row names the profile its /set chose, and keeps
+        # nothing of the worker fields.
+        new_register = json.loads(json.dumps(channel_register))
+        for move in register_moves:
+            row = new_register[move["channel"]]
+            row_settings = row.setdefault("settings", {})
+            name = named(move["combo"])
+            if move["combo"] is not None and name is None:
+                continue
+            row_settings.pop("worker", None)
+            row_settings.pop("model", None)
+            row.pop("workers", None)
+            if name is not None:
+                row_settings["profile"] = name
+        filled = [{**row, "profile": named(row["combo"])} for row in job_rows]
+        if apply:
+            adapter = _records()
+            for key in changed_keys:
+                adapter.set(NAME, "setting", key, new_settings[key],
+                            actor="telegram service migrate-profiles")
+            if new_register != channel_register:
+                _atomic_json(register_path, new_register)
+            for row in filled:
+                if row["profile"] is not None:
+                    register.update(row["id"], profile=row["profile"])
+    finally:
+        register.store.close()
+
+    # One line per profile the moves name, saying whether it is (or would be)
+    # written, or is one that exists already.
+    profiles_named: dict[str, dict] = {}
+    for one in found:
+        name = one.get("profile")
+        if not name or name == "stub":
+            continue
+        row = profiles_named.setdefault(name, {
+            "profile": name, "worker": one.get("worker"), "overlay": one.get("overlay"),
+            ("created" if apply else "would_create"): False})
+        row["created" if apply else "would_create"] |= bool(one.get("created"))
+
+    report = {
+        "applied": bool(apply),
+        "changed": bool(any(f.get("created") for f in found) or changed_keys
+                        or new_register != channel_register
+                        or any(row["profile"] for row in filled)),
+        "profiles": list(profiles_named.values()),
+        "settings": {
+            "keys_written": changed_keys,
+            "moves": [{"at": m["at"], "was": m["was"], "profile": named(m["combo"])}
+                      for m in moves],
+            "removed": removed,
+        },
+        "register": {
+            "path": str(register_path),
+            "moves": [{"channel": m["channel"], "was": m["was"],
+                       "profile": named(m["combo"])} for m in register_moves],
+        },
+        "jobs": [{"id": row["id"], "state": row["state"], "engine": row["engine"],
+                  "model": row["model"], "profile": row["profile"]} for row in filled],
+        "refused": refused,
+    }
+    if env_names:
+        report["environment"] = {
+            "set": env_names,
+            "replace_with": {"TELEGRAM_SERVICE_PROFILE": named(env_combo)},
+            "instruction": (f"unset {' and '.join(env_names)} and set "
+                            f"TELEGRAM_SERVICE_PROFILE={named(env_combo)} where the "
+                            "service's environment is declared; this command cannot "
+                            "rewrite a deploy environment"),
+        }
+    if refused:
+        report["instruction"] = ("Some combinations make no profile a turn can run on "
+                                 "(see `refused`); the positions naming them are left as "
+                                 "they are. Fix those settings and run this again.")
+    return report
 
 
 def cmd_service_migrate_ownership(connection_flag: str | None,
@@ -6140,6 +6457,8 @@ def _service_start_result(connection_flag: str | None, session_flag: str | None)
     root = _service_project_root()
     _require_service_initialized(root)
     settings = _validate_service_settings(root)
+    _service_old_names_preflight(
+        _service_state_dir(root, connection_flag, session_flag)[1]["register"])
     wanted = _service_wanted_connection(root, connection_flag)
     cfg = _load_config(wanted, session_flag)
     account_id = _service_account_id(cfg)
@@ -6447,14 +6766,16 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) ->
             "connection": cfg["id"],
             "note": ("`telegram doctor` performs the authenticated Telegram round-trip; "
                      "a running service is healthy only while its update sync stays fresh; "
-                     "`workers` is each configured (worker, model) pair's harness "
-                     "answering one live turn on the profile the pair runs on")}
+                     "`workers` is each profile the settings name answering one live "
+                     "turn on its harness")}
 
 
 def cmd_service_run(connection_flag: str | None, session_flag: str | None) -> None:
     root = _service_project_root()
     _require_service_initialized(root)
     settings = _validate_service_settings(root)
+    _service_old_names_preflight(
+        _service_state_dir(root, connection_flag, session_flag)[1]["register"])
     wanted = _service_wanted_connection(root, connection_flag)
     cfg = _load_config(wanted, session_flag)
     account_id = _service_account_id(cfg)
@@ -6624,8 +6945,12 @@ def main() -> None:
     jreg = job_scope(jb.add_parser(
         "register", help="enter one task into the queue"), needs_id=False)
     jreg.add_argument("description", help="one line, in the operator's terms")
-    jreg.add_argument("--engine", choices=["codex", "claude", "stub"])
-    jreg.add_argument("--model")
+    jreg.add_argument("--profile",
+                      help="the profile it runs on (default: defaults.profile, else stub)")
+    # A job names a profile, which carries the harness and the model together;
+    # these are kept only to say so.
+    jreg.add_argument("--engine", help=argparse.SUPPRESS)
+    jreg.add_argument("--model", help=argparse.SUPPRESS)
     jreg.add_argument("--requested-by", help="the operator whose authority it carries")
     jreg.add_argument("--origin-message-id")
     jsubmit = job_scope(jb.add_parser(
@@ -6666,6 +6991,10 @@ def main() -> None:
         help="one-time cutover to account-global daemon ownership")
     migrate.add_argument("--confirm-all-legacy-daemons-stopped",
                          action="store_true")
+    migrate_profiles = svc.add_parser(
+        "migrate-profiles",
+        help="move the old worker settings to profile names (a dry run unless --apply)")
+    migrate_profiles.add_argument("--apply", action="store_true")
 
     # `--connection <id>` selects a connection; `--session <PATH>` overrides the
     # session-file path. Both are global, accepted anywhere on the line (extracted
@@ -6731,9 +7060,14 @@ def main() -> None:
         elif args.jobs_cmd == "show":
             _emit(cmd_jobs_show(args.id, chat, topic, actor))
         elif args.jobs_cmd == "register":
-            _emit(cmd_jobs_register(args.description, chat, topic, args.engine,
+            if args.engine is not None or args.model is not None:
+                _die(6, "input",
+                     "--engine and --model are gone: a job runs on a profile, which "
+                     "carries the harness and the model together",
+                     "pass --profile <name>; `telegram profiles list` shows them")
+            _emit(cmd_jobs_register(args.description, chat, topic, args.profile,
                                     args.requested_by, args.origin_message_id,
-                                    args.model))
+                                    getattr(args, "authorized_engine", None)))
         elif args.jobs_cmd == "amend":
             _emit(cmd_jobs_amend(args.id, args.text, chat, topic, actor))
         elif args.jobs_cmd == "discard":
@@ -6770,8 +7104,8 @@ def main() -> None:
             if not report["ok"]:
                 # An entrypoint or a deploy step gates on this, so the verdict
                 # has to reach the exit code. What reaches `ok: false` is a
-                # running daemon whose update sync is not fresh, a configured
-                # (worker, model) pair its binary did not accept, or a job
+                # running daemon whose update sync is not fresh, a profile the
+                # settings name that its harness did not accept, or a job
                 # register the store did not open: a server/network outcome,
                 # category 5.
                 sys.exit(5)
@@ -6780,6 +7114,8 @@ def main() -> None:
         elif args.service_cmd == "migrate-ownership":
             _emit(cmd_service_migrate_ownership(
                 connection_flag, args.confirm_all_legacy_daemons_stopped))
+        elif args.service_cmd == "migrate-profiles":
+            _emit(cmd_service_migrate_profiles(connection_flag, session_flag, args.apply))
         return
 
     cfg = _load_config(

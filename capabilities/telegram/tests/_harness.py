@@ -128,10 +128,37 @@ class FakeHarness:
 
 def harness_turn(daemon, worker, fake, state=None, procs=None):
     """One turn through the daemon's own `worker_harness`, on the profile
-    `worker_turn` would resolve for it, with `fake` as the harness."""
+    `worker_turn` would resolve for it - the settings' `profile`, else
+    `telegram-<worker>` - with `fake` as the harness."""
     from unittest import mock
     state = dict(state or {})
     settings = state.setdefault("settings", {})
-    state["profile"] = daemon.resolve_turn_profile(worker, settings)
+    state["profile"] = daemon.resolve_turn_profile(settings.get("profile")
+                                                   or f"telegram-{worker}")
     with mock.patch.object(daemon, "harness_run", fake):
         return daemon.worker_harness("123", [], state, {} if procs is None else procs)
+
+
+CLAUDE_KNOBS = {"harness": "claude", "model": "opus", "permission_mode": "bypassPermissions",
+                "setting_sources": ["user", "project", "local"], "timeout_seconds": 86400}
+CODEX_KNOBS = {"harness": "codex", "model": "sol", "approval_policy": "never",
+               "codex_config": {"sandbox_mode": "danger-full-access"},
+               "bypass_hook_trust": True, "timeout_seconds": 86400}
+
+
+def stored(specs, scope="global", project=None):
+    """Store versions as the runner reads them, one per {name: spec}."""
+    return [lib.StoredProfile(id=f"v-{name}", scope=scope,
+                              scope_id=project if scope == "project" else None,
+                              name=name, spec=spec, active=True, created_at=None,
+                              created_by=None)
+            for name, spec in specs.items()]
+
+
+def held(daemon, specs, project=None):
+    """The daemon's store read answering with `specs` as global versions (or
+    project ones, with `project`), so a turn resolves them as it would from
+    the store."""
+    from unittest import mock
+    versions = stored(specs, "project" if project else "global", project)
+    return mock.patch.object(daemon, "turn_profiles", lambda: (versions, project))

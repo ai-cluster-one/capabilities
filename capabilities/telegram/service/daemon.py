@@ -150,7 +150,13 @@ import jobs
 import profiles
 import voice_agent
 from forum import GENERAL_TOPIC_ID, message_topic_id
-from settings_schema import VOICE_PROVIDER_INCUMBENT, validate_settings
+from settings_schema import (
+    VOICE_PROVIDER_INCUMBENT,
+    old_environment,
+    old_names_sentence,
+    old_register_fields,
+    validate_settings,
+)
 from workers import (
     DEFAULT_WORKER_TIMEOUT,
     WorkerFailed,
@@ -285,14 +291,8 @@ DEFAULT_SESSION = STATE_HOME / "telegram" / "session"
 if (not DEFAULT_SESSION.with_suffix(".session").exists()
         and (CONFIG_HOME / "telegram" / "session.session").exists()):
     DEFAULT_SESSION = CONFIG_HOME / "telegram" / "session"
-WORKER_CHOICES = ("claude", "codex", "stub")
-WORKER_NAMES = set(WORKER_CHOICES)
-CLAUDE_EFFORT_CHOICES = ("default", "low", "medium", "high", "xhigh", "max")
-CLAUDE_EFFORTS = set(CLAUDE_EFFORT_CHOICES)
-CODEX_REASONING_CHOICES = ("default", "low", "medium", "high", "xhigh")
-CODEX_REASONING_EFFORTS = set(CODEX_REASONING_CHOICES)
-CODEX_SERVICE_TIER_CHOICES = ("default", "fast", "priority")
-CODEX_SERVICE_TIERS = set(CODEX_SERVICE_TIER_CHOICES)
+# The reserved name a room runs in process, on no profile.
+STUB = "stub"
 TELEGRAM_MESSAGE_LIMIT = 4096
 
 
@@ -568,6 +568,11 @@ def _read_settings():
         validate_settings(settings, PROJECT_ROOT, SERVICE_DIR)
     except ValueError as exc:
         raise SettingsError(str(exc)) from exc
+    # The environment's default worker names a worker, not a profile; it is
+    # refused rather than read, so nothing silently changes what a room runs.
+    old_names = old_environment(os.environ)
+    if old_names:
+        raise SettingsError(old_names_sentence(old_names))
     return settings
 
 
@@ -623,14 +628,7 @@ def _runtime_settings(settings, project_layout=None):
         voice_context_file = SERVICE_DIR / voice_context_file
     assistant_name = str(
         settings.get("assistant_name") or defaults.get("assistant_name") or "Assistant")
-    default_worker = str(
-        os.environ.get("TELEGRAM_SERVICE_WORKER")
-        or os.environ.get("TG_WORKER")
-        or defaults.get("worker")
-        or "stub"
-    ).strip().lower()
-    if default_worker not in WORKER_NAMES:
-        default_worker = "stub"
+    default_profile, default_profile_position = profiles.default_profile(settings, os.environ)
 
     def positive_seconds(name, default, minimum=0.01):
         try:
@@ -674,7 +672,8 @@ def _runtime_settings(settings, project_layout=None):
         "VOICE_PROMPT_FILE_EXPLICIT": voice_prompt_file_explicit,
         "ASSISTANT_NAME": assistant_name,
         "DEFAULT_GROUP_ALIASES": group_aliases or (assistant_name,),
-        "DEFAULT_WORKER": default_worker,
+        "DEFAULT_PROFILE": default_profile or STUB,
+        "DEFAULT_PROFILE_POSITION": default_profile_position,
         "SYNC_INTERVAL": sync_interval,
         "SYNC_STALE_AFTER": max(
             sync_interval * 2, positive_seconds("sync_stale_after", 60)),
@@ -1934,8 +1933,8 @@ def _require_hardened_state():
 
 
 def reached_profile_problems(settings):
-    """Every worker `settings` reach whose profile does not resolve or fit,
-    each with its position; empty when every one does."""
+    """Every profile name `settings` reach that does not resolve or fit, each
+    with its position; empty when every one does."""
     active, project = turn_profiles()
     return profiles.check(settings, os.environ, active, project)
 
@@ -1957,8 +1956,8 @@ def reload_runtime_settings():
             raise SettingsError("settings.connection changed; a daemon restart is required")
         project_layout = _read_project_layout(reload_file=True)
         runtime = _runtime_settings(candidate, project_layout)
-        # Every worker the new settings reach has to have a profile a turn can
-        # run on, or the settings are refused here rather than at a message.
+        # Every profile the new settings name has to resolve and fit, or the
+        # settings are refused here rather than at a message.
         problems = reached_profile_problems(candidate)
         if problems:
             raise SettingsError(profiles.problems_sentence(problems))
@@ -3107,15 +3106,8 @@ def _default_as_none(value):
     return None if value in (None, "", "default") else value
 
 
-def _active_worker(row):
-    settings = (row or {}).get("settings", {})
-    worker = str(settings.get("worker") or DEFAULT_WORKER).strip().lower()
-    return worker if worker in WORKER_NAMES else DEFAULT_WORKER
-
-
 def migrate_register(reg):
-    """Migrate old per-channel settings.model into workers.<active>.model, and
-    carry a forum General row onto the topic id it now keys on."""
+    """Carry a forum General row onto the topic id it now keys on."""
     changed = False
     for key in list(reg.keys()):
         # General moved off the bare chat key the moment its chat declared a
@@ -3134,66 +3126,69 @@ def migrate_register(reg):
         if general not in reg:
             reg[general] = reg.pop(key)
             changed = True
-    for row in reg.values():
-        if not isinstance(row, dict):
-            continue
-        settings = row.setdefault("settings", {})
-        if "worker" in settings:
-            worker = str(settings.get("worker") or DEFAULT_WORKER).strip().lower()
-            if worker not in WORKER_NAMES:
-                settings["worker"] = DEFAULT_WORKER
-                changed = True
-        if "model" in settings:
-            old_model = settings.pop("model")
-            model = _default_as_none(old_model)
-            if model:
-                worker = _active_worker(row)
-                row.setdefault("workers", {}).setdefault(worker, {})["model"] = model
-            changed = True
     return changed
 
 
-def _worker_settings(row, worker):
-    cfg = dict((DEFAULTS.get("workers") or {}).get(worker, {}))
-    cfg.update(((row or {}).get("workers") or {}).get(worker, {}))
-    return {k: _default_as_none(v) for k, v in cfg.items()}
+def refuse_old_register(reg):
+    """Refuse a register whose rows still carry `/set worker`, `/set model` or
+    the per-worker `/set` fields: what those rows ran on is the migration's to
+    move, never this daemon's to guess."""
+    places = old_register_fields(reg)
+    if places:
+        raise SettingsError(old_names_sentence(places))
 
 
-def _worker_flags(worker, cfg):
-    out = {}
-    if worker == "claude":
-        out["effort"] = cfg.get("effort")
-        out["context"] = cfg.get("context")
-    elif worker == "codex":
-        out["reasoning_effort"] = cfg.get("reasoning_effort")
-        out["service_tier"] = cfg.get("service_tier")
-    return out
+def channel_profile(reg, key):
+    """The profile name this channel's turns run on, and the position that
+    named it: the channel's own `/set profile`, then its forum topic's entry,
+    then its group's or its direct user's, then the default (the environment's
+    TELEGRAM_SERVICE_PROFILE, then `defaults.profile`), else the stub. A topic's
+    `/set` is its own; it does not inherit its group's."""
+    chosen = _as_mapping(_as_mapping(reg.get(key)).get("settings")).get("profile")
+    if chosen:
+        return str(chosen), "/set profile"
+    chat_id, topic_id = _channel_identity(key)
+    group_key, group_policy = _group_policy(chat_id)
+    if group_policy is not None:
+        topic = _topic_policy(group_policy, topic_id)
+        if topic.get("profile"):
+            return (str(topic["profile"]),
+                    f"settings.allowed_groups.{group_key}.topics.{topic_id}.profile")
+        if group_policy.get("profile"):
+            return str(group_policy["profile"]), f"settings.allowed_groups.{group_key}.profile"
+    else:
+        user = _direct_user_policy(chat_id)
+        if user.get("profile"):
+            return str(user["profile"]), f"settings.allowed_users.{chat_id}.profile"
+    return DEFAULT_PROFILE, DEFAULT_PROFILE_POSITION
+
+
+def voice_profile():
+    """The profile a call's task and the post-call summary run on, and where
+    it was named: `defaults.voice_agent.profile`, then the default."""
+    named = VOICE_AGENT_DEFAULTS.get("profile")
+    if named:
+        return str(named), "settings.defaults.voice_agent.profile"
+    return DEFAULT_PROFILE, DEFAULT_PROFILE_POSITION
 
 
 def voice_agent_settings():
-    """Worker policy for a task started from a call: the project's own worker
-    settings, overlaid by whatever `defaults.voice_agent` names.
+    """Worker policy for a task started from a call: the profile the voice
+    defaults name, over the project's default.
 
     Work asked for by voice is operational and quick — look something up, file
-    something, write something down — so a project points this at a fast model
-    rather than the deep-reasoning mode it codes with. The timeout is the text
-    worker's: the tool returns at once, so nothing waits on the clock, and task
-    size is bounded by the model choice instead."""
-    worker = str(VOICE_AGENT_DEFAULTS.get("worker") or DEFAULT_WORKER).strip().lower()
-    if worker not in WORKER_NAMES:
-        worker = DEFAULT_WORKER
-    cfg = dict(_as_mapping(_as_mapping(DEFAULTS.get("workers")).get(worker)))
-    cfg.update(_as_mapping(_as_mapping(VOICE_AGENT_DEFAULTS.get("workers")).get(worker)))
-    cfg = {k: _default_as_none(v) for k, v in cfg.items()}
+    something, write something down — so a project points this at a profile on
+    a fast model rather than the deep-reasoning one it codes with. The timeout
+    is the text worker's: the tool returns at once, so nothing waits on the
+    clock, and task size is bounded by the model choice instead."""
+    name, position = voice_profile()
     session_mode = str(_as_mapping(VOICE_AGENT_DEFAULTS.get("session")).get("mode")
                        or "carry").strip().lower()
     return {
-        "worker": worker,
-        "worker_settings": cfg,
-        "model": cfg.get("model"),
+        "profile": name,
+        "profile_position": position,
         "worker_timeout": DEFAULTS.get("worker_timeout", DEFAULT_WORKER_TIMEOUT),
         "session_mode": session_mode,
-        **_worker_flags(worker, cfg),
     }
 
 
@@ -3482,7 +3477,8 @@ def channel_settings(reg, key):
     The worker window is declared by whichever policy owns the channel — a
     group's by its `allowed_groups` entry, a direct chat's by the participant's
     `allowed_users` entry — and a `/set` override in the channel still wins over
-    both."""
+    both. The profile is named along `channel_profile`'s order; which harness
+    and model it runs is read when a turn resolves it (`settings_on_profile`)."""
     row = reg.get(key, {})
     s = row.get("settings", {})
     chat_id, _ = _channel_identity(key)
@@ -3491,8 +3487,7 @@ def channel_settings(reg, key):
                       else _direct_user_policy(chat_id))
     configured_timeout = channel_policy.get(
         "worker_timeout", DEFAULTS.get("worker_timeout", DEFAULT_WORKER_TIMEOUT))
-    worker = _active_worker(row)
-    cfg = _worker_settings(row, worker)
+    profile, position = channel_profile(reg, key)
     out = {
         "tail_size": s.get("tail_size", DEFAULTS.get("tail_size", 50)),
         "debounce": s.get("debounce", DEFAULTS.get("debounce", 3)),
@@ -3502,41 +3497,10 @@ def channel_settings(reg, key):
         "max_parallel_dialogue": s.get(
             "max_parallel_dialogue", DEFAULTS.get("max_parallel_dialogue", 1)),
         "max_attempts": s.get("max_attempts", DEFAULTS.get("max_attempts", 3)),
-        "worker": worker,
-        "worker_settings": cfg,
-        "model": cfg.get("model"),
+        "profile": profile,
+        "profile_position": position,
     }
-    out.update(_worker_flags(worker, cfg))
     return out
-
-
-def _set_worker_setting(reg, key, worker, field, value):
-    row = reg.setdefault(key, {})
-    cfg = row.setdefault("workers", {}).setdefault(worker, {})
-    value = value.strip()
-    if field == "model":
-        cfg["model"] = _default_as_none(value)
-        return f"{worker}.model = {value}"
-    if worker == "claude" and field in ("effort", "reasoning"):
-        effort = value.lower()
-        if effort not in CLAUDE_EFFORTS:
-            raise ValueError(f"claude effort must be one of {_values(CLAUDE_EFFORT_CHOICES)}")
-        cfg["effort"] = _default_as_none(effort)
-        return f"claude.effort = {effort}"
-    if worker == "codex" and field in ("effort", "reasoning", "reasoning_effort"):
-        effort = value.lower()
-        if effort not in CODEX_REASONING_EFFORTS:
-            raise ValueError(f"codex reasoning must be one of {_values(CODEX_REASONING_CHOICES)}")
-        cfg["reasoning_effort"] = _default_as_none(effort)
-        return f"codex.reasoning = {effort}"
-    if worker == "codex" and field in ("speed", "service-tier", "service_tier"):
-        tier = value.lower()
-        if tier not in CODEX_SERVICE_TIERS:
-            raise ValueError(f"codex speed must be one of {_values(CODEX_SERVICE_TIER_CHOICES)}")
-        cfg["service_tier"] = None if tier == "default" else ("priority" if tier == "fast" else tier)
-        shown = "default" if cfg["service_tier"] is None else cfg["service_tier"]
-        return f"codex.service_tier = {shown}"
-    raise ValueError(f"{field} is not supported for worker {worker}")
 
 
 IN_FLIGHT_STATES = ("preparing", "queued", "running")
@@ -3578,24 +3542,29 @@ def _reply_line(position, job, at):
     return f"  {position}. {'running' if state == 'running' else 'waiting'} · {name}{elapsed}"
 
 
+def _profile_layer(name, found=None):
+    """Where a profile name resolves, as `/status` and `/profiles` say it."""
+    if name == STUB:
+        return "in process"
+    if found is None:
+        found = settings_on_profile({"profile": name})[1]
+    if isinstance(found, BaseException):
+        return "does not resolve or fit"
+    return found["layer"] + (f" {found['version']}" if found.get("version") else "")
+
+
 def _status(reg, key, replies=None):
     s = channel_settings(reg, key)
     wm = reg.get(key, {}).get("last_processed_message_id", 0)
     if replies is None:
         replies = _replies_in_flight(reg, key)
-    worker = s["worker"]
     lines = [
         f"settings [{key}]:",
         f"  tail = {s['tail_size']}",
         f"  debounce = {s['debounce']}s",
-        f"  worker = {worker}",
-        f"  {worker}.model = {s.get('model') or 'default'}",
+        f"  profile = {s['profile']} ({_profile_layer(s['profile'])}, "
+        f"from {s['profile_position']})",
     ]
-    if worker == "claude":
-        lines.append(f"  claude.effort = {s.get('effort') or 'default'}")
-    elif worker == "codex":
-        lines.append(f"  codex.reasoning = {s.get('reasoning_effort') or 'default'}")
-        lines.append(f"  codex.service_tier = {s.get('service_tier') or 'default'}")
     lines.append(f"  worker-timeout = {s['worker_timeout']}s")
     _, group_policy = _group_policy(_channel_identity(key)[0])
     if group_policy is not None:
@@ -3611,33 +3580,33 @@ def _status(reg, key, replies=None):
     return "\n".join(lines)
 
 
-def _values(items):
-    return "|".join(items)
+# What the `/set` settings that named a worker and its knobs are answered with.
+# A chat runs on a profile now, which says the harness, the model and the rest
+# at once.
+REMOVED_SET_SETTINGS = {"worker", "model", "effort", "reasoning", "reasoning_effort",
+                        "speed", "service-tier", "service_tier"}
+REMOVED_SET_SENTENCE = ("a chat runs on a profile now, which sets the harness, model, "
+                        "effort and speed together: /profiles lists them, and "
+                        "/set profile <name> picks one")
 
 
-def _model_hint(worker):
-    if worker == "claude":
-        return "default|opus|sonnet|haiku|fable|<full-claude-model-id>"
-    if worker == "codex":
-        return "default|gpt-5.5|gpt-5.4|gpt-5.4-mini|gpt-5.3-codex-spark|<codex-model-id>"
-    return "default"
+def _removed_set_setting(topic):
+    """Whether `/set <topic>` names a setting a profile replaced: the worker,
+    its model, effort, reasoning or speed, or `<worker>.<field>`."""
+    topic = (topic or "").strip().lower()
+    return (topic in REMOVED_SET_SETTINGS
+            or ("." in topic and topic.split(".", 1)[0] in ("claude", "codex", STUB)))
 
 
 def _set_help(reg, key, topic=None):
     s = channel_settings(reg, key)
-    active = s["worker"]
     topic = (topic or "").strip().lower()
     if topic in ("help", "?"):
         topic = ""
-    target_worker, field = None, topic
-    if "." in topic:
-        maybe_worker, field = topic.split(".", 1)
-        if maybe_worker in WORKER_NAMES:
-            target_worker = maybe_worker
-    worker = target_worker or active
-
-    if topic == "worker":
-        return f"usage: /set worker <{_values(WORKER_CHOICES)}>\ncurrent: {active}"
+    if topic == "profile":
+        return ("usage: /set profile <name|default>\n"
+                f"current: {s['profile']} (from {s['profile_position']})\n"
+                "/profiles lists the profiles this chat may run on")
     if topic == "tail":
         return f"usage: /set tail <1..500>\ncurrent: {s['tail_size']}"
     if topic == "debounce":
@@ -3651,55 +3620,19 @@ def _set_help(reg, key, topic=None):
             return "voice-transcription setting is only available in groups (direct messages always transcribe voice)"
         current = s.get("voice_transcription") or _voice_transcription_mode(group_policy, reg, key)
         return f"usage: /set voice-transcription <auto|disabled>\ncurrent: {current}\naliases: on=auto, off=disabled"
-    if field == "model" and worker in WORKER_NAMES:
-        current = channel_settings(reg, key).get("model") if worker == active else \
-            _worker_settings(reg.get(key, {}), worker).get("model")
-        return f"usage: /set {worker}.model <{_model_hint(worker)}>\ncurrent: {current or 'default'}"
-    if field in ("effort", "reasoning", "reasoning_effort") and worker == "claude":
-        current = channel_settings(reg, key).get("effort") if worker == active else \
-            _worker_settings(reg.get(key, {}), worker).get("effort")
-        return f"usage: /set claude.effort <{_values(CLAUDE_EFFORT_CHOICES)}>\ncurrent: {current or 'default'}"
-    if field in ("effort", "reasoning", "reasoning_effort") and worker == "codex":
-        current = channel_settings(reg, key).get("reasoning_effort") if worker == active else \
-            _worker_settings(reg.get(key, {}), worker).get("reasoning_effort")
-        return f"usage: /set codex.reasoning <{_values(CODEX_REASONING_CHOICES)}>\ncurrent: {current or 'default'}"
-    if field in ("speed", "service-tier", "service_tier") and worker == "codex":
-        current = channel_settings(reg, key).get("service_tier") if worker == active else \
-            _worker_settings(reg.get(key, {}), worker).get("service_tier")
-        return (f"usage: /set codex.speed <{_values(CODEX_SERVICE_TIER_CHOICES)}>\n"
-                f"current: {current or 'default'}\nfast is an alias for priority")
-    if topic in WORKER_NAMES:
-        lines = [f"{topic} settings:", f"  /set {topic}.model <{_model_hint(topic)}>"]
-        if topic == "claude":
-            lines.append(f"  /set claude.effort <{_values(CLAUDE_EFFORT_CHOICES)}>")
-        elif topic == "codex":
-            lines.append(f"  /set codex.reasoning <{_values(CODEX_REASONING_CHOICES)}>")
-            lines.append(f"  /set codex.speed <{_values(CODEX_SERVICE_TIER_CHOICES)}>")
-        return "\n".join(lines)
-    if field in ("speed", "service-tier", "service_tier"):
-        return "speed/service-tier is only available for codex\nusage: /set codex.speed <default|fast|priority>"
 
     lines = [
         "usage: /set <setting> <value>",
-        f"active worker: {active}",
+        f"profile: {s['profile']}",
         "settings:",
+        "  profile <name|default>  (/profiles lists them)",
         "  tail <1..500>",
         "  debounce <0..300>",
         "  worker-timeout <1..3600|default>",
-        f"  worker <{_values(WORKER_CHOICES)}>",
-        f"  model <{_model_hint(active)}>  (active worker)",
-        "  reasoning <default|low|medium|high|xhigh>  (codex active)",
-        "  effort <default|low|medium|high|xhigh|max>  (claude active)",
-        "  speed <default|fast|priority>  (codex active)",
     ]
     _, group_policy = _group_policy(_channel_identity(key)[0])
     if group_policy is not None:
         lines.append("  voice-transcription <auto|disabled>  (groups only)")
-    lines.extend([
-        "worker-specific:",
-        "  codex.model / codex.reasoning / codex.speed",
-        "  claude.model / claude.effort",
-    ])
     return "\n".join(lines)
 
 
@@ -3728,12 +3661,19 @@ def set_channel_setting(reg, key, k, v):
             raise ValueError("worker-timeout must be 1..3600 seconds or default")
         s["worker_timeout"] = n
         return f"worker-timeout = {n}s"
-    if k == "worker":
-        worker = v.strip().lower()
-        if worker not in WORKER_NAMES:
-            raise ValueError(f"worker must be one of {_values(WORKER_CHOICES)}")
-        s["worker"] = worker
-        return f"worker = {worker}"
+    if k == "profile":
+        name = v.strip()
+        if name.lower() == "default":
+            s.pop("profile", None)
+            effective, position = channel_profile(reg, key)
+            return f"profile = default ({effective} from {position})"
+        # Only a name a turn can run on is kept: the stub, or a telegram
+        # profile that resolves and fits now.
+        _, found = settings_on_profile({"profile": name})
+        if isinstance(found, BaseException):
+            raise ValueError(str(found))
+        s["profile"] = name
+        return f"profile = {name} ({_profile_layer(name, found)})"
     if k in ("voice-transcription", "voice_transcription", "voice"):
         _, group_policy = _group_policy(_channel_identity(key)[0])
         if group_policy is None:
@@ -3747,17 +3687,8 @@ def set_channel_setting(reg, key, k, v):
             return "voice-transcription = disabled (only addressed voice notes will be transcribed)"
         else:
             raise ValueError("voice-transcription must be auto or disabled (aliases: on=auto, off=disabled)")
-    target_worker, field = None, k
-    if "." in k:
-        maybe_worker, field = k.split(".", 1)
-        if maybe_worker in WORKER_NAMES:
-            target_worker = maybe_worker
-    worker = target_worker or channel_settings(reg, key)["worker"]
-    if field in ("model", "effort", "reasoning", "reasoning_effort",
-                 "speed", "service-tier", "service_tier"):
-        return _set_worker_setting(reg, key, worker, field, v)
-    raise ValueError("unknown setting; use tail, debounce, worker-timeout, worker, model, reasoning, "
-                     "effort, speed, service-tier, or <worker>.<setting>")
+    raise ValueError("unknown setting; use profile, tail, debounce, worker-timeout "
+                     "or voice-transcription")
 
 
 def _command_name(text):
@@ -3769,6 +3700,10 @@ def _command_name(text):
 
 def _control_command_key(command):
     key = str(command or "").strip().split("@", 1)[0].lower().lstrip("/")
+    # Listing the profiles is reading the channel's settings, so it passes the
+    # gate as /status does; choosing one is a /set.
+    if key == "profiles":
+        return "status"
     return key if key in {"status", "set", "reload", "stop"} else "help"
 
 
@@ -3829,16 +3764,20 @@ def handle_command(reg, key, text):
     cmd = _command_name(text)
     if cmd == "/status":
         return _status(reg, key)
+    if cmd == "/profiles":
+        return _profiles_reply(reg, key)
     if cmd == "/set":
         if len(parts) < 2:
             return _set_help(reg, key)
+        if _removed_set_setting(parts[1]):
+            return f"nope: /set {parts[1].lower()} is gone; {REMOVED_SET_SENTENCE}"
         if len(parts) < 3:
             return _set_help(reg, key, parts[1].lower())
         try:
             return "ok, " + set_channel_setting(reg, key, parts[1].lower(), parts[2])
         except ValueError as e:
             return f"nope: {e}\n\n{_set_help(reg, key, parts[1].lower())}"
-    return "commands: /status, /reload, /stop, /set help"
+    return "commands: /status, /profiles, /reload, /stop, /set help"
 
 
 # --- voice transcription (Deepgram) -------------------------------------------
@@ -4052,6 +3991,7 @@ def _format_conversation(tail):
 def _settings_summary(s):
     bits = [
         f"tail_size={s.get('tail_size')}",
+        f"profile={s.get('profile')}",
         f"worker={s.get('worker')}",
         f"model={s.get('model') or 'default'}",
         f"debounce={s.get('debounce')}s",
@@ -4060,10 +4000,9 @@ def _settings_summary(s):
         f"dialogue={s.get('max_parallel_dialogue')}",
         f"max_attempts={s.get('max_attempts')}",
     ]
-    if s.get("worker") == "claude":
+    if s.get("worker") in ("claude", "codex"):
         bits.append(f"effort={s.get('effort') or 'default'}")
-    elif s.get("worker") == "codex":
-        bits.append(f"reasoning={s.get('reasoning_effort') or 'default'}")
+    if s.get("worker") == "codex":
         bits.append(f"service_tier={s.get('service_tier') or 'default'}")
     return ", ".join(bits)
 
@@ -4493,15 +4432,27 @@ def worker_env_parts(state=None):
     req = st.get("current_request") or {}
     if req.get("sender_id") is not None:
         extra["TELEGRAM_AUTHORIZED_REQUESTER_ID"] = str(req["sender_id"])
+    # The requester's role as this daemon resolved it. `telegram profiles save`
+    # inside the turn saves only for a role the control gate admits to /set,
+    # and it reads that role from here, never from what the model says.
+    if req.get("sender_role"):
+        extra["TELEGRAM_AUTHORIZED_REQUESTER_ROLE"] = str(req["sender_role"])
+    else:
+        env.pop("TELEGRAM_AUTHORIZED_REQUESTER_ROLE", None)
     if req.get("message_id") is not None:
         extra["TELEGRAM_AUTHORIZED_ORIGIN_MESSAGE_ID"] = str(req["message_id"])
+    # A job this turn registers runs on the profile the turn runs on, and keeps
+    # its harness as the engine a session continues on.
     settings = st.get("settings") or {}
-    if settings.get("worker"):
-        extra["TELEGRAM_AUTHORIZED_JOB_ENGINE"] = str(settings["worker"])
-    if settings.get("model"):
-        extra["TELEGRAM_AUTHORIZED_JOB_MODEL"] = str(settings["model"])
-    else:
-        env.pop("TELEGRAM_AUTHORIZED_JOB_MODEL", None)
+    for name, value in (("TELEGRAM_AUTHORIZED_JOB_PROFILE", settings.get("profile")),
+                        ("TELEGRAM_AUTHORIZED_JOB_ENGINE", settings.get("worker"))):
+        if value:
+            extra[name] = str(value)
+        else:
+            env.pop(name, None)
+    # The job's model is its profile's; one handed down from the daemon's own
+    # launcher would be a pin the child never had.
+    env.pop("TELEGRAM_AUTHORIZED_JOB_MODEL", None)
     if req.get("reply_to"):
         extra["TELEGRAM_PROGRESS_REPLY_TO"] = str(req["reply_to"])
     return env, extra
@@ -4899,15 +4850,112 @@ def turn_profiles():
         return [], None
 
 
-def resolve_turn_profile(worker, settings):
-    """What a turn on `worker` with these settings runs on: its implicit
-    profile, or WorkerProfileRefused naming the profile and the problem."""
+def resolve_turn_profile(name):
+    """What a turn named `name` runs on: None for the stub, else the profile
+    resolved and fitted, or WorkerProfileRefused naming the profile and the
+    problem."""
     active, project = turn_profiles()
     try:
-        return profiles.implicit(worker, (settings or {}).get("worker_settings") or {},
-                                 active, project)
+        return profiles.turn(name, active, project)
     except profiles.Refusal as refused:
         return WorkerProfileRefused(refused.message)
+
+
+def _on_knobs(s, name, worker, knobs):
+    knobs = knobs or {}
+    return {**s, "profile": name, "worker": worker, "model": knobs.get("model"),
+            "effort": knobs.get("effort"), "service_tier": knobs.get("service_tier")}
+
+
+def settings_on_profile(s, name=None):
+    """`s` with the profile it names (or `name`) resolved, and what resolved.
+
+    The settings gain `worker`, the profile's harness or the stub, and the
+    model, effort and service tier it runs with; the second answer is the
+    resolved profile, None for the stub, or WorkerProfileRefused, on which the
+    turn ends without running. Called on the loop, which owns the store's
+    connection, so a profile saved a moment ago is the one a turn runs on."""
+    name = str(name or s.get("profile") or STUB)
+    if name == STUB:
+        return _on_knobs(s, STUB, STUB, None), None
+    found = resolve_turn_profile(name)
+    if isinstance(found, BaseException):
+        return _on_knobs(s, name, None, None), found
+    return _on_knobs(s, name, found["knobs"].get("harness"), found["knobs"]), found
+
+
+def settings_on_job_profile(s, row):
+    """`s` with the profile a registered job runs on, and what resolved.
+
+    The row's `profile`, pinned when it was registered. A profile that now runs
+    on another harness than the row's engine ends the job naming both: a
+    session continues only on the harness it began on. A row registered before
+    rooms named profiles has none and runs on `telegram-<engine>` with the
+    row's model laid over it."""
+    engine = row.get("engine")
+    name = row.get("profile")
+    if name:
+        s, found = settings_on_profile(s, name)
+        if found is not None and not isinstance(found, BaseException) \
+                and s["worker"] != engine:
+            found = WorkerProfileRefused(
+                f"job {row.get('id')} was registered on {engine} and its profile "
+                f"{name!r} now runs on {s['worker']}; a session continues only on the "
+                f"harness it began on, so it runs again once {name!r} runs on {engine}")
+        elif found is None and engine != STUB:
+            found = WorkerProfileRefused(
+                f"job {row.get('id')} was registered on {engine} and its profile is the "
+                "stub, which runs no harness")
+        return s, found
+    if engine not in profiles.WORKERS:
+        return settings_on_profile(s, STUB)
+    active, project = turn_profiles()
+    try:
+        found = profiles.implicit(engine, {"model": row.get("model")}, active, project)
+    except profiles.Refusal as refused:
+        return (_on_knobs(s, profiles.PREFIX + engine, engine, {"model": row.get("model")}),
+                WorkerProfileRefused(refused.message))
+    return _on_knobs(s, found["name"], engine, found["knobs"]), found
+
+
+def _profile_line(row):
+    """One `/profiles` line: never an `env_set` value or a `settings` object,
+    because a group may read it."""
+    if row.get("error"):
+        return f"- {row['name']}: cannot be read - {row['error']}"
+    where = row["layer"] + (f" {row['version']}" if row.get("version") else "")
+    bits = [f"{row['harness']} {row.get('model') or 'default model'}",
+            f"effort {row.get('effort') or 'default'}"]
+    if row.get("harness") == "codex":
+        bits.append(f"service tier {row.get('service_tier') or 'default'}")
+    bits.append(row["rights"])
+    bits.append(f"timeout {row['timeout_seconds']}s" if row.get("timeout_seconds")
+                else "no timeout")
+    line = f"- {row['name']} ({where}): " + ", ".join(bits)
+    line += "; fits" if row.get("ok") else "; does not fit: " + "; ".join(row["problems"])
+    if row.get("warnings"):
+        line += "; narrower: " + "; ".join(row["warnings"])
+    return line
+
+
+def _profiles_reply(reg, key):
+    """`/profiles`: every telegram profile this project reaches, where each
+    resolves from and what it sets, and which one this chat runs on."""
+    name, position = channel_profile(reg, key)
+    active, project = turn_profiles()
+    rows = profiles.listing(active, project)
+    found = None
+    if name != STUB:
+        try:
+            found = profiles.turn(name, active, project)
+        except profiles.Refusal as refused:
+            found = WorkerProfileRefused(refused.message)
+    current = f"this chat runs on {name} ({_profile_layer(name, found)}, from {position})"
+    if isinstance(found, BaseException):
+        current += f": {found}"
+    return "\n".join([f"profiles [{key}]:", current, *map(_profile_line, rows),
+                      "/set profile <name> picks one; /set profile default goes back "
+                      "to the settings' choice"])
 
 
 def harness_meta(result):
@@ -5031,9 +5079,9 @@ def discover_codex_images(thread_id):
     return images
 
 
-# The stub answers in process; every other worker is a harness turn on its
+# The stub answers in process; every other turn is a harness turn on its
 # profile.
-WORKERS = {"stub": worker_stub, "claude": worker_harness, "codex": worker_harness}
+WORKERS = {STUB: worker_stub, "claude": worker_harness, "codex": worker_harness}
 
 
 # The line a worker writes to declare where its message to the chat begins.
@@ -5084,11 +5132,16 @@ def worker_turn(loop, worker, key, tail, state, procs):
 
     The cut can never empty a reply, so a consumer that reads emptiness as
     silence reads exactly what it read before."""
-    run_worker = WORKERS[worker]
-    if run_worker is worker_harness and "profile" not in state:
+    run_worker = WORKERS.get(worker, worker_harness)
+    if isinstance(state.get("profile"), BaseException):
+        # A profile that does not resolve or fit ends the turn naming it,
+        # whatever the turn would otherwise have run.
+        run_worker = worker_harness
+    elif run_worker is worker_harness and "profile" not in state:
         # Resolved here, on the loop, where the store's connection lives: a
         # profile saved a moment ago is the one this turn runs on.
-        state["profile"] = resolve_turn_profile(worker, state.get("settings"))
+        name = (state.get("settings") or {}).get("profile") or profiles.PREFIX + str(worker)
+        state["profile"] = resolve_turn_profile(name)
 
     def turn():
         result = run_worker(key, tail, state, procs)
@@ -5830,7 +5883,7 @@ async def run_session(client):
         for k, v in ALLOWED_GROUPS.items()
     ]
     log(f"watching as {me.first_name} (id {me.id}); connection={CONNECTION}; "
-        f"default_worker={DEFAULT_WORKER}")
+        f"default_profile={DEFAULT_PROFILE}")
     log(f"connection state dir: {CONNECTION_STATE_DIR}")
     log(f"service state dir: {SERVICE_STATE_DIR}")
     log(f"direct messages: mode={DIRECT_MESSAGE_MODE}; default_role={DIRECT_DEFAULT_ROLE}")
@@ -6332,6 +6385,7 @@ async def run_session(client):
         job["started_at"] = now()
         job["attempts"] = current_attempts + 1
         save_register(reg)
+        s, turn_profile = settings_on_profile(s)
 
         proc_key = proc_key_for(key, job)
         future = None
@@ -6389,6 +6443,7 @@ async def run_session(client):
                      "topic_id": job.get("topic_id"),
                      "topic_title": job.get("topic_title"),
                      "harness": s["worker"], "participants": participants, "settings": s,
+                     "profile": turn_profile,
                      "messages": len(tail),
                      "history_chars": sum(len(m["text"]) for m in tail),
                      "channel_context": channel_context,
@@ -6413,7 +6468,8 @@ async def run_session(client):
             answer_mark = NO_REPLY_MARKER if job.get("external_request") else None
             routed = "" if project_dir == PROJECT_ROOT else f" project={project_dir}"
             log(f"{key}: dispatch job msg={job.get('message_id')} tail={s['tail_size']} "
-                f"worker={s['worker']} model={s['model'] or 'default'} msgs={len(tail)}{routed}")
+                f"profile={s['profile']} worker={s['worker']} "
+                f"model={s['model'] or 'default'} msgs={len(tail)}{routed}")
             loop = asyncio.get_running_loop()
             progress_stop = asyncio.Event()
             progress_task = asyncio.create_task(
@@ -6975,20 +7031,11 @@ async def run_session(client):
         chat_id, topic_id = _channel_identity(key)
         _, group_policy = _group_policy(chat_id)
         is_direct = group_policy is None
-        s = channel_settings(reg, key)
-        # The row's engine, not the channel's current one. Resumption is
+        # The row's profile, not the channel's current one. Resumption is
         # engine-specific: a job registered under codex and continued under
         # claude has no session to continue, which is the whole reason the
         # register records the engine at all.
-        engine = row["engine"] if row["engine"] in WORKERS else s["worker"]
-        if engine != s["worker"]:
-            cfg = _worker_settings(reg.get(key, {}), engine)
-            s = {**s, "worker": engine, "worker_settings": cfg,
-                 "model": cfg.get("model"), **_worker_flags(engine, cfg)}
-        if row.get("model") is not None:
-            s = {**s, "model": row["model"],
-                 "worker_settings": {**(s.get("worker_settings") or {}),
-                                     "model": row["model"]}}
+        s, turn_profile = settings_on_job_profile(channel_settings(reg, key), row)
         register = job_register()
         sender = job_sender(row, group_policy)
         attempt_token = row.get("attempt_token")
@@ -7134,7 +7181,7 @@ async def run_session(client):
                      "chat_name": (group_policy or {}).get("name"),
                      "topic_id": topic_id, "topic_title": None,
                      "harness": s["worker"], "participants": participants,
-                     "settings": s, "messages": len(tail),
+                     "settings": s, "profile": turn_profile, "messages": len(tail),
                      "history_chars": sum(len(m["text"]) for m in tail),
                      "channel_context": channel_context,
                      "context_exclusive": context_exclusive,
@@ -7155,7 +7202,7 @@ async def run_session(client):
                      "project_dir": project_dir,
                      "proc_key": proc_key}
             routed = "" if project_dir == PROJECT_ROOT else f" project={project_dir}"
-            log(f"{key}: dispatch job {job_id} worker={s['worker']} "
+            log(f"{key}: dispatch job {job_id} profile={s['profile']} worker={s['worker']} "
                 f"model={s['model'] or 'default'} attempt={row['attempt']}"
                 f"{' resumed' if resume_session else ''}{routed}")
             progress_stop = asyncio.Event()
@@ -7602,6 +7649,8 @@ async def run_session(client):
                 reply = stop_one(key, args[0]) if args else stop_running(key)
             elif cmd == "/status":
                 reply = show_status(key)
+            elif cmd == "/profiles":
+                reply = _profiles_reply(reg, key)
             elif cmd == "/reload":
                 result = reload_runtime_settings()
                 if result["ok"]:
@@ -8017,7 +8066,7 @@ async def run_session(client):
                 register = job_register()
                 draft = register.register(
                     channel_key=key, requested_by=key, description=description,
-                    engine=s["worker"], model=s["model"])
+                    engine=s["worker"], model=s["model"], profile=s["profile"])
                 row = register.begin_direct(
                     draft["id"], owner_id=VOICE_OWNER_ID, owner_host=JOB_OWNER_HOST,
                     lease_seconds=max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3))
@@ -8109,7 +8158,7 @@ async def run_session(client):
             channel lists it, `jobs stop` reaches it, and a restart that cuts it
             off leaves it interrupted rather than gone. It starts at once and
             holds none of the runner's slots."""
-            s = voice_agent_settings()
+            s, turn_profile = settings_on_profile(voice_agent_settings())
             key = str(caller_id)
             provider = provider or voice_agent.DEFAULT_PROVIDER
             row = open_voice_row(key, record, s) if record else None
@@ -8184,7 +8233,8 @@ async def run_session(client):
                              "harness": s["worker"],
                              "participants": [{"name": job["sender_name"],
                                                "role": job["sender_role"]}],
-                             "settings": s, "messages": 0, "history_chars": 0,
+                             "settings": s, "profile": turn_profile,
+                             "messages": 0, "history_chars": 0,
                              "current_request": {
                                  "message_id": task_id,
                                  "sender_id": key,
@@ -8209,7 +8259,8 @@ async def run_session(client):
                              "resume_reanchor": reanchor,
                              "cancel_event": cancel_event,
                              "proc_key": proc_key}
-                    log(f"voice: task {task_id} dispatched worker={s['worker']} "
+                    log(f"voice: task {task_id} dispatched profile={s['profile']} "
+                        f"worker={s['worker']} "
                         f"model={s['model'] or 'default'} "
                         f"session={resume_session or 'new'} "
                         f"authority={_authority_summary(authority)}")
@@ -9777,6 +9828,10 @@ async def main():
         CONNECTION_STATE_DIR.mkdir(parents=True, exist_ok=True)   # telethon opens the session sqlite here;
         SERVICE_STATE_DIR.mkdir(parents=True, exist_ok=True)
         _require_hardened_state()
+        try:
+            refuse_old_register(load_register())
+        except SettingsError as exc:
+            sys.exit(str(exc))
         lock_handle = acquire_daemon_lock()
         _atomic_json(OWNER_FILE, {
             **_owner_provenance(), "started_at": now(),

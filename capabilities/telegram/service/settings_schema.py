@@ -1,6 +1,5 @@
 """Strict, dependency-free validation for Telegram assistant settings."""
 
-import contextvars
 import re
 from pathlib import Path
 
@@ -13,7 +12,6 @@ TOP_LEVEL = {
 # production, and the job queue is filtered by this: without it a development
 # job is eligible for a production runner.
 ENVIRONMENT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.IGNORECASE)
-WORKERS = {"claude", "codex", "stub"}
 # What the media stack may be read at. A call under investigation is read at
 # debug; anything a normal call needs is at info.
 MEDIA_LOG_LEVELS = {"debug", "info", "warning", "error", "critical"}
@@ -146,9 +144,9 @@ def _route_project(value, path):
 def _topics(value, path, project_root, service_dir):
     """Per-topic overrides inside one group policy.
 
-    A topic carries where its work runs and what prose precedes it. It carries
-    no authority tier: a topic inherits its group's rights and cannot narrow or
-    widen them.
+    A topic carries where its work runs, the profile its turns run on and what
+    prose precedes it. It carries no authority tier: a topic inherits its
+    group's rights and cannot narrow or widen them.
     """
     value = _object(value, path)
     for topic_id, entry in value.items():
@@ -159,65 +157,20 @@ def _topics(value, path, project_root, service_dir):
         except (TypeError, ValueError):
             _fail(entry_path, "topic key must be a positive forum topic ID")
         entry = _object(entry, entry_path)
-        _unknown(entry, {"project", "context", "context_file", "context_mode"},
+        _unknown(entry, {"project", "profile", "context", "context_file", "context_mode"},
                  entry_path)
         if "project" in entry:
             _route_project(entry["project"], f"{entry_path}.project")
+        if "profile" in entry:
+            _profile(entry["profile"], f"{entry_path}.profile")
         _overlay(entry, entry_path, project_root, service_dir)
 
 
-def _worker_context(value, path):
-    """What a claude worker is launched holding: the built-in tools it keeps
-    and whether it has MCP servers at all. Skills, plugins and slash commands
-    are not governed here."""
-    value = _object(value, path)
-    _unknown(value, {"tools", "mcp"}, path)
-    if "tools" in value:
-        _string_list(value["tools"], f"{path}.tools")
-    if "mcp" in value:
-        _boolean(value["mcp"], f"{path}.mcp")
-
-
-def _worker_rule(value, path, worker):
-    value = _object(value, path)
-    allowed = {"model"}
-    if worker == "claude":
-        allowed.update({"effort", "context"})
-    elif worker == "codex":
-        allowed.update({"reasoning_effort", "service_tier"})
-    _unknown(value, allowed, path)
-    if "model" in value:
-        _string(value["model"], f"{path}.model", nullable=True)
-    if "context" in value:
-        _worker_context(value["context"], f"{path}.context")
-    if "effort" in value:
-        _enum(value["effort"], {"default", "low", "medium", "high", "xhigh", "max"},
-              f"{path}.effort", nullable=True)
-    if "reasoning_effort" in value:
-        _enum(value["reasoning_effort"],
-              {"default", "low", "medium", "high", "xhigh"},
-              f"{path}.reasoning_effort", nullable=True)
-    if "service_tier" in value:
-        _enum(value["service_tier"], {"default", "fast", "priority"},
-              f"{path}.service_tier", nullable=True)
-
-
-# Set only while `declared_worker_models` is collecting; the walk below appends
-# every worker rule it validates to it, so the positions reported are exactly
-# the positions this schema admits a `workers` block at.
-_DECLARED_WORKER_MODELS = contextvars.ContextVar(
-    "telegram_declared_worker_models", default=None)
-
-
-def _workers(value, path):
-    value = _object(value, path)
-    _unknown(value, WORKERS, path)
-    declared = _DECLARED_WORKER_MODELS.get()
-    for worker, rule in value.items():
-        _worker_rule(rule, f"{path}.{worker}", worker)
-        if declared is not None:
-            declared.append({"path": f"{path}.{worker}.model",
-                             "worker": worker, "model": rule.get("model")})
+def _profile(value, path):
+    """A profile name, judged by its shape alone. Whether it names a telegram
+    profile, resolves and fits is the profile module's to say, at start, at
+    reload and in the doctor, where the store can be read."""
+    _string(value, path, nonempty=True)
 
 
 def _capability_rule(value, path):
@@ -357,10 +310,12 @@ def _voice_session(value, path):
 
 def _voice_agent(value, path, *, defaults=False, project_root=None, service_dir=None):
     value = _object(value, path)
-    allowed = {"worker", "workers", "model", "voice", "greeting", "history", "tools",
-               "provider"}
+    allowed = {"model", "voice", "greeting", "history", "tools", "provider"}
     if defaults:
-        allowed.update({"timezone", "progress_interval", "recording_caption",
+        # The profile a call's task and the post-call summary run on. A
+        # participant's own voice entry has none: the voice task resolves its
+        # profile from the defaults alone.
+        allowed.update({"profile", "timezone", "progress_interval", "recording_caption",
                         "prompt_file", "session"})
     else:
         allowed.add("mode")
@@ -373,10 +328,8 @@ def _voice_agent(value, path, *, defaults=False, project_root=None, service_dir=
         _enum(value["mode"], VOICE_MODES, f"{path}.mode")
     if "provider" in value:
         _enum(value["provider"], VOICE_PROVIDERS, f"{path}.provider", nullable=True)
-    if "worker" in value:
-        _enum(value["worker"], WORKERS, f"{path}.worker", nullable=True)
-    if "workers" in value:
-        _workers(value["workers"], f"{path}.workers")
+    if "profile" in value:
+        _profile(value["profile"], f"{path}.profile")
     for key in ("model", "voice", "greeting", "timezone", "recording_caption"):
         if key in value:
             _string(value[key], f"{path}.{key}", nullable=True)
@@ -415,16 +368,18 @@ def _participant(value, path, project_root, service_dir, *, member=False):
         allowed.update({"kind", "address_aliases"})
     else:
         # A user entry is the only declaration of the channel a person is alone
-        # in, so it is where that channel's worker window belongs. A group
-        # member has no channel of their own here: their turn runs in the
-        # group's, whose window the group policy already owns.
-        allowed.add("worker_timeout")
+        # in, so it is where that channel's worker window and profile belong. A
+        # group member has no channel of their own here: their turn runs in the
+        # group's, whose window and profile the group policy already owns.
+        allowed.update({"worker_timeout", "profile"})
     _unknown(value, allowed, path)
     for key in ("name", "username", "role"):
         if key in value:
             _string(value[key], f"{path}.{key}", nonempty=True)
     if "worker_timeout" in value:
         _number(value["worker_timeout"], f"{path}.worker_timeout", 1, 3600)
+    if "profile" in value:
+        _profile(value["profile"], f"{path}.profile")
     if "may_address" in value:
         _boolean(value["may_address"], f"{path}.may_address")
     if "kind" in value:
@@ -455,7 +410,7 @@ def _group(value, path, project_root, service_dir):
     value = _object(value, path)
     allowed = {
         "name", "role", "member_role", "aliases", "address_aliases", "mentions",
-        "require_reference", "members", "agent_dialogue", "worker_timeout",
+        "require_reference", "members", "agent_dialogue", "worker_timeout", "profile",
         "voice_transcription", "call_recording", "delegation",
         "control", "authority",
         "allowed_capabilities", "capabilities", "context", "context_file",
@@ -472,6 +427,8 @@ def _group(value, path, project_root, service_dir):
         _boolean(value["require_reference"], f"{path}.require_reference")
     if "worker_timeout" in value:
         _number(value["worker_timeout"], f"{path}.worker_timeout", 1, 3600)
+    if "profile" in value:
+        _profile(value["profile"], f"{path}.profile")
     if "members" in value:
         members = _object(value["members"], f"{path}.members")
         for user_id, member in members.items():
@@ -527,7 +484,7 @@ def _defaults(value, path, project_root, service_dir):
         "assistant_name", "tail_size", "sync_interval", "sync_stale_after",
         "debounce", "worker_timeout", "progress_after", "progress_from_stream",
         "max_parallel_dialogue", "max_parallel_jobs", "job_poll_interval",
-        "job_recovery", "max_attempts", "group_aliases", "worker", "workers",
+        "job_recovery", "max_attempts", "group_aliases", "profile",
         "voice_agent", "delegation",
         "media_log_level", "link_preview",
     }
@@ -557,42 +514,98 @@ def _defaults(value, path, project_root, service_dir):
             _number(value[key], f"{path}.{key}", minimum, maximum, integer=integer)
     if "group_aliases" in value:
         _string_list(value["group_aliases"], f"{path}.group_aliases")
-    if "worker" in value:
-        _enum(value["worker"], WORKERS, f"{path}.worker")
+    if "profile" in value:
+        _profile(value["profile"], f"{path}.profile")
     if "media_log_level" in value:
         _enum(value["media_log_level"], MEDIA_LOG_LEVELS,
               f"{path}.media_log_level")
     if "job_recovery" in value:
         _enum(value["job_recovery"], JOB_RECOVERY, f"{path}.job_recovery")
-    if "workers" in value:
-        _workers(value["workers"], f"{path}.workers")
     if "voice_agent" in value:
         _voice_agent(value["voice_agent"], f"{path}.voice_agent", defaults=True,
                      project_root=project_root, service_dir=service_dir)
 
 
-def declared_worker_models(settings, project_root, service_dir):
-    """Every (worker, model) a settings document declares, with where it did.
+# --- The worker keys a profile replaced ---------------------------------------
+#
+# A room names the profile its turns run on. The keys that named a worker and
+# its knobs before that - `worker` and `workers` in the defaults and in a voice
+# entry, a channel register row's `/set worker` and `/set model` fields, and the
+# environment's default worker - are refused wherever they are found, naming
+# the command that moves them, so nothing silently changes what a room runs.
 
-    Collected by the validator's own walk rather than from a list of positions
-    kept beside it, so a position this schema admits a `workers` block at is a
-    position this reports, and one it does not admit cannot be. A rule that
-    names no model declares the binary's own default, reported as null. The
-    document is validated on the way, so an invalid one raises here exactly as
-    it does in `validate_settings`.
-    """
+MIGRATION_COMMAND = "telegram service migrate-profiles"
+OLD_ENVIRONMENT = ("TELEGRAM_SERVICE_WORKER", "TG_WORKER")
+OLD_KEYS = ("worker", "workers")
+
+
+class OldWorkerSettings(ValueError):
+    """Settings, a register or an environment still carrying the keys a
+    profile replaced. The message names every place and the command that moves
+    them."""
+
+
+def _mapping(value):
+    return value if isinstance(value, dict) else {}
+
+
+def old_worker_keys(settings):
+    """Every place `settings` still carries a worker key, as a settings path."""
+    settings = _mapping(settings)
     found = []
-    token = _DECLARED_WORKER_MODELS.set(found)
-    try:
-        validate_settings(settings, project_root, service_dir)
-    finally:
-        _DECLARED_WORKER_MODELS.reset(token)
+
+    def keys(owner, path):
+        found.extend(f"{path}.{key}" for key in OLD_KEYS if key in _mapping(owner))
+
+    defaults = _mapping(settings.get("defaults"))
+    keys(defaults, "settings.defaults")
+    keys(defaults.get("voice_agent"), "settings.defaults.voice_agent")
+    for user_id, policy in _mapping(settings.get("allowed_users")).items():
+        keys(_mapping(policy).get("voice_agent"),
+             f"settings.allowed_users.{user_id}.voice_agent")
+    for chat_id, policy in _mapping(settings.get("allowed_groups")).items():
+        for user_id, member in _mapping(_mapping(policy).get("members")).items():
+            keys(_mapping(member).get("voice_agent"),
+                 f"settings.allowed_groups.{chat_id}.members.{user_id}.voice_agent")
     return found
+
+
+def old_register_fields(register):
+    """Every channel register row still carrying the worker fields `/set worker`,
+    `/set model` and the per-worker `/set` wrote, as `<channel key>.<field>`."""
+    found = []
+    for key, row in _mapping(register).items():
+        row = _mapping(row)
+        settings = _mapping(row.get("settings"))
+        found.extend(f"{key}.settings.{field}" for field in ("worker", "model")
+                     if field in settings)
+        if "workers" in row:
+            found.append(f"{key}.workers")
+    return found
+
+
+def old_environment(environ):
+    """The environment names of the default worker that are set."""
+    return [name for name in OLD_ENVIRONMENT if str(environ.get(name) or "").strip()]
+
+
+def old_names_sentence(places):
+    """The refusal for the places that still carry a worker key."""
+    return (f"{', '.join(places)}: a worker is no longer named in settings, a channel's "
+            "register or the environment; a room names the profile its turns run on. "
+            f"Run `{MIGRATION_COMMAND}` to see the moves, then with --apply to make them")
+
+
+def refuse_old_worker_settings(settings):
+    places = old_worker_keys(settings)
+    if places:
+        raise OldWorkerSettings(old_names_sentence(places))
 
 
 def validate_settings(settings, project_root, service_dir):
     """Validate the complete public settings surface; return the same object."""
     settings = _object(settings, "settings")
+    refuse_old_worker_settings(settings)
     _unknown(settings, TOP_LEVEL, "settings")
     if "connection" in settings:
         _string(settings["connection"], "settings.connection", nullable=True, nonempty=True)

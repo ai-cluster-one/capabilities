@@ -139,6 +139,38 @@ class RegisterCase(unittest.TestCase):
         self.assertEqual(tables, {"telegram_jobs", "telegram_job_amendments",
                                   "telegram_job_slots"})
 
+    def test_the_profile_column_is_an_additive_fourth_step(self):
+        """A job carries the profile it runs on in a nullable column of its own,
+        added by a step of its own after the three the register had: a row
+        registered without one keeps none, and a store at the earlier version
+        takes the step without losing a row."""
+        self.assertEqual([step for step, _sql in jobs.STORE_STEPS][-1], "0004-job-profile")
+        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (1, 1))
+        with_profile = self.register(engine="claude", profile="telegram-fast")
+        without = self.register(engine="codex", model="gpt-5.5")
+        self.assertEqual(self.reg.get(with_profile["id"])["profile"], "telegram-fast")
+        self.assertIsNone(self.reg.get(without["id"])["profile"])
+        self.assertEqual(self.reg.get(without["id"])["model"], "gpt-5.5")
+
+        from capabilities_contract.db import connect, migrate
+        older = dataclasses.replace(self.setting, schema=f"{self.setting.schema}_older")
+        conn = connect(application_name="telegram", setting=older)
+        self.addCleanup(conn.close)
+        migrate(conn, jobs.STORE_OWNER, jobs.STORE_STEPS[:3], major=1, minor=0)
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO telegram_jobs (id, project_id, environment, surface, "
+                        "channel_key, requested_by, description, engine, state, "
+                        "created_at, updated_at) VALUES ('old-1', %s, 'development', "
+                        "'telegram', '123', '42', 'from before', 'codex', 'waiting', "
+                        "'2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')",
+                        (self.project_id,))
+        conn.commit()
+        old_store, old_reg = jobs.open_register(self.envelope, "development", setting=older)
+        self.addCleanup(old_store.close)
+        row = old_reg.get("old-1")
+        self.assertEqual((row["description"], row["engine"], row["profile"]),
+                         ("from before", "codex", None))
+
     def test_reopening_applies_nothing_twice(self):
         again_store, again = self.open()
         self.addCleanup(again_store.close)

@@ -27,10 +27,14 @@ room may run a narrower worker today.
 A profile is saved only at the project's scope, under a name neither bundled
 nor held globally, so a bundled or global profile is never changed from a chat.
 
-A turn runs on its implicit profile: `telegram-<worker>` for the worker the
-settings name, with that worker's settings laid over the knobs. The daemon
-resolves it per turn; `check` resolves every one the settings reach for a start
-or a reload, and `probe` runs one minimal live turn on each for the doctor.
+A room names the profile its turns run on: the channel's `/set profile`, a
+forum topic's, the group's or the direct user's `profile`, then
+`defaults.profile` (the environment's TELEGRAM_SERVICE_PROFILE in its place),
+else `stub`, which runs in process on no profile. The daemon resolves the name
+per turn; `check` resolves and fits every name the settings reach for a start,
+a reload or the doctor, and `probe` runs one minimal live turn on each for the
+doctor. `materialize` writes the profiles the migration from the old worker
+settings needs, named from the values they carry.
 
 The CLI does not carry the runner in its own dependency header: every worker
 `telegram send` resolves that header, and the runner is large. This file's
@@ -42,9 +46,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -53,6 +59,12 @@ from pathlib import Path
 RUNNER_PIN = "callva-harness-runner==0.10.0"
 PREFIX = "telegram-"
 BUNDLED = ("telegram-claude", "telegram-codex")
+# The reserved name that runs in process, on no profile: what a room runs when
+# nothing names a profile, and the seed's own choice.
+STUB = "stub"
+# The environment's default profile, over `defaults.profile`, so a deployed node
+# chooses without editing its settings.
+DEFAULT_ENV = "TELEGRAM_SERVICE_PROFILE"
 HERE = Path(__file__).resolve().parent
 
 
@@ -269,14 +281,14 @@ def listing(active: list, project: str | None) -> list[dict]:
     return rows
 
 
-# --- The implicit profile ----------------------------------------------------
+# --- The old worker settings ------------------------------------------------
 #
-# Settings still name a worker, not a profile: `worker`, and per worker a
-# model, an effort, a codex service tier and claude's `context` block. A turn
-# on worker W runs on `telegram-W`, resolved as any name is, with those
-# settings laid over its knobs. This is the one place the old settings become
-# knobs, so the migration that later writes them into named profiles maps them
-# with this same function.
+# Before a room named a profile it named a worker - `worker`, and per worker a
+# model, an effort, a codex service tier and claude's `context` block - and a
+# turn on worker W ran on `telegram-W` with those settings laid over its knobs.
+# `implicit_knobs` is the one place those settings become knobs: a job row
+# registered before rooms named profiles runs through it, and the migration
+# writes the profiles it derives with it.
 
 WORKERS = ("claude", "codex")
 
@@ -318,96 +330,115 @@ def implicit_knobs(worker: str, cfg: dict | None) -> dict:
     return knobs
 
 
-def implicit(worker: str, cfg: dict | None, active: list, project: str | None) -> dict:
-    """What a turn on `worker` runs on under today's settings: `telegram-<worker>`
-    resolved and fitted as any name is, with `implicit_knobs` laid over it, or
-    Refusal naming the profile and what the runner or fit refuses in the
-    result."""
-    if worker not in WORKERS:
-        raise Refusal(6, "profile_name_refused",
-                      f"worker {worker!r} runs on no profile; a harness turn runs on "
-                      "claude or codex")
-    found = resolve(PREFIX + worker, active, project)
-    overlay = implicit_knobs(worker, cfg)
+def _where(found: dict) -> str:
+    return (f"profile {found['name']!r} (layer {found['layer']}"
+            + (f", version {found['version']}" if found.get("version") else "") + ")")
+
+
+def overlaid(found: dict, overlay: dict) -> dict:
+    """`found` with `overlay` laid over its knobs, or Refusal naming the
+    profile and what the runner or fit refuses in the result."""
     knobs = {**found["knobs"], **overlay}
-    where = (f"profile {found['name']!r} (layer {found['layer']}"
-             + (f", version {found['version']}" if found.get("version") else "")
-             + ")")
     if overlay:
         lib = runner()
         try:
             lib.Profile.from_dict(knobs)
         except (lib.ProfileError, ValueError, TypeError, KeyError) as exc:
             raise Refusal(6, "profile_invalid",
-                          f"{where} with the worker settings {sorted(overlay)} laid over "
-                          f"it is refused by the harness runner: {exc}") from None
+                          f"{_where(found)} with the worker settings {sorted(overlay)} laid "
+                          f"over it is refused by the harness runner: {exc}") from None
         problems = fit_problems(knobs)
         if problems:
             raise Refusal(6, "profile_unfit",
-                          f"{where} with the worker settings {sorted(overlay)} laid over "
-                          "it does not fit a telegram turn: " + "; ".join(problems))
+                          f"{_where(found)} with the worker settings {sorted(overlay)} laid "
+                          "over it does not fit a telegram turn: " + "; ".join(problems))
     return {**found, "knobs": knobs, "overlay": overlay}
 
 
-def _worker_name(value, fallback: str = "stub") -> str:
-    name = str(value or fallback).strip().lower()
-    return name if name in (*WORKERS, "stub") else fallback
+def implicit(worker: str, cfg: dict | None, active: list, project: str | None) -> dict:
+    """What a turn on `worker` with these old settings runs on: `telegram-<worker>`
+    resolved and fitted as any name is, with `implicit_knobs` laid over it."""
+    if worker not in WORKERS:
+        raise Refusal(6, "profile_name_refused",
+                      f"worker {worker!r} runs on no profile; a harness turn runs on "
+                      "claude or codex")
+    return overlaid(resolve(PREFIX + worker, active, project), implicit_knobs(worker, cfg))
+
+
+# --- The names a room's settings reach -----------------------------------------
+
+def default_profile(settings: dict | None, environ=None) -> tuple[str | None, str]:
+    """The default profile name and where it was named: the environment's
+    TELEGRAM_SERVICE_PROFILE, then `defaults.profile`; None when neither does."""
+    environ = environ if environ is not None else {}
+    named = str(environ.get(DEFAULT_ENV) or "").strip()
+    if named:
+        return named, DEFAULT_ENV
+    defaults = (settings or {}).get("defaults")
+    defaults = defaults if isinstance(defaults, dict) else {}
+    if defaults.get("profile"):
+        return str(defaults["profile"]), "settings.defaults.profile"
+    return None, "default"
 
 
 def reached(settings: dict | None, environ=None) -> list[dict]:
-    """Every worker today's settings reach outside the channel register, with
-    the worker settings a turn there runs with: the default worker (the
-    environment's TELEGRAM_SERVICE_WORKER or TG_WORKER, then `defaults.worker`),
-    the voice worker, and every worker a `workers` block configures, which a
-    `/set worker` can switch a channel to. The stub runs on no profile and is
-    left out."""
-    environ = environ if environ is not None else {}
-    defaults = (settings or {}).get("defaults")
-    defaults = defaults if isinstance(defaults, dict) else {}
-    voice = defaults.get("voice_agent") if isinstance(defaults.get("voice_agent"), dict) else {}
+    """Every profile name the settings name, each with the position naming it:
+    the default (TELEGRAM_SERVICE_PROFILE or `defaults.profile`), the voice
+    default, and every direct user, group and forum topic that names one. The
+    stub is listed too; it runs in process and resolves to nothing."""
+    settings = settings if isinstance(settings, dict) else {}
 
-    def block(owner: dict, worker: str) -> dict:
-        workers = owner.get("workers") if isinstance(owner.get("workers"), dict) else {}
-        found = workers.get(worker)
-        return dict(found) if isinstance(found, dict) else {}
+    def mapping(value):
+        return value if isinstance(value, dict) else {}
 
-    default = _worker_name(environ.get("TELEGRAM_SERVICE_WORKER")
-                           or environ.get("TG_WORKER") or defaults.get("worker"))
-    voice_worker = _worker_name(voice.get("worker"), default)
-    rows = [("defaults", default, block(defaults, default)),
-            ("defaults.voice_agent", voice_worker,
-             {**block(defaults, voice_worker), **block(voice, voice_worker)})]
-    for worker in WORKERS:
-        if block(defaults, worker):
-            rows.append((f"defaults.workers.{worker}", worker, block(defaults, worker)))
-        if block(voice, worker):
-            rows.append((f"defaults.voice_agent.workers.{worker}", worker,
-                         {**block(defaults, worker), **block(voice, worker)}))
-    out, seen = [], set()
-    for position, worker, cfg in rows:
-        key = (worker, json.dumps(cfg, sort_keys=True, default=str))
-        if worker == "stub" or key in seen:
-            continue
-        seen.add(key)
-        out.append({"position": position, "worker": worker, "settings": cfg})
-    return out
+    rows = []
+    name, position = default_profile(settings, environ)
+    if name:
+        rows.append({"position": position, "profile": name})
+    defaults = mapping(settings.get("defaults"))
+    voice = mapping(defaults.get("voice_agent"))
+    if voice.get("profile"):
+        rows.append({"position": "settings.defaults.voice_agent.profile",
+                     "profile": str(voice["profile"])})
+    for user_id, policy in mapping(settings.get("allowed_users")).items():
+        if mapping(policy).get("profile"):
+            rows.append({"position": f"settings.allowed_users.{user_id}.profile",
+                         "profile": str(policy["profile"])})
+    for chat_id, policy in mapping(settings.get("allowed_groups")).items():
+        policy = mapping(policy)
+        if policy.get("profile"):
+            rows.append({"position": f"settings.allowed_groups.{chat_id}.profile",
+                         "profile": str(policy["profile"])})
+        for topic_id, topic in mapping(policy.get("topics")).items():
+            if mapping(topic).get("profile"):
+                rows.append({"position":
+                             f"settings.allowed_groups.{chat_id}.topics.{topic_id}.profile",
+                             "profile": str(topic["profile"])})
+    return rows
+
+
+def turn(name: str, active: list, project: str | None) -> dict | None:
+    """What a turn named `name` runs on: None for the stub, else the profile
+    resolved and fitted, or Refusal naming it and the problem."""
+    if name == STUB:
+        return None
+    return resolve(name, active, project)
 
 
 def check(settings: dict | None, environ, active: list, project: str | None) -> list[dict]:
-    """Every worker the settings reach whose implicit profile does not resolve
-    or fit, each with its position and why; empty when every one does."""
+    """Every name the settings reach that does not resolve or fit, each with its
+    position and why; empty when every one does."""
     problems = []
     for row in reached(settings, environ):
         try:
-            implicit(row["worker"], row["settings"], active, project)
+            turn(row["profile"], active, project)
         except Refusal as refused:
-            problems.append({"position": row["position"], "profile": PREFIX + row["worker"],
-                             "code": refused.code, "message": refused.message})
+            problems.append({**row, "code": refused.code, "message": refused.message})
     return problems
 
 
 def problems_sentence(problems: list[dict]) -> str:
-    return "; ".join(f"settings.{one['position']} runs on {one['profile']}: {one['message']}"
+    return "; ".join(f"{one['position']} names {one['profile']}: {one['message']}"
                      for one in problems)
 
 
@@ -432,38 +463,41 @@ def _workers_module():
     return module
 
 
-def probe(pairs: list[dict], timeout: float, active: list, project: str | None, cwd: str,
+def probe(entries: list[dict], timeout: float, active: list, project: str | None, cwd: str,
           *, run=None, environ=None) -> list[dict]:
-    """One minimal live turn per distinct (worker, model) pair, on the profile
-    a turn with that worker and model runs on, held to `timeout` seconds.
+    """One minimal live turn per distinct profile the settings name, held to
+    `timeout` seconds.
 
-    Each row keeps the pair and adds the verdict - `accepted`, `in_process` for
-    the stub, `model_refused`, `quota_exhausted`, `not_authenticated`,
-    `binary_missing`, `timed_out`, `incompatible_harness` or `failed` - with
-    the profile, the layer and the version it resolved to. Only `accepted` and
-    `in_process` are ok. `reason` is the harness's own sentence, `notice` the
-    product's for a refused model."""
+    Each entry is a name and the positions naming it (`declared_at`); its row
+    adds the harness and model it resolved to (`worker`, `model`), the layer
+    and the version, and the verdict - `accepted`, `in_process` for the stub,
+    `model_refused`, `quota_exhausted`, `not_authenticated`, `binary_missing`,
+    `timed_out`, `incompatible_harness` or `failed`. Only `accepted` and
+    `in_process` are ok. `reason` is the harness's own sentence, or why the
+    name does not resolve or fit; `notice` the product's for a refused model."""
     workers = _workers_module()
     lib = runner() if run is None else None
     run = run or lib.run
     env = workers.scrub_worker_env(environ if environ is not None else os.environ)
     rows = []
-    for pair in pairs:
-        worker = pair.get("worker")
-        row = {**pair, "profile": None, "layer": None, "version": None}
-        if worker not in WORKERS:
-            rows.append({**row, "ok": True, "verdict": "in_process", "binary": None,
-                         "reason": None, "notice": None, "seconds": 0.0})
+    for entry in entries:
+        name = entry.get("profile")
+        row = {"profile": name, "declared_at": list(entry.get("declared_at") or []),
+               "worker": None, "model": None, "layer": None, "version": None}
+        if name == STUB:
+            rows.append({**row, "worker": STUB, "ok": True, "verdict": "in_process",
+                         "binary": None, "reason": None, "notice": None, "seconds": 0.0})
             continue
         try:
-            found = implicit(worker, {"model": pair.get("model")}, active, project)
+            found = resolve(name, active, project)
         except Refusal as refused:
-            rows.append({**row, "profile": PREFIX + worker, "ok": False, "verdict": "failed",
-                         "binary": worker, "reason": refused.message, "notice": None,
-                         "seconds": 0.0})
+            rows.append({**row, "ok": False, "verdict": "failed", "binary": None,
+                         "reason": refused.message, "notice": None, "seconds": 0.0})
             continue
-        row.update(profile=found["name"], layer=found["layer"], version=found["version"])
         knobs = {**found["knobs"], "timeout_seconds": float(timeout)}
+        worker = knobs.get("harness")
+        row.update(worker=worker, model=knobs.get("model"), layer=found["layer"],
+                   version=found["version"])
         started = time.monotonic()
         lib = lib or runner()
         result = run(PROBE_PROMPT, lib.Profile.from_dict(knobs), cwd, environ=env)
@@ -573,6 +607,124 @@ def save(conn, name: str, text: str, where: str, project: str, *,
             "version": version.id, "created": created, "created_by": version.created_by}
 
 
+# --- The migration's profiles -------------------------------------------------
+#
+# `telegram service migrate-profiles` moves the old worker settings to profile
+# names. Each distinct combination of a worker and its settings becomes one
+# project profile: `telegram-<worker>` as it resolves, with `implicit_knobs`
+# laid over it, which is exactly what a turn on that combination ran on. A
+# combination that changes nothing is `telegram-<worker>` itself and writes
+# nothing. The name is read off the values, so a rerun finds the identical
+# spec under the same name and creates nothing.
+
+_SEGMENT = re.compile(r"[^A-Za-z0-9._]+")
+
+
+def _segment(value) -> str:
+    return _SEGMENT.sub("-", str(value)).strip("-.")
+
+
+def _digest(worker: str, overlay: dict) -> str:
+    return hashlib.sha256(json.dumps({"worker": worker, **overlay}, sort_keys=True)
+                          .encode("utf-8")).hexdigest()[:10]
+
+
+def derived_name(worker: str, overlay: dict) -> str:
+    """The profile name a worker and the knobs its settings lay over it are
+    saved under: `telegram-<worker>` then the model, the effort, the service
+    tier, the tools and `no-mcp`, each as written (`telegram-codex-gpt-5.5-high-
+    priority`); a name too long for the runner is the worker and a digest of
+    the values instead."""
+    if not overlay:
+        return PREFIX + worker
+    parts = [PREFIX + worker]
+    for knob in ("model", "effort", "service_tier"):
+        if overlay.get(knob):
+            parts.append(_segment(overlay[knob]))
+    if "tools" in overlay:
+        parts.append("tools-" + ("-".join(_segment(tool).lower() for tool in overlay["tools"])
+                                 or "none"))
+    if overlay.get("strict_mcp"):
+        parts.append("no-mcp")
+    name = "-".join(part for part in parts if part)
+    if len(name) > 64:
+        name = f"{PREFIX}{worker}-{_digest(worker, overlay)}"
+    return name
+
+
+def materialize(conn, combos: list[dict], project: str, *, apply: bool,
+                created_by: str | None = None, schema: str | None = None) -> list[dict]:
+    """The profile each old combination of a worker and its settings moves to,
+    in the order given, written at the project's scope when `apply`.
+
+    Each answer names the combination's `worker`, the `overlay` its settings
+    lay, the `profile` it moves to and whether that profile is `created` (or,
+    in a dry run, would be); `error` instead when the combination does not make
+    a profile a turn can run on, in which case nothing names it. A derived name
+    already held by a different spec, a bundled or a global profile takes the
+    digest form instead, so a migration never changes a profile it did not
+    write."""
+    lib = runner()
+    if apply:
+        from capabilities_contract.db import migrate
+        steps = store_steps()
+        migrate(conn, steps["owner"], [tuple(step) for step in steps["steps"]],
+                major=steps["major"], minor=steps["minor"])
+        conn.commit()
+    active = stored(conn, project, schema)
+    taken: dict[str, dict] = {}
+    out = []
+    try:
+        for combo in combos:
+            worker = combo.get("worker")
+            if worker == STUB:
+                out.append({"worker": STUB, "overlay": {}, "profile": STUB, "created": False})
+                continue
+            overlay = implicit_knobs(worker, combo.get("settings"))
+            answer = {"worker": worker, "overlay": overlay}
+            try:
+                found = implicit(worker, combo.get("settings"), active, project)
+            except Refusal as refused:
+                out.append({**answer, "profile": None, "error": refused.message})
+                continue
+            if not overlay:
+                out.append({**answer, "profile": PREFIX + worker, "created": False})
+                continue
+            spec = lib.check_spec({key: value for key, value in found["knobs"].items()},
+                                  f"profile for {worker} {sorted(overlay)}")
+            name = derived_name(worker, overlay)
+            for candidate in (name, f"{PREFIX}{worker}-{_digest(worker, overlay)}"):
+                held = next((one for one in active if one.name == candidate and one.active
+                             and (one.scope == "global" or one.scope_id == project)), None)
+                if candidate in BUNDLED or (held is not None and (
+                        held.scope == "global" or held.spec != spec)):
+                    continue
+                if candidate in taken and taken[candidate] != spec:
+                    continue
+                name = candidate
+                break
+            else:
+                out.append({**answer, "profile": None,
+                            "error": f"every name for {worker} {sorted(overlay)} is held by "
+                                     "another profile"})
+                continue
+            exists = name in taken or any(one.name == name and one.active and one.scope_id
+                                          == project for one in active)
+            taken[name] = spec
+            created = not exists
+            if apply and created:
+                _, created = lib.save_profile(conn, name, spec, scope="project",
+                                              scope_id=project, created_by=created_by,
+                                              schema=schema)
+            out.append({**answer, "profile": name, "created": created})
+        if apply:
+            conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return out
+
+
 # --- Who may save ------------------------------------------------------------
 
 def _daemon_control():
@@ -650,22 +802,26 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="profiles.py")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("store-steps")
-    # Both read their input as JSON on stdin: `check` the settings document,
-    # `probe` the pairs and the timeout.
+    # Both read their input as JSON on stdin: `check` the settings document and
+    # the environment, `probe` the names with their positions and the timeout.
     for verb in ("check", "probe"):
         one = commands.add_parser(verb)
         one.add_argument("--project-id")
         one.add_argument("--project-root")
-    for verb in ("list", "show", "save"):
+    for verb in ("list", "show", "resolve", "save", "materialize"):
         one = commands.add_parser(verb)
-        if verb != "list":
+        if verb not in ("list", "materialize"):
             one.add_argument("name")
         one.add_argument("--project-id", required=True)
         one.add_argument("--project-root")
+        if verb in ("save", "materialize"):
+            one.add_argument("--created-by")
         if verb == "save":
             one.add_argument("--where", default="stdin")
             one.add_argument("--base")
-            one.add_argument("--created-by")
+        if verb == "materialize":
+            # The combinations, as JSON on stdin.
+            one.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "store-steps":
@@ -680,7 +836,8 @@ def main(argv: list[str] | None = None) -> int:
                           "store_error": store_error}
             else:
                 with tempfile.TemporaryDirectory(prefix="telegram-doctor-") as scratch:
-                    rows = probe(given.get("pairs") or [], float(given.get("timeout") or 90),
+                    rows = probe(given.get("profiles") or [],
+                                 float(given.get("timeout") or 90),
                                  active, args.project_id, scratch)
                 answer = {"rows": rows, "store_error": store_error}
         else:
@@ -690,6 +847,16 @@ def main(argv: list[str] | None = None) -> int:
                     answer = save(conn, args.name, sys.stdin.read(), args.where,
                                   args.project_id, base=args.base,
                                   created_by=args.created_by, schema=schema)
+                elif args.command == "materialize":
+                    given = json.loads(sys.stdin.read() or "{}")
+                    answer = {"profiles": materialize(
+                        conn, given.get("combos") or [], args.project_id,
+                        apply=args.apply, created_by=args.created_by, schema=schema)}
+                elif args.command == "resolve":
+                    # What a job registered on `name` runs on: the profile
+                    # resolved and fitted, or the refusal saying why not.
+                    answer = describe(resolve(args.name, stored(conn, args.project_id, schema),
+                                              args.project_id))
                 else:
                     active = stored(conn, args.project_id, schema)
                     if args.command == "list":
