@@ -772,9 +772,14 @@ class MigrateProfiles(unittest.TestCase):
             "telegram-claude-sonnet-tools-read-no-mcp": True,
             "telegram-claude-opus-tools-read-no-mcp": True,
             "telegram-claude-sonnet": True,
+            "telegram-codex-gpt-5.4-high-priority": True,
             "telegram-codex": False})
         # Under the environment's worker a row without its own `/set worker`
-        # ran on claude, so its codex block is dropped rather than moved.
+        # ran on claude, so its codex block names no position and is carried
+        # as a profile `/set worker codex` reached.
+        self.assertEqual(report["carried"], [
+            {"at": "register.-100.workers.codex",
+             "profile": "telegram-codex-gpt-5.4-high-priority"}])
         moved = {move["channel"]: move["profile"] for move in report["register"]["moves"]}
         self.assertEqual(moved, {"11": "telegram-claude-sonnet-tools-read-no-mcp",
                                  "-100": None,
@@ -821,6 +826,9 @@ class MigrateProfiles(unittest.TestCase):
         self.assertEqual(self.reg.get(self.ids["waiting"])["profile"], "telegram-claude-sonnet")
         self.assertEqual(self.reg.get(self.ids["quota"])["profile"], "telegram-codex")
         self.assertIsNone(self.reg.get(self.ids["done"])["profile"])
+        self.assertEqual(report["carried"], [
+            {"at": "settings.defaults.workers.claude",
+             "profile": "telegram-claude-sonnet-tools-read-no-mcp"}])
         self.assertEqual(self.stored_names(), sorted([
             "telegram-codex-gpt-5.5-high-priority",
             "telegram-claude-sonnet-low-tools-read-no-mcp",
@@ -850,8 +858,39 @@ class MigrateProfiles(unittest.TestCase):
         self.assertEqual(again["profiles"], [])
         self.assertEqual(again["settings"]["keys_written"], [])
         self.assertEqual(again["jobs"], [])
+        self.assertEqual(again["carried"], [])
         self.assertEqual(self.settings, settings_after)
         self.assertEqual(self.register_path.read_text(), register_after)
+
+    def test_a_block_for_a_worker_no_position_runs_becomes_a_profile(self):
+        # Before profiles a chat reached each of these with `/set worker claude`.
+        self.settings = {"defaults": {
+            "worker": "codex", "workers": {"claude": {"model": "sonnet", "effort": "low"}},
+            "voice_agent": {"worker": "codex", "workers": {"claude": {"effort": "high"}}}}}
+        register = {"20": {"settings": {"worker": "codex"},
+                           "workers": {"claude": {"model": "haiku"}}}}
+        self.register_path.write_text(json.dumps(register))
+        code, report = self.migrate(apply=True)
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report["carried"], [
+            {"at": "settings.defaults.workers.claude", "profile": "telegram-claude-sonnet-low"},
+            {"at": "settings.defaults.voice_agent.workers.claude",
+             "profile": "telegram-claude-sonnet-high"},
+            {"at": "register.20.workers.claude", "profile": "telegram-claude-haiku-low"}])
+        self.assertEqual(self.settings, {"defaults": {"profile": "telegram-codex",
+                                                      "voice_agent": {}}})
+        self.assertEqual(json.loads(self.register_path.read_text()),
+                         {"20": {"settings": {"profile": "telegram-codex"}}})
+        self.assertEqual(self.stored_names(), sorted([
+            "telegram-claude-sonnet-low", "telegram-claude-sonnet-high",
+            "telegram-claude-haiku-low", "telegram-claude-sonnet"]))
+        active = profiles.stored(self.conn, self.project, self.setting.schema)
+        self.conn.rollback()
+        self.assertEqual(profiles.resolve("telegram-claude-sonnet-low", active,
+                                          self.project)["knobs"],
+                         {**CLAUDE, "model": "sonnet", "effort": "low"})
+        code, again = self.migrate(apply=True)
+        self.assertEqual((code, again["changed"], again["carried"]), (0, False, []))
 
     def test_apply_is_refused_while_the_service_runs(self):
         code, error = self.migrate(apply=True, running=True)

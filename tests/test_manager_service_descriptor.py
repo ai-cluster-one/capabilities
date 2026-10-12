@@ -51,7 +51,7 @@ def test_telegram_descriptor_matches_runtime_credentials_and_uses_portable_mount
     assert deploy["environment"]["required"] == ["TELEGRAM_API_HASH"]
     optional = {item["key"]: item for item in deploy["environment"]["optional"]}
     assert "TELEGRAM_API_ID" in optional
-    assert "default" not in optional["TG_WORKER"]
+    assert "default" not in optional["TELEGRAM_SERVICE_PROFILE"]
     assert all(item["target"].startswith(("{agent_home}", "{project_root}"))
                for item in deploy["mounts"])
 

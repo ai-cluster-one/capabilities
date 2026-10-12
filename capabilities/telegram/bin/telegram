@@ -5964,6 +5964,32 @@ def cmd_service_migrate_profiles(connection_flag: str | None, session_flag: str 
             "combo": (combo(worker, {**_worker_block(defaults, worker), **block})
                       if chosen else None)})
 
+    # A configured block for a worker its position does not run was reached by
+    # switching worker (`/set worker`, or TG_WORKER under the voice default), so
+    # it becomes a profile too, naming no position.
+    carried: list[dict] = []
+
+    def carry(at: str, owner: Any, base: Any, runs: set) -> None:
+        workers = owner.get("workers") if isinstance(owner, dict) else None
+        for worker in sorted(workers) if isinstance(workers, dict) else ():
+            block = _worker_block(owner, worker)
+            if worker in runs or worker not in ("claude", "codex") or not block:
+                continue
+            carried.append({"at": f"{at}.workers.{worker}",
+                            "combo": combo(worker, {**_worker_block(base, worker), **block})})
+
+    carry("settings.defaults", defaults, None, {file_worker, env_worker})
+    if any(key in voice for key in ("worker", "workers")):
+        carry("settings.defaults.voice_agent", voice, defaults,
+              {_old_worker(voice.get("worker"), file_worker)})
+    for key, row in channel_register.items():
+        if isinstance(row, dict):
+            row_settings = row.get("settings") if isinstance(row.get("settings"), dict) else {}
+            worker = _old_worker(row_settings.get("worker"), effective_worker)
+            move = next((m for m in register_moves if m["channel"] == key), None)
+            carry(f"register.{key}", row, defaults,
+                  {worker} if move is not None and move["combo"] is not None else set())
+
     module, register = _open_job_register(root, write=apply)
     try:
         job_rows = []
@@ -6016,7 +6042,8 @@ def cmd_service_migrate_profiles(connection_flag: str | None, session_flag: str 
                     if isinstance(group, dict) else ():
                 if isinstance(member, dict) and isinstance(member.get("voice_agent"), dict):
                     member["voice_agent"] = _with_profile(member["voice_agent"], None)
-        blocked = any(found[m["combo"]].get("error") for m in moves)
+        blocked = any(found[m["combo"]].get("error") for m in moves
+                      + [c for c in carried if c["at"].startswith("settings.")])
         changed_keys = [key for key in new_settings
                         if new_settings[key] != settings.get(key)] if not blocked else []
         # The register: each row names the profile its /set chose, and keeps
@@ -6027,6 +6054,9 @@ def cmd_service_migrate_profiles(connection_flag: str | None, session_flag: str 
             row_settings = row.setdefault("settings", {})
             name = named(move["combo"])
             if move["combo"] is not None and name is None:
+                continue
+            if any(found[c["combo"]].get("error") for c in carried
+                   if c["at"].startswith(f"register.{move['channel']}.workers.")):
                 continue
             row_settings.pop("worker", None)
             row_settings.pop("model", None)
@@ -6076,6 +6106,7 @@ def cmd_service_migrate_profiles(connection_flag: str | None, session_flag: str 
             "moves": [{"channel": m["channel"], "was": m["was"],
                        "profile": named(m["combo"])} for m in register_moves],
         },
+        "carried": [{"at": c["at"], "profile": named(c["combo"])} for c in carried],
         "jobs": [{"id": row["id"], "state": row["state"], "engine": row["engine"],
                   "model": row["model"], "profile": row["profile"]} for row in filled],
         "refused": refused,

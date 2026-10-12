@@ -496,7 +496,7 @@ def test_telegram_daemon_sigterm_stops_without_traceback() -> None:
             "direct_messages": {"mode": "allowed_users", "default_role": "direct_user"},
             "allowed_users": {},
             "allowed_groups": {},
-            "defaults": {"worker": "stub"},
+            "defaults": {"profile": "stub"},
         }) + "\n")
         (service_dir / "context.md").write_text("test context\n")
         connections = tmp / "connections.json"
@@ -748,7 +748,7 @@ def test_telegram_control_authority_limits_settings_commands() -> None:
                     "group_member": {"commands": ["status", "help"]},
                 },
             },
-            "defaults": {"worker": "stub"},
+            "defaults": {"profile": "stub"},
         })
         group_policy = {"name": "Test Group", "member_role": "group_member"}
         supervisor = {"id": "535123867", "name": "KZ", "role": "supervisor"}
@@ -772,7 +772,7 @@ def test_telegram_group_chat_ref_never_falls_back_to_sender() -> None:
             "direct_messages": {"mode": "allowed_users", "default_role": "direct_user"},
             "allowed_users": {},
             "allowed_groups": {},
-            "defaults": {"worker": "stub"},
+            "defaults": {"profile": "stub"},
         })
 
         class GroupEvent:
@@ -813,7 +813,7 @@ def test_telegram_channel_context_overlay_is_added_to_prompt() -> None:
             "direct_messages": {"mode": "allowed_users", "default_role": "direct_user"},
             "allowed_users": {},
             "allowed_groups": {},
-            "defaults": {"worker": "stub"},
+            "defaults": {"profile": "stub"},
         })
         channel_context_dir = tmp / "project" / "capabilities" / "telegram" / "service" / "context"
         channel_context_dir.mkdir(parents=True)
@@ -837,7 +837,7 @@ def test_telegram_channel_context_overlay_is_added_to_prompt() -> None:
                 "chat_name": "Family",
                 "channel_context": overlay,
                 "current_request": {"message_id": 1, "sender_name": "KZ", "sender_role": "supervisor", "kind": "text", "text": "Hello", "reply_to": 1},
-                "settings": {"tail_size": 30, "debounce": 2, "worker": "stub"},
+                "settings": {"tail_size": 30, "debounce": 2, "profile": "stub"},
             },
         )
         assert "--- Channel-specific context ---" in prompt
