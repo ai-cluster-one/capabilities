@@ -638,6 +638,24 @@ A tagged message stays in context. Suppression happens at the invocation gate, w
 
 `agent_dialogue.max_turns` is a runaway bound, not a way to arrange this. Its counter resets only when a non-agent writes, so in a room of two assistants and no humans it latches at the cap and the assistant falls permanently silent to its peer.
 
+## Harness Profiles
+
+A harness profile says how the model runs a turn: the harness, the model, its effort, what it may do without asking, and how long it may take. Profiles are callva-harness-runner profiles kept in the project's store, in the runner's `harness_profiles` table, which `telegram migrate` applies under the runner's own ledger `harness` before the job register's tables; the daemon does the same when it opens the register.
+
+Every telegram profile is named `telegram-<something>`; a name without the prefix is refused, so a room never runs another capability's profile. A name resolves to this project's version, then the global one, then the two the bundle ships: `telegram-claude` (claude on `opus`) and `telegram-codex` (codex on the `sol` family, project hooks run without recorded trust), both with every permission granted and a one-day `timeout_seconds`. A stored version the runner refuses is an error naming the name, the layer and the version; the search never falls through it. A room's turns run on the worker its settings name (`worker`, `workers`); the profiles are listed and saved here.
+
+- `telegram profiles list` shows every telegram profile the project reaches: its layer and version, harness, model, effort, service tier, rights, `timeout_seconds`, whether it fits and what narrows it. It never prints an `env_set` value or a `settings` object.
+- `telegram profiles show <name>` adds the profile's text.
+- `telegram profiles save <name> <file|->` saves a new version at this project's scope only. `--base <version>` names the version being replaced, and a save that another writer overtook exits 6 `conflict`. A bundled name or a name held at global scope is refused: those are changed outside telegram, never from a chat.
+
+### Writing a profile for a person
+
+A worker writes a profile when a person in the chat asks for one. Start from `telegram profiles show telegram-claude` or `telegram-codex`, change what was asked, and save it under a new `telegram-` name. The knobs are the runner's: `uv run --with callva-harness-runner==<pin> python -m callva.harness_runner knobs` lists every one, and `... profiles check FILE` checks a file before saving, where `<pin>` is the version `service/profiles.py` pins. A value carrying `${` is refused, because nothing is substituted.
+
+A profile fits a telegram turn when its harness is claude or codex, it sets no `output_schema` (the daemon reads free text and cuts it at the reply marker), claude runs with `permission_mode = "bypassPermissions"` and codex with `approval_policy = "never"` (a turn has nobody to approve anything), and it sets `timeout_seconds`. That last one matters: the runner's default is ten minutes, and a delegated job has no other deadline. A profile that leaves out Bash, enables a sandbox or narrows codex's sandbox fits, with a warning in `list`.
+
+A worker saves only for a requester whose role the control gate admits to `/set` - by default `supervisor` and `channel_admin`, as `control.roles` decides - as the daemon states that role in `TELEGRAM_AUTHORIZED_REQUESTER_ROLE`; any other requester, or a worker without the role stated, is refused with exit 4. The version records `telegram:<requester id>` as who saved it, or `user@host` from a terminal, and `CAPABILITIES_READ_ONLY` refuses every save. Anyone may list. What a room may reach is the authority below, delivered per turn; a profile never carries it and never widens it.
+
 ## Control Authority
 
 Service control commands are handled by the daemon before a worker job exists, so they are governed by `control.roles` instead of `authority.roles`. `/status` is safe to expose broadly: besides the channel's settings it lists the chat replies in flight, numbered, each with its state, sender name and elapsed time and never the message text or an id; `/set` changes per-channel runtime settings; `/reload` validates and reapplies `settings.json` without disconnecting; `/stop` stops queued/running work for the channel, and `/stop N` ends only the reply at position N of the last `/status` list - a reply that finished since is reported rather than shifting N onto another, and delegated jobs are never on that list.

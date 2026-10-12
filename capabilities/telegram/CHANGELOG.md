@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-12 — Harness profiles in the store, and `telegram profiles list|show|save`
+
+Telegram now keeps harness profiles: callva-harness-runner profiles in the project's store, named `telegram-<something>`, resolved to the project's version, then the global one, then the two the bundle ships, `telegram-claude` (claude on `opus`) and `telegram-codex` (codex on the `sol` family). `telegram profiles list` and `show` report each with its layer, version, settings, rights and fit; `telegram profiles save` writes a new version at the project's scope only, refuses a bundled or global name, a profile the runner or telegram's fit refuses and a `${` value, takes `--base` and exits 6 `conflict` when overtaken, and from a worker saves only for a requester whose role may `/set`. `telegram migrate` applies the runner's `harness_profiles` table under its ledger `harness` before the job register's tables, the daemon does the same when it opens the register, and `migrate status` reports both, the runner's under `harness`. The runner is pinned in `service/profiles.py` (0.10.0), not in the CLI. How a room's turns run is unchanged.
+
 ## 2026-10-11 — A store behind Supabase's transaction pooler is refused at connect
 
 `telegram` now uses `capabilities-contract` 0.4.1. A transaction-mode pooler keeps no session between transactions, so the schema binding, prepared statements and notifications a connection relies on are lost through one, and it is not supported. A database setting that points at Supabase's transaction pooler - a host under `pooler.supabase.com` on port 6543 - is refused before anything is sent to it, as `transaction_pooler`, with a hint naming the session pooler: the same host on port 5432. Every other database, the session pooler included, is reached as before.

@@ -1,0 +1,13 @@
+# Profile "telegram-codex": a telegram worker's turn on codex.
+#
+# The turn answers from the project it runs in: full access, approvals never
+# asked, and the project's hooks run without trust recorded on the machine. A
+# dialogue turn and a voice task end sooner at the room's worker_timeout; this
+# deadline is the ceiling, and the only one a delegated job has.
+
+harness = "codex"
+model = "sol"
+approval_policy = "never"
+codex_config = { sandbox_mode = "danger-full-access" }
+bypass_hook_trust = true
+timeout_seconds = 86400

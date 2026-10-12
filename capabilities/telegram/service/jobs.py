@@ -54,6 +54,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -217,6 +219,52 @@ STORE_STEPS = (
     """),
 )
 
+# The harness runner's profile table lives in the same store, under the
+# runner's own ledger, and is applied before the register's steps wherever the
+# daemon opens the register. The steps are the runner's: a process that has the
+# runner imports them, and one that does not asks the bundle's profiles module,
+# whose header pins it, once.
+_PROFILE_STORE_STEPS: dict | None = None
+
+
+def profile_store_steps() -> dict:
+    """The runner's profile-table steps as `{owner, steps, major, minor}`."""
+    global _PROFILE_STORE_STEPS
+    if _PROFILE_STORE_STEPS is not None:
+        return _PROFILE_STORE_STEPS
+    try:
+        from callva import harness_runner as lib
+    except ImportError:
+        lib = None
+    if lib is not None:
+        found = {"owner": lib.PROFILE_STORE_OWNER,
+                 "steps": [list(step) for step in lib.PROFILE_STORE_STEPS],
+                 "major": lib.PROFILE_STORE_MAJOR, "minor": lib.PROFILE_STORE_MINOR}
+    else:
+        script = Path(__file__).resolve().parent / "profiles.py"
+        uv = shutil.which("uv")
+        if uv is None:
+            raise JobError("harness_runner_unavailable",
+                           "uv is not on PATH, so the harness runner's profile table "
+                           "cannot be resolved",
+                           "install uv, which runs every telegram script")
+        try:
+            done = subprocess.run([uv, "run", "--quiet", "--script", str(script),
+                                   "store-steps"], capture_output=True, text=True,
+                                  timeout=600)
+            found = json.loads(done.stdout) if done.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            done, found = None, None
+            detail = str(exc)
+        if found is None:
+            detail = (done.stderr.strip() if done is not None else detail) or "no answer"
+            raise JobError("harness_runner_unavailable",
+                           f"the harness runner's profile table could not be resolved "
+                           f"from {script}: {detail}",
+                           "`telegram migrate` resolves the runner and applies it")
+    _PROFILE_STORE_STEPS = found
+    return found
+
 # WHAT A JOB IS DOING, AND WHY IT IS DOING THAT
 # =============================================
 # Two columns, because they answer two questions and only one of them changes
@@ -357,7 +405,7 @@ class JobStore:
 
 def open_register(envelope: Path, environment: str, surface: str = "telegram",
                   project_id: str | None = None, setting=None,
-                  project_root: Path | None = None):
+                  project_root: Path | None = None, profile_tables: bool = True):
     """The store this project's jobs live in, and the register onto it.
 
     There is no file-mode register and no local database. A queue, a slot count
@@ -369,7 +417,9 @@ def open_register(envelope: Path, environment: str, surface: str = "telegram",
     The project id is the one the launching CLI resolved and passes in;
     project.json's own id stands in only where no launcher resolved one.
     `setting` is the database already resolved by a caller that reads it once;
-    otherwise it is resolved now for `project_root`.
+    otherwise it is resolved now for `project_root`. The runner's profile table
+    is migrated first unless `profile_tables` is off, as it is for a CLI verb
+    that only reads or writes jobs.
     """
     identity = project_identity(envelope)
     project_id = project_id or identity.get("id")
@@ -385,6 +435,10 @@ def open_register(envelope: Path, environment: str, surface: str = "telegram",
     except DbError as exc:
         raise JobError(exc.slug, exc.message, exc.hint) from exc
     try:
+        if profile_tables:
+            harness = profile_store_steps()
+            migrate(conn, harness["owner"], [tuple(step) for step in harness["steps"]],
+                    major=harness["major"], minor=harness["minor"])
         migrate(conn, STORE_OWNER, STORE_STEPS, major=STORE_SCHEMA_MAJOR,
                 minor=STORE_SCHEMA_MINOR)
         conn.autocommit = True

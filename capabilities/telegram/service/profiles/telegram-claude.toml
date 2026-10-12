@@ -1,0 +1,13 @@
+# Profile "telegram-claude": a telegram worker's turn on claude.
+#
+# The turn answers from the project it runs in: every tool without a
+# permission prompt, and the user's, project's and local settings, as
+# `claude -p` loads them. A dialogue turn and a voice task end sooner at the
+# room's worker_timeout; this deadline is the ceiling, and the only one a
+# delegated job has.
+
+harness = "claude"
+model = "opus"
+permission_mode = "bypassPermissions"
+setting_sources = ["user", "project", "local"]
+timeout_seconds = 86400

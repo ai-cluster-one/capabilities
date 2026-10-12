@@ -192,6 +192,29 @@ Commands:
                                                which). With none, `start`, `run`
                                                and `jobs` exit 6
                                                store_not_configured.
+  telegram profiles list | show <name> | save <name> <file|-> [--base ID]
+                                               The harness profiles a worker runs
+                                               on, kept in the project's store.
+                                               Every name starts with telegram-;
+                                               one resolves to this project's
+                                               version, then the global one, then
+                                               the bundled telegram-claude and
+                                               telegram-codex. `list` shows each
+                                               with its layer, version, harness,
+                                               model, effort, rights, timeout and
+                                               fit; `show` adds its text. `save`
+                                               writes a new version at this
+                                               project's scope only, refusing a
+                                               bundled or global name, a profile
+                                               the runner or fit refuses, and a
+                                               `${`; `--base` names the version
+                                               replaced, and a save that lost the
+                                               race exits 6 conflict. A worker
+                                               saves only for a requester whose
+                                               role may /set. The runner is
+                                               pinned in the bundle's
+                                               service/profiles.py, which these
+                                               verbs run.
 
 Chat references:
   <chat> can be @username, a phone (+1555…), a numeric id, or a chat title
@@ -221,10 +244,13 @@ Contract commands (the same on every capability):
                                                 this project (--network adds
                                                 remote detail).
   telegram migrate [status]                     Apply the job register's pending
-                                                steps to the machine's store;
-                                                `status` reports where its
-                                                tables stand, without a lock,
-                                                changing nothing.
+                                                steps to the machine's store,
+                                                after the harness runner's
+                                                profile table under its ledger
+                                                `harness`; `status` reports
+                                                where both stand (the runner's
+                                                under `harness`), without a
+                                                lock, changing nothing.
 
 Exit codes:
   0  success
@@ -4510,7 +4536,7 @@ def _open_job_register(root: Path, write: bool = True):
     try:
         _store, register = module.open_register(
             _project_capabilities_dir(root), _job_environment(root),
-            project_id=project_id, project_root=root)
+            project_id=project_id, project_root=root, profile_tables=False)
         return module, register
     except module.JobError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
@@ -4536,13 +4562,165 @@ def _service_store_check(root: Path) -> dict:
         setting = module.store_setting(root)
         store, _register = module.open_register(
             _project_capabilities_dir(root), _job_environment(root),
-            project_id=_project_id(), setting=setting)
+            project_id=_project_id(), setting=setting, profile_tables=False)
     except module.JobError as exc:
         return {"ok": False, "code": exc.slug, "error": exc.message,
                 "hint": exc.hint}
     store.close()
     return {"ok": True, "level": setting.level, "sources": list(setting.sources),
             "schema": setting.schema}
+
+
+# --- Harness profiles ----------------------------------------------------------
+#
+# The profiles a worker runs on are kept in the project's store by the harness
+# runner, which this CLI does not carry: every worker `telegram send` resolves
+# this file's header, and the runner is large. Every answer that needs it comes
+# from the bundle's `service/profiles.py`, run under its own header, which pins
+# the runner; what needs no runner - who may save - is read from it in-process.
+
+PROFILE_ROLE_ENV = "TELEGRAM_AUTHORIZED_REQUESTER_ROLE"
+
+
+def _service_profiles() -> Path:
+    return _service_bundle_dir() / "service" / "profiles.py"
+
+
+def _profiles_module():
+    path = _service_profiles()
+    _require_service_bundle_files(path)
+    spec = importlib.util.spec_from_file_location("telegram_service_profiles", path)
+    if spec is None or spec.loader is None:
+        _die(3, "service_bundle_missing", f"cannot load the bundled profiles module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _profiles_answer(argv: list[str], text: str = "") -> dict:
+    """What `service/profiles.py` answers to `argv`, run under its own header;
+    a refusal it gives is this CLI's refusal, with its exit code."""
+    path = _service_profiles()
+    _require_service_bundle_files(path)
+    uv = shutil.which("uv")
+    if uv is None:
+        _die(5, "harness_runner_unavailable",
+             "uv is not on PATH, so the harness runner cannot be resolved",
+             "install uv, which runs every telegram script")
+    try:
+        done = subprocess.run([uv, "run", "--quiet", "--script", str(path), *argv],
+                              input=text, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _die(5, "harness_runner_unavailable", f"{path} did not answer: {exc}")
+    if done.returncode == 0:
+        try:
+            return json.loads(done.stdout)
+        except ValueError:
+            pass
+    lines = done.stderr.strip().splitlines()
+    try:
+        error = json.loads(lines[-1])["error"]
+    except (IndexError, ValueError, KeyError, TypeError):
+        _die(5, "harness_runner_unavailable",
+             f"{path} gave no answer it can be read by: {done.stderr.strip()[-800:]}")
+    _die(done.returncode, error["code"], error["message"], error.get("hint"))
+
+
+def _profile_tables() -> tuple:
+    """The harness runner's profile-table steps, as the database library
+    migrates them: (ledger, steps, major, minor)."""
+    module = _jobs_module()
+    try:
+        found = module.profile_store_steps()
+    except module.JobError as exc:
+        _die(5, exc.slug, exc.message, exc.hint)
+    return (found["owner"], [tuple(step) for step in found["steps"]],
+            found["major"], found["minor"])
+
+
+def _migrate_with_profile_tables(argv: list[str]) -> None:
+    """`migrate [status]`, around the contract's own: the runner's profile
+    table is applied first, under its ledger, on the same store, and both
+    ledgers are reported - the register's at the top, the runner's under
+    `harness`."""
+    owner, steps, major, minor = _profile_tables()
+    from capabilities_contract import db
+    conn = None
+    try:
+        conn = db.connect(application_name=NAME)
+        if argv:
+            found = db.status(conn, owner, steps, major=major, minor=minor)
+            harness = {"owner": found.owner, "schema": found.schema, "state": found.state,
+                       "code": {"major": found.major, "minor": found.minor},
+                       "store": (None if found.stored_major is None else
+                                 {"major": found.stored_major, "minor": found.stored_minor}),
+                       "applied": found.applied, "pending": found.pending,
+                       "changed": found.changed, "warnings": found.warnings}
+        else:
+            done = db.migrate(conn, owner, steps, major=major, minor=minor)
+            harness = {"owner": done.owner, "schema": done.schema,
+                       "applied": done.applied, "skipped": done.skipped,
+                       "version": {"major": done.major, "minor": done.minor},
+                       "warnings": done.warnings}
+    except db.DbError as exc:
+        _die(6 if exc.slug in _STORE_SETTING_SLUGS else 5, exc.slug, exc.message, exc.hint)
+    finally:
+        if conn is not None:
+            conn.close()
+    said = io.StringIO()
+    with contextlib.redirect_stdout(said):
+        _cmd_migrate(argv)
+    _emit({**json.loads(said.getvalue()), "harness": harness})
+    sys.exit(0)
+
+
+def _profile_saver(root: Path) -> str:
+    """Who a save is recorded as. A worker the daemon started saves only for a
+    requester whose role the control gate admits to `/set`, as the daemon
+    states that role; the CLI trusts the daemon, not the model."""
+    if not os.environ.get("TELEGRAM_DAEMON_CHILD", "").strip():
+        return f"{getpass.getuser()}@{os.uname().nodename}"
+    requester = os.environ.get("TELEGRAM_AUTHORIZED_REQUESTER_ID", "").strip()
+    role = os.environ.get(PROFILE_ROLE_ENV, "").strip()
+    if not requester or not role:
+        _die(4, "profile_save_denied",
+             "a worker the Telegram daemon started tried to save a profile without "
+             "the requester's role stated by the daemon",
+             f"the daemon hands its worker {PROFILE_ROLE_ENV}; only a sender whose "
+             "role may /set saves a profile")
+    if not _profiles_module().role_admitted_to_set(role, _service_settings(root)):
+        _die(4, "profile_save_denied",
+             f"role {role} may not /set, so it may not save a profile",
+             "ask a sender whose role may /set (by default supervisor or "
+             "channel_admin)")
+    return f"telegram:{requester}"
+
+
+def cmd_profiles(args) -> dict:
+    """`profiles list|show|save`: the telegram profiles this project reaches,
+    one as it resolves, and a new version saved at this project's scope."""
+    root = _service_project_root()
+    saving = args.profiles_cmd == "save"
+    project_id = _project_id(write=saving)
+    if not project_id:
+        _die(6, "no_project_identity", "this project declares no id",
+             "run `capabilities init` in the project")
+    common = ["--project-id", str(project_id), "--project-root", str(root)]
+    if args.profiles_cmd == "list":
+        return _profiles_answer(["list", *common])
+    if args.profiles_cmd == "show":
+        return _profiles_answer(["show", args.name, *common])
+    _read_only_gate(f"`{NAME} profiles save`")
+    created_by = _profile_saver(root)
+    try:
+        text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text()
+    except (OSError, UnicodeDecodeError) as exc:
+        _die(6, "input", f"cannot read {args.file}: {exc}")
+    tail = ["save", args.name, *common, "--created-by", created_by,
+            "--where", "stdin" if args.file == "-" else str(args.file)]
+    if args.base:
+        tail += ["--base", args.base]
+    return _profiles_answer(tail, text)
 
 
 def _job_channel_key(chat: str | None, topic_id: str | None) -> str | None:
@@ -5714,6 +5892,8 @@ def main() -> None:
     if (sys.argv[1:2] or [""])[0] == "manifest":
         _emit(_manifest_payload())
         return
+    if sys.argv[1:] in (["migrate"], ["migrate", "status"]):
+        _migrate_with_profile_tables(sys.argv[2:])
     _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
     p = argparse.ArgumentParser(
         prog="telegram",
@@ -5813,6 +5993,17 @@ def main() -> None:
     pt.add_argument("json_path")
     pt.add_argument("--force", action="store_true", help="re-transcribe even if already filled")
     pt.add_argument("--model", default="nova-3", help="Deepgram model (default: nova-3)")
+
+    pprofiles = sub.add_parser(
+        "profiles", help="the harness profiles a worker runs on")
+    pf = pprofiles.add_subparsers(dest="profiles_cmd", required=True)
+    pf.add_parser("list", help="every telegram profile this project reaches")
+    pf_show = pf.add_parser("show", help="one profile as it resolves, and its text")
+    pf_show.add_argument("name")
+    pf_save = pf.add_parser("save", help="save a version at this project's scope")
+    pf_save.add_argument("name")
+    pf_save.add_argument("file", help="the profile file, or - for stdin")
+    pf_save.add_argument("--base", help="the version being replaced, from `profiles show`")
 
     pjobs = sub.add_parser(
         "jobs", help="the register of work that outlives a conversation")
@@ -5965,6 +6156,10 @@ def main() -> None:
                                   args.confirm_active_jobs_checked, actor))
         elif args.jobs_cmd == "resume":
             _emit(cmd_jobs_resume(args.id, chat, topic, actor))
+        return
+    if args.cmd == "profiles":
+        # The profiles are rows in the store, so this never opens Telegram.
+        _emit(cmd_profiles(args))
         return
     if args.cmd == "service":
         if args.service_cmd == "init":
