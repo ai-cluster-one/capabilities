@@ -270,13 +270,20 @@ class OpenRecords(unittest.TestCase):
                                                        project_only=True)
                          .resolve("clickup", "identifier"))
 
-    def test_the_tier_keeps_no_database(self):
-        for name in ("Store", "SQLiteStore", "PostgresStore", "StoreRecords",
+    def test_the_tier_keeps_no_database_but_the_connection_tables(self):
+        for name in ("Store", "SQLiteStore", "PostgresStore",
                      "open_store", "records_mode", "default_store_path",
                      "read_store_setting", "find_store_setting", "store_setting_url"):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(S, name))
         self.assertNotIn("sqlite3", (Path(S.__file__)).read_text())
+        # Store mode holds a project's connections and grants and nothing else.
+        for collection in ("identifier", "setting", "policy", "document"):
+            with self.subTest(collection=collection):
+                self.assertFalse(S.StoreRecords._held(collection))
+        self.assertTrue(S.StoreRecords._held("setting", "connection.default"))
+        self.assertIsInstance(S.open_records(self.env, self.globals), S.FileRecords)
+        self.assertNotIsInstance(S.open_records(self.env, self.globals), S.StoreRecords)
 
 
 if __name__ == "__main__":

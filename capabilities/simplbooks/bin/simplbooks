@@ -5,6 +5,7 @@
 #     "httpx>=0.27",
 #     "click>=8.1",
 #     "beautifulsoup4>=4.12",
+#     "capabilities-contract==0.4.1",
 # ]
 # ///
 """simplbooks — agent-first CLI for the SimpleBooks accounting app."""
@@ -941,8 +942,10 @@ _RECORDS = None
 
 def _records():
     """The adapter this project's records are read and written through: the
-    project's envelope, then the user's config home. Everything below asks it
-    for a collection, never for a path."""
+    project's envelope, then the user's config home; in a project whose
+    connections are in store mode, its store for connections and grants, read
+    for the project's id. Everything below asks it for a collection, never for
+    a path."""
     global _RECORDS
     if _RECORDS is None:
         root = _project_root()
@@ -951,8 +954,11 @@ def _records():
         try:
             project_only = os.environ.get("CAPABILITIES_RECORDS_PROJECT_ONLY", "") \
                 .strip().lower() in ("1", "true", "yes", "on")
+            in_store = root is not None and connections_mode(envelope) == "store"
             _RECORDS = open_records(
-                envelope, _CONFIG_HOME, project_only=project_only)
+                envelope, _CONFIG_HOME, project_only=project_only,
+                project_root=root, project_id=_project_id() if in_store else None,
+                application_name=NAME)
         except StoreError as e:
             _die(6, e.slug, e.message, e.hint)
     return _RECORDS
@@ -1542,6 +1548,7 @@ import json
 import os
 import hashlib
 import re
+import socket
 # The capability core region reads the clock through `time` and imports nothing
 # of its own, so this region keeps carrying it.
 import time
@@ -1627,6 +1634,71 @@ def read_only_switch() -> bool:
     """True when this process runs under the read-only switch: the variable
     holds `1` or `true`, in any case."""
     return os.environ.get(READ_ONLY_ENV, "").strip().lower() in ("1", "true")
+
+
+def node_name() -> str:
+    """The node this process runs on, by the one name the package gives it: a
+    store-mode grant naming a node is matched against it, and a service that
+    records which node holds its work records it."""
+    return socket.gethostname()
+
+
+# Where a project keeps its connections and grants: files (the default) or the
+# store. The manager alone writes this key into `project.json`, when it imports
+# a project's files into the store; nothing infers it from a configured store.
+CONNECTIONS_MODE_KEY = "connections"
+CONNECTIONS_MODES = ("files", "store")
+
+# The contract's own tables in the store, migrated under the contract's own
+# ledger owner, and the schema version this code writes them at.
+STORE_OWNER = "capabilities"
+STORE_CONNECTIONS_TABLE = "capabilities_connections"
+STORE_GRANTS_TABLE = "capabilities_connection_grants"
+STORE_TABLES_VERSION = (1, 0)
+
+# A store that cannot be reached or is busy is the environment's fault, not
+# the configuration's: a capability maps these to its network exit code.
+STORE_ENVIRONMENT_SLUGS = frozenset({"store_unreachable", "store_busy"})
+
+# How long one process reuses what it read from the store, and a refusal to
+# connect: long enough that one command asks once, short enough that a
+# long-running service sees a changed grant, or a store that came back, at once.
+STORE_READ_SECONDS = 2.0
+
+
+def connection_table_steps() -> list[tuple[str, str]]:
+    """The migration steps of the two connection tables. `enabled` and
+    `allow_write` left null decide nothing, as a field absent from a file's
+    grant does; `node` null is the grant for every node."""
+    return [
+        ("0001-connections",
+         "CREATE TABLE capabilities_connections ("
+         " capability text NOT NULL,"
+         " name text NOT NULL,"
+         " spec jsonb NOT NULL,"
+         " PRIMARY KEY (capability, name),"
+         " CHECK (jsonb_typeof(spec) = 'object'))"),
+        ("0002-connection-grants",
+         "CREATE TABLE capabilities_connection_grants ("
+         " agent_id text NOT NULL,"
+         " capability text NOT NULL,"
+         " connection text NOT NULL,"
+         " node text CHECK (node <> ''),"
+         " enabled boolean,"
+         " allow_write boolean,"
+         " is_default boolean NOT NULL DEFAULT false,"
+         " FOREIGN KEY (capability, connection)"
+         "  REFERENCES capabilities_connections (capability, name)"
+         "  ON DELETE CASCADE ON UPDATE CASCADE)"),
+        ("0003-connection-grants-key",
+         "CREATE UNIQUE INDEX capabilities_connection_grants_key"
+         " ON capabilities_connection_grants"
+         " (agent_id, capability, connection, (coalesce(node, '')))"),
+        ("0004-connection-grants-default",
+         "CREATE UNIQUE INDEX capabilities_connection_grants_default"
+         " ON capabilities_connection_grants"
+         " (agent_id, capability, (coalesce(node, ''))) WHERE is_default"),
+    ]
 
 
 def _refuse_record_write(capability: str, collection: str) -> None:
@@ -1715,6 +1787,11 @@ class Records:
 
     mode = "?"
     source = "?"
+
+    def mode_of(self, collection: str, key: str | None = None) -> str:
+        """Where one collection is kept: `files`, or `store` for a project's
+        connections, grants and default pointer in store mode."""
+        return self.mode
 
     def __enter__(self) -> "Records":
         return self
@@ -2159,28 +2236,454 @@ class FileRecords(Records):
         return []
 
 
-def open_records(envelope: Path | str, global_dir: Path | str,
-                 project_only: bool = False) -> Records:
-    """The adapter this project's configuration is read and written through:
-    the project's envelope, then `global_dir` unless `project_only`.
+class StoreRecords(FileRecords):
+    """A project in store mode: its connections, its grants and its default
+    pointer are read from and written to the contract's two tables in the
+    project's store, and every other record stays in the files `FileRecords`
+    reads. The two homes never compose: the files' connections and grants are
+    not read here at all.
 
-    Records are files only. A `project.json` that declares a `store` other than
-    `files` is refused rather than read as files, since the records it points
-    at are not where it says."""
+    A connection row belongs to no project, so it resolves as an identity the
+    project did not declare itself would: withheld until this project's grant
+    enables it. This project's grants are the rows whose `agent_id` is its id,
+    the row naming this node read before the row for every node, field by
+    field. A row never holds a secret value: `spec` names each secret by its
+    `*_env` key, which resolves on each node through that node's own cascade.
+
+    The store is reached through the shared database library, on first use
+    only, so a call that reads no connection never connects."""
+
+    def __init__(self, envelope: Path, global_dir: Path,
+                 project_id: str | None = None, project: str | None = None,
+                 include_global: bool = True, project_root: Path | None = None,
+                 application_name: str = STORE_OWNER, connection: Any = None,
+                 schema: str | None = None):
+        super().__init__(envelope, global_dir, project_id, project, include_global)
+        self.project_root = (Path(project_root) if project_root is not None
+                             else self.envelope.parent)
+        self.application_name = application_name
+        self.node = node_name()
+        self._conn = connection
+        self._owns_conn = connection is None
+        self._schema = schema
+        self._failure: StoreError | None = None
+        self._failed_at = 0.0
+        self._cache: dict[tuple[str, str], tuple[float, Any]] = {}
+
+    @staticmethod
+    def _held(collection: str, key: str | None = None) -> bool:
+        return (collection in ("connection", "grant")
+                or (collection == "setting" and key == "connection.default"))
+
+    def mode_of(self, collection: str, key: str | None = None) -> str:
+        return "store" if self._held(collection, key) else "files"
+
+    def close(self) -> None:
+        if self._owns_conn and self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    # -- reaching the store ----------------------------------------------------
+
+    def _fail(self, error: StoreError) -> StoreError:
+        self._failure, self._failed_at = error, time.monotonic()
+        return error
+
+    def _unreachable(self, exc: Exception) -> StoreError:
+        """A connection that broke is dropped, so the next use opens a new one."""
+        if self._owns_conn and self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+        return self._fail(StoreError(
+            "store_unreachable", f"cannot reach the store: {exc}",
+            "check the database setting with `capabilities store doctor`"))
+
+    def _fresh(self, key: tuple[str, str]) -> Any:
+        held = self._cache.get(key)
+        if held is not None and time.monotonic() - held[0] < STORE_READ_SECONDS:
+            return held[1]
+        return None
+
+    def _db(self) -> Any:
+        """The connection, opened on first use. A refusal to connect stands for
+        STORE_READ_SECONDS, so one command does not wait on it twice."""
+        if self._failure is not None:
+            if time.monotonic() - self._failed_at < STORE_READ_SECONDS:
+                raise self._failure
+            self._failure = None
+        if self._conn is not None:
+            return self._conn
+        try:
+            from capabilities_contract import db
+        except ImportError:
+            raise self._fail(StoreError(
+                "driver_missing",
+                "the shared database library capabilities-contract is not installed",
+                "run the capability through its own script header, which pins it")) from None
+        try:
+            setting = db.resolve_setting(self.project_root)
+            self._conn = db.connect(application_name=self.application_name,
+                                    setting=setting)
+        except db.DbError as exc:
+            raise self._fail(StoreError(exc.slug, exc.message, exc.hint)) from None
+        self._schema = setting.schema
+        return self._conn
+
+    def _read(self, query: str, params: Sequence[Any]) -> list[tuple]:
+        conn = self._db()
+        import psycopg
+        try:
+            rows = conn.execute(query, params).fetchall()
+        except psycopg.errors.UndefinedTable:
+            # A store nothing was ever imported into holds no connection.
+            if self._owns_conn:
+                conn.rollback()
+            return []
+        except psycopg.OperationalError as exc:
+            raise self._unreachable(exc) from None
+        except psycopg.Error as exc:
+            if self._owns_conn:
+                conn.rollback()
+            raise StoreError("store_read_failed",
+                             f"reading connections from the store failed: {exc}") from None
+        if self._owns_conn:
+            conn.rollback()
+        return rows
+
+    def _write(self, work: Any) -> Any:
+        """Run `work(conn)` in one transaction, the tables migrated first. A
+        connection handed in belongs to a caller holding its own transaction,
+        which this neither migrates nor commits."""
+        conn = self._db()
+        import psycopg
+        from capabilities_contract import db
+        try:
+            try:
+                if not self._owns_conn:
+                    return work(conn)
+                major, minor = STORE_TABLES_VERSION
+                db.migrate(conn, STORE_OWNER, connection_table_steps(),
+                           major=major, minor=minor)
+                with conn.transaction():
+                    return work(conn)
+            except db.DbError as exc:
+                raise StoreError(exc.slug, exc.message, exc.hint) from None
+            except psycopg.OperationalError as exc:
+                raise self._unreachable(exc) from None
+            except psycopg.Error as exc:
+                raise StoreError("store_write_failed",
+                                 f"writing connections to the store failed: {exc}") from None
+        finally:
+            self._cache.clear()
+
+    def _table_source(self, collection: str) -> str:
+        self._db()
+        table = STORE_GRANTS_TABLE if collection == "grant" else STORE_CONNECTIONS_TABLE
+        return f"store:{self._schema}.{table}"
+
+    # -- reading ---------------------------------------------------------------
+
+    def _connection_rows(self, capability: str) -> dict[str, dict[str, Any]]:
+        key = ("connection", capability)
+        held = self._fresh(key)
+        if held is None:
+            rows = self._read(
+                "SELECT name, spec FROM capabilities_connections "
+                "WHERE capability = %s ORDER BY name", (capability,))
+            held = {name: spec if isinstance(spec, dict) else {} for name, spec in rows}
+            self._cache[key] = (time.monotonic(), held)
+        return held
+
+    def _grant_rows(self, capability: str) -> dict[str, list[dict[str, Any]]]:
+        """This project's grants on this node, per connection: the row naming
+        this node first, then the row for every node."""
+        key = ("grant", capability)
+        held = self._fresh(key)
+        if held is None:
+            out: dict[str, list[dict[str, Any]]] = {}
+            if self.project_id:
+                rows = self._read(
+                    "SELECT connection, node, enabled, allow_write, is_default "
+                    "FROM capabilities_connection_grants "
+                    "WHERE agent_id = %s AND capability = %s "
+                    "AND (node IS NULL OR node = %s) "
+                    "ORDER BY connection, node NULLS LAST",
+                    (self.project_id, capability, self.node))
+                for cid, node, enabled, allow_write, is_default in rows:
+                    out.setdefault(cid, []).append({
+                        "node": node, "enabled": enabled,
+                        "allow_write": allow_write, "is_default": bool(is_default)})
+            self._cache[key] = (time.monotonic(), out)
+            held = out
+        return held
+
+    def _store_default(self, capability: str) -> str | None:
+        """The default pointer: this node's, else the one for every node."""
+        grants = self._grant_rows(capability)
+        for node in (self.node, None):
+            for cid in sorted(grants):
+                if any(r["is_default"] and r["node"] == node for r in grants[cid]):
+                    return cid
+        return None
+
+    def _record(self, scope: str, capability: str, collection: str, key: str,
+                value: Any, ref: str) -> dict[str, Any]:
+        return {"id": f"store:{capability}/{collection}/{ref}", "scope": scope,
+                "project_id": self.project_id if scope == "project" else None,
+                "capability": capability, "collection": collection, "key": key,
+                "value": value, "note": None, "updated_at": None, "updated_by": None}
+
+    def _entries(self, root: Path, capability: str, collection: str) -> dict[str, Any]:
+        if collection in ("connection", "grant"):
+            return {}
+        entries = super()._entries(root, capability, collection)
+        if collection == "setting":
+            entries.pop("connection.default", None)
+        return entries
+
+    def config_layers(self, capability: str, collection: str,
+                      _scopes: Any = None) -> list[dict[str, dict[str, Any]]]:
+        _store_check("capability", capability, CAPABILITY_RE)
+        if collection == "connection":
+            rows = self._connection_rows(capability)
+            return [{name: self._record("store", capability, collection, name, spec, name)
+                     for name, spec in rows.items()}] if rows else []
+        if collection == "grant":
+            layers: list[dict[str, dict[str, Any]]] = []
+            for node in (self.node, None):
+                layer = {}
+                for cid, rows in self._grant_rows(capability).items():
+                    for row in rows:
+                        if row["node"] == node:
+                            value = {f: row[f] for f in GRANT_FIELDS if row[f] is not None}
+                            layer[cid] = self._record("project", capability, collection,
+                                                      cid, value, f"{cid}@{node or '*'}")
+                if layer:
+                    layers.append(layer)
+            return layers
+        layers = super().config_layers(capability, collection)
+        if collection == "setting":
+            default = self._store_default(capability)
+            if default is not None:
+                layers.insert(0, {"connection.default": self._record(
+                    "project", capability, collection, "connection.default", default,
+                    "connection.default")})
+        return layers
+
+    def resolve_scope(self, capability: str, collection: str,
+                      scope: str) -> dict[str, dict[str, Any]]:
+        if collection in ("connection", "grant") and scope in ("project", "store"):
+            return self.resolve(capability, collection)
+        return super().resolve_scope(capability, collection, scope)
+
+    def get(self, capability: str, collection: str, key: str) -> Any:
+        """A grant answers with the row that applies on this node, and says
+        which node it names (null for every node) and whether it is the
+        default pointer."""
+        if collection == "grant":
+            _store_check("capability", capability, CAPABILITY_RE)
+            rows = self._grant_rows(capability).get(key)
+            if not rows:
+                return None
+            row = rows[0]
+            out = {f: row[f] for f in GRANT_FIELDS if row[f] is not None}
+            out.update(node=row["node"], is_default=row["is_default"])
+            return out
+        return super().get(capability, collection, key)
+
+    def collection_source(self, capability: str, collection: str) -> str:
+        if collection in ("connection", "grant"):
+            return self._table_source(collection)
+        return super().collection_source(capability, collection)
+
+    def scope_source(self, capability: str, collection: str, scope: str) -> str:
+        if collection in ("connection", "grant"):
+            return self._table_source(collection)
+        return super().scope_source(capability, collection, scope)
+
+    # -- writing ---------------------------------------------------------------
+
+    def _grant_value(self, cid: str, value: Any) -> tuple[dict[str, Any], str | None]:
+        if not isinstance(value, dict):
+            raise StoreError("bad_grant",
+                             f"grant {cid!r} must be a table, got {type(value).__name__}")
+        known = (*GRANT_FIELDS, "node", "is_default")
+        unknown = set(value) - set(known)
+        if unknown:
+            raise StoreError("bad_grant",
+                             f"grant {cid!r} has unknown field(s): {', '.join(sorted(unknown))}",
+                             f"known: {', '.join(known)}")
+        for field in (*GRANT_FIELDS, "is_default"):
+            if field in value and not isinstance(value[field], bool) \
+                    and not (field in GRANT_FIELDS and value[field] is None):
+                raise StoreError("bad_grant", f"grant {cid!r} {field} must be true or false")
+        node = value.get("node")
+        if node is not None and (not isinstance(node, str) or not node.strip()):
+            raise StoreError("bad_grant",
+                             f"grant {cid!r} node must name a node, or be null for every node")
+        return {f: value[f] for f in (*GRANT_FIELDS, "is_default") if f in value}, node
+
+    def _put_grant(self, conn: Any, capability: str, cid: str,
+                   fields: dict[str, Any], node: str | None) -> None:
+        if not self.project_id:
+            raise StoreError("no_project_id",
+                             "this project has no id a grant could name",
+                             "run `capabilities init` in the project")
+        known = conn.execute(
+            "SELECT 1 FROM capabilities_connections WHERE capability = %s AND name = %s",
+            (capability, cid)).fetchone()
+        if known is None:
+            raise StoreError("unknown_connection",
+                             f"the store holds no {capability} connection {cid!r}",
+                             f"declare it first: `capabilities set {capability} "
+                             f"connection {cid} '{{...}}'`")
+        if fields.get("is_default"):
+            conn.execute(
+                "UPDATE capabilities_connection_grants SET is_default = false "
+                "WHERE agent_id = %s AND capability = %s AND connection <> %s "
+                "AND coalesce(node, '') = coalesce(%s, '') AND is_default",
+                (self.project_id, capability, cid, node))
+        columns = ["agent_id", "capability", "connection", "node", *fields]
+        values = [self.project_id, capability, cid, node, *fields.values()]
+        updates = ", ".join(f"{field} = EXCLUDED.{field}" for field in fields)
+        conn.execute(
+            f"INSERT INTO capabilities_connection_grants ({', '.join(columns)}) "
+            f"VALUES ({', '.join(['%s'] * len(values))}) "
+            "ON CONFLICT (agent_id, capability, connection, (coalesce(node, ''))) "
+            + (f"DO UPDATE SET {updates}" if updates else "DO NOTHING"),
+            values)
+
+    def _put_default(self, conn: Any, capability: str, cid: str | None,
+                     node: str | None) -> None:
+        if not self.project_id:
+            raise StoreError("no_project_id",
+                             "this project has no id a grant could name",
+                             "run `capabilities init` in the project")
+        conn.execute(
+            "UPDATE capabilities_connection_grants SET is_default = false "
+            "WHERE agent_id = %s AND capability = %s "
+            "AND coalesce(node, '') = coalesce(%s, '') AND is_default",
+            (self.project_id, capability, node))
+        if cid is not None:
+            self._put_grant(conn, capability, cid, {"is_default": True}, node)
+
+    def set(self, capability: str, collection: str, key: str, value: Any,
+            actor: str | None = None, note: str | None = None,
+            scope: str | None = None) -> None:
+        if not self._held(collection, key) or scope == "global":
+            return super().set(capability, collection, key, value,
+                               actor=actor, note=note, scope=scope)
+        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("key", key, KEY_RE)
+        _refuse_record_write(capability, collection)
+        if scope not in (None, "project"):
+            raise StoreError("bad_scope",
+                             f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
+        if collection == "connection":
+            if not isinstance(value, dict):
+                raise StoreError("bad_connection",
+                                 f"connection {key!r} must be a table, got "
+                                 f"{type(value).__name__}")
+            spec = {k: v for k, v in value.items() if k not in GRANT_FIELDS}
+            grant = {k: value[k] for k in GRANT_FIELDS if k in value}
+
+            def work(conn: Any) -> None:
+                conn.execute(
+                    "INSERT INTO capabilities_connections (capability, name, spec) "
+                    "VALUES (%s, %s, %s::jsonb) ON CONFLICT (capability, name) "
+                    "DO UPDATE SET spec = EXCLUDED.spec",
+                    (capability, key, json.dumps(spec, ensure_ascii=False)))
+                if grant:
+                    fields, node = self._grant_value(key, grant)
+                    self._put_grant(conn, capability, key, fields, node)
+            self._write(work)
+        elif collection == "grant":
+            fields, node = self._grant_value(key, value)
+            self._write(lambda conn: self._put_grant(conn, capability, key, fields, node))
+        else:
+            cid = value if isinstance(value, str) and value else None
+            if value not in (None, "") and cid is None:
+                raise StoreError("bad_default", "the default pointer names a connection id")
+            self._write(lambda conn: self._put_default(conn, capability, cid, None))
+
+    def delete(self, capability: str, collection: str, key: str,
+               scope: str | None = None) -> bool:
+        if not self._held(collection, key) or scope == "global":
+            return super().delete(capability, collection, key, scope=scope)
+        _refuse_record_write(capability, collection)
+        if collection == "connection":
+            def work(conn: Any) -> bool:
+                return conn.execute(
+                    "DELETE FROM capabilities_connections "
+                    "WHERE capability = %s AND name = %s", (capability, key)).rowcount > 0
+        elif collection == "grant":
+            def work(conn: Any) -> bool:
+                return conn.execute(
+                    "DELETE FROM capabilities_connection_grants WHERE agent_id = %s "
+                    "AND capability = %s AND connection = %s AND node IS NULL",
+                    (self.project_id, capability, key)).rowcount > 0
+        else:
+            def work(conn: Any) -> bool:
+                return conn.execute(
+                    "UPDATE capabilities_connection_grants SET is_default = false "
+                    "WHERE agent_id = %s AND capability = %s AND node IS NULL "
+                    "AND is_default", (self.project_id, capability)).rowcount > 0
+        return bool(self._write(work))
+
+
+def _identity_record(envelope: Path) -> dict[str, Any]:
+    try:
+        identity = json.loads((Path(envelope) / "project.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return identity if isinstance(identity, dict) else {}
+
+
+def connections_mode(envelope: Path | str) -> str:
+    """Where this project keeps its connections and grants: `files`, unless
+    its `project.json` says `store`. Only that record decides it."""
+    identity_file = Path(envelope) / "project.json"
+    declared = _identity_record(Path(envelope)).get(CONNECTIONS_MODE_KEY, "files")
+    if declared not in CONNECTIONS_MODES:
+        raise StoreError("bad_connections_mode",
+                         f"{identity_file} declares connections {declared!r}",
+                         f"one of: {', '.join(CONNECTIONS_MODES)}; the manager writes it")
+    return declared
+
+
+def open_records(envelope: Path | str, global_dir: Path | str,
+                 project_only: bool = False, project_root: Path | str | None = None,
+                 project_id: str | None = None,
+                 application_name: str = STORE_OWNER) -> Records:
+    """The adapter this project's configuration is read and written through:
+    the project's envelope, then `global_dir` unless `project_only`; in store
+    mode a project's connections and grants come from its store instead, for
+    the project id given (else project.json's), its database resolved for
+    `project_root` (else the envelope's parent).
+
+    A `project.json` that declares a `store` other than `files` is refused
+    rather than read as files, since the records it points at are not where it
+    says."""
     envelope, global_dir = Path(envelope), Path(global_dir)
     identity_file = envelope / "project.json"
-    try:
-        identity = json.loads(identity_file.read_text())
-    except (OSError, ValueError):
-        identity = {}
-    if not isinstance(identity, dict):
-        identity = {}
+    identity = _identity_record(envelope)
     declared = identity.get("store", "files")
     if declared != "files":
         raise StoreError("bad_store_mode",
                          f"{identity_file} declares store {declared!r}; records are "
                          "kept only in files",
                          'remove "store" from project.json, or set it to "files"')
+    if connections_mode(envelope) == "store":
+        return StoreRecords(envelope, global_dir, project_id or identity.get("id"),
+                            identity.get("slug"), include_global=not project_only,
+                            project_root=Path(project_root) if project_root else None,
+                            application_name=application_name)
     return FileRecords(envelope, global_dir, identity.get("id"), identity.get("slug"),
                        include_global=not project_only)
 
@@ -2290,12 +2793,13 @@ def _connections_composed() -> dict:
                                         include_disabled=True,
                                         machine_read=machine)
         default = adapter.get(NAME, "setting", "connection.default")
+        source = adapter.collection_source(NAME, "connection")
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     if not effective:
         _die(6, "connections_required",
              f"{NAME} requires an explicit connections registry and "
-             f"{adapter.source} holds none",
+             f"{source} holds none",
              'expected {"default": "<id>", "connections": {"<id>": { ... }}}')
     usable = {cid: e for cid, e in effective.items() if e["enabled"]}
     withheld = {cid: e for cid, e in effective.items() if not e["enabled"]}
@@ -2417,7 +2921,8 @@ def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
         _die(4, "read_only",
              f"connection {conn_id!r} does not allow writes",
              "Do not lift the gate yourself — ask the user; granting is "
-             "`allow_write: true` on this connection in connections.json.")
+             f"`capabilities set {NAME} grant {conn_id} '{{\"allow_write\": true}}'` "
+             "run inside this project.")
 
 
 def _key_report(key: str, secret: bool, required: bool,

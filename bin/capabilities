@@ -51,8 +51,9 @@ ENVIRONMENT
                        it starts under the read-only switch: every capability
                        reads but changes nothing (write verbs, project-record
                        writes and service activation exit 4), and this manager
-                       refuses allow, disable, enable, inherit, init,
-                       quarantine, relabel, set, store set and store unset.
+                       refuses allow, connections import, disable, enable,
+                       inherit, init, quarantine, relabel, set, store set and
+                       store unset.
                        doctor reports it. Unset, `0` or `false` leaves it off.
   AGENTKIT_DB_URL, AGENTKIT_DB_HOST, AGENTKIT_DB_PORT, AGENTKIT_DB_NAME,
   AGENTKIT_DB_USER, AGENTKIT_DB_PASSWORD, AGENTKIT_DB_SCHEMA,
@@ -74,7 +75,9 @@ PROJECT PATH VERB
 THE PROJECT ENVELOPE
   Every project file the system owns — identity, the gate, the state guard,
   and each capability's identifiers, references, connections, settings and
-  state — sits in one envelope; records are kept in files only. In a project
+  state — sits in one envelope; records are kept in files, except the
+  connections and grants of a project in store mode, which its store holds
+  (see `connections import`). In a project
   bound by `.contextkit/config.toml` its location
   belongs to ContextKit and is asked for, never assumed or stored:
   `contextkit path capabilities`, once per invocation. Without that binding the
@@ -266,10 +269,11 @@ STORE VERBS
                  format is SHEBANG.md's "The store setting".
   Within the project or environment level AGENTKIT_DB_URL, a postgresql://
   URL, wins over that level's separate keys; AGENTKIT_DB_SCHEMA applies
-  beside it. Records (the gate, connections, settings, identifiers,
-  references) are files and never in the database; the database holds only
-  the tables capabilities migrate for themselves. These verbs never create a
-  table.
+  beside it. Records (the gate, settings, identifiers, references, and the
+  connections and grants of a project in files mode) are files and never in
+  the database; the database holds only the tables capabilities migrate for
+  themselves and, for a project in store mode, the contract's two connection
+  tables. These verbs never create a table.
   store set --host H --database D --user U [--port P]
             [--sslmode require|verify-ca|verify-full|disable]
             [--sslrootcert PATH|system] [--schema NAME]
@@ -467,12 +471,42 @@ PROJECT VERBS (run inside a consuming project)
   get <name> <collection> <key>
         Read one resolved configuration record from wherever this project keeps
         its records. Collections are connection, grant, identifier, setting,
-        policy, and document.
+        policy, and document. In store mode a grant is the row that applies on
+        this node - the one naming it, else the one for every node - and adds
+        node (null for every node) and is_default to its fields.
   set <name> <collection> <key> <json-or-string> [--note TEXT]
         Write one project-scoped human-owned configuration record. The writable
         collections here are connection, grant, and setting; policy stays with
         the policy verbs, identifiers with the capability's ids verbs, and long
-        text with the capability's context verbs.
+        text with the capability's context verbs. In store mode a connection
+        is a row every project may be granted, a grant is this project's row
+        and may carry node (a node name, or null for every node, the default)
+        and is_default (the default pointer, one per capability and node), and
+        setting connection.default moves is_default; such a write stamps the
+        project id, so it refuses (exit 6) where the id is not verified, and
+        `records.mode` answers `store` with the table as `source`. A store
+        that cannot be reached is exit 5 store_unreachable.
+  connections import
+        Move this project's connections and grants from its files into its
+        store (the database `store show` names for it) and the project into
+        store mode, recorded as "connections": "store" in its project.json,
+        which only this verb writes. Every identity the project's files
+        resolve becomes a row of capabilities_connections, and every one it
+        may use, switched off itself, or points its default at gets a grant
+        for every node in capabilities_connection_grants, stamped with the
+        project id (verified, as any write that stamps it), carrying the
+        decision its files resolve to (a field no scope decided stays null).
+        The rows are written, and proven to resolve as the files do, in one
+        transaction before project.json changes. A row the store already
+        holds unchanged is left as it is, so running it again changes
+        nothing; one that differs, or a grant of this project the files do
+        not have, refuses the whole import (exit 6 import_conflict) and
+        writes nothing. The files are kept and no longer read for
+        connections and grants. JSON {ok, project, agent_id, node, mode,
+        previous_mode, identity, store {level, sources, schema, tables},
+        capabilities {<name> {connections {imported, unchanged}, grants
+        {imported, unchanged}, default}}, files_kept}. Exit 4 under the
+        read-only switch, 5 when the store cannot be reached.
 
 VERIFICATION VERBS
   doctor
@@ -480,7 +514,12 @@ VERIFICATION VERBS
         guard ↔ deny rules ↔ standalone host wiring, including what keeps
         Codex from loading the capability context ↔ project identity; report
         drift, and the project's project_identity state. A project.json id
-        that differs from ContextKit's is drift. Exit 0 clean, 7 drift found.
+        that differs from ContextKit's is drift, as is a store-mode project
+        whose store cannot be used. In store mode `information` lists, never
+        as drift, each agent_id holding grants in the store that ContextKit's
+        registry (contextkit_agents) does not know (grant_agent_unknown), or
+        that the registry is not in the store (agents_registry_absent).
+        Exit 0 clean, 7 drift found.
   audit <name> [--from <path>]
         Contract conformance: call the contract verbs, validate output
         shapes, exercise the gate (enabled / disabled / absent) in a
@@ -780,8 +819,9 @@ def _store_module():
 # The verbs that write a project record — policy, configuration, the project's
 # identity and its wiring — and the machine ceiling. Under the read-only switch the manager refuses them;
 # whether the switch is on is the store tier's answer, never the manager's own.
-READ_ONLY_REFUSED_VERBS = ("allow", "disable", "enable", "inherit", "init",
-                           "quarantine", "relabel", "set", "store set", "store unset")
+READ_ONLY_REFUSED_VERBS = ("allow", "connections import", "disable", "enable",
+                           "inherit", "init", "quarantine", "relabel", "set",
+                           "store set", "store unset")
 
 
 def _read_only_gate(verb: str) -> None:
@@ -804,12 +844,29 @@ def _read_only_report() -> dict | None:
             "refused_here": list(READ_ONLY_REFUSED_VERBS)}
 
 
+def _open_project_records(root: Path, *, project_only: bool = False):
+    """The records surface for one project, raising the store tier's error. In
+    store mode its connections and grants are read for the project's id, which
+    a read takes in every state."""
+    store = _store_module()
+    envelope = _project_capabilities_dir(root)
+    in_store = store.connections_mode(envelope) == "store"
+    return store.open_records(
+        envelope, _CONFIG_HOME, project_only=project_only, project_root=root,
+        project_id=_project_id_state(root)["id"] if in_store else None)
+
+
+def _store_error_exit(exc) -> int:
+    """A store that cannot be reached or is busy is the network's exit code;
+    every other records refusal is input."""
+    return 5 if exc.slug in _store_module().STORE_ENVIRONMENT_SLUGS else 6
+
+
 def _records_for(root: Path, *, project_only: bool = False):
     """The records surface for one project, with manager errors normalized."""
     store = _store_module()
-    envelope = _project_capabilities_dir(root)
     try:
-        return store.open_records(envelope, _CONFIG_HOME, project_only=project_only)
+        return _open_project_records(root, project_only=project_only)
     except store.StoreError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
 
@@ -4274,7 +4331,7 @@ def _resolved_registry(root: Path, capability: str, *,
         default = adapter.get(capability, "setting", "connection.default")
         source = adapter.collection_source(capability, "connection")
         if not effective:
-            return None, adapter.mode, source
+            return None, adapter.mode_of("connection"), source
         registry = {
             "default": default,
             "connections": {
@@ -4282,7 +4339,7 @@ def _resolved_registry(root: Path, capability: str, *,
                 for cid, row in effective.items()
             },
         }
-        return registry, adapter.mode, source
+        return registry, adapter.mode_of("connection"), source
     except _store_module().StoreError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
     finally:
@@ -6599,7 +6656,9 @@ def cmd_ids(name: str) -> None:
 
 
 def cmd_get(name: str, collection: str, key: str) -> None:
-    """Read one resolved record through the same adapter capabilities use."""
+    """Read one resolved record through the same adapter capabilities use. In
+    store mode a grant also says which node it names (null for every node) and
+    whether it is the default pointer."""
     root = _require_project()
     adapter = _records_for(root)
     try:
@@ -6608,7 +6667,7 @@ def cmd_get(name: str, collection: str, key: str) -> None:
             _die(3, "not_found", f"no resolved {name}/{collection}/{key}")
         _emit(value)
     except _store_module().StoreError as exc:
-        _die(6, exc.slug, exc.message, exc.hint)
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     finally:
         adapter.close()
 
@@ -6628,15 +6687,273 @@ def cmd_set(name: str, collection: str, key: str,
     root = _require_project()
     adapter = _records_for(root)
     try:
+        in_store = adapter.mode_of(collection, key) == "store"
+        if in_store:
+            # A store row carries the project id as its agent, so the write
+            # takes the id only once it is verified for this invocation.
+            _project_id_for_write(root)
         adapter.set(name, collection, key, value,
                     actor="capabilities set", note=note)
         _emit({"set": {"capability": name, "collection": collection,
                        "key": key, "value": value},
-               "records": {"mode": adapter.mode, "source": adapter.source}})
+               "records": {"mode": adapter.mode_of(collection, key),
+                           "source": (adapter.collection_source(
+                               name, "grant" if collection == "setting" else collection)
+                               if in_store else adapter.source)}})
     except _store_module().StoreError as exc:
-        _die(6, exc.slug, exc.message, exc.hint)
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     finally:
         adapter.close()
+
+
+# ---------------------------------------------------------------- connections import
+
+class _ImportRefused(Exception):
+    def __init__(self, code: str, message: str, hint: str | None = None):
+        super().__init__(message)
+        self.code, self.message, self.hint = code, message, hint
+
+
+def _import_names(envelope: Path) -> list[str]:
+    """The capabilities whose connections this project's files can resolve:
+    each one its envelope keeps a registry for, and each installed one the
+    user's config home keeps a registry for."""
+    store = _store_module()
+    names: set[str] = set()
+    if envelope.is_dir():
+        for path in envelope.glob("*/connections.json"):
+            names.add(path.parent.name)
+    for name in _installed():
+        if (_CONFIG_HOME / name / "connections.json").is_file():
+            names.add(name)
+    return sorted(n for n in names if store.CAPABILITY_RE.fullmatch(n))
+
+
+def _import_plan(files, names: list[str]) -> dict:
+    """What the store must hold for this project to resolve from it exactly
+    what its files resolve: per capability every identity the project can
+    see, and an every-node grant for each one it may use, each one it switched
+    off itself, and the one its default pointer names. A grant carries the
+    decision its fields resolved to across the files' scopes, and leaves a
+    field no scope decided null, so `allow_write` still falls to WRITE_DEFAULT."""
+    store = _store_module()
+    plan: dict = {}
+    problems: list[str] = []
+    for name in names:
+        try:
+            identities = files.resolve(name, "connection")
+            layers = files.config_layers(name, "grant")
+            effective = files.connections(name, include_disabled=True)
+            default = files.get(name, "setting", "connection.default")
+        except store.StoreError as exc:
+            problems.append(f"{name}: {exc.message}")
+            continue
+        if not identities:
+            continue
+        connections, grants = {}, {}
+        for cid, row in sorted(identities.items()):
+            if not isinstance(row["value"], dict):
+                problems.append(f"{name}: connection {cid!r} is not an object")
+                continue
+            connections[cid] = row["value"]
+            decided, decided_at = store._grant_decisions(
+                cid, [layer[cid] for layer in layers if cid in layer])
+            allow_write = decided.get("allow_write")
+            if allow_write is not None and not isinstance(allow_write, bool):
+                problems.append(f"{name}: grant {cid!r} allow_write is not boolean")
+                continue
+            enabled = bool(effective[cid]["enabled"])
+            switched_off = not enabled and (row["scope"] == "project"
+                                            or decided_at.get("enabled") == "project")
+            if enabled or switched_off or cid == default:
+                grants[cid] = {"enabled": True if enabled else (False if switched_off else None),
+                               "allow_write": allow_write, "is_default": cid == default}
+        if default is not None and default not in identities:
+            problems.append(f"{name}: the default points to {default!r}, which no "
+                            "connection declares")
+        plan[name] = {"connections": connections, "grants": grants, "default": default}
+    if problems:
+        raise _ImportRefused(
+            "import_unreadable",
+            "this project's files cannot be imported as they resolve today: "
+            + "; ".join(problems),
+            "repair them (`capabilities doctor` names the faults), then import again")
+    return plan
+
+
+def _import_rows(conn, agent_id: str, plan: dict) -> dict:
+    """Write what the store lacks, inside the caller's transaction, and refuse
+    the whole import where a row the store already holds differs from what the
+    import would write, or where this project already holds a grant the files
+    do not."""
+    result: dict = {}
+    conflicts: list[str] = []
+    writes: list[tuple[str, tuple]] = []
+    for name, wanted in plan.items():
+        held = dict(conn.execute(
+            "SELECT name, spec FROM capabilities_connections WHERE capability = %s",
+            (name,)).fetchall())
+        grants = {(cid, node): (enabled, allow_write, bool(is_default))
+                  for cid, node, enabled, allow_write, is_default in conn.execute(
+                      "SELECT connection, node, enabled, allow_write, is_default "
+                      "FROM capabilities_connection_grants "
+                      "WHERE agent_id = %s AND capability = %s", (agent_id, name)).fetchall()}
+        report = {"connections": {"imported": [], "unchanged": []},
+                  "grants": {"imported": [], "unchanged": []},
+                  "default": wanted["default"]}
+        for cid, spec in wanted["connections"].items():
+            if cid not in held:
+                writes.append((
+                    "INSERT INTO capabilities_connections (capability, name, spec) "
+                    "VALUES (%s, %s, %s::jsonb)",
+                    (name, cid, json.dumps(spec, ensure_ascii=False))))
+                report["connections"]["imported"].append(cid)
+            elif held[cid] == spec:
+                report["connections"]["unchanged"].append(cid)
+            else:
+                conflicts.append(f"{name} connection {cid!r}: the store holds "
+                                 f"{json.dumps(held[cid], sort_keys=True)}, the files "
+                                 f"{json.dumps(spec, sort_keys=True)}")
+        for cid, grant in wanted["grants"].items():
+            row = (grant["enabled"], grant["allow_write"], grant["is_default"])
+            found = grants.pop((cid, None), None)
+            if found is None:
+                writes.append((
+                    "INSERT INTO capabilities_connection_grants (agent_id, capability, "
+                    "connection, node, enabled, allow_write, is_default) "
+                    "VALUES (%s, %s, %s, NULL, %s, %s, %s)", (agent_id, name, cid, *row)))
+                report["grants"]["imported"].append(cid)
+            elif found == row:
+                report["grants"]["unchanged"].append(cid)
+            else:
+                conflicts.append(
+                    f"{name} grant {cid!r} for every node: the store holds enabled="
+                    f"{found[0]}, allow_write={found[1]}, is_default={found[2]}; the "
+                    f"files resolve enabled={row[0]}, allow_write={row[1]}, "
+                    f"is_default={row[2]}")
+        for (cid, node), _row in sorted(grants.items(), key=lambda item: (item[0][0], item[0][1] or "")):
+            conflicts.append(f"{name} grant {cid!r} for "
+                             f"{'node ' + repr(node) if node else 'every node'}: the store "
+                             "holds it and the files do not")
+        result[name] = report
+    if conflicts:
+        raise _ImportRefused(
+            "import_conflict",
+            f"the store already holds {len(conflicts)} row(s) that differ from what "
+            "this project's files resolve, and nothing was written: "
+            + "; ".join(conflicts),
+            "reconcile them - change the store row with `capabilities set`, or the "
+            "files - and import again")
+    for query, params in writes:
+        conn.execute(query, params)
+    return result
+
+
+def _import_verify(files, stored, plan: dict) -> None:
+    """The import holds only if the store now resolves, for this project on this
+    node, the very connections its files resolve: the same usable entries, with
+    the same values and writability under either WRITE_DEFAULT, the same
+    withheld ones, and the same default pointer."""
+    for name in plan:
+        for write_default in (False, True):
+            before = files.connections(name, write_default=write_default,
+                                       include_disabled=True)
+            after = stored.connections(name, write_default=write_default,
+                                       include_disabled=True)
+            usable_before = {cid: (e["value"], e["allow_write"])
+                             for cid, e in before.items() if e["enabled"]}
+            usable_after = {cid: (e["value"], e["allow_write"])
+                            for cid, e in after.items() if e["enabled"]}
+            withheld_after = {cid for cid, e in after.items() if not e["enabled"]}
+            withheld_before = {cid for cid, e in before.items() if not e["enabled"]}
+            if usable_before != usable_after or not withheld_before <= withheld_after:
+                raise _ImportRefused(
+                    "import_mismatch",
+                    f"after the import the store would resolve {name}'s connections "
+                    "differently from the files, so nothing was written",
+                    "report this as a defect in `capabilities connections import`")
+        if (files.get(name, "setting", "connection.default")
+                != stored.get(name, "setting", "connection.default")):
+            raise _ImportRefused(
+                "import_mismatch",
+                f"after the import the store would point {name}'s default elsewhere "
+                "than the files, so nothing was written",
+                "report this as a defect in `capabilities connections import`")
+
+
+def cmd_connections_import() -> None:
+    """Import this project's connections and grants from its files into its
+    store and move the project to store mode, as one decision: the rows are
+    written and checked to resolve as the files do in one transaction, and
+    only then does project.json say `connections: store`. A row the store
+    already holds unchanged is left as it is, so a second run changes nothing;
+    one that differs refuses the whole import."""
+    _read_only_gate("connections import")
+    store = _store_module()
+    root = _require_project()
+    envelope = _project_capabilities_dir(root)
+    identity_file = envelope / PROJECT_IDENTITY_REL
+    identity = _read_json(identity_file)
+    if not isinstance(identity, dict):
+        _die(6, "no_project_identity", f"{identity_file} is missing or unreadable",
+             "run `capabilities init` in the project")
+    agent_id = _project_id_for_write(root)
+    if not agent_id:
+        _die(6, "no_project_identity", f"{identity_file} carries no project id",
+             "run `capabilities init` in the project to mint its identity")
+    try:
+        previous = store.connections_mode(envelope)
+    except store.StoreError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+    files = store.FileRecords(envelope, _CONFIG_HOME, agent_id, identity.get("slug"))
+    names = _import_names(envelope)
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=store.STORE_OWNER, setting=setting)
+    except db.DbError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    import psycopg
+    try:
+        plan = _import_plan(files, names)
+        major, minor = store.STORE_TABLES_VERSION
+        db.migrate(conn, store.STORE_OWNER, store.connection_table_steps(),
+                   major=major, minor=minor)
+        with conn.transaction():
+            # One import at a time per store, so two cannot both find a row
+            # missing and both write it.
+            conn.execute("LOCK TABLE capabilities_connections, "
+                          "capabilities_connection_grants IN SHARE ROW EXCLUSIVE MODE")
+            imported = _import_rows(conn, agent_id, plan)
+            stored = store.StoreRecords(envelope, _CONFIG_HOME, agent_id,
+                                        identity.get("slug"), project_root=root,
+                                        connection=conn, schema=setting.schema)
+            _import_verify(files, stored, plan)
+    except _ImportRefused as exc:
+        _die(6 if exc.code != "import_mismatch" else 7, exc.code, exc.message, exc.hint)
+    except store.StoreError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    except db.DbError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    except psycopg.OperationalError as exc:
+        _die(5, "store_unreachable", f"cannot reach the store: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    except psycopg.Error as exc:
+        _die(5, "store_write_failed", f"importing into the store failed: {exc}")
+    finally:
+        conn.close()
+    if previous != "store":
+        identity = _read_json(identity_file) or identity
+        identity[store.CONNECTIONS_MODE_KEY] = "store"
+        _write_json(identity_file, identity)
+    _emit({"ok": True, "project": str(root), "agent_id": agent_id,
+           "node": store.node_name(), "mode": "store", "previous_mode": previous,
+           "identity": str(identity_file),
+           "store": {"level": setting.level, "sources": list(setting.sources),
+                     "schema": setting.schema,
+                     "tables": [store.STORE_CONNECTIONS_TABLE, store.STORE_GRANTS_TABLE]},
+           "capabilities": imported,
+           "files_kept": sorted(str(p) for p in envelope.glob("*/connections.json"))})
 
 
 # A TOML table header; every key after the first one belongs to that table.
@@ -7077,7 +7394,8 @@ def _check_policy(findings: list[str], owner: str, gate_file: Path) -> dict:
 
 
 def _check_record_connections(findings: list[str], adapter, names) -> None:
-    """Validate project connection/grant records through their live reader."""
+    """Validate project connection/grant records through their live reader. A
+    store that cannot be used is one finding, not one per capability."""
     store = _store_module()
     for name in sorted(names):
         try:
@@ -7085,6 +7403,10 @@ def _check_record_connections(findings: list[str], adapter, names) -> None:
             grants = adapter.resolve(name, "grant")
             adapter.connections(name, include_disabled=True)
         except store.StoreError as exc:
+            if exc is getattr(adapter, "_failure", None):
+                findings.append(f"project: connections store unavailable "
+                                f"({exc.slug}): {exc.message}")
+                return
             findings.append(f"project: {name} records: {exc.message}")
             continue
         for cid, row in identities.items():
@@ -7122,8 +7444,51 @@ def _check_skill(findings: list[str]) -> None:
                             f"{CANONICAL_SKILL_DIR} — run `capabilities skill`")
 
 
+def _grant_agents_information(root: Path) -> list[dict]:
+    """Grants in this project's store whose agent ContextKit's registry does
+    not know, as information and never as a failure: an agent id is a soft
+    reference to an identity that lives outside these tables, and the registry
+    may not exist in this store at all."""
+    db = _db_module()
+    try:
+        conn = db.connect(application_name="capabilities", project_root=root)
+    except db.DbError:
+        return []
+    import psycopg
+    out: list[dict] = []
+    try:
+        grants = conn.execute(
+            "SELECT agent_id, count(*) FROM capabilities_connection_grants "
+            "GROUP BY agent_id ORDER BY agent_id").fetchall()
+        if not grants:
+            return out
+        registry = conn.execute("SELECT to_regclass('contextkit_agents')").fetchone()[0]
+        if registry is None:
+            out.append({"code": "agents_registry_absent",
+                        "message": "ContextKit's agent registry (contextkit_agents) is "
+                                   "not in this store, so no grant's agent_id was "
+                                   "checked against it"})
+            return out
+        known = {row[0] for row in conn.execute(
+            "SELECT id::text FROM contextkit_agents WHERE id::text = ANY(%s)",
+            ([agent for agent, _count in grants],)).fetchall()}
+        for agent, count in grants:
+            if agent not in known:
+                out.append({"code": "grant_agent_unknown", "agent_id": agent,
+                            "grants": count,
+                            "message": f"{count} connection grant(s) name agent {agent}, "
+                                       "which ContextKit's registry does not know"})
+    except psycopg.Error as exc:
+        out.append({"code": "agents_unchecked",
+                    "message": f"the grants' agents could not be checked: {exc}"})
+    finally:
+        conn.close()
+    return out
+
+
 def cmd_doctor() -> None:
     findings: list[str] = []
+    information: list[dict] = []
     bin_dir = _bin_dir()
     for name, meta in _installed().items():
         script = _script_path(name)
@@ -7185,8 +7550,18 @@ def cmd_doctor() -> None:
         records = None
         store = _store_module()
         try:
-            records = store.open_records(envelope, _CONFIG_HOME)
-            _check_record_connections(findings, records, _installed())
+            records = _open_project_records(root)
+            in_store = records.mode_of("grant") == "store"
+            if in_store:
+                try:
+                    records._db()
+                except store.StoreError as exc:
+                    findings.append(f"project: connections store unavailable "
+                                    f"({exc.slug}): {exc.message}")
+            if not in_store or records._failure is None:
+                _check_record_connections(findings, records, _installed())
+            if in_store and records._failure is None:
+                information = _grant_agents_information(root)
         except store.StoreError as exc:
             findings.append(f"project: records unavailable: {exc.message}")
         finally:
@@ -7240,6 +7615,8 @@ def cmd_doctor() -> None:
                 for blocker in _codex_delivery_blockers(root):
                     findings.append(f"project: Codex capability context does not load — {blocker}")
     report = {"ok": not findings, "findings": findings}
+    if information:
+        report["information"] = information
     if identity is not None:
         report["project_identity"] = identity
     read_only = _read_only_report()
@@ -10320,6 +10697,11 @@ def main() -> None:
         if not pos:
             _die(6, "input", "ids needs a capability name")
         cmd_ids(pos[0])
+    elif cmd == "connections":
+        if rest != ["import"]:
+            _die(6, "input", "connections needs the subcommand import, and nothing else",
+                 "run `capabilities help`")
+        cmd_connections_import()
     elif cmd == "get":
         if len(pos) != 3:
             _die(6, "input", "get needs <name> <collection> <key>")

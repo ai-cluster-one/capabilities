@@ -22,7 +22,8 @@ The contract has three fenced regions; the store tier is canonical in
     carries it, connection-bearing or not.
 
   - **store** — the records adapter used by identifiers, policy, settings,
-    connections and documents, all kept in files. EVERY capability carries it
+    connections and documents, kept in files, and a store-mode project's
+    connections and grants, kept in its store. EVERY capability carries it
     because core calls into it.
 
   - **connections** — the credential cascade and connection resolver. Only a
@@ -948,8 +949,10 @@ _RECORDS = None
 
 def _records():
     """The adapter this project's records are read and written through: the
-    project's envelope, then the user's config home. Everything below asks it
-    for a collection, never for a path."""
+    project's envelope, then the user's config home; in a project whose
+    connections are in store mode, its store for connections and grants, read
+    for the project's id. Everything below asks it for a collection, never for
+    a path."""
     global _RECORDS
     if _RECORDS is None:
         root = _project_root()
@@ -958,8 +961,11 @@ def _records():
         try:
             project_only = os.environ.get("CAPABILITIES_RECORDS_PROJECT_ONLY", "") \
                 .strip().lower() in ("1", "true", "yes", "on")
+            in_store = root is not None and connections_mode(envelope) == "store"
             _RECORDS = open_records(
-                envelope, _CONFIG_HOME, project_only=project_only)
+                envelope, _CONFIG_HOME, project_only=project_only,
+                project_root=root, project_id=_project_id() if in_store else None,
+                application_name=NAME)
         except StoreError as e:
             _die(6, e.slug, e.message, e.hint)
     return _RECORDS
@@ -1644,12 +1650,13 @@ def _connections_composed() -> dict:
                                         include_disabled=True,
                                         machine_read=machine)
         default = adapter.get(NAME, "setting", "connection.default")
+        source = adapter.collection_source(NAME, "connection")
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     if not effective:
         _die(6, "connections_required",
              f"{NAME} requires an explicit connections registry and "
-             f"{adapter.source} holds none",
+             f"{source} holds none",
              'expected {"default": "<id>", "connections": {"<id>": { ... }}}')
     usable = {cid: e for cid, e in effective.items() if e["enabled"]}
     withheld = {cid: e for cid, e in effective.items() if not e["enabled"]}
@@ -1771,7 +1778,8 @@ def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
         _die(4, "read_only",
              f"connection {conn_id!r} does not allow writes",
              "Do not lift the gate yourself — ask the user; granting is "
-             "`allow_write: true` on this connection in connections.json.")
+             f"`capabilities set {NAME} grant {conn_id} '{{\"allow_write\": true}}'` "
+             "run inside this project.")
 
 
 def _key_report(key: str, secret: bool, required: bool,
