@@ -601,3 +601,154 @@ def test_database_probe_resolves_the_node_environment_through_the_library(tmp_pa
     out = json.loads(subprocess.run([sys.executable, "-c", m._NODE_DATABASE_PROBE], cwd=tmp_path,
                                     env=env, capture_output=True, text=True, check=True).stdout)
     assert out["configured"] is False and out["error"]["code"] == "store_not_configured"
+
+
+# A target that takes its body straight from GitHub. GitHub is a local bare
+# repository the checkout reaches through git's own URL rewriting, so the
+# checkout's remote reads exactly as a project declares it.
+REPOSITORY = "example-org/example-repo"
+
+
+@pytest.fixture
+def github(node, monkeypatch):
+    hub = node.tmp / "hub"
+    bare = hub / "example-org" / "example-repo.git"
+    bare.parent.mkdir(parents=True)
+    subprocess.run(["git", "clone", "--bare", str(node.root), str(bare)], check=True, capture_output=True)
+    git(node.root, "config", f"url.{hub}/.insteadOf", "https://github.com/")
+    git(node.root, "remote", "add", "origin", f"https://github.com/{REPOSITORY}.git")
+    node.target.update(deploy_key="node_key", body_source={"kind": "github", "repository": REPOSITORY})
+    monkeypatch.setattr(node.m, "_node_prepare_repo", lambda *a: pytest.fail("prepared a server repository"))
+    node.bare = bare
+    return node
+
+
+def test_github_deploy_builds_the_pushed_commit_with_no_server_repository(github, capsys):
+    node = github
+    server_branch = git(node.remote, "rev-parse", "main")
+    commit(node.root, "doctrine.md", "pushed\n")
+    git(node.root, "push", "-q", "origin", "main")
+    head = git(node.root, "rev-parse", "HEAD")
+    node.m.cmd_deploy(node.args)
+    result = json.loads(capsys.readouterr().out)
+    calls = [r["argv"] for r in rows(node)]
+    assert ["app", "update", "application-fixture", "--name", "fixture-body-test",
+            "--base-directory", "/deployment/targets/test", "--docker-compose-location",
+            "/docker-compose.yaml", "--git-repository", f"git@github.com:{REPOSITORY}.git",
+            "--git-branch", "main"] in calls
+    # Pinned to the deployed commit, not to whatever the branch holds by then.
+    assert ["app", "rollback", "application-fixture", "--to", head] in calls
+    assert not any(argv[0] == "deploy" for argv in calls)
+    assert result["release"]["commit"] == head and result["release"]["deployment"] == "rollback-fixture"
+    # No SSH at all, and the server repository never received anything.
+    assert node.ssh == []
+    assert git(node.remote, "rev-parse", "main") == server_branch
+    env = next(r["stdin"] for r in rows(node) if r["argv"][:2] == ["env", "bulk"])
+    assert f"AGENT_REPO_URL=https://github.com/{REPOSITORY}.git\n" in env
+    assert "GIT_DEPLOY_KEY_B64=\n" in env and "AGENT_GIT_KNOWN_HOSTS_B64=\n" in env
+    assert "fixture-private-material" not in env
+
+
+def test_github_first_deploy_creates_the_app_from_github_with_the_declared_key(github, monkeypatch, capsys):
+    monkeypatch.setenv("NODE_NEW_APP", "1")
+    github.m.cmd_deploy(github.args)
+    capsys.readouterr()
+    calls = [r["argv"] for r in rows(github)]
+    create = next(argv for argv in calls if argv[:2] == ["app", "create"])
+    assert create[create.index("--git-repository") + 1] == f"git@github.com:{REPOSITORY}.git"
+    assert create[create.index("--git-branch") + 1] == "main"
+    assert create[create.index("--private-deploy-key") + 1] == "key-fixture"
+    assert ["sources"] not in calls
+    assert any(argv[:2] == ["app", "rollback"] for argv in calls)
+    assert github.ssh == []
+
+
+def test_github_deploy_refuses_a_commit_not_on_the_remote_branch(github):
+    commit(github.root, "doctrine.md", "unpushed\n")
+    with pytest.raises(github.m.NodeFailure) as failure:
+        github.m.cmd_deploy(github.args)
+    assert failure.value.code == "commit_not_on_remote" and failure.value.exit_code == 6
+    calls = [r["argv"] for r in rows(github)]
+    assert all(argv[0] in ("ids", "servers") for argv in calls)
+    assert github.ssh == []
+
+
+def test_github_deploy_needs_a_remote_for_the_repository(github):
+    git(github.root, "remote", "remove", "origin")
+    with pytest.raises(github.m.NodeFailure) as failure:
+        github.m.cmd_deploy(github.args)
+    assert failure.value.code == "github_remote_missing"
+
+
+@pytest.mark.parametrize("url", [f"git@github.com:{REPOSITORY}.git", f"ssh://git@github.com/{REPOSITORY}",
+                                 f"https://github.com/{REPOSITORY.upper()}/"])
+def test_github_remote_is_recognised_in_every_form_git_writes(github, url):
+    git(github.root, "remote", "set-url", "origin", url)
+    assert github.m._github_remote(github.root, REPOSITORY) == "origin"
+    git(github.root, "remote", "set-url", "origin", "https://github.com/example-org/other-repo.git")
+    assert github.m._github_remote(github.root, REPOSITORY) is None
+
+
+def test_github_node_sync_has_nothing_to_carry_and_touches_no_remote(github, monkeypatch, capsys):
+    monkeypatch.setattr(github.m, "_node_git", lambda *a, **kw: pytest.fail("touched git"))
+    monkeypatch.setattr(github.m, "_records", lambda: pytest.fail("read the provider connection"))
+    github.m.cmd_node_sync(github.args)
+    sync = json.loads(capsys.readouterr().out)["sync"]
+    assert sync["state"] == "nothing_to_carry" and sync["repository"] == REPOSITORY
+    assert not github.trace.exists() and github.ssh == []
+
+
+def test_github_node_status_reads_sync_against_the_github_branch(github, capsys):
+    commit(github.root, "doctrine.md", "local\n")
+    git(github.root, "fetch", "-q", "origin")
+    github.m.cmd_node_status(github.args)
+    sync = json.loads(capsys.readouterr().out)["sync"]
+    assert sync == {"source": "github", "repository": REPOSITORY, "remote": "origin",
+                    "state": "ahead", "conflicts": []}
+    git(github.root, "push", "-q", "origin", "main")
+    git(github.root, "fetch", "-q", "origin")
+    assert github.m._node_sync_status(github.root, github.target)["state"] == "level"
+    git(github.root, "remote", "remove", "origin")
+    assert github.m._node_sync_status(github.root, github.target)["state"] == "unknown"
+
+
+def test_github_target_compiles_no_mac_side_sync_job(github):
+    github.runtime["profile"] = "host-agents"
+    (github.root / "deployment/targets").mkdir(parents=True)
+    (github.root / "deployment/targets/test.json").write_text(json.dumps(github.target))
+    texts, _ = github.m._host_artifact_texts(github.root, github.runtime, {})
+    assert not any("node-sync-test" in path.name for path in texts)
+
+
+@pytest.mark.parametrize("change,problem", [
+    (lambda t: t["body_source"].pop("repository"), "body_source.repository"),
+    (lambda t: t["body_source"].update(repository="example-repo"), "body_source.repository"),
+    (lambda t: t["body_source"].update(repository=REPOSITORY + ".git"), "body_source.repository"),
+    (lambda t: t.pop("deploy_key"), "needs deploy_key"),
+    (lambda t: t["body_source"].update(kind="gitlab"), "body_source.kind"),
+    (lambda t: t.update(body_source=REPOSITORY), "must be an object"),
+    (lambda t: t.update(provider="manual"), "only to a coolify target"),
+])
+def test_a_malformed_github_source_is_refused_with_its_code(github, monkeypatch, capsys, change, problem):
+    monkeypatch.setattr(github.m, "_capability_state", lambda root, name: {
+        "name": name, "installed": True, "gate": "enabled"})
+    path = github.root / "deployment" / "targets" / "test" / "target.json"
+    path.parent.mkdir(parents=True)
+    declared = {**github.target, "schema": github.m.TARGET_SCHEMA,
+                "body_source": dict(github.target["body_source"])}
+    path.write_text(json.dumps(declared))
+    github.m.cmd_plan(SimpleNamespace(target="test", json=True))
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+    change(declared)
+    path.write_text(json.dumps(declared))
+    with pytest.raises(SystemExit) as exit_:
+        github.m.cmd_plan(SimpleNamespace(target="test", json=True))
+    assert exit_.value.code == 6
+    findings = [f for f in json.loads(capsys.readouterr().out)["findings"] if f.get("code") == "body_source_invalid"]
+    assert findings and any(problem in f["message"] for f in findings)
+    if declared["provider"] == "coolify":
+        github.target.clear()
+        github.target.update(declared)
+        with pytest.raises(github.m.NodeFailure) as failure:
+            github.m.cmd_node_sync(github.args)
+        assert failure.value.code == "body_source_invalid" and failure.value.exit_code == 6

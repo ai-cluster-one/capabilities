@@ -140,7 +140,12 @@ USAGE
       The database is never sent: the node takes AGENTKIT_DB_* from the
       server's environment, and a deploy leaves those values standing.
       On failure request the previous release. Requires agent-box-checkout, a
-      committed branch and a granted connection.
+      committed branch and a granted connection. A target whose body_source
+      is GitHub ({"kind": "github", "repository": "<owner>/<repo>"}, with
+      deploy_key) prepares no server repository and pushes nothing: it
+      refuses (commit_not_on_remote) unless the commit is on the GitHub
+      branch, points the application at that repository and branch, sets
+      AGENT_REPO_URL to its HTTPS URL, and builds exactly that commit.
   deployment rollback [--target <name>] [--to <commit>]
       Roll back through Coolify and wait. Without --to use the previous release.
   deployment logs [--target <name>] [--build] [--follow]
@@ -151,9 +156,13 @@ USAGE
   deployment node sync [--target <name>]
       Fetch node-<target>, rebase and push; abort conflicts and report diverged.
       Optional target.mirror receives the synced branch. Host-agents compiles
-      an interval job (target.sync_interval, default 60 seconds).
+      an interval job (target.sync_interval, default 60 seconds). A target
+      whose body_source is GitHub answers state nothing_to_carry, touches no
+      remote and gets no interval job: its node syncs with GitHub itself.
   deployment node status [--target <name>] [--json]
       JSON host, release, Git sync, harness, store and per-service placement.
+      Git sync is against the node remote, or the GitHub branch for a target
+      whose body_source is GitHub.
       store is the node's database in force, resolved in its container through
       the shared library: level, sources and setting redacted, reachable,
       tls_enforced.
@@ -384,6 +393,10 @@ ROOT_LAYOUT_FILES = ("Dockerfile", "docker-compose.yaml", ".dockerignore",
 # application there unless the target names another existing one, and never
 # creates an environment of its own.
 COOLIFY_ENVIRONMENT = "production"
+# A checkout target's body_source names where Coolify builds the body from and
+# where the node pulls and pushes it. Without it the body travels through the
+# server's bare repository; with kind "github" it is that GitHub repository.
+GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?!\.)[A-Za-z0-9._-]+(?<!\.git)")
 
 
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
@@ -5098,6 +5111,10 @@ def _host_artifact_texts(root: Path, runtime: dict,
         target, error = _read_json(path)
         if error or not isinstance(target, dict) or target.get("provider") != "coolify":
             continue
+        # A node that takes its body from GitHub pulls and pushes it itself;
+        # this machine has nothing to carry for it.
+        if "body_source" in target:
+            continue
         name = "node-sync-" + target["name"]
         prefix = _host_label_prefix(runtime, root)
         launcher = agents_dir / f"{prefix}-{name}"
@@ -5909,7 +5926,39 @@ def _validate_target(root: Path, data: object, path: Path) -> list[dict]:
             if not resource.get(key):
                 findings.append({"severity": "warning", "path": _rel(root, path),
                                  "message": f"dockerhost target has no resource.{key}"})
+    for problem in _body_source_problems(data):
+        findings.append({"severity": "error", "code": "body_source_invalid",
+                         "path": _rel(root, path), "message": problem})
     return findings
+
+
+def _body_source_problems(target: dict) -> list[str]:
+    """What is wrong with a target's body_source; empty when it declares none."""
+    if "body_source" not in target:
+        return []
+    source = target["body_source"]
+    if not isinstance(source, dict):
+        return ["body_source must be an object"]
+    problems = []
+    if target.get("provider") != "coolify":
+        problems.append("body_source applies only to a coolify target")
+    if source.get("kind") != "github":
+        problems.append("body_source.kind must be 'github'")
+    repository = source.get("repository")
+    if not isinstance(repository, str) or not GITHUB_REPOSITORY.fullmatch(repository):
+        problems.append("body_source.repository must be <owner>/<repository> on GitHub, without .git")
+    if not isinstance(target.get("deploy_key"), str) or not target["deploy_key"].strip():
+        problems.append("a GitHub body source needs deploy_key: the Coolify identifier label of "
+                        "the key authorized read-only on that repository")
+    return problems
+
+
+def _github_repository(target: dict) -> str | None:
+    """The <owner>/<repository> a valid GitHub body source names, else None."""
+    source = target.get("body_source")
+    if isinstance(source, dict) and not _body_source_problems(target):
+        return source["repository"]
+    return None
 
 
 def _target_runtime_findings(root: Path, runtime: dict, target: object,
@@ -7181,6 +7230,9 @@ def _node_target(root, name):
         raise NodeFailure("target_name", "node target name must be a safe label", 6)
     if not target.get("server") or not target.get("project"):
         raise NodeFailure("target_incomplete", "node target needs server and project Coolify identifier labels", 6)
+    problems = _body_source_problems(target)
+    if problems:
+        raise NodeFailure("body_source_invalid", "; ".join(problems), 6)
     return target
 
 
@@ -7291,6 +7343,46 @@ def _node_remote(target):
     return "node-" + target["name"]
 
 
+def _github_urls(repository):
+    """How Coolify clones a GitHub body (SSH, with the target's deploy key) and
+    how the node clones, pulls and pushes it (HTTPS, with its own credentials)."""
+    return f"git@github.com:{repository}.git", f"https://github.com/{repository}.git"
+
+
+def _github_remote(root, repository):
+    """The configured remote of this checkout that is the GitHub repository, in
+    any of the forms git writes it, or None. Its fetch uses this machine's own
+    GitHub access and leaves a tracking ref that status reads."""
+    wanted = repository.lower()
+    for name in _node_git(root, "remote", check=False).splitlines():
+        # The configured URL, not get-url's rewritten one: the remote is
+        # recognised by what the project declared.
+        url = _node_git(root, "config", "--get", f"remote.{name}.url", check=False)
+        match = re.fullmatch(r"(?:git@github\.com:|ssh://git@github\.com/|https://github\.com/)"
+                             r"([^/]+/[^/]+?)(?:\.git)?/?", url.strip(), re.IGNORECASE)
+        if match and match.group(1).lower() == wanted:
+            return name
+    return None
+
+
+def _github_require_pushed(root, repository, branch):
+    """Fetch the GitHub branch and refuse unless HEAD is on it, since Coolify
+    builds the deployed commit from GitHub and nothing here pushes it."""
+    remote = _github_remote(root, repository)
+    if not remote:
+        raise NodeFailure("github_remote_missing", "this checkout has no git remote for "
+                          f"https://github.com/{repository}.git; add one so deploy can confirm "
+                          "the commit was pushed", 6)
+    _node_git(root, "fetch", "--quiet", remote, branch)
+    tracking = f"refs/remotes/{remote}/{branch}"
+    if not _node_git(root, "rev-parse", "--verify", "--quiet", tracking, check=False):
+        raise NodeFailure("commit_not_on_remote", f"GitHub has no branch {branch!r}; push it first", 6)
+    on_branch = _node_run(["git", "merge-base", "--is-ancestor", "HEAD", tracking], root, check=False)
+    if on_branch.returncode:
+        raise NodeFailure("commit_not_on_remote", "the commit being deployed is not on GitHub "
+                          f"branch {branch!r}; push it first", 6)
+
+
 def _node_sync(root, target, mirror=None):
     import fcntl
     lock_path = _node_state_path(root, target).with_suffix(".lock")
@@ -7336,8 +7428,17 @@ def _node_sync_locked(root, target, mirror=None):
 
 
 def _node_sync_status(root, target):
-    remote = _node_remote(target)
-    saved = (_node_state(root, target).get("sync") or {})
+    repository = _github_repository(target)
+    if repository:
+        # Against the GitHub branch the node pulls and pushes itself, read from
+        # this checkout's last fetch of it.
+        remote = _github_remote(root, repository)
+        saved = {"source": "github", "repository": repository}
+        if not remote:
+            return {**saved, "remote": None, "state": "unknown", "conflicts": []}
+    else:
+        remote = _node_remote(target)
+        saved = (_node_state(root, target).get("sync") or {})
     branch = _node_git(root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
     counts = _node_git(root, "rev-list", "--left-right", "--count",
                        f"HEAD...refs/remotes/{remote}/{branch}", check=False).split()
@@ -7443,10 +7544,17 @@ def _node_environment(root, runtime, target, host, repo_url, key, branch):
                 raise NodeFailure("environment_missing", f"required environment key {k} is missing", 6)
             env[k] = value
     import base64
-    env.update({REPO_URL_ENV: repo_url.replace(host["address"], "host.docker.internal"),
-                REPO_BRANCH_ENV: branch, "GIT_DEPLOY_KEY_B64": base64.b64encode(key.read_bytes()).decode(),
-                "AGENT_GIT_KNOWN_HOSTS_B64": base64.b64encode(_node_ssh(root, host,
-                    "cat /etc/ssh/ssh_host_ed25519_key.pub").encode()).decode()})
+    if key is None:
+        # A GitHub body: the node clones, pulls and pushes over HTTPS with its
+        # own credentials, so no key is shipped, and the bulk update empties
+        # any server-repository key an earlier deploy left on the application.
+        env.update({REPO_URL_ENV: repo_url, REPO_BRANCH_ENV: branch,
+                    "GIT_DEPLOY_KEY_B64": "", "AGENT_GIT_KNOWN_HOSTS_B64": ""})
+    else:
+        env.update({REPO_URL_ENV: repo_url.replace(host["address"], "host.docker.internal"),
+                    REPO_BRANCH_ENV: branch, "GIT_DEPLOY_KEY_B64": base64.b64encode(key.read_bytes()).decode(),
+                    "AGENT_GIT_KNOWN_HOSTS_B64": base64.b64encode(_node_ssh(root, host,
+                        "cat /etc/ssh/ssh_host_ed25519_key.pub").encode()).decode()})
     for k, value in env.items():
         if not _safe_env_key(k) or "\n" in str(value) or "\r" in str(value):
             raise NodeFailure("environment_format", f"environment key {k} cannot be sent as one bulk line", 6)
@@ -7548,14 +7656,26 @@ def cmd_deploy(args):
         raise NodeFailure("node_profile", "node deploy requires agent-box-checkout", 6)
     branch = _node_branch(root)
     app = _node_app(root, target, required=False)
-    _node_provider_requirements(root, create=not app)
-    repo, key = _node_prepare_repo(root, runtime, target, host, branch)
-    # Git's SSH override is scoped to these operations, never inherited by provider calls.
-    remote = _node_remote(target)
-    if _node_git(root, "ls-remote", "--heads", remote, branch):
-        _node_sync(root, target)
+    repository = _github_repository(target)
+    # A GitHub body is built at the exact commit, which goes through the
+    # provider's commit-pinned rollback path even on a first deploy.
+    _node_provider_requirements(root, create=not app and not repository)
+    if repository:
+        commit = _node_git(root, "rev-parse", "HEAD")
+        # Coolify clones GitHub with the target's deploy key; nothing is
+        # prepared on the server and nothing is pushed from here.
+        _github_require_pushed(root, repository, branch)
+        repo, node_url = _github_urls(repository)
+        key = None
     else:
-        _node_git(root, "push", "--quiet", remote, f"HEAD:refs/heads/{branch}")
+        repo, key = _node_prepare_repo(root, runtime, target, host, branch)
+        node_url = repo
+        # Git's SSH override is scoped to these operations, never inherited by provider calls.
+        remote = _node_remote(target)
+        if _node_git(root, "ls-remote", "--heads", remote, branch):
+            _node_sync(root, target)
+        else:
+            _node_git(root, "push", "--quiet", remote, f"HEAD:refs/heads/{branch}")
     compose = _coolify_compose_settings(root, runtime, bundle)
     name = _node_app_name(root, target)
     if not app:
@@ -7563,15 +7683,23 @@ def cmd_deploy(args):
     else:
         # An application created before its project moved to per-target bundles
         # still points at the old Compose file, and one created from a worktree
-        # carries that folder's name; every deploy sets all three again.
+        # carries that folder's name; every deploy sets all three again. One
+        # taking its body from GitHub is pointed at that repository and branch
+        # too, keeping the deploy key it already has.
+        source = ["--git-repository", repo, "--git-branch", branch] if repository else []
         _node_coolify(root, target, "app", "update", app, "--name", name,
                       "--base-directory", compose["base_directory"],
-                      "--docker-compose-location", compose["docker_compose_location"])
+                      "--docker-compose-location", compose["docker_compose_location"],
+                      *source)
     previous = _node_state(root, target).get("release") or {}
-    environment = _node_environment(root, runtime, target, host, repo, key, branch)
+    environment = _node_environment(root, runtime, target, host, node_url, key, branch)
     _node_coolify(root, target, "env", "bulk", app, stdin=environment)
     try:
-        deployment = _node_deployment_uuid(_node_coolify(root, target, "deploy", app))
+        if repository:
+            started = _node_coolify(root, target, "app", "rollback", app, "--to", commit)
+        else:
+            started = _node_coolify(root, target, "deploy", app)
+        deployment = _node_deployment_uuid(started)
         _node_wait(root, target, app, deployment)
     except NodeFailure as failure:
         rolled_back = False
@@ -7650,6 +7778,14 @@ def cmd_node_login(args):
 def cmd_node_sync(args):
     root = _root()
     target = _node_target(root, args.target)
+    repository = _github_repository(target)
+    if repository:
+        # The node pulls and pushes GitHub itself; no remote is touched here.
+        _emit({"target": target["name"], "sync": {
+            "source": "github", "repository": repository, "state": "nothing_to_carry",
+            "message": f"the node pulls and pushes https://github.com/{repository}.git itself; "
+                       "this checkout has nothing to carry for it"}})
+        return
     _node_connection(target, write=True)
     _emit({"target": target["name"], "sync": _node_sync(root, target)})
 
