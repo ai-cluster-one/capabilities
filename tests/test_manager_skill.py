@@ -90,6 +90,24 @@ def test_the_skill_is_carried_whole_so_the_bootstrap_can_place_it() -> None:
         "the bootstrap must make the machine aware, not wait for a later verb"
 
 
+def test_the_bootstrap_fetches_and_stages_every_manager_release_asset() -> None:
+    """install.sh re-declares the release asset set twice; both must match the manifest."""
+    import re
+    released = set(json.loads((REPO / ".capability-source" / "manager-release.json")
+                              .read_text())["assets"])
+    installer = (REPO / "install.sh").read_text()
+    loop = re.search(r"^for asset in (.*?); do$", installer, re.S | re.M)
+    assert loop, "install.sh fetch loop not found"
+    fetched = set(loop.group(1).replace("\\\n", " ").split())
+    copy = re.search(r"^\s*for rel in \((.*?)\):$", installer, re.S | re.M)
+    assert copy, "install.sh copy tuple not found"
+    staged = set(re.findall(r'"([^"]+)"', copy.group(1)))
+    assert fetched == released, \
+        f"install.sh fetch loop drifted from the release: missing {sorted(released - fetched)}, extra {sorted(fetched - released)}"
+    assert staged == released, \
+        f"install.sh copy tuple drifted from the release: missing {sorted(released - staged)}, extra {sorted(staged - released)}"
+
+
 def test_the_skill_introduces_the_manager_and_names_no_machine_state() -> None:
     """Whatever is installed here belongs to `capabilities list`, not to this file."""
     text = CARRIED.read_text()
@@ -176,6 +194,7 @@ def test_doctor_reports_every_way_the_awareness_surface_drifts() -> None:
 if __name__ == "__main__":
     tests = [
         ("the skill is carried whole as a release asset", test_the_skill_is_carried_whole_so_the_bootstrap_can_place_it),
+        ("the bootstrap carries every manager release asset", test_the_bootstrap_fetches_and_stages_every_manager_release_asset),
         ("the skill names no machine state", test_the_skill_introduces_the_manager_and_names_no_machine_state),
         ("skill writes one artifact and links no absent host", test_skill_writes_one_artifact_and_links_no_absent_host),
         ("present hosts are symlinked to the one artifact", test_present_hosts_are_symlinked_to_the_one_artifact),
