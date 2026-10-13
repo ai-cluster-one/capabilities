@@ -3697,7 +3697,8 @@ def _pid_alive(pid: int | None) -> bool:
 
 def _service_env(root: Path) -> dict[str, str]:
     # Resolving the id a write may stamp hands it down in the environment the
-    # daemon inherits, so the daemon registers under it without asking again.
+    # daemon inherits, so the daemon registers under it without asking again;
+    # the node it records runs on is handed down the same way.
     _project_id(write=True)
     env = dict(os.environ)
     env.update({key: str(value) for key, value in _project_env().items()})
@@ -3706,6 +3707,7 @@ def _service_env(root: Path) -> dict[str, str]:
             "AUTOMATIONS_PROJECT_ROOT": str(root),
             "AUTOMATIONS_CONFIG": str(_config_path(root)),
             "AUTOMATIONS_STATE_DIR": str(_state_path(root)),
+            "AUTOMATIONS_NODE_NAME": node_name(),
         }
     )
     return env

@@ -330,9 +330,12 @@ def _project_identity(root: Path) -> dict:
 # launcher resolved one.
 PROJECT_ID_FOR_WRITE = None
 
-# The node a run is recorded on is the one the contract names, which the CLI
-# installs here; the host name stands in only where no CLI installed it.
-NODE_NAME = socket.gethostname
+# The node a run is recorded on is the one the contract names: in process the
+# CLI installs its resolver here, and the daemon it launches is handed the
+# answer as AUTOMATIONS_NODE_NAME. The host name stands in only where neither
+# reached it.
+def NODE_NAME() -> str:
+    return os.environ.get("AUTOMATIONS_NODE_NAME", "").strip() or socket.gethostname()
 
 
 def _handed_project_id(root: Path) -> str:

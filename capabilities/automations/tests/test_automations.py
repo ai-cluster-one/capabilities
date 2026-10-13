@@ -1408,6 +1408,25 @@ every_seconds = 30
         self.assertEqual(row, ("lab-node",))
 
     @needs_store
+    def test_a_run_the_daemon_queues_is_recorded_under_the_node_s_declared_name(self) -> None:
+        self.env["AGENT_NODE_NAME"] = "lab-node"
+        self.cli("service", "start")
+        first = json.loads(self.cli("run", "flaky").stdout)["run"]
+        self.wait_status(first["id"], {"failed"})
+        deadline = time.time() + 8
+        row = None
+        conn = RUNTIME._database().connect(application_name="automations-test")
+        try:
+            while time.time() < deadline and row is None:
+                row = conn.execute(
+                    "SELECT trigger, host FROM automations_runs WHERE parent_run_id = %s",
+                    [first["id"]]).fetchone()
+                time.sleep(0.1)
+        finally:
+            conn.close()
+        self.assertEqual(row, ("retry", "lab-node"))
+
+    @needs_store
     def test_manual_run_history_and_logs(self) -> None:
         doctor = json.loads(self.cli("doctor").stdout)
         self.assertTrue(doctor["ok"])

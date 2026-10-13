@@ -2,7 +2,7 @@
 
 ## 2026-10-13 — A run is recorded under the node's declared name
 
-The `host` a run is recorded under in `automations_runs` is the node's name as the contract gives it: the value of `AGENT_NODE_NAME` where the machine declares one, and its host name as before where it declares none. A container node that declares its name keeps finding the runs it recorded, and their logs, after a redeploy; a store-mode grant naming the node is matched against the same name.
+The `host` a run is recorded under in `automations_runs` is the node's name as the contract gives it: the value of `AGENT_NODE_NAME` where the machine declares one, and its host name as before where it declares none, whether the CLI queued the run or the scheduler did. A container node that declares its name keeps finding the runs it recorded, and their logs, after a redeploy; a store-mode grant naming the node is matched against the same name.
 
 ## 2026-10-11 — A store behind Supabase's transaction pooler is refused at connect
 
