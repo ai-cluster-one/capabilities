@@ -814,16 +814,28 @@ def _policy_row():
     try:
         row = _records().resolve("capabilities", "policy").get(NAME)
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     if row is None:
         return None
     entry = row.get("value")
     if (not isinstance(entry, dict) or set(entry) != {"enabled"}
             or not isinstance(entry.get("enabled"), bool)):
         _die(6, "bad_policy",
-             f"invalid {NAME} policy entry in {_records().source}",
+             f"invalid {NAME} policy entry in {_policy_source()}",
              'expected {"enabled": true|false}')
     return row
+
+
+def _policy_source() -> str:
+    """Where the gate is kept: the project's envelope, or the store's policy
+    table in a project whose records are in the store."""
+    records = _records()
+    if records.mode_of("policy") != "store":
+        return records.source
+    try:
+        return records.collection_source("capabilities", "policy")
+    except StoreError:
+        return "the store"
 
 
 def _project_enabled_explicitly() -> bool:
@@ -956,11 +968,11 @@ def _gate() -> None:
         return
     if isinstance(entry, dict) and entry.get("enabled") is False and scope == "project":
         _die(4, "disabled",
-             f"{NAME} is disabled in this project ({_records().source})",
+             f"{NAME} is disabled in this project ({_policy_source()})",
              f"ask the user whether to enable {NAME} for this project; if yes, "
              f"run `capabilities enable {NAME} --project`")
     if isinstance(entry, dict) and entry.get("enabled") is False:
-        message = f"{NAME} is disabled globally ({_records().source})"
+        message = f"{NAME} is disabled globally ({_policy_source()})"
     else:
         message = f"{NAME} is not enabled by project or global policy"
     _die(4, "not_enabled", message,
@@ -1201,32 +1213,51 @@ def _render_ids_markdown(data: dict) -> str:
 
 def _identifiers_load() -> dict:
     """The identifiers envelope, resolved through the records adapter, in one
-    shape — `{label: {value, note}}` — for the help section, the report and
-    `ids get`."""
+    shape — `{label: {value, note, scope}}` — for the help section, the report
+    and `ids get`; `scope` names where the value came from, `project` or
+    `global`."""
     try:
         resolved = _records().resolve(NAME, "identifier")
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
-    return {label: {"note": row["note"] or "", "value": row["value"]}
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    return {label: {"note": row["note"] or "", "value": row["value"],
+                    "scope": row["scope"]}
             for label, row in sorted(resolved.items())}
 
 
-def _identifiers_write(label: str, value, note: str) -> None:
+def _identifiers_scope(scope: str) -> dict:
+    """The identifiers one scope holds itself, without inheritance."""
+    try:
+        return _records().resolve_scope(NAME, "identifier", scope)
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _identifiers_stamp(scope: str) -> None:
+    """A project row in the store carries the project id as its agent, so it
+    is written only once the id is verified for this invocation."""
+    if scope == "project" and _records().mode_of("identifier") == "store":
+        _project_id(write=True)
+
+
+def _identifiers_write(label: str, value, note: str, scope: str = "project") -> None:
     """Rule 15: a capability is the sole writer of its own identifiers,
     addressed by (capability, collection) rather than by path."""
-    kept = note or (_identifiers_load().get(label) or {}).get("note", "")
+    _identifiers_stamp(scope)
+    kept = note or ((_identifiers_scope(scope).get(label) or {}).get("note") or "")
     try:
         _records().set(NAME, "identifier", label, value,
-                       actor=f"{NAME} ids set", note=kept or None)
+                       actor=f"{NAME} ids set", note=kept or None, scope=scope)
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
-def _identifiers_remove(label: str) -> None:
+def _identifiers_remove(label: str, scope: str = "project") -> None:
+    _identifiers_stamp(scope)
     try:
-        _records().delete(NAME, "identifier", label)
+        _records().delete(NAME, "identifier", label, scope=scope)
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
 def _identifiers_section() -> str:
@@ -1266,6 +1297,10 @@ def _cmd_help() -> None:
 
 def _cmd_ids(argv: list[str]) -> None:
     sub = argv[0] if argv else "list"
+    scope = "project"
+    if sub in ("set", "rm") and "--global" in argv[1:]:
+        argv = [a for a in argv if a != "--global"]
+        scope = "global"
     data = _identifiers_load()
     if sub == "list":
         _emit(data); return
@@ -1278,7 +1313,7 @@ def _cmd_ids(argv: list[str]) -> None:
         _read_only_gate(f"`{NAME} ids {sub}`")
     if sub == "set":
         if len(argv) < 3:
-            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>] [--global]")
         label, raw = argv[1], argv[2]
         try:
             value = json.loads(raw)
@@ -1290,14 +1325,18 @@ def _cmd_ids(argv: list[str]) -> None:
             if ni + 1 >= len(argv):
                 _die(6, "input", "--note needs a value")
             note = argv[ni + 1]
-        _identifiers_write(label, value, note)
-        _emit({"set": label}); return
+        _identifiers_write(label, value, note, scope)
+        _emit({"set": label} if scope == "project" else {"set": label, "scope": scope})
+        return
     if sub == "rm":
-        if len(argv) < 2 or argv[1] not in data:
+        held = data if scope == "project" else _identifiers_scope(scope)
+        if len(argv) < 2 or argv[1] not in held:
             _die(3, "not_found", "unknown identifier label",
                  f"`{NAME} ids list` shows the labels")
-        _identifiers_remove(argv[1])
-        _emit({"removed": argv[1]}); return
+        _identifiers_remove(argv[1], scope)
+        _emit({"removed": argv[1]} if scope == "project"
+              else {"removed": argv[1], "scope": scope})
+        return
     _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
 
 
@@ -1746,9 +1785,16 @@ def node_name() -> str:
     return os.environ.get(NODE_NAME_ENV, "").strip() or socket.gethostname()
 
 
-# Where a project keeps its connections and grants: files (the default) or the
-# store. The manager alone writes this key into `project.json`, when it imports
-# a project's files into the store; nothing infers it from a configured store.
+# Where a project keeps its records: files (the default) or the store, which
+# then holds its connections, grants, identifiers and policy together. The
+# manager alone writes this key into `project.json`, when it imports a
+# project's files into the store; nothing infers it from a configured store.
+RECORDS_MODE_KEY = "records"
+RECORDS_MODES = ("files", "store")
+
+# The key a project that moved only its connections and grants to the store
+# carries. It keeps meaning exactly that: such a project reads its identifiers
+# and its gate from files until it is imported again.
 CONNECTIONS_MODE_KEY = "connections"
 CONNECTIONS_MODES = ("files", "store")
 
@@ -1757,7 +1803,22 @@ CONNECTIONS_MODES = ("files", "store")
 STORE_OWNER = "capabilities"
 STORE_CONNECTIONS_TABLE = "capabilities_connections"
 STORE_GRANTS_TABLE = "capabilities_connection_grants"
-STORE_TABLES_VERSION = (1, 0)
+STORE_IDENTIFIERS_TABLE = "capabilities_identifiers"
+STORE_POLICY_TABLE = "capabilities_policy"
+STORE_TABLES_VERSION = (1, 1)
+
+# Which collections each store mode keeps in the store. The default pointer is
+# a setting kept with the grants in both.
+STORE_COLLECTIONS = {
+    CONNECTIONS_MODE_KEY: frozenset({"connection", "grant"}),
+    RECORDS_MODE_KEY: frozenset({"connection", "grant", "identifier", "policy"}),
+}
+STORE_TABLES = {
+    "connection": STORE_CONNECTIONS_TABLE,
+    "grant": STORE_GRANTS_TABLE,
+    "identifier": STORE_IDENTIFIERS_TABLE,
+    "policy": STORE_POLICY_TABLE,
+}
 
 # A store that cannot be reached or is busy is the environment's fault, not
 # the configuration's: a capability maps these to its network exit code.
@@ -1769,10 +1830,11 @@ STORE_ENVIRONMENT_SLUGS = frozenset({"store_unreachable", "store_busy"})
 STORE_READ_SECONDS = 2.0
 
 
-def connection_table_steps() -> list[tuple[str, str]]:
-    """The migration steps of the two connection tables. `enabled` and
+def record_table_steps() -> list[tuple[str, str]]:
+    """The migration steps of the contract's tables. `enabled` and
     `allow_write` left null decide nothing, as a field absent from a file's
-    grant does; `node` null is the grant for every node."""
+    grant does; `node` null is the grant, or the policy row, for every node;
+    `agent_id` null is an identifier or a policy row for every project."""
     return [
         ("0001-connections",
          "CREATE TABLE capabilities_connections ("
@@ -1801,6 +1863,29 @@ def connection_table_steps() -> list[tuple[str, str]]:
          "CREATE UNIQUE INDEX capabilities_connection_grants_default"
          " ON capabilities_connection_grants"
          " (agent_id, capability, (coalesce(node, ''))) WHERE is_default"),
+        ("0005-identifiers",
+         "CREATE TABLE capabilities_identifiers ("
+         " agent_id text CHECK (agent_id <> ''),"
+         " capability text NOT NULL,"
+         " label text NOT NULL,"
+         " value jsonb NOT NULL,"
+         " note text NOT NULL DEFAULT '',"
+         " updated_at timestamptz NOT NULL DEFAULT now())"),
+        ("0006-identifiers-key",
+         "CREATE UNIQUE INDEX capabilities_identifiers_key"
+         " ON capabilities_identifiers"
+         " ((coalesce(agent_id, '')), capability, label)"),
+        ("0007-policy",
+         "CREATE TABLE capabilities_policy ("
+         " agent_id text CHECK (agent_id <> ''),"
+         " capability text NOT NULL,"
+         " node text CHECK (node <> ''),"
+         " enabled boolean NOT NULL,"
+         " updated_at timestamptz NOT NULL DEFAULT now())"),
+        ("0008-policy-key",
+         "CREATE UNIQUE INDEX capabilities_policy_key"
+         " ON capabilities_policy"
+         " ((coalesce(agent_id, '')), capability, (coalesce(node, '')))"),
     ]
 
 
@@ -1892,8 +1977,8 @@ class Records:
     source = "?"
 
     def mode_of(self, collection: str, key: str | None = None) -> str:
-        """Where one collection is kept: `files`, or `store` for a project's
-        connections, grants and default pointer in store mode."""
+        """Where one collection is kept: `files`, or `store` for what a
+        project in store mode keeps there."""
         return self.mode
 
     def __enter__(self) -> "Records":
@@ -2340,11 +2425,13 @@ class FileRecords(Records):
 
 
 class StoreRecords(FileRecords):
-    """A project in store mode: its connections, its grants and its default
-    pointer are read from and written to the contract's two tables in the
-    project's store, and every other record stays in the files `FileRecords`
-    reads. The two homes never compose: the files' connections and grants are
-    not read here at all.
+    """A project in store mode: its connections, its grants, its default
+    pointer, its identifiers and its policy are read from and written to the
+    contract's tables in the project's store, and every other record stays in
+    the files `FileRecords` reads. A project that moved only its connections
+    and grants (`held="connections"`) keeps its identifiers and policy in
+    files. The two homes never compose: what the store holds is not read from
+    the files at all.
 
     A connection row belongs to no project, so it resolves as an identity the
     project did not declare itself would: withheld until this project's grant
@@ -2353,15 +2440,28 @@ class StoreRecords(FileRecords):
     field. A row never holds a secret value: `spec` names each secret by its
     `*_env` key, which resolves on each node through that node's own cascade.
 
+    An identifier or a policy row whose `agent_id` is null is global: it
+    applies to every project reading this store, beneath the project's own
+    row. Identifiers resolve label by label, the project's row over the global
+    one. Policy resolves per capability, from the first of: the project's row
+    for this node, its row for every node, the global row for this node, the
+    global row for every node; none is default deny.
+
     The store is reached through the shared database library, on first use
-    only, so a call that reads no connection never connects."""
+    only, so a call that reads nothing the store holds never connects."""
 
     def __init__(self, envelope: Path, global_dir: Path,
                  project_id: str | None = None, project: str | None = None,
                  include_global: bool = True, project_root: Path | None = None,
                  application_name: str = STORE_OWNER, connection: Any = None,
-                 schema: str | None = None):
+                 schema: str | None = None, held: str = RECORDS_MODE_KEY):
         super().__init__(envelope, global_dir, project_id, project, include_global)
+        if held not in STORE_COLLECTIONS:
+            raise StoreError("bad_records_mode",
+                             f"a store holds {', '.join(sorted(STORE_COLLECTIONS))}, "
+                             f"not {held!r}")
+        self.held = held
+        self.collections = STORE_COLLECTIONS[held]
         self.project_root = (Path(project_root) if project_root is not None
                              else self.envelope.parent)
         self.application_name = application_name
@@ -2373,9 +2473,8 @@ class StoreRecords(FileRecords):
         self._failed_at = 0.0
         self._cache: dict[tuple[str, str], tuple[float, Any]] = {}
 
-    @staticmethod
-    def _held(collection: str, key: str | None = None) -> bool:
-        return (collection in ("connection", "grant")
+    def _held(self, collection: str, key: str | None = None) -> bool:
+        return (collection in self.collections
                 or (collection == "setting" and key == "connection.default"))
 
     def mode_of(self, collection: str, key: str | None = None) -> str:
@@ -2454,7 +2553,7 @@ class StoreRecords(FileRecords):
             if self._owns_conn:
                 conn.rollback()
             raise StoreError("store_read_failed",
-                             f"reading connections from the store failed: {exc}") from None
+                             f"reading records from the store failed: {exc}") from None
         if self._owns_conn:
             conn.rollback()
         return rows
@@ -2471,7 +2570,7 @@ class StoreRecords(FileRecords):
                 if not self._owns_conn:
                     return work(conn)
                 major, minor = STORE_TABLES_VERSION
-                db.migrate(conn, STORE_OWNER, connection_table_steps(),
+                db.migrate(conn, STORE_OWNER, record_table_steps(),
                            major=major, minor=minor)
                 with conn.transaction():
                     return work(conn)
@@ -2481,14 +2580,13 @@ class StoreRecords(FileRecords):
                 raise self._unreachable(exc) from None
             except psycopg.Error as exc:
                 raise StoreError("store_write_failed",
-                                 f"writing connections to the store failed: {exc}") from None
+                                 f"writing records to the store failed: {exc}") from None
         finally:
             self._cache.clear()
 
     def _table_source(self, collection: str) -> str:
         self._db()
-        table = STORE_GRANTS_TABLE if collection == "grant" else STORE_CONNECTIONS_TABLE
-        return f"store:{self._schema}.{table}"
+        return f"store:{self._schema}.{STORE_TABLES.get(collection, STORE_CONNECTIONS_TABLE)}"
 
     # -- reading ---------------------------------------------------------------
 
@@ -2535,15 +2633,74 @@ class StoreRecords(FileRecords):
                     return cid
         return None
 
+    def _identifier_rows(self, capability: str) -> dict[str, dict[str, tuple]]:
+        """This capability's identifiers in the store, per scope: this
+        project's rows and the global ones, each label to its value, note and
+        time of writing."""
+        key = ("identifier", capability)
+        held = self._fresh(key)
+        if held is None:
+            held = {"project": {}, "global": {}}
+            rows = self._read(
+                "SELECT agent_id, label, value, note, updated_at "
+                "FROM capabilities_identifiers "
+                "WHERE capability = %s AND (agent_id IS NULL OR agent_id = %s) "
+                "ORDER BY label", (capability, self.project_id))
+            for agent_id, label, value, note, updated_at in rows:
+                scope = "global" if agent_id is None else "project"
+                held[scope][label] = (value, note or "", _stamp(updated_at))
+            self._cache[key] = (time.monotonic(), held)
+        return held
+
+    def _policy_rows(self) -> list[tuple[str, str | None, dict[str, tuple]]]:
+        """The policy rows that apply to this project on this node, as the
+        layers they resolve in, highest first: (scope, node, rows by name)."""
+        key = ("policy", "")
+        held = self._fresh(key)
+        if held is None:
+            found: dict[tuple[str, str | None], dict[str, tuple]] = {}
+            rows = self._read(
+                "SELECT agent_id, capability, node, enabled, updated_at "
+                "FROM capabilities_policy "
+                "WHERE (agent_id IS NULL OR agent_id = %s) "
+                "AND (node IS NULL OR node = %s) ORDER BY capability",
+                (self.project_id, self.node))
+            for agent_id, name, node, enabled, updated_at in rows:
+                scope = "global" if agent_id is None else "project"
+                found.setdefault((scope, node), {})[name] = (
+                    {"enabled": bool(enabled)}, _stamp(updated_at))
+            held = [(scope, node, found.get((scope, node), {}))
+                    for scope in ("project", "global") for node in (self.node, None)]
+            self._cache[key] = (time.monotonic(), held)
+        return held
+
     def _record(self, scope: str, capability: str, collection: str, key: str,
-                value: Any, ref: str) -> dict[str, Any]:
+                value: Any, ref: str, note: str | None = None,
+                updated_at: str | None = None) -> dict[str, Any]:
         return {"id": f"store:{capability}/{collection}/{ref}", "scope": scope,
                 "project_id": self.project_id if scope == "project" else None,
                 "capability": capability, "collection": collection, "key": key,
-                "value": value, "note": None, "updated_at": None, "updated_by": None}
+                "value": value, "note": note, "updated_at": updated_at,
+                "updated_by": None}
+
+    def _scope_layers(self, capability: str, collection: str,
+                      scope: str) -> list[dict[str, dict[str, Any]]]:
+        """One scope's identifier or policy layers in the store, highest first:
+        for policy, the row for this node before the row for every node."""
+        if collection == "identifier":
+            rows = self._identifier_rows(capability)[scope]
+            return [{label: self._record(scope, capability, collection, label, value,
+                                         f"{scope}/{label}", note=note,
+                                         updated_at=updated_at)
+                     for label, (value, note, updated_at) in rows.items()}]
+        return [{name: self._record(scope, capability, collection, name, value,
+                                    f"{scope}/{name}@{node or '*'}",
+                                    updated_at=updated_at)
+                 for name, (value, updated_at) in rows.items()}
+                for at, node, rows in self._policy_rows() if at == scope]
 
     def _entries(self, root: Path, capability: str, collection: str) -> dict[str, Any]:
-        if collection in ("connection", "grant"):
+        if collection in self.collections:
             return {}
         entries = super()._entries(root, capability, collection)
         if collection == "setting":
@@ -2570,6 +2727,11 @@ class StoreRecords(FileRecords):
                 if layer:
                     layers.append(layer)
             return layers
+        if collection in self.collections:
+            scopes = ("project", "global") if self.include_global else ("project",)
+            return [layer for scope in scopes
+                    for layer in self._scope_layers(capability, collection, scope)
+                    if layer]
         layers = super().config_layers(capability, collection)
         if collection == "setting":
             default = self._store_default(capability)
@@ -2583,6 +2745,14 @@ class StoreRecords(FileRecords):
                       scope: str) -> dict[str, dict[str, Any]]:
         if collection in ("connection", "grant") and scope in ("project", "store"):
             return self.resolve(capability, collection)
+        if collection in self.collections and collection in ("identifier", "policy"):
+            _store_check("capability", capability, CAPABILITY_RE)
+            self._scope_root(scope)
+            out: dict[str, dict[str, Any]] = {}
+            for layer in self._scope_layers(capability, collection, scope):
+                for key, row in layer.items():
+                    out.setdefault(key, row)
+            return out
         return super().resolve_scope(capability, collection, scope)
 
     def get(self, capability: str, collection: str, key: str) -> Any:
@@ -2601,12 +2771,12 @@ class StoreRecords(FileRecords):
         return super().get(capability, collection, key)
 
     def collection_source(self, capability: str, collection: str) -> str:
-        if collection in ("connection", "grant"):
+        if collection in self.collections:
             return self._table_source(collection)
         return super().collection_source(capability, collection)
 
     def scope_source(self, capability: str, collection: str, scope: str) -> str:
-        if collection in ("connection", "grant"):
+        if collection in self.collections:
             return self._table_source(collection)
         return super().scope_source(capability, collection, scope)
 
@@ -2676,15 +2846,67 @@ class StoreRecords(FileRecords):
         if cid is not None:
             self._put_grant(conn, capability, cid, {"is_default": True}, node)
 
+    def _scoped(self, collection: str, key: str | None, scope: str | None) -> bool:
+        """Whether a write at `scope` lands in the store. Identifiers and
+        policy keep both scopes there; a global connection, grant or default
+        pointer stays the config home's."""
+        if not self._held(collection, key):
+            return False
+        return scope != "global" or collection in ("identifier", "policy")
+
+    def _agent(self, scope: str | None) -> str | None:
+        """The `agent_id` a row at `scope` carries: this project's id, or null
+        for a global row."""
+        if scope not in (None, "project", "global"):
+            raise StoreError("bad_scope",
+                             f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
+        if scope == "global":
+            return None
+        if not self.project_id:
+            raise StoreError("no_project_id",
+                             "this project has no id a store row could name",
+                             "run `capabilities init` in the project")
+        return self.project_id
+
+    def _put_identifier(self, capability: str, label: str, value: Any,
+                        note: str | None, scope: str | None) -> None:
+        agent = self._agent(scope)
+        self._write(lambda conn: conn.execute(
+            "INSERT INTO capabilities_identifiers "
+            "(agent_id, capability, label, value, note) "
+            "VALUES (%s, %s, %s, %s::jsonb, %s) "
+            "ON CONFLICT ((coalesce(agent_id, '')), capability, label) "
+            "DO UPDATE SET value = EXCLUDED.value, note = EXCLUDED.note, "
+            "updated_at = now()",
+            (agent, capability, label, json.dumps(value, ensure_ascii=False),
+             note or "")))
+
+    def _put_policy(self, name: str, value: Any, scope: str | None) -> None:
+        if (not isinstance(value, dict) or set(value) != {"enabled"}
+                or not isinstance(value["enabled"], bool)):
+            raise StoreError("bad_policy", f"policy for {name!r} must be "
+                             '{"enabled": true|false}')
+        agent = self._agent(scope)
+        self._write(lambda conn: conn.execute(
+            "INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
+            "VALUES (%s, %s, NULL, %s) "
+            "ON CONFLICT ((coalesce(agent_id, '')), capability, (coalesce(node, ''))) "
+            "DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()",
+            (agent, name, value["enabled"])))
+
     def set(self, capability: str, collection: str, key: str, value: Any,
             actor: str | None = None, note: str | None = None,
             scope: str | None = None) -> None:
-        if not self._held(collection, key) or scope == "global":
+        if not self._scoped(collection, key, scope):
             return super().set(capability, collection, key, value,
                                actor=actor, note=note, scope=scope)
         _store_check("capability", capability, CAPABILITY_RE)
         _store_check("key", key, KEY_RE)
         _refuse_record_write(capability, collection)
+        if collection == "identifier":
+            return self._put_identifier(capability, key, value, note, scope)
+        if collection == "policy":
+            return self._put_policy(key, value, scope)
         if scope not in (None, "project"):
             raise StoreError("bad_scope",
                              f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
@@ -2717,10 +2939,28 @@ class StoreRecords(FileRecords):
 
     def delete(self, capability: str, collection: str, key: str,
                scope: str | None = None) -> bool:
-        if not self._held(collection, key) or scope == "global":
+        if not self._scoped(collection, key, scope):
             return super().delete(capability, collection, key, scope=scope)
         _refuse_record_write(capability, collection)
-        if collection == "connection":
+        if collection == "identifier":
+            agent = self._agent(scope)
+
+            def work(conn: Any) -> bool:
+                return conn.execute(
+                    "DELETE FROM capabilities_identifiers "
+                    "WHERE coalesce(agent_id, '') = coalesce(%s, '') "
+                    "AND capability = %s AND label = %s",
+                    (agent, capability, key)).rowcount > 0
+        elif collection == "policy":
+            agent = self._agent(scope)
+
+            def work(conn: Any) -> bool:
+                return conn.execute(
+                    "DELETE FROM capabilities_policy "
+                    "WHERE coalesce(agent_id, '') = coalesce(%s, '') "
+                    "AND capability = %s AND node IS NULL",
+                    (agent, key)).rowcount > 0
+        elif collection == "connection":
             def work(conn: Any) -> bool:
                 return conn.execute(
                     "DELETE FROM capabilities_connections "
@@ -2740,6 +2980,11 @@ class StoreRecords(FileRecords):
         return bool(self._write(work))
 
 
+def _stamp(moment: Any) -> str | None:
+    """A row's time of writing as the text a report carries."""
+    return moment.isoformat() if hasattr(moment, "isoformat") else moment
+
+
 def _identity_record(envelope: Path) -> dict[str, Any]:
     try:
         identity = json.loads((Path(envelope) / "project.json").read_text())
@@ -2748,9 +2993,24 @@ def _identity_record(envelope: Path) -> dict[str, Any]:
     return identity if isinstance(identity, dict) else {}
 
 
+def records_mode(envelope: Path | str) -> str:
+    """Where this project keeps its records: `files`, unless its
+    `project.json` says `"records": "store"`. Only that record decides it."""
+    identity_file = Path(envelope) / "project.json"
+    declared = _identity_record(Path(envelope)).get(RECORDS_MODE_KEY, "files")
+    if declared not in RECORDS_MODES:
+        raise StoreError("bad_records_mode",
+                         f"{identity_file} declares records {declared!r}",
+                         f"one of: {', '.join(RECORDS_MODES)}; the manager writes it")
+    return declared
+
+
 def connections_mode(envelope: Path | str) -> str:
-    """Where this project keeps its connections and grants: `files`, unless
-    its `project.json` says `store`. Only that record decides it."""
+    """Where this project keeps its connections and grants: `store` when its
+    records are in the store or its `project.json` says `"connections":
+    "store"`, `files` otherwise. Only that record decides it."""
+    if records_mode(envelope) == "store":
+        return "store"
     identity_file = Path(envelope) / "project.json"
     declared = _identity_record(Path(envelope)).get(CONNECTIONS_MODE_KEY, "files")
     if declared not in CONNECTIONS_MODES:
@@ -2766,8 +3026,9 @@ def open_records(envelope: Path | str, global_dir: Path | str,
                  application_name: str = STORE_OWNER) -> Records:
     """The adapter this project's configuration is read and written through:
     the project's envelope, then `global_dir` unless `project_only`; in store
-    mode a project's connections and grants come from its store instead, for
-    the project id given (else project.json's), its database resolved for
+    mode a project's connections, grants, identifiers and policy come from its
+    store instead (only its connections and grants where it moved only those),
+    for the project id given (else project.json's), its database resolved for
     `project_root` (else the envelope's parent).
 
     A `project.json` that declares a `store` other than `files` is refused
@@ -2783,10 +3044,12 @@ def open_records(envelope: Path | str, global_dir: Path | str,
                          "kept only in files",
                          'remove "store" from project.json, or set it to "files"')
     if connections_mode(envelope) == "store":
+        held = (RECORDS_MODE_KEY if records_mode(envelope) == "store"
+                else CONNECTIONS_MODE_KEY)
         return StoreRecords(envelope, global_dir, project_id or identity.get("id"),
                             identity.get("slug"), include_global=not project_only,
                             project_root=Path(project_root) if project_root else None,
-                            application_name=application_name)
+                            application_name=application_name, held=held)
     return FileRecords(envelope, global_dir, identity.get("id"), identity.get("slug"),
                        include_global=not project_only)
 

@@ -270,21 +270,35 @@ class OpenRecords(unittest.TestCase):
                                                        project_only=True)
                          .resolve("clickup", "identifier"))
 
-    def test_the_tier_keeps_no_database_but_the_connection_tables(self):
+    def test_the_tier_keeps_no_database_but_the_record_tables(self):
         for name in ("Store", "SQLiteStore", "PostgresStore",
-                     "open_store", "records_mode", "default_store_path",
+                     "open_store", "default_store_path",
                      "read_store_setting", "find_store_setting", "store_setting_url"):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(S, name))
         self.assertNotIn("sqlite3", (Path(S.__file__)).read_text())
-        # Store mode holds a project's connections and grants and nothing else.
-        for collection in ("identifier", "setting", "policy", "document"):
+        # Store mode holds a project's connections, grants, identifiers and
+        # policy; a project that moved only its connections and grants keeps
+        # its identifiers and policy in files. Settings and documents never move.
+        full = S.StoreRecords(self.env, self.globals)
+        partial = S.StoreRecords(self.env, self.globals, held="connections")
+        for collection in ("setting", "document"):
             with self.subTest(collection=collection):
-                self.assertFalse(S.StoreRecords._held(collection))
-        self.assertTrue(S.StoreRecords._held("setting", "connection.default"))
+                self.assertFalse(full._held(collection))
+                self.assertFalse(partial._held(collection))
+        for collection in ("identifier", "policy"):
+            with self.subTest(collection=collection):
+                self.assertTrue(full._held(collection))
+                self.assertFalse(partial._held(collection))
+        for collection in ("connection", "grant"):
+            with self.subTest(collection=collection):
+                self.assertTrue(full._held(collection))
+                self.assertTrue(partial._held(collection))
+        for records in (full, partial):
+            self.assertTrue(records._held("setting", "connection.default"))
+        self.assertEqual(S.records_mode(self.env), "files")
         self.assertIsInstance(S.open_records(self.env, self.globals), S.FileRecords)
         self.assertNotIsInstance(S.open_records(self.env, self.globals), S.StoreRecords)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,11 +1,14 @@
-"""A project's connections and grants in its store.
+"""A project's records in its store.
 
 A project in store mode resolves its connections and grants from the contract's
-two tables, `capabilities_connections` and `capabilities_connection_grants`,
+tables, `capabilities_connections` and `capabilities_connection_grants`,
 exactly as a project in files mode resolves them from its files: the same
 entries, grant before use, the write gate, the read-only switch and the same
-reports. `capabilities connections import` moves a project from its files into
-its store; a project that was never moved keeps its files, store or no store.
+reports. Its identifiers and its gate come from `capabilities_identifiers` and
+`capabilities_policy` the same way, a global row beneath the project's own.
+`capabilities connections import` moves a project from its files into its
+store; a project that was never moved keeps its files, store or no store, and
+one that moved only its connections and grants keeps the rest in files.
 
 These tests drive the real manager and a real connection-bearing capability
 (coolify, against an HTTP instance that is nobody's) in a project that exists
@@ -251,6 +254,11 @@ def _without_sources(report: dict) -> dict:
     return out
 
 
+def _text(result: subprocess.CompletedProcess) -> str:
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout.strip()
+
+
 def _import(lab) -> dict:
     return _ok(_manager(lab, "connections", "import"))
 
@@ -276,7 +284,8 @@ def test_import_moves_the_project_and_it_resolves_the_same_set(lab):
     assert result["agent_id"] == PROJECT_ID and result["node"] == socket.gethostname()
     assert result["capabilities"]["coolify"]["connections"]["imported"] == ["box", "off", "spare"]
     identity = json.loads((lab["envelope"] / "project.json").read_text())
-    assert identity["connections"] == "store" and identity["id"] == PROJECT_ID
+    assert identity["records"] == "store" and identity["id"] == PROJECT_ID
+    assert "connections" not in identity
     after = _ok(_coolify(lab, "connections"))
     assert _without_sources(after) == _without_sources(before)
     assert after["connections"]["box"]["keys"][0]["source"] == \
@@ -493,3 +502,173 @@ def test_doctor_reports_unknown_agents_as_information_only(lab):
 def test_doctor_in_files_mode_does_not_reach_the_store(lab):
     assert "information" not in _doctor(lab)
     assert _tables(lab) == []
+
+
+# --- identifiers and the gate --------------------------------------------------
+
+NODE = "lab-node"
+
+
+def _global_files(lab) -> None:
+    """A global identifier and a global gate entry in the config home, beside
+    the project's own."""
+    (lab["config"] / "coolify").mkdir(parents=True, exist_ok=True)
+    (lab["config"] / "coolify" / "identifiers.json").write_text(json.dumps(
+        {"region": {"value": "eu", "note": "where it runs"},
+         "team": {"value": "global-team", "note": ""}}))
+    (lab["config"] / "capabilities").mkdir(parents=True, exist_ok=True)
+    (lab["config"] / "capabilities" / "settings.json").write_text(json.dumps(
+        {"capabilities": {"lab-other": {"enabled": True}}}))
+
+
+def test_import_moves_identifiers_and_the_gate_and_they_resolve_the_same(lab):
+    _global_files(lab)
+    _ok(_coolify(lab, "ids", "set", "team", "one", "--note", "the team"))
+    before = _ok(_coolify(lab, "ids", "list"))
+    assert before == {
+        "region": {"value": "eu", "note": "where it runs", "scope": "global"},
+        "team": {"value": "one", "note": "the team", "scope": "project"}}
+    listed_before = _ok(_manager(lab, "list"))
+    result = _import(lab)
+    assert result["identifiers"]["coolify"] == {
+        "project": {"imported": ["team"], "unchanged": []},
+        "global": {"imported": ["region", "team"], "unchanged": []}}
+    assert result["policy"] == {"project": {"imported": ["coolify"], "unchanged": []},
+                                "global": {"imported": ["lab-other"], "unchanged": []}}
+    assert set(result["store"]["tables"]) >= {"capabilities_identifiers",
+                                             "capabilities_policy"}
+    assert _rows(lab, "SELECT agent_id, label, value, note FROM capabilities_identifiers "
+                      "ORDER BY agent_id NULLS FIRST, label") == [
+        (None, "region", "eu", "where it runs"), (None, "team", "global-team", ""),
+        (PROJECT_ID, "team", "one", "the team")]
+    assert _rows(lab, "SELECT agent_id, capability, node, enabled FROM capabilities_policy "
+                      "ORDER BY agent_id NULLS FIRST") == [
+        (None, "lab-other", None, True), (PROJECT_ID, "coolify", None, True)]
+    assert _ok(_coolify(lab, "ids", "list")) == before
+    assert _ok(_manager(lab, "list")) == listed_before
+    # The files are kept and no longer read for these records.
+    (lab["envelope"] / "coolify" / "identifiers.json").write_text(json.dumps(
+        {"team": {"value": "changed-in-files", "note": ""}}))
+    (lab["envelope"] / "settings.json").write_text(json.dumps(
+        {"capabilities": {"coolify": {"enabled": False}}}))
+    assert _text(_coolify(lab, "ids", "get", "team")) == "one"
+    _ok(_coolify(lab, "deploy", "x"))
+    # Files that now say otherwise than the store are a conflict, not an update.
+    refused = _manager(lab, "connections", "import")
+    assert refused.returncode == 6 and _error(refused)["code"] == "import_conflict"
+
+
+def test_the_gate_is_written_to_and_read_from_the_store(lab):
+    _import(lab)
+    settings_before = (lab["envelope"] / "settings.json").read_text()
+    disabled = _ok(_manager(lab, "disable", "coolify", "--project"))
+    assert disabled["gate"] == "store:lab.capabilities_policy"
+    refused = _coolify(lab, "deploy", "x")
+    assert refused.returncode == 4
+    assert _error(refused)["code"] == "disabled"
+    assert "store:lab.capabilities_policy" in _error(refused)["message"]
+    assert (lab["envelope"] / "settings.json").read_text() == settings_before
+    _ok(_manager(lab, "inherit", "coolify", "--project"))
+    assert _error(_coolify(lab, "deploy", "x"))["code"] == "not_enabled"
+    _ok(_manager(lab, "enable", "coolify", "--global"))
+    assert _rows(lab, "SELECT agent_id, capability, node, enabled "
+                      "FROM capabilities_policy") == [(None, "coolify", None, True)]
+    _ok(_coolify(lab, "deploy", "x"))
+    # A row naming this node is read before the row for every node.
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("INSERT INTO lab.capabilities_policy (agent_id, capability, node, "
+                     "enabled) VALUES (NULL, 'coolify', %s, false)", (NODE,))
+        conn.execute("INSERT INTO lab.capabilities_policy (agent_id, capability, node, "
+                     "enabled) VALUES (%s, 'coolify', 'another-node', false)",
+                     (PROJECT_ID,))
+    declared = {"AGENT_NODE_NAME": NODE}
+    assert _error(_coolify(lab, "deploy", "x", extra=declared))["code"] == "not_enabled"
+    _ok(_coolify(lab, "deploy", "x"))
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("INSERT INTO lab.capabilities_policy (agent_id, capability, node, "
+                     "enabled) VALUES (%s, 'coolify', %s, true)", (PROJECT_ID, NODE))
+    _ok(_coolify(lab, "deploy", "x", extra=declared))
+
+
+def test_ids_set_global_writes_a_global_row_beneath_the_project_row(lab):
+    _import(lab)
+    assert _ok(_coolify(lab, "ids", "set", "shared", "g", "--global")) == {
+        "set": "shared", "scope": "global"}
+    assert _ok(_coolify(lab, "ids", "list"))["shared"] == {
+        "value": "g", "note": "", "scope": "global"}
+    _ok(_coolify(lab, "ids", "set", "shared", "p"))
+    assert _rows(lab, "SELECT agent_id, value FROM capabilities_identifiers "
+                      "WHERE label = 'shared' ORDER BY agent_id NULLS FIRST") == [
+        (None, "g"), (PROJECT_ID, "p")]
+    assert _text(_coolify(lab, "ids", "get", "shared")) == "p"
+    _ok(_coolify(lab, "ids", "rm", "shared"))
+    assert _text(_coolify(lab, "ids", "get", "shared")) == "g"
+    _ok(_coolify(lab, "ids", "rm", "shared", "--global"))
+    assert _coolify(lab, "ids", "get", "shared").returncode == 3
+    assert _rows(lab, "SELECT count(*) FROM capabilities_identifiers") == [(0,)]
+
+
+def test_ids_set_global_in_files_mode_writes_the_config_home(lab):
+    _ok(_coolify(lab, "ids", "set", "shared", "g", "--global", "--note", "n"))
+    held = json.loads((lab["config"] / "coolify" / "identifiers.json").read_text())
+    assert held == {"shared": {"value": "g", "note": "n"}}
+    assert not (lab["envelope"] / "coolify" / "identifiers.json").exists()
+    assert _ok(_coolify(lab, "ids", "list"))["shared"]["scope"] == "global"
+    assert _tables(lab) == []
+
+
+def test_a_project_with_only_its_connections_in_the_store_keeps_the_rest_in_files(lab):
+    _ok(_coolify(lab, "ids", "set", "team", "one"))
+    _import(lab)
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("DELETE FROM lab.capabilities_identifiers")
+        conn.execute("DELETE FROM lab.capabilities_policy")
+    identity_file = lab["envelope"] / "project.json"
+    identity = json.loads(identity_file.read_text())
+    identity.pop("records")
+    identity["connections"] = "store"
+    identity_file.write_text(json.dumps(identity))
+    # Connections from the store, the gate and identifiers from files.
+    report = _ok(_coolify(lab, "connections"))
+    assert report["connections"]["box"]["keys"][0]["source"] == \
+        "store:lab.capabilities_connections"
+    assert _text(_coolify(lab, "ids", "get", "team")) == "one"
+    _ok(_coolify(lab, "deploy", "x"))
+    assert _ok(_manager(lab, "disable", "coolify", "--project"))["gate"].endswith(
+        "capabilities/settings.json")
+    assert _error(_coolify(lab, "deploy", "x"))["code"] == "disabled"
+    _ok(_manager(lab, "enable", "coolify", "--project"))
+    again = _import(lab)
+    assert again["previous_mode"] == "connections"
+    assert again["identifiers"]["coolify"]["project"]["imported"] == ["team"]
+    identity = json.loads(identity_file.read_text())
+    assert identity["records"] == "store" and "connections" not in identity
+
+
+def test_import_refuses_store_rows_that_would_change_what_the_project_resolves(lab):
+    _import(lab)
+    held = _rows(lab, "SELECT count(*) FROM capabilities_identifiers")
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("INSERT INTO lab.capabilities_identifiers (agent_id, capability, "
+                     "label, value) VALUES (NULL, 'coolify', 'stray', '\"x\"')")
+        conn.execute("INSERT INTO lab.capabilities_policy (agent_id, capability, "
+                     "enabled) VALUES (NULL, 'lab-stray', true)")
+    refused = _manager(lab, "connections", "import")
+    assert refused.returncode == 6, refused.stdout + refused.stderr
+    error = _error(refused)
+    assert error["code"] == "import_conflict"
+    assert "global identifier 'stray'" in error["message"]
+    assert "lab-stray global policy" in error["message"]
+    assert _rows(lab, "SELECT count(*) FROM capabilities_identifiers") == [(held[0][0] + 1,)]
+
+
+def test_a_store_holding_the_gate_that_cannot_be_reached_refuses_with_exit_5(lab):
+    _import(lab)
+    closed = _free_port()
+    (lab["project"] / ".env").write_text(
+        f"AGENTKIT_DB_URL={lab['cluster'].url(lab['database'], port=closed)}\n"
+        "AGENTKIT_DB_SCHEMA=lab\nCOOLIFY_TOKEN=test-token-1234\n")
+    for result in (_coolify(lab, "deploy", "x"), _coolify(lab, "ids", "list"),
+                   _manager(lab, "enable", "coolify", "--project")):
+        assert result.returncode == 5, result.stdout + result.stderr
+        assert _error(result)["code"] == "store_unreachable"

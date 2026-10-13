@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-13 — `connections import` moves a project's identifiers and gate into its store as well, under `"records": "store"`
+
+`capabilities connections import` now also writes each scope's identifiers and policy entries into `capabilities_identifiers` and `capabilities_policy`: the envelope's under the project id, and the config home's as global rows, which every project reading that store shares. It proves in the same transaction that the store resolves this project's identifiers and gate as its files do, each from the same scope, and then records `"records": "store"` in `project.json` in place of `"connections": "store"`. A row that differs, a project row the files lack, or a global row that would change what this project resolves refuses the whole import with exit 6 `import_conflict`, and nothing is written. Its JSON adds `identifiers` and `policy` reports and the two tables, and `previous_mode` answers `files`, `connections` or `store`. A project left at `"connections": "store"` keeps working as it is until it is imported again. In store mode `enable`, `disable` and `inherit` write the project's row (stamping its verified id) or the global row, each for every node, and their `gate` names the store's table. `list`, `context` and `ids <name>` read the store. `doctor` reports a records store it cannot use as drift instead of stopping.
+
 ## 2026-10-13 — The running node is named by `AGENT_NODE_NAME` where the machine declares it
 
 The node a store-mode grant is matched against, and the `node` that `capabilities connections import` and `capabilities get <name> grant <id>` answer with, is the value of `AGENT_NODE_NAME` where the machine declares one, and its host name as before where it declares none. A container node that declares its name keeps the grants naming it across redeploys, when its host name, the container id, changes.

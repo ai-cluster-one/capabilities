@@ -76,8 +76,8 @@ THE PROJECT ENVELOPE
   Every project file the system owns — identity, the gate, the state guard,
   and each capability's identifiers, references, connections, settings and
   state — sits in one envelope; records are kept in files, except the
-  connections and grants of a project in store mode, which its store holds
-  (see `connections import`). In a project
+  connections, grants, identifiers and policy of a project in store mode,
+  which its store holds (see `connections import`). In a project
   bound by `.contextkit/config.toml` its location
   belongs to ContextKit and is asked for, never assumed or stored:
   `contextkit path capabilities`, once per invocation. Without that binding the
@@ -380,7 +380,11 @@ POLICY VERBS
   enable <name> --project|--global / disable <name> --project|--global [--deny]
         Write an explicit policy record at project or global scope through the
         active records backend. Files mode maps those scopes to
-        capabilities/settings.json and $XDG_CONFIG_HOME/capabilities/settings.json.
+        capabilities/settings.json and $XDG_CONFIG_HOME/capabilities/settings.json;
+        store mode to this project's row, stamped with its verified id, and the
+        global row of capabilities_policy, which applies to every project
+        reading that store, each for every node. A row naming this node is
+        read before the row for every node, at either scope.
         Scope is mandatory: ask whether the decision is for this project or
         every project before invoking the manager. Project enable removes any
         harness deny rule; project disable --deny additionally writes
@@ -495,10 +499,13 @@ PROJECT VERBS (run inside a consuming project)
         `records.mode` answers `store` with the table as `source`. A store
         that cannot be reached is exit 5 store_unreachable.
   connections import
-        Move this project's connections and grants from its files into its
-        store (the database `store show` names for it) and the project into
-        store mode, recorded as "connections": "store" in its project.json,
-        which only this verb writes. Every identity the project's files
+        Move this project's records - connections, grants, identifiers and
+        policy - from its files into its store (the database `store show`
+        names for it) and the project into store mode, recorded as
+        "records": "store" in its project.json, which only this verb writes;
+        a project at "connections": "store" keeps only its connections and
+        grants in the store, and its identifiers and policy in files, until
+        this verb runs again. Every identity the project's files
         resolve becomes a row of capabilities_connections, and every one it
         may use, switched off itself, or points its default at gets a grant
         for every node in capabilities_connection_grants, stamped with the
@@ -509,11 +516,20 @@ PROJECT VERBS (run inside a consuming project)
         holds unchanged is left as it is, so running it again changes
         nothing; one that differs, or a grant of this project the files do
         not have, refuses the whole import (exit 6 import_conflict) and
-        writes nothing. The files are kept and no longer read for
-        connections and grants. JSON {ok, project, agent_id, node, mode,
-        previous_mode, identity, store {level, sources, schema, tables},
-        capabilities {<name> {connections {imported, unchanged}, grants
-        {imported, unchanged}, default}}, files_kept}. Exit 4 under the
+        writes nothing. Each scope's identifiers and policy entries become
+        rows of capabilities_identifiers and capabilities_policy, the
+        envelope's under the project id and the config home's as global rows
+        (agent_id null, for every project reading the store), and the store
+        must resolve this project's identifiers and gate as its files do, each
+        from the same scope: a held row that differs, a project row the files
+        lack, or a global row that would change what this project resolves
+        refuses the import as well. The files are kept and no longer read for
+        those records. JSON {ok, project, agent_id, node, mode,
+        previous_mode (files, connections or store), identity, store {level,
+        sources, schema, tables}, capabilities {<name> {connections
+        {imported, unchanged}, grants {imported, unchanged}, default}},
+        identifiers {<name> {project|global {imported, unchanged}}}, policy
+        {project|global {imported, unchanged}}, files_kept}. Exit 4 under the
         read-only switch, 5 when the store cannot be reached.
 
 VERIFICATION VERBS
@@ -5530,18 +5546,41 @@ def _load_gate(root: Path) -> dict:
     return _load_gate_file(_gate_file(root))
 
 
+def _policy_scopes(root: Path) -> tuple[dict, dict]:
+    """Policy rows at each exact scope through the active records backend,
+    raising the store tier's error. In store mode a scope's row for this node
+    is read before its row for every node."""
+    adapter = _open_project_records(root)
+    try:
+        return (adapter.resolve_scope("capabilities", "policy", "project"),
+                adapter.resolve_scope("capabilities", "policy", "global"))
+    finally:
+        adapter.close()
+
+
+def _policy_views_checked(root: Path) -> tuple[dict, dict]:
+    """`_policy_views` for doctor: a store that cannot be used is raised, so it
+    is reported as a finding rather than ending the report."""
+    store = _store_module()
+    envelope = _project_capabilities_dir(root)
+    if store.records_mode(envelope) != "store":
+        return _policy_views(root)
+    return _policy_values(*_policy_scopes(root))
+
+
 def _policy_views(root: Path | None) -> tuple[dict, dict]:
     """Policy values at each exact scope through the active records backend."""
     if root is None:
         return {}, _load_gate_file(GLOBAL_GATE_FILE)["capabilities"]
-    adapter = _records_for(root)
     try:
-        project_rows = adapter.resolve_scope("capabilities", "policy", "project")
-        global_rows = adapter.resolve_scope("capabilities", "policy", "global")
+        project_rows, global_rows = _policy_scopes(root)
     except _store_module().StoreError as exc:
-        _die(6, exc.slug, exc.message, exc.hint)
-    finally:
-        adapter.close()
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    return _policy_values(project_rows, global_rows)
+
+
+def _policy_values(project_rows: dict, global_rows: dict) -> tuple[dict, dict]:
+    """Each scope's policy values, validated."""
     project = {key: row["value"] for key, row in project_rows.items()}
     global_ = {key: row["value"] for key, row in global_rows.items()}
     for scope, entries in (("project", project), ("global", global_)):
@@ -6393,8 +6432,18 @@ def _gate_scope(project: bool, global_: bool) -> str:
 
 
 def _gate_source(adapter, root: Path, scope: str) -> str:
-    """Name the exact policy file."""
+    """Name the exact policy file, or the store's policy table in a project
+    whose records are in the store."""
+    if adapter.mode_of("policy") == "store":
+        return adapter.scope_source("capabilities", "policy", scope)
     return str(_gate_file(root) if scope == "project" else GLOBAL_GATE_FILE)
+
+
+def _stamp_policy(adapter, root: Path, scope: str) -> None:
+    """A project policy row in the store carries the project id as its agent,
+    so it is written only once the id is verified for this invocation."""
+    if scope == "project" and adapter.mode_of("policy") == "store":
+        _project_id_for_write(root)
 
 
 def _refresh_after_gate(root: Path | None, result: dict, enabled: bool = False) -> None:
@@ -6421,11 +6470,12 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False) -> None:
     if root is not None:
         adapter = _records_for(root)
         try:
+            _stamp_policy(adapter, root, scope)
             adapter.set("capabilities", "policy", name, {"enabled": enabled},
                         actor="capabilities", scope=scope)
             gate_source = _gate_source(adapter, root, scope)
         except _store_module().StoreError as exc:
-            _die(6, exc.slug, exc.message, exc.hint)
+            _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
         finally:
             adapter.close()
     else:
@@ -6484,7 +6534,7 @@ def _arrival_global_enable(name: str, undo: bool = False) -> str | None:
                         actor="capabilities", scope="global")
         return _gate_source(adapter, root, "global")
     except _store_module().StoreError as exc:
-        _die(6, exc.slug, exc.message, exc.hint)
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     finally:
         adapter.close()
 
@@ -6497,10 +6547,11 @@ def _inherit_gate(name: str, scope: str) -> None:
     if root is not None:
         adapter = _records_for(root)
         try:
+            _stamp_policy(adapter, root, scope)
             removed = adapter.delete("capabilities", "policy", name, scope=scope)
             gate_source = _gate_source(adapter, root, scope)
         except _store_module().StoreError as exc:
-            _die(6, exc.slug, exc.message, exc.hint)
+            _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
         finally:
             adapter.close()
     else:
@@ -6721,7 +6772,7 @@ def cmd_ids(name: str) -> None:
     try:
         resolved = adapter.resolve(name, "identifier")
     except _store_module().StoreError as exc:
-        _die(6, exc.slug, exc.message, exc.hint)
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     finally:
         adapter.close()
     ids = {label: {"value": row["value"], "note": row["note"] or ""}
@@ -6970,13 +7021,197 @@ def _import_verify(files, stored, plan: dict) -> None:
                 "report this as a defect in `capabilities connections import`")
 
 
+def _import_identifier_names(envelope: Path) -> list[str]:
+    """The capabilities whose identifiers this project's files can resolve:
+    each one its envelope keeps identifiers for, and each installed one the
+    user's config home keeps identifiers for."""
+    store = _store_module()
+    names: set[str] = set()
+    if envelope.is_dir():
+        for path in envelope.glob("*/identifiers.json"):
+            names.add(path.parent.name)
+    for name in _installed():
+        if (_CONFIG_HOME / name / "identifiers.json").is_file():
+            names.add(name)
+    return sorted(n for n in names if store.CAPABILITY_RE.fullmatch(n))
+
+
+def _import_records_plan(files, names: list[str]) -> dict:
+    """The identifiers and policy rows the store must hold for this project to
+    resolve from it what its files resolve: each scope's own entries, the
+    project's under its id and the config home's as global rows."""
+    store = _store_module()
+    problems: list[str] = []
+    identifiers: dict = {}
+    for name in names:
+        try:
+            scopes = {scope: {label: (row["value"], row["note"] or "")
+                              for label, row in files.resolve_scope(
+                                  name, "identifier", scope).items()}
+                      for scope in ("project", "global")}
+        except (store.StoreError, AttributeError, TypeError) as exc:
+            problems.append(f"{name} identifiers: {getattr(exc, 'message', exc)}")
+            continue
+        if scopes["project"] or scopes["global"]:
+            identifiers[name] = scopes
+    policy: dict = {}
+    for scope in ("project", "global"):
+        try:
+            rows = files.resolve_scope("capabilities", "policy", scope)
+        except store.StoreError as exc:
+            problems.append(f"{scope} policy: {exc.message}")
+            continue
+        policy[scope] = {}
+        for name, row in rows.items():
+            value = row["value"]
+            if (not isinstance(value, dict) or set(value) != {"enabled"}
+                    or not isinstance(value.get("enabled"), bool)):
+                problems.append(f"{scope} policy for {name!r} is not "
+                                '{"enabled": true|false}')
+                continue
+            policy[scope][name] = value["enabled"]
+    if problems:
+        raise _ImportRefused(
+            "import_unreadable",
+            "this project's files cannot be imported as they resolve today: "
+            + "; ".join(problems),
+            "repair them (`capabilities doctor` names the faults), then import again")
+    return {"identifiers": identifiers, "policy": policy}
+
+
+def _import_record_rows(conn, agent_id: str, node: str, plan: dict) -> dict:
+    """Write the identifiers and policy rows the store lacks, inside the
+    caller's transaction. Refuse the whole import where a row the store holds
+    differs from what the import would write, where this project holds a row
+    the files do not, or where a global row the files do not have would apply
+    to this project."""
+    agent_of = {"project": agent_id, "global": None}
+    conflicts: list[str] = []
+    writes: list[tuple[str, tuple]] = []
+
+    def scope_of(agent):
+        return "global" if agent is None else "project"
+
+    held_ids = {(scope_of(agent), cap, label): (value, note or "")
+                for agent, cap, label, value, note in conn.execute(
+                    "SELECT agent_id, capability, label, value, note "
+                    "FROM capabilities_identifiers "
+                    "WHERE agent_id IS NULL OR agent_id = %s", (agent_id,)).fetchall()}
+    identifiers: dict = {}
+    for cap, scopes in plan["identifiers"].items():
+        report = identifiers[cap] = {}
+        for scope, labels in scopes.items():
+            done = report[scope] = {"imported": [], "unchanged": []}
+            for label, wanted in sorted(labels.items()):
+                found = held_ids.get((scope, cap, label))
+                if found is None:
+                    writes.append((
+                        "INSERT INTO capabilities_identifiers "
+                        "(agent_id, capability, label, value, note) "
+                        "VALUES (%s, %s, %s, %s::jsonb, %s)",
+                        (agent_of[scope], cap, label,
+                         json.dumps(wanted[0], ensure_ascii=False), wanted[1])))
+                    done["imported"].append(label)
+                elif found == wanted:
+                    done["unchanged"].append(label)
+                else:
+                    conflicts.append(
+                        f"{cap} {scope} identifier {label!r}: the store holds "
+                        f"{json.dumps({'value': found[0], 'note': found[1]}, sort_keys=True)}, "
+                        f"the files {json.dumps({'value': wanted[0], 'note': wanted[1]}, sort_keys=True)}")
+    for (scope, cap, label) in sorted(held_ids):
+        wanted = plan["identifiers"].get(cap, {"project": {}, "global": {}})
+        if label in wanted[scope]:
+            continue
+        if scope == "project":
+            conflicts.append(f"{cap} project identifier {label!r}: the store holds "
+                             "it and the files do not")
+        elif label not in wanted["project"]:
+            conflicts.append(f"{cap} global identifier {label!r}: the store holds "
+                             "it for every project and this project's files do not "
+                             "resolve it")
+
+    held_policy = {(scope_of(agent), cap, row_node): enabled
+                   for agent, cap, row_node, enabled in conn.execute(
+                       "SELECT agent_id, capability, node, enabled "
+                       "FROM capabilities_policy "
+                       "WHERE agent_id IS NULL OR agent_id = %s", (agent_id,)).fetchall()}
+    policy: dict = {}
+    for scope in ("project", "global"):
+        done = policy[scope] = {"imported": [], "unchanged": []}
+        for cap, enabled in sorted(plan["policy"].get(scope, {}).items()):
+            found = held_policy.get((scope, cap, None))
+            if found is None:
+                writes.append((
+                    "INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
+                    "VALUES (%s, %s, NULL, %s)", (agent_of[scope], cap, enabled)))
+                done["imported"].append(cap)
+            elif found == enabled:
+                done["unchanged"].append(cap)
+            else:
+                conflicts.append(f"{cap} {scope} policy for every node: the store holds "
+                                 f"enabled={found}, the files enabled={enabled}")
+    for (scope, cap, row_node) in sorted(held_policy,
+                                         key=lambda k: (k[0], k[1], k[2] or "")):
+        where = f"node {row_node!r}" if row_node else "every node"
+        if scope == "project":
+            if row_node is None and cap in plan["policy"].get("project", {}):
+                continue
+            conflicts.append(f"{cap} project policy for {where}: the store holds it "
+                             "and the files do not")
+        elif row_node in (None, node) and cap not in plan["policy"].get("project", {}) \
+                and (cap not in plan["policy"].get("global", {}) if row_node is None
+                     else held_policy[(scope, cap, row_node)]
+                     != plan["policy"].get("global", {}).get(cap)):
+            conflicts.append(f"{cap} global policy for {where}: the store holds it for "
+                             "every project and this project's files do not decide it")
+    if conflicts:
+        raise _ImportRefused(
+            "import_conflict",
+            f"the store already holds {len(conflicts)} row(s) that differ from what "
+            "this project's files resolve, and nothing was written: "
+            + "; ".join(conflicts),
+            "reconcile them - change the store row (`<name> ids set`, `capabilities "
+            "enable|disable|inherit`), or the files - and import again")
+    for query, params in writes:
+        conn.execute(query, params)
+    return {"identifiers": identifiers, "policy": policy}
+
+
+def _import_records_verify(files, stored, plan: dict) -> None:
+    """The import holds only if the store now resolves, for this project on
+    this node, the identifiers and the gate its files resolve, each from the
+    same scope."""
+    def identifiers(records, cap):
+        return {label: (row["value"], row["note"] or "", row["scope"])
+                for label, row in records.resolve(cap, "identifier").items()}
+
+    def gate(records):
+        return {name: (row["value"], row["scope"])
+                for name, row in records.resolve("capabilities", "policy").items()}
+
+    for cap in plan["identifiers"]:
+        if identifiers(files, cap) != identifiers(stored, cap):
+            raise _ImportRefused(
+                "import_mismatch",
+                f"after the import the store would resolve {cap}'s identifiers "
+                "differently from the files, so nothing was written",
+                "report this as a defect in `capabilities connections import`")
+    if gate(files) != gate(stored):
+        raise _ImportRefused(
+            "import_mismatch",
+            "after the import the store would resolve the policy gate differently "
+            "from the files, so nothing was written",
+            "report this as a defect in `capabilities connections import`")
+
+
 def cmd_connections_import() -> None:
-    """Import this project's connections and grants from its files into its
-    store and move the project to store mode, as one decision: the rows are
-    written and checked to resolve as the files do in one transaction, and
-    only then does project.json say `connections: store`. A row the store
-    already holds unchanged is left as it is, so a second run changes nothing;
-    one that differs refuses the whole import."""
+    """Import this project's records - connections, grants, identifiers and
+    policy - from its files into its store and move the project to store mode,
+    as one decision: the rows are written and checked to resolve as the files
+    do in one transaction, and only then does project.json say `records:
+    store`. A row the store already holds unchanged is left as it is, so a
+    second run changes nothing; one that differs refuses the whole import."""
     _read_only_gate("connections import")
     store = _store_module()
     root = _require_project()
@@ -6991,11 +7226,14 @@ def cmd_connections_import() -> None:
         _die(6, "no_project_identity", f"{identity_file} carries no project id",
              "run `capabilities init` in the project to mint its identity")
     try:
-        previous = store.connections_mode(envelope)
+        previous = ("store" if store.records_mode(envelope) == "store"
+                    else "connections" if store.connections_mode(envelope) == "store"
+                    else "files")
     except store.StoreError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
     files = store.FileRecords(envelope, _CONFIG_HOME, agent_id, identity.get("slug"))
     names = _import_names(envelope)
+    node = store.node_name()
     db = _db_module()
     try:
         setting = db.resolve_setting(root)
@@ -7005,19 +7243,23 @@ def cmd_connections_import() -> None:
     import psycopg
     try:
         plan = _import_plan(files, names)
+        records_plan = _import_records_plan(files, _import_identifier_names(envelope))
         major, minor = store.STORE_TABLES_VERSION
-        db.migrate(conn, store.STORE_OWNER, store.connection_table_steps(),
+        db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
                    major=major, minor=minor)
         with conn.transaction():
             # One import at a time per store, so two cannot both find a row
             # missing and both write it.
             conn.execute("LOCK TABLE capabilities_connections, "
-                          "capabilities_connection_grants IN SHARE ROW EXCLUSIVE MODE")
+                          "capabilities_connection_grants, capabilities_identifiers, "
+                          "capabilities_policy IN SHARE ROW EXCLUSIVE MODE")
             imported = _import_rows(conn, agent_id, plan)
+            records_imported = _import_record_rows(conn, agent_id, node, records_plan)
             stored = store.StoreRecords(envelope, _CONFIG_HOME, agent_id,
                                         identity.get("slug"), project_root=root,
                                         connection=conn, schema=setting.schema)
             _import_verify(files, stored, plan)
+            _import_records_verify(files, stored, records_plan)
     except _ImportRefused as exc:
         _die(6 if exc.code != "import_mismatch" else 7, exc.code, exc.message, exc.hint)
     except store.StoreError as exc:
@@ -7033,16 +7275,23 @@ def cmd_connections_import() -> None:
         conn.close()
     if previous != "store":
         identity = _read_json(identity_file) or identity
-        identity[store.CONNECTIONS_MODE_KEY] = "store"
+        identity[store.RECORDS_MODE_KEY] = "store"
+        identity.pop(store.CONNECTIONS_MODE_KEY, None)
         _write_json(identity_file, identity)
+    kept = [*envelope.glob("*/connections.json"), *envelope.glob("*/identifiers.json")]
+    if (envelope / "settings.json").is_file():
+        kept.append(envelope / "settings.json")
     _emit({"ok": True, "project": str(root), "agent_id": agent_id,
-           "node": store.node_name(), "mode": "store", "previous_mode": previous,
+           "node": node, "mode": "store", "previous_mode": previous,
            "identity": str(identity_file),
            "store": {"level": setting.level, "sources": list(setting.sources),
                      "schema": setting.schema,
-                     "tables": [store.STORE_CONNECTIONS_TABLE, store.STORE_GRANTS_TABLE]},
+                     "tables": [store.STORE_CONNECTIONS_TABLE, store.STORE_GRANTS_TABLE,
+                                store.STORE_IDENTIFIERS_TABLE, store.STORE_POLICY_TABLE]},
            "capabilities": imported,
-           "files_kept": sorted(str(p) for p in envelope.glob("*/connections.json"))})
+           "identifiers": records_imported["identifiers"],
+           "policy": records_imported["policy"],
+           "files_kept": sorted(str(p) for p in kept)})
 
 
 # A TOML table header; every key after the first one belongs to that table.
@@ -7631,7 +7880,16 @@ def cmd_doctor() -> None:
             "refuse until it can")
     if root and envelope and ((envelope / "settings.json").is_file()
                               or (envelope / PROJECT_IDENTITY_REL).is_file()):
-        caps, _global_caps = _policy_views(root)
+        store_finding = None
+        try:
+            caps, _global_caps = _policy_views_checked(root)
+        except _store_module().StoreError as exc:
+            # A store that holds the gate and cannot be used is drift like any
+            # other; the rest of the project is still worth reconciling.
+            caps = {}
+            store_finding = (f"project: records store unavailable "
+                             f"({exc.slug}): {exc.message}")
+            findings.append(store_finding)
         gi = envelope / ".gitignore"
         if not gi.exists() or "*/state/" not in gi.read_text():
             findings.append(f"project: {gi} missing the */state/ "
@@ -7645,8 +7903,9 @@ def cmd_doctor() -> None:
                 try:
                     records._db()
                 except store.StoreError as exc:
-                    findings.append(f"project: connections store unavailable "
-                                    f"({exc.slug}): {exc.message}")
+                    if store_finding is None:
+                        findings.append(f"project: connections store unavailable "
+                                        f"({exc.slug}): {exc.message}")
             if not in_store or records._failure is None:
                 _check_record_connections(findings, records, _installed())
             if in_store and records._failure is None:

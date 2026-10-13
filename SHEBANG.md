@@ -228,7 +228,7 @@ The envelope, the flag parsing and the empty answer are vendored in the contract
 
 ## Project records and the envelope
 
-Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its slug and holds its durable id (resolved as described below). Live configuration is kept in files, apart from the connections and grants a project keeps in its store ([connections in the store](#connections-in-the-store)), and the policy gate comes through the records adapter with every other live record.
+Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its slug and holds its durable id (resolved as described below). Live configuration is kept in files, apart from the connections, grants, identifiers and policy a project in store mode keeps in its store ([connections in the store](#connections-in-the-store)), and the policy gate comes through the records adapter with every other live record.
 
 All runtime readers open the same records adapter, which maps logical collections onto the established envelope and `$XDG_CONFIG_HOME` layout. Project records resolve before global records; merge collections compose by key, and a connection identity is always taken whole from one scope rather than assembled field by field. A call site asks for a collection, never for a path.
 
@@ -237,17 +237,17 @@ Project material has this layout:
 ```
 capabilities/
   project.json        # durable project identity
-  settings.json       # policy records
+  settings.json       # policy records (files mode)
   <name>/
     connections.json  # connection, grant, and default-setting records (files mode)
-    identifiers.json  # identifier records, managed by the ids verbs
+    identifiers.json  # identifier records, managed by the ids verbs (files mode)
     reference/        # one front-matter .md per reference
       *.md
     service/          # project-local service settings/context
     state/            # capability-written; never committed
 ```
 
-Configuration - settings, the gate, identifiers, references and state - stays in these files, and so do connections and grants in files mode. The database holds only the tables the package designs and migrates for itself: each capability's runtime state ([runtime state in the store](#runtime-state-in-the-store)) and, in store mode, the contract's connection tables ([connections in the store](#connections-in-the-store)).
+Configuration - settings, references and state - stays in these files, and so do the gate, identifiers, connections and grants in files mode. The database holds only the tables the package designs and migrates for itself: each capability's runtime state ([runtime state in the store](#runtime-state-in-the-store)) and, in store mode, the contract's record tables ([connections in the store](#connections-in-the-store)).
 
 **A project resolves its database through one cascade** - the project's env files, then the process environment, then the machine's store setting file - and its levels, keys and file are [the store setting](#the-store-setting).
 
@@ -316,12 +316,12 @@ The `ids` verbs manage the identifier collection through the adapter:
 
 | Verb | Does |
 |---|---|
-| `ids list` | Prints the resolved small, non-secret lookup. Empty/absent → `{}`. |
+| `ids list` | Prints the resolved small, non-secret lookup, each label's `scope` naming where its value came from (`project` or `global`). Empty/absent → `{}`. |
 | `ids get <label>` | Prints the value as stored. Unknown label → exit 3. |
-| `ids set <label> <value> [--note <text>]` | Upsert: `<value>` parses as JSON, a non-JSON argument stores as a string; `--note` sets the annotation. |
-| `ids rm <label>` | Removes the label. Unknown label → exit 3. |
+| `ids set <label> <value> [--note <text>] [--global]` | Upsert: `<value>` parses as JSON, a non-JSON argument stores as a string; `--note` sets the annotation. |
+| `ids rm <label> [--global]` | Removes the label. Unknown label → exit 3. |
 
-`ids set` writes the project scope, creating `capabilities/<name>/` on demand inside an existing envelope. In a project with no envelope it exits 6, naming `capabilities init` as the remediation.
+Identifiers resolve label by label, the project's value over the global one. `ids set` and `ids rm` act on the project scope, creating `capabilities/<name>/` on demand inside an existing envelope; in a project with no envelope they exit 6, naming `capabilities init` as the remediation. With `--global` they act on the global scope instead: `$XDG_CONFIG_HOME/<name>/identifiers.json` in files mode, and in store mode the global row, which every project reading that store resolves beneath its own.
 
 ## The store setting
 
@@ -365,10 +365,12 @@ A capability resolves the setting, and reaches its runtime state, through the sh
 
 ## The capability policy gate
 
-Operational verbs and `doctor` pass an effective two-scope policy gate before dispatch. Safe discovery verbs — `help`, `stub`, `manifest`, and the local-only `connections` report — remain available so a disabled capability can be understood and configured. The manager owns the policy collection, kept at:
+Operational verbs and `doctor` pass an effective two-scope policy gate before dispatch. Safe discovery verbs — `help`, `stub`, `manifest`, and the local-only `connections` report — remain available so a disabled capability can be understood and configured. The manager owns the policy collection, kept in files mode at:
 
 1. Project: `capabilities/settings.json`.
 2. Global machine default: `$XDG_CONFIG_HOME/capabilities/settings.json`.
+
+In store mode it is kept in the store instead ([connections in the store](#connections-in-the-store)): the project's rows and the global rows that every project reading that store shares, a row naming the running node read before the row for every node at each scope.
 
 An explicit project entry wins. An absent project entry inherits the global entry. Absence at both scopes is disabled by default. Policy mutations require explicit `--project` or `--global`; the agent asks the user which scope they mean rather than guessing.
 
@@ -548,20 +550,24 @@ Non-secret values sit literally in the entry: chosen, committed, per-connection 
 
 ### Connections in the store
 
-A project keeps its connections and grants in one of two homes: the files above, in files mode, or the project's store, in store mode, which serves a project whose agents run on more than one node. One mode owns a project at a time and the two never compose with each other. Either is read through the same records adapter, so `_connections_registry()` below and every verb above it behave the same in both. A project is in store mode when its `project.json` says `"connections": "store"`, and in files mode otherwise; the mode is never inferred from a configured store. The manager alone writes that key, through `capabilities connections import`, which writes the rows the project's files resolve to, proves the store resolves the same set, and only then records the mode; it never overwrites a row that differs, and run again it changes nothing.
+A project keeps its connections, grants, identifiers and policy in one of two homes: the files above, in files mode, or the project's store, in store mode, which serves a project whose agents run on more than one node. One mode owns a project at a time and the two never compose with each other. Either is read through the same records adapter, so `_connections_registry()` below, the gate, the `ids` verbs and every verb above them behave the same in both. A project is in store mode when its `project.json` says `"records": "store"`, and in files mode otherwise; the mode is never inferred from a configured store. A `project.json` saying `"connections": "store"` keeps only its connections and grants in the store, and its identifiers and policy in files. The manager alone writes these keys, through `capabilities connections import`, which writes the rows the project's files resolve to, proves the store resolves the same records, and only then records `"records": "store"`; it never overwrites a row that differs, and run again it changes nothing. The machine ceiling, the harness deny rule and the project's `slug` and `schema` stay in files in either mode.
 
-Store mode keeps two tables, owned by the contract and migrated under its own ledger in the schema the project's [store setting](#the-store-setting) names:
+Store mode keeps four tables, owned by the contract and migrated under its own ledger in the schema the project's [store setting](#the-store-setting) names:
 
 | Table | Columns |
 |---|---|
 | `capabilities_connections` | `capability`, `name`, `spec` (jsonb); one row per connection, keyed by `capability` and `name` |
 | `capabilities_connection_grants` | `agent_id`, `capability`, `connection`, `node` (nullable), `enabled`, `allow_write`, `is_default` |
+| `capabilities_identifiers` | `agent_id` (nullable), `capability`, `label`, `value` (jsonb), `note`, `updated_at`; one row per agent (or none), capability and label |
+| `capabilities_policy` | `agent_id` (nullable), `capability`, `node` (nullable), `enabled`, `updated_at`; one row per agent (or none), capability and node (or none) |
 
 `spec` is the entry interior, the same object a `connections.json` entry holds, and carries secret references only: each secret stays named by its `*_env` field and its value never enters the store. The value resolves on each node through that node's own cascade tiers 2–4, so one row serves every node while each node keeps its own values.
 
 `agent_id` is the project id, the `prj_<12hex>` value the project's identity carries, held as text and never as a foreign key, because the identity's home is outside these tables; `connection` refers to a connection row of the same capability inside them. `node` names the node a grant is for and is null for every node; a grant naming the running node is used before the grant for every node, field by field as grants resolve, and the running node is the name the store tier's `node_name()` returns: the name the machine declares in `AGENT_NODE_NAME`, and its host name where it declares none, so a container that declares one keeps its name across redeploys while its host name, the container id, changes. `enabled` or `allow_write` left null decides nothing, as a field absent from a file's grant does, so `allow_write` still falls to `WRITE_DEFAULT`. `is_default` is the default pointer, held by at most one grant per agent, capability and node.
 
 Every rule of [connections](#connections) holds unchanged. A connection row is used whole, never assembled from two rows. A row belongs to no project, so it is withheld from a project until that project's grant enables it, as an identity inherited from the global scope is in files mode. `allow_write` resolves through [the write gate](#the-write-gate), the read-only switch closes every gate, and a grant that resolves to `enabled: false` leaves the connection out of the set. `<name> connections` reads the store to report a resolution and reaches nothing a connection names. A store that cannot be reached refuses with `store_unreachable` and exit 5, never as `connection_not_granted`.
+
+An identifier or a policy row whose `agent_id` is null is global: it applies to every project that reads the store, on every machine, and a project's own row with the same label or capability is read before it. Identifiers carry no versions: `ids set` overwrites a row and `ids rm` deletes it. A policy row's `node` names the node it is for and is null for every node, the running node being `node_name()` as for grants, so the gate resolves from the first of the project's row for this node, its row for every node, the global row for this node and the global row for every node, and is denied where none exists; the scope that answered is the scope [the gate](#the-capability-policy-gate) acts on, so service activation still takes a project row. The manager writes policy rows for every node through `enable`, `disable` and `inherit`, and a write that stamps the project id takes it only once it is verified. With the gate in the store every gated call reads the store, and a store that cannot be reached refuses it with `store_unreachable` and exit 5.
 
 ### Selection
 

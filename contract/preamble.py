@@ -725,16 +725,28 @@ def _policy_row():
     try:
         row = _records().resolve("capabilities", "policy").get(NAME)
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     if row is None:
         return None
     entry = row.get("value")
     if (not isinstance(entry, dict) or set(entry) != {"enabled"}
             or not isinstance(entry.get("enabled"), bool)):
         _die(6, "bad_policy",
-             f"invalid {NAME} policy entry in {_records().source}",
+             f"invalid {NAME} policy entry in {_policy_source()}",
              'expected {"enabled": true|false}')
     return row
+
+
+def _policy_source() -> str:
+    """Where the gate is kept: the project's envelope, or the store's policy
+    table in a project whose records are in the store."""
+    records = _records()
+    if records.mode_of("policy") != "store":
+        return records.source
+    try:
+        return records.collection_source("capabilities", "policy")
+    except StoreError:
+        return "the store"
 
 
 def _project_enabled_explicitly() -> bool:
@@ -867,11 +879,11 @@ def _gate() -> None:
         return
     if isinstance(entry, dict) and entry.get("enabled") is False and scope == "project":
         _die(4, "disabled",
-             f"{NAME} is disabled in this project ({_records().source})",
+             f"{NAME} is disabled in this project ({_policy_source()})",
              f"ask the user whether to enable {NAME} for this project; if yes, "
              f"run `capabilities enable {NAME} --project`")
     if isinstance(entry, dict) and entry.get("enabled") is False:
-        message = f"{NAME} is disabled globally ({_records().source})"
+        message = f"{NAME} is disabled globally ({_policy_source()})"
     else:
         message = f"{NAME} is not enabled by project or global policy"
     _die(4, "not_enabled", message,
@@ -1112,32 +1124,51 @@ def _render_ids_markdown(data: dict) -> str:
 
 def _identifiers_load() -> dict:
     """The identifiers envelope, resolved through the records adapter, in one
-    shape — `{label: {value, note}}` — for the help section, the report and
-    `ids get`."""
+    shape — `{label: {value, note, scope}}` — for the help section, the report
+    and `ids get`; `scope` names where the value came from, `project` or
+    `global`."""
     try:
         resolved = _records().resolve(NAME, "identifier")
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
-    return {label: {"note": row["note"] or "", "value": row["value"]}
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    return {label: {"note": row["note"] or "", "value": row["value"],
+                    "scope": row["scope"]}
             for label, row in sorted(resolved.items())}
 
 
-def _identifiers_write(label: str, value, note: str) -> None:
+def _identifiers_scope(scope: str) -> dict:
+    """The identifiers one scope holds itself, without inheritance."""
+    try:
+        return _records().resolve_scope(NAME, "identifier", scope)
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _identifiers_stamp(scope: str) -> None:
+    """A project row in the store carries the project id as its agent, so it
+    is written only once the id is verified for this invocation."""
+    if scope == "project" and _records().mode_of("identifier") == "store":
+        _project_id(write=True)
+
+
+def _identifiers_write(label: str, value, note: str, scope: str = "project") -> None:
     """Rule 15: a capability is the sole writer of its own identifiers,
     addressed by (capability, collection) rather than by path."""
-    kept = note or (_identifiers_load().get(label) or {}).get("note", "")
+    _identifiers_stamp(scope)
+    kept = note or ((_identifiers_scope(scope).get(label) or {}).get("note") or "")
     try:
         _records().set(NAME, "identifier", label, value,
-                       actor=f"{NAME} ids set", note=kept or None)
+                       actor=f"{NAME} ids set", note=kept or None, scope=scope)
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
-def _identifiers_remove(label: str) -> None:
+def _identifiers_remove(label: str, scope: str = "project") -> None:
+    _identifiers_stamp(scope)
     try:
-        _records().delete(NAME, "identifier", label)
+        _records().delete(NAME, "identifier", label, scope=scope)
     except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
 def _identifiers_section() -> str:
@@ -1177,6 +1208,10 @@ def _cmd_help() -> None:
 
 def _cmd_ids(argv: list[str]) -> None:
     sub = argv[0] if argv else "list"
+    scope = "project"
+    if sub in ("set", "rm") and "--global" in argv[1:]:
+        argv = [a for a in argv if a != "--global"]
+        scope = "global"
     data = _identifiers_load()
     if sub == "list":
         _emit(data); return
@@ -1189,7 +1224,7 @@ def _cmd_ids(argv: list[str]) -> None:
         _read_only_gate(f"`{NAME} ids {sub}`")
     if sub == "set":
         if len(argv) < 3:
-            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>]")
+            _die(6, "input", f"usage: {NAME} ids set <label> <value> [--note <text>] [--global]")
         label, raw = argv[1], argv[2]
         try:
             value = json.loads(raw)
@@ -1201,14 +1236,18 @@ def _cmd_ids(argv: list[str]) -> None:
             if ni + 1 >= len(argv):
                 _die(6, "input", "--note needs a value")
             note = argv[ni + 1]
-        _identifiers_write(label, value, note)
-        _emit({"set": label}); return
+        _identifiers_write(label, value, note, scope)
+        _emit({"set": label} if scope == "project" else {"set": label, "scope": scope})
+        return
     if sub == "rm":
-        if len(argv) < 2 or argv[1] not in data:
+        held = data if scope == "project" else _identifiers_scope(scope)
+        if len(argv) < 2 or argv[1] not in held:
             _die(3, "not_found", "unknown identifier label",
                  f"`{NAME} ids list` shows the labels")
-        _identifiers_remove(argv[1])
-        _emit({"removed": argv[1]}); return
+        _identifiers_remove(argv[1], scope)
+        _emit({"removed": argv[1]} if scope == "project"
+              else {"removed": argv[1], "scope": scope})
+        return
     _die(6, "input", f"unknown ids subcommand {sub!r}", f"{NAME} ids list|get|set|rm")
 
 
