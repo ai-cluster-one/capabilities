@@ -18,10 +18,10 @@ Agent startup protocol (this is a STATEFUL CLI — it holds a login session):
   1. Run `telegram doctor` first. It proves the chain: credentials resolve, Telegram
      is reachable, and the session is authorized.
   2. Exit 2 from doctor means the session is missing or expired — run
-     `telegram login` (interactive: prompts for phone, the code Telegram sends, and a
-     2FA password if set), or `telegram login --qr` to scan from an already
-     authorized Telegram app. Login persists the session file; later commands
-     reuse it with no prompt.
+     `telegram login` (shows a QR to scan from an already authorized Telegram
+     app, then prompts for the 2FA password if set), or `telegram login --phone`
+     (prompts for phone, the code Telegram sends, and a 2FA password if set).
+     Login persists the session file; later commands reuse it with no prompt.
   3. A healthy `telegram doctor` (exit 0) means ready to work.
 
 Configuration requires explicit connections with a positive
@@ -75,8 +75,10 @@ unless a connection grants them. Grant them with
 Commands:
   telegram help                                Print this document.
   telegram doctor                              Health check: creds + reachability + session.
-  telegram login [--qr]                        Interactive first-time auth (phone + code,
-                                               or scan a QR from an authorized app).
+  telegram login [--phone [NUMBER]]            Interactive first-time auth: by default scan
+                                               a QR from an authorized app (`--qr` names it
+                                               explicitly); `--phone` signs in with the
+                                               phone number and the code Telegram sends.
   telegram whoami                              Identity of the signed-in account.
   telegram chats [--limit N]                   List recent dialogs. Beside `id`, `name`,
                                                `unread` and `kind` (the raw Telegram
@@ -3930,7 +3932,7 @@ async def _require_auth(client: TelegramClient) -> None:
     if not await client.is_user_authorized():
         await client.disconnect()
         _die(2, "not_authorized", "not logged in to Telegram",
-             "run: telegram login  (or: telegram login --qr)")
+             "run: telegram login  (QR; or: telegram login --phone)")
     me = await client.get_me()
     expected = getattr(client, "_cap_expected_account_id", None)
     if expected is not None and int(me.id) != int(expected):
@@ -3968,7 +3970,7 @@ async def _check_connection(cfg: dict) -> dict:
         if not await client.is_user_authorized():
             return {"ok": False, "category": 2, "error": "not logged in",
                     "hint": (f"run: telegram login --connection {cfg['id']} "
-                             f"(or: telegram login --qr --connection {cfg['id']})")}
+                             f"(QR; or: telegram login --phone --connection {cfg['id']})")}
         me = await client.get_me()
         expected = cfg.get("expected_account_id")
         if expected is not None and int(me.id) != expected:
@@ -4056,9 +4058,10 @@ def _login_result(cfg: dict, me, **extra) -> dict:
     return out
 
 
-async def cmd_login(cfg: dict) -> dict:
+async def cmd_login(cfg: dict, phone: str | None = None) -> dict:
     client = make_client(cfg)
-    await client.start()  # interactive: phone + code (+ 2FA password if set)
+    # interactive: phone (unless given) + code (+ 2FA password if set)
+    await client.start(**({"phone": phone} if phone else {}))
     me = await client.get_me()
     await client.disconnect()
     return _login_result(cfg, me)
@@ -4100,7 +4103,7 @@ async def cmd_login_qr(cfg: dict) -> dict:
             me = await client.get_me()
         except asyncio.TimeoutError:
             _die(2, "qr_expired", "QR login expired before it was approved",
-                 "run `telegram login --qr` again to generate a fresh QR")
+                 "run `telegram login` again to generate a fresh QR")
         return _login_result(cfg, me)
     finally:
         await client.disconnect()
@@ -7169,9 +7172,12 @@ def main() -> None:
 
     sub.add_parser("help", help="print the full usage contract")
     sub.add_parser("doctor", help="health check: creds + reachability + session")
-    pl = sub.add_parser("login", help="interactive first-time auth (phone + code, or QR)")
-    pl.add_argument("--qr", action="store_true",
-                    help="scan a QR from an already-authorized Telegram app")
+    pl = sub.add_parser("login", help="interactive first-time auth (QR, or phone + code)")
+    login_method = pl.add_mutually_exclusive_group()
+    login_method.add_argument("--qr", action="store_true",
+                              help="scan a QR from an already-authorized Telegram app (the default)")
+    login_method.add_argument("--phone", nargs="?", const="", default=None, metavar="NUMBER",
+                              help="sign in with the phone number and the code Telegram sends")
     sub.add_parser("whoami", help="identity of the signed-in account")
 
     pc = sub.add_parser("chats", help="list recent dialogs")
@@ -7491,7 +7497,8 @@ def main() -> None:
                  "retry the command; do not disable SQLite locking")
     try:
         if args.cmd == "login":
-            _emit(asyncio.run(cmd_login_qr(cfg) if args.qr else cmd_login(cfg)))
+            _emit(asyncio.run(cmd_login_qr(cfg) if args.phone is None
+                              else cmd_login(cfg, args.phone or None)))
         elif args.cmd == "whoami":
             _emit(asyncio.run(cmd_whoami(cfg)))
         elif args.cmd == "chats":
@@ -7525,7 +7532,7 @@ def main() -> None:
             )))
     except (ApiIdInvalidError, AuthKeyUnregisteredError) as e:
         _die(2, "auth_failed", f"Telegram rejected the session/credentials: {e.__class__.__name__}",
-             "run `telegram login` or `telegram login --qr` to re-authenticate; "
+             "run `telegram login` (QR) or `telegram login --phone` to re-authenticate; "
              "verify TELEGRAM_API_ID / TELEGRAM_API_HASH")
     except FloodWaitError as e:
         _die(5, "flood_wait", f"Telegram rate limit — wait {e.seconds}s before retrying",
