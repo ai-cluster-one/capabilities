@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-13 — `automations` declares what a person is asked for, and writes it through the contract
+
+Its settings (project `service/config.toml`, machine `service/config.toml`) are declared under `settings`, with the keys a panel shows as controls, and `automations settings` reads every document whole while `settings get|set|unset|put` write one key or one document, checked as automations reads it. Bare `automations help` ends with a section rendered from these declarations. Nothing else changes.
+
 ## 2026-10-13 — Automations are definitions in the store, each scheduled on one node
 
 Breaking. An automation is a row of the new table `automations_definitions` in the project's store, kept as versions, and `config.toml` keeps only `[engine]` and `[agents]`. While `config.toml` still declares `[[automations]]`, every command that reads the declaration exits 6 `definitions_not_imported`, and `agents` and `agent` still answer. `automations import` shows what moves, and `automations import --apply` saves each entry as a definition whose script stays the path it was, all or none, and removes the entries and `engine.timezone` from the file, keeping every other byte. `every_seconds` becomes the cron that fires at that rate, `name` and `description` become the description, `[engine] timezone` becomes each definition's `timezone`, and `environments` becomes the one `node`. The environment in force here maps to this machine's node and `--node ENVIRONMENT=NODE` maps the others. An enabled automation that reaches no node, or two, is refused. `max_parallel`, `max_pending` and `overlap` are gone: one run of an automation is active at a time across every node, and a firing that finds one is recorded `skipped`.

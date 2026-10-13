@@ -35,6 +35,9 @@ Every script implements the same contract verbs alongside its domain verbs. This
 | `ids list\|get\|set\|rm` | The project identifiers envelope, managed. |
 | `refs` | The menu of the project's reference files, from front-matter. |
 | `inventory` | What the capability holds in this project: headline metrics and the things inside. Local only by default — no network, no writes. |
+| `connection add\|remove` | Only for a capability that declares `CONN_FIELDS`: write or remove one connection from its declared fields, its secrets from stdin (see [what a person is asked for](#what-a-person-is-asked-for)). |
+| `setup` | Only for a capability that declares `SETUP_FIELDS`: report, write or remove the machine's prerequisites. |
+| `settings` | Only for a capability that declares `SETTINGS`: read every settings document whole, and write one key or one document, wherever it lives. |
 | `migrate` / `migrate status` | Only for a capability that declares `TABLES`: apply its pending migration steps to its tables in the project's database / report where they stand, without a lock, changing nothing (see [runtime state in the store](#runtime-state-in-the-store)). |
 
 The declaration facts feed the contract from **constants at the top of the script** — one home each. Guide topics are the exception: their one home is the set of shipped Markdown filenames. Contract verbs render from these sources so they cannot disagree with one another:
@@ -54,6 +57,14 @@ TABLES = False      # True when it keeps tables in the project's database, with 
 INVENTORY = None    # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
 POST_INSTALL = []   # [{"cmd": …, "note": …}] steps the manager offers at install
 SERVICE = None      # or {"name", "summary", "verbs", ...} when a bundled service ships
+CONN_FIELDS = [     # a connection entry's own fields; turns on `connection add|remove`
+    {"key": "secret_env", "label": "Personal access token", "type": "string",
+     "secret": True, "required": True, "env": "ASANA_{ID}_TOKEN",
+     "help": "An Asana personal access token."},
+]
+SETUP_FIELDS = []   # the machine's prerequisites, set once; turns on `setup`
+LINK_METHODS = []   # interactive ceremonies that link a connection, each with --events
+SETTINGS = None     # or {"homes": [...], "keys": [...]}; turns on `settings`
 ```
 
 ## Agent-first help is the surface
@@ -106,6 +117,16 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
   "inventory": { "network": "optional" },
   "post_install": [],
   "tables": false,
+  "connections": {
+    "fields": [
+      { "key": "secret_env", "label": "Personal access token", "type": "string",
+        "secret": true, "required": true, "env": "ASANA_{ID}_TOKEN",
+        "help": "An Asana personal access token." }
+    ],
+    "setup": [],
+    "link": []
+  },
+  "settings": null,
   "service": {
     "name": "assistant",
     "summary": "Project-local assistant daemon using the bundled service engine.",
@@ -140,6 +161,8 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 | `inventory` | `null` when the capability reports nothing of its own; otherwise `{ "network": "none" \| "optional" \| "required" }` — how much of its report needs the remote system (see [inventory](#inventory--what-the-capability-holds-here)). |
 | `post_install[]` | `{ "cmd", "note" }` steps the manager **offers** at install — idempotent, never auto-run. |
 | `tables` | `true` declares the capability keeps tables in the project's database and answers `migrate`; the manager runs `<name> migrate` where the payload arrives (see [runtime state in the store](#runtime-state-in-the-store)). |
+| `connections` | `null` for a capability without the connections tier; otherwise `{ "fields", "setup", "link" }` from `CONN_FIELDS` (`null` where it declares none), `SETUP_FIELDS` and `LINK_METHODS` ([what a person is asked for](#what-a-person-is-asked-for)). |
+| `settings` | `null` for a capability that keeps no settings; otherwise `{ "homes", "keys" }` from `SETTINGS` ([settings](#settings)). |
 | `contribution` *(optional)* | The capability's context contribution (DOCTRINE rule 2): `{ "path", "max_bytes" }`, and any other key is refused. `path` names a Markdown file relative to the capability's own folder in the project envelope and inside its `state/` folder — `state/context.md` — with no leading `/`, no backslash, and no empty, `.` or `..` segment. `max_bytes` is an integer from 1 to 32768, the most UTF-8 bytes the manager composes from that file. The capability keeps the file rendered and answers `<name> render`, which rewrites it. The manager reads that file and nothing else when it composes the project context, placing it directly after the stub line under the capability's own second-level heading, so the file opens no heading above the third level; an empty file adds nothing, and a missing, unreadable, malformed or oversized one is replaced by a single line pointing to `<name> render`. The manager validates the declaration during audit, source check, and install. |
 | `service` *(optional)* | Metadata for a bundled service: at minimum `name`, `summary`, and `verbs[]`. The CLI owns its lifecycle contract under `<name> service ...`. |
 | `service.deploy` *(optional)* | Versioned, provider-neutral deploy descriptor. Its v1 contract declares an argv `command`, service-only `environment.required[]` and optional `{key, default?}` entries, named `state`/`shared` mounts, Compose restart policy, optional doctor argv, and `default_policy` (`auto` or `disabled`). Mount targets are absolute or start with `{agent_home}` / `{project_root}` and are resolved by the consuming runtime. Generic CLI credentials do not become service requirements unless the descriptor declares them. |
@@ -518,7 +541,7 @@ A missing required value fails through `_die` with the exact remediation for bot
 
 **Credential scope** is declared in the manifest (`SCOPE`). `project` — the default — homes the secret in the project's `.env`/`.env.local`, nothing global: the shape for service- and tenant-scoped tools. `user` homes it in `~/.config/<name>/credentials.env`: reserved for personal-account tools where one human has one identity. Scope names where install scaffolds and where `doctor` points its remediation; the cascade itself consults all four tiers, identically, regardless of scope.
 
-`credentials.env` is **human-written only**: a script never writes back into it. An artifact a login ceremony mints — a session cookie, an exchanged token — is state and lands in the state directory ([below](#state)). One writer per file, everywhere.
+`credentials.env` is **human-written only**: a script never writes back into it of its own accord. What it holds comes from a person, by hand or through the contract's `connection add` and `setup set`, which take a secret on stdin at that person's request ([what a person is asked for](#what-a-person-is-asked-for)). An artifact a login ceremony mints — a session cookie, an exchanged token — is state and lands in the state directory ([below](#state)). One writer per file, everywhere.
 
 A capability whose secret is not a flat token resolves it in its own shape — keyed indirectly through a config file, or persisted after a login exchange — but the **tiers and their order are preserved**: an explicit override beats project config beats user config beats process env, resolved by deterministic code. The shape may vary; the order may not.
 
@@ -664,6 +687,61 @@ def _mask(value: str) -> str:
 Beside the connections the report carries `policy`, the capability's effective policy state in the words `capabilities list` uses: `effective` (`enabled` or `disabled`), the `source` that decided it (`machine` for the ceiling, `project`, `global`, or `default` when neither scope says anything) and the `machine` ceiling itself. A policy record that cannot be read is reported there as the refusal the gate would give, and the report still answers.
 
 A **core-only** capability — one carrying the `capability core` fence and no `connections` fence, because it has nothing to resolve (it drives a local tool or the host, with no credentials or endpoint) — still answers `connections`, reporting an empty map: `{ "connections": {}, "default": null }`. That absence is the contract, not a gap: `audit` accepts the empty report in place of the explicit-registry checks, and never writes a registry against such a capability.
+
+## What a person is asked for
+
+What a capability needs from a person is declared once, at the top of the script, so any reader - `manifest`, an agent, a control panel - renders it and drives it without knowing the capability. Four declarations, each optional:
+
+- `CONN_FIELDS` - the fields of one connection entry, the interior [connections](#connections) leaves to the capability.
+- `SETUP_FIELDS` - what the machine is given once, before any connection: an app's own credentials, a key a side feature uses. Each is an env key, kept in the capability's `credentials.env` and resolved through [the credential cascade](#the-credential-cascade).
+- `LINK_METHODS` - the interactive ceremonies that link a connection to an account.
+- `SETTINGS` - where the capability's settings live and the keys it declares ([settings](#settings)).
+
+A field, in `CONN_FIELDS`, `SETUP_FIELDS` and `SETTINGS.keys` alike:
+
+| Key | Meaning |
+|---|---|
+| `key` | The entry field, env key or dotted settings key it is written to. |
+| `label`, `help` | What a person is shown: a few words, and one sentence. |
+| `type` | `string`, `integer`, `number`, `boolean`, `url`, `email`, `phone`, `path`, `enum` (with `choices`), `list` or `object`. |
+| `required` | Whether a connection is incomplete without it. |
+| `secret` | The value is a secret: it is taken only on stdin and never from argv, and never sits in a record. A secret connection field's `key` is the entry field that names its env key (`secret_env`, `db_password_env`), and `env` is the template of that key, `{ID}` standing for the connection id upper-cased with every other character an underscore. |
+| `default`, `minimum`, `maximum`, `choices` | Optional: the value used when none is given, and the bounds a value is checked against. |
+
+The manager validates the declarations wherever it validates a manifest.
+
+### `connection add|remove`
+
+`<name> connection add <id> [--project|--global] [--default] [--field KEY=VALUE ...] [--stdin]` writes one connection from the declared fields, and is answered the same way by every capability that declares `CONN_FIELDS`. A non-secret field may come on argv; every field may come in one JSON object on stdin, and a secret field only there. A secret is written to the credentials file of the scope the record lands in - the project's `.env.local` for `--project`, the default, or the capability's `credentials.env` for `--global` - under its own env key, single-quoted, the file replaced atomically at mode 0600 and read back through the cascade's parser, and the entry names the key. The entry is written through the records adapter, so a project in store mode keeps it in its store as any connection. An existing connection keeps every field not given, and `null` in the JSON object clears one. Required fields left unset refuse with exit 6 `fields_required`, a secret on argv with exit 6 `secret_on_argv`. `--default` points the scope's default at it. The answer names the record, the credentials file and every field as it now resolves, secrets masked, and, for a global connection used inside a project, the grant it still needs.
+
+`<name> connection remove <id> [--project|--global]` removes the entry, the default pointer when it names it, and every secret line `connection add` wrote for it; a key another connection at that scope names is kept.
+
+### `setup`
+
+`<name> setup` reports each declared prerequisite: whether it resolves, from which tier and file, secrets masked, and `ready` when every required one does. `setup set [--field KEY=VALUE ...] [--stdin]` writes them to the capability's `credentials.env`, a secret only from the JSON object on stdin, and `setup unset <KEY> ...` removes them. Every connection of the capability resolves them through the cascade, so a control panel asks for them once, above the connections.
+
+### Linking a connection
+
+A verb that links a connection to an account interactively - a QR to scan, a code to enter, a two-step password - takes `--events`, and is then drivable with no terminal. It speaks JSON lines on stdout, one object per line naming its `event`, and reads the answer to each event that asks for one as one line on stdin:
+
+| Event | Fields | Meaning |
+|---|---|---|
+| `qr` | `payload`, `expires`?, `refreshed` | A QR to render and scan; a new one follows each that expires. |
+| `pairing_code` | `code`, `phone` | A code the person enters on the phone. |
+| `phone_needed` | | Answer with the phone number. |
+| `code_needed` | `phone`, `retry` | Answer with the code the service sent. |
+| `password_needed` | `hint`, `retry` | Answer with the account's two-step password. |
+| `linked`, `progress` | the capability's | The link completed; the ceremony is still at work. |
+| `done` | `result` | The result the verb prints without `--events`, as the last line. |
+| `error` | `exit`, `error` | The refusal, as the last line; the same envelope also goes to stderr. |
+
+Standard input closing while an answer is awaited exits 6 `input_closed`. The exit code is the one the verb has without `--events`, and without `--events` the verb is unchanged. `LINK_METHODS` names each ceremony - `id`, `label`, `help` and its `argv`, which carries `--events` - to be run with `--connection <id>` added. The contract carries the stream (`_events_begin`, `_event`, `_event_answer`): once a verb begins it, `_emit` writes the `done` event and `_die` the `error` event.
+
+### Settings
+
+A capability that keeps settings declares where: `SETTINGS["homes"]`, one home per scope, each `{ "scope", "path", "format", "inherits"?, "seed"? }`. `scope` is `project` (the path is under the capability's folder in the project envelope), `global` (under its folder in the user's config home, the defaults every project reads beneath its own) or `machine` (under the same folder, the settings of the capability's machine service); `format` is `json` or `toml`; `inherits` names the scope a top-level key absent here is read from, as the records adapter merges a project's settings over the global ones; `seed` is the document a file not yet written starts as. `SETTINGS["keys"]` declares the keys a control panel shows as controls, each a field as above with `scope`, and `apply`: `next_call` (read afresh by the next call), `reload` (a running service takes it on `service reload`) or `restart` (only a stopped and started one does). Keys not declared are still read and written; they are what a panel shows as JSON.
+
+`<name> settings [--scope S]` reads every home whole, with each declared key's value and the scope it came from. `settings get <key>`, `settings set <key> <value>`, `settings unset <key>` (a dotted key reaches a nested one; `<value>` is read as JSON, else as text) and `settings put < document.json`, which replaces one scope's document, write through one surface whatever the home's format; `--scope` defaults to the key's declared scope, else the only home. A declared key's value is checked against its declaration, then the whole document as the capability itself reads it - `_settings_check(scope, document, path)`, outside the fences, returns the problems its own reader finds in the file about to replace the home - and a refusal is exit 6 `settings_invalid` with nothing written. The file is replaced atomically; a TOML home is rewritten from its content, so its comments are not kept. The answer names `apply`, so a caller knows whether to `service reload`. Under the read-only switch every write is refused.
 
 ## Identity-free
 

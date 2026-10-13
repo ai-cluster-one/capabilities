@@ -1,5 +1,9 @@
 # coolify — change log
 
+## 2026-10-13 — `coolify` declares what a person is asked for, and writes it through the contract
+
+`coolify manifest` now declares a connection's fields under `connections.fields` (`base_url`, `secret_env`, `ssh`), each with its label, help, type, whether it is required and whether it is a secret, and `coolify connection add <id>` writes one connection from them: non-secret fields on argv with `--field KEY=VALUE` or in a JSON object on stdin with `--stdin`, a secret only on stdin, written to the scope's `.env.local` or `credentials.env` under its own env key. `coolify connection remove <id>` takes it out again with the secrets it wrote. Bare `coolify help` ends with a section rendered from these declarations. Nothing else changes.
+
 ## 2026-10-10 — The bootstrap guide never switches the Mac's store on its own
 
 Step 6 of `coolify guide bootstrap` still creates the Postgres, but no longer ends by running `capabilities store set`. It reads `capabilities store show` first: when a store is already in force at any level of the cascade, the setting is left as it is and the user is told that the new Postgres can take over later and that the data does not move by itself; when none is, the user is told a database is needed and chooses between this Postgres and a Supabase project, and `capabilities store set` runs only on the answer for this Postgres. Continuing without a database is never offered. No verb changes.

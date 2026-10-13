@@ -436,6 +436,55 @@ SUMMARY = (
 )
 SCOPE = "project"
 CRED_KEYS: list = []
+
+# Where this capability's settings live, and the keys it declares; `settings` reads and writes them.
+SETTINGS = {'homes': [{'scope': 'project',
+            'path': 'service/config.toml',
+            'format': 'toml',
+            'seed': {'version': 1}},
+           {'scope': 'machine',
+            'path': 'service/config.toml',
+            'format': 'toml',
+            'seed': {'version': 1}}],
+ 'keys': [{'key': 'engine.tick_seconds',
+           'label': 'Tick',
+           'help': 'Seconds between scheduler ticks.',
+           'type': 'number',
+           'default': 1.0,
+           'scope': 'project',
+           'apply': 'reload'},
+          {'key': 'engine.max_parallel',
+           'label': 'Parallel jobs',
+           'help': 'Jobs running at once in this project.',
+           'type': 'integer',
+           'default': 4,
+           'minimum': 1,
+           'scope': 'project',
+           'apply': 'reload'},
+          {'key': 'engine.shutdown_grace_seconds',
+           'label': 'Shutdown grace',
+           'help': 'Seconds a stop waits for running jobs.',
+           'type': 'integer',
+           'default': 15,
+           'minimum': 0,
+           'scope': 'project',
+           'apply': 'reload'},
+          {'key': 'engine.recovery',
+           'label': 'Recovery',
+           'help': 'What becomes of a run a restart interrupted.',
+           'type': 'enum',
+           'choices': ['fail', 'retry'],
+           'default': 'fail',
+           'scope': 'project',
+           'apply': 'reload'},
+          {'key': 'max_parallel',
+           'label': 'Machine parallel jobs',
+           'help': 'Jobs running at once across every joined project; no cap when '
+                   'empty.',
+           'type': 'integer',
+           'minimum': 1,
+           'scope': 'machine',
+           'apply': 'reload'}]}
 WRITE_VERBS: set = set()
 WRITE_DEFAULT = False
 DOCS_BASE = (
@@ -515,11 +564,20 @@ def _die(exit_code: int, code: str, message: str,
         err["hint"] = hint
     if status is not None:
         err["status"] = status
+    if _EVENTS_ON[0]:
+        sys.stdout.write(json.dumps({"event": "error", "exit": exit_code, "error": err},
+                                    ensure_ascii=False) + "\n")
+        sys.stdout.flush()
     sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
     sys.exit(exit_code)
 
 
 def _emit(value) -> None:
+    if _EVENTS_ON[0]:
+        sys.stdout.write(json.dumps({"event": "done", "result": value},
+                                    ensure_ascii=False, default=str) + "\n")
+        sys.stdout.flush()
+        return
     if isinstance(value, str):
         sys.stdout.write(value)
         if value and not value.endswith("\n"):
@@ -1627,9 +1685,100 @@ def _cmd_help() -> None:
     sys.stdout.write(text)
     if text and not text.endswith("\n"):
         sys.stdout.write("\n")
+    declared = _declared_section()
+    if declared:
+        sys.stdout.write(declared)
     section = _identifiers_section()
     if section:
         sys.stdout.write(section)
+
+
+def _field_line(field: dict, scoped: bool = False) -> str:
+    """One declared field or setting as help prints it."""
+    kind = field.get("type") or "string"
+    if kind == "enum":
+        kind = "|".join(field.get("choices") or [])
+    traits = [kind, "required" if field.get("required") else "optional"]
+    if field.get("secret"):
+        traits.append("secret, stdin only" + (f", kept as {field['env']}" if field.get("env") else ""))
+    if field.get("default") is not None:
+        traits.append(f"default {json.dumps(field['default'])}")
+    if scoped:
+        traits = [kind]
+        if field.get("default") is not None:
+            traits.append(f"default {json.dumps(field['default'])}")
+        traits.append({"reload": "a running service takes it on `service reload`",
+                       "restart": "a running service takes it on a restart",
+                       "next_call": "read on the next call"}.get(field.get("apply"), ""))
+        return (f"    {field['key']} @{field.get('scope')} ({', '.join(t for t in traits if t)})"
+                f" - {field.get('help', '')}\n")
+    return f"    {field['key']} ({', '.join(traits)}) - {field.get('help', '')}\n"
+
+
+def _declared_section() -> str:
+    """The verbs the contract answers from this capability's declarations -
+    `connection`, `setup`, `settings` and the linking methods - rendered from
+    the declarations themselves, so help and behaviour cannot part."""
+    conns = _connections_declaration()
+    settings = _settings_declaration()
+    out = ""
+    if conns and conns.get("fields") is not None:
+        out += (f"\n## Connections, written through the contract\n\n"
+                f"  {NAME} connection add <id> [--project|--global] [--default] "
+                "[--field KEY=VALUE ...] [--stdin]\n"
+                "      Write one connection from the fields below. --project (the default)\n"
+                "      writes this project's record, --global the machine's. A secret field is\n"
+                "      taken only from the JSON object on stdin (--stdin), never from argv, and\n"
+                "      written to that scope's credentials file - the project's .env.local, or\n"
+                f"      {CREDENTIALS_ENV} - under its own env key, which the\n"
+                "      entry names. A connection that exists keeps every field not given;\n"
+                "      null in the JSON object clears one. --default points the scope's default\n"
+                "      at it. Answers the fields as they now resolve, secrets masked.\n"
+                f"  {NAME} connection remove <id> [--project|--global]\n"
+                "      Remove it, its default pointer, and the secret lines `connection add`\n"
+                "      wrote for it; a key another connection names is kept.\n")
+        out += "  Fields:\n" + ("".join(_field_line(f) for f in conns["fields"])
+                                or "    none - an entry carries no fields of its own\n")
+    if conns and conns.get("setup"):
+        out += (f"\n## Machine setup, written through the contract\n\n"
+                f"  {NAME} setup [show] | setup set [--field KEY=VALUE ...] [--stdin] | "
+                "setup unset <KEY> ...\n"
+                "      What this machine is given once, before any connection, kept in\n"
+                f"      {CREDENTIALS_ENV}; `show` says where each resolves\n"
+                "      from, secrets masked. A secret is taken only from the JSON object on stdin.\n")
+        out += "".join(_field_line(f) for f in conns["setup"])
+    if conns and conns.get("link"):
+        out += ("\n## Linking a connection\n\n"
+                "  Each method runs with --connection <id> added, speaks JSON lines on stdout -\n"
+                "  one object per line naming its `event`: qr {payload, expires?, refreshed},\n"
+                "  pairing_code {code, phone}, phone_needed, code_needed {phone, retry},\n"
+                "  password_needed {hint, retry}, linked, progress, then done {result} or\n"
+                "  error {exit, error} - and reads the answer to each *_needed event as one\n"
+                "  line on stdin. The exit code is the one the method has without --events.\n")
+        for method in conns["link"]:
+            out += (f"  {' '.join(method.get('argv') or [])}\n"
+                    f"      {method.get('label', '')}: {method.get('help', '')}\n")
+    if settings:
+        out += (f"\n## Settings, read and written through the contract\n\n"
+                f"  {NAME} settings [show] [--scope S]\n"
+                "      Every settings document, whole, with the declared keys below resolved.\n"
+                f"  {NAME} settings get <key> | set <key> <value> | unset <key> [--scope S]\n"
+                "      One key, dotted for a nested one; <value> is read as JSON, else as text.\n"
+                f"  {NAME} settings put [--scope S] < document.json\n"
+                "      Replace one scope's document whole.\n"
+                "      A write is checked as the capability reads it before it replaces the file\n"
+                "      (exit 6 settings_invalid otherwise); a TOML file is rewritten from its\n"
+                "      content, so its comments are not kept. S is the scope a key is declared\n"
+                "      at, else the only one; homes:\n")
+        for home in settings["homes"]:
+            base = ("<envelope>/" + NAME if home["scope"] == "project"
+                    else str(_CONFIG_HOME / NAME))
+            out += (f"    {home['scope']}: {base}/{home['path']} ({home['format']})"
+                    + (f", inheriting {home['inherits']} key by key" if home.get("inherits") else "")
+                    + "\n")
+        if settings["keys"]:
+            out += "  Declared keys:\n" + "".join(_field_line(k, scoped=True) for k in settings["keys"])
+    return out
 
 
 def _cmd_ids(argv: list[str]) -> None:
@@ -1972,6 +2121,475 @@ def _cmd_connections_reported() -> None:
     _emit(report)
 
 
+# --- Declared connection fields, setup, linking and settings -----------------
+#
+# What a person is asked for is declared once, at the top of the script, so any
+# reader - `manifest`, an agent, a control panel - renders it without knowing
+# the capability. Each declaration is optional and read with `globals().get`,
+# so a script that declares none still runs:
+#   CONN_FIELDS   a connection entry's own fields, one dict per field
+#   SETUP_FIELDS  what the machine is given once, before any connection
+#   LINK_METHODS  the interactive ceremonies that link a connection
+#   SETTINGS      where the capability's settings live, and the keys it declares
+
+FIELD_TYPES = ("string", "integer", "number", "boolean", "url", "email",
+               "phone", "path", "enum", "list", "object")
+SETTING_SCOPES = ("project", "global", "machine")
+SETTING_APPLY = ("next_call", "reload", "restart")
+SETTING_FORMATS = ("json", "toml")
+LINK_EVENTS = ("qr", "pairing_code", "phone_needed", "code_needed",
+               "password_needed", "progress", "linked", "done", "error")
+
+
+def _connections_declaration() -> dict | None:
+    """The `connections` manifest entry: null for a capability without the
+    connections tier; `fields` null where the capability declares none yet."""
+    if "_resolve_env_key" not in globals():
+        return None
+    fields = globals().get("CONN_FIELDS")
+    return {"fields": [dict(f) for f in fields] if fields is not None else None,
+            "setup": [dict(f) for f in (globals().get("SETUP_FIELDS") or [])],
+            "link": [dict(m) for m in (globals().get("LINK_METHODS") or [])]}
+
+
+def _settings_declaration() -> dict | None:
+    """The `settings` manifest entry: null when the capability keeps none."""
+    declared = globals().get("SETTINGS")
+    if not declared:
+        return None
+    return {"homes": [dict(h) for h in (declared.get("homes") or [])],
+            "keys": [dict(k) for k in (declared.get("keys") or [])]}
+
+
+def _manifest_core() -> dict:
+    """The declaration every capability's manifest carries. A capability that
+    adds to its manifest - a service, a contribution - starts from this, so the
+    shared part has one home."""
+    return {"name": NAME, "summary": SUMMARY,
+            "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
+            "docs": {"base": DOCS_BASE,
+                     "topics": [entry["topic"] for entry in _guide_menu()]},
+            "state": STATE, "inventory": _inventory_declaration(),
+            "post_install": POST_INSTALL, "tables": _tables_declared(),
+            "connections": _connections_declaration(),
+            "settings": _settings_declaration()}
+
+
+def _field_value(field: dict, raw, from_argv: bool = False):
+    """One declared field's value, checked against its type. A value given on
+    argv arrives as text and is read as the type would write it; a value from
+    a JSON document arrives typed. Raises ValueError naming what is wrong."""
+    import re as _re
+    kind = field.get("type") or "string"
+    key = field.get("key")
+    if kind in ("string", "url", "email", "phone", "path", "enum"):
+        if not isinstance(raw, str) or (field.get("required") and not raw.strip()):
+            raise ValueError(f"{key} is text")
+        value = raw.strip()
+        if kind == "url" and not _re.match(r"https?://[^/\s]+", value):
+            raise ValueError(f"{key} is an http(s) URL")
+        if kind == "email" and not _re.fullmatch(r"[^@\s]+@[^@\s]+", value):
+            raise ValueError(f"{key} is an email address")
+        if kind == "phone" and not _re.fullmatch(r"\+?[0-9][0-9 ()-]{4,}", value):
+            raise ValueError(f"{key} is a phone number, digits with an optional +")
+        if kind == "enum" and value not in (field.get("choices") or []):
+            raise ValueError(f"{key} is one of: {', '.join(field.get('choices') or [])}")
+        return value
+    if kind in ("integer", "number"):
+        value = raw
+        if from_argv and isinstance(raw, str):
+            try:
+                value = int(raw) if kind == "integer" else float(raw)
+            except ValueError:
+                raise ValueError(f"{key} is a {'whole ' if kind == 'integer' else ''}number") from None
+        if isinstance(value, bool) or not isinstance(
+                value, int if kind == "integer" else (int, float)):
+            raise ValueError(f"{key} is a {'whole ' if kind == 'integer' else ''}number")
+        if field.get("minimum") is not None and value < field["minimum"]:
+            raise ValueError(f"{key} is at least {field['minimum']}")
+        if field.get("maximum") is not None and value > field["maximum"]:
+            raise ValueError(f"{key} is at most {field['maximum']}")
+        return value
+    if kind == "boolean":
+        if from_argv and isinstance(raw, str):
+            lowered = raw.strip().lower()
+            if lowered in ("true", "yes", "on", "1"):
+                return True
+            if lowered in ("false", "no", "off", "0"):
+                return False
+        if not isinstance(raw, bool):
+            raise ValueError(f"{key} is true or false")
+        return raw
+    if kind in ("list", "object"):
+        value = raw
+        if from_argv and isinstance(raw, str):
+            try:
+                value = json.loads(raw)
+            except ValueError:
+                if kind == "object":
+                    raise ValueError(f"{key} is a JSON object") from None
+                value = [part.strip() for part in raw.split(",") if part.strip()]
+        if kind == "list" and not isinstance(value, list):
+            raise ValueError(f"{key} is a list")
+        if kind == "object" and not isinstance(value, dict):
+            raise ValueError(f"{key} is a JSON object")
+        return value
+    raise ValueError(f"{key} declares an unknown type {kind!r}")
+
+
+def _stdin_document(what: str) -> dict:
+    """One JSON object read whole from standard input."""
+    text = sys.stdin.read()
+    try:
+        document = json.loads(text) if text.strip() else {}
+    except ValueError as e:
+        _die(6, "input", f"{what} on stdin is not JSON: {e}")
+    if not isinstance(document, dict):
+        _die(6, "input", f"{what} on stdin is a JSON object")
+    return document
+
+
+# --- Linking events ----------------------------------------------------------
+#
+# A verb that links a connection interactively takes `--events`, and then
+# speaks JSON lines on stdout, one object per line naming its `event`, and
+# reads each answer it asks for as one line on stdin - so a program with no
+# terminal can drive it. `_emit` then writes the result as the `done` event and
+# `_die` writes an `error` event before its usual envelope on stderr.
+
+_EVENTS_ON = [False]
+
+
+def _events_begin() -> None:
+    """Turn this process's output into the linking event stream."""
+    _EVENTS_ON[0] = True
+
+
+def _event(name: str, **fields) -> None:
+    if not _EVENTS_ON[0]:
+        return
+    sys.stdout.write(json.dumps({"event": name, **fields}, ensure_ascii=False,
+                                default=str) + "\n")
+    sys.stdout.flush()
+
+
+def _event_answer(name: str, **fields) -> str:
+    """Ask for one value with a `*_needed` event and read its line from stdin."""
+    _event(name, **fields)
+    line = sys.stdin.readline()
+    if not line:
+        _die(6, "input_closed", f"standard input closed while {name} waited for an answer",
+             "write one line on stdin for every *_needed event")
+    return line.rstrip("\r\n")
+
+
+# --- Settings ----------------------------------------------------------------
+
+def _settings_homes(scope: str | None = None) -> list[dict]:
+    homes = list(((globals().get("SETTINGS") or {}).get("homes")) or [])
+    return [h for h in homes if scope is None or h.get("scope") == scope]
+
+
+def _settings_home_path(home: dict) -> Path | None:
+    """Where one home's document sits: under the capability's folder in the
+    project envelope for `project`, under its config home otherwise."""
+    if home.get("scope") == "project":
+        root = _project_root()
+        if root is None:
+            return None
+        return _project_capabilities_dir(root) / NAME / home["path"]
+    return _CONFIG_HOME / NAME / home["path"]
+
+
+def _settings_read(home: dict) -> tuple[Path | None, dict | None, str | None]:
+    path = _settings_home_path(home)
+    if path is None or not path.is_file():
+        return path, None, None
+    try:
+        text = path.read_text()
+        if home.get("format") == "toml":
+            import tomllib
+            document = tomllib.loads(text)
+        else:
+            document = json.loads(text) if text.strip() else {}
+    except Exception as e:
+        return path, None, f"cannot read {path}: {e}"
+    if not isinstance(document, dict):
+        return path, None, f"{path} does not hold an object"
+    return path, document, None
+
+
+def _settings_dig(document, key: str):
+    """The value at a dotted key, and whether it is there."""
+    here = document
+    for part in key.split("."):
+        if not isinstance(here, dict) or part not in here:
+            return None, False
+        here = here[part]
+    return here, True
+
+
+def _settings_put(document: dict, key: str, value) -> None:
+    parts = key.split(".")
+    here = document
+    for part in parts[:-1]:
+        if not isinstance(here.get(part), dict):
+            here[part] = {}
+        here = here[part]
+    here[parts[-1]] = value
+
+
+def _settings_drop(document: dict, key: str) -> bool:
+    parts = key.split(".")
+    here = document
+    for part in parts[:-1]:
+        here = here.get(part) if isinstance(here, dict) else None
+        if not isinstance(here, dict):
+            return False
+    return here.pop(parts[-1], None) is not None if isinstance(here, dict) else False
+
+
+def _toml_scalar(value) -> str:
+    import datetime as _dt
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
+        return value.isoformat()
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_scalar(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{_toml_name(k)} = {_toml_scalar(v)}"
+                               for k, v in value.items()) + " }"
+    raise ValueError(f"TOML holds no {type(value).__name__}")
+
+
+def _toml_name(key: str) -> str:
+    import re as _re
+    return key if _re.fullmatch(r"[A-Za-z0-9_-]+", key) else json.dumps(key)
+
+
+def _toml_dumps(document: dict, prefix: tuple = ()) -> str:
+    """A document as TOML: scalars first, then each table, then each array of
+    tables, which reads back as the same document. Comments are not kept."""
+    lines, tables, arrays = [], [], []
+    for key, value in document.items():
+        if isinstance(value, dict):
+            tables.append((key, value))
+        elif isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+            arrays.append((key, value))
+        else:
+            lines.append(f"{_toml_name(key)} = {_toml_scalar(value)}")
+    out = "\n".join(lines) + ("\n" if lines else "")
+    for key, value in tables:
+        name = ".".join(_toml_name(k) for k in (*prefix, key))
+        body = _toml_dumps(value, (*prefix, key))
+        # A table holding only tables needs no header of its own.
+        holds_tables_only = value and all(
+            isinstance(v, dict) or (isinstance(v, list) and v and all(isinstance(i, dict) for i in v))
+            for v in value.values())
+        out += (body if holds_tables_only else f"\n[{name}]\n" + body)
+    for key, items in arrays:
+        name = ".".join(_toml_name(k) for k in (*prefix, key))
+        for item in items:
+            out += f"\n[[{name}]]\n" + _toml_dumps(item, (*prefix, key))
+    return out
+
+
+def _settings_write(home: dict, path: Path, document: dict) -> None:
+    """Replace one home's document whole: written beside it, checked by the
+    capability where it checks its settings, then renamed over it."""
+    text = (_toml_dumps(document) if home.get("format") == "toml"
+            else json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    spare = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+        fd = os.open(spare, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+        check = globals().get("_settings_check")
+        problems = [str(p).replace(str(spare), str(path))
+                    for p in (check(home["scope"], document, spare) or [])] if check else []
+        if problems:
+            _die(6, "settings_invalid",
+                 problems[0] if str(path) in problems[0] else f"{path}: {problems[0]}",
+                 f"`{NAME} settings` shows the document; `{NAME} help` states the keys")
+        os.replace(spare, path)
+    finally:
+        if spare.exists():
+            spare.unlink()
+
+
+def _settings_key_decl(key: str, scope: str | None = None) -> dict | None:
+    """A key's declaration: at `scope` when one is named, else the first."""
+    for decl in ((globals().get("SETTINGS") or {}).get("keys")) or []:
+        if decl.get("key") == key and (scope is None or decl.get("scope") == scope):
+            return decl
+    return None
+
+
+def _settings_value(decl: dict, documents: dict) -> tuple:
+    """A declared key's value and the scope it came from: its own scope, then
+    the scope that scope inherits from, by top-level key, else its default."""
+    scope = decl.get("scope")
+    top = decl["key"].split(".", 1)[0]
+    seen: set = set()
+    while scope and scope not in seen:
+        seen.add(scope)
+        document = documents.get(scope)
+        if isinstance(document, dict) and top in document:
+            value, found = _settings_dig(document, decl["key"])
+            return (value, scope) if found else (decl.get("default"), "default")
+        home = next(iter(_settings_homes(scope)), {})
+        scope = home.get("inherits")
+    return decl.get("default"), "default"
+
+
+def _settings_report(scope: str | None) -> dict:
+    homes, documents = [], {}
+    for home in _settings_homes(scope):
+        path, document, error = _settings_read(home)
+        documents[home["scope"]] = document
+        row = {"scope": home["scope"], "format": home.get("format", "json"),
+               "path": str(path) if path else None,
+               "exists": bool(path and path.is_file()), "document": document}
+        if home.get("inherits"):
+            row["inherits"] = home["inherits"]
+        if error:
+            row["error"] = error
+        homes.append(row)
+    for home in _settings_homes():
+        if home["scope"] not in documents:
+            documents[home["scope"]] = _settings_read(home)[1]
+    keys = []
+    for decl in ((globals().get("SETTINGS") or {}).get("keys")) or []:
+        if scope and decl.get("scope") != scope:
+            continue
+        value, source = _settings_value(decl, documents)
+        keys.append({**decl, "value": value, "from": source})
+    return {"capability": NAME, "declared": bool(globals().get("SETTINGS")),
+            "homes": homes, "keys": keys}
+
+
+def _cmd_settings(argv: list[str]) -> None:
+    """`settings` reads every settings document the capability keeps, wherever
+    it lives, with its declared keys resolved; `get`, `set`, `unset` and `put`
+    read and write them through one surface."""
+    usage = (f"{NAME} settings [show] [--scope S] | get <key> [--scope S] | "
+             "set <key> <value> [--scope S] | unset <key> [--scope S] | "
+             "put [--scope S] < document.json")
+    scope = None
+    rest = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--scope":
+            if i + 1 >= len(argv) or argv[i + 1] not in SETTING_SCOPES:
+                _die(6, "input", f"--scope is one of {', '.join(SETTING_SCOPES)}", usage)
+            scope = argv[i + 1]
+            i += 2
+        elif argv[i] == "--json":
+            i += 1
+        else:
+            rest.append(argv[i])
+            i += 1
+    sub = rest[0] if rest else "show"
+    if sub == "show" and len(rest) <= 1:
+        _emit(_settings_report(scope)); return
+    if sub not in ("get", "set", "unset", "put"):
+        _die(6, "input", f"unknown settings subcommand {sub!r}", usage)
+    if not globals().get("SETTINGS"):
+        _die(6, "settings_undeclared", f"{NAME} declares no settings",
+             f"`{NAME} manifest` carries `settings: null`")
+    key = rest[1] if len(rest) > 1 else None
+    if sub in ("get", "set", "unset") and not key:
+        _die(6, "input", f"settings {sub} needs a key", usage)
+    decl = _settings_key_decl(key, scope) if key else None
+    if scope is None:
+        if decl and decl.get("scope"):
+            scope = decl["scope"]
+        elif len(_settings_homes()) == 1:
+            scope = _settings_homes()[0]["scope"]
+        else:
+            _die(6, "scope_required", f"{NAME} keeps settings at more than one scope",
+                 f"pass --scope {'|'.join(h['scope'] for h in _settings_homes())}")
+    homes = _settings_homes(scope)
+    if not homes:
+        _die(6, "unknown_scope", f"{NAME} keeps no settings at scope {scope!r}",
+             f"scopes: {', '.join(h['scope'] for h in _settings_homes())}")
+    home = homes[0]
+    path, document, error = _settings_read(home)
+    if error:
+        _die(6, "settings_unreadable", error)
+    if document is None and sub != "put":
+        # A file not written yet starts as the document its home declares.
+        document = json.loads(json.dumps(home.get("seed") or {}))
+    if path is None:
+        _die(6, "no_project", f"the {scope} settings live in a project and there is no "
+             "project here", "run it inside the project")
+    if sub == "get":
+        value, found = _settings_dig(document or {}, key)
+        if not found:
+            if decl is None:
+                _die(3, "not_found", f"{key} is not set at scope {scope}")
+            value = decl.get("default")
+        _emit(value if not isinstance(value, str) else json.dumps(value)); return
+    _read_only_gate(f"`{NAME} settings {sub}`")
+    document = dict(document or {})
+    previous = None
+    if sub == "put":
+        document = _stdin_document("the settings document")
+        for each in ((globals().get("SETTINGS") or {}).get("keys")) or []:
+            if each.get("scope") != scope:
+                continue
+            value, found = _settings_dig(document, each["key"])
+            if found:
+                try:
+                    _field_value(each, value)
+                except ValueError as e:
+                    _die(6, "settings_invalid", str(e))
+    elif sub == "set":
+        if len(rest) < 3:
+            _die(6, "input", "settings set needs a key and a value", usage)
+        try:
+            value = json.loads(rest[2])
+        except ValueError:
+            value = rest[2]
+        if decl is not None:
+            # A textual key takes the word as written, so "123" stays text.
+            textual = (decl.get("type") or "string") in (
+                "string", "enum", "url", "email", "phone", "path")
+            try:
+                value = _field_value(decl, rest[2] if textual else value,
+                                     from_argv=True)
+            except ValueError as e:
+                _die(6, "settings_invalid", str(e))
+        previous, _ = _settings_dig(document, key)
+        _settings_put(document, key, value)
+    else:
+        previous, found = _settings_dig(document, key)
+        if not found:
+            _die(3, "not_found", f"{key} is not set at scope {scope}")
+        _settings_drop(document, key)
+    _settings_write(home, path, document)
+    out = {"ok": True, "scope": scope, "path": str(path), "action": sub}
+    if key:
+        out.update({"key": key, "previous": previous})
+        if sub == "set":
+            out["value"] = _settings_dig(document, key)[0]
+    applies = (decl or {}).get("apply") or home.get("apply")
+    if applies:
+        out["apply"] = applies
+        if applies == "reload":
+            out["hint"] = f"`{NAME} service reload` adopts it in a running service"
+        elif applies == "restart":
+            out["hint"] = f"a running service adopts it only after `{NAME} service stop` and `start`"
+    _emit(out)
+
+
 def _contract(argv: list[str]) -> None:
     """Dispatch the contract verbs; domain verbs fall through to the CLI's own
     parser. Runs after _gate(), before any credential is resolved.
@@ -1983,12 +2601,7 @@ def _contract(argv: list[str]) -> None:
     if cmd == "stub":
         _emit(f"{SUMMARY} Run `{NAME} help`.")
     elif cmd == "manifest":
-        _emit({"name": NAME, "summary": SUMMARY,
-               "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
-               "docs": {"base": DOCS_BASE,
-                        "topics": [entry["topic"] for entry in _guide_menu()]},
-               "state": STATE, "inventory": _inventory_declaration(),
-               "post_install": POST_INSTALL, "tables": _tables_declared()})
+        _emit(_manifest_core())
     elif cmd == "migrate" and _tables_declared():
         _cmd_migrate(argv[1:])
     elif cmd == "guide":
@@ -2003,6 +2616,13 @@ def _contract(argv: list[str]) -> None:
         _cmd_connections_reported()
     elif cmd == "inventory":
         _cmd_inventory(argv[1:])
+    elif cmd == "settings" and globals().get("SETTINGS") is not None:
+        _cmd_settings(argv[1:])
+    elif cmd == "connection" and "_cmd_connection" in globals() \
+            and globals().get("CONN_FIELDS") is not None:
+        _cmd_connection(argv[1:])
+    elif cmd == "setup" and "_cmd_setup" in globals() and globals().get("SETUP_FIELDS"):
+        _cmd_setup(argv[1:])
     elif cmd == "help" and len(argv) == 1:
         _cmd_help()
     else:
@@ -3599,17 +4219,7 @@ def _service_verdict(found: dict[str, Any]) -> dict[str, Any]:
 
 
 def _manifest_payload() -> dict[str, Any]:
-    return {
-        "name": NAME,
-        "summary": SUMMARY,
-        "credentials": {"scope": SCOPE, "keys": CRED_KEYS},
-        "docs": {"base": DOCS_BASE, "topics": [entry["topic"] for entry in _guide_menu()]},
-        "state": STATE,
-        "inventory": _inventory_declaration(),
-        "post_install": POST_INSTALL,
-        "tables": _tables_declared(),
-        "service": SERVICE,
-    }
+    return {**_manifest_core(), "service": SERVICE}
 
 
 def _tables():
@@ -5163,6 +5773,19 @@ class _Refusal(Exception):
     def __init__(self, exit_code: int, code: str, message: str, hint: str | None = None):
         super().__init__(message)
         self.exit_code, self.code, self.message, self.hint = exit_code, code, message, hint
+
+
+def _settings_check(scope: str, document: dict, path: Path) -> list:
+    """What the machine service's reader finds wrong with the machine settings
+    the contract's `settings` verb is about to write. The project's settings
+    are checked where the service loads them, by `reload`."""
+    if scope != "machine":
+        return []
+    try:
+        _read_machine_settings(path)
+    except _Refusal as refused:
+        return [refused.message]
+    return []
 
 
 def _machine_service_dir() -> Path:

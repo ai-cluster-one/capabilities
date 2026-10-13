@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-13 — `tasks` declares what a person is asked for, and writes it through the contract
+
+`tasks manifest` now declares a connection's fields under `connections.fields` (`timezone`), each with its label, help, type, whether it is required and whether it is a secret, and `tasks connection add <id>` writes one connection from them: non-secret fields on argv with `--field KEY=VALUE` or in a JSON object on stdin with `--stdin`, a secret only on stdin, written to the scope's `.env.local` or `credentials.env` under its own env key. `tasks connection remove <id>` takes it out again with the secrets it wrote. Its settings (project `service/config.toml`, machine `service/config.toml`) are declared under `settings`, with the keys a panel shows as controls, and `tasks settings` reads every document whole while `settings get|set|unset|put` write one key or one document, checked as tasks reads it. Bare `tasks help` ends with a section rendered from these declarations. Nothing else changes.
+
 ## 2026-10-11 — A store behind Supabase's transaction pooler is refused at connect
 
 `tasks` now uses `capabilities-contract` 0.4.1. A transaction-mode pooler keeps no session between transactions, so the schema binding, prepared statements and notifications a connection relies on are lost through one, and it is not supported. A database setting that points at Supabase's transaction pooler - a host under `pooler.supabase.com` on port 6543 - is refused before anything is sent to it, as `transaction_pooler`, with a hint naming the session pooler: the same host on port 5432. Every other database, the session pooler included, is reached as before.

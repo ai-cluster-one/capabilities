@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-13 — A manifest's `connections` and `settings` declarations are validated
+
+Audit, source check and install now check a manifest's `connections` (`null`, or `fields`, `setup` and `link`) and `settings` (`null`, or `homes` and `keys`) wherever they validate a manifest: every field has a `key`, a `label`, a `help` and a known `type`, an enum its `choices`, a secret's `env` template its `{ID}`; every link method an argv carrying `--events`; every settings home one scope of `project`, `global` or `machine`, a format of `json` or `toml` and a relative path inside the capability's folder; every settings key a scope that has a home and an `apply` of `next_call`, `reload` or `restart`, and no secret. A manifest without them still validates.
+
 ## 2026-10-13 — `enable`, `disable` and `inherit` write the policy row for one node with `--node`
 
 `capabilities enable|disable|inherit <name> --project|--global --node <node>` writes, or removes, the store's policy row naming that node (the name the node gives itself: `AGENT_NODE_NAME`, else its host name), and the result carries `node`; without `--node` they write the row for every node as before. Only the project's row naming a node places a capability's bundled service on that node, so this is how a service is turned on or off for one node. Files carry no node: in files mode, or outside a project, `--node` exits 6 `node_requires_store`, with a hint to move the project's records into its store with `capabilities connections import`. `disable --deny` takes no `--node`.

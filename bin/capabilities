@@ -2024,6 +2024,133 @@ def _validate_contribution(contribution: object) -> list[str]:
 INVENTORY_NETWORK_MODES = ("none", "optional", "required")
 
 
+FIELD_TYPES = ("string", "integer", "number", "boolean", "url", "email",
+               "phone", "path", "enum", "list", "object")
+SETTING_SCOPES = ("project", "global", "machine")
+SETTING_APPLY = ("next_call", "reload", "restart")
+SETTING_FORMATS = ("json", "toml")
+
+
+def _validate_fields(where: str, fields, setting: bool = False) -> list[str]:
+    """One list of declared fields: what a person is asked for, by key."""
+    problems: list[str] = []
+    if not isinstance(fields, list):
+        return [f"{where} is not a list"]
+    seen: set = set()
+    for index, field in enumerate(fields):
+        at = f"{where}[{index}]"
+        if not isinstance(field, dict):
+            problems.append(f"{at} is not an object")
+            continue
+        key = field.get("key")
+        # A setting is named by its key at its scope: one key may live at two.
+        name = (key, field.get("scope")) if setting else key
+        if not isinstance(key, str) or not key.strip():
+            problems.append(f"{at}.key missing or empty")
+        elif name in seen:
+            problems.append(f"{at}.key {key!r} is declared twice")
+        else:
+            seen.add(name)
+        if field.get("type", "string") not in FIELD_TYPES:
+            problems.append(f"{at}.type {field.get('type')!r} not {'|'.join(FIELD_TYPES)}")
+        if field.get("type") == "enum" and not (
+                isinstance(field.get("choices"), list) and field["choices"]
+                and all(isinstance(c, str) for c in field["choices"])):
+            problems.append(f"{at} is an enum without choices")
+        for flag in ("secret", "required"):
+            if flag in field and not isinstance(field[flag], bool):
+                problems.append(f"{at}.{flag} is not a boolean")
+        for text in ("label", "help"):
+            if not isinstance(field.get(text), str) or not field[text].strip():
+                problems.append(f"{at}.{text} missing or empty")
+        if field.get("secret") and "env" in field and (
+                not isinstance(field["env"], str) or "{ID}" not in field["env"]):
+            problems.append(f"{at}.env must name the env key with {{ID}} in it")
+        if setting:
+            if field.get("scope") not in SETTING_SCOPES:
+                problems.append(f"{at}.scope {field.get('scope')!r} not {'|'.join(SETTING_SCOPES)}")
+            if field.get("apply") not in SETTING_APPLY:
+                problems.append(f"{at}.apply {field.get('apply')!r} not {'|'.join(SETTING_APPLY)}")
+            if field.get("secret"):
+                problems.append(f"{at} is a secret, and settings hold none")
+    return problems
+
+
+def _validate_connections_declaration(declared) -> list[str]:
+    if declared is None:
+        return []
+    if not isinstance(declared, dict) or set(declared) != {"fields", "setup", "link"}:
+        return ["connections is not null or an object of fields, setup and link"]
+    problems: list[str] = []
+    if declared["fields"] is not None:
+        problems += _validate_fields("connections.fields", declared["fields"])
+    problems += _validate_fields("connections.setup", declared["setup"])
+    link = declared["link"]
+    if not isinstance(link, list):
+        problems.append("connections.link is not a list")
+    else:
+        for index, method in enumerate(link):
+            at = f"connections.link[{index}]"
+            if not isinstance(method, dict):
+                problems.append(f"{at} is not an object")
+                continue
+            for text in ("id", "label"):
+                if not isinstance(method.get(text), str) or not method[text].strip():
+                    problems.append(f"{at}.{text} missing or empty")
+            argv = method.get("argv")
+            if (not isinstance(argv, list) or not argv
+                    or not all(isinstance(a, str) for a in argv)
+                    or "--events" not in argv):
+                problems.append(f"{at}.argv is a list of words carrying --events")
+    return problems
+
+
+def _validate_settings_declaration(declared) -> list[str]:
+    if declared is None:
+        return []
+    if not isinstance(declared, dict) or set(declared) != {"homes", "keys"}:
+        return ["settings is not null or an object of homes and keys"]
+    problems: list[str] = []
+    homes = declared["homes"]
+    scopes: list = []
+    if not isinstance(homes, list) or not homes:
+        problems.append("settings.homes is not a non-empty list")
+        homes = []
+    for index, home in enumerate(homes):
+        at = f"settings.homes[{index}]"
+        if not isinstance(home, dict):
+            problems.append(f"{at} is not an object")
+            continue
+        if home.get("scope") not in SETTING_SCOPES:
+            problems.append(f"{at}.scope {home.get('scope')!r} not {'|'.join(SETTING_SCOPES)}")
+        elif home["scope"] in scopes:
+            problems.append(f"{at}.scope {home['scope']!r} has two homes")
+        else:
+            scopes.append(home["scope"])
+        if home.get("format") not in SETTING_FORMATS:
+            problems.append(f"{at}.format {home.get('format')!r} not {'|'.join(SETTING_FORMATS)}")
+        path = home.get("path")
+        if (not isinstance(path, str) or not path or path.startswith("/")
+                or any(part in ("", ".", "..") for part in path.split("/"))):
+            problems.append(f"{at}.path is a relative path inside the capability's folder")
+        if "seed" in home and not isinstance(home["seed"], dict):
+            problems.append(f"{at}.seed is the object a missing file starts as")
+        if "inherits" in home and home["inherits"] not in SETTING_SCOPES:
+            problems.append(f"{at}.inherits {home['inherits']!r} not {'|'.join(SETTING_SCOPES)}")
+    for index, home in enumerate(homes):
+        if isinstance(home, dict) and "inherits" in home and (
+                home["inherits"] == home.get("scope") or home["inherits"] not in scopes):
+            problems.append(f"settings.homes[{index}].inherits names no other home")
+    problems += _validate_fields("settings.keys", declared["keys"], setting=True)
+    if isinstance(declared["keys"], list):
+        for index, key in enumerate(declared["keys"]):
+            if isinstance(key, dict) and key.get("scope") in SETTING_SCOPES \
+                    and key["scope"] not in scopes:
+                problems.append(f"settings.keys[{index}] lives at {key['scope']!r}, "
+                                "where no home is declared")
+    return problems
+
+
 def _validate_manifest(name: str, manifest) -> list[str]:
     """Mechanical shape check; returns a list of problems (empty = conformant)."""
     problems: list[str] = []
@@ -2104,6 +2231,10 @@ def _validate_manifest(name: str, manifest) -> list[str]:
                     name, service["machine"], verbs))
     if "contribution" in manifest:
         problems.extend(_validate_contribution(manifest["contribution"]))
+    if "connections" in manifest:
+        problems.extend(_validate_connections_declaration(manifest["connections"]))
+    if "settings" in manifest:
+        problems.extend(_validate_settings_declaration(manifest["settings"]))
     return problems
 
 def _machine_reads_declared(text: str) -> tuple[tuple | None, str | None]:
@@ -10379,6 +10510,9 @@ DOCS_BASE = ""
 STATE = False
 INVENTORY = None  # {{"network": "none"|"optional"|"required"}} + an _inventory(network) builder
 POST_INSTALL: list[dict] = []
+# What a person is asked for (SHEBANG.md): a connection entry's fields, and
+# optionally SETUP_FIELDS, LINK_METHODS and SETTINGS beside them.
+CONN_FIELDS: list[dict] = []
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"

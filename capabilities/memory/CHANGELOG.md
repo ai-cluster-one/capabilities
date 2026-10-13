@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-10-13 — `memory` declares what a person is asked for, and writes it through the contract
+
+Its settings (project `service/settings.json`, global `service/settings.json`, machine `service/config.json`) are declared under `settings`, with the keys a panel shows as controls, and `memory settings` reads every document whole while `settings get|set|unset|put` write one key or one document, checked as memory reads it. Bare `memory help` ends with a section rendered from these declarations. Nothing else changes.
+
 ## 2026-10-13 — The block carries no entry: it says how to record and search, and how many entries there are
 
 The block `memory render` writes into context no longer shows any entry, title or index line, pinned or not. In this order it carries a directive that this memory takes the place of the harness's built-in memory, how to record with `memory add` and what belongs in an entry, how to search with `memory search`, how to search deeply through a subagent that returns only its conclusion, the count of active project-wide entries with the moment the newest was written and the `memory list --since` command that lists it and anything newer, and `memory show` and `memory help`, then the provenance line. Its size no longer grows with the entries.
