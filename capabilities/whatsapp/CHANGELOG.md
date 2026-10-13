@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-10-13 — Outside any project, `whatsapp pair` links a connection declared globally
+
+Run outside any project, `whatsapp pair` (with or without `--events`) uses the machine's own connections as `connections` and `doctor` do, so a connection added with `whatsapp connection add <id> --global` is linked on the machine, where `pair` used to refuse with exit 4 `connection_not_granted`. The verb a `connections.link` method runs is the one that is lent them; no project and no agent is granted anything, a connection whose grant is switched off is still refused, the connection stays read-only there, and the read-only switch still refuses `pair`. Inside a project nothing changes; its grants alone decide.
+
 ## 2026-10-13 — Outside any project, `whatsapp connections` and `whatsapp doctor` read the machine's own connections
 
 `whatsapp` declares `connections` and `doctor` as machine reads. Run outside any project, `whatsapp connections` lists the connections declared globally whose grant is not switched off, each under `machine_reads` with the scope `machine`, and `whatsapp doctor` checks their health, where both used to refuse with `connection_not_granted`. Each such connection is read-only there: a write through it exits 4 `read_only`, and every other verb outside a project is refused the machine's connections as before. Inside a project nothing changes; its grants alone decide.

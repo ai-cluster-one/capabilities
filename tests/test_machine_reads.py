@@ -4,7 +4,8 @@ own connections, read-only.
 A capability declares them in `MACHINE_READS`, beside `WRITE_DEFAULT`. The
 manager validates the declaration wherever it validates a capability, and the
 contract honours it only outside a project, only for the verbs declared, and
-only for reading. Inside a project the grant model alone decides, and the
+only for reading; a verb that `LINK_METHODS` runs is lent them the same way.
+Inside a project the grant model alone decides, and the
 policy gate is the same gate it always was. `connections` also reports the
 capability's effective policy state.
 
@@ -301,6 +302,61 @@ def test_a_capability_declaring_nothing_has_no_machine_reads(lab):
         result = _run(lab, verb)
         assert result.returncode == 4, verb
         assert _error(result)["code"] == "connection_not_granted"
+
+
+# --- a verb that links a connection is lent it too -----------------------------
+
+LINKS = "LINK_METHODS = [{'id': 'qr', 'label': 'Scan', 'argv': ['%s', 'peek', '--events']}]\n" % NAME
+
+
+def _with_links(lab, machine_reads: str | None = "('connections', 'look')") -> None:
+    text = _fixture_text(machine_reads).replace(
+        "WRITE_DEFAULT = True\n", "WRITE_DEFAULT = True\n" + LINKS, 1)
+    assert LINKS in text
+    lab["script"].write_text(text)
+
+
+def test_outside_a_project_a_linking_verb_uses_the_machine_connection_read_only(lab):
+    _with_links(lab)
+    result = _run(lab, "peek")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "verb": "peek", "connection": "home", "allow_write": False}
+
+
+def test_a_linking_verb_is_lent_without_any_machine_reads_declared(lab):
+    _with_links(lab, None)
+    assert json.loads(_run(lab, "peek").stdout)["connection"] == "home"
+    for verb in ("look", "connections"):
+        result = _run(lab, verb)
+        assert result.returncode == 4, verb
+        assert _error(result)["code"] == "connection_not_granted"
+
+
+def test_a_grant_switched_off_on_the_machine_still_withholds_it_from_linking(lab):
+    _with_links(lab)
+    _declare_global(lab, {"connections": {
+        "home": {"url": "https://a.example", "enabled": False}}})
+    result = _run(lab, "peek")
+    assert result.returncode == 4
+    assert _error(result)["code"] == "connection_not_granted"
+
+
+def test_the_machine_reads_report_is_unchanged_by_linking_verbs(lab):
+    _with_links(lab)
+    report = json.loads(_run(lab, "connections").stdout)
+    assert report["machine_reads"]["verbs"] == ["connections", "look"]
+
+
+def test_inside_a_project_a_linking_verb_needs_the_project_grant(lab):
+    _with_links(lab)
+    result = _run(lab, "peek", where="project")
+    assert result.returncode == 4
+    assert _error(result)["code"] == "connection_not_granted"
+    _declare_project(lab, {"connections": {"home": {"enabled": True}}})
+    granted = _run(lab, "peek", where="project")
+    assert granted.returncode == 0, granted.stderr
+    assert json.loads(granted.stdout)["allow_write"] is True
 
 
 # --- inside a project the grant model alone decides ---------------------------

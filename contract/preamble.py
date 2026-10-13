@@ -42,7 +42,7 @@ these module-level names; they are the only coupling):
 Optionally, beside WRITE_DEFAULT, `MACHINE_READS`: a tuple of the read verbs
 that, outside any project, use the machine's own connections read-only.
 Absent or empty means none; the manager validates it where it validates a
-capability.
+capability. The verbs `LINK_METHODS` runs use them there the same way.
 Optionally, the declarations a person is asked through (SHEBANG.md, "What a
 person is asked for"): `CONN_FIELDS`, a connection entry's own fields, which
 turns on `connection add|remove`; `SETUP_FIELDS`, the machine prerequisites,
@@ -924,15 +924,30 @@ def _invoked_verb() -> str | None:
     return None
 
 
+def _link_verbs() -> tuple:
+    """The verbs that link a connection: the one each `LINK_METHODS` ceremony
+    runs, read from its argv."""
+    verbs = []
+    for method in globals().get("LINK_METHODS") or []:
+        argv = method.get("argv") if isinstance(method, dict) else None
+        if isinstance(argv, list) and len(argv) > 1 and argv[1] not in verbs:
+            verbs.append(argv[1])
+    return tuple(verbs)
+
+
 def _machine_read(verb: str | None = None) -> bool:
-    """Whether `verb`, else the invoked one, is a machine read here.
+    """Whether `verb`, else the invoked one, uses the machine's connections here.
 
     Outside any project there is no scope a grant could have been written in,
-    so a verb the capability declares in `MACHINE_READS` uses the machine's own
-    connections instead, read-only. Inside a project the grant model alone
-    decides, and a capability that declares nothing has no machine reads."""
+    so a verb the capability declares in `MACHINE_READS`, and a verb that links
+    a connection, uses the machine's own connections instead, read-only: a
+    connection is linked on the machine before any project is granted it.
+    Inside a project the grant model alone decides, and a capability that
+    declares neither has none."""
     declared = globals().get("MACHINE_READS")
-    if not declared or not isinstance(declared, tuple):
+    declared = declared if isinstance(declared, tuple) else ()
+    declared = declared + _link_verbs()
+    if not declared:
         return False
     if _project_root() is not None:
         return False
