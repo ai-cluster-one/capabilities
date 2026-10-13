@@ -79,6 +79,53 @@ def test_history_before_the_first_sync_and_invites_wake_nothing():
     assert [w["kind"] for w in wakes] == ["direct"]
 
 
+def test_nothing_in_the_directory_wakes_anyone():
+    create = {"type": "m.room.create", "state_key": "", "sender": "@b:example.org",
+              "content": {"room_version": "12", "type": engine.DIRECTORY_TYPE}}
+    card = {"type": "agentrooms.card", "state_key": "@b:example.org", "sender": "@b:example.org",
+            "content": {"name": "Bee"}}
+    rooms: dict = {}
+    asked: list = []
+
+    def room_type(room_id):
+        asked.append(room_id)
+        return engine.DIRECTORY_TYPE if room_id == "!known" else None
+
+    joined = sync(join={"!dir": {"summary": {"m.joined_member_count": 2},
+                                 "state": {"events": [create]},
+                                 "timeline": {"events": [
+                                     {"type": "m.room.member", "state_key": ME, "sender": ME,
+                                      "content": {"membership": "join"}}, card]}}})
+    wakes, _ = engine.read_sync(joined, ME, rooms, initial=False, member_count=lambda r: 2,
+                                room_type=room_type)
+    assert wakes == [] and rooms["!dir"].directory is True
+    # A mention, a two-member room and a mark there wake nothing either.
+    later = sync(join={
+        "!dir": {"account_data": {"events": [{"type": engine.MARK_TYPE,
+                                              "content": {"marked": True}}]},
+                 "timeline": {"events": [message("$1", "@b:example.org", f"hey {ME}"),
+                                         message("$2", "@b:example.org", "hi")]}},
+        "!known": {"summary": {"m.joined_member_count": 2},
+                   "timeline": {"events": [message("$3", "@b:example.org", f"hey {ME}")]}},
+        "!plain": {"summary": {"m.joined_member_count": 2},
+                   "timeline": {"events": [message("$4", "@b:example.org", "dm"),
+                                           message("$5", "@b:example.org", "dm again")]}},
+    })
+    wakes, _ = engine.read_sync(later, ME, rooms, initial=False, member_count=lambda r: 2,
+                                room_type=room_type)
+    assert [(w["room_id"], w["kind"]) for w in wakes] == [("!plain", "direct"), ("!plain", "direct")]
+    # A room whose create event no sync brought is asked once, and only it.
+    assert sorted(asked) == ["!known", "!plain"]
+    # Where it cannot be read, the message is judged as before and asked again next time.
+    rooms.clear()
+    wakes, _ = engine.read_sync(sync(join={"!plain": {"summary": {"m.joined_member_count": 2},
+                                                      "timeline": {"events": [
+                                                          message("$6", "@b:example.org", "x")]}}}),
+                                ME, rooms, initial=False, member_count=lambda r: 2,
+                                room_type=lambda r: engine.UNREAD)
+    assert [w["kind"] for w in wakes] == ["direct"] and rooms["!plain"].directory is None
+
+
 def grant_data(**content):
     return {"account_data": {"events": [{"type": engine.GRANT_TYPE, "content": content}]}}
 

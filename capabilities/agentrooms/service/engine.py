@@ -222,6 +222,9 @@ MARK_TYPE = "agentrooms.marked"
 # The room account data the operator's wake grant is kept in: {"everyone": bool,
 # "users": [user id]}. A room with none admits everyone.
 GRANT_TYPE = "agentrooms.grant"
+# The room type the homeserver's directory is created with: nothing in it wakes
+# an agent.
+DIRECTORY_TYPE = "agentrooms.directory"
 # Where custom data rides in a message's content.
 DATA_KEY = "agentrooms.data"
 # Set in the environment of every turn the service starts, so what the agent
@@ -1015,10 +1018,10 @@ UNREAD = object()
 
 class RoomView:
     """What one agent knows of one room from its syncs: enough to tell a direct
-    message, an encrypted room and a marked room apart, and whom the room's
-    grant admits. Nothing a member said."""
+    message, an encrypted room, a marked room and the directory apart, and whom
+    the room's grant admits. Nothing a member said."""
 
-    __slots__ = ("members", "encrypted", "marked", "name", "grant")
+    __slots__ = ("members", "encrypted", "marked", "name", "grant", "directory")
 
     def __init__(self):
         self.members: int | None = None
@@ -1026,6 +1029,8 @@ class RoomView:
         self.marked = False
         self.name: str | None = None
         self.grant: Any = UNREAD
+        # None until the room's create event has been seen or asked for.
+        self.directory: bool | None = None
 
 
 def read_grant(content) -> dict:
@@ -1141,6 +1146,7 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
               before_join: Callable[[str, str], list[dict] | None] | None = None,
               grant_of: Callable[[str], dict | None] | None = None,
               grants: dict[str, dict | None] | None = None,
+              room_type: Callable[[str], str | None] | None = None,
               ) -> tuple[list[dict], list[str]]:
     """The wakes one sync response brings for `user_id`, and notes about what it
     passed over. `rooms` is updated in place. History before the agent was first
@@ -1153,7 +1159,10 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
     Each wake is judged against the room's grant and carries `held` when the
     grant does not name its sender. A grant the sync brings is recorded in
     `grants`; a room whose grant no sync has brought yet is asked once through
-    `grant_of(room_id)` (None: the room has none), never assumed open."""
+    `grant_of(room_id)` (None: the room has none), never assumed open.
+
+    Nothing in the homeserver's directory wakes: a room whose create event no
+    sync has brought is asked once through `room_type(room_id)`."""
     wakes: list[dict] = []
     notes: list[str] = []
     groups = response.get("rooms") or {}
@@ -1170,6 +1179,8 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
                 view.encrypted = True
             elif event.get("type") == "m.room.name":
                 view.name = (event.get("content") or {}).get("name") or view.name
+            elif event.get("type") == "m.room.create":
+                view.directory = (event.get("content") or {}).get("type") == DIRECTORY_TYPE
         for event in (room.get("account_data") or {}).get("events") or []:
             if event.get("type") == MARK_TYPE:
                 view.marked = (event.get("content") or {}).get("marked") is True
@@ -1196,6 +1207,12 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
                 continue
             content = event.get("content") or {}
             if is_default_answer(content):
+                continue
+            if view.directory is None and room_type is not None:
+                found = room_type(room_id)
+                if found is not UNREAD:
+                    view.directory = found == DIRECTORY_TYPE
+            if view.directory:
                 continue
             kind = None
             if mentions(content, user_id):
@@ -1468,10 +1485,20 @@ class Agent:
                 raise
             return read_grant(found)
 
+        def room_type(room_id: str):
+            try:
+                found = matrix.call("GET", f"/_matrix/client/v3/rooms/{quote(room_id)}"
+                                           "/state/m.room.create/")
+            except Exception as exc:
+                self.log(f"{room_id}: whether it is the directory is not read: "
+                         f"{getattr(exc, 'code', type(exc).__name__)}: {exc}")
+                return UNREAD
+            return (found or {}).get("type")
+
         grants: dict[str, dict | None] = {}
         wakes, notes = read_sync(response, self.plan["user_id"], self.rooms, initial=initial,
                                  member_count=member_count, before_join=before_join,
-                                 grant_of=grant_of, grants=grants)
+                                 grant_of=grant_of, grants=grants, room_type=room_type)
         for note in notes:
             self.log(note)
         next_batch = response.get("next_batch")

@@ -41,6 +41,8 @@ class FakeHomeserver:
         self.joined: set[str] = set()
         self.account: dict[str, dict] = {}
         self.refuse_kick: set[str] = set()
+        self.aliases: dict[str, str] = {}
+        self.claimed: set[str] = set()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -106,9 +108,43 @@ class FakeHomeserver:
             return httpx.Response(404, json={"errcode": "M_NOT_FOUND", "error": "no data"})
         if path.endswith("/state") and "/rooms/" in path:
             room = unquote(path.split("/rooms/")[1].split("/")[0])
+            if room in self.aliases.values() and room not in self.joined:
+                return httpx.Response(403, json={"errcode": "M_FORBIDDEN", "error": "not in room"})
             return httpx.Response(200, json=self.state.get(room, []))
+        if path.startswith("/_matrix/client/v3/directory/room/"):
+            alias = unquote(path.rsplit("/", 1)[1])
+            if alias in self.aliases:
+                return httpx.Response(200, json={"room_id": self.aliases[alias]})
+            return httpx.Response(404, json={"errcode": "M_NOT_FOUND", "error": "no alias"})
+        if "/state/agentrooms.card/" in path:
+            room = unquote(path.split("/rooms/")[1].split("/")[0])
+            key = unquote(path.rsplit("/", 1)[1])
+            if room not in self.joined:
+                return httpx.Response(403, json={"errcode": "M_FORBIDDEN", "error": "not in room"})
+            events = self.state.setdefault(room, [])
+            found = [e for e in events if e["type"] == "agentrooms.card" and e["state_key"] == key]
+            if request.method == "PUT":
+                # The homeserver's own rule: a state key that is a user id is that
+                # user's alone to write.
+                if key.startswith("@") and key != f"@alpha:{SERVER}":
+                    return httpx.Response(403, json={"errcode": "M_FORBIDDEN",
+                                                     "error": "state key is another user's"})
+                for event in found:
+                    events.remove(event)
+                events.append({"type": "agentrooms.card", "state_key": key,
+                               "sender": f"@alpha:{SERVER}", "content": body})
+                return httpx.Response(200, json={"event_id": "$card"})
+            if found:
+                return httpx.Response(200, json=found[-1]["content"])
+            return httpx.Response(404, json={"errcode": "M_NOT_FOUND", "error": "no state"})
         if path == "/_matrix/client/v3/createRoom":
             self.created.append(body)
+            if body.get("room_alias_name"):
+                alias = f"#{body['room_alias_name']}:{SERVER}"
+                if alias in self.aliases or alias in self.claimed:
+                    return httpx.Response(400, json={"errcode": "M_ROOM_IN_USE",
+                                                     "error": "Room alias already taken"})
+                self.aliases[alias] = "!new"
             return httpx.Response(200, json={"room_id": "!new"})
         if path.endswith("/state/m.room.encryption/"):
             room = path.split("/rooms/")[1].split("/")[0]
@@ -1204,3 +1240,102 @@ def test_watch_prints_block_and_archive_changes_and_no_blocked_invite(cli, proje
     for params in homeserver.sync_params[:2]:
         assert json.loads(params["filter"])["account_data"] == {
             "types": ["agentrooms.archived", "m.ignored_user_list"]}
+
+
+DIRECTORY = f"#agentrooms-directory:{SERVER}"
+
+
+def test_the_directory_is_created_once_and_lists_every_member_with_its_card(
+        cli, project, homeserver, capsys):
+    connect(project, allow_write=True)
+    code, _, err = run(cli, capsys, "directory", "list")
+    assert code == 3 and err["error"]["code"] == "no_directory"
+    code, out, _ = run(cli, capsys, "directory", "create")
+    assert code == 0 and out == {"room_id": "!new", "alias": DIRECTORY, "created": True}
+    body = homeserver.created[-1]
+    assert body["room_alias_name"] == "agentrooms-directory" and body["preset"] == "public_chat"
+    assert body["room_version"] == "12" and body["visibility"] == "private"
+    assert body["creation_content"] == {"m.federate": False, "type": "agentrooms.directory"}
+    assert body["power_level_content_override"] == {
+        "events_default": 50, "invite": 50, "state_default": 50,
+        "events": {"agentrooms.card": 0}}
+    made = len(homeserver.created)
+    code, _, err = run(cli, capsys, "directory", "create")
+    assert code == 6 and err["error"]["code"] == "directory_exists" and "!new" in err["error"]["message"]
+    assert len(homeserver.created) == made
+    # Created between the look-up and the create: the homeserver's refusal says so.
+    homeserver.aliases.clear()
+    homeserver.claimed.add(DIRECTORY)
+    code, _, err = run(cli, capsys, "directory", "create")
+    assert code == 6 and err["error"]["code"] == "directory_exists"
+
+    homeserver.aliases[DIRECTORY] = "!new"
+    code, _, err = run(cli, capsys, "directory", "list")
+    assert code == 6 and err["error"]["code"] == "not_in_directory"
+    code, out, _ = run(cli, capsys, "directory", "join")
+    assert code == 0 and out == {"room_id": "!new", "alias": DIRECTORY, "joined": True}
+    member = lambda user, name, membership="join": {  # noqa: E731
+        "type": "m.room.member", "state_key": user, "sender": user,
+        "content": {"membership": membership, "displayname": name}}
+    card = lambda user, content, sender=None: {  # noqa: E731
+        "type": "agentrooms.card", "state_key": user, "sender": sender or user, "content": content}
+    homeserver.state["!new"] = [
+        member(f"@alpha:{SERVER}", "Alpha"), member(f"@bee:{SERVER}", "Bee"),
+        member(f"@cee:{SERVER}", "Cee"), member(f"@gone:{SERVER}", "Gone", "leave"),
+        card(f"@bee:{SERVER}", {"name": "Bee", "about": "Reviews pull requests.",
+                                "supervisor": f"@operator:{SERVER}"}),
+        card(f"@cee:{SERVER}", {"name": "Not Cee"}, sender=f"@bee:{SERVER}"),
+        card(f"@gone:{SERVER}", {"name": "Gone"}),
+        card("bee", {"name": "keyed by no user"}, sender=f"@cee:{SERVER}"),
+    ]
+    code, out, _ = run(cli, capsys, "card", "set", "--name", "Alpha", "--about", "Plans releases.")
+    assert code == 0 and out == {"user_id": f"@alpha:{SERVER}", "card": {
+        "name": "Alpha", "about": "Plans releases.", "supervisor": None}}
+    code, out, _ = run(cli, capsys, "directory", "list")
+    assert code == 0 and out["room_id"] == "!new" and out["alias"] == DIRECTORY
+    assert out["members"] == [
+        {"user_id": f"@alpha:{SERVER}", "display_name": "Alpha",
+         "card": {"name": "Alpha", "about": "Plans releases.", "supervisor": None}},
+        {"user_id": f"@bee:{SERVER}", "display_name": "Bee",
+         "card": {"name": "Bee", "about": "Reviews pull requests.",
+                  "supervisor": f"@operator:{SERVER}"}},
+        {"user_id": f"@cee:{SERVER}", "display_name": "Cee", "card": None}]
+    code, out, _ = run(cli, capsys, "card", "show", f"@bee:{SERVER}")
+    assert code == 0 and out["card"]["about"] == "Reviews pull requests."
+
+
+def test_an_agent_sets_changes_and_clears_its_own_card_only(cli, project, homeserver, capsys):
+    connect(project, allow_write=False)
+    code, _, err = run(cli, capsys, "card", "set", "--name", "Alpha")
+    assert code == 4 and err["error"]["code"] == "read_only"
+    code, _, err = run(cli, capsys, "directory", "join")
+    assert code == 4 and err["error"]["code"] == "read_only"
+    connect(project, allow_write=True)
+    code, _, err = run(cli, capsys, "card", "set", "--name", "Alpha")
+    assert code == 3 and err["error"]["code"] == "no_directory"
+    homeserver.aliases[DIRECTORY] = "!dir"
+    code, _, err = run(cli, capsys, "card", "set")
+    assert code == 6 and err["error"]["code"] == "invalid_arguments"
+    code, _, err = run(cli, capsys, "card", "set", "--about", "x" * 501)
+    assert code == 6 and err["error"]["code"] == "invalid_arguments"
+    code, _, err = run(cli, capsys, "card", "set", "--name", "  ")
+    assert code == 6 and err["error"]["code"] == "invalid_arguments"
+    code, out, _ = run(cli, capsys, "card", "set", "--name", "Alpha")
+    assert code == 0 and "!dir" in homeserver.joined
+    code, out, _ = run(cli, capsys, "card", "set", "--about", "Plans releases.",
+                       "--supervisor", f"@operator:{SERVER}")
+    assert out["card"] == {"name": "Alpha", "about": "Plans releases.",
+                           "supervisor": f"@operator:{SERVER}"}
+    puts = [(m, p) for m, p, _ in homeserver.requests if m == "PUT" and "agentrooms.card" in p]
+    assert puts and all(p.endswith(f"/state/agentrooms.card/@alpha:{SERVER}") for _, p in puts)
+    code, out, _ = run(cli, capsys, "card", "show")
+    assert code == 0 and out["card"]["name"] == "Alpha"
+    code, out, _ = run(cli, capsys, "card", "clear")
+    assert code == 0 and out == {"user_id": f"@alpha:{SERVER}", "card": None}
+    assert homeserver.requests[-1][2] == {}
+    code, out, _ = run(cli, capsys, "card", "show")
+    assert code == 0 and out == {"user_id": f"@alpha:{SERVER}", "card": None}
+    code, out, _ = run(cli, capsys, "card", "show", f"@nobody:{SERVER}")
+    assert code == 0 and out["card"] is None
+    code, _, err = run(cli, capsys, "card", "show", "@bee:other.org")
+    assert code == 6 and err["error"]["code"] == "federation_refused"

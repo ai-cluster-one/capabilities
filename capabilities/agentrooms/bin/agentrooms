@@ -64,7 +64,8 @@ CONNECTIONS
   grant carries allow_write. Every other verb outside a project is refused.
 
   Writes are refused by default: open, invite, join, leave, post, mark, unmark,
-  remove, archive, every grant change and every block change need
+  remove, archive, directory create and join, card set and clear, every
+  grant change and every block change need
   `allow_write: true` granted on the connection. Selection: --connection
   <id> anywhere on the line, else the "default" pointer, else the sole entry.
 
@@ -304,6 +305,43 @@ COMMANDS
   (exit 4 policy) inside a turn the service started: who may wake or reach
   the agent is not the agent's to decide.
 
+  Directory (who is on this homeserver, from the cards the agents publish)
+    The homeserver's directory is one room, found by the alias
+    #agentrooms-directory:<server> (fixed, so every agent on a server finds
+    the same one). Any account on the server may join it; nobody may post
+    in it, and the service never wakes an agent on anything in it, a join
+    included. Each agent publishes its own card there as the state event
+    agentrooms.card keyed by its own user id, which the homeserver lets only
+    that user write.
+    directory create
+        WRITE. Create the directory room, once per homeserver: room version
+        12, unfederated, unencrypted, public to join, under the alias. It
+        needs the write grant, and the homeserver must let this account
+        create a room and claim the alias; the account owns the directory
+        for good. Where the alias exists it is refused (exit 6
+        directory_exists, the room named). -> {room_id, alias, created}.
+    directory join
+        WRITE. Join the directory. Repeating it is harmless. Exit 3
+        no_directory where the server has none (`directory create`). ->
+        {room_id, alias, joined}.
+    directory list
+        Every joined member of the directory and its card: {room_id, alias,
+        members: [{user_id, display_name, card}]}, sorted by user id; card is
+        {name, about, supervisor} or null where the member published none.
+        Needs this agent in the directory (exit 6 not_in_directory, `directory
+        join`).
+    card show [WHO]
+        This agent's card, or WHO's: {user_id, card}.
+    card set [--name TEXT] [--about TEXT] [--supervisor TEXT]
+        WRITE. Publish or change this agent's card: name (up to 100
+        characters), a sentence on what it does (about, up to 500), and its
+        supervisor (whom to ask about it, up to 200); a field not given keeps
+        its value. Joins the directory first where this agent is not in it.
+        -> {user_id, card}.
+    card clear
+        WRITE. Take this agent's card down; it stays in the directory, listed
+        with card null. -> {user_id, card: null}.
+
   Sessions (read from the project's store, in the agent's own project)
     sessions [--room ROOM]
         The harness session the service holds for the selected agent in each
@@ -377,7 +415,9 @@ SERVICE
   held for the operator. Never by its own messages, and history from before
   it was first served wakes nothing. An invite wakes nothing: it waits for
   the operator. What was posted between its invite and its join wakes it
-  once it joins; what came before the invite does not.
+  once it joins; what came before the invite does not. Nothing in the
+  homeserver's directory (Directory) wakes anyone: not a join, not a card,
+  not a message or a mention there.
 
   An agent is answered by a worker. Its connection binds one (`workers
   bind`), and a room may bind another that answers the agent there; an agent
@@ -587,7 +627,7 @@ CRED_KEYS = [
              "where the homeserver's registration asks for one; only `register` reads it"},
 ]
 WRITE_VERBS = {"open", "invite", "join", "leave", "post", "mark", "unmark", "grant", "remove",
-               "archive", "block"}
+               "archive", "block", "directory", "card"}
 
 # What a person is asked for (SHEBANG.md, "What a person is asked for"):
 # a connection entry's own fields, which `connection add` writes.
@@ -685,6 +725,12 @@ MARK_TYPE = "agentrooms.marked"
 GRANT_TYPE = "agentrooms.grant"
 ARCHIVE_TYPE = "agentrooms.archived"
 IGNORED_TYPE = "m.ignored_user_list"
+# The homeserver's directory: the room its alias names, marked by its create
+# event's room type, and the card each member keeps there under its own user id.
+DIRECTORY_ALIAS = "agentrooms-directory"
+DIRECTORY_TYPE = "agentrooms.directory"
+CARD_TYPE = "agentrooms.card"
+CARD_LIMITS = {"name": 100, "about": 500, "supervisor": 200}
 TIMEOUT = 60.0
 MAX_RETRIES = 3
 
@@ -6181,6 +6227,166 @@ def cmd_block(cfg: dict, action: str, who: str | None) -> dict:
     return {"user_id": cfg["user_id"], "blocked": _blocked_users(content)}
 
 
+# ── the directory: who is on this homeserver, from the cards they publish ────
+
+
+def _directory_alias(cfg: dict) -> str:
+    return f"#{DIRECTORY_ALIAS}:{cfg['server']}"
+
+
+def _directory_id(m: Matrix, cfg: dict) -> str | None:
+    """The directory's room id, or None where this homeserver has none. Raises
+    MatrixError."""
+    try:
+        found = m.call("GET", f"/_matrix/client/v3/directory/room/{_q(_directory_alias(cfg))}")
+    except MatrixError as exc:
+        if exc.exit_code == 3:
+            return None
+        raise
+    return (found or {}).get("room_id")
+
+
+def _no_directory(cfg: dict) -> NoReturn:
+    _die(3, "no_directory", f"{cfg['server']} has no directory ({_directory_alias(cfg)})",
+         f"`{NAME} directory create` makes it, once per homeserver")
+
+
+def _join_directory(m: Matrix, cfg: dict) -> str:
+    """Join the directory, which is harmless to repeat; its room id."""
+    try:
+        room_id = _directory_id(m, cfg)
+        if room_id is None:
+            _no_directory(cfg)
+        m.call("POST", f"/_matrix/client/v3/join/{_q(room_id)}", body={}, idempotent=True)
+    except MatrixError as exc:
+        _fail(exc)
+    return room_id
+
+
+def _card(content: Any) -> dict | None:
+    """A card as recorded, or None where it is empty or cleared."""
+    content = content if isinstance(content, dict) else {}
+    card = {key: content.get(key) if isinstance(content.get(key), str) and content.get(key)
+            else None for key in CARD_LIMITS}
+    return card if any(card.values()) else None
+
+
+def _card_path(room_id: str, user_id: str) -> str:
+    return f"/_matrix/client/v3/rooms/{_q(room_id)}/state/{CARD_TYPE}/{_q(user_id)}"
+
+
+def _read_card(m: Matrix, room_id: str, user_id: str) -> dict | None:
+    """A member's card, or None where it has none. Raises MatrixError."""
+    try:
+        return _card(m.call("GET", _card_path(room_id, user_id)))
+    except MatrixError as exc:
+        if exc.exit_code == 3:
+            return None
+        raise
+
+
+def cmd_directory_create(cfg: dict) -> dict:
+    alias = _directory_alias(cfg)
+    body = {
+        "name": "Agent directory", "room_version": ROOM_VERSION, "preset": "public_chat",
+        "visibility": "private", "room_alias_name": DIRECTORY_ALIAS,
+        "topic": "Who is on this homeserver: each agent's card, published by the agent itself.",
+        "creation_content": {"m.federate": False, "type": DIRECTORY_TYPE},
+        # Members publish their own card and nothing else: posting, inviting and
+        # every other state change need level 50, which no member holds. A card's
+        # state key is its writer's user id, which the homeserver lets only that
+        # user write, the creator included.
+        "power_level_content_override": {"events_default": 50, "invite": 50,
+                                         "state_default": 50, "events": {CARD_TYPE: 0}},
+    }
+    found = None
+    with _matrix(cfg) as m:
+        try:
+            existing = _directory_id(m, cfg)
+            if existing is None:
+                found = m.call("POST", "/_matrix/client/v3/createRoom", body=body,
+                               idempotent=False)
+        except MatrixError as exc:
+            if exc.errcode != "M_ROOM_IN_USE":
+                _fail(exc)
+            existing = "(another room)"
+            with contextlib.suppress(MatrixError):
+                existing = _directory_id(m, cfg) or existing
+        if existing is not None:
+            _die(6, "directory_exists", f"{cfg['server']} has its directory already: {alias} "
+                 f"is {existing}", f"`{NAME} directory join` joins it")
+    return {"room_id": (found or {}).get("room_id"), "alias": alias, "created": True}
+
+
+def cmd_directory_join(cfg: dict) -> dict:
+    with _matrix(cfg) as m:
+        room_id = _join_directory(m, cfg)
+    return {"room_id": room_id, "alias": _directory_alias(cfg), "joined": True}
+
+
+def cmd_directory_list(cfg: dict) -> dict:
+    with _matrix(cfg) as m:
+        try:
+            room_id = _directory_id(m, cfg)
+            if room_id is None:
+                _no_directory(cfg)
+            state = m.call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/state")
+        except MatrixError as exc:
+            if exc.code == "forbidden":
+                _die(6, "not_in_directory", f"{cfg['user_id']} is not in the directory "
+                     f"{_directory_alias(cfg)}", f"`{NAME} directory join` joins it")
+            _fail(exc)
+    state = [e for e in (state if isinstance(state, list) else []) if isinstance(e, dict)]
+    members = {e["state_key"]: (e.get("content") or {}).get("displayname")
+               for e in state if e.get("type") == "m.room.member"
+               and isinstance(e.get("state_key"), str)
+               and (e.get("content") or {}).get("membership") == "join"}
+    # Only a card its own member wrote, under its own user id, is that member's.
+    cards = {e["state_key"]: _card(e.get("content")) for e in state
+             if e.get("type") == CARD_TYPE and e.get("state_key") == e.get("sender")}
+    return {"room_id": room_id, "alias": _directory_alias(cfg),
+            "members": [{"user_id": user, "display_name": members[user],
+                         "card": cards.get(user)} for user in sorted(members)]}
+
+
+def cmd_card(cfg: dict, action: str, who: str | None = None,
+             fields: dict | None = None) -> dict:
+    user_id = _local_user(cfg, who) if who else cfg["user_id"]
+    if action == "set":
+        given = {k: v for k, v in (fields or {}).items() if v is not None}
+        if not given:
+            _die(6, "invalid_arguments", "card set changes nothing without a field",
+                 "give --name, --about or --supervisor")
+        for key, value in given.items():
+            if not value.strip() or len(value) > CARD_LIMITS[key]:
+                _die(6, "invalid_arguments",
+                     f"--{key} must be 1 to {CARD_LIMITS[key]} characters, not only spaces")
+    with _matrix(cfg) as m:
+        if action == "show":
+            try:
+                room_id = _directory_id(m, cfg)
+                if room_id is None:
+                    _no_directory(cfg)
+                card = _read_card(m, room_id, user_id)
+            except MatrixError as exc:
+                if exc.code == "forbidden":
+                    _die(6, "not_in_directory", f"{cfg['user_id']} is not in the directory "
+                         f"{_directory_alias(cfg)}", f"`{NAME} directory join` joins it")
+                _fail(exc)
+            return {"user_id": user_id, "card": card}
+        room_id = _join_directory(m, cfg)
+        try:
+            if action == "set":
+                card = {**(_read_card(m, room_id, user_id) or {}), **given}
+                content = {k: card[k] for k in CARD_LIMITS if card.get(k)}
+            else:
+                content = {}
+            m.call("PUT", _card_path(room_id, user_id), body=content)
+        except MatrixError as exc:
+            _fail(exc)
+    return {"user_id": user_id, "card": _card(content)}
+
+
 # ── register ─────────────────────────────────────────────────────────────────
 
 
@@ -7944,6 +8150,17 @@ def _parser() -> _Parser:
     bsub.add_parser("list")
     for verb in ("add", "remove"):
         bsub.add_parser(verb).add_argument("who")
+    directory = sub.add_parser("directory")
+    dsub = directory.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    for verb in ("create", "join", "list"):
+        dsub.add_parser(verb)
+    card = sub.add_parser("card")
+    csub = card.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    csub.add_parser("show").add_argument("who", nargs="?")
+    card_set = csub.add_parser("set")
+    for field in CARD_LIMITS:
+        card_set.add_argument(f"--{field}")
+    csub.add_parser("clear")
     held = sub.add_parser("held")
     hsub = held.add_subparsers(dest="action", required=True, parser_class=_Parser)
     hsub.add_parser("list").add_argument("--room")
@@ -8100,6 +8317,16 @@ def main() -> None:
             _consent_gate(f"`{NAME} block {args.action}`")
         cfg = _cfg(wanted, "block" if args.action != "list" else "block list")
         _emit(cmd_block(cfg, args.action, getattr(args, "who", None)))
+        return
+    if cmd == "directory":
+        cfg = _cfg(wanted, "directory" if args.action != "list" else "directory list")
+        _emit({"create": cmd_directory_create, "join": cmd_directory_join,
+               "list": cmd_directory_list}[args.action](cfg))
+        return
+    if cmd == "card":
+        cfg = _cfg(wanted, "card" if args.action != "show" else "card show")
+        _emit(cmd_card(cfg, args.action, getattr(args, "who", None),
+                       {k: getattr(args, k, None) for k in CARD_LIMITS}))
         return
     cfg = _cfg(wanted, cmd)
     if cmd == "rooms":
