@@ -52,6 +52,14 @@ CONNECTIONS
     AGENTROOMS_REGISTRATION_TOKEN    the shared registration token
   Every agent then registers itself with `register`.
 
+  A person's own account is a connection too, written by `login` with its
+  password. With --global it is the machine's, in
+  ~/.config/agentrooms/connections.json and the user credentials.env:
+  outside any project connections, doctor, rooms, read and watch are machine
+  reads and use it read-only, unless a grant switched it off; inside a
+  project it is usable once that project grants it, and it writes once the
+  grant carries allow_write. Every other verb outside a project is refused.
+
   Writes are refused by default: open, invite, join, leave, post, mark and unmark
   need `allow_write: true` granted on the connection. Selection: --connection
   <id> anywhere on the line, else the "default" pointer, else the sole entry.
@@ -80,12 +88,68 @@ COMMANDS
         exits 6 user_in_use; a registration whose answer was lost exits 5
         outcome_unknown (the account may exist; register another NAME).
         The new connection has no write grant; ask the user to grant it.
+    login USER_ID [--homeserver URL] [--as ID] [--global | --project]
+                  [--default]
+        Sign in to an existing account (@name:server) with its password,
+        read from standard input (no echo on a terminal), and write the
+        connection ID (default the localpart) and the minted access token
+        under AGENTROOMS_<ID>_TOKEN, mode 0600, into the credentials file of
+        the same scope: --project (the default) this project's registry and
+        .env.local, --global ~/.config/agentrooms/connections.json and the
+        user credentials.env. The password is sent once to the homeserver
+        (m.login.password) and never stored or printed; nor is the token. The
+        homeserver comes from --homeserver, else AGENTROOMS_HOMESERVER. Not
+        idempotent: each sign-in mints a new device and token. Signing in
+        again to the account an ID already names replaces its token; an ID
+        that names another account exits 6 connection_exists. A wrong
+        password exits 2 login_rejected; a lost answer exits 5 outcome_unknown
+        (a device may have been made; sign in again). -> {logged_in, connection,
+        scope, user_id, homeserver, device_id, secret_env, credentials,
+        registry, default, allow_write, usable_here}, with the grant to ask
+        for where the connection is not usable here.
 
   Rooms
     rooms
         Joined rooms and pending invites: {joined: [{room_id, name, topic,
-        members, encrypted, marked}], invites: [{room_id, name, inviter,
-        encrypted}]}.
+        members, encrypted, marked, owners, owner_basis}], invites: [{room_id,
+        name, inviter, encrypted}]}. owners are the user ids that own the
+        room; owner_basis says what that rests on: "creator" where the room's
+        version (12 and later) gives its creators every right for good, or
+        where no power levels were ever set, and "power_level" where the
+        owners are the users holding the highest power level an earlier
+        room version grants, which can move.
+    watch [--room ROOM ...]
+        A read that does not end: it follows the rooms the selected
+        connection sees, or only the ROOMs named, from now on - nothing from
+        before it started - and prints one JSON object per line, flushed as
+        written, until it is stopped. Each line's `event` names its shape:
+          {"event": "ready", "connection", "user_id", "rooms"}
+              first, once following; rooms is the --room filter or null.
+              Read what you hold after this line: no change falls between.
+          {"event": "message", "room_id", "message": {...}}
+              one message, the row `read` prints.
+          {"event": "invite", "room_id", "invite": {...}}
+              this connection was invited; the row `rooms` prints.
+          {"event": "membership", "room_id", "user_id", "membership",
+           "sender", "event_id", "ts"}
+              someone joined, left, was invited, kicked or banned.
+          {"event": "receipt", "room_id", "user_id", "event_id", "ts"}
+              someone's read marker moved to event_id.
+          {"event": "marked", "room_id", "marked"}
+              this connection's mark on the room changed.
+          {"event": "room", "room": {...}}
+              a room was joined, or its name, topic, encryption or power
+              levels changed; the joined row `rooms` prints, owners included.
+          {"event": "gap", "room_id"}
+              more arrived in the room than one sync carries; the messages
+              between were not printed - `read` the room.
+          {"event": "lost", "error"} / {"event": "resumed"}
+              the homeserver could not be reached; it is asked again after 1
+              second, doubling to 30, for as long as it takes, and resumes
+              where it stopped, so nothing is skipped.
+        Encrypted rooms print no messages. Exit 0 on SIGTERM or SIGINT or
+        when its reader goes away; 2 a token the homeserver rejects; a
+        ROOM that is encrypted exits 6 before following starts.
     read ROOM [--limit N]
         The last N messages (default 20, 1-100), oldest first: {room_id,
         limit, count, more, messages: [{event_id, sender, ts, msgtype, body,
@@ -128,6 +192,21 @@ COMMANDS
 
   ROOM is a room id (!abc...) or an alias (#name:example.org) on this
   homeserver; WHO is a user id (@agent:example.org) on this homeserver.
+
+  Sessions (read from the project's store, in the agent's own project)
+    sessions [--room ROOM]
+        The harness session the service holds for the selected agent in each
+        room, or in ROOM - the room-to-session map every turn resumes:
+        {connection, user_id, sessions: [{room_id, harness, session_id, node,
+        seen_ts, turns, updated_at}]}. An agent the service never answered
+        for has none. Local: no homeserver request unless ROOM is an alias.
+    turn EVENT
+        The service turn of the selected agent that posted the message EVENT
+        and the harness session that wrote it: {event_id, connection, turn,
+        room_id, worker, harness, session_id, node, started_at, outcome}, or
+        null (exit 0) when no turn of this agent is recorded as posting it -
+        a message the agent posted itself, or one answered before this
+        version recorded it.
 
   Workers (WORKERS states the document)
     workers list
@@ -393,6 +472,7 @@ CRED_KEYS = [
 ]
 WRITE_VERBS = {"open", "invite", "join", "leave", "post", "mark", "unmark"}
 WRITE_DEFAULT = False   # a post reaches other agents and people on a shared server
+MACHINE_READS = ("connections", "doctor", "rooms", "read", "watch")   # outside any project, read-only on the machine's connections
 DOCS_BASE = "https://raw.githubusercontent.com/ai-cluster-one/capabilities/main/capabilities/agentrooms/guides/"
 STATE = False       # register writes the token to the project's .env.local; nothing is minted into state
 TABLES = True       # the service's runtime state lives in the project's store
@@ -3647,17 +3727,72 @@ def _refuse_encrypted(m: Matrix, room_id: str) -> None:
              "agentrooms reads and posts in unencrypted rooms only")
 
 
+# The state a room's row is read from.
+ROOM_STATE_TYPES = ["m.room.name", "m.room.topic", "m.room.encryption",
+                    "m.room.canonical_alias", "m.room.create", "m.room.power_levels"]
 ROOMS_FILTER = {
     "presence": {"not_types": ["*"]},
     "account_data": {"not_types": ["*"]},
     "room": {
         "timeline": {"limit": 1},
         "ephemeral": {"not_types": ["*"]},
-        "state": {"types": ["m.room.name", "m.room.topic", "m.room.encryption",
-                            "m.room.canonical_alias"]},
+        "state": {"types": ROOM_STATE_TYPES},
         "account_data": {"types": [MARK_TYPE]},
     },
 }
+# The first room version whose creators hold every right and cannot lose it.
+PRIVILEGED_CREATORS_FROM = 12
+
+
+def _room_owners(create: dict | None, levels: dict | None) -> tuple[list[str], str | None]:
+    """Who owns a room, and what that rests on.
+
+    From room version 12 the creator, and any additional creator the create
+    event names, holds every right for good, so ownership is the creators'.
+    Before it ownership is a power level: the users holding the highest one in
+    the room's power levels, which can move - or, where none were ever set, the
+    creator, whom the defaults put above everyone."""
+    if create is None:
+        return [], None
+    content = create.get("content") or {}
+    creators = [create.get("sender"), *(content.get("additional_creators") or [])]
+    creators = list(dict.fromkeys(u for u in creators if isinstance(u, str) and u))
+    try:
+        privileged = int(str(content.get("room_version") or "1")) >= PRIVILEGED_CREATORS_FROM
+    except ValueError:
+        privileged = False
+    if privileged or levels is None:
+        return creators, "creator"
+    users = (levels.get("content") or {}).get("users") or {}
+    ranked = {u: n for u, n in users.items() if isinstance(n, int) and not isinstance(n, bool)}
+    if not ranked:
+        return [], "power_level"
+    top = max(ranked.values())
+    return sorted(u for u, n in ranked.items() if n == top), "power_level"
+
+
+def _room_row(room_id: str, events: list[dict]) -> dict:
+    """A joined room's row, as far as its state events say: everything but its
+    member count and this connection's mark, which the caller reads."""
+    row = {"room_id": room_id, "name": None, "topic": None, "members": None,
+           "encrypted": False, "marked": False, "owners": [], "owner_basis": None}
+    create = levels = None
+    for event in events:
+        if event.get("state_key") != "":
+            continue
+        kind, content = event.get("type"), event.get("content") or {}
+        if kind == "m.room.name":
+            row["name"] = content.get("name")
+        elif kind == "m.room.topic":
+            row["topic"] = content.get("topic")
+        elif kind == "m.room.encryption":
+            row["encrypted"] = True
+        elif kind == "m.room.create":
+            create = event
+        elif kind == "m.room.power_levels":
+            levels = event
+    row["owners"], row["owner_basis"] = _room_owners(create, levels)
+    return row
 
 
 def cmd_rooms(cfg: dict) -> dict:
@@ -3671,20 +3806,8 @@ def cmd_rooms(cfg: dict) -> dict:
         groups = (sync or {}).get("rooms") or {}
         joined = []
         for room_id, room in sorted((groups.get("join") or {}).items()):
-            row = {"room_id": room_id, "name": None, "topic": None, "members": None,
-                   "encrypted": False, "marked": False}
-            events = [*((room.get("state") or {}).get("events") or []),
-                      *((room.get("timeline") or {}).get("events") or [])]
-            for event in events:
-                if "state_key" not in event:
-                    continue
-                kind, content = event.get("type"), event.get("content") or {}
-                if kind == "m.room.name":
-                    row["name"] = content.get("name")
-                elif kind == "m.room.topic":
-                    row["topic"] = content.get("topic")
-                elif kind == "m.room.encryption":
-                    row["encrypted"] = True
+            row = _room_row(room_id, [*((room.get("state") or {}).get("events") or []),
+                                      *((room.get("timeline") or {}).get("events") or [])])
             members = (room.get("summary") or {}).get("m.joined_member_count")
             if not isinstance(members, int):
                 with contextlib.suppress(MatrixError):
@@ -3695,19 +3818,22 @@ def cmd_rooms(cfg: dict) -> dict:
                 if event.get("type") == MARK_TYPE:
                     row["marked"] = (event.get("content") or {}).get("marked") is True
             joined.append(row)
-    invites = []
-    for room_id, room in sorted((groups.get("invite") or {}).items()):
-        row = {"room_id": room_id, "name": None, "inviter": None, "encrypted": False}
-        for event in (room.get("invite_state") or {}).get("events") or []:
-            kind = event.get("type")
-            if kind == "m.room.name":
-                row["name"] = (event.get("content") or {}).get("name")
-            elif kind == "m.room.member" and event.get("state_key") == cfg["user_id"]:
-                row["inviter"] = event.get("sender")
-            elif kind == "m.room.encryption":
-                row["encrypted"] = True
-        invites.append(row)
+    invites = [_invite_row(cfg, room_id, room)
+               for room_id, room in sorted((groups.get("invite") or {}).items())]
     return {"user_id": cfg["user_id"], "joined": joined, "invites": invites}
+
+
+def _invite_row(cfg: dict, room_id: str, room: dict) -> dict:
+    row = {"room_id": room_id, "name": None, "inviter": None, "encrypted": False}
+    for event in (room.get("invite_state") or {}).get("events") or []:
+        kind = event.get("type")
+        if kind == "m.room.name":
+            row["name"] = (event.get("content") or {}).get("name")
+        elif kind == "m.room.member" and event.get("state_key") == cfg["user_id"]:
+            row["inviter"] = event.get("sender")
+        elif kind == "m.room.encryption":
+            row["encrypted"] = True
+    return row
 
 
 def _message_row(event: dict) -> dict:
@@ -3745,6 +3871,188 @@ def cmd_read(cfg: dict, room: str, limit: int) -> dict:
     more = bool((found or {}).get("end")) and len(chunk) >= limit
     return {"room_id": room_id, "limit": limit, "count": len(messages), "more": more,
             "messages": messages}
+
+
+# ── watch ────────────────────────────────────────────────────────────────────
+
+# What `watch` follows: every room event, read receipts, and this connection's
+# mark. The first sync only takes the position, so nothing from before it prints.
+WATCH_FILTER = {
+    "presence": {"not_types": ["*"]},
+    "account_data": {"not_types": ["*"]},
+    "room": {
+        "timeline": {"limit": 50},
+        "state": {"types": ROOM_STATE_TYPES},
+        "ephemeral": {"types": ["m.receipt"]},
+        "account_data": {"types": [MARK_TYPE]},
+    },
+}
+WATCH_START_FILTER = {
+    "presence": {"not_types": ["*"]},
+    "account_data": {"not_types": ["*"]},
+    "room": {"timeline": {"limit": 1}, "state": {"not_types": ["*"]},
+             "ephemeral": {"not_types": ["*"]}, "account_data": {"not_types": ["*"]}},
+}
+WATCH_POLL_MS = 30000
+# A change to one of these in a joined room reprints the room's row.
+WATCH_ROOM_TYPES = {"m.room.name", "m.room.topic", "m.room.encryption", "m.room.power_levels"}
+
+
+class _WatchStopped(Exception):
+    """The watch was told to end: a signal, or its reader went away."""
+
+
+def _watch_stop(signum, frame) -> NoReturn:
+    raise _WatchStopped()
+
+
+def _watch_line(value: dict) -> None:
+    try:
+        sys.stdout.write(json.dumps(value, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, ValueError):
+        raise _WatchStopped() from None
+
+
+def _ms_iso(ts) -> str | None:
+    return (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts / 1000))
+            if isinstance(ts, (int, float)) else None)
+
+
+def _live_room_row(m: Matrix, cfg: dict, room_id: str) -> dict:
+    """A joined room's whole row, read from the room as it is now."""
+    try:
+        state = m.call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/state") or []
+    except MatrixError as exc:
+        if exc.exit_code == 3 or exc.code == "forbidden":
+            state = []
+        else:
+            raise
+    row = _room_row(room_id, state if isinstance(state, list) else [])
+    row["members"] = sum(1 for e in state if isinstance(e, dict)
+                         and e.get("type") == "m.room.member"
+                         and (e.get("content") or {}).get("membership") == "join") or None
+    try:
+        mark = m.call("GET", f"/_matrix/client/v3/user/{_q(cfg['user_id'])}/rooms/{_q(room_id)}"
+                      f"/account_data/{MARK_TYPE}")
+        row["marked"] = (mark or {}).get("marked") is True
+    except MatrixError as exc:
+        if exc.exit_code != 3:
+            raise
+    return row
+
+
+def _watch_lines(m: Matrix, cfg: dict, sync: dict, rooms: set | None,
+                 joined: set) -> list[dict]:
+    """What one sync says, as watch lines, in the order it says it. `joined`
+    is the set of rooms this connection is in, kept current."""
+    out: list[dict] = []
+    groups = (sync or {}).get("rooms") or {}
+    for room_id, room in (groups.get("invite") or {}).items():
+        if rooms is None or room_id in rooms:
+            out.append({"event": "invite", "room_id": room_id,
+                        "invite": _invite_row(cfg, room_id, room)})
+    for section in ("join", "leave"):
+        for room_id, room in (groups.get(section) or {}).items():
+            if rooms is not None and room_id not in rooms:
+                continue
+            timeline = room.get("timeline") or {}
+            events = timeline.get("events") or []
+            fresh = section == "join" and room_id not in joined
+            if fresh:
+                # A room just joined arrives with its recent history; only what
+                # follows this connection's own join is new.
+                mine = [i for i, e in enumerate(events) if e.get("type") == "m.room.member"
+                        and e.get("state_key") == cfg["user_id"]
+                        and (e.get("content") or {}).get("membership") == "join"]
+                events = events[mine[-1]:] if mine else []
+            elif timeline.get("limited"):
+                out.append({"event": "gap", "room_id": room_id})
+            reprint = fresh
+            for event in events:
+                kind = event.get("type")
+                if kind == "m.room.message" and "state_key" not in event:
+                    out.append({"event": "message", "room_id": room_id,
+                                "message": _message_row(event)})
+                elif kind == "m.room.member" and "state_key" in event:
+                    out.append({"event": "membership", "room_id": room_id,
+                                "user_id": event.get("state_key"),
+                                "membership": (event.get("content") or {}).get("membership"),
+                                "sender": event.get("sender"), "event_id": event.get("event_id"),
+                                "ts": _ms_iso(event.get("origin_server_ts"))})
+                elif kind in WATCH_ROOM_TYPES and event.get("state_key") == "":
+                    reprint = True
+            if section == "leave":
+                joined.discard(room_id)
+                continue
+            joined.add(room_id)
+            if reprint:
+                out.append({"event": "room", "room": _live_room_row(m, cfg, room_id)})
+            for event in (room.get("ephemeral") or {}).get("events") or []:
+                if event.get("type") != "m.receipt":
+                    continue
+                for event_id, kinds in (event.get("content") or {}).items():
+                    for kind in ("m.read", "m.read.private"):
+                        for user_id, info in ((kinds or {}).get(kind) or {}).items():
+                            out.append({"event": "receipt", "room_id": room_id,
+                                        "user_id": user_id, "event_id": event_id,
+                                        "ts": _ms_iso((info or {}).get("ts"))})
+            for event in (room.get("account_data") or {}).get("events") or []:
+                if event.get("type") == MARK_TYPE:
+                    out.append({"event": "marked", "room_id": room_id,
+                                "marked": (event.get("content") or {}).get("marked") is True})
+    return out
+
+
+def cmd_watch(cfg: dict, rooms_named: list[str] | None) -> None:
+    previous = {sig: signal.signal(sig, _watch_stop) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        with _matrix(cfg) as m:
+            rooms = None
+            if rooms_named:
+                rooms = set()
+                for room in rooms_named:
+                    room_id = _resolve_room(m, cfg, room)
+                    _refuse_encrypted(m, room_id)
+                    rooms.add(room_id)
+            try:
+                first = m.call("GET", "/_matrix/client/v3/sync", params={
+                    "filter": json.dumps(WATCH_START_FILTER, separators=(",", ":")),
+                    "timeout": "0"})
+            except MatrixError as exc:
+                _fail(exc)
+            since = (first or {}).get("next_batch")
+            joined = set(((first or {}).get("rooms") or {}).get("join") or {})
+            _watch_line({"event": "ready", "connection": cfg["id"], "user_id": cfg["user_id"],
+                         "rooms": sorted(rooms) if rooms is not None else None})
+            params = {"filter": json.dumps(WATCH_FILTER, separators=(",", ":")),
+                      "timeout": str(WATCH_POLL_MS)}
+            wait, lost = 1.0, False
+            while True:
+                try:
+                    sync = m.call("GET", "/_matrix/client/v3/sync",
+                                  params={**params, **({"since": since} if since else {})})
+                    lines = _watch_lines(m, cfg, sync, rooms, joined)
+                except MatrixError as exc:
+                    if exc.exit_code != 5:
+                        _fail(exc)
+                    if not lost:
+                        _watch_line({"event": "lost", "error": exc.message})
+                        lost = True
+                    time.sleep(wait)
+                    wait = min(wait * 2, 30.0)
+                    continue
+                if lost:
+                    _watch_line({"event": "resumed"})
+                    wait, lost = 1.0, False
+                for line in lines:
+                    _watch_line(line)
+                since = (sync or {}).get("next_batch") or since
+    except _WatchStopped:
+        sys.exit(0)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def cmd_open(cfg: dict, name: str, invites: list[str], topic: str | None) -> dict:
@@ -3932,6 +4240,7 @@ def _write_env_key(path: Path, key: str, value: str) -> None:
         out.append(line)
     if not done:
         out.append(written)
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -4031,6 +4340,153 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
             "registry": str(registry), "default": make_default, "allow_write": WRITE_DEFAULT,
             "next": f"writes need a grant: ask the user to run `capabilities set {NAME} grant "
                     f"{cid} '{{\"allow_write\": true}}'` in this project"}
+
+
+def _read_password() -> str:
+    """Standard input whole, less one trailing newline; without echo when it is
+    a terminal."""
+    if sys.stdin.isatty():
+        import getpass
+        return getpass.getpass("")
+    value = sys.stdin.read()
+    return value[:-1] if value.endswith("\n") else value
+
+
+def cmd_login(user_id: str, homeserver_flag: str | None, as_id: str | None, scope: str,
+              make_default: bool) -> dict:
+    _read_only_gate(f"`{NAME} login`")
+    if not USER_RE.fullmatch(user_id):
+        _die(6, "bad_user", f"{user_id!r} is not a user id (@name:server)",
+             "e.g. @person:example.org")
+    cid = as_id or user_id[1:].split(":", 1)[0]
+    if not KEY_RE.fullmatch(cid):
+        _die(6, "bad_connection_id", f"connection id {cid!r} must match {KEY_RE.pattern}",
+             "pass --as <id>")
+    root = _project_root()
+    adapter = _records()
+    if scope == "project":
+        envelope = getattr(adapter, "envelope", None)
+        if root is None:
+            _die(6, "no_project", "--project signs in for this project and there is no "
+                 "project here", "run it inside the project, or pass --global")
+        if envelope is None or not Path(envelope).is_dir():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+    declared = (_inventory_connections()["connections"] or {}).get(cid)
+    if declared is not None and declared.get("user_id") != user_id:
+        _die(6, "connection_exists",
+             f"connection {cid!r} is already declared for {declared.get('user_id')!r}",
+             "pass --as <another-id>")
+    homeserver = homeserver_flag or _resolve_env_key(HOMESERVER_KEY)[0]
+    if not homeserver:
+        _die(6, "homeserver_missing", "no homeserver to sign in to",
+             f"pass --homeserver https://matrix.example.org, or a person sets {HOMESERVER_KEY} "
+             f"once per machine in {CREDENTIALS_ENV}")
+    homeserver = homeserver.rstrip("/")
+    if not re.match(r"https?://[^/\s]+$", homeserver):
+        _die(6, "bad_homeserver", f"{homeserver!r} is not http(s)://host[:port]")
+    password = _read_password()
+    if not password:
+        _die(6, "password_missing", "no password on standard input",
+             "pipe the account's password to standard input; it is never stored or printed")
+    with Matrix(homeserver) as m:
+        try:
+            done = m.call("POST", "/_matrix/client/v3/login", idempotent=False, body={
+                "type": "m.login.password",
+                "identifier": {"type": "m.id.user", "user": user_id},
+                "password": password, "initial_device_display_name": f"{NAME} {cid}"})
+        except MatrixError as exc:
+            if exc.status in (401, 403):
+                _die(2, "login_rejected", f"the homeserver refused the sign-in: {exc.message}",
+                     "check the user id and the password with the person who owns the account")
+            _fail(exc)
+        finally:
+            password = None
+    found, access, device = done.get("user_id"), done.get("access_token"), done.get("device_id")
+    if not found or not access:
+        _die(5, "login_incomplete", "the homeserver signed in without returning a token")
+    if found != user_id:
+        _die(6, "login_mismatch", f"the homeserver signed in {found!r}, not {user_id!r}",
+             "name the account by its full user id")
+    secret_env = _connection_env_key(cid)
+    credentials = CREDENTIALS_ENV if scope == "global" else root / ".env.local"
+    _write_env_key(credentials, secret_env, access)
+    entry = {"homeserver": homeserver, "user_id": found, "secret_env": secret_env,
+             "device_id": device}
+    try:
+        adapter.set(NAME, "connection", cid, entry, scope=scope)
+        if make_default:
+            adapter.set(NAME, "setting", "connection.default", cid, scope=scope)
+        registry = adapter.scope_source(NAME, "connection", scope)
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+    out = {"logged_in": True, "connection": cid, "scope": scope, "user_id": found,
+           "homeserver": homeserver, "device_id": device, "secret_env": secret_env,
+           "credentials": str(credentials), "registry": str(registry), "default": make_default}
+    machine_read = _machine_read("rooms")
+    usable = (_inventory_connections(machine_read)["connections"].get(cid) or {})
+    out["allow_write"] = bool(usable.get("allow_write")) and not machine_read
+    out["usable_here"] = bool(usable.get("granted"))
+    if not out["usable_here"]:
+        out["hint"] = _grant_hint(cid)
+    elif machine_read:
+        out["machine_reads"] = list(MACHINE_READS)
+    if out["usable_here"] and not out["allow_write"]:
+        out["next"] = ("writes need a grant: ask the user to run `capabilities set "
+                       f"{NAME} grant {cid} '{{\"enabled\": true, \"allow_write\": true}}'` "
+                       "in the project that should post as this account")
+    return out
+
+
+# ── sessions: what the service recorded ──────────────────────────────────────
+
+
+def _agent_store(wanted: str | None, verb: str):
+    """The selected agent's connection and the project's store its service
+    writes to, or the refusal that says why there is none here."""
+    root = _project_root()
+    if root is None:
+        _die(6, "input", f"`{verb}` reads the service's record in an agent's project, and "
+             "this is not one", "run it where the project whose agent it is")
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    try:
+        project, _slug = _identity_here()
+        store = _open_store(root)
+    except _Refusal as exc:
+        _refused(exc)
+    return cid, (entry or {}), project, store
+
+
+def cmd_sessions(wanted: str | None, room: str | None) -> dict:
+    cid, entry, project, store = _agent_store(wanted, "sessions")
+    try:
+        room_id = None
+        if room:
+            if room.startswith("#"):
+                cfg = _cfg(wanted, "sessions")
+                with _matrix(cfg) as m:
+                    room_id = _resolve_room(m, cfg, room)
+            elif room.startswith("!"):
+                room_id = room
+            else:
+                _die(6, "bad_room",
+                     f"{room!r} is neither a room id (!...) nor an alias (#name:server)")
+        rows = store.sessions(project, cid, room_id)
+    finally:
+        store.close()
+    return {"connection": cid, "user_id": entry.get("user_id"), "sessions": rows}
+
+
+def cmd_turn(wanted: str | None, event_id: str):
+    if not event_id.startswith("$"):
+        _die(6, "bad_event", f"{event_id!r} is not an event id ($...)")
+    cid, _entry, project, store = _agent_store(wanted, "turn")
+    try:
+        found = store.answered_by(project, cid, event_id)
+    finally:
+        store.close()
+    return None if found is None else {"event_id": event_id, "connection": cid, **found}
 
 
 # ── the service: files, settings, the opt-in list ────────────────────────────
@@ -5441,7 +5897,18 @@ def _parser() -> _Parser:
     register.add_argument("--homeserver")
     register.add_argument("--as", dest="as_id")
     register.add_argument("--default", action="store_true")
+    login = sub.add_parser("login")
+    login.add_argument("user_id")
+    login.add_argument("--homeserver")
+    login.add_argument("--as", dest="as_id")
+    login_scope = login.add_mutually_exclusive_group()
+    login_scope.add_argument("--global", dest="scope", action="store_const", const="global")
+    login_scope.add_argument("--project", dest="scope", action="store_const", const="project")
+    login.add_argument("--default", action="store_true")
     sub.add_parser("rooms")
+    sub.add_parser("watch").add_argument("--room", action="append")
+    sub.add_parser("sessions").add_argument("--room")
+    sub.add_parser("turn").add_argument("event")
     read = sub.add_parser("read")
     read.add_argument("room")
     read.add_argument("--limit", type=_limit, default=20)
@@ -5573,6 +6040,17 @@ def main() -> None:
     if cmd == "register":
         _emit(cmd_register(args.name, args.homeserver, args.as_id, args.default))
         return
+    if cmd == "login":
+        _emit(cmd_login(args.user_id, args.homeserver, args.as_id, args.scope or "project",
+                        args.default))
+        return
+    if cmd == "sessions":
+        _emit(cmd_sessions(wanted, args.room))
+        return
+    if cmd == "turn":
+        found = cmd_turn(wanted, args.event)
+        _emit("null" if found is None else found)
+        return
     if cmd == "service":
         _service(args)
         return
@@ -5584,6 +6062,8 @@ def main() -> None:
         _emit(cmd_rooms(cfg))
     elif cmd == "read":
         _emit(cmd_read(cfg, args.room, args.limit))
+    elif cmd == "watch":
+        cmd_watch(cfg, args.room)
     elif cmd == "open":
         _emit(cmd_open(cfg, args.name, args.invite, args.topic))
     elif cmd == "invite":

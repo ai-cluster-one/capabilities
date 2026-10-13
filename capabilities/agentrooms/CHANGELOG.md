@@ -1,5 +1,15 @@
 # agentrooms — change log
 
+## 2026-10-13 — A person's sign-in, a live stream, each room's owners, and the session behind an answer
+
+`agentrooms login USER_ID` signs in to an existing account with its password, read from standard input, and writes the connection and the access token it minted - into the project, or with `--global` into `~/.config/agentrooms/` as the machine's connection. The password is sent once and never stored or printed. Outside any project `connections`, `doctor`, `rooms`, `read` and `watch` are now machine reads: they use the machine's connections read-only, and posting as that account still needs a project that grants the connection writes.
+
+`agentrooms watch [--room ROOM ...]` follows the rooms a connection sees from the moment it starts and prints one JSON line per message, invite, membership change, read receipt, change of the connection's mark, and joined or changed room, until it is stopped; a dropped connection is resumed where it stopped.
+
+`rooms`, and `watch`'s room lines, name each joined room's `owners` and what that rests on, `owner_basis`: its creators in room version 12 and later, else the users holding the highest power level.
+
+The service now records, on each turn, the message it posted and the harness session that wrote it (store step `0008-turn-sessions`, applied when the store is next opened). `agentrooms turn EVENT` reads the turn behind a message, and `agentrooms sessions [--room ROOM]` the room-to-session map of the selected agent. A message answered before this version has no record, and `turn` answers null for it.
+
 ## 2026-10-11 — A store behind Supabase's transaction pooler is refused at connect
 
 `agentrooms` now uses `capabilities-contract` 0.4.1. A transaction-mode pooler keeps no session between transactions, so the schema binding, prepared statements and notifications a connection relies on are lost through one, and it is not supported. A database setting that points at Supabase's transaction pooler - a host under `pooler.supabase.com` on port 6543 - is refused before anything is sent to it, as `transaction_pooler`, with a hint naming the session pooler: the same host on port 5432. Every other database, the session pooler included, is reached as before.

@@ -81,6 +81,14 @@ def test_sessions_and_pause(store):
     store.save_session("p", "alpha", "!r", harness="claude", session_id="s1", node="n1", seen_ts=3)
     found = store.session("p", "alpha", "!r")
     assert found == {"harness": "claude", "session_id": "s1", "node": "n1", "seen_ts": 5, "turns": 2}
+    store.save_session("p", "alpha", "!s", harness="codex", session_id="s2", node="n1", seen_ts=1)
+    store.save_session("p", "beta", "!r", harness="claude", session_id="s3", node="n1", seen_ts=1)
+    mapped = store.sessions("p", "alpha")
+    assert [(r["room_id"], r["session_id"], r["turns"]) for r in mapped] == [("!r", "s1", 2),
+                                                                            ("!s", "s2", 1)]
+    assert mapped[0]["updated_at"]
+    assert [r["session_id"] for r in store.sessions("p", "alpha", "!s")] == ["s2"]
+    assert store.sessions("p", "alpha", "!none") == []
     assert store.pause_of("p") is None
     store.pause("p", "me@host", "testing")
     assert store.pause_of("p")["reason"] == "testing"
@@ -122,6 +130,15 @@ def test_turn_counts_reset_a_room_after_quiet_and_skip_default_answers(store):
     assert not store.default_answered("p", "alpha", "!other", "@s:x", 60)
     store.end_turn("t0", "answered")
     assert store.execute("SELECT outcome FROM agentrooms_turns WHERE id = 't0'", fetch="one") == ("answered",)
+    assert store.answered_by("p", "alpha", "$a") is None
+    store.end_turn("t1", "answered", event_id="$a", harness="claude", session_id="s1", node="n1")
+    found = store.answered_by("p", "alpha", "$a")
+    assert {k: found[k] for k in ("turn", "room_id", "worker", "harness", "session_id", "node",
+                                  "outcome")} == {
+        "turn": "t1", "room_id": "!r", "worker": "w", "harness": "claude", "session_id": "s1",
+        "node": "n1", "outcome": "answered"}
+    assert found["started_at"]
+    assert store.answered_by("p", "beta", "$a") is None
 
 
 def test_only_the_named_wakes_are_handed_back(store):

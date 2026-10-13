@@ -8,6 +8,12 @@ The standard keeps a connection record human-written and what a login mints in s
 
 The token is the agent's only credential - the account has no password - and the connection resolves it through `secret_env` like any other secret, so a deployed host injects the same key into its environment instead. Writing it anywhere a person would have to copy it from would carry a live token through a prompt or a terminal, which is where tokens leak. It is written by an atomic writer that keeps every other line, read back through the contract's parser, and never printed.
 
+## `login` writes the connection entry and the token the sign-in minted
+
+`agentrooms login` signs a person's existing account in and writes the entry and the access token in one act, as `register` does for a new agent: the entry, holding only non-secret values, through the contract's records adapter at the scope asked for, and the token into the credentials file of that scope - the project's `.env.local`, or with `--global` the user `credentials.env` - under the entry's `secret_env`, at mode 0600, by the same atomic writer, never printed.
+
+The password the sign-in takes is read from standard input, sent once to the homeserver and kept nowhere: the token is the credential the connection resolves, and a person who would otherwise copy it out of a client would carry a live token through a terminal.
+
 ## The machine service holds each served agent's access token
 
 A machine service loads no project's secrets: the work it starts runs as the project's child. The service this capability ships keeps one `/sync` long-poll per agent inside the one machine process, so that process holds each served agent's access token. It resolves the token inside that project's own resolution - the project's cascade, for that one key - and uses it only for that agent's requests; it loads no other value of the project's environment, and every turn still runs as a child in the project's root with the project's own context.

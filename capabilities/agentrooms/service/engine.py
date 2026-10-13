@@ -15,7 +15,8 @@ Runtime state lives in the PostgreSQL the project resolves to, under the
 each agent, the wakes not yet answered, the harness session of each agent in each
 room, the lease that keeps a second process off an agent, a project's pause, the
 project's workers as versions, and the record of the turns run, which the limits
-count. No message text is kept: a turn reads the room live.
+count and which names the message a turn posted and the harness session that
+wrote it. No message text is kept: a turn reads the room live.
 
 A worker admits and limits an agent's turns. Which worker answers an agent in a
 room is read from the agent's connection at every turn, and the worker and its
@@ -47,7 +48,7 @@ from typing import Any, Callable
 
 LEDGER_OWNER = "agentrooms"
 LEDGER_MAJOR = 1
-LEDGER_MINOR = 1
+LEDGER_MINOR = 2
 LEDGER_STEPS = [
     ("0001-sync", """
     CREATE TABLE agentrooms_sync (
@@ -152,6 +153,15 @@ LEDGER_STEPS = [
     CREATE INDEX agentrooms_turns_agent_idx ON agentrooms_turns (project_id, agent, started_at);
     CREATE INDEX agentrooms_turns_room_idx
         ON agentrooms_turns (project_id, agent, room_id, started_at);
+    """),
+    ("0008-turn-sessions", """
+    ALTER TABLE agentrooms_turns
+        ADD COLUMN event_id    text,
+        ADD COLUMN harness     text,
+        ADD COLUMN session_id  text,
+        ADD COLUMN node        text;
+    CREATE INDEX agentrooms_turns_event_idx ON agentrooms_turns (project_id, event_id)
+        WHERE event_id IS NOT NULL;
     """),
 ]
 
@@ -675,6 +685,17 @@ class Store:
 
     # -- sessions -------------------------------------------------------------
 
+    def sessions(self, project: str, agent: str, room_id: str | None = None) -> list[dict]:
+        """The room-to-session map of `agent`, every room or the one named."""
+        rows = self.execute(
+            "SELECT room_id, harness, session_id, node, seen_ts, turns, updated_at "
+            "FROM agentrooms_sessions WHERE project_id = %s AND agent = %s "
+            "AND (%s::text IS NULL OR room_id = %s) ORDER BY room_id",
+            (project, agent, room_id, room_id), fetch="all")
+        return [{"room_id": r[0], "harness": r[1], "session_id": r[2], "node": r[3],
+                 "seen_ts": r[4], "turns": r[5],
+                 "updated_at": r[6].isoformat() if r[6] else None} for r in rows]
+
     def session(self, project: str, agent: str, room_id: str) -> dict | None:
         row = self.execute(
             "SELECT harness, session_id, node, seen_ts, turns FROM agentrooms_sessions "
@@ -811,8 +832,26 @@ class Store:
                      "ON CONFLICT (id) DO NOTHING",
                      (turn, project, agent, room_id, worker, worker_id, senders, kinds))
 
-    def end_turn(self, turn: str, outcome: str) -> None:
-        self.execute("UPDATE agentrooms_turns SET outcome = %s WHERE id = %s", (outcome, turn))
+    def end_turn(self, turn: str, outcome: str, *, event_id: str | None = None,
+                 harness: str | None = None, session_id: str | None = None,
+                 node: str | None = None) -> None:
+        """How the turn ended, and the message it posted and the harness session
+        that wrote it, where there are."""
+        self.execute("UPDATE agentrooms_turns SET outcome = %s, event_id = %s, harness = %s, "
+                     "session_id = %s, node = %s WHERE id = %s",
+                     (outcome, event_id, harness, session_id, node, turn))
+
+    def answered_by(self, project: str, agent: str, event_id: str) -> dict | None:
+        """The turn of `agent` that posted `event_id`, with the session it ran in."""
+        row = self.execute(
+            "SELECT id, room_id, worker, harness, session_id, node, started_at, outcome "
+            "FROM agentrooms_turns WHERE project_id = %s AND agent = %s AND event_id = %s "
+            "ORDER BY started_at DESC LIMIT 1", (project, agent, event_id), fetch="one")
+        if row is None:
+            return None
+        return {"turn": row[0], "room_id": row[1], "worker": row[2], "harness": row[3],
+                "session_id": row[4], "node": row[5],
+                "started_at": row[6].isoformat() if row[6] else None, "outcome": row[7]}
 
     def turn_counts(self, project: str, agent: str, room_id: str, senders: list[str], *,
                     window: int, quiet: int, room_cap: int) -> dict:
@@ -1930,7 +1969,10 @@ class Engine:
             ended = self.run_turn(turn, agent, worker, wakes)
         finally:
             with contextlib.suppress(Exception):
-                store.end_turn(turn.id, ended["outcome"])
+                store.end_turn(turn.id, ended["outcome"], event_id=ended.get("event_id"),
+                               harness=ended.get("harness"),
+                               session_id=ended.get("session_id"),
+                               node=self.node if ended.get("session_id") else None)
         after = worker["hooks"].get("after")
         if after:
             said = verdict(run_hook(after, cwd=slot.entry["root"], env={
@@ -2012,7 +2054,7 @@ class Engine:
                 store.save_session(slot.project_id, cid, room_id, harness=harness,
                                    session_id=session_id, node=self.node, seen_ts=seen)
             slot.turns += 1
-            ended = {"session_id": session_id}
+            ended = {"session_id": session_id, "harness": harness}
             if not getattr(result, "ok", False):
                 failure = getattr(result, "failure", None)
                 kind = getattr(getattr(failure, "kind", None), "value", None) or str(

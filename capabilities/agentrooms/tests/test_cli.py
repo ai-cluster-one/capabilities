@@ -9,6 +9,8 @@ import stat
 import sys
 from pathlib import Path
 
+from urllib.parse import unquote
+
 import httpx
 import pytest
 
@@ -29,6 +31,10 @@ class FakeHomeserver:
         self.messages: dict[str, list[dict]] = {}
         self.txns: dict[str, str] = {}
         self.created: list[dict] = []
+        self.passwords: dict[str, str] = {}
+        self.syncs: list = []
+        self.state: dict[str, list[dict]] = {}
+        self.sync_params: list[dict] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -49,10 +55,27 @@ class FakeHomeserver:
             self.users.add(f"@{name}:{SERVER}")
             return httpx.Response(200, json={"user_id": f"@{name}:{SERVER}",
                                              "access_token": TOKEN, "device_id": "DEV1"})
+        if path == "/_matrix/client/v3/login":
+            user = ((body or {}).get("identifier") or {}).get("user")
+            if body.get("type") != "m.login.password" or \
+                    self.passwords.get(user) != body.get("password"):
+                return httpx.Response(403, json={"errcode": "M_FORBIDDEN",
+                                                 "error": "Invalid username or password"})
+            return httpx.Response(200, json={"user_id": user, "access_token": TOKEN,
+                                             "device_id": "DEV2"})
         if auth != f"Bearer {TOKEN}":
             return httpx.Response(401, json={"errcode": "M_UNKNOWN_TOKEN", "error": "unknown"})
         if path == "/_matrix/client/v3/account/whoami":
             return httpx.Response(200, json={"user_id": f"@alpha:{SERVER}", "device_id": "DEV1"})
+        if path == "/_matrix/client/v3/sync":
+            self.sync_params.append(dict(request.url.params))
+            answer = self.syncs.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return httpx.Response(200, json=answer)
+        if path.endswith("/state") and "/rooms/" in path:
+            room = unquote(path.split("/rooms/")[1].split("/")[0])
+            return httpx.Response(200, json=self.state.get(room, []))
         if path == "/_matrix/client/v3/createRoom":
             self.created.append(body)
             return httpx.Response(200, json={"room_id": "!new"})
@@ -468,3 +491,222 @@ def test_an_agents_map_moves_into_a_bound_worker_that_admits_everyone(cli, proje
     assert out["spec"]["limits"] == {"turn_timeout": 600}
     entry = json.loads((project / "capabilities" / "agentrooms" / "connections.json").read_text())
     assert entry["connections"]["alpha"]["worker"] == "alpha"
+
+
+# ── a person's connection, the stream, owners, sessions ──────────────────────
+
+OWNER = f"@owner:{SERVER}"
+
+
+def test_login_signs_in_an_existing_account_and_keeps_no_password(cli, project, homeserver,
+                                                                  capsys, monkeypatch):
+    import io
+    homeserver.passwords[OWNER] = "pw with spaces"
+    monkeypatch.setattr(sys, "stdin", io.StringIO("wrong\n"))
+    code, _out, err = run(cli, capsys, "login", OWNER, "--homeserver", HS)
+    assert code == 2 and err["error"]["code"] == "login_rejected"
+    assert not (project / ".env.local").exists()
+    monkeypatch.setattr(sys, "stdin", io.StringIO("pw with spaces\n"))
+    code, out, err = run(cli, capsys, "login", OWNER, "--homeserver", HS)
+    assert code == 0, err
+    assert out["connection"] == "owner" and out["scope"] == "project" and out["user_id"] == OWNER
+    assert out["usable_here"] is True and out["allow_write"] is False and "next" in out
+    login = [b for m, p, b in homeserver.requests if p.endswith("/login")][-1]
+    assert login["identifier"] == {"type": "m.id.user", "user": OWNER}
+    for text in (json.dumps(out), (project / ".env.local").read_text(),
+                 (project / "capabilities" / "agentrooms" / "connections.json").read_text()):
+        assert "pw with spaces" not in text and TOKEN not in json.dumps(out)
+    assert f"AGENTROOMS_OWNER_TOKEN='{TOKEN}'" in (project / ".env.local").read_text()
+    # Signing in again to the same account replaces its token; another account is refused.
+    monkeypatch.setattr(sys, "stdin", io.StringIO("pw with spaces"))
+    code, _out, err = run(cli, capsys, "login", OWNER, "--homeserver", HS)
+    assert code == 0, err
+    monkeypatch.setattr(sys, "stdin", io.StringIO("x"))
+    code, _out, err = run(cli, capsys, "login", f"@other:{SERVER}", "--as", "owner",
+                          "--homeserver", HS)
+    assert code == 6 and err["error"]["code"] == "connection_exists"
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    code, _out, err = run(cli, capsys, "login", f"@other:{SERVER}", "--homeserver", HS)
+    assert code == 6 and err["error"]["code"] == "password_missing"
+
+
+@pytest.fixture()
+def nowhere(project, tmp_path, monkeypatch):
+    """Outside any project, on a machine whose global policy enables agentrooms."""
+    away = tmp_path / "away"
+    away.mkdir()
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.chdir(away)
+    caps = Path(os.environ["XDG_CONFIG_HOME"]) / "capabilities"
+    caps.mkdir(parents=True, exist_ok=True)
+    (caps / "settings.json").write_text(json.dumps({"capabilities": {"agentrooms": {"enabled": True}}}))
+    return away
+
+
+def test_a_global_login_is_the_machines_read_only_outside_a_project(cli, nowhere, homeserver,
+                                                                    capsys, monkeypatch):
+    import io
+    homeserver.passwords[OWNER] = "pw"
+    monkeypatch.setattr(sys, "stdin", io.StringIO("pw"))
+    code, out, err = run(cli, capsys, "login", OWNER, "--homeserver", HS, "--global", "--default")
+    assert code == 0, err
+    assert out["scope"] == "global" and out["usable_here"] is True and out["allow_write"] is False
+    assert "watch" in out["machine_reads"]
+    credentials = Path(out["credentials"])
+    assert credentials == cli.CREDENTIALS_ENV and stat.S_IMODE(credentials.stat().st_mode) == 0o600
+    homeserver.syncs.append({"next_batch": "b0", "rooms": {"join": {}}})
+    code, out, err = run(cli, capsys, "rooms")
+    assert code == 0 and out["user_id"] == OWNER, err
+    # A write is no machine read: outside a project it gets no connection at all.
+    code, _out, err = run(cli, capsys, "post", "!room", "hi")
+    assert code == 4 and err["error"]["code"] == "connection_not_granted"
+    monkeypatch.setattr(sys, "stdin", io.StringIO("pw"))
+    code, _out, err = run(cli, capsys, "login", OWNER, "--homeserver", HS)
+    assert code == 6 and err["error"]["code"] == "no_project"
+
+
+def _create(sender, version="12", **extra):
+    return {"type": "m.room.create", "state_key": "", "sender": sender,
+            "content": {"room_version": version, **extra}}
+
+
+def _levels(users):
+    return {"type": "m.room.power_levels", "state_key": "", "sender": OWNER,
+            "content": {"users": users}}
+
+
+def test_rooms_name_each_rooms_owners_and_what_that_rests_on(cli, project, homeserver, capsys):
+    connect(project, allow_write=False)
+    me = f"@alpha:{SERVER}"
+    homeserver.syncs.append({"next_batch": "b1", "rooms": {"join": {
+        "!new": {"state": {"events": [_create(OWNER, additional_creators=[me]),
+                                      _levels({})]},
+                 "summary": {"m.joined_member_count": 2}},
+        "!old": {"state": {"events": [_create(me, version="10"),
+                                      _levels({me: 50, OWNER: 100, f"@c:{SERVER}": 100})]},
+                 "summary": {"m.joined_member_count": 3}},
+        "!bare": {"state": {"events": [_create(me, version="9")]},
+                  "summary": {"m.joined_member_count": 1}}}}})
+    code, out, err = run(cli, capsys, "rooms")
+    assert code == 0, err
+    rows = {r["room_id"]: r for r in out["joined"]}
+    assert (rows["!new"]["owners"], rows["!new"]["owner_basis"]) == ([OWNER, me], "creator")
+    assert (rows["!old"]["owners"], rows["!old"]["owner_basis"]) == \
+        ([f"@c:{SERVER}", OWNER], "power_level")
+    assert (rows["!bare"]["owners"], rows["!bare"]["owner_basis"]) == ([me], "creator")
+    assert rows["!old"]["members"] == 3
+
+
+def _message(event_id, body, sender=OWNER):
+    return {"type": "m.room.message", "event_id": event_id, "sender": sender,
+            "origin_server_ts": 1_700_000_000_000, "content": {"msgtype": "m.text", "body": body}}
+
+
+def test_watch_prints_one_line_per_change_from_now_until_stopped(cli, project, homeserver,
+                                                                 capsys, monkeypatch):
+    connect(project, allow_write=False)
+    me = f"@alpha:{SERVER}"
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    homeserver.state["!lab"] = [_create(OWNER), {"type": "m.room.name", "state_key": "",
+                                                 "content": {"name": "Lab"}},
+                                {"type": "m.room.member", "state_key": me,
+                                 "content": {"membership": "join"}},
+                                {"type": "m.room.member", "state_key": OWNER,
+                                 "content": {"membership": "join"}}]
+    join = {"type": "m.room.member", "state_key": me, "sender": me, "event_id": "$j",
+            "content": {"membership": "join"}}
+    homeserver.syncs += [
+        {"next_batch": "b0", "rooms": {"join": {"!old": {}}}},
+        {"next_batch": "b1", "rooms": {
+            "invite": {"!inv": {"invite_state": {"events": [
+                {"type": "m.room.member", "state_key": me, "sender": OWNER,
+                 "content": {"membership": "invite"}}]}}},
+            "join": {
+                "!old": {"timeline": {"events": [_message("$1", "hello")]},
+                         "ephemeral": {"events": [{"type": "m.receipt", "content": {
+                             "$1": {"m.read": {OWNER: {"ts": 1_700_000_000_000}}}}}]},
+                         "account_data": {"events": [{"type": "agentrooms.marked",
+                                                      "content": {"marked": True}}]}},
+                "!lab": {"timeline": {"limited": True, "events": [
+                    _message("$before", "said before the join"), join,
+                    _message("$2", "welcome")]}}}}},
+        httpx.ConnectError("down"),
+        {"next_batch": "b2", "rooms": {"join": {"!old": {"timeline": {"limited": True,
+                                                                     "events": []}}}}},
+        cli._WatchStopped(),
+    ]
+    code, lines, err = run_stream(cli, capsys, "watch")
+    assert code == 0, err
+    assert [line["event"] for line in lines] == [
+        "ready", "invite", "message", "receipt", "marked", "membership", "message", "room",
+        "lost", "resumed", "gap"]
+    ready, invite, hello, receipt, marked, joined, welcome, room, lost, _resumed, gap = lines
+    assert ready == {"event": "ready", "connection": "alpha", "user_id": me, "rooms": None}
+    assert invite["room_id"] == "!inv" and invite["invite"]["inviter"] == OWNER
+    assert hello["room_id"] == "!old" and hello["message"]["body"] == "hello"
+    assert receipt == {"event": "receipt", "room_id": "!old", "user_id": OWNER, "event_id": "$1",
+                       "ts": "2023-11-14T22:13:20Z"}
+    assert marked == {"event": "marked", "room_id": "!old", "marked": True}
+    # A room just joined prints nothing from before the join, and then its row.
+    assert joined["membership"] == "join" and joined["user_id"] == me
+    assert welcome["message"]["event_id"] == "$2"
+    assert room["room"]["name"] == "Lab" and room["room"]["members"] == 2
+    assert (room["room"]["owners"], room["room"]["owner_basis"]) == ([OWNER], "creator")
+    assert lost["error"] and gap == {"event": "gap", "room_id": "!old"}
+    # The first sync only takes the position; every later one goes on from the last.
+    assert "since" not in homeserver.sync_params[0]
+    assert [p.get("since") for p in homeserver.sync_params[1:]] == ["b0", "b1", "b1", "b2"]
+
+
+def run_stream(cli, capsys, *argv) -> tuple[int, list[dict], dict | None]:
+    sys_argv = sys.argv
+    sys.argv = ["agentrooms", *argv]
+    cli._RECORDS = None
+    code = 0
+    try:
+        cli.main()
+    except SystemExit as stop:
+        code = stop.code if isinstance(stop.code, int) else 1
+    finally:
+        sys.argv = sys_argv
+    out, err = capsys.readouterr()
+    lines = [json.loads(line) for line in out.splitlines() if line.strip()]
+    return code, lines, json.loads(err.strip().splitlines()[-1]) if err.strip() else None
+
+
+def test_watch_refuses_an_encrypted_room_before_following(cli, project, homeserver, capsys):
+    connect(project, allow_write=False)
+    homeserver.encrypted.add("!secret")
+    code, lines, err = run_stream(cli, capsys, "watch", "--room", "!secret")
+    assert code == 6 and err["error"]["code"] == "encrypted_room" and lines == []
+    assert not homeserver.sync_params
+
+
+@needs_store
+def test_sessions_and_the_turn_behind_an_answer(cli, project, stored, capsys):
+    connect(project, allow_write=False)
+    code, out, err = run(cli, capsys, "sessions")
+    assert code == 0 and out == {"connection": "alpha", "user_id": f"@alpha:{SERVER}",
+                                 "sessions": []}, err
+    code, out, err = run(cli, capsys, "turn", "$a")
+    assert code == 0 and out is None and err is None
+    engine = cli._engine()
+    store = engine.Store(engine.resolve_store(project)).open()
+    try:
+        store.save_session("prj_test", "alpha", "!r", harness="claude", session_id="s1",
+                           node="n1", seen_ts=1)
+        store.start_turn("t1", "prj_test", "alpha", "!r", "lab", None, ["@b:x"], ["mention"])
+        store.end_turn("t1", "answered", event_id="$a", harness="claude", session_id="s1",
+                       node="n1")
+    finally:
+        store.close()
+    code, out, _err = run(cli, capsys, "sessions", "--room", "!r")
+    assert [(r["room_id"], r["harness"], r["session_id"], r["turns"]) for r in out["sessions"]] \
+        == [("!r", "claude", "s1", 1)]
+    code, out, _err = run(cli, capsys, "turn", "$a")
+    assert {k: out[k] for k in ("event_id", "connection", "turn", "room_id", "worker", "harness",
+                                "session_id", "node", "outcome")} == {
+        "event_id": "$a", "connection": "alpha", "turn": "t1", "room_id": "!r", "worker": "lab",
+        "harness": "claude", "session_id": "s1", "node": "n1", "outcome": "answered"}
+    code, _out, err = run(cli, capsys, "turn", "nope")
+    assert code == 6 and err["error"]["code"] == "bad_event"

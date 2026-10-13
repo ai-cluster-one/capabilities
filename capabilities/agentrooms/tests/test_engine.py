@@ -139,10 +139,11 @@ class FakeStore:
         self.turn_log.append({"id": turn, "room": room, "worker": worker, "senders": senders,
                               "kinds": kinds, "at": time.time(), "outcome": None})
 
-    def end_turn(self, turn, outcome):
+    def end_turn(self, turn, outcome, *, event_id=None, harness=None, session_id=None, node=None):
         for row in self.turn_log:
             if row["id"] == turn:
-                row["outcome"] = outcome
+                row.update(outcome=outcome, event_id=event_id, harness=harness,
+                           session_id=session_id, node=node)
 
     def turn_counts(self, project, agent, room, senders, *, window, quiet, room_cap):
         ran = [r for r in self.turn_log if r["worker"] != "default"]
@@ -332,6 +333,10 @@ def test_first_turn_is_primed_and_the_next_resumes(tmp_path):
                                             "AGENTROOMS_TURN": turn_id}
     assert slot.store.turn_log[0]["id"] == turn_id and slot.store.turn_log[0]["worker"] == "w"
     assert slot.store.turn_log[0]["outcome"] == "answered"
+    # The turn names the message it posted and the harness session that wrote it.
+    assert {k: slot.store.turn_log[0][k] for k in ("event_id", "harness", "session_id")} == \
+        {"event_id": "$posted1", "harness": "claude", "session_id": "sess1"}
+    assert slot.store.turn_log[0]["node"] == eng.node
     room, content = matrix.posted[0]
     assert room == "!r" and content["body"] == "first answer"
     assert content["m.relates_to"]["rel_type"] == "m.thread" and content["m.relates_to"]["event_id"] == "$1"
