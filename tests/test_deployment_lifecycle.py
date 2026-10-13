@@ -158,8 +158,9 @@ def test_dockerfile_ordering_capabilities_to_contextkit(tmp_path: Path) -> None:
         )
 
 
-def test_freeze_includes_deployment_in_lock(tmp_path: Path) -> None:
-    """Verify deployment freeze includes deployment itself in capabilities.lock."""
+def test_init_writes_no_capabilities_lock(tmp_path: Path) -> None:
+    """A container image installs the whole catalogue, so no install list is
+    compiled and the verb that refreshed one is gone."""
     project = _project(tmp_path, has_contextkit=False)
     (project / "capabilities").mkdir()
     (project / "capabilities" / "settings.json").write_text(json.dumps({
@@ -168,21 +169,13 @@ def test_freeze_includes_deployment_in_lock(tmp_path: Path) -> None:
 
     result = _run(tmp_path, project, "init", "--profile", "agent-box")
     assert result.returncode == 0, result.stderr
+    assert not (project / "deployment" / "capabilities.lock").exists()
+    runtime = json.loads((project / "deployment" / "runtime.json").read_text())
+    assert "lockfile" not in runtime["capabilities"]
 
     result = _run(tmp_path, project, "freeze")
-    assert result.returncode == 0, result.stderr
-
-    lock = (project / "deployment" / "capabilities.lock").read_text()
-    entries = [
-        line.strip()
-        for line in lock.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
-
-    # Verify deployment is in the lock
-    assert "deployment" in entries, "deployment should be in capabilities.lock"
-    # Verify enabled capabilities are in the lock
-    assert "telegram" in entries, "enabled capabilities should be in lock"
+    assert result.returncode != 0
+    assert not (project / "deployment" / "capabilities.lock").exists()
 
 
 def test_init_does_not_create_reference_files(tmp_path: Path) -> None:

@@ -93,13 +93,13 @@ def test_sync_writes_each_target_into_its_own_folder_only(tmp_path: Path, profil
         expected.discard("supervisord.conf")
     assert {path.name for path in bundle.iterdir()} == expected
     assert sorted(path.relative_to(root).as_posix() for path in (root / "deployment").iterdir()) == [
-        "deployment/capabilities.lock", "deployment/runtime.json", "deployment/targets"]
+        "deployment/runtime.json", "deployment/targets"]
     runtime = json.loads((root / "deployment" / "runtime.json").read_text())
     assert "compose_file" not in runtime and "artifacts" not in runtime["compiler"]
 
     # A second target compiles its own bundle beside the first, and a sync
     # writes nothing anywhere else.
-    # init leaves the existing runtime and lock alone and adds the declaration.
+    # init leaves the existing runtime alone and adds the declaration.
     _run(root, env, "init", "--profile", profile, "--target", "edge", "--provider", "manual")
     assert (root / "deployment" / "targets" / "edge" / "target.json").is_file()
     before = _root_entries(root)
@@ -134,7 +134,7 @@ def test_the_bundle_builds_from_the_root_with_its_own_ignore_file(
     else:
         lines = [line for line in ignore.splitlines() if line and not line.startswith("#")]
         assert lines[0] == "*"
-        for kept in ("deployment/capabilities.lock", f"{bundle}/entrypoint.sh",
+        for kept in (f"{bundle}/entrypoint.sh",
                      f"{bundle}/supervisord.conf", f"{bundle}/body-sync.sh"):
             assert "!" + kept in lines
             assert kept in (root / bundle / "Dockerfile").read_text()

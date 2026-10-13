@@ -151,7 +151,7 @@ def test_embedded_service_merges_contract_into_agent(tmp_path: Path) -> None:
     assert '"$HOME/.local/state/telegram"' in dockerfile
 
 
-def test_runtime_capability_exclusions_only_trim_image_lock(tmp_path: Path) -> None:
+def test_runtime_capability_exclusions_only_trim_the_image_catalogue(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("telegram",))
     _setup(root, env)
     runtime_path = root / "deployment" / "runtime.json"
@@ -165,11 +165,25 @@ def test_runtime_capability_exclusions_only_trim_image_lock(tmp_path: Path) -> N
 
     proc = _run(root, env, "sync")
     assert proc.returncode == 0, proc.stderr
-    lock = (root / "deployment" / "capabilities.lock").read_text().splitlines()
-    assert "deployment" not in lock
-    assert "telegram" in lock
+    # The exclusion is handed to the catalogue listing at build and at boot.
+    program = ('[print(n) for n in sorted(json.load(sys.stdin)["capabilities"]) '
+               "if n not in ex]' deployment")
+    assert program in (root / BUNDLE / "Dockerfile").read_text()
+    assert program in (root / BUNDLE / "entrypoint.sh").read_text()
     compiled = json.loads(runtime_path.read_text())
     assert compiled["capabilities"]["exclude"] == ["deployment"]
+
+
+def test_a_global_enable_alone_embeds_no_service(tmp_path: Path) -> None:
+    root, env = _project(tmp_path, ("automations",))
+    global_gate = tmp_path / "config" / "capabilities" / "settings.json"
+    global_gate.parent.mkdir(parents=True)
+    global_gate.write_text(json.dumps(
+        {"capabilities": {"telegram": {"enabled": True}}}) + "\n")
+    result = _setup(root, env)
+    assert result["embedded_services"] == ["automations"]
+    assert "telegram service run" not in (root / BUNDLE / "supervisord.conf").read_text()
+    assert not (root / "deployment" / "capabilities.lock").exists()
 
 
 def test_runtime_cannot_exclude_an_embedded_service(tmp_path: Path) -> None:
@@ -262,7 +276,6 @@ def test_stale_service_directory_is_ignored(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("path", [
-    "deployment/capabilities.lock",
     "deployment/runtime.json",
     "deployment/targets/production/docker-compose.yaml",
 ])

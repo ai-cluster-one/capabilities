@@ -49,7 +49,7 @@ For projects with `.contextkit/config.toml`, the generated Dockerfile:
 
 1. Installs ContextKit globally via the public installer (pinned to `CONTEXTKIT_REF`).
 2. Copies the project body.
-3. Installs the capabilities manager and all locked capability payloads.
+3. Installs the capabilities manager and every capability in the catalogue.
 4. Runs `contextkit init` to create target-local technical bindings (`.env.local`, guards).
 5. Runs `capabilities init --codex --claude` to initialize project contexts.
 6. Runs `contextkit install-hooks --target codex --target claude` to install hooks.

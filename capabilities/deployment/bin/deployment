@@ -14,7 +14,7 @@ the external substrate. A project can use deployment without enabling Coolify.
 
 For ContextKit projects, generated Docker builds install ContextKit via the
 public installer (https://raw.githubusercontent.com/ai-cluster-one/context-kit/main/install.sh),
-install capabilities from the lock, then initialize with the canonical sequence:
+install every capability in the catalogue, then initialize with the canonical sequence:
 `contextkit init` (target-local bindings), `capabilities init --codex --claude`,
 `capabilities doctor`, `contextkit install-hooks`, `contextkit doctor`,
 `contextkit build --target all`, `contextkit audit`. Generated host bindings,
@@ -46,7 +46,6 @@ USAGE
       Create the standard local deployment files:
         deployment/runtime.json
         deployment/targets/<target>/target.json
-        deployment/capabilities.lock
       Existing files are left untouched unless --force is passed. This command
       requires an existing project `capabilities/` envelope; it never writes
       `capabilities/settings.json`.
@@ -68,18 +67,13 @@ USAGE
       with a supervisor the project owns. Run `deployment guide profiles` for
       the trade-offs.
 
-  deployment freeze [--force]
-      Refresh deployment/capabilities.lock from the current project capability gate.
-      The file is a lightweight install list: one capability name per line,
-      comments allowed. Docker builds bootstrap the capabilities manager and run
-      `capabilities install <name> --allow` for each entry.
-
   deployment sync [--check|--adopt]
       Compile the project-enabled deployable-service descriptors into the
-      runtime service graph, capability lock, and, for a container profile,
+      runtime service graph and, for a container profile,
       one bundle per declared target (Compose, Dockerfile, ignore file, env
       example, entrypoint, supervisor configuration) in its folder.
-      Only capabilities explicitly enabled in project settings are candidates.
+      Only capabilities explicitly enabled in project settings are candidates;
+      one enabled only at global scope contributes no service.
       --check is read-only and exits 7 with structured drift details.
       --adopt explicitly replaces unmarked files at the runtime-declared
       managed artifact paths; external artifacts and overlays are never written.
@@ -203,8 +197,8 @@ Contract commands:
 FILES
   deployment/runtime.json
       The project's runtime declaration: profile, services, service-level
-      required env, state volumes, runtime capability exclusions, capability
-      lock path, and service_policy and compiler layout. A container runtime
+      required env, state volumes, runtime capability exclusions, and
+      service_policy and compiler layout. A container runtime
       that names no artifact path compiles one bundle per target (below).
       compiler.artifacts declares the
       Dockerfile, entrypoint, env example, dockerignore, and optional supervisor paths;
@@ -216,7 +210,7 @@ FILES
       capabilities manager's whole home on named volumes, its launcher
       directory first on PATH: the node keeps the tools it installs and
       updates, a redeploy no longer upgrades them, and each boot installs only
-      lock entries the registry lacks;
+      the catalogue capabilities the registry lacks;
       compiler.build_args is the only source of generated Compose build args.
       A service environment_defaults mapping overrides descriptor env defaults.
 
@@ -238,11 +232,15 @@ FILES
       supervisord.conf when Supervisor runs, and body-sync.sh on the checkout
       profile. The project root gains only .gitattributes on that profile.
 
-  deployment/capabilities.lock
-      Lightweight install list for the agent image: one capability per line.
-      It is a deployment input, not a capability manager file. The runtime's
-      capabilities.exclude list removes operator-only tools from the image
-      without changing their project policy on the host.
+  Capabilities in a container image
+      The image installs every capability in the official catalogue at
+      CAPABILITIES_REF (default main) with `capabilities install <name>
+      --allow`, a core one arriving enabled by the manager's first-install
+      rule, and each boot installs any catalogue capability the registry lacks
+      and leaves installed ones as they are. Whether a capability is usable is
+      its gate's and its connections' answer, not whether it is installed. The
+      runtime's capabilities.exclude list keeps operator-only tools out of the
+      image without changing their project policy on the host.
 
   capabilities/deployment/reference/*.md
       Optional project-specific operational models. Reference files are neither
@@ -283,7 +281,7 @@ SUMMARY = ("Project deployment standard - declare the services a project runs, "
            "processes on a Mac, and describe the targets they deploy to.")
 SCOPE = "project"
 CRED_KEYS: list = []
-WRITE_VERBS = {"init", "freeze", "setup", "scaffold", "sync", "deploy", "rollback"}
+WRITE_VERBS = {"init", "setup", "scaffold", "sync", "deploy", "rollback"}
 WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/deployment/guides/")
@@ -346,7 +344,6 @@ MANAGER_VOLUMES = {
     "capabilities_data": ("/.local/share/capabilities", "The capabilities manager's dev worktrees."),
     "capabilities_cache": ("/.cache/capabilities", "The capabilities manager's source and lookup caches."),
 }
-LOCK_REL = "deployment/capabilities.lock"
 REPO_URL_ENV = "AGENT_REPO_URL"
 REPO_BRANCH_ENV = "AGENT_REPO_BRANCH"
 # The one program the compiler owns on this substrate. Every other Supervisor
@@ -3164,9 +3161,16 @@ def _write_file(root: Path, path: Path, text: str, force: bool) -> dict:
 
 
 def _enabled_capabilities(root: Path) -> list[str]:
-    caps = _settings(root).get("capabilities") or {}
-    return sorted(name for name, gate in caps.items()
-                  if isinstance(gate, dict) and gate.get("enabled") is True)
+    """The capabilities this project enabled itself. A global enable makes a
+    capability usable here, but only the project's own choice puts its service
+    into what this project runs."""
+    try:
+        rows = _records().resolve_scope("capabilities", "policy", "project")
+    except StoreError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+    return sorted(name for name, row in rows.items()
+                  if isinstance(row.get("value"), dict)
+                  and row["value"].get("enabled") is True)
 
 
 def _has_enabled(root: Path, name: str) -> bool:
@@ -3970,18 +3974,21 @@ def _body_sync_template(project_name: str, project_root: str) -> str:
             .replace("__QUIET__", SYNC_QUIET_ENV))
 
 
-_MANAGER_LOCK_BLOCK = """
-# --- Capabilities the lock names and the persisted registry lacks -------------
-if [ -f __LOCK__ ]; then
-  registry="${CAPABILITIES_HOME:-$HOME/.capabilities}"
-  while read -r name; do
-    case "$name" in ""|'#'*) continue ;; esac
+_CATALOGUE_BLOCK = """
+# --- Catalogue capabilities this node's registry lacks -----------------------
+# A node holds the whole catalogue; whether a capability is usable is its gate's
+# and its connections' answer. One already installed is left as it is.
+registry="${CAPABILITIES_HOME:-$HOME/.capabilities}"
+if names="$(__NAMES__)"; then
+  for name in $names; do
     if [ -f "$registry/$name/$name" ]; then continue; fi
-    echo "[entrypoint] installing $name: the lock names it and this node's registry lacks it"
+    echo "[entrypoint] installing $name: the catalogue carries it and this node's registry lacks it"
     if ! capabilities install "$name" --allow < /dev/null > /dev/null; then
       echo "[entrypoint] WARN: could not install $name; the box runs without it" >&2
     fi
-  done < __LOCK__
+  done
+else
+  echo "[entrypoint] WARN: could not read the capability catalogue; the box runs with the capabilities it has" >&2
 fi
 """
 
@@ -4064,14 +4071,14 @@ def _entrypoint_template(project_name: str, supervisor_config: str | None = None
                          checkout: bool = False, project_root: str = "/app",
                          has_contextkit: bool = False,
                          body_sync: str | None = None,
-                         manager_lock: str | None = None) -> str:
+                         catalogue_exclude: set[str] | None = None) -> str:
     identity = _slug(project_name)
-    # With the manager's home on volumes the image seeds it once, and every
-    # later boot runs what the volumes hold. A capability added to the lock
-    # after that is installed here; one already installed is left as it is,
-    # so a redeploy never takes back a tool the node updated.
-    manager_block = "" if manager_lock is None else (
-        _MANAGER_LOCK_BLOCK.replace("__LOCK__", shlex.quote(manager_lock)))
+    # The image installs the catalogue at build. A capability the catalogue
+    # gained since, or one a persisted registry never had, is installed here;
+    # one already installed is left as it is, so a redeploy never takes back a
+    # tool the node updated.
+    manager_block = _CATALOGUE_BLOCK.replace(
+        "__NAMES__", _catalogue_names(catalogue_exclude))
     default_command = (
         f"exec /usr/bin/supervisord -c {shlex.quote(supervisor_config)}"
         if supervisor_config else
@@ -4152,18 +4159,18 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
                          mounts: list[str] | None = None,
                          checkout: bool = False,
                          boot_copy: list[str] | None = None,
-                         persistent_manager: bool = False) -> str:
+                         persistent_manager: bool = False,
+                         catalogue_exclude: set[str] | None = None) -> str:
     agent_home = compiler["container"]["agent_home"]
     project_root = compiler["container"]["project_root"]
     username = Path(agent_home).name
     entrypoint_path = project_root.rstrip("/") + "/" + entrypoint_rel
-    lock_path = project_root.rstrip("/") + "/deployment/capabilities.lock"
     chmod_paths = entrypoint_path
     if checkout:
-        # Both are read from the boot directory instead: the volume mounts over
-        # the project root and would hide anything the image left under it.
+        # Read from the boot directory instead: the volume mounts over the
+        # project root and would hide anything the image left under it.
         entrypoint_path = BOOT_DIR + "/" + entrypoint_rel.rsplit("/", 1)[-1]
-        lock_path = BOOT_DIR + "/capabilities.lock"
+    catalogue_names = _catalogue_names(catalogue_exclude)
     contextkit_install = ""
     contextkit_link = ""
     contextkit_build = ""
@@ -4297,22 +4304,22 @@ RUN ln -sf {agent_home}/.local/bin/claude /usr/local/bin/claude \\
  && ln -sf {agent_home}/.local/bin/codex /usr/local/bin/codex{contextkit_link}
 USER ${{USERNAME}}
 
-# Capability CLIs are installed from the capabilities catalogue by the manager.
-# CAPABILITIES_REF can be a branch, tag, or SHA that contains every name in
-# deployment/capabilities.lock.
+# Capability CLIs: every capability in the catalogue at CAPABILITIES_REF (a
+# branch, tag, or SHA), installed by the manager. Whether one is usable is its
+# gate's and its connections' answer, not whether it is installed; a core one
+# arrives enabled by the manager's first-install rule. Each install also warms
+# its PEP-723 environment, best-effort so missing credentials break no build.
 ARG CAPABILITIES_REF=main
 ENV CAPABILITIES_SOURCE=https://raw.githubusercontent.com/ai-cluster-one/capabilities/${{CAPABILITIES_REF}}
 RUN curl -fsSL "https://raw.githubusercontent.com/ai-cluster-one/capabilities/${{CAPABILITIES_REF}}/install.sh" \\
       | CAPABILITIES_TAG=${{CAPABILITIES_REF}} sh \\
- && grep -v '^[[:space:]]*#' {lock_path} | grep -v '^[[:space:]]*$' \\
-      | while read -r name; do capabilities install "$name" --allow; done{capabilities_init_and_doctor} || {{ echo "[build] capabilities readiness check failed" >&2; exit 1; }}
-
-# Warm common PEP-723 environments. Best-effort so missing runtime credentials do not
-# break image builds.
-RUN while read -r name; do \\
-      case "$name" in ""|\\#*) continue ;; esac; \\
+ && names="$({catalogue_names})" \\
+ && test -n "$names" \\
+ && for name in $names; do \\
+      capabilities install "$name" --allow < /dev/null \\
+        || {{ echo "[build] could not install $name from the catalogue" >&2; exit 1; }}; \\
       "$name" help >/dev/null 2>&1 || true; \\
-    done < {lock_path}
+    done{capabilities_init_and_doctor} || {{ echo "[build] capabilities readiness check failed" >&2; exit 1; }}
 
 # Capability service state is mounted at descriptor-declared targets. Each one is
 # created here, as root and handed to the agent, so a fresh named volume inherits
@@ -4570,7 +4577,7 @@ def _runtime_template(profile: str, project_name: str) -> dict:
             "default_mode": "embedded" if profile in CONTAINER_PROFILES else "enabled",
             "capabilities": {},
         },
-        "capabilities": {"lockfile": "deployment/capabilities.lock"},
+        "capabilities": {},
     }
 
 
@@ -4761,7 +4768,8 @@ def _compile_runtime(root: Path, runtime: dict,
         serialized_policy.pop("default_mode", None)
     capability_config = (dict(runtime.get("capabilities"))
                          if isinstance(runtime.get("capabilities"), dict) else {})
-    capability_config.setdefault("lockfile", "deployment/capabilities.lock")
+    # The capabilities lock is retired: a container node installs the catalogue.
+    capability_config.pop("lockfile", None)
     compiled.update({
         "schema": RUNTIME_SCHEMA,
         "services": services,
@@ -4880,38 +4888,16 @@ def _capability_state(root: Path, name: str) -> dict:
     return {"name": name, "installed": _installed_capability(name), "gate": gate}
 
 
-def _lock_text(root: Path, extra: list[str] | None = None,
-               exclude: set[str] | None = None) -> str:
-    caps = _settings(root).get("capabilities") or {}
-    wanted = set(extra or [])
-    wanted.add(NAME)
-    wanted.update(name for name, gate in caps.items()
-                  if isinstance(gate, dict) and gate.get("enabled") is True)
-    wanted.difference_update(exclude or set())
-    enabled = sorted(wanted)
-    lines = [
-        "# Capabilities the image installs via the `capabilities` manager.",
-        "# One capability name per line; comments and blank lines are ignored.",
-        "# Source ref is selected by the Dockerfile's CAPABILITIES_REF build arg.",
-        "",
-    ]
-    lines.extend(enabled)
-    return "\n".join(lines) + "\n"
-
-
-def _lock_entries(text: str) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if not re.match(r"^[a-z][a-z0-9_-]*$", line):
-            _die(6, "bad_lock", f"invalid capability name in deployment/capabilities.lock: {line!r}")
-        if line not in seen:
-            out.append(line)
-            seen.add(line)
-    return out
+def _catalogue_names(exclude: set[str] | None = None) -> str:
+    """A shell command printing, one per line, every capability the official
+    catalogue carries less the runtime's exclusions. It reads the catalogue
+    from the same base `capabilities install <name>` fetches from, so the
+    names it prints are exactly the ones an install can resolve."""
+    program = ('import json,sys; ex=set(sys.argv[1:]); '
+               '[print(n) for n in sorted(json.load(sys.stdin)["capabilities"]) if n not in ex]')
+    args = "".join(" " + shlex.quote(name) for name in sorted(exclude or ()))
+    return ('curl -fsSL "${CAPABILITIES_SOURCE}/.capability-source/catalog.json"'
+            f" | python3 -c {shlex.quote(program)}{args}")
 
 
 def _mark_generated(path: Path, text: str) -> str:
@@ -4945,6 +4931,7 @@ def _artifact_texts(root: Path, runtime: dict,
     checkout = _is_checkout(runtime)
     project_root = compiler["container"]["project_root"]
     paths, _overlays = _artifact_paths(root, runtime, target, embedded)
+    catalogue_exclude = _runtime_capability_excludes(runtime)
     build_context = Path(os.path.relpath(root, paths["compose"].parent)).as_posix()
     dockerfile_rel = paths["dockerfile"].relative_to(root).as_posix()
     entrypoint_rel = paths["entrypoint"].relative_to(root).as_posix()
@@ -4970,7 +4957,7 @@ def _artifact_texts(root: Path, runtime: dict,
                              else project_root.rstrip("/") + "/" + supervisor_rel)
     # A checkout image copies these and nothing else, so they are both what the
     # Dockerfile names and the only paths the build context has to carry.
-    boot_copy = ([LOCK_REL, entrypoint_rel]
+    boot_copy = ([entrypoint_rel]
                  + ([supervisor_rel] if supervisor_config else [])
                  + ([body_sync_rel] if body_sync_rel else [])
                  if checkout else None)
@@ -4984,14 +4971,12 @@ def _artifact_texts(root: Path, runtime: dict,
             mounts=[v["mount"] for v in (runtime.get("volumes") or {}).values()
                     if isinstance(v, dict) and isinstance(v.get("mount"), str)],
             checkout=checkout, boot_copy=boot_copy,
-            persistent_manager=_persistent_manager(runtime)),
+            persistent_manager=_persistent_manager(runtime),
+            catalogue_exclude=catalogue_exclude),
         "entrypoint": _entrypoint_template(
             project_name, supervisor_config, checkout=checkout,
             project_root=project_root, has_contextkit=has_contextkit,
-            body_sync=body_sync_config,
-            manager_lock=(((BOOT_DIR + "/capabilities.lock") if checkout
-                           else project_root.rstrip("/") + "/" + LOCK_REL)
-                          if _persistent_manager(runtime) else None)),
+            body_sync=body_sync_config, catalogue_exclude=catalogue_exclude),
     }
     if supervisor_path is not None:
         candidates["supervisor"] = _supervisor_template(
@@ -5565,14 +5550,12 @@ def _desired_state(root: Path, runtime: dict, targets: list[str] | None = None
         if attrs:
             texts[attrs[0]] = attrs[1]
     texts[_runtime_path(root)] = _json_text(compiled)
-    texts[root / "deployment" / "capabilities.lock"] = _lock_text(
-        root, exclude=_runtime_capability_excludes(runtime))
     return compiled, texts, active, embedded, findings, migrated
 
 
 def _artifact_drift(root: Path, texts: dict[Path, str]) -> list[dict]:
     drift: list[dict] = []
-    managed_without_marker = {_runtime_path(root), root / "deployment" / "capabilities.lock", root / ".gitattributes"}
+    managed_without_marker = {_runtime_path(root), root / ".gitattributes"}
     for path, expected in sorted(texts.items(), key=lambda item: _rel(root, item[0])):
         actual = _read_text(path)
         if actual == expected:
@@ -5768,10 +5751,6 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
         findings.append({"severity": "error", "path": _rel(root, path),
                          "message": "capabilities must be an object"})
     else:
-        if not _safe_relative_path(capability_config.get(
-                "lockfile", "deployment/capabilities.lock")):
-            findings.append({"severity": "error", "path": _rel(root, path),
-                             "message": "capabilities.lockfile must be a safe project-relative path"})
         excludes = capability_config.get("exclude", [])
         if (not isinstance(excludes, list)
                 or not all(isinstance(name, str)
@@ -5964,7 +5943,7 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
                                 "and a fresh volume has nothing to clone")})
         # The boot inputs are copied into one directory, so two of them cannot
         # share a file name.
-        boot_names = [Path(LOCK_REL).name, SYNC_PROGRAM]
+        boot_names = [SYNC_PROGRAM]
         raw_artifacts = (compiler_raw.get("artifacts")
                          if isinstance(compiler_raw, dict) else None)
         if isinstance(raw_artifacts, dict):
@@ -6157,42 +6136,12 @@ def cmd_init(args) -> None:
         (_target_path(root, target), _json_text(_target_template(
             provider, target, project_name,
             _template_compose_file(root, runtime, target)))),
-        (root / "deployment" / "capabilities.lock", _lock_text(root)),
     ]
     results = [_write_file(root, path, text, args.force) for path, text in writes]
     conflicts = [r for r in results if r["action"] in {"skipped", "error"}]
     _emit({"ok": not conflicts, "project": str(root), "written": results})
     if conflicts:
         sys.exit(6)
-
-
-def cmd_freeze(args) -> None:
-    root = _root()
-    _require_envelope(root)
-    path = root / "deployment" / "capabilities.lock"
-    runtime, err = _read_json(_runtime_path(root))
-    runtime = runtime if not err and isinstance(runtime, dict) else {}
-    extra = _runtime_capabilities(root)
-    result = _write_file(root, path, _lock_text(
-        root, extra, _runtime_capability_excludes(runtime)), args.force)
-    _emit({"ok": result["action"] not in {"skipped", "error"}, "written": [result]})
-    if result["action"] in {"skipped", "error"}:
-        sys.exit(6)
-
-
-def _runtime_capabilities(root: Path) -> list[str]:
-    path = _runtime_path(root)
-    data, err = _read_json(path)
-    if err or not isinstance(data, dict):
-        return []
-    services = data.get("services")
-    if not isinstance(services, dict):
-        return []
-    out: list[str] = []
-    for entry in services.values():
-        if isinstance(entry, dict) and isinstance(entry.get("capability"), str):
-            out.append(entry["capability"])
-    return sorted(set(out))
 
 
 def _deployment_questions() -> list[dict]:
@@ -6429,7 +6378,7 @@ def _next_payload(root: Path, target_name: str | None) -> dict:
             "Compose from the base directory, and the build context the file names "
             "is relative to its own folder.",
             f"Add every required secret from `{_rel(root, artifact_paths['env_example'])}` as Coolify environment variables.",
-            "Set `CAPABILITIES_REF` to a branch, tag, or SHA that contains every capability in `deployment/capabilities.lock`.",
+            "Optionally set `CAPABILITIES_REF` to the branch, tag, or SHA of the capabilities catalogue the image installs whole (default `main`).",
             "Deploy the resource.",
         ]
     elif provider == "dockerhost":
@@ -6632,8 +6581,7 @@ def cmd_doctor(args) -> None:
             message = "generated artifact drift; run `deployment sync`"
             severity = "error"
             if (item["kind"] == "missing"
-                    and item["path"] not in {"deployment/runtime.json",
-                                             "deployment/capabilities.lock"}):
+                    and item["path"] != "deployment/runtime.json"):
                 severity = "warning"
                 message = "generated artifact is absent; run `deployment sync` when this runtime should be containerized"
             if item["kind"] == "unmanaged_conflict":
@@ -8043,10 +7991,6 @@ def main(argv: list[str] | None = None) -> None:
     p_init.add_argument("--provider", choices=PROVIDERS, default="coolify")
     p_init.add_argument("--force", action="store_true")
     p_init.set_defaults(fn=cmd_init)
-
-    p_freeze = sub.add_parser("freeze", add_help=False)
-    p_freeze.add_argument("--force", action="store_true")
-    p_freeze.set_defaults(fn=cmd_freeze)
 
     p_sync = sub.add_parser("sync", add_help=False)
     p_sync.add_argument("--check", action="store_true")

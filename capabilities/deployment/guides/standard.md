@@ -18,9 +18,6 @@ The standard files are:
 - `deployment/runtime.json` - one runtime declaration for the project.
 - `deployment/targets/<name>/target.json` - one target declaration per deploy
   destination, with the target's compiled bundle beside it.
-- `deployment/capabilities.lock` - lightweight install list for the agent image:
-  one capability name per line. It is derived from the project gate, minus the
-  host-only names declared by `runtime.json` under `capabilities.exclude`.
 - `capabilities/deployment/reference/*.md` - optional project-specific operational
   models. Reference files are neither created nor required by deployment init or
   setup. When present, they hold genuine project-specific deployment context
@@ -33,7 +30,7 @@ human next steps. Use
 compiler for capability services: it discovers installed
 `manifest.service.deploy` descriptors, filters them through explicit project
 enablement and `runtime.json` service policy, and reconciles the runtime graph,
-lock, Compose, env example, Dockerfile, dockerignore, and entrypoint.
+Compose, env example, Dockerfile, dockerignore, and entrypoint.
 
 `service_policy.auto_include` controls descriptor-default auto inclusion, and
 `service_policy.default_mode` selects `embedded` or `enabled` for those auto
@@ -45,19 +42,19 @@ do not declare the field retain the previous `enabled` behavior.
 service and, for managed agent-box artifacts, renders its command into a
 generated Supervisor configuration; `disabled`
 omits the service runtime while leaving the CLI available. An override cannot
-bypass the explicit project gate. Run
+bypass the explicit project gate, and a capability enabled only at global scope
+contributes no service. Run
 `deployment sync --check` in CI; it performs no writes and reports structured
 missing/content/ownership drift with exit 7.
 
-The project gate answers which capabilities are usable while working in the
-repository. The image lock answers which of those capabilities ship inside the
-deployed body. Keep operator-only adapters such as a deployment provider on the
-host with an explicit runtime exclusion:
+A container image installs every capability in the official catalogue, and
+whether one is usable is its gate's and its connections' answer, not whether it
+is installed. Keep operator-only adapters such as a deployment provider out of
+the image with an explicit runtime exclusion:
 
 ```json
 {
   "capabilities": {
-    "lockfile": "deployment/capabilities.lock",
     "exclude": ["deployment", "coolify"]
   }
 }
@@ -71,9 +68,8 @@ target into `deployment/targets/<name>/`, beside the target's `target.json`:
 `docker-compose.yaml`, `Dockerfile`, `Dockerfile.dockerignore`, `.env.example`,
 `entrypoint.sh`, `supervisord.conf` when Supervisor runs, and `body-sync.sh` on
 the checkout profile. The project root gains nothing but `.gitattributes`, which
-the checkout profile needs and git reads only there. `runtime.json` and
-`capabilities.lock` stay shared in `deployment/`, because every target builds
-the same service graph from the same install list.
+the checkout profile needs and git reads only there. `runtime.json` stays
+shared in `deployment/`, because every target builds the same service graph.
 
 The build context is the project root, since the image copies the body from it.
 The Compose file names it as `../../..` from its own folder, so
@@ -194,17 +190,20 @@ This stage compiles generated container artifacts for the `agent-box` profile.
 The `generic` profile remains a declaration-only runtime and doctor reports an
 actionable finding if sync is requested for it.
 
-Use `deployment freeze` after a capability gate change when only the lock is
-needed. `deployment doctor` validates settings → lock → runtime services →
+`deployment doctor` validates settings → runtime services →
 declared generated artifacts, then runs Compose semantic validation with the
 declared base and overlays. `deployment next` likewise emits layout-aware local
 commands. Use `deployment plan` to select the provider adapter.
 
-Docker builds should bootstrap the capabilities manager from the selected
-`CAPABILITIES_REF`, then run `capabilities install <name> --allow` for each non-comment
-line in `deployment/capabilities.lock`, initialize project contexts with
-`capabilities init`, and verify the capability set with `capabilities doctor` to
-ensure the lock is complete before proceeding.
+Docker builds bootstrap the capabilities manager from the selected
+`CAPABILITIES_REF`, then run `capabilities install <name> --allow` for every
+capability that ref's catalogue (`.capability-source/catalog.json`) carries,
+less `capabilities.exclude`, and fail when one cannot be installed; a core
+capability arrives enabled by the manager's first-install rule. They then
+initialize project contexts with `capabilities init` and verify the capability
+set with `capabilities doctor`. Every boot installs any catalogue capability the
+registry lacks and leaves installed ones as they are; a catalogue that cannot be
+read at boot leaves the box running with what it has.
 
 Generated agent-box images install Codex from the complete pinned release
 package rather than the legacy single-binary archive, so the CLI,

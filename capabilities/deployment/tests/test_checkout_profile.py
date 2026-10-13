@@ -93,17 +93,16 @@ def test_image_carries_the_boot_path_and_not_the_project(tmp_path: Path) -> None
     _setup(root, env, "agent-box-checkout")
     dockerfile = (root / BUNDLE / "Dockerfile").read_text()
     assert "COPY --chown=${USERNAME}:${USERNAME} . /app" not in dockerfile
-    assert ("COPY --chown=${USERNAME}:${USERNAME} deployment/capabilities.lock "
+    assert ("COPY --chown=${USERNAME}:${USERNAME} "
             f"{BUNDLE}/entrypoint.sh {BUNDLE}/supervisord.conf {BUNDLE}/" + SYNC_PROGRAM
             + " /opt/agent/") in dockerfile
     # A COPY carries the mode the build context held, so every generated program
     # the boot path runs is made executable, not only the entrypoint.
     assert ("RUN chmod +x /opt/agent/entrypoint.sh /opt/agent/" + SYNC_PROGRAM) in dockerfile
-    # The lock and the entrypoint are read from the boot directory: the volume
-    # mounts over the project root and would hide anything left under it.
+    # The entrypoint is read from the boot directory: the volume mounts over
+    # the project root and would hide anything left under it.
     assert 'ENTRYPOINT ["/opt/agent/entrypoint.sh"]' in dockerfile
-    assert "/opt/agent/capabilities.lock" in dockerfile
-    assert "/app/deployment/capabilities.lock" not in dockerfile
+    assert "capabilities.lock" not in dockerfile
 
 
 def test_baked_profile_still_copies_the_project(tmp_path: Path) -> None:
@@ -163,7 +162,7 @@ def test_build_context_is_narrowed_to_the_copied_files(tmp_path: Path) -> None:
     # Excluding a directory stops the walk into it, so each parent of a kept
     # file is re-admitted before its own contents are excluded again.
     assert lines.index("!deployment") < lines.index("deployment/*")
-    assert lines.index("deployment/*") < lines.index("!deployment/capabilities.lock")
+    assert "!deployment/capabilities.lock" not in lines
     assert lines.index(f"!{BUNDLE}") < lines.index(f"{BUNDLE}/*")
     assert lines.index(f"{BUNDLE}/*") < lines.index(f"!{BUNDLE}/entrypoint.sh")
     assert f"!{BUNDLE}/supervisord.conf" in lines
@@ -301,11 +300,7 @@ def test_the_sync_program_reaches_for_nothing_but_git(tmp_path: Path) -> None:
     # healthy could not repair the box whose configuration is what broke.
     assert "capabilities" not in program
     assert "contextkit" not in program
-    lock = [line.strip() for line in
-            (root / "deployment" / "capabilities.lock").read_text().splitlines()
-            if line.strip() and not line.startswith("#")]
-    assert lock
-    for name in lock:
+    for name in ("telegram", "automations", "deployment"):
         assert name not in program, name
     # The box runs whatever bash the base image ships, which is not the one this
     # workstation has.

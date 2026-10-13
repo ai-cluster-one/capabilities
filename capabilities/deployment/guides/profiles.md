@@ -69,10 +69,12 @@ to its own project and that writing has to last - an assistant whose repository
 is its memory. Pick `agent-box` when the project is input the box only reads,
 which is the ordinary case and the simpler one.
 
-**What still comes from the image.** `deployment/capabilities.lock` is compiled
-from the effective project gate on the workstation and copied into the image, so
-under both profiles adding a capability needs an image rebuild rather than a
-push. Only the project travels through Git.
+**What still comes from the image.** Under both profiles the image installs
+every capability in the official catalogue at `CAPABILITIES_REF`, and every boot
+installs any catalogue capability the registry lacks, so a capability the
+catalogue gains reaches the box without a change to the project. Whether one is
+usable is its gate's and its connections' answer, not whether it is installed.
+Only the project travels through Git.
 
 **Keeping the tools the box updates.** By default the capabilities manager's
 home is part of the image: a redeploy brings every capability back to what the
@@ -91,17 +93,16 @@ writes is one volume, so every rename it makes - a temporary beside its target,
 a stage beside the registry entry or release it becomes, a launcher swapped
 beside the old one - stays inside one volume. The Dockerfile sets
 `CAPABILITIES_BIN` to the launcher directory and puts it first on `PATH` in its
-own `ENV`, installs the lock there at build, and creates each mount point owned
+own `ENV`, installs the catalogue there at build, and creates each mount point owned
 by the agent; the agent CLIs keep their links in the image's `~/.local/bin`.
 
 A fresh volume is seeded from the image, so the first deploy starts from the
 tools the image installed. From then on the volumes are what runs: a redeploy
 no longer upgrades a capability the box already has, and the box keeps its tools
 current through its own `capabilities update` and source releases. On every boot
-the entrypoint installs each capability the lock names and the registry lacks,
-so adding one to the lock still reaches a box on its next deploy, and it leaves
-an installed one exactly as it is, so a redeploy never takes back a tool the box
-updated. A capability service's own state mount under
+the entrypoint installs each catalogue capability the registry lacks, so one the
+catalogue gains still reaches the box, and it leaves an installed one exactly as
+it is, so a redeploy never takes back a tool the box updated. A capability service's own state mount under
 `~/.local/state/capabilities` - `~/.local/state/capabilities/projects` - sits
 inside `capabilities_state` as a volume of its own; Docker mounts the parent
 before the child, the manager never writes under `projects`, and the service
@@ -119,8 +120,8 @@ project on this profile has to ignore its generated host bindings, or every boot
 shows up as a commit the box sends to the branch everyone else reads.
 
 **Where the boot inputs sit.** A volume mounted at the project root hides
-anything the image left underneath it, so the checkout profile copies the lock,
-the entrypoint, the sync program, and the Supervisor configuration to
+anything the image left underneath it, so the checkout profile copies the
+entrypoint, the sync program, and the Supervisor configuration to
 `/opt/agent` and reads them from there. They are copied into one directory, so
 their file names must differ, and `deployment doctor` refuses a declaration that
 collides with one of them. The generated `Dockerfile.dockerignore` narrows the build

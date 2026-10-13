@@ -286,7 +286,7 @@ def test_dockerfile_uses_public_installer(tmp_path: Path) -> None:
 
 def test_the_image_installs_its_capabilities_allowed(tmp_path: Path) -> None:
     """A fresh install arrives quarantined on a machine; in an image one agent
-    is one environment, so every locked capability is installed allowed."""
+    is one environment, so every catalogue capability is installed allowed."""
     for with_contextkit in (True, False):
         project = setup_test_project(
             tmp_path, with_contextkit=with_contextkit,
@@ -296,7 +296,7 @@ def test_the_image_installs_its_capabilities_allowed(tmp_path: Path) -> None:
         installs = [line for line in dockerfile.splitlines()
                     if "capabilities install" in line]
         assert installs, dockerfile
-        assert all('capabilities install "$name" --allow;' in line
+        assert all('capabilities install "$name" --allow' in line
                    for line in installs), installs
 
 

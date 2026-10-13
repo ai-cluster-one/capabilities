@@ -4,7 +4,7 @@ With compiler.container.persistent_manager the capabilities manager's whole
 writable home is compiled onto named volumes. What is proven here: every
 directory the manager writes sits on exactly one of them and every rename it
 makes keeps both ends on one; the image puts the launcher directory first on
-PATH and installs the lock there; each boot installs only what the registry
+PATH and installs the catalogue there; each boot installs only what the registry
 lacks; a capability service's own state mount keeps working beside them; and a
 runtime that does not opt in compiles exactly as it did.
 """
@@ -153,8 +153,8 @@ def test_the_image_puts_the_launchers_on_a_volume_first_on_path(tmp_path: Path, 
     assert f"ENV CAPABILITIES_BIN={launchers}\n" in dockerfile
     assert f"ENV PATH={launchers}:{HOME}/.local/bin:${{PATH}}\n" in dockerfile
     assert f"ENV PATH={HOME}/.local/bin:${{PATH}}\n" not in dockerfile
-    # Set in the image's own environment before the manager and the lock are
-    # installed, so both land in the launcher directory.
+    # Set in the image's own environment before the manager and the catalogue
+    # are installed, so both land in the launcher directory.
     assert dockerfile.index("ENV CAPABILITIES_BIN=") < dockerfile.index("install.sh")
     assert 'capabilities install "$name" --allow' in dockerfile
     chown = next(line for line in dockerfile.splitlines() if line.startswith(" && chown "))
@@ -169,29 +169,32 @@ def test_the_image_puts_the_launchers_on_a_volume_first_on_path(tmp_path: Path, 
     assert '"$HOME/.local/bin/codex"' in dockerfile
 
 
-def _boot_block(entrypoint: str, lock: Path) -> str:
-    start = entrypoint.index("# --- Capabilities the lock names")
+def _boot_block(entrypoint: str) -> str:
+    start = entrypoint.index("# --- Catalogue capabilities this node's registry lacks")
     end = entrypoint.index("\nfi\n", start) + len("\nfi\n")
     block = entrypoint[start:end]
-    assert "/opt/agent/capabilities.lock" in block or "/app/deployment/capabilities.lock" in block
-    return (block.replace("/opt/agent/capabilities.lock", str(lock))
-            .replace("/app/deployment/capabilities.lock", str(lock)))
+    assert '"${CAPABILITIES_SOURCE}/.capability-source/catalog.json"' in block
+    return block
 
 
+@pytest.mark.parametrize("persistent", (False, True))
 @pytest.mark.parametrize("profile", PROFILES)
-def test_each_boot_installs_only_what_the_registry_lacks(tmp_path: Path, profile: str) -> None:
+def test_each_boot_installs_only_the_catalogue_the_registry_lacks(
+        tmp_path: Path, profile: str, persistent: bool) -> None:
     root, env = _project(tmp_path, ("telegram",))
     _setup(root, env, profile)
-    assert "# --- Capabilities the lock names" not in (root / BUNDLE / "entrypoint.sh").read_text()
-    assert _opt_in(root, env).returncode == 0
+    if persistent:
+        assert _opt_in(root, env).returncode == 0
     entrypoint = (root / BUNDLE / "entrypoint.sh").read_text()
+    assert "capabilities.lock" not in entrypoint
     assert subprocess.run(["bash", "-n", str(root / BUNDLE / "entrypoint.sh")]).returncode == 0
     box = tmp_path / "box"
     registry = box / "registry"
     (registry / "kept").mkdir(parents=True)
     (registry / "kept" / "kept").write_text("updated on the node\n")
-    lock = box / "capabilities.lock"
-    lock.write_text("# comment\n\nkept\nadded\nbroken\n")
+    catalogue = box / "catalog.json"
+    catalogue.write_text(json.dumps({"capabilities": {
+        "kept": {}, "added": {}, "broken": {}}}))
     fake = box / "bin" / "capabilities"
     fake.parent.mkdir()
     fake.write_text(f"""#!/usr/bin/env bash
@@ -200,12 +203,22 @@ echo "$*" >> {box}/calls
 mkdir -p "$CAPABILITIES_HOME/$2" && echo installed > "$CAPABILITIES_HOME/$2/$2"
 """)
     fake.chmod(0o755)
+    curl = box / "bin" / "curl"
+    curl.write_text(f"""#!/usr/bin/env bash
+echo "$*" >> {box}/fetched
+[ -f {box}/offline ] && exit 22
+cat {catalogue}
+""")
+    curl.chmod(0o755)
     script = box / "boot.sh"
-    script.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + _boot_block(entrypoint, lock))
+    script.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + _boot_block(entrypoint))
     run_env = {**os.environ, "PATH": f"{fake.parent}{os.pathsep}{os.environ['PATH']}",
-               "CAPABILITIES_HOME": str(registry)}
+               "CAPABILITIES_HOME": str(registry),
+               "CAPABILITIES_SOURCE": "https://catalogue.invalid/ref"}
     first = subprocess.run(["bash", str(script)], env=run_env, capture_output=True, text=True)
     assert first.returncode == 0, first.stderr
+    assert (box / "fetched").read_text().split() == [
+        "-fsSL", "https://catalogue.invalid/ref/.capability-source/catalog.json"]
     assert (box / "calls").read_text().splitlines() == ["install added --allow", "install broken --allow"]
     assert "could not install broken" in first.stderr
     # What the node updated is never reinstalled over.
@@ -214,6 +227,13 @@ mkdir -p "$CAPABILITIES_HOME/$2" && echo installed > "$CAPABILITIES_HOME/$2/$2"
     second = subprocess.run(["bash", str(script)], env=run_env, capture_output=True, text=True)
     assert second.returncode == 0
     assert (box / "calls").read_text().splitlines() == ["install broken --allow"]
+    # A catalogue that cannot be read still boots the box on what it has.
+    (box / "calls").unlink()
+    (box / "offline").touch()
+    third = subprocess.run(["bash", str(script)], env=run_env, capture_output=True, text=True)
+    assert third.returncode == 0, third.stderr
+    assert not (box / "calls").exists()
+    assert "could not read the capability catalogue" in third.stderr
 
 
 def test_a_service_state_mount_inside_the_manager_state_keeps_its_own_volume(tmp_path: Path) -> None:

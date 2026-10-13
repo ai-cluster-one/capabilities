@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-13 — A container node installs the whole catalogue, and the capabilities lock is retired
+
+Breaking. A container image (`agent-box`, `agent-box-checkout`) now installs every capability in the official catalogue at `CAPABILITIES_REF`, read from that ref's `.capability-source/catalog.json`, with `capabilities install <name> --allow`, less the runtime's `capabilities.exclude`; a core capability arrives enabled by the manager's first-install rule, and the build fails when one cannot be installed. Every boot, on every container profile and not only with `persistent_manager`, installs any catalogue capability the registry lacks and leaves installed ones as they are; a catalogue that cannot be read leaves the box running with what it has. Whether a capability is usable is its gate's and its connections' answer, not whether it is installed. `deployment/capabilities.lock` is no longer compiled, copied into the image or read: `init` and `sync` stop writing it, `deployment freeze` is gone, and `sync` drops `capabilities.lockfile` from `deployment/runtime.json`; delete the file from a project. A capability service is embedded or enabled only when the project itself enabled that capability, as help already stated: one enabled only at global scope no longer contributes a service. Run `deployment sync` and redeploy to pick it up.
+
 ## 2026-10-13 — A checkout node follows its declared repository on boot
 
 On the `agent-box-checkout` profile, a boot whose body is already populated now points the checkout's `origin` at `AGENT_REPO_URL` when it is set and differs, before the boot sync pass, and logs `origin now <url>`. A node moved to a GitHub body source therefore pulls and pushes GitHub from its first boot after the deploy, rather than the server repository it was first cloned from. The body's content and its own commits are untouched, and a matching or unset `AGENT_REPO_URL` changes nothing.
