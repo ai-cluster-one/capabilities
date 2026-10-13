@@ -13,6 +13,14 @@ harness = "claude"
 model = "haiku"
 effort = "low"
 thinking = false
+# claude's CLI drops `--thinking disabled` for a model its own table marks as
+# refusing it, Haiku 5.5 among them, and the model then thinks adaptively. This
+# undocumented CLI setting takes that mark off Haiku 5.5, so thinking off
+# reaches the model; a CLI that stops reading it only brings adaptive thinking
+# back.
+env_set = { CLAUDE_CODE_MODEL_CAPABILITIES = "claude-haiku-5-5=-rejects_disabled_thinking" }
+# A named session gets no session-title request beside the decision.
+name = "telegram-gate"
 max_turns = 1
 tools = []
 setting_sources = []

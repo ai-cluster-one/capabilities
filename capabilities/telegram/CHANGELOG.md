@@ -1,8 +1,8 @@
 # telegram — change log
 
-## 2026-10-13 — A reply gate run reads the cached prompt of the chat's earlier runs
+## 2026-10-13 — A reply gate decision on claude runs without thinking, reads its chat's cached prompt, and asks for no session title
 
-The schema a gate decision is held to no longer names the batch's message ids: it is the same for every run in a chat, narrowed only to the chat's allowed reactions. The harness carries that schema at the head of the prompt prefix it caches, so a schema naming the batch made every run's prefix new and no run read the cache; a chat's later runs now read the earlier run's cached prefix. A decision whose target is not a message of the batch is still read as `ignore`, as before. Nothing in the settings, the record or the decisions changes.
+The schema a gate decision is held to no longer names the batch's message ids: it is the same for every run in a chat, narrowed only to the chat's allowed reactions. The harness carries that schema at the head of the prompt prefix it caches, so a schema naming the batch made every run's prefix new and no run read the cache; a chat's later runs now read the earlier run's cached prefix. A decision whose target is not a message of the batch is still read as `ignore`, as before. On Haiku 5.5, claude's CLI drops the gate profile's thinking off, because its own model table marks that model as refusing it, and the model then thought before every decision; `telegram-gate-claude` now sets the CLI's `CLAUDE_CODE_MODEL_CAPABILITIES` to take that mark off Haiku 5.5, so thinking off reaches it. The setting is undocumented, and a CLI that stops reading it brings adaptive thinking back and nothing else. The profile also names its session `telegram-gate`, so the CLI no longer sends a session-title request beside each decision. Nothing in the settings, the record or the decisions changes.
 
 ## 2026-10-13 — Groups can switch each trigger off, and a reply gate can decide whether a conversation needs the assistant
 

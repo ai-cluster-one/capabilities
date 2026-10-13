@@ -473,7 +473,21 @@ class Profiles(unittest.TestCase):
         self.assertEqual((claude["tools"], claude["setting_sources"], claude["max_turns"],
                           claude["thinking"], claude["strict_mcp"], claude["mcp_config"]),
                          ([], [], 1, False, True, {"mcpServers": {}}))
+        # Thinking off reaches Haiku 5.5 only with the CLI's mark taken off
+        # it, and a named session makes no session-title request; both reach
+        # the CLI as the runner builds its options.
+        self.assertEqual(claude["env_set"], {
+            "CLAUDE_CODE_MODEL_CAPABILITIES": "claude-haiku-5-5=-rejects_disabled_thinking"})
+        self.assertEqual(claude["name"], "telegram-gate")
+        from callva.harness_runner import claude as claude_sdk
+        opts = claude_sdk.options(lib.Profile.from_dict(claude), cli_path="claude", cwd=".",
+                                  env={}, session_id=None, resume_id=None,
+                                  stderr=lambda _line: None)
+        self.assertEqual(opts.extra_args.get("name"), "telegram-gate")
+        self.assertEqual(opts.thinking, {"type": "disabled"})
         codex = self.bundled("telegram-gate-codex")["knobs"]
+        # Codex makes no title request; its `name` would name the thread.
+        self.assertNotIn("name", codex)
         self.assertEqual(codex["approval_policy"], "never")
         self.assertEqual(codex["codex_config"]["sandbox_mode"], "read-only")
         self.assertFalse(any(codex["codex_config"]["features"].values()))
@@ -662,6 +676,9 @@ class GateSession(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("enum", call["profile"].output_schema["properties"]
                                  ["target_message_id"])
                 self.assertNotIn("CODEX_HOME", call["extra_env"])
+                self.assertEqual(call["profile"].name, "telegram-gate")
+                self.assertEqual(call["profile"].env_set["CLAUDE_CODE_MODEL_CAPABILITIES"],
+                                 "claude-haiku-5-5=-rejects_disabled_thinking")
                 # The chat's reactions are read once.
                 await s.send(group_message(7, "more"))
                 await wait_until(lambda: len(answering.gate_calls) == 2)
