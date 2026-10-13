@@ -2037,10 +2037,21 @@ def acquire_daemon_lock():
 
 # --- credentials (resolve the connection the way the capability does) ---------
 def resolve_creds():
-    # A connection naming no app of its own signs in through the machine's.
+    # An app is an id and its hash together: a connection naming its own api_id
+    # takes the hash its secret_env names, else the one under its own key, where
+    # `connection add` writes it; a connection naming no app signs in through the
+    # machine's.
     entry = CONNECTION_ENTRY or {}
-    api_id_raw = entry.get("api_id") or _env_value("TELEGRAM_API_ID")
-    secret_env = entry.get("secret_env") or "TELEGRAM_API_HASH"
+    if entry.get("api_id"):
+        api_id_raw = entry["api_id"]
+        own_key = f"TELEGRAM_{re.sub(r'[^A-Z0-9]', '_', str(CONNECTION).upper())}_API_HASH"
+        secret_env = (entry.get("secret_env")
+                      or (own_key if _env_value(own_key) else "TELEGRAM_API_HASH"))
+    elif entry.get("secret_env"):
+        sys.exit(f"connection {CONNECTION!r} names secret_env but no api_id")
+    else:
+        api_id_raw = _env_value("TELEGRAM_API_ID")
+        secret_env = "TELEGRAM_API_HASH"
     if not api_id_raw:
         sys.exit("TELEGRAM_API_ID not resolved (project .env.local, credentials.env, or env)")
     api_id = int(api_id_raw)

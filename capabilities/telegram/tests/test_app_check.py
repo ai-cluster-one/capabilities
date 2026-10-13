@@ -208,8 +208,25 @@ class MachineAppTests(unittest.TestCase):
         self.assertIn("telegram setup set", problem["hint"])
 
     def test_a_named_hash_that_does_not_resolve_is_still_refused(self):
-        _, _, problem = self.cli._app_credentials("own", {"secret_env": "TELEGRAM_GONE_API_HASH"})
+        entry = {"api_id": 7654321, "secret_env": "TELEGRAM_GONE_API_HASH"}
+        _, _, problem = self.cli._app_credentials("own", entry)
         self.assertEqual(problem["code"], "missing_secret")
+
+    def test_an_own_id_takes_the_hash_under_its_own_key(self):
+        # `connection add own --field api_id=...` names no secret_env when the
+        # field is optional; the hash already under TELEGRAM_OWN_API_HASH is its.
+        api_id, api_hash, problem = self.cli._app_credentials("own", {"api_id": 7654321})
+        self.assertIsNone(problem)
+        self.assertEqual((api_id, api_hash), (7654321, "b" * 32))
+
+    def test_an_own_id_is_never_paired_with_the_machines_hash(self):
+        _, _, problem = self.cli._app_credentials("other", {"api_id": 7654321})
+        self.assertEqual((problem["exit"], problem["code"]), (2, "missing_secret"))
+        self.assertIn("TELEGRAM_OTHER_API_HASH", problem["message"])
+
+    def test_a_hash_with_no_id_is_refused_as_before(self):
+        _, _, problem = self.cli._app_credentials("own", {"secret_env": "TELEGRAM_OWN_API_HASH"})
+        self.assertEqual((problem["exit"], problem["code"]), (6, "incomplete_connection"))
 
     def test_the_machine_app_is_a_required_setup_prerequisite(self):
         setup = {field["key"]: field for field in self.cli.SETUP_FIELDS}

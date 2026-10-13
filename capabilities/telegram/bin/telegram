@@ -4818,12 +4818,18 @@ APP_SETUP_HINT = ("register an app at my.telegram.org/apps, then give this machi
                   "with {\"TELEGRAM_API_HASH\": \"<hash>\"} on stdin")
 
 
-def _app_keys(entry: dict | None) -> tuple[str | None, str]:
-    """Where a connection's app comes from: the literal `api_id` it names, else
-    None for the machine's TELEGRAM_API_ID; and the env key of its hash, the one
-    `secret_env` names, else the machine's TELEGRAM_API_HASH."""
+def _app_keys(cid: str | None, entry: dict | None) -> tuple[str | None, str]:
+    """Where a connection's app comes from. An app is an id and its hash taken
+    together: a connection naming its own `api_id` takes the hash its
+    `secret_env` names, else the one under its own key (TELEGRAM_<ID>_API_HASH,
+    where `connection add` writes it), never the machine's; a connection naming
+    no app inherits the machine's TELEGRAM_API_ID and TELEGRAM_API_HASH."""
     entry = entry or {}
-    return entry.get("api_id"), entry.get("secret_env") or "TELEGRAM_API_HASH"
+    literal_id, secret_env = entry.get("api_id"), entry.get("secret_env")
+    if literal_id is not None and not secret_env and cid:
+        field = next(f for f in CONN_FIELDS if f["key"] == "secret_env")
+        secret_env = _connection_env_name(field, cid)
+    return literal_id, secret_env or "TELEGRAM_API_HASH"
 
 
 def _app_credentials(cid: str | None, entry: dict | None
@@ -4831,11 +4837,17 @@ def _app_credentials(cid: str | None, entry: dict | None
     """The app a connection signs in through - the id and hash it names, else the
     machine's app that `telegram setup set` writes once and every connection
     naming none inherits. Returns (api_id, api_hash, problem)."""
-    literal_id, secret_env = _app_keys(entry)
+    literal_id, secret_env = _app_keys(cid, entry)
+    if literal_id is None and (entry or {}).get("secret_env"):
+        return None, None, {
+            "exit": 6, "code": "incomplete_connection",
+            "message": f"connection {cid!r} names 'secret_env' but no 'api_id'",
+            "hint": "name the id of the app the hash belongs to, or neither to sign in "
+                    "through the machine's app"}
     api_id = literal_id if literal_id is not None else _resolve_env_key("TELEGRAM_API_ID")[0]
     api_hash = _resolve_env_key(secret_env)[0]
     whose = f" (for connection {cid!r})" if cid and entry is not None else ""
-    if entry is not None and entry.get("secret_env") and not api_hash:
+    if literal_id is not None and not api_hash:
         return None, None, {
             "exit": 2, "code": "missing_secret",
             "message": f"env var {secret_env}{whose} is unset",
@@ -4929,10 +4941,13 @@ def _connections_report() -> dict:
         entry = entry if isinstance(entry, dict) else {}
         origin = reg["sources"][cid]
         keys = []
-        api_id, secret_env = _app_keys(entry)
+        api_id, secret_env = _app_keys(cid, entry)
         if api_id is not None:
             keys.append(_key_report("api_id", False, True, str(api_id),
                                     "connection", origin))
+        elif entry.get("secret_env"):   # a hash with no id is no app
+            keys.append(_key_report("api_id", False, True, None, None, None))
+            secret_env = entry["secret_env"]
         else:               # inherits the machine's app
             value, tier, source = _resolve_env_key("TELEGRAM_API_ID")
             keys.append(_key_report("TELEGRAM_API_ID", False, True, value, tier, source))
@@ -5150,10 +5165,9 @@ def cmd_app_check(wanted: str | None) -> None:
     api_id, api_hash, problem = _app_credentials(wanted, entry)
     if problem:
         _die(problem["exit"], problem["code"], problem["message"], problem.get("hint"))
-    literal_id, secret_env = _app_keys(entry)
+    literal_id, secret_env = _app_keys(wanted, entry)
     app = {"api_id": api_id,
-           "from": "connection" if (literal_id is not None or
-                                    (entry or {}).get("secret_env")) else "machine",
+           "from": "connection" if literal_id is not None else "machine",
            "hash_env": secret_env}
     if wanted is not None:
         app["connection"] = wanted
