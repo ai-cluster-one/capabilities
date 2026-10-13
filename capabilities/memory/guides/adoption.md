@@ -1,0 +1,19 @@
+# Moving a memory folder into the store
+
+How to carry a project's existing memory folder into the store without losing an entry or carrying one twice.
+
+## Read the dry run first
+
+Run adopt without applying, naming the project roots you mean, or with none to take every project root a machine service on this machine lists. The answer shows, for every entry it found, the title it read, the date it gave the entry and where that date came from, and whether it will be carried or skipped and why; it also lists every file it did not read. Nothing is written. Read it before applying: a folder written in a shape the reader does not expect shows up here as odd titles or skipped sections, and is easier to tidy now than to supersede later.
+
+## Decide what is pinned
+
+Decisions the project's owner made belong pinned. When their titles share a recognisable form, pass a pattern that matches them and they are pinned as they are carried; otherwise pin them one by one afterwards.
+
+## Apply
+
+Applying enables memory for each project that does not already decide for itself, joins it to the machine service, carries every entry with its original date, and renders its block. A project that disables memory is left alone. Running it again, here or on another machine that holds the same project, carries nothing twice and reports each entry it finds already carried.
+
+## Afterwards
+
+Check the project with `memory status` and `memory doctor`, and read the block it now carries. The folder itself is left exactly as it was; removing it, and whatever in the project still writes to it, is the project's own change to make once its memory reads from the store on every machine it runs on.

@@ -100,6 +100,11 @@
       "payload_sha256": "cabbb61b169d03a3c04b95e0f5bd6bbece505f4f96407e873dc496d65e5f903c",
       "summary": "Thin IMAP/SMTP CLI for mailboxes — list/show messages, save attachments, render PDF, save raw .eml, flag `\\Seen`, move between folders, and send."
     },
+    "memory": {
+      "path": "capabilities/memory",
+      "payload_sha256": "40147cb735da99a3c78ebfaf73592b82be910cf86c664345d6bd5596895b6938",
+      "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time, the newest rendered into every session's context, the rest searched on demand, and a service that keeps the block current and consolidates it."
+    },
     "notion": {
       "path": "capabilities/notion",
       "payload_sha256": "e0ded3affd6b087859e96ca6590627e383efdf2fbee1f0dcb81db9ed56464d63",
