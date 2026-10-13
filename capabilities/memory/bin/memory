@@ -14,7 +14,8 @@ title, which is the line the index shows, and its text. Entries are appended
 and never edited. A conclusion that changed is superseded by a new entry; one
 that no longer holds is dropped with the reason; every change is an event in
 the entry's trail, which nothing rewrites. The project's context carries a
-rendered block of the newest entries, and everything else is one search away.
+rendered block that says how to record and how to search, and how many entries
+there are; no entry is in it, and every one is one search away.
 Agent-invoked: every answer is JSON or plain lines on stdout.
 
 Memory lives in the PostgreSQL the project resolves (STORE). Without a store
@@ -24,12 +25,13 @@ there is no memory: every verb that reads or writes it exits 6
 WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
   memory add <text|-> --title TEXT [--pin] [--scope NAME]
       Record one entry; `-` reads the text from stdin. The title is one line of
-      at most 200 characters; the text at most 20000. --pin keeps it in the
-      block whatever its age and out of every grooming pass: pin a decision
-      the owner of the project made, and quote the owner's words as written.
-      --scope names a narrower audience (a room, a person); the block carries
-      project-wide entries only. Safe to repeat: an active entry with the same
-      title, text and scope is answered with `"created": false`.
+      at most 200 characters; the text at most 20000. --pin keeps it out of
+      every grooming pass, never merged or dropped by one; a rule every
+      session must hold belongs in the project's doctrine, since a session
+      reaches an entry through search. --scope names a narrower audience (a
+      room, a person); the block counts project-wide entries only. Safe to
+      repeat: an active entry with the same title, text and scope is
+      answered with `"created": false`.
   memory supersede <id> [<id>...] --with <text|-> --title TEXT
                    [--with <text> --title TEXT ...] [--reason TEXT] [--pin]
       Replace entries with new ones, paired --with/--title in order. Each
@@ -45,7 +47,8 @@ WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
       prefix, removes the text for good and leaves the trail an event without
       it.
   memory pin <id> | memory unpin <id>
-      Pin or unpin an active entry; repeating it changes nothing.
+      Pin or unpin an active entry, which keeps it out of grooming passes or
+      returns it to them; repeating it changes nothing.
 
   An entry's text is never edited in place; the store refuses it. An id is the
   whole id or its first six or more characters, as `list` shows it. A write
@@ -90,23 +93,26 @@ THE BLOCK
       prints the block and writes nothing. Under the read-only switch render
       still writes: the file is operational state, not a project record.
 
-  The block, newest first, never an entry cut except at entry_chars:
-    1. Pinned entries with their text, within a fifth of block_chars; past
-       it the rest of them as index lines with one warning line.
-    2. Entries of the last window_days with their text, each cut at
-       entry_chars with a pointer to `memory show`, while they fit.
-    3. The rest of the window as index lines, while they fit.
-    4. One line when any active entry is not in the block, those older than
-       window_days included: showing N of M active entries, pointing to
-       `memory list` and `memory search`.
-    5. How to go further: `memory search`, `memory show`, a subagent.
-    6. Where the block came from, when, and how to repair it.
-  A project with fewer than min_entries entries in its window shows its
-  newest min_entries; at most max_entries are shown. A merged entry carries
-  `merged N, <first>..<last>`. The block never passes block_chars characters
-  nor 32768 UTF-8 bytes, the ceiling `memory manifest` declares. A line of
-  entry text that would open a heading is escaped, and no HTML comment opener
-  from entry text reaches the block.
+  The block carries no entry, title or index line, and its size does not
+  grow with the entries. In this order:
+    1. A directive: this memory takes the place of the harness's built-in
+       memory in the project.
+    2. How to record, with `memory add`, and what belongs in an entry and
+       what does not.
+    3. How to search, with `memory search`, before relying on what seems
+       known.
+    4. How to search deeply: a broad question handed to a subagent that
+       returns only its conclusion.
+    5. The count of active project-wide entries, the moment the newest was
+       written, and the `memory list --since` command that lists it and
+       anything newer.
+    6. Reading one entry with `memory show`, and `memory help` for every
+       command.
+    7. Where the block came from, when, and how to repair it.
+  The render report and context.json add the window's measure: `window`,
+  the entries it holds, `window_chars`, and `fits`, whether it is within
+  max_entries and block_chars (SETTINGS), which decides when the service
+  consolidates.
 
 CONSOLIDATION
   memory groom [--apply] [--undo <pass>]
@@ -165,7 +171,7 @@ SERVICE  (memory service <verb> [--machine])
   changes, and renders hourly besides so the window moves with the clock. It
   runs a grooming pass for a project - `memory groom --apply` as a child in
   the project's root with the project's own environment - when the window no
-  longer fits the block, no pass ran for the project within
+  longer fits (SETTINGS), no pass ran for the project within
   groom_interval_hours on any machine, and nothing was written for
   quiet_minutes; whatever comes of an attempt, the next waits the interval.
   Consolidation is off where `consolidate` is false, or where the profile's
@@ -209,11 +215,15 @@ SERVICE  (memory service <verb> [--machine])
 
 SETTINGS  (capabilities/memory/service/settings.json, project over global
            $XDG_CONFIG_HOME/memory/service/settings.json, key by key)
+  The window is the active, unpinned project-wide entries of the last
+  window_days; it fits while it holds at most max_entries and, each entry
+  written out at entry_chars, at most block_chars characters. A window that
+  no longer fits is what a grooming pass is for.
   window_days 30 (1-3650)       entries this recent are the window
-  min_entries 5 (0-200)         a dormant project still shows its newest five
-  max_entries 30 (1-500)        the most window entries the block shows
-  block_chars 12000 (2000-16000)  the block's size in characters
-  entry_chars 1200 (200-8000, at most half of block_chars)  one entry's text
+  min_entries 5 (0-200)         a dormant project's window still holds its newest five
+  max_entries 30 (1-500)        the most entries the window holds and still fits
+  block_chars 12000 (2000-16000)  the most characters the window takes and still fits
+  entry_chars 1200 (200-8000, at most half of block_chars)  one entry's text, as measured
   consolidate true              grooming passes by the service
   quiet_minutes 30 (0-1440)     no pass until the project is this quiet
   groom_interval_hours 24 (1-720)  at most one pass per project in this time
@@ -286,8 +296,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 NAME = "memory"
 SUMMARY = ("Project memory over a PostgreSQL store - conclusions recorded one entry at a "
-           "time, the newest rendered into every session's context, the rest searched on "
-           "demand, and a service that keeps the block current and consolidates it.")
+           "time and searched on demand, a block in every session's context that says how to "
+           "record and search them and how many there are, and a service that keeps the "
+           "block current and consolidates the entries.")
 SCOPE = "project"
 CRED_KEYS: list = []
 # Every verb that changes the store's record of a project's memory; each is
@@ -302,9 +313,8 @@ TABLES = True       # memory_* tables in the project's store, built by _tables()
 INVENTORY = {"network": "none"}   # the service's state on this machine; entries are the store's
 POST_INSTALL: list[dict] = []
 # The block the manager composes after the stub: a file under this capability's
-# folder in the project envelope, and the most UTF-8 bytes it may hold: the
-# default block_chars in a two-byte script fits with room to spare, and render
-# shrinks any block that would not.
+# folder in the project envelope, and the most UTF-8 bytes it may hold; the
+# block carries no entry and stays far below it.
 CONTRIBUTION = {"path": "state/context.md", "max_bytes": 32768}
 SERVICE = {
     "name": "memory",
@@ -3398,7 +3408,8 @@ def _context_report(root: Path, last_event: int | None) -> dict:
         sidecar = {}
     if out["exists"]:
         out["bytes"] = path.stat().st_size
-    for key in ("rendered_at", "rendered_by", "last_event", "window", "shown", "fits", "chars"):
+    for key in ("rendered_at", "rendered_by", "last_event", "active", "newest", "window",
+                "fits", "chars"):
         if key in sidecar:
             out[key] = sidecar[key]
     out["current"] = bool(out["exists"] and sidecar.get("last_event") == last_event)
@@ -4147,7 +4158,7 @@ class _Host:
         env["CLAUDE_PROJECT_DIR"] = str(root)
         env["MEMORY_ACTOR"] = f"{NAME} service on {node_name()}"
         return ([str(Path(__file__).resolve()), "groom", "--apply", "--trigger",
-                 "service: the window no longer fits the block"], str(root), env)
+                 "service: the window no longer fits block_chars"], str(root), env)
 
 
 # ── the service verbs ────────────────────────────────────────────────────────

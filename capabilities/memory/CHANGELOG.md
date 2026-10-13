@@ -1,5 +1,13 @@
 # memory — change log
 
+## 2026-10-13 — The block carries no entry: it says how to record and search, and how many entries there are
+
+The block `memory render` writes into context no longer shows any entry, title or index line, pinned or not. In this order it carries a directive that this memory takes the place of the harness's built-in memory, how to record with `memory add` and what belongs in an entry, how to search with `memory search`, how to search deeply through a subagent that returns only its conclusion, the count of active project-wide entries with the moment the newest was written and the `memory list --since` command that lists it and anything newer, and `memory show` and `memory help`, then the provenance line. Its size no longer grows with the entries.
+
+A pin now only keeps an entry out of grooming passes. If you relied on a pin to put a decision in front of every session, promote that decision into your project's doctrine, where every session reads it, and drop the entry naming where it went; `memory list --pinned` lists what to look at.
+
+The render report, `context.json` and `memory status`'s `context` lose `shown`, `full`, `index`, `pinned_full`, `pinned_index` and `cap`, and add `newest` and `window_chars`; the service's project row reports `active` in place of `shown`. `window_days`, `min_entries`, `max_entries`, `block_chars` and `entry_chars` keep their names and bounds and now measure only the window, the unpinned recent entries: it fits while it holds at most `max_entries` and, each entry written out at `entry_chars`, at most `block_chars` characters, and the service grooms a window that no longer fits as before. Pinned entries no longer count against it.
+
 ## 2026-10-13 — Adopt reads a folder's dates in the zone they were written in
 
 `memory adopt` now reads a memory file's date and a section's `HH:MM` in the machine's local zone, the zone ContextKit's memory writer stamps them in, instead of as UTC, so a carried entry keeps the moment it was written rather than one shifted by the writer's offset. `--timezone ZONE` reads them in the IANA zone it names instead, each date taking that zone's offset on it, and every entry's `dated_from` names the zone it was read in. An entry already carried still answers `already`: what makes an entry the same entry is unchanged, and its stored date is not rewritten.

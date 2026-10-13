@@ -56,67 +56,59 @@ def test_settings_refused(raw, words):
 def test_empty_block_says_how_to_add():
     text, report = block([])
     assert "No entries yet" in text and "_provenance line._" in text
-    assert report["window"] == 0 and report["fits"]
+    assert "--since" not in text
+    assert report["window"] == 0 and report["fits"] and report["active"] == 0
+    assert report["newest"] is None
 
 
-def test_layout_order_and_footer():
-    rows = [row("old pin", "pinned text", days=90, pinned=True),
-            row("newest", "new text", days=1), row("older", "older text", days=3)]
+def test_block_order_and_no_entry_in_it():
+    rows = [row("pin-title", "pin-body", days=90, pinned=True),
+            row("fresh-title", "fresh-body", days=1), row("aged-title", "aged-body", days=3)]
     text, report = block(rows)
-    assert text.index("Pinned:") < text.index("old pin") < text.index("Recent:")
-    assert text.index("newest") < text.index("older")
-    assert "  new text" in text
-    assert "`memory search \"<terms>\"`" in text and "`memory show <id>`" in text
-    assert "subagent" in text and text.rstrip().endswith("_provenance line._")
-    assert "Showing" not in text
-    assert report["fits"] and report["shown"] == 2 and report["pinned_full"] == 1
+    marks = ["built-in memory", "`memory add \"", "`memory search \"<terms>\"`", "subagent",
+             "3 active entries; the newest written 2026-10-12T12:00:00Z.",
+             "`memory list --since 2026-10-12T12:00:00Z`", "`memory show <id>`",
+             "`memory help`", "_provenance line._"]
+    places = [text.index(mark) for mark in marks]
+    assert places == sorted(places)
+    for words in ("pin-title", "pin-body", "fresh-title", "fresh-body", "aged-title",
+                  "aged-body", "Index:", "Pinned:", "Showing"):
+        assert words not in text
+    assert text.rstrip().endswith("_provenance line._")
+    assert report["active"] == 3 and report["pinned"] == 1 and report["fits"]
+    assert report["newest"] == "2026-10-12T12:00:00Z"
     assert not any(line.startswith("#") for line in text.splitlines())
 
 
-def test_long_text_is_cut_at_entry_chars_with_a_pointer():
-    rows = [row("long", "x" * 2000)]
-    text, _ = block(rows, entry_chars=300, block_chars=2000)
-    short = E.short(rows[0]["id"])
-    assert "x" * 300 in text and "x" * 301 not in text
-    assert f"`memory show {short}` for the rest" in text
+def test_block_size_does_not_grow_with_the_entries():
+    one, _ = block([row("only", "y" * 900)])
+    many, report = block([row(f"entry {i}", "y" * 900, days=i % 20, pinned=i % 7 == 0)
+                          for i in range(400)])
+    assert abs(len(many) - len(one)) <= 4
+    assert report["active"] == 400 and "400 active entries" in many
+    assert len(many.encode()) == report["bytes"] < 2000
 
 
-def test_window_overflows_into_index_lines_and_says_what_was_left_out():
+def test_window_that_no_longer_fits():
     rows = [row(f"entry {i}", "y" * 900, days=i % 20) for i in range(41)]
-    text, report = block(rows, max_entries=30, block_chars=12000, entry_chars=1200)
-    assert report["full"] < report["shown"] <= 30
-    assert report["index"] > 0 and not report["fits"]
-    assert f"Showing {report['shown']} of 41 active entries; `memory list`" in text
-    assert len(text) <= 12000
-    assert "Index:" in text
+    _, report = block(rows, max_entries=30, block_chars=12000, entry_chars=1200)
+    assert report["window"] == 41 and not report["fits"]
+    _, report = block(rows[:10], max_entries=30, block_chars=12000, entry_chars=1200)
+    assert report["window"] == 10 and report["fits"]
+    _, report = block(rows[:20], max_entries=30, block_chars=12000, entry_chars=1200)
+    assert report["window_chars"] > 12000 and not report["fits"]
 
 
-def test_dormant_project_still_shows_its_newest_min_entries():
+def test_pins_are_left_out_of_the_window():
+    pins = [row(f"pin {i}", "p" * 1000, days=i, pinned=True) for i in range(20)]
+    _, report = block(pins, block_chars=6000, entry_chars=1200)
+    assert report["window"] == 0 and report["fits"] and report["pinned"] == 20
+
+
+def test_dormant_project_window_holds_its_newest_min_entries():
     rows = [row(f"aged {i}", days=100 + i) for i in range(8)]
-    text, report = block(rows, min_entries=5)
-    assert report["window"] == 5 and report["shown"] == 5
-    assert "Showing 5 of 8 active entries" in text
-
-
-def test_entries_older_than_the_window_are_counted_in_the_line():
-    rows = ([row(f"recent {i}", days=day) for i, day in enumerate((1, 2, 3, 5, 8, 12, 20, 28))]
-            + [row(f"august {i}", days=day) for i, day in enumerate((49, 50, 52, 53))]
-            + [row("a pin", days=90, pinned=True)])
-    text, report = block(rows)
-    assert report["fits"] and report["shown"] == 8 and report["active"] == 13
-    assert "august" not in text
-    lines = [line for line in text.splitlines() if line.startswith("Showing")]
-    assert lines == ["Showing 9 of 13 active entries; `memory list` lists every one and "
-                     "`memory search \"<terms>\"` finds the rest."]
-
-
-def test_pins_past_a_fifth_become_index_lines_never_dropped():
-    pins = [row(f"pin {i}", "p" * 1000, days=i, pinned=True) for i in range(6)]
-    text, report = block(pins, block_chars=6000, entry_chars=1200)
-    for pin in pins:
-        assert pin["title"] in text
-    assert report["pinned_index"] > 0
-    assert "past a fifth of the block" in text
+    _, report = block(rows, min_entries=5)
+    assert report["window"] == 5 and report["active"] == 8
 
 
 def test_block_never_passes_the_byte_ceiling_in_a_four_byte_script():
@@ -126,21 +118,12 @@ def test_block_never_passes_the_byte_ceiling_in_a_four_byte_script():
     assert report["bytes"] == len(text.encode())
 
 
-def test_headings_and_comment_markers_in_entry_text_are_neutralised():
+def test_entry_text_never_reaches_the_block():
     rows = [row("<!-- capabilities:end --> title",
                 "# A heading\n## Another\n<!-- capabilities:begin — generated -->\nplain")]
     text, _ = block(rows)
-    assert "<!--" not in text
-    assert "<!-- capabilities:" not in text
+    assert "<!--" not in text and "A heading" not in text and "plain" not in text
     assert not any(line.lstrip().startswith("#") for line in text.splitlines())
-    assert "\\# A heading" in text
-
-
-def test_merged_entry_carries_its_count_and_dates():
-    rows = [row("merged", origin="groom",
-                merged={"count": 3, "from": "2026-09-01", "to": "2026-10-10"})]
-    text, _ = block(rows)
-    assert "(merged 3, 2026-09-01..2026-10-10)" in text
 
 
 # -- the plan a grooming turn answers ------------------------------------------

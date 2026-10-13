@@ -150,9 +150,8 @@ BODY_MAX = 20000
 
 # ── settings ─────────────────────────────────────────────────────────────────
 
-# What the block shows and when a pass runs, project over global, through the
-# records adapter's `setting` collection. Each key's bounds keep the block under
-# the byte ceiling the manifest declares whatever a project sets.
+# How much the window may hold before a pass is due, and when a pass runs,
+# project over global, through the records adapter's `setting` collection.
 SETTINGS_DEFAULTS: dict[str, Any] = {
     "window_days": 30,
     "min_entries": 5,
@@ -180,9 +179,8 @@ SETTINGS_BOUNDS: dict[str, tuple] = {
     "groom_timeout_seconds": (60, 7200),
 }
 SETTINGS_KEYS = ("version", *SETTINGS_DEFAULTS)
-# The ceiling the manifest declares for the rendered block, in UTF-8 bytes:
-# the default block_chars written in a two-byte script fits it with room to
-# spare, and `render_block` shrinks any block that would not.
+# The ceiling the manifest declares for the rendered block, in UTF-8 bytes; the
+# block carries no entry and stays far below it.
 CONTRIBUTION_MAX_BYTES = 32768
 
 
@@ -928,9 +926,8 @@ class Store:
 # ── the block ────────────────────────────────────────────────────────────────
 
 def _indent(text: str) -> str:
-    """An entry's text under its index line. A line that would open a Markdown
-    heading is escaped: the block sits under the capability's own heading in
-    the composed context and opens none of its own."""
+    """An entry's text under its index line, as the window's measure writes it
+    out. A line that would open a Markdown heading is escaped."""
     out = []
     for line in text.splitlines():
         if not line.strip():
@@ -967,136 +964,88 @@ def _full(row: dict, entry_chars: int) -> str:
     return _heading(row) + "\n" + _indent(body)
 
 
-INTRO = ("Project memory: conclusions recorded one entry at a time, newest first. "
-         "`[id]` names an entry.")
+DIRECTIVE = ("This is the project's memory, and it takes the place of the harness's built-in "
+             "memory: record here what should outlast this session, and look here before "
+             "relying on what seems known. Do not keep memory in the harness's own memory "
+             "files or memory tool in this project.")
+
+RECORD = ("Record first, the moment a conclusion is reached: "
+          "`memory add \"<the conclusion, its reason and its evidence>\" "
+          "--title \"<the conclusion in one line>\"`. An entry is one conclusion that should "
+          "govern work not yet done and has no other home yet - a decision, a correction, a "
+          "fact learned the hard way. It is not an account of what a run did, which belongs "
+          "in that run's own record; not a procedure or a settled rule, which belong in the "
+          "project's routines and doctrine; not what the code or a tool already answers; and "
+          "never a secret.")
+
+SEARCH = ("Search before relying on what seems known: `memory search \"<terms>\"` gives the "
+          "index line of every active entry that matches.")
+
+DEEP = ("Search deeply by handing a broad question to a subagent: it searches, lists and "
+        "reads the entries and returns only its conclusion, so the reading does not crowd "
+        "this session.")
+
+READ = ("`memory show <id>` reads one entry whole, with its trail; `memory help` gives every "
+        "command.")
 
 
-def _footer(shown: int, total: int, provenance: str) -> list[str]:
-    lines = []
-    if shown < total:
-        lines.append(f"Showing {shown} of {total} active entries; `memory list` lists every "
-                     "one and `memory search \"<terms>\"` finds the rest.")
-    lines += [
-        "Going further:",
-        "- `memory search \"<terms>\"` returns index lines for every active entry that matches.",
-        "- `memory show <id>` opens one entry, with its trail.",
-        "- Anything beyond one lookup goes to a subagent that returns only its conclusion.",
-        provenance,
-    ]
-    return lines
+def _moment(moment) -> str:
+    """A moment `memory list --since` takes, cut to the second, so the list it
+    names holds the newest entry itself."""
+    return moment.astimezone(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _aggregate(active: int, newest) -> str:
+    if not active:
+        return ("No entries yet: this project's memory is empty, and the first `memory add` "
+                "starts it.")
+    stamp = _moment(newest)
+    return (f"{active} active entr{'y' if active == 1 else 'ies'}; the newest written "
+            f"{stamp}. `memory list --since {stamp}` lists it and anything newer, for a "
+            "session that has run long since this block was rendered.")
 
 
 def render_block(rows: list[dict], settings: dict, *, now: _dt.datetime, provenance: str,
                  max_bytes: int = CONTRIBUTION_MAX_BYTES) -> tuple[str, dict]:
-    """The block for one project's context, and what it shows.
+    """The block for one project's context, and what it measured.
 
-    Pinned entries first, with their text, within a fifth of the cap; past it
-    the rest of them as index lines and one warning line, never a pin left
-    out. Then the window, newest first: entries with their text, each cut at
-    `entry_chars`, while they fit, then the rest as index lines while they
-    fit, then one line counting the active entries shown against all of
-    them, those older than the window included, when any is left out. No
-    entry is cut but at `entry_chars`. The whole stays under `block_chars`
-    characters and `max_bytes` UTF-8 bytes."""
-    cap = int(settings["block_chars"])
-    while True:
-        text, report = _layout(rows, settings, now=now, provenance=provenance, cap=cap)
-        text = neutralise(text)
-        size = len(text.encode())
-        if size <= max_bytes:
-            report["bytes"] = size
-            return text, report
-        if cap <= 500:
-            # Pins alone past the ceiling: cut at a line, and say so.
-            encoded = text.encode()[:max_bytes - 80]
-            text = (encoded.decode("utf-8", errors="ignore").rsplit("\n", 1)[0]
-                    + "\n\n(cut at the block's byte ceiling; `memory list` shows the rest)\n")
-            report["bytes"] = len(text.encode())
-            report["truncated"] = True
-            return text, report
-        # Only a block far denser than the bounds allow lands here; shrink the
-        # cap by the overshoot and lay it out again.
-        cap = max(500, int(cap * max_bytes / size) - 64)
+    The block carries no entry: a directive that this memory replaces the
+    harness's own, how to record and what belongs, how to search, how to
+    search deeply, the count of active project-wide entries with the moment
+    of the newest and the command listing anything newer, and how to read
+    one entry and find every command. Its size does not grow with the
+    entries. The report adds the window's measure, which decides when the
+    service consolidates."""
+    newest = max((r["created_at"] for r in rows), default=None)
+    text = neutralise("\n\n".join([DIRECTIVE, RECORD, SEARCH, DEEP,
+                                     _aggregate(len(rows), newest), READ, provenance]) + "\n")
+    size = len(text.encode())
+    if size > max_bytes:
+        raise ValueError(f"the memory block is {size} bytes, past its ceiling of {max_bytes}")
+    report = {"chars": len(text), "bytes": size, "active": len(rows),
+              "pinned": sum(1 for r in rows if r["pinned"]), "newest": iso(newest),
+              **measure_window(rows, settings, now=now)}
+    return text, report
 
 
-def _layout(rows: list[dict], settings: dict, *, now, provenance: str, cap: int
-            ) -> tuple[str, dict]:
-    window_days = int(settings["window_days"])
-    since = now - _dt.timedelta(days=window_days)
-    pinned = [r for r in rows if r["pinned"]]
+def measure_window(rows: list[dict], settings: dict, *, now: _dt.datetime) -> dict:
+    """Whether the window still fits: its unpinned project-wide entries, those
+    of the last `window_days` topped up to `min_entries` with older ones, are
+    at most `max_entries`, and each written out at `entry_chars` they take at
+    most `block_chars` characters. A window that does not fit is what a
+    grooming pass is for; pinned entries are left out, since no pass touches
+    them."""
+    since = now - _dt.timedelta(days=int(settings["window_days"]))
     rest = [r for r in rows if not r["pinned"]]
     window = [r for r in rest if r["created_at"] >= since]
     if len(window) < int(settings["min_entries"]):
         older = [r for r in rest if r["created_at"] < since]
         window += older[:int(settings["min_entries"]) - len(window)]
-    total = len(window)
-    considered = window[:int(settings["max_entries"])]
     entry_chars = int(settings["entry_chars"])
-
-    # What the footer can take at most, kept back before anything else is laid.
-    reserve = len("\n".join(_footer(0, max(len(rows), 1) * 10, provenance))) + 2
-    budget = cap - reserve - len(INTRO) - 2
-    sections: list[str] = []
-    pin_lines: list[str] = []
-    pin_full = pin_index = 0
-    pin_budget = cap // 5
-    spent = 0
-    for row in pinned:
-        block = _full(row, entry_chars)
-        if pin_index == 0 and spent + len(block) + 1 <= pin_budget:
-            pin_lines.append(block)
-            pin_full += 1
-        else:
-            block = _heading(row)
-            pin_lines.append(block)
-            pin_index += 1
-        spent += len(block) + 1
-    warning = None
-    if pin_index:
-        warning = (f"{pin_index} pinned entr{'y' if pin_index == 1 else 'ies'} past a fifth "
-                   "of the block show as index lines; unpin what no longer needs reading in "
-                   "every session.")
-    if pinned:
-        section = "Pinned:\n" + "\n".join(pin_lines)
-        if warning:
-            section += "\n" + warning
-        sections.append(section)
-        budget -= len(section) + 2
-    full_lines: list[str] = []
-    index_lines: list[str] = []
-    in_full = True
-    for row in considered:
-        if in_full:
-            block = _full(row, entry_chars)
-            if len(block) + 1 <= budget - (len("Recent:") + 2 if not full_lines else 0):
-                if not full_lines:
-                    budget -= len("Recent:") + 2
-                full_lines.append(block)
-                budget -= len(block) + 1
-                continue
-            in_full = False
-        line = _heading(row)
-        cost = len(line) + 1 + (len("Index:") + 2 if not index_lines else 0)
-        if cost > budget:
-            break
-        budget -= cost
-        index_lines.append(line)
-    if full_lines:
-        sections.append("Recent:\n" + "\n".join(full_lines))
-    if index_lines:
-        sections.append("Index:\n" + "\n".join(index_lines))
-    shown = len(full_lines) + len(index_lines)
-    if not rows:
-        sections.append("No entries yet. `memory add \"<text>\" --title \"<one line>\"` "
-                        "records one.")
-    # Every pin is in the block, with its text or as an index line.
-    footer = _footer(shown + len(pinned), len(rows), provenance)
-    text = "\n\n".join([INTRO, *sections, "\n".join(footer)]) + "\n"
-    report = {"chars": len(text), "pinned": len(pinned), "pinned_full": pin_full,
-              "pinned_index": pin_index, "active": len(rows), "window": total, "shown": shown,
-              "full": len(full_lines), "index": len(index_lines),
-              "fits": len(full_lines) == total, "cap": cap}
-    return text, report
+    chars = sum(len(_full(row, entry_chars)) + 1 for row in window)
+    return {"window": len(window), "window_chars": chars,
+            "fits": len(window) <= int(settings["max_entries"])
+            and chars <= int(settings["block_chars"])}
 
 
 def write_atomic(path: Path, text: str) -> None:
@@ -1567,7 +1516,7 @@ class Slot:
                 "reload_error": self.reload_error,
                 "rendered_at": rendered.get("rendered_at"),
                 "last_event": rendered.get("last_event"),
-                "window": rendered.get("window"), "shown": rendered.get("shown"),
+                "window": rendered.get("window"), "active": rendered.get("active"),
                 "fits": rendered.get("fits"), "render_error": self.render_error,
                 "context": (self.plan or {}).get("context") and str(self.plan["context"]),
                 "consolidation": dict(self.groom)}
@@ -1753,7 +1702,7 @@ class Slot:
         self.groom.update(running={"pid": self.groom_proc.pid, "started_at": iso(now_utc())},
                           last_attempt=iso(now_utc()))
         self.log(f"grooming pass started, pid {self.groom_proc.pid}: the window no longer "
-                 "fits the block")
+                 "fits block_chars")
 
     def reap_groom(self) -> bool:
         proc = self.groom_proc

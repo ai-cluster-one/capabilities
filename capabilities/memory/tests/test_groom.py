@@ -78,7 +78,7 @@ def test_apply_then_undo(world, tmp_path):
     assert set(titles) == {"alpha and beta", "pinned"}
     assert titles["alpha and beta"]["merged"]["count"] == 2
     block = (root / "capabilities" / "memory" / "state" / "context.md").read_text()
-    assert "(merged 2, " in block
+    assert "2 active entries" in block and "alpha" not in block
     status = world.ok(root, "status")
     assert status["grooming"]["passes"] == 1
 

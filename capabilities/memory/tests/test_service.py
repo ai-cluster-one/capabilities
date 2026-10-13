@@ -142,7 +142,7 @@ def test_the_service_grooms_a_window_that_no_longer_fits(world, tmp_path):
     root = world.project("p")
     settings = root / "capabilities" / "memory" / "service" / "settings.json"
     settings.parent.mkdir(parents=True)
-    settings.write_text(json.dumps({"version": 1, "block_chars": 2000, "entry_chars": 300,
+    settings.write_text(json.dumps({"version": 1, "block_chars": 2000, "entry_chars": 1000,
                                     "quiet_minutes": 0}))
     ids = [world.ok(root, "add", f"entry {i} " + "z" * 700, "--title", f"e{i}")["entry"]["id"]
            for i in range(4)]

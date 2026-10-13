@@ -84,13 +84,13 @@ def test_write_read_and_the_block(world):
 
     context = root / "capabilities" / "memory" / "state" / "context.md"
     text = context.read_text()
-    assert text.index("Pinned:") < text.index("Dates") < text.index("From stdin")
+    assert "2 active entries" in text and "Dates" not in text and "From stdin" not in text
     sidecar = json.loads(context.with_suffix(".json").read_text())
     assert sidecar["last_event"] == status["last_event"]
 
     before = tree(root)
     fragment = world.run(root, "render", "--fragment")
-    assert fragment.returncode == 0 and "From stdin" in fragment.stdout
+    assert fragment.returncode == 0 and "2 active entries" in fragment.stdout
     assert tree(root) == before
 
     doctor = world.ok(root, "doctor")
@@ -144,7 +144,7 @@ def test_the_read_only_switch_refuses_writes_and_leaves_reads(world):
         assert done.returncode == 4, (args, done.stderr)
         assert error(done)["code"] == "read_only_switch"
     assert world.ok(root, "list", "--json", CAPABILITIES_READ_ONLY="1")["total"] == 1
-    assert world.ok(root, "render", CAPABILITIES_READ_ONLY="1")["shown"] == 1
+    assert world.ok(root, "render", CAPABILITIES_READ_ONLY="1")["active"] == 1
 
 
 @needs_store

@@ -12,7 +12,7 @@ On a workstation that holds several projects, run the service once for the machi
 
 ## Consolidation
 
-A project's memory grows by appends, and the block shows only what fits. When the newest entries no longer fit, the service runs one grooming pass for the project: an agent turn reads the entries and proposes merges of related or contradicting entries and drops of entries that no longer hold, and the capability checks every proposal before applying any of it. Pinned entries are never touched, quotations survive word for word, and nothing is deleted.
+A project's memory grows by appends. The window is its recent, unpinned entries, and it fits while it stays within the entry count and the characters the settings allow. When it no longer fits, the service runs one grooming pass for the project: an agent turn reads the entries and proposes merges of related or contradicting entries and drops of entries that no longer hold, and the capability checks every proposal before applying any of it. Pinned entries are never touched, quotations survive word for word, and nothing is deleted.
 
 Passes run at most once per project in the configured interval, only after the project has been quiet for a while, one machine at a time, and only where the profile's harness is installed and logged in headless. A project that wants no passes turns consolidation off in its settings; `memory service doctor` says whether consolidation is on and why not.
 

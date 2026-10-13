@@ -12,7 +12,7 @@ A memory folder's file dates and section times carry no zone of their own, so ad
 
 ## Decide what is pinned
 
-Decisions the project's owner made belong pinned. When their titles share a recognisable form, pass a pattern that matches them and they are pinned as they are carried; otherwise pin them one by one afterwards.
+A pinned entry stays out of every grooming pass, so pin the decisions the project's owner made whose words must stay as they were written. When their titles share a recognisable form, pass a pattern that matches them and they are pinned as they are carried; otherwise pin them one by one afterwards. Every session reaches an entry through search, so a decision every session must hold is promoted into the project's doctrine before or after the move.
 
 ## Apply
 
