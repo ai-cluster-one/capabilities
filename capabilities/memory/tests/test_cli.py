@@ -213,4 +213,7 @@ def test_migrate_reports_and_applies(world):
     assert status["state"] == "pending"
     applied = world.ok(root, "migrate")
     assert applied["owner"] == "memory"
+    assert applied["applied"] == status["pending"] and applied["skipped"] == []
     assert world.ok(root, "migrate", "status")["state"] == "current"
+    again = world.ok(root, "migrate")
+    assert again["applied"] == [] and again["skipped"] == status["pending"]

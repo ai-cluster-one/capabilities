@@ -86,15 +86,28 @@ def test_window_overflows_into_index_lines_and_says_what_was_left_out():
     text, report = block(rows, max_entries=30, block_chars=12000, entry_chars=1200)
     assert report["full"] < report["shown"] <= 30
     assert report["index"] > 0 and not report["fits"]
-    assert f"Showing {report['shown']} of 41 entries from the last 30 days." in text
+    assert f"Showing {report['shown']} of 41 active entries; `memory list`" in text
     assert len(text) <= 12000
     assert "Index:" in text
 
 
 def test_dormant_project_still_shows_its_newest_min_entries():
     rows = [row(f"aged {i}", days=100 + i) for i in range(8)]
-    _text, report = block(rows, min_entries=5)
+    text, report = block(rows, min_entries=5)
     assert report["window"] == 5 and report["shown"] == 5
+    assert "Showing 5 of 8 active entries" in text
+
+
+def test_entries_older_than_the_window_are_counted_in_the_line():
+    rows = ([row(f"recent {i}", days=day) for i, day in enumerate((1, 2, 3, 5, 8, 12, 20, 28))]
+            + [row(f"august {i}", days=day) for i, day in enumerate((49, 50, 52, 53))]
+            + [row("a pin", days=90, pinned=True)])
+    text, report = block(rows)
+    assert report["fits"] and report["shown"] == 8 and report["active"] == 13
+    assert "august" not in text
+    lines = [line for line in text.splitlines() if line.startswith("Showing")]
+    assert lines == ["Showing 9 of 13 active entries; `memory list` lists every one and "
+                     "`memory search \"<terms>\"` finds the rest."]
 
 
 def test_pins_past_a_fifth_become_index_lines_never_dropped():

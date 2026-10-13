@@ -429,8 +429,11 @@ PROJECT VERBS (run inside a consuming project)
         project envelope and held to its declared byte ceiling, composed after
         its stub line; a contribution that is missing, unreadable, malformed
         or over its ceiling is replaced by one line naming `<name> render`,
-        and costs nothing else. Run by hand, a host mode prints the file
-        it wrote and the enabled set. Run as the host's SessionStart hook (the
+        and costs nothing else. Directly above a composed contribution of
+        `memory`, and nowhere else, the block carries the line
+        `<!-- contextkit:memory-contribution -->`, on which ContextKit leaves
+        out its own projection of the project's memory folder. Run by hand, a
+        host mode prints the file it wrote and the enabled set. Run as the host's SessionStart hook (the
         harness pipes a payload whose hook_event_name is SessionStart), it
         prints nothing unless the session must be told: the file was just
         created or changed since the session loaded it, it could not be
@@ -1956,6 +1959,13 @@ CONTRIBUTION_KEYS = ("path", "max_bytes")
 # The largest context contribution any capability may declare, in UTF-8 bytes:
 # the block is always loaded, so its ceiling is the manager's to hold.
 CONTRIBUTION_MAX_BYTES = 32768
+# The capability whose contribution is the project's memory, and the line
+# ContextKit looks for in this block before it leaves out its own projection of
+# the project's memory folder. The line is ContextKit's; it is composed only
+# above a contribution that was composed, so an unavailable or empty one leaves
+# ContextKit's projection in place and the session never goes without memory.
+MEMORY_CAPABILITY = "memory"
+MEMORY_CONTRIBUTION_MARKER = "<!-- contextkit:memory-contribution -->"
 
 
 def _validate_contribution(contribution: object) -> list[str]:
@@ -6575,7 +6585,11 @@ def _context_contribution(root: Path, name: str, manifest: dict | None) -> list[
                     problem = f"its file exceeds the declared {limit} bytes"
                 else:
                     text = raw.decode("utf-8").strip("\n").rstrip()
-                    return [text, ""] if text.strip() else []
+                    if not text.strip():
+                        return []
+                    marker = ([MEMORY_CONTRIBUTION_MARKER] if name == MEMORY_CAPABILITY
+                              else [])
+                    return [*marker, text, ""]
         except FileNotFoundError:
             problem = "its file has not been rendered"
         except (OSError, RuntimeError, UnicodeDecodeError, ValueError) as exc:

@@ -96,7 +96,9 @@ THE BLOCK
     2. Entries of the last window_days with their text, each cut at
        entry_chars with a pointer to `memory show`, while they fit.
     3. The rest of the window as index lines, while they fit.
-    4. One line when anything was left out: showing N of M entries.
+    4. One line when any active entry is not in the block, those older than
+       window_days included: showing N of M active entries, pointing to
+       `memory list` and `memory search`.
     5. How to go further: `memory search`, `memory show`, a subagent.
     6. Where the block came from, when, and how to repair it.
   A project with fewer than min_entries entries in its window shows its

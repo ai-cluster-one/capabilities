@@ -187,19 +187,19 @@ def test_a_disabled_capability_contributes_nothing(tmp_path):
     assert "demo" not in _sections(fragment)
 
 
-def _break(kind: str, tmp_path: Path, project: Path) -> None:
+def _break(kind: str, tmp_path: Path, project: Path, name: str = "demo") -> None:
     if kind == "missing":
         return
     if kind == "oversized":
-        _render(project, "demo", "x" * (DECLARED["max_bytes"] + 1))
+        _render(project, name, "x" * (DECLARED["max_bytes"] + 1))
     elif kind == "not utf-8":
-        _render(project, "demo", b"\xff\xfe broken")
+        _render(project, name, b"\xff\xfe broken")
     elif kind == "a directory":
-        (project / "capabilities" / "demo" / "state" / "context.md").mkdir(parents=True)
+        (project / "capabilities" / name / "state" / "context.md").mkdir(parents=True)
     elif kind == "outside the state folder":
         outside = tmp_path / "elsewhere.md"
         outside.write_text("- read from elsewhere\n")
-        link = project / "capabilities" / "demo" / "state" / "context.md"
+        link = project / "capabilities" / name / "state" / "context.md"
         link.parent.mkdir(parents=True)
         link.symlink_to(outside)
     else:
@@ -256,6 +256,41 @@ def test_a_malformed_declaration_costs_only_its_own_block(tmp_path, declared):
     _assert_only_demo_degraded(fragment)
     assert "declaration is malformed" in _sections(fragment)["demo"]
     assert "must not appear" not in fragment
+
+
+# --- the memory marker -----------------------------------------------------------
+
+def test_a_composed_memory_contribution_carries_the_marker_once(tmp_path):
+    _snapshot(tmp_path, "memory", DECLARED)
+    _snapshot(tmp_path, "demo", DECLARED)
+    project = _project(tmp_path, "memory", "demo")
+    _render(project, "memory", "- remembered here\n")
+    _render(project, "demo", "- kept by demo\n")
+
+    fragment = _fragment(tmp_path, project)
+    sections = _sections(fragment)
+
+    assert fragment.count(M.MEMORY_CONTRIBUTION_MARKER) == 1
+    assert sections["memory"].startswith(
+        "\nWork with memory records. Run `memory help`.\n\n"
+        f"{M.MEMORY_CONTRIBUTION_MARKER}\n- remembered here\n\n")
+    assert M.MEMORY_CONTRIBUTION_MARKER not in sections["demo"]
+
+
+@pytest.mark.parametrize("kind", ["empty", *FAILURES])
+def test_a_memory_contribution_not_composed_carries_no_marker(tmp_path, kind):
+    _snapshot(tmp_path, "memory", DECLARED)
+    project = _project(tmp_path, "memory")
+    if kind == "empty":
+        _render(project, "memory", "\n  \n")
+    else:
+        _break(kind, tmp_path, project, "memory")
+
+    fragment = _fragment(tmp_path, project)
+
+    assert M.MEMORY_CONTRIBUTION_MARKER not in fragment
+    if kind != "empty":
+        assert "The context contribution of `memory` is unavailable: " in fragment
 
 
 def test_the_contribution_is_read_from_the_envelope_the_project_resolves(tmp_path):

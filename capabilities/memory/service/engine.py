@@ -971,10 +971,11 @@ INTRO = ("Project memory: conclusions recorded one entry at a time, newest first
          "`[id]` names an entry.")
 
 
-def _footer(shown: int, total: int, window_days: int, provenance: str) -> list[str]:
+def _footer(shown: int, total: int, provenance: str) -> list[str]:
     lines = []
     if shown < total:
-        lines.append(f"Showing {shown} of {total} entries from the last {window_days} days.")
+        lines.append(f"Showing {shown} of {total} active entries; `memory list` lists every "
+                     "one and `memory search \"<terms>\"` finds the rest.")
     lines += [
         "Going further:",
         "- `memory search \"<terms>\"` returns index lines for every active entry that matches.",
@@ -993,9 +994,10 @@ def render_block(rows: list[dict], settings: dict, *, now: _dt.datetime, provena
     the rest of them as index lines and one warning line, never a pin left
     out. Then the window, newest first: entries with their text, each cut at
     `entry_chars`, while they fit, then the rest as index lines while they
-    fit, then one line saying what was left out. No entry is cut but at
-    `entry_chars`. The whole stays under `block_chars` characters and
-    `max_bytes` UTF-8 bytes."""
+    fit, then one line counting the active entries shown against all of
+    them, those older than the window included, when any is left out. No
+    entry is cut but at `entry_chars`. The whole stays under `block_chars`
+    characters and `max_bytes` UTF-8 bytes."""
     cap = int(settings["block_chars"])
     while True:
         text, report = _layout(rows, settings, now=now, provenance=provenance, cap=cap)
@@ -1032,7 +1034,7 @@ def _layout(rows: list[dict], settings: dict, *, now, provenance: str, cap: int
     entry_chars = int(settings["entry_chars"])
 
     # What the footer can take at most, kept back before anything else is laid.
-    reserve = len("\n".join(_footer(0, max(total, 1) * 10, window_days, provenance))) + 2
+    reserve = len("\n".join(_footer(0, max(len(rows), 1) * 10, provenance))) + 2
     budget = cap - reserve - len(INTRO) - 2
     sections: list[str] = []
     pin_lines: list[str] = []
@@ -1087,10 +1089,11 @@ def _layout(rows: list[dict], settings: dict, *, now, provenance: str, cap: int
     if not rows:
         sections.append("No entries yet. `memory add \"<text>\" --title \"<one line>\"` "
                         "records one.")
-    footer = _footer(shown, total, window_days, provenance)
+    # Every pin is in the block, with its text or as an index line.
+    footer = _footer(shown + len(pinned), len(rows), provenance)
     text = "\n\n".join([INTRO, *sections, "\n".join(footer)]) + "\n"
     report = {"chars": len(text), "pinned": len(pinned), "pinned_full": pin_full,
-              "pinned_index": pin_index, "window": total, "shown": shown,
+              "pinned_index": pin_index, "active": len(rows), "window": total, "shown": shown,
               "full": len(full_lines), "index": len(index_lines),
               "fits": len(full_lines) == total, "cap": cap}
     return text, report
