@@ -132,6 +132,14 @@ fresh volume has nothing to clone - `deployment doctor` refuses that runtime
 rather than letting the first boot discover it. A private repository also needs
 `GIT_DEPLOY_KEY_B64`. `AGENT_REPO_BRANCH` defaults to `main`.
 
+The declared repository wins over the remote the body was cloned from. On every
+boot of a populated body, when `AGENT_REPO_URL` is set and differs from the
+checkout's `origin`, the entrypoint points `origin` at it before the boot sync
+pass and logs that it did, so a box whose source moved follows it on its next
+deploy; the body's content and its own commits stay as they are, and the sync
+pass rebases them onto the new branch. A matching or unset `AGENT_REPO_URL`
+changes nothing.
+
 The repository is still needed wherever the image is built: the Compose build
 context is the project, even though the running container clones its own copy.
 What the checkout profile removes is the project from the *image*, not from the

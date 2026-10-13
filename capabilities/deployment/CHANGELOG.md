@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-13 — A checkout node follows its declared repository on boot
+
+On the `agent-box-checkout` profile, a boot whose body is already populated now points the checkout's `origin` at `AGENT_REPO_URL` when it is set and differs, before the boot sync pass, and logs `origin now <url>`. A node moved to a GitHub body source therefore pulls and pushes GitHub from its first boot after the deploy, rather than the server repository it was first cloned from. The body's content and its own commits are untouched, and a matching or unset `AGENT_REPO_URL` changes nothing.
+
 ## 2026-10-13 — A container node can keep the tools it installs and updates
 
 `compiler.container.persistent_manager: true` in `deployment/runtime.json`, on `agent-box` or `agent-box-checkout`, compiles the capabilities manager's whole writable home onto named volumes that every container the image runs mounts: `capabilities_registry` (`~/.capabilities`), `capabilities_bin` (`~/.capabilities-bin`), `capabilities_config` (`~/.config/capabilities`), `capabilities_state` (`~/.local/state/capabilities`), `capabilities_data` (`~/.local/share/capabilities`) and `capabilities_cache` (`~/.cache/capabilities`), one per directory the manager writes, so each rename it makes stays inside one volume. The Dockerfile sets `CAPABILITIES_BIN` to the launcher directory and puts it first on `PATH` in its own `ENV`, so the manager and the lock install there at build while the agent CLIs keep their links in the image, and the entrypoint installs at boot each capability the lock names and the registry lacks, leaving installed ones as they are. A redeploy then no longer upgrades a capability the node already has; the node keeps its tools current through its own updates and releases. Setting the option to `false` or removing it takes back exactly the volumes it added. A runtime that never declares it compiles exactly as before.

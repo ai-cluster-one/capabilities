@@ -461,3 +461,75 @@ def test_a_failing_pass_keeps_the_supervised_program_alive(tmp_path: Path) -> No
     assert output.count("FATAL: rebasing onto origin/main conflicts") >= 2, output
     # And at the interval it was told, not as fast as it can fetch.
     assert output.count("FATAL: rebasing onto origin/main conflicts") <= 8, output
+
+
+def _checkout_block(root: Path, app: Path) -> str:
+    """The compiled boot path from the project checkout up to the sync pass."""
+    entrypoint = (root / BUNDLE / "entrypoint.sh").read_text()
+    start = entrypoint.index("APP=/app\n")
+    end = entrypoint.index('cd "$APP"\n', start) + len('cd "$APP"\n')
+    return "set -euo pipefail\n" + entrypoint[start:end].replace("APP=/app\n", f"APP={app}\n", 1)
+
+
+def _populated_body(tmp_path: Path) -> tuple[Path, Path, Path]:
+    old, new = tmp_path / "old.git", tmp_path / "new.git"
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(seed)], check=True, env=GIT_ENV)
+    (seed / "notes.md").write_text("base\n")
+    subprocess.run(["git", "-C", str(seed), "add", "."], check=True, env=GIT_ENV)
+    subprocess.run(["git", "-C", str(seed), "commit", "-qm", "base"], check=True, env=GIT_ENV)
+    for bare in (old, new):
+        subprocess.run(["git", "clone", "-q", "--bare", str(seed), str(bare)], check=True, env=GIT_ENV)
+    app = tmp_path / "app"
+    subprocess.run(["git", "clone", "-q", str(old), str(app)], check=True, env=GIT_ENV)
+    # The body's own work, committed and not: neither may be touched.
+    (app / "notes.md").write_text("base\nlocal commit\n")
+    subprocess.run(["git", "-C", str(app), "commit", "-qam", "local"], check=True, env=GIT_ENV)
+    (app / "notes.md").write_text("base\nlocal commit\nuncommitted\n")
+    return app, old, new
+
+
+def _boot(root: Path, tmp_path: Path, app: Path, url: str | None) -> subprocess.CompletedProcess[str]:
+    env = {**GIT_ENV, "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig")}
+    env.pop("AGENT_REPO_URL", None)
+    if url is not None:
+        env["AGENT_REPO_URL"] = url
+    return subprocess.run(["bash", "-c", _checkout_block(root, app)], env=env,
+                          capture_output=True, text=True)
+
+
+def _origin(app: Path) -> str:
+    return subprocess.run(["git", "-C", str(app), "config", "--get", "remote.origin.url"],
+                          capture_output=True, text=True, env=GIT_ENV).stdout.strip()
+
+
+def test_a_populated_body_follows_the_declared_repository_on_boot(tmp_path: Path) -> None:
+    root, env = _project(tmp_path)
+    _setup(root, env, "agent-box-checkout")
+    entrypoint = (root / BUNDLE / "entrypoint.sh").read_text()
+    # Repointed before the boot sync pass takes anything in.
+    assert entrypoint.index("remote set-url origin") < entrypoint.index("/opt/agent/" + SYNC_PROGRAM)
+    app, old, new = _populated_body(tmp_path)
+    head = subprocess.run(["git", "-C", str(app), "rev-parse", "HEAD"], capture_output=True,
+                          text=True, check=True).stdout
+    boot = _boot(root, tmp_path, app, str(new))
+    assert boot.returncode == 0, boot.stderr
+    assert _origin(app) == str(new)
+    assert f"[entrypoint] origin now {new}" in boot.stdout
+    assert str(old) not in boot.stdout + boot.stderr
+    assert subprocess.run(["git", "-C", str(app), "rev-parse", "HEAD"], capture_output=True,
+                          text=True, check=True).stdout == head
+    assert (app / "notes.md").read_text() == "base\nlocal commit\nuncommitted\n"
+
+
+def test_a_body_already_on_the_declared_repository_is_left_alone(tmp_path: Path) -> None:
+    root, env = _project(tmp_path)
+    _setup(root, env, "agent-box-checkout")
+    app, old, _new = _populated_body(tmp_path)
+    for url in (str(old), None):
+        boot = _boot(root, tmp_path, app, url)
+        assert boot.returncode == 0, boot.stderr
+        assert _origin(app) == str(old)
+        assert boot.stdout.splitlines() == [line for line in boot.stdout.splitlines()
+                                            if line.startswith("[entrypoint] checkout present at ")]
+        assert len(boot.stdout.splitlines()) == 1 and boot.stderr == ""

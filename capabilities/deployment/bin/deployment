@@ -4002,6 +4002,18 @@ git config --global --add safe.directory "$APP"
 
 if [ -d "$APP/.git" ]; then
   echo "[entrypoint] checkout present at $APP on $(git -C "$APP" rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached), $(git -C "$APP" rev-parse --short HEAD 2>/dev/null || echo 'no commit')"
+  # The declared repository wins over the remote the body was first cloned
+  # from: a box whose source moved follows it on its next boot, and the sync
+  # pass below rebases the body's own commits onto the new branch.
+  origin="$(git -C "$APP" config --get remote.origin.url 2>/dev/null || true)"
+  if [ -n "${__URL__:-}" ] && [ "$origin" != "${__URL__}" ]; then
+    if [ -n "$origin" ]; then
+      git -C "$APP" remote set-url origin "${__URL__}"
+    else
+      git -C "$APP" remote add origin "${__URL__}"
+    fi
+    echo "[entrypoint] origin now ${__URL__}, the declared repository, instead of the remote this body was cloned from"
+  fi
 elif [ -z "$(find "$APP" -mindepth 1 -type f -print -quit 2>/dev/null)" ]; then
   if [ -z "${__URL__:-}" ]; then
     echo "[entrypoint] FATAL: $APP carries no checkout and __URL__ is unset; nothing to clone" >&2
