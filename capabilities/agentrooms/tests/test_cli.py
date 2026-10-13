@@ -416,8 +416,8 @@ Keep the lab tidy.
 
 
 @needs_store
-def test_workers_are_saved_as_versions_and_bound_on_the_connection(cli, project, stored, capsys,
-                                                                    tmp_path):
+def test_workers_are_saved_as_versions_and_bound_in_the_projects_settings(cli, project, stored,
+                                                                          capsys, tmp_path):
     connect(project, allow_write=True)
     doc = tmp_path / "lab.md"
     doc.write_text(ROLE)
@@ -449,9 +449,13 @@ def test_workers_are_saved_as_versions_and_bound_on_the_connection(cli, project,
     assert out["rooms"] == {"!lab:example.org": "lab"}
     code, out, _err = run(cli, capsys, "workers", "supervisor", "@boss:example.org")
     assert out["supervisor"] == "@boss:example.org"
+    settings = json.loads((project / "capabilities" / "agentrooms" / "service"
+                           / "settings.json").read_text())
+    assert settings["binding.alpha"] == {"worker": "lab", "rooms": {"!lab:example.org": "lab"},
+                                         "supervisor": "@boss:example.org"}
     entry = json.loads((project / "capabilities" / "agentrooms" / "connections.json").read_text())
     alpha = entry["connections"]["alpha"]
-    assert alpha["worker"] == "lab" and alpha["supervisor"] == "@boss:example.org"
+    assert "worker" not in alpha and "supervisor" not in alpha
     assert alpha["allow_write"] is True and alpha["secret_env"] == "AGENTROOMS_ALPHA_TOKEN"
     code, out, _err = run(cli, capsys, "workers", "list")
     names = {w["worker"]: w for w in out["workers"]}
@@ -484,13 +488,68 @@ def test_an_agents_map_moves_into_a_bound_worker_that_admits_everyone(cli, proje
     assert out["moved"] == {"alpha": "alpha"} and out["dropped"] == ["gone"]
     assert settings.is_file() and out["applied"] is False
     code, out, err = run(cli, capsys, "workers", "import", "--apply")
-    assert code == 0 and out["removed"] == str(settings), err
-    assert not settings.exists()
+    assert code == 0 and "removed" not in out, err
+    assert json.loads(settings.read_text()) == {"version": 1, "binding.alpha": {"worker": "alpha"}}
     code, out, _err = run(cli, capsys, "workers", "show", "alpha")
     assert out["spec"]["accepts_from"] == ["*"] and out["spec"]["history"] == 20
     assert out["spec"]["limits"] == {"turn_timeout": 600}
-    entry = json.loads((project / "capabilities" / "agentrooms" / "connections.json").read_text())
-    assert entry["connections"]["alpha"]["worker"] == "alpha"
+
+
+@needs_store
+def test_a_binding_an_earlier_release_left_on_the_connection_holds_and_moves_at_the_next_write(
+        cli, project, stored, capsys, tmp_path):
+    connect(project, allow_write=True)
+    path = project / "capabilities" / "agentrooms" / "connections.json"
+    entry = json.loads(path.read_text())
+    entry["connections"]["alpha"].update(worker="lab", supervisor="@boss:example.org")
+    path.write_text(json.dumps(entry))
+    doc = tmp_path / "lab.md"
+    doc.write_text(ROLE)
+    run(cli, capsys, "workers", "save", "lab", str(doc))
+    code, out, _err = run(cli, capsys, "workers", "list")
+    assert out["bindings"]["alpha"]["worker"] == "lab"
+    assert out["bindings"]["alpha"]["supervisor"] == "@boss:example.org"
+    code, out, err = run(cli, capsys, "workers", "bind", "lab", "--room", "!lab:example.org")
+    assert code == 0 and out["worker"] == "lab", err
+    alpha = json.loads(path.read_text())["connections"]["alpha"]
+    assert "worker" not in alpha and "supervisor" not in alpha and alpha["allow_write"] is True
+    settings = json.loads((project / "capabilities" / "agentrooms" / "service"
+                           / "settings.json").read_text())
+    assert settings["binding.alpha"] == {"worker": "lab", "rooms": {"!lab:example.org": "lab"},
+                                         "supervisor": "@boss:example.org"}
+
+
+@needs_store
+def test_a_connection_held_in_the_store_is_bound_in_this_projects_settings(cli, project, stored,
+                                                                           capsys, tmp_path):
+    identity = project / "capabilities" / "project.json"
+    identity.write_text(json.dumps({"id": "prj_test", "slug": "project", "connections": "store"}))
+    (project / ".env.local").write_text(f"AGENTROOMS_ALPHA_TOKEN={TOKEN}\n")
+    records = cli._records()
+    records.set("agentrooms", "connection", "alpha", {
+        "homeserver": HS, "user_id": f"@alpha:{SERVER}", "secret_env": "AGENTROOMS_ALPHA_TOKEN"})
+    records.set("agentrooms", "grant", "alpha", {"enabled": True, "allow_write": True})
+    doc = tmp_path / "lab.md"
+    doc.write_text(ROLE)
+    code, _out, err = run(cli, capsys, "workers", "save", "lab", str(doc))
+    assert code == 0, err
+    code, out, err = run(cli, capsys, "--connection", "alpha", "workers", "bind", "lab")
+    assert code == 0 and out["worker"] == "lab", err
+    code, out, _err = run(cli, capsys, "workers", "supervisor", "@boss:example.org")
+    assert out["supervisor"] == "@boss:example.org"
+    settings = json.loads((project / "capabilities" / "agentrooms" / "service"
+                           / "settings.json").read_text())
+    assert settings["binding.alpha"] == {"worker": "lab", "supervisor": "@boss:example.org"}
+    cli._RECORDS = None
+    spec = cli._records().resolve("agentrooms", "connection")["alpha"]["value"]
+    assert "worker" not in spec and "supervisor" not in spec
+    code, out, _err = run(cli, capsys, "workers", "list")
+    assert out["bindings"]["alpha"]["worker"] == "lab"
+    code, out, _err = run(cli, capsys, "workers", "unbind")
+    assert code == 0 and out["worker"] is None
+    code, out, _err = run(cli, capsys, "workers", "list")
+    assert out["bindings"]["alpha"]["worker"] is None
+    assert out["bindings"]["alpha"]["supervisor"] == "@boss:example.org"
 
 
 # ── a person's connection, the stream, owners, sessions ──────────────────────

@@ -235,19 +235,20 @@ COMMANDS
     workers bind NAME [--room ROOM]
         Bind the worker to the selected connection's agent, or, with --room,
         to that agent in that room only, overriding the agent's. NAME must
-        have an active version. Writes the connection's `worker` or
-        `rooms.<room id>` key.
+        have an active version. Writes `worker` or `rooms.<room id>` in the
+        project's `binding.<connection>` setting, in service/settings.json,
+        whether the connection is declared in files or held in the store.
     workers unbind [--room ROOM]
         Take the agent's binding off, or the room's.
     workers supervisor [USER_ID] [--clear]
         The selected agent's supervisor - the address the default worker
         names to a sender it does not admit: show it, set it, or clear it.
-        Writes the connection's `supervisor` key.
+        Writes `supervisor` in the project's `binding.<connection>` setting.
     workers import [--apply]
         Move a project's service/settings.json agents map into workers: one
         worker per listed connection, named after it, with its profile,
         turn_timeout and history, admitting every sender as the map did,
-        bound on the connection; the map is then removed. Without --apply,
+        bound in the project's settings; the map is then removed. Without --apply,
         says what it would do. The service does this itself when it takes up
         a project that still carries the map.
   save, remove, bind, unbind, supervisor and import --apply are refused
@@ -4500,8 +4501,9 @@ def cmd_turn(wanted: str | None, event_id: str):
 
 MACHINE_KEYS = ("version", "max_turns")
 DEFAULT_MAX_TURNS = 2
-# What a connection carries beyond its identity: the worker bound to the agent,
-# the workers bound to it per room, and its supervisor's address.
+# What binds an agent, kept in the project's `binding.<connection>` setting: the
+# worker bound to the agent, the workers bound to it per room, and its
+# supervisor's address. An earlier release kept them on the connection.
 BINDING_KEYS = ("worker", "rooms", "supervisor")
 _PROJECT_POINTERS = ("CLAUDE_PROJECT_DIR", "CAPABILITIES_PROJECT_ID",
                      "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_PROJECT_ENVELOPE",
@@ -5031,7 +5033,10 @@ class _Host:
 
         def question():
             found = (_connections_composed().get("connections") or {}).get(cid) or {}
-            return {key: found.get(key) for key in BINDING_KEYS}
+            try:
+                return _binding_of(cid, found, _binding_settings())
+            except StoreError as exc:
+                raise _Refusal(6, exc.slug, exc.message, exc.hint) from None
 
         with self.lock:
             return _ask_in_project(root, question)
@@ -5081,27 +5086,44 @@ def _worker_name_for(cid: str) -> str:
     return f"{name}-agent" if name == _engine().DEFAULT_WORKER else name
 
 
+def _binding_settings() -> dict:
+    """This project's binding records, by setting key. Raises StoreError."""
+    rows = _records().resolve_scope(NAME, "setting", "project")
+    return {key: row["value"] for key, row in rows.items() if key.startswith("binding.")}
+
+
+def _binding_of(cid: str, entry: dict | None, settings: dict) -> dict:
+    """What binds an agent: this project's `binding.<connection>` setting, else
+    the keys an earlier release wrote onto the connection itself."""
+    held = settings.get(f"binding.{cid}")
+    source = held if isinstance(held, dict) else (entry or {})
+    return {key: source.get(key) for key in BINDING_KEYS}
+
+
 def _write_binding(cid: str, changes: dict) -> tuple[dict, str]:
-    """Write binding keys onto a connection this project declares: a value of
-    None takes the key off. Raises _Refusal."""
+    """Write binding keys into this project's `binding.<connection>` setting: a
+    value of None takes the key off. A binding is the project's whichever scope
+    declares the connection, so it never lands on the connection; keys an
+    earlier release left on a connection this project declares are taken off
+    it. Raises _Refusal."""
     adapter = _records()
     try:
         ident = adapter.resolve(NAME, "connection").get(cid)
         if ident is None or not ident.get("value"):
             raise _Refusal(3, "unknown_connection", f"no connection {cid!r} is declared here")
-        if ident.get("scope") != "project":
-            raise _Refusal(6, "connection_not_in_project",
-                           f"connection {cid!r} is declared at the {ident.get('scope')} scope, "
-                           "and a binding is this project's",
-                           "declare the agent's connection in this project to bind its workers")
-        value = dict(ident["value"])
+        current = _binding_of(cid, ident["value"], _binding_settings())
+        value = {key: held for key, held in current.items() if held not in (None, {})}
         for key, wanted in changes.items():
             if wanted is None or wanted == {}:
                 value.pop(key, None)
             else:
                 value[key] = wanted
-        adapter.set(NAME, "connection", cid, value, scope="project")
-        return value, adapter.scope_source(NAME, "connection", "project")
+        adapter.set(NAME, "setting", f"binding.{cid}", value, scope="project")
+        if ident.get("scope") == "project" and set(ident["value"]) & set(BINDING_KEYS):
+            adapter.set(NAME, "connection", cid,
+                        {k: v for k, v in ident["value"].items() if k not in BINDING_KEYS},
+                        scope="project")
+        return value, adapter.scope_source(NAME, "setting", "project")
     except StoreError as e:
         raise _Refusal(4 if e.slug == "read_only_switch" else 6, e.slug, e.message,
                        e.hint) from None
@@ -5111,7 +5133,7 @@ def _import_agents_map(root: Path, apply: bool) -> dict | None:
     """Move an earlier release's service/settings.json agents map into workers:
     one worker per listed connection, named after it, with the profile,
     turn_timeout and history the map gave it, admitting every sender as the
-    service did, bound on the connection; then the map is taken out of the
+    service did, bound in the project's settings; then the map is taken out of the
     file, and the file removed when nothing else is left in it. A connection
     the project no longer declares is dropped. A connection that already binds
     a worker keeps it. None when there is no map."""
@@ -5122,6 +5144,7 @@ def _import_agents_map(root: Path, apply: bool) -> dict | None:
     path = _settings_path(root)
     try:
         identities = _records().resolve(NAME, "connection")
+        settings = _binding_settings()
     except StoreError as e:
         raise _Refusal(6, e.slug, e.message, e.hint) from None
     moves: dict = {}
@@ -5131,8 +5154,9 @@ def _import_agents_map(root: Path, apply: bool) -> dict | None:
         if ident is None or not ident.get("value"):
             dropped.append(cid)
             continue
-        if ident["value"].get("worker"):
-            moves[cid] = (ident["value"]["worker"], None)
+        bound = _binding_of(cid, ident["value"], settings)["worker"]
+        if bound:
+            moves[cid] = (bound, None)
             continue
         name = _worker_name_for(cid)
         spec = {"description": "Moved from service/settings.json: admits every sender, as the "
@@ -5204,10 +5228,17 @@ def _read_input(source: str) -> str:
 
 def _bindings() -> dict:
     conns = _inventory_connections().get("connections") or {}
-    return {cid: {"user_id": e.get("user_id"), "worker": e.get("worker"),
-                  "rooms": e.get("rooms") or {}, "supervisor": e.get("supervisor"),
-                  "granted": bool(e.get("granted")), "allow_write": bool(e.get("allow_write"))}
-            for cid, e in sorted(conns.items())}
+    try:
+        settings = _binding_settings()
+    except StoreError:
+        settings = {}
+    out = {}
+    for cid, e in sorted(conns.items()):
+        bound = _binding_of(cid, e, settings)
+        out[cid] = {"user_id": e.get("user_id"), "worker": bound["worker"],
+                    "rooms": bound["rooms"] or {}, "supervisor": bound["supervisor"],
+                    "granted": bool(e.get("granted")), "allow_write": bool(e.get("allow_write"))}
+    return out
 
 
 def cmd_workers(args, wanted: str | None) -> None:
@@ -5311,6 +5342,10 @@ def _cmd_binding(args, wanted: str | None) -> dict:
     reg, _ = _connections_registry()
     cid, entry = _select_connection(reg, wanted)
     entry = entry or {}
+    try:
+        bound = _binding_of(cid, entry, _binding_settings())
+    except StoreError as e:
+        raise _Refusal(6, e.slug, e.message, e.hint) from None
     room_id = None
     if getattr(args, "room", None):
         room_id = args.room
@@ -5321,14 +5356,14 @@ def _cmd_binding(args, wanted: str | None) -> dict:
     if args.action == "supervisor":
         if not args.user_id and not args.clear:
             return {"connection": cid, "user_id": entry.get("user_id"),
-                    "supervisor": entry.get("supervisor")}
+                    "supervisor": bound["supervisor"]}
         if args.user_id and args.clear:
             raise _Refusal(6, "input", "supervisor takes a user id or --clear, not both")
         if args.user_id and not USER_RE.fullmatch(args.user_id):
             raise _Refusal(6, "input", f"{args.user_id!r} is not a Matrix user id (@name:server)")
         value, where = _write_binding(cid, {"supervisor": None if args.clear else args.user_id})
         return {"connection": cid, "supervisor": value.get("supervisor"), "registry": where}
-    rooms = dict(entry.get("rooms") or {}) if isinstance(entry.get("rooms"), dict) else {}
+    rooms = dict(bound["rooms"]) if isinstance(bound["rooms"], dict) else {}
     if args.action == "bind":
         if args.name == engine.DEFAULT_WORKER:
             raise _Refusal(6, "input", f"`{engine.DEFAULT_WORKER}` answers every agent no worker "
@@ -5353,7 +5388,7 @@ def _cmd_binding(args, wanted: str | None) -> dict:
                         "reason": "no worker is bound to this agent in that room"}
             changes = {"rooms": rooms}
         else:
-            if not entry.get("worker"):
+            if not bound["worker"]:
                 return {"connection": cid, "unbound": False,
                         "reason": "no worker is bound to this agent"}
             changes = {"worker": None}
@@ -5838,6 +5873,7 @@ def _inventory(_network: bool) -> dict:
     conns = (_inventory_connections().get("connections") or {})
     root = _project_root()
     served = sorted(cid for cid, e in conns.items() if e.get("granted") and e.get("allow_write"))
+    bindings = _bindings()
     items = []
     for cid, entry in sorted(conns.items()):
         items.append({"group": "agents", "name": cid, "state": "granted" if entry.get("granted")
@@ -5845,7 +5881,8 @@ def _inventory(_network: bool) -> dict:
                       "attributes": [{"label": "homeserver", "value": entry.get("homeserver")},
                                      {"label": "writes", "value": bool(entry.get("allow_write"))},
                                      {"label": "served", "value": cid in served},
-                                     {"label": "worker", "value": entry.get("worker")}]})
+                                     {"label": "worker",
+                                      "value": (bindings.get(cid) or {}).get("worker")}]})
     service: dict = {"state": "stopped"}
     try:
         identity = json.loads((_project_capabilities_dir(root) / "project.json").read_text()) \

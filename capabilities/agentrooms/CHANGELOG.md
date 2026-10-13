@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-13 — A worker binds to an agent whose connection is held in the store
+
+`agentrooms workers bind|unbind|supervisor` now write the agent's binding - `worker`, `rooms`, `supervisor` - into the project's `binding.<connection>` setting in `capabilities/agentrooms/service/settings.json`, and the service reads it from there. A project whose connections are held in the store could not bind at all: the binding was written onto the connection, which the store shares between projects, and was refused as `connection_not_in_project`. A binding an earlier release wrote onto a connection the project declares still holds, and the next bind, unbind or supervisor write moves it into the setting and takes it off the connection. Moving an agents map into workers binds each worker the same way, so the settings file stays, holding the bindings.
+
 ## 2026-10-13 — Sessions and leases are held under the node's declared name
 
 The node the service records its sessions and leases under is the node's name as the contract gives it: the value of `AGENT_NODE_NAME` where the machine declares one, and its host name as before where it declares none. A container node that declares its name holds the same leases after a redeploy, when its host name, the container id, changes.
