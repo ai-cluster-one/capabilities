@@ -49,6 +49,11 @@ CALL_GROUP_MODES = {
 CALL_USER_MODES = {"disabled", "off", "enabled", "auto", "on"}
 CONTROL_COMMANDS = {"status", "set", "reload", "stop", "help", "*"}
 CONTEXT_MODES = {"extend", "exclusive"}
+# The mechanical triggers a group may switch off one by one, and the modes of
+# its reply gate: `shadow` decides and logs, `live` acts.
+GROUP_TRIGGERS = {"username", "alias", "reply"}
+GATE_MODES = {"shadow", "live"}
+GATE_HARNESSES = {"claude", "codex"}
 # What becomes of work a restart interrupted: kept for inspection, or
 # queued as a fresh attempt.
 JOB_RECOVERY = {"inspect", "requeue"}
@@ -414,7 +419,7 @@ def _group(value, path, project_root, service_dir):
         "voice_transcription", "call_recording", "delegation",
         "control", "authority",
         "allowed_capabilities", "capabilities", "context", "context_file",
-        "context_mode", "project", "topics",
+        "context_mode", "project", "topics", "triggers", "gate",
     }
     _unknown(value, allowed, path)
     for key in ("name", "role", "member_role"):
@@ -468,7 +473,59 @@ def _group(value, path, project_root, service_dir):
         _route_project(value["project"], f"{path}.project")
     if "topics" in value:
         _topics(value["topics"], f"{path}.topics", project_root, service_dir)
+    if "triggers" in value:
+        _triggers(value["triggers"], f"{path}.triggers")
+    if "gate" in value:
+        _gate(value["gate"], f"{path}.gate")
     _overlay(value, path, project_root, service_dir)
+
+
+def _triggers(value, path):
+    """Which mechanical triggers start a turn in this group. Absent, all three
+    do; an empty list switches every one off, which leaves the group to the
+    gate, a command and `require_reference: false`."""
+    if not isinstance(value, list):
+        _fail(path, "must be a JSON array")
+    for index, item in enumerate(value):
+        _enum(item, GROUP_TRIGGERS, f"{path}[{index}]")
+    if len(set(value)) != len(value):
+        _fail(path, "must not name a trigger twice")
+
+
+def _per_harness(value, path):
+    """A gate `model` or `effort`: one value for whichever harness the channel
+    runs, or one per harness. Neither chooses the harness."""
+    if isinstance(value, dict):
+        _unknown(value, GATE_HARNESSES, path)
+        for harness, item in value.items():
+            _string(item, f"{path}.{harness}", nonempty=True)
+        return
+    _string(value, path, nonempty=True)
+
+
+def _gate(value, path):
+    """The reply gate of one group: off unless `enabled`, `shadow` unless a
+    mode is named."""
+    value = _object(value, path)
+    _unknown(value, {"enabled", "mode", "brief", "context_messages", "context_chars",
+                     "max_batch", "model", "effort"}, path)
+    if "enabled" in value:
+        _boolean(value["enabled"], f"{path}.enabled")
+    if "mode" in value:
+        _enum(value["mode"], GATE_MODES, f"{path}.mode")
+    if "brief" in value:
+        _string(value["brief"], f"{path}.brief")
+        if len(value["brief"]) > 2000:
+            _fail(f"{path}.brief", "must be at most 2000 characters")
+    if "context_messages" in value:
+        _number(value["context_messages"], f"{path}.context_messages", 0, 100, integer=True)
+    if "context_chars" in value:
+        _number(value["context_chars"], f"{path}.context_chars", 0, 20000, integer=True)
+    if "max_batch" in value:
+        _number(value["max_batch"], f"{path}.max_batch", 1, 100, integer=True)
+    for key in ("model", "effort"):
+        if key in value:
+            _per_harness(value[key], f"{path}.{key}")
 
 
 def _delegation(value, path):

@@ -146,6 +146,7 @@ from call_recording_helpers import (
     trailing_silence_start,
     write_metadata,
 )
+import gate as reply_gate
 import jobs
 import profiles
 import voice_agent
@@ -2792,13 +2793,27 @@ def _message_kind(message):
 
 
 def _text_names_me(text, me, policy):
+    """Whether the text names the account by a trigger the group leaves on:
+    its @username under `username`, a configured alias under `alias`."""
     if not text:
         return False
+    on = reply_gate.triggers(policy)
     username = getattr(me, "username", None)
-    if username and re.search(rf"(?iu)(?<![\w@])@{re.escape(username)}(?!\w)", text):
+    if ("username" in on and username
+            and re.search(rf"(?iu)(?<![\w@])@{re.escape(username)}(?!\w)", text)):
         return True
-    for alias in _group_aliases(policy):
-        if re.search(rf"(?iu)(?<!\w){re.escape(alias)}(?!\w)", text):
+    if "alias" in on:
+        for alias in _group_aliases(policy):
+            if re.search(rf"(?iu)(?<!\w){re.escape(alias)}(?!\w)", text):
+                return True
+    return False
+
+
+def _entity_mentions_me(message, me):
+    """Whether the message mentions the account by a mention entity: one that
+    names the account's id, which a person without a @username is mentioned by."""
+    for entity in getattr(message, "entities", None) or ():
+        if getattr(entity, "user_id", None) == getattr(me, "id", object()):
             return True
     return False
 
@@ -2842,15 +2857,37 @@ async def _message_addresses_me(message, me, policy):
     if (_call_recording_mode(policy) == "on_request"
             and _command_name(_message_text(message)) == "/record"):
         return True
-    if getattr(message, "mentioned", False):
+    on = reply_gate.triggers(policy)
+    # Telegram also raises the mention flag on a reply to the account's own
+    # message, so with the reply trigger off the flag counts for `username`
+    # only where the message is not such a reply, or mentions the account
+    # outright.
+    if "username" in on and getattr(message, "mentioned", False) and (
+            "reply" in on or _entity_mentions_me(message, me)
+            or not await _reply_is_to_me(message, me)):
         return True
     if _text_names_me(_message_text(message), me, policy):
         return True
     # A reply is transport context, not an implicit invocation, for another
     # configured agent. It must name or mention Marvin explicitly above.
-    if agent_sender:
+    if agent_sender or "reply" not in on:
         return False
     return await _reply_is_to_me(message, me)
+
+
+def _gate_candidate(message, policy):
+    """Whether a group message no trigger admitted goes to the group's reply
+    gate: the gate is on, and the doors a mechanical trigger passes would pass
+    it too - it carries no #noreply, its sender may address the account, is
+    no configured agent, and it is no command. Agent exchange stays under its
+    own cap."""
+    if reply_gate.settings(policy) is None or getattr(message, "out", False):
+        return False
+    text = _message_text(message)
+    sender_id = getattr(message, "sender_id", None)
+    return not (_marker_line(text, NO_REPLY_MARKER) or text.startswith("/")
+                or not _may_address(sender_id, policy)
+                or _is_agent_member(sender_id, policy))
 
 
 async def _event_access(event, me, reg):
@@ -2875,6 +2912,9 @@ async def _event_access(event, me, reg):
     if (_is_voice_or_video_note(event.message)
             and _voice_transcription_mode(policy, reg, key) == "auto"):
         return {"kind": "group", "group_key": group_key, "policy": policy, "addressed": False, "ambient_voice": True}
+    if _gate_candidate(event.message, policy):
+        return {"kind": "group", "group_key": group_key, "policy": policy, "addressed": False,
+                "gate": True}
     return None
 
 
@@ -4082,6 +4122,18 @@ def _channel_context(policies):
     return "\n\n".join(parts).strip(), exclusive
 
 
+def _woken_by_gate(st):
+    """The line a turn the reply gate woke is told, or None: nobody addressed
+    it, so staying silent or reacting is as good an answer as a reply."""
+    woke = st.get("gate")
+    if not isinstance(woke, dict):
+        return None
+    reason = str(woke.get("reason") or "").strip() or "no reason given"
+    return ("Woken by: the reply gate, not by an address. Its reason: "
+            f"{reason} An empty final answer (silence) or a reaction on the request "
+            "message is as valid an answer here as a reply.")
+
+
 def resumed_prompt(st, tail=None):
     """The next turn inside a thread the worker is already holding.
 
@@ -4103,6 +4155,8 @@ def resumed_prompt(st, tail=None):
         lines.append(f"Time: {st['now']}")
     if req.get("delivery"):
         lines.append(f"Delivery: {req['delivery']}")
+    if _woken_by_gate(st):
+        lines.append(_woken_by_gate(st))
     if lines:
         lines.append("")
     lines.append(req.get("text") or "")
@@ -4243,6 +4297,8 @@ def build_prompt(tail, state=None):
         lines.append(f'Jobs command: {WORKER_BIN / "telegram"} jobs')
     if st.get("quota_pause"):
         lines.append(f"Queue paused: {st['quota_pause']}")
+    if _woken_by_gate(st):
+        lines.append(_woken_by_gate(st))
     block = ("--- Channel state ---\n" + "\n".join(lines) + "\n\n") if lines else ""
     request_block = ""
     if req:
@@ -4966,6 +5022,98 @@ def harness_meta(result):
                        "cache_read": tokens.cache_read, "cache_write": tokens.cache_creation},
             "cost_usd": result.cost_usd, "duration_ms": result.duration_ms,
             "session_id": result.session_id}
+
+
+# --- The reply gate's run ----------------------------------------------------
+#
+# What a gate run needs of the machine: a profile on the channel's vendor, an
+# empty directory to start in, and on codex a codex home of its own. The batch,
+# the decision and acting on it live in the session (`run_session`), beside the
+# client; the rules are `gate.py`'s.
+
+GATE_RUN_DIR = SERVICE_STATE_DIR / "gate"
+# The environment name that places the gate's codex home elsewhere, for a
+# deployment that keeps logins on a volume of their own.
+GATE_CODEX_HOME_ENV = "TELEGRAM_GATE_CODEX_HOME"
+
+
+def gate_codex_home():
+    """The codex home a codex gate run reads instead of the user's, so the
+    user's codex settings, MCP servers, plugins, skills and instructions stay
+    out of it. One per machine, shared by every telegram service on it, so one
+    login serves them all; it has none until an operator runs `codex login`
+    with CODEX_HOME set to it, and until then a codex gate run fails
+    `not_authenticated`."""
+    named = str(os.environ.get(GATE_CODEX_HOME_ENV) or "").strip()
+    return Path(named).expanduser() if named else STATE_HOME / "telegram" / "gate-codex-home"
+
+
+def resolve_gate_profile(harness, gate_settings):
+    """The gate profile for a channel on `harness`, resolved as every telegram
+    profile is and with the group's `gate.model` and `gate.effort` laid over
+    it, or WorkerProfileRefused naming it and why it cannot carry a gate run."""
+    name = reply_gate.profile_name(harness)
+    if name is None:
+        return WorkerProfileRefused(f"the reply gate has no profile for harness {harness!r}")
+    active, project = turn_profiles()
+    try:
+        found = profiles.resolve(name, active, project, fit=False)
+    except profiles.Refusal as refused:
+        return WorkerProfileRefused(refused.message)
+    knobs = {**found["knobs"], **reply_gate.overlay(gate_settings, harness)}
+    problems = reply_gate.fit_problems(knobs)
+    if knobs.get("harness") != harness:
+        problems.insert(0, f"it runs {knobs.get('harness')!r}, and the gate runs on the "
+                           f"channel's harness, {harness!r}")
+    if problems:
+        return WorkerProfileRefused(f"profile {name!r} (layer {found['layer']}) does not fit "
+                                    "the reply gate: " + "; ".join(problems))
+    return {**found, "knobs": knobs}
+
+
+def gate_run(found, prompt, schema, channel_key):
+    """One gate run through the runner (`gate.run`), from an empty directory
+    under the service's state, on codex under the gate's codex home. Blocking;
+    the session runs it in an executor."""
+    return reply_gate.run(profiles.runner(), harness_run, found, prompt, schema,
+                          channel_key, run_root=GATE_RUN_DIR, codex_home=gate_codex_home(),
+                          environ=scrub_worker_env(os.environ))
+
+
+async def send_reaction(client, peer, message_id, emoji):
+    """Set one emoji reaction on a message through the daemon's own client."""
+    from telethon.tl.functions.messages import SendReactionRequest
+    from telethon.tl.types import ReactionEmoji
+    await client(SendReactionRequest(peer=peer, msg_id=int(message_id),
+                                     reaction=[ReactionEmoji(emoticon=emoji)]))
+
+
+async def chat_available_reactions(client, peer):
+    """What a chat allows as reactions: "all", a list of emoji, or None for
+    none. A chat that states nothing allows every standard reaction, which is
+    Telegram's own default for a group."""
+    from telethon.tl import functions, types
+    entity = await client.get_entity(peer)
+    if isinstance(entity, types.Channel):
+        full = await client(functions.channels.GetFullChannelRequest(entity))
+    else:
+        full = await client(functions.messages.GetFullChatRequest(entity.id))
+    available = getattr(full.full_chat, "available_reactions", None)
+    if available is None or isinstance(available, types.ChatReactionsAll):
+        return "all"
+    if isinstance(available, types.ChatReactionsSome):
+        return [one.emoticon for one in available.reactions
+                if isinstance(one, types.ReactionEmoji)]
+    return None
+
+
+def gate_sender_role(sender_id, group_policy):
+    """A sender's role as the gate reads it: the role a member or user entry
+    gives them, else `unknown`."""
+    sid = str(sender_id)
+    member = _member_policy(sid, group_policy)
+    return (member.get("role") or _as_mapping(ALLOWED.get(sid)).get("role")
+            or "unknown")
 
 
 def worker_harness(chat, tail, state=None, procs=None):
@@ -5916,6 +6064,9 @@ async def run_session(client):
     # way out: was I stopped, or did I break? A chat can have several runs going
     # at once, so a flag on the chat cannot tell one run's ending from another's.
     procs, stopping = {}, set()
+    # The reply gate's batches by channel key, the chats' allowed reactions as
+    # read once per chat, and every task a gate run or its typing holds.
+    gate_batches, gate_reactions, gate_tasks = {}, {}, set()
     closing = False
 
     def kill_worker_proc(key, reason):
@@ -6164,15 +6315,20 @@ async def run_session(client):
             key, outbox, ent_id, is_direct, reply_to, offset, throttle,
             mark=mark, delivered=delivered, handoff=handoff, window=window)
 
-    def reserve_job(key, message, group_policy, is_direct, reason, chat_id=None):
+    def reserve_job(key, message, group_policy, is_direct, reason, chat_id=None,
+                    past_watermark=False):
         """Persist ownership of a message before any transcription or other await.
 
         The preparing state is recovered as queued on startup. This reservation is the
         idempotency boundary for both live delivery and startup catch-up.
+
+        `past_watermark` is the reply gate's: it decides about a message after
+        later ones may have moved the channel's watermark past it, so only a
+        job already held for the message refuses it.
         """
         jobs = _job_map(reg, key)
         jid = _job_id(message.id)
-        if _message_is_known(reg, key, message.id):
+        if (jid in jobs) if past_watermark else _message_is_known(reg, key, message.id):
             return None
         sender_id = str(getattr(message, "sender_id", None))
         member = (group_policy or {}).get("members", {}).get(sender_id, {})
@@ -6461,7 +6617,8 @@ async def run_session(client):
                      "worker_session": worker_session,
                      "cancel_event": cancel_event,
                      "project_dir": project_dir,
-                     "proc_key": proc_key}
+                     "proc_key": proc_key,
+                     "gate": job.get("gate")}
             # Everything this job sends carries the tag, not only the final
             # answer: a progress line or an error notice naming the peer would
             # wake the daemon this exchange is trying to keep out of it.
@@ -6709,6 +6866,10 @@ async def run_session(client):
                 timers.pop(key, None)
         if closing:
             return
+        start_queue(key, ent_id)
+
+    def start_queue(key, ent_id):
+        """Start the channel's queue runner unless one is running."""
         existing = runners.get(key)
         if existing is not None and not existing.done():
             return
@@ -6733,6 +6894,267 @@ async def run_session(client):
         if key in timers:
             timers[key].cancel()
         timers[key] = asyncio.create_task(debounce(key, ent_id))
+
+    # --- The reply gate ------------------------------------------------------
+    #
+    # A gated group's unaddressed messages collect per channel key. The
+    # channel's debounce restarts on each; when it fires, one gate run takes
+    # the batch, and messages arriving while it runs form the next one. A
+    # batch at `max_batch` does not wait, and only its newest `max_batch`
+    # messages are read. Catch-up never offers a message here.
+
+    def gate_task(coro):
+        task = asyncio.create_task(coro)
+        gate_tasks.add(task)
+        task.add_done_callback(gate_tasks.discard)
+        return task
+
+    def gate_offer(key, ent_id, message, group_policy, transcript=None):
+        """Add an unaddressed message to its channel's gate batch."""
+        settings = reply_gate.settings(group_policy)
+        if settings is None:
+            return
+        batch = gate_batches.setdefault(
+            key, {"items": [], "timer": None, "running": False, "ent": ent_id})
+        batch["ent"] = ent_id
+        if any(item["message"].id == message.id for item in batch["items"]):
+            return
+        batch["items"].append({"message": message, "transcript": transcript})
+        log(f"{key}: gate batch +msg={message.id} ({len(batch['items'])} waiting)")
+        if not batch["running"]:
+            gate_arm(key, 0 if len(batch["items"]) >= settings["max_batch"]
+                     else channel_settings(reg, key)["debounce"])
+
+    def gate_arm(key, delay):
+        batch = gate_batches[key]
+        if batch["timer"] is not None:
+            batch["timer"].cancel()
+        batch["timer"] = gate_task(gate_wait(key, float(delay)))
+
+    async def gate_wait(key, delay):
+        current = asyncio.current_task()
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        finally:
+            batch = gate_batches.get(key)
+            if batch is not None and batch["timer"] is current:
+                batch["timer"] = None
+        await gate_fire(key)
+
+    async def gate_fire(key):
+        """Run the gate on the channel's batch, unless a run is in flight."""
+        batch = gate_batches.get(key)
+        if closing or batch is None or batch["running"] or not batch["items"]:
+            return
+        items, batch["items"] = batch["items"], []
+        batch["running"] = True
+        try:
+            await run_gate(key, batch["ent"], items)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log(f"{key}: gate run failed: {_short_error(exc)}")
+        finally:
+            batch["running"] = False
+            if batch["items"] and not closing:
+                _, policy = _group_policy(_channel_identity(key)[0])
+                settings = reply_gate.settings(policy) or {"max_batch": 1}
+                gate_arm(key, 0 if len(batch["items"]) >= settings["max_batch"]
+                         else channel_settings(reg, key)["debounce"])
+
+    async def gate_emoji(chat_id, ent_id):
+        """The emoji a gate run may choose for this chat: the standard set
+        narrowed to the chat's reactions, read once per chat. A chat whose
+        reactions cannot be read is offered none this time and asked again."""
+        if chat_id not in gate_reactions:
+            try:
+                gate_reactions[chat_id] = await chat_available_reactions(client, ent_id)
+            except Exception as exc:
+                log(f"{chat_id}: gate cannot read the chat's reactions: {_short_error(exc)}")
+                return []
+        return reply_gate.allowed_emoji(gate_reactions[chat_id])
+
+    async def gate_input(key, ent_id, group_policy, settings, items, emoji):
+        """What one gate run reads, built from the batch and the messages just
+        before it; never the turn's prompt, the project's context or a
+        channel's context file."""
+        _, topic_id = _channel_identity(key)
+        batch_ids = {item["message"].id for item in items}
+        limit = settings["context_messages"] + len(items) + 20
+        if topic_id is None:
+            raw = await client.get_messages(ent_id, limit=limit)
+        else:
+            try:
+                raw = await client.get_messages(ent_id, limit=limit, reply_to=int(topic_id))
+            except TypeError:
+                raw = await client.get_messages(ent_id, limit=limit * 4)
+        echo_senders = _voice_echo_senders(reg, key)
+        window = [m for m in reversed(raw or [])
+                  if (topic_id is None or _message_topic_id(m) == int(topic_id))
+                  and _tail_in_scope(m, group_policy) and m.id not in batch_ids]
+        by_id = {m.id: m for m in window}
+        by_id.update({item["message"].id: item["message"] for item in items})
+        names = {}
+
+        def own(m):
+            return bool(getattr(m, "out", False)) and str(m.id) not in echo_senders
+
+        async def row(m, transcript=None):
+            if own(m):
+                sender, role = ASSISTANT_NAME, "assistant"
+            elif getattr(m, "out", False):
+                sender, role = echo_senders.get(str(m.id)), "unknown"
+            else:
+                sid = str(getattr(m, "sender_id", None))
+                if sid not in names:
+                    names[sid] = (await _sender_profile(m, group_policy))["name"]
+                sender, role = names[sid], gate_sender_role(sid, group_policy)
+            reply_id = _reply_to_message_id(m)
+            target = by_id.get(reply_id)
+            if target is not None:
+                reply_to_you = own(target)
+            else:
+                reply_to_you = bool(reply_id) and await _reply_is_to_me(m, me)
+            kind = _message_kind(m)
+            text = transcript or (getattr(m, "text", None) or "")
+            if not transcript:
+                placeholder = reply_gate.media_placeholder(
+                    kind, photo=bool(getattr(m, "photo", False)))
+                text = f"{text}\n{placeholder}".strip() if placeholder else text
+            date, clock = _message_display_time(m)
+            return {"id": m.id, "sender": sender, "role": role,
+                    "time": f"{date} {clock}" if date else None, "reply_to": reply_id,
+                    "reply_to_you": reply_to_you, "text": text, "you": own(m)}
+
+        first = min(batch_ids)
+        lead = [await row(m) for m in window if m.id < first]
+        lead = reply_gate.lead_in_within(lead, settings["context_messages"],
+                                         settings["context_chars"])
+        batch = [await row(item["message"], item.get("transcript")) for item in items]
+        spoke = [m for m in window if own(m)]
+        last = getattr(spoke[-1], "date", None) if spoke else None
+        if isinstance(last, datetime) and last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        seen = lead + batch
+        facts = {"seconds_since_you_spoke": (
+                     round((datetime.now(timezone.utc) - last).total_seconds())
+                     if isinstance(last, datetime) else None),
+                 "your_messages_in_window": sum(1 for one in seen if one["you"]),
+                 "messages_in_window": len(seen)}
+        display = " ".join(part for part in (getattr(me, "first_name", None),
+                                             getattr(me, "last_name", None)) if part)
+        identity = {"name": display or ASSISTANT_NAME,
+                    "username": getattr(me, "username", None),
+                    "aliases": _group_aliases(group_policy),
+                    "brief": settings["brief"] or ASSISTANT_NAME}
+        return reply_gate.build_input(identity, batch, lead, facts, emoji)
+
+    async def run_gate(key, ent_id, items):
+        """One gate run on a batch: decide, act unless in shadow, and write the
+        run's one record."""
+        chat_id, _ = _channel_identity(key)
+        _, group_policy = _group_policy(chat_id)
+        settings = reply_gate.settings(group_policy)
+        if settings is None:
+            log(f"{key}: gate off since the batch formed; "
+                f"{len(items)} message(s) left unread")
+            return
+        items = items[-settings["max_batch"]:]
+        batch_ids = [item["message"].id for item in items]
+        started = time.monotonic()
+        s, turn_found = settings_on_profile(channel_settings(reg, key))
+        harness, model, tokens, error = s["worker"], None, None, None
+        emoji = await gate_emoji(chat_id, ent_id)
+        decision = None
+        if isinstance(turn_found, BaseException):
+            error = f"the channel's profile does not resolve: {turn_found}"
+        elif harness == STUB:
+            decision = reply_gate.parse_decision(dict(reply_gate.STUB_DECISION),
+                                                 batch_ids, emoji)
+        else:
+            found = resolve_gate_profile(harness, settings)
+            if isinstance(found, BaseException):
+                error = str(found)
+            else:
+                model = found["knobs"].get("model")
+                prompt = await gate_input(key, ent_id, group_policy, settings, items, emoji)
+                schema = reply_gate.decision_schema(batch_ids, emoji)
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None, gate_run, found, prompt, schema, key)
+                for warning in result.warnings:
+                    log(f"{key}: gate: {warning}")
+                model = result.model or model
+                tokens = harness_meta(result)["tokens"]
+                if result.ok:
+                    decision = reply_gate.parse_decision(
+                        result.structured if result.structured is not None
+                        else result.answer, batch_ids, emoji)
+                else:
+                    error = (f"{result.failure.kind}: "
+                             f"{str(result.failure.message or '')[:300]}")
+        if decision is None:
+            decision = {"action": "ignore", "target_message_id": None, "emoji": None,
+                        "reason": ""}
+        latency_ms = round((time.monotonic() - started) * 1000)
+        acted, outcome = await gate_act(key, ent_id, group_policy, settings, decision,
+                                        items)
+        record = reply_gate.record(
+            channel=key, batch_ids=batch_ids, harness=harness, model=model,
+            decision=decision, latency_ms=latency_ms, tokens=tokens,
+            mode=settings["mode"], acted=acted, error=error, outcome=outcome)
+        log(f"{key}: gate " + json.dumps(record, ensure_ascii=False))
+
+    async def gate_act(key, ent_id, group_policy, settings, decision, items):
+        """Act on a decision: `(acted, outcome)`. Shadow acts on nothing."""
+        action = decision["action"]
+        if action == "ignore":
+            return False, None
+        if settings["mode"] != "live":
+            return False, "shadow"
+        item = next(one for one in items
+                    if one["message"].id == decision["target_message_id"])
+        message = item["message"]
+        if action == "react":
+            try:
+                await send_reaction(client, ent_id, message.id, decision["emoji"])
+            except Exception as exc:
+                # A chat's limits decide; asking again would be refused again.
+                return False, f"reaction refused: {_short_error(exc)}"
+            return True, "reacted"
+        chat_id, _ = _channel_identity(key)
+        job = reserve_job(key, message, group_policy, False, "gate", chat_id=chat_id,
+                          past_watermark=True)
+        if job is None:
+            return False, "already queued or answered"
+        job["gate"] = {"reason": decision.get("reason") or "", "decided_at": now()}
+        if not await finalize_job(key, message, group_policy, False, "gate", job,
+                                  text_override=item.get("transcript")):
+            return False, "already queued or answered"
+        gate_task(hold_typing(key, ent_id, job))
+        start_queue(key, ent_id)
+        return True, "reply queued"
+
+    async def hold_typing(key, ent_id, job):
+        """Show the account typing from a gate's reply decision until the turn
+        has answered or stayed silent; the client renews the action while it
+        is held."""
+        s = channel_settings(reg, key)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(s["worker_timeout"]) + float(s["debounce"]) + 60
+        try:
+            async with client.action(ent_id, "typing"):
+                while not closing and loop.time() < deadline:
+                    current = _job_map(reg, key).get(_job_id(job.get("message_id")))
+                    if current is not job or job.get("status") not in IN_FLIGHT_STATES:
+                        break
+                    await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log(f"{key}: gate typing failed: {_short_error(exc)}")
 
     def stop_running(key):
         """/stop: abort this channel's in-flight workers and clear queued jobs.
@@ -7634,6 +8056,9 @@ async def run_session(client):
         if _message_is_known(reg, key, event.message.id):
             log(f"{key}: already queued/done msg={event.message.id}")
             return
+        if access.get("gate"):                            # unaddressed, gated — the batch decides
+            gate_offer(key, chat_ref, event.message, group_policy)
+            return
         if not is_direct and await handle_call_recording_request(
                 key, event.chat_id, event.message, group_policy, chat_ref):
             return
@@ -7708,6 +8133,10 @@ async def run_session(client):
             # Otherwise echo-only, no worker
             mark_job_finished(key, job, "done")
             log(f"{key}: ambient voice msg={event.message.id} transcribed; no worker dispatch")
+            if _gate_candidate(event.message, group_policy):
+                gate_offer(key, chat_ref, event.message, group_policy,
+                           transcript=(spoken if spoken and spoken !=
+                                       "[голосовое — не удалось расшифровать]" else None))
             return
         job = reserve_job(
             key, event.message, group_policy, is_direct, "live",
@@ -9711,7 +10140,7 @@ async def run_session(client):
             if not task.done():
                 task.cancel()
         await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-        pending_timers = list(timers.values())
+        pending_timers = list(timers.values()) + list(gate_tasks)
         for task in pending_timers:
             task.cancel()
         timers.clear()

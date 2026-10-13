@@ -239,7 +239,7 @@ or merged.
 ## Behavior
 
 - Direct messages are accepted according to `direct_messages.mode` and `allowed_users`.
-- Group messages are accepted only for `allowed_groups` and only when addressed by mention, reply, or configured alias unless the group policy sets `require_reference` to `false`.
+- Group messages are accepted only for `allowed_groups` and only when addressed by mention, reply, or configured alias unless the group policy sets `require_reference` to `false`. A group can switch each of those three triggers off and hand unaddressed messages to the reply gate; see The Reply Gate below.
 - Each addressed message becomes its own queued dialogue job, capped per channel by `max_parallel_dialogue`.
 - A Codex turn that exits successfully with `turn.completed` and an intentionally empty final answer completes silently: the job is marked done and nothing is posted to Telegram. An empty result without that protocol completion remains a worker error.
 - The worker tail is a compact Tallinn-time timeline. Forum-topic messages automatically use a topic-specific channel key and fetch/filter only that topic; interleaved topics never share a tail, watermark, debounce, retry, progress, or dialogue slot. Ordinary groups and direct chats keep whole-chat behavior. Each message keeps its Telegram id and in-window reply topology.
@@ -638,11 +638,79 @@ A tagged message stays in context. Suppression happens at the invocation gate, w
 
 `agent_dialogue.max_turns` is a runaway bound, not a way to arrange this. Its counter resets only when a non-agent writes, so in a room of two assistants and no humans it latches at the cap and the assistant falls permanently silent to its peer.
 
+## The Reply Gate
+
+A group message starts a turn mechanically: every message under `require_reference: false`, or one that triggers it. Each of the three mechanical triggers is switched on or off per group in `allowed_groups.<chat_id>.triggers`, a list of the ones that stay on:
+
+- `username` - Telegram's mention flag and the account's `@username` in the text;
+- `alias` - one of the group's `aliases` (or `defaults.group_aliases`);
+- `reply` - a Telegram reply to one of the account's messages.
+
+Without `triggers` all three are on, which is how every group was admitted before; `[]` switches all three off. Telegram also raises the mention flag on a reply to the account, so with `reply` off and `username` on, that flag counts only for a reply that also mentions the account. An unknown name, a repeated one or anything but a list is refused when the settings are read.
+
+The reply gate is one more trigger, independent of the three: a judgement of whether the conversation needs the assistant at all. It is switched on per group with a `gate` block:
+
+```json
+"gate": {
+  "enabled": true,
+  "mode": "shadow",
+  "brief": "Answers questions about the team's build and release tooling.",
+  "context_messages": 12,
+  "context_chars": 4000,
+  "max_batch": 10,
+  "model": "haiku",
+  "effort": "low"
+}
+```
+
+- `enabled` switches it on; without it the gate is off and nothing changes.
+- `mode` is `shadow` (decide and log, act on nothing) or `live` (act); a switched-on gate without a mode is `shadow`.
+- `brief` is a few sentences saying what the assistant is for in this group; without one the gate is told the assistant's name only.
+- `context_messages` (default 12, at most 100) is how many messages before the batch the gate reads, and `context_chars` (default 4000) caps their text together.
+- `max_batch` (default 10) bounds how many new messages one run reads.
+- `model` and `effort` override the gate profile's for whichever harness the channel runs, or name one per harness as `{"claude": "...", "codex": "..."}`. Neither chooses the harness.
+
+### What reaches the gate
+
+The existing doors stay first: `allowed_groups`, `#noreply`, `may_address`, the agent-dialogue cap and the commands. A message an enabled mechanical trigger admits starts a turn directly and never meets the gate. With the gate on, every other message from a sender who may address the assistant goes to the gate, except a configured agent's (`kind: "agent"`), which stays under its cap, and a command. Startup and periodic catch-up never run the gate: they admit mechanical triggers only, so a restart cannot make the assistant comment on old chatter.
+
+Messages collect per channel - a chat, or one forum topic - and the channel's `debounce` restarts on each. When it fires, one gate run reads the whole batch. At most one run per channel is in flight; what arrives meanwhile forms the next batch. A batch that reaches `max_batch` runs without waiting, and a run reads only its newest `max_batch` messages.
+
+The gate reads a document built for it and nothing else: the assistant's display name, `@username`, aliases and the brief; each new message with its id, sender, the sender's role from `members` or `allowed_users` (else `unknown`), time, the message it replies to and whether that is the assistant's, and its text, with `[photo]`, `[voice]` or `[file]` for media and a voice note's transcript only when ambient transcription already made one; the lead-in, with the assistant's own messages marked; how many seconds ago the assistant last spoke here and how many of the window's messages are its own; and the emoji it may react with - Telegram's standard reaction set narrowed to the chat's available reactions, read once per chat. It never reads `context.md`, a channel's context or the project's instructions.
+
+### What it decides
+
+The run's answer is held to a JSON schema: `action` (`ignore`, `react` or `reply`), `target_message_id` (a message of the batch), `emoji` (one of the allowed set, required for `react`) and `reason` (one sentence). An answer that does not parse, names a message outside the batch or an emoji outside the set, or a run that fails, is `ignore`, and the record says why.
+
+In `live` mode:
+
+- `ignore` is logged.
+- `react` sets the reaction on the target through the service's own client; no turn runs. A reaction the chat refuses is logged and not tried again.
+- `reply` queues a turn for the target exactly as a mechanical trigger would, on the channel's own profile, and tells the turn it was woken by the gate and why. The chat shows the account typing from the decision until the turn has answered or stayed silent. The turn may still stay silent or answer with a reaction: the shipped `context.md` says an empty final answer is silence and a valid outcome, and that a reaction is an answer for a turn the gate woke.
+
+In `shadow` mode nothing is acted on - no reaction, no turn, no typing - and every decision is logged, so a group's decisions can be read and judged before it goes `live`.
+
+Every run writes one line to the service log, `<channel>: gate {...}`, with `channel`, `batch` (the message ids), `harness`, `model`, `action`, `target`, `emoji`, `reason`, `latency_ms`, `tokens`, `mode`, `acted`, and where they apply `invalid`, `error` and `outcome`.
+
+### How the gate runs
+
+The gate runs on the vendor of the channel's resolved profile: a channel on a claude profile gates on `telegram-gate-claude` (`haiku`), one on a codex profile on `telegram-gate-codex` (the `luna` family), and a channel on `stub` gates on a stub decision that runs no harness. Both are bundled profiles at the lowest layer of the same resolution every telegram profile uses (see Harness Profiles); telegram never saves either. Each is one light turn: the gate's own system prompt in place of the coding agent's, the lowest effort, no tools, no settings files, hooks, skills or MCP servers, a single turn, the decision schema, and no session saved, so a run appears in neither harness's session list. The turn's fit refuses both, so `/set profile` never puts a room on one. Each run starts in an empty directory under the service's state, removed after, so no project file is in reach.
+
+A codex gate run reads a codex home of its own instead of the user's, so the user's codex settings, MCP servers, plugins, skills and instructions stay out of it: `$XDG_STATE_HOME/telegram/gate-codex-home` (`~/.local/state/telegram/gate-codex-home` when `XDG_STATE_HOME` is unset), one per machine for every telegram service on it, or the path in `TELEGRAM_GATE_CODEX_HOME`. It has no login until one is made there, once per machine, by the operator:
+
+```sh
+mkdir -p ~/.local/state/telegram/gate-codex-home && CODEX_HOME=~/.local/state/telegram/gate-codex-home codex login
+```
+
+Until then every codex gate run fails `not_authenticated`, which its record names, and is read as `ignore`.
+
+A gate run costs latency on every gated reply - a few seconds of harness start and decision before the turn begins - and mechanical triggers never pay it. Runs bill to the account the harness is logged in with; batching is the main control on how many there are.
+
 ## Harness Profiles
 
 A harness profile says how the model runs a turn: the harness, the model, its effort, what it may do without asking, and how long it may take. Profiles are callva-harness-runner profiles kept in the project's store, in the runner's `harness_profiles` table, which `telegram migrate` applies under the runner's own ledger `harness` before the job register's tables; the daemon does the same when it opens the register.
 
-Every telegram profile is named `telegram-<something>`; a name without the prefix is refused, so a room never runs another capability's profile. A name resolves to this project's version, then the global one, then the two the bundle ships: `telegram-claude` (claude on `opus`) and `telegram-codex` (codex on the `sol` family, project hooks run without recorded trust), both with every permission granted and a one-day `timeout_seconds`. A stored version the runner refuses is an error naming the name, the layer and the version; the search never falls through it.
+Every telegram profile is named `telegram-<something>`; a name without the prefix is refused, so a room never runs another capability's profile. A name resolves to this project's version, then the global one, then the two the bundle ships: `telegram-claude` (claude on `opus`) and `telegram-codex` (codex on the `sol` family, project hooks run without recorded trust), both with every permission granted and a one-day `timeout_seconds`. The bundle also ships the reply gate's `telegram-gate-claude` and `telegram-gate-codex`, which resolve the same way and carry no turn (see The Reply Gate). A stored version the runner refuses is an error naming the name, the layer and the version; the search never falls through it.
 
 ### Which profile a turn runs on
 

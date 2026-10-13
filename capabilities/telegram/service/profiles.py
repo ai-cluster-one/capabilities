@@ -14,8 +14,9 @@ in the store, in the `harness_profiles` table the runner owns. Every name
 telegram reaches starts with `telegram-`: the prefix is the capability's scope,
 so a room never runs another capability's profile and the runner's own shipped
 profiles are out of reach. A name resolves to the project's active version,
-then the global one, then the two this bundle ships in `profiles/` -
-`telegram-claude` and `telegram-codex`. The version found is used whole, and a
+then the global one, then the ones this bundle ships in `profiles/` -
+`telegram-claude` and `telegram-codex` for a turn, `telegram-gate-claude` and
+`telegram-gate-codex` for the reply gate. The version found is used whole, and a
 version or file the runner refuses is an error, never a step to the next layer.
 
 Fit is what a turn needs of a profile, checked after the runner has accepted
@@ -59,6 +60,10 @@ from pathlib import Path
 RUNNER_PIN = "callva-harness-runner==0.10.0"
 PREFIX = "telegram-"
 BUNDLED = ("telegram-claude", "telegram-codex")
+# The reply gate's profiles, bundled beside the turn's at the same lowest layer.
+# They are no turn's: they set an output schema, so the turn's fit refuses them,
+# and the gate checks its own fit for them (`gate.py`).
+GATE_BUNDLED = ("telegram-gate-claude", "telegram-gate-codex")
 # The reserved name that runs in process, on no profile: what a room runs when
 # nothing names a profile, and the seed's own choice.
 STUB = "stub"
@@ -539,7 +544,7 @@ def checked_spec(name: str, text: str, where: str, active: list) -> dict:
     it is refused."""
     lib = runner()
     check_name(name)
-    if name in BUNDLED:
+    if name in BUNDLED + GATE_BUNDLED:
         raise Refusal(6, "profile_reserved",
                       f"profile {name!r} ships with telegram and is never changed from "
                       "here",
