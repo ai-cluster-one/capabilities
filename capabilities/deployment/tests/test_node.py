@@ -305,6 +305,23 @@ def test_memory_root_is_asked_of_contextkit_and_existing_attrs_preserved(node, m
     assert '"memory/**" merge=union' in text
 
 
+def test_body_without_memory_layer_writes_no_attributes(node, monkeypatch):
+    (node.root / ".contextkit").mkdir()
+    (node.root / ".contextkit/config.toml").write_text("")
+    monkeypatch.setattr(node.m, "_node_run", lambda *a, **kw: SimpleNamespace(
+        returncode=2, stdout="", stderr="unknown layer: memory\nKnown layers: assets, context.\n"))
+    assert node.m._memory_attributes(node.root) is None
+
+
+def test_other_contextkit_failure_still_refused(node, monkeypatch):
+    (node.root / ".contextkit").mkdir()
+    (node.root / ".contextkit/config.toml").write_text("")
+    monkeypatch.setattr(node.m, "_node_run", lambda *a, **kw: SimpleNamespace(
+        returncode=1, stdout="", stderr="config broken"))
+    with pytest.raises(node.m.NodeFailure, match="contextkit failed"):
+        node.m._memory_attributes(node.root)
+
+
 def test_memory_path_outside_body_refused(node, monkeypatch):
     (node.root / ".contextkit").mkdir()
     (node.root / ".contextkit/config.toml").write_text("")
