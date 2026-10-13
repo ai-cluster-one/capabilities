@@ -187,6 +187,25 @@ Where the entrypoint artifact is declared `external`, the project has taken its
 boot path and process management whole, and the profile renders no sync program
 into it.
 
+**Other repositories the box works on.** A box that develops another repository
+beside its own body - the capabilities source it releases from, say - declares
+it in `compiler.container.checkouts`, a list of `{path, url, branch, register}`:
+an absolute path outside the project root, the repository to clone, the branch
+(default `main`), and optionally `register: "official"`. On every boot, after
+initialization and before the doctors, the entrypoint takes each in turn. A path
+that is already a git checkout is left exactly as it is - never cloned over,
+reset or fetched - because it is the box's own working tree. A path that is
+absent or holds no files is cloned at the branch. A path that holds files but
+no checkout is left untouched with a warning. With `register`, the checkout is
+then registered with the capabilities manager as its integration checkout for
+that source (`./bin/capabilities source register-checkout official` from the
+checkout), unless the manager already names that checkout, so a fresh node can
+open a development session with no manual step. A clone or a registration that
+fails warns and lets the box come up. Keep the path on a volume of its own when
+the work in it has to outlive a redeploy; without one, each new container clones
+it afresh. The declaration applies only to `agent-box-checkout`, and a runtime
+that declares none compiles exactly as before.
+
 ## What changes between a container and a host
 
 **Supervision.** Both substrates read the same `restart` field from a

@@ -211,6 +211,11 @@ FILES
       directory first on PATH: the node keeps the tools it installs and
       updates, a redeploy no longer upgrades them, and each boot installs only
       the catalogue capabilities the registry lacks;
+      compiler.container.checkouts (agent-box-checkout) lists other
+      repositories the box works on, each {path, url, branch, register}: each
+      boot clones one whose path is absent or empty, never touches one already
+      checked out, and with register "official" registers it as the manager's
+      integration checkout unless the manager already names it;
       compiler.build_args is the only source of generated Compose build args.
       A service environment_defaults mapping overrides descriptor env defaults.
 
@@ -345,6 +350,11 @@ MANAGER_VOLUMES = {
     "capabilities_cache": ("/.cache/capabilities", "The capabilities manager's source and lookup caches."),
 }
 REPO_URL_ENV = "AGENT_REPO_URL"
+# compiler.container.checkouts: other repositories a checkout box works on beside
+# its own body, each brought up at boot while absent. `register` names the one
+# manager source a checkout may be registered as.
+CHECKOUT_KEYS = ("path", "url", "branch", "register")
+CHECKOUT_REGISTRATIONS = ("official",)
 REPO_BRANCH_ENV = "AGENT_REPO_BRANCH"
 # The one program the compiler owns on this substrate. Every other Supervisor
 # program comes from an installed capability's deploy descriptor; this one comes
@@ -3417,6 +3427,11 @@ def _compiler_config(runtime: dict) -> dict:
                 name for name in declared if _safe_package_name(name)]
         if isinstance(raw_container.get("persistent_manager"), bool):
             container["persistent_manager"] = raw_container["persistent_manager"]
+        # A declaration doctor would refuse is dropped here, never compiled.
+        checkouts, _problems = _declared_checkouts(
+            raw_container.get("checkouts"), container["project_root"])
+        if checkouts:
+            container["checkouts"] = checkouts
     host = dict(defaults["host"])
     raw_host = raw.get("host")
     if isinstance(raw_host, dict):
@@ -3465,6 +3480,55 @@ def _safe_container_path(value: object) -> bool:
     return (isinstance(value, str)
             and re.fullmatch(r"/[A-Za-z0-9._/-]+", value) is not None
             and ".." not in Path(value).parts)
+
+
+def _declared_checkouts(raw: object, project_root: str) -> tuple[list[dict], list[str]]:
+    """The checkouts a runtime declares, each normalized, and what is wrong with
+    the ones that cannot be compiled."""
+    if raw is None:
+        return [], []
+    if not isinstance(raw, list):
+        return [], ["compiler.container.checkouts must be a list"]
+    body = project_root.rstrip("/") or "/"
+    checkouts: list[dict] = []
+    problems: list[str] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(raw):
+        label = f"compiler.container.checkouts[{index}]"
+        if not isinstance(entry, dict):
+            problems.append(f"{label} must be an object")
+            continue
+        unknown = sorted(set(entry) - set(CHECKOUT_KEYS))
+        path = entry.get("path")
+        url = entry.get("url")
+        branch = entry.get("branch", "main")
+        register = entry.get("register")
+        wrong = []
+        if unknown:
+            wrong.append("carries unknown keys " + ", ".join(unknown))
+        if not _safe_container_path(path):
+            wrong.append("path must be an absolute container path")
+        else:
+            path = path.rstrip("/") or "/"
+            if path == body or path.startswith(body + "/") or body.startswith(path + "/"):
+                wrong.append(f"path must lie outside the project root {project_root}")
+            elif path in seen:
+                wrong.append(f"path {path} is declared twice")
+        if not (isinstance(url, str) and re.fullmatch(r"[^\s-]\S*", url)):
+            wrong.append("url must be a repository URL")
+        if not (isinstance(branch, str) and re.fullmatch(r"[A-Za-z0-9._/][A-Za-z0-9._/-]*", branch)):
+            wrong.append("branch must be a branch name")
+        if register is not None and register not in CHECKOUT_REGISTRATIONS:
+            wrong.append("register must be " + " or ".join(map(repr, CHECKOUT_REGISTRATIONS)))
+        if wrong:
+            problems.append(f"{label} " + "; ".join(wrong))
+            continue
+        seen.add(path)
+        checkout = {"path": path, "url": url, "branch": branch}
+        if register is not None:
+            checkout["register"] = register
+        checkouts.append(checkout)
+    return checkouts, problems
 
 
 def _bundle_layout(runtime: dict) -> bool:
@@ -4061,10 +4125,58 @@ __SYNC__
 # a checkout. There is no checkout at build time, so they are made here against
 # the real one, on every boot.
 __INIT__
-
+__CHECKOUTS__
 # Readiness is reported, never fatal: one briefly unreachable service must not
 # stop the box from coming up.
 __DOCTORS__
+"""
+
+_DECLARED_CHECKOUTS_BLOCK = """
+# --- Declared checkouts ------------------------------------------------------
+# Other repositories this box works on beside its own body. One that is absent
+# is cloned; one that is present is never cloned over, reset or fetched, because
+# it is the box's own working tree. A declared registration makes a checkout the
+# manager's integration checkout for that source, so a fresh node can open a
+# development session with no manual step; it is left alone when the manager
+# already names that checkout. Nothing here stops the box from coming up.
+declared_checkout() {
+  path="$1" url="$2" branch="$3" register="$4"
+  git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$path" \\
+    || git config --global --add safe.directory "$path"
+  if [ -d "$path/.git" ]; then
+    echo "[entrypoint] declared checkout present at $path"
+  elif [ -z "$(find "$path" -mindepth 1 -type f -print -quit 2>/dev/null)" ]; then
+    echo "[entrypoint] cloning $url ($branch) into $path"
+    seed="$(mktemp -d)"
+    if ! { mkdir -p "$path" \\
+             && git clone --quiet --branch "$branch" --no-checkout -- "$url" "$seed/repo" \\
+             && mv "$seed/repo/.git" "$path/.git" \\
+             && git -C "$path" checkout --quiet -f "$branch"; }; then
+      rm -rf "$seed"
+      echo "[entrypoint] WARN: could not clone $url into $path; the box runs without it" >&2
+      return 0
+    fi
+    rm -rf "$seed"
+  else
+    echo "[entrypoint] WARN: $path holds files but is not a git checkout; leaving it untouched" >&2
+    return 0
+  fi
+  [ -n "$register" ] || return 0
+  if capabilities source list 2>/dev/null | python3 -c '
+import json, os, sys
+sources = json.load(sys.stdin).get("sources") or []
+source = next((s for s in sources if s.get("id") == sys.argv[2]), {})
+checkout = source.get("checkout") or {}
+sys.exit(0 if checkout.get("valid") and checkout.get("path") == os.path.realpath(sys.argv[1]) else 1)
+' "$path" "$register"; then
+    echo "[entrypoint] $path is already the manager's $register checkout"
+  elif (cd "$path" && ./bin/capabilities source register-checkout "$register" > /dev/null); then
+    echo "[entrypoint] registered $path as the manager's $register checkout"
+  else
+    echo "[entrypoint] WARN: could not register $path as the manager's $register checkout; run ./bin/capabilities source register-checkout $register from it" >&2
+  fi
+}
+__CALLS__
 """
 
 _ENTRYPOINT_DOCTORS = {
@@ -4078,7 +4190,8 @@ def _entrypoint_template(project_name: str, supervisor_config: str | None = None
                          checkout: bool = False, project_root: str = "/app",
                          has_contextkit: bool = False,
                          body_sync: str | None = None,
-                         catalogue_exclude: set[str] | None = None) -> str:
+                         catalogue_exclude: set[str] | None = None,
+                         checkouts: list[dict] | None = None) -> str:
     identity = _slug(project_name)
     # The image installs the catalogue at build. A capability the catalogue
     # gained since, or one a persisted registry never had, is installed here;
@@ -4108,7 +4221,14 @@ def _entrypoint_template(project_name: str, supervisor_config: str | None = None
         sync = (f"{shlex.quote(body_sync)} --once || echo \"[entrypoint] WARN: the body"
                 " could not be brought level with its branch; the box is running what"
                 " the volume already held\" >&2") if body_sync else ""
+        declared = ""
+        if checkouts:
+            declared = _DECLARED_CHECKOUTS_BLOCK.replace("__CALLS__", "\n".join(
+                "declared_checkout " + shlex.join(
+                    [item["path"], item["url"], item["branch"], item.get("register") or ""])
+                for item in checkouts))
         checkout_block = (_CHECKOUT_BLOCK
+                          .replace("__CHECKOUTS__", declared)
                           .replace("__APP__", shlex.quote(project_root.rstrip("/") or "/app"))
                           .replace("__URL__", REPO_URL_ENV)
                           .replace("__BRANCH__", REPO_BRANCH_ENV)
@@ -4983,7 +5103,8 @@ def _artifact_texts(root: Path, runtime: dict,
         "entrypoint": _entrypoint_template(
             project_name, supervisor_config, checkout=checkout,
             project_root=project_root, has_contextkit=has_contextkit,
-            body_sync=body_sync_config, catalogue_exclude=catalogue_exclude),
+            body_sync=body_sync_config, catalogue_exclude=catalogue_exclude,
+            checkouts=compiler["container"].get("checkouts")),
     }
     if supervisor_path is not None:
         candidates["supervisor"] = _supervisor_template(
@@ -5892,6 +6013,16 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
                 findings.append({"severity": "warning", "path": _rel(root, path),
                                  "message": "compiler.container.persistent_manager applies only to a "
                                             "container profile and is ignored here"})
+            checkouts, problems = _declared_checkouts(
+                container.get("checkouts"),
+                container["project_root"] if _safe_container_path(container.get("project_root"))
+                else "/app")
+            for problem in problems:
+                findings.append({"severity": "error", "path": _rel(root, path), "message": problem})
+            if (checkouts or problems) and data.get("profile") not in CHECKOUT_PROFILES:
+                findings.append({"severity": "warning", "path": _rel(root, path),
+                                 "message": "compiler.container.checkouts applies only to the "
+                                            "agent-box-checkout profile and is ignored here"})
             declaration = artifacts.get("dockerfile") if isinstance(artifacts, dict) else None
             if packages and _artifact_declaration(declaration)[1] == "external":
                 findings.append({"severity": "warning", "path": _rel(root, path),

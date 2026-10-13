@@ -528,3 +528,196 @@ def test_a_body_already_on_the_declared_repository_is_left_alone(tmp_path: Path)
         assert boot.stdout.splitlines() == [line for line in boot.stdout.splitlines()
                                             if line.startswith("[entrypoint] checkout present at ")]
         assert len(boot.stdout.splitlines()) == 1 and boot.stderr == ""
+
+
+# Declared checkouts: other repositories the box brings up at boot beside its body.
+
+PRODUCT = "/home/agent/product/tool"
+
+
+def _declare(root: Path, checkouts: object) -> None:
+    path = root / "deployment" / "runtime.json"
+    runtime = json.loads(path.read_text())
+    container = runtime.setdefault("compiler", {}).setdefault("container", {})
+    if checkouts is None:
+        container.pop("checkouts", None)
+    else:
+        container["checkouts"] = checkouts
+    path.write_text(json.dumps(runtime, indent=2) + "\n")
+
+
+def _sync(root: Path, env: dict[str, str]) -> None:
+    proc = _run(root, env, "sync")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def _declared_block(root: Path) -> str:
+    entrypoint = (root / BUNDLE / "entrypoint.sh").read_text()
+    start = entrypoint.index("# --- Declared checkouts")
+    end = entrypoint.index("# Readiness is reported", start)
+    return "set -euo pipefail\n" + entrypoint[start:end]
+
+
+def _tool_remote(tmp_path: Path) -> Path:
+    """A remote whose checkout carries a manager that records being run."""
+    seed = tmp_path / "tool-seed"
+    (seed / "bin").mkdir(parents=True)
+    manager = seed / "bin" / "capabilities"
+    manager.write_text('#!/usr/bin/env bash\necho "$(pwd -P) $*" >> "$CALLS"\n')
+    manager.chmod(0o755)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(seed)], check=True, env=GIT_ENV)
+    subprocess.run(["git", "-C", str(seed), "add", "."], check=True, env=GIT_ENV)
+    subprocess.run(["git", "-C", str(seed), "commit", "-qm", "base"], check=True, env=GIT_ENV)
+    remote = tmp_path / "tool.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(seed), str(remote)], check=True, env=GIT_ENV)
+    return remote
+
+
+def _boot_declared(root: Path, tmp_path: Path, registered: Path | None = None
+                   ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Run the compiled declared-checkout block against a stand-in for the
+    installed manager, which answers `source list` with the binding given."""
+    tools = tmp_path / "tools"
+    tools.mkdir(exist_ok=True)
+    installed = tools / "capabilities"
+    installed.write_text('#!/usr/bin/env bash\necho "installed $*" >> "$CALLS"\n'
+                         'if [ "$1 $2" = "source list" ]; then cat "$SOURCES"; fi\n')
+    installed.chmod(0o755)
+    checkout = ({"path": os.path.realpath(registered), "valid": True}
+                if registered is not None else None)
+    sources = tmp_path / "sources.json"
+    sources.write_text(json.dumps({"sources": [{"id": "official", **(
+        {"checkout": checkout} if checkout else {})}]}))
+    calls = tmp_path / "calls"
+    calls.write_text("")
+    env = {**GIT_ENV, "GIT_CONFIG_GLOBAL": str(tmp_path / "gitconfig"),
+           "PATH": f"{tools}:{os.environ['PATH']}", "CALLS": str(calls), "SOURCES": str(sources)}
+    proc = subprocess.run(["bash", "-c", _declared_block(root)], env=env,
+                          capture_output=True, text=True)
+    return proc, calls.read_text().splitlines()
+
+
+def test_a_runtime_that_declares_no_checkout_compiles_exactly_as_before(tmp_path: Path) -> None:
+    root, env = _project(tmp_path, ("telegram",))
+    _setup(root, env, "agent-box-checkout")
+    before = (root / BUNDLE / "entrypoint.sh").read_text()
+    assert "declared_checkout" not in before
+    _declare(root, [{"path": PRODUCT, "url": "https://example.invalid/tool.git"}])
+    _sync(root, env)
+    assert (root / BUNDLE / "entrypoint.sh").read_text() != before
+    _declare(root, None)
+    _sync(root, env)
+    assert (root / BUNDLE / "entrypoint.sh").read_text() == before
+
+
+def test_declared_checkouts_come_up_after_init_and_before_the_doctors(tmp_path: Path) -> None:
+    root, env = _project(tmp_path, ("telegram",))
+    _setup(root, env, "agent-box-checkout")
+    _declare(root, [{"path": PRODUCT, "url": "https://example.invalid/tool.git",
+                     "register": "official"},
+                    {"path": "/srv/other", "url": "https://example.invalid/other.git",
+                     "branch": "stable"}])
+    _sync(root, env)
+    entrypoint = (root / BUNDLE / "entrypoint.sh").read_text()
+    first = f"declared_checkout {PRODUCT} https://example.invalid/tool.git main official"
+    second = "declared_checkout /srv/other https://example.invalid/other.git stable ''"
+    assert entrypoint.index("capabilities init --codex --claude") < entrypoint.index(first)
+    assert entrypoint.index(first) < entrypoint.index(second)
+    assert entrypoint.index(second) < entrypoint.index("capabilities doctor")
+    assert subprocess.run(["bash", "-n", str(root / BUNDLE / "entrypoint.sh")]).returncode == 0
+    assert not [f for f in json.loads(_run(root, env, "doctor").stdout)["findings"]
+                if "checkouts" in f["message"]]
+
+
+def test_a_fresh_node_clones_and_registers_its_declared_checkout(tmp_path: Path) -> None:
+    root, env = _project(tmp_path)
+    _setup(root, env, "agent-box-checkout")
+    remote = _tool_remote(tmp_path)
+    target = tmp_path / "volume" / "tool"
+    # A fresh named volume arrives as an empty directory, or not at all.
+    for fresh in (lambda: target.mkdir(parents=True), lambda: None):
+        if target.exists():
+            subprocess.run(["rm", "-rf", str(target)], check=True)
+        fresh()
+        _declare(root, [{"path": str(target), "url": str(remote), "register": "official"}])
+        _sync(root, env)
+        boot, calls = _boot_declared(root, tmp_path)
+        assert boot.returncode == 0, boot.stderr
+        assert (target / "bin" / "capabilities").is_file()
+        assert _git(target, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+        assert calls == ["installed source list",
+                         f"{os.path.realpath(target)} source register-checkout official"]
+        assert f"[entrypoint] registered {target} as the manager's official checkout" in boot.stdout
+
+
+def test_a_present_checkout_is_never_cloned_over_and_a_registered_one_boots_unchanged(
+        tmp_path: Path) -> None:
+    root, env = _project(tmp_path)
+    _setup(root, env, "agent-box-checkout")
+    remote = _tool_remote(tmp_path)
+    target = tmp_path / "volume" / "tool"
+    subprocess.run(["git", "clone", "-q", str(remote), str(target)], check=True, env=GIT_ENV)
+    (target / "notes.md").write_text("work in progress\n")
+    subprocess.run(["git", "-C", str(target), "add", "."], check=True, env=GIT_ENV)
+    subprocess.run(["git", "-C", str(target), "commit", "-qm", "local"], check=True, env=GIT_ENV)
+    (target / "notes.md").write_text("work in progress\nuncommitted\n")
+    head = _git(target, "rev-parse", "HEAD")
+    _declare(root, [{"path": str(target), "url": str(tmp_path / "elsewhere.git"),
+                     "register": "official"}])
+    _sync(root, env)
+    boot, calls = _boot_declared(root, tmp_path, registered=target)
+    assert boot.returncode == 0, boot.stderr
+    assert _git(target, "rev-parse", "HEAD") == head
+    assert (target / "notes.md").read_text() == "work in progress\nuncommitted\n"
+    assert calls == ["installed source list"]
+    assert boot.stderr == ""
+    # A kept checkout the manager does not name - its registry was not kept - is
+    # registered again, and still not touched.
+    boot, calls = _boot_declared(root, tmp_path)
+    assert boot.returncode == 0, boot.stderr
+    assert calls[-1] == f"{os.path.realpath(target)} source register-checkout official"
+    assert _git(target, "rev-parse", "HEAD") == head
+
+
+def test_a_checkout_that_cannot_come_up_never_stops_the_box(tmp_path: Path) -> None:
+    root, env = _project(tmp_path)
+    _setup(root, env, "agent-box-checkout")
+    occupied = tmp_path / "volume" / "occupied"
+    occupied.mkdir(parents=True)
+    (occupied / "keep.txt").write_text("not a checkout\n")
+    missing = tmp_path / "volume" / "missing"
+    _declare(root, [{"path": str(occupied), "url": str(_tool_remote(tmp_path))},
+                    {"path": str(missing), "url": str(tmp_path / "absent.git"),
+                     "register": "official"}])
+    _sync(root, env)
+    boot, calls = _boot_declared(root, tmp_path)
+    assert boot.returncode == 0, boot.stderr
+    assert sorted(p.name for p in occupied.iterdir()) == ["keep.txt"]
+    assert f"WARN: {occupied} holds files but is not a git checkout" in boot.stderr
+    assert f"WARN: could not clone {tmp_path / 'absent.git'} into {missing}" in boot.stderr
+    assert not (missing / ".git").exists()
+    assert calls == []
+
+
+def test_a_malformed_or_misplaced_checkout_declaration_is_named(tmp_path: Path) -> None:
+    root, env = _project(tmp_path)
+    _setup(root, env, "agent-box-checkout")
+    _declare(root, [{"path": "relative", "url": "https://example.invalid/a.git"},
+                    {"path": "/app/vendor", "url": "https://example.invalid/b.git"},
+                    {"path": PRODUCT, "url": "-u evil", "register": "custom", "depth": 1}])
+    messages = [f["message"] for f in json.loads(_run(root, env, "doctor").stdout)["findings"]
+                if f["severity"] == "error"]
+    assert any("checkouts[0] path must be an absolute container path" in m for m in messages)
+    assert any("checkouts[1] path must lie outside the project root /app" in m for m in messages)
+    assert any("checkouts[2]" in m and "unknown keys depth" in m and "url must be" in m
+               and "register must be 'official'" in m for m in messages)
+    _declare(root, None)
+    path = root / "deployment" / "runtime.json"
+    runtime = json.loads(path.read_text())
+    runtime["profile"] = "agent-box"
+    runtime["compiler"]["container"]["checkouts"] = [
+        {"path": PRODUCT, "url": "https://example.invalid/tool.git"}]
+    path.write_text(json.dumps(runtime))
+    findings = json.loads(_run(root, env, "doctor").stdout)["findings"]
+    assert any(f["severity"] == "warning" and "applies only to the agent-box-checkout" in f["message"]
+               for f in findings)
