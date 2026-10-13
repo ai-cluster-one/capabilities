@@ -3,9 +3,7 @@
 A deployment answers two independent questions, and they belong to two
 different files.
 
-`deployment/runtime.json` answers **what this project runs**: the service
-graph, which capability services are on, the environment they need. Its
-`profile` field picks the **substrate** those services run on.
+`deployment/runtime.json` answers **what this project runs**: the service graph, which capability services are on and in what shape, the environment they need. Its `profile` field picks the **substrate** those services run on. A project whose gate is in the store is the exception: there, whether a service runs on a given node is neither file's answer but the gate's, read on that node (see **Where a service runs** below).
 
 `deployment/targets/<name>/target.json` answers **where it goes**: a provider,
 a connection, a resource handle. On a container profile the same folder holds
@@ -17,11 +15,7 @@ file. Changing what the services run *on* is a profile.
 
 ## The profiles
 
-`agent-box` compiles a container. `deployment sync` writes, into each target's
-folder, a Dockerfile, a Compose file, an entrypoint, an env example, and - when
-services are embedded - a Supervisor configuration that runs them as one PID 1. Every embedded service
-shares one image and one set of mounts. The project is copied into the image at
-build time.
+`agent-box` compiles a container. `deployment sync` writes, into each target's folder, a Dockerfile, a Compose file, an entrypoint, an env example, and - when services are embedded - a Supervisor configuration that runs them as one PID 1. Every embedded service shares one image and one set of mounts. The project is copied into the image at build time.
 
 `agent-box-checkout` compiles the same container and fills it differently. The
 image carries tools and the boot path and no project at all; the checkout
@@ -43,6 +37,22 @@ A Linux host runs the same services one of two ways. A container profile
 compiles them into the image and Compose file the host runs. `generic` declares
 them, and a supervisor the project owns on that host - a
 systemd unit, for instance - starts them and keeps them running.
+
+## Where a service runs
+
+Every compiled profile supervises each service it compiles through its runner, `deployment runner <name> ... -- <command>`: the Supervisor program in the agent container, the command of a service's own Compose service, and the program of its launchd agent on a Mac. Which services are compiled depends on where the project keeps its gate.
+
+**Files mode.** Files carry no answer per node, so a project whose gate is in `capabilities/settings.json` keeps deciding in its runtime declaration, exactly as before: only capabilities the project enabled itself are candidates, `service_policy` (`auto_include`, `default_mode`, `auto`, `enabled`, `disabled` or `embedded` per capability, and the descriptor's `default_policy`) decides which of them run and how, and `service_policy.placement` and `services.<name>.placement` (`node`, `local` or `both`) choose the substrate. A capability enabled for its CLI and set to `disabled` gets no runner at all.
+
+**Store mode.** A project whose `project.json` says `"records": "store"` compiles every deployable service the installed catalogue declares, less the runtime's `capabilities.exclude`, and the runner, not the compile, decides whether the service's own command runs. The compile is the same on every node, and turning a service on or off for a node is a gate write that needs no recompile and no redeploy.
+
+Once per reconcile (`service_policy.reconcile_seconds`, default 60) the runner reads the gate for its capability in this project on this node, the node being the name the machine declares in `AGENT_NODE_NAME`, else its host name. A project whose records are in the store places a service on a node only through its own policy row naming that node with `enabled` true, written by `capabilities enable <name> --project --node <node>`; its row for every node, and any global row, make the capability's CLI usable there without placing the service, and a node row saying false, or no node row, leaves it off. In files mode the runtime declaration has already chosen which services are compiled, and the runner runs one where the project's own explicit enable stands, on every machine that reads those files. Nothing inherited or global places a service. A container node keeps its name across redeploys only by declaring it: set `AGENT_NODE_NAME` in the node's environment, which the Compose file passes through.
+
+Placed, the runner takes the service's lease before starting it: a row in the project's store, keyed by project and capability, naming the holding node and expiring three reconciles after its last renewal. The holder renews it every reconcile. A runner on another node whose gate also places the service refuses to start it while that lease is live, says so on its stderr naming the holder and the expiry, and keeps checking, so it takes over once the lease expires or is released. A runner the gate turns off stops its service - TERM to the service's process group, KILL after 20 seconds - and then releases the lease, so the node the service moved to need not wait for it to run out. A runner that cannot confirm its lease keeps a running service only until its own hold would have run out, and starts none. Exit 4 is the contract's policy refusal, so a service that exits with it is not restarted: its runner releases the lease, holds the service idle, and reports the refusal - the service's own error code and message when it printed one - in its log, in `deployment services` and in `deployment node status`. It tries again only when the gate answer it reads for this node changes (a row appears, disappears or flips) or the runner restarts. Every other exit follows the descriptor's restart policy. Where no database is resolvable for the project, which is possible only in files mode, no lease can be taken: the runner runs the service as the gate says and reports the lease as unavailable.
+
+`deployment services` is a node's own view: for each compiled service, what the gate answers there and which row answered, whether its runner is running it, and who holds its lease. `deployment node status` runs it inside a container node and folds it into each service it reports. Each runner also records its state under `capabilities/deployment/state/runners/`, and the host profile's watchdog leaves alone a service its runner holds idle.
+
+In store mode `service_policy` keeps only the shape of the container a service runs in: `shape` for every service and `capabilities.<name>` for one, each `embedded` (a Supervisor program in the agent container) or `container` (a Compose service of its own). There the switches that decide whether a service runs in files mode - `auto_include`, `default_mode`, and `auto`, `enabled` or `disabled` per capability - and `service_policy.placement` and `services.<name>.placement` are retired: `deployment doctor` and `deployment sync --check` report each one a store-mode runtime still carries, and `deployment sync` rewrites it, keeping the shape it implied (`enabled` was a container of its own); a `disabled` service is no longer kept from running by it, and `capabilities.exclude` is what keeps a service out of the runtime altogether. A files-mode runtime is neither warned about nor rewritten. `service_policy.reconcile_seconds` sets the reconcile in either mode.
 
 ## What changes between a baked body and a checkout body
 
@@ -208,20 +218,9 @@ that declares none compiles exactly as before.
 
 ## What changes between a container and a host
 
-**Supervision.** Both substrates read the same `restart` field from a
-capability's deploy descriptor, and they honour it differently on purpose. In a
-container, `unless-stopped` means an unconditional restart: nobody is at a
-terminal inside the image to stop anything, so a process that exits has failed.
-On a host there *is* a person, and `<capability> service stop` has to mean what
-it says - so the agent restarts on a non-zero exit and stays down after a clean
-one. A crash comes back; a deliberate stop is honoured. `restart: "no"` leaves
-the job to `RunAtLoad` alone on both.
+**Supervision.** Both substrates read the same `restart` field from a capability's deploy descriptor, and each runner applies it to its service, honouring it differently on purpose. In a container, `unless-stopped` means an unconditional restart: nobody is at a terminal inside the image to stop anything, so a process that exits has failed. On a host there *is* a person, and `<capability> service stop` has to mean what it says - so the runner restarts the service after a non-zero exit and leaves it down after a clean one, until the gate turns it off and on again or the runner restarts. A crash comes back; a deliberate stop is honoured. `restart: "no"` starts the service once on both. The runner itself is kept running by its supervisor whatever the descriptor says, since it is what starts the service when the gate places it.
 
-**The composition modes collapse.** `service_policy` distinguishes `embedded`
-from `enabled` because a container can either fold a service into the agent
-image or give it its own Compose service. A host has no image to fold into, so
-both modes render the same thing: one supervised process per service.
-`disabled` still means the CLI is installed and the service does not run.
+**The shapes collapse.** `service_policy` distinguishes `embedded` from a Compose service of its own (`enabled` in files mode, `container` in store mode) because a container can either fold a service into the agent image or give it its own Compose service. A host has no image to fold into, so both shapes render the same thing: one supervised runner per service.
 
 **The program carries the project's name.** A host agent does not run a
 capability's CLI directly; each service compiles a launcher beside its plist,
@@ -309,14 +308,9 @@ is what a `service run` written for a supervisor already does.
 installed or not, loaded or not, so a service that was compiled and never
 handed over, or handed over and since unloaded, is visible rather than assumed.
 
-## One substrate at a time
+## One machine at a time
 
-Two profiles that both run the same service are two processes competing for one
-identity - one Telegram account, one job queue, one state directory. Nothing
-in this capability prevents a container and a host agent from being started
-against the same project, because nothing here can see the other machine. That
-remains an operator decision, and it is worth making deliberately rather than
-discovering through a lock file.
+Two machines that both run the same service are two processes competing for one identity - one Telegram account, one job queue, one state directory. The lease is what prevents it: a container node and a Mac compiled from the same project each run the service's runner, and only the one holding the lease runs the service, whichever profile compiled it. Where the project has no database the lease cannot be taken, so in files mode without a store keeping one machine at a time remains an operator decision, made with the runtime's placement. The capability's own `service start` and `service run`, called by hand, take no lease.
 
 ## The machine scope
 
@@ -330,4 +324,4 @@ The declaration is this machine's, at `$XDG_CONFIG_HOME/deployment/machine.json`
 
 `deployment machine next` prints the hand-over: stop any copy started by hand, create a working directory launchd would otherwise refuse to start in, remove any earlier installed copy, `ln -sf` each agent into `~/Library/LaunchAgents`, and `launchctl bootstrap gui/$UID` it. Installing stays a person's act. `deployment machine status` reports each compiled agent and whether it is linked and loaded, and writes nothing. An agent left for a service that is no longer supervised is reported by sync with the `bootout` that removes it; sync never deletes it.
 
-A project that joins a machine service stops supervising that service itself first: set `service_policy.capabilities.<name>` to `"disabled"` in its `deployment/runtime.json`, run `deployment sync`, and boot out and remove its project agent. Otherwise its project agent and watchdog keep starting a project-mode process the joined project refuses.
+A project that joins a machine service stops supervising that service itself first: in files mode set `service_policy.capabilities.<name>` to `"disabled"` in its `deployment/runtime.json`, run `deployment sync`, and boot out and remove its project agent. In store mode leave the project no row naming that node, or list the capability in `capabilities.exclude` to keep the project-mode copy out altogether. A runner that starts a project-mode copy anyway is refused by the capability with exit 4 and holds the service idle (see **Where a service runs**), rather than restarting it.

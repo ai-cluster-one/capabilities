@@ -102,6 +102,10 @@ print(json.dumps(fixtures[key]))
         if script.startswith("docker ps"): return "aabbccddeeff"
         if 'test -s' in script: return "logged_out"
         if 'supervisorctl' in script: return "body-sync RUNNING pid 1\n"
+        if 'deployment services' in script: return json.dumps({"node": "node-a", "services": [
+            {"name": "telegram", "running": True, "refusal": None,
+             "gate": {"placed": True, "row": {"scope": "project", "node": "node-a", "enabled": True}},
+             "lease": {"state": "held", "holder": "node-a", "expires_at": "2026-01-01T00:03:00+00:00"}}]})
         if 'capabilities-contract==' in script: return json.dumps({"configured": True,
             "setting": {"level": "environment", "sources": ["AGENTKIT_DB_URL"], "schema": "agentkit"},
             "reachable": True, "tls_enforced": True})
@@ -217,6 +221,14 @@ def test_status_reports_actual_fixture_facts(node, capsys):
     assert probe.startswith("docker exec aabbccddeeff uv run ")
     assert "store show" not in " ".join(script for script, _ in node.ssh)
     assert data["services"][0]["placement"] == "node"
+    services = {entry["name"]: entry for entry in data["services"]}
+    # What the node itself reads: its gate, its runner and the lease.
+    assert data["node_name"] == "node-a"
+    assert services["telegram"]["gate"]["row"] == {"scope": "project", "node": "node-a", "enabled": True}
+    assert services["telegram"]["running"] is True and services["telegram"]["refusal"] is None
+    assert services["telegram"]["lease"]["holder"] == "node-a"
+    read = next(script for script, _ in node.ssh if "deployment services" in script)
+    assert read.startswith("docker exec aabbccddeeff sh -c ") and "cd /app && exec" in read
     assert data["errors"] == []
 
 
@@ -752,3 +764,22 @@ def test_a_malformed_github_source_is_refused_with_its_code(github, monkeypatch,
         with pytest.raises(github.m.NodeFailure) as failure:
             github.m.cmd_node_sync(github.args)
         assert failure.value.code == "body_source_invalid" and failure.value.exit_code == 6
+
+
+def test_in_store_mode_placement_no_longer_filters_and_the_shape_composes(node, monkeypatch):
+    descriptor = {"summary": "fixture", "deploy": {"default_policy": "disabled", "mounts": []}}
+    monkeypatch.setattr(node.m, "_store_placed", lambda root: True)
+    monkeypatch.setattr(node.m, "_store_service_descriptors",
+                        lambda runtime=None: ({"fixture": descriptor}, []))
+    monkeypatch.setattr(node.m, "_enabled_capabilities", lambda root: [])
+    # Neither the retired placement nor the gate keeps a service out of a
+    # store-mode compile: the runner on each node asks the gate there.
+    node.runtime["service_policy"] = {"shape": "embedded", "capabilities": {},
+                                      "placement": {"fixture": "local"}}
+    for profile in ("host-agents", "agent-box-checkout"):
+        node.runtime["profile"] = profile
+        active, embedded, errors, _ = node.m._active_descriptors(node.root, node.runtime)
+        assert "fixture" in embedded and not active and not errors
+    node.runtime["service_policy"]["capabilities"] = {"fixture": "container"}
+    active, embedded, errors, _ = node.m._active_descriptors(node.root, node.runtime)
+    assert "fixture" in active and not embedded and not errors

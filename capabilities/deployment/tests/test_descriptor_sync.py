@@ -89,8 +89,9 @@ def test_auto_discovers_only_explicit_project_services(tmp_path: Path) -> None:
     assert runtime["service_policy"]["default_mode"] == "embedded"
     assert runtime["services"]["agent"]["embedded_services"] == ["automations", "telegram"]
     supervisor = (root / BUNDLE / "supervisord.conf").read_text()
-    assert "command=automations service run" in supervisor
-    assert "command=telegram service run" in supervisor
+    # Each service runs under its runner, which the gate on the node starts.
+    assert "command=deployment runner automations --every 60 --restart unless-stopped -- automations service run" in supervisor
+    assert "command=deployment runner telegram --every 60 --restart unless-stopped -- telegram service run" in supervisor
 
 
 def test_explicit_disable_and_enable_overrides(tmp_path: Path) -> None:
@@ -141,7 +142,7 @@ def test_embedded_service_merges_contract_into_agent(tmp_path: Path) -> None:
     assert "project-telegram" not in compose
     assert 'TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:-}"' in compose
     assert "telegram_state:/home/agent/.local/state/telegram" in compose
-    assert "command=telegram service run" in (root / BUNDLE / "supervisord.conf").read_text()
+    assert "command=deployment runner telegram --every 60 --restart unless-stopped -- telegram service run" in (root / BUNDLE / "supervisord.conf").read_text()
     assert (f"exec /usr/bin/supervisord -c /app/{BUNDLE}/supervisord.conf"
             in (root / BUNDLE / "entrypoint.sh").read_text())
     dockerfile = (root / BUNDLE / "Dockerfile").read_text()
@@ -645,3 +646,33 @@ def test_system_packages_are_reported_as_ignored_under_an_external_dockerfile(
     proc = _run(root, env, "sync")
     assert proc.returncode == 0, proc.stderr
     assert (root / "Dockerfile").read_text() == "FROM debian:bookworm-slim\n"
+
+
+def test_a_files_mode_runtime_keeps_deciding_which_services_run(tmp_path: Path) -> None:
+    """Files carry no answer per node, so a project whose gate is in files
+    keeps its runtime declaration in charge: a capability enabled for its CLI
+    and set to disabled gets no runner, and nothing is warned about or
+    rewritten."""
+    root, env = _project(tmp_path, ("telegram", "automations", "slack"))
+    _setup(root, env)
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    policy = {"auto_include": True, "default_mode": "embedded",
+              "capabilities": {"telegram": "disabled", "slack": "disabled",
+                               "automations": "embedded"},
+              "placement": {"automations": "both"}}
+    runtime["service_policy"] = policy
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    proc = _run(root, env, "sync")
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+    assert result["services"] == []
+    assert result["embedded_services"] == ["automations"]
+    assert result["retired"] == []
+    assert not [f for f in result["findings"] if "retired" in f["message"]]
+    supervisor = (root / BUNDLE / "supervisord.conf").read_text()
+    assert "[program:automations]" in supervisor
+    assert "telegram" not in supervisor and "slack" not in supervisor
+    assert json.loads(runtime_path.read_text())["service_policy"] == policy
+    clean = _run(root, env, "sync", "--check")
+    assert clean.returncode == 0, clean.stdout

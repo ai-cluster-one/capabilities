@@ -112,7 +112,8 @@ def test_each_service_gets_a_launcher_named_for_its_project(tmp_path: Path) -> N
     assert os.access(launcher, os.X_OK)
     body = launcher.read_text()
     assert body.startswith("#!")
-    assert "service run" in body
+    # The agent runs the service's runner; a clean stop stays a stop.
+    assert "runner telegram --every 60 --restart on-failure -- telegram service run" in body
     assert body.rstrip().endswith('"$@"')
 
     plist = _agents(root)["project.telegram.plist"]

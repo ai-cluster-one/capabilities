@@ -81,6 +81,24 @@ class FileAdapter(unittest.TestCase):
         self.assertEqual(self.r.get("capabilities", "policy", "telegram"),
                          {"enabled": True, "allow_write": True})
 
+    def test_a_policy_record_from_files_names_no_node_and_no_node_is_written(self):
+        """Files carry no node: every policy record read from them is the one
+        for every node, and a row for one node is refused rather than written
+        as one for every node."""
+        self.assertIsNone(self.r.resolve("capabilities", "policy")["telegram"]["node"])
+        self.assertIsNone(
+            self.r.resolve_scope("capabilities", "policy", "project")["clickup"]["node"])
+        self.assertNotIn("node", self.r.resolve("clickup", "identifier")["flat-one"])
+        before = (self.env / "settings.json").read_text()
+        for write in (lambda: self.r.set("capabilities", "policy", "clickup",
+                                         {"enabled": False}, node="node-a"),
+                      lambda: self.r.delete("capabilities", "policy", "clickup",
+                                            node="node-a")):
+            with self.assertRaises(S.StoreError) as caught:
+                write()
+            self.assertEqual(caught.exception.slug, "node_requires_store")
+        self.assertEqual((self.env / "settings.json").read_text(), before)
+
     def test_a_grant_is_read_apart_from_the_identity_it_decides(self):
         """The file keeps them in one object; the records surface keeps them
         apart, because who a connection is and what it may do are different

@@ -377,23 +377,34 @@ DEVELOPMENT VERBS
         reported and retained.
 
 POLICY VERBS
-  enable <name> --project|--global / disable <name> --project|--global [--deny]
+  enable <name> --project|--global [--node <node>]
+  disable <name> --project|--global [--node <node>] [--deny]
         Write an explicit policy record at project or global scope through the
         active records backend. Files mode maps those scopes to
         capabilities/settings.json and $XDG_CONFIG_HOME/capabilities/settings.json;
         store mode to this project's row, stamped with its verified id, and the
         global row of capabilities_policy, which applies to every project
-        reading that store, each for every node. A row naming this node is
-        read before the row for every node, at either scope.
+        reading that store, each for every node, or with --node for that one
+        node (the name a node gives itself: AGENT_NODE_NAME, else its host
+        name). A row naming this node is read before the row for every node,
+        at either scope. Only the project's row naming a node places a
+        capability's bundled service on that node; a row for every node, or a
+        global row, makes the CLI usable there without placing the service
+        (`deployment guide profiles`). Files carry no node, so --node in files
+        mode is refused with node_requires_store; `capabilities connections
+        import` moves the project's records into its store first. --deny takes
+        no --node.
         Scope is mandatory: ask whether the decision is for this project or
         every project before invoking the manager. Project enable removes any
         harness deny rule; project disable --deny additionally writes
         permissions.deny Bash(<name>:*) into .claude/settings.json. Enabling a
         capability quarantined on this machine writes the entry and warns: it
         stays effective-disabled until the user allows it.
-  inherit <name> --project|--global
+  inherit <name> --project|--global [--node <node>]
         Remove the selected scope's explicit entry. A project then inherits the
-        machine default; removing the global entry restores default deny.
+        machine default; removing the global entry restores default deny. With
+        --node (store mode only) remove that scope's row for that one node,
+        which stops a service placed there by it.
 
 PROJECT VERBS (run inside a consuming project)
   init [--claude] [--codex]
@@ -6439,6 +6450,23 @@ def _gate_source(adapter, root: Path, scope: str) -> str:
     return str(_gate_file(root) if scope == "project" else GLOBAL_GATE_FILE)
 
 
+def _gate_node(node: str | None, root: Path | None, adapter=None) -> str | None:
+    """The node a policy write names, or None for every node. Only the store
+    holds a row for one node: files carry no node."""
+    if node is None:
+        return None
+    if not node.strip():
+        _die(6, "input", "--node needs a node name")
+    if root is None or adapter is None or adapter.mode_of("policy") != "store":
+        _die(6, "node_requires_store",
+             "a policy row naming a node is kept only in the store: this "
+             "project's gate is in files, and files carry no node, so a "
+             "record written there is for every node",
+             "import this project's records into its store with `capabilities "
+             "connections import`, then write the row for the node")
+    return node.strip()
+
+
 def _stamp_policy(adapter, root: Path, scope: str) -> None:
     """A project policy row in the store carries the project id as its agent,
     so it is written only once the id is verified for this invocation."""
@@ -6459,7 +6487,8 @@ def _refresh_after_gate(root: Path | None, result: dict, enabled: bool = False) 
         result["context_hint"] = _project_visibility_hint(result.get("enabled"))
 
 
-def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False) -> None:
+def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False,
+              node: str | None = None) -> None:
     root = _project_root()
     migrated: list[str] = []
     if scope == "project":
@@ -6467,18 +6496,23 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False) -> None:
         migrated = _ensure_envelope(root)
     elif deny:
         _die(6, "input", "--deny is available only with --project")
+    if deny and node is not None:
+        _die(6, "input", "--deny takes no --node: the harness deny rule is the "
+             "project's on every node")
     if root is not None:
         adapter = _records_for(root)
         try:
+            node = _gate_node(node, root, adapter)
             _stamp_policy(adapter, root, scope)
             adapter.set("capabilities", "policy", name, {"enabled": enabled},
-                        actor="capabilities", scope=scope)
+                        actor="capabilities", scope=scope, node=node)
             gate_source = _gate_source(adapter, root, scope)
         except _store_module().StoreError as exc:
             _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
         finally:
             adapter.close()
     else:
+        _gate_node(node, None)
         gate_file = GLOBAL_GATE_FILE
         gate = _load_gate_file(gate_file)
         gate["capabilities"].setdefault(name, {})["enabled"] = enabled
@@ -6486,6 +6520,8 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False) -> None:
         gate_source = str(gate_file)
     result: dict = {("enabled" if enabled else "disabled"): name,
                     "scope": scope, "gate": gate_source}
+    if node is not None:
+        result["node"] = node
     if migrated:
         result["migrated_from"] = str(root / LEGACY_PROJECT_CAPABILITIES_REL)
     if scope == "project" and enabled:
@@ -6539,7 +6575,7 @@ def _arrival_global_enable(name: str, undo: bool = False) -> str | None:
         adapter.close()
 
 
-def _inherit_gate(name: str, scope: str) -> None:
+def _inherit_gate(name: str, scope: str, node: str | None = None) -> None:
     root = _project_root()
     if scope == "project":
         root = _require_project()
@@ -6547,14 +6583,17 @@ def _inherit_gate(name: str, scope: str) -> None:
     if root is not None:
         adapter = _records_for(root)
         try:
+            node = _gate_node(node, root, adapter)
             _stamp_policy(adapter, root, scope)
-            removed = adapter.delete("capabilities", "policy", name, scope=scope)
+            removed = adapter.delete("capabilities", "policy", name, scope=scope,
+                                     node=node)
             gate_source = _gate_source(adapter, root, scope)
         except _store_module().StoreError as exc:
             _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
         finally:
             adapter.close()
     else:
+        _gate_node(node, None)
         gate_file = GLOBAL_GATE_FILE
         gate = _load_gate_file(gate_file)
         removed = gate["capabilities"].pop(name, None) is not None
@@ -6562,6 +6601,8 @@ def _inherit_gate(name: str, scope: str) -> None:
         gate_source = str(gate_file)
     result = {"inherited": name, "scope": scope, "removed": removed,
               "gate": gate_source}
+    if node is not None:
+        result["node"] = node
     _refresh_after_gate(root, result)
     _emit(result)
 
@@ -10750,7 +10791,7 @@ def main() -> None:
             if skip:
                 skip = False
                 continue
-            if a in ("--from", "--source", "--remote", "--ref", "--note"):
+            if a in ("--from", "--source", "--remote", "--ref", "--note", "--node"):
                 skip = True
                 continue
             if a.startswith("--"):
@@ -11010,17 +11051,17 @@ def main() -> None:
         if not pos:
             _die(6, "input", "enable needs a capability name")
         scope = _gate_scope(flag("--project"), flag("--global"))
-        _set_gate(pos[0], True, scope)
+        _set_gate(pos[0], True, scope, node=opt("--node"))
     elif cmd == "disable":
         if not pos:
             _die(6, "input", "disable needs a capability name")
         scope = _gate_scope(flag("--project"), flag("--global"))
-        _set_gate(pos[0], False, scope, deny=flag("--deny"))
+        _set_gate(pos[0], False, scope, deny=flag("--deny"), node=opt("--node"))
     elif cmd == "inherit":
         if not pos:
             _die(6, "input", "inherit needs a capability name")
         scope = _gate_scope(flag("--project"), flag("--global"))
-        _inherit_gate(pos[0], scope)
+        _inherit_gate(pos[0], scope, node=opt("--node"))
     elif cmd == "init":
         cmd_init(flag("--claude"), flag("--codex"))
     elif cmd == "relabel":

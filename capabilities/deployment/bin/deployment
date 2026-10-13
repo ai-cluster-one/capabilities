@@ -30,12 +30,16 @@ USAGE
       Full bootstrap for a non-technical deployment path. Creates the deployment
       declarations and the target's bundle in deployment/targets/<target>/:
       docker-compose.yaml, Dockerfile, Dockerfile.dockerignore, .env.example,
-      entrypoint.sh, and (when needed) supervisord.conf. Agent-box
-      setup embeds descriptor-default services from explicitly project-enabled
-      capabilities in one supervised container; `enabled` remains available for
-      separate Compose services. The Telegram/automations flags are
-      compatibility shorthands for per-capability service policy. If --dry-run
-      is passed, print the files that would be written.
+      entrypoint.sh, and (when needed) supervisord.conf. Agent-box setup
+      embeds services in one supervised container, each under its runner (see
+      `deployment runner`): in files mode the descriptor-default services of
+      capabilities the project enabled itself, with `enabled` available for
+      separate Compose services, and the Telegram/automations flags are
+      compatibility shorthands for per-capability service policy; in store
+      mode (project.json "records": "store") every installed capability
+      service, and those flags with any value but `auto` exit 6
+      retired_option, since whether a service runs is the gate's answer on
+      each node. If --dry-run is passed, print the files that would be written.
 
   deployment scaffold
       Alias for `deployment setup`.
@@ -68,15 +72,64 @@ USAGE
       the trade-offs.
 
   deployment sync [--check|--adopt]
-      Compile the project-enabled deployable-service descriptors into the
-      runtime service graph and, for a container profile,
-      one bundle per declared target (Compose, Dockerfile, ignore file, env
-      example, entrypoint, supervisor configuration) in its folder.
-      Only capabilities explicitly enabled in project settings are candidates;
-      one enabled only at global scope contributes no service.
+      Compile the project's deployable-service descriptors into the runtime
+      service graph and, for a container profile, one bundle per declared
+      target (Compose, Dockerfile, ignore file, env example, entrypoint,
+      supervisor configuration) in its folder. Every compiled service runs
+      under its runner (see `deployment runner`). Which services are compiled
+      depends on where the project's gate is kept:
+      Files mode (no node in the gate): as before, only capabilities
+      explicitly enabled in project settings are candidates, one enabled only
+      at global scope contributes no service, and service_policy decides
+      which run and how: auto_include, default_mode (enabled|embedded),
+      capabilities.<name> auto|enabled|disabled|embedded and the descriptor's
+      default_policy; service_policy.placement and services.<name>.placement
+      (node|local|both) choose the substrate.
+      Store mode (project.json "records": "store"): every deployable
+      descriptor of the installed catalogue, less capabilities.exclude, so
+      the gate row naming each node, not the compile, decides whether a
+      service runs there, and turning it on or off needs no recompile or
+      redeploy. service_policy keeps only the shape: `shape`
+      (embedded|container) for every service and `capabilities.<name>` for
+      one; embedded runs under the agent container's Supervisor, container is
+      a Compose service of its own. A store-mode runtime still carrying the
+      retired switches (auto_include, default_mode, capabilities.<name>
+      auto|enabled|disabled) or placement is reported as a warning naming each
+      one, and sync rewrites it, keeping the shape it implied; `retired` in
+      the result lists what it rewrote.
       --check is read-only and exits 7 with structured drift details.
       --adopt explicitly replaces unmarked files at the runtime-declared
       managed artifact paths; external artifacts and overlays are never written.
+
+  deployment runner <name> [--every SECONDS] [--restart POLICY] -- <command...>
+      Run one capability service as the gate on this node says, until
+      stopped; this is what every compiled supervisor entry runs (Supervisor
+      program, own Compose service, host launchd agent). Every SECONDS
+      (service_policy.reconcile_seconds, default 60, 5-3600) it reads the gate
+      for <name> in this project on this node (AGENT_NODE_NAME, else the host
+      name): in store mode only the project's row naming this node places the
+      service, in files mode the project's own enable does (the runtime
+      declaration having already chosen which services are compiled), and
+      nothing inherited or global places it. Placed, it takes or renews the service's
+      lease, a row in the project's store naming the holding node and
+      expiring after three reconciles, starts <command> in a process group of
+      its own and restarts it per POLICY (no|on-failure|always|unless-stopped);
+      a service that exits 4, the contract's policy refusal, is not restarted:
+      the runner releases the lease and holds it idle, reporting the refusal
+      (the service's error code and message when it printed one), until the
+      gate answer for this node changes or the runner restarts.
+      Not placed, or the lease held live by another node, it stops the group
+      (TERM, KILL after 20 seconds) and releases its lease; a refusal names
+      the holder and expiry on stderr, and it keeps checking, so it takes over
+      once the lease expires or is released. With no database resolvable no
+      lease can be taken, and it runs as the gate says. It records its state
+      under capabilities/deployment/state/runners/.
+
+  deployment services
+      This node's view of each compiled service: what the gate answers for
+      it here (placed, the row that answered: scope, node, enabled, and why),
+      whether its runner is running it, a refusal it is held idle for, and
+      who holds its lease (state, holder, expiry). Writes nothing.
 
   deployment watchdog [--dry-run]
       One pass over the launchd agents this project supervises: ask each
@@ -154,14 +207,17 @@ USAGE
       whose body_source is GitHub answers state nothing_to_carry, touches no
       remote and gets no interval job: its node syncs with GitHub itself.
   deployment node status [--target <name>] [--json]
-      JSON host, release, Git sync, harness, store and per-service placement.
+      JSON host, release, Git sync, harness, store and per-service state.
       Git sync is against the node remote, or the GitHub branch for a target
       whose body_source is GitHub.
       store is the node's database in force, resolved in its container through
       the shared library: level, sources and setting redacted, reachable,
       tls_enforced.
-      runtime service_policy.placement maps service names to node|local|both;
-      services.<name>.placement applies to custom services.
+      Each service carries `node` (its Supervisor or container state there),
+      `local` (its launchd agent here), `placement` in files mode, and, from
+      `deployment services` run in the node's container, `gate`, `running`,
+      `lease` and any `refusal`; node_name is the name the node answers to in
+      the gate.
 
   deployment doctor [--target <name>]
       Validate deployment/runtime.json, deployment/targets/*.json, and the deployment
@@ -188,7 +244,8 @@ Contract commands:
   deployment help
   deployment stub
   deployment manifest --json
-  deployment guide [bootstrap|standard|targets]
+  deployment guide [bootstrap|profiles|standard|targets]
+  deployment migrate [status]
   deployment connections
   deployment ids list|get <label>|set <label> <value>|rm <label> [--note <text>]
   deployment refs
@@ -198,7 +255,7 @@ FILES
   deployment/runtime.json
       The project's runtime declaration: profile, services, service-level
       required env, state volumes, runtime capability exclusions, and
-      service_policy and compiler layout. A container runtime
+      service_policy (see `deployment sync`; reconcile_seconds in either mode) and compiler layout. A container runtime
       that names no artifact path compiles one bundle per target (below).
       compiler.artifacts declares the
       Dockerfile, entrypoint, env example, dockerignore, and optional supervisor paths;
@@ -258,6 +315,7 @@ EXIT CODES
   0 success
   3 not found (no project, no runtime, unknown target)
   4 project policy refused this capability
+  5 the store cannot be reached (migrate)
   6 malformed input, validation failure, or init conflict
   7 deployment sync --check drift
 """
@@ -290,7 +348,8 @@ WRITE_VERBS = {"init", "setup", "scaffold", "sync", "deploy", "rollback"}
 WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/deployment/guides/")
-STATE = False
+STATE = True        # each service runner's record under capabilities/deployment/state/
+TABLES = True       # deployment_service_leases in the project's store, built by _tables()
 INVENTORY = {"network": "none"}   # the declarations are files in this project
 POST_INSTALL: list = []
 
@@ -304,6 +363,21 @@ SERVICE_DEPLOY_SCHEMA = "capabilities.service.deploy.v1"
 GENERATED_SCHEMA = "capabilities.deployment.generated.v1"
 GENERATED_MARKER = f"Generated by deployment sync ({GENERATED_SCHEMA})"
 SERVICE_MOUNT_TOKENS = ("{agent_home}", "{project_root}")
+# What remains of service_policy: the shape a service is composed in. Whether it
+# runs, and on which node, is the gate's answer, read by the service's runner.
+SERVICE_SHAPES = ("embedded", "container")
+RESTART_POLICIES = ("no", "on-failure", "always", "unless-stopped")
+# How often a runner asks the gate, renews its lease and converges its service,
+# unless service_policy.reconcile_seconds says otherwise. A lease lasts three
+# reconciles, so one missed renewal never hands the service to another machine.
+RECONCILE_DEFAULT_SECONDS = 60
+RECONCILE_BOUNDS = (5, 3600)
+LEASE_TTL_RECONCILES = 3
+RUNNER_STOP_GRACE_SECONDS = 20
+# The contract's policy refusal. A service that exits with it is refusing to run
+# here, so restarting it would only be refused again.
+POLICY_REFUSAL_EXIT = 4
+RUNNER_STATE_DIR = "runners"
 PROFILES = ("generic", "agent-box", "agent-box-checkout", "host-agents")
 # A profile picks the substrate: a container image the target runs, or
 # supervised processes on the machine itself.
@@ -2049,6 +2123,17 @@ def node_name() -> str:
     return os.environ.get(NODE_NAME_ENV, "").strip() or socket.gethostname()
 
 
+def _node_check(node: Any) -> str | None:
+    """A node a policy row is written for: a name, stripped, or None for every
+    node."""
+    if node is None:
+        return None
+    if not isinstance(node, str) or not node.strip():
+        raise StoreError("bad_node", f"node {node!r} must name a node, or be null "
+                         "for every node")
+    return node.strip()
+
+
 # Where a project keeps its records: files (the default) or the store, which
 # then holds its connections, grants, identifiers and policy together. The
 # manager alone writes this key into `project.json`, when it imports a
@@ -2260,6 +2345,21 @@ class Records:
         raise NotImplementedError
 
 
+# A policy record says which node its row names. Files carry no node, so every
+# policy record read from them names none: it is the record for every node.
+_FILE_NODE = {"policy": {"node": None}}
+
+
+def _files_carry_no_node(node: Any) -> None:
+    if node is not None:
+        raise StoreError(
+            "node_requires_store",
+            "a policy row naming a node is kept only in the store: files carry no "
+            "node, so a record written there is for every node",
+            "import this project's records into its store with `capabilities "
+            "connections import`, then write the row for the node")
+
+
 class FileRecords(Records):
     """Configuration kept as the files the envelope has always held.
 
@@ -2388,7 +2488,8 @@ class FileRecords(Records):
                       "project_id": pid, "capability": capability,
                       "collection": collection, "key": key, "value": value,
                       "note": self._note(root, capability, collection, key),
-                      "updated_at": None, "updated_by": None}
+                      "updated_at": None, "updated_by": None,
+                      **_FILE_NODE.get(collection, {})}
                 for key, value in entries.items()
             })
         return layers
@@ -2436,7 +2537,8 @@ class FileRecords(Records):
                   "capability": capability, "collection": collection,
                   "key": key, "value": value,
                   "note": self._note(root, capability, collection, key),
-                  "updated_at": None, "updated_by": None}
+                  "updated_at": None, "updated_by": None,
+                  **_FILE_NODE.get(collection, {})}
             for key, value in self._entries(root, capability, collection).items()
         }
 
@@ -2521,10 +2623,11 @@ class FileRecords(Records):
 
     def set(self, capability: str, collection: str, key: str, value: Any,
             actor: str | None = None, note: str | None = None,
-            scope: str | None = None) -> None:
+            scope: str | None = None, node: str | None = None) -> None:
         _store_check("capability", capability, CAPABILITY_RE)
         _store_check("key", key, KEY_RE)
         _semantics(collection)
+        _files_carry_no_node(node)
         _refuse_record_write(capability, collection)
         target_scope = scope or "project"
         if target_scope not in SCOPE_KINDS:
@@ -2563,7 +2666,8 @@ class FileRecords(Records):
         self._save(path, body, sort=collection == "identifier")
 
     def delete(self, capability: str, collection: str, key: str,
-               scope: str | None = None) -> bool:
+               scope: str | None = None, node: str | None = None) -> bool:
+        _files_carry_no_node(node)
         _refuse_record_write(capability, collection)
         target_scope = scope or "project"
         if target_scope not in SCOPE_KINDS:
@@ -2709,7 +2813,10 @@ class StoreRecords(FileRecords):
     row. Identifiers resolve label by label, the project's row over the global
     one. Policy resolves per capability, from the first of: the project's row
     for this node, its row for every node, the global row for this node, the
-    global row for every node; none is default deny.
+    global row for every node; none is default deny. A policy record carries
+    `node`, the node the row that answered names (None for every node), and
+    `set`/`delete` of a policy row take `node` to write or remove the row for
+    one node.
 
     The store is reached through the shared database library, on first use
     only, so a call that reads nothing the store holds never connects."""
@@ -2940,12 +3047,17 @@ class StoreRecords(FileRecords):
 
     def _record(self, scope: str, capability: str, collection: str, key: str,
                 value: Any, ref: str, note: str | None = None,
-                updated_at: str | None = None) -> dict[str, Any]:
-        return {"id": f"store:{capability}/{collection}/{ref}", "scope": scope,
-                "project_id": self.project_id if scope == "project" else None,
-                "capability": capability, "collection": collection, "key": key,
-                "value": value, "note": note, "updated_at": updated_at,
-                "updated_by": None}
+                updated_at: str | None = None, node: str | None = None) -> dict[str, Any]:
+        record = {"id": f"store:{capability}/{collection}/{ref}", "scope": scope,
+                  "project_id": self.project_id if scope == "project" else None,
+                  "capability": capability, "collection": collection, "key": key,
+                  "value": value, "note": note, "updated_at": updated_at,
+                  "updated_by": None}
+        if collection == "policy":
+            # Which node the row that answered names: this node's name, or None
+            # for the row for every node.
+            record["node"] = node
+        return record
 
     def _scope_layers(self, capability: str, collection: str,
                       scope: str) -> list[dict[str, dict[str, Any]]]:
@@ -2959,7 +3071,7 @@ class StoreRecords(FileRecords):
                      for label, (value, note, updated_at) in rows.items()}]
         return [{name: self._record(scope, capability, collection, name, value,
                                     f"{scope}/{name}@{node or '*'}",
-                                    updated_at=updated_at)
+                                    updated_at=updated_at, node=node)
                  for name, (value, updated_at) in rows.items()}
                 for at, node, rows in self._policy_rows() if at == scope]
 
@@ -3145,32 +3257,35 @@ class StoreRecords(FileRecords):
             (agent, capability, label, json.dumps(value, ensure_ascii=False),
              note or "")))
 
-    def _put_policy(self, name: str, value: Any, scope: str | None) -> None:
+    def _put_policy(self, name: str, value: Any, scope: str | None,
+                    node: str | None = None) -> None:
         if (not isinstance(value, dict) or set(value) != {"enabled"}
                 or not isinstance(value["enabled"], bool)):
             raise StoreError("bad_policy", f"policy for {name!r} must be "
                              '{"enabled": true|false}')
         agent = self._agent(scope)
+        node = _node_check(node)
         self._write(lambda conn: conn.execute(
             "INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
-            "VALUES (%s, %s, NULL, %s) "
+            "VALUES (%s, %s, %s, %s) "
             "ON CONFLICT ((coalesce(agent_id, '')), capability, (coalesce(node, ''))) "
             "DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()",
-            (agent, name, value["enabled"])))
+            (agent, name, node, value["enabled"])))
 
     def set(self, capability: str, collection: str, key: str, value: Any,
             actor: str | None = None, note: str | None = None,
-            scope: str | None = None) -> None:
+            scope: str | None = None, node: str | None = None) -> None:
         if not self._scoped(collection, key, scope):
             return super().set(capability, collection, key, value,
-                               actor=actor, note=note, scope=scope)
+                               actor=actor, note=note, scope=scope, node=node)
         _store_check("capability", capability, CAPABILITY_RE)
         _store_check("key", key, KEY_RE)
+        _only_policy_names_a_node(collection, node)
         _refuse_record_write(capability, collection)
         if collection == "identifier":
             return self._put_identifier(capability, key, value, note, scope)
         if collection == "policy":
-            return self._put_policy(key, value, scope)
+            return self._put_policy(key, value, scope, node)
         if scope not in (None, "project"):
             raise StoreError("bad_scope",
                              f"scope {scope!r} must be one of {', '.join(SCOPE_KINDS)}")
@@ -3202,9 +3317,10 @@ class StoreRecords(FileRecords):
             self._write(lambda conn: self._put_default(conn, capability, cid, None))
 
     def delete(self, capability: str, collection: str, key: str,
-               scope: str | None = None) -> bool:
+               scope: str | None = None, node: str | None = None) -> bool:
         if not self._scoped(collection, key, scope):
-            return super().delete(capability, collection, key, scope=scope)
+            return super().delete(capability, collection, key, scope=scope, node=node)
+        _only_policy_names_a_node(collection, node)
         _refuse_record_write(capability, collection)
         if collection == "identifier":
             agent = self._agent(scope)
@@ -3217,13 +3333,14 @@ class StoreRecords(FileRecords):
                     (agent, capability, key)).rowcount > 0
         elif collection == "policy":
             agent = self._agent(scope)
+            node = _node_check(node)
 
             def work(conn: Any) -> bool:
                 return conn.execute(
                     "DELETE FROM capabilities_policy "
                     "WHERE coalesce(agent_id, '') = coalesce(%s, '') "
-                    "AND capability = %s AND node IS NULL",
-                    (agent, key)).rowcount > 0
+                    "AND capability = %s AND coalesce(node, '') = coalesce(%s, '')",
+                    (agent, key, node)).rowcount > 0
         elif collection == "connection":
             def work(conn: Any) -> bool:
                 return conn.execute(
@@ -3242,6 +3359,14 @@ class StoreRecords(FileRecords):
                     "WHERE agent_id = %s AND capability = %s AND node IS NULL "
                     "AND is_default", (self.project_id, capability)).rowcount > 0
         return bool(self._write(work))
+
+
+def _only_policy_names_a_node(collection: str, node: Any) -> None:
+    """A grant names its node inside its value; a policy row is the one record
+    written for a node through `node`."""
+    if node is not None and collection != "policy":
+        raise StoreError("bad_node", f"a {collection} record is not written for a "
+                         "node this way; only a policy row is")
 
 
 def _stamp(moment: Any) -> str | None:
@@ -3441,9 +3566,9 @@ def _write_file(root: Path, path: Path, text: str, force: bool) -> dict:
 
 
 def _enabled_capabilities(root: Path) -> list[str]:
-    """The capabilities this project enabled itself. A global enable makes a
-    capability usable here, but only the project's own choice puts its service
-    into what this project runs."""
+    """The capabilities this project enabled itself, as this node reads its
+    gate. A global enable makes a capability usable here but never places its
+    service on a node."""
     try:
         rows = _records().resolve_scope("capabilities", "policy", "project")
     except StoreError as exc:
@@ -3451,10 +3576,6 @@ def _enabled_capabilities(root: Path) -> list[str]:
     return sorted(name for name, row in rows.items()
                   if isinstance(row.get("value"), dict)
                   and row["value"].get("enabled") is True)
-
-
-def _has_enabled(root: Path, name: str) -> bool:
-    return name in _enabled_capabilities(root)
 
 
 def _installed_manifest(name: str) -> tuple[dict | None, str | None]:
@@ -3515,7 +3636,33 @@ def _deploy_descriptor_problems(name: str, deploy: object) -> list[str]:
     return problems
 
 
-def _discover_service_descriptors(root: Path) -> tuple[dict[str, dict], list[dict]]:
+def _installed_service_names() -> list[str]:
+    """Every capability in this machine's registry, by the manifest it left."""
+    home = _cap_home()
+    if not home.is_dir():
+        return []
+    return sorted(path.name for path in home.iterdir()
+                  if (path / "manifest.json").is_file()
+                  and re.fullmatch(r"[a-z][a-z0-9_-]*", path.name))
+
+
+def _store_placed(root: Path) -> bool:
+    """Whether this project's gate is in the store, where a row can name a
+    node. Only such a project has its services placed per node by the gate;
+    files carry no answer per node, so a files-mode project keeps deciding
+    which services it runs, and where, in its runtime declaration."""
+    del root
+    try:
+        return _records().mode_of("policy") == "store"
+    except (StoreError, AttributeError):
+        return False
+
+
+# --- Files mode: the runtime declaration decides which services run ---------
+# A project whose gate is in files compiles exactly what it always has: the
+# capabilities it enabled itself, filtered by service_policy and placement.
+
+def _files_service_descriptors(root: Path) -> tuple[dict[str, dict], list[dict]]:
     """Discover descriptors; project enablement is the only authorization input."""
     descriptors: dict[str, dict] = {}
     findings: list[dict] = []
@@ -3535,7 +3682,7 @@ def _discover_service_descriptors(root: Path) -> tuple[dict[str, dict], list[dic
     return descriptors, findings
 
 
-def _service_policy(runtime: dict) -> tuple[dict, bool]:
+def _files_service_policy(runtime: dict) -> tuple[dict, bool]:
     raw = runtime.get("service_policy")
     if isinstance(raw, dict):
         auto_include = raw.get("auto_include", True)
@@ -3547,6 +3694,8 @@ def _service_policy(runtime: dict) -> tuple[dict, bool]:
             "default_mode": default_mode if default_mode in ("enabled", "embedded") else "enabled",
             "capabilities": dict(overrides) if isinstance(overrides, dict) else {},
             "placement": dict(placement) if isinstance(placement, dict) else {},
+            **({"reconcile_seconds": raw["reconcile_seconds"]}
+               if "reconcile_seconds" in raw else {}),
         }, False
     # Legacy runtime files preserve explicitly listed capability services on first sync.
     overrides: dict[str, str] = {}
@@ -3558,20 +3707,10 @@ def _service_policy(runtime: dict) -> tuple[dict, bool]:
     return {"auto_include": True, "default_mode": "enabled", "capabilities": overrides}, True
 
 
-def _runtime_capability_excludes(runtime: dict) -> set[str]:
-    raw = runtime.get("capabilities")
-    if not isinstance(raw, dict):
-        return set()
-    values = raw.get("exclude", [])
-    if not isinstance(values, list):
-        return set()
-    return {value for value in values if isinstance(value, str)}
-
-
-def _active_descriptors(root: Path, runtime: dict) -> tuple[
+def _files_active_descriptors(root: Path, runtime: dict) -> tuple[
         dict[str, dict], dict[str, dict], list[dict], bool]:
     discovered, findings = _discover_service_descriptors(root)
-    policy, migrated = _service_policy(runtime)
+    policy, migrated = _files_service_policy(runtime)
     overrides = policy["capabilities"]
     project_enabled = set(_enabled_capabilities(root))
     runtime_excludes = _runtime_capability_excludes(runtime)
@@ -3611,6 +3750,202 @@ def _active_descriptors(root: Path, runtime: dict) -> tuple[
             placement = placements.get(name, ((runtime.get("services") or {}).get(name) or {}).get("placement"))
             if placement == ("node" if host else "local"):
                 del group[name]
+    mount_contracts: dict[str, tuple[str, str]] = {}
+    for name, service in {**active, **embedded}.items():
+        deploy = service["deploy"]
+        for mount in deploy["mounts"]:
+            contract = (mount["kind"], mount["target"])
+            previous = mount_contracts.setdefault(mount["name"], contract)
+            if previous != contract:
+                findings.append({"severity": "error", "path": f"registry:{name}/manifest.json",
+                                 "message": f"mount {mount['name']!r} conflicts with another active descriptor"})
+    return active, embedded, findings, migrated
+
+
+# --- Store mode: the gate on each node decides ---------------------------------
+
+
+def _discover_service_descriptors(root: Path, runtime: dict | None = None
+                                  ) -> tuple[dict[str, dict], list[dict]]:
+    """The deployable services this project compiles: in store mode every one
+    the installed catalogue declares, less the runtime's exclusions, each
+    under a runner that asks the gate on its node; in files mode the ones the
+    project enabled itself."""
+    if not _store_placed(root):
+        return _files_service_descriptors(root)
+    return _store_service_descriptors(runtime)
+
+
+def _store_service_descriptors(runtime: dict | None = None
+                               ) -> tuple[dict[str, dict], list[dict]]:
+    """Every deployable service the installed catalogue declares, less the
+    runtime's exclusions. Nothing here decides whether a service runs: each one
+    is compiled under a runner that asks the gate on the node it runs on, so
+    turning a service on or off needs no recompile."""
+    excluded = _runtime_capability_excludes(runtime or {})
+    descriptors: dict[str, dict] = {}
+    findings: list[dict] = []
+    for name in _installed_service_names():
+        if name in excluded:
+            continue
+        manifest, err = _installed_manifest(name)
+        if err or manifest is None:
+            continue
+        service = manifest.get("service")
+        if not isinstance(service, dict) or "deploy" not in service:
+            continue
+        problems = _deploy_descriptor_problems(name, service.get("deploy"))
+        if problems:
+            findings.extend({"severity": "error", "path": f"registry:{name}/manifest.json",
+                             "message": problem} for problem in problems)
+            continue
+        descriptors[name] = service
+    return descriptors, findings
+
+
+# What a runtime's service_policy says, once its retired on/off vocabulary is
+# read for the shape it implied. `enabled` always meant a Compose service of its
+# own; `auto` and `disabled` said only whether a service ran, which the gate now
+# answers on each node.
+RETIRED_SHAPES = {"enabled": "container", "embedded": "embedded",
+                  "auto": None, "disabled": None}
+RETIRED_POLICY_KEYS = ("auto_include", "default_mode", "placement")
+
+
+def _retired_service_policy(runtime: dict) -> list[dict]:
+    """Each retired switch a runtime still carries, said in words: what it
+    used to decide, and what decides it now. `deployment sync` removes each
+    one and keeps the shape it implied, so none is dropped without a word."""
+    notes: list[dict] = []
+    raw = runtime.get("service_policy")
+    gate = ("whether a service runs on a node is the gate's answer for that node: "
+            "the project's row naming the node (`capabilities enable <name> "
+            "--project --node <node>`), or the project's own enable in files mode, "
+            "with a lease keeping it on one machine at a time")
+    if isinstance(raw, dict):
+        if "auto_include" in raw:
+            notes.append({"key": "service_policy.auto_include",
+                          "message": f"service_policy.auto_include is retired: {gate}; "
+                                     "`deployment sync` removes it"})
+        if "default_mode" in raw:
+            shape = RETIRED_SHAPES.get(raw.get("default_mode"))
+            notes.append({"key": "service_policy.default_mode",
+                          "message": "service_policy.default_mode is retired: "
+                                     f"{gate}; `deployment sync` keeps the shape it "
+                                     f"named as service_policy.shape {shape!r}"})
+        if "placement" in raw:
+            notes.append({"key": "service_policy.placement",
+                          "message": f"service_policy.placement is retired: {gate}; "
+                                     "`deployment sync` removes it"})
+        overrides = raw.get("capabilities")
+        for name, mode in sorted((overrides or {}).items()
+                                 if isinstance(overrides, dict) else []):
+            if mode in ("auto", "disabled"):
+                notes.append({"key": f"service_policy.capabilities.{name}",
+                              "message": f"service_policy.capabilities.{name} "
+                                         f"{mode!r} is retired and no longer decides "
+                                         f"whether {name}'s service runs: {gate}; "
+                                         "`deployment sync` removes it, and "
+                                         "capabilities.exclude is what keeps a "
+                                         "service out of a runtime altogether"})
+            elif mode == "enabled":
+                notes.append({"key": f"service_policy.capabilities.{name}",
+                              "message": f"service_policy.capabilities.{name} "
+                                         "'enabled' is retired: `deployment sync` "
+                                         "keeps the shape it named, 'container'; "
+                                         f"{gate}"})
+    services = runtime.get("services")
+    for name, service in sorted(services.items() if isinstance(services, dict) else []):
+        if isinstance(service, dict) and "placement" in service:
+            notes.append({"key": f"services.{name}.placement",
+                          "message": f"services.{name}.placement is retired: {gate}; "
+                                     "`deployment sync` removes it"})
+    return notes
+
+
+def _service_policy(runtime: dict, store: bool = True) -> tuple[dict, bool]:
+    """In files mode, the runtime's service_policy as it has always been read.
+    In store mode, the runtime's service shape: `shape`, the default for every service
+    (`embedded` in the agent container's Supervisor, or `container`, a Compose
+    service of its own), `capabilities`, a shape per capability, and
+    `reconcile_seconds`, how often each runner asks the gate. A runtime
+    still carrying the retired on/off vocabulary is read for the shape it
+    implied. The second value says the runtime declared no service_policy."""
+    if not store:
+        return _files_service_policy(runtime)
+    raw = runtime.get("service_policy")
+    if isinstance(raw, dict):
+        shape = raw.get("shape")
+        if shape not in SERVICE_SHAPES:
+            shape = RETIRED_SHAPES.get(raw.get("default_mode")) or "container"
+        overrides: dict[str, str] = {}
+        declared = raw.get("capabilities", {})
+        for name, mode in (declared.items() if isinstance(declared, dict) else []):
+            if mode in SERVICE_SHAPES:
+                overrides[name] = mode
+            elif RETIRED_SHAPES.get(mode):
+                overrides[name] = RETIRED_SHAPES[mode]
+        policy = {"shape": shape, "capabilities": overrides}
+        if "reconcile_seconds" in raw:
+            policy["reconcile_seconds"] = raw["reconcile_seconds"]
+        return policy, False
+    # A runtime from before service_policy keeps each listed capability service
+    # in the Compose service of its own it had.
+    overrides = {}
+    services = runtime.get("services")
+    if isinstance(services, dict):
+        for entry in services.values():
+            if isinstance(entry, dict) and isinstance(entry.get("capability"), str):
+                overrides[entry["capability"]] = "container"
+    return {"shape": "container", "capabilities": overrides}, True
+
+
+def _reconcile_seconds(runtime: dict) -> int:
+    value = (runtime.get("service_policy") or {}).get("reconcile_seconds") \
+        if isinstance(runtime.get("service_policy"), dict) else None
+    low, high = RECONCILE_BOUNDS
+    if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
+        return value
+    return RECONCILE_DEFAULT_SECONDS
+
+
+def _runtime_capability_excludes(runtime: dict) -> set[str]:
+    raw = runtime.get("capabilities")
+    if not isinstance(raw, dict):
+        return set()
+    values = raw.get("exclude", [])
+    if not isinstance(values, list):
+        return set()
+    return {value for value in values if isinstance(value, str)}
+
+
+def _active_descriptors(root: Path, runtime: dict) -> tuple[
+        dict[str, dict], dict[str, dict], list[dict], bool]:
+    """The services this project compiles, split into a Compose service of
+    their own and embedded in the agent container. In files mode the runtime
+    declaration decides as it always has; in store mode every deployable
+    service is compiled, split by shape, and the gate on each node starts and
+    stops it through its runner."""
+    if not _store_placed(root):
+        return _files_active_descriptors(root, runtime)
+    discovered, findings = _store_service_descriptors(runtime)
+    policy, migrated = _service_policy(runtime)
+    overrides = policy["capabilities"]
+    runtime_excludes = _runtime_capability_excludes(runtime)
+    for name, shape in sorted(overrides.items()):
+        if name in runtime_excludes:
+            findings.append({"severity": "error", "path": "deployment/runtime.json",
+                             "message": f"service {name!r} cannot be both {shape} and excluded from the runtime image"})
+        elif name not in discovered:
+            findings.append({"severity": "warning", "path": "deployment/runtime.json",
+                             "message": f"service_policy.capabilities.{name} names a shape, but no installed capability here declares a deploy descriptor for it"})
+    active: dict[str, dict] = {}
+    embedded: dict[str, dict] = {}
+    for name, service in sorted(discovered.items()):
+        if overrides.get(name, policy["shape"]) == "embedded":
+            embedded[name] = service
+        else:
+            active[name] = service
     mount_contracts: dict[str, tuple[str, str]] = {}
     for name, service in {**active, **embedded}.items():
         deploy = service["deploy"]
@@ -3971,6 +4306,10 @@ def _env_example_template(runtime: dict, descriptors: dict[str, dict],
         ]
     lines += [
         "",
+        "# This node's name in the gate. A capability service runs here only where",
+        "# the project's policy row names it; keep it the same across redeploys.",
+        f"{NODE_NAME_ENV}=",
+        "",
         "# Runtime secrets injected by Coolify / docker compose env.",
     ]
     required: set[str] = set(x for x in runtime.get("required_env", [])
@@ -3999,7 +4338,7 @@ def _env_example_template(runtime: dict, descriptors: dict[str, dict],
     # Keys the file already states under a heading that explains what they are
     # for. Restating them lower down would leave the reader two assignments to
     # the same name, and the later one wins.
-    stated = [runtime.get("image_env")]
+    stated = [runtime.get("image_env"), NODE_NAME_ENV]
     if checkout:
         stated += [REPO_URL_ENV, REPO_BRANCH_ENV, *SYNC_DEFAULTS]
     for key in stated:
@@ -4723,8 +5062,18 @@ ENTRYPOINT [{json.dumps(entrypoint_path)}]
 """
 
 
+def _runner_argv(name: str, command: list[str], restart: str, every: int) -> list[str]:
+    """The one way a supervisor starts a capability service: through its
+    runner, which asks the gate on this node every `every` seconds, holds the
+    service's lease, and starts or stops the descriptor's command to match."""
+    return [NAME, "runner", name, "--every", str(every), "--restart",
+            restart if restart in RESTART_POLICIES else "unless-stopped",
+            "--", *command]
+
+
 def _supervisor_template(embedded: dict[str, dict], project_root: str,
-                         body_sync: str | None = None) -> str:
+                         body_sync: str | None = None,
+                         every: int = RECONCILE_DEFAULT_SECONDS) -> str:
     sections = ["""[unix_http_server]
 file=/tmp/agent-box-supervisor.sock
 chmod=0700
@@ -4766,22 +5115,22 @@ stdout_logfile_maxbytes=0
 stderr_logfile=/dev/fd/2
 stderr_logfile_maxbytes=0
 priority=5""")
+    # Each program is the service's runner, kept running whatever the gate
+    # says: the runner is what starts the service when the gate places it on
+    # this node and stops it when it does not, and it applies the descriptor's
+    # restart policy to the service itself.
     for priority, (name, service) in enumerate(sorted(embedded.items()), 10):
         deploy = service["deploy"]
         restart = str(deploy.get("restart") or "unless-stopped")
-        autorestart = (
-            "false" if restart == "no" else
-            "unexpected" if restart == "on-failure" else
-            "true"
-        )
         sections.append(f"""[program:{name}]
-command={shlex.join(deploy["command"])}
+command={shlex.join(_runner_argv(name, deploy["command"], restart, every))}
 directory={project_root}
 autostart=true
-autorestart={autorestart}
+autorestart=true
 startsecs=3
 startretries=100
 stopsignal=TERM
+stopwaitsecs={RUNNER_STOP_GRACE_SECONDS + 10}
 stopasgroup=true
 killasgroup=true
 stdout_logfile=/dev/fd/1
@@ -4808,6 +5157,9 @@ def _compose_template(project_name: str, runtime: dict,
         "x-agent-env: &agent-env",
         "  GIT_DEPLOY_KEY_B64: ${GIT_DEPLOY_KEY_B64:-}",
         "  AGENT_GIT_KNOWN_HOSTS_B64: ${AGENT_GIT_KNOWN_HOSTS_B64:-}",
+        # The node's name in the gate: a runner starts a service only where
+        # the project's policy row names this node.
+        f"  {NODE_NAME_ENV}: ${{{NODE_NAME_ENV}:-}}",
         # The database is the server's: each key passes through from the
         # target's environment, and one left unset there is empty, which the
         # resolver reads as not set.
@@ -4847,6 +5199,10 @@ def _compose_template(project_name: str, runtime: dict,
                 "      interval: 10s", "      timeout: 5s", "      retries: 6", "      start_period: 30s"]
         command = service.get("command")
         if isinstance(command, list) and command:
+            if isinstance(service.get("capability"), str):
+                command = _runner_argv(name, command,
+                                       str(service.get("restart") or "unless-stopped"),
+                                       _reconcile_seconds(runtime))
             block.insert(-2, f"    command: {json.dumps(command, ensure_ascii=False)}")
         required = [key for key in service.get("required_env", []) if isinstance(key, str)]
         optional = [key for key in service.get("optional_env", [])
@@ -4893,7 +5249,7 @@ volumes:
 """
 
 
-def _runtime_template(profile: str, project_name: str) -> dict:
+def _runtime_template(profile: str, project_name: str, store: bool = False) -> dict:
     slug = _slug(project_name)
     services: dict = {
         "app": {
@@ -4962,11 +5318,16 @@ def _runtime_template(profile: str, project_name: str) -> dict:
                      if profile in HOST_PROFILES else
                      {key: value for key, value in _compiler_config({}).items()
                       if key != "artifacts" or profile not in CONTAINER_PROFILES}),
-        "service_policy": {
+        # A project whose gate is in the store keeps only the shape here; one
+        # whose gate is in files keeps deciding which services run, as before.
+        "service_policy": ({
+            "shape": "embedded" if profile in CONTAINER_PROFILES else "container",
+            "capabilities": {},
+        } if store else {
             "auto_include": True,
             "default_mode": "embedded" if profile in CONTAINER_PROFILES else "enabled",
             "capabilities": {},
-        },
+        }),
         "capabilities": {},
     }
 
@@ -5023,6 +5384,7 @@ def _compile_runtime(root: Path, runtime: dict,
                      active: dict[str, dict], embedded: dict[str, dict]) -> dict:
     compiled = dict(runtime)
     compiler = _compiler_config(runtime)
+    store = _store_placed(root)
     # On a host profile every service is its own supervised process, so the
     # embedded/enabled distinction - which only says how a container is
     # composed - collapses into one flat set.
@@ -5047,8 +5409,12 @@ def _compile_runtime(root: Path, runtime: dict,
     base = _runtime_template(str(runtime.get("profile") or "agent-box"),
                              str(runtime.get("name") or root.name))
     existing_services = runtime.get("services") if isinstance(runtime.get("services"), dict) else {}
+    # In store mode a service's placement is retired: which node runs it is
+    # the gate's answer. A files-mode runtime keeps it.
     services = {
-        name: value for name, value in existing_services.items()
+        name: ({key: item for key, item in value.items() if key != "placement"}
+               if store else value)
+        for name, value in existing_services.items()
         if isinstance(value, dict) and not isinstance(value.get("capability"), str)
     }
     if runtime.get("profile") in CONTAINER_PROFILES:
@@ -5107,7 +5473,10 @@ def _compile_runtime(root: Path, runtime: dict,
         deploy = service["deploy"]
         previous = existing_services.get(name)
         entry = dict(previous) if isinstance(previous, dict) else {}
-        entry["placement"] = (runtime.get("service_policy") or {}).get("placement", {}).get(name, entry.get("placement", "local" if host else "node"))
+        if store:
+            entry.pop("placement", None)
+        else:
+            entry["placement"] = (runtime.get("service_policy") or {}).get("placement", {}).get(name, entry.get("placement", "local" if host else "node"))
         entry.setdefault("role", "capability-service")
         if not host:
             entry.setdefault("compose_service", name)
@@ -5149,13 +5518,14 @@ def _compile_runtime(root: Path, runtime: dict,
             if added and isinstance(entry, dict) and isinstance(entry.get("state"), list):
                 services[name] = {**entry, "state": [
                     value for value in entry["state"] if value not in added]}
-    policy, _migrated = _service_policy(runtime)
+    policy, _migrated = _service_policy(runtime, store)
     serialized_policy = dict(policy)
     raw_policy = runtime.get("service_policy")
-    if not serialized_policy.get("placement"):
-        serialized_policy.pop("placement", None)
-    if isinstance(raw_policy, dict) and "default_mode" not in raw_policy:
-        serialized_policy.pop("default_mode", None)
+    if not store:
+        if not serialized_policy.get("placement"):
+            serialized_policy.pop("placement", None)
+        if isinstance(raw_policy, dict) and "default_mode" not in raw_policy:
+            serialized_policy.pop("default_mode", None)
     capability_config = (dict(runtime.get("capabilities"))
                          if isinstance(runtime.get("capabilities"), dict) else {})
     # The capabilities lock is retired: a container node installs the catalogue.
@@ -5372,7 +5742,7 @@ def _artifact_texts(root: Path, runtime: dict,
     if supervisor_path is not None:
         candidates["supervisor"] = _supervisor_template(
             embedded, compiler["container"]["project_root"],
-            body_sync=body_sync_config)
+            body_sync=body_sync_config, every=_reconcile_seconds(runtime))
     # The profile owns this one outright rather than offering it as a declarable
     # artifact: which program keeps the body current is not a project's choice.
     if body_sync_path is not None:
@@ -5519,7 +5889,7 @@ def _host_launcher_text(command: list[str]) -> str:
 
 def _launchd_plist(root: Path, runtime: dict, name: str, service: dict,
                    search_path: str, launcher: Path) -> str:
-    deploy = service["deploy"]
+    del service
     prefix = _host_label_prefix(runtime, root)
     agents_dir = _host_agents_dir(root, runtime)
     body: dict = {
@@ -5529,9 +5899,10 @@ def _launchd_plist(root: Path, runtime: dict, name: str, service: dict,
         "EnvironmentVariables": _launchd_environment(runtime, name, search_path),
         "RunAtLoad": True,
     }
-    keep_alive = _launchd_keep_alive(str(deploy.get("restart") or "unless-stopped"))
-    if keep_alive is not None:
-        body["KeepAlive"] = keep_alive
+    # The agent runs the service's runner, which is meant to run for as long as
+    # the agent is loaded: it starts and stops the service itself as the gate
+    # answers, so even a descriptor that restarts nothing keeps its runner.
+    body["KeepAlive"] = _launchd_keep_alive("unless-stopped")
     body.update({
         "ThrottleInterval": 10,
         "ProcessType": SERVICE_PROCESS_TYPE,
@@ -5584,8 +5955,15 @@ def _host_artifact_texts(root: Path, runtime: dict,
                            "time"})
         prefix = _host_label_prefix(runtime, root)
         launcher = agents_dir / f"{prefix}-{name}"
+        # A person at the machine stops a service with `<name> service stop`,
+        # so a clean exit stays a stop here, as launchd's SuccessfulExit has
+        # always made it; a descriptor that restarts nothing still does not.
+        restart = str(service["deploy"].get("restart") or "unless-stopped")
+        runner = _runner_argv(name, list(command),
+                              "no" if restart == "no" else "on-failure",
+                              _reconcile_seconds(runtime))
         texts[launcher] = _mark_generated(
-            launcher, _host_launcher_text(_launchd_program(list(command))))
+            launcher, _host_launcher_text(_launchd_program(runner)))
         path = agents_dir / f"{prefix}.{name}.plist"
         texts[path] = _mark_generated(
             path, _launchd_plist(root, runtime, name, service, search_path, launcher))
@@ -5774,6 +6152,15 @@ def cmd_watchdog(dry_run: bool, now: float | None = None) -> dict:
     for name in sorted(services):
         service = services[name]
         if not isinstance(service, dict):
+            continue
+        # A runner the gate keeps idle runs no service to ask about, and a
+        # restart would change nothing it decides.
+        runner = _read_runner_state(name)
+        if runner and runner.get("want") is False:
+            state.pop(name, None)
+            report["services"].append({
+                "service": name, "label": f"{prefix}.{name}", "action": "none",
+                "detail": f"not running here by the gate: {runner.get('reason')}"})
             continue
         report["services"].append(_watchdog_check(
             name, f"{prefix}.{name}", list(service.get("doctor") or []), root,
@@ -6001,6 +6388,8 @@ def _sync(root: Path, runtime: dict, *, check: bool,
         "embedded_services": sorted(embedded),
         "service_policy": compiled["service_policy"],
         "migrated_legacy_runtime": migrated,
+        "retired": ([note["key"] for note in _retired_service_policy(runtime)]
+                    if _store_placed(root) else []),
         "drift": drift,
         "findings": findings,
         "written": written,
@@ -6158,7 +6547,8 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
                 findings.append({"severity": "error", "path": _rel(root, path),
                                  "message": f"services.{service_name} must be an object"})
                 continue
-            if service.get("placement", "node") not in ("node", "local", "both"):
+            if (not _store_placed(root)
+                    and service.get("placement", "node") not in ("node", "local", "both")):
                 findings.append({"severity": "error", "path": _rel(root, path),
                                  "message": f"services.{service_name}.placement must be node|local|both"})
             for field in ("required_env", "optional_env", "state"):
@@ -6358,6 +6748,59 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
                 "message": (f"boot artifacts are copied into {BOOT_DIR} together, so their file "
                             "names must differ: " + ", ".join(sorted(boot_names)))})
     policy = data.get("service_policy")
+    if not _store_placed(root):
+        return findings + _files_policy_findings(root, path, policy)
+    shapes = "|".join(SERVICE_SHAPES)
+    if policy is None:
+        findings.append({"severity": "warning", "path": _rel(root, path),
+                         "message": "legacy runtime has no service_policy; sync adds one and keeps each listed capability service in a container of its own"})
+    elif not isinstance(policy, dict):
+        findings.append({"severity": "error", "path": _rel(root, path),
+                         "message": "service_policy must be an object"})
+    else:
+        if "shape" in policy and policy["shape"] not in SERVICE_SHAPES:
+            findings.append({"severity": "error", "path": _rel(root, path),
+                             "message": f"service_policy.shape must be {shapes}"})
+        if ("default_mode" in policy
+                and policy["default_mode"] not in ("enabled", "embedded")):
+            findings.append({"severity": "error", "path": _rel(root, path),
+                             "message": "service_policy.default_mode is retired and "
+                                        f"names no shape; set service_policy.shape to {shapes}"})
+        findings += _reconcile_findings(root, path, policy)
+        overrides = policy.get("capabilities", {})
+        if not isinstance(overrides, dict):
+            findings.append({"severity": "error", "path": _rel(root, path),
+                             "message": "service_policy.capabilities must be an object"})
+        else:
+            for name, mode in overrides.items():
+                if mode not in SERVICE_SHAPES and mode not in RETIRED_SHAPES:
+                    findings.append({"severity": "error", "path": _rel(root, path),
+                                     "message": f"service_policy.capabilities.{name} must be {shapes}"})
+    # A project whose gate is in the store never has a retired switch or
+    # placement dropped quietly: each one is named with what now decides it,
+    # and `deployment sync` rewrites it.
+    for note in _retired_service_policy(data):
+        findings.append({"severity": "warning", "path": _rel(root, path),
+                         "message": note["message"]})
+    return findings
+
+
+def _reconcile_findings(root: Path, path: Path, policy: dict) -> list[dict]:
+    if "reconcile_seconds" not in policy:
+        return []
+    value = policy["reconcile_seconds"]
+    low, high = RECONCILE_BOUNDS
+    if (not isinstance(value, int) or isinstance(value, bool)
+            or not low <= value <= high):
+        return [{"severity": "error", "path": _rel(root, path),
+                 "message": f"service_policy.reconcile_seconds must be "
+                            f"an integer from {low} to {high}"}]
+    return []
+
+
+def _files_policy_findings(root: Path, path: Path, policy: object) -> list[dict]:
+    """A files-mode runtime's service_policy, checked as it always has been."""
+    findings: list[dict] = []
     if policy is None:
         findings.append({"severity": "warning", "path": _rel(root, path),
                          "message": "legacy runtime has no service_policy; sync will preserve listed capability services as enabled overrides"})
@@ -6371,6 +6814,7 @@ def _validate_runtime(root: Path, data: object, path: Path) -> list[dict]:
         if policy.get("default_mode", "enabled") not in ("enabled", "embedded"):
             findings.append({"severity": "error", "path": _rel(root, path),
                              "message": "service_policy.default_mode must be enabled|embedded"})
+        findings += _reconcile_findings(root, path, policy)
         overrides = policy.get("capabilities", {})
         if not isinstance(overrides, dict):
             findings.append({"severity": "error", "path": _rel(root, path),
@@ -6531,7 +6975,7 @@ def cmd_init(args) -> None:
     profile = args.profile
     provider = args.provider
     project_name = root.name
-    runtime = _runtime_template(profile, project_name)
+    runtime = _runtime_template(profile, project_name, _store_placed(root))
     writes = [
         (_runtime_path(root), _json_text(runtime)),
         (_target_path(root, target), _json_text(_target_template(
@@ -6545,7 +6989,7 @@ def cmd_init(args) -> None:
         sys.exit(6)
 
 
-def _deployment_questions() -> list[dict]:
+def _deployment_questions(store: bool = False) -> list[dict]:
     return [
         {
             "id": "profile",
@@ -6563,6 +7007,14 @@ def _deployment_questions() -> list[dict]:
             "plain_language": "Use coolify if there is a Coolify dashboard; use manual for local Docker or a hand-managed server.",
         },
         {"id": "service_policy",
+         "question": "Should each capability service run inside the agent container or in a container of its own?",
+         "default": "embedded",
+         "plain_language": ("Every installed capability service is compiled; runtime.json's "
+                            "service_policy only chooses where its process lives. Whether a "
+                            "service runs on a node is the gate's answer: `capabilities "
+                            "enable <name> --project --node <node>` turns it on there, "
+                            "without a redeploy.")} if store else
+        {"id": "service_policy",
          "question": "Which explicitly project-enabled capability services should run?",
          "default": "auto",
          "plain_language": "Auto includes descriptor-default services; runtime.json can enable, embed into the agent, disable, or auto each capability."},
@@ -6579,14 +7031,26 @@ def cmd_setup(args) -> None:
              "use `deployment init --profile generic` for descriptors only")
     target = _slug(args.target)
     project_name = args.project_name or root.name
-    runtime = _runtime_template(args.profile, project_name)
+    store = _store_placed(root)
+    runtime = _runtime_template(args.profile, project_name, store)
     overrides = runtime["service_policy"]["capabilities"]
-    for name, choice in (("telegram", args.with_telegram),
-                         ("automations", args.with_automations)):
-        if choice == "yes":
-            overrides[name] = "enabled"
-        elif choice == "no":
-            overrides[name] = "disabled"
+    for flag, choice in (("--with-telegram", args.with_telegram),
+                         ("--with-automations", args.with_automations)):
+        if not store:
+            # A files-mode runtime keeps these compatibility shorthands.
+            if choice == "yes":
+                overrides[flag.removeprefix("--with-")] = "enabled"
+            elif choice == "no":
+                overrides[flag.removeprefix("--with-")] = "disabled"
+        elif choice != "auto":
+            name = flag.removeprefix("--with-")
+            _die(6, "retired_option",
+                 f"{flag} {choice} is retired: whether a service runs on a node is "
+                 "the gate's answer for that node, not the runtime's",
+                 f"every installed service is compiled; run `capabilities enable {name} "
+                 f"--project --node <node>` to run it on a node, or set "
+                 f"service_policy.capabilities.{name} to \"container\" in "
+                 "deployment/runtime.json for a container of its own")
     preview = _sync(root, runtime, check=True, targets=[target])
     if args.dry_run:
         present = set(preview["services"]) | set(preview["embedded_services"])
@@ -6603,7 +7067,7 @@ def cmd_setup(args) -> None:
             "with_automations": "automations" in present,
             "would_write": [d["path"] for d in preview["drift"]],
             "findings": preview["findings"],
-            "questions": _deployment_questions(),
+            "questions": _deployment_questions(store),
         })
         return
     sync = _sync(root, runtime, check=False, allow_takeover=args.force, targets=[target])
@@ -6991,13 +7455,19 @@ def cmd_doctor(args) -> None:
             findings.append({"severity": severity, "path": item["path"], "message": message})
         if migrated:
             findings.append({"severity": "warning", "path": _rel(root, runtime_path),
-                             "message": "legacy runtime migration is pending; `deployment sync` adds service_policy and preserves listed capability services"})
+                             "message": ("legacy runtime migration is pending; `deployment sync` adds service_policy and keeps each listed capability service in a container of its own"
+                                         if _store_placed(root) else
+                                         "legacy runtime migration is pending; `deployment sync` adds service_policy and preserves listed capability services")})
         project_env = {}
         project_env.update(_parse_env_file(root / ".env"))
         project_env.update(_parse_env_file(root / ".env.local"))
+        # Every installed service is compiled, but only one this project
+        # enabled itself can be placed on a node, so only that one has to be
+        # configured.
+        enabled_here = set(_enabled_capabilities(root))
         for name, service in {**active, **embedded}.items():
             config = service.get("config")
-            if (isinstance(config, str) and config
+            if (name in enabled_here and isinstance(config, str) and config
                     and not _service_configured(root, name, config)):
                 findings.append({"severity": "error", "path": config,
                                  "message": f"active service {name!r} is not configured; run `{name} service init`"})
@@ -7076,6 +7546,688 @@ def cmd_doctor(args) -> None:
 def cmd_watchdog_command(args) -> None:
     report = cmd_watchdog(bool(getattr(args, "dry_run", False)))
     _emit(report)
+
+
+# --- Service runners -----------------------------------------------------------
+# Every capability service a supervisor runs is started through its runner: one
+# long-running process per service that asks the gate on this node what it
+# answers for the service, holds the service's lease in the project's store,
+# and starts or stops the descriptor's command to match, once per reconcile.
+# Turning a service on or off for a node is therefore a gate write, never a
+# recompile or a redeploy, and the lease keeps one service on one machine.
+
+LEASE_STEPS = [
+    ("0001-service-leases",
+     "CREATE TABLE deployment_service_leases ("
+     " project text NOT NULL,"
+     " capability text NOT NULL,"
+     " node text NOT NULL CHECK (node <> ''),"
+     " acquired_at timestamptz NOT NULL DEFAULT now(),"
+     " renewed_at timestamptz NOT NULL DEFAULT now(),"
+     " expires_at timestamptz NOT NULL,"
+     " PRIMARY KEY (project, capability))"),
+]
+LEASE_MAJOR, LEASE_MINOR = 1, 0
+RUNNER_SCHEMA = "capabilities.deployment.runner.v1"
+
+
+def _tables():
+    """The steps and version of deployment's tables, for the contract's `migrate`."""
+    return LEASE_STEPS, LEASE_MAJOR, LEASE_MINOR
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _iso(moment) -> str | None:
+    return moment.isoformat(timespec="seconds") if hasattr(moment, "isoformat") else moment
+
+
+def _gate_answer(name: str) -> dict:
+    """What the gate answers for `name` on this node, and whether that places
+    its service here. In store mode only the project's row naming this node
+    places it; in files mode, which carries no node, the project's own enable
+    does. Nothing inherited or global places a service."""
+    node = node_name()
+    answer: dict = {"node": node, "records": None, "placed": False, "row": None}
+    try:
+        records = _records()
+        answer["records"] = records.mode_of("policy")
+        row = records.resolve("capabilities", "policy").get(name)
+    except StoreError as exc:
+        answer["error"] = {"code": exc.slug, "message": exc.message}
+        answer["reason"] = f"the gate cannot be read: {exc.message}"
+        return answer
+    value = (row or {}).get("value")
+    enabled = isinstance(value, dict) and value.get("enabled") is True
+    scope = (row or {}).get("scope")
+    named = (row or {}).get("node")
+    if row is not None:
+        answer["row"] = {"scope": scope, "node": named,
+                         "enabled": value.get("enabled") if isinstance(value, dict) else None}
+    if answer["records"] == "store":
+        answer["placed"] = enabled and scope == "project" and named == node
+        if row is None:
+            answer["reason"] = f"no policy row answers for {name} on {node}"
+        elif scope != "project":
+            answer["reason"] = (f"only a global row answers for {name} on {node}, and a "
+                                "global row never places a service")
+        elif named is None:
+            answer["reason"] = (f"the project's row for every node answers; only a row "
+                                f"naming {node} places the service here")
+        elif not enabled:
+            answer["reason"] = f"the project's row for {node} disables {name}"
+        else:
+            answer["reason"] = f"the project's row for {node} enables {name}"
+    else:
+        answer["placed"] = enabled and scope == "project"
+        if answer["placed"]:
+            answer["reason"] = (f"the project enables {name} itself, which places it on "
+                                "every machine reading these files")
+        elif scope == "project":
+            answer["reason"] = f"the project disables {name}"
+        else:
+            answer["reason"] = (f"the project does not enable {name} itself, and nothing "
+                                "inherited or global places a service")
+    return answer
+
+
+def _runner_project_key(root: Path) -> str:
+    """Whose lease this is: the project's id, else its root."""
+    project = _project_id(refuse=False)
+    return project or f"path:{root}"
+
+
+class _Lease:
+    """One project's service leases in its store: a row per (project,
+    capability) naming the node that holds it and when that hold expires. The
+    holder renews it every reconcile; another node takes it only once it has
+    expired or been released. With no database resolvable for the project,
+    no lease can be taken and the lease is `unavailable`."""
+
+    def __init__(self, root: Path, project: str, node: str, ttl: int = 0):
+        self.root, self.project, self.node, self.ttl = root, project, node, ttl
+        self.conn = None
+        self.mine_until: float | None = None
+
+    def _connect(self):
+        if self.conn is not None:
+            return self.conn
+        try:
+            from capabilities_contract import db
+        except ImportError:
+            raise _LeaseProblem("unavailable", "driver_missing",
+                                "the shared database library capabilities-contract "
+                                "is not installed") from None
+        try:
+            setting = db.resolve_setting(self.root)
+        except db.DbError as exc:
+            state = "unavailable" if exc.slug in _STORE_SETTING_SLUGS else "unreachable"
+            raise _LeaseProblem(state, exc.slug, exc.message) from None
+        try:
+            conn = db.connect(application_name=NAME, setting=setting)
+        except db.DbError as exc:
+            raise _LeaseProblem("unreachable", exc.slug, exc.message) from None
+        try:
+            steps, major, minor = _tables()
+            db.migrate(conn, NAME, steps, major=major, minor=minor)
+        except db.DbError as exc:
+            conn.close()
+            raise _LeaseProblem("unreachable", exc.slug, exc.message) from None
+        self.conn = conn
+        return conn
+
+    def _run(self, work):
+        """`work(conn)` in one transaction; a failure drops the connection."""
+        try:
+            conn = self._connect()
+        except _LeaseProblem as problem:
+            return problem.report()
+        try:
+            with conn.transaction():
+                return work(conn)
+        except Exception as exc:  # psycopg.Error, or a connection that went away
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self.conn = None
+            return {"state": "unreachable", "error": {
+                "code": "store_unreachable",
+                "message": " ".join(f"{type(exc).__name__}: {exc}".split())[:300]}}
+
+    @staticmethod
+    def _holding(row, node: str) -> dict:
+        if row is None:
+            return {"state": "free", "holder": None}
+        holder, acquired, renewed, expires, live = row
+        return {"state": ("held" if holder == node else
+                          "held_elsewhere" if live else "free"),
+                "holder": holder, "acquired_at": _iso(acquired),
+                "renewed_at": _iso(renewed), "expires_at": _iso(expires),
+                "live": bool(live)}
+
+    def acquire(self, capability: str) -> dict:
+        """Take or renew this node's hold, unless another node's is live."""
+        def work(conn):
+            row = conn.execute(
+                "INSERT INTO deployment_service_leases AS l "
+                "(project, capability, node, expires_at) "
+                "VALUES (%s, %s, %s, now() + %s * interval '1 second') "
+                "ON CONFLICT (project, capability) DO UPDATE "
+                "SET node = EXCLUDED.node, expires_at = EXCLUDED.expires_at, "
+                "renewed_at = now(), acquired_at = CASE WHEN l.node = EXCLUDED.node "
+                "THEN l.acquired_at ELSE now() END "
+                "WHERE l.node = EXCLUDED.node OR l.expires_at <= now() "
+                "RETURNING node, acquired_at, renewed_at, expires_at, true",
+                (self.project, capability, self.node, self.ttl)).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now() "
+                    "FROM deployment_service_leases WHERE project = %s AND capability = %s",
+                    (self.project, capability)).fetchone()
+            return self._holding(row, self.node)
+        found = self._run(work)
+        if found.get("state") == "held":
+            self.mine_until = time.monotonic() + self.ttl
+        elif found.get("state") != "unreachable":
+            self.mine_until = None
+        return found
+
+    def release(self, capability: str) -> dict:
+        """Give up this node's hold, so another node may take it at once."""
+        def work(conn):
+            gone = conn.execute(
+                "DELETE FROM deployment_service_leases "
+                "WHERE project = %s AND capability = %s AND node = %s",
+                (self.project, capability, self.node)).rowcount
+            row = conn.execute(
+                "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now() "
+                "FROM deployment_service_leases WHERE project = %s AND capability = %s",
+                (self.project, capability)).fetchone()
+            found = self._holding(row, self.node)
+            found["released"] = bool(gone)
+            return found
+        found = self._run(work)
+        if found.get("state") != "unreachable":
+            self.mine_until = None
+        return found
+
+    def read(self, capability: str) -> dict:
+        def work(conn):
+            row = conn.execute(
+                "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now() "
+                "FROM deployment_service_leases WHERE project = %s AND capability = %s",
+                (self.project, capability)).fetchone()
+            return self._holding(row, self.node)
+        return self._run(work)
+
+    def still_mine(self) -> bool:
+        """Whether the hold this node last renewed has not yet run out."""
+        return self.mine_until is not None and time.monotonic() < self.mine_until
+
+    def close(self) -> None:
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+
+class _LeaseProblem(Exception):
+    def __init__(self, state: str, code: str, message: str):
+        super().__init__(message)
+        self.state, self.code, self.message = state, code, message
+
+    def report(self) -> dict:
+        return {"state": self.state, "error": {"code": self.code, "message": self.message}}
+
+
+def _runner_state_path(name: str) -> Path:
+    return _state_dir() / RUNNER_STATE_DIR / f"{name}.json"
+
+
+def _read_runner_state(name: str) -> dict:
+    data, _err = _read_json(_runner_state_path(name))
+    return data if isinstance(data, dict) and data.get("schema") == RUNNER_SCHEMA else {}
+
+
+def _child_preexec() -> None:
+    """The service leads a process group of its own, so stopping it reaches
+    every worker it started; on Linux it is also told when its runner dies."""
+    os.setpgid(0, 0)
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+            import signal
+            ctypes.CDLL(None).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+        except (OSError, AttributeError):
+            pass
+
+
+def _relay_stderr(stream, tail: list) -> None:
+    """Pass the service's stderr through unchanged, keeping its last lines so
+    a refusal can be reported in the service's own words."""
+    for raw in iter(stream.readline, b""):
+        try:
+            sys.stderr.buffer.write(raw)
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+        tail.append(raw.decode("utf-8", "replace").rstrip("\n"))
+        del tail[:-20]
+    stream.close()
+
+
+def _refusal_of(lines: list) -> dict:
+    """The contract's error envelope among a service's last stderr lines, if
+    it printed one: its code and message."""
+    for line in reversed(lines):
+        try:
+            error = json.loads(line).get("error")
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(error, dict) and error.get("code"):
+            return {"slug": str(error["code"]),
+                    "message": str(error.get("message") or "")[:500]}
+    return {}
+
+
+def _gate_key(gate: dict) -> tuple:
+    """What a gate answer says, for telling whether it changed: placed or not,
+    and the row that answered."""
+    row = gate.get("row") or {}
+    return (bool(gate.get("placed")), row.get("scope"), row.get("node"), row.get("enabled"))
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stop_group(pgid: int, grace: float = RUNNER_STOP_GRACE_SECONDS,
+                reap=None) -> None:
+    """TERM the group, and KILL what is left of it after `grace`. `reap` lets
+    the runner collect its own child as it exits, since a child that exited
+    but was not yet collected still counts as a member of its group."""
+    import signal
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if reap is not None:
+            reap()
+        if not _group_alive(pgid):
+            return
+        time.sleep(0.1)
+    if _group_alive(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+class _Runner:
+    def __init__(self, root: Path, name: str, command: list[str], restart: str,
+                 every: int):
+        self.root, self.name, self.command = root, name, command
+        self.restart, self.every = restart, every
+        self.node = node_name()
+        self.lease = _Lease(root, _runner_project_key(root), self.node,
+                            every * LEASE_TTL_RECONCILES)
+        self.child: subprocess.Popen | None = None
+        self.child_started: float | None = None
+        self.child_started_at: str | None = None
+        self.want = False
+        self.placed = False
+        self.held_down = False
+        self.restart_at: float | None = None
+        self.quick_failures = 0
+        self.gate: dict = {}
+        self.lease_state: dict = {}
+        self.reason = "starting"
+        self.last_exit: dict | None = None
+        self.said: object = None
+        self.tick_at: str | None = None
+        self.stderr_tail: list = []
+        # A service that refused with the policy exit is held idle until the
+        # gate answer it was refused under changes, or the runner restarts.
+        self.refusal: dict | None = None
+        self.gate_seen: tuple | None = None
+
+    def say(self, message: str) -> None:
+        sys.stderr.write(f"[deployment runner {self.name}] {message}\n")
+        sys.stderr.flush()
+
+    def say_once(self, key: object, message: str) -> None:
+        if key != self.said:
+            self.said = key
+            self.say(message)
+
+    def running(self) -> bool:
+        return self.child is not None and self.child.poll() is None
+
+    def adopt_orphan(self) -> None:
+        """A service a previous runner left behind - killed before it could
+        stop it - is stopped, so this runner never starts a second copy."""
+        record = _read_runner_state(self.name)
+        child = record.get("child") if isinstance(record.get("child"), dict) else {}
+        pgid = child.get("pgid")
+        previous = record.get("runner_pid")
+        if not isinstance(pgid, int) or pgid <= 1 or previous == os.getpid():
+            return
+        if isinstance(previous, int) and previous > 1:
+            try:
+                os.kill(previous, 0)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                return
+            else:
+                self.say(f"another runner, pid {previous}, still records this service "
+                         "here; its service is left to it")
+                return
+        if _group_alive(pgid):
+            self.say(f"stopping process group {pgid} a previous runner left running")
+            _stop_group(pgid)
+
+    def start(self) -> None:
+        try:
+            self.child = subprocess.Popen(self.command, cwd=str(self.root),
+                                          preexec_fn=_child_preexec,
+                                          stderr=subprocess.PIPE)
+        except OSError as exc:
+            self.child = None
+            self.last_exit = {"code": None, "at": _now_iso(),
+                              "error": f"{type(exc).__name__}: {exc}"[:300]}
+            self.say(f"cannot start {shlex.join(self.command)}: {exc}")
+            self.restart_at = time.monotonic() + self.every
+            return
+        import threading
+        self.stderr_tail = []
+        threading.Thread(target=_relay_stderr, args=(self.child.stderr, self.stderr_tail),
+                         daemon=True).start()
+        self.child_started = time.monotonic()
+        self.child_started_at = _now_iso()
+        self.restart_at = None
+        self.say(f"started {shlex.join(self.command)} as pid {self.child.pid} on {self.node}")
+        self.save()
+
+    def stop(self, why: str) -> None:
+        if self.child is None:
+            return
+        pid = self.child.pid
+        _stop_group(pid, reap=self.child.poll)
+        try:
+            self.child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        self.last_exit = {"code": self.child.returncode, "at": _now_iso(), "stopped": why}
+        self.child = None
+        self.say(f"stopped pid {pid}: {why}")
+        self.save()
+
+    def reap(self) -> None:
+        """A service that exited on its own: restart it as its policy says."""
+        if self.child is None or self.child.poll() is None:
+            return
+        code = self.child.returncode
+        ran = time.monotonic() - (self.child_started or time.monotonic())
+        self.last_exit = {"code": code, "at": _now_iso(), "ran_seconds": round(ran, 1)}
+        self.child = None
+        if code == POLICY_REFUSAL_EXIT and self.want:
+            time.sleep(0.2)  # let the relay take the service's last words
+            self.hold_refused()
+            return
+        again = (self.restart in ("always", "unless-stopped")
+                 or (self.restart == "on-failure" and code != 0))
+        if not self.want:
+            self.save()
+            return
+        if not again:
+            self.held_down = True
+            self.say(f"exited with {code}; restart policy {self.restart!r} keeps it "
+                     "stopped until the gate turns it off and on again or the runner "
+                     "restarts")
+        else:
+            self.quick_failures = self.quick_failures + 1 if ran < 10 else 0
+            delay = min(2 ** self.quick_failures, self.every)
+            self.restart_at = time.monotonic() + delay
+            self.say(f"exited with {code}; restarting in {delay}s")
+        self.save()
+
+    def hold_refused(self) -> None:
+        """The service refused to run here with the policy exit: hold it
+        idle, give up the lease, and say what it said."""
+        said = _refusal_of(self.stderr_tail)
+        self.refusal = {"exit": POLICY_REFUSAL_EXIT, "at": _now_iso(), **said,
+                        "gate": self.gate_seen}
+        detail = (f"{said['slug']}: {said['message']}" if said
+                  else "it printed no error envelope")
+        self.want = False
+        self.reason = (f"held idle: {self.name} refused to run here with exit "
+                       f"{POLICY_REFUSAL_EXIT} ({detail}); it is tried again when the "
+                       f"gate answer for {self.node} changes or the runner restarts")
+        self.say(self.reason)
+        self.lease_state = self.lease.release(self.name)
+        if self.lease_state.get("released"):
+            self.say(f"released the lease for {self.name}")
+        self.save()
+
+    def converge(self) -> None:
+        if self.want and not self.running() and not self.held_down:
+            if self.restart_at is None or time.monotonic() >= self.restart_at:
+                self.start()
+        elif not self.want and self.child is not None:
+            self.stop(self.reason)
+
+    def tick(self) -> None:
+        self.tick_at = _now_iso()
+        gate = _gate_answer(self.name)
+        self.gate = gate
+        if "error" in gate:
+            # A gate that cannot be read changes nothing this reconcile; the
+            # lease below still decides how long a running service may stay.
+            self.say_once(("gate_error", gate["error"]["code"]), gate["reason"])
+            placed = self.placed
+        else:
+            placed = bool(gate["placed"])
+            seen = _gate_key(gate)
+            if self.refusal is not None and seen != self.gate_seen:
+                self.say(f"the gate answer for {self.node} changed; the refusal "
+                         "hold is lifted")
+                self.refusal = None
+            self.gate_seen = seen
+        if placed and self.refusal is not None:
+            want, key = False, ("refused",)
+            reason = self.reason if self.reason.startswith("held idle") else "held idle"
+            lease = self.lease.release(self.name)
+            self.placed, self.want, self.reason, self.lease_state = placed, want, reason, lease
+            self.converge()
+            self.save()
+            return
+        if placed:
+            lease = self.lease.acquire(self.name)
+            state = lease.get("state")
+            if state == "held":
+                want = True
+                reason = f"{gate.get('reason') or 'placed'}; this node holds the lease"
+                key: object = ("held",)
+            elif state == "unavailable":
+                want = True
+                reason = (f"{gate.get('reason') or 'placed'}; the lease is unavailable "
+                          f"({(lease.get('error') or {}).get('code')}), so it runs as the "
+                          "gate says")
+                key = ("unavailable",)
+            elif state == "held_elsewhere":
+                want = False
+                reason = (f"refused: the lease for {self.name} is held by "
+                          f"{lease.get('holder')} until {lease.get('expires_at')}; "
+                          "checking again every reconcile")
+                key = ("held_elsewhere", lease.get("holder"))
+            else:
+                want = self.running() and self.lease.still_mine()
+                reason = ("the lease cannot be confirmed: "
+                          f"{(lease.get('error') or {}).get('message')}; "
+                          + ("keeping the service until this node's hold runs out" if want
+                             else "not starting the service until it can be"))
+                key = ("lease_unreachable", want)
+        else:
+            want = False
+            reason = f"not placed on {self.node}: {gate.get('reason')}"
+            key = ("idle", reason)
+            lease = self.lease_state
+        if not want:
+            self.held_down = False
+        if want and not self.want:
+            self.quick_failures = 0
+            self.restart_at = None
+        self.placed, self.want, self.reason, self.lease_state = placed, want, reason, lease
+        if "error" not in gate or placed:
+            self.say_once(key, reason)
+        self.converge()
+        if not placed:
+            # A node the gate turned off gives the service up once it has
+            # stopped it, so the node it was moved to need not wait for the
+            # hold to run out, and never starts it beside this one.
+            self.lease_state = self.lease.release(self.name)
+            if self.lease_state.get("released"):
+                self.say(f"released the lease for {self.name}")
+        self.save()
+
+    def save(self) -> None:
+        child = None
+        if self.child is not None and self.child.poll() is None:
+            child = {"pid": self.child.pid, "pgid": self.child.pid,
+                     "started_at": self.child_started_at}
+        record = {"schema": RUNNER_SCHEMA, "service": self.name, "node": self.node,
+                  "runner_pid": os.getpid(), "every": self.every,
+                  "restart": self.restart, "command": self.command,
+                  "tick_at": self.tick_at, "want": self.want, "reason": self.reason,
+                  "running": child is not None, "child": child,
+                  "last_exit": self.last_exit, "gate": self.gate,
+                  "lease": self.lease_state, "refusal": self.refusal}
+        path = _runner_state_path(self.name)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+            os.replace(tmp, path)
+        except OSError as exc:
+            self.say_once(("state_unwritable", str(path)),
+                          f"cannot record its state in {path}: {exc}")
+
+    def shutdown(self) -> None:
+        self.want = False
+        self.reason = "the runner is stopping"
+        self.stop("the runner is stopping")
+        if self.lease.mine_until is not None:
+            self.lease_state = self.lease.release(self.name)
+        self.lease.close()
+        self.save()
+
+
+def cmd_runner(args) -> None:
+    """Run one capability service as the gate on this node says, until stopped."""
+    import signal
+    root = _root()
+    name = args.name
+    if not re.fullmatch(r"[a-z][a-z0-9_-]*", name or ""):
+        _die(6, "input", f"runner needs a capability name, not {name!r}")
+    command = list(args.service_command or [])
+    if not command:
+        _die(6, "input", "runner needs the service command after `--`",
+             f"deployment runner {name} [--every N] [--restart POLICY] -- <command...>")
+    low, high = RECONCILE_BOUNDS
+    if not low <= args.every <= high:
+        _die(6, "input", f"--every must be from {low} to {high} seconds")
+    runner = _Runner(root, name, command, args.restart, args.every)
+    stopping = {"now": False}
+
+    def stop(_signum, _frame):
+        stopping["now"] = True
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, stop)
+    runner.adopt_orphan()
+    runner.say(f"runs {shlex.join(command)} on {runner.node} as the gate says, "
+               f"reconciling every {args.every}s")
+    next_tick = 0.0
+    try:
+        while not stopping["now"]:
+            now = time.monotonic()
+            if now >= next_tick:
+                runner.tick()
+                next_tick = now + args.every
+            else:
+                runner.reap()
+                runner.converge()
+            time.sleep(max(0.05, min(1.0, next_tick - time.monotonic())))
+    finally:
+        runner.shutdown()
+
+
+def _compiled_service_names(runtime: dict) -> list[str]:
+    services = runtime.get("services") if isinstance(runtime.get("services"), dict) else {}
+    names = {name for name, entry in services.items()
+             if isinstance(entry, dict) and isinstance(entry.get("capability"), str)}
+    agent = services.get("agent")
+    if isinstance(agent, dict):
+        names.update(x for x in agent.get("embedded_services") or [] if isinstance(x, str))
+    return sorted(names)
+
+
+def _services_report(root: Path) -> dict:
+    runtime = _load_runtime(root)
+    node = node_name()
+    lease = _Lease(root, _runner_project_key(root), node)
+    every_default = _reconcile_seconds(runtime)
+    out: dict = {"project": str(root), "node": node, "records": None, "services": []}
+    try:
+        for name in _compiled_service_names(runtime):
+            gate = _gate_answer(name)
+            out["records"] = out["records"] or gate.get("records")
+            record = _read_runner_state(name)
+            every = record.get("every") if isinstance(record.get("every"), int) else every_default
+            tick = record.get("tick_at")
+            fresh = False
+            if isinstance(tick, str):
+                try:
+                    age = (datetime.now(timezone.utc)
+                           - datetime.fromisoformat(tick)).total_seconds()
+                    fresh = age <= 2 * every + 5
+                except ValueError:
+                    fresh = False
+            runner = ({"recorded": True, "node": record.get("node"),
+                       "tick_at": tick, "current": fresh, "want": record.get("want"),
+                       "reason": record.get("reason"), "last_exit": record.get("last_exit"),
+                       "refusal": record.get("refusal")}
+                      if record else {"recorded": False})
+            out["services"].append({
+                "name": name,
+                "gate": {key: gate.get(key) for key in ("placed", "row", "reason", "error")
+                         if key in gate},
+                "running": (bool(record.get("running")) and fresh) if record else None,
+                "refusal": record.get("refusal") if record else None,
+                "runner": runner,
+                "lease": lease.read(name),
+            })
+    finally:
+        lease.close()
+    return out
+
+
+def cmd_services(args) -> None:
+    _emit(_services_report(_root()))
 
 
 # --- Machine scope ------------------------------------------------------------
@@ -7987,6 +9139,15 @@ def _node_environment(root, runtime, target, host, repo_url, key, branch):
     # server's own values standing.
     database_keys = set(_database_keys())
     project_values = _project_env()
+    # In store mode every installed service is compiled, and which of them runs
+    # on the node is the gate's answer there, so a key only a capability
+    # service requires is not refused here: left unset, the server's value stands, and a
+    # service placed without it says so when its runner starts it.
+    service_keys: set[str] = set()
+    if _store_placed(root):
+        descriptors, _findings = _store_service_descriptors(runtime)
+        service_keys = {key for service in descriptors.values()
+                        for key in service["deploy"]["environment"]["required"]}
     env = {}
     for service in runtime.get("services", {}).values():
         if service.get("placement") == "local":
@@ -8004,6 +9165,8 @@ def _node_environment(root, runtime, target, host, repo_url, key, branch):
                 continue
             value = project_values.get(k) or machine_values.get(k) or os.environ.get(k) or defaults.get(k, "")
             if k in service.get("required_env", []) and not value and k != REPO_URL_ENV:
+                if k in service_keys:
+                    continue
                 raise NodeFailure("environment_missing", f"required environment key {k} is missing", 6)
             env[k] = value
     import base64
@@ -8299,6 +9462,7 @@ def cmd_node_status(args):
         "store": {"configured": False, "reachable": False, "tls_enforced": False}, "errors": []}
     runtime = _load_runtime(root)
     node_services = {}
+    host = container = None
     try:
         host = _node_host(root, target)
         report["instance"]["url"] = host["url"]
@@ -8326,16 +9490,40 @@ def cmd_node_status(args):
         report["store"].update(_node_database(root, host, container))
     except NodeFailure as e:
         report["errors"].append({"code": e.code, "message": e.message})
-    services = dict(runtime.get("services") or {})
-    for name in set((services.get("agent") or {}).get("embedded_services", [])) | set((runtime.get("service_policy") or {}).get("placement", {})):
-        services.setdefault(name, {"placement": (runtime.get("service_policy") or {}).get("placement", {}).get(name, "node")})
-    for name, service in services.items():
-        placement = service.get("placement") or (runtime.get("service_policy") or {}).get("placement", {}).get(name, "node")
+    # What the gate on the node answers for each service, whether its runner
+    # runs it, and who holds its lease, as the node itself reads them.
+    remote: dict = {}
+    if container is not None:
+        project_root = _compiler_config(runtime)["container"]["project_root"]
+        try:
+            remote = json.loads(_node_exec(root, host, container, [
+                "sh", "-c", f"cd {shlex.quote(project_root)} && exec deployment services"]))
+        except NodeFailure as e:
+            report["errors"].append({"code": e.code, "message": e.message})
+        except ValueError:
+            report["errors"].append({"code": "node_services_unreadable",
+                                     "message": "deployment services on the node returned malformed JSON"})
+    report["node_name"] = remote.get("node")
+    on_node = {item.get("name"): item for item in remote.get("services") or []
+               if isinstance(item, dict)}
+    names = {*(runtime.get("services") or {}), *_compiled_service_names(runtime), *on_node}
+    # A files-mode runtime still places its services itself.
+    placements = ({} if _store_placed(root) else
+                  (runtime.get("service_policy") or {}).get("placement") or {})
+    names |= set(placements)
+    for name in sorted(names):
         label = _host_label_prefix(runtime, root) + "." + name
         local = _launchd_status(label)
-        report["services"].append({"name": name, "placement": placement,
-            "node": node_services.get(name, "running" if name == "agent" and report["application"].get("status") == "running:healthy" else "absent"),
-            "local": ("running" if local.get("pid") else "stopped") if local.get("loaded") else "absent"})
+        entry = {"name": name,
+                 "node": node_services.get(name, "running" if name == "agent" and report["application"].get("status") == "running:healthy" else "absent"),
+                 "local": ("running" if local.get("pid") else "stopped") if local.get("loaded") else "absent"}
+        if not _store_placed(root):
+            declared = (runtime.get("services") or {}).get(name) or {}
+            entry["placement"] = declared.get("placement") or placements.get(name, "node")
+        if name in on_node:
+            entry.update({key: on_node[name].get(key)
+                          for key in ("gate", "running", "lease", "refusal")})
+        report["services"].append(entry)
     _emit(report)
 
 
@@ -8360,6 +9548,11 @@ def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     _gate()
     _contract(argv)
+    # The runner's service command follows `--` and is passed on untouched.
+    service_command: list[str] = []
+    if argv and argv[0] == "runner" and "--" in argv:
+        split = argv.index("--")
+        argv, service_command = argv[:split], argv[split + 1:]
 
     parser = argparse.ArgumentParser(prog=NAME, add_help=False)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -8405,6 +9598,14 @@ def main(argv: list[str] | None = None) -> None:
     p_watchdog = sub.add_parser("watchdog", add_help=False)
     p_watchdog.add_argument("--dry-run", action="store_true")
     p_watchdog.set_defaults(fn=cmd_watchdog_command)
+
+    p_runner = sub.add_parser("runner", add_help=False)
+    p_runner.add_argument("name")
+    p_runner.add_argument("--every", type=int, default=RECONCILE_DEFAULT_SECONDS)
+    p_runner.add_argument("--restart", choices=RESTART_POLICIES, default="unless-stopped")
+    p_runner.set_defaults(fn=cmd_runner)
+
+    sub.add_parser("services", add_help=False).set_defaults(fn=cmd_services)
 
     sub.add_parser("runtime", add_help=False).set_defaults(fn=cmd_runtime)
 
@@ -8457,10 +9658,12 @@ def main(argv: list[str] | None = None) -> None:
     args, extra = parser.parse_known_args(argv)
     if extra:
         _die(6, "input", f"unknown arguments: {' '.join(extra)}")
-    # A write verb, and a watchdog pass that may restart a service, change the
-    # project or its machine; a preview (--check, --dry-run) only reads.
+    args.service_command = service_command
+    # A write verb, a watchdog pass that may restart a service, and a runner
+    # that starts and stops one change the project or its machine; a preview
+    # (--check, --dry-run) only reads.
     previews = getattr(args, "check", False) or getattr(args, "dry_run", False)
-    if (args.cmd in WRITE_VERBS or args.cmd == "watchdog") and not previews:
+    if (args.cmd in WRITE_VERBS or args.cmd in ("watchdog", "runner")) and not previews:
         _read_only_gate(f"`{NAME} {args.cmd}`")
     if (args.cmd == "machine" and args.machine_cmd in ("sync", "watchdog")
             and not previews):

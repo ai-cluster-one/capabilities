@@ -590,6 +590,35 @@ def test_the_gate_is_written_to_and_read_from_the_store(lab):
     _ok(_coolify(lab, "deploy", "x", extra=declared))
 
 
+def test_a_policy_row_is_written_and_removed_for_one_node(lab):
+    # Files carry no node, so before the import a row for one node is refused.
+    refused = _manager(lab, "enable", "coolify", "--project", "--node", NODE)
+    assert refused.returncode == 6 and _error(refused)["code"] == "node_requires_store"
+    _import(lab)
+    declared = {"AGENT_NODE_NAME": NODE}
+    disabled = _ok(_manager(lab, "disable", "coolify", "--project", "--node", NODE))
+    assert {k: disabled[k] for k in ("disabled", "scope", "node", "gate")} == {
+        "disabled": "coolify", "scope": "project", "node": NODE,
+        "gate": "store:lab.capabilities_policy"}
+    assert _rows(lab, "SELECT agent_id, capability, node, enabled FROM capabilities_policy "
+                      "WHERE capability = 'coolify' ORDER BY node NULLS FIRST") == [
+        (PROJECT_ID, "coolify", None, True), (PROJECT_ID, "coolify", NODE, False)]
+    # The row naming this node answers before the row for every node.
+    assert _error(_coolify(lab, "deploy", "x", extra=declared))["code"] == "disabled"
+    _ok(_coolify(lab, "deploy", "x"))
+    _ok(_manager(lab, "enable", "coolify", "--global", "--node", "another-node"))
+    removed = _ok(_manager(lab, "inherit", "coolify", "--project", "--node", NODE))
+    assert removed["removed"] is True and removed["node"] == NODE
+    assert _rows(lab, "SELECT agent_id, node, enabled FROM capabilities_policy "
+                      "WHERE capability = 'coolify' ORDER BY agent_id NULLS FIRST") == [
+        (None, "another-node", True), (PROJECT_ID, None, True)]
+    _ok(_coolify(lab, "deploy", "x", extra=declared))
+    assert _ok(_manager(lab, "inherit", "coolify", "--project", "--node", NODE))[
+        "removed"] is False
+    deny = _manager(lab, "disable", "coolify", "--project", "--node", NODE, "--deny")
+    assert deny.returncode == 6 and "--deny takes no --node" in _error(deny)["message"]
+
+
 def test_ids_set_global_writes_a_global_row_beneath_the_project_row(lab):
     _import(lab)
     assert _ok(_coolify(lab, "ids", "set", "shared", "g", "--global")) == {
