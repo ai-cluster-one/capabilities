@@ -62,18 +62,69 @@ def test_what_wakes_an_agent():
     })
     wakes, notes = engine.read_sync(response, ME, rooms, initial=False, member_count=lambda r: None)
     found = {(w["room_id"], w["event_id"], w["kind"]) for w in wakes}
+    # An invite wakes nothing: it waits for the operator.
     assert found == {("!group", "$2", "mention"), ("!group", "$3", "mention"),
-                     ("!direct", "$5", "direct"), ("!marked", "$6", "marked"),
-                     ("!invited", None, "invite")}
-    assert any("!secret" in n for n in notes) and any("!locked" in n for n in notes)
+                     ("!direct", "$5", "direct"), ("!marked", "$6", "marked")}
+    assert not any(w["held"] for w in wakes)  # no room here has a grant: everyone
+    assert any("!secret" in n for n in notes)
 
 
-def test_history_before_the_first_sync_wakes_nothing_but_invites():
+def test_history_before_the_first_sync_and_invites_wake_nothing():
     response = sync(join={"!direct": {"summary": {"m.joined_member_count": 2},
                                       "timeline": {"events": [message("$1", "@b:example.org", "old")]}}},
                     invite={"!invited": {"invite_state": {"events": []}}})
     wakes, _notes = engine.read_sync(response, ME, {}, initial=True, member_count=lambda r: 2)
-    assert [w["kind"] for w in wakes] == ["invite"]
+    assert wakes == []
+    wakes, _notes = engine.read_sync(response, ME, {}, initial=False, member_count=lambda r: 2)
+    assert [w["kind"] for w in wakes] == ["direct"]
+
+
+def grant_data(**content):
+    return {"account_data": {"events": [{"type": engine.GRANT_TYPE, "content": content}]}}
+
+
+def test_a_rooms_grant_holds_the_senders_it_does_not_name():
+    rooms: dict = {}
+    grants: dict = {}
+    asked: list = []
+    response = sync(join={
+        "!granted": {"summary": {"m.joined_member_count": 4},
+                     **grant_data(everyone=False, users=["@b:example.org"]),
+                     "timeline": {"events": [message("$1", "@b:example.org", f"{ME} hi"),
+                                             message("$2", "@c:example.org", f"{ME} me too")]}},
+        "!open": {"summary": {"m.joined_member_count": 4},
+                  **grant_data(everyone=True, users=[]),
+                  "timeline": {"events": [message("$3", "@c:example.org", f"{ME} hello")]}},
+        "!unread": {"summary": {"m.joined_member_count": 2},
+                    "timeline": {"events": [message("$4", "@c:example.org", "dm"),
+                                            message("$5", "@c:example.org", "dm again")]}},
+        "!older": {"summary": {"m.joined_member_count": 2},
+                   "timeline": {"events": [message("$6", "@c:example.org", "dm")]}},
+    })
+
+    def grant_of(room_id):
+        asked.append(room_id)
+        return {"everyone": False, "users": []} if room_id == "!unread" else None
+
+    wakes, _notes = engine.read_sync(response, ME, rooms, initial=False,
+                                     member_count=lambda r: None, grant_of=grant_of,
+                                     grants=grants)
+    held = {w["event_id"]: w["held"] for w in wakes}
+    assert held == {"$1": False, "$2": True, "$3": False, "$4": True, "$5": True, "$6": False}
+    # A grant the sync brought is reported; a room whose grant was never seen is
+    # asked once - a room with none reads as everyone, never one not yet read.
+    assert grants == {"!granted": {"everyone": False, "users": ["@b:example.org"]},
+                      "!open": {"everyone": True, "users": []}}
+    assert sorted(asked) == ["!older", "!unread"]
+    more = sync(join={"!unread": {"timeline": {"events": [message("$7", "@c:example.org", "x")]}}})
+    wakes, _ = engine.read_sync(more, ME, rooms, initial=False, member_count=lambda r: None,
+                                grant_of=grant_of)
+    assert [w["held"] for w in wakes] == [True] and sorted(asked) == ["!older", "!unread"]
+    # A record that names nobody admits nobody; a malformed one is read the same.
+    assert engine.read_grant({}) == {"everyone": False, "users": []}
+    assert engine.read_grant("x") == {"everyone": False, "users": []}
+    assert not engine.granted(engine.read_grant({}), "@b:example.org")
+    assert engine.granted(None, "@anyone:example.org")
 
 
 def test_prompt_marks_what_woke_the_agent():
@@ -89,10 +140,6 @@ def test_prompt_marks_what_woke_the_agent():
     assert prompt.startswith("=== This turn ===\n") and "You are" not in prompt
     assert "=== Room history ===" in prompt
     assert "in thread $1, WOKE YOU" in prompt
-    resumed = engine.build_prompt(room_id="!r", room_name=None,
-                                  wakes=[{"kind": "invite", "event_id": None,
-                                          "sender": "@b:example.org"}], events=[], primed=False)
-    assert "invited to this room by @b:example.org" in resumed
 
 
 def test_answers_cut_and_endings_judged():
@@ -559,9 +606,11 @@ class SyncMatrix:
     """Answers the agent's syncs from a list, and its reads of the room from
     pages keyed by their `from` token, as the homeserver did."""
 
-    def __init__(self, syncs, pages):
+    def __init__(self, syncs, pages, grant=None):
         self.syncs, self.pages = list(syncs), pages
         self.reads: list[dict] = []
+        self.grant_reads: list[str] = []
+        self.grant = grant
 
     def call(self, method, path, params=None, body=None):
         if path == "/_matrix/client/v3/sync":
@@ -571,6 +620,11 @@ class SyncMatrix:
             return self.pages[params["from"]]
         if path.endswith("/joined_members"):
             return {"joined": {INVITER: {}, ME: {}}}
+        if path.endswith(f"/account_data/{engine.GRANT_TYPE}"):
+            self.grant_reads.append(path)
+            if self.grant is None:
+                raise NotFound("no grant")
+            return self.grant
         raise AssertionError(path)
 
 
@@ -578,13 +632,15 @@ class SyncStore:
     def __init__(self):
         self.position = None
         self.wakes: dict = {}
+        self.grants: list = []
 
     def next_batch(self, project, agent, user_id):
         return self.position
 
-    def save_sync(self, project, agent, user_id, holder, next_batch, wakes):
+    def save_sync(self, project, agent, user_id, holder, next_batch, wakes, grants=None):
         for wake in wakes:  # the table's key, ON CONFLICT DO NOTHING
             self.wakes.setdefault((wake["room_id"], wake["key"]), wake)
+        self.grants.append(dict(grants or {}))
         self.position = next_batch
         return True
 
@@ -611,11 +667,9 @@ def test_a_mention_posted_before_the_join_wakes_the_agent_once_it_joins(tmp_path
         mention, member("$inv", ME, "invite", INVITER, 1_000),
         member("$creator", INVITER, "join", INVITER, 100)]}}
     seen, matrix = serve(tmp_path, pages)
-    # Nothing but the invite until the join; the mention once the join is seen,
-    # and nothing new after it.
-    assert seen == [[], [("invite", "invite")], [("invite", "invite")],
-                    [("$mention", "mention"), ("invite", "invite")],
-                    [("$mention", "mention"), ("invite", "invite")]]
+    # Nothing until the join - the invite waits for the operator; the mention
+    # once the join is seen, and nothing new after it.
+    assert seen == [[], [], [], [("$mention", "mention")], [("$mention", "mention")]]
     assert [r["from"] for r in matrix.reads] == ["p646"] and matrix.reads[0]["dir"] == "b"
 
 
@@ -626,14 +680,14 @@ def test_history_from_before_the_invite_wakes_nothing_after_the_join(tmp_path):
         said("$old-mention", f"{ME} said before the invite", 3_000),
         said("$old", "chatter before the invite", 2_000)]}}
     seen, _matrix = serve(tmp_path, pages)
-    assert seen[3] == [("$after", "mention"), ("invite", "invite")]
+    assert seen[3] == [("$after", "mention")]
     # The invite not found behind the timeline (another membership of the
     # agent's own comes first): nothing from before the join wakes.
     rejoined = {"p646": {"start": "p646", "end": "p640", "chunk": [
         said("$x", f"{ME} while you were away", 6_000),
         member("$left", ME, "leave", ME, 5_000)]}}
     seen, _matrix = serve(tmp_path / "rejoined", rejoined)
-    assert seen[3] == [("invite", "invite")]
+    assert seen[3] == []
 
 
 def test_a_pre_join_mention_also_in_the_timeline_wakes_once(tmp_path):
@@ -645,7 +699,7 @@ def test_a_pre_join_mention_also_in_the_timeline_wakes_once(tmp_path):
                              "limited": False, "prev_batch": "p600"}}}}}
     seen, matrix = serve(tmp_path, {}, [{"next_batch": "s0"}, INVITE_SYNC, QUIET_SYNC,
                                         unlimited, NEXT_SYNC])
-    assert seen[3] == [("$mention", "mention"), ("invite", "invite")] and matrix.reads == []
+    assert seen[3] == [("$mention", "mention")] and matrix.reads == []
     limited_overlap = {"next_batch": "s3", "rooms": {"join": {ROOM: {
         **join, "timeline": {"events": [mention,
                                         member("$join", ME, "join", ME, 8_000, prev="invite")],
@@ -669,6 +723,30 @@ def test_a_profile_change_reads_nothing_back(tmp_path):
     wakes, _notes = engine.read_sync(renamed, ME, {}, initial=False, member_count=lambda r: 3,
                                      before_join=lambda room, token: asked.append(token) or [])
     assert wakes == [] and asked == []
+
+
+def test_a_restarted_agent_reads_a_rooms_grant_before_it_judges_a_wake(tmp_path):
+    eng, slot = make_engine(tmp_path, None, FakeRunner([]))
+    slot.store = SyncStore()
+    slot.store.position = "s0"  # served before: account data is not sent again
+    agent = engine.Agent(slot, slot.plan["agents"]["alpha"])
+    stranger = "@c:example.org"
+    direct = {"next_batch": "s1", "rooms": {"join": {ROOM: {
+        "summary": {"m.joined_member_count": 2},
+        "timeline": {"events": [said("$dm", "hello", 9_000, sender=stranger)]}}}}}
+    regrant = {"next_batch": "s2", "rooms": {"join": {ROOM: grant_data(
+        everyone=False, users=[INVITER, stranger])}}}
+    matrix = SyncMatrix([direct, regrant], {}, grant={"everyone": False, "users": [INVITER]})
+    agent.sync_once(matrix)
+    agent.sync_once(matrix)
+    # The grant was asked once, held the stranger, and the grant that names him
+    # reached the store, which releases what it held.
+    assert slot.store.wakes[(ROOM, "$dm")]["held"] is True
+    assert len(matrix.grant_reads) == 1
+    assert slot.store.grants == [{}, {ROOM: {"everyone": False,
+                                             "users": sorted([INVITER, stranger])}}]
+    log = (tmp_path / engine.LOG_FILE).read_text()
+    assert "held: the room's grant does not name the sender" in log and "the grant changed" in log
 
 
 # ── workers: who is admitted, what the default worker answers, the limits ────
@@ -750,15 +828,15 @@ def test_a_worker_admits_its_senders_and_the_default_answers_the_rest(tmp_path):
     assert f"worker 'w' does not admit {STRANGER}" in (tmp_path / engine.LOG_FILE).read_text()
 
 
-def test_an_invite_no_worker_admits_is_declined_with_the_answer(tmp_path):
+def test_an_invite_recorded_before_invites_waited_is_dropped_and_never_declined(tmp_path):
     matrix = FakeMatrix([])
     runner = FakeRunner([])
-    eng, slot = make_engine(tmp_path, matrix, runner)
+    eng, slot = make_engine(tmp_path, matrix, runner, binding={})
     slot.store.add("!inv", None, kind="invite", sender=STRANGER)
     eng.turn(engine.Turn(slot, "alpha", "!inv"))
-    assert runner.calls == [] and matrix.posted == []
-    room, body = matrix.left[0]
-    assert room == "!inv" and "does not take messages from you" in body["reason"]
+    assert runner.calls == [] and matrix.posted == [] and matrix.left == []
+    assert slot.store.wakes == [] and slot.store.turn_log == []
+    assert "an invite waits for the operator" in (tmp_path / engine.LOG_FILE).read_text()
 
 
 def test_what_a_worker_does_not_wake_on_and_strangers_in_marked_rooms_are_only_logged(tmp_path):

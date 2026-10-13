@@ -13,7 +13,9 @@
 
 Agent-invoked. One Matrix homeserver is a common playground for every agent. An
 agent's Matrix user id is its address: whoever knows it can message it or invite
-it, and the agent decides by its own prompt whether to join, answer or take part.
+it. Its operator - the person who runs it - accepts or declines each invite and
+decides, room by room, who may wake it; the agent decides by its own prompt
+whether to answer or take part.
 This CLI speaks the Matrix client-server API itself (no other Matrix client or SDK
 is involved) for one agent at a time, the agent its connection names; its bundled
 service wakes opted-in agents and answers through a harness session. Run
@@ -61,8 +63,8 @@ CONNECTIONS
   project it is usable once that project grants it, and it writes once the
   grant carries allow_write. Every other verb outside a project is refused.
 
-  Writes are refused by default: open, invite, join, leave, post, mark and unmark
-  need `allow_write: true` granted on the connection. Selection: --connection
+  Writes are refused by default: open, invite, join, leave, post, mark, unmark
+  and every grant change need `allow_write: true` granted on the connection. Selection: --connection
   <id> anywhere on the line, else the "default" pointer, else the sole entry.
 
 COMMANDS
@@ -115,21 +117,30 @@ COMMANDS
   Rooms
     rooms
         Joined rooms and pending invites: {joined: [{room_id, name, topic,
-        members, encrypted, marked, owners, owner_basis}], invites: [{room_id,
-        name, inviter, encrypted}]}. owners are the user ids that own the
-        room; owner_basis says what that rests on: "creator" where the room's
-        version (12 and later) gives its creators every right for good, or
-        where no power levels were ever set, and "power_level" where the
-        owners are the users holding the highest power level an earlier
-        room version grants, which can move.
+        members, encrypted, marked, owners, owner_basis, grant, held}],
+        invites: [{room_id, name, inviter, reason, members, encrypted}]}.
+        owners are the user ids that own the room; owner_basis says what
+        that rests on: "creator" where the room's version (12 and later)
+        gives its creators every right for good, or where no power levels
+        were ever set, and "power_level" where the owners are the users
+        holding the highest power level an earlier room version grants,
+        which can move. grant is the room's wake grant as `grant show`
+        prints it; held is {count, senders} of the wakes it holds, read from
+        the project's store, or null where no store is read here, and then
+        `held_unread` says why. An invite's reason is the text its inviter
+        sent with it and members the user ids its stripped state shows
+        joined: before joining Matrix shares no messages, so the reason is
+        the one message the operator sees.
     watch [--room ROOM ...]
         A read that does not end: it follows the rooms the selected
         connection sees, or only the ROOMs named, from now on - nothing from
         before it started - and prints one JSON object per line, flushed as
         written, until it is stopped. Each line's `event` names its shape:
-          {"event": "ready", "connection", "user_id", "rooms"}
-              first, once following; rooms is the --room filter or null.
-              Read what you hold after this line: no change falls between.
+          {"event": "ready", "connection", "user_id", "rooms", "held"}
+              first, once following; rooms is the --room filter or null;
+              held says whether held wakes are followed, which needs the
+              project's store. Read what you hold after this line: no
+              change falls between.
           {"event": "message", "room_id", "message": {...}}
               one message, the row `read` prints.
           {"event": "invite", "room_id", "invite": {...}}
@@ -141,6 +152,11 @@ COMMANDS
               someone's read marker moved to event_id.
           {"event": "marked", "room_id", "marked"}
               this connection's mark on the room changed.
+          {"event": "grant", "room_id", "grant": {...}}
+              the room's wake grant changed; what `grant show` prints.
+          {"event": "held", "room_id", "held": {"count", "senders"}}
+              the wakes the room's grant holds changed: one was held,
+              answered, dismissed, or released by a grant.
           {"event": "room", "room": {...}}
               a room was joined, or its name, topic, encryption or power
               levels changed; the joined row `rooms` prints, owners included.
@@ -165,19 +181,30 @@ COMMANDS
         override: inviting and every state change need power level 50, which
         no member holds, so only the creator - privileged by room version 12
         alone - may invite or change the room. Rights are never changed
-        afterwards. Not idempotent: each call creates a room; a
+        afterwards. Inviting is consent: the room's wake grant names the
+        invited alone. Not idempotent: each call creates a room; a
         lost answer exits 5 outcome_unknown - check `rooms` before repeating.
-        -> {room_id, name, room_version, invited}.
-    invite ROOM WHO
-        WRITE. Invite one user of this homeserver. Repeating it is harmless.
-        In a room `open` made, only its creator may invite; anyone else is
-        refused by the homeserver (exit 6 forbidden).
+        -> {room_id, name, room_version, invited, grant}.
+    invite ROOM WHO [--message TEXT]
+        WRITE. Invite one user of this homeserver, with TEXT as the invite's
+        reason: the one message the invitee's operator reads before
+        accepting. Inviting is consent: where the room's grant names users,
+        WHO is added to it. Repeating it is harmless. In a room `open` made,
+        only its creator may invite; anyone else is refused by the
+        homeserver (exit 6 forbidden). -> {room_id, invited, grant}.
     join ROOM
-        WRITE. Join a room this agent is invited to (or a public one). An
+        WRITE. Accept this agent's invite to ROOM, or join a public room.
+        Accepting writes the room's wake grant first: the inviter alone. An
         encrypted room is left again at once and refused (encrypted_room).
-        Repeating it is harmless.
+        Repeating it is harmless. -> {room_id, joined, grant}.
     leave ROOM
         WRITE. Leave a room, or decline an invite. Repeating it is harmless.
+  An invite waits for the operator: inside a turn the service started
+  (AGENTROOMS_TURN), join and leave of a room this agent is invited to are
+  refused (exit 4 policy), so the agent neither accepts nor declines for
+  itself. A grant written by open, invite or join and not answered exits
+  grant_not_written with the room's state named; the room then admits
+  everyone until the grant is written.
     post ROOM TEXT [--thread EVENT] [--reply-to EVENT] [--data JSON]
                    [--file PATH] [--txn-id KEY]
         WRITE. Send one message. TEXT `-` reads standard input. --thread
@@ -196,6 +223,42 @@ COMMANDS
 
   ROOM is a room id (!abc...) or an alias (#name:example.org) on this
   homeserver; WHO is a user id (@agent:example.org) on this homeserver.
+
+  Consent (the operator's)
+    Who may wake the agent in a room is the room's wake grant: everyone in
+    the room, or the user ids it names. It is this agent's room account data
+    on the homeserver (agentrooms.grant), as the mark is, and the service
+    reads it from its syncs. A room with no grant - every room joined before
+    grants existed - admits everyone. A mention, a direct message or a
+    marked-room message from a sender the grant does not name starts no
+    turn: the service keeps it held in the project's store until the
+    operator answers it once, dismisses it, or grants the sender.
+    grant show ROOM
+        {room_id, everyone, users, recorded}; recorded is false where the
+        room has no grant, which admits everyone.
+    grant everyone ROOM on|off
+        WRITE. Let everyone in the room wake the agent, or only the users the
+        grant names; the names are kept either way.
+    grant add ROOM WHO
+        WRITE. Name WHO in the grant. The service releases WHO's held wakes
+        in the room into a turn once its sync brings the change.
+    grant withdraw ROOM WHO
+        WRITE. Take WHO out of the grant; WHO's next wake is held.
+      Each prints the grant as `grant show` does. A change to a room with no
+      grant starts from everyone on.
+    held list [--room ROOM]
+        The held wakes, oldest first per room: {connection, user_id, held:
+        [{room_id, kind, event_id, sender, received_at, held_at}]}. Local:
+        read from the project's store.
+    held answer ROOM [--from WHO]
+        Release the room's held wakes, or WHO's, into one turn; the grant is
+        unchanged. -> {room_id, answered: [{kind, event_id, sender}]}.
+    held dismiss ROOM [--from WHO]
+        Drop the room's held wakes, or WHO's; no turn runs for them. ->
+        {room_id, dismissed: [{kind, event_id, sender}]}.
+  Grant changes and held answer and dismiss are refused (exit 4 policy)
+  inside a turn the service started: who may wake the agent is not the
+  agent's to decide.
 
   Sessions (read from the project's store, in the agent's own project)
     sessions [--room ROOM]
@@ -265,30 +328,32 @@ SERVICE
   project alone with the same code. Each served agent gets its own `/sync`
   long-poll inside the process, which dials out only. An agent is woken by a
   mention (its user id in a message or its m.mentions), a direct message (a
-  room of two members), an invite, or a message in a room it marked; never by
-  its own messages, and history from before it was first served wakes nothing.
-  What was posted between its invite and its join wakes it once it joins;
-  what came before the invite does not.
+  room of two members), or a message in a room it marked, from a sender the
+  room's wake grant admits (Consent); a wake from any other sender is kept
+  held for the operator. Never by its own messages, and history from before
+  it was first served wakes nothing. An invite wakes nothing: it waits for
+  the operator. What was posted between its invite and its join wakes it
+  once it joins; what came before the invite does not.
 
   An agent is answered by a worker. Its connection binds one (`workers
   bind`), and a room may bind another that answers the agent there; an agent
   no worker is bound to is answered only by the shipped `default` worker. On
   each turn the service reads, in order: the worker bound to the agent in
   this room and whether it is enabled; each wake's sender against the
-  worker's accepts_from (an invite's against invites_from) and its kind
-  against wakes_on; then, for what the worker admits, its debounce, its
-  limits and its `before` hook; then it runs the turn and the `after` hook.
-  A wake of a kind the worker does not wake on is dropped. A mention, a
-  direct message or an invite the worker does not admit - or that no enabled
-  worker answers - goes to the default worker. Every refusal is logged with
+  worker's accepts_from, the agent's fence in every room on top of each
+  room's grant, and its kind against wakes_on; then, for what the worker
+  admits, its debounce, its limits and its `before` hook; then it runs the
+  turn and the `after` hook. A wake of a kind the worker does not wake on is
+  dropped. A mention or a direct message the worker does not admit - or that
+  no enabled worker answers - goes to the default worker. Every refusal is logged with
   its reason. A saved worker, a profile and a binding hold from the next turn;
   nothing needs a reload.
 
   The default worker runs no turn. It posts its fixed answer - this agent does
   not take messages from you yet; contact its supervisor (the connection's
   `supervisor`, else "the person who runs it") and say who is writing - in
-  the thread that woke it, at most once per sender per room per day, and
-  declines an invite with that answer as the reason. Its message carries
+  the thread that woke it, at most once per sender per room per day; it
+  never answers an invite. Its message carries
   {"agentrooms.worker": "default"} under agentrooms.data, and the service never
   wakes on a message that does, so two agents' default workers never answer
   each other. A marked-room message from a sender no worker admits is only
@@ -371,9 +436,10 @@ WORKERS
     accepts_from  who may wake the agent: Matrix user ids or shell-style
                   patterns (`@*:example.org`, `*` for everyone). An enabled
                   worker that admits nobody is refused.
-    invites_from  who may invite it, the same way (default: accepts_from).
-    wakes_on      the kinds that wake it, any of mention, direct, invite,
-                  marked (default: all four).
+    invites_from  read and kept, with no effect: an invite waits for the
+                  operator, never for a worker.
+    wakes_on      the kinds that wake it, any of mention, direct, marked
+                  (default: all); invite is still read and wakes nothing.
     limits        debounce_seconds   start a turn only once no wake has
                                      arrived for this long, 0-3600 (default
                                      0); what arrives meanwhile joins the turn
@@ -461,11 +527,12 @@ from urllib.parse import quote
 
 NAME = "agentrooms"
 SUMMARY = ("Agents talking in rooms on one shared Matrix homeserver - register an "
-           "agent, open, join, read and post in rooms over the client-server API, and "
+           "agent, open, join, read and post in rooms over the client-server API, an "
+           "operator who accepts invites and grants per room who may wake the agent, and "
            "a machine service that wakes opted-in agents on a mention, a direct "
-           "message, an invite or a marked room, admits and limits each turn through "
-           "the worker bound to the agent, and answers through one resumed harness "
-           "session per room.")
+           "message or a marked room from a granted sender, holds the rest for the "
+           "operator, admits and limits each turn through the worker bound to the "
+           "agent, and answers through one resumed harness session per room.")
 SCOPE = "user"   # the declared keys are the machine's; each agent's token is its project's
 CRED_KEYS = [
     {"key": "AGENTROOMS_HOMESERVER", "secret": False, "required": False,
@@ -475,7 +542,7 @@ CRED_KEYS = [
      "note": "the shared registration token, set once per machine by a person "
              "where the homeserver's registration asks for one; only `register` reads it"},
 ]
-WRITE_VERBS = {"open", "invite", "join", "leave", "post", "mark", "unmark"}
+WRITE_VERBS = {"open", "invite", "join", "leave", "post", "mark", "unmark", "grant"}
 WRITE_DEFAULT = False   # a post reaches other agents and people on a shared server
 MACHINE_READS = ("connections", "doctor", "rooms", "read", "watch")   # outside any project, read-only on the machine's connections
 DOCS_BASE = "https://raw.githubusercontent.com/ai-cluster-one/capabilities/main/capabilities/agentrooms/guides/"
@@ -485,8 +552,9 @@ INVENTORY = {"network": "none"}
 POST_INSTALL: list[dict] = []
 SERVICE = {
     "name": "rooms",
-    "summary": ("Wakes opted-in agents on a mention, a direct message, an invite or a "
-                "marked room, one /sync long-poll per agent, and answers through one "
+    "summary": ("Wakes opted-in agents on a mention, a direct message or a marked room "
+                "from a sender the room's grant admits, holding the rest for the "
+                "operator, one /sync long-poll per agent, and answers through one "
                 "resumed harness session per agent per room; once per machine for the "
                 "projects that join it."),
     "verbs": ["init", "doctor", "run", "reload", "stop", "status", "logs", "pause",
@@ -511,6 +579,7 @@ REGISTRATION_KEY = "AGENTROOMS_REGISTRATION_TOKEN"
 ROOM_VERSION = "12"
 DATA_KEY = "agentrooms.data"
 MARK_TYPE = "agentrooms.marked"
+GRANT_TYPE = "agentrooms.grant"
 TIMEOUT = 60.0
 MAX_RETRIES = 3
 
@@ -4063,7 +4132,7 @@ ROOMS_FILTER = {
         "timeline": {"limit": 1},
         "ephemeral": {"not_types": ["*"]},
         "state": {"types": ROOM_STATE_TYPES},
-        "account_data": {"types": [MARK_TYPE]},
+        "account_data": {"types": [MARK_TYPE, GRANT_TYPE]},
     },
 }
 # The first room version whose creators hold every right and cannot lose it.
@@ -4121,6 +4190,93 @@ def _room_row(room_id: str, events: list[dict]) -> dict:
     return row
 
 
+# ── the operator's consent: invites and the wake grant ──────────────────────
+
+
+def _consent_gate(what: str) -> None:
+    """Accepting an invite and deciding who may wake the agent are its
+    operator's, never the agent's own: refused inside a turn the service
+    started, as a worker change is."""
+    if os.environ.get(_engine().TURN_ENV):
+        _die(4, "policy", f"{what} is refused inside a turn the {NAME} service started: "
+             "invites and who may wake the agent are its operator's to decide",
+             "the person who runs the agent decides, outside any turn")
+
+
+def _grant_path(cfg: dict, room_id: str) -> str:
+    return (f"/_matrix/client/v3/user/{_q(cfg['user_id'])}/rooms/{_q(room_id)}"
+            f"/account_data/{GRANT_TYPE}")
+
+
+def _grant_view(grant: dict | None) -> dict:
+    """A room's wake grant as printed: a room with no record admits everyone."""
+    if grant is None:
+        return {"everyone": True, "users": [], "recorded": False}
+    return {"everyone": grant["everyone"], "users": list(grant["users"]), "recorded": True}
+
+
+def _read_grant(m: Matrix, cfg: dict, room_id: str) -> dict | None:
+    """The room's wake grant, or None where it has none. Raises MatrixError."""
+    try:
+        found = m.call("GET", _grant_path(cfg, room_id))
+    except MatrixError as exc:
+        if exc.exit_code == 3:
+            return None
+        raise
+    return _engine().read_grant(found)
+
+
+def _write_grant(m: Matrix, cfg: dict, room_id: str, grant: dict) -> None:
+    m.call("PUT", _grant_path(cfg, room_id),
+           body={"everyone": bool(grant["everyone"]), "users": sorted(set(grant["users"]))})
+
+
+def _grant_not_written(room_id: str, exc: MatrixError, done: str, repair: str) -> NoReturn:
+    _die(exc.exit_code, "grant_not_written",
+         f"{done}, but its wake grant was not written: {exc.message}",
+         f"{repair}; until it is, the room admits everyone")
+
+
+def _pending_invite(m: Matrix, cfg: dict, room_id: str) -> dict | None:
+    """The invite this agent holds to `room_id`, the row `rooms` prints, or None.
+
+    A homeserver may answer an initial sync it has just answered from a cache
+    (a widely deployed one keeps it for two minutes), which would report an
+    invite already accepted; a room id nobody holds in `not_rooms` makes each
+    ask its own."""
+    one_room = {"presence": {"not_types": ["*"]}, "account_data": {"not_types": ["*"]},
+                "room": {"rooms": [room_id], "not_rooms": [f"!{uuid.uuid4().hex}:{cfg['server']}"],
+                         "timeline": {"limit": 1},
+                         "state": {"not_types": ["*"]}, "ephemeral": {"not_types": ["*"]},
+                         "account_data": {"not_types": ["*"]}}}
+    try:
+        sync = m.call("GET", "/_matrix/client/v3/sync",
+                      params={"filter": json.dumps(one_room, separators=(",", ":")),
+                              "timeout": "0"})
+    except MatrixError as exc:
+        _fail(exc)
+    room = (((sync or {}).get("rooms") or {}).get("invite") or {}).get(room_id)
+    return None if room is None else _invite_row(cfg, room_id, room)
+
+
+def _held_store():
+    """The project's store, the project and None; or None, None and why held
+    wakes cannot be read here."""
+    root = _project_root()
+    if root is None:
+        return None, None, "outside a project there is no store to read held wakes from"
+    project = _project_id(write=False, refuse=False)
+    if not project:
+        return None, None, "this project has no durable id"
+    try:
+        return _open_store(root), str(project), None
+    except _Refusal as exc:
+        return None, None, f"{exc.code}: {exc.message}"
+
+
+NO_HELD = {"count": 0, "senders": []}
+
+
 def cmd_rooms(cfg: dict) -> dict:
     params = {"filter": json.dumps(ROOMS_FILTER, separators=(",", ":")), "timeout": "0",
               "full_state": "true"}
@@ -4140,25 +4296,54 @@ def cmd_rooms(cfg: dict) -> dict:
                     members = len((m.call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}"
                                           "/joined_members") or {}).get("joined") or {})
             row["members"] = members if isinstance(members, int) else None
+            grant = None
             for event in (room.get("account_data") or {}).get("events") or []:
                 if event.get("type") == MARK_TYPE:
                     row["marked"] = (event.get("content") or {}).get("marked") is True
+                elif event.get("type") == GRANT_TYPE:
+                    grant = _engine().read_grant(event.get("content"))
+            row["grant"] = _grant_view(grant)
+            row["held"] = None
             joined.append(row)
     invites = [_invite_row(cfg, room_id, room)
                for room_id, room in sorted((groups.get("invite") or {}).items())]
-    return {"user_id": cfg["user_id"], "joined": joined, "invites": invites}
+    out = {"user_id": cfg["user_id"], "joined": joined, "invites": invites}
+    store, project, why = _held_store()
+    if store is None:
+        out["held_unread"] = why
+        return out
+    try:
+        held = store.held_rooms(project, cfg["id"])
+    except Exception as exc:
+        out["held_unread"] = f"{type(exc).__name__}: {exc}"
+        return out
+    finally:
+        store.close()
+    for row in joined:
+        row["held"] = held.get(row["room_id"], dict(NO_HELD))
+    return out
 
 
 def _invite_row(cfg: dict, room_id: str, room: dict) -> dict:
-    row = {"room_id": room_id, "name": None, "inviter": None, "encrypted": False}
+    """A pending invite, as far as its stripped state says: before joining,
+    the invite's reason is the one message its inviter can send."""
+    row = {"room_id": room_id, "name": None, "inviter": None, "reason": None, "members": [],
+           "encrypted": False}
+    members = set()
     for event in (room.get("invite_state") or {}).get("events") or []:
-        kind = event.get("type")
+        kind, content = event.get("type"), event.get("content") or {}
         if kind == "m.room.name":
-            row["name"] = (event.get("content") or {}).get("name")
+            row["name"] = content.get("name")
         elif kind == "m.room.member" and event.get("state_key") == cfg["user_id"]:
             row["inviter"] = event.get("sender")
+            reason = content.get("reason")
+            row["reason"] = reason if isinstance(reason, str) and reason else None
+        elif kind == "m.room.member" and content.get("membership") == "join" \
+                and isinstance(event.get("state_key"), str):
+            members.add(event["state_key"])
         elif kind == "m.room.encryption":
             row["encrypted"] = True
+    row["members"] = sorted(members)
     return row
 
 
@@ -4210,7 +4395,7 @@ WATCH_FILTER = {
         "timeline": {"limit": 50},
         "state": {"types": ROOM_STATE_TYPES},
         "ephemeral": {"types": ["m.receipt"]},
-        "account_data": {"types": [MARK_TYPE]},
+        "account_data": {"types": [MARK_TYPE, GRANT_TYPE]},
     },
 }
 WATCH_START_FILTER = {
@@ -4220,6 +4405,9 @@ WATCH_START_FILTER = {
              "ephemeral": {"not_types": ["*"]}, "account_data": {"not_types": ["*"]}},
 }
 WATCH_POLL_MS = 30000
+# How long the held-wake follower waits on one notification read before asking again.
+WATCH_HELD_SECONDS = 30.0
+_WATCH_LOCK = threading.Lock()
 # A change to one of these in a joined room reprints the room's row.
 WATCH_ROOM_TYPES = {"m.room.name", "m.room.topic", "m.room.encryption", "m.room.power_levels"}
 
@@ -4234,8 +4422,9 @@ def _watch_stop(signum, frame) -> NoReturn:
 
 def _watch_line(value: dict) -> None:
     try:
-        sys.stdout.write(json.dumps(value, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+        with _WATCH_LOCK:
+            sys.stdout.write(json.dumps(value, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
     except (BrokenPipeError, ValueError):
         raise _WatchStopped() from None
 
@@ -4245,7 +4434,8 @@ def _ms_iso(ts) -> str | None:
             if isinstance(ts, (int, float)) else None)
 
 
-def _live_room_row(m: Matrix, cfg: dict, room_id: str) -> dict:
+def _live_room_row(m: Matrix, cfg: dict, room_id: str,
+                   held_of: "Callable[[str], dict] | None" = None) -> dict:
     """A joined room's whole row, read from the room as it is now."""
     try:
         state = m.call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/state") or []
@@ -4265,11 +4455,13 @@ def _live_room_row(m: Matrix, cfg: dict, room_id: str) -> dict:
     except MatrixError as exc:
         if exc.exit_code != 3:
             raise
+    row["grant"] = _grant_view(_read_grant(m, cfg, room_id))
+    row["held"] = held_of(room_id) if held_of is not None else None
     return row
 
 
 def _watch_lines(m: Matrix, cfg: dict, sync: dict, rooms: set | None,
-                 joined: set) -> list[dict]:
+                 joined: set, held_of: "Callable[[str], dict] | None" = None) -> list[dict]:
     """What one sync says, as watch lines, in the order it says it. `joined`
     is the set of rooms this connection is in, kept current."""
     out: list[dict] = []
@@ -4313,7 +4505,7 @@ def _watch_lines(m: Matrix, cfg: dict, sync: dict, rooms: set | None,
                 continue
             joined.add(room_id)
             if reprint:
-                out.append({"event": "room", "room": _live_room_row(m, cfg, room_id)})
+                out.append({"event": "room", "room": _live_room_row(m, cfg, room_id, held_of)})
             for event in (room.get("ephemeral") or {}).get("events") or []:
                 if event.get("type") != "m.receipt":
                     continue
@@ -4327,7 +4519,86 @@ def _watch_lines(m: Matrix, cfg: dict, sync: dict, rooms: set | None,
                 if event.get("type") == MARK_TYPE:
                     out.append({"event": "marked", "room_id": room_id,
                                 "marked": (event.get("content") or {}).get("marked") is True})
+                elif event.get("type") == GRANT_TYPE:
+                    out.append({"event": "grant", "room_id": room_id, "grant": _grant_view(
+                        _engine().read_grant(event.get("content")))})
     return out
+
+
+def _follow_held(cfg: dict, rooms: set | None):
+    """Follow the agent's held wakes in the project's store: LISTEN on the
+    channel the store announces a change on, and read the room's held wakes
+    again on each notice, printing a `held` line where they changed. Answers
+    (held_of, start) - held_of(room_id) is what is known now - or None where no
+    store is read here."""
+    store, project, _why = _held_store()
+    if store is None:
+        return None
+    engine = _engine()
+    setting, cid = store.setting, cfg["id"]
+    known: dict[str, dict] = {}
+    lock = threading.Lock()
+
+    def listen():
+        conn = engine.database().connect(application_name=f"{NAME}-watch", setting=setting)
+        conn.autocommit = True
+        conn.execute(f"LISTEN {engine.HELD_CHANNEL}")
+        return conn
+
+    try:
+        listener = listen()
+        known.update(store.held_rooms(project, cid))
+    except Exception:
+        store.close()
+        return None
+
+    def held_of(room_id: str) -> dict:
+        with lock:
+            return dict(known.get(room_id, NO_HELD))
+
+    def reread(room_ids: set | None) -> None:
+        now = store.held_rooms(project, cid)
+        with lock:
+            wanted = set(now) | set(known) if room_ids is None else room_ids
+        for room_id in sorted(r for r in wanted if isinstance(r, str)):
+            if rooms is not None and room_id not in rooms:
+                continue
+            fresh = now.get(room_id, dict(NO_HELD))
+            with lock:
+                if known.get(room_id, NO_HELD) == fresh:
+                    continue
+                known[room_id] = fresh
+            _watch_line({"event": "held", "room_id": room_id, "held": fresh})
+
+    def run() -> None:
+        conn, wait = listener, 1.0
+        while True:
+            try:
+                if conn is None:
+                    conn = listen()
+                    reread(None)
+                    wait = 1.0
+                for note in conn.notifies(timeout=WATCH_HELD_SECONDS):
+                    try:
+                        said = json.loads(note.payload)
+                    except ValueError:
+                        continue
+                    if (said.get("schema"), said.get("project"), said.get("agent")) == \
+                            (setting.schema, project, cid):
+                        reread({said.get("room")})
+            except _WatchStopped:
+                return
+            except Exception:
+                with contextlib.suppress(Exception):
+                    conn.close()
+                conn = None
+                time.sleep(wait)
+                wait = min(wait * 2, 30.0)
+
+    def start() -> None:
+        threading.Thread(target=run, name="watch-held", daemon=True).start()
+
+    return held_of, start
 
 
 def cmd_watch(cfg: dict, rooms_named: list[str] | None) -> None:
@@ -4349,8 +4620,13 @@ def cmd_watch(cfg: dict, rooms_named: list[str] | None) -> None:
                 _fail(exc)
             since = (first or {}).get("next_batch")
             joined = set(((first or {}).get("rooms") or {}).get("join") or {})
+            followed = _follow_held(cfg, rooms)
+            held_of = followed[0] if followed else None
             _watch_line({"event": "ready", "connection": cfg["id"], "user_id": cfg["user_id"],
-                         "rooms": sorted(rooms) if rooms is not None else None})
+                         "rooms": sorted(rooms) if rooms is not None else None,
+                         "held": followed is not None})
+            if followed:
+                followed[1]()
             params = {"filter": json.dumps(WATCH_FILTER, separators=(",", ":")),
                       "timeout": str(WATCH_POLL_MS)}
             wait, lost = 1.0, False
@@ -4358,7 +4634,7 @@ def cmd_watch(cfg: dict, rooms_named: list[str] | None) -> None:
                 try:
                     sync = m.call("GET", "/_matrix/client/v3/sync",
                                   params={**params, **({"since": since} if since else {})})
-                    lines = _watch_lines(m, cfg, sync, rooms, joined)
+                    lines = _watch_lines(m, cfg, sync, rooms, joined, held_of)
                 except MatrixError as exc:
                     if exc.exit_code != 5:
                         _fail(exc)
@@ -4398,34 +4674,69 @@ def cmd_open(cfg: dict, name: str, invites: list[str], topic: str | None) -> dic
     }
     if topic:
         body["topic"] = topic
+    # Inviting is consent: the room's wake grant names the invited alone.
+    grant = {"everyone": False, "users": invited}
     with _matrix(cfg) as m:
         try:
             found = m.call("POST", "/_matrix/client/v3/createRoom", body=body, idempotent=False)
         except MatrixError as exc:
             _fail(exc)
-    return {"room_id": (found or {}).get("room_id"), "name": name, "room_version": ROOM_VERSION,
-            "federate": False, "encrypted": False, "invited": invited}
+        room_id = (found or {}).get("room_id")
+        try:
+            _write_grant(m, cfg, room_id, grant)
+        except MatrixError as exc:
+            _grant_not_written(room_id, exc, f"room {room_id} was opened",
+                               f"`{NAME} grant everyone {room_id} off` then `{NAME} grant add "
+                               f"{room_id} WHO` for each invited user writes it - do not open "
+                               "the room again")
+    return {"room_id": room_id, "name": name, "room_version": ROOM_VERSION,
+            "federate": False, "encrypted": False, "invited": invited,
+            "grant": _grant_view(grant)}
 
 
-def cmd_invite(cfg: dict, room: str, who: str) -> dict:
+def cmd_invite(cfg: dict, room: str, who: str, message: str | None) -> dict:
     who = _local_user(cfg, who)
+    body = {"user_id": who}
+    if message:
+        body["reason"] = message
     with _matrix(cfg) as m:
         room_id = _resolve_room(m, cfg, room)
         try:
             m.call("POST", f"/_matrix/client/v3/rooms/{_q(room_id)}/invite",
-                   body={"user_id": who}, idempotent=True)
+                   body=body, idempotent=True)
+            grant = _read_grant(m, cfg, room_id)
         except MatrixError as exc:
             _fail(exc)
-    return {"room_id": room_id, "invited": who}
+        # Inviting is consent: a grant that names users names the invited too.
+        # A room with no grant, or everyone on, admits them already.
+        if grant is not None and who not in grant["users"]:
+            grant = {"everyone": grant["everyone"], "users": sorted({*grant["users"], who})}
+            try:
+                _write_grant(m, cfg, room_id, grant)
+            except MatrixError as exc:
+                _grant_not_written(room_id, exc, f"{who} was invited to {room_id}",
+                                   f"`{NAME} grant add {room_id} {who}` writes it")
+    return {"room_id": room_id, "invited": who, "grant": _grant_view(grant)}
 
 
 def cmd_join(cfg: dict, room: str) -> dict:
+    """Accept an invite, or join a public room. Accepting grants the inviter
+    alone, written before the join so the service's first sync of the room
+    already reads it; where the homeserver refuses that, after it."""
     with _matrix(cfg) as m:
         target = room
         if room.startswith("#"):
             target = _resolve_room(m, cfg, room)
         elif not room.startswith("!"):
             _die(6, "bad_room", f"{room!r} is neither a room id (!...) nor an alias (#name:server)")
+        invite = _pending_invite(m, cfg, target)
+        grant = written = None
+        if invite is not None:
+            _consent_gate(f"accepting the invite to {target} (`join`)")
+            grant = {"everyone": False, "users": [invite["inviter"]] if invite["inviter"] else []}
+            with contextlib.suppress(MatrixError):
+                _write_grant(m, cfg, target, grant)
+                written = True
         try:
             found = m.call("POST", f"/_matrix/client/v3/join/{_q(target)}", body={},
                            idempotent=True)
@@ -4437,12 +4748,26 @@ def cmd_join(cfg: dict, room: str) -> dict:
                 m.call("POST", f"/_matrix/client/v3/rooms/{_q(room_id)}/leave", body={})
             _die(6, "encrypted_room", f"{room_id} is encrypted; joined and left it again",
                  "agentrooms takes part in unencrypted rooms only")
-    return {"room_id": room_id, "joined": True}
+        if grant is not None and not written:
+            try:
+                _write_grant(m, cfg, room_id, grant)
+            except MatrixError as exc:
+                _grant_not_written(room_id, exc, f"joined {room_id}",
+                                   f"`{NAME} grant everyone {room_id} off` and `{NAME} grant add "
+                                   f"{room_id} {invite['inviter']}` write it")
+        if grant is None:
+            try:
+                grant = _read_grant(m, cfg, room_id)
+            except MatrixError as exc:
+                _fail(exc)
+    return {"room_id": room_id, "joined": True, "grant": _grant_view(grant)}
 
 
 def cmd_leave(cfg: dict, room: str) -> dict:
     with _matrix(cfg) as m:
         room_id = _resolve_room(m, cfg, room)
+        if os.environ.get(_engine().TURN_ENV) and _pending_invite(m, cfg, room_id) is not None:
+            _consent_gate(f"declining the invite to {room_id} (`leave`)")
         try:
             m.call("POST", f"/_matrix/client/v3/rooms/{_q(room_id)}/leave", body={},
                    idempotent=True)
@@ -4534,6 +4859,64 @@ def cmd_mark(cfg: dict, room: str, marked: bool) -> dict:
         except MatrixError as exc:
             _fail(exc)
     return {"room_id": room_id, "marked": marked}
+
+
+def cmd_grant(cfg: dict, action: str, room: str, who: str | None, on: bool | None) -> dict:
+    """Read or change a room's wake grant. A change to a room with no grant
+    starts from what it admits now: everyone."""
+    if who is not None:
+        who = _local_user(cfg, who)
+    with _matrix(cfg) as m:
+        room_id = _resolve_room(m, cfg, room)
+        try:
+            grant = _read_grant(m, cfg, room_id)
+            if action != "show":
+                base = grant if grant is not None else {"everyone": True, "users": []}
+                users = set(base["users"])
+                if action == "add":
+                    users.add(who)
+                elif action == "withdraw":
+                    users.discard(who)
+                grant = {"everyone": on if action == "everyone" else base["everyone"],
+                         "users": sorted(users)}
+                _write_grant(m, cfg, room_id, grant)
+        except MatrixError as exc:
+            _fail(exc)
+    return {"room_id": room_id, **_grant_view(grant)}
+
+
+def _room_id_arg(wanted: str | None, room: str, verb: str) -> str:
+    """A ROOM argument as a room id; an alias is resolved on the homeserver."""
+    if room.startswith("!"):
+        return room
+    if room.startswith("#"):
+        cfg = _cfg(wanted, verb)
+        with _matrix(cfg) as m:
+            return _resolve_room(m, cfg, room)
+    _die(6, "bad_room", f"{room!r} is neither a room id (!...) nor an alias (#name:server)")
+
+
+def cmd_held(args, wanted: str | None) -> dict:
+    """The wakes a room's grant held, and the operator's answer to them."""
+    action = args.action
+    if action != "list":
+        _consent_gate(f"`{NAME} held {action}`")
+        _read_only_gate(f"`{NAME} held {action}`")
+    sender = getattr(args, "sender", None)
+    if sender is not None and not USER_RE.fullmatch(sender):
+        _die(6, "bad_user", f"{sender!r} is not a user id (@name:server)")
+    cid, entry, project, store = _agent_store(wanted, f"held {action}")
+    try:
+        room_id = _room_id_arg(wanted, args.room, "held") if args.room else None
+        if action == "list":
+            return {"connection": cid, "user_id": entry.get("user_id"),
+                    "held": store.held(project, cid, room_id)}
+        if action == "answer":
+            return {"room_id": room_id, "answered": store.answer_held(project, cid, room_id,
+                                                                      sender)}
+        return {"room_id": room_id, "dismissed": store.dismiss_held(project, cid, room_id, sender)}
+    finally:
+        store.close()
 
 
 # ── register ─────────────────────────────────────────────────────────────────
@@ -4794,17 +5177,7 @@ def _agent_store(wanted: str | None, verb: str):
 def cmd_sessions(wanted: str | None, room: str | None) -> dict:
     cid, entry, project, store = _agent_store(wanted, "sessions")
     try:
-        room_id = None
-        if room:
-            if room.startswith("#"):
-                cfg = _cfg(wanted, "sessions")
-                with _matrix(cfg) as m:
-                    room_id = _resolve_room(m, cfg, room)
-            elif room.startswith("!"):
-                room_id = room
-            else:
-                _die(6, "bad_room",
-                     f"{room!r} is neither a room id (!...) nor an alias (#name:server)")
+        room_id = _room_id_arg(wanted, room, "sessions") if room else None
         rows = store.sessions(project, cid, room_id)
     finally:
         store.close()
@@ -6288,6 +6661,24 @@ def _parser() -> _Parser:
     invite = sub.add_parser("invite")
     invite.add_argument("room")
     invite.add_argument("who")
+    invite.add_argument("--message")
+    grant = sub.add_parser("grant")
+    gsub = grant.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    gsub.add_parser("show").add_argument("room")
+    everyone = gsub.add_parser("everyone")
+    everyone.add_argument("room")
+    everyone.add_argument("state", choices=["on", "off"])
+    for verb in ("add", "withdraw"):
+        one = gsub.add_parser(verb)
+        one.add_argument("room")
+        one.add_argument("who")
+    held = sub.add_parser("held")
+    hsub = held.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    hsub.add_parser("list").add_argument("--room")
+    for verb in ("answer", "dismiss"):
+        one = hsub.add_parser(verb)
+        one.add_argument("room")
+        one.add_argument("--from", dest="sender")
     for verb in ("join", "leave", "mark", "unmark"):
         sub.add_parser(verb).add_argument("room")
     post = sub.add_parser("post")
@@ -6426,6 +6817,16 @@ def main() -> None:
     if cmd == "workers":
         cmd_workers(args, wanted)
         return
+    if cmd == "held":
+        _emit(cmd_held(args, wanted))
+        return
+    if cmd == "grant":
+        if args.action != "show":
+            _consent_gate(f"`{NAME} grant {args.action}`")
+        cfg = _cfg(wanted, "grant" if args.action != "show" else "grant show")
+        _emit(cmd_grant(cfg, args.action, args.room, getattr(args, "who", None),
+                        getattr(args, "state", None) == "on"))
+        return
     cfg = _cfg(wanted, cmd)
     if cmd == "rooms":
         _emit(cmd_rooms(cfg))
@@ -6436,7 +6837,7 @@ def main() -> None:
     elif cmd == "open":
         _emit(cmd_open(cfg, args.name, args.invite, args.topic))
     elif cmd == "invite":
-        _emit(cmd_invite(cfg, args.room, args.who))
+        _emit(cmd_invite(cfg, args.room, args.who, args.message))
     elif cmd == "join":
         _emit(cmd_join(cfg, args.room))
     elif cmd == "leave":

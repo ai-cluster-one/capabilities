@@ -36,6 +36,9 @@ class FakeHomeserver:
         self.state: dict[str, list[dict]] = {}
         self.sync_params: list[dict] = []
         self.registration_flows = [["m.login.registration_token"]]
+        self.grants: dict[str, dict] = {}
+        self.refuse_grant_before_join = False
+        self.joined: set[str] = set()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -78,6 +81,8 @@ class FakeHomeserver:
         if path == "/_matrix/client/v3/sync":
             self.sync_params.append(dict(request.url.params))
             answer = self.syncs.pop(0)
+            if callable(answer):
+                answer = answer()
             if isinstance(answer, Exception):
                 raise answer
             return httpx.Response(200, json=answer)
@@ -106,11 +111,25 @@ class FakeHomeserver:
                       "content": {"msgtype": "m.text", "body": f"message {i}"}}
                      for i in (3, 2, 1)]
             return httpx.Response(200, json={"chunk": chunk, "end": "t1"})
-        if path.startswith("/_matrix/client/v3/join/") or path.endswith("/leave") \
-                or path.endswith("/invite"):
+        if path.startswith("/_matrix/client/v3/join/"):
+            room = unquote(path.rsplit("/", 1)[1])
+            self.joined.add(room)
+            return httpx.Response(200, json={"room_id": room})
+        if path.endswith("/leave") or path.endswith("/invite"):
             return httpx.Response(200, json={"room_id": "!joined"})
         if "/account_data/agentrooms.marked" in path:
             return httpx.Response(200, json={})
+        if "/account_data/agentrooms.grant" in path:
+            room = unquote(path.split("/rooms/")[1].split("/")[0])
+            if request.method == "PUT":
+                if self.refuse_grant_before_join and room not in self.joined:
+                    return httpx.Response(403, json={"errcode": "M_FORBIDDEN",
+                                                     "error": "not in room"})
+                self.grants[room] = body
+                return httpx.Response(200, json={})
+            if room in self.grants:
+                return httpx.Response(200, json=self.grants[room])
+            return httpx.Response(404, json={"errcode": "M_NOT_FOUND", "error": "no data"})
         return httpx.Response(404, json={"errcode": "M_UNRECOGNIZED", "error": path})
 
 
@@ -734,7 +753,8 @@ def test_watch_prints_one_line_per_change_from_now_until_stopped(cli, project, h
         "ready", "invite", "message", "receipt", "marked", "membership", "message", "room",
         "lost", "resumed", "gap"]
     ready, invite, hello, receipt, marked, joined, welcome, room, lost, _resumed, gap = lines
-    assert ready == {"event": "ready", "connection": "alpha", "user_id": me, "rooms": None}
+    assert ready == {"event": "ready", "connection": "alpha", "user_id": me, "rooms": None,
+                     "held": False}
     assert invite["room_id"] == "!inv" and invite["invite"]["inviter"] == OWNER
     assert hello["room_id"] == "!old" and hello["message"]["body"] == "hello"
     assert receipt == {"event": "receipt", "room_id": "!old", "user_id": OWNER, "event_id": "$1",
@@ -744,6 +764,8 @@ def test_watch_prints_one_line_per_change_from_now_until_stopped(cli, project, h
     assert joined["membership"] == "join" and joined["user_id"] == me
     assert welcome["message"]["event_id"] == "$2"
     assert room["room"]["name"] == "Lab" and room["room"]["members"] == 2
+    assert room["room"]["grant"] == {"everyone": True, "users": [], "recorded": False}
+    assert room["room"]["held"] is None
     assert (room["room"]["owners"], room["room"]["owner_basis"]) == ([OWNER], "creator")
     assert lost["error"] and gap == {"event": "gap", "room_id": "!old"}
     # The first sync only takes the position; every later one goes on from the last.
@@ -803,3 +825,188 @@ def test_sessions_and_the_turn_behind_an_answer(cli, project, stored, capsys):
         "harness": "claude", "session_id": "s1", "node": "n1", "outcome": "answered"}
     code, _out, err = run(cli, capsys, "turn", "nope")
     assert code == 6 and err["error"]["code"] == "bad_event"
+
+
+# ── the operator's consent: invites wait, a grant per room, held wakes ───────
+
+
+def _invited(room, me, inviter=OWNER, reason=None, members=()):
+    mine = {"membership": "invite", **({"reason": reason} if reason else {})}
+    events = [{"type": "m.room.name", "state_key": "", "content": {"name": "Lab"}},
+              {"type": "m.room.member", "state_key": me, "sender": inviter, "content": mine}]
+    events += [{"type": "m.room.member", "state_key": who, "sender": who,
+                "content": {"membership": "join"}} for who in members]
+    return {"next_batch": "i1", "rooms": {"invite": {room: {"invite_state": {"events": events}}}}}
+
+
+def _paths(homeserver, method, part):
+    return [p for m, p, _b in homeserver.requests if m == method and part in p]
+
+
+def test_an_invite_waits_for_the_operator_and_accepting_grants_the_inviter(
+        cli, project, homeserver, capsys, monkeypatch):
+    connect(project, allow_write=True)
+    me = f"@alpha:{SERVER}"
+    homeserver.syncs.append(_invited("!inv", me, reason="Help us sort the lab?",
+                                     members=[OWNER, f"@c:{SERVER}"]))
+    code, out, err = run(cli, capsys, "rooms")
+    assert code == 0, err
+    assert out["invites"] == [{"room_id": "!inv", "name": "Lab", "inviter": OWNER,
+                               "reason": "Help us sort the lab?",
+                               "members": [f"@c:{SERVER}", OWNER], "encrypted": False}]
+    assert out["held_unread"]  # no store here: held wakes are not read, and it says so
+    # Inside a turn the agent neither accepts nor declines for itself.
+    monkeypatch.setenv("AGENTROOMS_TURN", "t1")
+    for verb in ("join", "leave"):
+        homeserver.syncs.append(_invited("!inv", me))
+        code, _out, err = run(cli, capsys, verb, "!inv")
+        assert code == 4 and err["error"]["code"] == "policy" and "operator" in err["error"]["message"]
+    assert not _paths(homeserver, "POST", "/join/") and not _paths(homeserver, "POST", "/leave")
+    assert homeserver.grants == {}
+    monkeypatch.delenv("AGENTROOMS_TURN")
+    # The operator accepts: the grant - the inviter alone - is written before the join.
+    homeserver.syncs.append(_invited("!inv", me))
+    code, out, err = run(cli, capsys, "join", "!inv")
+    assert code == 0, err
+    assert out == {"room_id": "!inv", "joined": True,
+                   "grant": {"everyone": False, "users": [OWNER], "recorded": True}}
+    order = [(m, p) for m, p, _b in homeserver.requests
+             if "agentrooms.grant" in p or "/join/" in p]
+    assert [m for m, _p in order] == ["PUT", "POST"]
+    # A homeserver that refuses account data for a room not joined gets it after.
+    homeserver.grants.clear()
+    homeserver.refuse_grant_before_join = True
+    homeserver.syncs.append(_invited("!two", me))
+    code, out, err = run(cli, capsys, "join", "!two")
+    assert code == 0 and homeserver.grants["!two"] == {"everyone": False, "users": [OWNER]}, err
+    # A room joined without an invite keeps whatever grant it has; none admits everyone.
+    homeserver.syncs.append({"next_batch": "n"})
+    code, out, err = run(cli, capsys, "join", "!public")
+    assert code == 0 and out["grant"] == {"everyone": True, "users": [], "recorded": False}, err
+    # Outside a turn, declining is the operator's leave.
+    monkeypatch.setenv("AGENTROOMS_TURN", "")
+    code, out, err = run(cli, capsys, "leave", "!other")
+    assert code == 0 and out["left"] is True, err
+
+
+def test_the_grant_verbs_and_inviting_as_consent(cli, project, homeserver, capsys, monkeypatch):
+    connect(project, allow_write=True)
+    b, c = f"@b:{SERVER}", f"@c:{SERVER}"
+    code, out, err = run(cli, capsys, "grant", "show", "!r")
+    assert out == {"room_id": "!r", "everyone": True, "users": [], "recorded": False}, err
+    # Inviting into a room with no grant writes none: it admits everyone already.
+    code, out, err = run(cli, capsys, "invite", "!r", c)
+    assert code == 0 and "!r" not in homeserver.grants and out["grant"]["recorded"] is False
+    code, out, err = run(cli, capsys, "grant", "everyone", "!r", "off")
+    assert out == {"room_id": "!r", "everyone": False, "users": [], "recorded": True}, err
+    code, out, err = run(cli, capsys, "grant", "add", "!r", b)
+    assert out["users"] == [b] and homeserver.grants["!r"] == {"everyone": False, "users": [b]}
+    code, out, err = run(cli, capsys, "invite", "!r", c, "--message", "Join us for the review")
+    assert code == 0 and out["grant"]["users"] == [b, c], err
+    sent = [body for m, p, body in homeserver.requests if p.endswith("/invite")][-1]
+    assert sent == {"user_id": c, "reason": "Join us for the review"}
+    code, out, err = run(cli, capsys, "grant", "withdraw", "!r", b)
+    assert out["users"] == [c] and out["everyone"] is False
+    code, out, err = run(cli, capsys, "grant", "everyone", "!r", "on")
+    assert out == {"room_id": "!r", "everyone": True, "users": [c], "recorded": True}
+    code, out, err = run(cli, capsys, "grant", "add", "!r", "@b:other.org")
+    assert code == 6 and err["error"]["code"] == "federation_refused"
+    # A room the agent opens admits the invited alone.
+    code, out, err = run(cli, capsys, "open", "lab", "--invite", b)
+    assert code == 0 and out["grant"] == {"everyone": False, "users": [b], "recorded": True}, err
+    assert homeserver.grants["!new"] == {"everyone": False, "users": [b]}
+    # Inside a turn no grant moves and nothing held is answered.
+    monkeypatch.setenv("AGENTROOMS_TURN", "t1")
+    for argv in (["grant", "add", "!r", b], ["grant", "everyone", "!r", "off"],
+                 ["held", "answer", "!r"], ["held", "dismiss", "!r"]):
+        code, _out, err = run(cli, capsys, *argv)
+        assert code == 4 and err["error"]["code"] == "policy", argv
+    code, out, err = run(cli, capsys, "grant", "show", "!r")
+    assert code == 0 and out["users"] == [c]
+    monkeypatch.delenv("AGENTROOMS_TURN")
+    # A grant change is a write: refused on a connection without the write grant.
+    connect(project, allow_write=False)
+    code, _out, err = run(cli, capsys, "grant", "add", "!r", b)
+    assert code == 4 and err["error"]["code"] == "read_only"
+    code, out, err = run(cli, capsys, "grant", "show", "!r")
+    assert code == 0 and out["everyone"] is True
+
+
+def test_watch_prints_grant_changes(cli, project, homeserver, capsys):
+    connect(project, allow_write=False)
+    homeserver.syncs += [
+        {"next_batch": "b0", "rooms": {"join": {"!old": {}}}},
+        {"next_batch": "b1", "rooms": {"join": {"!old": {"account_data": {"events": [
+            {"type": "agentrooms.grant", "content": {"everyone": False,
+                                                     "users": [OWNER]}}]}}}}},
+        cli._WatchStopped(),
+    ]
+    code, lines, err = run_stream(cli, capsys, "watch")
+    assert code == 0, err
+    assert lines[1:] == [{"event": "grant", "room_id": "!old", "grant": {
+        "everyone": False, "users": [OWNER], "recorded": True}}]
+
+
+@needs_store
+def test_held_wakes_are_listed_answered_and_dismissed(cli, project, stored, homeserver, capsys):
+    connect(project, allow_write=False)
+    engine = cli._engine()
+    store = engine.Store(engine.resolve_store(project)).open()
+    stranger, other = f"@s:{SERVER}", f"@o:{SERVER}"
+    try:
+        store.acquire("prj_test", "alpha", "h1", "n1", 1)
+        store.save_sync("prj_test", "alpha", f"@alpha:{SERVER}", "h1", "b1", [
+            {"room_id": "!r", "key": key, "kind": "mention", "event_id": key, "sender": who,
+             "held": True} for key, who in (("$1", stranger), ("$2", other), ("$3", stranger))])
+    finally:
+        store.close()
+    homeserver.syncs.append({"next_batch": "b1", "rooms": {"join": {
+        "!r": {"state": {"events": [_create(OWNER)]}, "summary": {"m.joined_member_count": 3}},
+        "!quiet": {"state": {"events": [_create(OWNER)]},
+                   "summary": {"m.joined_member_count": 3}}}}})
+    code, out, err = run(cli, capsys, "rooms")
+    assert code == 0 and "held_unread" not in out, err
+    rows = {r["room_id"]: r for r in out["joined"]}
+    assert rows["!r"]["held"] == {"count": 3, "senders": [other, stranger]}
+    assert rows["!quiet"]["held"] == {"count": 0, "senders": []}
+    code, out, err = run(cli, capsys, "held", "list", "--room", "!r")
+    assert code == 0 and [(h["event_id"], h["sender"]) for h in out["held"]] == [
+        ("$1", stranger), ("$2", other), ("$3", stranger)], err
+    code, out, err = run(cli, capsys, "held", "answer", "!r", "--from", stranger)
+    assert code == 0 and [w["event_id"] for w in out["answered"]] == ["$1", "$3"], err
+    code, out, err = run(cli, capsys, "held", "dismiss", "!r")
+    assert code == 0 and [w["event_id"] for w in out["dismissed"]] == ["$2"], err
+    code, out, err = run(cli, capsys, "held", "list")
+    assert out["held"] == []
+    code, _out, err = run(cli, capsys, "held", "answer", "!r", "--from", "nobody")
+    assert code == 6 and err["error"]["code"] == "bad_user"
+
+
+@needs_store
+def test_watch_follows_the_held_wakes_in_the_store(cli, project, stored, homeserver, capsys):
+    import time as _time
+    connect(project, allow_write=False)
+    engine = cli._engine()
+    stranger = f"@s:{SERVER}"
+
+    def hold_one():
+        store = engine.Store(engine.resolve_store(project)).open()
+        try:
+            store.acquire("prj_test", "alpha", "h1", "n1", 1)
+            store.save_sync("prj_test", "alpha", f"@alpha:{SERVER}", "h1", "b1", [
+                {"room_id": "!r", "key": "$1", "kind": "mention", "event_id": "$1",
+                 "sender": stranger, "held": True}])
+            _time.sleep(1.0)
+            store.dismiss_held("prj_test", "alpha", "!r")
+            _time.sleep(1.0)
+        finally:
+            store.close()
+        return {"next_batch": "b2"}
+
+    homeserver.syncs += [{"next_batch": "b0"}, hold_one, cli._WatchStopped()]
+    code, lines, err = run_stream(cli, capsys, "watch")
+    assert code == 0, err
+    assert lines[0]["held"] is True
+    assert lines[1:] == [
+        {"event": "held", "room_id": "!r", "held": {"count": 1, "senders": [stranger]}},
+        {"event": "held", "room_id": "!r", "held": {"count": 0, "senders": []}}]

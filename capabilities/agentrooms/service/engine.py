@@ -12,13 +12,17 @@ machine's opt-in list, through the same code.
 
 Runtime state lives in the PostgreSQL the project resolves to, under the
 `agentrooms_` prefix and the `agentrooms` migration ledger: the sync position of
-each agent, the wakes not yet answered, the harness session of each agent in each
-room, the lease that keeps a second process off an agent, a project's pause, the
+each agent, the wakes not yet answered - those the room's wake grant holds for
+the operator among them - the harness session of each agent in each room, the lease that keeps a second process off an agent, a project's pause, the
 project's workers as versions, and the record of the turns run, which the limits
 count and which names the message a turn posted and the harness session that
 wrote it. No message text is kept: a turn reads the room live.
 
-A worker admits and limits an agent's turns. Which worker answers an agent in a
+Who may wake an agent in a room is the operator's grant, kept as the agent's
+room account data on the homeserver and read from its syncs; a wake from a
+sender the grant does not name is recorded held and starts no turn until the
+operator answers it once or grants the sender. A worker then admits and limits
+an agent's turns. Which worker answers an agent in a
 room is read from the agent's connection at every turn, and the worker and its
 profile from the store, so a saved worker or a new binding holds from the next
 turn on.
@@ -48,7 +52,7 @@ from typing import Any, Callable
 
 LEDGER_OWNER = "agentrooms"
 LEDGER_MAJOR = 1
-LEDGER_MINOR = 2
+LEDGER_MINOR = 3
 LEDGER_STEPS = [
     ("0001-sync", """
     CREATE TABLE agentrooms_sync (
@@ -163,7 +167,34 @@ LEDGER_STEPS = [
     CREATE INDEX agentrooms_turns_event_idx ON agentrooms_turns (project_id, event_id)
         WHERE event_id IS NOT NULL;
     """),
+    ("0009-held-wakes", """
+    ALTER TABLE agentrooms_wakes ADD COLUMN held_at timestamptz;
+    COMMENT ON COLUMN agentrooms_wakes.held_at IS
+        'when the room''s wake grant held this wake: the grant did not name its sender, so it is never claimed while set and waits for the operator to answer it once, dismiss it or grant the sender';
+    CREATE INDEX agentrooms_wakes_held_idx ON agentrooms_wakes (project_id, agent, room_id)
+        WHERE held_at IS NOT NULL;
+    CREATE FUNCTION agentrooms_wakes_held_notify() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        changed record;
+    BEGIN
+        IF tg_op = 'INSERT' AND new.held_at IS NULL
+           OR tg_op = 'DELETE' AND old.held_at IS NULL
+           OR tg_op = 'UPDATE' AND old.held_at IS NOT DISTINCT FROM new.held_at THEN
+            RETURN NULL;
+        END IF;
+        IF tg_op = 'DELETE' THEN changed := old; ELSE changed := new; END IF;
+        PERFORM pg_notify('agentrooms_held', json_build_object(
+            'schema', tg_table_schema, 'project', changed.project_id, 'agent', changed.agent,
+            'room', changed.room_id)::text);
+        RETURN NULL;
+    END $$;
+    CREATE TRIGGER agentrooms_wakes_held_notify AFTER INSERT OR UPDATE OR DELETE
+        ON agentrooms_wakes FOR EACH ROW EXECUTE FUNCTION agentrooms_wakes_held_notify();
+    """),
 ]
+# The channel a change to an agent's held wakes is announced on, with the
+# schema, project, agent and room; a listener reads the rows again.
+HELD_CHANNEL = "agentrooms_held"
 
 # How long a lease outlives its last renewal, and how often it is renewed. A
 # process that dies leaves its agents to another process once this runs out.
@@ -188,6 +219,9 @@ INVITE_GAP_PAGES = 4
 INVITE_GAP_EVENTS = 50
 # The room account data an agent marks a room with, to be woken by every message.
 MARK_TYPE = "agentrooms.marked"
+# The room account data the operator's wake grant is kept in: {"everyone": bool,
+# "users": [user id]}. A room with none admits everyone.
+GRANT_TYPE = "agentrooms.grant"
 # Where custom data rides in a message's content.
 DATA_KEY = "agentrooms.data"
 # Set in the environment of every turn the service starts, so what the agent
@@ -207,7 +241,7 @@ SYNC_FILTER = {
     "room": {
         "timeline": {"limit": 50},
         "ephemeral": {"not_types": ["*"]},
-        "account_data": {"types": [MARK_TYPE]},
+        "account_data": {"types": [MARK_TYPE, GRANT_TYPE]},
     },
 }
 
@@ -220,10 +254,13 @@ SYNC_FILTER = {
 WORKER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 DEFAULT_WORKER = "default"
 DEFAULT_WORKER_PATH = Path(__file__).resolve().parent / "workers" / "default.md"
+# The kinds a worker may name in wakes_on. `invite` stays a valid name so a
+# worker saved before invites waited for the operator still loads; no invite
+# wakes an agent now.
 WAKE_KINDS = ("mention", "direct", "invite", "marked")
 # The kinds the default worker can answer: a signal addressed to the agent. A
 # message in a room the agent marked is addressed to nobody.
-ADDRESSED_KINDS = ("mention", "direct", "invite")
+ADDRESSED_KINDS = ("mention", "direct")
 WORKER_KEYS = ("enabled", "description", "profile", "history", "accepts_from",
                "invites_from", "wakes_on", "limits", "hooks")
 DEFAULT_KEYS = ("description", "limits")
@@ -624,19 +661,30 @@ class Store:
         return row[1]
 
     def save_sync(self, project: str, agent: str, user_id: str, holder: str,
-                  next_batch: str, wakes: list[dict]) -> bool:
+                  next_batch: str, wakes: list[dict],
+                  grants: dict[str, dict | None] | None = None) -> bool:
         """Record the wakes a sync brought and the position after it, in one
-        transaction, only while this process still holds the agent."""
+        transaction, only while this process still holds the agent. A wake the
+        room's grant refused is recorded held. Each room whose grant the sync
+        brought (`grants`) has its held wakes from the senders that grant now
+        names released, so granting a sender answers what it was held for."""
         with self.transaction() as cur:
             if not self.holds(cur, project, agent, holder):
                 return False
             for wake in wakes:
                 cur.execute(
                     "INSERT INTO agentrooms_wakes (project_id, agent, room_id, wake_key, kind, "
-                    "event_id, sender) VALUES (%s, %s, %s, %s, %s, %s, %s) "
-                    "ON CONFLICT DO NOTHING",
+                    "event_id, sender, held_at) VALUES (%s, %s, %s, %s, %s, %s, %s, "
+                    "CASE WHEN %s THEN now() END) ON CONFLICT DO NOTHING",
                     (project, agent, wake["room_id"], wake["key"], wake["kind"],
-                     wake.get("event_id"), wake.get("sender")))
+                     wake.get("event_id"), wake.get("sender"), bool(wake.get("held"))))
+            for room_id, grant in (grants or {}).items():
+                everyone = grant is None or grant["everyone"]
+                cur.execute(
+                    "UPDATE agentrooms_wakes SET held_at = NULL WHERE project_id = %s "
+                    "AND agent = %s AND room_id = %s AND held_at IS NOT NULL "
+                    "AND (%s OR sender = ANY(%s))",
+                    (project, agent, room_id, everyone, [] if everyone else grant["users"]))
             cur.execute(
                 "INSERT INTO agentrooms_sync (project_id, agent, user_id, next_batch, updated_at) "
                 "VALUES (%s, %s, %s, %s, now()) ON CONFLICT (project_id, agent) DO UPDATE "
@@ -653,13 +701,14 @@ class Store:
     def ready(self, project: str) -> list[tuple[str, str, Any]]:
         return [tuple(r) for r in self.execute(
             "SELECT agent, room_id, min(received_at) FROM agentrooms_wakes "
-            "WHERE project_id = %s AND claimed_by IS NULL GROUP BY agent, room_id "
+            "WHERE project_id = %s AND claimed_by IS NULL AND held_at IS NULL "
+            "GROUP BY agent, room_id "
             "ORDER BY 3", (project,), fetch="all")]
 
     def claim(self, project: str, agent: str, room_id: str, turn: str) -> list[dict]:
         rows = self.execute(
             "UPDATE agentrooms_wakes SET claimed_by = %s WHERE project_id = %s AND agent = %s "
-            "AND room_id = %s AND claimed_by IS NULL "
+            "AND room_id = %s AND claimed_by IS NULL AND held_at IS NULL "
             "RETURNING wake_key, kind, event_id, sender, received_at",
             (turn, project, agent, room_id), fetch="all")
         out = [{"key": r[0], "kind": r[1], "event_id": r[2], "sender": r[3],
@@ -682,6 +731,52 @@ class Store:
         self.execute("UPDATE agentrooms_wakes SET claimed_by = NULL WHERE project_id = %s "
                      "AND agent = %s AND room_id = %s AND claimed_by = %s "
                      "AND wake_key = ANY(%s)", (project, agent, room_id, turn, list(keys)))
+
+    # -- held wakes -----------------------------------------------------------
+    #
+    # What the room's grant held waits for the operator, who answers it once
+    # (released into a turn, the grant unchanged), dismisses it, or grants the
+    # sender, which the service's next sync releases (`save_sync`).
+
+    def held(self, project: str, agent: str, room_id: str | None = None,
+             sender: str | None = None) -> list[dict]:
+        rows = self.execute(
+            "SELECT room_id, kind, event_id, sender, received_at, held_at FROM agentrooms_wakes "
+            "WHERE project_id = %s AND agent = %s AND held_at IS NOT NULL "
+            "AND (%s::text IS NULL OR room_id = %s) AND (%s::text IS NULL OR sender = %s) "
+            "ORDER BY room_id, received_at",
+            (project, agent, room_id, room_id, sender, sender), fetch="all")
+        return [{"room_id": r[0], "kind": r[1], "event_id": r[2], "sender": r[3],
+                 "received_at": r[4].isoformat() if r[4] else None,
+                 "held_at": r[5].isoformat() if r[5] else None} for r in rows]
+
+    def held_rooms(self, project: str, agent: str) -> dict[str, dict]:
+        """Each room's held wakes as `rooms` reports them: {count, senders}."""
+        rows = self.execute(
+            "SELECT room_id, count(*), array_agg(DISTINCT sender) FROM agentrooms_wakes "
+            "WHERE project_id = %s AND agent = %s AND held_at IS NOT NULL GROUP BY room_id",
+            (project, agent), fetch="all")
+        return {r[0]: {"count": int(r[1]), "senders": sorted(s for s in (r[2] or []) if s)}
+                for r in rows}
+
+    def answer_held(self, project: str, agent: str, room_id: str,
+                    sender: str | None = None) -> list[dict]:
+        """Release the room's held wakes, or one sender's, into a turn."""
+        rows = self.execute(
+            "UPDATE agentrooms_wakes SET held_at = NULL WHERE project_id = %s AND agent = %s "
+            "AND room_id = %s AND held_at IS NOT NULL AND (%s::text IS NULL OR sender = %s) "
+            "RETURNING kind, event_id, sender", (project, agent, room_id, sender, sender),
+            fetch="all")
+        return [{"kind": r[0], "event_id": r[1], "sender": r[2]} for r in rows]
+
+    def dismiss_held(self, project: str, agent: str, room_id: str,
+                     sender: str | None = None) -> list[dict]:
+        rows = self.execute(
+            "DELETE FROM agentrooms_wakes WHERE project_id = %s AND agent = %s "
+            "AND room_id = %s AND held_at IS NOT NULL AND (%s::text IS NULL OR sender = %s) "
+            "RETURNING kind, event_id, sender", (project, agent, room_id, sender, sender),
+            fetch="all")
+        return [{"kind": r[0], "event_id": r[1], "sender": r[2]} for r in rows]
 
     # -- sessions -------------------------------------------------------------
 
@@ -913,18 +1008,40 @@ class WorkerConflict(Exception):
 # ── reading a sync ───────────────────────────────────────────────────────────
 
 
+# A room whose grant this process has not read yet: not the same as a room
+# with no grant, which admits everyone.
+UNREAD = object()
+
+
 class RoomView:
     """What one agent knows of one room from its syncs: enough to tell a direct
-    message, an encrypted room and a marked room apart. Nothing a member said."""
+    message, an encrypted room and a marked room apart, and whom the room's
+    grant admits. Nothing a member said."""
 
-    __slots__ = ("members", "encrypted", "marked", "name", "joined")
+    __slots__ = ("members", "encrypted", "marked", "name", "grant")
 
     def __init__(self):
         self.members: int | None = None
         self.encrypted = False
         self.marked = False
         self.name: str | None = None
-        self.joined = True
+        self.grant: Any = UNREAD
+
+
+def read_grant(content) -> dict:
+    """A wake grant as recorded: everyone, or the user ids it names. A record
+    that says neither admits nobody."""
+    content = content if isinstance(content, dict) else {}
+    users = content.get("users") if isinstance(content.get("users"), list) else []
+    return {"everyone": content.get("everyone") is True,
+            "users": sorted({u for u in users if isinstance(u, str) and u})}
+
+
+def granted(grant: dict | None, sender: str | None) -> bool:
+    """Whether a room's grant lets `sender` wake the agent; no grant, everyone."""
+    if grant is None or grant["everyone"]:
+        return True
+    return bool(sender) and sender in grant["users"]
 
 
 def mentions(content: dict, user_id: str) -> bool:
@@ -1022,19 +1139,26 @@ def joined_events(room_id: str, block: dict, user_id: str,
 def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
               initial: bool, member_count: Callable[[str], int | None],
               before_join: Callable[[str, str], list[dict] | None] | None = None,
+              grant_of: Callable[[str], dict | None] | None = None,
+              grants: dict[str, dict | None] | None = None,
               ) -> tuple[list[dict], list[str]]:
     """The wakes one sync response brings for `user_id`, and notes about what it
-    passed over. `rooms` is updated in place. An initial sync wakes only for the
-    invites waiting; history before the agent was first served wakes nothing. A
-    sync that brings the agent's join also wakes on what arrived between its
-    invite and its join, read back through `before_join(room_id, prev_batch)`.
-    A default worker's answer, by its mark in `agentrooms.data`, wakes nothing."""
+    passed over. `rooms` is updated in place. History before the agent was first
+    served wakes nothing, and an invite wakes nothing: it waits for the
+    operator. A sync that brings the agent's join also wakes on what arrived
+    between its invite and its join, read back through
+    `before_join(room_id, prev_batch)`. A default worker's answer, by its mark
+    in `agentrooms.data`, wakes nothing.
+
+    Each wake is judged against the room's grant and carries `held` when the
+    grant does not name its sender. A grant the sync brings is recorded in
+    `grants`; a room whose grant no sync has brought yet is asked once through
+    `grant_of(room_id)` (None: the room has none), never assumed open."""
     wakes: list[dict] = []
     notes: list[str] = []
     groups = response.get("rooms") or {}
     for room_id, room in (groups.get("join") or {}).items():
         view = rooms.setdefault(room_id, RoomView())
-        view.joined = True
         summary = room.get("summary") or {}
         if isinstance(summary.get("m.joined_member_count"), int):
             view.members = summary["m.joined_member_count"]
@@ -1049,6 +1173,10 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
         for event in (room.get("account_data") or {}).get("events") or []:
             if event.get("type") == MARK_TYPE:
                 view.marked = (event.get("content") or {}).get("marked") is True
+            elif event.get("type") == GRANT_TYPE:
+                view.grant = read_grant(event.get("content"))
+                if grants is not None:
+                    grants[room_id] = view.grant
         if initial:
             continue
         events = timeline
@@ -1080,25 +1208,12 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
                 elif view.marked:
                     kind = "marked"
             if kind:
+                if view.grant is UNREAD:
+                    view.grant = grant_of(room_id) if grant_of is not None else None
                 woken.add(event.get("event_id"))
                 wakes.append({"room_id": room_id, "key": event.get("event_id"), "kind": kind,
-                              "event_id": event.get("event_id"), "sender": event.get("sender")})
-    for room_id, room in (groups.get("invite") or {}).items():
-        stripped = (room.get("invite_state") or {}).get("events") or []
-        inviter = None
-        encrypted = False
-        for event in stripped:
-            if event.get("type") == "m.room.member" and event.get("state_key") == user_id:
-                inviter = event.get("sender")
-            elif event.get("type") == "m.room.encryption":
-                encrypted = True
-        if encrypted:
-            notes.append(f"{room_id}: an invite to an encrypted room is passed over")
-            continue
-        view = rooms.setdefault(room_id, RoomView())
-        view.joined = False
-        wakes.append({"room_id": room_id, "key": "invite", "kind": "invite",
-                      "event_id": None, "sender": inviter})
+                              "event_id": event.get("event_id"), "sender": event.get("sender"),
+                              "held": not granted(view.grant, event.get("sender"))})
     for room_id in (groups.get("leave") or {}):
         rooms.pop(room_id, None)
     return wakes, notes
@@ -1159,17 +1274,13 @@ def build_prompt(*, room_id: str, room_name: str | None, wakes: list[dict],
     lines = ["=== This turn ===",
              f"Room: {room_id}" + (f" ({room_name})" if room_name else ""),
              f"Woken by: {', '.join(kinds)}"]
-    for wake in wakes:
-        if wake["kind"] == "invite":
-            lines.append(f"You are invited to this room by {wake.get('sender') or 'someone'}. "
-                         "You are not a member yet.")
     wake_ids = {w["event_id"] for w in wakes if w.get("event_id")}
     if events:
         lines += ["", "=== Room history ===" if primed
                   else "=== New in the room since your last turn ==="]
         for event in events:
             lines += [message_line(event, wake_ids), ""]
-    elif primed and not any(w["kind"] == "invite" for w in wakes):
+    elif primed:
         lines += ["", "(No readable messages in the room.)"]
     return "\n".join(lines).rstrip() + "\n"
 
@@ -1347,15 +1458,27 @@ class Agent:
                          f"{getattr(exc, 'code', type(exc).__name__)}: {exc}")
                 return None
 
+        def grant_of(room_id: str) -> dict | None:
+            try:
+                found = matrix.call("GET", f"/_matrix/client/v3/user/{quote(self.plan['user_id'])}"
+                                           f"/rooms/{quote(room_id)}/account_data/{GRANT_TYPE}")
+            except Exception as exc:
+                if getattr(exc, "exit_code", None) == 3:
+                    return None
+                raise
+            return read_grant(found)
+
+        grants: dict[str, dict | None] = {}
         wakes, notes = read_sync(response, self.plan["user_id"], self.rooms, initial=initial,
-                                 member_count=member_count, before_join=before_join)
+                                 member_count=member_count, before_join=before_join,
+                                 grant_of=grant_of, grants=grants)
         for note in notes:
             self.log(note)
         next_batch = response.get("next_batch")
         if not next_batch:
             raise RuntimeError("the homeserver answered a sync without next_batch")
         if not store.save_sync(self.slot.project_id, self.cid, self.plan["user_id"],
-                               self.engine.holder, next_batch, wakes):
+                               self.engine.holder, next_batch, wakes, grants):
             self.lease = False
             raise RuntimeError("the lease on this agent was lost before the sync was recorded")
         self.last_sync = now_iso()
@@ -1366,8 +1489,12 @@ class Agent:
         if initial:
             self.log("first sync recorded; history before now wakes nothing")
         for wake in wakes:
-            self.log(f"wake {wake['kind']} in {wake['room_id']} from {wake.get('sender')}")
-        if wakes:
+            self.log(f"wake {wake['kind']} in {wake['room_id']} from {wake.get('sender')}"
+                     + (" held: the room's grant does not name the sender" if wake.get("held")
+                        else ""))
+        for room_id in grants:
+            self.log(f"{room_id}: the grant changed; held wakes it now admits are released")
+        if wakes or grants:
             self.engine.poke()
 
 
@@ -1818,17 +1945,19 @@ class Engine:
         defaulted: dict[str, tuple[dict, str]] = {}
         for wake in wakes:
             kind, sender = wake["kind"], wake.get("sender")
+            if kind == "invite":
+                slot.log(f"{cid}: invite to {room_id} from {sender} dropped: an invite waits "
+                         "for the operator")
+                continue
             if worker is not None and kind not in worker["wakes_on"]:
                 slot.log(f"{cid}: {kind} in {room_id} from {sender} refused: worker "
                          f"{worker['name']!r} does not wake on {kind}")
                 continue
             if worker is not None:
-                patterns = worker["invites_from"] if kind == "invite" else worker["accepts_from"]
-                if admits(patterns, sender):
+                if admits(worker["accepts_from"], sender):
                     admitted.append(wake)
                     continue
-                reason = (f"worker {worker['name']!r} does not admit "
-                          f"{'invites from ' if kind == 'invite' else ''}{sender}")
+                reason = f"worker {worker['name']!r} does not admit {sender}"
             else:
                 reason = why_none
             if kind not in default["wakes_on"]:
@@ -1848,8 +1977,7 @@ class Engine:
     def answer_default(self, turn: Turn, agent: dict, binding: dict, wake: dict,
                        default: dict) -> None:
         """The default worker's answer to one sender: a fixed text and no turn, at
-        most once per sender per room per window. An invite is declined with the
-        text as its reason, since the agent cannot post where it has not joined."""
+        most once per sender per room per window."""
         slot, cid, room_id = turn.slot, turn.cid, turn.room_id
         store = slot.store
         sender = wake.get("sender")
@@ -1865,12 +1993,6 @@ class Engine:
                          [sender], [wake["kind"]])
         matrix = self.host.matrix(agent["homeserver"], agent["token"], timeout=60.0)
         try:
-            if wake["kind"] == "invite":
-                matrix.call("POST", f"/_matrix/client/v3/rooms/{quote(room_id)}/leave",
-                            body={"reason": text})
-                store.end_turn(mark, "declined")
-                slot.log(f"{cid}: default worker declined the invite to {room_id} from {sender}")
-                return
             thread = thread_root(self.wake_content(matrix, room_id, wake.get("event_id")))
             event_id = self.post(matrix, room_id, text, thread, data=dict(DEFAULT_MARK))
             store.end_turn(mark, "answered")
@@ -2011,15 +2133,11 @@ class Engine:
             return {"outcome": "refused"}
         matrix = self.host.matrix(agent["homeserver"], agent["token"], timeout=60.0)
         try:
-            invite_only = all(w["kind"] == "invite" for w in wakes)
-            room_name = None
-            events: list[dict] = []
-            if not invite_only:
-                if self.room_encrypted(matrix, room_id):
-                    slot.log(f"{cid}: {room_id} is encrypted; the wake is dropped")
-                    return {"outcome": "refused"}
-                room_name = self.room_name(matrix, room_id)
-                events = self.history(matrix, room_id, worker["history"])
+            if self.room_encrypted(matrix, room_id):
+                slot.log(f"{cid}: {room_id} is encrypted; the wake is dropped")
+                return {"outcome": "refused"}
+            room_name = self.room_name(matrix, room_id)
+            events = self.history(matrix, room_id, worker["history"])
             row = store.session(slot.project_id, cid, room_id)
             resumable = bool(row and row.get("session_id") and row.get("node") == self.node
                              and row.get("harness") == harness)

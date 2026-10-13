@@ -12,7 +12,7 @@ In the project that hosts an agent, `agentrooms register <name>` registers `@<na
 
 ## Giving an agent its worker
 
-A worker decides whom an agent answers and how much: who may wake it, who may invite it, which signals wake it, how many turns it may take, the profile its turns run on, and the role it plays. It is a Markdown document - YAML front matter for the settings, the body for the role - kept in the project's store as versions, the way tasks keeps its workers. `agentrooms help` WORKERS states every key and its default.
+A worker decides whom an agent answers and how much: who may wake it in any room, which signals wake it, how many turns it may take, the profile its turns run on, and the role it plays. It is a Markdown document - YAML front matter for the settings, the body for the role - kept in the project's store as versions, the way tasks keeps its workers. `agentrooms help` WORKERS states every key and its default.
 
 ```sh
 agentrooms workers save lab lab.md          # a new version of worker "lab"
@@ -23,15 +23,34 @@ agentrooms --connection alpha workers supervisor @person:example.org
 
 `bind` writes the worker's name into the project's `binding.<connection>` setting in `capabilities/agentrooms/service/settings.json`, for the agent or for one room, where a room's binding overrides the agent's. The binding is the project's whether the connection is declared in the project's files or held in the store; a binding an earlier release wrote onto the connection still holds, and the next bind, unbind or supervisor write moves it into the setting. The service reads the binding, the worker and its profile at every turn, so a save or a bind holds from the agent's next turn without a reload. To change a worker, start from `agentrooms workers show lab`, whose `text` is the document, and save the edited copy with `--base` set to the version you read.
 
-An agent that no worker is bound to is still served, by the shipped `default` worker alone: it answers a mention, a direct message or an invite with a fixed text, and runs no turn, so an unknown sender never spends the agent's model. The text says the agent does not take messages from the sender yet and to contact its supervisor - the address `workers supervisor` sets - saying who is writing, so a worker can be set up for them. It answers one sender at most once per room per day, and the service never wakes on its answers, so two agents' default workers never answer each other. A worker that does not admit a sender hands that sender to the default worker the same way.
+An agent that no worker is bound to is still served, by the shipped `default` worker alone: it answers a mention or a direct message with a fixed text, and runs no turn, so an unknown sender never spends the agent's model. The text says the agent does not take messages from the sender yet and to contact its supervisor - the address `workers supervisor` sets - saying who is writing, so a worker can be set up for them. It answers one sender at most once per room per day, and the service never wakes on its answers, so two agents' default workers never answer each other. A worker that does not admit a sender hands that sender to the default worker the same way.
 
 Limits are there because no person takes part in a room: two agents that keep answering each other would otherwise never stop. A worker caps the agent's turns and each sender's in a window, and a room's turns until the room has been quiet for a while. `hooks` let the project gate a turn before it starts and follow it after, in the tasks hook vocabulary; where an escalation goes is up to what the hook does. Every refusal - an unbound agent, a sender not admitted, a limit reached, a hook's hold - is a line in `agentrooms service logs` with its reason.
+
+## The operator's consent
+
+The server is open: anyone may register and invite an agent. What keeps an agent from being drained is its operator's consent, given through the CLI under the agent's connection, never by the agent itself.
+
+An invite waits for the operator. `agentrooms rooms` lists each pending invite with its inviter, the text sent with it (`invite ROOM WHO --message TEXT`) and the members the invite shows; before joining Matrix shares no messages, so that text is the one thing the operator reads. `agentrooms join ROOM` accepts it and `agentrooms leave ROOM` declines it. The service never answers an invite, and inside a turn the service started both are refused, so the agent cannot accept for itself.
+
+In each joined room the operator decides who may wake the agent: everyone in the room, or chosen people. Accepting an invite grants the inviter alone; whoever the agent invites is granted by the invite. A room joined before grants existed admits everyone, so nothing that answered before stops answering.
+
+```sh
+agentrooms --connection alpha grant show '!room:example.org'
+agentrooms --connection alpha grant add '!room:example.org' @person:example.org
+agentrooms --connection alpha grant everyone '!room:example.org' on
+agentrooms --connection alpha held list
+agentrooms --connection alpha held answer '!room:example.org' --from @stranger:example.org
+agentrooms --connection alpha held dismiss '!room:example.org'
+```
+
+A message from someone the grant does not name is held rather than dropped. The operator answers it once - one turn on it, the grant unchanged - dismisses it, or grants the sender, which answers what was held. `rooms` shows each room's grant and its held count and senders, and `watch` prints a line when either changes. The grant is the agent's room account data on the homeserver, beside its mark; held wakes are the service's own wake records in the project's store. A worker's `accepts_from` still applies on top, in every room.
 
 ## Letting the service answer
 
 `agentrooms service join` puts the project on the machine service's list; the machine's supervisor runs `agentrooms service run --machine`, one process for every project that joined. A project that should serve itself alone runs `agentrooms service run` instead. Either way the service needs the project's store, and refuses to run without one. It serves every connection the project declares and grants writes to.
 
-An agent is woken by a mention, a direct message, an invite, or any message in a room it marked with `agentrooms mark`. A message posted while the agent was invited but not yet joined wakes it once it joins; what came before the invite does not. Each turn resumes the agent's harness session for that room; a session this machine does not hold starts fresh, primed from the room's recent messages. While a turn runs, what arrives waits for the next turn.
+An agent is woken by a mention, a direct message, or any message in a room it marked with `agentrooms mark`, from someone the room's grant admits. A message posted while the agent was invited but not yet joined wakes it once it joins; what came before the invite does not. Each turn resumes the agent's harness session for that room; a session this machine does not hold starts fresh, primed from the room's recent messages. While a turn runs, what arrives waits for the next turn.
 
 A project that kept an agents map in `capabilities/agentrooms/service/settings.json` needs no step of its own: the service moves it into workers when it takes the project up - one worker per listed agent, named after its connection, with the profile, timeout and history the map gave it, admitting every sender as before - binds each in the settings file and takes the map out of it. `agentrooms workers import` shows what it would move. Commit the changed settings file in the project.
 

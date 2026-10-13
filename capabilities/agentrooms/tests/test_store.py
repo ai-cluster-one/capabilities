@@ -150,3 +150,51 @@ def test_only_the_named_wakes_are_handed_back(store):
     store.restore("p", "alpha", "!r", "t1", ["$2"])
     store.finish("p", "alpha", "!r", "t1")
     assert [w["key"] for w in store.claim("p", "alpha", "!r", "t2")] == ["$2"]
+
+
+def test_held_wakes_wait_for_the_operator_and_a_grant_releases_them(store):
+    import json
+
+    import psycopg
+
+    listener = psycopg.connect(DSN, autocommit=True)
+    listener.execute(f"LISTEN {engine.HELD_CHANNEL}")
+    store.acquire("p", "alpha", "h1", "n1", 1)
+
+    def wake(key, sender, held):
+        return {"room_id": "!r", "key": key, "kind": "mention", "event_id": key, "sender": sender,
+                "held": held}
+
+    store.save_sync("p", "alpha", "@alpha:x", "h1", "b1",
+                    [wake("$1", "@c:x", True), wake("$2", "@b:x", False), wake("$3", "@d:x", True)])
+    # A held wake is never claimed; the rest of the room is.
+    assert [w["key"] for w in store.claim("p", "alpha", "!r", "t1")] == ["$2"]
+    store.finish("p", "alpha", "!r", "t1")
+    assert store.ready("p") == []
+    assert store.held_rooms("p", "alpha") == {"!r": {"count": 2, "senders": ["@c:x", "@d:x"]}}
+    assert [(w["event_id"], w["sender"]) for w in store.held("p", "alpha")] == [
+        ("$1", "@c:x"), ("$3", "@d:x")]
+    assert store.held("p", "alpha", "!other") == [] and store.held_rooms("p", "beta") == {}
+    # A grant the sync brings releases what it now admits, and only that.
+    store.save_sync("p", "alpha", "@alpha:x", "h1", "b2", [],
+                    {"!r": {"everyone": False, "users": ["@c:x"]}})
+    assert [w["key"] for w in store.claim("p", "alpha", "!r", "t2")] == ["$1"]
+    store.finish("p", "alpha", "!r", "t2")
+    store.save_sync("p", "alpha", "@alpha:x", "h1", "b3", [wake("$4", "@d:x", True),
+                                                           wake("$5", "@e:x", True)])
+    # Answered once: released into a turn, the rest still held.
+    assert [w["event_id"] for w in store.answer_held("p", "alpha", "!r", "@d:x")] == ["$3", "$4"]
+    assert [w["key"] for w in store.claim("p", "alpha", "!r", "t3")] == ["$3", "$4"]
+    store.finish("p", "alpha", "!r", "t3")
+    assert [w["event_id"] for w in store.dismiss_held("p", "alpha", "!r")] == ["$5"]
+    assert store.held_rooms("p", "alpha") == {} and store.ready("p") == []
+    # No grant, or everyone on, releases every held wake in the room.
+    store.save_sync("p", "alpha", "@alpha:x", "h1", "b4", [wake("$6", "@f:x", True)])
+    store.save_sync("p", "alpha", "@alpha:x", "h1", "b5", [], {"!r": None})
+    assert [w["key"] for w in store.claim("p", "alpha", "!r", "t4")] == ["$6"]
+    store.finish("p", "alpha", "!r", "t4")
+    # Every change to what is held was announced, with ids only.
+    said = [json.loads(n.payload) for n in listener.notifies(timeout=1.0)]
+    listener.close()
+    assert said and all(n == {"schema": store.setting.schema, "project": "p", "agent": "alpha",
+                              "room": "!r"} for n in said)

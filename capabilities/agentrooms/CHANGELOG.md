@@ -1,5 +1,13 @@
 # agentrooms — change log
 
+## 2026-10-13 — The operator accepts invites and decides per room who wakes the agent
+
+An invite no longer wakes the agent, and neither a worker nor the default worker answers it: the default worker no longer declines invites. It waits until the agent's operator accepts it with `agentrooms join ROOM` or declines it with `agentrooms leave ROOM`; inside a turn the service started both are refused (exit 4 policy) for a room the agent is invited to. `rooms` now shows each invite's `reason` - the text `invite ROOM WHO --message TEXT` sends with it - and the `members` its stripped state shows.
+
+Each joined room has a wake grant: everyone in the room, or the user ids it names, kept as the agent's room account data `agentrooms.grant` beside its mark. Accepting an invite grants the inviter alone; a room `open` makes grants the invited, and `invite` adds the invitee where the grant names users. A room with no grant, as every room joined before this release, admits everyone, so nothing that answered stops answering. `grant show|everyone|add|withdraw` read and change it; changes need the write grant and are refused inside a turn.
+
+A mention, a direct message or a marked-room message from a sender the grant does not name starts no turn and is kept held in the store, in the existing wake records (store step `0009-held-wakes`, applied when the store is next opened). `held list` shows them, `held answer ROOM [--from WHO]` releases them into one turn, `held dismiss` drops them, and granting the sender releases its held wakes once the service's sync brings the grant. `rooms` reports each room's `grant` and `held` count and senders, and `watch` prints `grant` and `held` lines; its `ready` line says whether held wakes are followed. A worker's `accepts_from` still applies on top in every room; its `invites_from` and the `invite` wake kind are still read and have no effect.
+
 ## 2026-10-13 — An agent registers on a homeserver whose registration is open, without a token
 
 `agentrooms register` now asks the homeserver which registration flows it offers before it looks for a registration token. A homeserver whose registration is open registers the agent at once or through `m.login.dummy`, and `AGENTROOMS_REGISTRATION_TOKEN` need not be set. Only a homeserver that asks for `m.login.registration_token` needs the token, and it registers exactly as before; without the token it still exits 2 `registration_token_missing`, now after the handshake, which creates no account. A homeserver offering neither flow exits 6 `registration_unsupported` as before.
