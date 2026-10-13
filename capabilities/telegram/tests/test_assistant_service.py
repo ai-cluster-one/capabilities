@@ -5320,6 +5320,36 @@ class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(context, "briefing prose")
             self.assertNotIn("missing", context)
 
+    async def test_a_chat_prompt_written_through_the_context_verb_is_what_the_next_turn_reads(self):
+        """A panel never edits the prompt files: it writes a chat's prompt
+        through `telegram context edit|put` under the key `service validate`
+        names, and the daemon reads that key on the next turn."""
+        from test_outbound_actions import import_cli
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), self.group(context_file="context/ops.md"))
+            _, policy = daemon._group_policy(-200)
+            self.assertEqual(daemon._channel_context([policy]),
+                             ("[channel context file missing: context/ops.md]", False))
+            cli = import_cli()
+
+            def context(*argv):
+                out = io.StringIO()
+                cli._RECORDS = None
+                with mock.patch.object(cli, "_project_root", lambda: daemon.PROJECT_ROOT), \
+                        mock.patch.object(cli, "_project_capabilities_dir",
+                                          lambda root: daemon.PROJECT_CAPABILITIES_DIR), \
+                        mock.patch.object(cli, "_CONFIG_HOME", Path(td) / "config"), \
+                        mock.patch.object(cli, "_state_dir", lambda: Path(td) / "cli-state"), \
+                        contextlib.redirect_stdout(out):
+                    cli._cmd_context(list(argv))
+                return json.loads(out.getvalue())
+
+            checkout = context("edit", "context.ops")
+            Path(checkout["path"]).write_text("ops room prose\n")
+            context("put", "context.ops")
+
+            self.assertEqual(daemon._channel_context([policy]), ("ops room prose", False))
+
     async def test_an_exclusive_room_still_lets_its_topics_speak(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), self.group(

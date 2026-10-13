@@ -153,6 +153,7 @@ import voice_agent
 from forum import GENERAL_TOPIC_ID, message_topic_id
 from settings_schema import (
     VOICE_PROVIDER_INCUMBENT,
+    document_key,
     old_environment,
     old_names_sentence,
     old_register_fields,
@@ -2081,10 +2082,7 @@ def _document_key(path):
         rel = Path(path).resolve().relative_to(SERVICE_DIR.resolve())
     except (OSError, ValueError):
         rel = Path(path)
-    stem = rel.stem.replace("_", "-").lower()
-    if rel.parent.name == "context":
-        return f"context.{stem}"
-    return stem
+    return document_key(rel)
 
 
 def read_delegation_context():

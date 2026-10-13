@@ -88,6 +88,8 @@ Use `telegram service stop` or foreground `run` for supervisor-managed processes
 
 After editing `settings.json`, use `telegram service reload`. The complete strict schema is validated before publishing: unknown properties, invalid shapes/enums/bounds, and unsafe overlay paths are errors with their full JSON path. A rejected cold start/doctor/init check never begins service work; a rejected reload keeps the previous immutable settings and project-layout snapshot active. Changing the selected connection still requires a real restart. The same operation is available as `/reload` and as the live-call `reload_service` tool only when the caller's `control.roles` policy permits `reload` (the shipped default grants it only to `supervisor`). A worker may invoke the CLI form only when its request authority role is `supervisor`; an external terminal without request authority remains an operator surface.
 
+A program that edits the settings for a person reads that schema from `telegram service schema`, as JSON Schema with what it needs to render it under `x-` keys - which keys a reload takes and which need a restart, what each map is keyed by and which field names an entry, where an absent value is inherited from, how rights layer, and the document key of each prompt file - and checks a proposed document, or one key's value, with `telegram service validate` before saving it. `validate` writes nothing and refuses exactly what a reload would refuse, with the same full path.
+
 The accepted schema is deliberately finite:
 
 - Top level: `connection`, `assistant_name`, `direct_messages`, `allowed_users`, `allowed_groups`, `control`, `authority`, and `defaults`.
@@ -515,7 +517,7 @@ One prompt file per run class, each owned whole by the project and each the enti
 | `job-worker.md` | a worker running a registered job, on its own |
 | `voice-agent.md` | a direct call answered by voice |
 
-`telegram service init` seeds all four from the shipped templates and never touches them again. The capability injects no prose of its own at run time, so the file an author is reading is the prompt the model receives, and a template that improves later reaches new projects rather than rewriting an existing one under it.
+Each is a document read and written through `telegram context show|edit|put <key>` under its name without `.md`, and a channel's `context_file` under `context/` is the key `context.<name>`; `telegram service validate` lists the key of every prompt file the settings name. `telegram service init` seeds all four from the shipped templates and never touches them again. The capability injects no prose of its own at run time, so the file an author is reading is the prompt the model receives, and a template that improves later reaches new projects rather than rewriting an existing one under it.
 
 A job worker reads `job-worker.md` and nothing else — not `context.md`, not a channel overlay. It answers to the job rather than to the room, so prose about how to carry yourself in a conversation is not its prose.
 

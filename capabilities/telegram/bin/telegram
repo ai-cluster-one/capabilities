@@ -198,6 +198,37 @@ Commands:
                                                TELEGRAM_SERVICE_PROFILE value
                                                that replaces a set TG_WORKER or
                                                TELEGRAM_SERVICE_WORKER.
+  telegram service schema                      Print the settings the service
+                                               holds itself to as JSON Schema
+                                               (draft 2020-12), with what a
+                                               panel needs under x- keys:
+                                               x-apply (reload or restart),
+                                               x-keyed-by and x-entry-label of
+                                               each map, x-inherits (where an
+                                               absent value comes from),
+                                               x-layers, x-document (a prompt
+                                               file and its document key) and
+                                               x-documents (the service's own
+                                               prompts).
+  telegram service validate [--scope project|global] [--key KEY]
+                                               Judge proposed settings exactly
+                                               as `service reload` would and
+                                               write nothing: stdin carries the
+                                               scope's whole document, or with
+                                               --key the JSON value of that key
+                                               (dotted for a nested one) put
+                                               over the document held now.
+                                               Refused with exit 6
+                                               service_settings_invalid naming
+                                               the full path the reload names.
+                                               Accepted, it prints the top-level
+                                               keys that change, `apply`
+                                               (reload, or restart when
+                                               connection or environment
+                                               changes) and each prompt file the
+                                               settings name with its document
+                                               key: `telegram context show|edit|
+                                               put <key>` reads and writes it.
   telegram service doctor|run|start|reload|stop|status|logs
                                                Manage the bundled Telegram assistant
                                                service for this project. The engine
@@ -548,7 +579,7 @@ SERVICE = {
     "name": "assistant",
     "summary": "Project-local Telegram assistant daemon using the bundled service engine.",
     "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs",
-              "migrate-ownership", "migrate-profiles"],
+              "migrate-ownership", "migrate-profiles", "schema", "validate"],
     "config": "capabilities/telegram/service",
     "state": "<connection-state>/service",
     "deploy": {
@@ -6592,6 +6623,61 @@ def _validate_service_settings(root: Path, data: dict | None = None) -> dict:
     return data
 
 
+def cmd_service_validate(scope: str, key: str | None) -> dict:
+    """Judge proposed settings the way `service reload` judges them, and write
+    nothing. Standard input carries the whole document `scope` would hold, or
+    with `key` that key's value put over the document it holds now; the result
+    is laid over the other scope key by key, as the service loads it."""
+    root = _service_project_root()
+    schema = _settings_schema_module()
+    text = sys.stdin.read()
+    try:
+        proposed = json.loads(text)
+    except ValueError as exc:
+        _die(6, "input", f"the proposed settings on stdin are not JSON: {exc}",
+             f"`{NAME} service validate` reads a JSON document, or one key's JSON value")
+    try:
+        held = {name: row["value"] for name, row in
+                _records().resolve_scope(NAME, "setting", scope).items()
+                if name != "connection.default"}
+    except StoreError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+    if key:
+        document = json.loads(json.dumps(held))
+        _settings_put(document, key, proposed)
+    elif isinstance(proposed, dict):
+        document = proposed
+    else:
+        _die(6, "input", "the proposed settings on stdin are not a JSON object",
+             "pass --key KEY to give one key's value instead")
+    merged = _settings_merged(scope, document)
+    if "__error__" in merged:
+        _die(6, "settings_unreadable", merged["__error__"])
+    current = _service_settings(root)
+    _validate_service_settings(root, merged)
+    changed = sorted(name for name in set(current) | set(merged)
+                     if current.get(name) != merged.get(name))
+    restart = [name for name in changed if name in schema.RESTART_KEYS]
+    service_dir = _service_dir(root).resolve()
+    documents = []
+    for setting, value in schema.named_documents(merged):
+        path = Path(value).expanduser()
+        path = path if path.is_absolute() else service_dir / path
+        rel = path.resolve().relative_to(service_dir)
+        doc_key = schema.document_key(rel)
+        documents.append({
+            "setting": setting, "file": value, "key": doc_key,
+            # The context verbs address the files directly in the service
+            # directory and in its `context/`; a file elsewhere is still read,
+            # but a document written under its key is read in its place.
+            "context_verbs": rel.suffix == ".md" and (
+                len(rel.parts) == 1 or (len(rel.parts) == 2 and rel.parts[0] == "context")),
+            "exists": _records().document_path(NAME, doc_key) is not None})
+    return {"ok": True, "scope": scope, "key": key, "changed": changed,
+            "apply": "restart" if restart else "reload", "restart": restart,
+            "documents": documents}
+
+
 def _declared_profiles(settings: dict) -> list[dict]:
     """The distinct profile names the settings reach, each with every position
     naming it, from the profile module's own reading of the settings, so a
@@ -8655,6 +8741,11 @@ def main() -> None:
         "migrate-profiles",
         help="move the old worker settings to profile names (a dry run unless --apply)")
     migrate_profiles.add_argument("--apply", action="store_true")
+    svc.add_parser("schema", help="print the settings schema as JSON Schema")
+    validate = svc.add_parser(
+        "validate", help="judge proposed settings on stdin as a reload would; writes nothing")
+    validate.add_argument("--scope", choices=("project", "global"), default="project")
+    validate.add_argument("--key", help="stdin is this key's value, not the whole document")
 
     # `--connection <id>` selects a connection; `--session <PATH>` overrides the
     # session-file path. Both are global, accepted anywhere on the line (extracted
@@ -8782,6 +8873,10 @@ def main() -> None:
                 connection_flag, args.confirm_all_legacy_daemons_stopped))
         elif args.service_cmd == "migrate-profiles":
             _emit(cmd_service_migrate_profiles(connection_flag, session_flag, args.apply))
+        elif args.service_cmd == "schema":
+            _emit(_settings_schema_module().json_schema())
+        elif args.service_cmd == "validate":
+            _emit(cmd_service_validate(args.scope, args.key))
         return
 
     cfg = _load_config(
