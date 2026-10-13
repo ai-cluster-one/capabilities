@@ -24,6 +24,12 @@ Agent startup protocol (this is a STATEFUL CLI — it holds a login session):
      Login persists the session file; later commands reuse it with no prompt.
   3. A healthy `telegram doctor` (exit 0) means ready to work.
 
+The app every account signs in through is registered once at my.telegram.org/apps
+and given to the machine once: `telegram setup set --field TELEGRAM_API_ID=<id>
+--stdin` with {"TELEGRAM_API_HASH": "<hash>"} on stdin. A connection naming no
+`api_id` or `secret_env` of its own inherits it, and `telegram app-check` asks
+Telegram whether it accepts it before any account is linked.
+
 Configuration requires explicit connections with a positive
 `expected_account_id`, including the one-account case. The selected connection's app credentials and session resolve by the
 cascade (first non-empty wins): the `--session` flag
@@ -34,8 +40,9 @@ flag — only their env-var NAME resolves them, never the command line.
 More than one account is declared in a connections registry — project
 capabilities/telegram/connections.json, else the machine-level
 ~/.config/telegram/connections.json (the natural home for a personal account),
-first found wins. Each entry names its app id literally and its app hash by
-env-key indirection, and owns a per-connection session:
+first found wins. An entry may name an app of its own - its id literally and
+its hash by env-key indirection - and otherwise signs in through the machine's;
+each owns a per-connection session:
 
   {
     "default": "marvin",
@@ -63,9 +70,10 @@ other verb that needs a connection is refused there.
 
   --connection <id>        Select a connection; accepted by every verb. Optional
                            with a default pointer or a sole connection.
-  TELEGRAM_API_ID          Numeric app id from my.telegram.org/apps (implicit
-                           default; a registry entry names `api_id` instead).
-  TELEGRAM_API_HASH        App hash paired with the id (secret).
+  TELEGRAM_API_ID          Numeric app id from my.telegram.org/apps: the machine's
+                           app, which every connection naming no `api_id` inherits.
+  TELEGRAM_API_HASH        App hash paired with the id (secret); a connection naming
+                           no `secret_env` inherits it.
   TELEGRAM_SESSION         Session path, no extension — Telethon writes
                            <path>.session on disk. Optional one-shot override; the
                            default connection's session defaults to
@@ -89,6 +97,17 @@ Commands:
                                                phone_needed; code_needed; password_needed
                                                with the account's hint; done; error) and
                                                each answer as one line on stdin.
+  telegram app-check                           Ask Telegram whether it accepts the app
+                                               this machine signs in through (`--connection`
+                                               names a connection's app instead), by asking
+                                               for a login token: no account is touched and
+                                               no code is sent. `status` is `accepted`
+                                               (exit 0), `invalid` (Telegram does not know
+                                               the id and hash; exit 2), or `refused`, with
+                                               `reason` `blocked` (exit 2), `flood_limited`
+                                               and `retry_after` seconds (exit 5), or
+                                               `other` (exit 5); `error` carries what
+                                               Telegram answered.
   telegram whoami                              Identity of the signed-in account.
   telegram chats [--limit N]                   List recent dialogs. Beside `id`, `name`,
                                                `unread` and `kind` (the raw Telegram
@@ -383,15 +402,17 @@ CRED_KEYS = [    # an override-free registry entry resolves these flat keys
 # a connection entry's own fields, which `connection add` writes.
 CONN_FIELDS = [{'key': 'api_id',
   'label': 'App id',
-  'help': 'The numeric app id from my.telegram.org/apps.',
+  'help': "A numeric app id of this connection's own; the machine's app (`telegram setup`) "
+          'when empty.',
   'type': 'integer',
-  'required': True},
+  'required': False},
  {'key': 'secret_env',
   'label': 'App hash',
-  'help': 'The app hash paired with the id, from my.telegram.org/apps.',
+  'help': "The hash of this connection's own app; the machine's app (`telegram setup`) "
+          'when empty.',
   'type': 'string',
   'secret': True,
-  'required': True,
+  'required': False,
   'env': 'TELEGRAM_{ID}_API_HASH'},
  {'key': 'session',
   'label': 'Session file',
@@ -420,7 +441,19 @@ CONN_FIELDS = [{'key': 'api_id',
   'required': False,
   'env': 'TELEGRAM_{ID}_OPENAI_KEY'}]
 # What the machine is given once, before any connection; `setup` writes it.
-SETUP_FIELDS = [{'key': 'DEEPGRAM_API_KEY',
+SETUP_FIELDS = [{'key': 'TELEGRAM_API_ID',
+  'label': 'App id',
+  'help': 'The numeric app id of the app registered at my.telegram.org/apps; every '
+          'connection that names none signs in through it.',
+  'type': 'integer',
+  'required': True},
+ {'key': 'TELEGRAM_API_HASH',
+  'label': 'App hash',
+  'help': 'The app hash paired with the id, from my.telegram.org/apps.',
+  'type': 'string',
+  'secret': True,
+  'required': True},
+ {'key': 'DEEPGRAM_API_KEY',
   'label': 'Transcription key',
   'help': 'The Deepgram key voice and audio transcription use.',
   'type': 'string',
@@ -4780,6 +4813,49 @@ def _cmd_setup(argv: list[str]) -> None:
 
 # --- Connections / credentials ----------------------------------------------
 
+APP_SETUP_HINT = ("register an app at my.telegram.org/apps, then give this machine its id "
+                  "and hash once: `telegram setup set --field TELEGRAM_API_ID=<id> --stdin` "
+                  "with {\"TELEGRAM_API_HASH\": \"<hash>\"} on stdin")
+
+
+def _app_keys(entry: dict | None) -> tuple[str | None, str]:
+    """Where a connection's app comes from: the literal `api_id` it names, else
+    None for the machine's TELEGRAM_API_ID; and the env key of its hash, the one
+    `secret_env` names, else the machine's TELEGRAM_API_HASH."""
+    entry = entry or {}
+    return entry.get("api_id"), entry.get("secret_env") or "TELEGRAM_API_HASH"
+
+
+def _app_credentials(cid: str | None, entry: dict | None
+                     ) -> tuple[int | None, str | None, dict | None]:
+    """The app a connection signs in through - the id and hash it names, else the
+    machine's app that `telegram setup set` writes once and every connection
+    naming none inherits. Returns (api_id, api_hash, problem)."""
+    literal_id, secret_env = _app_keys(entry)
+    api_id = literal_id if literal_id is not None else _resolve_env_key("TELEGRAM_API_ID")[0]
+    api_hash = _resolve_env_key(secret_env)[0]
+    whose = f" (for connection {cid!r})" if cid and entry is not None else ""
+    if entry is not None and entry.get("secret_env") and not api_hash:
+        return None, None, {
+            "exit": 2, "code": "missing_secret",
+            "message": f"env var {secret_env}{whose} is unset",
+            "hint": f"set {secret_env} in a project .env / .env.local, "
+                    f"{CREDENTIALS_ENV}, or the environment"}
+    missing = [k for k, v in (("TELEGRAM_API_ID", api_id), (secret_env, api_hash)) if not v]
+    if missing:
+        return None, None, {
+            "exit": 2, "code": "missing_credentials",
+            "message": f"unset: {', '.join(missing)}{whose}",
+            "hint": APP_SETUP_HINT}
+    try:
+        return int(str(api_id)), api_hash, None
+    except (TypeError, ValueError):
+        return None, None, {
+            "exit": 6, "code": "bad_api_id",
+            "message": f"api id{whose or ' of the machine app'} must be an integer",
+            "hint": "copy the numeric App api_id from my.telegram.org/apps"}
+
+
 def _build_cfg(cid: str, entry: dict | None,
                session_flag: str | None) -> tuple[dict | None, dict | None]:
     """Materialize one connection's client config. Returns (cfg, problem) —
@@ -4789,47 +4865,17 @@ def _build_cfg(cid: str, entry: dict | None,
     holds the login. An override-free declared connection keeps its established session
     location; a named connection's session lives at <state-dir>/<id>/session.
     --session / TELEGRAM_SESSION is the one-shot override either way."""
+    api_id_int, api_hash, problem = _app_credentials(cid, entry)
+    if problem:
+        return None, problem
     if entry is None:   # declared entry without overrides — use the flat-key cascade
-        api_id = _resolve_env_key("TELEGRAM_API_ID")[0]
-        api_hash = _resolve_env_key("TELEGRAM_API_HASH")[0]
-        missing = [k for k, v in (("TELEGRAM_API_ID", api_id),
-                                   ("TELEGRAM_API_HASH", api_hash)) if not v]
-        if missing:
-            return None, {
-                "exit": 2, "code": "missing_credentials",
-                "message": f"unset: {', '.join(missing)}",
-                "hint": f"create an app at my.telegram.org/apps, then set them in a "
-                        f"project .env(.local), {CREDENTIALS_ENV}, or the environment "
-                        f"— or declare a connections registry "
-                        f"(capabilities/{NAME}/connections.json)"}
         session = (session_flag or _resolve_env_key("TELEGRAM_SESSION")[0]
                    or str(DEFAULT_SESSION))
         allow_write = WRITE_DEFAULT
     else:
-        api_id = entry.get("api_id")
-        if api_id is None:
-            return None, {"exit": 6, "code": "incomplete_connection",
-                          "message": f"connection {cid!r} is missing 'api_id'"}
-        secret_env = entry.get("secret_env")
-        if not secret_env:
-            return None, {"exit": 6, "code": "no_secret_env",
-                          "message": f"connection {cid!r} is missing 'secret_env'"}
-        api_hash = _resolve_env_key(secret_env)[0]
-        if not api_hash:
-            return None, {
-                "exit": 2, "code": "missing_secret",
-                "message": f"env var {secret_env} (for connection {cid!r}) is unset",
-                "hint": f"set {secret_env} in a project .env / .env.local, "
-                        f"{CREDENTIALS_ENV}, or the environment"}
         session = (session_flag or entry.get("session")
                    or str(_state_dir() / cid / "session"))
         allow_write = bool(entry.get("allow_write", WRITE_DEFAULT))
-    try:
-        api_id_int = int(str(api_id))
-    except (TypeError, ValueError):
-        return None, {"exit": 6, "code": "bad_api_id",
-                      "message": f"api id for connection {cid!r} must be an integer",
-                      "hint": "copy the numeric App api_id from my.telegram.org/apps"}
     try:
         expected_raw = entry.get("expected_account_id") if isinstance(entry, dict) else None
         expected_account_id = int(expected_raw)
@@ -4883,16 +4929,15 @@ def _connections_report() -> dict:
         entry = entry if isinstance(entry, dict) else {}
         origin = reg["sources"][cid]
         keys = []
-        api_id = entry.get("api_id")
-        keys.append(_key_report("api_id", False, True,
-                                str(api_id) if api_id is not None else None,
-                                "connection", origin))
-        secret_env = entry.get("secret_env")
-        if secret_env:
-            value, tier, source = _resolve_env_key(secret_env)
-            keys.append(_key_report(secret_env, True, True, value, tier, source))
-        else:
-            keys.append(_key_report("secret_env", False, True, None, None, None))
+        api_id, secret_env = _app_keys(entry)
+        if api_id is not None:
+            keys.append(_key_report("api_id", False, True, str(api_id),
+                                    "connection", origin))
+        else:               # inherits the machine's app
+            value, tier, source = _resolve_env_key("TELEGRAM_API_ID")
+            keys.append(_key_report("TELEGRAM_API_ID", False, True, value, tier, source))
+        value, tier, source = _resolve_env_key(secret_env)
+        keys.append(_key_report(secret_env, True, True, value, tier, source))
         session = entry.get("session") or str(_state_dir() / cid / "session")
         keys.append(_key_report("session", False, False, session, "connection", origin))
         report["connections"][cid] = {
@@ -5054,6 +5099,74 @@ async def _check_connection(cfg: dict) -> dict:
             await client.disconnect()
         if temporary is not None:
             temporary.cleanup()
+
+
+def _rpc_error_name(e: RPCError) -> str:
+    """The error string Telegram sent (API_ID_INVALID, FLOOD_WAIT_30), which
+    Telethon keeps only as the class it maps it to."""
+    from telethon.errors import rpcerrorlist
+    if isinstance(e, FloodWaitError):
+        return f"FLOOD_WAIT_{e.seconds}"
+    for name, cls in rpcerrorlist.rpc_errors_dict.items():
+        if cls is type(e):
+            return name
+    return getattr(e, "message", None) or e.__class__.__name__
+
+
+async def _probe_app(api_id: int, api_hash: str) -> dict:
+    """Ask Telegram for a login token with the app's credentials on a session
+    held only in memory: it proves the app without an account, sends no code,
+    and leaves nothing on disk. The answer is Telegram's verdict on the app."""
+    from telethon.errors.rpcerrorlist import ApiIdPublishedFloodError
+    from telethon.sessions import MemorySession
+    client = TelegramClient(MemorySession(), api_id, api_hash)
+    try:
+        await client.connect()
+        await client(functions.auth.ExportLoginTokenRequest(
+            api_id=api_id, api_hash=api_hash, except_ids=[]))
+        return {"status": "accepted"}
+    except RPCError as e:
+        error = {"name": _rpc_error_name(e), "code": getattr(e, "code", None),
+                 "message": str(e)}
+        if isinstance(e, ApiIdInvalidError):
+            return {"status": "invalid", "error": error}
+        if isinstance(e, ApiIdPublishedFloodError):
+            return {"status": "refused", "reason": "blocked", "error": error}
+        if isinstance(e, FloodWaitError):
+            return {"status": "refused", "reason": "flood_limited",
+                    "retry_after": e.seconds, "error": error}
+        return {"status": "refused", "reason": "other", "error": error}
+    finally:
+        await client.disconnect()
+
+
+def cmd_app_check(wanted: str | None) -> None:
+    """`app-check`: Telegram's verdict on the machine's app, or on the app the
+    named connection signs in through, apart from any account."""
+    entry = None
+    if wanted is not None:
+        reg, _ = _connections_registry()
+        wanted, entry = _select_connection(reg, wanted)
+    api_id, api_hash, problem = _app_credentials(wanted, entry)
+    if problem:
+        _die(problem["exit"], problem["code"], problem["message"], problem.get("hint"))
+    literal_id, secret_env = _app_keys(entry)
+    app = {"api_id": api_id,
+           "from": "connection" if (literal_id is not None or
+                                    (entry or {}).get("secret_env")) else "machine",
+           "hash_env": secret_env}
+    if wanted is not None:
+        app["connection"] = wanted
+    try:
+        verdict = asyncio.run(_probe_app(api_id, api_hash))
+    except (ConnectionError, OSError) as e:
+        _die(5, "network_error", f"network error reaching Telegram: {e}", "check connectivity")
+    _emit({"ok": verdict["status"] == "accepted", "app": app, **verdict})
+    if verdict["status"] == "accepted":
+        return
+    if verdict["status"] == "invalid" or verdict.get("reason") == "blocked":
+        sys.exit(2)
+    sys.exit(5)
 
 
 def cmd_doctor(wanted: str | None) -> None:
@@ -8348,6 +8461,8 @@ def main() -> None:
     pl.add_argument("--events", action="store_true",
                     help="speak JSON lines on stdout (qr, phone_needed, code_needed, "
                          "password_needed, done, error) and read each answer from stdin")
+    sub.add_parser("app-check",
+                   help="ask Telegram whether it accepts the app, apart from any account")
     sub.add_parser("whoami", help="identity of the signed-in account")
 
     pc = sub.add_parser("chats", help="list recent dialogs")
@@ -8562,6 +8677,9 @@ def main() -> None:
         return
     if args.cmd == "doctor":
         cmd_doctor(connection_flag)   # per-connection; emits and sets the exit code itself
+        return
+    if args.cmd == "app-check":       # the app alone: no account, no session
+        cmd_app_check(connection_flag)
         return
     if args.cmd == "transcribe":      # connection-independent: a local file + Deepgram
         _emit(cmd_transcribe(args.json_path, args.force, args.model))
