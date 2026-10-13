@@ -1289,13 +1289,15 @@ _MEMORY_ID = re.compile(r"\s*<!--\s*contextkit-memory-id:\s*([0-9A-Fa-f]{64})\s*
 _TIMED = re.compile(r"^(\d{1,2}):(\d{2})\s*(?:[—–-]+\s*)?(.*)$")
 
 
-def parse_memory_folder(folder: Path) -> dict:
+def parse_memory_folder(folder: Path, zone=None) -> dict:
     """Every entry a memory folder holds, with the decision taken for each.
 
     A file is one day's Markdown: an optional `# <date>` heading, then one
     `## [HH:MM — ]<title>` section per entry whose paragraphs are its text. The
     day comes from the file name, else its first heading, else its modification
-    time; a section with no time keeps the file's order. Text before the first
+    time; a section with no time keeps the file's order. The date and the time
+    are read in `zone`, a tzinfo, or in the machine's local zone when it is
+    None, each date taking that zone's offset on it. Text before the first
     section is an entry of its own, titled after the file. What is not read is
     said, never passed over in silence.
 
@@ -1322,22 +1324,36 @@ def parse_memory_folder(folder: Path) -> dict:
         except (OSError, UnicodeDecodeError) as exc:
             found["not_read"].append({"path": str(path), "why": f"unreadable: {exc}"})
             continue
-        found["entries"] += _parse_file(path, text)
+        found["entries"] += _parse_file(path, text, zone)
     return found
 
 
-def _parse_file(path: Path, text: str) -> list[dict]:
+def _in_zone(day: _dt.date, hour: int, minute: int, zone) -> _dt.datetime:
+    """A wall-clock moment on `day` in `zone`, or in the machine's local zone
+    when it is None, carrying the offset that zone has on that date."""
+    naive = _dt.datetime(day.year, day.month, day.day, hour, minute)
+    return naive.replace(tzinfo=zone) if zone is not None else naive.astimezone()
+
+
+def _zone_said(moment: _dt.datetime, zone) -> str:
+    offset = moment.strftime("%z")
+    offset = f"UTC{offset[:3]}:{offset[3:]}"
+    if zone is None:
+        return f"the machine's local zone ({moment.tzname()}, {offset})"
+    return f"{getattr(zone, 'key', None) or moment.tzname()} ({offset})"
+
+
+def _parse_file(path: Path, text: str, zone=None) -> list[dict]:
     lines = text.splitlines()
     heading = next((line[2:].strip() for line in lines if line.startswith("# ")), None)
     dated = _DATED.search(path.stem) or (_DATED.search(heading) if heading else None)
     if dated:
-        base = _dt.datetime(int(dated.group(1)), int(dated.group(2)), int(dated.group(3)),
-                            tzinfo=_dt.timezone.utc)
+        day = _dt.date(int(dated.group(1)), int(dated.group(2)), int(dated.group(3)))
         when = "the file name" if _DATED.search(path.stem) else "the file's heading"
     else:
-        base = _dt.datetime.fromtimestamp(path.stat().st_mtime, _dt.timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0)
+        day = _dt.datetime.fromtimestamp(path.stat().st_mtime, zone).date()
         when = "the file's modification time"
+    base = _in_zone(day, 0, 0, zone)
     sections: list[tuple[str | None, list[str], str | None]] = [(None, [], None)]
     pending: str | None = None
     unattached: list[str] = []
@@ -1381,11 +1397,11 @@ def _parse_file(path: Path, text: str) -> list[dict]:
             else:
                 time_of, title = None, head
         if time_of:
-            created = base.replace(hour=time_of[0], minute=time_of[1])
-            when_said = f"{when} and the section's time, read as UTC"
+            created = _in_zone(day, time_of[0], time_of[1], zone)
+            when_said = f"{when} and the section's time, read in {_zone_said(created, zone)}"
         else:
             created = base + _dt.timedelta(seconds=index)
-            when_said = f"{when}, in the file's order"
+            when_said = f"{when}, in the file's order, read in {_zone_said(base, zone)}"
         title = " ".join(title.split())
         if len(title) > TITLE_MAX:
             title = title[:TITLE_MAX - 1].rstrip() + "…"

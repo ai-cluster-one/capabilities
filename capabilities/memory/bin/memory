@@ -133,13 +133,16 @@ CONSOLIDATION
       names itself there.
 
 MOVING IN AND OUT
-  memory adopt [ROOT...] [--apply] [--pin-titles REGEX]
+  memory adopt [ROOT...] [--apply] [--pin-titles REGEX] [--timezone ZONE]
       Carry existing memory folders into the store. ROOTs are project roots;
       with none, the project roots named by the machine service opt-in lists
       under $XDG_CONFIG_HOME/*/service/projects.{json,toml}. A root's memory
       folder is the one `contextkit path memory` names in a ContextKit-bound
       project, else <root>/memory. Every file is one day of
-      `## [HH:MM — ]title` sections. A `<!-- contextkit-memory-id: <hex> -->`
+      `## [HH:MM — ]title` sections. The day and the HH:MM are read in the
+      machine's local zone, or in the IANA zone --timezone names (each date
+      taking that zone's offset on it), and every entry's dated_from says which.
+      A `<!-- contextkit-memory-id: <hex> -->`
       line names the id of the section after it: it is never an entry nor part
       of one, and the id, recorded on the carried entry, is what makes it the
       same entry on every machine whatever its heading says by then. The
@@ -279,6 +282,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, NoReturn
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 NAME = "memory"
 SUMMARY = ("Project memory over a PostgreSQL store - conclusions recorded one entry at a "
@@ -3618,7 +3622,7 @@ def _adopt_roots(given: list[str]) -> tuple[list[Path], list[dict]]:
     return roots, list(lists.values())
 
 
-def _adopt_one(root: Path, apply: bool, pin_titles) -> dict:
+def _adopt_one(root: Path, apply: bool, pin_titles, zone=None) -> dict:
     engine = _engine()
     row: dict = {"root": str(root)}
     if not root.is_dir():
@@ -3643,7 +3647,7 @@ def _adopt_one(root: Path, apply: bool, pin_titles) -> dict:
     folder, named = _memory_folder(root)
     row["memory_folder"] = str(folder)
     row["folder_from"] = named
-    parsed = engine.parse_memory_folder(folder)
+    parsed = engine.parse_memory_folder(folder, zone)
     row["not_read"] = parsed["not_read"]
     entries = parsed["entries"]
     if not folder.is_dir():
@@ -3748,11 +3752,17 @@ def cmd_adopt(args) -> None:
             pin_titles = re.compile(args.pin_titles)
         except re.error as exc:
             _die(6, "input", f"--pin-titles is no regular expression: {exc}")
+    zone = None
+    if args.timezone is not None:
+        try:
+            zone = ZoneInfo(args.timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            _die(6, "input", f"--timezone names no IANA zone: {args.timezone!r} ({exc})")
     roots, lists = _adopt_roots(args.roots)
     projects = []
     with _guarded():
         for root in roots:
-            projects.append(_adopt_one(root, args.apply, pin_titles))
+            projects.append(_adopt_one(root, args.apply, pin_titles, zone))
     out = {"mode": "apply" if args.apply else "dry-run",
            "roots_from": "the arguments" if args.roots else "the machine's service opt-in lists",
            "projects": projects}
@@ -4704,6 +4714,7 @@ def _parser() -> _Parser:
     adopt.add_argument("roots", nargs="*")
     adopt.add_argument("--apply", action="store_true")
     adopt.add_argument("--pin-titles", dest="pin_titles")
+    adopt.add_argument("--timezone")
     export = sub.add_parser("export")
     export.add_argument("--out")
     export.add_argument("--project")

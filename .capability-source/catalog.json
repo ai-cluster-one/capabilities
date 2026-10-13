@@ -102,7 +102,7 @@
     },
     "memory": {
       "path": "capabilities/memory",
-      "payload_sha256": "eb1d2f99f9ec9aa5593d029b06ad6f113fbec7f46f23f4c169e719de7654a692",
+      "payload_sha256": "d3b5e5f68260d06cf3aefe84393e0307eaa67f96b770c2ac878ec6399f611de4",
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time, the newest rendered into every session's context, the rest searched on demand, and a service that keeps the block current and consolidates it."
     },
     "notion": {

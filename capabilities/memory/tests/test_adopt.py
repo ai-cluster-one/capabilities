@@ -53,7 +53,7 @@ def test_dry_run_reports_every_decision_and_writes_nothing(world, tmp_path):
 def test_apply_enables_joins_carries_and_is_idempotent(world, tmp_path):
     root = world.project("p", enabled=None)
     folder(root)
-    out = world.ok(tmp_path, "adopt", str(root), "--apply", "--pin-titles", "^Owner")
+    out = world.ok(tmp_path, "adopt", str(root), "--apply", "--pin-titles", "^Owner", TZ="UTC")
     project = out["projects"][0]
     assert project["enabled"]["ok"], project
     assert project["counts"]["carried"] == 2 and project["joined"]["joined"] is True
@@ -68,8 +68,27 @@ def test_apply_enables_joins_carries_and_is_idempotent(world, tmp_path):
 
     again = world.ok(tmp_path, "adopt", str(root), "--apply")["projects"][0]
     assert again["counts"]["carried"] == 0 and again["counts"]["already"] == 2
+    zoned = world.ok(tmp_path, "adopt", str(root), "--apply", "--timezone",
+                     "Asia/Tokyo")["projects"][0]
+    assert zoned["counts"]["carried"] == 0 and zoned["counts"]["already"] == 2
     assert world.ok(root, "status")["entries"]["active"] == 2
     assert (root / "memory" / "2026-09-14.md").read_text() == DAY
+
+
+def test_timezone_names_the_zone_heading_times_are_read_in(world, tmp_path):
+    root = world.project("p", enabled=None)
+    folder(root)
+    out = world.ok(tmp_path, "adopt", str(root), "--timezone", "Europe/Berlin")
+    entries = {e["title"]: e for e in out["projects"][0]["entries"]}
+    first = entries["What memory is for"]
+    assert first["created_at"] == "2026-09-13T22:01:00Z"
+    assert first["dated_from"] == ("the file name and the section's time, read in "
+                                   "Europe/Berlin (UTC+02:00)")
+    local = world.ok(tmp_path, "adopt", str(root), TZ="UTC")["projects"][0]["entries"][0]
+    assert local["created_at"] == "2026-09-14T00:01:00Z"
+    assert "the machine's local zone (UTC, UTC+00:00)" in local["dated_from"]
+    done = world.run(tmp_path, "adopt", str(root), "--timezone", "Mars/Olympus")
+    assert done.returncode == 6 and "--timezone names no IANA zone" in done.stderr
 
 
 def test_disabled_projects_and_projects_without_identity_are_skipped(world, tmp_path):

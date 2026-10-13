@@ -6,6 +6,10 @@ How to carry a project's existing memory folder into the store without losing an
 
 Run adopt without applying, naming the project roots you mean, or with none to take every project root a machine service on this machine lists. The answer shows, for every entry it found, the title it read, the date it gave the entry and where that date came from, and whether it will be carried or skipped and why; it also lists every file it did not read. Nothing is written. Read it before applying: a folder written in a shape the reader does not expect shows up here as odd titles or skipped sections, and is easier to tidy now than to supersede later.
 
+## Check the zone the dates are read in
+
+A memory folder's file dates and section times carry no zone of their own, so adopt reads them in the machine's local zone, which is the zone a writer on the same machine stamped them in. When the folder was written on a machine in another zone, pass that machine's IANA zone with `--timezone`, such as `Europe/Berlin`; each date then takes the offset that zone had on it. Every entry's `dated_from` names the zone it was read in, so the dry run shows whether the moments are the ones the folder meant.
+
 ## Decide what is pinned
 
 Decisions the project's owner made belong pinned. When their titles share a recognisable form, pass a pattern that matches them and they are pinned as they are carried; otherwise pin them one by one afterwards.

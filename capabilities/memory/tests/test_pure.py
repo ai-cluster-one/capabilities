@@ -230,6 +230,39 @@ def test_memory_folder_is_read_with_a_decision_per_entry(tmp_path):
     assert "image.png" in whys and "nested" in whys
 
 
+def test_heading_times_are_read_in_the_named_zone_with_each_dates_offset(tmp_path):
+    from zoneinfo import ZoneInfo
+    folder = tmp_path / "memory"
+    folder.mkdir()
+    (folder / "2026-09-14.md").write_text("# 2026-09-14\n\n## 00:01 — Summer\n\nOne.\n\n"
+                                          "## Untimed\n\nTwo.\n")
+    (folder / "2026-01-10.md").write_text("# 2026-01-10\n\n## 09:00 — Winter\n\nThree.\n")
+    found = E.parse_memory_folder(folder, ZoneInfo("Europe/Berlin"))
+    entries = {e["title"]: e for e in found["entries"]}
+    assert E.iso(entries["Summer"]["created_at"]) == "2026-09-13T22:01:00Z"
+    assert "read in Europe/Berlin (UTC+02:00)" in entries["Summer"]["dated_from"]
+    assert E.iso(entries["Winter"]["created_at"]) == "2026-01-10T08:00:00Z"
+    assert "read in Europe/Berlin (UTC+01:00)" in entries["Winter"]["dated_from"]
+    assert E.iso(entries["Untimed"]["created_at"]) == "2026-09-13T22:00:02Z"
+    assert "in the file's order, read in Europe/Berlin" in entries["Untimed"]["dated_from"]
+
+
+def test_heading_times_are_read_in_the_machines_local_zone_by_default(tmp_path, monkeypatch):
+    import time
+    folder = tmp_path / "memory"
+    folder.mkdir()
+    (folder / "2026-09-14.md").write_text("# 2026-09-14\n\n## 00:01 — Local\n\nOne.\n")
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        entry = E.parse_memory_folder(folder)["entries"][0]
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+    assert E.iso(entry["created_at"]) == "2026-09-14T04:01:00Z"
+    assert "read in the machine's local zone (EDT, UTC-04:00)" in entry["dated_from"]
+
+
 def test_missing_folder_is_said():
     found = E.parse_memory_folder(__import__("pathlib").Path("/nonexistent/memory"))
     assert found["entries"] == [] and found["not_read"][0]["why"] == "no such folder"
