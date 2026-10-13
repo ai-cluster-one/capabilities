@@ -49,7 +49,8 @@ CONNECTIONS
   A person configures the shared homeserver once per machine, in the user
   credentials.env (`capabilities install` scaffolds both keys there):
     AGENTROOMS_HOMESERVER            the homeserver's base URL
-    AGENTROOMS_REGISTRATION_TOKEN    the shared registration token
+    AGENTROOMS_REGISTRATION_TOKEN    the shared registration token, where the
+                                     homeserver's registration asks for one
   Every agent then registers itself with `register`.
 
   A person's own account is a connection too, written by `login` with its
@@ -76,17 +77,20 @@ COMMANDS
 
   Identity
     register NAME [--homeserver URL] [--as ID] [--default]
-        Register @NAME on the shared homeserver with its registration token
-        (m.login.registration_token, read from AGENTROOMS_REGISTRATION_TOKEN
-        through the cascade; the homeserver from --homeserver, else
-        AGENTROOMS_HOMESERVER). Writes connection ID (default NAME) into this
-        project's registry and the minted access token into the project's
-        .env.local under AGENTROOMS_<ID>_TOKEN, mode 0600; the token is never
-        printed. The account has no password: its access token is its only
-        credential. NAME is the localpart: lowercase letters, digits and . _ = -.
-        Needs `capabilities init` in the project. Not idempotent: a NAME taken
-        exits 6 user_in_use; a registration whose answer was lost exits 5
-        outcome_unknown (the account may exist; register another NAME).
+        Register @NAME on the shared homeserver (from --homeserver, else
+        AGENTROOMS_HOMESERVER). A homeserver whose registration is open
+        registers it at once or through m.login.dummy, with no token; only one
+        that asks for m.login.registration_token needs the registration token,
+        read from AGENTROOMS_REGISTRATION_TOKEN through the cascade, and exits
+        2 registration_token_missing without it. Writes connection ID (default
+        NAME) into this project's registry and the minted access token into
+        the project's .env.local under AGENTROOMS_<ID>_TOKEN, mode 0600; the
+        token is never printed. The account has no password: its access token
+        is its only credential. NAME is the localpart: lowercase letters,
+        digits and . _ = -. Needs `capabilities init` in the project. Not
+        idempotent: a NAME taken exits 6 user_in_use; a registration whose
+        answer was lost exits 5 outcome_unknown (the account may exist;
+        register another NAME).
         The new connection has no write grant; ask the user to grant it.
     login USER_ID [--homeserver URL] [--as ID] [--global | --project]
                   [--default]
@@ -468,8 +472,8 @@ CRED_KEYS = [
      "note": "the shared homeserver's base URL, set once per machine; `register` "
              "takes it unless --homeserver names one"},
     {"key": "AGENTROOMS_REGISTRATION_TOKEN", "secret": True, "required": False,
-     "note": "the shared registration token, set once per machine by a person; "
-             "only `register` reads it"},
+     "note": "the shared registration token, set once per machine by a person "
+             "where the homeserver's registration asks for one; only `register` reads it"},
 ]
 WRITE_VERBS = {"open", "invite", "join", "leave", "post", "mark", "unmark"}
 WRITE_DEFAULT = False   # a post reaches other agents and people on a shared server
@@ -4552,13 +4556,10 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
     homeserver = homeserver.rstrip("/")
     if not re.match(r"https?://[^/\s]+$", homeserver):
         _die(6, "bad_homeserver", f"{homeserver!r} is not http(s)://host[:port]")
-    token = _resolve_env_key(REGISTRATION_KEY)[0]
-    if not token:
-        _die(2, "registration_token_missing", f"{REGISTRATION_KEY} is unset",
-             f"a person sets it once per machine in {CREDENTIALS_ENV}; ask the user")
     with Matrix(homeserver) as m:
         # The interactive-auth handshake: the first request answers 401 with the
-        # session and the flows on offer; an open homeserver registers at once.
+        # session and the flows on offer; an open homeserver registers at once,
+        # or through m.login.dummy, and only a token-gated one needs the token.
         try:
             probe = m.http.post("/_matrix/client/v3/register", json={"username": name})
         except m.httpx.TimeoutException:
@@ -4577,16 +4578,26 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
         else:
             info = probe.json()
             flows = [f.get("stages") for f in info.get("flows") or []]
-            if ["m.login.registration_token"] not in flows:
+            if ["m.login.dummy"] in flows:
+                auth = {"type": "m.login.dummy", "session": info.get("session")}
+            elif ["m.login.registration_token"] in flows:
+                token = _resolve_env_key(REGISTRATION_KEY)[0]
+                if not token:
+                    _die(2, "registration_token_missing",
+                         f"{homeserver} asks for a registration token and {REGISTRATION_KEY} is unset",
+                         f"a person sets it once per machine in {CREDENTIALS_ENV}; ask the user")
+                auth = {"type": "m.login.registration_token", "token": token,
+                        "session": info.get("session")}
+            else:
                 _die(6, "registration_unsupported",
-                     f"{homeserver} offers no m.login.registration_token flow (offers {flows})")
+                     f"{homeserver} offers neither an m.login.dummy nor an "
+                     f"m.login.registration_token flow (offers {flows})")
             try:
                 done = m.call("POST", "/_matrix/client/v3/register", idempotent=False, body={
                     "username": name, "initial_device_display_name": f"{NAME} {cid}",
-                    "auth": {"type": "m.login.registration_token", "token": token,
-                             "session": info.get("session")}})
+                    "auth": auth})
             except MatrixError as exc:
-                if exc.status == 401:
+                if exc.status == 401 and auth["type"] == "m.login.registration_token":
                     _die(2, "registration_token_rejected",
                          "the homeserver rejected the registration token",
                          f"check {REGISTRATION_KEY} with the person who configured it")

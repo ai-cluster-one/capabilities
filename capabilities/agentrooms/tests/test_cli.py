@@ -35,6 +35,7 @@ class FakeHomeserver:
         self.syncs: list = []
         self.state: dict[str, list[dict]] = {}
         self.sync_params: list[dict] = []
+        self.registration_flows = [["m.login.registration_token"]]
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -48,9 +49,16 @@ class FakeHomeserver:
                 if f"@{name}:{SERVER}" in self.users:
                     return httpx.Response(400, json={"errcode": "M_USER_IN_USE",
                                                      "error": "User ID is not available."})
+                if not self.registration_flows:
+                    self.users.add(f"@{name}:{SERVER}")
+                    return httpx.Response(200, json={"user_id": f"@{name}:{SERVER}",
+                                                     "access_token": TOKEN, "device_id": "DEV1"})
                 return httpx.Response(401, json={"session": "s1", "flows": [
-                    {"stages": ["m.login.registration_token"]}]})
-            if body["auth"].get("token") != "reg-token":
+                    {"stages": stages} for stages in self.registration_flows]})
+            if [body["auth"].get("type")] not in self.registration_flows:
+                return httpx.Response(401, json={"errcode": "M_FORBIDDEN", "error": "no such flow"})
+            if body["auth"]["type"] == "m.login.registration_token" and \
+                    body["auth"].get("token") != "reg-token":
                 return httpx.Response(401, json={"errcode": "M_FORBIDDEN", "error": "bad token"})
             self.users.add(f"@{name}:{SERVER}")
             return httpx.Response(200, json={"user_id": f"@{name}:{SERVER}",
@@ -201,7 +209,33 @@ def test_register_writes_connection_and_token(cli, project, homeserver, capsys, 
 def test_register_needs_the_registration_token(cli, project, homeserver, capsys):
     code, _out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS)
     assert code == 2 and err["error"]["code"] == "registration_token_missing"
-    assert not homeserver.requests
+    # Only the handshake reached the homeserver, which creates no account.
+    assert [b for _m, _p, b in homeserver.requests] == [{"username": "alpha"}]
+    assert not homeserver.users and not (project / ".env.local").exists()
+
+
+def test_register_on_an_open_homeserver_needs_no_token(cli, project, homeserver, capsys):
+    homeserver.registration_flows = [["m.login.registration_token"], ["m.login.dummy"]]
+    code, out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS)
+    assert code == 0, err
+    assert out["user_id"] == f"@alpha:{SERVER}"
+    auth = [b for m, p, b in homeserver.requests if b and "auth" in b][0]["auth"]
+    assert auth == {"type": "m.login.dummy", "session": "s1"}
+    assert f"AGENTROOMS_ALPHA_TOKEN='{TOKEN}'" in (project / ".env.local").read_text()
+
+
+def test_register_on_a_homeserver_that_registers_at_once(cli, project, homeserver, capsys):
+    homeserver.registration_flows = []
+    code, out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS)
+    assert code == 0, err
+    assert out["user_id"] == f"@alpha:{SERVER}"
+    assert not [b for m, p, b in homeserver.requests if b and "auth" in b]
+
+
+def test_register_refuses_a_homeserver_offering_no_usable_flow(cli, project, homeserver, capsys):
+    homeserver.registration_flows = [["m.login.recaptcha", "m.login.email.identity"]]
+    code, _out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS)
+    assert code == 6 and err["error"]["code"] == "registration_unsupported"
 
 
 def test_register_refuses_a_bad_registration_token(cli, project, homeserver, capsys, monkeypatch):

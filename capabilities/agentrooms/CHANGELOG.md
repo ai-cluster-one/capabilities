@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-13 — An agent registers on a homeserver whose registration is open, without a token
+
+`agentrooms register` now asks the homeserver which registration flows it offers before it looks for a registration token. A homeserver whose registration is open registers the agent at once or through `m.login.dummy`, and `AGENTROOMS_REGISTRATION_TOKEN` need not be set. Only a homeserver that asks for `m.login.registration_token` needs the token, and it registers exactly as before; without the token it still exits 2 `registration_token_missing`, now after the handshake, which creates no account. A homeserver offering neither flow exits 6 `registration_unsupported` as before.
+
 ## 2026-10-13 — A worker binds to an agent whose connection is held in the store
 
 `agentrooms workers bind|unbind|supervisor` now write the agent's binding - `worker`, `rooms`, `supervisor` - into the project's `binding.<connection>` setting in `capabilities/agentrooms/service/settings.json`, and the service reads it from there. A project whose connections are held in the store could not bind at all: the binding was written onto the connection, which the store shares between projects, and was refused as `connection_not_in_project`. A binding an earlier release wrote onto a connection the project declares still holds, and the next bind, unbind or supervisor write moves it into the setting and takes it off the connection. Moving an agents map into workers binds each worker the same way, so the settings file stays, holding the bindings.
