@@ -39,6 +39,8 @@ class FakeHomeserver:
         self.grants: dict[str, dict] = {}
         self.refuse_grant_before_join = False
         self.joined: set[str] = set()
+        self.account: dict[str, dict] = {}
+        self.refuse_kick: set[str] = set()
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -86,6 +88,22 @@ class FakeHomeserver:
             if isinstance(answer, Exception):
                 raise answer
             return httpx.Response(200, json=answer)
+        if path.endswith("/kick"):
+            room = unquote(path.split("/rooms/")[1].split("/")[0])
+            if body["user_id"] in self.refuse_kick:
+                return httpx.Response(403, json={"errcode": "M_FORBIDDEN", "error": "no"})
+            for event in self.state.get(room, []):
+                if event.get("type") == "m.room.member" and event.get("state_key") == body["user_id"]:
+                    event["content"] = {"membership": "leave"}
+            return httpx.Response(200, json={})
+        if "/account_data/" in path and "/rooms/" not in path:
+            kind = unquote(path.rsplit("/", 1)[1])
+            if request.method == "PUT":
+                self.account[kind] = body
+                return httpx.Response(200, json={})
+            if kind in self.account:
+                return httpx.Response(200, json=self.account[kind])
+            return httpx.Response(404, json={"errcode": "M_NOT_FOUND", "error": "no data"})
         if path.endswith("/state") and "/rooms/" in path:
             room = unquote(path.split("/rooms/")[1].split("/")[0])
             return httpx.Response(200, json=self.state.get(room, []))
@@ -1010,3 +1028,179 @@ def test_watch_follows_the_held_wakes_in_the_store(cli, project, stored, homeser
     assert lines[1:] == [
         {"event": "held", "room_id": "!r", "held": {"count": 1, "senders": [stranger]}},
         {"event": "held", "room_id": "!r", "held": {"count": 0, "senders": []}}]
+
+
+def _member(who, membership):
+    return {"type": "m.room.member", "state_key": who, "sender": who,
+            "content": {"membership": membership}}
+
+
+def _owned(homeserver, room, me, others=(), invited=(), creator=None):
+    homeserver.state[room] = [_create(creator or me), {"type": "m.room.name", "state_key": "",
+                                                        "content": {"name": "Lab"}},
+                              _member(me, "join"), *[_member(u, "join") for u in others],
+                              *[_member(u, "invite") for u in invited]]
+
+
+def test_an_owner_removes_a_member_and_cancels_an_invite(cli, project, homeserver, capsys):
+    connect(project, allow_write=True)
+    me, b, c = f"@alpha:{SERVER}", f"@b:{SERVER}", f"@c:{SERVER}"
+    _owned(homeserver, "!lab", me, others=[b], invited=[c])
+    code, out, err = run(cli, capsys, "remove", "!lab", b, "--reason", "off topic")
+    assert code == 0 and out == {"room_id": "!lab", "removed": b, "was": "join"}, err
+    code, out, err = run(cli, capsys, "remove", "!lab", c)
+    assert code == 0 and out == {"room_id": "!lab", "removed": c, "was": "invite"}, err
+    kicks = [body for m, p, body in homeserver.requests if p.endswith("/kick")]
+    assert kicks == [{"user_id": b, "reason": "off topic"}, {"user_id": c}]
+    # Repeating it is harmless: WHO is already out, and nothing is sent.
+    code, out, err = run(cli, capsys, "remove", "!lab", b)
+    assert code == 0 and out["was"] is None and len(_paths(homeserver, "POST", "/kick")) == 2
+    code, _out, err = run(cli, capsys, "remove", "!lab", me)
+    assert code == 6 and err["error"]["code"] == "bad_user"
+    # In a room another agent owns, refused before anything is sent, the owners named.
+    _owned(homeserver, "!theirs", me, others=[OWNER, b], creator=OWNER)
+    code, _out, err = run(cli, capsys, "remove", "!theirs", b)
+    assert code == 6 and err["error"]["code"] == "not_owner" and OWNER in err["error"]["message"]
+    code, _out, err = run(cli, capsys, "remove", "!nowhere", b)
+    assert code == 6 and err["error"]["code"] == "not_member"
+    assert len(_paths(homeserver, "POST", "/kick")) == 2
+    # A write: refused on a connection without the write grant.
+    connect(project, allow_write=False)
+    code, _out, err = run(cli, capsys, "remove", "!lab", b)
+    assert code == 4 and err["error"]["code"] == "read_only"
+
+
+def test_an_owner_cannot_simply_leave_and_archives_instead(cli, project, homeserver, capsys):
+    connect(project, allow_write=True)
+    me, b, c = f"@alpha:{SERVER}", f"@b:{SERVER}", f"@c:{SERVER}"
+    _owned(homeserver, "!lab", me, others=[b], invited=[c])
+    code, _out, err = run(cli, capsys, "leave", "!lab")
+    assert code == 6 and err["error"]["code"] == "owner_cannot_leave"
+    assert "archive" in err["error"]["hint"] and not _paths(homeserver, "POST", "/leave")
+    # A room it does not own, or one it owns alone, it leaves as before.
+    _owned(homeserver, "!theirs", me, others=[OWNER], creator=OWNER)
+    _owned(homeserver, "!alone", me)
+    for room in ("!theirs", "!alone"):
+        code, out, err = run(cli, capsys, "leave", room)
+        assert code == 0 and out["left"] is True, err
+    # Archive: everyone else out, the record written, then the agent leaves.
+    code, out, err = run(cli, capsys, "archive", "!lab")
+    assert code == 0, err
+    assert out["removed"] == [{"user_id": b, "was": "join"}, {"user_id": c, "was": "invite"}]
+    assert out["name"] == "Lab" and out["archived_at"] and out["left"] is True
+    assert out["already_archived"] is False
+    record = homeserver.account["agentrooms.archived"]["rooms"]["!lab"]
+    assert record == {"name": "Lab", "archived_at": out["archived_at"]}
+    acts = [(m, p.rsplit("/", 1)[1]) for m, p, _b in homeserver.requests
+            if m in ("POST", "PUT") and ("/rooms/!lab" in p or "agentrooms.archived" in p)]
+    assert acts[-4:] == [("POST", "kick"), ("POST", "kick"), ("PUT", "agentrooms.archived"),
+                         ("POST", "leave")]
+    # Once left, repeating it answers the record and sends nothing.
+    homeserver.state["!lab"][2] = _member(me, "leave")
+    code, again, err = run(cli, capsys, "archive", "!lab")
+    assert code == 0 and again["already_archived"] is True and again["removed"] == [], err
+    assert again["archived_at"] == out["archived_at"]
+    # rooms lists it on request; read reads its history.
+    homeserver.syncs.append({"next_batch": "n"})
+    code, rooms, err = run(cli, capsys, "rooms", "--archived")
+    assert code == 0 and rooms["archived"] == [{"room_id": "!lab", "name": "Lab",
+                                                "archived_at": out["archived_at"]}], err
+    homeserver.syncs.append({"next_batch": "n"})
+    code, rooms, err = run(cli, capsys, "rooms")
+    assert code == 0 and "archived" not in rooms
+    code, read, err = run(cli, capsys, "read", "!lab")
+    assert code == 0 and read["count"] == 3, err
+    # Not an owner: refused.
+    code, _out, err = run(cli, capsys, "archive", "!theirs")
+    assert code == 6 and err["error"]["code"] == "not_owner"
+
+
+def test_an_archive_stopped_part_way_names_what_was_done_and_finishes_when_repeated(
+        cli, project, homeserver, capsys):
+    connect(project, allow_write=True)
+    me, b, c = f"@alpha:{SERVER}", f"@b:{SERVER}", f"@c:{SERVER}"
+    _owned(homeserver, "!lab", me, others=[b, c])
+    homeserver.refuse_kick.add(c)
+    code, _out, err = run(cli, capsys, "archive", "!lab")
+    assert code == 6 and err["error"]["code"] == "archive_incomplete"
+    assert b in err["error"]["message"] and c in err["error"]["message"]
+    assert "agentrooms.archived" not in homeserver.account
+    assert not _paths(homeserver, "POST", "/leave")
+    homeserver.refuse_kick.clear()
+    code, out, err = run(cli, capsys, "archive", "!lab")
+    assert code == 0 and out["removed"] == [{"user_id": c, "was": "join"}], err
+
+
+def test_an_operator_blocks_a_sender(cli, project, homeserver, capsys, monkeypatch):
+    connect(project, allow_write=True)
+    me, b = f"@alpha:{SERVER}", f"@b:{SERVER}"
+    homeserver.account["m.ignored_user_list"] = {"ignored_users": {f"@old:{SERVER}": {}}}
+    code, out, err = run(cli, capsys, "block", "add", b)
+    assert code == 0 and out == {"user_id": me, "blocked": [b, f"@old:{SERVER}"]}, err
+    assert homeserver.account["m.ignored_user_list"] == {
+        "ignored_users": {f"@old:{SERVER}": {}, b: {}}}
+    puts = len(_paths(homeserver, "PUT", "m.ignored_user_list"))
+    code, out, err = run(cli, capsys, "block", "add", b)
+    assert code == 0 and len(_paths(homeserver, "PUT", "m.ignored_user_list")) == puts
+    # A blocked inviter's invite leaves the list; another's stays.
+    homeserver.syncs.append(_invited("!inv", me, inviter=b))
+    code, rooms, err = run(cli, capsys, "rooms")
+    assert code == 0 and rooms["invites"] == [], err
+    code, out, err = run(cli, capsys, "block", "remove", b)
+    assert code == 0 and out["blocked"] == [f"@old:{SERVER}"], err
+    homeserver.syncs.append(_invited("!inv", me, inviter=b))
+    code, rooms, err = run(cli, capsys, "rooms")
+    assert [r["inviter"] for r in rooms["invites"]] == [b]
+    code, out, err = run(cli, capsys, "block", "list")
+    assert code == 0 and out == {"user_id": me, "blocked": [f"@old:{SERVER}"]}
+    code, _out, err = run(cli, capsys, "block", "add", me)
+    assert code == 6 and err["error"]["code"] == "bad_user"
+    code, _out, err = run(cli, capsys, "block", "add", "@b:other.org")
+    assert code == 6 and err["error"]["code"] == "federation_refused"
+    # The operator's, not the agent's: refused inside a turn; a write otherwise.
+    monkeypatch.setenv("AGENTROOMS_TURN", "t1")
+    for verb in ("add", "remove"):
+        code, _out, err = run(cli, capsys, "block", verb, b)
+        assert code == 4 and err["error"]["code"] == "policy"
+    code, out, err = run(cli, capsys, "block", "list")
+    assert code == 0
+    monkeypatch.delenv("AGENTROOMS_TURN")
+    connect(project, allow_write=False)
+    code, _out, err = run(cli, capsys, "block", "add", b)
+    assert code == 4 and err["error"]["code"] == "read_only"
+    code, out, err = run(cli, capsys, "block", "list")
+    assert code == 0 and out["blocked"] == [f"@old:{SERVER}"]
+
+
+def test_watch_prints_block_and_archive_changes_and_no_blocked_invite(cli, project, homeserver,
+                                                                     capsys):
+    connect(project, allow_write=False)
+    me, b = f"@alpha:{SERVER}", f"@b:{SERVER}"
+    old = {"!old": {"name": "Old", "archived_at": "2026-10-01T00:00:00Z"}}
+    homeserver.syncs += [
+        {"next_batch": "b0", "account_data": {"events": [
+            {"type": "agentrooms.archived", "content": {"rooms": old}}]}},
+        {"next_batch": "b1", "account_data": {"events": [
+            {"type": "m.ignored_user_list", "content": {"ignored_users": {b: {}}}}]},
+         "rooms": {"invite": {
+             **_invited("!fromb", me, inviter=b)["rooms"]["invite"],
+             **_invited("!fromowner", me)["rooms"]["invite"]}}},
+        {"next_batch": "b2", "account_data": {"events": [
+            {"type": "agentrooms.archived", "content": {"rooms": {
+                **old, "!lab": {"name": "Lab", "archived_at": "2026-10-13T00:00:00Z"}}}}]},
+         "rooms": {"leave": {"!lab": {"timeline": {"events": [
+             {**_member(me, "leave"), "event_id": "$l"}]}}}}},
+        cli._WatchStopped(),
+    ]
+    code, lines, err = run_stream(cli, capsys, "watch")
+    assert code == 0, err
+    assert [line["event"] for line in lines] == ["ready", "invite", "blocked", "membership",
+                                                 "archived"]
+    assert lines[1]["room_id"] == "!fromowner"
+    assert lines[2] == {"event": "blocked", "blocked": [b]}
+    assert lines[4] == {"event": "archived", "room_id": "!lab",
+                        "archived": {"name": "Lab", "archived_at": "2026-10-13T00:00:00Z"}}
+    # The first sync takes what the account data holds; both types are followed.
+    for params in homeserver.sync_params[:2]:
+        assert json.loads(params["filter"])["account_data"] == {
+            "types": ["agentrooms.archived", "m.ignored_user_list"]}

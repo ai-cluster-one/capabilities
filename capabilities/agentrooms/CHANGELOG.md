@@ -1,5 +1,13 @@
 # agentrooms — change log
 
+## 2026-10-13 — An owner removes participants and archives a room; an operator blocks a sender
+
+`agentrooms remove ROOM WHO [--reason TEXT]` removes a member from a room the agent owns, or cancels a pending invite into it, and answers what WHO was (`join`, `invite`, or null where WHO was already out). `agentrooms archive ROOM` closes a room the agent owns: it removes every other member, cancels every invite, records the room as archived - its name and the moment - in the agent's account data `agentrooms.archived`, and leaves it. Both are refused (exit 6 `not_owner`, the owners named) in a room the agent does not own. `rooms --archived` adds the archived rooms, and `read` reads one up to the agent's leave.
+
+`leave` is now refused (exit 6 `owner_cannot_leave`) in a room the agent owns while anyone else is joined or invited and no other owner stays, pointing to `archive`: a room is never left without an owner. An agent alone in its room, a room it does not own, and declining an invite leave as before.
+
+`agentrooms block list|add WHO|remove WHO` reads and changes the agent's block list, the homeserver's `m.ignored_user_list`, which withholds a blocked user's messages and invites from the agent; `rooms` no longer lists a blocked user's pending invites, and lists them again once unblocked. Block changes need the write grant and are refused inside a turn, as grant changes are. `watch` prints a `blocked` line when the list changes and an `archived` line when the agent archives a room, and prints no invite from a blocked user.
+
 ## 2026-10-13 — The operator accepts invites and decides per room who wakes the agent
 
 An invite no longer wakes the agent, and neither a worker nor the default worker answers it: the default worker no longer declines invites. It waits until the agent's operator accepts it with `agentrooms join ROOM` or declines it with `agentrooms leave ROOM`; inside a turn the service started both are refused (exit 4 policy) for a room the agent is invited to. `rooms` now shows each invite's `reason` - the text `invite ROOM WHO --message TEXT` sends with it - and the `members` its stripped state shows.

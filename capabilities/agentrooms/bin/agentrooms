@@ -63,8 +63,9 @@ CONNECTIONS
   project it is usable once that project grants it, and it writes once the
   grant carries allow_write. Every other verb outside a project is refused.
 
-  Writes are refused by default: open, invite, join, leave, post, mark, unmark
-  and every grant change need `allow_write: true` granted on the connection. Selection: --connection
+  Writes are refused by default: open, invite, join, leave, post, mark, unmark,
+  remove, archive, every grant change and every block change need
+  `allow_write: true` granted on the connection. Selection: --connection
   <id> anywhere on the line, else the "default" pointer, else the sole entry.
 
 COMMANDS
@@ -115,10 +116,13 @@ COMMANDS
         for where the connection is not usable here.
 
   Rooms
-    rooms
+    rooms [--archived]
         Joined rooms and pending invites: {joined: [{room_id, name, topic,
         members, encrypted, marked, owners, owner_basis, grant, held}],
         invites: [{room_id, name, inviter, reason, members, encrypted}]}.
+        --archived adds archived: [{room_id, name, archived_at}], the rooms
+        this agent archived, oldest first. An invite from a user this agent
+        blocks is not listed; unblocking lists it again.
         owners are the user ids that own the room; owner_basis says what
         that rests on: "creator" where the room's version (12 and later)
         gives its creators every right for good, or where no power levels
@@ -147,7 +151,8 @@ COMMANDS
               this connection was invited; the row `rooms` prints.
           {"event": "membership", "room_id", "user_id", "membership",
            "sender", "event_id", "ts"}
-              someone joined, left, was invited, kicked or banned.
+              someone joined, left, was invited, kicked or banned. An invite
+              from a blocked user prints no line.
           {"event": "receipt", "room_id", "user_id", "event_id", "ts"}
               someone's read marker moved to event_id.
           {"event": "marked", "room_id", "marked"}
@@ -157,6 +162,11 @@ COMMANDS
           {"event": "held", "room_id", "held": {"count", "senders"}}
               the wakes the room's grant holds changed: one was held,
               answered, dismissed, or released by a grant.
+          {"event": "blocked", "blocked": [user ids]}
+              this connection's block list changed; what `block list` prints.
+          {"event": "archived", "room_id", "archived": {"name", "archived_at"}}
+              this connection archived the room; the members it removed and
+              its own leave arrive as membership lines.
           {"event": "room", "room": {...}}
               a room was joined, or its name, topic, encryption or power
               levels changed; the joined row `rooms` prints, owners included.
@@ -174,7 +184,8 @@ COMMANDS
         The last N messages (default 20, 1-100), oldest first: {room_id,
         limit, count, more, messages: [{event_id, sender, ts, msgtype, body,
         thread, reply_to, data, file}]}. `more` is true when older messages
-        exist beyond N. Refuses an encrypted room.
+        exist beyond N. Refuses an encrypted room. An archived room - or any
+        room the agent left - reads up to the agent's leave.
     open NAME --invite WHO [--invite WHO ...] [--topic TEXT]
         WRITE. Create a room: room version 12, unfederated, unencrypted,
         invite-only, its rights fixed at creation through the power-level
@@ -199,6 +210,9 @@ COMMANDS
         Repeating it is harmless. -> {room_id, joined, grant}.
     leave ROOM
         WRITE. Leave a room, or decline an invite. Repeating it is harmless.
+        A room is never left without an owner: where this agent owns ROOM,
+        no other owner is joined, and anyone else is joined or invited, it
+        is refused (exit 6 owner_cannot_leave) - `archive` closes it.
   An invite waits for the operator: inside a turn the service started
   (AGENTROOMS_TURN), join and leave of a room this agent is invited to are
   refused (exit 4 policy), so the agent neither accepts nor declines for
@@ -220,6 +234,28 @@ COMMANDS
         WRITE. Mark a room so the service wakes this agent on every message
         in it, or take the mark off. The mark is this agent's own room
         account data on the homeserver.
+
+  Owning a room (`rooms` names each room's owners)
+    remove ROOM WHO [--reason TEXT]
+        WRITE. Remove WHO from a room this agent owns: a member is kicked, a
+        pending invite is cancelled; TEXT is the reason WHO is shown. ->
+        {room_id, removed, was}: was is "join" or "invite", or null where
+        WHO was already out, so repeating it is harmless. Refused in a room
+        this agent does not own (exit 6 not_owner, its owners named) or is
+        not in (exit 6 not_member).
+    archive ROOM
+        WRITE. Close a room this agent owns: remove every other member,
+        cancel every pending invite, record the room as archived (its name
+        and the moment) in this agent's account data (agentrooms.archived),
+        then leave it. The history stays on the homeserver, readable to the
+        agent up to its leave (`read`), and `rooms --archived` lists it. ->
+        {room_id, name, archived_at, removed: [{user_id, was}], left,
+        already_archived}. It cannot be undone: nobody is left to invite
+        anyone back. Repeating it is harmless: on a room already archived it
+        answers the record with already_archived true; one stopped part way
+        (exit archive_incomplete, archive_not_recorded or archive_not_left,
+        each naming what was done) finishes when repeated. Refused as
+        remove is.
 
   ROOM is a room id (!abc...) or an alias (#name:example.org) on this
   homeserver; WHO is a user id (@agent:example.org) on this homeserver.
@@ -256,9 +292,17 @@ COMMANDS
     held dismiss ROOM [--from WHO]
         Drop the room's held wakes, or WHO's; no turn runs for them. ->
         {room_id, dismissed: [{kind, event_id, sender}]}.
-  Grant changes and held answer and dismiss are refused (exit 4 policy)
-  inside a turn the service started: who may wake the agent is not the
-  agent's to decide.
+    block list
+        The users this agent blocks: {user_id, blocked: [user ids]}.
+    block add WHO / block remove WHO
+        WRITE. Block WHO, or lift the block. The block list is the agent's
+        m.ignored_user_list on the homeserver, which then withholds WHO's
+        messages and invites from the agent - from every read, every sync
+        and the service - and `rooms` drops WHO's pending invites. Each
+        prints the list as `block list` does; repeating it is harmless.
+  Grant changes, block changes and held answer and dismiss are refused
+  (exit 4 policy) inside a turn the service started: who may wake or reach
+  the agent is not the agent's to decide.
 
   Sessions (read from the project's store, in the agent's own project)
     sessions [--room ROOM]
@@ -542,7 +586,8 @@ CRED_KEYS = [
      "note": "the shared registration token, set once per machine by a person "
              "where the homeserver's registration asks for one; only `register` reads it"},
 ]
-WRITE_VERBS = {"open", "invite", "join", "leave", "post", "mark", "unmark", "grant"}
+WRITE_VERBS = {"open", "invite", "join", "leave", "post", "mark", "unmark", "grant", "remove",
+               "archive", "block"}
 WRITE_DEFAULT = False   # a post reaches other agents and people on a shared server
 MACHINE_READS = ("connections", "doctor", "rooms", "read", "watch")   # outside any project, read-only on the machine's connections
 DOCS_BASE = "https://raw.githubusercontent.com/ai-cluster-one/capabilities/main/capabilities/agentrooms/guides/"
@@ -580,6 +625,8 @@ ROOM_VERSION = "12"
 DATA_KEY = "agentrooms.data"
 MARK_TYPE = "agentrooms.marked"
 GRANT_TYPE = "agentrooms.grant"
+ARCHIVE_TYPE = "agentrooms.archived"
+IGNORED_TYPE = "m.ignored_user_list"
 TIMEOUT = 60.0
 MAX_RETRIES = 3
 
@@ -4277,12 +4324,16 @@ def _held_store():
 NO_HELD = {"count": 0, "senders": []}
 
 
-def cmd_rooms(cfg: dict) -> dict:
+def cmd_rooms(cfg: dict, archived: bool = False) -> dict:
     params = {"filter": json.dumps(ROOMS_FILTER, separators=(",", ":")), "timeout": "0",
               "full_state": "true"}
     with _matrix(cfg) as m:
         try:
             sync = m.call("GET", "/_matrix/client/v3/sync", params=params)
+            # Read directly, not from the sync: a homeserver may answer an initial
+            # sync from a cache, and a block or an archive must show at once.
+            blocked = set(_blocked_users(_read_account(m, cfg, IGNORED_TYPE)))
+            records = _archive_records(_read_account(m, cfg, ARCHIVE_TYPE)) if archived else {}
         except MatrixError as exc:
             _fail(exc)
         groups = (sync or {}).get("rooms") or {}
@@ -4307,7 +4358,12 @@ def cmd_rooms(cfg: dict) -> dict:
             joined.append(row)
     invites = [_invite_row(cfg, room_id, room)
                for room_id, room in sorted((groups.get("invite") or {}).items())]
+    # A blocked inviter's invite leaves the list; unblocking brings it back.
+    invites = [row for row in invites if row["inviter"] not in blocked]
     out = {"user_id": cfg["user_id"], "joined": joined, "invites": invites}
+    if archived:
+        out["archived"] = sorted(({"room_id": room_id, **rec} for room_id, rec in records.items()),
+                                 key=lambda row: (str(row["archived_at"] or ""), row["room_id"]))
     store, project, why = _held_store()
     if store is None:
         out["held_unread"] = why
@@ -4386,11 +4442,14 @@ def cmd_read(cfg: dict, room: str, limit: int) -> dict:
 
 # ── watch ────────────────────────────────────────────────────────────────────
 
-# What `watch` follows: every room event, read receipts, and this connection's
-# mark. The first sync only takes the position, so nothing from before it prints.
+# What `watch` follows: every room event, read receipts, this connection's
+# mark and grant, its archive record and its block list. The first sync only
+# takes the position and what the agent's account data holds, so nothing from
+# before it prints.
+WATCH_ACCOUNT_TYPES = [ARCHIVE_TYPE, IGNORED_TYPE]
 WATCH_FILTER = {
     "presence": {"not_types": ["*"]},
-    "account_data": {"not_types": ["*"]},
+    "account_data": {"types": WATCH_ACCOUNT_TYPES},
     "room": {
         "timeline": {"limit": 50},
         "state": {"types": ROOM_STATE_TYPES},
@@ -4400,7 +4459,7 @@ WATCH_FILTER = {
 }
 WATCH_START_FILTER = {
     "presence": {"not_types": ["*"]},
-    "account_data": {"not_types": ["*"]},
+    "account_data": {"types": WATCH_ACCOUNT_TYPES},
     "room": {"timeline": {"limit": 1}, "state": {"not_types": ["*"]},
              "ephemeral": {"not_types": ["*"]}, "account_data": {"not_types": ["*"]}},
 }
@@ -4460,16 +4519,46 @@ def _live_room_row(m: Matrix, cfg: dict, room_id: str,
     return row
 
 
+def _account_seen(sync: dict) -> dict:
+    """What the agent's account data in a sync holds of what watch follows:
+    {"blocked": [...]} and {"archived": {room id: record}}, each only where the
+    sync carries it."""
+    seen: dict = {}
+    for event in ((sync or {}).get("account_data") or {}).get("events") or []:
+        content = event.get("content") if isinstance(event.get("content"), dict) else {}
+        if event.get("type") == IGNORED_TYPE:
+            seen["blocked"] = _blocked_users(content)
+        elif event.get("type") == ARCHIVE_TYPE:
+            seen["archived"] = _archive_records(content)
+    return seen
+
+
 def _watch_lines(m: Matrix, cfg: dict, sync: dict, rooms: set | None,
-                 joined: set, held_of: "Callable[[str], dict] | None" = None) -> list[dict]:
+                 joined: set, held_of: "Callable[[str], dict] | None" = None,
+                 account: dict | None = None) -> list[dict]:
     """What one sync says, as watch lines, in the order it says it. `joined`
-    is the set of rooms this connection is in, kept current."""
+    is the set of rooms this connection is in, kept current; `account` is what
+    the agent's block list and archive record held, kept current."""
     out: list[dict] = []
+    account = account if account is not None else {}
+    after: list[dict] = []
+    seen = _account_seen(sync)
+    if "blocked" in seen and seen["blocked"] != account.get("blocked"):
+        account["blocked"] = seen["blocked"]
+        after.append({"event": "blocked", "blocked": seen["blocked"]})
+    if "archived" in seen:
+        known = account.get("archived") or {}
+        for room_id, record in sorted(seen["archived"].items()):
+            if known.get(room_id) != record and (rooms is None or room_id in rooms):
+                after.append({"event": "archived", "room_id": room_id, "archived": record})
+        account["archived"] = seen["archived"]
+    blocked = set(account.get("blocked") or [])
     groups = (sync or {}).get("rooms") or {}
     for room_id, room in (groups.get("invite") or {}).items():
         if rooms is None or room_id in rooms:
-            out.append({"event": "invite", "room_id": room_id,
-                        "invite": _invite_row(cfg, room_id, room)})
+            row = _invite_row(cfg, room_id, room)
+            if row["inviter"] not in blocked:
+                out.append({"event": "invite", "room_id": room_id, "invite": row})
     for section in ("join", "leave"):
         for room_id, room in (groups.get(section) or {}).items():
             if rooms is not None and room_id not in rooms:
@@ -4522,7 +4611,7 @@ def _watch_lines(m: Matrix, cfg: dict, sync: dict, rooms: set | None,
                 elif event.get("type") == GRANT_TYPE:
                     out.append({"event": "grant", "room_id": room_id, "grant": _grant_view(
                         _engine().read_grant(event.get("content")))})
-    return out
+    return out + after
 
 
 def _follow_held(cfg: dict, rooms: set | None):
@@ -4620,6 +4709,7 @@ def cmd_watch(cfg: dict, rooms_named: list[str] | None) -> None:
                 _fail(exc)
             since = (first or {}).get("next_batch")
             joined = set(((first or {}).get("rooms") or {}).get("join") or {})
+            account = _account_seen(first)
             followed = _follow_held(cfg, rooms)
             held_of = followed[0] if followed else None
             _watch_line({"event": "ready", "connection": cfg["id"], "user_id": cfg["user_id"],
@@ -4634,7 +4724,7 @@ def cmd_watch(cfg: dict, rooms_named: list[str] | None) -> None:
                 try:
                     sync = m.call("GET", "/_matrix/client/v3/sync",
                                   params={**params, **({"since": since} if since else {})})
-                    lines = _watch_lines(m, cfg, sync, rooms, joined, held_of)
+                    lines = _watch_lines(m, cfg, sync, rooms, joined, held_of, account)
                 except MatrixError as exc:
                     if exc.exit_code != 5:
                         _fail(exc)
@@ -4768,6 +4858,22 @@ def cmd_leave(cfg: dict, room: str) -> dict:
         room_id = _resolve_room(m, cfg, room)
         if os.environ.get(_engine().TURN_ENV) and _pending_invite(m, cfg, room_id) is not None:
             _consent_gate(f"declining the invite to {room_id} (`leave`)")
+        # A room is never left without an owner: an owner who is the last one in
+        # it leaves only through archive while anyone else is joined or invited.
+        try:
+            info = _room_state(m, room_id)
+        except MatrixError as exc:
+            _fail(exc)
+        me = cfg["user_id"]
+        if info is not None and info["members"].get(me) == "join" and me in info["owners"]:
+            others = _others_in(info, me)
+            if others and not any(u in info["owners"] and s == "join" for u, s in others):
+                _die(6, "owner_cannot_leave",
+                     f"this agent owns {room_id} and {len(others)} other(s) are in it or "
+                     f"invited ({', '.join(u for u, _s in others)}): a room is never left "
+                     "without an owner",
+                     f"`{NAME} archive {room_id}` removes everyone else, records the room as "
+                     "archived and leaves it")
         try:
             m.call("POST", f"/_matrix/client/v3/rooms/{_q(room_id)}/leave", body={},
                    idempotent=True)
@@ -4917,6 +5023,185 @@ def cmd_held(args, wanted: str | None) -> dict:
         return {"room_id": room_id, "dismissed": store.dismiss_held(project, cid, room_id, sender)}
     finally:
         store.close()
+
+
+# ── the agent's own account data: archived rooms and blocked senders ────────
+
+
+def _account_path(cfg: dict, kind: str) -> str:
+    return f"/_matrix/client/v3/user/{_q(cfg['user_id'])}/account_data/{kind}"
+
+
+def _read_account(m: Matrix, cfg: dict, kind: str) -> dict:
+    """The agent's account data of `kind`, or {} where it has none. Raises
+    MatrixError."""
+    try:
+        found = m.call("GET", _account_path(cfg, kind))
+    except MatrixError as exc:
+        if exc.exit_code == 3:
+            return {}
+        raise
+    return found if isinstance(found, dict) else {}
+
+
+def _archive_records(content: dict) -> dict[str, dict]:
+    """The archived rooms an `agentrooms.archived` record names: room id ->
+    {name, archived_at}."""
+    rooms = content.get("rooms") if isinstance(content.get("rooms"), dict) else {}
+    return {room_id: {"name": rec.get("name"), "archived_at": rec.get("archived_at")}
+            for room_id, rec in rooms.items()
+            if isinstance(room_id, str) and isinstance(rec, dict)}
+
+
+def _blocked_users(content: dict) -> list[str]:
+    """The user ids an m.ignored_user_list names."""
+    users = content.get("ignored_users") if isinstance(content.get("ignored_users"), dict) else {}
+    return sorted(u for u in users if isinstance(u, str) and u)
+
+
+# ── owning a room: remove a participant, archive the room ───────────────────
+
+
+def _room_state(m: Matrix, room_id: str) -> dict | None:
+    """Who owns a room and who is in it, read from its state as it is now:
+    {name, owners, members: {user id: membership}}; None where this agent may
+    not read it (never joined, or unknown). Raises MatrixError otherwise."""
+    try:
+        state = m.call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/state")
+    except MatrixError as exc:
+        if exc.exit_code == 3 or exc.code == "forbidden":
+            return None
+        raise
+    state = state if isinstance(state, list) else []
+    row = _room_row(room_id, state)
+    members = {e["state_key"]: (e.get("content") or {}).get("membership")
+               for e in state if isinstance(e, dict) and e.get("type") == "m.room.member"
+               and isinstance(e.get("state_key"), str)}
+    return {"name": row["name"], "owners": row["owners"], "members": members}
+
+
+def _others_in(info: dict, user_id: str) -> list[tuple[str, str]]:
+    """Everyone but `user_id` who is joined to or invited into the room."""
+    return sorted((u, s) for u, s in info["members"].items()
+                  if u != user_id and s in ("join", "invite"))
+
+
+def _owner_gate(cfg: dict, room_id: str, info: dict | None, act: str) -> dict:
+    """The room's state where this agent owns it and is in it; refused
+    otherwise, naming who owns it."""
+    if info is None or info["members"].get(cfg["user_id"]) != "join":
+        _die(6, "not_member", f"this agent is not in {room_id}, so it cannot {act}",
+             f"`{NAME} rooms` lists the rooms it is in")
+    if cfg["user_id"] not in info["owners"]:
+        _die(6, "not_owner", f"this agent does not own {room_id}, so it cannot {act}; "
+             f"its owners: {', '.join(info['owners']) or 'none recorded'}",
+             f"only an owner {act.split(' ', 1)[0]}s; `{NAME} rooms` names each room's owners")
+    return info
+
+
+def _kick(m: Matrix, room_id: str, who: str, reason: str | None) -> None:
+    body = {"user_id": who, **({"reason": reason} if reason else {})}
+    m.call("POST", f"/_matrix/client/v3/rooms/{_q(room_id)}/kick", body=body, idempotent=True)
+
+
+def cmd_remove(cfg: dict, room: str, who: str, reason: str | None) -> dict:
+    """Remove a member from a room this agent owns, or cancel an invite into it:
+    one Matrix act, the kick, on either."""
+    who = _local_user(cfg, who)
+    if who == cfg["user_id"]:
+        _die(6, "bad_user", "an agent does not remove itself",
+             f"an owner leaves through `{NAME} archive ROOM`")
+    with _matrix(cfg) as m:
+        room_id = _resolve_room(m, cfg, room)
+        try:
+            info = _owner_gate(cfg, room_id, _room_state(m, room_id),
+                               f"remove {who} from it")
+            was = info["members"].get(who)
+            if was in ("join", "invite"):
+                _kick(m, room_id, who, reason)
+        except MatrixError as exc:
+            _fail(exc)
+    return {"room_id": room_id, "removed": who,
+            "was": was if was in ("join", "invite") else None}
+
+
+def cmd_archive(cfg: dict, room: str) -> dict:
+    """Close a room this agent owns: remove every other member and cancel every
+    invite, record the room as archived in the agent's account data, then
+    leave. The room's history stays readable to the agent up to its leave."""
+    with _matrix(cfg) as m:
+        room_id = _resolve_room(m, cfg, room)
+        try:
+            content = _read_account(m, cfg, ARCHIVE_TYPE)
+            info = _room_state(m, room_id)
+        except MatrixError as exc:
+            _fail(exc)
+        records = _archive_records(content)
+        mine = (info or {}).get("members", {}).get(cfg["user_id"])
+        if room_id in records and mine != "join":
+            return {"room_id": room_id, **records[room_id], "removed": [], "left": True,
+                    "already_archived": True}
+        _owner_gate(cfg, room_id, info, "archive it")
+        removed: list[dict] = []
+        for who, was in _others_in(info, cfg["user_id"]):
+            try:
+                _kick(m, room_id, who, "the room was archived")
+            except MatrixError as exc:
+                done = ", ".join(r["user_id"] for r in removed) or "nobody"
+                _die(exc.exit_code, "archive_incomplete",
+                     f"{room_id} is not archived: removing {who} failed ({exc.message}); "
+                     f"removed before it: {done}",
+                     f"`{NAME} archive {room_id}` again removes whoever is left and finishes")
+            removed.append({"user_id": who, "was": was})
+        record = records.get(room_id) or {"name": info["name"],
+                                          "archived_at": _engine().now_iso()}
+        rooms = dict(content.get("rooms") if isinstance(content.get("rooms"), dict) else {})
+        rooms[room_id] = record
+        try:
+            m.call("PUT", _account_path(cfg, ARCHIVE_TYPE), body={**content, "rooms": rooms})
+        except MatrixError as exc:
+            _die(exc.exit_code, "archive_not_recorded",
+                 f"everyone else was removed from {room_id} ({len(removed)}), but its archive "
+                 f"record was not written, so the agent stays in it: {exc.message}",
+                 f"`{NAME} archive {room_id}` again writes it and leaves")
+        try:
+            m.call("POST", f"/_matrix/client/v3/rooms/{_q(room_id)}/leave", body={},
+                   idempotent=True)
+        except MatrixError as exc:
+            _die(exc.exit_code, "archive_not_left",
+                 f"{room_id} is recorded as archived and everyone else was removed, but the "
+                 f"agent did not leave it: {exc.message}",
+                 f"`{NAME} archive {room_id}` again leaves it")
+    return {"room_id": room_id, **record, "removed": removed, "left": True,
+            "already_archived": False}
+
+
+# ── blocking a sender: the homeserver's ignored-users list ──────────────────
+
+
+def cmd_block(cfg: dict, action: str, who: str | None) -> dict:
+    """Read or change the agent's m.ignored_user_list: the homeserver withholds
+    an ignored user's messages and invites from the agent."""
+    if who is not None:
+        who = _local_user(cfg, who)
+        if who == cfg["user_id"]:
+            _die(6, "bad_user", "an agent does not block itself")
+    with _matrix(cfg) as m:
+        try:
+            content = _read_account(m, cfg, IGNORED_TYPE)
+            users = dict(content.get("ignored_users")
+                         if isinstance(content.get("ignored_users"), dict) else {})
+            if action == "add" and who not in users:
+                users[who] = {}
+            elif action == "remove" and who in users:
+                users.pop(who)
+            else:
+                return {"user_id": cfg["user_id"], "blocked": _blocked_users(content)}
+            content = {**content, "ignored_users": users}
+            m.call("PUT", _account_path(cfg, IGNORED_TYPE), body=content)
+        except MatrixError as exc:
+            _fail(exc)
+    return {"user_id": cfg["user_id"], "blocked": _blocked_users(content)}
 
 
 # ── register ─────────────────────────────────────────────────────────────────
@@ -6647,7 +6932,7 @@ def _parser() -> _Parser:
     login_scope.add_argument("--global", dest="scope", action="store_const", const="global")
     login_scope.add_argument("--project", dest="scope", action="store_const", const="project")
     login.add_argument("--default", action="store_true")
-    sub.add_parser("rooms")
+    sub.add_parser("rooms").add_argument("--archived", action="store_true")
     sub.add_parser("watch").add_argument("--room", action="append")
     sub.add_parser("sessions").add_argument("--room")
     sub.add_parser("turn").add_argument("event")
@@ -6672,6 +6957,16 @@ def _parser() -> _Parser:
         one = gsub.add_parser(verb)
         one.add_argument("room")
         one.add_argument("who")
+    kick = sub.add_parser("remove")
+    kick.add_argument("room")
+    kick.add_argument("who")
+    kick.add_argument("--reason")
+    sub.add_parser("archive").add_argument("room")
+    block = sub.add_parser("block")
+    bsub = block.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    bsub.add_parser("list")
+    for verb in ("add", "remove"):
+        bsub.add_parser(verb).add_argument("who")
     held = sub.add_parser("held")
     hsub = held.add_subparsers(dest="action", required=True, parser_class=_Parser)
     hsub.add_parser("list").add_argument("--room")
@@ -6827,9 +7122,19 @@ def main() -> None:
         _emit(cmd_grant(cfg, args.action, args.room, getattr(args, "who", None),
                         getattr(args, "state", None) == "on"))
         return
+    if cmd == "block":
+        if args.action != "list":
+            _consent_gate(f"`{NAME} block {args.action}`")
+        cfg = _cfg(wanted, "block" if args.action != "list" else "block list")
+        _emit(cmd_block(cfg, args.action, getattr(args, "who", None)))
+        return
     cfg = _cfg(wanted, cmd)
     if cmd == "rooms":
-        _emit(cmd_rooms(cfg))
+        _emit(cmd_rooms(cfg, args.archived))
+    elif cmd == "remove":
+        _emit(cmd_remove(cfg, args.room, args.who, args.reason))
+    elif cmd == "archive":
+        _emit(cmd_archive(cfg, args.room))
     elif cmd == "read":
         _emit(cmd_read(cfg, args.room, args.limit))
     elif cmd == "watch":

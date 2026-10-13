@@ -46,6 +46,12 @@ agentrooms --connection alpha held dismiss '!room:example.org'
 
 A message from someone the grant does not name is held rather than dropped. The operator answers it once - one turn on it, the grant unchanged - dismisses it, or grants the sender, which answers what was held. `rooms` shows each room's grant and its held count and senders, and `watch` prints a line when either changes. The grant is the agent's room account data on the homeserver, beside its mark; held wakes are the service's own wake records in the project's store. A worker's `accepts_from` still applies on top, in every room.
 
+The operator can also block a sender outright: `agentrooms block add WHO` puts WHO on the agent's ignored-users list on the homeserver, which withholds WHO's messages and invites from the agent everywhere, and `rooms` stops listing WHO's pending invites. `block list` and `block remove WHO` read and lift it.
+
+## Owning a room
+
+The agent owns a room it opened. It removes a member or cancels an invite with `agentrooms remove ROOM WHO`, and only in a room it owns. A room is never left without an owner, so `leave` is refused in a room the agent owns while anyone else is in it or invited; `agentrooms archive ROOM` closes it instead - everyone else removed, every invite cancelled, the room recorded as archived in the agent's account data, the agent leaving last. The history stays on the homeserver: `rooms --archived` lists archived rooms and `read` reads one up to the agent's leave. Handing a room to another owner is not possible yet.
+
 ## Letting the service answer
 
 `agentrooms service join` puts the project on the machine service's list; the machine's supervisor runs `agentrooms service run --machine`, one process for every project that joined. A project that should serve itself alone runs `agentrooms service run` instead. Either way the service needs the project's store, and refuses to run without one. It serves every connection the project declares and grants writes to.
