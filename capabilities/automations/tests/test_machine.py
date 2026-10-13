@@ -56,34 +56,23 @@ print(f"start {time.time()}", flush=True)
 time.sleep(1.0)
 print(f"end {time.time()}", flush=True)
 """
-BEAT = """
-[[automations]]
-id = "beat"
-script = "capabilities/automations/scripts/probe.py"
-every_seconds = 2
-timeout_seconds = 10
-overlap = "skip"
-"""
 CONFIG = """version = 1
 [engine]
 tick_seconds = 0.1
 max_parallel = 2
-timezone = "UTC"
 shutdown_grace_seconds = 1
-
-[[automations]]
-id = "probe"
-script = "capabilities/automations/scripts/probe.py"
-timeout_seconds = 10
-
-[[automations]]
-id = "nap"
-script = "capabilities/automations/scripts/nap.py"
-timeout_seconds = 30
-max_parallel = 2
-max_pending = 10
-overlap = "queue"
 """
+# The automations each fixture project defines in the store, for this machine's
+# node: two run by hand, and `beat`, the one a schedule fires, every minute.
+DEFINITIONS = {
+    "probe": {"script_path": "capabilities/automations/scripts/probe.py",
+              "timeout_seconds": 10},
+    "nap": {"script_path": "capabilities/automations/scripts/nap.py", "timeout_seconds": 30},
+}
+BEAT = {"beat": {"script_path": "capabilities/automations/scripts/probe.py",
+                 "timeout_seconds": 10, "schedule": "* * * * *"}}
+# A scheduled firing comes at the next minute's turn.
+MINUTE = 75
 LINE = re.compile(r"^\S+ automations service \[([^\]]+)\]: ")
 
 
@@ -121,7 +110,8 @@ class Farm:
         self.tmp = tmp
         self.env = {key: value for key, value in os.environ.items() if key not in POINTERS}
         self.env.update(XDG_CONFIG_HOME=str(tmp / "config"), XDG_STATE_HOME=str(tmp / "state"))
-        if store and DSN:
+        self.store = bool(store and DSN)
+        if self.store:
             self.env["AGENTKIT_DB_URL"] = DSN
         self.projects: dict[str, dict] = {}
 
@@ -145,10 +135,21 @@ class Farm:
         (envelope / "automations" / "scripts" / "probe.py").write_text(PROBE)
         (envelope / "automations" / "scripts" / "nap.py").write_text(NAP)
         (envelope / "automations" / "service" / "config.toml").write_text(
-            config if config is not None else CONFIG + (BEAT if beat else ""))
+            config if config is not None else CONFIG)
         (root / ".env").write_text(env_text if env_text is not None
                                    else f"PROJECT_SECRET={name}-secret\n")
         self.projects[name] = {"root": root, "id": project_id, "slug": slug}
+        if self.store:
+            runtime = load_runtime()
+            try:
+                ledger = runtime.RunLedger(project_id, root=root).open()
+            except runtime.StoreUnavailable:
+                return root          # a project whose own store is away on purpose
+            with ledger:
+                for automation, fields in {**DEFINITIONS, **(BEAT if beat else {})}.items():
+                    checked = runtime.check_definition(
+                        root, automation, {**fields, "node": socket.gethostname()})
+                    ledger.save_definition(automation, checked, by="fixture")
         return root
 
     def state(self, name: str) -> Path:
@@ -188,7 +189,7 @@ class Farm:
 
     def runs(self, name: str) -> list[dict]:
         runtime = load_runtime()
-        with runtime.RunLedger(self.projects[name]["id"], "",
+        with runtime.RunLedger(self.projects[name]["id"],
                                root=self.projects[name]["root"]).open() as ledger:
             return ledger.list(limit=500)
 
@@ -384,7 +385,7 @@ def test_one_machine_process_serves_two_projects_and_a_third_keeps_its_own(farm)
         assert queued["project_id"] == farm.projects[name]["id"]
 
     for name in ("alpha", "beta", "gamma"):
-        until(lambda: farm.finished(name, trigger="schedule"), 30, f"{name} scheduled run")
+        until(lambda: farm.finished(name, trigger="schedule"), MINUTE, f"{name} scheduled run")
     for name in ("alpha", "beta"):
         manual = until(lambda: farm.finished(name, trigger="manual"), 30, f"{name} manual run")
         scheduled = farm.finished(name, trigger="schedule")
@@ -433,12 +434,12 @@ def test_one_machine_process_serves_two_projects_and_a_third_keeps_its_own(farm)
 def test_a_project_that_does_not_load_is_paused_or_refused_leaves_the_others_served(farm):
     for name in ("alpha", "beta"):
         farm.project(name)
-    farm.project("delta", config="version = 1\n[[automations]]\nid = \"Bad Id\"\n")
+    farm.project("delta", config="version = 1\n[engine]\ntick_seconds = \"fast\"\n")
     for name in ("alpha", "beta", "delta"):
         assert farm.ok(name, "service", "join")["joined"] is True
     farm.ok(None, "service", "start", "--machine")
     delta = farm.until_state("delta", "error")
-    assert "id must match" in delta["reason"]
+    assert "engine.tick_seconds must be a number" in delta["reason"]
     for name in ("alpha", "beta"):
         farm.until_state(name, "served")
 
@@ -447,12 +448,11 @@ def test_a_project_that_does_not_load_is_paused_or_refused_leaves_the_others_ser
     row = farm.until_state("alpha", "paused")
     assert "maintenance" in row["reason"]
     held = farm.ok("alpha", "run", "probe")["run"]
-    seen_alpha = len(farm.runs("alpha"))
-    seen_beta = len(farm.finished("beta", trigger="schedule"))
-    time.sleep(4.5)
-    assert len(farm.runs("alpha")) == seen_alpha
+    served = farm.ok("beta", "run", "probe")["run"]
+    until(lambda: any(r["id"] == served["id"] and r["status"] == "succeeded"
+                      for r in farm.runs("beta")), 30, "beta's run while alpha is paused")
+    time.sleep(1.0)
     assert any(r["id"] == held["id"] and r["status"] == "pending" for r in farm.runs("alpha"))
-    assert len(farm.finished("beta", trigger="schedule")) > seen_beta
     assert farm.ok("alpha", "service", "resume")["resumed"] is True
     farm.until_state("alpha", "served")
     until(lambda: any(r["id"] == held["id"] and r["status"] == "succeeded"

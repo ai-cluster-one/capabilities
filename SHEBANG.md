@@ -227,7 +227,7 @@ The envelope, the flag parsing and the empty answer are vendored in the contract
 
 ## Project records and the envelope
 
-Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its slug and holds its durable id (resolved as described below). Live configuration is kept in files, apart from the connections, grants, identifiers and policy a project in store mode keeps in its store ([connections in the store](#connections-in-the-store)), and the policy gate comes through the records adapter with every other live record.
+Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its slug and holds its durable id (resolved as described below). Live configuration is kept in files, apart from the connections, grants, identifiers and policy a project in store mode keeps in its store ([connections in the store](#connections-in-the-store)) and the definitions a service runs from - its workers, its scheduled jobs - which the store keeps as versions (DOCTRINE rule 22), and the policy gate comes through the records adapter with every other live record.
 
 All runtime readers open the same records adapter, which maps logical collections onto the established envelope and `$XDG_CONFIG_HOME` layout. Project records resolve before global records; merge collections compose by key, and a connection identity is always taken whole from one scope rather than assembled field by field. A call site asks for a collection, never for a path.
 
@@ -246,7 +246,7 @@ capabilities/
     state/            # capability-written; never committed
 ```
 
-Configuration - settings, references and state - stays in these files, and so do the gate, identifiers, connections and grants in files mode. The database holds only the tables the package designs and migrates for itself: each capability's runtime state ([runtime state in the store](#runtime-state-in-the-store)) and, in store mode, the contract's record tables ([connections in the store](#connections-in-the-store)).
+Configuration - settings, references and state - stays in these files, and so do the gate, identifiers, connections and grants in files mode; a service's definitions - its workers, its scheduled jobs - are versions in the store. The database holds only the tables the package designs and migrates for itself: each capability's runtime state and the definitions its service runs from ([runtime state in the store](#runtime-state-in-the-store)) and, in store mode, the contract's record tables ([connections in the store](#connections-in-the-store)).
 
 **A project resolves its database through one cascade** - the project's env files, then the process environment, then the machine's store setting file - and its levels, keys and file are [the store setting](#the-store-setting).
 

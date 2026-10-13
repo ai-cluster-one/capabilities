@@ -7,73 +7,120 @@
 # ///
 """automations — project-local scheduler and subprocess runner.
 
-Automations keeps schedules and executable scripts in the consuming project's
-capabilities/automations/ files, runs the same way on a developer machine and in an
-agent container, and records operational state in the capabilities store.
+Automations keeps each automation as a definition in the capabilities store,
+scheduled on the one node it names, runs the same way on a developer machine
+and in an agent container, and records its runs in the same store.
 
 Configuration:
-  capabilities/automations/service/config.toml
+  capabilities/automations/service/config.toml holds the scheduler's own
+  [engine] settings and the [agents] profiles. The automations are not in it.
+
+Definitions:
+  An automation is a row of automations_definitions in the store the project
+  resolves (Run ledger), kept as versions: a change saves a new version and
+  the old one stays as history, so a run names the exact version it ran and
+  the version names who saved it. Its fields are: the slug that names it; a
+  description; the script, as exactly one of a path relative to the project
+  root (`script_path`, a file on the node that runs it) or the script itself
+  (`script_body`, which reads no file beside itself and starts with a #! line);
+  arguments; a five-field numeric cron `schedule` read in its `timezone`
+  (default UTC), or none for manual only; the `node` that schedules it, or
+  none; `enabled`; `timeout_seconds` (default 300); and `retries` (default 0).
+  One run of an automation is active at a time across every node, and a
+  firing that finds one is recorded skipped.
+
+  A node schedules the enabled definitions that name it, by the node name its
+  service runs under (AGENT_NODE_NAME, else the host name). Every definition
+  saved is announced on the store, so a running daemon on any machine takes
+  the change up within a tick without a reload, and moving an automation to
+  another node touches no file of either. A row the store holds that does
+  not validate is skipped and named by `list` and `doctor`, and the others
+  run.
+
+  While config.toml still declares [[automations]], every command that reads
+  the declaration refuses with exit 6 `definitions_not_imported`, naming the
+  import; `import`, `agents` and `agent` still answer.
 
 Scripts:
-  Relative paths declared by config.toml. Python files may be ordinary scripts or
-  executable PEP-723/shebang scripts. Every job inherits the daemon environment and
-  receives AUTOMATION_ID, AUTOMATION_RUN_ID, AUTOMATION_ATTEMPT,
-  AUTOMATION_TRIGGER, AUTOMATION_ENVIRONMENT, AUTOMATION_NAMESPACE,
-  AUTOMATION_PROJECT_ROOT, and AUTOMATION_STATE_DIR.
+  A path script is a file in the project; Python files may be ordinary scripts
+  or executable PEP-723/shebang scripts. A body is written to a file of its own
+  under the state root for the one run and removed after it, and runs through
+  its #! line. Either runs in the project root, inherits the daemon
+  environment and receives AUTOMATION_ID, AUTOMATION_RUN_ID,
+  AUTOMATION_ATTEMPT, AUTOMATION_TRIGGER, AUTOMATION_ENVIRONMENT,
+  AUTOMATION_NAMESPACE, AUTOMATION_PROJECT_ROOT, and AUTOMATION_STATE_DIR.
 
 Commands:
   automations help
   automations doctor [--repair]
-      Validate config, scripts, state storage, and daemon status. Fails with
-      `config_stale` when the running daemon loaded a configuration that has
-      changed since, because a daemon reads its declaration once and a
-      supervisor cannot see that it went out of date. Fails with
-      `environment_idle` when the daemon loaded an environment none of the
-      declared automations is declared for, so a daemon that is alive and
-      scheduling nothing stops reading as healthy. `daemon_environment` is the
-      environment that daemon published; `environment` is this invocation's, and
-      the two are ordinarily different. Reports `environment_unknown`, without
-      failing, when a running daemon published no environment at all - one
-      started before this payload - because a missing record says what this
-      answer cannot speak to rather than that anything is wrong.
+      Validate config, definitions, scripts, state storage, and daemon
+      status. Fails with `invalid_definitions` naming each stored definition
+      that does not validate, and with `missing_scripts` for a script path
+      missing on this node. Fails with `config_stale` when the running daemon
+      loaded a declaration that has changed since and it has not taken up.
+      Fails with `node_idle` when the running daemon's node is named by none
+      of the enabled automations, so a daemon that is alive and scheduling
+      nothing stops reading as healthy. `daemon_node` is the node that daemon
+      published, null when it published none; `node` is this invocation's.
       Exits 6 `store_not_configured` when the machine has no store to keep
-      the run ledger in, and 5 when the store cannot be reached. `--repair`
-      is accepted and repairs nothing: the ledger's table is created whole by
-      its own migration.
+      the definitions and runs in, and 5 when the store cannot be reached.
+      `--repair` is accepted and repairs nothing: the tables are created whole
+      by their own migration.
   automations list
-      List configured automations and whether they apply to this environment.
-  automations set <automation-id> [--name TEXT] [--description TEXT] [--enabled true|false]
-      Rename, describe, or switch one automation on or off without editing
-      config.toml by hand. At least one flag is required; `--flag=VALUE` also
-      works. Only the named values of the [[automations]] entry with that id
-      change: every other byte of the file - comments, order, other entries,
-      whitespace - stays as it was, and a key the entry does not declare yet is
-      added as one line directly after the entry's id, name or description.
-      --name is at most 80 characters and --description at most 500, each
-      single-line text: control characters and line or paragraph separators
-      are refused, as is a value that is only whitespace. An empty value
-      (--name '') clears the field: its line, with any comment on that line, is
-      removed, so the entry no longer declares it and the name falls back to
-      the id. --enabled takes exactly true or false; an entry that omits
-      enabled is enabled, so --enabled true leaves such an entry as it is.
-      Nothing is written unless the whole request is valid and the edited file
-      loads exactly as the daemon loads it (exit 6 otherwise; an unknown id
-      exits 3), and the file is replaced atomically, so a failed write leaves
-      it as it was. Writing config.toml requires an explicit project enable,
-      as `service init` does (exit 4 otherwise).
-      When the project's daemon is running and a value changed, the change is
-      published through the `service reload` path and the verb returns once
-      the daemon has taken it up, so a new enabled state is in force without a
-      restart; a daemon that does not take it up exits 5 with the file change
-      standing. With no daemon running the file change alone stands and is
-      read when one starts. The answer is
-      {"item": <the automation's inventory item, as `inventory` reports it>,
-       "changed": [fields whose value changed; empty when none did],
-       "config": <path of the file>,
-       "daemon": {"running": bool, "reloaded": bool, "pid"?: int,
-                  "reason"?: text}}.
+      The project's automations as their active versions say, each with
+      `id`, `version`, `description`, `enabled`, `node`, `scheduled_here`
+      (whether this invocation's node schedules it), `script` (its path, or
+      null for a body), `body` (whether it is one), `arguments`, `schedule`,
+      `timezone`, `timeout_seconds`, `retries`, `created_at` and `created_by`;
+      and `invalid_definitions` when a row is skipped.
+  automations set <automation> [--description TEXT] [--enabled true|false]
+                  [--node NODE] [--schedule CRON] [--timezone ZONE]
+                  [--timeout SEC] [--retries N] [--script PATH | --body FILE|-]
+                  [--arguments JSON] [--base VERSION]
+      Save a new version of the automation with the named fields changed, or
+      create it when it has no active version and --script or --body is given
+      (exit 3 otherwise). At least one field is required; `--flag=VALUE` also
+      works. --script makes the script that path and --body the content of
+      FILE, or of stdin for `-`, each clearing the other. An empty --node,
+      --schedule or --description clears it. --arguments takes a JSON array of
+      strings. --description is single-line text of at most 500 characters.
+      --base names the version the writer read, refused with exit 6
+      `conflict` when another is active now. The whole definition is judged
+      before anything is saved (exit 6 `invalid_definition`), and a request
+      that changes nothing saves no version. Saving requires an explicit
+      project enable, as `service init` does (exit 4 otherwise), and the
+      read-only switch refuses it. The answer is
+      {"automation", "version", "created", "changed": [fields that moved],
+       "item": <as `list` reports it>}.
+  automations remove <automation> [--base VERSION]
+      Clear the active version, leaving the automation's history and no
+      successor. Exit 3 when it has no active version. Gated as `set` is.
+  automations history <automation>
+      Every version of the automation, oldest first, each whole with
+      `version`, `active`, `created_at` and `created_by`.
+  automations import [--apply] [--node ENVIRONMENT=NODE ...]
+      Move config.toml's [[automations]] into the store, all or none, each as
+      a definition whose script stays the file it was. `id` becomes the slug,
+      `name` and `description` the description, `every_seconds` the cron that
+      fires at that rate (a whole number of minutes under an hour, of hours
+      under a day, or one day; anything else is refused), [engine] timezone
+      the definition's timezone, and `environments` the one node: the
+      environment in force here (AUTOMATIONS_ENVIRONMENT, else
+      engine.environment, else development) is this machine's node, and
+      --node maps another; an empty node leaves it on none. An enabled
+      automation whose environments reach no node, or two, refuses the import
+      (exit 6 `definitions_not_importable`), as does an automation the store
+      already holds differently (`definition_differs`). `max_parallel`,
+      `max_pending` and `overlap` are dropped: one run at a time is fixed. With
+      --apply the definitions are saved and the [[automations]] tables and
+      engine.timezone are removed from the file, every other byte kept; without
+      it nothing is written. Answers {"applied", "node", "environment",
+      "config", "automations": [{"automation", "outcome", "node", "schedule",
+      "script", "version"?}], "config_rewritten"?}. --apply is gated as `set`
+      is.
   automations run <automation-id>
-      Enqueue one manual run. The daemon dispatches it asynchronously.
+      Enqueue one manual run, for the automation's node, or for this machine
+      when it names none. The daemon of that node dispatches it.
   automations runs [--limit N] [--status STATUS]
       List recent run records from the run ledger.
   automations show <run-id>
@@ -83,7 +130,7 @@ Commands:
   automations cancel <run-id>
       Cancel a pending run or request termination of a running process.
   automations retry <run-id>
-      Enqueue a new attempt for a completed run.
+      Enqueue a new attempt for a completed run, as `run` places it.
   automations agents
       List agent profiles and which one is the default.
   automations agent <prompt|-> [--profile NAME] [--schema PATH] [--timeout SEC]
@@ -91,7 +138,8 @@ Commands:
       reads the prompt from stdin. --schema names a JSON Schema file and makes
       `answer` a parsed object instead of prose.
   automations service init [--force]
-      Create project-local config and an example script.
+      Create project-local config and an example script; the example is
+      defined in the store with `set`.
   automations service doctor|run|start|stop|status|logs
       Manage the bundled scheduler service. `run` stays in the foreground for
       Docker Compose; `start` is the local background convenience. `run` and
@@ -101,12 +149,13 @@ Commands:
       `machine`), `store_sources`, the files or variables it came from, and
       `schema`; or `store` null with `store_error`.
   automations service reload [--timeout SEC]
-      Publish an edited configuration to the daemon already running, without
-      stopping the jobs it is running. The configuration is validated first, and
-      a daemon that rejects it keeps the one it has. Returns once the daemon
-      publishes the new declaration as loaded, so a success is demonstrated
-      rather than assumed. Changing the state root or the records backend still
-      needs a real restart.
+      Publish an edited config.toml to the daemon already running, without
+      stopping the jobs it is running; definitions saved in the store need no
+      reload. The configuration is validated first, and a daemon that rejects
+      it keeps the one it has. Returns once the daemon publishes the new
+      declaration as loaded, so a success is demonstrated rather than assumed.
+      Changing the state root or the records backend still needs a real
+      restart.
   automations service pause [--reason TEXT]
       Hold this project: its scheduler registers no firing and starts no run
       until resumed, in either mode, and running jobs finish; a manual run
@@ -186,13 +235,14 @@ Machine mode:
   `pause`, `resume` and `inventory` in a joined project work as before and
   speak of the machine process. It loads no project's environment, and its own
   environment supplies no project's AUTOMATIONS_* selectors: each project's
-  declaration and selectors are read inside that project's own resolution,
-  from its own files. Each job starts through `service launch`, which puts the
-  project's .env and .env.local under the job in the job's own process, with
-  the project as its working directory and the same variables a project
+  configuration and selectors are read inside that project's own resolution,
+  from its own files, and its definitions from its store, on the link it
+  holds for that store. Each job starts through `service launch`, which puts
+  the project's .env and .env.local under the job in the job's own process,
+  with the project as its working directory and the same variables a project
   daemon hands it. Before every tick for a project it checks again that the
   project is on the list and enables automations for itself. Every run lands
-  in the one automations_runs table under the project's id and this host.
+  in the one automations_runs table under the project's id and this node.
 
   A project the machine process cannot serve is reported with the reason and
   the others are served. `refused`: it does not enable automations for itself,
@@ -234,8 +284,8 @@ Machine mode:
   `project_id`, `root`, `joined_at`, `joined_by`,
   `present`, `enabled_explicitly`, `state` (`served`, `paused`, `refused`,
   `error`, or null with no machine process) and `reason`, and while it is held
-  its `environment`, `fingerprint`, `reload_error`, `automations`, `running`
-  and `pause`. `service status` in a joined project answers `mode` "machine"
+  its `node`, `environment`, `fingerprint`, `reload_error`, `automations`,
+  `running` and `pause`. `service status` in a joined project answers `mode` "machine"
   and the machine's word on it under `machine`. `doctor --machine` exits 0
   while the process holds its lock, published its status within twice its
   publish interval, runs the machine settings on disk and holds a connection
@@ -265,8 +315,13 @@ Machine mode:
   and `reload`.
 
 Environment:
-  AUTOMATIONS_ENVIRONMENT  Active environment selector (default: development).
-  AUTOMATIONS_NAMESPACE    Coordination namespace (default: project directory name).
+  AGENT_NODE_NAME          The node this machine schedules for (default: the host
+                           name), matched against each definition's node.
+  AUTOMATIONS_ENVIRONMENT  Handed to every job as AUTOMATION_ENVIRONMENT, and the
+                           environment `import` maps to this node (default:
+                           development).
+  AUTOMATIONS_NAMESPACE    Handed to every job as AUTOMATION_NAMESPACE (default:
+                           project directory name).
   AUTOMATIONS_CONFIG       Optional config path override.
   AUTOMATIONS_STATE_DIR    Optional state root override. By default project runtime
                            state lives under $XDG_STATE_HOME/capabilities/projects/
@@ -280,19 +335,25 @@ Environment:
   every invocation made in it, `service status` included, without a shell export.
 
 Run ledger:
-  Runs, the queue and their history live in the table automations_runs of
-  the PostgreSQL the shared capabilities-contract library resolves for the
-  project: the AGENTKIT_DB_* keys in its .env.local / .env, then the same keys
-  in the process environment, then the machine's store setting file that
-  `capabilities store set` writes; the first level that answers is used
-  whole. Each run carries its project's id and the
-  host it was recorded on; its log stays a file on that host.
+  Definitions live in the table automations_definitions, and runs, the queue
+  and their history in automations_runs, of the PostgreSQL the shared
+  capabilities-contract library resolves for the project: the AGENTKIT_DB_*
+  keys in its .env.local / .env, then the same keys in the process
+  environment, then the machine's store setting file that `capabilities store
+  set` writes; the first level that answers is used whole. Each run carries
+  its project's id, the node it belongs to, the definition version it was
+  queued and run under, and the host that started it; its log stays a file
+  on that host. A daemon recovers, claims and counts only its own node's runs,
+  and signals a pid only where its host recorded it. A run of another node
+  still active past its automation's timeout and the shutdown grace is marked
+  interrupted when the automation next fires, so a node that went away holds
+  nothing.
 
 Scheduling:
-  Each automation may use a numeric five-field cron `schedule`, an
-  `every_seconds` interval, or neither (manual only). The one-second ticker only
-  registers due runs and dispatches subprocesses; job logic never runs inside the
-  ticker. `overlap = "skip"` or `"queue"` controls overlapping scheduled runs.
+  Each definition carries a numeric five-field cron `schedule` read in its
+  timezone, or none (manual only). The ticker only registers due runs and
+  dispatches subprocesses; job logic never runs inside the ticker. A firing
+  that finds a run of the automation active on any node is recorded skipped.
 
 Agents:
   A script that needs judgement rather than computation runs one agent turn
@@ -321,23 +382,23 @@ Contract commands:
   automations migrate [status]
 
 Inventory:
-  `automations inventory` reports one item per declared automation, in
-  declaration order. `name` is the display name (name, else id); `state` is
-  disabled | active | other environment | enabled, judged by the running
-  daemon's environment, else this invocation's, and `enabled` when a running
-  daemon published none; `detail` is the schedule as display text. The facts
-  a program reads are `attributes`, by these fixed labels, in this order:
-    id              the config id, exactly as declared
-    description     the declared description; absent when none is declared
-    schedule_kind   cron | interval | manual
-    schedule_value  cron: the expression as declared (text); interval: the
-                    seconds (integer); absent for manual
-    script          the script path as declared
-    environments    the declared environments, comma-separated; absent when
-                    none are declared
+  `automations inventory` reports one item per automation, by slug, read from
+  the store in one query. `name` is the slug; `state` is disabled | no node |
+  active | other node | enabled, judged by the running daemon's node, else
+  this invocation's, and `enabled` when a running daemon published none;
+  `detail` is the schedule as display text, or `manual`. The facts a program
+  reads are `attributes`, by these fixed labels, in this order:
+    id              the slug
+    description     the description; absent when empty
+    schedule_kind   cron | manual
+    schedule_value  the cron expression; absent for manual
+    timezone        the zone the cron is read in; absent for manual
+    script          the script path, or `stored body`
+    node            the node that schedules it; absent when none
   Its `service` carries `ok` and, when false, `problem`: the findings
-  `doctor` makes from this machine alone - missing_scripts, config_stale,
-  environment_idle - and none of the store's.
+  `doctor` makes of the declaration and the daemon - missing_scripts,
+  invalid_definitions, config_stale, node_idle - or why the definitions did
+  not load, and none of the run ledger's.
 
 Exit codes:
   0 success · 3 not found · 4 disabled by project policy · 5 runtime failure ·
@@ -351,6 +412,7 @@ import contextlib
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -3394,16 +3456,16 @@ def _cmd_connections() -> None:
     _emit({"connections": {}})
 
 
-def _judging_environment(runtime, config: dict, state: Path, running: bool) -> str | None:
-    """The environment an automation's state is judged against: the running
-    daemon's published one, else this invocation's; None when a running daemon
-    published none."""
+def _judging_node(runtime, state: Path, running: bool) -> str | None:
+    """The node an automation's state is judged against: the running daemon's
+    published one, else this invocation's; None when a running daemon published
+    none."""
     if running:
-        return runtime.read_daemon_environment(state)
-    return config["engine"]["environment"]
+        return runtime.read_daemon_node(state)
+    return node_name()
 
 
-def _inventory_item(runtime, item: dict, environment: str | None) -> dict:
+def _inventory_item(runtime, item: dict, node: str | None) -> dict:
     """One automation as an inventory item.
 
     The contract's item has no field for an id, a description or a schedule
@@ -3415,29 +3477,28 @@ def _inventory_item(runtime, item: dict, environment: str | None) -> dict:
     if item["schedule"]:
         when = item["schedule"]
         attributes += [{"label": "schedule_kind", "value": "cron"},
-                       {"label": "schedule_value", "value": item["schedule"]}]
-    elif item["every_seconds"]:
-        when = f"every {item['every_seconds']}s"
-        attributes += [{"label": "schedule_kind", "value": "interval"},
-                       {"label": "schedule_value", "value": item["every_seconds"]}]
+                       {"label": "schedule_value", "value": item["schedule"]},
+                       {"label": "timezone", "value": item["timezone"]}]
     else:
         when = "manual"
         attributes.append({"label": "schedule_kind", "value": "manual"})
-    attributes.append({"label": "script", "value": item["script"]})
-    if item["environments"]:
-        attributes.append({"label": "environments",
-                           "value": ", ".join(item["environments"])})
+    attributes.append({"label": "script", "value": item["script"]
+                       if item["script"] is not None else "stored body"})
+    if item["node"] is not None:
+        attributes.append({"label": "node", "value": item["node"]})
     if not item["enabled"]:
         state_word = "disabled"
-    elif environment is None:
+    elif item["node"] is None:
+        state_word = "no node"
+    elif node is None:
         state_word = "enabled"
-    elif runtime.applies(item, environment):
+    elif runtime.scheduled_here(item, node):
         state_word = "active"
     else:
-        state_word = "other environment"
+        state_word = "other node"
     return {
         "group": "automations",
-        "name": item["name"] or item["id"],
+        "name": item["id"],
         "state": state_word,
         "detail": when,
         "attributes": attributes,
@@ -3445,25 +3506,25 @@ def _inventory_item(runtime, item: dict, environment: str | None) -> dict:
 
 
 def _inventory(_network: bool) -> dict:
-    """The automations this project declares, and whether the daemon is up.
+    """The automations this project defines, and whether the daemon is up.
 
-    Everything here is already on this machine - the config file and the pid
-    the daemon left beside its state - so the report never opens the store and
-    never counts a run: a reader asking every capability at once must not pay
-    a query for the asking.
+    The definitions are the store's, so the report reads them there, in one
+    query, and counts no run: a reader asking every capability at once must
+    not pay more than that for the asking. A store that does not answer is
+    the report's problem rather than its failure.
 
     Whether an automation is active is the running daemon's question, not this
-    invocation's: the daemon selects by the environment it was started under,
-    which a terminal opened later does not share. So a running daemon's
-    published environment is the one each automation is judged against, and
-    this invocation's stands in only when no daemon is running. A running
-    daemon that published none leaves the environment undecided, and the
-    report says `enabled` rather than guessing which side of it each one is.
+    invocation's: the daemon schedules for the node it was started as, which a
+    terminal opened later may not share. So a running daemon's published node
+    is the one each automation is judged against, and this invocation's stands
+    in only when no daemon is running. A running daemon that published none
+    leaves the node undecided, and the report says `enabled` rather than
+    guessing which side of it each one is.
 
     The service's state is part of every answer, a project with no
     configuration included, because a reader assembling a project takes it
     from here and nowhere else. So is its verdict: the checks `doctor` makes
-    from this machine alone, and none of the store's."""
+    of the declaration and the running daemon, and none of the run ledger's."""
     root = _project_root()
     if root is None:
         return {"metrics": [{"label": "automations", "value": 0,
@@ -3480,26 +3541,33 @@ def _inventory(_network: bool) -> dict:
                 "service": {**(live or {"state": "not initialized",
                                         "detail": "no configuration in this project"}),
                             "ok": False, "problem": "no configuration in this project"}}
+    errors = io.StringIO()
     try:
-        runtime, config = _load(root)
+        with contextlib.redirect_stderr(errors):
+            runtime, config = _load(root)
     except SystemExit:
+        try:
+            said = json.loads(errors.getvalue().strip().splitlines()[-1])["error"]
+            problem = f"{said['code']}: {said['message']}"
+        except (ValueError, KeyError, IndexError, TypeError):
+            problem = "configuration does not load"
         return {"metrics": [{"label": "automations", "value": 0,
-                             "note": "configuration does not load"}],
+                             "note": "definitions do not load"}],
                 "service": {**(live or {"state": "stopped",
-                                        "detail": "configuration does not load"}),
-                            "ok": False, "problem": "configuration does not load"}}
-    environment = _judging_environment(runtime, config, state, running)
+                                        "detail": "definitions do not load"}),
+                            "ok": False, "problem": problem}}
+    node = _judging_node(runtime, state, running)
     whose = "the running daemon's" if running else "no daemon running"
     declared = config["automations"]
-    items = [_inventory_item(runtime, item, environment) for item in declared]
+    items = [_inventory_item(runtime, item, node) for item in declared]
     active = sum(1 for item in items if item["state"] == "active")
-    if environment is None:
+    if node is None:
         active_metric = {"label": "enabled",
                          "value": sum(1 for item in declared if item["enabled"]),
-                         "note": "the running daemon published no environment"}
+                         "note": "the running daemon published no node"}
     else:
         active_metric = {"label": "active here", "value": active,
-                         "note": f"environment: {environment} ({whose})"}
+                         "note": f"node: {node} ({whose})"}
     return {
         "metrics": [
             {"label": "automations", "value": len(declared)},
@@ -3507,12 +3575,11 @@ def _inventory(_network: bool) -> dict:
         ],
         "items": items,
         "service": {"state": "running" if running else "stopped",
-                    "detail": (f"pid {pid}, environment {environment or 'unpublished'}"
-                               if running else
-                               f"environment: {environment}"),
+                    "detail": (f"pid {pid}, node {node or 'unpublished'}"
+                               if running else f"node: {node}"),
                     **_service_verdict(_service_findings(
                         runtime, config, state, running,
-                        environment if running else None))},
+                        node if running else None))},
     }
 
 
@@ -3522,7 +3589,10 @@ def _service_verdict(found: dict[str, Any]) -> dict[str, Any]:
     if found["missing_scripts"]:
         return {"ok": False, "problem": "missing_scripts: "
                 + ", ".join(map(str, found["missing_scripts"]))}
-    for code in ("config_stale", "environment_idle"):
+    if found["invalid_definitions"]:
+        return {"ok": False, "problem": "invalid_definitions: "
+                + "; ".join(found["invalid_definitions"])}
+    for code in ("config_stale", "node_idle"):
         if found[code] is not None:
             return {"ok": False, "problem": f"{code}: {found[code]['message']}"}
     return {"ok": True}
@@ -3981,12 +4051,23 @@ def _load_config(runtime, root: Path) -> dict[str, Any]:
     return config
 
 
-def _load(root: Path):
+def _load(root: Path, definitions: bool = True):
+    """The runtime and the project's declaration: its file's part and, unless
+    `definitions` is False, its automations as the store holds them."""
     runtime = _runtime_module()
     try:
         config = _load_config(runtime, root)
+    except runtime.DefinitionsNotImported as exc:
+        _die(6, "definitions_not_imported", str(exc),
+             f"run `{NAME} import` to see what moves, then `{NAME} import --apply`")
     except runtime.ConfigError as exc:
         _die(6, "invalid_config", str(exc), "run `automations service init` or repair config.toml")
+    if definitions:
+        try:
+            with runtime.open_ledger(root, config, strict=False) as ledger:
+                runtime.apply_definitions(root, config, ledger.definitions())
+        except runtime.StoreUnavailable as exc:
+            _store_refusal(exc)
     return runtime, config
 
 
@@ -4054,7 +4135,8 @@ def cmd_service_init(force: bool) -> dict[str, Any]:
         "written": written,
         "skipped": skipped,
         "next": [
-            "edit config.toml and add project scripts",
+            f"define an automation in the store: `{NAME} set example --script "
+            f"{script_path.relative_to(root)} --node {node_name()} --schedule '*/5 * * * *'`",
             "run `automations doctor`",
             "run `automations service start` or `automations service run`",
         ],
@@ -4078,7 +4160,7 @@ def service_status(root: Path) -> dict[str, Any]:
     # here, so what it catches now, it says.
     if initialized and counts_error is None:
         try:
-            counts = runtime.counts(root, _load(root)[1])
+            counts = runtime.counts(root, None)
         except Exception as exc:
             counts_error = f"{type(exc).__name__}: {exc}"
     joined = _joined_here()
@@ -4102,6 +4184,10 @@ def service_status(root: Path) -> dict[str, Any]:
         # both. This is the daemon's own answer, published by the daemon; `null`
         # says there is no daemon, or that it is one too old to have published it.
         "daemon_environment": runtime.read_daemon_environment(state) if running else None,
+        # The node this invocation runs as, and the one the running daemon
+        # published, which decides what it schedules.
+        "node": node_name(),
+        "daemon_node": runtime.read_daemon_node(state) if running else None,
         "config": str(_config_path(root)),
         "state_dir": str(state),
         # A `running: false` is a statement about one directory, and a reader who
@@ -4134,17 +4220,25 @@ def _store_named(runtime, root: Path) -> dict[str, Any]:
 
 
 def _service_findings(runtime, config: dict, state: Path, running: bool,
-                      daemon_environment: str | None) -> dict[str, Any]:
-    """What the service's health answer finds from this machine alone: the
-    declared scripts, and whether a running daemon is current and selecting
-    anything. Nothing here reaches the store, so `doctor` and `inventory`
+                      daemon_node: str | None) -> dict[str, Any]:
+    """What the service's health answer finds of the declaration and the
+    running daemon: the scripts the node runs from files, the definitions that
+    do not validate, and whether a running daemon is current and scheduling
+    anything. Nothing here reads the run ledger, so `doctor` and `inventory`
     judge these by the same code and only `doctor` adds the store's checks."""
+    # A script path is a file on the node that runs it, so only the scripts of
+    # the automations this node runs - its own, and the ones of no node whose
+    # manual runs come to the machine that asks - are looked for here.
+    node = daemon_node if running and daemon_node else node_name()
     missing_scripts = [
-        item["script"] for item in config["automations"] if not item["script_path"].is_file()
+        item["script"] for item in config["automations"]
+        if item["script_path"] is not None and item["node"] in (None, node)
+        and not item["script_path"].is_file()
     ]
-    # A daemon that is alive is not thereby current: it loaded its declaration
-    # once, at startup, and every edit since is something it has never seen.
-    # Nothing else in the system can notice that, so the health answer does.
+    invalid_definitions = list(config.get("definition_problems") or [])
+    # A daemon that is alive is not thereby current: whatever it loaded and
+    # was not told about since is something it has never seen. Nothing else
+    # in the system can notice that, so the health answer does.
     config_stale = None
     if running:
         loaded = runtime.read_config_fingerprint(state)
@@ -4161,66 +4255,33 @@ def _service_findings(runtime, config: dict, state: Path, running: bool,
                     "since; the automations declared now are not the ones it "
                     "is scheduling"
                 ),
-                "hint": "restart the service so the daemon reloads its configuration",
+                "hint": "run `automations service reload` so the daemon takes up "
+                        "the declaration",
             }
-    # A daemon that is alive is not thereby working: it selects what to schedule
-    # by the environment it was started under, which is its own and not this
-    # invocation's, so a supervisor's selector can leave every declared
-    # automation unselected. That daemon ticks, answers, and schedules nothing,
-    # and counting the declarations rather than the selected ones reports it as
-    # healthy. Selection here is by environment alone and not by `applies`,
-    # because an automation switched off is off on purpose and a health answer
-    # that failed over it would be wrong about a project that meant it.
-    #
-    # Only a project whose every automation names an environment can be left
-    # idle this way: one that names none runs under all of them, so a daemon
-    # with even one of those is scheduling regardless and is owed no finding.
-    #
-    # A daemon that published no environment is a different answer and not a
-    # quieter version of this one. The finding is a positive fact - this daemon
-    # holds an environment, and nothing declared here names it - while an
-    # absent record is the absence of the fact that would decide, and inferring
-    # idleness from it would fail every correctly running daemon started before
-    # this payload, on the first health check after an upgrade. So it is said in
-    # the payload instead of in the exit code: `environment_unknown` names what
-    # this answer cannot speak to, and leaves `ok` to the things it can.
-    environment_idle = None
-    environment_unknown = None
-    environment_scoped = config["automations"] and all(
-        item["environments"] for item in config["automations"])
-    if running and environment_scoped:
-        declared = sorted({name for item in config["automations"]
-                           for name in item["environments"]})
-        selected = [item["id"] for item in config["automations"]
-                    if daemon_environment in item["environments"]]
-        if daemon_environment is None:
-            environment_unknown = {
-                "daemon_environment": None,
-                "declared": declared,
-                "message": (
-                    "the running daemon did not record which environment it loaded, so this "
-                    "answer cannot say which of the automations declared here it is "
-                    "scheduling, or whether it is scheduling any; a daemon started before "
-                    "this payload publishes no environment and keeps running across the "
-                    "upgrade, and that is not itself a fault"
-                ),
-                "hint": "restart the service so the daemon publishes the environment it loads",
-            }
-        elif not selected:
-            environment_idle = {
-                "daemon_environment": daemon_environment,
-                "declared": declared,
-                "message": (
-                    f"the running daemon loaded environment {daemon_environment!r}, and none "
-                    f"of the {len(config['automations'])} automations declared here is "
-                    "declared for it, so it is scheduling nothing"
-                ),
-                "hint": "start the service under a declared environment, or declare these "
-                        "automations for the one it runs under",
-            }
-    return {"missing_scripts": missing_scripts, "config_stale": config_stale,
-            "environment_idle": environment_idle,
-            "environment_unknown": environment_unknown}
+    # A daemon that is alive is not thereby working: it schedules the
+    # automations whose node is the one it runs as, which is its own and not
+    # this invocation's, so a supervisor's node name can leave every enabled
+    # automation to other nodes. That daemon ticks, answers, and schedules
+    # nothing. An automation switched off is off on purpose, and a health
+    # answer that failed over it would be wrong about a project that meant it,
+    # so only enabled ones count. A daemon that published no node says nothing
+    # either way, and is owed no finding.
+    node_idle = None
+    enabled = [item for item in config["automations"] if item["enabled"]]
+    if running and daemon_node and enabled and not any(
+            runtime.scheduled_here(item, daemon_node) for item in enabled):
+        node_idle = {
+            "daemon_node": daemon_node,
+            "nodes": sorted({item["node"] for item in enabled if item["node"]}),
+            "message": (
+                f"the running daemon schedules for node {daemon_node!r}, and none of the "
+                f"{len(enabled)} enabled automations here names it, so it is scheduling "
+                "nothing"
+            ),
+            "hint": f"`{NAME} set <automation> --node {daemon_node}` places one on it",
+        }
+    return {"missing_scripts": missing_scripts, "invalid_definitions": invalid_definitions,
+            "config_stale": config_stale, "node_idle": node_idle}
 
 
 def cmd_doctor(repair: bool = False) -> dict[str, Any]:
@@ -4235,32 +4296,25 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
     except Exception as exc:
         _die(5, "state_unavailable", f"the store is unavailable: {exc}")
     status = service_status(root)
-    daemon_environment = status["daemon_environment"]
-    found = _service_findings(runtime, config, state, status["running"],
-                              daemon_environment)
-    missing_scripts = found["missing_scripts"]
-    config_stale = found["config_stale"]
-    environment_idle = found["environment_idle"]
-    environment_unknown = found["environment_unknown"]
+    daemon_node = status["daemon_node"]
+    found = _service_findings(runtime, config, state, status["running"], daemon_node)
     result = {
-        "ok": not missing_scripts and config_stale is None
-        and environment_idle is None,
+        "ok": not found["missing_scripts"] and not found["invalid_definitions"]
+        and found["config_stale"] is None and found["node_idle"] is None,
         "project": str(root),
-        "environment": config["engine"]["environment"],
-        # This invocation's environment is the one above; this is the running
+        "node": node_name(),
+        # This invocation's node is the one above; this is the running
         # daemon's, and only it decides what is actually being scheduled.
-        "daemon_environment": daemon_environment,
+        "daemon_node": daemon_node,
+        "environment": config["engine"]["environment"],
         "namespace": config["engine"]["namespace"],
         "automations": len(config["automations"]),
-        "missing_scripts": missing_scripts,
+        "missing_scripts": found["missing_scripts"],
         "service": status,
     }
-    if config_stale is not None:
-        result["config_stale"] = config_stale
-    if environment_idle is not None:
-        result["environment_idle"] = environment_idle
-    if environment_unknown is not None:
-        result["environment_unknown"] = environment_unknown
+    for code in ("invalid_definitions", "config_stale", "node_idle"):
+        if found[code]:
+            result[code] = found[code]
     if repair:
         result["repaired"] = {
             "repaired": False,
@@ -4269,49 +4323,253 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
     return result
 
 
+def _definition_view(runtime, item: dict, node: str) -> dict[str, Any]:
+    """One automation as `list` and `set` answer it."""
+    return {
+        "id": item["id"],
+        "version": item["version"],
+        "description": item["description"],
+        "enabled": item["enabled"],
+        "node": item["node"],
+        "scheduled_here": runtime.scheduled_here(item, node),
+        "script": item["script"],
+        "body": item["script_body"] is not None,
+        "arguments": item["arguments"],
+        "schedule": item["schedule"],
+        "timezone": item["timezone"],
+        "timeout_seconds": item["timeout_seconds"],
+        "retries": item["retries"],
+        "created_at": item["created_at"],
+        "created_by": item["created_by"],
+    }
+
+
 def cmd_list() -> dict[str, Any]:
     root = _root_required()
     runtime, config = _load(root)
-    environment = config["engine"]["environment"]
-    items = []
-    for item in config["automations"]:
-        items.append(
-            {
-                "id": item["id"],
-                # Authored for whoever reads the listing rather than for the
-                # engine, so this is the surface they exist to reach.
-                "name": item["name"],
-                "description": item["description"],
-                "enabled": item["enabled"],
-                "applies": runtime.applies(item, environment),
-                "environments": item["environments"],
-                "script": item["script"],
-                "schedule": item["schedule"],
-                "every_seconds": item["every_seconds"],
-                "overlap": item["overlap"],
-                "max_parallel": item["max_parallel"],
-                "timeout_seconds": item["timeout_seconds"],
-                "retries": item["retries"],
-            }
-        )
-    return {"environment": environment, "automations": items}
+    node = node_name()
+    answer = {"node": node,
+              "automations": [_definition_view(runtime, item, node)
+                              for item in config["automations"]]}
+    if config["definition_problems"]:
+        answer["invalid_definitions"] = config["definition_problems"]
+    return answer
 
 
-# --- set: editing one entry of config.toml in place ---------------------------
+# --- definitions: writing them, reading their history, importing them -------
 #
-# config.toml is a person's file: its comments carry why each automation exists.
-# So `set` never round-trips it through a serializer. A small scanner locates the
-# byte span of each value, the edit replaces that span (or inserts or removes
-# the one key line), and the candidate is proven twice before it replaces the
-# file: re-parsed to show that only the requested values moved, and loaded by
-# the runtime exactly as the daemon loads it.
+# An automation is a definition in the store, kept as versions: `set` saves a
+# new version, `remove` clears the active one, `history` reads every version,
+# and `import` moves the [[automations]] of a config.toml into the store. Every
+# write is judged by the runtime's own check before it is made, so nothing the
+# daemon would refuse is saved. A daemon takes a saved change up on the store's
+# announcement, wherever it runs, so no write here signals one.
 
-SET_TEXT_LIMITS = {"name": 80, "description": 500}
-SET_FIELDS = ("name", "description", "enabled")
-# Where a key the entry does not declare yet is inserted: after the nearest
-# earlier key of this order that it does declare (`id` always exists).
-_SET_KEY_ORDER = ("id", "name", "description", "enabled")
-_SET_SEPARATORS = {" ", " "}
+SET_TEXT_LIMITS = {"description": 500}
+_SET_SEPARATORS = {"\u2028", "\u2029"}
+SET_FLAGS = ("description", "enabled", "node", "schedule", "timezone", "timeout",
+             "retries", "script", "body", "arguments", "base")
+SET_USAGE = (f"{NAME} set <automation> [--description TEXT] [--enabled true|false] "
+             "[--node NODE] [--schedule CRON] [--timezone ZONE] [--timeout SEC] "
+             "[--retries N] [--script PATH | --body FILE|-] [--arguments JSON] [--base VERSION]")
+
+
+def _definitions_write_gate(verb: str) -> Path:
+    """The project a definitions write is made for: one that enables automations
+    for itself, as `service init` requires, outside the read-only switch."""
+    _read_only_gate(f"`{NAME} {verb}`")
+    root = _root_required()
+    if not _project_enabled_explicitly():
+        _die(4, "project_enable_required",
+             f"`{NAME} {verb}` writes the project's automation definitions, which "
+             "requires an explicit project enable",
+             f"ask the user, then run `capabilities enable {NAME} --project`")
+    return root
+
+
+def _write_ledger(runtime, root: Path, config: dict | None = None):
+    """The ledger a definitions write is made on, under the id the project may
+    stamp; refused as the store's or the identity's fault, never as a trace."""
+    try:
+        return runtime.open_ledger(root, config)
+    except runtime.StoreUnavailable as exc:
+        _store_refusal(exc)
+    except runtime.ConfigError as exc:
+        _die(6, "no_project_identity", str(exc), "run `capabilities init` in the project")
+
+
+def _set_text_value(field: str, raw: str) -> str:
+    """The validated value for --description; '' clears it."""
+    limit = SET_TEXT_LIMITS[field]
+    for ch in raw:
+        if unicodedata.category(ch) in {"Cc", "Cs"} or ch in _SET_SEPARATORS:
+            _die(6, "invalid_text",
+                 f"--{field} must be single-line text: control characters and "
+                 f"line or paragraph separators are refused (found U+{ord(ch):04X})")
+    if raw and not raw.strip():
+        _die(6, "invalid_text", f"--{field} must not be only whitespace",
+             f"pass --{field} '' to clear it")
+    if len(raw) > limit:
+        _die(6, "too_long",
+             f"--{field} is {len(raw)} characters; the limit is {limit}")
+    return raw
+
+
+def _parse_set_args(argv: list[str]) -> tuple[str, dict[str, str]]:
+    slug: str | None = None
+    raw: dict[str, str] = {}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("--"):
+            flag, eq, value = arg[2:].partition("=")
+            if flag not in SET_FLAGS:
+                _die(6, "input", f"unknown set option {arg!r}", SET_USAGE)
+            if not eq:
+                if i + 1 >= len(argv):
+                    _die(6, "input", f"--{flag} needs a value", SET_USAGE)
+                i += 1
+                value = argv[i]
+            if flag in raw:
+                _die(6, "input", f"--{flag} given more than once", SET_USAGE)
+            raw[flag] = value
+        elif slug is None:
+            slug = arg
+        else:
+            _die(6, "input", f"unexpected argument {arg!r}", SET_USAGE)
+        i += 1
+    if slug is None:
+        _die(6, "input", "set needs an automation", SET_USAGE)
+    if not set(raw) - {"base"}:
+        _die(6, "input", "set needs at least one field to change", SET_USAGE)
+    if "script" in raw and "body" in raw:
+        _die(6, "input", "--script and --body are the two homes of one script; give one",
+             SET_USAGE)
+    return slug, raw
+
+
+def _set_changes(raw: dict[str, str]) -> dict[str, Any]:
+    """The definition fields a `set` request names, typed; the runtime's check
+    judges them whole once they are laid over the active version."""
+    changes: dict[str, Any] = {}
+    if "description" in raw:
+        changes["description"] = _set_text_value("description", raw["description"])
+    if "enabled" in raw:
+        if raw["enabled"] not in {"true", "false"}:
+            _die(6, "invalid_enabled",
+                 f"--enabled takes exactly true or false, not {raw['enabled']!r}")
+        changes["enabled"] = raw["enabled"] == "true"
+    for flag, field in (("node", "node"), ("schedule", "schedule")):
+        if flag in raw:
+            changes[field] = raw[flag].strip() or None
+    if "timezone" in raw:
+        changes["timezone"] = raw["timezone"]
+    for flag, field in (("timeout", "timeout_seconds"), ("retries", "retries")):
+        if flag in raw:
+            try:
+                changes[field] = int(raw[flag])
+            except ValueError:
+                _die(6, "input", f"--{flag} takes a whole number, not {raw[flag]!r}")
+    if "script" in raw:
+        changes.update(script_path=raw["script"], script_body=None)
+    if "body" in raw:
+        source = raw["body"]
+        try:
+            body = sys.stdin.read() if source == "-" else Path(source).read_text()
+        except (OSError, UnicodeDecodeError) as exc:
+            _die(6, "input", f"the body {source} could not be read: {exc}")
+        changes.update(script_body=body, script_path=None)
+    if "arguments" in raw:
+        try:
+            arguments = json.loads(raw["arguments"])
+        except ValueError:
+            arguments = None
+        if not isinstance(arguments, list) or not all(isinstance(v, str) for v in arguments):
+            _die(6, "input", "--arguments takes a JSON array of strings, as '[\"--all\"]'")
+        changes["arguments"] = arguments
+    return changes
+
+
+def _definition_fields(runtime, row: dict | None) -> dict[str, Any]:
+    if row is None:
+        return dict(runtime.DEFINITION_DEFAULTS)
+    return {name: (list(row[name]) if name == "arguments" else row[name])
+            for name in runtime.DEFINITION_FIELDS}
+
+
+def _version_view(row: dict, whole: bool = True) -> dict[str, Any]:
+    view = {"automation": row["slug"], "version": row["id"], "active": row["active"],
+            "created_at": _stamp(row["created_at"]), "created_by": row["created_by"]}
+    if whole:
+        view.update({name: (list(row[name]) if name == "arguments" else row[name])
+                     for name in ("description", "script_path", "script_body", "arguments",
+                                  "schedule", "timezone", "node", "enabled",
+                                  "timeout_seconds", "retries")})
+    return view
+
+
+def cmd_set(argv: list[str]) -> dict[str, Any]:
+    slug, raw = _parse_set_args(argv)
+    root = _definitions_write_gate("set")
+    runtime, config = _load(root, definitions=False)
+    changes = _set_changes(raw)
+    try:
+        with _write_ledger(runtime, root, config) as ledger:
+            active = ledger.definition(slug)
+            if active is None and "script_path" not in changes \
+                    and "script_body" not in changes:
+                _die(3, "not_found", f"unknown automation {slug!r}",
+                     "give --script or --body to create it; `automations list` shows "
+                     "this project's")
+            before = _definition_fields(runtime, active)
+            try:
+                fields = runtime.check_definition(root, slug, {**before, **changes})
+            except runtime.ConfigError as exc:
+                _die(6, "invalid_definition", str(exc), "nothing was saved")
+            changed = [name for name in runtime.DEFINITION_FIELDS
+                       if active is None or fields[name] != before[name]]
+            try:
+                row, created = ledger.save_definition(slug, fields, by=_actor(),
+                                                      base=raw.get("base"))
+            except runtime.ConfigError as exc:
+                _die(6, "conflict", str(exc), f"read it again with `{NAME} list`")
+    except runtime.StoreUnavailable as exc:
+        _store_refusal(exc)
+    item = runtime.definition_item(root, row)
+    return {"automation": slug, "version": row["id"], "created": created,
+            "changed": changed if created else [],
+            "item": _definition_view(runtime, item, node_name())}
+
+
+def cmd_remove(slug: str, base: str | None) -> dict[str, Any]:
+    root = _definitions_write_gate("remove")
+    runtime, config = _load(root, definitions=False)
+    try:
+        with _write_ledger(runtime, root, config) as ledger:
+            try:
+                removed = ledger.remove_definition(slug, base)
+            except runtime.ConfigError as exc:
+                _die(6, "conflict", str(exc), f"read it again with `{NAME} list`")
+    except runtime.StoreUnavailable as exc:
+        _store_refusal(exc)
+    if removed is None:
+        _die(3, "not_found", f"automation {slug!r} has no active version",
+             f"`{NAME} list` shows this project's automations")
+    return {"automation": slug, "removed": removed["id"]}
+
+
+def cmd_history(slug: str) -> dict[str, Any]:
+    root = _root_required()
+    runtime, config = _load(root, definitions=False)
+    try:
+        with runtime.open_ledger(root, config, strict=False) as ledger:
+            rows = ledger.definition_history(slug)
+    except runtime.StoreUnavailable as exc:
+        _store_refusal(exc)
+    if not rows:
+        _die(3, "not_found", f"no automation {slug!r} was ever saved here",
+             f"`{NAME} list` shows this project's automations")
+    return {"automation": slug, "versions": [_version_view(row) for row in rows]}
 
 
 class _TomlScanError(ValueError):
@@ -4476,119 +4734,30 @@ def _toml_scan(text: str) -> list[dict]:
     return rows
 
 
-def _toml_string(value: str) -> str:
-    """A TOML basic string. Control characters are refused before this, so
-    only the backslash and the quote need escaping."""
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def _set_text_value(field: str, raw: str) -> str | None:
-    """The validated value for --name/--description; None means clear."""
-    if raw == "":
-        return None
-    limit = SET_TEXT_LIMITS[field]
-    for ch in raw:
-        if unicodedata.category(ch) in {"Cc", "Cs"} or ch in _SET_SEPARATORS:
-            _die(6, "invalid_text",
-                 f"--{field} must be single-line text: control characters and "
-                 f"line or paragraph separators are refused (found U+{ord(ch):04X})")
-    if not raw.strip():
-        _die(6, "invalid_text", f"--{field} must not be only whitespace",
-             f"pass --{field} '' to clear it")
-    if len(raw) > limit:
-        _die(6, "too_long",
-             f"--{field} is {len(raw)} characters; the limit is {limit}")
-    return raw
-
-
-def _parse_set_args(argv: list[str]) -> tuple[str, dict[str, Any]]:
-    usage = "automations set <automation-id> [--name TEXT] [--description TEXT] [--enabled true|false]"
-    automation_id: str | None = None
-    raw: dict[str, str] = {}
-    i = 0
-    while i < len(argv):
-        arg = argv[i]
-        if arg.startswith("--"):
-            flag, eq, value = arg[2:].partition("=")
-            if flag not in SET_FIELDS:
-                _die(6, "input", f"unknown set option {arg!r}", usage)
-            if not eq:
-                if i + 1 >= len(argv):
-                    _die(6, "input", f"--{flag} needs a value", usage)
-                i += 1
-                value = argv[i]
-            if flag in raw:
-                _die(6, "input", f"--{flag} given more than once", usage)
-            raw[flag] = value
-        elif automation_id is None:
-            automation_id = arg
-        else:
-            _die(6, "input", f"unexpected argument {arg!r}", usage)
-        i += 1
-    if automation_id is None:
-        _die(6, "input", "set needs an automation id", usage)
-    if not raw:
-        _die(6, "input", "set needs at least one of --name, --description, --enabled", usage)
-    changes: dict[str, Any] = {}
-    for field in ("name", "description"):
-        if field in raw:
-            changes[field] = _set_text_value(field, raw[field])
-    if "enabled" in raw:
-        if raw["enabled"] not in {"true", "false"}:
-            _die(6, "invalid_enabled",
-                 f"--enabled takes exactly true or false, not {raw['enabled']!r}")
-        changes["enabled"] = raw["enabled"] == "true"
-    return automation_id, changes
-
-
-def _edit_entry(text: str, index: int, entry: dict, changes: dict[str, Any]) -> tuple[str, list[str]]:
-    """The document with `changes` applied to the index-th [[automations]]
-    entry, touching only those values' spans; and the fields that changed."""
+def _without_definitions(text: str) -> str:
+    """config.toml without its [[automations]] tables and without
+    `engine.timezone`, which moved onto each definition; every other byte -
+    comments, order, `[engine]` and `[agents]` - stays as it was. A table runs
+    from its header to the next header or the end of the file."""
     rows = _toml_scan(text)
-    headers = [n for n, row in enumerate(rows)
-               if row["kind"] == "array" and row["path"] == ("automations",)]
-    if len(headers) <= index:
-        raise _TomlScanError("the entry is not written as an [[automations]] table")
-    header = headers[index]
-    keys = {row["path"][0]: row for row in rows
-            if row["kind"] == "key" and row["header"] == header and len(row["path"]) == 1}
-    newline = "\r\n" if "\r\n" in text else "\n"
-    edits: list[tuple[int, int, str]] = []
-    changed: list[str] = []
-    for field in SET_FIELDS:
-        if field not in changes:
+    spans: list[tuple[int, int]] = []
+    headers = [n for n, row in enumerate(rows) if row["kind"] in ("table", "array")]
+    for n in headers:
+        row = rows[n]
+        if row["kind"] == "array" and row["path"] == ("automations",):
+            later = [rows[m]["start"] for m in headers if m > n]
+            spans.append((row["start"], later[0] if later else len(text)))
+    for row in rows:
+        if row["kind"] != "key":
             continue
-        wanted = changes[field]
-        current = entry.get(field)
-        if field == "enabled":
-            # An entry that omits `enabled` is enabled; saying so adds nothing.
-            if (current if field in entry else True) == wanted:
-                continue
-            literal = "true" if wanted else "false"
-        else:
-            if current == wanted or (wanted is None and field not in entry):
-                continue
-            literal = None if wanted is None else _toml_string(wanted)
-        changed.append(field)
-        row = keys.get(field)
-        if row is not None and literal is not None:
-            edits.append((*row["value"], literal))
-        elif row is not None:
-            edits.append((row["start"], row["end"], ""))
-        else:
-            anchor = next(keys[k] for k in reversed(_SET_KEY_ORDER[:_SET_KEY_ORDER.index(field)])
-                          if k in keys)
-            line = text[anchor["start"]:anchor["end"]]
-            indent = line[:len(line) - len(line.lstrip(" \t"))]
-            lead = "" if line.endswith("\n") else newline
-            edits.append((anchor["end"], anchor["end"],
-                          f"{lead}{indent}{field} = {literal}{newline}"))
-    # Applied from the end so earlier spans keep their positions; lines
-    # inserted at one point are applied last-field-first to read in field order.
-    for start, end, replacement in sorted(edits, key=lambda e: (e[0], edits.index(e)),
-                                          reverse=True):
-        text = text[:start] + replacement + text[end:]
-    return text, changed
+        in_engine = (row["header"] is not None
+                     and rows[row["header"]]["path"] == ("engine",) and row["path"] == ("timezone",))
+        dotted = row["header"] is None and row["path"] == ("engine", "timezone")
+        if in_engine or dotted:
+            spans.append((row["start"], row["end"]))
+    for start, end in sorted(spans, reverse=True):
+        text = text[:start] + text[end:]
+    return text
 
 
 def _write_atomically(runtime, root: Path, target: Path, data: bytes) -> None:
@@ -4606,100 +4775,106 @@ def _write_atomically(runtime, root: Path, target: Path, data: bytes) -> None:
         try:
             runtime.load_config(root, tmp)
         except runtime.ConfigError as exc:
-            _die(6, "invalid_config",
-                 f"the edited configuration would not load: {exc}",
-                 "nothing was written; repair config.toml and retry")
+            _die(5, "write_failed", f"the file without its definitions would not load: {exc}",
+                 "the definitions are in the store; remove [[automations]] from "
+                 "config.toml by hand")
         os.replace(tmp, target)
     except OSError as exc:
         _die(5, "write_failed", f"cannot write {target}: {exc}",
-             "nothing was written")
+             "the definitions are in the store; remove [[automations]] from "
+             "config.toml by hand")
     finally:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
 
 
-def cmd_set(argv: list[str], timeout: float = 20.0) -> dict[str, Any]:
-    automation_id, changes = _parse_set_args(argv)
-    root = _root_required()
-    if not _project_enabled_explicitly():
-        _die(4, "project_enable_required",
-             f"`{NAME} set` writes the project's config.toml, which requires an "
-             "explicit project enable",
-             f"ask the user, then run `capabilities enable {NAME} --project`")
+def _parse_node_map(values: list[str]) -> dict[str, str | None]:
+    out: dict[str, str | None] = {}
+    for value in values:
+        environment, eq, node = value.partition("=")
+        if not eq or not environment.strip():
+            _die(6, "input", f"--node takes <environment>=<node>, not {value!r}",
+                 "an empty node, as `production=`, leaves that environment's "
+                 "automations on no node")
+        out[environment.strip()] = node.strip() or None
+    return out
+
+
+def cmd_import(apply: bool, nodes: list[str]) -> dict[str, Any]:
+    """Move config.toml's [[automations]] into the store, all or none, each as
+    a definition whose script stays the file it was, then take them out of
+    the file."""
+    if apply:
+        root = _definitions_write_gate("import --apply")
+    else:
+        root = _root_required()
     runtime = _runtime_module()
     config_path = _config_path(root)
     target = config_path.resolve()
     try:
-        original = target.read_bytes()
+        text = target.read_text()
+        document = tomllib.loads(text)
     except FileNotFoundError:
         _die(6, "invalid_config", f"config not found: {config_path}",
              "run `automations service init`")
-    except OSError as exc:
-        _die(5, "read_failed", f"cannot read {config_path}: {exc}")
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        _die(6, "invalid_config", f"cannot read config {config_path}: {exc}")
+    selectors = _project_selectors()
+    environment = (os.environ.get("AUTOMATIONS_ENVIRONMENT")
+                   or selectors.get("AUTOMATIONS_ENVIRONMENT")
+                   or str((document.get("engine") or {}).get("environment") or "development"))
+    here = node_name()
+    definitions, refused = runtime.legacy_definitions(
+        root, document, environment, here, _parse_node_map(nodes))
+    if refused:
+        _die(6, "definitions_not_importable",
+             f"{len(refused)} automation(s) cannot be imported, so none is: "
+             + "; ".join(refused),
+             "repair config.toml, or name the node with --node <environment>=<node>, "
+             "then import again")
+    plan: list[dict[str, Any]] = []
+    ledger = _write_ledger(runtime, root)
     try:
-        text = original.decode("utf-8")
-        document = tomllib.loads(text)
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        _die(6, "invalid_config", f"cannot read config {config_path}: {exc}",
-             "nothing was written; repair config.toml and retry")
-    entries = document.get("automations")
-    entries = entries if isinstance(entries, list) else []
-    index = next((n for n, entry in enumerate(entries)
-                  if isinstance(entry, dict) and entry.get("id") == automation_id), None)
-    if index is None:
-        _die(3, "not_found", f"unknown automation {automation_id!r}",
-             "run `automations list`")
-    try:
-        edited, changed = _edit_entry(text, index, entries[index], changes)
-    except (_TomlScanError, tomllib.TOMLDecodeError, StopIteration) as exc:
-        _die(6, "config_not_editable",
-             f"cannot locate the entry for {automation_id!r} in {config_path}: {exc}",
-             "nothing was written; edit config.toml by hand")
-    # The scanner is proven on every write: the candidate must parse to exactly
-    # the original document with the requested values changed.
-    expected = copy.deepcopy(document)
-    for field, value in changes.items():
-        if value is None:
-            expected["automations"][index].pop(field, None)
-        elif field == "enabled" and "enabled" not in changed:
-            continue
+        with ledger:
+            with ledger.transaction():
+                for one in definitions:
+                    active = ledger.definition(one["slug"])
+                    if active is None:
+                        outcome = "created"
+                    elif _definition_fields(runtime, active) == one["fields"]:
+                        outcome = "unchanged"
+                    else:
+                        _die(6, "definition_differs",
+                             f"automation {one['slug']!r} is already in the store as "
+                             f"version {active['id']}, and differs from config.toml, so "
+                             "nothing is imported",
+                             f"`{NAME} history {one['slug']}` shows it; remove it from the "
+                             f"store with `{NAME} remove {one['slug']}`, or from the file")
+                    entry = {"automation": one["slug"], "outcome": outcome if apply
+                             else f"would_be_{outcome}", "node": one["fields"]["node"],
+                             "schedule": one["fields"]["schedule"],
+                             "script": one["fields"]["script_path"]}
+                    if apply and outcome == "created":
+                        row, _created = ledger.save_definition(one["slug"], one["fields"],
+                                                               by=_actor())
+                        entry["version"] = row["id"]
+                    elif active is not None:
+                        entry["version"] = active["id"]
+                    plan.append(entry)
+    except runtime.StoreUnavailable as exc:
+        _store_refusal(exc)
+    except runtime.ConfigError as exc:
+        _die(6, "conflict", str(exc), "import again")
+    answer: dict[str, Any] = {"applied": apply, "node": here, "environment": environment,
+                              "config": str(config_path), "automations": plan}
+    edited = _without_definitions(text)
+    if edited != text:
+        if apply:
+            _write_atomically(runtime, root, target, edited.encode("utf-8"))
+            answer["config_rewritten"] = True
         else:
-            expected["automations"][index][field] = value
-    try:
-        actual = tomllib.loads(edited)
-    except tomllib.TOMLDecodeError:
-        actual = None
-    if actual != expected:
-        _die(5, "edit_failed",
-             f"the edit to {config_path} did not come out as requested",
-             "nothing was written; edit config.toml by hand")
-    if changed:
-        _write_atomically(runtime, root, target, edited.encode("utf-8"))
-    _, config = _load(root)
-    state = _state_path(root)
-    pid = _read_pid(state / "daemon.pid")
-    running = _pid_alive(pid)
-    if not running:
-        daemon = {"running": False, "reloaded": False,
-                  "reason": "no daemon is running; the file change stands and is "
-                            "read when one starts"}
-    elif not changed:
-        daemon = {"running": True, "reloaded": False, "pid": pid,
-                  "reason": "nothing changed"}
-    else:
-        try:
-            daemon = _publish_reload(runtime, state, pid, config, timeout)
-        except _ReloadFailed as exc:
-            _die(exc.exit_code, exc.code,
-                 f"config.toml was updated, but the running daemon did not take it "
-                 f"up: {exc.message}",
-                 "the file change stands; retry with `automations service reload`")
-        daemon.pop("automations", None)
-        running = _pid_alive(pid)
-    item = runtime.automation_map(config)[automation_id]
-    environment = _judging_environment(runtime, config, state, running)
-    return {"item": _inventory_item(runtime, item, environment),
-            "changed": changed, "config": str(config_path), "daemon": daemon}
+            answer["config_rewritten"] = False
+    return answer
 
 
 def cmd_run(automation_id: str) -> dict[str, Any]:
@@ -4716,14 +4891,14 @@ def cmd_run(automation_id: str) -> dict[str, Any]:
 
 def cmd_runs(limit: int, status: str | None) -> dict[str, Any]:
     root = _root_required()
-    runtime, config = _load(root)
+    runtime, config = _load(root, definitions=False)
     if status and status not in {*runtime.ACTIVE_STATUSES, *runtime.FINAL_STATUSES}:
         _die(6, "invalid_status", f"unknown run status {status!r}")
     return {"runs": runtime.list_runs(root, config, limit=limit, status=status)}
 
 
 def _run_required(root: Path, run_id: str):
-    runtime, config = _load(root)
+    runtime, config = _load(root, definitions=False)
     row = runtime.get_run(root, config, run_id)
     if row is None:
         _die(3, "not_found", f"unknown run {run_id!r}", "run `automations runs`")
@@ -4748,7 +4923,7 @@ def cmd_logs(run_id: str, tail: int) -> dict[str, Any]:
 
 def cmd_cancel(run_id: str) -> dict[str, Any]:
     root = _root_required()
-    runtime, config = _load(root)
+    runtime, config = _load(root, definitions=False)
     row = runtime.request_cancel(root, config, run_id)
     if row is None:
         _die(3, "not_found", f"unknown run {run_id!r}")
@@ -4834,9 +5009,17 @@ def cmd_service_reload(timeout: float) -> dict[str, Any]:
              "start it with `automations service start`")
     try:
         config = runtime.load_effective_config(root, _config_path(root), state)
+    except runtime.DefinitionsNotImported as exc:
+        _die(6, "definitions_not_imported", str(exc),
+             f"run `{NAME} import` to see what moves, then `{NAME} import --apply`")
     except runtime.ConfigError as exc:
         _die(6, "invalid_config", str(exc),
              "the daemon keeps the declaration it has; repair config.toml and retry")
+    try:
+        with runtime.open_ledger(root, config, strict=False) as ledger:
+            runtime.apply_definitions(root, config, ledger.definitions())
+    except runtime.StoreUnavailable as exc:
+        _store_refusal(exc)
     try:
         return _publish_reload(runtime, state, pid, config, timeout)
     except _ReloadFailed as exc:
@@ -6079,9 +6262,19 @@ def _codex_answer(answer_file: Path, stdout: str, structured: bool) -> dict[str,
             "num_turns": None, "session_id": session_id, "tokens": tokens}
 
 
+def _agents_config(root: Path) -> dict[str, Any]:
+    """The declaration as far as `[agents]`, read past [[automations]] not yet
+    imported: a job running mid-migration still gets its agent turn."""
+    runtime = _runtime_module()
+    try:
+        return runtime.load_config(root, _config_path(root), unimported=True)
+    except runtime.ConfigError as exc:
+        _die(6, "invalid_config", str(exc), "run `automations service init` or repair config.toml")
+
+
 def cmd_agents() -> dict[str, Any]:
     root = _root_required()
-    _, config = _load(root)
+    config = _agents_config(root)
     agents = config["agents"]
     return {"default": agents["default"],
             "workers": {name: dict(spec) for name, spec in sorted(agents["workers"].items())}}
@@ -6090,7 +6283,7 @@ def cmd_agents() -> dict[str, Any]:
 def cmd_agent(profile_name: str | None, prompt_raw: str, schema_raw: str | None,
               timeout_override: float | None) -> dict[str, Any]:
     root = _root_required()
-    _, config = _load(root)
+    config = _agents_config(root)
     agents = config["agents"]
     name = profile_name or agents["default"]
     profile = agents["workers"].get(name)
@@ -6150,7 +6343,6 @@ def main() -> None:
         return
     _contract(argv)
     if argv[:1] == ["set"]:
-        _read_only_gate(f"`{NAME} set`")
         # Parsed by hand so a value may start with a dash and every refusal
         # carries the error envelope and exit 6.
         _emit(cmd_set(argv[1:]))
@@ -6162,6 +6354,14 @@ def main() -> None:
     doctor_parser = sub.add_parser("doctor", add_help=False)
     doctor_parser.add_argument("--repair", action="store_true")
     sub.add_parser("list", add_help=False)
+    remove = sub.add_parser("remove", add_help=False)
+    remove.add_argument("automation_id")
+    remove.add_argument("--base")
+    history = sub.add_parser("history", add_help=False)
+    history.add_argument("automation_id")
+    import_parser = sub.add_parser("import", add_help=False)
+    import_parser.add_argument("--apply", action="store_true")
+    import_parser.add_argument("--node", action="append", default=[])
     run = sub.add_parser("run", add_help=False)
     run.add_argument("automation_id")
     runs = sub.add_parser("runs", add_help=False)
@@ -6226,6 +6426,12 @@ def main() -> None:
             raise SystemExit(6)
     elif args.cmd == "list":
         _emit(cmd_list())
+    elif args.cmd == "remove":
+        _emit(cmd_remove(args.automation_id, args.base))
+    elif args.cmd == "history":
+        _emit(cmd_history(args.automation_id))
+    elif args.cmd == "import":
+        _emit(cmd_import(args.apply, args.node))
     elif args.cmd == "run":
         _emit(cmd_run(args.automation_id))
     elif args.cmd == "runs":

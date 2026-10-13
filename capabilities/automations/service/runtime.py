@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -31,18 +32,27 @@ CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 AGENT_KEYS = frozenset(
     {"engine", "model", "effort", "mode", "timeout_seconds", "service_tier"}
 )
-# Exactly the keys the block loop below reads. A key outside it was silently
-# dropped, so a misspelled `arguments` left an automation running on schedule,
-# exiting zero, and doing none of what it was declared to do.
-# `name` and `description` are read for a person rather than for the engine:
-# they change no scheduling, and they carry what an automation is called and
-# why it exists into the listing, so reading one no longer means opening every
-# script. Nothing executing consumes them, which is a fact about their reader.
-AUTOMATION_KEYS = frozenset(
+# The keys an `[[automations]]` entry of config.toml could carry before the
+# definitions moved into the store. Only `import` reads such an entry now, and
+# it refuses one carrying any other key, as the loader did: a key the runtime
+# never read was a declaration silently doing nothing.
+LEGACY_AUTOMATION_KEYS = frozenset(
     {"id", "name", "description", "script", "enabled", "schedule",
      "every_seconds", "timeout_seconds", "max_parallel", "max_pending",
      "overlap", "retries", "arguments", "environments"}
 )
+
+# What one definition holds, each its own column of automations_definitions.
+# `max_parallel`, `max_pending` and `overlap` are not among them: no project
+# ever set them to anything but 1, 1 and skip, so those are fixed here, and
+# one run of an automation at a time holds across every machine on the store.
+DEFINITION_FIELDS = ("description", "script_path", "script_body", "arguments",
+                     "schedule", "timezone", "node", "enabled", "timeout_seconds",
+                     "retries")
+DEFINITION_DEFAULTS = {"description": "", "script_path": None, "script_body": None,
+                       "arguments": [], "schedule": None, "timezone": "UTC",
+                       "node": None, "enabled": True, "timeout_seconds": 300,
+                       "retries": 0}
 
 # Shipped profiles name Claude's rolling aliases, which keep pointing at the
 # newest model of each tier, so the capability carries no model id that ages.
@@ -233,7 +243,9 @@ def load_agents(raw: dict[str, Any]) -> dict[str, Any]:
 
 def load_effective_config(root: Path, config_path: Path,
                           state_dir: Path) -> dict[str, Any]:
-    """The config the scheduler acts on: the project's config file."""
+    """The part of the declaration the project's file holds: `[engine]` and
+    `[agents]`. The automations themselves are the store's, read by
+    `apply_definitions`."""
     return load_config(root, config_path)
 
 
@@ -256,6 +268,9 @@ def config_fingerprint(config: dict[str, Any]) -> str:
     reloads."""
     engine = {key: value for key, value in config["engine"].items()
               if key not in {"environment", "namespace"}}
+    # The automations are the definition rows read from the store, so a change
+    # to one, from any machine, moves the fingerprint of every daemon that
+    # reads the project.
     material = {"version": config["version"], "engine": engine,
                 "automations": config["automations"], "agents": config["agents"]}
     # `default=str` is here for the resolved script paths, which are the one
@@ -279,6 +294,7 @@ def daemon_record(config: dict[str, Any]) -> str:
     return json.dumps({
         "config": config_fingerprint(config),
         "environment": config["engine"]["environment"],
+        "node": NODE_NAME(),
     }, sort_keys=True) + "\n"
 
 
@@ -312,6 +328,13 @@ def read_config_fingerprint(state_dir: Path) -> str | None:
 def read_daemon_environment(state_dir: Path) -> str | None:
     """The environment the running daemon loaded, or None if it published none."""
     value = read_daemon_record(state_dir).get("environment")
+    return value if isinstance(value, str) and value else None
+
+
+def read_daemon_node(state_dir: Path) -> str | None:
+    """The node the running daemon schedules for, or None if it published none:
+    a supervisor's AGENT_NODE_NAME is not visible from a terminal opened later."""
+    value = read_daemon_record(state_dir).get("node")
     return value if isinstance(value, str) and value else None
 
 
@@ -356,36 +379,44 @@ def _registration_id(root: Path, identity: dict, strict: bool = True) -> str | N
     return _handed_project_id(root) or identity.get("id")
 
 
-def load_config(root: Path, config_path: Path) -> dict[str, Any]:
-    """The config as the file declares it."""
+class DefinitionsNotImported(ConfigError):
+    """config.toml still declares `[[automations]]`, which nothing reads since
+    the definitions moved into the store: every command refuses until
+    `automations import --apply` has moved them, so an automation never stops
+    running without anyone having been told."""
+
+
+def load_config(root: Path, config_path: Path,
+                unimported: bool = False) -> dict[str, Any]:
+    """The config as the file declares it. `unimported` reads past
+    [[automations]] still in it, for what reads `[agents]` alone: a running job
+    asking for an agent turn mid-migration is not the one to stop."""
     try:
         raw = tomllib.loads(config_path.read_text())
     except FileNotFoundError as exc:
         raise ConfigError(f"config not found: {config_path}") from exc
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"cannot read config {config_path}: {exc}") from exc
-    return normalise_config(root, raw)
+    return normalise_config(root, raw, unimported)
 
 
 def normalise_config(root: Path, raw: dict[str, Any],
-                     script_root: Path | None = None) -> dict[str, Any]:
-    """Validation and defaulting, shared by both sources. A record that came
-    from the store is checked exactly as one that came from the file, so the
-    two cannot drift into disagreeing about what a valid automation is."""
+                     unimported: bool = False) -> dict[str, Any]:
+    """Validation and defaulting of the file's part of the declaration. Its
+    `automations` start empty: `apply_definitions` fills them from the store."""
     if raw.get("version") != 1:
         raise ConfigError("config version must be 1")
+    if raw.get("automations") and not unimported:
+        raise DefinitionsNotImported(
+            "config.toml still declares [[automations]], and automations are read "
+            "from the store only; `automations import` shows what moves, and "
+            "`automations import --apply` moves them and removes them from the file")
     engine = raw.get("engine") or {}
     if not isinstance(engine, dict):
         raise ConfigError("engine must be a table")
-    timezone_name = str(engine.get("timezone") or "UTC")
-    try:
-        ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError as exc:
-        raise ConfigError(f"unknown timezone {timezone_name!r}") from exc
     normalized_engine = {
         "tick_seconds": _number(engine.get("tick_seconds", 1.0), "engine.tick_seconds", 0.1),
         "max_parallel": _int(engine.get("max_parallel", 4), "engine.max_parallel", 1),
-        "timezone": timezone_name,
         "shutdown_grace_seconds": _number(
             engine.get("shutdown_grace_seconds", 15.0),
             "engine.shutdown_grace_seconds",
@@ -402,96 +433,228 @@ def normalise_config(root: Path, raw: dict[str, Any],
     if recovery not in {"fail", "retry"}:
         raise ConfigError("engine.recovery must be fail or retry")
     normalized_engine["recovery"] = recovery
-    entries = raw.get("automations") or []
-    if not isinstance(entries, list):
-        raise ConfigError("automations must be an array of tables")
-    seen: set[str] = set()
-    automations: list[dict[str, Any]] = []
-    for index, item in enumerate(entries):
-        label = f"automations[{index}]"
-        if not isinstance(item, dict):
-            raise ConfigError(f"{label} must be a table")
-        unknown = sorted(set(item) - AUTOMATION_KEYS)
-        if unknown:
-            raise ConfigError(f"{label} has unknown key(s): {', '.join(unknown)}")
-        automation_id = item.get("id")
-        if not isinstance(automation_id, str) or not ID_RE.fullmatch(automation_id):
-            raise ConfigError(f"{label}.id must match {ID_RE.pattern}")
-        if automation_id in seen:
-            raise ConfigError(f"duplicate automation id {automation_id!r}")
-        seen.add(automation_id)
-        script_raw = item.get("script")
-        if not isinstance(script_raw, str) or not script_raw.strip():
-            raise ConfigError(f"{label}.script must be a non-empty relative path")
-        script = Path(script_raw)
-        if script.is_absolute():
-            boundary = "script cache" if script_root is not None else "project root"
-            raise ConfigError(f"{label}.script must be relative to the {boundary}")
-        allowed_root = (script_root or root).resolve()
-        resolved_script = (allowed_root / script).resolve()
-        try:
-            resolved_script.relative_to(allowed_root)
-        except ValueError as exc:
-            boundary = "script cache" if script_root is not None else "project root"
-            raise ConfigError(f"{label}.script escapes the {boundary}") from exc
-        schedule = item.get("schedule")
-        every_seconds = item.get("every_seconds")
-        if schedule is not None and every_seconds is not None:
-            raise ConfigError(f"{label} may declare schedule or every_seconds, not both")
-        if schedule is not None:
-            if not isinstance(schedule, str):
-                raise ConfigError(f"{label}.schedule must be a string")
-            parse_cron(schedule)
-        if every_seconds is not None:
-            every_seconds = _int(every_seconds, f"{label}.every_seconds", 1)
-        overlap = str(item.get("overlap") or "skip")
-        if overlap not in {"skip", "queue"}:
-            raise ConfigError(f"{label}.overlap must be skip or queue")
-        arguments = item.get("arguments") or []
-        if not isinstance(arguments, list) or not all(isinstance(v, str) for v in arguments):
-            raise ConfigError(f"{label}.arguments must be an array of strings")
-        environments = item.get("environments") or []
-        if not isinstance(environments, list) or not all(
-            isinstance(v, str) and v for v in environments
-        ):
-            raise ConfigError(f"{label}.environments must be an array of strings")
-        name = item.get("name")
-        if name is not None and not isinstance(name, str):
-            raise ConfigError(f"{label}.name must be a string")
-        description = item.get("description")
-        if description is not None and not isinstance(description, str):
-            raise ConfigError(f"{label}.description must be a string")
-        automations.append({
-            "id": automation_id,
-            "name": name or None,
-            "description": description or None,
-            "script": script_raw,
-            "script_path": resolved_script,
-            "enabled": bool(item.get("enabled", True)),
-            "schedule": schedule,
-            "every_seconds": every_seconds,
-            "timeout_seconds": _number(
-                item.get("timeout_seconds", 300), f"{label}.timeout_seconds", 1
-            ),
-            "max_parallel": _int(item.get("max_parallel", 1), f"{label}.max_parallel", 1),
-            "max_pending": _int(item.get("max_pending", 1), f"{label}.max_pending", 0),
-            "overlap": overlap,
-            "retries": _int(item.get("retries", 0), f"{label}.retries", 0),
-            "arguments": arguments,
-            "environments": environments,
-        })
     return {"version": 1, "engine": normalized_engine,
-            "automations": automations, "agents": load_agents(raw)}
+            "automations": [], "agents": load_agents(raw)}
+
+
+def _script_path(root: Path, script: Any, label: str) -> Path:
+    """A script path as a definition declares it, resolved under the project
+    root and refused when it leaves it."""
+    if not isinstance(script, str) or not script.strip():
+        raise ConfigError(f"{label}.script_path must be a non-empty relative path")
+    path = Path(script)
+    if path.is_absolute():
+        raise ConfigError(f"{label}.script_path must be relative to the project root")
+    if ".." in path.parts:
+        raise ConfigError(f"{label}.script_path must not climb out with ..")
+    allowed_root = root.resolve()
+    resolved = (allowed_root / path).resolve()
+    try:
+        resolved.relative_to(allowed_root)
+    except ValueError as exc:
+        raise ConfigError(f"{label}.script_path escapes the project root") from exc
+    return resolved
+
+
+def check_definition(root: Path, slug: Any, fields: dict[str, Any]) -> dict[str, Any]:
+    """One definition's fields, validated and defaulted exactly as the store
+    and the daemon take them; raises ConfigError naming the first fault. The
+    same check runs on every write and on every row read, so a row another
+    writer put in the store is judged as one this CLI wrote."""
+    if not isinstance(slug, str) or not ID_RE.fullmatch(slug):
+        raise ConfigError(f"automation slug {slug!r} must match {ID_RE.pattern}")
+    label = f"automation {slug!r}"
+    unknown = sorted(set(fields) - set(DEFINITION_FIELDS))
+    if unknown:
+        raise ConfigError(f"{label} has unknown field(s): {', '.join(unknown)}")
+    out = {**DEFINITION_DEFAULTS, **fields}
+    if out["description"] is None:
+        out["description"] = ""
+    if not isinstance(out["description"], str):
+        raise ConfigError(f"{label}.description must be text")
+    if (out["script_path"] is None) == (out["script_body"] is None):
+        raise ConfigError(f"{label} must have exactly one of script_path and script_body")
+    if out["script_path"] is not None:
+        _script_path(root, out["script_path"], label)
+    elif not isinstance(out["script_body"], str) or not out["script_body"].strip():
+        raise ConfigError(f"{label}.script_body must be a non-empty script")
+    elif not out["script_body"].startswith("#!"):
+        raise ConfigError(f"{label}.script_body must start with a #! line naming "
+                          "what runs it")
+    arguments = out["arguments"]
+    if not isinstance(arguments, (list, tuple)) or not all(isinstance(v, str) for v in arguments):
+        raise ConfigError(f"{label}.arguments must be an array of strings")
+    out["arguments"] = list(arguments)
+    if out["schedule"] is not None:
+        if not isinstance(out["schedule"], str):
+            raise ConfigError(f"{label}.schedule must be a five-field cron expression")
+        parse_cron(out["schedule"])
+    if not isinstance(out["timezone"], str):
+        raise ConfigError(f"{label}.timezone must name a time zone")
+    try:
+        ZoneInfo(out["timezone"])
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ConfigError(f"{label}.timezone: unknown time zone {out['timezone']!r}") from exc
+    if out["node"] is not None and (not isinstance(out["node"], str) or not out["node"].strip()
+                                    or out["node"] != out["node"].strip()):
+        raise ConfigError(f"{label}.node must name a node, or be null for none")
+    if not isinstance(out["enabled"], bool):
+        raise ConfigError(f"{label}.enabled must be true or false")
+    out["timeout_seconds"] = _int(out["timeout_seconds"], f"{label}.timeout_seconds", 1)
+    out["retries"] = _int(out["retries"], f"{label}.retries", 0)
+    return out
+
+
+def definition_item(root: Path, row: dict[str, Any]) -> dict[str, Any]:
+    """The automation one stored definition declares, as the scheduler acts on
+    it. Raises ConfigError for a row that does not validate."""
+    fields = check_definition(root, row["slug"],
+                              {name: row[name] for name in DEFINITION_FIELDS})
+    script = fields["script_path"]
+    return {
+        "id": row["slug"],
+        "version": str(row["id"]),
+        "description": fields["description"] or None,
+        "script": script,
+        "script_path": _script_path(root, script, row["slug"]) if script else None,
+        "script_body": fields["script_body"],
+        "arguments": fields["arguments"],
+        "schedule": fields["schedule"],
+        "timezone": fields["timezone"],
+        "node": fields["node"],
+        "enabled": fields["enabled"],
+        "timeout_seconds": float(fields["timeout_seconds"]),
+        "retries": fields["retries"],
+        "created_at": iso(row["created_at"]) if isinstance(row["created_at"], datetime)
+        else row["created_at"],
+        "created_by": row["created_by"],
+    }
+
+
+def apply_definitions(root: Path, config: dict[str, Any],
+                      rows: Sequence[dict[str, Any]]) -> list[str]:
+    """Fill `config["automations"]` from the project's active definitions and
+    say which rows were left out. A row that does not validate is skipped and
+    named, never refusing the rest: one bad definition must not stop every
+    other automation of the project."""
+    items: list[dict[str, Any]] = []
+    problems: list[str] = []
+    for row in sorted(rows, key=lambda r: r["slug"]):
+        try:
+            items.append(definition_item(root, row))
+        except ConfigError as exc:
+            problems.append(f"definition {row['id']} of {row['slug']!r} is skipped: {exc}")
+    config["automations"] = items
+    config["definition_problems"] = problems
+    return problems
 
 
 def automation_map(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {item["id"]: item for item in config["automations"]}
 
 
-def applies(item: dict[str, Any], environment: str) -> bool:
-    return item["enabled"] and (
-        not item["environments"] or environment in item["environments"]
-    )
+def scheduled_here(item: dict[str, Any], node: str) -> bool:
+    """Whether the node schedules this automation: it is enabled and names it."""
+    return item["enabled"] and item["node"] == node
+
+
+def runs_here(item: dict[str, Any], node: str) -> bool:
+    """Whether a run queued for the node may start there: the automation is
+    enabled and is the node's, or is no node's, whose manual runs go to the
+    machine that asked."""
+    return item["enabled"] and item["node"] in (None, node)
+
+
+def every_seconds_as_cron(seconds: int) -> str:
+    """An `every_seconds` interval as the five-field cron that fires at the same
+    rate, for `import`; raises ConfigError for one no cron expresses."""
+    if seconds % 60 == 0 and seconds < 3600:
+        minutes = seconds // 60
+        return "* * * * *" if minutes == 1 else f"*/{minutes} * * * *"
+    if seconds % 3600 == 0 and seconds < 86400:
+        hours = seconds // 3600
+        return "0 * * * *" if hours == 1 else f"0 */{hours} * * *"
+    if seconds == 86400:
+        return "0 0 * * *"
+    raise ConfigError(f"every_seconds = {seconds} has no five-field cron equivalent: "
+                      "a whole number of minutes under an hour, of hours under a day, "
+                      "or one day converts")
+
+
+def legacy_definitions(root: Path, raw: dict[str, Any], here_environment: str,
+                       here_node: str, nodes: dict[str, str | None]) -> tuple[list, list]:
+    """The `[[automations]]` entries of a config.toml as store definitions, for
+    `import`: (definitions, refusals). Each definition is
+    {"slug", "fields", "from"}; a refusal names the entry and why it cannot be
+    imported. `environments` becomes the one node: the environment in force here
+    is this node, `nodes` maps the others, and an enabled automation whose
+    environments reach no node, or reach two, is refused rather than imported
+    to stop."""
+    entries = raw.get("automations") or []
+    if not isinstance(entries, list):
+        return [], ["automations must be an array of tables"]
+    timezone_name = str((raw.get("engine") or {}).get("timezone") or "UTC")
+    mapping = {here_environment: here_node, **nodes}
+    out: list[dict[str, Any]] = []
+    refused: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(entries):
+        label = f"automations[{index}]"
+        try:
+            if not isinstance(item, dict):
+                raise ConfigError("must be a table")
+            label = f"automation {item.get('id')!r}"
+            unknown = sorted(set(item) - LEGACY_AUTOMATION_KEYS)
+            if unknown:
+                raise ConfigError(f"has unknown key(s): {', '.join(unknown)}")
+            slug = item.get("id")
+            if slug in seen:
+                raise ConfigError("is declared twice")
+            seen.add(slug)
+            schedule = item.get("schedule")
+            every = item.get("every_seconds")
+            if schedule is not None and every is not None:
+                raise ConfigError("declares schedule and every_seconds")
+            if every is not None:
+                schedule = every_seconds_as_cron(_int(every, "every_seconds", 1))
+            name = item.get("name")
+            description = item.get("description")
+            if name is not None and not isinstance(name, str):
+                raise ConfigError("name must be a string")
+            text = " - ".join(part for part in (name, description) if part)
+            enabled = item.get("enabled", True)
+            environments = item.get("environments") or []
+            if not isinstance(environments, list) or not all(
+                    isinstance(v, str) and v for v in environments):
+                raise ConfigError("environments must be an array of strings")
+            reached = ({here_node} if not environments else
+                       {mapping[env] for env in environments if mapping.get(env)})
+            if len(reached) > 1:
+                raise ConfigError(f"its environments ({', '.join(environments)}) reach "
+                                  f"the nodes {', '.join(sorted(reached))}, and an "
+                                  "automation is scheduled on one node")
+            if not reached and enabled:
+                raise ConfigError(f"none of its environments ({', '.join(environments)}) "
+                                  "names a node: the one in force here is "
+                                  f"{here_environment!r}, node {here_node!r}; pass "
+                                  "--node <environment>=<node> for the one it runs under")
+            timeout = _number(item.get("timeout_seconds", 300), "timeout_seconds", 1)
+            fields = {
+                "description": text,
+                "script_path": item.get("script"),
+                "arguments": item.get("arguments") or [],
+                "schedule": schedule,
+                "timezone": timezone_name,
+                "node": next(iter(reached)) if reached else None,
+                "enabled": enabled,
+                "timeout_seconds": int(math.ceil(timeout)),
+                "retries": item.get("retries", 0),
+            }
+            out.append({"slug": slug, "fields": check_definition(root, slug, fields),
+                        "from": {key: item[key] for key in item}})
+        except ConfigError as exc:
+            refused.append(str(exc) if str(exc).startswith(label) else f"{label}: {exc}")
+    return out, refused
 
 
 # --- the run ledger -------------------------------------------------------------
@@ -502,18 +665,27 @@ def applies(item: dict[str, Any], environment: str) -> bool:
 # library records the steps under is the capability's name, and every object a
 # step creates is named after it.
 #
-# `dedupe_key` is project, environment, automation and scheduled time. It is the
-# whole of the mutual exclusion between machines running one project: whichever
-# inserts a firing first owns it and the other is told. It is unique within its
-# project rather than across the table, because one database serves every
-# project on every machine, and two projects living in directories of the same
-# name would otherwise take each other's firings.
+# `dedupe_key` is automation and scheduled time. It is the whole of the mutual
+# exclusion between machines running one project: whichever inserts a firing
+# first owns it and the other is told. It is unique within its project rather
+# than across the table, because one database serves every project on every
+# machine, and two projects living in directories of the same name would
+# otherwise take each other's firings. (Rows written before the definitions
+# moved into the store carry namespace and environment in front of it.)
 #
-# `host` names the machine a run was recorded on, because the log a run points
-# at is a file on that machine and means nothing on any other.
+# `node` names the node a run belongs to: the one that schedules it, or for a
+# manual run the definition's node, else the machine that asked. Recovery,
+# claims and the node's running count read only the node's own runs, so two
+# machines on one store never take each other's. `host` names the physical
+# machine that started it, because a pid and the log a run points at mean
+# something on that machine alone.
+#
+# The definitions are versions (`0003-definitions`): a body kept in the store
+# has no git history, so a run names the exact version it ran as
+# `definition_id`, and the version names who saved it.
 LEDGER_OWNER = "automations"
 LEDGER_MAJOR = 1
-LEDGER_MINOR = 0
+LEDGER_MINOR = 1
 LEDGER_STEPS = [
     ("0001-runs", """
     CREATE TABLE automations_runs (
@@ -542,6 +714,119 @@ LEDGER_STEPS = [
     ("0002-runs-status-index", """
     CREATE INDEX automations_runs_status_idx
         ON automations_runs (project_id, status, queued_at)
+    """),
+    ("0003-definitions", r"""
+    CREATE TABLE automations_definitions (
+        id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+        project_id      text        NOT NULL CHECK (project_id <> ''),
+        slug            text        NOT NULL CHECK (slug ~ '^[a-z][a-z0-9_-]*$'),
+        description     text        NOT NULL DEFAULT '',
+        script_path     text        CHECK (script_path <> '' AND script_path !~ '^/'
+                                           AND script_path !~ '(^|/)\.\.(/|$)'),
+        script_body     text        CHECK (script_body <> ''),
+        arguments       text[]      NOT NULL DEFAULT '{}',
+        schedule        text,
+        timezone        text        NOT NULL DEFAULT 'UTC',
+        node            text        CHECK (node <> ''),
+        enabled         boolean     NOT NULL DEFAULT true,
+        timeout_seconds integer     NOT NULL DEFAULT 300 CHECK (timeout_seconds > 0),
+        retries         integer     NOT NULL DEFAULT 0 CHECK (retries >= 0),
+        active          boolean     NOT NULL DEFAULT true,
+        created_at      timestamptz NOT NULL DEFAULT clock_timestamp(),
+        created_by      text,
+        CONSTRAINT automations_definitions_one_script
+            CHECK (num_nonnulls(script_path, script_body) = 1)
+    );
+    CREATE UNIQUE INDEX automations_definitions_one_active
+        ON automations_definitions (project_id, slug) WHERE active;
+    CREATE INDEX automations_definitions_history_idx
+        ON automations_definitions (project_id, slug, created_at);
+
+    COMMENT ON TABLE automations_definitions IS
+        'One row is one version of an automation. A change never edits a row: it '
+        'inserts a new version and clears active on the version the writer read, in '
+        'one transaction; removing an automation clears active with no successor. '
+        'History is every version of a slug by created_at.';
+    COMMENT ON COLUMN automations_definitions.script_path IS
+        'The script as a file in the project, relative to its root, on the node that '
+        'runs it. Exactly one of script_path and script_body is set.';
+    COMMENT ON COLUMN automations_definitions.script_body IS
+        'The script itself, run from a temporary file through its #! line. A body '
+        'reads no file beside itself.';
+    COMMENT ON COLUMN automations_definitions.schedule IS
+        'A five-field cron expression read in timezone; null runs only when asked.';
+    COMMENT ON COLUMN automations_definitions.timezone IS
+        'The zone the schedule is read in, kept on the row so its meaning does not '
+        'depend on which machine reads it.';
+    COMMENT ON COLUMN automations_definitions.node IS
+        'The one node that schedules the automation, matched against the node name '
+        'its service runs under; null schedules it nowhere.';
+    COMMENT ON COLUMN automations_definitions.created_by IS
+        'Who saved this version, as the CLI resolved it.';
+
+    CREATE FUNCTION automations_definitions_keep_history() RETURNS trigger AS $$
+    BEGIN
+      IF tg_op = 'UPDATE' AND (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') THEN
+        RETURN new;
+      END IF;
+      RAISE EXCEPTION 'an automation version is never edited or deleted: % on automations_definitions is refused, and only active may move; save a new version instead', lower(tg_op)
+        USING errcode = 'restrict_violation', constraint = 'automations_definitions_history';
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE TRIGGER automations_definitions_keep_history_row
+        BEFORE UPDATE OR DELETE ON automations_definitions
+        FOR EACH ROW EXECUTE FUNCTION automations_definitions_keep_history();
+    CREATE TRIGGER automations_definitions_keep_history_truncate
+        BEFORE TRUNCATE ON automations_definitions
+        FOR EACH STATEMENT EXECUTE FUNCTION automations_definitions_keep_history();
+
+    CREATE FUNCTION automations_definitions_announce() RETURNS trigger AS $$
+    BEGIN
+      PERFORM pg_notify('automations_changed', json_build_object(
+          'schema', tg_table_schema, 'project', new.project_id, 'slug', new.slug)::text);
+      RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE TRIGGER automations_definitions_changed
+        AFTER INSERT OR UPDATE ON automations_definitions
+        FOR EACH ROW EXECUTE FUNCTION automations_definitions_announce();
+    """),
+    ("0004-runs-node", """
+    ALTER TABLE automations_runs ADD COLUMN node text;
+    UPDATE automations_runs SET node = host;
+    ALTER TABLE automations_runs ALTER COLUMN node SET NOT NULL;
+    -- A release from before node existed, still running on another machine
+    -- of the store, inserts no node; its host was the node name it ran under,
+    -- so its run is that node's rather than refused.
+    CREATE FUNCTION automations_runs_node_from_host() RETURNS trigger AS $$
+    BEGIN
+      IF new.node IS NULL THEN
+        new.node := new.host;
+      END IF;
+      RETURN new;
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE TRIGGER automations_runs_node_from_host
+        BEFORE INSERT ON automations_runs
+        FOR EACH ROW EXECUTE FUNCTION automations_runs_node_from_host();
+    ALTER TABLE automations_runs ADD CONSTRAINT automations_runs_node_named CHECK (node <> '');
+    ALTER TABLE automations_runs ADD COLUMN definition_id uuid
+        CONSTRAINT automations_runs_definition_id_fkey
+        REFERENCES automations_definitions (id);
+    CREATE INDEX automations_runs_node_idx
+        ON automations_runs (project_id, node, status, queued_at);
+    COMMENT ON COLUMN automations_runs.node IS
+        'The node the run belongs to; recovery, claims and running counts read only '
+        'their own node''s runs. Rows from before it existed carry their host.';
+    COMMENT ON COLUMN automations_runs.host IS
+        'The machine that recorded or started the run, where its pid and log mean '
+        'something.';
+    COMMENT ON COLUMN automations_runs.definition_id IS
+        'The definition version the run was queued under, and once started the one '
+        'it ran.';
+    COMMENT ON COLUMN automations_runs.environment IS
+        'Rows from before definitions moved into the store: the environment selector; '
+        'since then the node.';
     """),
 ]
 
@@ -607,7 +892,8 @@ def store_key(setting) -> tuple:
                          setting.connect_kwargs().items())), setting.schema)
 
 
-def open_ledger(root: Path, config: dict[str, Any], strict: bool = True) -> "RunLedger":
+def open_ledger(root: Path, config: dict[str, Any] | None = None,
+                strict: bool = True) -> "RunLedger":
     """The ledger of this project's runs, open on the store. The caller closes it.
 
     A run is recorded under the project's id, the one the launching CLI resolves
@@ -620,7 +906,7 @@ def open_ledger(root: Path, config: dict[str, Any], strict: bool = True) -> "Run
         project_id = project_id or _handed_project_id(root) or identity.get("id") or ""
     elif not project_id:
         raise ConfigError("this project declares no id to record its runs under")
-    return RunLedger(project_id, config["engine"]["environment"], root=root).open()
+    return RunLedger(project_id, root=root).open()
 
 
 class StoreLink:
@@ -635,7 +921,13 @@ class StoreLink:
 
     `setting` is the store, as `resolve_store` gives it; without one the link
     resolves the store for `root` when it first opens. `error` is why the link
-    is down, while it is."""
+    is down, while it is.
+
+    It listens on `automations_changed`, which the store announces on every
+    definition saved or removed: the projects it names are collected in
+    `changed` as the connection reads them, and `generation` moves on every
+    open, because what was announced while the link was down is lost and every
+    project on it has to read its definitions again."""
 
     def __init__(self, setting=None, root: Path | None = None):
         self.setting = setting
@@ -644,6 +936,8 @@ class StoreLink:
         self.warnings: list[str] = []
         self.in_transaction = False
         self.error: str | None = None
+        self.changed: set[str] = set()
+        self.generation = 0
 
     @property
     def name(self) -> str:
@@ -661,6 +955,8 @@ class StoreLink:
             result = db.migrate(conn, LEDGER_OWNER, LEDGER_STEPS,
                                 major=LEDGER_MAJOR, minor=LEDGER_MINOR)
             conn.autocommit = True
+            conn.add_notify_handler(self._announced)
+            conn.execute("LISTEN automations_changed")
         except db.DbError as exc:
             conn.close()
             raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
@@ -669,7 +965,24 @@ class StoreLink:
             raise
         self.conn = conn
         self.warnings = list(result.warnings)
+        self.generation += 1
         return self
+
+    def _announced(self, notify) -> None:
+        try:
+            said = json.loads(notify.payload)
+        except ValueError:
+            return
+        if isinstance(said, dict) and said.get("schema") == self.setting.schema \
+                and isinstance(said.get("project"), str):
+            self.changed.add(said["project"])
+
+    def take_changed(self, project_id: str) -> bool:
+        """Whether a definition of the project was announced since last asked."""
+        if project_id in self.changed:
+            self.changed.discard(project_id)
+            return True
+        return False
 
     def close(self) -> None:
         if self.conn is not None:
@@ -704,11 +1017,11 @@ class RunLedger:
     as, and the cancel flag as 0 or 1, so what `runs` and `show` print does not
     depend on how the store keeps them."""
 
-    def __init__(self, project_id: str, environment: str, link: StoreLink | None = None,
+    def __init__(self, project_id: str, link: StoreLink | None = None,
                  root: Path | None = None):
         self.project_id = project_id
-        self.environment = environment
-        self.host = NODE_NAME()
+        self.node = NODE_NAME()
+        self.host = socket.gethostname()
         self._owns_link = link is None
         self.link = link if link is not None else StoreLink(root=root)
 
@@ -771,6 +1084,8 @@ class RunLedger:
             return iso(value)
         if isinstance(value, bool):
             return int(value)
+        if isinstance(value, uuid.UUID):
+            return str(value)
         return value
 
     @classmethod
@@ -811,12 +1126,14 @@ class RunLedger:
         return {row[0]: row[1] for row in rows}
 
     def unfinished(self) -> list[dict[str, Any]]:
-        return self._rows("status IN ('starting', 'running')")
+        """This node's runs that were starting or running."""
+        return self._rows("node = %s AND status IN ('starting', 'running')", (self.node,))
 
     def pending(self, *, lock: bool = False) -> list[dict[str, Any]]:
-        """The queue in order. `lock` holds the rows for the transaction it is
-        read in, so two dispatchers cannot take the same one."""
-        return self._rows("status = 'pending'", order="queued_at, id", lock=lock)
+        """This node's queue in order. `lock` holds the rows for the transaction
+        it is read in, so two dispatchers cannot take the same one."""
+        return self._rows("node = %s AND status = 'pending'", (self.node,),
+                          order="queued_at, id", lock=lock)
 
     def has_active(self, slug: str, statuses: Sequence[str]) -> bool:
         clause, params = self._where("automation_slug = %s", "status = ANY(%s)")
@@ -830,33 +1147,55 @@ class RunLedger:
                              params + [slug, status]).fetchone()[0]
 
     def running(self) -> int:
-        clause, params = self._where("status IN ('starting', 'running')")
+        """How many of this node's runs are starting or running."""
+        clause, params = self._where("node = %s", "status IN ('starting', 'running')")
         return self._execute("SELECT COUNT(*) FROM automations_runs" + clause,
-                             params).fetchone()[0]
+                             params + [self.node]).fetchone()[0]
+
+    def expire_foreign(self, slug: str, older_than_seconds: float) -> int:
+        """Mark interrupted the active runs of the automation that belong to
+        another node and are older than `older_than_seconds`, counted from their
+        start, or from their queueing while pending. One run at a time holds
+        across every node, so a node that went away or was renamed would
+        otherwise hold its automation forever."""
+        clause, params = self._where(
+            "automation_slug = %s", "node <> %s",
+            "status IN ('pending', 'starting', 'running')",
+            "COALESCE(started_at, queued_at) < clock_timestamp() - make_interval(secs => %s)")
+        with self.transaction():
+            return self._execute(
+                "UPDATE automations_runs SET status = 'interrupted', pid = NULL, "
+                "finished_at = %s, summary = 'its node ' || node || ' stopped answering "
+                "for it within its timeout and shutdown grace'" + clause,
+                [iso()] + params + [slug, self.node, older_than_seconds]).rowcount
 
     # -- writes ---------------------------------------------------------------
 
     def claim(self, slug: str, state_dir: Path, *,
               trigger: str, scheduled_for: str | None = None,
               dedupe_key: str | None = None, attempt: int = 1,
-              parent_run_id: str | None = None) -> dict[str, Any] | None:
-        """Take one firing, or find it already taken.
+              parent_run_id: str | None = None, node: str | None = None,
+              definition_id: str | None = None) -> dict[str, Any] | None:
+        """Take one firing, or find it already taken, for `node`, this one's
+        unless named. The log path is this machine's until the run starts,
+        when the machine that starts it writes its own.
 
         The key is the only conflict the insert treats as someone else's win.
         Anything else is a schema the code no longer matches, and a run that
         vanishes quietly is worse than one that fails loudly."""
         run_id = uuid.uuid4().hex
         log_path = state_dir / "runs" / f"{run_id}.log"
+        node = node or self.node
         with self.transaction():
             inserted = self._execute(
                 "INSERT INTO automations_runs (id, project_id, automation_slug, "
                 "environment, trigger, scheduled_for, dedupe_key, status, attempt, "
-                "parent_run_id, queued_at, log_path, host) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s) "
+                "parent_run_id, queued_at, log_path, host, node, definition_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (project_id, dedupe_key) DO NOTHING",
-                (run_id, self.project_id, slug, self.environment, trigger,
+                (run_id, self.project_id, slug, node, trigger,
                  scheduled_for, dedupe_key, attempt, parent_run_id, iso(),
-                 str(log_path), self.host)).rowcount
+                 str(log_path), self.host, node, definition_id)).rowcount
         if not inserted:
             return None
         return self.get(run_id)
@@ -875,20 +1214,92 @@ class RunLedger:
             return self._execute("UPDATE automations_runs SET status = 'starting'" + clause,
                                  params + [run_id]).rowcount == 1
 
+    # -- definitions ----------------------------------------------------------
+
+    def _definition_rows(self, predicates: str, params: Sequence[Any],
+                         order: str = "slug", lock: bool = False) -> list[dict[str, Any]]:
+        sql = ("SELECT * FROM automations_definitions WHERE project_id = %s AND "
+               + predicates + f" ORDER BY {order}" + (" FOR UPDATE" if lock else ""))
+        cursor = self._execute(sql, [self.project_id, *params])
+        names = [c[0] for c in cursor.description]
+        return [{name: (str(value) if isinstance(value, uuid.UUID) else value)
+                 for name, value in zip(names, row)} for row in cursor.fetchall()]
+
+    def definitions(self) -> list[dict[str, Any]]:
+        """The project's active definitions, one per slug."""
+        return self._definition_rows("active", ())
+
+    def definition(self, slug: str, version: str | None = None) -> dict[str, Any] | None:
+        """One definition: the active version, or the version named."""
+        rows = (self._definition_rows("slug = %s AND id::text = %s", (slug, version))
+                if version else self._definition_rows("slug = %s AND active", (slug,)))
+        return rows[0] if rows else None
+
+    def definition_history(self, slug: str) -> list[dict[str, Any]]:
+        return self._definition_rows("slug = %s", (slug,), order="created_at, id")
+
+    def save_definition(self, slug: str, fields: dict[str, Any], *, by: str | None,
+                        base: str | None = None) -> tuple[dict[str, Any], bool]:
+        """Save a version of the definition and say whether one was created: a
+        save identical to the active version creates none. `base` is the
+        version the writer read; without it, the version active now is the one
+        replaced. Raises ConfigError on a conflict."""
+        with self.transaction():
+            active = self._definition_rows("slug = %s AND active", (slug,), lock=True)
+            active = active[0] if active else None
+            if base is not None and (active is None or active["id"] != base):
+                raise ConfigError(
+                    f"automation {slug!r} is no longer at version {base}: "
+                    + (f"{active['id']} is active" if active else "it has no active version"))
+            if active is not None and all(
+                    (list(active[name]) if name == "arguments" else active[name]) == fields[name]
+                    for name in DEFINITION_FIELDS):
+                return active, False
+            if active is not None:
+                self._execute("UPDATE automations_definitions SET active = false "
+                              "WHERE id = %s AND active", [active["id"]])
+            columns = ["project_id", "slug", *DEFINITION_FIELDS, "created_by"]
+            values = [self.project_id, slug, *(fields[name] for name in DEFINITION_FIELDS), by]
+            try:
+                cursor = self._execute(
+                    f"INSERT INTO automations_definitions ({', '.join(columns)}) "
+                    f"VALUES ({', '.join(['%s'] * len(columns))}) RETURNING id", values)
+            except Exception as exc:
+                if type(exc).__name__ != "UniqueViolation":
+                    raise
+                raise ConfigError(f"automation {slug!r} was saved by someone else "
+                                  "first; read it again and save over that") from None
+            created = str(cursor.fetchone()[0])
+        return self.definition(slug, created), True
+
+    def remove_definition(self, slug: str, base: str | None = None) -> dict[str, Any] | None:
+        """Clear `active` on the definition, leaving it no successor; None when
+        it had no active version. Raises ConfigError when `base` is stale."""
+        with self.transaction():
+            rows = self._definition_rows("slug = %s AND active", (slug,), lock=True)
+            if not rows:
+                return None
+            if base is not None and rows[0]["id"] != base:
+                raise ConfigError(f"automation {slug!r} is no longer at version {base}: "
+                                  f"{rows[0]['id']} is active")
+            self._execute("UPDATE automations_definitions SET active = false "
+                          "WHERE id = %s AND active", [rows[0]["id"]])
+        return rows[0]
+
 
 def enqueue_manual(
     root: Path, config: dict[str, Any], state_dir: Path, automation_id: str
 ) -> dict[str, Any]:
+    """Queue one run of the automation for its node, or for this machine when
+    it names none."""
     item = automation_map(config).get(automation_id)
     if item is None:
         raise KeyError(automation_id)
-    if not applies(item, config["engine"]["environment"]):
-        raise ConfigError(
-            f"automation {automation_id!r} is disabled or not enabled for environment "
-            f"{config['engine']['environment']!r}"
-        )
+    if not item["enabled"]:
+        raise ConfigError(f"automation {automation_id!r} is disabled")
     with open_ledger(root, config) as ledger:
-        row = ledger.claim(automation_id, state_dir, trigger="manual")
+        row = ledger.claim(automation_id, state_dir, trigger="manual", node=item["node"],
+                           definition_id=item["version"])
     assert row is not None
     return row
 
@@ -931,14 +1342,12 @@ def retry_run(root: Path, config: dict[str, Any], state_dir: Path,
             raise ConfigError(f"run {run_id} is still {row['status']}")
         slug = row["automation_slug"]
         item = automation_map(config).get(slug)
-        if item is None or not applies(item, config["engine"]["environment"]):
-            raise ConfigError(
-                f"automation {slug!r} is missing, disabled, or outside "
-                f"environment {config['engine']['environment']!r}"
-            )
+        if item is None or not item["enabled"]:
+            raise ConfigError(f"automation {slug!r} is missing or disabled")
         return ledger.claim(
             slug, state_dir, trigger="retry", attempt=int(row["attempt"]) + 1,
-            parent_run_id=row["parent_run_id"] or row["id"])
+            parent_run_id=row["parent_run_id"] or row["id"], node=item["node"],
+            definition_id=item["version"])
 
 
 def _summary(log_path: Path) -> str | None:
@@ -1111,6 +1520,15 @@ class Child:
     started_at: str = ""
     started: bool = False
     outcome: dict[str, Any] | None = None
+    # The definition version the job runs, and the temporary file a script
+    # body runs from, removed once the job has ended.
+    definition_id: str | None = None
+    body_file: Path | None = None
+
+
+# Where a script kept in the store is written for the one run that runs it,
+# under the project's state root.
+BODIES_DIR = "bodies"
 
 
 class Daemon:
@@ -1136,27 +1554,54 @@ class Daemon:
         self._loader = loader
         self._launcher = launcher
         self._log = log
-        self.config = self.load()
-        self.by_id = automation_map(self.config)
         self.children: dict[str, Child] = {}
         self.stop_requested = False
         self.reload_requested = False
         self.reload_error: str | None = None
         self.pause: dict | None = None
+        self.definition_problems: list[str] = []
+        self._generation = -1
+        # The file's part is read first, so a declaration that does not load is
+        # refused before the store is opened for it.
+        file_config = self._load_file()
+        self.runs = runs if runs is not None else open_ledger(self.root)
+        self.config = self.load(file_config)
+        self.by_id = automation_map(self.config)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "runs").mkdir(parents=True, exist_ok=True)
-        if runs is None:
-            self.runs = open_ledger(self.root, self.config)
-        else:
-            self.runs = runs
-            self.runs.environment = self.config["engine"]["environment"]
         for warning in self.runs.warnings:
             self.log(warning)
 
-    def load(self) -> dict[str, Any]:
+    @property
+    def node(self) -> str:
+        return self.runs.node
+
+    def _load_file(self) -> dict[str, Any]:
         if self._loader is not None:
             return self._loader()
         return load_effective_config(self.root, self.config_path, self.state_dir)
+
+    def load(self, file_config: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The declaration: the file's part, and the project's definitions as
+        the store holds them now. A definition that does not validate is
+        logged once and left out, and the others are loaded."""
+        config = file_config if file_config is not None else self._load_file()
+        generation = self.runs.link.generation
+        self.runs.link.take_changed(self.runs.project_id)
+        problems = apply_definitions(self.root, config, self.runs.definitions())
+        for problem in problems:
+            if problem not in self.definition_problems:
+                self.log(problem)
+        self.definition_problems = problems
+        self._generation = generation
+        return config
+
+    def follow_definitions(self) -> None:
+        """Take up the definitions again when the store announced a change to
+        one of this project's, or the link reconnected and may have missed one."""
+        link = self.runs.link
+        if link.generation != self._generation or link.take_changed(self.runs.project_id):
+            self.reload_declaration(self.state_dir / DAEMON_FINGERPRINT_FILE)
 
     def log(self, message: str) -> None:
         if self._log is not None:
@@ -1169,8 +1614,12 @@ class Daemon:
         return self.runs.claim(slug, self.state_dir, **kwargs)
 
     def recover(self) -> None:
+        """Close what this node left starting or running. A pid is signalled
+        only where this machine recorded it: a node name moves with a
+        container that is redeployed, and its old pids were another machine's."""
         rows = self.runs.unfinished()
-        live_pids = [int(row["pid"]) for row in rows if row["pid"]]
+        live_pids = [int(row["pid"]) for row in rows
+                     if row["pid"] and row["host"] == self.runs.host]
         for pid in live_pids:
             _signal_group(pid, signal.SIGTERM)
         if live_pids:
@@ -1199,10 +1648,11 @@ class Daemon:
             if (
                 self.config["engine"]["recovery"] == "retry"
                 and item is not None
-                and applies(item, self.config["engine"]["environment"])
+                and runs_here(item, self.node)
             ):
                 self._claim(slug, trigger="recovery", attempt=int(row["attempt"]) + 1,
-                            parent_run_id=row["parent_run_id"] or row["id"])
+                            parent_run_id=row["parent_run_id"] or row["id"],
+                            definition_id=item["version"])
 
     def _has_active(self, automation_id: str) -> bool:
         return self.runs.has_active(automation_id, ACTIVE_STATUSES)
@@ -1218,41 +1668,34 @@ class Daemon:
         self.pause = pause
 
     def schedule_due(self, now: datetime) -> None:
-        engine = self.config["engine"]
-        local = now.astimezone(ZoneInfo(engine["timezone"]))
+        """Register the firings due now of the automations this node schedules.
+        One run of an automation at a time holds across every node: a firing
+        that finds one active anywhere is recorded skipped, once another
+        node's run past its timeout and grace is closed for it."""
+        grace = self.config["engine"]["shutdown_grace_seconds"]
         for item in self.config["automations"]:
-            if not applies(item, engine["environment"]):
+            if not scheduled_here(item, self.node) or not item["schedule"]:
                 continue
-            scheduled: datetime | None = None
-            if item["every_seconds"]:
-                seconds = item["every_seconds"]
-                scheduled = datetime.fromtimestamp(
-                    int(now.timestamp()) // seconds * seconds, timezone.utc
-                )
-            elif item["schedule"] and cron_matches(item["schedule"], local):
-                scheduled = local.replace(second=0, microsecond=0).astimezone(timezone.utc)
-            if scheduled is None:
+            local = now.astimezone(ZoneInfo(item["timezone"]))
+            if not cron_matches(item["schedule"], local):
                 continue
-            scheduled_text = iso(scheduled)
-            dedupe = ":".join(
-                (engine["namespace"], engine["environment"], item["id"], scheduled_text)
-            )
-            if item["overlap"] == "skip" and self._has_active(item["id"]):
-                self._insert_skipped(item["id"], scheduled_text, dedupe, "overlap policy")
+            scheduled_text = iso(local.replace(second=0, microsecond=0))
+            dedupe = f"{item['id']}:{scheduled_text}"
+            self.runs.expire_foreign(item["id"], item["timeout_seconds"] + grace)
+            if self._has_active(item["id"]):
+                self._insert_skipped(item, scheduled_text, dedupe, "overlap policy")
                 continue
-            pending = self.runs.count_for(item["id"], "pending")
-            if pending >= item["max_pending"]:
-                self._insert_skipped(item["id"], scheduled_text, dedupe, "pending limit")
-                continue
-            self._claim(item["id"], trigger="schedule",
-                        scheduled_for=scheduled_text, dedupe_key=dedupe)
+            self._claim(item["id"], trigger="schedule", scheduled_for=scheduled_text,
+                        dedupe_key=dedupe, definition_id=item["version"])
 
-    def _insert_skipped(self, automation_id: str, scheduled: str, dedupe: str, reason: str) -> None:
+    def _insert_skipped(self, item: dict[str, Any], scheduled: str, dedupe: str,
+                        reason: str) -> None:
         row = self._claim(
-            automation_id,
+            item["id"],
             trigger="schedule",
             scheduled_for=scheduled,
             dedupe_key=dedupe,
+            definition_id=item["version"],
         )
         if row:
             self.runs.update(row["id"], status="skipped", finished_at=iso(), summary=reason)
@@ -1268,13 +1711,13 @@ class Daemon:
             for row in pending:
                 slug = row["automation_slug"]
                 item = self.by_id.get(slug)
-                if item is None or not applies(item, self.config["engine"]["environment"]):
+                if item is None or not runs_here(item, self.node):
                     self.runs.update(
                         row["id"], status="skipped", finished_at=iso(),
-                        summary="automation missing, disabled, or outside environment")
+                        summary="automation missing, disabled, or scheduled on another node")
                     continue
                 if self.runs.count_for(slug, "starting") + \
-                        self.runs.count_for(slug, "running") >= item["max_parallel"]:
+                        self.runs.count_for(slug, "running") >= 1:
                     continue
                 if self.runs.take(row["id"]):
                     return row
@@ -1294,19 +1737,44 @@ class Daemon:
             taken += 1
         return taken
 
+    def _body_file(self, run_id: str, body: str) -> Path:
+        """The script body written where the run starts it from: a file of its
+        own in the project's state root, executable by this user alone."""
+        directory = self.state_dir / BODIES_DIR
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / run_id
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        os.chmod(path, 0o700)
+        return path
+
     def _start(self, row: dict[str, Any]) -> None:
         item = self.by_id[row["automation_slug"]]
-        script = item["script_path"]
-        if not script.is_file():
-            self._finish_without_child(row, "failed", None, f"script not found: {script}")
-            return
-        command = [str(script), *item["arguments"]]
-        if script.suffix == ".py" and not os.access(script, os.X_OK):
-            command = [sys.executable, str(script), *item["arguments"]]
-        elif not os.access(script, os.X_OK):
-            self._finish_without_child(row, "failed", None, f"script is not executable: {script}")
-            return
-        log_path = Path(row["log_path"])
+        body_file: Path | None = None
+        if item["script_body"] is not None:
+            try:
+                body_file = self._body_file(row["id"], item["script_body"])
+            except OSError as exc:
+                self._finish_without_child(row, "failed", None,
+                                           f"cannot write the script body to run: {exc}")
+                return
+            command = [str(body_file), *item["arguments"]]
+        else:
+            script = item["script_path"]
+            if not script.is_file():
+                self._finish_without_child(row, "failed", None, f"script not found: {script}")
+                return
+            command = [str(script), *item["arguments"]]
+            if script.suffix == ".py" and not os.access(script, os.X_OK):
+                command = [sys.executable, str(script), *item["arguments"]]
+            elif not os.access(script, os.X_OK):
+                self._finish_without_child(row, "failed", None,
+                                           f"script is not executable: {script}")
+                return
+        # The log is a file on the machine that runs the job, whichever machine
+        # queued it.
+        log_path = self.state_dir / "runs" / f"{row['id']}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_handle = log_path.open("a", encoding="utf-8")
         env = dict(os.environ)
@@ -1315,7 +1783,9 @@ class Daemon:
             "AUTOMATION_RUN_ID": row["id"],
             "AUTOMATION_ATTEMPT": str(row["attempt"]),
             "AUTOMATION_TRIGGER": row["trigger"],
-            "AUTOMATION_ENVIRONMENT": row["environment"],
+            # What a script reads stays what it read before definitions moved
+            # into the store, though the run row now records the node here.
+            "AUTOMATION_ENVIRONMENT": self.config["engine"]["environment"],
             "AUTOMATION_NAMESPACE": self.config["engine"]["namespace"],
             "AUTOMATION_PROJECT_ROOT": str(self.root),
             "AUTOMATION_STATE_DIR": str(self.state_dir),
@@ -1338,6 +1808,8 @@ class Daemon:
             )
         except OSError as exc:
             log_handle.close()
+            if body_file is not None:
+                body_file.unlink(missing_ok=True)
             self._finish_without_child(row, "failed", None, f"spawn failed: {exc}")
             return
         # Held before it is recorded: a job whose running write fails is still
@@ -1351,6 +1823,8 @@ class Daemon:
             timeout_seconds=item["timeout_seconds"],
             started_monotonic=time.monotonic(),
             started_at=iso(),
+            definition_id=item["version"],
+            body_file=body_file,
         )
         self._record(child)
 
@@ -1435,17 +1909,30 @@ class Daemon:
         or how it ended, after which the daemon lets go of it."""
         if child.outcome is None:
             if not child.started:
-                self.runs.update(child.run_id, status="running", started_at=child.started_at,
-                                 pid=child.process.pid)
+                self.runs.update(child.run_id, **self._started_columns(child))
                 child.started = True
             return
         columns = dict(child.outcome, pid=None)
         if not child.started:
-            columns["started_at"] = child.started_at
+            columns = {**self._started_columns(child), **columns}
         self.runs.update(child.run_id, **columns)
         del self.children[child.run_id]
+        self._discard_body(child)
         if columns["status"] == "failed":
             self._maybe_retry(child.run_id)
+
+    def _started_columns(self, child: Child) -> dict[str, Any]:
+        """What the ledger records of a job as it starts: here, on this machine,
+        with its pid, its log, and the definition version it runs."""
+        return {"status": "running", "started_at": child.started_at,
+                "pid": child.process.pid, "host": self.runs.host,
+                "log_path": str(child.log_path), "definition_id": child.definition_id}
+
+    @staticmethod
+    def _discard_body(child: Child) -> None:
+        if child.body_file is not None:
+            with contextlib.suppress(OSError):
+                child.body_file.unlink()
 
     def _maybe_retry(self, run_id: str) -> None:
         row = self.runs.get(run_id)
@@ -1456,7 +1943,8 @@ class Daemon:
         if item is None or int(row["attempt"]) > item["retries"]:
             return
         self._claim(slug, trigger="retry", attempt=int(row["attempt"]) + 1,
-                    parent_run_id=row["parent_run_id"] or row["id"])
+                    parent_run_id=row["parent_run_id"] or row["id"],
+                    definition_id=item["version"])
 
     def interrupt(self, summary: str = "daemon stopped") -> None:
         """Ask every running job to stop, killing what is still running after
@@ -1499,6 +1987,7 @@ class Daemon:
             try:
                 self._record(child)
             except Exception as exc:
+                self._discard_body(child)
                 if self.children.pop(child.run_id, None) is not None:
                     self.log(f"run {child.run_id} ended with exit code "
                              f"{child.process.returncode} and its outcome is not "
@@ -1528,10 +2017,11 @@ class Daemon:
             return False
         self.config = config
         self.by_id = automation_map(config)
-        self.runs.environment = config["engine"]["environment"]
         self.reload_error = None
         fingerprint_path.write_text(daemon_record(config))
-        self.log(f"reloaded, {len(self.by_id)} automations declared")
+        here = sum(1 for item in config["automations"] if scheduled_here(item, self.node))
+        self.log(f"reloaded, {len(self.by_id)} automations declared, {here} scheduled "
+                 f"on node {self.node}")
         return True
 
     def run(self) -> None:
@@ -1574,9 +2064,12 @@ class Daemon:
             lock.close()
 
     def prepare(self) -> None:
-        """Reap what ended, take up the pause, and register the firings due
-        unless paused: everything a tick does short of starting work."""
+        """Reap what ended, take up changed definitions and the pause, and
+        register the firings due unless paused: everything a tick does short of
+        starting work. Reaping comes first because it supervises the running
+        jobs, which a store that is gone must not hold up."""
         self.reap()
+        self.follow_definitions()
         self.take_pause()
         if self.pause is None:
             self.schedule_due(utc_now())
@@ -1627,6 +2120,9 @@ class ProjectSlot:
         self.refusal: tuple[str, str] | None = None
         self.next_tick = 0.0
         self.leaving: str | None = None
+        # A declaration that failed to load because its store was away is
+        # loaded again once the store answers, without waiting for a reload.
+        self.load_waits_on_store = False
 
     @property
     def slug(self) -> str:
@@ -1652,9 +2148,10 @@ class ProjectSlot:
         try:
             daemon = Daemon(self.host.root, self.host.config_path, self.state_dir,
                             slug=self.slug, loader=self.host.load,
-                            runs=RunLedger(self.project_id, "", link=self.link),
+                            runs=RunLedger(self.project_id, link=self.link),
                             launcher=self.host.launcher, log=self.log)
         except Exception as exc:
+            self.load_waits_on_store = self.link.lost() or isinstance(exc, StoreUnavailable)
             reason = _why(exc)
             if reason != self.load_error:
                 self.log(f"error: its declaration does not load, so nothing is registered "
@@ -1664,9 +2161,12 @@ class ProjectSlot:
                 (self.state_dir / DAEMON_FINGERPRINT_FILE).unlink()
             return False
         self.daemon, self.load_error, self.recovered = daemon, None, False
+        self.load_waits_on_store = False
         write_atomic(self.state_dir / DAEMON_FINGERPRINT_FILE, daemon_record(daemon.config))
-        self.log(f"served: {len(daemon.by_id)} automations declared, environment "
-                 f"{daemon.config['engine']['environment']}")
+        here = sum(1 for item in daemon.config["automations"]
+                   if scheduled_here(item, daemon.node))
+        self.log(f"served: {len(daemon.by_id)} automations declared, {here} scheduled on "
+                 f"node {daemon.node}, environment {daemon.config['engine']['environment']}")
         return True
 
     def tick_seconds(self) -> float:
@@ -1688,6 +2188,8 @@ class ProjectSlot:
     def prepare(self) -> None:
         """The project's part of a pass short of starting work: reap what ended
         and, while it may be served and is not paused, register what is due."""
+        if self.daemon is None and self.load_waits_on_store:
+            self.load()
         daemon = self.daemon
         if daemon is None:
             return
@@ -1695,6 +2197,7 @@ class ProjectSlot:
             daemon.recover()
             self.recovered = True
         daemon.reap()
+        daemon.follow_definitions()
         if self.leaving or not self.check():
             return
         daemon.take_pause()
@@ -1746,6 +2249,7 @@ class ProjectSlot:
         row = {"state": state, "reason": reason, "state_dir": str(self.state_dir)}
         if self.daemon is not None:
             row.update({
+                "node": self.daemon.node,
                 "environment": self.daemon.config["engine"]["environment"],
                 "fingerprint": config_fingerprint(self.daemon.config),
                 "reload_error": self.daemon.reload_error,

@@ -8,6 +8,7 @@ import os
 import pytest
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -111,62 +112,31 @@ class AutomationsTests(unittest.TestCase):
 [engine]
 tick_seconds = 0.1
 max_parallel = 2
-timezone = "UTC"
 shutdown_grace_seconds = 1
 recovery = "retry"
 environment = "test"
-
-[[automations]]
-id = "job"
-environments = ["test"]
-script = "capabilities/automations/scripts/job.py"
-timeout_seconds = 5
-max_parallel = 1
-max_pending = 2
-overlap = "queue"
-retries = 0
-
-[[automations]]
-id = "agentbin"
-environments = ["test"]
-script = "capabilities/automations/scripts/agentbin.py"
-timeout_seconds = 5
-max_parallel = 1
-max_pending = 1
-overlap = "skip"
-retries = 0
-
-[[automations]]
-id = "slow"
-environments = ["test"]
-script = "capabilities/automations/scripts/slow.py"
-timeout_seconds = 60
-max_parallel = 1
-max_pending = 1
-overlap = "skip"
-retries = 0
-
-[[automations]]
-id = "timeout"
-environments = ["test"]
-script = "capabilities/automations/scripts/slow.py"
-timeout_seconds = 1
-max_parallel = 1
-max_pending = 1
-overlap = "skip"
-retries = 0
-
-[[automations]]
-id = "flaky"
-environments = ["test"]
-script = "capabilities/automations/scripts/flaky.py"
-timeout_seconds = 5
-max_parallel = 1
-max_pending = 1
-overlap = "queue"
-retries = 1
 """
         )
+        # The automations are definitions in the store, scheduled on the node
+        # the CLI runs as here: the host name, since the fixture declares none.
+        self.node = socket.gethostname()
+        if DSN:
+            for slug, script, timeout, retries in (
+                    ("job", "job.py", 5, 0), ("agentbin", "agentbin.py", 5, 0),
+                    ("slow", "slow.py", 60, 0), ("timeout", "slow.py", 1, 0),
+                    ("flaky", "flaky.py", 5, 1)):
+                self.define(slug, script_path=f"capabilities/automations/scripts/{script}",
+                            timeout_seconds=timeout, retries=retries, node=self.node)
+
+    def define(self, slug: str, **fields) -> dict:
+        """Save a version of a definition straight into the store, as `set` does."""
+        with RUNTIME.RunLedger(self.project_id, root=self.root).open() as ledger:
+            current = ledger.definition(slug)
+            base = ({name: (list(current[name]) if name == "arguments" else current[name])
+                     for name in RUNTIME.DEFINITION_FIELDS} if current else {})
+            checked = RUNTIME.check_definition(self.root, slug, {**base, **fields})
+            row, _created = ledger.save_definition(slug, checked, by="fixture")
+        return row
 
     def tearDown(self) -> None:
         with contextlib.suppress(Exception):
@@ -289,8 +259,7 @@ retries = 1
         (legacy / "scripts" / "cached.py").write_text("generated\n")
         (legacy / "automations.db").write_text("obsolete\n")
 
-        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
-        config = RUNTIME.load_config(self.root, config_path)
+        config = self.loaded()
         row = RUNTIME.enqueue_manual(self.root, config, legacy, "job")
         self.assertIsNotNone(row)
         old_log = Path(row["log_path"])
@@ -652,85 +621,159 @@ retries = 1
                 with self.assertRaises(RUNTIME.ConfigError):
                     RUNTIME.load_agents({"agents": case})
 
-    def test_automation_block_refuses_a_key_it_does_not_read(self) -> None:
-        # The dropped key was the whole defect: `args` where the runtime reads
-        # `arguments` left the automation running on schedule, exiting zero, and
-        # passing nothing — a green record every tick and no work done.
-        with self.assertRaises(RUNTIME.ConfigError) as caught:
-            RUNTIME.normalise_config(self.root, {"version": 1, "automations": [{
-                "id": "job", "script": "capabilities/automations/scripts/job.py",
-                "args": ["--apply"], "retires": 2,
-            }]})
-        self.assertEqual(str(caught.exception),
-                         "automations[0] has unknown key(s): args, retires")
-
-        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
-        config_path.write_text(config_path.read_text() + """
+    LEGACY = """
 [[automations]]
-id = "misspelled"
-environments = ["test"]
+id = "full"
+name = "Full block"
+description = "Every key a block may carry, in one place."
 script = "capabilities/automations/scripts/job.py"
-args = ["--apply"]
-""")
-        refused = self.cli("service", "doctor", check=False)
+enabled = false
+every_seconds = 300
+timeout_seconds = 12.5
+max_parallel = 2
+max_pending = 3
+overlap = "queue"
+retries = 1
+arguments = ["--apply"]
+environments = ["test"]
+
+[[automations]]
+id = "nightly"
+script = "capabilities/automations/scripts/job.py"
+schedule = "0 3 * * *"
+environments = ["production"]
+"""
+
+    def legacy_config(self, extra: str = LEGACY) -> Path:
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        text = config_path.read_text().replace(
+            "[engine]\n", "# why the engine is tuned so\n[engine]\ntimezone = \"Etc/GMT-3\"\n")
+        config_path.write_text(text + extra + "\n[agents]\ndefault = \"haiku\"\n")
+        return config_path
+
+    @needs_store
+    def test_a_config_still_declaring_automations_refuses_and_names_the_import(self) -> None:
+        # Nothing reads [[automations]] any more, so a command that went on as if
+        # the file were empty would stop every automation without a word.
+        self.legacy_config()
+        for args in (("list",), ("doctor",), ("run", "job"), ("service", "start"),
+                     ("set", "job", "--enabled", "false")):
+            with self.subTest(args=args):
+                refused = self.cli(*args, check=False)
+                self.assertEqual(refused.returncode, 6, refused.stderr)
+                error = json.loads(refused.stderr)["error"]
+                self.assertEqual(error["code"], "definitions_not_imported")
+                self.assertIn("automations import --apply", error["hint"])
+        # A job mid-migration still gets its agent turn: `agents` reads [agents].
+        self.assertEqual(json.loads(self.cli("agents").stdout)["default"], "haiku")
+
+    @needs_store
+    def test_import_moves_every_automation_as_a_path_and_empties_the_file(self) -> None:
+        config_path = self.legacy_config()
+        # `production` names no node here, so nothing is imported until one does.
+        refused = self.cli("import", check=False)
         self.assertEqual(refused.returncode, 6)
-        self.assertEqual(json.loads(refused.stderr)["error"]["code"], "invalid_config")
-        self.assertIn("automations[5] has unknown key(s): args", refused.stderr)
+        error = json.loads(refused.stderr)["error"]
+        self.assertEqual(error["code"], "definitions_not_importable")
+        self.assertIn("'nightly'", error["message"])
+        self.assertIn("--node", error["message"])
 
-    def test_every_key_the_block_loop_reads_is_accepted(self) -> None:
-        # The refusal above is only correct while this set is exactly what the
-        # loop below it reads, so the set is pinned from the other side: a key
-        # dropped from it would start refusing a config that was always valid.
-        declared = {
-            "id": "full", "name": "Full block",
-            "description": "Every key a block may carry, in one place.",
-            "script": "capabilities/automations/scripts/job.py",
-            "enabled": False, "every_seconds": 30, "timeout_seconds": 12,
-            "max_parallel": 2, "max_pending": 3, "overlap": "queue",
-            "retries": 1, "arguments": ["--apply"], "environments": ["test"],
-        }
-        normalised = RUNTIME.normalise_config(
-            self.root, {"version": 1, "automations": [declared]})["automations"][0]
-        for key, value in declared.items():
-            self.assertEqual(normalised[key], value, key)
-        # `schedule` is the last and cannot share a block with `every_seconds`.
-        scheduled = {**declared, "schedule": "0 3 * * *"}
-        scheduled.pop("every_seconds")
-        self.assertEqual(RUNTIME.normalise_config(
-            self.root, {"version": 1, "automations": [scheduled]})["automations"][0]["schedule"],
-            "0 3 * * *")
-        self.assertEqual(set(RUNTIME.AUTOMATION_KEYS), set(declared) | {"schedule"})
+        planned = json.loads(self.cli("import", "--node", "production=node-b").stdout)
+        self.assertFalse(planned["applied"])
+        self.assertEqual({a["automation"]: a["outcome"] for a in planned["automations"]},
+                         {"full": "would_be_created", "nightly": "would_be_created"})
+        self.assertIn("[[automations]]", config_path.read_text())
 
-    def test_a_labelled_automation_reaches_the_listing(self) -> None:
-        # `name` and `description` have one consumer, a person reading the
-        # listing, so a value that loads and is then dropped between the config
-        # and this output has not arrived anywhere.
-        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
-        config_path.write_text(config_path.read_text() + """
-[[automations]]
-id = "labelled"
-name = "Nightly digest"
-description = "Summarises yesterday's runs before the morning review."
-environments = ["test"]
-script = "capabilities/automations/scripts/job.py"
-""")
+        applied = json.loads(self.cli("import", "--apply", "--node", "production=node-b").stdout)
+        self.assertTrue(applied["applied"] and applied["config_rewritten"])
+        text = config_path.read_text()
+        self.assertNotIn("[[automations]]", text)
+        self.assertNotIn("timezone", text)
+        self.assertIn("# why the engine is tuned so\n[engine]\n", text)
+        self.assertIn("[agents]\ndefault = \"haiku\"", text)
+
+        listed = {a["id"]: a for a in json.loads(self.cli("list").stdout)["automations"]}
+        full, nightly = listed["full"], listed["nightly"]
+        self.assertEqual(full["description"],
+                         "Full block - Every key a block may carry, in one place.")
+        self.assertEqual((full["schedule"], full["timezone"], full["node"]),
+                         ("*/5 * * * *", "Etc/GMT-3", self.node))
+        self.assertEqual((full["enabled"], full["timeout_seconds"], full["retries"],
+                          full["arguments"], full["script"], full["body"]),
+                         (False, 13, 1, ["--apply"],
+                          "capabilities/automations/scripts/job.py", False))
+        self.assertEqual((nightly["schedule"], nightly["node"]), ("0 3 * * *", "node-b"))
+
+        # Importing again finds nothing in the file, and the store unchanged.
+        again = json.loads(self.cli("import", "--apply").stdout)
+        self.assertEqual(again["automations"], [])
+
+    @needs_store
+    def test_import_refuses_an_entry_it_cannot_carry_and_imports_none(self) -> None:
+        for extra, said in (
+                ('\n[[automations]]\nid = "x"\nscript = "capabilities/automations/scripts/job.py"\n'
+                 'args = ["--apply"]\n', "unknown key(s): args"),
+                ('\n[[automations]]\nid = "x"\nscript = "capabilities/automations/scripts/job.py"\n'
+                 'every_seconds = 30\n', "no five-field cron"),
+                ('\n[[automations]]\nid = "job"\nscript = "capabilities/automations/scripts/slow.py"\n',
+                 "differs from config.toml")):
+            with self.subTest(said=said):
+                config_path = self.legacy_config(extra)
+                refused = self.cli("import", "--apply", check=False)
+                self.assertEqual(refused.returncode, 6, refused.stderr)
+                self.assertIn(said, refused.stderr)
+                self.assertIn("[[automations]]", config_path.read_text())
+                self.cli("service", "init", "--force")
+
+    def test_a_definition_is_judged_whole_before_it_is_saved(self) -> None:
+        script = "capabilities/automations/scripts/job.py"
+        good = RUNTIME.check_definition(self.root, "job", {"script_path": script})
+        self.assertEqual((good["timezone"], good["node"], good["enabled"]), ("UTC", None, True))
+        for fields, said in (
+                ({}, "exactly one of script_path and script_body"),
+                ({"script_path": script, "script_body": "#!/bin/sh\n"}, "exactly one"),
+                ({"script_path": "/etc/passwd"}, "relative to the project root"),
+                ({"script_path": "../outside.py"}, "must not climb out"),
+                ({"script_body": "echo no shebang\n"}, "#! line"),
+                ({"script_path": script, "schedule": "every day"}, "five-field cron"),
+                ({"script_path": script, "timezone": "Mars/Base"}, "unknown time zone"),
+                ({"script_path": script, "node": " "}, "must name a node"),
+                ({"script_path": script, "description": 12}, "description must be text"),
+                ({"script_path": script, "retries": -1}, "retries must be an integer"),
+                ({"script_path": script, "colour": "red"}, "unknown field(s): colour")):
+            with self.subTest(said=said), self.assertRaises(RUNTIME.ConfigError) as caught:
+                RUNTIME.check_definition(self.root, "job", fields)
+            self.assertIn(said, str(caught.exception))
+        with self.assertRaises(RUNTIME.ConfigError):
+            RUNTIME.check_definition(self.root, "Job", {"script_path": script})
+
+    @needs_store
+    def test_a_described_automation_reaches_the_listing(self) -> None:
+        # `description` has one consumer, a person reading the listing, so a
+        # value that is saved and then dropped before this output has not
+        # arrived anywhere.
+        self.cli("set", "labelled", "--script", "capabilities/automations/scripts/job.py",
+                 "--description", "Summarises yesterday's runs before the morning review.")
         listed = {item["id"]: item
                   for item in json.loads(self.cli("list").stdout)["automations"]}
-        self.assertEqual(listed["labelled"]["name"], "Nightly digest")
         self.assertEqual(listed["labelled"]["description"],
                          "Summarises yesterday's runs before the morning review.")
-        # Both are optional, and a block declaring neither reads as it always did.
-        self.assertIsNone(listed["job"]["name"])
         self.assertIsNone(listed["job"]["description"])
 
-    def test_a_label_must_be_text(self) -> None:
-        for key in ("name", "description"):
-            with self.subTest(key=key), self.assertRaises(RUNTIME.ConfigError) as caught:
-                RUNTIME.normalise_config(self.root, {"version": 1, "automations": [{
-                    "id": "job", "script": "capabilities/automations/scripts/job.py",
-                    key: 12,
-                }]})
-            self.assertEqual(str(caught.exception), f"automations[0].{key} must be a string")
+    @needs_store
+    def test_a_definition_the_store_holds_but_does_not_validate_is_skipped_alone(self) -> None:
+        # Another writer can put a row the CLI would refuse; the others still load.
+        with RUNTIME.RunLedger(self.project_id, root=self.root).open() as ledger:
+            ledger.save_definition("broken", {**RUNTIME.DEFINITION_DEFAULTS,
+                                              "script_path": "capabilities/x.py",
+                                              "schedule": "not a cron"}, by="elsewhere")
+        listed = json.loads(self.cli("list").stdout)
+        self.assertIn("job", {a["id"] for a in listed["automations"]})
+        self.assertNotIn("broken", {a["id"] for a in listed["automations"]})
+        self.assertIn("'broken' is skipped", listed["invalid_definitions"][0])
+        doctor = self.cli("doctor", check=False)
+        self.assertEqual(doctor.returncode, 6)
+        self.assertIn("'broken' is skipped", json.loads(doctor.stdout)["invalid_definitions"][0])
 
     def test_agent_command_fences_read_and_opens_write(self) -> None:
         import importlib.util as _ilu
@@ -858,36 +901,35 @@ script = "capabilities/automations/scripts/job.py"
         self.assertNotEqual(reported, "MISSING")
         self.assertTrue(os.access(reported, os.X_OK), reported)
 
+    def loaded(self) -> dict:
+        """The declaration as the daemon reads it: the file, and the store's
+        definitions."""
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        config = RUNTIME.load_config(self.root, config_path)
+        with RUNTIME.open_ledger(self.root, config) as ledger:
+            RUNTIME.apply_definitions(self.root, config, ledger.definitions())
+        return config
+
+    @needs_store
     def test_config_fingerprint_ignores_the_process_environment(self) -> None:
         # The daemon and whatever asks it for a health answer need not share an
         # environment, and if the fingerprint moved with one they would disagree
         # permanently: a stale verdict no restart could ever clear.
-        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
         before = os.environ.get("AUTOMATIONS_ENVIRONMENT")
         try:
             os.environ["AUTOMATIONS_ENVIRONMENT"] = "production"
-            production = RUNTIME.config_fingerprint(
-                RUNTIME.load_config(self.root, config_path))
+            production = RUNTIME.config_fingerprint(self.loaded())
             os.environ["AUTOMATIONS_ENVIRONMENT"] = "development"
-            development = RUNTIME.config_fingerprint(
-                RUNTIME.load_config(self.root, config_path))
+            development = RUNTIME.config_fingerprint(self.loaded())
         finally:
             if before is None:
                 os.environ.pop("AUTOMATIONS_ENVIRONMENT", None)
             else:
                 os.environ["AUTOMATIONS_ENVIRONMENT"] = before
         self.assertEqual(production, development)
-
-        config_path.write_text(config_path.read_text() + """
-[[automations]]
-id = "added"
-environments = ["test"]
-script = "capabilities/automations/scripts/job.py"
-""")
-        self.assertNotEqual(
-            production,
-            RUNTIME.config_fingerprint(RUNTIME.load_config(self.root, config_path)),
-        )
+        # A definition saved in the store moves it, from whichever machine.
+        self.define("added", script_path="capabilities/automations/scripts/job.py")
+        self.assertNotEqual(production, RUNTIME.config_fingerprint(self.loaded()))
 
     @needs_store
     def test_doctor_fails_while_the_daemon_runs_a_superseded_configuration(self) -> None:
@@ -895,13 +937,8 @@ script = "capabilities/automations/scripts/job.py"
         self.assertTrue(json.loads(self.cli("doctor").stdout)["ok"])
 
         config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
-        config_path.write_text(config_path.read_text() + """
-[[automations]]
-id = "added-after-start"
-environments = ["test"]
-script = "capabilities/automations/scripts/job.py"
-schedule = "0 3 * * *"
-""")
+        config_path.write_text(config_path.read_text().replace(
+            "max_parallel = 2", "max_parallel = 3", 1))
 
         probe = self.cli("service", "doctor", check=False)
         self.assertEqual(probe.returncode, 6)
@@ -917,25 +954,38 @@ schedule = "0 3 * * *"
         self.assertTrue(json.loads(self.cli("doctor").stdout)["ok"])
 
     @needs_store
+    def test_a_definition_saved_anywhere_reaches_the_running_daemon_unasked(self) -> None:
+        # The store announces every saved definition, and the daemon that
+        # listens re-reads them: no reload, no file on its machine touched.
+        started = json.loads(self.cli("service", "start").stdout)
+        pid = self.live_daemon(started["state_dir"])
+        self.define("added", script_path="capabilities/automations/scripts/job.py",
+                    schedule="0 3 * * *", node=self.node)
+        deadline = time.time() + 10
+        report = None
+        while time.time() < deadline:
+            report = json.loads(self.cli("doctor", check=False).stdout)
+            if report["ok"]:
+                break
+            time.sleep(0.2)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(json.loads(self.cli("service", "status").stdout)["pid"], pid)
+
+    @needs_store
     def test_doctor_stays_quiet_about_configuration_while_stopped(self) -> None:
         # A stopped daemon is not running the wrong declaration; it is not
         # running one at all, and saying otherwise would restart nothing.
-        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
-        config_path.write_text(config_path.read_text() + """
-[[automations]]
-id = "added-while-stopped"
-environments = ["test"]
-script = "capabilities/automations/scripts/job.py"
-""")
+        self.define("added-while-stopped",
+                    script_path="capabilities/automations/scripts/job.py")
         report = json.loads(self.cli("doctor").stdout)
         self.assertTrue(report["ok"])
         self.assertNotIn("config_stale", report)
 
-    def _supervised_daemon(self, environment: str) -> subprocess.Popen:
+    def _supervised_daemon(self, node: str) -> subprocess.Popen:
         state = Path(json.loads(self.cli("service", "status").stdout)["state_dir"])
         daemon = subprocess.Popen(
             [str(CLI), "service", "run"], cwd=self.root,
-            env={**self.env, "AUTOMATIONS_ENVIRONMENT": environment},
+            env={**self.env, "AGENT_NODE_NAME": node},
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         deadline = time.time() + 15
         while time.time() < deadline and not (state / "daemon.pid").is_file():
@@ -944,137 +994,80 @@ script = "capabilities/automations/scripts/job.py"
         return daemon
 
     @needs_store
-    def test_doctor_reports_the_environment_its_daemon_loaded(self) -> None:
-        # A supervisor starts the daemon with its own selector and the shell that
-        # asks afterwards carries none, so an answer computed from the asking
-        # process describes nobody. Both belong in the payload, told apart.
-        daemon = self._supervised_daemon("test")
+    def test_doctor_reports_the_node_its_daemon_runs_as(self) -> None:
+        # A supervisor starts the daemon with its own node name and the shell
+        # that asks afterwards may carry none, so an answer computed from the
+        # asking process describes nobody. Both belong in the payload, told apart.
+        daemon = self._supervised_daemon(self.node)
         try:
             report = json.loads(self.cli("doctor").stdout)
             self.assertTrue(report["ok"])
-            self.assertEqual(report["environment"], "test")
-            self.assertEqual(report["daemon_environment"], "test")
-            self.assertEqual(report["service"]["daemon_environment"], "test")
-            self.assertNotIn("environment_idle", report)
-
-            # Asked from an environment of its own, the invocation's answer moves
-            # and the daemon's does not, which is what makes them two answers.
+            self.assertEqual(report["daemon_node"], self.node)
+            self.assertEqual(report["service"]["daemon_node"], self.node)
+            self.assertNotIn("node_idle", report)
             elsewhere = json.loads(subprocess.run(
                 [str(CLI), "doctor"], cwd=self.root,
-                env={**self.env, "AUTOMATIONS_ENVIRONMENT": "staging"},
+                env={**self.env, "AGENT_NODE_NAME": "elsewhere"},
                 capture_output=True, text=True, timeout=30).stdout)
-            self.assertEqual(elsewhere["environment"], "staging")
-            self.assertEqual(elsewhere["daemon_environment"], "test")
+            self.assertEqual(elsewhere["node"], "elsewhere")
+            self.assertEqual(elsewhere["daemon_node"], self.node)
         finally:
             daemon.terminate()
             daemon.wait(timeout=15)
 
     @needs_store
-    def test_doctor_fails_when_the_daemon_schedules_none_of_the_declarations(self) -> None:
-        # The failure this closes: a daemon started under a selector no
-        # automation is declared for is alive, answering, and scheduling
-        # nothing, and a count of the declarations reports it as healthy. What a
-        # supervisor acts on is `ok`, so this is where it has to show.
-        daemon = self._supervised_daemon("production")
+    def test_doctor_fails_when_the_daemon_schedules_none_of_the_definitions(self) -> None:
+        # The failure this closes: a daemon started as a node no automation
+        # names is alive, answering, and scheduling nothing, and a count of the
+        # definitions reports it as healthy. What a supervisor acts on is `ok`,
+        # so this is where it has to show.
+        daemon = self._supervised_daemon("production-node")
         try:
             probe = self.cli("service", "doctor", check=False)
             self.assertEqual(probe.returncode, 6)
             report = json.loads(probe.stdout)
             self.assertFalse(report["ok"])
-            self.assertEqual(report["daemon_environment"], "production")
-            self.assertEqual(report["environment"], "test")
-            self.assertTrue(report["service"]["running"])
-            self.assertEqual(report["environment_idle"]["daemon_environment"], "production")
-            self.assertEqual(report["environment_idle"]["declared"], ["test"])
-            self.assertIn("scheduling nothing", report["environment_idle"]["message"])
+            self.assertEqual(report["daemon_node"], "production-node")
+            self.assertEqual(report["node_idle"]["nodes"], [self.node])
+            self.assertIn("scheduling nothing", report["node_idle"]["message"])
         finally:
             daemon.terminate()
             daemon.wait(timeout=15)
-
-        # Stopped, the daemon is not scheduling the wrong thing; there is
-        # nothing to be wrong about, and the answer goes quiet again.
         stopped = json.loads(self.cli("doctor").stdout)
         self.assertTrue(stopped["ok"])
-        self.assertIsNone(stopped["daemon_environment"])
-        self.assertNotIn("environment_idle", stopped)
+        self.assertIsNone(stopped["daemon_node"])
+        self.assertNotIn("node_idle", stopped)
 
     @needs_store
-    def test_an_automation_declared_for_every_environment_keeps_doctor_quiet(self) -> None:
-        # An automation naming no environment runs under all of them, so a
-        # daemon holding one is scheduling whatever its selector is, and a
-        # finding about the selector would be about nothing.
-        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
-        config_path.write_text(config_path.read_text() + """
-[[automations]]
-id = "everywhere"
-script = "capabilities/automations/scripts/job.py"
-schedule = "0 3 * * *"
-""")
-        daemon = self._supervised_daemon("production")
-        try:
-            report = json.loads(self.cli("doctor").stdout)
-            self.assertTrue(report["ok"])
-            self.assertEqual(report["daemon_environment"], "production")
-            self.assertNotIn("environment_idle", report)
-        finally:
-            daemon.terminate()
-            daemon.wait(timeout=15)
-
-    @needs_store
-    def test_a_daemon_that_published_no_environment_is_reported_without_failing(self) -> None:
-        # A daemon started by an older payload published the bare fingerprint
-        # and keeps running across an upgrade, scheduling correctly all the
-        # while. Its declaration still reads, so `config_stale` stays quiet, and
-        # an absent environment is the absence of the fact that would decide
-        # rather than evidence of a mismatch: reading it as one fails every
-        # working deployment on its first health check after the upgrade. So it
-        # is said in the payload, and `ok` is left to what can be shown.
-        daemon = self._supervised_daemon("test")
+    def test_a_daemon_that_published_no_node_is_reported_without_failing(self) -> None:
+        # A daemon started by an older payload published no node and keeps
+        # running across an upgrade; the absence of the fact that would decide
+        # is not a mismatch.
+        daemon = self._supervised_daemon(self.node)
         try:
             state = Path(json.loads(self.cli("service", "status").stdout)["state_dir"])
             legacy = state / RUNTIME.DAEMON_FINGERPRINT_FILE
             fingerprint = RUNTIME.read_config_fingerprint(state)
             legacy.write_text(fingerprint + "\n")
-            self.assertEqual(RUNTIME.read_config_fingerprint(state), fingerprint)
-            self.assertIsNone(RUNTIME.read_daemon_environment(state))
-
+            self.assertIsNone(RUNTIME.read_daemon_node(state))
             probe = self.cli("service", "doctor", check=False)
-            self.assertEqual(probe.returncode, 0)
+            self.assertEqual(probe.returncode, 0, probe.stdout)
             report = json.loads(probe.stdout)
             self.assertTrue(report["ok"])
-            self.assertNotIn("config_stale", report)
-            self.assertNotIn("environment_idle", report)
-            self.assertIsNone(report["daemon_environment"])
-            self.assertIsNone(report["service"]["daemon_environment"])
-            self.assertIsNone(report["environment_unknown"]["daemon_environment"])
-            self.assertEqual(report["environment_unknown"]["declared"], ["test"])
-            self.assertIn("did not record which environment",
-                          report["environment_unknown"]["message"])
-            self.assertIn("cannot say", report["environment_unknown"]["message"])
+            self.assertIsNone(report["daemon_node"])
+            self.assertNotIn("node_idle", report)
         finally:
             daemon.terminate()
             daemon.wait(timeout=15)
 
-        # Once that daemon is gone there is nothing left to be unable to speak
-        # for, so the notice goes with it rather than lingering.
-        stopped = json.loads(self.cli("doctor").stdout)
-        self.assertTrue(stopped["ok"])
-        self.assertNotIn("environment_unknown", stopped)
-
     @needs_store
-    def test_inventory_judges_automations_by_the_running_daemons_environment(self) -> None:
+    def test_inventory_judges_automations_by_the_running_daemons_node(self) -> None:
         # Whether an automation is active is decided by the daemon that runs it,
-        # under the environment it was started with, and a terminal asking later
-        # carries a different one. Judged from the asker, every automation a
-        # supervised daemon is running reads as inactive.
-        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
-        config_path.write_text(config_path.read_text() + """
-[[automations]]
-id = "nightly"
-environments = ["production"]
-script = "capabilities/automations/scripts/job.py"
-schedule = "0 3 * * *"
-""")
+        # as the node it was started as, and a terminal asking later may be
+        # another. Judged from the asker, every automation a supervised daemon
+        # runs would read as another node's.
+        self.define("nightly", script_path="capabilities/automations/scripts/job.py",
+                    schedule="0 3 * * *", node="production-node")
 
         def states(report: dict) -> dict:
             return {item["name"]: item["state"] for item in report["items"]}
@@ -1082,43 +1075,33 @@ schedule = "0 3 * * *"
         def active(report: dict) -> dict:
             return next(m for m in report["metrics"] if m["label"] == "active here")
 
-        # No daemon: this invocation's environment is the only one there is.
         idle = json.loads(self.cli("inventory").stdout)
         self.assertEqual(idle["service"]["state"], "stopped")
         self.assertIs(idle["service"]["ok"], True)
         self.assertEqual(states(idle)["job"], "active")
-        self.assertEqual(states(idle)["nightly"], "other environment")
-        self.assertIn("test", active(idle)["note"])
+        self.assertEqual(states(idle)["nightly"], "other node")
+        self.assertIn(self.node, active(idle)["note"])
 
-        daemon = self._supervised_daemon("production")
+        daemon = self._supervised_daemon("production-node")
         try:
             report = json.loads(self.cli("inventory").stdout)
             self.assertEqual(report["service"]["state"], "running")
-            self.assertIn("production", report["service"]["detail"])
+            self.assertIn("production-node", report["service"]["detail"])
             self.assertIs(report["service"]["ok"], True)
             self.assertEqual(states(report)["nightly"], "active")
-            self.assertEqual(states(report)["job"], "other environment")
+            self.assertEqual(states(report)["job"], "other node")
             self.assertEqual(active(report)["value"], 1)
-            self.assertIn("production", active(report)["note"])
 
-            # A daemon that published no environment leaves the question open,
-            # and the report says enabled rather than guessing either way.
             state = Path(json.loads(self.cli("service", "status").stdout)["state_dir"])
             legacy = state / RUNTIME.DAEMON_FINGERPRINT_FILE
             legacy.write_text(RUNTIME.read_config_fingerprint(state) + "\n")
             unknown = json.loads(self.cli("inventory").stdout)
             self.assertEqual(states(unknown)["nightly"], "enabled")
-            self.assertEqual(states(unknown)["job"], "enabled")
             self.assertNotIn("active here", [m["label"] for m in unknown["metrics"]])
 
-            # The verdict is doctor's own local finding: a declaration edited
-            # under a running daemon reads as a problem, with no store asked.
-            config_path.write_text(config_path.read_text() + """
-[[automations]]
-id = "later"
-script = "capabilities/automations/scripts/job.py"
-schedule = "0 4 * * *"
-""")
+            config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+            config_path.write_text(config_path.read_text().replace(
+                "max_parallel = 2", "max_parallel = 3", 1))
             stale = json.loads(self.cli("inventory").stdout)["service"]
             self.assertIs(stale["ok"], False)
             self.assertTrue(stale["problem"].startswith("config_stale: "))
@@ -1126,25 +1109,15 @@ schedule = "0 4 * * *"
             daemon.terminate()
             daemon.wait(timeout=15)
 
+    @needs_store
     def test_inventory_item_carries_id_description_and_schedule_as_data(self) -> None:
         # A reader addresses an automation by its id and reads its schedule
         # without parsing display text; the contract's item has no such fields,
         # so they ride in `attributes` under fixed labels.
-        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
-        config_path.write_text(config_path.read_text() + """
-[[automations]]
-id = "nightly"
-name = "Nightly digest"
-description = "Summarises yesterday's runs."
-environments = ["test"]
-script = "capabilities/automations/scripts/job.py"
-schedule = "0 3 * * *"
-
-[[automations]]
-id = "poller"
-script = "capabilities/automations/scripts/job.py"
-every_seconds = 30
-""")
+        self.define("nightly", script_path="capabilities/automations/scripts/job.py",
+                    description="Summarises yesterday's runs.", schedule="0 3 * * *",
+                    timezone="Etc/GMT-3", node=self.node)
+        self.define("bodied", script_body="#!/bin/sh\necho hi\n")
         items = json.loads(self.cli("inventory").stdout)["items"]
         by_id = {}
         for item in items:
@@ -1153,210 +1126,111 @@ every_seconds = 30
             by_id[dict(attributes)["id"]] = (item, attributes)
 
         nightly, attrs = by_id["nightly"]
-        self.assertEqual(nightly["name"], "Nightly digest")
+        self.assertEqual(nightly["name"], "nightly")
         self.assertEqual(nightly["detail"], "0 3 * * *")
         self.assertEqual(attrs, [
             ("id", "nightly"), ("description", "Summarises yesterday's runs."),
             ("schedule_kind", "cron"), ("schedule_value", "0 3 * * *"),
-            ("script", "capabilities/automations/scripts/job.py"),
-            ("environments", "test")])
+            ("timezone", "Etc/GMT-3"),
+            ("script", "capabilities/automations/scripts/job.py"), ("node", self.node)])
 
-        poller, attrs = by_id["poller"]
-        self.assertEqual(poller["name"], "poller")
-        self.assertEqual(poller["detail"], "every 30s")
-        self.assertEqual(attrs, [
-            ("id", "poller"), ("schedule_kind", "interval"), ("schedule_value", 30),
-            ("script", "capabilities/automations/scripts/job.py")])
+        bodied, attrs = by_id["bodied"]
+        self.assertEqual((bodied["state"], bodied["detail"]), ("no node", "manual"))
+        self.assertEqual(attrs, [("id", "bodied"), ("schedule_kind", "manual"),
+                                 ("script", "stored body")])
 
-        job, attrs = by_id["job"]
-        self.assertEqual(job["detail"], "manual")
-        self.assertEqual(attrs[:2], [("id", "job"), ("schedule_kind", "manual")])
-        labels = [label for label, _ in attrs]
-        self.assertNotIn("description", labels)
-        self.assertNotIn("schedule_value", labels)
+    @needs_store
+    def test_set_saves_a_version_and_an_unchanged_set_saves_none(self) -> None:
+        first = json.loads(self.cli("set", "job", "--description", "Does the job").stdout)
+        self.assertTrue(first["created"])
+        self.assertEqual(first["changed"], ["description"])
+        self.assertEqual(first["item"]["description"], "Does the job")
+        same = json.loads(self.cli("set", "job", "--description", "Does the job").stdout)
+        self.assertFalse(same["created"])
+        self.assertEqual(same["version"], first["version"])
+        moved = json.loads(self.cli("set", "job", "--node", "node-b", "--schedule",
+                                    "*/10 * * * *", "--timezone", "Etc/GMT-3",
+                                    "--timeout", "30", "--retries", "2",
+                                    "--arguments", '["--all"]').stdout)
+        self.assertEqual(moved["changed"], ["arguments", "schedule", "timezone", "node",
+                                            "timeout_seconds", "retries"])
+        cleared = json.loads(self.cli("set", "job", "--node", "", "--schedule", "",
+                                      "--description", "").stdout)
+        self.assertEqual((cleared["item"]["node"], cleared["item"]["schedule"],
+                          cleared["item"]["description"]), (None, None, None))
+        history = json.loads(self.cli("history", "job").stdout)["versions"]
+        self.assertEqual([v["active"] for v in history], [False, False, False, True])
+        self.assertEqual(history[0]["created_by"], "fixture")
+        self.assertEqual(history[2]["node"], "node-b")
+        # A writer that read an older version is told rather than overwriting.
+        stale = self.cli("set", "job", "--enabled", "false", "--base", first["version"],
+                         check=False)
+        self.assertEqual(stale.returncode, 6)
+        self.assertEqual(json.loads(stale.stderr)["error"]["code"], "conflict")
 
-    SET_CONFIG = (
-        "# Header comment - must survive.\n"
-        "version = 1\n"
-        "\n"
-        "[engine]\n"
-        "tick_seconds = 0.1   # fast\n"
-        "environment = \"test\"\n"
-        "\n"
-        "# Why nightly exists.\n"
-        "[[automations]]\n"
-        "id = \"nightly\"\n"
-        "  name = 'Nightly'   # tile label\n"
-        "description = \"\"\"old \\\n"
-        "text\"\"\"\n"
-        "script = \"capabilities/automations/scripts/job.py\"\n"
-        "schedule = \"0 3 * * *\"\n"
-        "environments = [\n"
-        "  \"test\",  # here\n"
-        "]\n"
-        "\n"
-        "[[ automations ]]   # manual\n"
-        "\"id\" = \"job\"\n"
-        "script = \"capabilities/automations/scripts/job.py\"\n"
-        "enabled = true\n"
-    )
+    @needs_store
+    def test_set_creates_with_a_script_and_moves_a_script_into_a_body(self) -> None:
+        missing = self.cli("set", "new-one", "--enabled", "true", check=False)
+        self.assertEqual(missing.returncode, 3)
+        created = json.loads(self.cli("set", "new-one", "--script",
+                                      "capabilities/automations/scripts/job.py").stdout)
+        self.assertTrue(created["created"])
+        body = Path(self.tmp.name) / "body.sh"
+        body.write_text("#!/bin/sh\necho from the store\n")
+        moved = json.loads(self.cli("set", "new-one", "--body", str(body)).stdout)
+        self.assertEqual((moved["item"]["script"], moved["item"]["body"]), (None, True))
+        self.assertEqual(sorted(moved["changed"]), ["script_body", "script_path"])
+        version = json.loads(self.cli("history", "new-one").stdout)["versions"][-1]
+        self.assertEqual(version["script_body"], "#!/bin/sh\necho from the store\n")
+        removed = json.loads(self.cli("remove", "new-one").stdout)
+        self.assertEqual(removed["removed"], moved["version"])
+        self.assertNotIn("new-one", {a["id"] for a in json.loads(self.cli("list").stdout)
+                                     ["automations"]})
+        self.assertEqual(self.cli("remove", "new-one", check=False).returncode, 3)
 
-    def _set_config(self, text: str | None = None, newline: str = "\n") -> Path:
-        path = self.root / "capabilities" / "automations" / "service" / "config.toml"
-        path.write_bytes((text or self.SET_CONFIG).replace("\n", newline).encode())
-        return path
-
-    def test_set_inserts_each_flag_as_one_line_and_touches_nothing_else(self) -> None:
-        path = self._set_config()
-        answer = json.loads(self.cli(
-            "set", "job", "--name", 'Job "quoted" \\ back', "--description",
-            "Runs on demand", "--enabled", "false").stdout)
-        self.assertEqual(answer["changed"], ["name", "description", "enabled"])
-        self.assertEqual(path.read_text(), self.SET_CONFIG.replace(
-            '"id" = "job"\n',
-            '"id" = "job"\nname = "Job \\"quoted\\" \\\\ back"\n'
-            'description = "Runs on demand"\n').replace(
-            "enabled = true\n", "enabled = false\n"))
-        item = answer["item"]
-        self.assertEqual(item["name"], 'Job "quoted" \\ back')
-        self.assertEqual(item["state"], "disabled")
-        self.assertEqual(item["attributes"][:3], [
-            {"label": "id", "value": "job"},
-            {"label": "description", "value": "Runs on demand"},
-            {"label": "schedule_kind", "value": "manual"}])
-        # The answer is the item `inventory` reports for the same automation.
-        inventory = json.loads(self.cli("inventory").stdout)["items"]
-        self.assertIn(item, inventory)
-        self.assertFalse(answer["daemon"]["running"])
-        self.assertFalse(answer["daemon"]["reloaded"])
-
-    def test_set_replaces_values_in_place_and_clears_them(self) -> None:
-        path = self._set_config()
-        self.cli("set", "nightly", "--name", "Renamed", "--description", "One line")
-        self.assertEqual(path.read_text(), self.SET_CONFIG.replace(
-            "  name = 'Nightly'   # tile label\n", '  name = "Renamed"   # tile label\n').replace(
-            'description = """old \\\ntext"""\n', 'description = "One line"\n'))
-
-        answer = json.loads(self.cli("set", "nightly", "--name", "", "--description=").stdout)
-        self.assertEqual(answer["changed"], ["name", "description"])
-        self.assertEqual(path.read_text(), self.SET_CONFIG.replace(
-            "  name = 'Nightly'   # tile label\n", "").replace(
-            'description = """old \\\ntext"""\n', ""))
-        # Cleared, the name falls back to the id and no description is carried.
-        self.assertEqual(answer["item"]["name"], "nightly")
-        self.assertNotIn("description", [a["label"] for a in answer["item"]["attributes"]])
-
-        # Clearing what is not declared, and enabling what omits `enabled`,
-        # change nothing and write nothing.
-        before = path.read_bytes()
-        again = json.loads(self.cli("set", "nightly", "--name", "", "--enabled", "true").stdout)
-        self.assertEqual(again["changed"], [])
-        self.assertEqual(path.read_bytes(), before)
-
-        # A key added later lands after the nearest earlier key the entry has.
-        self.cli("set", "nightly", "--enabled", "false", "--name", "-dash-first")
-        self.assertIn('id = "nightly"\nname = "-dash-first"\nenabled = false\nscript',
-                      path.read_text())
-
-    def test_set_keeps_crlf_line_endings(self) -> None:
-        path = self._set_config(newline="\r\n")
-        self.cli("set", "job", "--name", "Job")
-        self.assertEqual(path.read_bytes(), self.SET_CONFIG.replace(
-            '"id" = "job"\n', '"id" = "job"\nname = "Job"\n').replace(
-            "\n", "\r\n").encode())
-
-    def test_set_refuses_invalid_requests_and_writes_nothing(self) -> None:
-        path = self._set_config()
-        before = path.read_bytes()
-        refused = [
-            (3, "not_found", ("set", "missing", "--name", "x")),
-            (6, "input", ("set", "job")),
-            (6, "input", ("set",)),
-            (6, "input", ("set", "job", "--title", "x")),
-            (6, "input", ("set", "job", "--name", "a", "--name", "b")),
-            (6, "input", ("set", "job", "--name")),
-            (6, "invalid_enabled", ("set", "job", "--enabled", "yes")),
-            (6, "invalid_enabled", ("set", "job", "--enabled", "True")),
-            (6, "invalid_enabled", ("set", "job", "--enabled", "1")),
-            (6, "invalid_text", ("set", "job", "--name", "a\tb")),
-            (6, "invalid_text", ("set", "job", "--name", "a\x7fb")),
-            (6, "invalid_text", ("set", "job", "--description", "a\nb")),
-            (6, "invalid_text", ("set", "job", "--description", "a b")),
-            (6, "invalid_text", ("set", "job", "--description", "a b")),
-            (6, "invalid_text", ("set", "job", "--name", "   ")),
-            (6, "too_long", ("set", "job", "--name", "n" * 81)),
-            (6, "too_long", ("set", "job", "--description", "d" * 501)),
-            # Valid text with an invalid flag beside it writes nothing either.
-            (6, "invalid_enabled", ("set", "job", "--name", "ok", "--enabled", "no")),
+    @needs_store
+    def test_set_refuses_invalid_requests_and_saves_nothing(self) -> None:
+        before = json.loads(self.cli("history", "job").stdout)["versions"]
+        cases = [
+            (("--colour", "red"), "input"),
+            (("--enabled", "yes"), "invalid_enabled"),
+            (("--description", "two\nlines"), "invalid_text"),
+            (("--description", "x" * 501), "too_long"),
+            (("--schedule", "every day"), "invalid_definition"),
+            (("--timezone", "Mars/Base"), "invalid_definition"),
+            (("--timeout", "soon"), "input"),
+            (("--script", "../outside.py"), "invalid_definition"),
+            (("--script", "a.py", "--body", "-"), "input"),
+            (("--arguments", "--all"), "input"),
+            ((), "input"),
         ]
-        for code, slug, args in refused:
+        for args, code in cases:
             with self.subTest(args=args):
-                proc = self.cli(*args, check=False)
-                self.assertEqual(proc.returncode, code, proc.stderr)
-                self.assertEqual(json.loads(proc.stderr)["error"]["code"], slug)
-                self.assertEqual(path.read_bytes(), before)
-        # The limits themselves are allowed, counted in characters.
-        self.cli("set", "job", "--name", "n" * 80, "--description", "é" * 500)
+                refused = self.cli("set", "job", *args, check=False)
+                self.assertEqual(refused.returncode, 6, refused.stderr)
+                self.assertEqual(json.loads(refused.stderr)["error"]["code"], code)
+        self.assertEqual(json.loads(self.cli("history", "job").stdout)["versions"], before)
 
-    def test_set_refuses_an_edit_that_leaves_an_invalid_configuration(self) -> None:
-        # The edited file is loaded exactly as the daemon loads it before it
-        # replaces anything, so a file that would not load stays as it was.
-        for broken in (self.SET_CONFIG + "\n[[automations]]\nid = \"x\"\n"
-                       "script = \"capabilities/automations/scripts/job.py\"\nbogus = 1\n",
-                       self.SET_CONFIG + "\nthis is not toml [[[\n"):
-            with self.subTest(broken=broken[-20:]):
-                path = self._set_config(broken)
-                proc = self.cli("set", "job", "--name", "x", check=False)
-                self.assertEqual(proc.returncode, 6, proc.stderr)
-                self.assertIn("invalid_config", proc.stderr)
-                self.assertEqual(path.read_text(), broken)
-                self.assertEqual(sorted(p.name for p in path.parent.iterdir()),
-                                 ["config.toml"])
-
-    def test_set_requires_an_explicit_project_enable(self) -> None:
+    @needs_store
+    def test_writing_definitions_requires_an_explicit_project_enable(self) -> None:
         # Global inheritance runs the other verbs, but writing the project's
-        # config.toml is gated as `service init` is.
+        # definitions is gated as `service init` is.
         config_home = Path(self.tmp.name) / "xdg-config"
-        (config_home / "capabilities").mkdir(parents=True)
+        (config_home / "capabilities").mkdir(parents=True, exist_ok=True)
         (config_home / "capabilities" / "settings.json").write_text(
             json.dumps({"capabilities": {"automations": {"enabled": True}}}) + "\n")
         (self.root / "capabilities" / "settings.json").write_text(
             json.dumps({"capabilities": {}}) + "\n")
         self.env["XDG_CONFIG_HOME"] = str(config_home)
-        path = self._set_config()
+        before = json.loads(self.cli("history", "job").stdout)["versions"]
         self.cli("list")
-        proc = self.cli("set", "job", "--name", "x", check=False)
-        self.assertEqual(proc.returncode, 4, proc.stderr)
-        self.assertIn("project_enable_required", proc.stderr)
-        self.assertEqual(path.read_text(), self.SET_CONFIG)
-
-    @needs_store
-    def test_set_publishes_the_change_to_a_running_daemon(self) -> None:
-        self.cli("service", "start")
-        pid = json.loads(self.cli("service", "status").stdout)["pid"]
-        answer = json.loads(self.cli("set", "job", "--enabled", "false").stdout)
-        self.assertEqual(answer["daemon"], {"running": True, "reloaded": True, "pid": pid})
-        self.assertEqual(answer["item"]["state"], "disabled")
-        # The same process took it up and is current: no restart, no stale config.
-        self.assertTrue(json.loads(self.cli("service", "doctor").stdout)["ok"])
-        self.assertEqual(json.loads(self.cli("service", "status").stdout)["pid"], pid)
-        state = Path(json.loads(self.cli("service", "status").stdout)["state_dir"])
-        loaded = RUNTIME.read_config_fingerprint(state)
-
-        # Nothing changed: the daemon is not signalled.
-        same = json.loads(self.cli("set", "job", "--enabled", "false").stdout)
-        self.assertFalse(same["daemon"]["reloaded"])
-        self.assertEqual(RUNTIME.read_config_fingerprint(state), loaded)
-
-        on = json.loads(self.cli("set", "job", "--enabled", "true").stdout)
-        self.assertTrue(on["daemon"]["reloaded"])
-        self.assertEqual(on["item"]["state"], "active")
-
-        self.cli("service", "stop")
-        stopped = json.loads(self.cli("set", "job", "--name", "Job").stdout)
-        self.assertEqual(stopped["daemon"]["running"], False)
-        self.assertEqual(stopped["daemon"]["reloaded"], False)
-        self.assertEqual(stopped["changed"], ["name"])
+        for args in (("set", "job", "--enabled", "false"), ("remove", "job"),
+                     ("import", "--apply")):
+            with self.subTest(args=args):
+                refused = self.cli(*args, check=False)
+                self.assertEqual(refused.returncode, 4, refused.stderr)
+                self.assertIn("project_enable_required", refused.stderr)
+        self.assertEqual(json.loads(self.cli("history", "job").stdout)["versions"], before)
 
     def test_without_a_store_the_service_refuses_and_says_why(self) -> None:
         """Runtime state has no local default: with no store configured nothing
@@ -1397,19 +1271,28 @@ every_seconds = 30
 
     @needs_store
     def test_a_run_is_recorded_under_the_node_s_declared_name(self) -> None:
+        # A manual run goes to the automation's node, and to the machine that
+        # asked when it names none; the host is the machine, whatever its node.
         self.env["AGENT_NODE_NAME"] = "lab-node"
+        self.define("job", node=None)
         run = json.loads(self.cli("run", "job").stdout)["run"]
+        placed = json.loads(self.cli("run", "slow").stdout)["run"]
         conn = RUNTIME._database().connect(application_name="automations-test")
         try:
             row = conn.execute(
-                "SELECT host FROM automations_runs WHERE id = %s", [run["id"]]).fetchone()
+                "SELECT node, host, environment FROM automations_runs WHERE id = %s",
+                [run["id"]]).fetchone()
+            other = conn.execute(
+                "SELECT node FROM automations_runs WHERE id = %s", [placed["id"]]).fetchone()
         finally:
             conn.close()
-        self.assertEqual(row, ("lab-node",))
+        self.assertEqual(row, ("lab-node", socket.gethostname(), "lab-node"))
+        self.assertEqual(other, (self.node,))
 
     @needs_store
     def test_a_run_the_daemon_queues_is_recorded_under_the_node_s_declared_name(self) -> None:
         self.env["AGENT_NODE_NAME"] = "lab-node"
+        self.define("flaky", node="lab-node")
         self.cli("service", "start")
         first = json.loads(self.cli("run", "flaky").stdout)["run"]
         self.wait_status(first["id"], {"failed"})
@@ -1419,7 +1302,7 @@ every_seconds = 30
         try:
             while time.time() < deadline and row is None:
                 row = conn.execute(
-                    "SELECT trigger, host FROM automations_runs WHERE parent_run_id = %s",
+                    "SELECT trigger, node FROM automations_runs WHERE parent_run_id = %s",
                     [first["id"]]).fetchone()
                 time.sleep(0.1)
         finally:
@@ -1486,13 +1369,8 @@ every_seconds = 30
         pid = json.loads(self.cli("service", "status").stdout)["pid"]
 
         config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
-        config_path.write_text(config_path.read_text() + """
-[[automations]]
-id = "added-after-start"
-environments = ["test"]
-script = "capabilities/automations/scripts/job.py"
-schedule = "0 3 * * *"
-""")
+        config_path.write_text(config_path.read_text().replace(
+            "max_parallel = 2", "max_parallel = 3", 1))
         self.assertFalse(json.loads(self.cli("service", "doctor", check=False).stdout)["ok"])
 
         published = json.loads(self.cli("service", "reload").stdout)
@@ -1540,13 +1418,8 @@ schedule = "0 3 * * *"
         self.wait_status(run_id, {"running"})
 
         config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
-        config_path.write_text(config_path.read_text() + """
-[[automations]]
-id = "added-mid-flight"
-environments = ["test"]
-script = "capabilities/automations/scripts/job.py"
-schedule = "0 4 * * *"
-""")
+        config_path.write_text(config_path.read_text().replace(
+            "max_parallel = 2", "max_parallel = 3", 1))
         self.assertTrue(json.loads(self.cli("service", "reload").stdout)["reloaded"])
 
         # This is the whole difference between reloading and restarting: work
@@ -1566,8 +1439,9 @@ schedule = "0 4 * * *"
         row = self.wait_status(run_id, {"canceled"})
         self.assertEqual(row["status"], "canceled")
 
-    def test_environment_gate(self) -> None:
-        self.env["AUTOMATIONS_ENVIRONMENT"] = "production"
+    @needs_store
+    def test_a_disabled_automation_is_not_runnable(self) -> None:
+        self.define("job", enabled=False)
         proc = self.cli("run", "job", check=False)
         self.assertEqual(proc.returncode, 6)
         self.assertIn("not_runnable", proc.stderr)
@@ -1580,28 +1454,12 @@ schedule = "0 4 * * *"
             RUNTIME.parse_cron("0 8 * JAN MON")
 
     @needs_store
-    def test_ticker_deduplicates_one_interval_bucket(self) -> None:
-        config_path = self.root / "schedule.toml"
-        config_path.write_text(
-            """version = 1
-[engine]
-tick_seconds = 1
-max_parallel = 1
-timezone = "UTC"
-environment = "test"
-
-[[automations]]
-id = "scheduled"
-environments = ["test"]
-script = "capabilities/automations/scripts/job.py"
-every_seconds = 60
-timeout_seconds = 5
-max_parallel = 1
-max_pending = 1
-overlap = "skip"
-retries = 0
-"""
-        )
+    def test_ticker_deduplicates_one_firing(self) -> None:
+        self.define("scheduled", script_path="capabilities/automations/scripts/job.py",
+                    schedule="*/5 * * * *", timezone="Etc/GMT-3", node=self.node)
+        self.define("elsewhere", script_path="capabilities/automations/scripts/job.py",
+                    schedule="*/5 * * * *", node="node-b")
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
         state_dir = self.root / "schedule-state"
         daemon = RUNTIME.Daemon(self.root, config_path, state_dir)
         try:
@@ -1610,17 +1468,20 @@ retries = 0
             daemon.schedule_due(when)
         finally:
             daemon.runs.close()
-        rows = RUNTIME.list_runs(self.root, RUNTIME.load_config(self.root, config_path),
-                                 limit=10)
+        rows = RUNTIME.list_runs(self.root, self.loaded(), limit=10)
         self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["automation_slug"], "scheduled")
         self.assertEqual(rows[0]["status"], "pending")
         self.assertEqual(rows[0]["trigger"], "schedule")
+        self.assertEqual(rows[0]["dedupe_key"], "scheduled:2026-07-20T08:10:00+00:00")
+        self.assertEqual(rows[0]["node"], self.node)
+        self.assertIsNotNone(rows[0]["definition_id"])
 
     @needs_store
     def test_startup_recovery_requeues_by_policy(self) -> None:
         config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
         state_dir = self.root / "capabilities" / "automations" / "state"
-        config = RUNTIME.load_config(self.root, config_path)
+        config = self.loaded()
         row = RUNTIME.enqueue_manual(self.root, config, state_dir, "job")
         self.assertIsNotNone(row)
         with RUNTIME.open_ledger(self.root, config) as ledger:
@@ -1636,6 +1497,74 @@ retries = 0
         self.assertEqual(original["status"], "interrupted")
         self.assertEqual(recovered["status"], "pending")
         self.assertEqual(recovered["trigger"], "recovery")
+
+    @needs_store
+    def test_a_script_body_runs_from_the_store_as_a_file_script_runs(self) -> None:
+        # The body is written to a file of its own for the one run, run through
+        # its #! line in the project with the same variables, and removed after.
+        self.define("bodied", script_body="#!/bin/sh\n"
+                    "echo \"$AUTOMATION_ID $1 $AUTOMATION_ENVIRONMENT $(pwd)\"\n",
+                    arguments=["first"], node=self.node)
+        started = json.loads(self.cli("service", "start").stdout)
+        run = json.loads(self.cli("run", "bodied").stdout)["run"]
+        row = self.wait_status(run["id"], {"succeeded", "failed"})
+        self.assertEqual(row["status"], "succeeded", row)
+        self.assertEqual(row["summary"], f"bodied first test {self.root.resolve()}")
+        self.assertEqual(row["definition_id"],
+                         json.loads(self.cli("history", "bodied").stdout)["versions"][-1]["version"])
+        self.assertEqual(list((Path(started["state_dir"]) / "bodies").iterdir()), [])
+
+    @needs_store
+    def test_two_machines_on_one_store_never_take_each_others_runs(self) -> None:
+        # A second machine is a checkout of its own of the same project, with a
+        # state root and a node name of its own, on the same store. Each node
+        # recovers, claims and fires only its own runs, and switching an
+        # automation's node from either machine moves where it runs without
+        # touching the other machine's files.
+        root_b = Path(self.tmp.name) / "machine-b" / "project"
+        shutil.copytree(self.root, root_b)
+        env_b = {**self.env, "CLAUDE_PROJECT_DIR": str(root_b), "AGENT_NODE_NAME": "node-b",
+                 "XDG_STATE_HOME": str(Path(self.tmp.name) / "machine-b" / "xdg-state")}
+
+        def cli_b(*args: str) -> dict:
+            proc = subprocess.run([str(CLI), *args], cwd=root_b, env=env_b,
+                                  capture_output=True, text=True, timeout=30)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return json.loads(proc.stdout)
+
+        started_b = cli_b("service", "start")
+        try:
+            self.assertEqual(started_b["daemon_node"], "node-b")
+            self.cli("service", "start")
+            here = self.wait_status(json.loads(self.cli("run", "job").stdout)["run"]["id"],
+                                    {"succeeded"})
+            self.assertEqual((here["node"], here["host"]), (self.node, socket.gethostname()))
+            self.assertTrue(here["log_path"].startswith(
+                json.loads(self.cli("service", "status").stdout)["state_dir"]))
+            # Moved to node-b from this machine: its runs are node-b's, and run
+            # there, from node-b's own checkout and state root.
+            self.cli("set", "job", "--node", "node-b")
+            there = json.loads(self.cli("run", "job").stdout)["run"]
+            self.assertEqual(there["node"], "node-b")
+            finished = self.wait_status(there["id"], {"succeeded"})
+            self.assertTrue(finished["log_path"].startswith(started_b["state_dir"]), finished)
+            # A restart of this node closes what it ran and nothing of node-b's.
+            mine = json.loads(self.cli("run", "slow").stdout)["run"]
+            self.wait_status(mine["id"], {"running"})
+            self.cli("set", "slow", "--node", "node-b")
+            theirs = json.loads(self.cli("run", "slow").stdout)["run"]
+            self.cli("service", "stop", "--timeout", "10")
+            self.assertEqual(json.loads(self.cli("show", mine["id"]).stdout)["status"],
+                             "interrupted")
+            self.wait_status(theirs["id"], {"running"}, timeout=15)
+            self.cli("service", "start")
+            time.sleep(1)
+            self.assertEqual(json.loads(self.cli("show", theirs["id"]).stdout)["status"],
+                             "running")
+            self.cli("cancel", theirs["id"])
+            self.wait_status(theirs["id"], {"canceled"})
+        finally:
+            cli_b("service", "stop", "--timeout", "10", "--force")
 
     @needs_store
     def test_timeout_and_automatic_retry(self) -> None:
@@ -1677,9 +1606,9 @@ def ledger_env(tmp_path, monkeypatch):
     (tmp_path / "runs").mkdir(exist_ok=True)
     opened = []
 
-    def ledger(project_id=None, environment="production"):
-        led = RUNTIME.RunLedger(project_id or f"prj_{uuid.uuid4().hex[:12]}",
-                                environment).open()
+    def ledger(project_id=None, node="node-a"):
+        monkeypatch.setenv("AUTOMATIONS_NODE_NAME", node)
+        led = RUNTIME.RunLedger(project_id or f"prj_{uuid.uuid4().hex[:12]}").open()
         opened.append(led)
         return led
 
@@ -1688,14 +1617,14 @@ def ledger_env(tmp_path, monkeypatch):
         led.close()
 
 
-DEDUPE = "fixture:production:nightly:2026-08-23T03:00:00+00:00"
+DEDUPE = "nightly:2026-08-23T03:00:00+00:00"
 
 
 def test_two_machines_cannot_both_claim_one_scheduled_firing(tmp_path, ledger_env):
     """The whole reason the ledger lives in a shared store: two daemons of one
     project, on two machines, race one firing and exactly one owns it."""
     a = ledger_env()
-    b = ledger_env(a.project_id)
+    b = ledger_env(a.project_id, node="node-b")
     first = a.claim("nightly", tmp_path, trigger="schedule", dedupe_key=DEDUPE)
     second = b.claim("nightly", tmp_path, trigger="schedule", dedupe_key=DEDUPE)
     assert first is not None and second is None
@@ -1744,6 +1673,54 @@ def test_the_ledger_counts_per_automation_within_the_project(tmp_path, ledger_en
     assert led.running() == 0
 
 
+def test_two_machines_on_one_store_read_only_their_own_runs(tmp_path, ledger_env):
+    """Recovery, the queue and the running count read only the node's own runs,
+    while one run of an automation at a time still holds across both."""
+    a = ledger_env(node="node-a")
+    b = ledger_env(a.project_id, node="node-b")
+    queued = a.claim("nightly", tmp_path, trigger="manual")
+    started = a.claim("other", tmp_path, trigger="manual")
+    a.update(started["id"], status="running", pid=os.getpid())
+    assert [row["id"] for row in a.pending()] == [queued["id"]]
+    assert b.pending() == []
+    assert [row["id"] for row in a.unfinished()] == [started["id"]]
+    assert b.unfinished() == []
+    assert (a.running(), b.running()) == (1, 0)
+    assert b.has_active("other", ["running"]) is True
+    assert b.claim("nightly", tmp_path, trigger="manual", node="node-a")["node"] == "node-a"
+    assert b.pending() == []
+
+
+def test_another_nodes_run_past_its_timeout_is_closed_for_the_automation(tmp_path, ledger_env):
+    """A node that went away cannot hold its automation forever: past the
+    timeout and grace another node marks its run interrupted, and never its own."""
+    a = ledger_env(node="node-a")
+    b = ledger_env(a.project_id, node="node-b")
+    gone = a.claim("nightly", tmp_path, trigger="manual")
+    a.update(gone["id"], status="running", started_at="2026-01-01T00:00:00+00:00")
+    mine = b.claim("nightly", tmp_path, trigger="manual")
+    b.update(mine["id"], status="running", started_at="2026-01-01T00:00:00+00:00")
+    assert b.expire_foreign("nightly", 60) == 1
+    assert a.get(gone["id"])["status"] == "interrupted"
+    assert "node-a" in a.get(gone["id"])["summary"]
+    assert b.get(mine["id"])["status"] == "running"
+    fresh = a.claim("nightly", tmp_path, trigger="manual")
+    assert b.expire_foreign("nightly", 60) == 0
+    assert a.get(fresh["id"])["status"] == "pending"
+
+
+def test_a_writer_from_before_the_node_column_still_records_its_runs(tmp_path, ledger_env):
+    """A machine still on the release before `node` inserts none; its host was
+    its node name then, and the run is that node's rather than refused."""
+    led = ledger_env()
+    led._execute(
+        "INSERT INTO automations_runs (id, project_id, automation_slug, environment, "
+        "trigger, status, queued_at, log_path, host) VALUES "
+        "(%s, %s, 'nightly', 'production', 'manual', 'pending', %s, '/tmp/x.log', 'old-node')",
+        [uuid.uuid4().hex, led.project_id, RUNTIME.iso()])
+    assert [row["node"] for row in led.list()] == ["old-node"]
+
+
 def test_a_run_reads_as_it_always_has_and_says_where_it_was_recorded(tmp_path, ledger_env):
     """Times come back as the ISO text they were written as and the cancel flag
     as 0 or 1, so `runs` and `show` print what they printed before; the host is
@@ -1767,10 +1744,10 @@ def test_a_run_reads_as_it_always_has_and_says_where_it_was_recorded(tmp_path, l
 def test_a_run_the_schema_cannot_hold_fails_loudly(tmp_path, ledger_env):
     """The dedupe key is the only conflict a claim treats as someone else's win;
     a run the table cannot hold raises instead of vanishing."""
-    led = ledger_env(environment=None)
+    led = ledger_env()
     with pytest.raises(Exception) as caught:
-        led.claim("nightly", tmp_path, trigger="manual")
-    assert "null value" in str(caught.value)
+        led.claim("nightly", tmp_path, trigger="manual", definition_id=str(uuid.uuid4()))
+    assert "foreign key" in str(caught.value)
 
 
 def test_a_dedupe_collision_still_yields_rather_than_raising(tmp_path, ledger_env):
@@ -1888,6 +1865,8 @@ class UpLedger:
 
     environment = "test"
     warnings: list[str] = []
+    node = "node-a"
+    host = "host-a"
 
     def __init__(self, cancel: set[str] = frozenset()):
         self.rows: dict[str, dict] = {}
@@ -1917,19 +1896,46 @@ def _scheduler(tmp_path, *, grace=0.5, timeout=60):
     (root / "jobs").mkdir(parents=True)
     declared = "version = 1\n[engine]\nmax_parallel = 8\n" \
                f"shutdown_grace_seconds = {grace}\nenvironment = \"test\"\n"
+    rows = []
     for slug, body in (("job", "exec sleep 60"), ("stubborn", STUBBORN)):
         job = root / "jobs" / f"{slug}.sh"
         job.write_text(f"#!/bin/sh\n{body}\n")
         job.chmod(0o755)
-        declared += f"\n[[automations]]\nid = \"{slug}\"\nscript = \"jobs/{slug}.sh\"\n" \
-                    f"timeout_seconds = {timeout}\nmax_parallel = 8\n"
+        rows.append({**RUNTIME.DEFINITION_DEFAULTS, "id": str(uuid.uuid4()), "slug": slug,
+                     "script_path": f"jobs/{slug}.sh", "timeout_seconds": timeout,
+                     "node": "node-a", "created_at": None, "created_by": None})
     config_path = root / "config.toml"
     config_path.write_text(declared)
     said: list[str] = []
     daemon = RUNTIME.Daemon(root, config_path, tmp_path / "state", slug="scratch",
                             loader=lambda: RUNTIME.load_config(root, config_path),
-                            runs=DownLedger(), log=said.append)
+                            runs=DefinedLedger(rows), log=said.append)
+    daemon.runs = DownLedger()
     return daemon, said
+
+
+class _QuietLink:
+    generation = 1
+
+    def take_changed(self, _project_id):
+        return False
+
+
+class DefinedLedger:
+    """A ledger that answers only with the definitions it was given, for a
+    daemon to be built over."""
+
+    warnings: list[str] = []
+    project_id = "prj_fixture"
+    node = "node-a"
+    host = "host-a"
+    link = _QuietLink()
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def definitions(self):
+        return self.rows
 
 
 def _start(daemon, run_id, slug="job"):
