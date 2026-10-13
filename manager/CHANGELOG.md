@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-13 — The running node is named by `AGENT_NODE_NAME` where the machine declares it
+
+The node a store-mode grant is matched against, and the `node` that `capabilities connections import` and `capabilities get <name> grant <id>` answer with, is the value of `AGENT_NODE_NAME` where the machine declares one, and its host name as before where it declares none. A container node that declares its name keeps the grants naming it across redeploys, when its host name, the container id, changes.
+
 ## 2026-10-13 — A composed `memory` contribution tells ContextKit the memory is carried
 
 `capabilities context` now composes the line `<!-- contextkit:memory-contribution -->` directly above the context contribution of `memory` whenever that contribution is composed, and nowhere else. `contextkit build` reads that line and leaves out its own projection of the project's memory folder, so a ContextKit-bound project that keeps a `memory/` folder beside its store carries its memory once instead of twice. A `memory` contribution that is missing, unreadable, over its ceiling or empty carries no such line, so ContextKit goes on projecting the folder and the session is never left without memory. Every other capability's block is unchanged. Run `capabilities help` for the details.

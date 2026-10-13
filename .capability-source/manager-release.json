@@ -2,12 +2,12 @@
   "assets": {
     "DOCTRINE.md": "4e39a81d407e175de35bf119396f5116e8cf898b343412f2f69971fdbe40fdf7",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "3db3bae618f19105381ae5b812deb2aafbae8cd5063afd5f3413559290e3342e",
+    "SHEBANG.md": "b5825e0aa362c3affab6fd4a707bcff7cc7c6d3f80ac25f70d352daf87289f2b",
     "SOURCES.md": "79e453cf68a08ba2b2e5e460064eb0a5aca8f13071e9d6557be1b7361f1e0075",
     "TEMPLATE.md": "770dac19fc4beab216b81a61f6b833dab9668f774055559f6dab1c7d266ea5f5",
-    "contract/CHANGELOG.md": "3dd5153c135962cbed614eb3ae533950eba9d52e2060c73c2ebd99aa3a2c80e8",
+    "contract/CHANGELOG.md": "45db0035d425f0ea355a49e96a8f9c470e9835fe84a34185746b028500b43ed1",
     "contract/preamble.py": "9c6c8a12f87a8b3551dad0e6cacb5dc86b9339f8f0089e832e4238ecae07d846",
-    "contract/store.py": "4d2bd075174d4c78d9e275c0ad21c3aa7b05dbd2dea1ab0e407be27365df8e46",
+    "contract/store.py": "950141e460a061b988eac1d37a18c16715c558bae4cc5ca607e36ad3c5963b79",
     "guides/authoring.md": "e467e5343a54e99c991592d06233fd98b7be13fa32a174d0f27d3a8a06478724",
     "guides/conforming.md": "1c3a44cd7662cb26eec400d05290f6b9f364758387e8d3f974ad8eb74abde93b",
     "guides/contract.md": "72408b3b5d035b15f9d98b5a5dc3d558870f391ed254b8c5f017656be75a13f4",
@@ -18,7 +18,7 @@
     "guides/repositories.md": "0ec2af6dfc92d20aa283fecab82b7888fb22b2480541cbb597e9a52f680ec2f4",
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "f3c6a51777712d58fcbc0689bc20cfb51f4eb03763f3a947e246314952855bfa",
+    "manager/CHANGELOG.md": "5e622980f0fc3df4b4c630253a845a9e0d2eb684a63bd62f0840bd3f50ea6862",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {

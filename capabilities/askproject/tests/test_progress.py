@@ -61,6 +61,17 @@ def _stored(lab) -> list[tuple]:
             (f"path:{lab.caller.resolve()}",)).fetchall()
 
 
+def test_a_session_is_kept_under_the_node_s_declared_name(lab):
+    declared = {"AGENT_NODE_NAME": "lab-node"}
+    first, result, _ = lab.ask("--engine", "codex", env=declared)
+    assert first.returncode == 0, first.stderr
+    [row] = _stored(lab)
+    assert row[1] == "lab-node"
+    second, again, _ = lab.ask("-c", env=declared)
+    assert second.returncode == 0, second.stderr
+    assert (again["resumed"], again["session_id"]) == (True, result["session_id"])
+
+
 def test_a_second_question_resumes_the_session_the_first_recorded_in_the_store(lab):
     first, result, _ = lab.ask("--engine", "codex")
     assert first.returncode == 0, first.stderr

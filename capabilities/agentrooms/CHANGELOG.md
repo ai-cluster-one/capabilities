@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-13 — Sessions and leases are held under the node's declared name
+
+The node the service records its sessions and leases under is the node's name as the contract gives it: the value of `AGENT_NODE_NAME` where the machine declares one, and its host name as before where it declares none. A container node that declares its name holds the same leases after a redeploy, when its host name, the container id, changes.
+
 ## 2026-10-13 — A person's sign-in, a live stream, each room's owners, and the session behind an answer
 
 `agentrooms login USER_ID` signs in to an existing account with its password, read from standard input, and writes the connection and the access token it minted - into the project, or with `--global` into `~/.config/agentrooms/` as the machine's connection. The password is sent once and never stored or printed. Outside any project `connections`, `doctor`, `rooms`, `read` and `watch` are now machine reads: they use the machine's connections read-only, and posting as that account still needs a project that grants the connection writes.

@@ -157,11 +157,18 @@ def read_only_switch() -> bool:
     return os.environ.get(READ_ONLY_ENV, "").strip().lower() in ("1", "true")
 
 
+# The name a machine declares for itself as a node. A container's host name is
+# its container id and changes on every redeploy, so a node that declares one
+# keeps the same name in the store across them.
+NODE_NAME_ENV = "AGENT_NODE_NAME"
+
+
 def node_name() -> str:
     """The node this process runs on, by the one name the package gives it: a
     store-mode grant naming a node is matched against it, and a service that
-    records which node holds its work records it."""
-    return socket.gethostname()
+    records which node holds its work records it. It is the name the machine
+    declares in AGENT_NODE_NAME, and the host name where it declares none."""
+    return os.environ.get(NODE_NAME_ENV, "").strip() or socket.gethostname()
 
 
 # Where a project keeps its connections and grants: files (the default) or the

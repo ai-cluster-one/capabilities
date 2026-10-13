@@ -78,6 +78,7 @@ class AutomationsTests(unittest.TestCase):
         else:
             os.environ.pop("AGENTKIT_DB_URL", None)
         self.env = dict(os.environ)
+        self.env.pop("AGENT_NODE_NAME", None)
         self.env.update(
             {
                 "CLAUDE_PROJECT_DIR": str(self.root),
@@ -1393,6 +1394,18 @@ every_seconds = 30
         self.assertFalse(self.store_path.exists())
         repaired = json.loads(self.cli("doctor", "--repair").stdout)["repaired"]
         self.assertFalse(repaired["repaired"])
+
+    @needs_store
+    def test_a_run_is_recorded_under_the_node_s_declared_name(self) -> None:
+        self.env["AGENT_NODE_NAME"] = "lab-node"
+        run = json.loads(self.cli("run", "job").stdout)["run"]
+        conn = RUNTIME._database().connect(application_name="automations-test")
+        try:
+            row = conn.execute(
+                "SELECT host FROM automations_runs WHERE id = %s", [run["id"]]).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row, ("lab-node",))
 
     @needs_store
     def test_manual_run_history_and_logs(self) -> None:

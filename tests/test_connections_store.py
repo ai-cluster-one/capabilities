@@ -43,7 +43,15 @@ sys.path.insert(0, str(REPO / "contract"))
 import store as S  # noqa: E402
 
 
-def test_the_node_is_the_host_name():
+def test_the_node_is_the_host_name(monkeypatch):
+    monkeypatch.delenv(S.NODE_NAME_ENV, raising=False)
+    assert S.node_name() == socket.gethostname()
+
+
+def test_a_declared_node_name_is_the_node(monkeypatch):
+    monkeypatch.setenv(S.NODE_NAME_ENV, " lab-node ")
+    assert S.node_name() == "lab-node"
+    monkeypatch.setenv(S.NODE_NAME_ENV, "  ")
     assert S.node_name() == socket.gethostname()
 
 
@@ -188,7 +196,7 @@ def lab(tmp_path, instance, cluster):
     for leaked in ("CAPABILITIES_READ_ONLY", "COOLIFY_BASE_URL", "COOLIFY_TOKEN",
                    "VIRTUAL_ENV", "CAPABILITIES_PROJECT_ENVELOPE",
                    "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "CAPABILITIES_PROJECT_ID",
-                   "CAPABILITIES_PROJECT_ID_ROOT", *DB_KEYS):
+                   "CAPABILITIES_PROJECT_ID_ROOT", "AGENT_NODE_NAME", *DB_KEYS):
         env.pop(leaked, None)
     return {"project": project, "envelope": envelope, "env": env, "seen": seen,
             "database": database, "cluster": cluster, "url": url,
@@ -413,6 +421,20 @@ def test_a_grant_naming_this_node_is_used_before_the_grant_for_every_node(lab):
     assert _manager(lab, "get", "coolify", "setting",
                     "connection.default").stdout.strip() == "spare"
     assert _ok(_coolify(lab, "connections"))["default"] == "spare"
+
+
+def test_a_node_that_declares_its_name_is_matched_by_it_and_not_its_host_name(lab):
+    declared = {"AGENT_NODE_NAME": "lab-node"}
+    result = _ok(_manager(lab, "connections", "import", extra=declared))
+    assert result["node"] == "lab-node"
+    _ok(_manager(lab, "set", "coolify", "grant", "box", '{"allow_write": false}'))
+    _ok(_manager(lab, "set", "coolify", "grant", "box",
+                 json.dumps({"node": "lab-node", "allow_write": True})))
+    assert _ok(_manager(lab, "get", "coolify", "grant", "box", extra=declared)) == {
+        "allow_write": True, "node": "lab-node", "is_default": False}
+    _ok(_coolify(lab, "deploy", "x", extra=declared))
+    # The host name names another node now, so the grant for every node applies.
+    assert _error(_coolify(lab, "deploy", "x"))["code"] == "read_only"
 
 
 def test_a_store_that_cannot_be_reached_is_store_unreachable(lab):

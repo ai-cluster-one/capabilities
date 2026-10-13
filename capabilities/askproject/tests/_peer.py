@@ -107,7 +107,7 @@ class Lab:
         self.env = os.environ.copy()
         for key in (*CHAIN_KEYS, "CLAUDE_PROJECT_DIR", "CAPABILITIES_READ_ONLY",
                     "CAPABILITIES_PROJECT_ENVELOPE",
-                    "CAPABILITIES_PROJECT_ENVELOPE_ROOT"):
+                    "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "AGENT_NODE_NAME"):
             self.env.pop(key, None)
         clear_db_env(self.env)
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env.get("PATH", "")

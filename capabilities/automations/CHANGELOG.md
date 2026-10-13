@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-13 — A run is recorded under the node's declared name
+
+The `host` a run is recorded under in `automations_runs` is the node's name as the contract gives it: the value of `AGENT_NODE_NAME` where the machine declares one, and its host name as before where it declares none. A container node that declares its name keeps finding the runs it recorded, and their logs, after a redeploy; a store-mode grant naming the node is matched against the same name.
+
 ## 2026-10-11 — A store behind Supabase's transaction pooler is refused at connect
 
 `automations` now uses `capabilities-contract` 0.4.1. A transaction-mode pooler keeps no session between transactions, so the schema binding, prepared statements and notifications a connection relies on are lost through one, and it is not supported. A database setting that points at Supabase's transaction pooler - a host under `pooler.supabase.com` on port 6543 - is refused before anything is sent to it, as `transaction_pooler`, with a hint naming the session pooler: the same host on port 5432. Every other database, the session pooler included, is reached as before.

@@ -330,6 +330,10 @@ def _project_identity(root: Path) -> dict:
 # launcher resolved one.
 PROJECT_ID_FOR_WRITE = None
 
+# The node a run is recorded on is the one the contract names, which the CLI
+# installs here; the host name stands in only where no CLI installed it.
+NODE_NAME = socket.gethostname
+
 
 def _handed_project_id(root: Path) -> str:
     """The id handed down for this root, scoped the way the envelope is."""
@@ -701,7 +705,7 @@ class RunLedger:
                  root: Path | None = None):
         self.project_id = project_id
         self.environment = environment
-        self.host = socket.gethostname()
+        self.host = NODE_NAME()
         self._owns_link = link is None
         self.link = link if link is not None else StoreLink(root=root)
 
