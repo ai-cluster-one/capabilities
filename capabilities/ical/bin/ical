@@ -25,6 +25,10 @@ without the flag the registry's default applies (marked with * in the
 `connections` output). Read verbs also respect the connection's scope —
 when `calendars` is non-empty they read only those calendars.
 
+Outside any project, connections and doctor are machine reads: they use the
+machine's own connections read-only, unless a grant switched one off; every
+other verb that needs a connection is refused there.
+
 Registry (first found wins, never merged):
   <project>/capabilities/ical/connections.json
   ~/.config/ical/connections.json
@@ -263,6 +267,7 @@ CONN_FIELDS = [{'key': 'calendars',
   'required': False}]
 WRITE_VERBS: list = ["create", "update", "delete"]  # gated per-connection
 WRITE_DEFAULT = False   # safe default when a registry entry omits the flag
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 STATE = False       # True when the capability writes session/cache state
 INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder

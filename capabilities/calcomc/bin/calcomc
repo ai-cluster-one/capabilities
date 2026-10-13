@@ -64,6 +64,10 @@ CONNECTIONS
   registry's "default" pointer applies, else the sole entry; several entries without a
   pointer is refused as ambiguous.
 
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
   Secret resolution (first non-empty wins), for the var named by secret_env:
     1. project env   .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
     2. user config   $XDG_CONFIG_HOME/calcomc/credentials.env (default ~/.config/calcomc/)
@@ -238,6 +242,7 @@ CONN_FIELDS = [{'key': 'secret_env',
 API_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 WRITE_VERBS = {"bookings cancel"} | {f"api {m}" for m in API_METHODS if m != "GET"}
 WRITE_DEFAULT = False   # a Cal.com write leaves the system — it reaches real attendees
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 STATE = False       # calcomc mints nothing; the key is the whole credential
 INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder

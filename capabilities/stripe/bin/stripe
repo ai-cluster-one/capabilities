@@ -48,6 +48,10 @@ CONNECTIONS
   Unflagged, the registry's "default" pointer applies, else the sole entry;
   several entries without a pointer is refused as ambiguous.
 
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
 COMMANDS
   connections
       Where every connection's values resolve from (tier, source, secrets
@@ -158,6 +162,7 @@ CONN_FIELDS = [{'key': 'secret_env',
   'env': 'STRIPE_{ID}_SECRET_KEY'}]
 WRITE_VERBS: set = set()   # every command is a GET — nothing mutates Stripe
 WRITE_DEFAULT = True    # protocol default; this CLI has no write verbs to gate
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 STATE = False       # True when the capability writes session/cache state
 INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder

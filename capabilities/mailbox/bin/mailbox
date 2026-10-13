@@ -54,6 +54,10 @@ CONNECTIONS
   pointer applies, else the sole entry; several entries without a pointer
   is refused as ambiguous.
 
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
   Credential keys a connection may resolve through the cascade:
     MAILBOX_ADDRESS       mailbox address                  (required)
     MAILBOX_IMAP_HOST     IMAP host                        (required)
@@ -240,6 +244,7 @@ CONN_FIELDS = [{'key': 'address',
   'env': 'MAILBOX_{ID}_APP_PASSWORD'}]
 WRITE_VERBS = {"send", "move", "seen"}   # domain verbs that mutate the mailbox
 WRITE_DEFAULT = False   # mailbox writes leave the system (mail to real people) — granted per connection, explicitly
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 STATE = False       # True when the capability writes session/cache state
 INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder

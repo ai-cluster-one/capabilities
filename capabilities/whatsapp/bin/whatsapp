@@ -86,6 +86,10 @@ Connections
   "default" pointer applies, else the sole entry; several entries without a
   pointer is refused as ambiguous.
 
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
 Credentials (4-tier cascade; first non-empty wins)
   flags > project .env(.local) > ~/.config/whatsapp/credentials.env > process env.
         DEEPGRAM_API_KEY   only `whatsapp transcribe` reads it
@@ -686,6 +690,7 @@ SETTINGS = {'homes': [{'scope': 'project',
            'apply': 'reload'}]}
 WRITE_VERBS = ["send"]   # domain verbs that mutate the remote system
 WRITE_DEFAULT = False    # a WhatsApp send leaves the system — granted per connection, explicitly
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/whatsapp/guides/")
 STATE = True        # True when the capability writes session/cache state

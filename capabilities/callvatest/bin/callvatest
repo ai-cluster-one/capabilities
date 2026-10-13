@@ -64,6 +64,10 @@ CONNECTIONS
   Selection: --connection <id>. Unflagged, the registry's "default" pointer
   applies, else the sole entry; several entries without a pointer is refused.
 
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
 JUDGES
   A `semantic` assertion is settled by a judge model. A judge is this harness's
   own configuration rather than a CallVA tenant, so the roster is the "judges"
@@ -507,6 +511,7 @@ SETTINGS = {'homes': [{'scope': 'project',
 # placed.
 WRITE_VERBS = {"run", "suite", "probe", "explore", "session start"}
 WRITE_DEFAULT = True    # calls land in a tenant the consumer owns
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/callvatest/guides/")
 STATE = True        # True when the capability writes session/cache state

@@ -70,6 +70,10 @@ CONNECTIONS
   registry's "default" pointer applies, else the sole entry; several entries
   without a pointer is refused as ambiguous.
 
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
 DATABASE
   The store is the consumer's own PostgreSQL. Two tables back this CLI:
     journal         id (uuid PK), created_at, message (the transcript),
@@ -222,6 +226,7 @@ CONN_FIELDS = [{'key': 'db_host',
   'required': False}]
 WRITE_VERBS = {"update", "chunk", "schema"}     # verbs that mutate the store
 WRITE_DEFAULT = True    # writes stay inside a database the consumer owns
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/journal/guides/")
 STATE = False       # entries live in the remote database; only the guides cache is local

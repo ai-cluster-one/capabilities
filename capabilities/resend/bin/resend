@@ -55,6 +55,10 @@ CONNECTIONS
   Unflagged, the registry's "default" pointer applies, else the sole entry;
   several entries without a pointer is refused as ambiguous.
 
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
 COMMANDS
   connections
       Where every connection's values resolve from (tier, source, secrets
@@ -154,6 +158,7 @@ CONN_FIELDS = [{'key': 'secret_env',
   'required': False}]
 WRITE_VERBS: set = {"send"}   # a send leaves the system
 WRITE_DEFAULT = False   # off unless a connection grants allow_write
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 STATE = False       # True when the capability writes session/cache state
 INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder

@@ -80,6 +80,10 @@ CONNECTIONS
   subcommand. Unflagged, the registry's "default" pointer applies, else the
   sole entry; several entries without a pointer is refused as ambiguous.
 
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
   WRITES ARE OFF BY DEFAULT: a calendar write leaves the system — it creates
   an event other people see and, where the server schedules, mails a real
   invitation to a real human. create/update/delete exit 4 unless the
@@ -297,6 +301,7 @@ CONN_FIELDS = [{'key': 'backend',
   'required': False}]
 WRITE_VERBS = {"create", "update", "delete"}   # domain verbs that mutate the calendar
 WRITE_DEFAULT = False   # a calendar write leaves the system (invitations reach real people)
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/calendar/guides/")
 STATE = False       # True when the capability writes session/cache state

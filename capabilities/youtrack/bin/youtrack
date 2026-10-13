@@ -29,6 +29,10 @@ A project may declare capabilities/youtrack/connections.json:
     }
   }
 
+Outside any project, connections and doctor are machine reads: they use the
+machine's own connections read-only, unless a grant switched one off; every
+other verb that needs a connection is refused there.
+
 Commands:
   youtrack help                              Print this contract.
   youtrack connections                       Show local config resolution.
@@ -272,6 +276,7 @@ WRITE_VERBS = {"issues create", "issues update", "issues comments add",
                "issues tags add", "issues tags remove", "issues work log",
                "articles create", "articles update", "articles comments add"}
 WRITE_DEFAULT = True
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/youtrack/guides/")
 STATE = False

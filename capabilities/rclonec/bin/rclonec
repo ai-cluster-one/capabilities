@@ -88,6 +88,10 @@ CONNECTIONS
   `allow_write: false` makes the connection read-only. Verbs that mutate the remote exit
   4, and so does a forwarded transfer whose DESTINATION is this remote; reading from it
   stays available. Nothing in the cascade lifts the gate.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
 """
 
 import json
@@ -130,6 +134,7 @@ CONN_FIELDS = [{'key': 'type',
   'type': 'object',
   'required': False}]
 WRITE_DEFAULT = True    # a connection points at a store the consumer owns
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/rclonec/guides/")
 STATE = False       # the child writes no config and rclonec mints nothing

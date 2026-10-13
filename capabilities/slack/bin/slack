@@ -115,6 +115,7 @@ SETTINGS = {'homes': [{'scope': 'project',
            'apply': 'restart'}]}
 WRITE_VERBS = {"post", "service"}
 WRITE_DEFAULT = False
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = (
     "https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
     "main/capabilities/slack/guides/"
@@ -150,6 +151,10 @@ WRITES
   post is a write verb and is refused unless the selected connection sets
   "allow_write": true in capabilities/slack/connections.json. Writes are off
   by default; do not lift the gate yourself — ask the user.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
 
 ALLOW-LIST POLICY  (capabilities/slack/policy.json)
   Even when writes are allowed, post/read may only touch permitted conversations.

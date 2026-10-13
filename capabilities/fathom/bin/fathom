@@ -72,6 +72,10 @@ CONNECTIONS
   registry's "default" pointer applies, else the sole entry; several entries
   without a pointer is refused as ambiguous.
 
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
 DATABASE
   The store is the consumer's own PostgreSQL. Two tables back this CLI:
     fathom      id (bigint PK, the Fathom recording_id), title, recording_start,
@@ -235,6 +239,7 @@ WRITE_VERBS = {     # verbs that mutate the consumer's database
     "sync", "update", "transcript", "schema", "vocab-add", "vocab-remove",
 }
 WRITE_DEFAULT = True    # writes stay inside a database the consumer owns
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/fathom/guides/")
 STATE = False       # data lives in the remote DB; only the guides cache is local

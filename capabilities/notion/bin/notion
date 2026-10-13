@@ -41,6 +41,10 @@ CONNECTIONS
   Unflagged, the registry's "default" pointer applies, else the sole entry;
   several entries without a pointer is refused as ambiguous.
 
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
 Global option (accepted anywhere on the line):
   --token-env <KEY>   Act as a different identity by naming the env/cred KEY
                       that holds the token (default NOTION_TOKEN; with a
@@ -162,6 +166,7 @@ CONN_FIELDS = [{'key': 'secret_env',
   'env': 'NOTION_{ID}_TOKEN'}]
 WRITE_VERBS = {"publish", "create", "upsert"}   # domain verbs that mutate Notion
 WRITE_DEFAULT = True    # writes stay inside a workspace the consumer owns
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 STATE = False       # True when the capability writes session/cache state
 INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder

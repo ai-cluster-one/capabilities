@@ -102,6 +102,10 @@ CONNECTIONS
   applies, else the sole entry; several entries without a pointer is refused
   as ambiguous.
 
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
   Optional, non-secret — RAILWAYC_EXPECT_PROJECT (project .env): if set, `doctor`
   asserts the token resolves to that project (by name or id) and exits 7 on mismatch.
   The safety net against pasting the wrong project's token into a project's .env.
@@ -245,6 +249,7 @@ READ_SUBCOMMANDS = {"volume": {"list"}}
 READ_VERBS = {"backups"}
 assert not (READ_VERBS & WRITE_VERBS), "a verb is a read or a write, never both"
 WRITE_DEFAULT = True    # writes stay inside a project the consumer owns
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 STATE = False       # True when the capability writes session/cache state
 INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder

@@ -57,6 +57,10 @@ unless a connection grants them. Grant them with
 `"allow_write": true` on a connection in connections.json. A refused write exits
 4 — ask the user, never lift the gate yourself.
 
+Outside any project, connections and doctor are machine reads: they use the
+machine's own connections read-only, unless a grant switched one off; every
+other verb that needs a connection is refused there.
+
   --connection <id>        Select a connection; accepted by every verb. Optional
                            with a default pointer or a sole connection.
   TELEGRAM_API_ID          Numeric app id from my.telegram.org/apps (implicit
@@ -499,6 +503,7 @@ SETTINGS = {'homes': [{'scope': 'project',
            'apply': 'reload'}]}
 WRITE_VERBS = {"send", "send-media", "react"}
 WRITE_DEFAULT = False    # outbound messages and reactions need an explicit connection grant
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/telegram/guides/")
 STATE = True       # True when the capability writes session/cache state

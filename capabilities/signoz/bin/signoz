@@ -65,6 +65,10 @@ CONNECTIONS
   --environment overrides both. Queries apply the connection's base scope
   unless overridden with --environment, --all-environments, or --legacy-unscoped.
 
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
 COMMANDS
   signoz doctor [--connection ID]
       Verify version, management API authentication, and OTLP configuration.
@@ -237,6 +241,7 @@ CONN_FIELDS = [{'key': 'url',
   'default': True}]
 WRITE_VERBS = {"api"}
 WRITE_DEFAULT = False
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/signoz/guides/")
 STATE = False
