@@ -186,12 +186,18 @@ def allowed_emoji(available) -> list[str]:
     return [one for one in STANDARD_REACTIONS if _plain(one) in held]
 
 
-def decision_schema(batch_ids, emoji) -> dict:
-    """The schema one run's answer is held to: an action, a message from the
-    batch, an emoji from the allowed set (null unless reacting) and a reason.
-    Every property is required and nullable where it may be empty, which both
+def decision_schema(emoji) -> dict:
+    """The schema one run's answer is held to: an action, a message id, an
+    emoji from the allowed set (null unless reacting) and a reason. Every
+    property is required and nullable where it may be empty, which both
     harnesses' structured output accept. A chat that allows no reaction is
-    offered no `react`."""
+    offered no `react`.
+
+    It depends on the chat's allowed set alone and never on the batch. The
+    harness carries the schema ahead of the gate's system prompt, at the head
+    of the prompt prefix it caches, so a schema that named the batch's ids
+    would make every run's prefix new and no run would read the cache. That
+    the target is a message of the batch is held by `parse_decision`."""
     actions = [one for one in ACTIONS if one != "react" or emoji]
     return {
         "type": "object",
@@ -199,8 +205,7 @@ def decision_schema(batch_ids, emoji) -> dict:
         "required": ["action", "target_message_id", "emoji", "reason"],
         "properties": {
             "action": {"type": "string", "enum": actions},
-            "target_message_id": {"type": ["integer", "null"],
-                                  "enum": [*map(int, batch_ids), None]},
+            "target_message_id": {"type": ["integer", "null"]},
             "emoji": {"type": ["string", "null"], "enum": [*emoji, None]},
             "reason": {"type": "string"},
         },
@@ -339,8 +344,8 @@ def record(*, channel, batch_ids, harness, model, decision, latency_ms, tokens, 
 
 def run(lib, run_fn, found, prompt, schema, channel, *, run_root, codex_home, environ):
     """One gate run: the resolved gate profile with its schema narrowed to the
-    batch (`schema`), started from an empty directory made under `run_root` and
-    removed after, as a fresh session. On codex the run reads `codex_home`
+    chat's allowed emoji (`schema`), started from an empty directory made under
+    `run_root` and removed after, as a fresh session. On codex the run reads `codex_home`
     rather than the user's codex home, unless the profile sets CODEX_HOME
     itself. `lib` is the harness runner and `run_fn` its `run`."""
     knobs = {**found["knobs"], "output_schema": schema}

@@ -376,17 +376,23 @@ class Decision(unittest.TestCase):
 
     emoji = ["👍", "❤", "🔥"]
 
-    def test_the_schema_offers_the_batch_and_the_allowed_set(self):
-        schema = gate.decision_schema([5, 6], self.emoji)
+    def test_the_schema_offers_the_allowed_set_and_never_names_the_batch(self):
+        schema = gate.decision_schema(self.emoji)
         props = schema["properties"]
         self.assertEqual(schema["required"], ["action", "target_message_id", "emoji", "reason"])
         self.assertFalse(schema["additionalProperties"])
         self.assertEqual(props["action"]["enum"], ["ignore", "react", "reply"])
-        self.assertEqual(props["target_message_id"]["enum"], [5, 6, None])
+        self.assertEqual(props["target_message_id"], {"type": ["integer", "null"]})
         self.assertEqual(props["emoji"]["enum"], ["👍", "❤", "🔥", None])
         # A chat that allows no reaction is offered no react.
-        self.assertEqual(gate.decision_schema([5], [])["properties"]["action"]["enum"],
+        self.assertEqual(gate.decision_schema([])["properties"]["action"]["enum"],
                          ["ignore", "reply"])
+        # The harness caches the schema at the head of the prompt prefix, so
+        # it is the chat's alone; the decision's parse holds the batch.
+        self.assertIn("target_message_id",
+                      gate.parse_decision({"action": "reply", "target_message_id": 7,
+                                           "emoji": None, "reason": "q"},
+                                          [5, 6], self.emoji)["invalid"])
 
     def test_a_valid_decision_is_read_as_given(self):
         for answer, expected in (
@@ -646,20 +652,27 @@ class GateSession(unittest.IsolatedAsyncioTestCase):
                                "Channel state", "Progress command", "Tool authority"):
                     self.assertNotIn(absent, prompt)
                 # A run is a fresh session from an empty directory under the
-                # service's state, removed after, on the narrowed schema.
+                # service's state, removed after, on the chat's schema.
                 self.assertEqual(call["session"].kind, "fresh")
                 self.assertEqual(call["cwd_listing"], [])
                 self.assertEqual(Path(call["cwd"]).parent, s.daemon.GATE_RUN_DIR)
                 self.assertFalse(Path(call["cwd"]).exists())
                 self.assertEqual(call["profile"].output_schema["properties"]["emoji"]["enum"],
                                  ["👍", None])
-                self.assertEqual(call["profile"].output_schema["properties"]
-                                 ["target_message_id"]["enum"], [5, 6, None])
+                self.assertNotIn("enum", call["profile"].output_schema["properties"]
+                                 ["target_message_id"])
                 self.assertNotIn("CODEX_HOME", call["extra_env"])
                 # The chat's reactions are read once.
                 await s.send(group_message(7, "more"))
                 await wait_until(lambda: len(answering.gate_calls) == 2)
                 self.assertEqual(s.reaction_reads, 1)
+                # Two batches of one chat run on one schema and one system
+                # prompt, the prefix the harness caches, so the later run
+                # reads what the earlier one wrote.
+                later = answering.gate_calls[1]["profile"]
+                self.assertEqual(json.dumps(later.output_schema),
+                                 json.dumps(call["profile"].output_schema))
+                self.assertEqual(later.system_prompt, call["profile"].system_prompt)
 
     async def test_a_voice_note_carries_its_transcript_only_once_one_was_made(self):
         for mode, expected in (("auto", "the build is red again"), ("disabled", "[voice]")):

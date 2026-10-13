@@ -7080,7 +7080,7 @@ async def run_session(client):
             else:
                 model = found["knobs"].get("model")
                 prompt = await gate_input(key, ent_id, group_policy, settings, items, emoji)
-                schema = reply_gate.decision_schema(batch_ids, emoji)
+                schema = reply_gate.decision_schema(emoji)
                 loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(
                     None, gate_run, found, prompt, schema, key)

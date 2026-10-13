@@ -4,8 +4,8 @@
 # assistant: the gate's own system prompt in place of codex's instructions,
 # the lowest effort, no tool it could reach for, a read-only sandbox, nobody
 # asked to approve anything, an answer held to the decision schema, and an
-# ephemeral thread saved nowhere. The daemon narrows the schema per run to the
-# batch's message ids and the chat's emoji, and runs it under a codex home of
+# ephemeral thread saved nowhere. The daemon narrows the schema to the chat's
+# emoji, never to the batch, and runs it under a codex home of
 # the gate's own, so the user's codex settings, MCP servers, plugins, skills
 # and instructions are not read; codex's own bundled skills are switched off
 # too. It is not a turn profile: the turn's fit

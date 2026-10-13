@@ -4,9 +4,10 @@
 # assistant: the gate's own system prompt in place of the coding-agent preset,
 # no tools, no settings files (so no hooks, plugins or skills), no MCP server,
 # thinking off, a single turn, an answer held to the decision schema, and no
-# session saved anywhere. The daemon narrows the schema per run to the batch's
-# message ids and the chat's emoji. It is not a turn profile: the turn's fit
-# refuses it, so no room can be set to run on it.
+# session saved anywhere. The daemon narrows the schema to the chat's emoji,
+# never to the batch, so a chat's runs share one cached prompt prefix. It is
+# not a turn profile: the turn's fit refuses it, so no room can be set to run
+# on it.
 
 harness = "claude"
 model = "haiku"
