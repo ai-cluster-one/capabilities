@@ -240,14 +240,14 @@ CONFERENCE_PEER_INTERVAL = 2.0
 # because one failed round-trip must not end a live recording.
 CONFERENCE_QUIET_BEFORE_CHECK = 20.0
 CONFERENCE_JOIN_GRACE = 30.0
-# A conference is not always finished when its invite arrives. One whose chain
-# answers within this is joined straight away; one that takes longer is held
+# A conference is not always finished when its invite arrives, and how fast its
+# chain first answers says nothing about whether it is. Every invite is held
 # until its newest block has stood unchanged for the settle time and joined
-# then, which is worth the wait: a chain that first answered after 2.9s grew
-# another block while being held and then recorded cleanly. A chain still
-# producing new blocks when the budget runs out is declined, because no join
-# into one of those has yet been seen to work.
-CONFERENCE_CHAIN_READY_LIMIT = 2.0
+# then: on 2026-10-12 three of four joins taken on a chain that answered within
+# two seconds ended the call within fifteen, one of them for everyone in it,
+# while all three held ones recorded cleanly. A chain still producing new
+# blocks when the budget runs out is declined, because no join into one of
+# those has yet been seen to work.
 CONFERENCE_CHAIN_SETTLE_STEP = 2.0
 CONFERENCE_CHAIN_SETTLE_MIN = 4.0
 CONFERENCE_CHAIN_SETTLE_BUDGET = 12.0
@@ -1073,7 +1073,7 @@ async def join_conference_on_a_current_chain(prepare, join, leave,
 
 
 async def settle_conference_chain(invite_msg_id, block, waited, read_block):
-    """Hold a conference that is still being built until its chain stops.
+    """Hold a conference invite until its chain stops.
 
     Nothing is re-sent and nothing is answered again: the caller stays invited,
     their phone goes on showing the call, and the join happens a few seconds
@@ -1084,9 +1084,8 @@ async def settle_conference_chain(invite_msg_id, block, waited, read_block):
     work, so a chain that keeps changing until the budget is gone is declined.
     """
     digest = hashlib.sha256(block).hexdigest()[:12]
-    log(f"call: conference chain for invite {invite_msg_id} was still being "
-        f"built — first block {digest} after {waited:.1f}s; letting it settle "
-        f"instead of joining now")
+    log(f"call: conference chain for invite {invite_msg_id} — first block "
+        f"{digest} after {waited:.1f}s; letting it settle before joining")
     deadline = time.monotonic() + CONFERENCE_CHAIN_SETTLE_BUDGET
     seen_at = time.monotonic()
     while True:
@@ -1115,6 +1114,27 @@ async def settle_conference_chain(invite_msg_id, block, waited, read_block):
                 f"{time.monotonic() - seen_at:.1f}s")
             block, digest = fresh, fresh_digest
             seen_at = time.monotonic()
+
+
+async def require_settled_conference_chain(invite_msg_id, first_block,
+                                           read_block):
+    """Return once the invite's chain has a block that has stopped moving.
+
+    `first_block` waits for the chain's first block and `read_block` reads it
+    once; every invite whose chain answers is settled, however fast it did.
+    """
+    started = time.monotonic()
+    try:
+        block = await first_block(invite_msg_id)
+    except Exception as exc:
+        raise RuntimeError(
+            f"conference chain unreadable for invite {invite_msg_id} — "
+            f"{type(exc).__name__}: {exc}") from exc
+    if not block:
+        raise RuntimeError(
+            f"conference chain empty for invite {invite_msg_id}")
+    return await settle_conference_chain(
+        invite_msg_id, block, time.monotonic() - started, read_block)
 
 
 def _unsigned_ssrc(value):
@@ -8324,23 +8344,8 @@ async def run_session(client):
             already cost its caller the call, so nothing about the join is
             worth hardening against that.
             """
-            started = time.monotonic()
-            try:
-                block = await conference_last_block(invite_msg_id)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"conference chain unreadable for invite {invite_msg_id} — "
-                    f"{type(exc).__name__}: {exc}") from exc
-            if not block:
-                raise RuntimeError(
-                    f"conference chain empty for invite {invite_msg_id}")
-            waited = time.monotonic() - started
-            if waited > CONFERENCE_CHAIN_READY_LIMIT:
-                await settle_conference_chain(
-                    invite_msg_id, block, waited, read_chain_last_block)
-            else:
-                log(f"call: conference chain readable — last block "
-                    f"{len(block)} bytes in {waited:.1f}s")
+            await require_settled_conference_chain(
+                invite_msg_id, conference_last_block, read_chain_last_block)
 
         def conference_audio_map(chat_id: int):
             """The user-to-ssrc map the library last handed the media stack.

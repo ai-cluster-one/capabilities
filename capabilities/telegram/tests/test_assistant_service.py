@@ -6195,7 +6195,7 @@ class MediaLogLevelTests(unittest.TestCase):
 
 
 class ConferenceChainSettleTests(unittest.IsolatedAsyncioTestCase):
-    """A conference still being built is waited out, not refused outright."""
+    """Every conference is waited out before the join, not refused outright."""
 
     def prepare(self, daemon):
         daemon.CONFERENCE_CHAIN_SETTLE_STEP = 0.01
@@ -6224,7 +6224,7 @@ class ConferenceChainSettleTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(block, b"block-one")
             self.assertTrue(reads, "the chain is re-read while it settles")
-            self.assertTrue(any("still being built" in line
+            self.assertTrue(any("letting it settle" in line
                                 for line in daemon._test_logs))
             # The join is announced as one made on an unready invite, because
             # whether it works is what the wait exists to find out.
@@ -6272,6 +6272,64 @@ class ConferenceChainSettleTests(unittest.IsolatedAsyncioTestCase):
                                                      6.0, read)
 
             self.assertIn("went empty", str(caught.exception))
+
+    async def test_a_chain_that_answers_at_once_is_settled_before_the_join(self):
+        # A fast first answer was once joined straight away, and three of four
+        # such joins ended the call; how fast the chain answered says nothing
+        # about whether the conference is finished.
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.prepare(daemon)
+            read, reads = self.reader([b"block-two", b"block-three"])
+
+            async def first_block(invite_msg_id):
+                return b"block-one"
+
+            block = await daemon.require_settled_conference_chain(
+                4242, first_block, read)
+
+            self.assertEqual(block, b"block-three")
+            self.assertTrue(reads, "the chain is re-read while it settles")
+            self.assertTrue(any("settled" in line and "joining" in line
+                                for line in daemon._test_logs))
+            self.assertFalse(hasattr(daemon, "CONFERENCE_CHAIN_READY_LIMIT"))
+
+    async def test_a_fast_chain_that_never_stops_growing_is_declined(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.prepare(daemon)
+            counter = itertools.count()
+
+            async def first_block(invite_msg_id):
+                return b"block-one"
+
+            async def read(invite_msg_id):
+                return f"block-{next(counter)}".encode()
+
+            with self.assertRaises(RuntimeError) as caught:
+                await daemon.require_settled_conference_chain(
+                    4242, first_block, read)
+
+            self.assertIn("declined", str(caught.exception))
+
+    async def test_an_empty_or_unreadable_chain_is_not_joined(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.prepare(daemon)
+
+            async def empty(invite_msg_id):
+                return None
+
+            async def broken(invite_msg_id):
+                raise OSError("no route")
+
+            async def read(invite_msg_id):
+                self.fail("an invite with no block is never settled")
+
+            with self.assertRaisesRegex(RuntimeError, "chain empty"):
+                await daemon.require_settled_conference_chain(4242, empty, read)
+            with self.assertRaisesRegex(RuntimeError, "chain unreadable"):
+                await daemon.require_settled_conference_chain(4242, broken, read)
 
 
 class ConferenceJoinChainRetryTests(unittest.IsolatedAsyncioTestCase):
