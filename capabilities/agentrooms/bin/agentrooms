@@ -89,8 +89,15 @@ COMMANDS
         2 registration_token_missing without it. Writes connection ID (default
         NAME) into this project's registry and the minted access token into
         the project's .env.local under AGENTROOMS_<ID>_TOKEN, mode 0600; the
-        token is never printed. The account has no password: its access token
-        is its only credential. NAME is the localpart: lowercase letters,
+        token is never printed. The account gets a random password, sent
+        once and never stored or printed, so its access token is its only
+        credential: a tuwunel homeserver treats an account without a
+        password as a guest and keeps it out of public rooms such as the
+        directory. An agent registered without one, by an earlier register,
+        stays a guest (whoami answers is_guest true; directory join exits 6
+        forbidden); the homeserver's admin repairs it with `!admin users
+        reset-password @NAME:server` in the admin room, which keeps the
+        agent's token working. NAME is the localpart: lowercase letters,
         digits and . _ = -. Needs `capabilities init` in the project. Not
         idempotent: a NAME taken exits 6 user_in_use; a registration whose
         answer was lost exits 5 outcome_unknown (the account may exist;
@@ -6473,12 +6480,16 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
     homeserver = homeserver.rstrip("/")
     if not re.match(r"https?://[^/\s]+$", homeserver):
         _die(6, "bad_homeserver", f"{homeserver!r} is not http(s)://host[:port]")
+    # A password nobody keeps: the token stays the only credential, and the
+    # account is not a guest, which a homeserver makes of one without a password.
+    password = secrets.token_urlsafe(32)
     with Matrix(homeserver) as m:
         # The interactive-auth handshake: the first request answers 401 with the
         # session and the flows on offer; an open homeserver registers at once,
         # or through m.login.dummy, and only a token-gated one needs the token.
         try:
-            probe = m.http.post("/_matrix/client/v3/register", json={"username": name})
+            probe = m.http.post("/_matrix/client/v3/register",
+                                json={"username": name, "password": password})
         except m.httpx.TimeoutException:
             _die(5, "outcome_unknown", "the registration request timed out after it was sent; "
                  "whether the account exists is unknown", "register another NAME")
@@ -6511,8 +6522,8 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
                      f"m.login.registration_token flow (offers {flows})")
             try:
                 done = m.call("POST", "/_matrix/client/v3/register", idempotent=False, body={
-                    "username": name, "initial_device_display_name": f"{NAME} {cid}",
-                    "auth": auth})
+                    "username": name, "password": password,
+                    "initial_device_display_name": f"{NAME} {cid}", "auth": auth})
             except MatrixError as exc:
                 if exc.status == 401 and auth["type"] == "m.login.registration_token":
                     _die(2, "registration_token_rejected",

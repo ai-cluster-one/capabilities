@@ -58,6 +58,7 @@ class FakeHomeserver:
                                                      "error": "User ID is not available."})
                 if not self.registration_flows:
                     self.users.add(f"@{name}:{SERVER}")
+                    self.passwords[f"@{name}:{SERVER}"] = body.get("password")
                     return httpx.Response(200, json={"user_id": f"@{name}:{SERVER}",
                                                      "access_token": TOKEN, "device_id": "DEV1"})
                 return httpx.Response(401, json={"session": "s1", "flows": [
@@ -68,6 +69,7 @@ class FakeHomeserver:
                     body["auth"].get("token") != "reg-token":
                 return httpx.Response(401, json={"errcode": "M_FORBIDDEN", "error": "bad token"})
             self.users.add(f"@{name}:{SERVER}")
+            self.passwords[f"@{name}:{SERVER}"] = body.get("password")
             return httpx.Response(200, json={"user_id": f"@{name}:{SERVER}",
                                              "access_token": TOKEN, "device_id": "DEV1"})
         if path == "/_matrix/client/v3/login":
@@ -271,6 +273,13 @@ def test_register_writes_connection_and_token(cli, project, homeserver, capsys, 
                                              "device_id": "DEV1"}
     auth = [b for m, p, b in homeserver.requests if b and "auth" in b][0]["auth"]
     assert auth == {"type": "m.login.registration_token", "token": "reg-token", "session": "s1"}
+    # The account has a password, which a homeserver needs to make it no guest; it is
+    # sent with both requests and kept nowhere.
+    password = homeserver.passwords[f"@alpha:{SERVER}"]
+    assert password and len(password) >= 32
+    assert [b["password"] for _m, p, b in homeserver.requests if p.endswith("/register")] == \
+        [password, password]
+    assert password not in json.dumps(out) + json.dumps(err) + env_file.read_text()
     # A second registration of the same connection id is refused before the network.
     code, _out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS)
     assert code == 6 and err["error"]["code"] == "connection_exists"
@@ -283,7 +292,7 @@ def test_register_needs_the_registration_token(cli, project, homeserver, capsys)
     code, _out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS)
     assert code == 2 and err["error"]["code"] == "registration_token_missing"
     # Only the handshake reached the homeserver, which creates no account.
-    assert [b for _m, _p, b in homeserver.requests] == [{"username": "alpha"}]
+    assert [sorted(b) for _m, _p, b in homeserver.requests] == [["password", "username"]]
     assert not homeserver.users and not (project / ".env.local").exists()
 
 
@@ -294,6 +303,7 @@ def test_register_on_an_open_homeserver_needs_no_token(cli, project, homeserver,
     assert out["user_id"] == f"@alpha:{SERVER}"
     auth = [b for m, p, b in homeserver.requests if b and "auth" in b][0]["auth"]
     assert auth == {"type": "m.login.dummy", "session": "s1"}
+    assert homeserver.passwords[f"@alpha:{SERVER}"]
     assert f"AGENTROOMS_ALPHA_TOKEN='{TOKEN}'" in (project / ".env.local").read_text()
 
 
@@ -303,6 +313,7 @@ def test_register_on_a_homeserver_that_registers_at_once(cli, project, homeserve
     assert code == 0, err
     assert out["user_id"] == f"@alpha:{SERVER}"
     assert not [b for m, p, b in homeserver.requests if b and "auth" in b]
+    assert homeserver.passwords[f"@alpha:{SERVER}"]
 
 
 def test_register_refuses_a_homeserver_offering_no_usable_flow(cli, project, homeserver, capsys):
