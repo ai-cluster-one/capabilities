@@ -24,7 +24,7 @@ host hook wiring. Capability scripts never write any of these.
 ENVIRONMENT
   CAPABILITIES_HOME    machine registry root        (default ~/.capabilities)
   CAPABILITIES_SOURCE  catalogue base URL           (default the public repo, raw)
-  CAPABILITIES_BIN     PATH dir for symlinks        (default the directory already
+  CAPABILITIES_BIN     PATH dir for symlinks        (default every directory already
                                                      holding the manager's own link,
                                                      on PATH or ~/.local/bin or ~/bin;
                                                      else ~/.local/bin or ~/bin,
@@ -1853,30 +1853,54 @@ def _run_script(script: Path, args: list[str], cwd: Path | None = None,
 
 # ---------------------------------------------------------------- bin dir
 
-def _bin_dir() -> Path:
-    override = os.environ.get("CAPABILITIES_BIN")
-    if override:
-        return Path(override).expanduser()
-    # The directory is the machine's, not the call's: where the manager's own
-    # link already sits, so a call whose environment differs (a service
-    # without the shell's CAPABILITIES_BIN) links where every other call does.
+def _manager_link_dirs() -> list[Path]:
+    """Every directory holding the manager's own `capabilities` link, PATH
+    entries first, then `~/.local/bin` and `~/bin`."""
     path_dirs = [Path(p).expanduser() for p in
                  os.environ.get("PATH", "").split(os.pathsep) if p]
     defaults = (Path.home() / ".local" / "bin", Path.home() / "bin")
     manager_home = (CAP_HOME / ".manager").resolve()
+    found: list[Path] = []
+    seen: set[Path] = set()
     for cand in (*path_dirs, *defaults):
         link = cand / "capabilities"
         try:
-            if link.is_symlink() and link.resolve().is_relative_to(manager_home):
-                return cand
+            if not (link.is_symlink()
+                    and link.resolve().is_relative_to(manager_home)):
+                continue
+            key = cand.resolve()
         except (OSError, RuntimeError):
             continue
-    on_path = {p.resolve() for p in path_dirs}
-    for cand in defaults:
+        if key not in seen:
+            seen.add(key)
+            found.append(cand)
+    return found
+
+
+def _link_dirs() -> list[Path]:
+    """Every directory a capability link belongs in, the primary one first."""
+    override = os.environ.get("CAPABILITIES_BIN")
+    if override:
+        return [Path(override).expanduser()]
+    # The directories are the machine's, not the call's: wherever the
+    # manager's own link already sits, so a call whose environment differs (a
+    # service without the shell's CAPABILITIES_BIN) links where every other
+    # call looks. A machine an older manager left with the manager linked in
+    # two directories gets every link in both.
+    found = _manager_link_dirs()
+    if found:
+        return found
+    on_path = {Path(p).expanduser().resolve() for p in
+               os.environ.get("PATH", "").split(os.pathsep) if p}
+    for cand in (Path.home() / ".local" / "bin", Path.home() / "bin"):
         if cand.is_dir() and cand.resolve() in on_path:
-            return cand
-    fallback = Path.home() / ".local" / "bin"
-    return fallback
+            return [cand]
+    return [Path.home() / ".local" / "bin"]
+
+
+def _bin_dir() -> Path:
+    return _link_dirs()[0]
+
 
 # ---------------------------------------------------------------- manifest
 
@@ -2714,17 +2738,18 @@ def _payload_sha256(reg: Path, script: str | None = None) -> str:
 
 
 def _symlink(name: str, script: Path) -> Path:
-    bin_dir = _bin_dir()
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    link = bin_dir / name
-    if link.is_symlink() or link.exists():
-        link.unlink()
-    link.symlink_to(script)
+    bin_dirs = _link_dirs()
+    for bin_dir in bin_dirs:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        link = bin_dir / name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(script)
     on_path = {Path(p).expanduser().resolve() for p in
                os.environ.get("PATH", "").split(os.pathsep) if p}
-    if bin_dir.resolve() not in on_path:
-        _warn(f"{bin_dir} is not on PATH — add it so `{name}` resolves by name")
-    return link
+    if not any(d.resolve() in on_path for d in bin_dirs):
+        _warn(f"{bin_dirs[0]} is not on PATH — add it so `{name}` resolves by name")
+    return bin_dirs[0] / name
 
 
 MIGRATE_TIMEOUT_SECONDS = 120
@@ -2892,11 +2917,11 @@ def cmd_uninstall(name: str, purge_credentials: bool) -> None:
     with MANAGER_MUTATION_LOCK.open("a+") as mutation:
         fcntl.flock(mutation, fcntl.LOCK_EX)
         _assert_payload_mutable(name)
-        link = _bin_dir() / name
         removed_link = False
-        if link.is_symlink():
-            link.unlink()
-            removed_link = True
+        for bin_dir in _link_dirs():
+            if (bin_dir / name).is_symlink():
+                (bin_dir / name).unlink()
+                removed_link = True
         shutil.rmtree(reg)
     _write_machine(name, None)
     _sync_skill()
@@ -3544,7 +3569,20 @@ def _activate_manager_release(
              "the complete manager release cannot be read", str(exc))
     after = hashlib.sha256(content).hexdigest()
     link_changed = previous != manager_target or before != after
-    changed = release_repaired or link_changed
+    # A manager link an older manager left in a second directory is relinked
+    # too, so whichever one a call's PATH reaches runs this release.
+    stale_links = []
+    for other in _manager_link_dirs():
+        other_link = other / "capabilities"
+        try:
+            if other.resolve() == link.parent.resolve():
+                continue
+            if other_link.resolve(strict=True) == manager_target:
+                continue
+        except OSError:
+            pass
+        stale_links.append(other_link)
+    changed = release_repaired or link_changed or bool(stale_links)
     result = {
         "self_update": "updated" if changed else "already current",
         "manager": str(manager),
@@ -3556,23 +3594,24 @@ def _activate_manager_release(
         "source": source,
         "manager_assets": sorted(assets),
     }
-    if not link_changed:
-        return result
-    temporary_link = link.with_name(
-        f".{link.name}.manager-release-{secrets.token_hex(8)}")
-    try:
-        link.parent.mkdir(parents=True, exist_ok=True)
-        temporary_link.symlink_to(manager)
-        os.replace(temporary_link, link)
-    except OSError as exc:
-        _die(5, "manager_release_activate_failed",
-             "the complete manager release was staged but could not be activated",
-             str(exc))
-    finally:
+    if stale_links:
+        result["also_relinked"] = [str(other) for other in stale_links]
+    for target_link in ([link] if link_changed else []) + stale_links:
+        temporary_link = target_link.with_name(
+            f".{target_link.name}.manager-release-{secrets.token_hex(8)}")
         try:
-            temporary_link.unlink(missing_ok=True)
-        except OSError:
-            pass
+            target_link.parent.mkdir(parents=True, exist_ok=True)
+            temporary_link.symlink_to(manager)
+            os.replace(temporary_link, target_link)
+        except OSError as exc:
+            _die(5, "manager_release_activate_failed",
+                 "the complete manager release was staged but could not be activated",
+                 str(exc))
+        finally:
+            try:
+                temporary_link.unlink(missing_ok=True)
+            except OSError:
+                pass
     return result
 
 
@@ -10179,9 +10218,10 @@ def _remove_released_capability(name: str) -> dict:
         reg = _registry_dir(name)
         link = _bin_dir() / name
         removed_link = False
-        if link.is_symlink():
-            link.unlink()
-            removed_link = True
+        for bin_dir in _link_dirs():
+            if (bin_dir / name).is_symlink():
+                (bin_dir / name).unlink()
+                removed_link = True
         removed_registry = reg.is_dir()
         if removed_registry:
             shutil.rmtree(reg)
