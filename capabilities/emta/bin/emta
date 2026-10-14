@@ -5234,6 +5234,7 @@ def main() -> None:
 
     if not cleaned or cleaned[0] in ("help", "--help", "-h"):
         sys.stdout.write((__doc__ or "").lstrip("\n"))
+        sys.stdout.write(_connections_home_section())
         return
 
     _contract(cleaned)               # contract verbs; falls through otherwise
