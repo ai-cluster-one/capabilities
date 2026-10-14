@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-14 — Without `CAPABILITIES_BIN`, the manager links beside its own link
+
+A call that does not set `CAPABILITIES_BIN` now links, unlinks and looks for capability links in the directory that already holds the manager's own `capabilities` link - searched on `PATH`, then in `~/.local/bin` and `~/bin` - rather than choosing again from that call's `PATH`. An install, self-update or `doctor` run from an environment that lacks the shell's `CAPABILITIES_BIN`, such as a service, therefore uses the same directory as every other call on the machine. Where no such link exists the choice is as before: the first of `~/.local/bin` and `~/bin` that exists and is on `PATH`. `CAPABILITIES_BIN`, when set, still decides. Run `capabilities help` for the details.
+
 ## 2026-10-14 — `connections import` writes only the connections a project uses
 
 `capabilities connections import` no longer writes every connection the workstation's config home could lend the project. It writes each connection the project's envelope declares, as before, and a config-home connection only where the capability is enabled for the project and the project may use that connection or points its default at it; grants follow the connections written. A config-home connection the project merely could resolve stays out of the store, and the JSON names it under a new `skipped` {<name> [<id>]}. Once the project uses one, running the import again from its files writes it, and a project already in store mode writes it with `capabilities set <name> connection <id> <spec>` and grants it with `capabilities set <name> grant <id> '{"enabled": true}'`. Rows already in the store are never removed, and one an earlier import wrote that still matches the files is reported unchanged. What a project uses resolves from the store as before. Run `capabilities help` for the details.

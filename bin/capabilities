@@ -24,7 +24,10 @@ host hook wiring. Capability scripts never write any of these.
 ENVIRONMENT
   CAPABILITIES_HOME    machine registry root        (default ~/.capabilities)
   CAPABILITIES_SOURCE  catalogue base URL           (default the public repo, raw)
-  CAPABILITIES_BIN     PATH dir for symlinks        (default ~/.local/bin or ~/bin,
+  CAPABILITIES_BIN     PATH dir for symlinks        (default the directory already
+                                                     holding the manager's own link,
+                                                     on PATH or ~/.local/bin or ~/bin;
+                                                     else ~/.local/bin or ~/bin,
                                                      whichever exists and is on PATH)
   CAPABILITIES_CONTEXT_PROMPT
                        optional project .env(.local) or process-env override
@@ -1854,9 +1857,22 @@ def _bin_dir() -> Path:
     override = os.environ.get("CAPABILITIES_BIN")
     if override:
         return Path(override).expanduser()
-    on_path = {Path(p).expanduser().resolve() for p in
-               os.environ.get("PATH", "").split(os.pathsep) if p}
-    for cand in (Path.home() / ".local" / "bin", Path.home() / "bin"):
+    # The directory is the machine's, not the call's: where the manager's own
+    # link already sits, so a call whose environment differs (a service
+    # without the shell's CAPABILITIES_BIN) links where every other call does.
+    path_dirs = [Path(p).expanduser() for p in
+                 os.environ.get("PATH", "").split(os.pathsep) if p]
+    defaults = (Path.home() / ".local" / "bin", Path.home() / "bin")
+    manager_home = (CAP_HOME / ".manager").resolve()
+    for cand in (*path_dirs, *defaults):
+        link = cand / "capabilities"
+        try:
+            if link.is_symlink() and link.resolve().is_relative_to(manager_home):
+                return cand
+        except (OSError, RuntimeError):
+            continue
+    on_path = {p.resolve() for p in path_dirs}
+    for cand in defaults:
         if cand.is_dir() and cand.resolve() in on_path:
             return cand
     fallback = Path.home() / ".local" / "bin"
