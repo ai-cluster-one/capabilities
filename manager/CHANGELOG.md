@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-14 — `connections import` writes only the connections a project uses
+
+`capabilities connections import` no longer writes every connection the workstation's config home could lend the project. It writes each connection the project's envelope declares, as before, and a config-home connection only where the capability is enabled for the project and the project may use that connection or points its default at it; grants follow the connections written. A config-home connection the project merely could resolve stays out of the store, and the JSON names it under a new `skipped` {<name> [<id>]}. Once the project uses one, running the import again from its files writes it, and a project already in store mode writes it with `capabilities set <name> connection <id> <spec>` and grants it with `capabilities set <name> grant <id> '{"enabled": true}'`. Rows already in the store are never removed, and one an earlier import wrote that still matches the files is reported unchanged. What a project uses resolves from the store as before. Run `capabilities help` for the details.
+
 ## 2026-10-13 — A manifest's `connections` and `settings` declarations are validated
 
 Audit, source check and install now check a manifest's `connections` (`null`, or `fields`, `setup` and `link`) and `settings` (`null`, or `homes` and `keys`) wherever they validate a manifest: every field has a `key`, a `label`, a `help` and a known `type`, an enum its `choices`, a secret's `env` template its `{ID}`; every link method an argv carrying `--events`; every settings home one scope of `project`, `global` or `machine`, a format of `json` or `toml` and a relative path inside the capability's folder; every settings key a scope that has a home and an `apply` of `next_call`, `reload` or `restart`, and no secret. A manifest without them still validates.

@@ -516,12 +516,20 @@ PROJECT VERBS (run inside a consuming project)
         "records": "store" in its project.json, which only this verb writes;
         a project at "connections": "store" keeps only its connections and
         grants in the store, and its identifiers and policy in files, until
-        this verb runs again. Every identity the project's files
-        resolve becomes a row of capabilities_connections, and every one it
-        may use, switched off itself, or points its default at gets a grant
-        for every node in capabilities_connection_grants, stamped with the
-        project id (verified, as any write that stamps it), carrying the
-        decision its files resolve to (a field no scope decided stays null).
+        this verb runs again. Every identity the project uses becomes a row
+        of capabilities_connections: each one its envelope declares, and an
+        identity of the config home only where the capability is enabled for
+        the project and the project may use that identity or points its
+        default at it. One the config home merely offers stays out of the
+        store and is named under skipped; once the project uses it, the
+        import run again from its files writes it, and a project already in
+        store mode writes it with `set <name> connection <id> <spec>` and
+        `set <name> grant <id> '{"enabled": true}'`. Every row written that
+        the project may use, switched off itself, or points its default at
+        gets a grant for every node in capabilities_connection_grants,
+        stamped with the project id (verified, as any write that stamps it),
+        carrying the decision its files resolve to (a field no scope decided
+        stays null). Rows already in the store are never removed.
         The rows are written, and proven to resolve as the files do, in one
         transaction before project.json changes. A row the store already
         holds unchanged is left as it is, so running it again changes
@@ -539,7 +547,7 @@ PROJECT VERBS (run inside a consuming project)
         previous_mode (files, connections or store), identity, store {level,
         sources, schema, tables}, capabilities {<name> {connections
         {imported, unchanged}, grants {imported, unchanged}, default}},
-        identifiers {<name> {project|global {imported, unchanged}}}, policy
+        skipped {<name> [<id>]}, identifiers {<name> {project|global {imported, unchanged}}}, policy
         {project|global {imported, unchanged}}, files_kept}. Exit 4 under the
         read-only switch, 5 when the store cannot be reached.
 
@@ -7115,16 +7123,43 @@ def _import_names(envelope: Path) -> list[str]:
     return sorted(n for n in names if store.CAPABILITY_RE.fullmatch(n))
 
 
+def _import_gate(files) -> dict[str, bool]:
+    """Whether each installed capability is enabled for this project as its
+    files resolve the gate, under the machine ceiling."""
+    scopes = {scope: {name: row["value"] for name, row in
+                      files.resolve_scope("capabilities", "policy", scope).items()}
+              for scope in ("project", "global")}
+    return {name: _effective_gate_state(name, scopes["project"].get(name),
+                                        scopes["global"].get(name))[0] == "enabled"
+            for name in set(_installed()) | set(scopes["project"]) | set(scopes["global"])}
+
+
 def _import_plan(files, names: list[str]) -> dict:
-    """What the store must hold for this project to resolve from it exactly
-    what its files resolve: per capability every identity the project can
-    see, and an every-node grant for each one it may use, each one it switched
-    off itself, and the one its default pointer names. A grant carries the
-    decision its fields resolved to across the files' scopes, and leaves a
-    field no scope decided null, so `allow_write` still falls to WRITE_DEFAULT."""
+    """What the store must hold for this project to resolve from it what its
+    files resolve for the connections it uses: per capability every identity
+    its envelope declares, and an identity of the config home only where the
+    capability is enabled for the project and the project may use that
+    identity or points its default at it. Each one written gets an every-node
+    grant where the project may use it, switched it off itself, or points its
+    default at it. A grant carries the decision its fields resolved to across
+    the files' scopes, and leaves a field no scope decided null, so
+    `allow_write` still falls to WRITE_DEFAULT. A config-home identity the
+    project does not use is returned beside the plan as skipped and never
+    written; `specs` and `held` keep every identity and grant the files
+    resolve, so a row an earlier import wrote is recognised as unchanged
+    rather than taken for a conflict."""
     store = _store_module()
     plan: dict = {}
+    skipped_by: dict[str, list[str]] = {}
     problems: list[str] = []
+    try:
+        gate = _import_gate(files)
+    except (store.StoreError, AttributeError, TypeError) as exc:
+        raise _ImportRefused(
+            "import_unreadable",
+            "this project's files cannot be imported as they resolve today: policy: "
+            + str(getattr(exc, "message", exc)),
+            "repair them (`capabilities doctor` names the faults), then import again")
     for name in names:
         try:
             identities = files.resolve(name, "connection")
@@ -7136,12 +7171,11 @@ def _import_plan(files, names: list[str]) -> dict:
             continue
         if not identities:
             continue
-        connections, grants = {}, {}
+        connections, grants, held, specs, skipped = {}, {}, {}, {}, []
         for cid, row in sorted(identities.items()):
             if not isinstance(row["value"], dict):
                 problems.append(f"{name}: connection {cid!r} is not an object")
                 continue
-            connections[cid] = row["value"]
             decided, decided_at = store._grant_decisions(
                 cid, [layer[cid] for layer in layers if cid in layer])
             allow_write = decided.get("allow_write")
@@ -7149,29 +7183,44 @@ def _import_plan(files, names: list[str]) -> dict:
                 problems.append(f"{name}: grant {cid!r} allow_write is not boolean")
                 continue
             enabled = bool(effective[cid]["enabled"])
+            specs[cid] = row["value"]
             switched_off = not enabled and (row["scope"] == "project"
                                             or decided_at.get("enabled") == "project")
+            grant = None
             if enabled or switched_off or cid == default:
-                grants[cid] = {"enabled": True if enabled else (False if switched_off else None),
-                               "allow_write": allow_write, "is_default": cid == default}
+                grant = {"enabled": True if enabled else (False if switched_off else None),
+                         "allow_write": allow_write, "is_default": cid == default}
+                held[cid] = grant
+            used = row["scope"] == "project" or (
+                gate.get(name, False) and (enabled or cid == default))
+            if not used:
+                skipped.append(cid)
+                continue
+            connections[cid] = row["value"]
+            if grant is not None:
+                grants[cid] = grant
         if default is not None and default not in identities:
             problems.append(f"{name}: the default points to {default!r}, which no "
                             "connection declares")
-        plan[name] = {"connections": connections, "grants": grants, "default": default}
+        if skipped:
+            skipped_by[name] = skipped
+        if connections:
+            plan[name] = {"connections": connections, "grants": grants,
+                          "default": default, "specs": specs, "held": held}
     if problems:
         raise _ImportRefused(
             "import_unreadable",
             "this project's files cannot be imported as they resolve today: "
             + "; ".join(problems),
             "repair them (`capabilities doctor` names the faults), then import again")
-    return plan
+    return plan, skipped_by
 
 
 def _import_rows(conn, agent_id: str, plan: dict) -> dict:
-    """Write what the store lacks, inside the caller's transaction, and refuse
-    the whole import where a row the store already holds differs from what the
-    import would write, or where this project already holds a grant the files
-    do not."""
+    """Write what the store lacks of the connections this project uses, inside
+    the caller's transaction, and refuse the whole import where a row the store
+    already holds differs from what the files resolve, or where this project
+    already holds a grant the files do not."""
     result: dict = {}
     conflicts: list[str] = []
     writes: list[tuple[str, tuple]] = []
@@ -7187,8 +7236,10 @@ def _import_rows(conn, agent_id: str, plan: dict) -> dict:
         report = {"connections": {"imported": [], "unchanged": []},
                   "grants": {"imported": [], "unchanged": []},
                   "default": wanted["default"]}
-        for cid, spec in wanted["connections"].items():
+        for cid, spec in wanted["specs"].items():
             if cid not in held:
+                if cid not in wanted["connections"]:
+                    continue
                 writes.append((
                     "INSERT INTO capabilities_connections (capability, name, spec) "
                     "VALUES (%s, %s, %s::jsonb)",
@@ -7200,10 +7251,12 @@ def _import_rows(conn, agent_id: str, plan: dict) -> dict:
                 conflicts.append(f"{name} connection {cid!r}: the store holds "
                                  f"{json.dumps(held[cid], sort_keys=True)}, the files "
                                  f"{json.dumps(spec, sort_keys=True)}")
-        for cid, grant in wanted["grants"].items():
+        for cid, grant in wanted["held"].items():
             row = (grant["enabled"], grant["allow_write"], grant["is_default"])
             found = grants.pop((cid, None), None)
             if found is None:
+                if cid not in wanted["grants"]:
+                    continue
                 writes.append((
                     "INSERT INTO capabilities_connection_grants (agent_id, capability, "
                     "connection, node, enabled, allow_write, is_default) "
@@ -7237,28 +7290,34 @@ def _import_rows(conn, agent_id: str, plan: dict) -> dict:
 
 def _import_verify(files, stored, plan: dict) -> None:
     """The import holds only if the store now resolves, for this project on this
-    node, the very connections its files resolve: the same usable entries, with
-    the same values and writability under either WRITE_DEFAULT, the same
-    withheld ones, and the same default pointer."""
-    for name in plan:
+    node, the connections its files resolve among those the store holds - every
+    one the plan writes, and any an earlier import left: the same usable
+    entries, with the same values and writability under either WRITE_DEFAULT,
+    the same withheld ones, and the same default pointer where the store holds
+    the connection it names."""
+    for name, wanted in plan.items():
+        present: set = set(wanted["connections"])
         for write_default in (False, True):
             before = files.connections(name, write_default=write_default,
                                        include_disabled=True)
             after = stored.connections(name, write_default=write_default,
                                        include_disabled=True)
+            present |= set(after)
             usable_before = {cid: (e["value"], e["allow_write"])
-                             for cid, e in before.items() if e["enabled"]}
+                             for cid, e in before.items() if e["enabled"] and cid in present}
             usable_after = {cid: (e["value"], e["allow_write"])
                             for cid, e in after.items() if e["enabled"]}
             withheld_after = {cid for cid, e in after.items() if not e["enabled"]}
-            withheld_before = {cid for cid, e in before.items() if not e["enabled"]}
+            withheld_before = {cid for cid, e in before.items()
+                               if not e["enabled"] and cid in present}
             if usable_before != usable_after or not withheld_before <= withheld_after:
                 raise _ImportRefused(
                     "import_mismatch",
                     f"after the import the store would resolve {name}'s connections "
                     "differently from the files, so nothing was written",
                     "report this as a defect in `capabilities connections import`")
-        if (files.get(name, "setting", "connection.default")
+        default = files.get(name, "setting", "connection.default")
+        if ((default if default in present else None)
                 != stored.get(name, "setting", "connection.default")):
             raise _ImportRefused(
                 "import_mismatch",
@@ -7488,7 +7547,7 @@ def cmd_connections_import() -> None:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     import psycopg
     try:
-        plan = _import_plan(files, names)
+        plan, skipped = _import_plan(files, names)
         records_plan = _import_records_plan(files, _import_identifier_names(envelope))
         major, minor = store.STORE_TABLES_VERSION
         db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
@@ -7535,6 +7594,7 @@ def cmd_connections_import() -> None:
                      "tables": [store.STORE_CONNECTIONS_TABLE, store.STORE_GRANTS_TABLE,
                                 store.STORE_IDENTIFIERS_TABLE, store.STORE_POLICY_TABLE]},
            "capabilities": imported,
+           "skipped": skipped,
            "identifiers": records_imported["identifiers"],
            "policy": records_imported["policy"],
            "files_kept": sorted(str(p) for p in kept)})

@@ -370,7 +370,121 @@ def test_a_global_identity_keeps_its_grant_through_the_import(lab):
     assert _without_sources(after) == _without_sources(before)
     assert after["connections"]["shared"]["allow_write"] is False
     hidden = _coolify(lab, "--connection", "hidden", "resources")
-    assert hidden.returncode == 4 and _error(hidden)["code"] == "connection_not_granted"
+    assert hidden.returncode == 6 and _error(hidden)["code"] == "unknown_connection"
+
+
+# --- the import writes only the connections the project uses -------------------------
+
+def _offer_global(lab, connections: dict, default: str | None = None) -> None:
+    """The config home offers these coolify connections to every project."""
+    global_dir = lab["config"] / "coolify"
+    global_dir.mkdir(parents=True, exist_ok=True)
+    body: dict = {"connections": {
+        cid: {"base_url": lab["url"], "secret_env": "COOLIFY_TOKEN", **extra}
+        for cid, extra in connections.items()}}
+    if default:
+        body["default"] = default
+    (global_dir / "connections.json").write_text(json.dumps(body))
+
+
+def _grant_in_envelope(lab, **grants: dict) -> None:
+    registry = lab["envelope"] / "coolify" / "connections.json"
+    body = json.loads(registry.read_text())
+    body["connections"].update(grants)
+    registry.write_text(json.dumps(body))
+
+
+def _stored_connections(lab) -> list[str]:
+    return [row[0] for row in _rows(lab, "SELECT name FROM capabilities_connections "
+                                         "ORDER BY name")]
+
+
+def _stored_grants(lab) -> list[str]:
+    return [row[0] for row in _rows(lab, "SELECT connection FROM "
+                                         "capabilities_connection_grants ORDER BY connection")]
+
+
+def test_import_writes_the_declared_and_used_connections_and_skips_the_rest(lab):
+    _offer_global(lab, {"shared": {}, "hidden": {}, "elsewhere": {"enabled": True}})
+    _grant_in_envelope(lab, shared={"enabled": True})
+    before = _ok(_coolify(lab, "connections"))
+    result = _import(lab)
+    report = result["capabilities"]["coolify"]
+    assert report["connections"]["imported"] == ["box", "off", "shared", "spare"]
+    assert report["grants"]["imported"] == ["box", "off", "shared", "spare"]
+    assert result["skipped"] == {"coolify": ["elsewhere", "hidden"]}
+    assert _stored_connections(lab) == ["box", "off", "shared", "spare"]
+    assert _without_sources(_ok(_coolify(lab, "connections"))) == _without_sources(before)
+
+
+def test_import_writes_a_config_home_default_of_an_enabled_capability(lab):
+    registry = lab["envelope"] / "coolify" / "connections.json"
+    body = json.loads(registry.read_text())
+    body.pop("default")
+    registry.write_text(json.dumps(body))
+    _offer_global(lab, {"shared": {}, "hidden": {}}, default="shared")
+    result = _import(lab)
+    assert result["skipped"] == {"coolify": ["hidden"]}
+    assert _stored_connections(lab) == ["box", "off", "shared", "spare"]
+    assert _rows(lab, "SELECT connection, enabled, is_default FROM "
+                      "capabilities_connection_grants WHERE connection = 'shared'") \
+        == [("shared", None, True)]
+    assert _manager(lab, "get", "coolify", "setting", "connection.default").stdout.strip() \
+        == "shared"
+
+
+def test_import_skips_config_home_connections_of_a_capability_the_project_disables(lab):
+    (lab["envelope"] / "settings.json").write_text(
+        json.dumps({"capabilities": {"coolify": {"enabled": False}}}))
+    _offer_global(lab, {"shared": {}, "hidden": {}})
+    _grant_in_envelope(lab, shared={"enabled": True})
+    result = _import(lab)
+    assert result["skipped"] == {"coolify": ["hidden", "shared"]}
+    assert _stored_connections(lab) == ["box", "off", "spare"]
+    assert _stored_grants(lab) == ["box", "off", "spare"]
+
+
+def test_a_second_import_with_config_home_connections_changes_nothing(lab):
+    _offer_global(lab, {"shared": {}, "hidden": {}})
+    _grant_in_envelope(lab, shared={"enabled": True})
+    _import(lab)
+    rows = _rows(lab, "SELECT * FROM capabilities_connections ORDER BY name")
+    grants = _rows(lab, "SELECT * FROM capabilities_connection_grants ORDER BY connection")
+    again = _import(lab)
+    assert again["capabilities"]["coolify"]["connections"] == {
+        "imported": [], "unchanged": ["box", "off", "shared", "spare"]}
+    assert again["capabilities"]["coolify"]["grants"] == {
+        "imported": [], "unchanged": ["box", "off", "shared", "spare"]}
+    assert again["skipped"] == {"coolify": ["hidden"]}
+    assert _rows(lab, "SELECT * FROM capabilities_connections ORDER BY name") == rows
+    assert _rows(lab, "SELECT * FROM capabilities_connection_grants "
+                      "ORDER BY connection") == grants
+
+
+def test_import_keeps_a_config_home_row_an_earlier_import_wrote(lab):
+    _offer_global(lab, {"hidden": {}})
+    _import(lab)
+    spec = {"base_url": lab["url"], "secret_env": "COOLIFY_TOKEN"}
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("SET search_path TO lab")
+        conn.execute("INSERT INTO capabilities_connections (capability, name, spec) "
+                     "VALUES ('coolify', 'hidden', %s::jsonb)", (json.dumps(spec),))
+    again = _import(lab)
+    assert again["capabilities"]["coolify"]["connections"]["unchanged"] == [
+        "box", "hidden", "off", "spare"]
+    assert again["skipped"] == {"coolify": ["hidden"]}
+    assert _stored_connections(lab) == ["box", "hidden", "off", "spare"]
+
+
+def test_a_store_mode_project_takes_up_a_config_home_connection_with_set(lab):
+    _offer_global(lab, {"hidden": {}})
+    assert _import(lab)["skipped"] == {"coolify": ["hidden"]}
+    spec = json.loads((lab["config"] / "coolify" / "connections.json")
+                      .read_text())["connections"]["hidden"]
+    _ok(_manager(lab, "set", "coolify", "connection", "hidden", json.dumps(spec)))
+    _ok(_manager(lab, "set", "coolify", "grant", "hidden", '{"enabled": true}'))
+    _ok(_coolify(lab, "--connection", "hidden", "resources"))
+    assert ("GET", "/api/v1/resources") in lab["seen"]
 
 
 # --- store mode, as a capability sees it --------------------------------------------
