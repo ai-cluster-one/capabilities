@@ -156,10 +156,15 @@ INVALID = {
 }
 
 
-def _declared(tmp_path: Path, machine_reads: str | None) -> Path:
+def _declared(tmp_path: Path, machine_reads: str | None,
+              links: str | None = None) -> Path:
     script = tmp_path / "src" / "capabilities" / NAME / "bin" / NAME
     script.parent.mkdir(parents=True)
-    script.write_text(_fixture_text(machine_reads))
+    text = _fixture_text(machine_reads)
+    if links is not None:
+        text = text.replace("WRITE_DEFAULT = True\n",
+                            f"WRITE_DEFAULT = True\nLINK_METHODS = {links}\n", 1)
+    script.write_text(text)
     script.chmod(0o755)
     return script
 
@@ -220,6 +225,70 @@ def test_the_refusals_say_which_rule_the_declaration_broke(tmp_path):
     assert "tuple of verb names" in problems(INVALID["a list"], "a")
     assert "'nosuchverb'" in problems(INVALID["an unknown verb"], "b")
     assert "write verb 'push'" in problems(INVALID["a write verb"], "c")
+
+
+# --- the linking verbs, validated as the machine reads are -------------------
+
+def _link(*argv: str) -> str:
+    return repr([{"id": "qr", "label": "Scan", "argv": list(argv)}])
+
+
+LINKS_INVALID = {
+    "computed": "list(%s)" % _link(NAME, "peek", "--events"),
+    "no verb": _link("--events"),
+    "another capability": _link("other", "peek", "--events"),
+    "an unknown verb": _link(NAME, "nosuchverb", "--events"),
+    "a write verb": _link(NAME, "push", "--events"),
+}
+
+
+@pytest.mark.parametrize("links", [_link(NAME, "peek", "--events"),
+                                   _link(NAME, "peek", "--qr", "--events")])
+def test_a_valid_linking_declaration_is_accepted_at_audit_source_check_and_install(
+        lab, tmp_path, links):
+    script = _declared(tmp_path, None, links)
+    assert M._machine_reads_problems(script) == []
+    audit = _manager(lab, "audit", NAME, "--from", str(script))
+    assert _machine_read_failures(json.loads(audit.stdout)["failures"]) == []
+    _catalog, failures = M._catalog_payload(tmp_path / "src", audit=False)
+    assert _machine_read_failures(failures.get(NAME, [])) == []
+    install = _manager(lab, "install", NAME, "--from", str(script), "--allow")
+    assert install.returncode == 0, install.stderr
+
+
+@pytest.mark.parametrize("case", sorted(LINKS_INVALID))
+def test_an_invalid_linking_declaration_is_refused_at_audit_source_check_and_install(
+        lab, tmp_path, case):
+    script = _declared(tmp_path, None, LINKS_INVALID[case])
+    assert M._machine_reads_problems(script), case
+
+    audit = _manager(lab, "audit", NAME, "--from", str(script))
+    assert audit.returncode != 0
+    assert _machine_read_failures(json.loads(audit.stdout)["failures"]), case
+
+    _catalog, failures = M._catalog_payload(tmp_path / "src", audit=False)
+    assert _machine_read_failures(failures.get(NAME, [])), case
+    _catalog, failures = M._catalog_payload_scoped(
+        tmp_path / "src", {NAME}, {}, audit=False)
+    assert _machine_read_failures(failures.get(NAME, [])), case
+
+    install = _manager(lab, "install", NAME, "--from", str(script), "--allow")
+    assert install.returncode == 6, install.stdout + install.stderr
+    assert _error(install)["code"] == "machine_reads_invalid"
+    assert not (Path(lab["env"]["CAPABILITIES_HOME"]) / NAME).exists()
+
+
+def test_the_linking_refusals_say_which_rule_the_declaration_broke(tmp_path):
+    def problems(case, sub):
+        target = tmp_path / sub
+        target.mkdir()
+        return " ".join(M._machine_reads_problems(
+            _declared(target, None, LINKS_INVALID[case])))
+    assert "list of methods" in problems("computed", "a")
+    assert "name the capability and the verb" in problems("no verb", "b")
+    assert "'other'" in problems("another capability", "c")
+    assert "'nosuchverb'" in problems("an unknown verb", "d")
+    assert "write verb 'push'" in problems("a write verb", "e")
 
 
 # --- resolution outside any project -------------------------------------------

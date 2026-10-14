@@ -2268,6 +2268,64 @@ def _machine_reads_declared(text: str) -> tuple[tuple | None, str | None]:
     return value, None
 
 
+def _link_verbs_declared(text: str) -> tuple[list | None, str | None]:
+    """The verbs a capability's `LINK_METHODS` ceremonies run, as its source
+    declares them, read without running it: `([], None)` when it declares
+    none, `([(index, argv), ...], None)` when the declaration is a literal
+    list of methods whose argv names the capability and then a verb, and
+    `(None, problem)` otherwise. The contract lends these verbs the machine's
+    connections outside any project, so they are checked as machine reads are.
+    The capability each argv names is checked against the declared `NAME`."""
+    import ast
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return [], None
+    node = None
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            targets = [stmt.target]
+        else:
+            continue
+        if any(isinstance(t, ast.Name) and t.id == "LINK_METHODS" for t in targets):
+            node = stmt.value
+    if node is None:
+        return [], None
+    try:
+        value = ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        value = None
+    if not isinstance(value, list) or not all(isinstance(m, dict) for m in value):
+        return None, "LINK_METHODS must be a list of methods"
+    verbs = []
+    for index, method in enumerate(value):
+        argv = method.get("argv")
+        if (not isinstance(argv, list) or len(argv) < 2
+                or not all(isinstance(a, str) and a for a in argv[:2])):
+            return None, (f"LINK_METHODS[{index}].argv must name the capability "
+                          "and the verb that links")
+        verbs.append((index, argv))
+    return verbs, None
+
+
+def _name_declared(text: str) -> str | None:
+    """The capability's `NAME` as its source states it literally, else None."""
+    import ast
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return None
+    for stmt in tree.body:
+        if (isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Constant)
+                and isinstance(stmt.value.value, str)
+                and any(isinstance(t, ast.Name) and t.id == "NAME"
+                        for t in stmt.targets)):
+            return stmt.value.value
+    return None
+
+
 def _write_verbs_declared(text: str) -> set[str]:
     """Every verb name `WRITE_VERBS` states literally in the source."""
     import ast
@@ -2291,32 +2349,47 @@ def _write_verbs_declared(text: str) -> set[str]:
 
 def _machine_reads_problems(script: Path, help_text: str | None = None,
                             env: dict | None = None) -> list[str]:
-    """The declared machine reads checked where a capability is validated: a
-    tuple of strings, each a verb the capability exposes - one its `help`
-    names - and none of them a write verb. A capability declaring none has
-    nothing to check, and its `help` is not run for it."""
+    """The verbs lent the machine's connections outside any project, checked
+    where a capability is validated. The declared machine reads: a tuple of
+    strings, each a verb the capability exposes - one its `help` names - and
+    none of them a write verb. The verbs `LINK_METHODS` ceremonies run: each
+    argv names this capability and then such a verb. A capability declaring
+    neither has nothing to check, and its `help` is not run for it."""
     try:
         text = script.read_text()
     except (OSError, UnicodeDecodeError):
         return []
     declared, problem = _machine_reads_declared(text)
-    if problem:
-        return [problem]
+    links, link_problem = _link_verbs_declared(text)
+    problems = [p for p in (problem, link_problem) if p]
+    declared = [("MACHINE_READS names", verb) for verb in declared or ()]
+    name = _name_declared(text) or script.name
+    for index, argv in links or []:
+        if argv[0] != name:
+            problems.append(f"LINK_METHODS[{index}].argv runs {argv[0]!r}, "
+                            f"not this capability {name!r}")
+        declared.append((f"LINK_METHODS[{index}] links with", argv[1]))
     if not declared:
-        return []
+        return problems
     writes = _write_verbs_declared(text)
-    problems = [f"MACHINE_READS names the write verb {verb!r}"
-                for verb in declared if verb in writes]
+    problems += [f"{at} the write verb {verb!r}"
+                 for at, verb in declared if verb in writes]
     if help_text is None:
         rc, help_text, _err = _run_script(script, ["help"], env=env)
         if rc != 0:
             return problems + [
-                f"MACHINE_READS cannot be checked: `help` exited {rc}"]
-    for verb in declared:
+                f"machine reads cannot be checked: `help` exited {rc}"]
+    # `help` lists each ceremony's argv itself, so a linking verb is looked
+    # for in the rest of it: one the capability documents as its own.
+    own_help = help_text
+    for _index, argv in links or []:
+        own_help = own_help.replace(" ".join(argv), "")
+    for at, verb in declared:
         if verb in writes:
             continue
-        if not re.search(rf"(?<![\w-]){re.escape(verb)}(?![\w-])", help_text):
-            problems.append(f"MACHINE_READS names {verb!r}, a verb the "
+        seen = help_text if at.startswith("MACHINE_READS") else own_help
+        if not re.search(rf"(?<![\w-]){re.escape(verb)}(?![\w-])", seen):
+            problems.append(f"{at} {verb!r}, a verb the "
                             "capability does not expose")
     return problems
 
@@ -2342,7 +2415,8 @@ def _snapshot(name: str, script: Path, registry: Path | None = None) -> dict:
              "; ".join(problems))
     problems = _machine_reads_problems(script)
     if problems:
-        _die(6, "machine_reads_invalid", f"{name}: MACHINE_READS fails validation",
+        _die(6, "machine_reads_invalid",
+             f"{name}: MACHINE_READS or LINK_METHODS fails validation",
              "; ".join(problems))
     (reg / "stub").write_text(stub_out.strip() + "\n")
     _write_json(reg / "manifest.json", manifest)
