@@ -506,6 +506,42 @@ def test_an_ungranted_store_connection_is_refused_until_granted(lab):
     assert ("GET", "/api/v1/resources") in lab["seen"]
 
 
+def test_a_store_connection_another_project_is_granted_is_not_removed(lab):
+    _import(lab)
+    other = "prj_" + "9f8e7d6c5b4a"
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("SET search_path TO lab")
+        conn.execute("INSERT INTO capabilities_connection_grants "
+                     "(agent_id, capability, connection, node, enabled) "
+                     "VALUES (%s, 'coolify', 'spare', 'elsewhere', true)", (other,))
+    _ok(_manager(lab, "set", "coolify", "grant", "spare", '{"enabled": false}'))
+    refused = _coolify(lab, "connection", "remove", "spare")
+    assert refused.returncode == 6, refused.stdout + refused.stderr
+    error = _error(refused)
+    assert error["code"] == "connection_granted"
+    assert other in error["message"] and PROJECT_ID not in error["message"]
+    assert "spare" in _stored_connections(lab)
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("SET search_path TO lab")
+        conn.execute("UPDATE capabilities_connection_grants SET enabled = false "
+                     "WHERE agent_id = %s", (other,))
+    removed = _ok(_coolify(lab, "connection", "remove", "spare"))
+    assert removed["action"] == "remove"
+    assert "spare" not in _stored_connections(lab)
+
+
+def test_a_store_connection_is_written_over_only_with_replace(lab):
+    _import(lab)
+    refused = _coolify(lab, "connection", "add", "box", "--field", f"base_url={lab['url']}/x")
+    assert refused.returncode == 6 and _error(refused)["code"] == "connection_exists"
+    spec = _rows(lab, "SELECT spec FROM capabilities_connections WHERE name = 'box'")[0][0]
+    assert spec["base_url"] == lab["url"]
+    _ok(_coolify(lab, "connection", "add", "box", "--replace",
+                 "--field", f"base_url={lab['url']}/x"))
+    spec = _rows(lab, "SELECT spec FROM capabilities_connections WHERE name = 'box'")[0][0]
+    assert spec["base_url"] == lab["url"] + "/x"
+
+
 def test_a_read_only_grant_refuses_a_write_verb(lab):
     _import(lab)
     _ok(_coolify(lab, "deploy", "some-app"))

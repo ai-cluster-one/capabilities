@@ -117,7 +117,8 @@ def _write(path: Path, body) -> None:
 @pytest.fixture()
 def lab(tmp_path):
     home = tmp_path / "home"
-    home.mkdir()
+    nowhere = home / "nowhere"
+    nowhere.mkdir(parents=True)
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
     (project / "capabilities").mkdir()
@@ -138,8 +139,8 @@ def lab(tmp_path):
            {"capabilities": {NAME: {"enabled": True}}})
     _write(config / "capabilities" / "settings.json",
            {"capabilities": {NAME: {"enabled": True}}})
-    return {"tmp": tmp_path, "home": home, "project": project, "config": config,
-            "env": env, "script": script}
+    return {"tmp": tmp_path, "home": home, "nowhere": nowhere, "project": project,
+            "config": config, "env": env, "script": script}
 
 
 def _run(lab, *args, stdin=None, extra=None, where="project"):
@@ -258,8 +259,13 @@ def test_add_writes_the_entry_and_its_secret_and_remove_takes_both(lab):
     assert _env_file(env_local) == {"DECLFIX_WORK_TOKEN": "tok-123456789"}
     assert stat.S_IMODE(env_local.stat().st_mode) == 0o600
 
-    # An update keeps every field not given, the secret's pointer included.
+    # An existing connection is written over only when asked to.
     result = _run(lab, "connection", "add", "work", "--field", "port=9443")
+    assert result.returncode == 6 and _error(result)["code"] == "connection_exists"
+    assert _registry(lab)["connections"]["work"]["port"] == 8443
+
+    # A replacement keeps every field not given, the secret's pointer included.
+    result = _run(lab, "connection", "add", "work", "--field", "port=9443", "--replace")
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["action"] == "update"
     assert _registry(lab)["connections"]["work"]["secret_env"] == "DECLFIX_WORK_TOKEN"
@@ -284,6 +290,171 @@ def test_a_global_connection_keeps_its_secret_in_credentials_env(lab):
     assert stat.S_IMODE(credentials.stat().st_mode) == 0o600
     held = json.loads((lab["config"] / NAME / "connections.json").read_text())
     assert held["connections"]["home"]["secret_env"] == "DECLFIX_HOME_TOKEN"
+
+
+def _global_connection(lab, cid: str = "home") -> None:
+    result = _run(lab, "connection", "add", cid, "--global", "--stdin",
+                  stdin=json.dumps({"url": "https://b.example", "secret_env": "g-tok-0001"}))
+    assert result.returncode == 0, result.stderr
+
+
+def _project_registry(lab, body) -> None:
+    _write(lab["project"] / "capabilities" / NAME / "connections.json", body)
+
+
+def test_a_global_connection_is_written_over_only_with_replace(lab):
+    _global_connection(lab)
+    for args in (("--global",), ("--machine",)):
+        result = _run(lab, "connection", "add", "home", *args, "--field", "port=1")
+        assert result.returncode == 6 and _error(result)["code"] == "connection_exists"
+    held = json.loads((lab["config"] / NAME / "connections.json").read_text())
+    assert "port" not in held["connections"]["home"]
+    result = _run(lab, "connection", "add", "home", "--machine", "--replace",
+                  "--field", "port=1", where="nowhere")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["action"] == "update"
+    held = json.loads((lab["config"] / NAME / "connections.json").read_text())
+    assert held["connections"]["home"]["port"] == 1
+    assert held["connections"]["home"]["secret_env"] == "DECLFIX_HOME_TOKEN"
+
+
+def test_replace_is_only_an_option_of_add(lab):
+    _global_connection(lab)
+    result = _run(lab, "connection", "remove", "home", "--global", "--replace")
+    assert result.returncode == 6 and _error(result)["code"] == "input"
+
+
+def test_a_machine_connection_this_project_grants_is_not_removed(lab):
+    _global_connection(lab)
+    _project_registry(lab, {"connections": {"home": {"enabled": True}}})
+    for args in (("--global",), ("--machine",)):
+        result = _run(lab, "connection", "remove", "home", *args)
+        assert result.returncode == 6, result.stderr
+        error = _error(result)
+        assert error["code"] == "connection_granted"
+        assert str(lab["project"]) in error["message"]
+        assert "capabilities set declfix grant home" in error["hint"]
+    held = json.loads((lab["config"] / NAME / "connections.json").read_text())
+    assert "home" in held["connections"]
+    assert _env_file(lab["config"] / NAME / "credentials.env") == {
+        "DECLFIX_HOME_TOKEN": "g-tok-0001"}
+
+    _project_registry(lab, {"connections": {"home": {"enabled": False}}})
+    result = _run(lab, "connection", "remove", "home", "--global")
+    assert result.returncode == 0, result.stderr
+    held = json.loads((lab["config"] / NAME / "connections.json").read_text())
+    assert "home" not in held["connections"]
+
+
+def test_a_project_declaring_its_own_connection_under_the_id_does_not_hold_the_machines(lab):
+    _global_connection(lab)
+    _project_registry(lab, {"connections": {"home": {
+        "url": "https://own.example", "secret_env": "OWN_TOKEN", "enabled": True}}})
+    result = _run(lab, "connection", "remove", "home", "--global")
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_project_connection_is_removed_from_its_own_project(lab):
+    result = _run(lab, "connection", "add", "work", "--field", "url=https://a.example",
+                  "--stdin", stdin=json.dumps({"secret_env": "tok-1"}))
+    assert result.returncode == 0, result.stderr
+    _project_registry(lab, {"connections": {"work": {
+        **_registry(lab)["connections"]["work"], "enabled": True}}})
+    result = _run(lab, "connection", "remove", "work")
+    assert result.returncode == 0, result.stderr
+
+
+# --- machine administration -------------------------------------------------------
+
+def _not_enabled(lab) -> None:
+    (lab["config"] / "capabilities" / "settings.json").unlink()
+
+
+def _quarantine(lab) -> None:
+    _write(lab["config"] / "capabilities" / "machine.json",
+           {"schema": "capabilities.machine.v1",
+            "capabilities": {NAME: {"state": "quarantined", "at": "t", "by": "t"}}})
+
+
+MACHINE_WRITES = (
+    (("setup", "set", "--machine", "--field", "DECLFIX_APP_ID=7"), None),
+    (("setup", "unset", "--machine", "DECLFIX_APP_ID"), None),
+    (("connection", "add", "home", "--machine", "--stdin"),
+     json.dumps({"url": "https://b.example", "secret_env": "g-tok-0001"})),
+    (("connection", "remove", "home", "--machine"), None),
+)
+
+
+def test_outside_a_project_setup_is_reported_with_no_policy(lab):
+    _not_enabled(lab)
+    result = _run(lab, "setup", where="nowhere")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["ready"] is False
+    result = _run(lab, "setup", "show", where="nowhere")
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_machine_write_with_machine_reads_no_policy_wherever_it_runs(lab):
+    _not_enabled(lab)
+    for where in ("nowhere", "project"):
+        if where == "project":
+            _write(lab["project"] / "capabilities" / "settings.json",
+                   {"capabilities": {NAME: {"enabled": False}}})
+        for args, stdin in MACHINE_WRITES:
+            result = _run(lab, *args, stdin=stdin, where=where)
+            assert result.returncode == 0, (where, args, result.stderr)
+    assert not (lab["config"] / NAME / "credentials.env").read_text().strip()
+
+
+def test_a_machine_write_without_machine_answers_to_policy(lab):
+    _not_enabled(lab)
+    (lab["project"] / "capabilities" / "settings.json").unlink()
+    for args, stdin in (
+            (("setup", "set", "--field", "DECLFIX_APP_ID=7"), None),
+            (("setup", "unset", "DECLFIX_APP_ID"), None),
+            (("connection", "add", "home", "--global", "--stdin"),
+             json.dumps({"url": "https://b.example", "secret_env": "g-tok-0001"})),
+            (("connection", "remove", "home", "--global"), None)):
+        for where in ("nowhere", "project"):
+            result = _run(lab, *args, stdin=stdin, where=where)
+            assert result.returncode == 4, (where, args, result.stderr)
+            assert _error(result)["code"] == "not_enabled"
+    result = _run(lab, "setup", "set", "--field", "DECLFIX_APP_ID=7",
+                  extra={"CLAUDE_PROJECT_DIR": str(lab["nowhere"])}, where="nowhere")
+    assert result.returncode == 4 and _error(result)["code"] == "not_enabled"
+
+
+def test_inside_a_project_setup_reporting_answers_to_policy(lab):
+    _write(lab["project"] / "capabilities" / "settings.json",
+           {"capabilities": {NAME: {"enabled": False}}})
+    result = _run(lab, "setup")
+    assert result.returncode == 4 and _error(result)["code"] == "disabled"
+
+
+def test_machine_administration_answers_to_the_ceiling(lab):
+    _not_enabled(lab)
+    _quarantine(lab)
+    for args, stdin in ((("setup",), None), *MACHINE_WRITES):
+        result = _run(lab, *args, stdin=stdin, where="nowhere")
+        assert result.returncode == 4, (args, result.stderr)
+        assert _error(result)["code"] == "quarantined"
+
+
+def test_machine_writes_answer_to_the_read_only_switch(lab):
+    _not_enabled(lab)
+    switch = {"CAPABILITIES_READ_ONLY": "1"}
+    for args, stdin in MACHINE_WRITES:
+        result = _run(lab, *args, stdin=stdin, where="nowhere", extra=switch)
+        assert result.returncode == 4, (args, result.stderr)
+        assert _error(result)["code"] == "read_only_switch"
+    result = _run(lab, "setup", where="nowhere", extra=switch)
+    assert result.returncode == 0, result.stderr
+
+
+def test_machine_and_project_are_not_asked_together(lab):
+    result = _run(lab, "connection", "add", "home", "--machine", "--project",
+                  "--field", "url=https://b.example")
+    assert result.returncode == 6 and _error(result)["code"] == "input"
 
 
 def test_a_value_is_checked_against_its_type(lab):
@@ -396,6 +567,6 @@ def test_stdin_closing_while_an_answer_is_awaited_is_input_closed(lab):
 
 def test_help_ends_with_the_declared_verbs(lab):
     text = _run(lab, "help").stdout
-    for needle in ("connection add <id>", "setup set", "settings put", "declfix link --events",
-                   "poll_seconds @project"):
+    for needle in ("connection add <id>", "--replace", "--machine", "setup set",
+                   "settings put", "declfix link --events", "poll_seconds @project"):
         assert needle in text, needle

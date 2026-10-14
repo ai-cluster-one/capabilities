@@ -5,9 +5,10 @@ A capability declares them in `MACHINE_READS`, beside `WRITE_DEFAULT`. The
 manager validates the declaration wherever it validates a capability, and the
 contract honours it only outside a project, only for the verbs declared, and
 only for reading; a verb that `LINK_METHODS` runs is lent them the same way.
-Inside a project the grant model alone decides, and the
-policy gate is the same gate it always was. `connections` also reports the
-capability's effective policy state.
+Outside any project such a verb is machine administration: it reads no policy
+row and answers to the machine ceiling. Inside a project the grant model alone
+decides, and the policy gate is the same gate it always was. `connections` also
+reports the capability's effective policy state.
 
 The capability these tests drive is the manager's own scaffold, stamped with
 the canonical contract and given three domain verbs: `look` (a read, which
@@ -459,24 +460,63 @@ def test_inside_a_project_a_project_switch_off_stands(lab):
     assert _error(result)["code"] == "connection_not_granted"
 
 
-# --- the gate is the gate it was ----------------------------------------------
+# --- outside a project a machine read answers to the machine ceiling ---------
 
-def test_outside_a_project_a_declared_read_of_a_capability_not_enabled_is_refused(lab):
+def test_outside_a_project_a_declared_read_of_a_capability_not_enabled_is_served(lab):
     (lab["config"] / "capabilities" / "settings.json").unlink()
-    result = _run(lab, "look")
+    for policy in (None, False):
+        if policy is not None:
+            _policy(lab, glob=policy)
+        for args in (("look",), ("--connection", "home", "look")):
+            result = _run(lab, *args)
+            assert result.returncode == 0, (policy, args, result.stderr)
+            assert json.loads(result.stdout) == {
+                "verb": "look", "connection": "home", "allow_write": False}
+        push = _run(lab, "look", "push")
+        assert push.returncode == 4 and _error(push)["code"] == "read_only"
+
+
+def test_outside_a_project_a_linking_verb_of_a_capability_not_enabled_is_served(lab):
+    _with_links(lab)
+    _policy(lab, glob=False)
+    result = _run(lab, "--connection", "home", "peek")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["allow_write"] is False
+
+
+def test_outside_a_project_an_undeclared_verb_of_a_capability_not_enabled_is_refused(lab):
+    _policy(lab, glob=False)
+    for verb in ("peek", "push", "doctor"):
+        result = _run(lab, verb)
+        assert result.returncode == 4, verb
+        assert _error(result)["code"] == "not_enabled"
+
+
+def test_inside_a_project_a_declared_read_still_answers_to_policy(lab):
+    _policy(lab, glob=False)
+    _declare_project(lab, {"connections": {"home": {"enabled": True}}})
+    result = _run(lab, "look", where="project")
     assert result.returncode == 4
     assert _error(result)["code"] == "not_enabled"
+    _policy(lab, proj=False)
+    result = _run(lab, "look", where="project")
+    assert result.returncode == 4
+    assert _error(result)["code"] == "disabled"
+
+
+def test_a_project_named_by_claude_project_dir_is_not_outside_a_project(lab):
     _policy(lab, glob=False)
-    result = _run(lab, "look")
+    result = _run(lab, "look", extra={"CLAUDE_PROJECT_DIR": str(lab["project"])})
     assert result.returncode == 4
     assert _error(result)["code"] == "not_enabled"
 
 
 def test_outside_a_project_a_declared_read_of_a_quarantined_capability_is_refused(lab):
     _quarantine(lab)
-    result = _run(lab, "look")
-    assert result.returncode == 4
-    assert _error(result)["code"] == "quarantined"
+    for args in (("look",), ("--connection", "home", "look")):
+        result = _run(lab, *args)
+        assert result.returncode == 4
+        assert _error(result)["code"] == "quarantined"
 
 
 def test_under_the_read_only_switch_writes_stay_refused(lab):

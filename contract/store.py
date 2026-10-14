@@ -393,6 +393,12 @@ class Records:
         """Resolve exactly one scope, without inheritance."""
         raise NotImplementedError
 
+    def grantees(self, capability: str, connection: str) -> list[str]:
+        """Every project a grant enables this connection for, on any node.
+        Only the store holds a connection more than one project is granted;
+        files keep each project's grants in that project alone."""
+        return []
+
 
 # A policy record says which node its row names. Files carry no node, so every
 # policy record read from them names none: it is the record for every node.
@@ -1043,6 +1049,16 @@ class StoreRecords(FileRecords):
             self._cache[key] = (time.monotonic(), out)
             held = out
         return held
+
+    def grantees(self, capability: str, connection: str) -> list[str]:
+        _store_check("capability", capability, CAPABILITY_RE)
+        if "grant" not in self.collections:
+            return []
+        rows = self._read(
+            "SELECT DISTINCT agent_id FROM capabilities_connection_grants "
+            "WHERE capability = %s AND connection = %s AND enabled "
+            "ORDER BY agent_id", (capability, connection))
+        return [agent for (agent,) in rows]
 
     def _store_default(self, capability: str) -> str | None:
         """The default pointer: this node's, else the one for every node."""

@@ -1,13 +1,13 @@
 {
   "assets": {
-    "DOCTRINE.md": "20e689890f517def32a883a0ca9843df2c4a5e942865dbb28f744264954df810",
+    "DOCTRINE.md": "a96525f48c2fa66053bb6fa29c6f670810fd4bd8924d29e16895a7197b6fbcc1",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "41701a2c7946af338a9137ac73fcc6aafc652d68151d2767b8a081e9ce91da6d",
+    "SHEBANG.md": "10134719e36024a89a2aa43aba8338ec0ccb51e58e3c153955a889f59d5321a4",
     "SOURCES.md": "79e453cf68a08ba2b2e5e460064eb0a5aca8f13071e9d6557be1b7361f1e0075",
     "TEMPLATE.md": "c9818625f5372ba7c53a423be43543f9f485435dae5a71ffbc4b61e5c81617e7",
-    "contract/CHANGELOG.md": "11d44b57cf28bd879042e35d93908f8ca6231ce50ef7e960150257bb8f5e7c4e",
-    "contract/preamble.py": "c2e18539cae3267472728efa6c2454a0777418e57646cc094b78839f9f10fb15",
-    "contract/store.py": "e5d3ba068953bc33ddbe2df940e1bbba81bf82fe96ae597cbbc3f855100fe76b",
+    "contract/CHANGELOG.md": "4d5fd233bde8c6ad0908c61066b53cc6e216f9de54f29b1ad4457d76c2eccd05",
+    "contract/preamble.py": "032f4c93ff7e82b39d2d925432a7eabb0b9b334a74e7a7b7305db9860b05f6d5",
+    "contract/store.py": "38ea708984e8d46431f09adbeff9a78a5a4edc48a8fb016087b0dc774f19ecdd",
     "guides/authoring.md": "e467e5343a54e99c991592d06233fd98b7be13fa32a174d0f27d3a8a06478724",
     "guides/conforming.md": "1c3a44cd7662cb26eec400d05290f6b9f364758387e8d3f974ad8eb74abde93b",
     "guides/contract.md": "72408b3b5d035b15f9d98b5a5dc3d558870f391ed254b8c5f017656be75a13f4",

@@ -1202,6 +1202,10 @@ def _gate() -> None:
     store rather than for a project, so it too reads no policy row: it answers
     to the machine ceiling, and `migrate` (not `migrate status`) to the
     read-only switch.
+
+    Machine administration reads no policy row either: it answers to the
+    machine ceiling, and its writes to the read-only switch
+    (`_machine_administration`).
     """
     _auth_gate()
     verb = sys.argv[1] if len(sys.argv) > 1 else "help"
@@ -1220,6 +1224,8 @@ def _gate() -> None:
                          or (machine_service and service_action in {"join", "leave"})):
         _read_only_gate(f"`{NAME} service {service_action}`")
     if machine_service and service_action != "join" and "--machine" in sys.argv[3:]:
+        return
+    if not safe and _machine_administration():
         return
     if service_call and (service_action in {"init", "start", "run"}
                          or (machine_service and service_action == "join")):
@@ -1289,6 +1295,33 @@ def _machine_read(verb: str | None = None) -> bool:
     if _project_root() is not None:
         return False
     return (verb if verb is not None else _invoked_verb()) in declared
+
+
+def _machine_administration() -> bool:
+    """Whether this call administers the machine rather than acting for a
+    project, so it reads no policy row and answers to the machine ceiling
+    alone, its writes to the read-only switch as well.
+
+    Outside any project, a machine read - a verb declared in `MACHINE_READS`,
+    a verb that links a connection, and `setup` reporting the machine's
+    prerequisites - has no project whose policy it could answer to, and uses
+    the machine's connections only read-only. A write to the machine's own
+    configuration - `setup set|unset`, and `connection add|remove` at machine
+    scope - is administration only when it says so with `--machine`, wherever
+    it runs; it is never inferred from where the call runs."""
+    verb = _invoked_verb()
+    first = sys.argv[1] if len(sys.argv) > 1 else None
+    rest = sys.argv[2:]
+    if (verb == "setup" == first and "_cmd_setup" in globals()
+            and globals().get("SETUP_FIELDS")):
+        sub = rest[0] if rest and not rest[0].startswith("--") else "show"
+        if sub in ("set", "unset"):
+            return "--machine" in rest
+        return _project_root() is None
+    if (verb == "connection" == first and "_cmd_connection" in globals()
+            and globals().get("CONN_FIELDS") is not None):
+        return "--machine" in rest
+    return _machine_read(verb)
 
 
 def _policy_state() -> dict:
@@ -1609,28 +1642,35 @@ def _declared_section() -> str:
     out = ""
     if conns and conns.get("fields") is not None:
         out += (f"\n## Connections, written through the contract\n\n"
-                f"  {NAME} connection add <id> [--project|--global] [--default] "
-                "[--field KEY=VALUE ...] [--stdin]\n"
+                f"  {NAME} connection add <id> [--project|--global|--machine] [--default] "
+                "[--replace] [--field KEY=VALUE ...] [--stdin]\n"
                 "      Write one connection from the fields below. --project (the default)\n"
-                "      writes this project's record, --global the machine's. A secret field is\n"
+                "      writes this project's record, --global the machine's, and --machine\n"
+                "      the machine's as administration of the machine: from anywhere, with\n"
+                "      no project or global policy read. A secret field is\n"
                 "      taken only from the JSON object on stdin (--stdin), never from argv, and\n"
                 "      written to that scope's credentials file - the project's .env.local, or\n"
                 f"      {CREDENTIALS_ENV} - under its own env key, which the\n"
-                "      entry names. A connection that exists keeps every field not given;\n"
-                "      null in the JSON object clears one. --default points the scope's default\n"
-                "      at it. Answers the fields as they now resolve, secrets masked.\n"
-                f"  {NAME} connection remove <id> [--project|--global]\n"
+                "      entry names. A connection that exists is refused (exit 6\n"
+                "      connection_exists) unless --replace is given; it then keeps every\n"
+                "      field not given, and null in the JSON object clears one. --default\n"
+                "      points the scope's default at it. Answers the fields as they now\n"
+                "      resolve, secrets masked.\n"
+                f"  {NAME} connection remove <id> [--project|--global|--machine]\n"
                 "      Remove it, its default pointer, and the secret lines `connection add`\n"
-                "      wrote for it; a key another connection names is kept.\n")
+                "      wrote for it; a key another connection names is kept. Refused (exit 6\n"
+                "      connection_granted) while a project is granted it, naming each one.\n")
         out += "  Fields:\n" + ("".join(_field_line(f) for f in conns["fields"])
                                 or "    none - an entry carries no fields of its own\n")
     if conns and conns.get("setup"):
         out += (f"\n## Machine setup, written through the contract\n\n"
-                f"  {NAME} setup [show] | setup set [--field KEY=VALUE ...] [--stdin] | "
-                "setup unset <KEY> ...\n"
+                f"  {NAME} setup [show] | setup set [--machine] [--field KEY=VALUE ...] "
+                "[--stdin] | setup unset [--machine] <KEY> ...\n"
                 "      What this machine is given once, before any connection, kept in\n"
                 f"      {CREDENTIALS_ENV}; `show` says where each resolves\n"
-                "      from, secrets masked. A secret is taken only from the JSON object on stdin.\n")
+                "      from, secrets masked, and outside any project reads no policy. A secret\n"
+                "      is taken only from the JSON object on stdin. --machine writes as\n"
+                "      administration of the machine: from anywhere, with no policy read.\n")
         out += "".join(_field_line(f) for f in conns["setup"])
     if conns and conns.get("link"):
         out += ("\n## Linking a connection\n\n"
@@ -2848,6 +2888,12 @@ class Records:
         """Resolve exactly one scope, without inheritance."""
         raise NotImplementedError
 
+    def grantees(self, capability: str, connection: str) -> list[str]:
+        """Every project a grant enables this connection for, on any node.
+        Only the store holds a connection more than one project is granted;
+        files keep each project's grants in that project alone."""
+        return []
+
 
 # A policy record says which node its row names. Files carry no node, so every
 # policy record read from them names none: it is the record for every node.
@@ -3498,6 +3544,16 @@ class StoreRecords(FileRecords):
             self._cache[key] = (time.monotonic(), out)
             held = out
         return held
+
+    def grantees(self, capability: str, connection: str) -> list[str]:
+        _store_check("capability", capability, CAPABILITY_RE)
+        if "grant" not in self.collections:
+            return []
+        rows = self._read(
+            "SELECT DISTINCT agent_id FROM capabilities_connection_grants "
+            "WHERE capability = %s AND connection = %s AND enabled "
+            "ORDER BY agent_id", (capability, connection))
+        return [agent for (agent,) in rows]
 
     def _store_default(self, capability: str) -> str | None:
         """The default pointer: this node's, else the one for every node."""
@@ -4356,14 +4412,39 @@ def _connection_env_name(field: dict, cid: str) -> str:
 
 
 def _connection_scope(words: list[str], usage: str) -> tuple[str, list[str]]:
+    """The scope a connection is written at. `--machine` is the machine's
+    scope, `--global`'s, named as administration of the machine
+    (`_machine_administration`), so it cannot be asked of a project."""
     scope = "project"
     rest = []
     for word in words:
-        if word in ("--project", "--global"):
+        if word in ("--project", "--global", "--machine"):
             scope = word[2:]
         else:
             rest.append(word)
-    return scope, rest
+    if "--machine" in words and "--project" in words:
+        _die(6, "input", "--machine writes the machine's connection, --project this "
+             "project's; pass one", usage)
+    return ("global" if scope == "machine" else scope), rest
+
+
+def _connection_grantees(adapter, cid: str, scope: str, root) -> list:
+    """The projects a connection removed at `scope` is granted to and would be
+    taken from: every project the store holds an enabling grant for, for a
+    connection kept in the store; the project the call runs in, for a
+    connection of the machine it grants and does not declare itself. A
+    project's own connection in its files is granted to no other project."""
+    if scope == "global":
+        if root is None or adapter.mode_of("grant") != "files":
+            return []
+        grant = (adapter.resolve_scope(NAME, "grant", "project").get(cid) or {}).get("value")
+        own = (adapter.resolve_scope(NAME, "connection", "project").get(cid) or {}).get("value")
+        if isinstance(grant, dict) and grant.get("enabled") is True and not own:
+            return [str(root)]
+        return []
+    if adapter.mode_of("connection") == "store":
+        return adapter.grantees(NAME, cid)
+    return []
 
 
 def _scope_credentials(scope: str) -> Path:
@@ -4376,16 +4457,19 @@ def _cmd_connection(argv: list[str]) -> None:
     """`connection add <id>` writes one connection from its declared fields,
     its secrets into the scope's credentials file; `connection remove <id>`
     takes it out again with the secrets it wrote."""
-    usage = (f"{NAME} connection add <id> [--project|--global] [--default] "
-             "[--field KEY=VALUE ...] [--stdin] | "
-             f"{NAME} connection remove <id> [--project|--global]")
+    usage = (f"{NAME} connection add <id> [--project|--global|--machine] [--default] "
+             "[--replace] [--field KEY=VALUE ...] [--stdin] | "
+             f"{NAME} connection remove <id> [--project|--global|--machine]")
     import re as _re
     sub = argv[0] if argv else ""
     if sub not in ("add", "remove"):
         _die(6, "input", f"unknown connection subcommand {sub!r}", usage)
     argv_values, words, stdin = _field_args(argv[1:], usage)
     default = "--default" in words
-    words = [w for w in words if w != "--default"]
+    replace = "--replace" in words
+    if replace and sub != "add":
+        _die(6, "input", "--replace is an option of connection add", usage)
+    words = [w for w in words if w not in ("--default", "--replace")]
     scope, rest = _connection_scope(words, usage)
     flags = [w for w in rest if w.startswith("--")]
     if flags:
@@ -4421,6 +4505,17 @@ def _cmd_connection(argv: list[str]) -> None:
         if held is None:
             _die(3, "unknown_connection", f"no {scope} connection {cid!r}",
                  f"`{NAME} connections` lists them")
+        try:
+            grantees = _connection_grantees(adapter, cid, scope, root)
+        except StoreError as e:
+            _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+        if grantees:
+            _die(6, "connection_granted",
+                 f"connection {cid!r} is granted to {len(grantees)} project(s), so "
+                 f"removing it would take it from them: {', '.join(grantees)}",
+                 "ask the user; each project switches its grant off first, with "
+                 f"`capabilities set {NAME} grant {cid} '{{\"enabled\": false}}'` "
+                 "run in that project")
         others = {}
         try:
             for other, row in adapter.resolve_scope(NAME, "connection", scope).items():
@@ -4453,6 +4548,12 @@ def _cmd_connection(argv: list[str]) -> None:
                "secrets_removed": removed, "secrets_kept": kept})
         return
 
+    if held is not None and not replace:
+        _die(6, "connection_exists",
+             f"a {scope} connection {cid!r} already exists, and connection add "
+             "writes over it only when asked to",
+             f"pass --replace to change it, keeping every field not given; "
+             f"`{NAME} connections` shows it as it resolves")
     given = _declared_values(declared, argv_values, stdin, "connection")
     entry = dict(existing)
     secrets: dict = {}
@@ -4520,14 +4621,18 @@ def _cmd_connection(argv: list[str]) -> None:
 def _cmd_setup(argv: list[str]) -> None:
     """`setup` reports the machine prerequisites the capability declares and
     where each resolves from; `setup set` writes them to the capability's
-    credentials.env, secrets from stdin; `setup unset` takes them out."""
-    usage = (f"{NAME} setup [show] | setup set [--field KEY=VALUE ...] [--stdin] | "
-             "setup unset <KEY> ...")
+    credentials.env, secrets from stdin; `setup unset` takes them out.
+    `--machine` names a write as administration of the machine
+    (`_machine_administration`)."""
+    usage = (f"{NAME} setup [show] | setup set [--machine] [--field KEY=VALUE ...] "
+             "[--stdin] | setup unset [--machine] <KEY> ...")
     declared = list(globals().get("SETUP_FIELDS") or [])
     sub = argv[0] if argv and not argv[0].startswith("--") else "show"
     rest = argv[1:] if argv and argv[0] == sub else argv
     if sub not in ("show", "set", "unset"):
         _die(6, "input", f"unknown setup subcommand {sub!r}", usage)
+    if sub != "show":
+        rest = [w for w in rest if w != "--machine"]
     changed: list = []
     if sub == "set":
         argv_values, words, stdin = _field_args(rest, usage)
