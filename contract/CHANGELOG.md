@@ -1,5 +1,9 @@
 # contract — change log
 
+## 2026-10-14 — Bare `help` says where the project it runs in keeps connections
+
+For a capability with the connections tier, bare `help` now prints a section, `Where connections live`, after the CLI's own help body and before the declared verbs, rendered by the new `_connections_home_section()` from the project's `connections_mode()`: in files mode the project's own `connections.json` and the machine's beneath it, in store mode the store's `capabilities_connections` and `capabilities_connection_grants` tables and that no `connections.json` is read for the project, and outside any project the machine's `connections.json`. It reads `project.json` only. A capability's help body no longer states that home itself and points at the section. Every capability carries the change through `sync-contract`.
+
 ## 2026-10-14 — Machine administration answers to the machine ceiling, and `connection add|remove` guard what they would overwrite or take away
 
 Breaking for a caller that updated a connection by adding it again: `connection add` now refuses an id that already exists at its scope with exit 6 `connection_exists`, and writes over it only with `--replace`, which keeps every field not given as an update did. `connection remove` refuses with exit 6 `connection_granted`, naming each project, while a project is granted the connection and would lose it. For a connection kept in the store, that is every project the store holds a grant enabling it for, on any node; the store tier adds `Records.grantees(capability, connection)`. For a connection of the machine, it is the project the call runs in, when that project grants it and declares no connection of its own under that id.

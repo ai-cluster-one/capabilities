@@ -305,6 +305,18 @@ def test_import_moves_the_project_and_it_resolves_the_same_set(lab):
     assert "test-token" not in json.dumps(specs)
 
 
+def test_help_names_the_home_the_project_keeps_its_connections_in(lab):
+    before = _text(_coolify(lab, "help"))
+    assert "This project keeps its connections in files" in before
+    assert str(lab["envelope"] / "coolify" / "connections.json") in before
+    _import(lab)
+    after = _text(_coolify(lab, "help"))
+    home = after.split("═══ Where connections live", 1)[1]
+    assert "This project keeps its connections in its store" in home
+    assert "capabilities_connections" in home
+    assert str(lab["envelope"] / "coolify" / "connections.json") not in after
+
+
 def test_a_second_import_changes_nothing(lab):
     _import(lab)
     again = _import(lab)

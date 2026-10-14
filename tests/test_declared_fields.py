@@ -570,3 +570,21 @@ def test_help_ends_with_the_declared_verbs(lab):
     for needle in ("connection add <id>", "--replace", "--machine", "setup set",
                    "settings put", "declfix link --events", "poll_seconds @project"):
         assert needle in text, needle
+
+
+def test_help_names_where_this_project_keeps_its_connections(lab):
+    text = _run(lab, "help").stdout
+    home = text.split("═══ Where connections live", 1)[1]
+    assert "This project keeps its connections in files" in home
+    assert str(lab["project"] / "capabilities" / NAME / "connections.json") in home
+    assert str(lab["config"] / NAME / "connections.json") in home
+    outside = _run(lab, "help", where="nowhere").stdout
+    assert "There is no project here" in outside
+    assert str(lab["config"] / NAME / "connections.json") in outside
+
+
+def test_help_of_a_capability_without_connections_names_no_home(lab):
+    lab["script"].write_text(M._capability_skeleton(NAME, True))
+    result = _run(lab, "help")
+    assert result.returncode == 0, result.stderr
+    assert "Where connections live" not in result.stdout

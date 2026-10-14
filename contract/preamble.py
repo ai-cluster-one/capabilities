@@ -59,7 +59,10 @@ none, and `migrate` is then left to the CLI's own parser.
 The bare `help` verb is dispatched by `_contract` and reads the CLI's help
 body from a module-level `HELP` constant if defined, else the module docstring
 (`__doc__`) — either wire is acceptable, and every capability already carries
-one or the other. It then appends the project's identifiers as a labelled
+one or the other. For a capability with the connections tier it then appends
+where the project it runs in keeps connections, rendered from that project's
+connections mode (`connections_mode`), so no help body states that home itself.
+Last it appends the project's identifiers as a labelled
 section rendered by `_render_ids_markdown` (the same format the manager's
 `capabilities ids <NAME>` produces, so one home for the rendering).
 
@@ -1254,11 +1257,50 @@ def _identifiers_section() -> str:
     return header + _render_ids_markdown(data) + "\n"
 
 
+def _connections_home_section() -> str:
+    """Where the connections this help describes are kept, for the project it
+    is run in - rendered from the project's connections mode, so help names
+    the home the resolver reads rather than one it may not. Empty for a
+    capability without the connections tier. Reads `project.json` only and
+    never reaches the store, so help stays local."""
+    if "_resolve_env_key" not in globals():
+        return ""
+    machine = _CONFIG_HOME / NAME / "connections.json"
+    header = (
+        "\n═══ Where connections live ══════════════════════════════════════════════════\n\n")
+    reported = f"`{NAME} connections` names where each value resolves from.\n"
+    root = _project_root()
+    if root is None:
+        return (header + "There is no project here, so connections are read from the "
+                "machine's\n"
+                f"  {machine}\n" + reported)
+    envelope = _project_capabilities_dir(root)
+    try:
+        mode = connections_mode(envelope)
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+    if mode == "store":
+        return (header + "This project keeps its connections in its store, not in "
+                "files: each\n"
+                "connection is a row of the store's `capabilities_connections` table, "
+                "and\n"
+                "this project's grant on it a row of `capabilities_connection_grants`.\n"
+                "No connections.json, the project's or the machine's, is read for this "
+                "project.\n" + reported)
+    return (header + "This project keeps its connections in files: its own\n"
+            f"  {envelope / NAME / 'connections.json'}\n"
+            "then, for a connection id the project does not declare itself, the "
+            "machine's\n"
+            f"  {machine}\n"
+            "used here once this project grants it.\n" + reported)
+
+
 def _cmd_help() -> None:
     """Bare top-level help: the CLI's HELP body (module-level `HELP` if
-    defined, else the module docstring), then the project's Identifiers
-    section. Only fires when no extra args follow — per-verb help stays
-    untouched so `<NAME> help <subcommand>` is not intercepted."""
+    defined, else the module docstring), then where this project keeps the
+    capability's connections, then the project's Identifiers section. Only
+    fires when no extra args follow — per-verb help stays untouched so
+    `<NAME> help <subcommand>` is not intercepted."""
     g = globals()
     text = g.get("HELP") or g.get("__doc__") or ""
     if text.startswith("\n"):
@@ -1266,6 +1308,9 @@ def _cmd_help() -> None:
     sys.stdout.write(text)
     if text and not text.endswith("\n"):
         sys.stdout.write("\n")
+    home = _connections_home_section()
+    if home:
+        sys.stdout.write(home)
     declared = _declared_section()
     if declared:
         sys.stdout.write(declared)
