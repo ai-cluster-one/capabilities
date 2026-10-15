@@ -6675,7 +6675,7 @@ def _resolve_project_layout(root: Path) -> dict:
         "provider": ("contextkit" if (root / ".contextkit" / "config.toml").is_file()
                      else "default"),
     }
-    layer_names = ("context", "routines", "assets", "memory", "deployment")
+    layer_names = ("context", "routines", "assets", "memory")
     if layout["provider"] == "contextkit":
         for name in layer_names:
             value = (_contextkit_memory(root) if name == "memory"
@@ -6687,6 +6687,11 @@ def _resolve_project_layout(root: Path) -> dict:
             candidate = (root / name).resolve()
             if candidate.exists():
                 layout[name] = str(candidate)
+    # The deployment capability keeps its folder at the project root whatever
+    # body layout ContextKit names, so it is read there for every provider.
+    deployment = (root / "deployment").resolve()
+    if deployment.exists():
+        layout["deployment"] = str(deployment)
     return layout
 
 
