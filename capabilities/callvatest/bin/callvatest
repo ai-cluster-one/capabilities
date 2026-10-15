@@ -5090,20 +5090,12 @@ _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 
 
 def _resolve_agent(ref: str) -> str:
-    """An agent uuid passes through; anything else is a label in this project's
-    identifiers envelope, so a scenario names an agent the way a human does."""
+    """An agent uuid passes through; anything else is a label among this
+    project's identifiers, read through the records adapter `ids get` reads,
+    so a scenario names an agent the way a human does."""
     if _UUID_RE.match(ref or ""):
         return ref
-    envdir = _env_dir()
-    ids_file = (envdir / "identifiers.json") if envdir else None
-    data: dict = {}
-    if ids_file and ids_file.exists():
-        try:
-            data = json.loads(ids_file.read_text())
-        except ValueError:
-            _die(6, "bad_envelope", f"{ids_file} is not valid JSON")
-    entry = data.get(ref)
-    value = (entry or {}).get("value") if isinstance(entry, dict) else entry
+    value = (_identifiers_load().get(ref) or {}).get("value")
     if not isinstance(value, str) or not _UUID_RE.match(value):
         _die(3, "unknown_agent",
              f"{ref!r} is neither an agent uuid nor a label in the identifiers envelope",

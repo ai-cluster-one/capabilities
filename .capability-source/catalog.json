@@ -37,7 +37,7 @@
     },
     "callvatest": {
       "path": "capabilities/callvatest",
-      "payload_sha256": "557a93b1a9c58af50623f04ecbeb0663813af4fa8e1b21ac40f0590c81472caa",
+      "payload_sha256": "0edb051ffb45f72e9ddaea493bcb371ee081e5f1ebc29d0cf647e003f6f4c1b2",
       "summary": "CallVA agent test harness — drives a deployed voice agent through a real LiveKit room over text, then asserts the transcript, the tools it called, the arguments it generated, the results it answered from, and the fields stored after the call."
     },
     "clickup": {
@@ -62,7 +62,7 @@
     },
     "emta": {
       "path": "capabilities/emta",
-      "payload_sha256": "af4a4dd32d407159c43bbb87b91319b72585f88c014d32b482a976068d47819c",
+      "payload_sha256": "8b59e601671a1f45e8a4336625adb4a5b86bf784f3da3539a94775e5b3978768",
       "summary": "Estonian Tax Board (maasikas.emta.ee) read-only CLI — prepay balances, per-period balances, prepay ledger. Session is paste-fed from a logged-in browser. Stateful — run `emta doctor` first."
     },
     "fathom": {
@@ -72,7 +72,7 @@
     },
     "geminitalk": {
       "path": "capabilities/geminitalk",
-      "payload_sha256": "bcbee60faa3e92d37971e5de94a0bfa169e6b185b8afe862e3fcf33142485e6f",
+      "payload_sha256": "229b826b5666bb25dae14cd5e818fbeec25497334e9d5762087de832aaf409f1",
       "summary": "Gemini Live native-audio project companion with continuous duplex audio, bounded project tools, optional headless Codex delegation, and an active Codex-thread relay."
     },
     "ical": {

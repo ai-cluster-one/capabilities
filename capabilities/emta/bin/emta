@@ -4567,28 +4567,15 @@ def _cmd_connections() -> None:
     _emit(_connections_report())
 
 
-# ─── Identifier helpers (internal — reuse the on-disk envelope) ──────────────
-
-def _ids_data() -> dict:
-    envdir = _env_dir()
-    if envdir is None:
-        return {}
-    p = envdir / "identifiers.json"
-    if not p.exists():
-        return {}
-    try:
-        d = json.loads(p.read_text())
-    except ValueError:
-        return {}
-    return d if isinstance(d, dict) else {}
-
+# ─── Identifier helpers (internal — the records adapter's identifiers) ───────
 
 def _ids_get(label: str) -> str | None:
-    """Read one ids value, coerced to str. ints/floats (e.g. principalId
-    written by `ids set` as a JSON number) become their str form so the
-    resolver works regardless of whether the value was stored as "749..."
-    or 749…. Bools, lists, dicts, and None do not coerce."""
-    e = _ids_data().get(label) or {}
+    """Read one ids value through the same records adapter `ids get` reads,
+    coerced to str. ints/floats (e.g. principalId written by `ids set` as a
+    JSON number) become their str form so the resolver works regardless of
+    whether the value was stored as "749..." or 749…. Bools, lists, dicts,
+    and None do not coerce."""
+    e = _identifiers_load().get(label) or {}
     v = e.get("value")
     if isinstance(v, str):
         return v
@@ -4600,27 +4587,17 @@ def _ids_get(label: str) -> str | None:
 
 
 def _ids_set_silent(label: str, value, note: str = "") -> bool:
-    """Direct write to the ids envelope without stdout side effects, so the
-    ingest verb can auto-populate principal_person_id without polluting its
-    own response. Returns True on success. An identifier is a project record,
-    so under the read-only switch this writes nothing and returns False."""
+    """Write one project identifier through the records adapter `ids set`
+    writes, without stdout side effects, so the ingest verb can auto-populate
+    principal_person_id without polluting its own response. Returns True on
+    success. Outside a project envelope, and under the read-only switch (an
+    identifier is a project record), this writes nothing and returns False."""
     if read_only_switch():
         return False
     envdir = _env_dir()
     if envdir is None or not envdir.parent.is_dir():
         return False
-    p = envdir / "identifiers.json"
-    data: dict = {}
-    if p.exists():
-        try:
-            data = json.loads(p.read_text())
-        except ValueError:
-            return False
-    if not isinstance(data, dict):
-        return False
-    data[label] = {"value": value, "note": note or (data.get(label) or {}).get("note", "")}
-    envdir.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    _identifiers_write(label, value, note)
     return True
 
 
