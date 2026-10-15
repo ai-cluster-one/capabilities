@@ -62,7 +62,7 @@
     },
     "emta": {
       "path": "capabilities/emta",
-      "payload_sha256": "8b59e601671a1f45e8a4336625adb4a5b86bf784f3da3539a94775e5b3978768",
+      "payload_sha256": "b9165a3e35104f6ce507f83a5105dc3fd1f79e3d17fa7eb503064b2f6c95231a",
       "summary": "Estonian Tax Board (maasikas.emta.ee) read-only CLI — prepay balances, per-period balances, prepay ledger. Session is paste-fed from a logged-in browser. Stateful — run `emta doctor` first."
     },
     "fathom": {
@@ -72,7 +72,7 @@
     },
     "geminitalk": {
       "path": "capabilities/geminitalk",
-      "payload_sha256": "229b826b5666bb25dae14cd5e818fbeec25497334e9d5762087de832aaf409f1",
+      "payload_sha256": "8e92b1917f95f9d6f536f91b4b25701bffbee84546b07cff707eb551598192ed",
       "summary": "Gemini Live native-audio project companion with continuous duplex audio, bounded project tools, optional headless Codex delegation, and an active Codex-thread relay."
     },
     "ical": {

@@ -4571,11 +4571,15 @@ def _cmd_connections() -> None:
 
 def _ids_get(label: str) -> str | None:
     """Read one ids value through the same records adapter `ids get` reads,
-    coerced to str. ints/floats (e.g. principalId written by `ids set` as a
-    JSON number) become their str form so the resolver works regardless of
-    whether the value was stored as "749..." or 749…. Bools, lists, dicts,
-    and None do not coerce."""
-    e = _identifiers_load().get(label) or {}
+    coerced to str; None where the identifier source cannot be read, so the
+    caller falls back as it does for an unset value. ints/floats (e.g.
+    principalId written by `ids set` as a JSON number) become their str form
+    so the resolver works regardless of whether the value was stored as
+    "749..." or 749…. Bools, lists, dicts, and None do not coerce."""
+    try:
+        e = _records().resolve(NAME, "identifier").get(label) or {}
+    except StoreError:
+        return None  # an unreadable identifier source reads as unset
     v = e.get("value")
     if isinstance(v, str):
         return v
@@ -4590,14 +4594,27 @@ def _ids_set_silent(label: str, value, note: str = "") -> bool:
     """Write one project identifier through the records adapter `ids set`
     writes, without stdout side effects, so the ingest verb can auto-populate
     principal_person_id without polluting its own response. Returns True on
-    success. Outside a project envelope, and under the read-only switch (an
-    identifier is a project record), this writes nothing and returns False."""
+    success. Outside a project envelope, under the read-only switch (an
+    identifier is a project record), and where the identifier source cannot be
+    read or written, this writes nothing and returns False, so the caller
+    falls back to the session."""
     if read_only_switch():
         return False
     envdir = _env_dir()
     if envdir is None or not envdir.parent.is_dir():
         return False
-    _identifiers_write(label, value, note)
+    try:
+        records = _records()
+        if (records.mode_of("identifier") == "store"
+                and _project_id(write=True, refuse=False) is None):
+            return False
+        kept = note or ((records.resolve_scope(NAME, "identifier", "project")
+                         .get(label) or {}).get("note") or "")
+        records.set(NAME, "identifier", label, value,
+                    actor=f"{NAME} session ingest", note=kept or None,
+                    scope="project")
+    except StoreError:
+        return False
     return True
 
 
@@ -4878,8 +4895,9 @@ def _bootstrap(cid: str, session: dict) -> dict:
             note="discovered from /client/session-user; sent as the "
                  "x-principal-person-id header on every data call"):
         return {"ok": True, "status": 200, "ids_action": action}
-    # No project envelope to write into, or the read-only switch keeps the
-    # project's identifiers as they are — stash in the session as a fallback
+    # No project envelope to write into, an identifier source that cannot be
+    # read or written, or the read-only switch keeps the project's identifiers
+    # as they are — stash in the session as a fallback
     # so the same process and later invocations on this connection still work.
     session["principal_person_id_fallback"] = pid
     _save_session(cid, session)
