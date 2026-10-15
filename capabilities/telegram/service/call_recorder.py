@@ -5,6 +5,7 @@
 #     "py-tgcalls==3.0.1b1",
 #     "ntgcalls==3.0.3",
 #     "telethon==1.45.0",
+#     "capabilities-contract==0.4.1",
 # ]
 # ///
 # The 3.x line is what carries conference calls: joining one needs
@@ -79,11 +80,11 @@ from call_recording_helpers import (
     voice_document_attributes,
     write_metadata,
 )
+import records
 
 
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
-USER_CONNECTIONS = CONFIG_HOME / "telegram" / "connections.json"
 USER_CREDENTIALS = CONFIG_HOME / "telegram" / "credentials.env"
 JOIN_ATTEMPTS = 3
 JOIN_TIMEOUT_SECONDS = 20
@@ -186,20 +187,15 @@ def env_value(root: Path, key: str) -> str | None:
     return os.environ.get(key) or None
 
 
-def connections_registry(root: Path) -> tuple[dict | None, Path | None]:
-    candidates = [project_capabilities_dir(root) / "telegram" / "connections.json",
-                  USER_CONNECTIONS]
-    for path in candidates:
-        if not path.is_file():
-            continue
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError) as exc:
-            raise RecorderError(6, "bad_config", f"cannot read {path}: {exc}") from exc
-        if not isinstance(data.get("connections"), dict) or not data["connections"]:
-            raise RecorderError(6, "bad_config", f"{path} is not a connections envelope")
-        return data, path
-    return None, None
+def connections_registry(root: Path) -> tuple[dict | None, str | None]:
+    """The connections this project may use and where they were read, through
+    the records adapter."""
+    try:
+        adapter = records.open_records(project_capabilities_dir(root), CONFIG_HOME, root)
+        registry, source = records.connections(adapter)
+    except records.store().StoreError as exc:
+        raise RecorderError(6, exc.slug, exc.message, exc.hint) from exc
+    return registry, source if registry is not None else None
 
 
 def select_connection(registry: dict | None, wanted: str | None) -> tuple[str, dict | None]:
@@ -209,7 +205,11 @@ def select_connection(registry: dict | None, wanted: str | None) -> tuple[str, d
                                 f"no Telegram connection matches {wanted!r}")
         return "default", None
     connections = registry["connections"]
+    withheld = registry.get("withheld") or ()
     selected = wanted or registry.get("default")
+    if selected in withheld:
+        raise RecorderError(4, "connection_not_granted",
+                            f"Telegram connection {selected!r} is not granted to this project")
     if selected:
         if selected not in connections:
             raise RecorderError(6, "unknown_connection",
@@ -219,6 +219,10 @@ def select_connection(registry: dict | None, wanted: str | None) -> tuple[str, d
     if len(connections) == 1:
         selected = next(iter(connections))
         return selected, connections[selected]
+    if not connections:
+        raise RecorderError(4, "connection_not_granted",
+                            "no Telegram connection is granted to this project",
+                            f"withheld: {', '.join(withheld)}")
     raise RecorderError(6, "ambiguous_connection",
                         "multiple Telegram connections are configured; pass --connection")
 

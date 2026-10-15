@@ -149,6 +149,7 @@ from call_recording_helpers import (
 import gate as reply_gate
 import jobs
 import profiles
+import records
 import voice_agent
 from forum import GENERAL_TOPIC_ID, message_topic_id
 from settings_schema import (
@@ -288,7 +289,6 @@ RECOVERY_MAX_GAP = 600.0
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 CRED_FILE = CONFIG_HOME / "telegram" / "credentials.env"
-USER_CONN_FILE = CONFIG_HOME / "telegram" / "connections.json"
 DEFAULT_SESSION = STATE_HOME / "telegram" / "session"
 if (not DEFAULT_SESSION.with_suffix(".session").exists()
         and (CONFIG_HOME / "telegram" / "session.session").exists()):
@@ -391,10 +391,9 @@ JOB_WORKER_FILE = Path(os.environ.get("TELEGRAM_SERVICE_JOB_WORKER")
                        or SERVICE_DIR / "job-worker.md")
 
 
-# The service's records are files, read the way the CLI reads them: the
-# project's envelope first, then the user's config home. Settings merge key by
-# key, the project's winning; a document is the first file, in that order, that
-# answers to its key.
+# Settings and connections are read through the records adapter, as the CLI
+# reads them. A document is the first file, the project's envelope before the
+# user's config home, that answers to its key.
 RECORD_ROOTS = (PROJECT_CAPABILITIES_DIR, CONFIG_HOME)
 # Where a document key's file may sit under a scope's `telegram/` folder, and
 # the prefix its key carries there.
@@ -402,24 +401,30 @@ DOCUMENT_FOLDERS = (("reference", "reference"), ("context", "service/context"),
                     (None, "service"))
 
 
+_RECORDS = None
+
+
+def _records():
+    """The records adapter for this daemon's project, opened once: its
+    envelope, then the user's config home; its store for connections and
+    grants where the project keeps them there. Raises the contract's
+    StoreError."""
+    global _RECORDS
+    if _RECORDS is None:
+        _RECORDS = records.open_records(
+            PROJECT_CAPABILITIES_DIR, CONFIG_HOME, PROJECT_ROOT,
+            jobs.handed_project_id(PROJECT_ROOT))
+    return _RECORDS
+
+
 def _read_record_settings():
-    """The service settings the project's envelope and the config home hold,
-    merged key by key with the project's winning."""
-    merged = {}
-    for root in RECORD_ROOTS:
-        path = root / "telegram" / "service" / "settings.json"
-        try:
-            body = json.loads(path.read_text())
-        except FileNotFoundError:
-            continue
-        except (OSError, ValueError) as exc:
-            raise SettingsError(
-                f"Telegram service records are unavailable: cannot read {path}: {exc}") from exc
-        if isinstance(body, dict):
-            for key, value in body.items():
-                merged.setdefault(key, value)
-    merged.pop("connection.default", None)
-    return merged
+    """The service settings, the project's over the config home's key by key,
+    read through the records adapter."""
+    try:
+        return records.service_settings(_records())
+    except records.store().StoreError as exc:
+        raise SettingsError(
+            f"Telegram service records are unavailable: {exc.message}") from exc
 
 
 def _document_file(key):
@@ -771,28 +776,25 @@ def _connection_file_override():
 
 
 def _connections_envelope():
-    override = _connection_file_override()
-    candidates = [override] if override else [
-        PROJECT_CAPABILITIES_DIR / "telegram" / "connections.json",
-        USER_CONN_FILE,
-    ]
-    for path in candidates:
-        if path is None:
-            continue
-        if not path.exists():
-            if override:
-                sys.exit(f"Telegram connections envelope not found: {path}")
-            continue
+    """The connections this project may use and where they were read: through
+    the records adapter, or from the file a connections-file override names."""
+    path = _connection_file_override()
+    if path is None:
         try:
-            data = json.loads(path.read_text())
-        except json.JSONDecodeError as e:
-            sys.exit(f"{path} is not valid JSON: {e}")
-        except OSError as e:
-            sys.exit(f"cannot read {path}: {e}")
-        if not isinstance(data.get("connections"), dict) or not data["connections"]:
-            sys.exit(f"{path} is not a valid Telegram connections envelope")
-        return data, path
-    return None, None
+            return records.connections(_records())
+        except records.store().StoreError as e:
+            sys.exit(f"Telegram connections are unavailable: {e.message}")
+    if not path.exists():
+        sys.exit(f"Telegram connections envelope not found: {path}")
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as e:
+        sys.exit(f"{path} is not valid JSON: {e}")
+    except OSError as e:
+        sys.exit(f"cannot read {path}: {e}")
+    if not isinstance(data.get("connections"), dict) or not data["connections"]:
+        sys.exit(f"{path} is not a valid Telegram connections envelope")
+    return data, path
 
 
 def _select_connection(data):
@@ -806,14 +808,21 @@ def _select_connection(data):
                 f"no Telegram connections registry; requested connection {wanted!r}")
         return "default", None
     conns = data["connections"]
+    withheld = data.get("withheld") or ()
     wanted = wanted or data.get("default")
     if wanted:
+        if wanted in withheld:
+            sys.exit(f"Telegram connection {wanted!r} in {CONN_FILE} is not granted "
+                     "to this project")
         if wanted not in conns:
             sys.exit(f"Telegram connection {wanted!r} not found in {CONN_FILE}")
         return wanted, conns[wanted]
     if len(conns) == 1:
         cid = next(iter(conns))
         return cid, conns[cid]
+    if not conns:
+        sys.exit(f"no Telegram connection in {CONN_FILE} is granted to this project; "
+                 f"withheld: {', '.join(withheld)}")
     sys.exit(
         f"{CONN_FILE} defines {len(conns)} Telegram connections and no default; "
         "set TELEGRAM_SERVICE_CONNECTION, TG_CONNECTION, or TELEGRAM_CONNECTION"

@@ -260,7 +260,9 @@ def import_daemon(tmp: Path, service_settings: dict, *,
                   delegation: str | None = None,
                   job_worker: str | None = None,
                   project_env: dict | None = None,
-                  store: bool = False):
+                  store: bool = False,
+                  connections_file: bool = True,
+                  before_import=None):
     """Import one daemon against a throwaway project.
 
     `store` gives that project the identity and the store the job register
@@ -270,6 +272,11 @@ def import_daemon(tmp: Path, service_settings: dict, *,
     second one the same way whatever the first says. Without it the register
     cannot open, and the daemon keeps answering with the job class off — the
     degradation every other test here exercises.
+
+    `connections_file` hands the daemon a connections file through its
+    override; without it the daemon resolves connections through the records
+    adapter. `before_import(project, config_home)` writes whatever records a
+    case needs once the project exists.
     """
     if store and not STORE_DSN:
         raise unittest.SkipTest("TELEGRAM_TEST_DSN is unset")
@@ -296,11 +303,14 @@ def import_daemon(tmp: Path, service_settings: dict, *,
     if project_env:
         (project / ".env.local").write_text(
             "".join(f"{key}={value}\n" for key, value in project_env.items()))
-    connections_file = tmp / "connections.json"
-    connections_file.write_text(json.dumps({
-        "connections": {"test": {"api_id": 12345, "allow_write": True,
-                                 **(connection_extra or {})}},
-    }) + "\n")
+    if connections_file:
+        connections_file = tmp / "connections.json"
+        connections_file.write_text(json.dumps({
+            "connections": {"test": {"api_id": 12345, "allow_write": True,
+                                     **(connection_extra or {})}},
+        }) + "\n")
+    if before_import is not None:
+        before_import(project, tmp / "config")
     fake_root = tmp / "fake"
     write_fake_telethon(fake_root)
     write_fake_pytgcalls(fake_root)
@@ -332,7 +342,6 @@ def import_daemon(tmp: Path, service_settings: dict, *,
             "XDG_STATE_HOME": str(tmp / "state"),
             "TELEGRAM_API_HASH": "test-hash",
             "TELEGRAM_SERVICE_CONNECTION": "test",
-            "TELEGRAM_SERVICE_CONNECTIONS_FILE": str(connections_file),
             "TELEGRAM_SERVICE_CONTEXT": str(context_file),
             "TELEGRAM_SERVICE_PROJECT_ROOT": str(project),
             "TELEGRAM_SERVICE_PROJECT_ENVELOPE": str(project / "capabilities"),
@@ -347,6 +356,11 @@ def import_daemon(tmp: Path, service_settings: dict, *,
             os.environ.pop(key, None)
         if store:
             os.environ["AGENTKIT_DB_URL"] = STORE_DSN
+        for key in ("TELEGRAM_SERVICE_CONNECTIONS_FILE", "TG_CONNECTIONS_FILE",
+                    "TELEGRAM_CONNECTIONS_FILE"):
+            os.environ.pop(key, None)
+        if connections_file:
+            os.environ["TELEGRAM_SERVICE_CONNECTIONS_FILE"] = str(connections_file)
         os.environ.pop("TELEGRAM_SERVICE_VOICE_CONTEXT", None)
         if voice_context is not None:
             os.environ["TELEGRAM_SERVICE_VOICE_CONTEXT"] = str(voice_context_file)
