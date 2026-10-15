@@ -6112,7 +6112,14 @@ def _ensure_envelope(root: Path) -> list[str]:
                       + GITIGNORE_BODY)
     _ensure_project_identity(capdir, root)
     gate_file = capdir / "settings.json"
-    if not gate_file.exists():
+    # The file gate exists only in files mode; a project whose records are in
+    # the store keeps its policy there and is marked by project.json.
+    store = _store_module()
+    try:
+        in_store = store.records_mode(capdir) == "store"
+    except store.StoreError:
+        in_store = False  # the records backend refuses it on its own read
+    if not gate_file.exists() and not in_store:
         _write_json(gate_file, {"capabilities": {}})
     return migrated
 

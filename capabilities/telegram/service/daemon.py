@@ -312,6 +312,7 @@ def _find_project_root():
         if d == home:
             break
         if ((d / "capabilities" / "settings.json").is_file()
+                or (d / "capabilities" / "project.json").is_file()
                 or (d / ".capabilities").is_dir()
                 or (d / ".env").exists()
                 or (d / ".env.local").exists() or (d / ".git").is_dir()):
@@ -2644,7 +2645,8 @@ class RouteUnavailable(RuntimeError):
 
 
 ROUTE_PROJECT_MARKERS = (
-    ("capabilities", "settings.json"), (".contextkit", "config.toml"),
+    ("capabilities", "settings.json"), ("capabilities", "project.json"),
+    (".contextkit", "config.toml"),
     (".capabilities",), (".env",), (".env.local",), (".git",),
 )
 

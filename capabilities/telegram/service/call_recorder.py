@@ -127,6 +127,7 @@ def find_project_root(explicit: str | None) -> Path:
         if candidate == home:
             break
         if ((candidate / "capabilities" / "settings.json").is_file()
+                or (candidate / "capabilities" / "project.json").is_file()
                 or (candidate / ".capabilities").is_dir()
                 or (candidate / ".env.local").is_file()
                 or (candidate / ".env").is_file()
@@ -153,7 +154,8 @@ def project_capabilities_dir(root: Path) -> Path:
         return resolved
     current = root / "capabilities"
     legacy = root / ".capabilities"
-    if (current / "settings.json").is_file() or not legacy.is_dir():
+    if ((current / "settings.json").is_file()
+            or (current / "project.json").is_file() or not legacy.is_dir()):
         return current
     return legacy
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import time
@@ -13,6 +14,7 @@ import types
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 
 TELEGRAM_DIR = Path(__file__).resolve().parents[1]
@@ -601,6 +603,63 @@ class RecordingFailureNoticeTests(unittest.IsolatedAsyncioTestCase):
                              "ChatWriteForbiddenError: chat is gone")
             self.assertEqual([event for event, _ in events],
                              ["recording_failure_unreported"])
+
+
+
+def import_call_recorder():
+    service = str(TELEGRAM_DIR / "service")
+    sys.path.insert(0, service)
+    try:
+        with fake_runtime_modules():
+            name = f"telegram_call_recorder_test_{time.time_ns()}"
+            spec = importlib.util.spec_from_file_location(
+                name, TELEGRAM_DIR / "service" / "call_recorder.py")
+            if spec is None or spec.loader is None:
+                raise AssertionError("cannot import the Telegram call recorder")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+            return module
+    finally:
+        sys.path.remove(service)
+
+
+class ProjectMarkerTests(unittest.TestCase):
+    def test_project_json_alone_marks_the_project_and_its_envelope(self):
+        recorder = import_call_recorder()
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td).resolve() / "project"
+            (project / "capabilities").mkdir(parents=True)
+            (project / "capabilities" / "project.json").write_text("{}")
+            (project / ".capabilities").mkdir()
+            nested = project / "deep" / "er"
+            nested.mkdir(parents=True)
+            with mock.patch.dict(os.environ,
+                                 {"TELEGRAM_SERVICE_PROJECT_ROOT": str(nested)}):
+                self.assertEqual(recorder.find_project_root(None), project)
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("TELEGRAM_SERVICE_PROJECT_ENVELOPE", None)
+                os.environ.pop("CAPABILITIES_PROJECT_ENVELOPE", None)
+                self.assertEqual(recorder.project_capabilities_dir(project),
+                                 project / "capabilities")
+
+    def test_settings_json_still_marks_the_project_and_its_envelope(self):
+        recorder = import_call_recorder()
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td).resolve() / "project"
+            (project / "capabilities").mkdir(parents=True)
+            (project / "capabilities" / "settings.json").write_text("{}")
+            (project / ".capabilities").mkdir()
+            nested = project / "deep"
+            nested.mkdir()
+            with mock.patch.dict(os.environ,
+                                 {"TELEGRAM_SERVICE_PROJECT_ROOT": str(nested)}):
+                self.assertEqual(recorder.find_project_root(None), project)
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("TELEGRAM_SERVICE_PROJECT_ENVELOPE", None)
+                os.environ.pop("CAPABILITIES_PROJECT_ENVELOPE", None)
+                self.assertEqual(recorder.project_capabilities_dir(project),
+                                 project / "capabilities")
 
 
 if __name__ == "__main__":

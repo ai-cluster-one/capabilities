@@ -5182,6 +5182,34 @@ class ChatProjectRoutingTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(daemon.RouteUnavailable, "no project marker"):
                 daemon._route_target(str(bare), "label")
 
+    async def test_project_json_alone_marks_a_route_target_and_the_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            target = Path(td) / "home" / "stored"
+            (target / "capabilities").mkdir(parents=True)
+            (target / "capabilities" / "project.json").write_text("{}")
+            self.assertEqual(daemon._route_target(str(target), "label"),
+                             target.resolve())
+            nested = target / "deep"
+            nested.mkdir()
+            with mock.patch.dict(os.environ,
+                                 {"TELEGRAM_SERVICE_PROJECT_ROOT": str(nested)}):
+                self.assertEqual(daemon._find_project_root(), target.resolve())
+
+    async def test_settings_json_still_marks_a_route_target_and_the_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            target = Path(td) / "home" / "gated"
+            (target / "capabilities").mkdir(parents=True)
+            (target / "capabilities" / "settings.json").write_text("{}")
+            self.assertEqual(daemon._route_target(str(target), "label"),
+                             target.resolve())
+            nested = target / "deep"
+            nested.mkdir()
+            with mock.patch.dict(os.environ,
+                                 {"TELEGRAM_SERVICE_PROJECT_ROOT": str(nested)}):
+                self.assertEqual(daemon._find_project_root(), target.resolve())
+
     async def test_a_routed_worker_is_told_where_it_is_and_loses_the_pin(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())

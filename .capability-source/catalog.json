@@ -72,7 +72,7 @@
     },
     "geminitalk": {
       "path": "capabilities/geminitalk",
-      "payload_sha256": "9821010f30de021ee89cf6d323a5bda8f16ee4c551ab3c6e4b29eaf6bd44eeef",
+      "payload_sha256": "bcbee60faa3e92d37971e5de94a0bfa169e6b185b8afe862e3fcf33142485e6f",
       "summary": "Gemini Live native-audio project companion with continuous duplex audio, bounded project tools, optional headless Codex delegation, and an active Codex-thread relay."
     },
     "ical": {
@@ -157,7 +157,7 @@
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "433e9853fb5d2886454d10e33c2c15651f971fa604b0b3a19d86097ca5be0b13",
+      "payload_sha256": "8c1101aa03fb4ee6402828af445fdccd9ebd82f00508208d940d26e14fa650d4",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {

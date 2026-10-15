@@ -781,6 +781,31 @@ def test_a_policy_row_is_written_and_removed_for_one_node(lab):
     assert deny.returncode == 6 and "--deny takes no --node" in _error(deny)["message"]
 
 
+def test_a_store_mode_project_marked_only_by_project_json_gets_no_file_gate(lab):
+    # A project whose records are in the store keeps its gate in the store, so
+    # project.json alone marks it and no write brings back a file gate.
+    _import(lab)
+    (lab["envelope"] / "settings.json").unlink()
+    gate = lab["envelope"] / "settings.json"
+    enabled = _ok(_manager(lab, "enable", "coolify", "--project"))
+    assert enabled["gate"] == "store:lab.capabilities_policy"
+    assert not gate.exists()
+    _ok(_manager(lab, "enable", "coolify", "--project", "--node", NODE))
+    assert not gate.exists()
+    _ok(_manager(lab, "disable", "coolify", "--project"))
+    assert not gate.exists()
+    _ok(_manager(lab, "inherit", "coolify", "--project", "--node", NODE))
+    assert not gate.exists()
+    assert _rows(lab, "SELECT agent_id, capability, node, enabled FROM capabilities_policy "
+                      "WHERE capability = 'coolify' ORDER BY node NULLS FIRST") == [
+        (PROJECT_ID, "coolify", None, False)]
+    assert _error(_coolify(lab, "deploy", "x"))["code"] == "disabled"
+    _ok(_manager(lab, "enable", "coolify", "--project"))
+    _ok(_coolify(lab, "deploy", "x"))
+    _ok(_manager(lab, "init"))
+    assert not gate.exists()
+
+
 def test_ids_set_global_writes_a_global_row_beneath_the_project_row(lab):
     _import(lab)
     assert _ok(_coolify(lab, "ids", "set", "shared", "g", "--global")) == {
