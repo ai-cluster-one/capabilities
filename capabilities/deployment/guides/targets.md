@@ -90,4 +90,20 @@ A node takes its database only from its server's environment. Set `AGENTKIT_DB_U
 
 `deployment node sync --target <name>` fetches, rebases the current clean branch on the node branch, and pushes it. For a target with a GitHub body source it answers `"state": "nothing_to_carry"` with exit 0 and touches no remote, and `host-agents` compiles no interval job for it. A conflict aborts the rebase, preserves the branch and reports `diverged` with paths. `mirror` optionally names a second Git remote to push afterwards. ContextKit resolves its memory root for the compiler's union rule in `.gitattributes`; commit that rule before deploying. The node snapshots its own changes before trying the network, so an offline interval loses nothing. Each successful sync rebuilds ContextKit output; generated output remains covered by the body's existing ignore rules and is never a deployment source. `host-agents` compiles a launchd interval job for each Coolify target (`sync_interval`, default 60 seconds); hand it to launchd through the existing `deployment next` procedure.
 
+### The node a target's server runs as
+
+`node` names the node the target's server runs as in the gate, the name a store-mode policy row and a service lease name it by:
+
+```json
+{
+  "schema": "capabilities.deployment.target.v1",
+  "name": "production",
+  "provider": "coolify",
+  "node": "example-node",
+  "resource": {"type": "application", "identifier_label": "node_app_uuid"}
+}
+```
+
+It takes letters, digits, `.`, `_` and `-`, starting with a letter or digit. `deployment sync` writes it into the target's bundle as `AGENT_NODE_NAME` in the Compose file's shared environment, as a literal every container receives whatever the server's environment holds, and `deployment deploy` sends the same value to the application's environment. The target is its one home: a `services.<name>.environment_defaults` that also sets `AGENT_NODE_NAME` stops `sync` and `doctor` with `node_declared_twice`, and a malformed value with `node_invalid`. A target without `node` compiles as before, and its containers take `AGENT_NODE_NAME` from the server's environment, the host name - for a container, its id - where that holds none. A runtime that names its own artifact paths compiles no bundle, so `node` there is reported as `node_not_compiled`. `deployment node status` reports the declared name as `declared_node_name` beside the `node_name` the node answers to, with `node_name_mismatch` while they differ.
+
 `service_policy.placement` maps capability service names to `node`, `local` or `both`. Custom services use `services.<name>.placement`. An absent placement preserves the profile's current behavior. The container compiler selects node/both; host-agents selects local/both. Placement is read in files mode; in store mode it is retired, and which node runs a service is the gate row naming that node, with a lease keeping it on one machine (`deployment guide profiles`). `deployment node status --target <name> --json` reports provider and SSH observations, the recorded release, the fetched Git sync state, login state, service placement (files mode) with each service's state on the node and here and, from `deployment services` run in the node's container, what the gate answers for it there, whether it runs, any refusal it is held idle for, and who holds its lease, and the node's database in force - resolved in its container through the shared library, with the level and sources that answered, the setting with its secrets redacted, whether it is reachable and whether the server refuses it without TLS; unknown observations and errors remain explicit. Git sync state is read against the node remote, or for a GitHub body source against this checkout's remote for that repository, `unknown` when it has none. The status read uses the last fetched Git refs and does not itself fetch, rebuild or write.

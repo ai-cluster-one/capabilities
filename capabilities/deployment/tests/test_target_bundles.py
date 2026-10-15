@@ -258,3 +258,77 @@ def test_a_bundled_runtime_without_a_target_says_so(tmp_path: Path) -> None:
     sync = _run(root, env, "sync")
     assert sync.returncode == 6
     assert any("no target declared" in f["message"] for f in json.loads(sync.stdout)["findings"])
+
+
+def _declare_node(root: Path, target: str, node: object) -> None:
+    path = root / "deployment" / "targets" / target / "target.json"
+    data = json.loads(path.read_text())
+    data["node"] = node
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _bundle_files(root: Path, target: str) -> dict[str, str]:
+    bundle = root / "deployment" / "targets" / target
+    return {path.name: path.read_text() for path in bundle.iterdir()
+            if path.name != "target.json"}
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_a_target_node_is_the_name_every_container_receives(tmp_path: Path, profile: str) -> None:
+    root, env = _project(tmp_path, contextkit=False)
+    assert _run(root, env, "setup", "--profile", profile, "--target", "staging",
+                "--provider", "coolify").returncode == 0
+    assert _run(root, env, "init", "--profile", profile, "--target", "edge",
+                "--provider", "coolify").returncode == 0
+    # A service that passes the key through would override the shared entry.
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["services"]["agent"].setdefault("optional_env", []).append("AGENT_NODE_NAME")
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    assert _run(root, env, "sync").returncode == 0
+    before = _bundle_files(root, "edge")
+    _declare_node(root, "staging", "staging-node.1")
+    sync = _run(root, env, "sync")
+    assert sync.returncode == 0, sync.stdout + sync.stderr
+    compose = (root / "deployment" / "targets" / "staging" / "docker-compose.yaml").read_text()
+    assert compose.count("AGENT_NODE_NAME") == 1
+    assert '  AGENT_NODE_NAME: "staging-node.1"' in compose.splitlines()
+    example = (root / "deployment" / "targets" / "staging" / ".env.example").read_text()
+    assert "AGENT_NODE_NAME=" not in example and "'staging-node.1'" in example
+    # A target that declares no node compiles exactly as before.
+    assert _bundle_files(root, "edge") == before
+    edge = before["docker-compose.yaml"]
+    assert "  AGENT_NODE_NAME: ${AGENT_NODE_NAME:-}" in edge.splitlines()
+    assert '      AGENT_NODE_NAME: "${AGENT_NODE_NAME:-}"' in edge.splitlines()
+    assert _run(root, env, "sync", "--check").returncode == 0
+
+
+def test_a_node_declared_beside_a_service_default_is_refused(tmp_path: Path) -> None:
+    root, env = _project(tmp_path, contextkit=False)
+    assert _run(root, env, "setup", "--profile", "agent-box-checkout",
+                "--provider", "coolify").returncode == 0
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["services"]["agent"].setdefault("environment_defaults", {})["AGENT_NODE_NAME"] = "old"
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    assert _run(root, env, "sync").returncode == 0
+    _declare_node(root, "production", "prod-node")
+    sync = _run(root, env, "sync")
+    assert sync.returncode == 6
+    codes = [f.get("code") for f in json.loads(sync.stdout)["findings"]]
+    assert "node_declared_twice" in codes
+    doctor = json.loads(_run(root, env, "doctor").stdout)
+    assert "node_declared_twice" in [f.get("code") for f in doctor["findings"]]
+
+
+@pytest.mark.parametrize("node", ["", "has space", "${HOST}", 7, "-leading"])
+def test_a_malformed_node_is_refused(tmp_path: Path, node: object) -> None:
+    root, env = _project(tmp_path, contextkit=False)
+    assert _run(root, env, "setup", "--profile", "agent-box-checkout",
+                "--provider", "coolify").returncode == 0
+    before = _bundle_files(root, "production")
+    _declare_node(root, "production", node)
+    sync = _run(root, env, "sync")
+    assert sync.returncode == 6
+    assert "node_invalid" in [f.get("code") for f in json.loads(sync.stdout)["findings"]]
+    assert _bundle_files(root, "production") == before

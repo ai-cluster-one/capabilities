@@ -97,6 +97,12 @@ USAGE
       auto|enabled|disabled) or placement is reported as a warning naming each
       one, and sync rewrites it, keeping the shape it implied; `retired` in
       the result lists what it rewrote.
+      A target's `node` is the name its server runs as in the gate: its
+      bundle's Compose file sets AGENT_NODE_NAME to it in every container,
+      and `deploy` sends it to the application. A target without one takes
+      AGENT_NODE_NAME from the server's environment. A malformed node
+      (node_invalid) or a service environment_defaults also setting
+      AGENT_NODE_NAME beside it (node_declared_twice) stops the sync.
       --check is read-only and exits 7 with structured drift details.
       --adopt explicitly replaces unmarked files at the runtime-declared
       managed artifact paths; external artifacts and overlays are never written.
@@ -217,7 +223,8 @@ USAGE
       `local` (its launchd agent here), `placement` in files mode, and, from
       `deployment services` run in the node's container, `gate`, `running`,
       `lease` and any `refusal`; node_name is the name the node answers to in
-      the gate.
+      the gate. A target that declares `node` adds declared_node_name, and an
+      error node_name_mismatch while the node answers to another name.
 
   deployment doctor [--target <name>]
       Validate deployment/runtime.json, deployment/targets/*.json, and the deployment
@@ -503,6 +510,10 @@ COOLIFY_ENVIRONMENT = "production"
 # where the node pulls and pushes it. Without it the body travels through the
 # server's bare repository; with kind "github" it is that GitHub repository.
 GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?!\.)[A-Za-z0-9._-]+(?<!\.git)")
+# A target's `node` is the name its server runs as in the gate. Its bundle sets
+# it as AGENT_NODE_NAME in every container, written literally into the Compose
+# file, so it takes no interpolation characters and fits one environment line.
+TARGET_NODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
 
 
 # >>> contract: capability core (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
@@ -4968,7 +4979,7 @@ def _dockerignore_template(has_contextkit: bool, keep: list[str] | None = None) 
 
 
 def _env_example_template(runtime: dict, descriptors: dict[str, dict],
-                          has_contextkit: bool = False) -> str:
+                          has_contextkit: bool = False, node: str | None = None) -> str:
     del has_contextkit
     compiler = _compiler_config(runtime)
     checkout = _is_checkout(runtime)
@@ -4992,7 +5003,8 @@ def _env_example_template(runtime: dict, descriptors: dict[str, dict],
         "",
         "# This node's name in the gate. A capability service runs here only where",
         "# the project's policy row names it; keep it the same across redeploys.",
-        f"{NODE_NAME_ENV}=",
+        *([f"# The target declares it as {node!r}, and the Compose file sets it."]
+          if node else [f"{NODE_NAME_ENV}="]),
         "",
         "# Runtime secrets injected by Coolify / docker compose env.",
     ]
@@ -5834,7 +5846,8 @@ def _database_keys() -> tuple[str, ...]:
 
 def _compose_template(project_name: str, runtime: dict,
                       descriptors: dict[str, dict], build_context: str,
-                      dockerfile_rel: str, has_contextkit: bool = False) -> str:
+                      dockerfile_rel: str, has_contextkit: bool = False,
+                      node: str | None = None) -> str:
     del has_contextkit
     slug = _slug(project_name)
     env_lines = [
@@ -5842,8 +5855,11 @@ def _compose_template(project_name: str, runtime: dict,
         "  GIT_DEPLOY_KEY_B64: ${GIT_DEPLOY_KEY_B64:-}",
         "  AGENT_GIT_KNOWN_HOSTS_B64: ${AGENT_GIT_KNOWN_HOSTS_B64:-}",
         # The node's name in the gate: a runner starts a service only where
-        # the project's policy row names this node.
-        f"  {NODE_NAME_ENV}: ${{{NODE_NAME_ENV}:-}}",
+        # the project's policy row names this node. A target that declares
+        # its node sets it here and nowhere else; one that declares none takes
+        # it from the server's environment.
+        (f"  {NODE_NAME_ENV}: {json.dumps(node)}" if node else
+         f"  {NODE_NAME_ENV}: ${{{NODE_NAME_ENV}:-}}"),
         # The database is the server's: each key passes through from the
         # target's environment, and one left unset there is empty, which the
         # resolver reads as not set.
@@ -5901,6 +5917,9 @@ def _compose_template(project_name: str, runtime: dict,
             defaults.update({key: value for key, value in project_defaults.items()
                              if _safe_env_key(key) and isinstance(value, str)})
         environment_keys = set(required) | set(optional) | set(defaults)
+        if node:
+            # A service entry for the key would override the shared one.
+            environment_keys.discard(NODE_NAME_ENV)
         for key in sorted(environment_keys):
             expression = f"${{{key}:-{defaults.get(key, '')}}}"
             block.append(f"      {key}: {json.dumps(expression)}")
@@ -6405,11 +6424,12 @@ def _artifact_texts(root: Path, runtime: dict,
                  + ([supervisor_rel] if supervisor_config else [])
                  + ([body_sync_rel] if body_sync_rel else [])
                  if checkout else None)
+    node = _declared_node(root, target) if _bundle_layout(runtime) else None
     raw = {paths["compose"]: _compose_template(
-        project_name, runtime, active, build_context, dockerfile_rel, has_contextkit)}
+        project_name, runtime, active, build_context, dockerfile_rel, has_contextkit, node)}
     candidates = {
         "dockerignore": _dockerignore_template(has_contextkit, keep=boot_copy),
-        "env_example": _env_example_template(runtime, active, has_contextkit),
+        "env_example": _env_example_template(runtime, active, has_contextkit, node),
         "dockerfile": _dockerfile_template(
             has_contextkit, compiler, entrypoint_rel, bool(supervisor_config),
             mounts=[v["mount"] for v in (runtime.get("volumes") or {}).values()
@@ -7003,10 +7023,19 @@ def _desired_state(root: Path, runtime: dict, targets: list[str] | None = None
                     "message": f"target name {name!r} cannot name a folder; use "
                                "letters, digits, '-' and '_'"})
                 continue
+            findings.extend(_target_node_findings(root, compiled, name))
             texts.update(_artifact_texts(root, compiled, active, embedded, name))
         findings.extend(_root_layout_leftovers(root))
     else:
         texts = _artifact_texts(root, compiled, active, embedded)
+        if profile in CONTAINER_PROFILES:
+            findings.extend(
+                {"severity": "warning", "code": "node_not_compiled",
+                 "path": _rel(root, _target_path(root, name)),
+                 "message": "node is compiled into a target's bundle, and this runtime "
+                            "names its own artifact paths, so its containers do not "
+                            "receive it"}
+                for name in _target_names(root) if _target_node(root, name) is not None)
     if _is_checkout(runtime):
         attrs = _memory_attributes(root)
         if attrs:
@@ -7581,6 +7610,51 @@ def _github_repository(target: dict) -> str | None:
     if isinstance(source, dict) and not _body_source_problems(target):
         return source["repository"]
     return None
+
+
+def _target_node(root: Path, name: str | None) -> object:
+    """The `node` a target's declaration carries as written; None when it
+    carries none or cannot be read."""
+    if not isinstance(name, str):
+        return None
+    data, err = _read_json(_target_path(root, name))
+    return data.get("node") if err is None and isinstance(data, dict) else None
+
+
+def _valid_node(value: object) -> str | None:
+    return value if isinstance(value, str) and TARGET_NODE.fullmatch(value) else None
+
+
+def _declared_node(root: Path, name: str | None) -> str | None:
+    """The node name a target declares for its server, when it declares a
+    valid one."""
+    return _valid_node(_target_node(root, name))
+
+
+def _target_node_findings(root: Path, runtime: dict, name: str) -> list[dict]:
+    value = _target_node(root, name)
+    if value is None:
+        return []
+    path = _rel(root, _target_path(root, name))
+    if _valid_node(value) is None:
+        return [{"severity": "error", "code": "node_invalid", "path": path,
+                 "message": "node must name the node the target's server runs as: "
+                            "letters, digits, '.', '_' and '-', starting with a "
+                            "letter or digit"}]
+    # The target is the one home of its node's name; a service default for the
+    # same key would be a second one that the compiled file no longer reads.
+    services = runtime.get("services") if isinstance(runtime.get("services"), dict) else {}
+    doubled = sorted(service_name for service_name, service in services.items()
+                     if isinstance(service, dict)
+                     and isinstance(service.get("environment_defaults"), dict)
+                     and NODE_NAME_ENV in service["environment_defaults"])
+    return [{"severity": "error", "code": "node_declared_twice", "path": path,
+             "message": f"the target declares node {value!r}, and "
+                        f"services.{service_name}.environment_defaults in "
+                        f"deployment/runtime.json also sets {NODE_NAME_ENV}",
+             "hint": f"remove {NODE_NAME_ENV} from that environment_defaults; "
+                     "the target's node is the one the containers receive"}
+            for service_name in doubled]
 
 
 def _target_runtime_findings(root: Path, runtime: dict, target: object,
@@ -9865,6 +9939,11 @@ def _node_environment(root, runtime, target, host, repo_url, key, branch):
                     REPO_BRANCH_ENV: branch, "GIT_DEPLOY_KEY_B64": base64.b64encode(key.read_bytes()).decode(),
                     "AGENT_GIT_KNOWN_HOSTS_B64": base64.b64encode(_node_ssh(root, host,
                         "cat /etc/ssh/ssh_host_ed25519_key.pub").encode()).decode()})
+    # A target that declares its node is the one home of its name, so the
+    # application's environment carries that name rather than this machine's.
+    node = _valid_node(target.get("node"))
+    if node:
+        env[NODE_NAME_ENV] = node
     for k, value in env.items():
         if not _safe_env_key(k) or "\n" in str(value) or "\r" in str(value):
             raise NodeFailure("environment_format", f"environment key {k} cannot be sent as one bulk line", 6)
@@ -10188,6 +10267,17 @@ def cmd_node_status(args):
             report["errors"].append({"code": "node_services_unreadable",
                                      "message": "deployment services on the node returned malformed JSON"})
     report["node_name"] = remote.get("node")
+    # The name the target declares for its server, beside the one the node
+    # answers to; a node not yet redeployed since the declaration differs.
+    declared = _valid_node(target.get("node"))
+    if declared:
+        report["declared_node_name"] = declared
+        if report["node_name"] and report["node_name"] != declared:
+            report["errors"].append({
+                "code": "node_name_mismatch",
+                "message": f"the target declares node {declared!r} and the node "
+                           f"answers as {report['node_name']!r}; run `deployment "
+                           "sync` and redeploy"})
     on_node = {item.get("name"): item for item in remote.get("services") or []
                if isinstance(item, dict)}
     names = {*(runtime.get("services") or {}), *_compiled_service_names(runtime), *on_node}

@@ -831,3 +831,30 @@ def test_in_store_mode_placement_no_longer_filters_and_the_shape_composes(node, 
     node.runtime["service_policy"]["capabilities"] = {"fixture": "container"}
     active, embedded, errors, _ = node.m._active_descriptors(node.root, node.runtime)
     assert "fixture" in active and not embedded and not errors
+
+
+def test_a_target_node_reaches_the_application_and_status(node, monkeypatch, capsys):
+    # This machine declares its own name; a target that declares its node
+    # sends that one instead.
+    monkeypatch.setenv("AGENT_NODE_NAME", "the-mac")
+    service = next(svc for svc in node.runtime["services"].values() if svc.get("placement") != "local")
+    service.setdefault("optional_env", []).append("AGENT_NODE_NAME")
+    node.target["node"] = "node-a"
+    node.m.cmd_deploy(node.args)
+    capsys.readouterr()
+    env = next(r["stdin"] for r in rows(node) if r["argv"][:2] == ["env", "bulk"])
+    assert "AGENT_NODE_NAME=node-a" in env.splitlines() and "the-mac" not in env
+    node.m.cmd_node_status(node.args)
+    data = json.loads(capsys.readouterr().out)
+    assert data["declared_node_name"] == "node-a" and data["node_name"] == "node-a"
+    assert data["errors"] == []
+    node.target["node"] = "node-b"
+    node.m.cmd_node_status(node.args)
+    data = json.loads(capsys.readouterr().out)
+    assert data["declared_node_name"] == "node-b"
+    assert [e["code"] for e in data["errors"]] == ["node_name_mismatch"]
+
+
+def test_status_of_a_target_without_a_node_reports_no_declaration(node, capsys):
+    node.m.cmd_node_status(node.args)
+    assert "declared_node_name" not in json.loads(capsys.readouterr().out)

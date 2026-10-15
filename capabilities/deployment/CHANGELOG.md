@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-15 — A target declares the node its server runs as
+
+A deployment target takes an optional `node` field: the name its server runs as in the gate. `deployment sync` writes it into the target's bundle as `AGENT_NODE_NAME` in the Compose file's shared environment, as a literal every container receives whatever the server's environment holds, the bundle's `.env.example` names it as the target's instead of asking for it, and `deployment deploy` sends the same value to the application's environment rather than the deploying machine's own. `deployment node status` reports it as `declared_node_name` beside the `node_name` the node answers to, with the error `node_name_mismatch` while they differ. The target is the one home of the name: `sync` and `doctor` refuse a `services.<name>.environment_defaults` setting `AGENT_NODE_NAME` beside it (`node_declared_twice`) and a malformed value (`node_invalid`); a runtime that names its own artifact paths compiles no bundle and reports a declared node as `node_not_compiled`. A target without `node` compiles, deploys and reports exactly as before. To move a server's name onto its target, add `node`, remove `AGENT_NODE_NAME` from any `environment_defaults`, run `deployment sync` and redeploy.
+
 ## 2026-10-14 — A checkout body whose ContextKit keeps no memory layer syncs without one
 
 On the `agent-box-checkout` profile, `deployment sync`, `sync --check` and `doctor` asked ContextKit for its memory layer to write the union-merge rule in `.gitattributes`, and stopped with `node_command_failed` when the project's ContextKit has no such layer - a project whose memory lives in the memory capability's store rather than in the body. Such a project now compiles with no memory rule, since nothing in the body needs a union merge; any other ContextKit failure still stops the command as before, and a project with a memory layer compiles exactly as it did.
