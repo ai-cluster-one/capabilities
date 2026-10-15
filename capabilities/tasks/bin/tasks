@@ -10514,10 +10514,8 @@ def _service_retry_delay() -> int | None:
     """`retry_delay_seconds` as this project's service settings set it, or None.
     Read only as the cool-down it became; a file that cannot be read is the
     service doctor's to report."""
-    import tomllib
-    try:
-        raw = tomllib.loads(_service_settings_path().read_text())
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+    _path, raw, _error = _service_settings_document()
+    if raw is None:
         return None
     value = raw.get("retry_delay_seconds")
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -13782,8 +13780,24 @@ def _settings_check(scope: str, document: dict, path: Path) -> list:
     return []
 
 
+def _service_settings_home() -> dict:
+    """The project home `SETTINGS` declares for the service's settings."""
+    return _settings_homes("project")[0]
+
+
 def _service_settings_path() -> Path:
-    return _envelope_dir() / "service" / "config.toml"
+    """Where this project's service settings sit, as the contract's settings
+    reader places the project home."""
+    _project_here()
+    return _settings_home_path(_service_settings_home())
+
+
+def _service_settings_document() -> tuple[Path, dict | None, str | None]:
+    """This project's service settings as the contract's settings reader reads
+    the project home: its path, the document (None when there is none or it
+    cannot be read) and what is wrong with it."""
+    _project_here()
+    return _settings_read(_service_settings_home())
 
 
 def _service_template() -> Path:
@@ -13884,23 +13898,21 @@ def _inventory_verdict(module) -> dict:
     return {"ok": False, "problem": problems[0]} if problems else {"ok": True}
 
 
-def _read_service_settings(path: Path) -> dict:
-    """The settings file, whole and checked, or the refusal that says what is
-    wrong with it."""
-    import tomllib
+def _read_service_settings() -> dict:
+    """The settings, read by the contract's settings reader, whole and checked,
+    or the refusal that says what is wrong with them."""
+    path, raw, error = _service_settings_document()
 
     def refuse(sentence: str) -> NoReturn:
         raise Refusal(6, "service_invalid", f"{path}: {sentence}",
                       f"`{NAME} help` states the settings; `{NAME} service init --force` "
                       "writes the shipped template")
 
-    if not path.is_file():
+    if error is not None:
+        refuse(f"it could not be read: {error.removeprefix(f'cannot read {path}: ')}")
+    if raw is None:
         raise Refusal(3, "service_not_initialized", f"no service settings at {path}",
                       f"`{NAME} service init` writes them from the shipped template")
-    try:
-        raw = tomllib.loads(path.read_text())
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        refuse(f"it could not be read: {exc}")
     unknown = sorted(set(raw) - set(_SERVICE_KEYS))
     if unknown:
         refuse(f"it names {', '.join(map(repr, unknown))}, which nothing reads")
@@ -14058,7 +14070,7 @@ def _service_declaration() -> dict:
     the way `doctor` refuses it. Raises Refusal."""
     fingerprint = _service_fingerprint()
     path = _service_settings_path()
-    settings = _read_service_settings(path)
+    settings = _read_service_settings()
     retired = _retired_workers_file()
     if retired:
         raise Refusal(*_retired_refusal(retired))
@@ -15774,7 +15786,7 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
         if refused.code not in ("unreachable", "store_busy"):
             problems.append(refused.message)
         else:
-            settings = _read_service_settings(_service_settings_path())
+            settings = _read_service_settings()
             answer["settings"] = {k: v for k, v in settings.items() if k != "lanes"}
     conn_id, entry = _service_connection(wanted)
     answer["connection"] = conn_id

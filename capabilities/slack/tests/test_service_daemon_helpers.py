@@ -1,3 +1,5 @@
+import pytest
+
 import daemon
 
 
@@ -91,3 +93,20 @@ def test_worker_env_sets_shim_and_paths(tmp_path):
     assert "UNRELATED_SECRET" not in env
     assert env["HOME"] == str((tmp_path / "worker-home").resolve())
     assert env["CODEX_HOME"].endswith("worker-home/.codex")
+
+
+def test_settings_are_the_ones_the_executable_resolved(monkeypatch, tmp_path):
+    # The daemon opens no settings file: what it runs by is what `slack` resolved
+    # through the records adapter and handed it, whatever sits on disk.
+    (tmp_path / "settings.json").write_text('{"connection": "from-file"}')
+    monkeypatch.setenv(
+        "SLACK_SERVICE_SETTINGS_RESOLVED",
+        '{"connection": "resolved", "connection.default": "x"}',
+    )
+    assert daemon._load_settings(tmp_path / "settings.json") == {"connection": "resolved"}
+
+
+def test_settings_not_handed_over_are_refused(monkeypatch, tmp_path):
+    monkeypatch.delenv("SLACK_SERVICE_SETTINGS_RESOLVED", raising=False)
+    with pytest.raises(RuntimeError, match="SLACK_SERVICE_SETTINGS_RESOLVED"):
+        daemon._load_settings(tmp_path / "settings.json")

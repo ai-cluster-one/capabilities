@@ -5230,6 +5230,9 @@ def _service_env(root: Path, cid: str, state: Path, bot: str, app: str) -> dict:
     env["CAPABILITIES_PROJECT_ENVELOPE"] = str(_project_capabilities_dir(root))
     env["SLACK_SERVICE_PROJECT_ROOT"] = str(root)
     env["SLACK_SERVICE_SETTINGS"] = str(_service_settings_path(root))
+    # The settings as the records adapter resolves them, so the daemon reads
+    # exactly what `_service_settings_strict` judged and opens no file itself.
+    env["SLACK_SERVICE_SETTINGS_RESOLVED"] = json.dumps(_service_settings(root))
     env["SLACK_SERVICE_CONTEXT"] = str(_service_context_path(root))
     env["SLACK_SERVICE_STATE_DIR"] = str(state)
     env["SLACK_SERVICE_CONNECTION"] = cid

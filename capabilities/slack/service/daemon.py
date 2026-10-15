@@ -139,27 +139,28 @@ def process_event(
 
 
 def _load_settings(path: Path) -> dict:
-    root = Path(os.environ.get("SLACK_SERVICE_PROJECT_ROOT") or os.getcwd()).resolve()
-    envelope = Path(os.environ.get("CAPABILITIES_PROJECT_ENVELOPE")
-                    or root / "capabilities").resolve()
-    config_home = Path(os.environ.get("XDG_CONFIG_HOME")
-                       or (Path.home() / ".config"))
-    # The project's envelope, then the user's config home: key by key, the
-    # project's value wins.
-    settings: dict = {}
-    for scope in (envelope, config_home):
-        settings_file = scope / "slack" / "service" / "settings.json"
-        try:
-            body = json.loads(settings_file.read_text())
-        except FileNotFoundError:
-            continue
-        except (OSError, ValueError) as exc:
-            raise RuntimeError(
-                f"Slack service records are unavailable: cannot read {settings_file}: {exc}"
-            ) from exc
-        if isinstance(body, dict):
-            for key, value in body.items():
-                settings.setdefault(key, value)
+    """The service settings as the executable that started this daemon resolved
+    them through the records adapter: the project's envelope, then the user's
+    config home, key by key. `path` names where the project's own document
+    sits and is not read here."""
+    resolved = os.environ.get("SLACK_SERVICE_SETTINGS_RESOLVED")
+    if resolved is None:
+        raise RuntimeError(
+            "Slack service records are unavailable: SLACK_SERVICE_SETTINGS_RESOLVED "
+            "is not set; start the daemon with `slack service start` or `slack service run`"
+        )
+    try:
+        settings = json.loads(resolved)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Slack service records are unavailable: SLACK_SERVICE_SETTINGS_RESOLVED "
+            f"is not JSON: {exc}"
+        ) from exc
+    if not isinstance(settings, dict):
+        raise RuntimeError(
+            "Slack service records are unavailable: SLACK_SERVICE_SETTINGS_RESOLVED "
+            "is not a JSON object"
+        )
     settings.pop("connection.default", None)
     return settings
 

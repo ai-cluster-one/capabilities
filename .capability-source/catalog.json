@@ -142,7 +142,7 @@
     },
     "slack": {
       "path": "capabilities/slack",
-      "payload_sha256": "c012dfa0392bd5112de4f6f543670c852870dc3e1aeecb4575ff738f99933b35",
+      "payload_sha256": "a887f57f79ed0f71aeb317b2285a53fdf51ba2f0f0d05215e44d6b1f0f46aa91",
       "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy."
     },
     "stripe": {
@@ -152,7 +152,7 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "96540fd60c9de1a6bd23999a088683e4d34a5ca4dc94e5055951540ea331723c",
+      "payload_sha256": "a4cac2d90c44c04bb765df64b0875673354e5aee961568e17696c15b894d8c79",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {

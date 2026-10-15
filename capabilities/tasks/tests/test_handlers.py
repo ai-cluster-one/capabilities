@@ -177,7 +177,7 @@ def test_the_cool_down_is_read_from_the_old_keys_and_doctor_names_them(project):
                        "limits: {cool_down_seconds: 5}")
     assert mod._worker("alpha")["limits"]["cool_down_seconds"] == 5
     # The service settings still load with the old key, which it no longer reads.
-    loaded = mod._read_service_settings(settings / "config.toml")
+    loaded = mod._read_service_settings()
     assert "retry_delay_seconds" not in loaded
 
 
