@@ -143,8 +143,8 @@ MOVING IN AND OUT
       Carry existing memory folders into the store. ROOTs are project roots;
       with none, the project roots named by the machine service opt-in lists
       under $XDG_CONFIG_HOME/*/service/projects.{json,toml}. A root's memory
-      folder is the one `contextkit path memory` names in a ContextKit-bound
-      project, else <root>/memory. Every file is one day of
+      folder is `memory` inside the body root `contextkit path --json` names
+      in a ContextKit-bound project, else <root>/memory. Every file is one day of
       `## [HH:MM — ]title` sections. The day and the HH:MM are read in the
       machine's local zone, or in the IANA zone --timezone names (each date
       taking that zone's offset on it), and every entry's dated_from says which.
@@ -4699,21 +4699,22 @@ def _manager_bin() -> str:
 
 
 def _memory_folder(root: Path) -> tuple[Path, str]:
-    """A project's memory folder: what its context owner names, else
-    <root>/memory."""
+    """A project's memory folder: `memory` in the body root its context owner
+    names, else <root>/memory."""
     if (root / ".contextkit" / "config.toml").is_file():
         env = {k: v for k, v in os.environ.items() if k not in _PROJECT_POINTERS}
         try:
-            done = subprocess.run(["contextkit", "path", "memory"], cwd=root, env=env,
+            done = subprocess.run(["contextkit", "path", "--json"], cwd=root, env=env,
                                   capture_output=True, text=True, timeout=10,
                                   stdin=subprocess.DEVNULL)
-            named = Path(done.stdout.strip())
-            if done.returncode == 0 and named.is_absolute():
-                named.resolve().relative_to(root.resolve())
-                return named, "named by `contextkit path memory`"
-        except (OSError, subprocess.TimeoutExpired, ValueError):
+            body = json.loads(done.stdout).get("body_root") if done.returncode == 0 else None
+            if isinstance(body, str) and body.strip():
+                folder = root / body.strip() / "memory"
+                folder.resolve().relative_to(root.resolve())
+                return folder, "the body root named by `contextkit path --json`"
+        except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
             pass
-        return root / "memory", "<root>/memory; `contextkit path memory` gave no folder"
+        return root / "memory", "<root>/memory; `contextkit path --json` named no body root"
     return root / "memory", "<root>/memory"
 
 

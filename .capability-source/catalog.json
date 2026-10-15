@@ -52,7 +52,7 @@
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "d0a01fb9a3b883afb0274265698988ed86cda3681d8e3ebe549f99ff00ebf820",
+      "payload_sha256": "c611f5ba77b6497fee5dc412b0adce93c28ab611e64e6b3c5e1b787a2c9d6c4a",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into launchd-supervised processes on a Mac, and describe the targets they deploy to."
     },
     "directo": {
@@ -102,7 +102,7 @@
     },
     "memory": {
       "path": "capabilities/memory",
-      "payload_sha256": "253ac502c21a24a235a9ea35a7ca7b0628a400074ab975b4acea132281676758",
+      "payload_sha256": "08f9459bb463d3e5ea4c64db2dc1da53a8badb535991593e71e101160bc719c1",
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a block in every session's context that says how to record and search them and how many there are, and a service that keeps the block current and consolidates the entries."
     },
     "notion": {
@@ -157,7 +157,7 @@
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "8c1101aa03fb4ee6402828af445fdccd9ebd82f00508208d940d26e14fa650d4",
+      "payload_sha256": "f998f9c9e3227ba2eedbef0322e0b58873d183b85c6dbbe9618e1472fd5c08eb",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {

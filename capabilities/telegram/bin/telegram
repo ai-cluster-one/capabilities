@@ -6653,6 +6653,20 @@ def _contextkit_layer(root: Path, name: str) -> str | None:
     return _layout_path(root, lines[0], f"ContextKit {name}")
 
 
+def _contextkit_memory(root: Path) -> str | None:
+    """The memory folder: `memory` in the body root ContextKit names."""
+    try:
+        proc = subprocess.run(
+            ["contextkit", "path", "--json"], cwd=root, capture_output=True,
+            text=True, timeout=10)
+        body = json.loads(proc.stdout).get("body_root") if proc.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return None
+    if not isinstance(body, str) or not body.strip():
+        return None
+    return _layout_path(root, str(root / body.strip() / "memory"), "ContextKit memory")
+
+
 def _resolve_project_layout(root: Path) -> dict:
     root = root.resolve()
     layout: dict = {
@@ -6664,7 +6678,8 @@ def _resolve_project_layout(root: Path) -> dict:
     layer_names = ("context", "routines", "assets", "memory", "deployment")
     if layout["provider"] == "contextkit":
         for name in layer_names:
-            value = _contextkit_layer(root, name)
+            value = (_contextkit_memory(root) if name == "memory"
+                     else _contextkit_layer(root, name))
             if value and Path(value).exists():
                 layout[name] = value
     else:

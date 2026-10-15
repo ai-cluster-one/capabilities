@@ -289,27 +289,46 @@ def test_optional_mirror_pushes_only_after_success(node):
     assert git(mirror, "rev-parse", "main") == git(node.root, "rev-parse", "HEAD")
 
 
-def test_memory_root_is_asked_of_contextkit_and_existing_attrs_preserved(node, monkeypatch):
+def _contextkit_body(root, body_root):
+    return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+        {"project": str(root), "body_root": body_root, "layers": {}}) + "\n")
+
+
+def test_memory_root_is_the_body_root_contextkit_names_and_existing_attrs_preserved(
+        node, monkeypatch):
     (node.root / ".contextkit").mkdir()
     (node.root / ".contextkit/config.toml").write_text("")
-    memory = node.root / "body notes" / "memory"
-    memory.mkdir(parents=True)
+    (node.root / "body notes" / "memory").mkdir(parents=True)
     calls = []
     def run(argv, root, **kw):
         calls.append(argv)
-        return SimpleNamespace(stdout=str(memory) + "\n")
+        return _contextkit_body(root, "body notes")
     monkeypatch.setattr(node.m, "_node_run", run)
     path, text = node.m._memory_attributes(node.root)
-    assert calls == [["contextkit", "path", "memory"]]
+    assert calls == [["contextkit", "path", "--json"]]
     assert path.name == ".gitattributes" and '"body notes/memory/**" merge=union' in text
     assert '"memory/**" merge=union' in text
 
 
-def test_body_without_memory_layer_writes_no_attributes(node, monkeypatch):
+def test_a_project_root_body_merges_its_root_memory_folder(node, monkeypatch):
     (node.root / ".contextkit").mkdir()
     (node.root / ".contextkit/config.toml").write_text("")
-    monkeypatch.setattr(node.m, "_node_run", lambda *a, **kw: SimpleNamespace(
-        returncode=2, stdout="", stderr="unknown layer: memory\nKnown layers: assets, context.\n"))
+    (node.root / "memory").mkdir(exist_ok=True)
+    monkeypatch.setattr(node.m, "_node_run", lambda argv, root, **kw: _contextkit_body(root, "."))
+    path, text = node.m._memory_attributes(node.root)
+    assert text.splitlines() == ['"memory/**" merge=union']
+
+
+def test_body_without_memory_folder_writes_no_attributes(node, monkeypatch):
+    (node.root / ".contextkit").mkdir()
+    (node.root / ".contextkit/config.toml").write_text("")
+    monkeypatch.setattr(node.m, "_node_run", lambda argv, root, **kw: _contextkit_body(root, "agent"))
+    assert node.m._memory_attributes(node.root) is None
+
+
+def test_a_project_without_contextkit_asks_nothing_and_writes_no_attributes(node, monkeypatch):
+    (node.root / "memory").mkdir(exist_ok=True)
+    monkeypatch.setattr(node.m, "_node_run", lambda *a, **kw: pytest.fail("contextkit asked"))
     assert node.m._memory_attributes(node.root) is None
 
 
@@ -322,11 +341,21 @@ def test_other_contextkit_failure_still_refused(node, monkeypatch):
         node.m._memory_attributes(node.root)
 
 
-def test_memory_path_outside_body_refused(node, monkeypatch):
+@pytest.mark.parametrize("body_root", ["../elsewhere", "/elsewhere"])
+def test_memory_path_outside_body_refused(node, monkeypatch, body_root):
     (node.root / ".contextkit").mkdir()
     (node.root / ".contextkit/config.toml").write_text("")
-    monkeypatch.setattr(node.m, "_node_run", lambda *a, **kw: SimpleNamespace(stdout=str(node.tmp)))
+    monkeypatch.setattr(node.m, "_node_run", lambda argv, root, **kw: _contextkit_body(root, body_root))
     with pytest.raises(node.m.NodeFailure, match="inside the body"):
+        node.m._memory_attributes(node.root)
+
+
+def test_an_answer_naming_no_body_root_refused(node, monkeypatch):
+    (node.root / ".contextkit").mkdir()
+    (node.root / ".contextkit/config.toml").write_text("")
+    monkeypatch.setattr(node.m, "_node_run", lambda *a, **kw: SimpleNamespace(
+        returncode=0, stdout="/somewhere\n", stderr=""))
+    with pytest.raises(node.m.NodeFailure, match="no body root"):
         node.m._memory_attributes(node.root)
 
 
@@ -515,8 +544,10 @@ def test_a_contextkit_name_set_in_config_names_the_app(node, monkeypatch, capsys
             name = "Fixture Agent" if source == "config" else root.name
             return subprocess.CompletedProcess(argv, 0, json.dumps(
                 {"name": name, "name_source": source}), "")
-        if argv[:2] == ["contextkit", "build"] or argv[:3] == ["contextkit", "path", "memory"]:
-            return subprocess.CompletedProcess(argv, 0, str(root / "memory"), "")
+        if argv[:2] == ["contextkit", "build"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["contextkit", "path", "--json"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"body_root": "."}), "")
         return real(argv, root, **kw)
     monkeypatch.setattr(node.m, "_node_run", run)
     node.m.cmd_deploy(node.args)

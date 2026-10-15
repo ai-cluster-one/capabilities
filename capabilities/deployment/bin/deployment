@@ -10214,19 +10214,25 @@ def cmd_node_status(args):
 def _memory_attributes(root):
     if not _has_contextkit(root):
         return None
-    p = _node_run(["contextkit", "path", "memory"], root, check=False)
+    p = _node_run(["contextkit", "path", "--json"], root, check=False)
     if getattr(p, "returncode", 0):
-        # A ContextKit that keeps no memory layer in the body - memory held by
-        # the memory capability's store instead - has nothing to merge.
-        if "unknown layer" in (getattr(p, "stderr", "") or "") + (p.stdout or ""):
-            return None
         raise NodeFailure("node_command_failed", f"contextkit failed (exit {p.returncode})",
                           p.returncode)
-    raw = p.stdout.strip()
-    memory = Path(raw).resolve()
-    if not memory.is_relative_to(root.resolve()) or memory == root.resolve():
+    try:
+        body = json.loads(p.stdout or "").get("body_root")
+    except (ValueError, AttributeError):
+        body = None
+    if not isinstance(body, str) or not body.strip():
+        raise NodeFailure("memory_path", "ContextKit named no body root", 6)
+    relative = Path(os.path.normpath(Path(body.strip()) / "memory"))
+    if relative.is_absolute() or ".." in relative.parts:
         raise NodeFailure("memory_path", "ContextKit memory root must be inside the body", 6)
-    pattern = memory.relative_to(root.resolve()).as_posix() + "/**"
+    # The memory folder sits in the body root; with no folder there - memory
+    # held by the memory capability's store instead - there is nothing to merge.
+    memory = root / relative
+    if not (memory.is_dir() or memory.is_symlink()):
+        return None
+    pattern = relative.as_posix() + "/**"
     # Attribute patterns may contain spaces; quote with Git's C-string syntax.
     line = json.dumps(pattern) + " merge=union"
     path = root / ".gitattributes"
