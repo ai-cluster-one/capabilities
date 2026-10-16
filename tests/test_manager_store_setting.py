@@ -792,9 +792,10 @@ def test_doctor_without_a_setting_is_not_found(tmp_path):
     assert result.returncode == 3 and _error(result)["code"] == "no_store_setting"
 
 
-def test_no_manager_verb_creates_a_table(tmp_path, enforced):
+def test_no_manager_verb_writes_a_record_into_the_store(tmp_path, enforced):
     """Records are files; with a database configured at every level the
-    manager's verbs still create nothing in it."""
+    manager's verbs write none of them into it. The one row written is the
+    agent's registration, which init makes where a database resolves."""
     env = _env(tmp_path)
     _set_cluster(env, enforced)
     root = _project(tmp_path, f"AGENTKIT_DB_URL={_cluster_url(enforced)}\n")
@@ -806,12 +807,26 @@ def test_no_manager_verb_creates_a_table(tmp_path, enforced):
         _manager(project_env, *args, cwd=root)
     assert json.loads((root / "capabilities" / "settings.json").read_text())[
         "capabilities"]["slack"] == {"enabled": True}
+    project_id = json.loads((root / "capabilities" / "project.json").read_text())["id"]
     admin = enforced.connect(ADMIN, "app")
     try:
         with admin.cursor() as cur:
             cur.execute("SELECT schemaname, tablename FROM pg_tables WHERE schemaname "
                         "NOT IN ('pg_catalog', 'information_schema')")
-            assert cur.fetchall() == []
+            tables = cur.fetchall()
+            assert {name for _schema, name in tables} == {
+                "schema_ledger", "schema_version", "capabilities_connections",
+                "capabilities_connection_grants", "capabilities_identifiers",
+                "capabilities_policy", "capabilities_agents", "capabilities_agent_nodes",
+                "capabilities_global"}
+            schema = tables[0][0]
+            for table in ("capabilities_connections", "capabilities_connection_grants",
+                          "capabilities_identifiers", "capabilities_policy",
+                          "capabilities_agent_nodes"):
+                cur.execute(f"SELECT count(*) FROM {schema}.{table}")
+                assert cur.fetchone() == (0,), table
+            cur.execute(f"SELECT id FROM {schema}.capabilities_agents")
+            assert cur.fetchall() == [(project_id,)]
     finally:
         admin.close()
     assert not list(tmp_path.rglob("*.db"))
