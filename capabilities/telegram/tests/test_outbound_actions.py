@@ -1601,8 +1601,9 @@ def _profiles_module():
 
 
 class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
-    """`service doctor` asks each harness, once per distinct profile the
-    settings name, whether it runs that profile, with one live turn on it. The
+    """`service doctor` resolves and fits each distinct profile the settings
+    name and runs nothing; `service doctor --live` asks each harness, once per
+    distinct profile, whether it runs that profile, with one live turn on it. The
     turns run in the bundle's `service/profiles.py`, here in-process with the
     runner's `run` stood in for: the real harnesses would spend money and need
     a login, and the doctor's verdict has to come from the harness's own answer
@@ -1660,13 +1661,13 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
         return run
 
     def _run_doctor(self, cli, tmp, settings, *, held=None, refused=(),
-                    binaries=("claude", "codex"), hang=False):
+                    binaries=("claude", "codex"), hang=False, live=True):
         """Drive the real dispatch. The verdict is computed by the real
         `cmd_service_doctor`, the real reading of the settings and the real
         `probe` in `service/profiles.py`; the harness, the store, the
         initialization, connection and daemon-status plumbing are stood in
         for. `held` is {name: spec}, global versions the resolution reaches.
-        Returns (exit_code, payload, invocations)."""
+        `live` passes `--live`. Returns (exit_code, payload, invocations)."""
         from callva import harness_runner as lib
         calls = []
         profiles = _profiles_module()
@@ -1711,7 +1712,8 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
                                   lambda root: {"ok": True}), \
                 mock.patch.object(cli, "_project_id", lambda write=False: None), \
                 mock.patch.object(cli, "_profiles_call", profiles_call), \
-                mock.patch.object(sys, "argv", ["telegram", "service", "doctor"]), \
+                mock.patch.object(sys, "argv", ["telegram", "service", "doctor"]
+                                  + (["--live"] if live else [])), \
                 contextlib.redirect_stdout(captured):
             try:
                 cli.main()
@@ -1725,6 +1727,46 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
         return next(row for row in payload["workers"]["checked"]
                     if row["profile"] == profile)
 
+    def test_without_live_each_profile_is_resolved_and_no_harness_runs(self):
+        """The default doctor spends nothing: each name is resolved and fitted
+        and reported with what it resolved to, and no harness is started."""
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload, calls = self._run_doctor(
+                cli, tmp, self._settings(defaults="telegram-claude", voice="telegram-fast",
+                                         user="stub"),
+                held={"telegram-fast": {**self.CODEX, "model": "fast-model"}},
+                refused=("fast-model",), live=False)
+        self.assertEqual(code, 0)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["workers"]["live"])
+        self.assertEqual(calls, [])
+        default = self._row(payload, "telegram-claude")
+        fast = self._row(payload, "telegram-fast")
+        for row in (default, fast):
+            self.assertTrue(row["ok"])
+            self.assertEqual(row["verdict"], "resolved")
+            self.assertEqual(row["seconds"], 0.0)
+        self.assertEqual((default["binary"], default["model"], default["layer"]),
+                         ("claude", "opus", "bundled"))
+        self.assertEqual((fast["binary"], fast["model"], fast["layer"], fast["version"]),
+                         ("codex", "fast-model", "global", "v-telegram-fast"))
+        self.assertEqual(self._row(payload, "stub")["verdict"], "in_process")
+
+    def test_without_live_a_name_that_does_not_resolve_or_fit_still_fails(self):
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload, calls = self._run_doctor(
+                cli, tmp, self._settings(defaults="telegram-claude", group="telegram-gone"),
+                live=False)
+        self.assertEqual(code, 5)
+        self.assertFalse(payload["workers"]["ok"])
+        gone = self._row(payload, "telegram-gone")
+        self.assertEqual((gone["ok"], gone["verdict"]), (False, "failed"))
+        self.assertIn("'telegram-gone'", gone["reason"])
+        self.assertEqual(self._row(payload, "telegram-claude")["verdict"], "resolved")
+        self.assertEqual(calls, [])
+
     def test_a_profile_the_harness_accepts_is_ok(self):
         cli = import_cli()
         with tempfile.TemporaryDirectory() as tmp:
@@ -1734,6 +1776,7 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["workers"]["ok"])
+        self.assertTrue(payload["workers"]["live"])
         default = self._row(payload, "telegram-claude")
         fast = self._row(payload, "telegram-fast")
         for row in (default, fast):
@@ -1915,15 +1958,16 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
                       guide)
         self.assertIn("Every profile on another model is an exception taken for a named "
                       "reason", guide)
-        self.assertIn("`telegram service doctor` verifies each distinct profile the settings "
-                      "name against the harness itself", guide)
+        self.assertIn("`telegram service doctor --live` verifies each distinct profile the "
+                      "settings name against the harness itself", guide)
 
     def test_help_says_what_doctor_spends(self):
-        """An operator is told the cost before paying it: one live turn per
-        distinct profile, each held to the turn's own window."""
+        """An operator is told the cost before paying it: nothing by default,
+        and under `--live` one live turn per distinct profile, each held to
+        the turn's own window."""
         help_text = " ".join(import_cli().__doc__.split())
-        self.assertIn("`doctor` also spends one live turn per distinct profile the "
-                      "settings name", help_text)
+        self.assertIn("and starts no session", help_text)
+        self.assertIn("`doctor --live` also spends one live turn per profile", help_text)
         self.assertIn("held to `defaults.worker_timeout`", help_text)
 
 

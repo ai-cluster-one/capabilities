@@ -469,17 +469,19 @@ def _workers_module():
 
 
 def probe(entries: list[dict], timeout: float, active: list, project: str | None, cwd: str,
-          *, run=None, environ=None) -> list[dict]:
+          *, run=None, environ=None, live: bool = True) -> list[dict]:
     """One minimal live turn per distinct profile the settings name, held to
-    `timeout` seconds.
+    `timeout` seconds; with `live` false, only whether each resolves and fits,
+    and no turn is run.
 
     Each entry is a name and the positions naming it (`declared_at`); its row
     adds the harness and model it resolved to (`worker`, `model`), the layer
-    and the version, and the verdict - `accepted`, `in_process` for the stub,
-    `model_refused`, `quota_exhausted`, `not_authenticated`, `binary_missing`,
-    `timed_out`, `incompatible_harness` or `failed`. Only `accepted` and
-    `in_process` are ok. `reason` is the harness's own sentence, or why the
-    name does not resolve or fit; `notice` the product's for a refused model."""
+    and the version, and the verdict - `accepted`, `resolved` when no turn was
+    run, `in_process` for the stub, `model_refused`, `quota_exhausted`,
+    `not_authenticated`, `binary_missing`, `timed_out`, `incompatible_harness`
+    or `failed`. Only `accepted`, `resolved` and `in_process` are ok. `reason`
+    is the harness's own sentence, or why the name does not resolve or fit;
+    `notice` the product's for a refused model."""
     workers = _workers_module()
     lib = runner() if run is None else None
     run = run or lib.run
@@ -503,6 +505,10 @@ def probe(entries: list[dict], timeout: float, active: list, project: str | None
         worker = knobs.get("harness")
         row.update(worker=worker, model=knobs.get("model"), layer=found["layer"],
                    version=found["version"])
+        if not live:
+            rows.append({**row, "ok": True, "verdict": "resolved", "binary": worker,
+                         "reason": None, "notice": None, "seconds": 0.0})
+            continue
         started = time.monotonic()
         lib = lib or runner()
         result = run(PROBE_PROMPT, lib.Profile.from_dict(knobs), cwd, environ=env)
@@ -808,7 +814,8 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("store-steps")
     # Both read their input as JSON on stdin: `check` the settings document and
-    # the environment, `probe` the names with their positions and the timeout.
+    # the environment, `probe` the names with their positions, the timeout and
+    # whether to run the live turn.
     for verb in ("check", "probe"):
         one = commands.add_parser(verb)
         one.add_argument("--project-id")
@@ -843,7 +850,8 @@ def main(argv: list[str] | None = None) -> int:
                 with tempfile.TemporaryDirectory(prefix="telegram-doctor-") as scratch:
                     rows = probe(given.get("profiles") or [],
                                  float(given.get("timeout") or 90),
-                                 active, args.project_id, scratch)
+                                 active, args.project_id, scratch,
+                                 live=bool(given.get("live")))
                 answer = {"rows": rows, "store_error": store_error}
         else:
             conn, schema = _connect(args.project_root)

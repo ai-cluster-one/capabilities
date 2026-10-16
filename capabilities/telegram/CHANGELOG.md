@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-16 — `telegram service doctor` runs the live harness turn only when asked with `--live`
+
+`telegram service doctor` no longer starts a claude or codex session: under `workers` it reports each distinct profile the settings name as `resolved`, with the harness, model, layer and version it resolved to, or `failed` with why when it does not resolve or fit, and spends nothing. `telegram service doctor --live` runs the one live turn per profile it ran before, held to `defaults.worker_timeout`, and reports the harness's own verdict in place of `resolved` (`accepted`, `model_refused`, `quota_exhausted`, `not_authenticated`, `binary_missing`, `timed_out`, `incompatible_harness` or `failed`). `workers` now carries `live`, saying which of the two ran. A doctor called by a watchdog or a control panel no longer leaves a session behind on every call; the deploy descriptor's doctor command is unchanged, so it no longer probes either. `ok`, the exit codes and every other key are as before.
+
 ## 2026-10-14 — The assistant service lets every conference chain settle before it joins
 
 A conference invite whose chain answered within two seconds used to be joined at once, and most such joins ended the call within seconds, once for everyone in it. Every accepted invite is now held until the newest block of its chain has stood unchanged for the settle time, as invites whose chain answered slowly already were, so the assistant is heard about four seconds later in every conference; a chain still growing when the settle budget runs out is declined whichever way it first answered. No verb, output or setting changes.

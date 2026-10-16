@@ -262,18 +262,24 @@ Commands:
                                                or the environment still name a
                                                worker (`worker`, `workers`,
                                                TELEGRAM_SERVICE_WORKER,
-                                               TG_WORKER). `doctor` also spends
-                                               one live turn per distinct
-                                               profile the settings name, held
-                                               to `defaults.worker_timeout`,
-                                               and reports the harness's own
-                                               verdict with the profile, layer
-                                               and version. A model the harness
-                                               refuses, a harness missing from
-                                               PATH or older than the runner
-                                               supports, one that cannot
-                                               authenticate, or one that gives
-                                               no verdict in time is not ok.
+                                               TG_WORKER). `doctor` reports
+                                               each distinct profile the
+                                               settings name as `resolved` with
+                                               its harness, model, layer and
+                                               version, or `failed` when it does
+                                               not resolve or fit, and starts
+                                               no session. `doctor --live` also
+                                               spends one live turn per
+                                               profile, held to
+                                               `defaults.worker_timeout`, and
+                                               reports the harness's own
+                                               verdict in place of `resolved`:
+                                               a model the harness refuses, a
+                                               harness missing from PATH or
+                                               older than the runner supports,
+                                               one that cannot authenticate, or
+                                               one that gives no verdict in
+                                               time is not ok.
                                                `doctor` exits 5 when its own
                                                verdict is `ok: false`, so a
                                                script can gate on it.
@@ -360,9 +366,9 @@ Exit codes:
      yourself
   5  server / network — Telegram unreachable, flood-wait, Deepgram 5xx, and
      `service doctor` reporting `ok: false` — a running daemon whose update
-     sync is not fresh, a profile the settings name that its harness did
-     not accept or that does not resolve or fit, or a job register the
-     store did not open
+     sync is not fresh, a profile the settings name that does not resolve
+     or fit or, under `--live`, that its harness did not accept, or a job
+     register the store did not open
   6  input / validation — a malformed argument, a bad date, a machine with
      no store configured for the service or its jobs, a profile the
      service settings name that does not resolve or fit, or a worker still
@@ -6880,11 +6886,12 @@ def _stub_row(entry: dict) -> dict:
             "notice": None, "seconds": 0.0}
 
 
-def _service_worker_preflight(root: Path, settings: dict) -> dict:
-    """Ask each harness, once per distinct profile the settings name, whether
-    it runs that profile - the harness's own answer to one minimal live turn on
-    it, never a list held here. Each turn is held to the same window a turn is,
-    `defaults.worker_timeout`, so the whole check is bounded. The turns run in
+def _service_worker_preflight(root: Path, settings: dict, live: bool = False) -> dict:
+    """Whether each distinct profile the settings name resolves and fits, and
+    with `live` whether its harness runs it - the harness's own answer to one
+    minimal live turn on it, never a list held here. Without `live` no turn is
+    run and nothing is spent. Each turn is held to the same window a turn is,
+    `defaults.worker_timeout`, so the whole check is bounded. The check runs in
     the bundle's `service/profiles.py`, which carries the runner; the stub is
     answered here. A name that does not resolve or fit is reported as `failed`
     with why."""
@@ -6892,7 +6899,7 @@ def _service_worker_preflight(root: Path, settings: dict) -> dict:
     timeout = float((settings.get("defaults") or {}).get("worker_timeout")
                     or workers.DEFAULT_WORKER_TIMEOUT)
     entries = _declared_profiles(settings) if settings else []
-    answer = {"ok": True, "timeout_seconds": timeout, "checked": []}
+    answer = {"ok": True, "live": live, "timeout_seconds": timeout, "checked": []}
     if not any(entry["profile"] != "stub" for entry in entries):
         answer["checked"] = [_stub_row(entry) for entry in entries]
         return answer
@@ -6900,7 +6907,8 @@ def _service_worker_preflight(root: Path, settings: dict) -> dict:
     argv = ["probe", "--project-root", str(root)]
     if project_id:
         argv += ["--project-id", str(project_id)]
-    code, found = _profiles_call(argv, json.dumps({"profiles": entries, "timeout": timeout}))
+    code, found = _profiles_call(argv, json.dumps({"profiles": entries, "timeout": timeout,
+                                                   "live": live}))
     if code != 0:
         reason = found.get("message") or "the profile module gave no answer"
         answer["checked"] = [
@@ -8671,14 +8679,15 @@ def _service_local_check(connection_flag: str | None,
                                          and runtime_ok)
 
 
-def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) -> dict:
+def cmd_service_doctor(connection_flag: str | None, session_flag: str | None,
+                       live: bool = False) -> dict:
     """The service's verdict, for the caller to gate on. Like `telegram doctor`,
     it exits 0 only while the verdict is ok; the dispatcher below turns an
-    `ok: false` into exit 5."""
+    `ok: false` into exit 5. Only `live` spends a turn on a harness."""
     root, settings, cfg, status, local_ok = _service_local_check(connection_flag, session_flag)
     session_file = Path(cfg["session"] + ".session")
     status["session_file_exists"] = session_file.exists()
-    workers = _service_worker_preflight(root, settings or {})
+    workers = _service_worker_preflight(root, settings or {}, live)
     store = _service_store_check(root)
     return {"ok": local_ok and workers["ok"] and store["ok"],
             "service": status,
@@ -8687,8 +8696,8 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None) ->
             "connection": cfg["id"],
             "note": ("`telegram doctor` performs the authenticated Telegram round-trip; "
                      "a running service is healthy only while its update sync stays fresh; "
-                     "`workers` is each profile the settings name answering one live "
-                     "turn on its harness")}
+                     "`workers` is each profile the settings name resolved and fitted; "
+                     "with `--live`, each answering one live turn on its harness")}
 
 
 def cmd_service_run(connection_flag: str | None, session_flag: str | None) -> None:
@@ -8913,7 +8922,9 @@ def main() -> None:
     svc.add_parser("status", help="show local service status")
     logs = svc.add_parser("logs", help="tail the service log")
     logs.add_argument("--tail", type=int, default=80)
-    svc.add_parser("doctor", help="local service readiness check")
+    svc_doctor = svc.add_parser("doctor", help="local service readiness check")
+    svc_doctor.add_argument("--live", action="store_true",
+                            help="also run one live turn per profile on its harness")
     svc.add_parser("run", help="run the assistant service in the foreground")
     migrate = svc.add_parser(
         "migrate-ownership",
@@ -9039,7 +9050,7 @@ def main() -> None:
         elif args.service_cmd == "logs":
             _emit(cmd_service_logs(connection_flag, session_flag, args.tail))
         elif args.service_cmd == "doctor":
-            report = cmd_service_doctor(connection_flag, session_flag)
+            report = cmd_service_doctor(connection_flag, session_flag, args.live)
             _emit(report)                # the payload first — a caller reads it
             if not report["ok"]:
                 # An entrypoint or a deploy step gates on this, so the verdict
