@@ -205,6 +205,8 @@ def _machine_env(tmp_path: Path, source: str) -> dict[str, str]:
                 "CAPABILITIES_PROJECT_ID_ROOT", "AGENTKIT_DB_URL",
                 "CAPABILITIES_DEV_SESSION", "CAPABILITIES_WORKSPACE"):
         env.pop(key, None)
+    for key in [k for k in env if k.startswith("AGENTKIT_DB_")]:
+        env.pop(key)
     env.update({
         "HOME": str(tmp_path / "home"),
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
@@ -234,20 +236,24 @@ def _global_policy(env: dict[str, str]) -> dict:
     return json.loads(path.read_text())["capabilities"] if path.exists() else {}
 
 
-def test_a_core_capability_arrives_allowed_and_enabled_globally(tmp_path):
+def test_a_core_capability_arrives_allowed_and_its_enable_pending_without_a_database(
+        tmp_path):
     with _catalogue(tmp_path / "catalogue", CORE) as source:
         env = _machine_env(tmp_path, source)
         here = _outside(tmp_path)
         installed = _manager(here, env, "install", CORE)
-    gate = str(tmp_path / "config" / "capabilities" / "settings.json")
     assert installed["machine"] == "allowed"
     assert "machine_hint" not in installed
-    assert installed["global_policy"] == {"enabled": True, "gate": gate}
+    # Install writes no policy file: with no database the enable is pending.
+    policy = installed["global_policy"]
+    assert (policy["enabled"], policy["pending"], policy["reason"]) == (
+        True, True, "store_not_configured")
+    assert f"capabilities enable {CORE} --global" in policy["hint"]
     assert _machine(env)[CORE]["state"] == "allowed"
-    assert _global_policy(env) == {CORE: {"enabled": True}}
+    assert not (tmp_path / "config" / "capabilities" / "settings.json").exists()
     row = {r["name"]: r for r in _manager(here, env, "list")["installed"]}[CORE]
-    assert (row["tier"], row["machine"], row["global_gate"], row["effective"]) == (
-        "core", "allowed", "enabled", "enabled")
+    assert (row["tier"], row["machine"], row["global_gate"]) == (
+        "core", "allowed", "absent")
 
 
 def test_a_standard_capability_still_arrives_quarantined_with_no_policy(tmp_path):
@@ -269,18 +275,16 @@ def test_a_core_name_from_another_source_arrives_as_any_capability(tmp_path):
     assert _global_policy(env) == {}
 
 
-def test_arrival_writes_the_global_record_where_enable_global_would(tmp_path):
+def test_an_arrival_in_a_project_writes_no_file_either(tmp_path):
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
     (project / "capabilities").mkdir()
     with _catalogue(tmp_path / "catalogue", CORE) as source:
         env = _machine_env(tmp_path, source)
         installed = _manager(project, env, "install", CORE)
-    assert installed["global_policy"]["enabled"] is True
-    assert _global_policy(env) == {CORE: {"enabled": True}}
-    row = {r["name"]: r for r in _manager(project, env, "list")["installed"]}[CORE]
-    assert (row["project_gate"], row["global_gate"], row["effective"]) == (
-        "absent", "enabled", "enabled")
+    assert installed["global_policy"]["pending"] is True
+    assert _global_policy(env) == {}
+    assert not (project / "capabilities" / "settings.json").exists()
 
 
 def test_the_users_later_choices_survive_reinstall_update_and_a_second_arrival(tmp_path):
@@ -301,7 +305,9 @@ def test_the_users_later_choices_survive_reinstall_update_and_a_second_arrival(t
         _manager(here, env, "uninstall", CORE)
         again = _manager(here, env, "install", CORE)
     assert again["machine"] == "allowed"
-    assert "global_policy" not in again
+    # Install reads and writes no policy file: the enable is pending, and the
+    # user's own file entry is left as it is.
+    assert again["global_policy"]["pending"] is True
     assert _global_policy(env) == {CORE: {"enabled": False}}
 
 
@@ -321,14 +327,12 @@ def test_under_the_read_only_switch_a_core_capability_arrives_as_any_other(tmp_p
     assert _global_policy(env) == {}
 
 
-def test_an_arrival_that_cannot_write_the_global_record_leaves_nothing(tmp_path):
+def test_an_arrival_whose_database_does_not_answer_is_pending_and_writes_nothing(tmp_path):
     with _catalogue(tmp_path / "catalogue", CORE) as source:
         env = _machine_env(tmp_path, source)
-        (tmp_path / "config" / "capabilities" / "settings.json").mkdir(parents=True)
-        result = subprocess.run(
-            [str(MANAGER), "install", CORE], cwd=_outside(tmp_path), env=env,
-            text=True, capture_output=True, timeout=120)
-    assert result.returncode != 0
-    assert CORE not in _machine(env)
-    registry = tmp_path / "registry"
-    assert not registry.exists() or not any(registry.iterdir())
+        env["AGENTKIT_DB_URL"] = "postgresql://nobody@127.0.0.1:9/none?sslmode=disable"
+        installed = _manager(_outside(tmp_path), env, "install", CORE)
+    assert installed["machine"] == "allowed"
+    assert installed["global_policy"]["pending"] is True
+    assert installed["global_policy"]["reason"] != "store_not_configured"
+    assert _global_policy(env) == {}

@@ -560,3 +560,121 @@ def test_init_names_the_store_gate_of_a_store_or_moved_agent(blank):
         assert out[name]["gate"].startswith("store:"), out[name]
         assert not (w.roots[name] / "capabilities" / "settings.json").exists()
     assert out["plain"]["gate"] == str(files_mode / "capabilities" / "settings.json")
+
+
+# --- install, images and the dev lane ----------------------------------------------------------
+
+def test_a_core_arrival_is_a_global_row_where_a_database_resolves(blank, tmp_path):
+    from test_manager_core_tier import CORE, _catalogue, _machine_env, _outside
+    w = blank
+    with _catalogue(tmp_path / "catalogue", CORE) as source:
+        env = _machine_env(tmp_path, source)
+        env.update({"AGENTKIT_DB_URL": w.url(), "AGENTKIT_DB_SCHEMA": SCHEMA})
+        installed = subprocess.run([str(MANAGER), "install", CORE], cwd=_outside(tmp_path),
+                                   env=env, text=True, capture_output=True, timeout=300)
+        assert installed.returncode == 0, installed.stderr
+        first = json.loads(installed.stdout)
+        # A row the store holds already is the user's, and is kept.
+        w.sql("UPDATE capabilities_policy SET enabled = false WHERE agent_id IS NULL AND "
+              "capability = %s", (CORE,))
+        subprocess.run([str(MANAGER), "uninstall", CORE], cwd=_outside(tmp_path), env=env,
+                       text=True, capture_output=True, timeout=120, check=True)
+        again = json.loads(subprocess.run(
+            [str(MANAGER), "install", CORE], cwd=_outside(tmp_path), env=env, text=True,
+            capture_output=True, timeout=300, check=True).stdout)
+    _say("install-arrival-with-database", {"first": first, "again": again})
+    assert first["global_policy"] == {"enabled": True,
+                                      "gate": f"store:{SCHEMA}.capabilities_policy"}
+    assert "global_policy" not in again
+    assert w.sql("SELECT enabled FROM capabilities_policy WHERE agent_id IS NULL AND "
+                 "capability = %s AND node IS NULL", (CORE,)) == [(False,)]
+    assert not (tmp_path / "config" / "capabilities" / "settings.json").exists()
+    w.sql("DELETE FROM capabilities_policy WHERE agent_id IS NULL AND capability = %s",
+          (CORE,))
+
+
+def test_a_dev_session_keeps_its_records_in_a_schema_of_its_own(world, tmp_path):
+    from test_manager_dev_sessions import _commit_all, _source_repo
+    w = world
+    source = _source_repo(tmp_path)
+    shutil.copytree(REPO / "capabilities" / "memory", source / "capabilities" / "memory",
+                    ignore=shutil.ignore_patterns("__pycache__", "tests"))
+    _commit_all(source, "memory")
+    outer = {k: v for k, v in os.environ.items()
+             if not k.startswith(("AGENTKIT_DB_", "CAPABILITIES_")) and k not in (
+                 "CLAUDE_PROJECT_DIR", "VIRTUAL_ENV")}
+    outer.update({"HOME": str(tmp_path / "outer-home"),
+                  "CAPABILITIES_HOME": str(tmp_path / "outer-registry"),
+                  "CAPABILITIES_BIN": str(tmp_path / "outer-bin"),
+                  "XDG_CONFIG_HOME": str(tmp_path / "outer-config"),
+                  "XDG_STATE_HOME": str(tmp_path / "outer-state"),
+                  "XDG_DATA_HOME": str(tmp_path / "outer-data"),
+                  "XDG_CACHE_HOME": str(tmp_path / "outer-cache"),
+                  "AGENT_NODE_NAME": MASTER, "USER": "tester"})
+    # The machine's database, as `capabilities store set` leaves it.
+    w.write(tmp_path / "outer-config" / "agentkit" / "store.json", {
+        "schema": "agentkit.store.v1", "host": "127.0.0.1", "port": w.port,
+        "database": w.database, "user": "pgadmin", "sslmode": "disable",
+        "db_schema": SCHEMA})
+
+    def manager(*args: str, cwd: Path = REPO) -> subprocess.CompletedProcess:
+        return subprocess.run([str(MANAGER), *args], cwd=cwd, env=outer, text=True,
+                              capture_output=True, timeout=900)
+
+    started = manager("dev", "start", "memory", "--source", str(source), "--project",
+                      str(w.roots["moved"]), "--session", "dbonly-lane", "--allow-parallel")
+    assert started.returncode == 0, started.stderr
+    session = json.loads(started.stdout)
+    try:
+        # One uv cache for the machine, also inside the lane.
+        lane_cache = Path(session["isolated"]["cache"]) / "uv"
+        if os.environ.get("UV_CACHE_DIR") and not lane_cache.exists():
+            lane_cache.parent.mkdir(parents=True, exist_ok=True)
+            lane_cache.symlink_to(os.environ["UV_CACHE_DIR"])
+        installed = manager("dev", "install", "dbonly-lane", "memory")
+        assert installed.returncode == 0, installed.stderr
+        probe = manager("dev", "exec", "dbonly-lane", "--", "sh", "-c",
+                        "echo $AGENTKIT_DB_SCHEMA $AGENT_NODE_NAME")
+        ran = manager("dev", "run", "dbonly-lane", "memory", "--", "settings")
+        direct = w.cap(w.roots["moved"], "memory", "settings")
+        _say("dev-session-schema", {"probe": probe.stdout, "run_stdout": ran.stdout,
+                                    "run_stderr": ran.stderr[-3000:],
+                                    "direct": direct.stdout})
+        assert probe.returncode == 0 and probe.stdout.split() == ["dev_dbonly_lane", MASTER]
+        assert ran.returncode == 0, ran.stderr
+        diagnostic = next(json.loads(line)["dev_run"] for line in ran.stderr.splitlines()
+                          if line.startswith('{"dev_run"'))
+        assert diagnostic["database_schema"] == "dev_dbonly_lane"
+        assert diagnostic["projected_rows"]["capabilities_agents"] == 1
+        # The payload read the projected rows of its own schema, as the agent's
+        # own command reads the store's.
+        lane_homes = json.loads(ran.stdout)["homes"]
+        real_homes = json.loads(direct.stdout)["homes"]
+        assert [h["document"] for h in lane_homes] == [h["document"] for h in real_homes]
+        assert lane_homes[0]["path"] == "store:dev_dbonly_lane.capabilities_settings"
+        assert real_homes[0]["path"] == f"store:{SCHEMA}.capabilities_settings"
+        held = w.sql("SELECT id, migrated_at IS NOT NULL FROM dev_dbonly_lane."
+                     "capabilities_agents")
+        assert held == [(IDS["moved"], True)]
+    finally:
+        manager("dev", "stop", "dbonly-lane", "--discard-work")
+
+
+def test_the_machine_scheduler_serves_a_moved_agent(world):
+    w = world
+    joined = w.answer(run(w, "moved", "automations", "service", "join"))
+    assert joined["joined"] is True
+    started = w.answer(run(w, "moved", "automations", "service", "start", "--machine"))
+    try:
+        deadline, served = time.monotonic() + 60, None
+        while time.monotonic() < deadline:
+            status = w.answer(run(w, "moved", "automations", "service", "status", "--machine"))
+            served = {row["project_id"]: row for row in status["projects"]}.get(IDS["moved"])
+            if served and served.get("state") in ("served", "error", "refused"):
+                break
+            time.sleep(0.5)
+        _say("automations-machine-moved", {"started": started, "row": served})
+        assert served and served["state"] == "served", served
+    finally:
+        run(w, "moved", "automations", "service", "stop", "--machine")
+        run(w, "moved", "automations", "service", "leave")

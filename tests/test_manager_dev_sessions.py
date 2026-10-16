@@ -561,12 +561,15 @@ def test_dev_run_executes_only_the_session_payload_against_attached_project(tmp_
     _run(env, "dev", "stop", "deployment-test")
 
 
-def test_dev_run_hands_the_child_no_database_of_its_own_choosing(tmp_path):
-    """Which database the child uses is the child's to resolve from the project
-    it stands in; `dev run` passes no store variable down."""
+def test_dev_run_hands_the_child_the_machine_database_bound_to_the_session_schema(tmp_path):
+    """Where the machine resolves a database, the session reaches it bound to a
+    schema of its own, through the setting's schema field; nothing else of the
+    parent's store variables goes down."""
     source = _source_repo(tmp_path)
     consumer = _consumer_repo(tmp_path)
     env = _env(tmp_path)
+    for key in [k for k in env if k.startswith("AGENTKIT_DB_")]:
+        env.pop(key)
     env["AGENTKIT_DB_URL"] = "postgresql://parent.invalid/db"
     env["AGENTKIT_DB_PASSWORD"] = "parent-secret"
     started = _start(env, source, consumer, session="db-run")
@@ -581,6 +584,15 @@ def test_dev_run_hands_the_child_no_database_of_its_own_choosing(tmp_path):
         'if __name__ == "__main__":',
     ))
     _run(env, "dev", "install", "db-run", "deployment")
+    result = _run(
+        env, "dev", "run", "db-run", "deployment",
+        "--project-only", "--", "store-probe")
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == {
+        "AGENTKIT_DB_URL": "postgresql://parent.invalid/db",
+        "AGENTKIT_DB_SCHEMA": "dev_db_run"}
+    # Without a database the session has none, as before.
+    for key in ("AGENTKIT_DB_URL", "AGENTKIT_DB_PASSWORD"):
+        env.pop(key)
     result = _run(
         env, "dev", "run", "db-run", "deployment",
         "--project-only", "--", "store-probe")
