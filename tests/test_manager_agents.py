@@ -185,8 +185,8 @@ def test_the_ledger_creates_the_kernel_tables_with_their_indexes_and_comments(la
 
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'capabilities' ORDER BY step")]
-    assert steps[-5:] == ["0009-agents", "0010-agents-from-contextkit", "0011-agent-nodes",
-                          "0012-agent-nodes-master", "0013-global"]
+    assert steps[8:13] == ["0009-agents", "0010-agents-from-contextkit", "0011-agent-nodes",
+                           "0012-agent-nodes-master", "0013-global"]
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
     assert "WHERE is_master" in indexes["capabilities_agent_nodes_master"]

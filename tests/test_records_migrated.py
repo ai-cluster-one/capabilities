@@ -759,3 +759,27 @@ def test_a_files_mode_project_with_a_store_configured_creates_no_tables(lab):
     with lab.cluster.admin(lab.database) as conn:
         assert conn.execute("SELECT count(*) FROM pg_tables WHERE schemaname = %s",
                             (SCHEMA,)).fetchone() == (0,)
+
+
+def test_a_service_and_the_migration_are_recorded_by_name(moved, monkeypatch):
+    lab = moved
+    for key, value in lab.env().items():
+        monkeypatch.setenv(key, value)
+    for key in DB_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    adapter = S.open_records(lab.envelope, lab.config, project_root=lab.project,
+                             actor="memory-service")
+    try:
+        adapter.set("memory", "setting", "window_days", 4)
+        adapter.set("memory", "setting", "block_chars", 4000, actor="migrate")
+        adapter.set("memory", "setting", "max_entries", 50, actor="memory set by hand")
+    finally:
+        adapter.close()
+    assert [row[4] for row in _trail(lab)] == [
+        f"memory-service@{MASTER}", f"migrate@{MASTER}", f"memory-service@{MASTER}"]
+    adapter = S.open_records(lab.envelope, lab.config, project_root=lab.project)
+    try:
+        adapter.set("memory", "setting", "window_days", 5)
+    finally:
+        adapter.close()
+    assert _trail(lab)[-1][4] == f"tester@{MASTER}"

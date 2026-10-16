@@ -50,7 +50,8 @@ which turns on `setup`; `LINK_METHODS`, the interactive ceremonies that link a
 connection; and `SETTINGS`, where the capability's settings live and the keys
 it declares, which turns on `settings`, with an optional
 `_settings_check(scope, document)` outside the fences returning the
-problems its own reader finds in the whole document as it would read it. Each is absent where it does not apply.
+problems its own reader finds in the whole document as it would read it.
+Each is absent where it does not apply.
 Optionally, beside STATE, `TABLES = True` when the capability keeps tables in
 the machine's store, with a `_tables()` builder outside the fences returning
 `(steps, major, minor)` for the shared database library. Absent or false means
