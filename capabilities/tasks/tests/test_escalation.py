@@ -54,6 +54,14 @@ def conveyor(project: Path, text: str = CHAIN) -> Path:
     return path
 
 
+def settings_chain(project: Path, table: str = CHAIN, head: str = "version = 1\n") -> Path:
+    """The chain as the `escalation` table of the project's tasks settings."""
+    path = project / "capabilities" / "tasks" / "service" / "config.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(head + "\n[escalation]\n" + table)
+    return path
+
+
 def supervised(project: Path, hooked: bool = False) -> None:
     """A supervisor worker that takes the waiting tasks assigned to it."""
     hooks.write_worker(project, "supervisor",
@@ -126,7 +134,47 @@ def test_a_project_without_the_file_escalates_nothing_and_is_warned(project):
     assert mod._conveyor() is None
     block, wrong, warning = mod._conveyor_report()
     assert block is None and wrong == []
-    assert "no escalation chain is set" in warning and "conveyor.toml" in warning
+    assert "no escalation chain is set" in warning
+    assert "settings set escalation.escalate_to" in warning
+
+
+def test_the_settings_table_is_read_and_stands_over_the_file(project):
+    supervised(project)
+    conveyor(project, 'escalate_to = ["owner"]\n')
+    where = settings_chain(project, CHAIN + 'stall_after = "90m"\n')
+    settings, problems = mod._read_conveyor()
+    assert problems == []
+    assert settings["escalate_to"] == ["supervisor", "owner"]
+    assert settings["stall_after"] == 5400
+    assert settings["path"] == f"{where} [escalation]"
+    block, wrong, _warning = mod._conveyor_report()
+    assert wrong == [] and block["file"] == f"{where} [escalation]"
+    # Settings without the table leave the file to be read, as before.
+    where.write_text("version = 1\npoll_seconds = 30\n")
+    assert mod._read_conveyor()[0]["escalate_to"] == ["owner"]
+    # The service reads past the table, and checks the rest as it always has.
+    settings_chain(project)
+    assert mod._check_service_settings({"version": 1, "escalation": {}}, where)["version"] == 1
+
+
+@pytest.mark.parametrize("table, said", [
+    ("escalate_to = []\n", "a list of names"),
+    ('escalate_to = ["owner", "owner"]\n', "names 'owner' twice"),
+    (CHAIN + 'stall_after = "soon"\n', "`stall_after` is a duration"),
+    (CHAIN + "cool_down = 3\n", "names 'cool_down', which nothing reads"),
+    ('stall_after = "6h"\n', "nothing would ever be escalated"),
+])
+def test_the_settings_table_is_checked_as_the_claim_reads_it(project, capsys, table, said):
+    import tomllib
+    where = settings_chain(project, table)
+    problems = mod._settings_check("project", tomllib.loads(where.read_text()))
+    assert any(said in one for one in problems), problems
+    with pytest.raises(SystemExit) as stopped:
+        mod._conveyor()
+    assert stopped.value.code == 6
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "conveyor_invalid"
+    assert mod._settings_check("project", {"version": 1, "escalation": {
+        "escalate_to": ["supervisor", "owner"], "stall_after": "2h"}}) == []
 
 
 @pytest.mark.parametrize("text, said", [
@@ -227,6 +275,26 @@ def test_a_hold_past_the_ceiling_escalates_and_writes_no_pickup(project, store, 
                                                                           "t-stuck")}
     assert moves == {("status", "waiting", "tasks:scan"),
                      ("assignee", "supervisor", "tasks:scan")}
+
+
+@needs_store
+def test_a_hold_past_the_ceiling_escalates_by_the_settings_table(project, store, turns,
+                                                                 capsys):
+    entry, schema, conn = store
+    hooks.hooked(project)
+    supervised(project)
+    settings_chain(project, CHAIN + 'stall_after = "2h"\n')
+    add(entry, capsys, "t-settled")
+    aged(conn, schema, "t-settled", 4)
+    tell(project, "before", "t-settled", exit=75, print=moment_ahead())
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    assert answer(capsys)["passed_over"][0]["verdict"] == "hold"
+    held_for(conn, schema, "t-settled", 3)
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    report = answer(capsys)
+    [moved] = report["escalated"]
+    assert (moved["task"], moved["to"]) == ("t-settled", "supervisor")
+    assert "2h ceiling" in trail(entry, capsys, "t-settled")[0]["description"]
 
 
 @needs_store

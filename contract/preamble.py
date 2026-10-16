@@ -2157,33 +2157,6 @@ def _records_in_store() -> bool:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
-def _settings_named(name: str) -> tuple:
-    """A named settings document `<capability>.<name>` of an agent whose
-    records moved into the store: where it is kept, and the document (None
-    where the agent has none)."""
-    try:
-        records = _records()
-        key = settings_document(NAME, name)
-        return (f"{records.collection_source(NAME, 'setting')} {key}",
-                records.setting_document(key, "project"))
-    except StoreError as e:
-        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
-
-
-def _settings_named_write(name: str, change, check=None) -> dict:
-    """Change a named settings document `<capability>.<name>` of an agent
-    whose records moved into the store, in the store's one transaction:
-    `change` takes the document and returns the new one, `check` returns what
-    is wrong with the result before anything is written."""
-    try:
-        return _records().settings_write(settings_document(NAME, name), "project",
-                                         change, check=check)
-    except StoreError as e:
-        if e.slug == "settings_invalid":
-            _die(6, e.slug, e.message)
-        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
-
-
 def _env_override(*keys: str, value=None):
     """The first of `keys` the environment sets (or `value`, where the caller
     read it elsewhere), naming a file to read records or settings from; for an

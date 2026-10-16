@@ -69,12 +69,14 @@ Here `scripts/resource-free.py` reads the task from stdin, exits 0 when the reso
 
 ## When a task cannot move: escalation
 
-A worker can hold a task back for ever - a `before` hook that keeps answering "not now", a turn that keeps ending without moving it - and without a rule above the workers such a task stands still with nobody named to move it. A project names that rule in `capabilities/tasks/conveyor.toml`, beside its workers; an agent whose records moved into the store keeps the same keys as its `tasks.conveyor` settings document instead:
+A worker can hold a task back for ever - a `before` hook that keeps answering "not now", a turn that keeps ending without moving it - and without a rule above the workers such a task stands still with nobody named to move it. A project names that rule in the `escalation` table of its tasks settings, with the settings verb:
 
-```toml
-escalate_to = ["supervisor", "owner"]
-stall_after = "6h"
+```sh
+tasks settings set escalation.escalate_to supervisor,owner
+tasks settings set escalation.stall_after 6h
 ```
+
+The table sits in the project's `service/config.toml`, or in its settings rows once its records moved into the store, and `tasks settings` shows it. A project whose settings carry no `escalation` table and whose records have not moved still has `capabilities/tasks/conveyor.toml` beside its workers read, holding the same two keys at its top level.
 
 `escalate_to` is the chain a stuck task goes along, in order, and its last name is a person - a name no worker of the project has. Every name before it is a worker that is switched on and takes the waiting tasks assigned to it, as the supervisor does. `stall_after` is how long a task may be held back before it is escalated, 6h when unsaid.
 

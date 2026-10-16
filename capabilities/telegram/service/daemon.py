@@ -419,11 +419,10 @@ def _records():
 
 def _records_moved():
     """Whether this daemon's agent keeps its records and settings in the store:
-    no file is read for them then, whatever an override names."""
-    try:
-        return _records().settings_kept() == "store"
-    except records.store().StoreError:
-        return False
+    no file is read for them then, whatever an override names. A store that
+    cannot answer is raised, never read as "not moved": an agent whose records
+    moved is not to be run from files because its store was down."""
+    return _records().settings_kept() == "store"
 
 
 def _override_ignored(key):
@@ -443,10 +442,15 @@ def _read_record_settings():
         raise SettingsError(
             f"Telegram service records are unavailable: {exc.message}") from exc
     global _SETTINGS_OVERRIDE_SAID
-    if (os.environ.get("TELEGRAM_SERVICE_SETTINGS") and not _SETTINGS_OVERRIDE_SAID
-            and _records_moved()):
-        _SETTINGS_OVERRIDE_SAID = True
-        _override_ignored("TELEGRAM_SERVICE_SETTINGS")
+    if os.environ.get("TELEGRAM_SERVICE_SETTINGS") and not _SETTINGS_OVERRIDE_SAID:
+        try:
+            moved = _records_moved()
+        except records.store().StoreError as exc:
+            raise SettingsError(
+                f"Telegram service records are unavailable: {exc.message}") from exc
+        if moved:
+            _SETTINGS_OVERRIDE_SAID = True
+            _override_ignored("TELEGRAM_SERVICE_SETTINGS")
     return settings
 
 
@@ -796,10 +800,19 @@ def _connection_file_override():
     keys = ("TELEGRAM_SERVICE_CONNECTIONS_FILE", "TG_CONNECTIONS_FILE",
             "TELEGRAM_CONNECTIONS_FILE")
     value = _config_value(*keys)
-    if value and _records_moved():
+    if not value:
+        return None
+    try:
+        moved = _records_moved()
+    except records.store().StoreError as exc:
+        # Whether this agent's records moved is the store's to say: while it
+        # cannot, the override is not read in its place.
+        sys.exit("Telegram cannot tell whether this agent's records are in the store, "
+                 f"so the connections file override is not read: {exc.message}")
+    if moved:
         _override_ignored(next(key for key in keys if _project_env_value(key)))
         return None
-    return _project_path(value) if value else None
+    return _project_path(value)
 
 
 def _connections_envelope():

@@ -172,6 +172,11 @@ ALLOW-LIST POLICY  (capabilities/slack/policy.json)
   channel/group → allowed only if the channel id is in allowed_channels
                   (unless default_channel_policy=open). Threads follow their parent.
 
+  An agent whose records moved into the store keeps one allow-list: these
+  keys of its slack settings, which the service admits inbound events by as
+  well, edited with `slack settings set` (for example `slack settings set
+  allowed_channels.C0123456789 '"#team"'`). Absent keys fail closed as above.
+
 SERVICE (real-time daemon, Socket Mode — needs SLACK_APP_TOKEN xapp-…)
   slack service init [--connection ID]   write project service settings/context
   slack service doctor                   verify both tokens + Socket Mode endpoint issuance
@@ -2298,33 +2303,6 @@ def _records_in_store() -> bool:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
-def _settings_named(name: str) -> tuple:
-    """A named settings document `<capability>.<name>` of an agent whose
-    records moved into the store: where it is kept, and the document (None
-    where the agent has none)."""
-    try:
-        records = _records()
-        key = settings_document(NAME, name)
-        return (f"{records.collection_source(NAME, 'setting')} {key}",
-                records.setting_document(key, "project"))
-    except StoreError as e:
-        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
-
-
-def _settings_named_write(name: str, change, check=None) -> dict:
-    """Change a named settings document `<capability>.<name>` of an agent
-    whose records moved into the store, in the store's one transaction:
-    `change` takes the document and returns the new one, `check` returns what
-    is wrong with the result before anything is written."""
-    try:
-        return _records().settings_write(settings_document(NAME, name), "project",
-                                         change, check=check)
-    except StoreError as e:
-        if e.slug == "settings_invalid":
-            _die(6, e.slug, e.message)
-        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
-
-
 def _env_override(*keys: str, value=None):
     """The first of `keys` the environment sets (or `value`, where the caller
     read it elsewhere), naming a file to read records or settings from; for an
@@ -2751,11 +2729,6 @@ HASH_LENGTH = 12
 # separators and anything that would make a key ambiguous to address.
 KEY_RE = re.compile(r"[a-z0-9][a-z0-9._@+-]{0,127}", re.IGNORECASE)
 CAPABILITY_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
-# The document a settings row belongs to: a capability's own settings, or a
-# named document of it, `<capability>.<name>`, for settings it keeps outside its
-# declared homes (tasks' `conveyor`, slack's `policy`). A capability name never
-# holds a dot, so a named document can never be taken for a capability.
-SETTINGS_DOCUMENT_RE = re.compile(r"[a-z][a-z0-9-]{0,63}(?:\.[a-z][a-z0-9-]{0,63})?")
 
 
 class StoreError(Exception):
@@ -3198,16 +3171,6 @@ def _store_check(name: str, value: str, pattern: re.Pattern) -> str:
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise StoreError("bad_name", f"{name} {value!r} must match {pattern.pattern}")
     return value
-
-
-def settings_document(capability: str, name: str | None = None) -> str:
-    """The key a settings document is kept under: the capability's own, or
-    its named document `<capability>.<name>`."""
-    _store_check("capability", capability, CAPABILITY_RE)
-    if name is None:
-        return capability
-    return _store_check("settings document", f"{capability}.{name}",
-                        SETTINGS_DOCUMENT_RE)
 
 
 def _semantics(collection: str) -> str:
@@ -4837,7 +4800,7 @@ class AgentRecords(StoreRecords):
         """One scope's settings document as this node reads it: the rows for
         every node with this node's rows over them. None where neither
         document exists, which a reader takes as the capability's seed."""
-        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         self._scope_root(scope)
         docs, rows = self._settings_rows(capability)
         shared, mine = (scope, None), (scope, self.node)
@@ -4957,7 +4920,7 @@ class AgentRecords(StoreRecords):
         then write the paths that differ, removals first, one trail row each,
         and move the document's generation to the last of them. A refused
         write changes nothing."""
-        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         _refuse_record_write(capability, "setting")
         agent = self._agent(scope)
         who = self.actor_name(actor)
@@ -6218,12 +6181,18 @@ _POLICY_DEFAULT = {
 }
 
 
+# The keys of the one allow-list an agent whose records moved into the store
+# keeps in its slack settings: the conversations `read` and `post` may touch
+# and the service admits, edited with `slack settings set`.
+_POLICY_KEYS = tuple(_POLICY_DEFAULT)
+
+
 def _policy_where() -> str:
     """Where the allow-list is kept, as a person edits it: the envelope's
-    policy.json, or the `slack.policy` settings document of an agent whose
-    records moved into the store."""
+    policy.json, or the slack settings of an agent whose records moved into
+    the store."""
     if _records_in_store():
-        return "the slack.policy settings document in the store"
+        return "the slack settings (`slack settings set allowed_channels.<id> <name>`)"
     return "capabilities/slack/policy.json"
 
 
@@ -6232,9 +6201,11 @@ def _policy() -> dict:
     if envdir is None:
         return dict(_POLICY_DEFAULT)
     if _records_in_store():
-        pfile, data = _settings_named("policy")
-        if data is None:
-            return dict(_POLICY_DEFAULT)
+        # One allow-list: the slack settings' own, which the service admits by.
+        root = _project_root()
+        settings = _service_settings(root) if root is not None else {}
+        pfile = f"the slack settings ({_records().collection_source(NAME, 'setting')})"
+        data = {key: settings[key] for key in _POLICY_KEYS if key in settings}
     else:
         pfile = envdir / "policy.json"
         if not pfile.is_file():
@@ -6518,10 +6489,19 @@ def _service_settings(root: Path) -> dict:
         _die(6, exc.slug, exc.message, exc.hint)
 
 
+def _service_initialized(settings: dict) -> bool:
+    """Whether the service's settings were written: any key at all, or, for an
+    agent whose records moved into the store - whose allow-list is part of the
+    same settings and may stand before the service does - a key beyond it."""
+    if _records_in_store():
+        return any(key not in _POLICY_KEYS for key in settings)
+    return bool(settings)
+
+
 def _service_settings_strict(root: Path, *, check_worker: bool) -> dict:
     path = _service_settings_path(root)
     data = _service_settings(root)
-    if not data:
+    if not _service_initialized(data):
         _die(6, "service_not_initialized", "run `slack service init` first")
 
     import importlib.util
@@ -6628,11 +6608,15 @@ def cmd_service_init(flag: str | None) -> None:
     if missing:
         _die(3, "service_bundle_missing", "Slack service templates are missing",
              "reinstall slack from the source bundle; missing: " + ", ".join(missing))
-    if not _service_settings(root):
+    held = _service_settings(root)
+    if not _service_initialized(held):
         settings = json.loads(settings_template.read_text())
         if flag:
             settings["connection"] = flag
         for key, value in settings.items():
+            if key in held:
+                # The allow-list an agent kept before its service was set up.
+                continue
             adapter.set(NAME, "setting", key, value, actor="slack service init")
         written.append(f"{adapter.source}:slack/settings")
     if adapter.document_read(NAME, "context") is None:
@@ -6666,7 +6650,7 @@ def _service_status(flag: str | None) -> dict:
     running = _pid_matches_service(pid)
     return (
         {
-            "initialized": bool(_service_settings(root)),
+            "initialized": _service_initialized(_service_settings(root)),
             "running": running,
             "pid": pid if running else None,
             "ready": running and (state / "ready.json").is_file(),
@@ -6764,7 +6748,7 @@ def cmd_service_doctor(flag: str | None) -> None:
             },
             "socket_mode": "app token accepted",
             "settings": _records().collection_source(NAME, "setting"),
-            "initialized": bool(_service_settings(root)),
+            "initialized": _service_initialized(_service_settings(root)),
         }
     )
 

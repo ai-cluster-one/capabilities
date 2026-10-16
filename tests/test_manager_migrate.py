@@ -663,12 +663,14 @@ def test_dry_run_reports_and_writes_nothing(world, name):
         assert not questions
         assert {(i["kind"], i["name"]) for i in plan["movers"]["tasks"]["items"]} == {
             ("worker", "reviewer"), ("worker", "builder"), ("profile", "review-claude")}
-        assert {s["document"] for s in plan["settings"]} == {"tasks", "tasks.conveyor"}
+        assert {s["document"] for s in plan["settings"]} == {"tasks"}
+        [settings] = plan["settings"]
+        assert settings["fold"].endswith("capabilities/tasks/conveyor.toml")
         assert [(Path(v["root"]).name, v["differences"]) for v in plan["verify_only"]] == [
             ("admin-copy", [])]
     elif name == "body":
         assert not questions and dry["identity_write"]["id"] == IDS["body"]
-        assert {s["document"] for s in plan["settings"]} == {"agentrooms", "slack.policy"}
+        assert {s["document"] for s in plan["settings"]} == {"agentrooms", "slack"}
         [settings] = [s for s in plan["settings"] if s["document"] == "agentrooms"]
         assert settings["excluded"] == [["agents"]]
         assert [(i["name"], i["outcome"]) for i in plan["movers"]["agentrooms"]["items"]] == [
@@ -715,7 +717,20 @@ def test_apply_moves_everything_and_reads_the_same_through_the_switch(world, nam
         before_switch["settings"]["telegram"]["keys"].pop("defaults.profile")
         assert after_switch["settings"]["telegram"]["keys"].pop("defaults.profile") \
             == defaults["profile"]
+    if name == "admin":
+        # conveyor.toml became the `escalation` table of the tasks settings.
+        tasks = after_switch["settings"]["tasks"]
+        assert tasks["document"].pop("escalation") == {"escalate_to": ["reviewer", "Owner"],
+                                                       "stall_after": "6h"}
+        assert tasks["keys"].pop("escalation.escalate_to") == ["reviewer", "Owner"]
+        before_switch["settings"]["tasks"]["keys"].pop("escalation.escalate_to")
     if name == "body":
+        # policy.json became the slack settings' allow-list: with no service
+        # settings, the whole document.
+        assert after_switch["settings"]["slack"]["document"] == {
+            "allowed_users": ["U01"], "allowed_channels": ["C01"]}
+        assert before_switch["settings"]["slack"]["document"] is None
+        after_switch["settings"]["slack"]["document"] = None
         # The agents map became a worker, bound in the settings under a key
         # that holds a dot.
         assert after_switch["settings"]["agentrooms"]["document"] == {
@@ -787,16 +802,17 @@ def test_apply_moves_everything_and_reads_the_same_through_the_switch(world, nam
                          "ORDER BY name", (IDS[name],))
         assert rows == [("builder",), ("reviewer",)]
         conveyor = world.sql("SELECT path, value FROM capabilities_settings WHERE "
-                             "agent_id = %s AND capability = 'tasks.conveyor' ORDER BY path",
-                             (IDS[name],))
-        assert conveyor == [(["escalate_to"], ["reviewer", "Owner"]), (["stall_after"], "6h")]
+                             "agent_id = %s AND capability = 'tasks' AND path[1] = "
+                             "'escalation' ORDER BY path", (IDS[name],))
+        assert conveyor == [(["escalation", "escalate_to"], ["reviewer", "Owner"]),
+                            (["escalation", "stall_after"], "6h")]
         trail = world.sql("SELECT DISTINCT changed_by FROM capabilities_settings_changes "
                           "WHERE agent_id = %s", (IDS[name],))
         assert trail == [(f"migrate@{MASTER}",)]
     if name == "body":
         assert not (root / "agent" / "capabilities" / "slack" / "policy.json").exists()
         assert world.sql("SELECT value FROM capabilities_settings WHERE agent_id = %s AND "
-                         "capability = 'slack.policy' AND path = '{allowed_users}'",
+                         "capability = 'slack' AND path = '{allowed_users}'",
                          (IDS[name],)) == [(["U01"],)]
     # A second apply changes nothing.
     before = world.everything()

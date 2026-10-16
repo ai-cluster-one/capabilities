@@ -5,9 +5,9 @@
     "SHEBANG.md": "70cb33811ab72ee291d3a3796f901764cd925566a72cc69f532effaf5be8da24",
     "SOURCES.md": "79e453cf68a08ba2b2e5e460064eb0a5aca8f13071e9d6557be1b7361f1e0075",
     "TEMPLATE.md": "c9818625f5372ba7c53a423be43543f9f485435dae5a71ffbc4b61e5c81617e7",
-    "contract/CHANGELOG.md": "3e1452672b05b1e40b5afe6d711f5aa49d9d2d504a13b193d8c8df894490d8e7",
-    "contract/preamble.py": "8af1c755b5985451505a35dfbf8ed0286f4074922b84494fe7699fe000c8238a",
-    "contract/store.py": "c64a862195fee8cf7b75d79f2285392cba4c933efc2bb237efd5e5d6cfa9bb14",
+    "contract/CHANGELOG.md": "bd74aba4a3fd6f5fb3a776774acfe01aba40cd1a0be832893a5b35f4c0b6b663",
+    "contract/preamble.py": "337f75795e260cbc84d53c49429afd85fb92fb97ca755ddd8a5bd2139c7b8ed7",
+    "contract/store.py": "9ca69d1f6ca3ae7e82042d6492f62c709c1655d9cbd310e180f60d918e140980",
     "guides/authoring.md": "e467e5343a54e99c991592d06233fd98b7be13fa32a174d0f27d3a8a06478724",
     "guides/conforming.md": "1c3a44cd7662cb26eec400d05290f6b9f364758387e8d3f974ad8eb74abde93b",
     "guides/contract.md": "72408b3b5d035b15f9d98b5a5dc3d558870f391ed254b8c5f017656be75a13f4",
@@ -18,12 +18,12 @@
     "guides/repositories.md": "0ec2af6dfc92d20aa283fecab82b7888fb22b2480541cbb597e9a52f680ec2f4",
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "1c2cebf5be8ba99137ea59fdaf19f1cbb101f9df4b3c5682c1650237ab8690cd",
+    "manager/CHANGELOG.md": "371fa721cdd8fe4f575ffc7ffac40dc1c71e8276f0f70a4c6dd55c9b9eedd00e",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "6d7310a5b9c4fa9780c308c9ffe3c6056c8f11db3ee238fd5be90beab6510575"
+    "sha256": "de8402ace9fba53073fbbe2358559f78f0350401b6474a7624e574b27d2cef3a"
   },
   "schema": "capabilities.manager-release.v1"
 }

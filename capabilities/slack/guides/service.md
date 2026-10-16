@@ -88,10 +88,18 @@ actual ids from Slack:
 
 The connection must set `allow_write: true` before the daemon can start or run,
 because replies and reactions leave the system. The direct CLI's
-`capabilities/slack/policy.json` (for an agent whose records moved into the
-store, its `slack.policy` settings document) controls conversations that
-`slack read` and `slack post` may access. Service settings control inbound Socket Mode
+`capabilities/slack/policy.json` controls conversations that `slack read` and
+`slack post` may access. Service settings control inbound Socket Mode
 admission; these are different directions and neither widens the other.
+
+An agent whose records moved into the store keeps one allow-list instead: the
+`direct_messages`, `allowed_users`, `allowed_channels` and
+`default_channel_policy` of its slack settings decide both what the service
+admits and what `slack read` and `slack post` may access, and `slack settings
+set` edits them. Its move folds `policy.json` into them: an entry the service
+settings already held is kept as it was, with its role, an entry only
+`policy.json` held is added, and where the two disagree on a mode the move
+asks which one stands.
 
 ## Runtime behavior
 

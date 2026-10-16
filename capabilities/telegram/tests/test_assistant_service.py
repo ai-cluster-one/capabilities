@@ -608,6 +608,38 @@ CLAUDE_ORDINARY_FAILURE = "Credit balance is too low to run this request."
 
 
 class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_store_that_cannot_say_whether_records_moved_reads_no_override(self):
+        """Whether an agent's records moved is the store's to say: while it
+        cannot, the daemon refuses rather than read the file an override
+        names, and only an agent the store says has not moved reads it."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            override = Path(td) / "connections.json"
+            store_error = daemon.records.store().StoreError
+
+            class Unanswered:
+                def settings_kept(self):
+                    raise store_error("store_unreachable", "cannot reach the store")
+
+            class Files:
+                def settings_kept(self):
+                    return "files"
+
+            with mock.patch.dict(os.environ, {"TG_CONNECTIONS_FILE": str(override)}):
+                with mock.patch.object(daemon, "_records", Unanswered):
+                    with self.assertRaises(SystemExit) as stopped:
+                        daemon._connection_file_override()
+                    self.assertIn("cannot tell whether this agent's records are in the store",
+                                  str(stopped.exception.code))
+                    with mock.patch.dict(os.environ, {"TELEGRAM_SERVICE_SETTINGS": "x"}):
+                        daemon._SETTINGS_OVERRIDE_SAID = False
+                        with mock.patch.object(daemon.records, "service_settings",
+                                               lambda adapter: {}):
+                            with self.assertRaises(daemon.SettingsError):
+                                daemon._read_record_settings()
+                with mock.patch.object(daemon, "_records", Files):
+                    self.assertEqual(daemon._connection_file_override(), override)
+
     async def test_register_replace_failure_keeps_previous_complete_json(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())

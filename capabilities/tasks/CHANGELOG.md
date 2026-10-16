@@ -1,12 +1,16 @@
 # tasks — change log
 
-## 2026-10-16 — A moved agent's conveyor and service settings are rows
+## 2026-10-16 — The escalation is a table of the tasks settings
 
-For an agent whose records moved into the store, the escalation chain is its `tasks.conveyor` settings document, `service init` writes the template as rows once, `service status`, `service doctor` and `inventory` judge the document and name the store, and the service's fingerprint covers the document's content. Worker, profile and retired workers.toml files left in such an agent are neither read, imported nor removed, by `run` or by the service. Every other project behaves as before.
+The escalation chain and its ceiling are the `escalation` table of the tasks settings document - `escalation.escalate_to` and `escalation.stall_after`, declared keys edited with `tasks settings set` and checked by it as the claim reads them - in the project's `service/config.toml`, or in its rows for an agent whose records moved into the store. A project whose settings carry no `escalation` table and whose records have not moved still has its `conveyor.toml` read, so such a project behaves as before; `doctor`'s warning for a project with enabled workers and no chain names the settings verb. `service init` writes the template beside an escalation set before it, and `--force` keeps that table.
+
+## 2026-10-16 — A moved agent's service settings are rows
+
+For an agent whose records moved into the store, `service init` writes the template as rows once, `service status`, `service doctor` and `inventory` judge the document and name the store, and the service's fingerprint covers the document's content. Worker, profile and retired workers.toml files left in such an agent are neither read, imported nor removed, by `run` or by the service. Every other project behaves as before.
 
 ## 2026-10-16 — `migrate files` moves workers and profiles for `capabilities migrate`
 
-Its mover saves the project's worker and profile files into the store at the project's scope, as `workers import` and `profiles import` do, without removing them: the manager archives and removes them once the whole move is verified, and moves `conveyor.toml` as the named settings document `tasks.conveyor`. `workers import` and `profiles import` are unchanged.
+Its mover saves the project's worker and profile files into the store at the project's scope, as `workers import` and `profiles import` do, without removing them: the manager archives and removes them once the whole move is verified, and moves `conveyor.toml` into the `escalation` table of the tasks settings. `workers import` and `profiles import` are unchanged.
 
 ## 2026-10-13 — `tasks` declares what a person is asked for, and writes it through the contract
 

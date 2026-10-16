@@ -1,12 +1,12 @@
 # contract — change log
 
-## 2026-10-16 — Helpers for a moved agent: whether its records are rows, its named settings documents, and retired overrides
+## 2026-10-16 — Helpers for a moved agent: whether its records are rows, and retired overrides
 
-The preamble gains `_records_in_store()` (whether this project is an agent whose records and settings moved into the store), `_settings_named(name)` and `_settings_named_write(name, change, check)` (a moved agent's named settings document `<capability>.<name>`, read and written as rows), and `_env_override(*keys)`, which returns an override naming a record or settings file and, for a moved agent, ignores it with a one-line notice on stderr. Every capability carries the change through `sync-contract`.
+The preamble gains `_records_in_store()` (whether this project is an agent whose records and settings moved into the store) and `_env_override(*keys)`, which returns an override naming a record or settings file and, for a moved agent, ignores it with a one-line notice on stderr. Every capability carries the change through `sync-contract`.
 
-## 2026-10-16 — `migrate files` moves a capability's own files of a project into the store, and settings take named documents
+## 2026-10-16 — `migrate files` moves a capability's own files of a project into the store
 
-Every capability answers `<name> migrate files plan|write|verify [--answers FILE]` with JSON, for the manager's `capabilities migrate`: it reads no policy row (the machine ceiling answers it, and `write` the read-only switch), opens the project's records as the migration (`migrate@<node>`, through the new `_RECORDS_ACTOR`), and calls the capability's optional `_migrate_files_mover(action, answers, all_answers)`, defined outside the fences, which returns its `items`, `questions`, `files`, `verified` and whatever else it names; without one it moves nothing. The manifest carries `migrate_files`, true where the capability defines a mover. The store tier adds `SETTINGS_DOCUMENT_RE` and `settings_document(capability, name)`: a capability's named settings document is kept under `<capability>.<name>` in the settings tables, and `AgentRecords.setting_document()` and `settings_write()` take one. Every capability carries the change through `sync-contract`.
+Every capability answers `<name> migrate files plan|write|verify [--answers FILE]` with JSON, for the manager's `capabilities migrate`: it reads no policy row (the machine ceiling answers it, and `write` the read-only switch), opens the project's records as the migration (`migrate@<node>`, through the new `_RECORDS_ACTOR`), and calls the capability's optional `_migrate_files_mover(action, answers, all_answers)`, defined outside the fences, which returns its `items`, `questions`, `files`, `verified` and whatever else it names; without one it moves nothing. The manifest carries `migrate_files`, true where the capability defines a mover. Every capability carries the change through `sync-contract`.
 
 ## 2026-10-16 — An agent whose records moved into the store reads and writes everything there, settings included
 

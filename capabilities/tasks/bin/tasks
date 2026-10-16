@@ -639,22 +639,27 @@ HOOKS
   moment. The worker's `after` hook may hold the lane longer, never shorter.
 
 ESCALATION
-  A project names, in `capabilities/tasks/conveyor.toml` beside its workers
-  (for an agent whose records moved into the store, its `tasks.conveyor`
-  settings document instead), whom a task that cannot move goes over to. The
-  claim reads it, so it holds with or without the service:
+  A project names, in the `escalation` table of its tasks settings (the
+  project's service/config.toml, or its rows for an agent whose records moved
+  into the store), whom a task that cannot move goes over to. The claim reads
+  it, so it holds with or without the service:
 
-    escalate_to = ["supervisor", "owner"]   # in order; the last is a person
-    stall_after = "6h"                      # 45m, 6h, 2d or seconds; 6h unsaid
+    tasks settings set escalation.escalate_to supervisor,owner   # in order; the last is a person
+    tasks settings set escalation.stall_after 6h                 # 45m, 6h, 2d or seconds; 6h unsaid
+
+  A project whose settings carry no `escalation` table and whose records have
+  not moved still has `capabilities/tasks/conveyor.toml` beside its workers
+  read, with the same two keys at its top level.
 
   A name that is no worker of the project is a person. Every name but the
   last must be a worker that is switched on and takes waiting tasks assigned
-  to it; the last must be a person. Any other key is refused, and a file that
-  cannot be read refuses `run` with exit 6 `conveyor_invalid`. `doctor` refuses
+  to it; the last must be a person. Any other key is refused, `settings set`
+  refuses a table that would not be read, and settings that cannot be read
+  refuse `run` with exit 6 `conveyor_invalid`. `doctor` refuses
   a chain naming a name before its end that is no worker here, ending at a
   worker, or naming a worker that is off or takes no waiting task assigned to
   it, and shows the settings as `escalation`; a project with enabled workers
-  and no chain is warned. A project without the file escalates nothing, and
+  and no chain is warned. A project that sets none escalates nothing, and
   every rule above runs as it always did.
 
   Where a task stands is derived from what the store already records: its
@@ -1791,6 +1796,21 @@ SETTINGS = {'homes': [{'scope': 'project',
            'minimum': 0,
            'scope': 'project',
            'apply': 'reload'},
+          {'key': 'escalation.escalate_to',
+           'label': 'Escalation chain',
+           'help': 'Whom a task that cannot move goes over to, in order: workers, the '
+                   'last a person.',
+           'type': 'list',
+           'scope': 'project',
+           'apply': 'next_call'},
+          {'key': 'escalation.stall_after',
+           'label': 'Stall ceiling',
+           'help': 'How long a task may be held back before it is escalated: 45m, 6h, '
+                   '2d or seconds.',
+           'type': 'string',
+           'default': '6h',
+           'scope': 'project',
+           'apply': 'next_call'},
           {'key': 'max_parallel',
            'label': 'Machine parallel turns',
            'help': 'Turns running at once across every joined project; no cap when '
@@ -3942,33 +3962,6 @@ def _records_in_store() -> bool:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
-def _settings_named(name: str) -> tuple:
-    """A named settings document `<capability>.<name>` of an agent whose
-    records moved into the store: where it is kept, and the document (None
-    where the agent has none)."""
-    try:
-        records = _records()
-        key = settings_document(NAME, name)
-        return (f"{records.collection_source(NAME, 'setting')} {key}",
-                records.setting_document(key, "project"))
-    except StoreError as e:
-        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
-
-
-def _settings_named_write(name: str, change, check=None) -> dict:
-    """Change a named settings document `<capability>.<name>` of an agent
-    whose records moved into the store, in the store's one transaction:
-    `change` takes the document and returns the new one, `check` returns what
-    is wrong with the result before anything is written."""
-    try:
-        return _records().settings_write(settings_document(NAME, name), "project",
-                                         change, check=check)
-    except StoreError as e:
-        if e.slug == "settings_invalid":
-            _die(6, e.slug, e.message)
-        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
-
-
 def _env_override(*keys: str, value=None):
     """The first of `keys` the environment sets (or `value`, where the caller
     read it elsewhere), naming a file to read records or settings from; for an
@@ -4395,11 +4388,6 @@ HASH_LENGTH = 12
 # separators and anything that would make a key ambiguous to address.
 KEY_RE = re.compile(r"[a-z0-9][a-z0-9._@+-]{0,127}", re.IGNORECASE)
 CAPABILITY_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
-# The document a settings row belongs to: a capability's own settings, or a
-# named document of it, `<capability>.<name>`, for settings it keeps outside its
-# declared homes (tasks' `conveyor`, slack's `policy`). A capability name never
-# holds a dot, so a named document can never be taken for a capability.
-SETTINGS_DOCUMENT_RE = re.compile(r"[a-z][a-z0-9-]{0,63}(?:\.[a-z][a-z0-9-]{0,63})?")
 
 
 class StoreError(Exception):
@@ -4842,16 +4830,6 @@ def _store_check(name: str, value: str, pattern: re.Pattern) -> str:
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise StoreError("bad_name", f"{name} {value!r} must match {pattern.pattern}")
     return value
-
-
-def settings_document(capability: str, name: str | None = None) -> str:
-    """The key a settings document is kept under: the capability's own, or
-    its named document `<capability>.<name>`."""
-    _store_check("capability", capability, CAPABILITY_RE)
-    if name is None:
-        return capability
-    return _store_check("settings document", f"{capability}.{name}",
-                        SETTINGS_DOCUMENT_RE)
 
 
 def _semantics(collection: str) -> str:
@@ -6481,7 +6459,7 @@ class AgentRecords(StoreRecords):
         """One scope's settings document as this node reads it: the rows for
         every node with this node's rows over them. None where neither
         document exists, which a reader takes as the capability's seed."""
-        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         self._scope_root(scope)
         docs, rows = self._settings_rows(capability)
         shared, mine = (scope, None), (scope, self.node)
@@ -6601,7 +6579,7 @@ class AgentRecords(StoreRecords):
         then write the paths that differ, removals first, one trail row each,
         and move the document's generation to the last of them. A refused
         write changes nothing."""
-        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         _refuse_record_write(capability, "setting")
         agent = self._agent(scope)
         who = self.actor_name(actor)
@@ -10495,10 +10473,16 @@ _TAKE_STATUSES = ("todo", "waiting")
 
 _WORKER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
-# The project's conveyor settings: whom a task that cannot move is escalated
-# to, and how long a task may be refused before it is. One file beside the
-# workers, read by the claim, so the escalation holds with or without the
-# service. A project without it escalates nothing and runs exactly as before.
+# The project's escalation settings: whom a task that cannot move is escalated
+# to, and how long a task may be refused before it is. They are the
+# `escalation` table of the capability's own settings document (the project's
+# service/config.toml, or its rows for an agent whose records moved into the
+# store), edited with `tasks settings set escalation.<key>`, and read by the
+# claim, so the escalation holds with or without the service. A project whose
+# settings carry no `escalation` table and that has not moved still has its
+# conveyor.toml beside its workers read, as before. A project with neither
+# escalates nothing and runs exactly as before.
+_ESCALATION_KEY = "escalation"
 _CONVEYOR_FILE = "conveyor.toml"
 _CONVEYOR_KEYS = ("escalate_to", "stall_after")
 _STALL_DEFAULT = 6 * 3600
@@ -10512,10 +10496,9 @@ def _conveyor_path() -> Path:
 
 
 def _conveyor_where() -> str:
-    """Where the conveyor settings are kept, as a person reads it: the file, or
-    the `tasks.conveyor` settings document of an agent whose records moved
-    into the store."""
-    return _settings_named("conveyor")[0] if _records_in_store() else str(_conveyor_path())
+    """Where the escalation settings are set, as a person does it."""
+    return (f"the `{_ESCALATION_KEY}` table of {_service_settings_where()} "
+            f"(`{NAME} settings set {_ESCALATION_KEY}.escalate_to <names>`)")
 
 
 def _seconds_of(value) -> int | None:
@@ -10531,22 +10514,34 @@ def _seconds_of(value) -> int | None:
     return int(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
 
 
-def _read_conveyor() -> tuple[dict | None, list[str]]:
-    """The conveyor settings as the file states them, and every way it is not
-    readable. None and no problems when the project has no such file."""
+def _escalation_source() -> tuple[str | None, dict | None, list[str]]:
+    """Where the escalation settings are read from, as a person reads it, the
+    table itself, and what keeps it from being read: the settings document's
+    `escalation` table where it has one, else - for a project that has not
+    moved - its conveyor.toml. (None, None, []) when the project sets neither."""
     import tomllib
+    where, document, _error = _service_settings_document()
+    if isinstance(document, dict) and _ESCALATION_KEY in document:
+        raw = document[_ESCALATION_KEY]
+        label = f"{where} [{_ESCALATION_KEY}]"
+        if not isinstance(raw, dict):
+            return label, None, [f"{label}: `{_ESCALATION_KEY}` is a table of "
+                                 "`escalate_to` and `stall_after`"]
+        return label, raw, []
     if _records_in_store():
-        path, raw = _settings_named("conveyor")
-        if raw is None:
-            return None, []
-    else:
-        path = _conveyor_path()
-        if not path.is_file():
-            return None, []
-        try:
-            raw = tomllib.loads(path.read_text())
-        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-            return None, [f"{path} could not be read: {exc}"]
+        return None, None, []
+    path = _conveyor_path()
+    if not path.is_file():
+        return None, None, []
+    try:
+        return str(path), tomllib.loads(path.read_text()), []
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        return str(path), None, [f"{path} could not be read: {exc}"]
+
+
+def _escalation_problems(path, raw: dict) -> tuple[dict | None, list[str]]:
+    """The escalation settings `raw` states, checked, naming `path` as where
+    they are kept: (settings, problems)."""
     problems = [f"{path}: it names {key!r}, which nothing reads"
                 for key in sorted(set(raw) - set(_CONVEYOR_KEYS))]
     chain = raw.get("escalate_to")
@@ -10571,6 +10566,15 @@ def _read_conveyor() -> tuple[dict | None, list[str]]:
     if problems:
         return None, problems
     return {"path": str(path), "escalate_to": chain, "stall_after": stall}, []
+
+
+def _read_conveyor() -> tuple[dict | None, list[str]]:
+    """The escalation settings as the project states them, and every way they
+    are not readable. None and no problems when the project sets none."""
+    path, raw, problems = _escalation_source()
+    if problems or raw is None:
+        return None, problems
+    return _escalation_problems(path, raw)
 
 
 def _conveyor() -> dict | None:
@@ -15354,7 +15358,9 @@ _SERVICE_MINIMUMS = {"poll_seconds": 1, "max_parallel": 1, "shutdown_grace_secon
 # Read only as the cool-down every worker without its own takes, and named by
 # `doctor` as the key it was: the service no longer waits on it.
 _SERVICE_DEPRECATED = ("retry_delay_seconds",)
-_SERVICE_KEYS = ("version", *_SERVICE_DEFAULTS, *_SERVICE_DEPRECATED, "lanes")
+# `escalation` is the claim's, read by `_read_conveyor`; the service reads past it.
+_SERVICE_KEYS = ("version", *_SERVICE_DEFAULTS, *_SERVICE_DEPRECATED, "lanes",
+                 _ESCALATION_KEY)
 _LANE_DEFAULTS = {"max_parallel": 1}
 
 # The store notifies this channel when a task becomes claimable. It is one
@@ -15394,9 +15400,16 @@ def _settings_check(scope: str, document: dict) -> list:
     try:
         if scope == "project":
             home = _service_settings_home()
-            _check_service_settings(document, (
-                _records().collection_source(NAME, "setting") if _settings_in_rows(home)
-                else _service_settings_path()))
+            where = (_records().collection_source(NAME, "setting") if _settings_in_rows(home)
+                     else _service_settings_path())
+            _check_service_settings(document, where)
+            if _ESCALATION_KEY in document:
+                raw = document[_ESCALATION_KEY]
+                label = f"{where} [{_ESCALATION_KEY}]"
+                if not isinstance(raw, dict):
+                    return [f"{label}: `{_ESCALATION_KEY}` is a table of `escalate_to` "
+                            "and `stall_after`"]
+                return _escalation_problems(label, raw)[1]
         elif scope == "machine":
             _check_machine_settings(document, _machine_settings_path())
     except Refusal as refused:
@@ -15429,8 +15442,14 @@ def _service_settings_where() -> str:
 def _service_settings_initialized() -> bool:
     """Whether this project has service settings at all: a document in the
     store for an agent whose records moved there, else the file."""
+    document = _service_settings_document()[1]
+    if isinstance(document, dict) and set(document) <= {"version", _ESCALATION_KEY} \
+            and _ESCALATION_KEY in document:
+        # Only the escalation, set before the service was: `service init`
+        # writes the template beside it.
+        return False
     if _service_settings_in_rows():
-        return _service_settings_document()[1] is not None
+        return document is not None
     return _service_settings_path().is_file()
 
 
@@ -17373,6 +17392,10 @@ def cmd_service_init(args: list[str]) -> None:
              "reinstall the capability from a bundled source")
     target = _service_settings_path()
     written, skipped = [], []
+    # The escalation the settings already carry is the claim's, not the
+    # service's: writing the template keeps it.
+    held = _service_settings_document()[1]
+    escalation = held.get(_ESCALATION_KEY) if isinstance(held, dict) else None
     if _service_settings_in_rows():
         # The settings are rows: the template is written there, once.
         import tomllib
@@ -17381,14 +17404,19 @@ def cmd_service_init(args: list[str]) -> None:
             skipped.append(where)
         else:
             seed = tomllib.loads(template.read_text())
+            if escalation is not None:
+                seed[_ESCALATION_KEY] = escalation
             _settings_rows_write(_service_settings_home(), "project", lambda _current: seed)
             written.append(where)
         target = where
-    elif target.exists() and not opts.get("force"):
+    elif _service_settings_initialized() and not opts.get("force"):
         skipped.append(str(target))
     else:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(template.read_text())
+        text = template.read_text()
+        if escalation is not None:
+            text = text.rstrip("\n") + "\n\n" + _toml_dumps({_ESCALATION_KEY: escalation})
+        target.write_text(text)
         written.append(str(target))
     _emit({"initialized": NAME, "project": str(_project_here()), "config": str(target),
            "written": written, "skipped": skipped,

@@ -366,7 +366,11 @@ DEVELOPMENT VERBS
         its store setting file), the session reaches that database bound to a
         schema of its own, dev_<session>, through the AGENTKIT_DB_* keys with
         AGENTKIT_DB_SCHEMA (which then cannot be inherited), and AGENT_NODE_NAME
-        goes with it; without one the lane has no database, as before.
+        goes with it; without one the lane has no database, as before. The
+        session creates that schema, marked as its own, before anything in
+        the lane reaches it, and drops it when it ends - by finish, stop or
+        gc - unless the schema was already there or no longer carries its
+        mark; `database_schema` in the answer says which.
   dev run <session> <capability> [--project-only] -- [<arg> ...]
         Run exactly one session-installed capability against the attached live
         project through a mode-0700, per-invocation selected-input projection.
@@ -628,10 +632,11 @@ PROJECT VERBS (run inside a consuming project)
         Move this agent's file-held configuration into the store, on its
         master node, as one deliberate run: its connections, grants and
         default pointer, identifiers and gate (as rows naming the agent), the
-        settings of every capability's project home and the named documents
-        capabilities/slack/policy.json (slack.policy) and
-        capabilities/tasks/conveyor.toml (tasks.conveyor) as settings rows,
-        and through each capability's `<name> migrate files` what it keeps
+        settings of every capability's project home as settings rows - with
+        capabilities/tasks/conveyor.toml folded in as the tasks settings'
+        `escalation` table and capabilities/slack/policy.json merged into
+        the slack settings' allow-list (the service's entries kept, a mode
+        the two disagree on asked) - and through each capability's `<name> migrate files` what it keeps
         of its own: automations [[automations]] and engine.timezone as
         definitions and [agents.workers] as harness profiles
         automations-<name>, askproject's profiles folder, whatsapp's and tasks'
@@ -646,7 +651,8 @@ PROJECT VERBS (run inside a consuming project)
         deployment target, and every question code cannot answer - a node
         for a legacy automation, a connection whose stored spec differs, a
         node to register, an id project.json and .contextkit/config.toml
-        disagree on. Each question names the path in the --answers JSON its
+        disagree on, an allow-list mode policy.json and the slack service
+        settings disagree on. Each question names the path in the --answers JSON its
         answer goes to. --apply refuses (exit 6, nothing written) without a
         database (its own code), without AGENT_NODE_NAME (node_unnamed), on a
         node other than the answers' or the open migration's (node_mismatch)
@@ -4382,6 +4388,9 @@ def cmd_dev_start(name: str, source_ref: str | None, project_ref: str | None,
             "project": attached,
             "paths": {key: str(value) for key, value in paths.items()},
             "installed_payloads": {},
+            # What the session writes on the schema it creates, so it drops
+            # only a schema it made.
+            "database_token": secrets.token_hex(16),
         }
         _write_json(state_dir / "session.json", session)
     except BaseException:
@@ -4441,6 +4450,7 @@ def _dev_database(session: dict):
         setting = db.resolve_setting(None)
     except db.DbError:
         return None
+    _dev_claim_schema(session, setting)
     keys = {"AGENTKIT_DB_SCHEMA": _dev_schema(session)}
     if setting.url is not None:
         keys["AGENTKIT_DB_URL"] = setting.url
@@ -4453,6 +4463,93 @@ def _dev_database(session: dict):
         if setting.password:
             keys["AGENTKIT_DB_PASSWORD"] = setting.password
     return setting, keys
+
+
+def _dev_schema_marker(session: dict) -> str | None:
+    """The comment a session writes on the schema it creates."""
+    token = session.get("database_token")
+    return f"capabilities dev session {session['id']} {token}" if token else None
+
+
+def _dev_claim_schema(session: dict, setting) -> None:
+    """Before anything in the lane reaches the database, create the session's
+    schema and mark it as the session's, or record that a schema of that name
+    was already there and so is not the session's to drop. Once recorded it is
+    not asked again; a database that cannot be reached is asked next time."""
+    marker = _dev_schema_marker(session)
+    if marker is None or isinstance(session.get("database_schema"), dict):
+        return
+    import dataclasses
+    import psycopg
+    from psycopg import sql
+    db = _db_module()
+    schema = _dev_schema(session)
+    try:
+        conn = db.connect(application_name="capabilities-dev",
+                          setting=dataclasses.replace(setting, schema=schema))
+    except db.DbError:
+        return
+    try:
+        with conn.transaction():
+            held = conn.execute("SELECT 1 FROM pg_namespace WHERE nspname = %s",
+                                (schema,)).fetchone()
+            created = held is None and schema != setting.schema
+            if created:
+                conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+                conn.execute(sql.SQL("COMMENT ON SCHEMA {} IS {}").format(
+                    sql.Identifier(schema), sql.Literal(marker)))
+    except psycopg.Error:
+        return
+    finally:
+        conn.close()
+    session["database_schema"] = {"name": schema, "created": created}
+    _write_json(_dev_state_dir(session["id"]) / "session.json", session)
+
+
+def _dev_drop_schema(session: dict) -> dict | None:
+    """Drop the session's schema as the session ends, where the session
+    created it: its record says so and the schema still carries the session's
+    mark. A schema the session found already there, the machine's own store
+    schema, and one whose mark is not the session's are never dropped. None
+    where the session holds no schema of its own."""
+    held = session.get("database_schema")
+    marker = _dev_schema_marker(session)
+    if not isinstance(held, dict) or not held.get("created") or marker is None:
+        return None
+    schema = held.get("name")
+    out = {"schema": schema, "dropped": False}
+    if schema != _dev_schema(session):
+        return {**out, "reason": "the recorded schema is not this session's name"}
+    import dataclasses
+    import psycopg
+    from psycopg import sql
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(None)
+    except db.DbError as exc:
+        return {**out, "reason": f"no database resolves: {exc.message}"}
+    if schema == setting.schema:
+        return {**out, "reason": "it is the machine's own store schema"}
+    try:
+        conn = db.connect(application_name="capabilities-dev",
+                          setting=dataclasses.replace(setting, schema=schema))
+    except db.DbError as exc:
+        return {**out, "reason": f"the database cannot be reached: {exc.message}"}
+    try:
+        with conn.transaction():
+            row = conn.execute(
+                "SELECT obj_description(oid, 'pg_namespace') FROM pg_namespace "
+                "WHERE nspname = %s", (schema,)).fetchone()
+            if row is None:
+                return {**out, "reason": "it is no longer there"}
+            if row[0] != marker:
+                return {**out, "reason": "it does not carry this session's mark"}
+            conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+    except psycopg.Error as exc:
+        return {**out, "reason": f"the drop failed: {exc}"}
+    finally:
+        conn.close()
+    return {**out, "dropped": True}
 
 
 def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> dict:
@@ -4504,9 +4601,8 @@ def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> d
                                                     sql.Identifier(real)))
             for table, column in DEV_PROJECTED_TABLES:
                 by_agent = table != "capabilities_connections"
-                condition = sql.SQL("({} = %s OR {} LIKE %s)").format(
-                    sql.Identifier(column), sql.Identifier(column))
-                params: tuple = (capability, capability + ".%")
+                condition = sql.SQL("{} = %s").format(sql.Identifier(column))
+                params: tuple = (capability,)
                 if by_agent:
                     condition = condition + sql.SQL(
                         " AND (agent_id IS NULL OR agent_id = %s)")
@@ -5966,11 +6062,15 @@ def _dev_stop(session_id: str, emit_result: bool,
         mutation.close()
         return {"session": session_id, "removed": False, "problems": problems}
     _dev_remove_worktree(session["source"], bool(discarded))
+    # The schema the session made in the machine's database goes with it.
+    schema = _dev_drop_schema(session)
     if data_dir.exists():
         shutil.rmtree(data_dir)
     if state_dir.exists():
         shutil.rmtree(state_dir)
     result = {"session": session_id, "removed": True}
+    if schema is not None:
+        result["database_schema"] = schema
     if discarded:
         result["discarded"] = discarded
     mutation.close()
@@ -7588,12 +7688,22 @@ def _context_contribution(root: Path, name: str, manifest: dict | None) -> list[
 _CONTEXT_WITHOUT_STORE = False
 
 
+def _store_absent(exc) -> bool:
+    """Whether a store error says only that no store answers here - none is
+    configured, it cannot be reached, or it is busy - rather than that the
+    project's own records are wrong."""
+    return exc.slug == "store_not_configured" or \
+        exc.slug in _store_module().STORE_ENVIRONMENT_SLUGS
+
+
 def _compose_context(root: Path) -> str:
     """Deterministic injection body: gate, snapshots, and resolved records."""
     if _CONTEXT_WITHOUT_STORE:
         try:
             _policy_scopes(root)
         except _store_module().StoreError as exc:
+            if not _store_absent(exc):
+                _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
             return "\n".join([
                 "# Capabilities", "", CONTEXT_BEGIN, "", CAPABILITIES_CONTEXT_INTRO, "",
                 "This project keeps its gate in the store, which was not reachable when "
@@ -8309,10 +8419,23 @@ def cmd_connections_import() -> None:
 # drives a run that was interrupted to its end.
 MIGRATE_ACTOR = "migrate"
 MIGRATE_JOURNAL_SCHEMA = "capabilities.migrate-journal.v1"
-# Settings a capability keeps outside its declared homes, moved as the named
-# documents `<capability>.<name>` of the settings rows.
-MIGRATE_NAMED_SETTINGS = {("slack", "policy"): ("policy.json", "json"),
-                          ("tasks", "conveyor"): ("conveyor.toml", "toml")}
+# Settings a capability kept beside its declared project home, folded into
+# that home's document as it moves: tasks' conveyor.toml becomes the
+# `escalation` table of the tasks settings, slack's policy.json the allow-list
+# of the slack settings. Each names the file, its format, and the home the
+# capability declares, for a capability whose manifest is not at hand.
+MIGRATE_FOLDED_SETTINGS = {
+    "slack": {"file": "policy.json", "format": "json",
+              "home": {"scope": "project", "path": "service/settings.json", "format": "json"}},
+    "tasks": {"file": "conveyor.toml", "format": "toml",
+              "home": {"scope": "project", "path": "service/config.toml", "format": "toml",
+                       "seed": {"version": 1}}},
+}
+# The allow-list keys of slack's policy.json, and the mode each falls back to
+# where a document leaves it out.
+MIGRATE_SLACK_MODES = {"default_channel_policy": "allowed_only",
+                       "direct_messages.mode": "allowed_users"}
+MIGRATE_SLACK_LISTS = ("allowed_users", "allowed_channels")
 # The marker of a payload stamped with the contract that carries `migrate files`.
 MIGRATE_CONTRACT_MARKER = "def _cmd_migrate_files("
 MIGRATE_MOVER_TIMEOUT = 600
@@ -8762,14 +8885,15 @@ def _migrate_git_state(root: Path, paths: list[Path]) -> dict[str, str]:
 def _migrate_record_files(envelope: Path, manifests: dict) -> list[Path]:
     """Every record and settings file the envelope holds that the store keeps
     once the agent has moved: the gate, each capability's connections and
-    identifiers, its project settings home and its named settings documents."""
+    identifiers, its project settings home and the settings files folded into it."""
     files = [envelope / "settings.json"]
     files += sorted(envelope.glob("*/connections.json"))
     files += sorted(envelope.glob("*/identifiers.json"))
     for name, home in _migrate_settings_homes(manifests, "project"):
         files.append(envelope / name / home["path"])
-    for (name, _doc), (filename, _fmt) in MIGRATE_NAMED_SETTINGS.items():
-        files.append(envelope / name / filename)
+    for name, fold in MIGRATE_FOLDED_SETTINGS.items():
+        files.append(envelope / name / fold["home"]["path"])
+        files.append(envelope / name / fold["file"])
     seen, out = set(), []
     for path in files:
         if path.is_file() and str(path) not in seen:
@@ -8857,7 +8981,7 @@ def _migrate_context(root: Path, opts: dict, answers: dict) -> dict:
     declared = str(identity.get("id") or "").strip() or None
     bound = _contextkit_config_id(root)
     ctx: dict = {"root": root, "envelope": envelope, "identity_file": identity_file,
-                 "given_roots": opts.get("roots") or [],
+                 "given_roots": opts.get("roots") or [], "answers": answers,
                  "identity": identity, "blockers": [], "questions": [], "warnings": [],
                  "slug": identity.get("slug") or _default_project_slug(root)}
     agent_id = declared or bound
@@ -9100,32 +9224,142 @@ def _migrate_records_plan(ctx: dict, answers: dict) -> dict:
     return plan
 
 
-def _migrate_settings_plan(ctx: dict, excludes: dict) -> list[dict]:
+def _migrate_fold(name: str, document: dict | None, folded: dict | None,
+                  fold: dict, answers: dict, where: str) -> tuple:
+    """A capability's settings document with the file folded into it that it
+    kept beside it: (document, questions, warnings). The document is None
+    where neither holds anything."""
+    questions: list = []
+    warnings: list = []
+    if folded is None:
+        if name == "slack" and document is not None and any(
+                key in document for key in MIGRATE_SLACK_LISTS):
+            warnings.append(f"slack: {where} carries no policy.json, so `slack read` and "
+                            "`post` will reach the conversations its service settings "
+                            "admit, its one allow-list once it has moved")
+        return document, questions, warnings
+    if name == "tasks":
+        out = json.loads(json.dumps(document if document is not None
+                                    else fold["home"].get("seed") or {}))
+        if "escalation" in out:
+            warnings.append(f"tasks: {fold['file']} is not moved: the settings already "
+                            "carry an `escalation` table, which is what the claim reads")
+        else:
+            out["escalation"] = folded
+        return out, questions, warnings
+    # slack: one allow-list. An entry the service settings hold keeps its
+    # meaning - their own entry, with its role - and an entry only the
+    # policy held is added; a mode the two read differently is asked.
+    if document is None:
+        return json.loads(json.dumps(folded)), questions, warnings
+    out = json.loads(json.dumps(document))
+    for key in MIGRATE_SLACK_LISTS:
+        if key not in folded:
+            continue
+        theirs, ours = folded[key], out.get(key)
+        if key not in out:
+            out[key] = theirs
+        elif isinstance(theirs, dict) and isinstance(ours, dict):
+            out[key] = {**theirs, **ours}
+        elif theirs != ours:
+            choice = _migrate_dig(answers, f"settings.{name}.{key}")
+            if choice == "policy":
+                out[key] = theirs
+            elif choice != "service":
+                questions.append(_migrate_fold_question(name, key, theirs, ours, where))
+    for key, fallback in MIGRATE_SLACK_MODES.items():
+        theirs = _migrate_fold_value(folded, key, fallback)
+        ours = _migrate_fold_value(out, key, fallback)
+        if theirs == ours:
+            continue
+        qid = f"settings.{name}.{key}"
+        choice = _migrate_dig(answers, qid)
+        if choice == "policy":
+            _migrate_fold_put(out, key, theirs)
+        elif choice != "service":
+            questions.append(_migrate_fold_question(name, key, theirs, ours, where))
+    return out, questions, warnings
+
+
+def _migrate_fold_value(document: dict, dotted: str, fallback):
+    here = document
+    for part in dotted.split("."):
+        if not isinstance(here, dict) or part not in here:
+            return fallback
+        here = here[part]
+    return here
+
+
+def _migrate_fold_put(document: dict, dotted: str, value) -> None:
+    parts = dotted.split(".")
+    here = document
+    for part in parts[:-1]:
+        if not isinstance(here.get(part), dict):
+            here[part] = {}
+        here = here[part]
+    here[parts[-1]] = value
+
+
+def _migrate_fold_question(name: str, key: str, theirs, ours, where: str) -> dict:
+    qid = f"settings.{name}.{key}"
+    return {"id": qid, "answer": qid, "choices": ["policy", "service"],
+            "question": f"{name}'s policy.json says {key} is {json.dumps(theirs)} and its "
+                        f"service settings ({where}) say {json.dumps(ours)}; once it has "
+                        "moved one allow-list decides both what `slack read` and `post` "
+                        "reach and what the service admits: keep the policy's, or the "
+                        "service's?"}
+
+
+def _migrate_settings_document(entry: dict, answers: dict) -> tuple:
+    """One settings entry's document as it moves: its home file less what a
+    mover excludes, with the file it kept beside it folded in. (document,
+    problem, questions, warnings); the document is None where there is none."""
+    document, problem = _migrate_read_document(Path(entry["file"]), entry["format"])
+    if problem:
+        return None, problem, [], []
+    if document is not None:
+        document = _migrate_without(document, entry["excluded"])
+    fold = MIGRATE_FOLDED_SETTINGS.get(entry["document"])
+    if fold is None:
+        return document, None, [], []
+    folded, problem = _migrate_read_document(Path(entry["fold"]), fold["format"])
+    if problem:
+        return None, problem, [], []
+    document, questions, warnings = _migrate_fold(entry["document"], document, folded, fold,
+                                                  answers, entry["file"])
+    return document, None, questions, warnings
+
+
+def _migrate_settings_plan(ctx: dict, excludes: dict, answers: dict | None = None) -> dict:
     """Each settings document this agent keeps in files - every capability's
-    project home and named document - as the rows it would become."""
+    project home, with the file it kept beside it folded in - as the rows it
+    would become, and the questions and warnings the folding raised."""
     root, envelope = ctx["root"], ctx["envelope"]
+    answers = answers or {}
     conn, _setting = _migrate_connect(root)
-    sources: list[tuple[str, Path, str, list]] = []
-    for name, home in _migrate_settings_homes(ctx["manifests"], "project"):
-        sources.append((name, envelope / name / home["path"], home.get("format") or "json",
-                        excludes.get(name) or []))
-    for (name, doc), (filename, fmt) in sorted(MIGRATE_NAMED_SETTINGS.items()):
-        sources.append((f"{name}.{doc}", envelope / name / filename, fmt, []))
-    out = []
+    homes = dict(_migrate_settings_homes(ctx["manifests"], "project"))
+    for name, fold in MIGRATE_FOLDED_SETTINGS.items():
+        homes.setdefault(name, fold["home"])
+    out = {"settings": [], "questions": [], "warnings": []}
     try:
-        for document_key, path, fmt, exclude in sources:
-            document, problem = _migrate_read_document(path, fmt)
+        for name, home in sorted(homes.items()):
+            entry = {"document": name, "file": str(envelope / name / home["path"]),
+                     "format": home.get("format") or "json",
+                     "excluded": excludes.get(name) or []}
+            if name in MIGRATE_FOLDED_SETTINGS:
+                entry["fold"] = str(envelope / name / MIGRATE_FOLDED_SETTINGS[name]["file"])
+            wanted, problem, questions, warnings = _migrate_settings_document(entry, answers)
             if problem:
                 raise _MigrateRefusal("settings_unreadable", problem,
                                       "repair the file, then run it again")
-            if document is None:
+            out["questions"].extend(questions)
+            out["warnings"].extend(warnings)
+            if wanted is None:
                 continue
-            wanted = _migrate_without(document, exclude)
-            held = _migrate_setting_rows(conn, ctx["agent_id"], document_key)
-            out.append({"document": document_key, "file": str(path), "format": fmt,
-                        "excluded": exclude, "document_value": wanted,
-                        "outcome": "held" if held == wanted else "write",
-                        "host_paths": _migrate_host_paths(wanted)})
+            held = _migrate_setting_rows(conn, ctx["agent_id"], name)
+            out["settings"].append({**entry, "document_value": wanted,
+                                    "outcome": "held" if held == wanted else "write",
+                                    "host_paths": _migrate_host_paths(wanted)})
     finally:
         conn.close()
     return out
@@ -9215,7 +9449,10 @@ def _migrate_plan(ctx: dict, answers: dict) -> dict:
                          for row in policy]
     plan["records"] = _migrate_records_plan(ctx, answers)
     plan["questions"].extend(plan["records"].pop("questions"))
-    plan["settings"] = _migrate_settings_plan(ctx, excludes)
+    settings = _migrate_settings_plan(ctx, excludes, answers)
+    plan["settings"] = settings["settings"]
+    plan["questions"].extend(settings["questions"])
+    plan["warnings"].extend(settings["warnings"])
     for entry in plan["settings"]:
         for found in entry["host_paths"]:
             plan["warnings"].append(f"{entry['document']} settings carry a host path, which "
@@ -9615,13 +9852,13 @@ def _migrate_write_settings(ctx: dict, plan: dict) -> dict:
     written = {}
     try:
         for entry in plan["settings"]:
-            # The file is read again here: a mover may have rewritten it.
-            document, problem = _migrate_read_document(Path(entry["file"]), entry["format"])
+            # The files are read again here: a mover may have rewritten them.
+            wanted, problem, _questions, _warnings = _migrate_settings_document(
+                entry, ctx.get("answers") or {})
             if problem:
                 raise _MigrateRefusal("settings_unreadable", problem)
-            if document is None:
+            if wanted is None:
                 continue
-            wanted = _migrate_without(document, entry["excluded"])
             result = writer.settings_write(entry["document"], "project",
                                            lambda _current, wanted=wanted: wanted,
                                            actor=MIGRATE_ACTOR)
@@ -9695,8 +9932,9 @@ def _migrate_verify(ctx: dict, plan: dict) -> list[str]:
                                        f"the store {right.get(key)}")
         moved = set()
         for entry in plan["settings"]:
-            document, _problem = _migrate_read_document(Path(entry["file"]), entry["format"])
-            wanted = _migrate_without(document or {}, entry["excluded"])
+            wanted, _problem, _questions, _warnings = _migrate_settings_document(
+                entry, ctx.get("answers") or {})
+            wanted = wanted if wanted is not None else {}
             held = rows.setting_document(entry["document"], "project")
             moved.add(entry["document"])
             if held != wanted:
@@ -9954,7 +10192,15 @@ def cmd_migrate_agent(opts: dict) -> None:
                                   + "; ".join(q["id"] for q in late),
                                   "answer them and run `capabilities migrate --apply` again; "
                                   "the migration resumes", detail={"questions": late})
-        plan["settings"] = _migrate_settings_plan(ctx, excludes)
+        settings = _migrate_settings_plan(ctx, excludes, answers)
+        if settings["questions"]:
+            raise _MigrateRefusal("question_open", f"{len(settings['questions'])} question(s) "
+                                  "arose once the capabilities had moved their own files: "
+                                  + "; ".join(q["id"] for q in settings["questions"]),
+                                  "answer them and run `capabilities migrate --apply` again; "
+                                  "the migration resumes",
+                                  detail={"questions": settings["questions"]})
+        plan["settings"] = settings["settings"]
         now = [str(p) for p in _migrate_record_files(ctx["envelope"], ctx["manifests"])]
         journal["files"] = sorted(set(journal["files"]) | set(now))
         answer["records_written"] = _migrate_write_records(ctx, plan)
@@ -10780,14 +11026,20 @@ def cmd_init(claude: bool, codex: bool) -> None:
     # Init's offline part never needs the database: where the project keeps its
     # gate in a store this process cannot reach (an image built without one),
     # the gate is named as the store's table and read where the store is.
+    # Only a store that is absent is passed over: any other refusal of the
+    # project's records stops init, as it always has.
     store = _store_module()
     try:
         adapter = _open_project_records(root)
-    except store.StoreError:
+    except store.StoreError as exc:
+        if not _store_absent(exc):
+            _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
         adapter = None
     try:
         gate = _gate_source(adapter, root, "project") if adapter is not None else None
-    except store.StoreError:
+    except store.StoreError as exc:
+        if not _store_absent(exc):
+            _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
         gate = None
     finally:
         if adapter is not None:

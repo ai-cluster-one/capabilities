@@ -286,8 +286,21 @@ def test_askproject_resolves_its_profiles_from_the_store(world):
     entry = {e["name"]: e for e in listed["profiles"]}["peer-read"]
     assert entry["source"] == "store" and entry["harness"] == "claude"
     assert listed["lookup"][0]["source"] == "store"
-    assert shown.returncode == 0 and shown.stdout.startswith("# store: profile 'peer-read'")
+    assert shown.returncode == 0 and shown.stdout.startswith("# store: profile 'askproject-peer-read'")
     assert 'model = "opus"' in shown.stdout
+    # Only its own: the other capabilities' harness profiles at the agent's
+    # scope - automations' agents, whatsapp's dialogue profile - are neither
+    # listed nor resolved, as its folder never held them.
+    held = {name for (name,) in w.sql("SELECT name FROM harness_profiles WHERE scope_id = %s "
+                                      "AND active", (IDS["moved"],))}
+    assert "askproject-peer-read" in held and "automations-researcher" in held
+    assert "clinic-claude" in held
+    assert {e["name"] for e in listed["profiles"] if e["source"] == "store"} == {"peer-read"}
+    assert not {"automations-researcher", "clinic-claude", "askproject-peer-read"} & {
+        e["name"] for e in listed["profiles"]}
+    for foreign in ("automations-researcher", "clinic-claude"):
+        missing = run(w, "moved", "askproject", "profiles", "show", foreign)
+        assert missing.returncode == 3 and w.error(missing)["code"] == "not_found", foreign
     files = w.answer(w.cap(w.roots["files"], "askproject", "profiles"))
     assert {e["name"]: e for e in files["profiles"]}["peer-read"]["source"] == "folder"
 
@@ -305,16 +318,35 @@ def test_tasks_reads_its_conveyor_and_settings_as_rows(world):
     assert out["status"]["config"].startswith("store:")
     assert out["init"]["written"] == [] and out["init"]["skipped"][0].startswith("store:")
     assert out["doctor"].get("settings", {}).get("poll_seconds") == 30, out["doctor"]
-    # The conveyor is read from its document: the chain refuses a name that
-    # is no worker before its last, and the doctor says so naming the store.
-    w.sql("UPDATE capabilities_settings SET value = '[\"nobody\", \"Owner\"]' "
-          "WHERE agent_id = %s AND capability = 'tasks.conveyor' AND path = '{escalate_to}'",
-          (IDS["moved"],))
+    # The escalation is the `escalation` table of the tasks settings: the chain
+    # refuses a name that is no worker before its last, and the doctor says so
+    # naming the store.
+    assert out["settings"]["homes"][0]["document"]["escalation"] == {
+        "escalate_to": ["Owner"], "stall_after": "6h"}
+    w.sql("UPDATE capabilities_settings SET value = '[\"nobody\", \"Owner\"]' WHERE agent_id "
+          "= %s AND capability = 'tasks' AND path = '{escalation,escalate_to}'", (IDS["moved"],))
     doctor = run(w, "moved", "tasks", "doctor")
     _say("tasks-doctor-conveyor", {"stdout": doctor.stdout, "stderr": doctor.stderr})
-    assert "tasks.conveyor" in doctor.stdout + doctor.stderr
-    w.sql("UPDATE capabilities_settings SET value = '[\"Owner\"]' WHERE agent_id = %s AND "
-          "capability = 'tasks.conveyor' AND path = '{escalate_to}'", (IDS["moved"],))
+    assert "store:" in doctor.stdout + doctor.stderr and "[escalation]" in doctor.stdout + \
+        doctor.stderr and "'nobody', which is no worker here" in doctor.stdout + doctor.stderr
+    # Edited with the settings verb, checked as the claim reads it.
+    refused = run(w, "moved", "tasks", "settings", "set", "escalation.stall_after", "soon")
+    assert w.error(refused)["code"] == "settings_invalid", refused.stderr
+    edits = {"chain": w.answer(run(w, "moved", "tasks", "settings", "set",
+                                   "escalation.escalate_to", "Owner")),
+             "ceiling": w.answer(run(w, "moved", "tasks", "settings", "set",
+                                     "escalation.stall_after", "2h"))}
+    _say("tasks-settings-escalation", edits)
+    assert edits["chain"]["value"] == ["Owner"] and edits["ceiling"]["value"] == "2h"
+    assert w.sql("SELECT path, value FROM capabilities_settings WHERE agent_id = %s AND "
+                 "capability = 'tasks' AND path[1] = 'escalation' ORDER BY path",
+                 (IDS["moved"],)) == [(["escalation", "escalate_to"], ["Owner"]),
+                                      (["escalation", "stall_after"], "2h")]
+    doctor = run(w, "moved", "tasks", "doctor")
+    assert "conveyor_invalid" not in doctor.stdout + doctor.stderr, doctor.stderr
+    assert json.loads(doctor.stdout)["escalation"]["stall_after"] == 7200, doctor.stdout
+    assert run(w, "moved", "tasks", "settings", "set", "escalation.stall_after",
+               "6h").returncode == 0
     assert w.files_left(w.roots["moved"]) == []
 
 
@@ -337,14 +369,106 @@ def test_slack_reads_its_allow_list_as_rows(world):
     _say("slack-policy-refusal", {"stderr": refused.stderr, "exit": refused.returncode})
     error = w.error(refused)
     assert error["code"] == "policy_refusal" and refused.returncode == 4
-    assert "slack.policy settings document" in error["hint"]
+    assert "slack settings set allowed_channels" in error["hint"]
     allowed = run(w, "moved", "slack", "read", "C01")
     _say("slack-policy-allowed", {"stderr": allowed.stderr, "exit": allowed.returncode})
     assert w.error(allowed)["code"] != "policy_refusal"
-    # Through the contract's reader of named documents, as slack reads it.
+    # policy.json is the slack settings' own allow-list now.
     assert w.sql("SELECT value FROM capabilities_settings WHERE agent_id = %s AND "
-                 "capability = 'slack.policy' AND path = '{allowed_users,U01}'",
+                 "capability = 'slack' AND path = '{allowed_users,U01}'",
                  (IDS["moved"],)) == [({},)]
+    # Edited with the settings verb, and the gate reads the edit.
+    added = w.answer(run(w, "moved", "slack", "settings", "set", "allowed_channels.C99",
+                         '"#ninety-nine"', "--scope", "project"))
+    opened = run(w, "moved", "slack", "read", "C99")
+    _say("slack-settings-edit", {"set": added, "stderr": opened.stderr})
+    assert w.error(opened)["code"] != "policy_refusal"
+    w.answer(run(w, "moved", "slack", "settings", "unset", "allowed_channels.C99", "--scope",
+                 "project"))
+    assert w.error(run(w, "moved", "slack", "read", "C99"))["code"] == "policy_refusal"
+    # Holding only the allow-list, the service is not yet initialized.
+    assert w.answer(run(w, "moved", "slack", "service", "status"))["initialized"] is False
+
+
+def test_policy_and_service_settings_move_as_one_allow_list(world):
+    """The move folds policy.json into the slack settings: the service's own
+    entries stay as they were, with their roles, an entry only the policy held
+    is added, and a mode the two read differently is asked."""
+    w = world
+    root = w.agent("chat", "prj_dbonly00004", {
+        "{env}/settings.json": gate("slack"),
+        "{env}/slack/connections.json": {"default": "workspace",
+                                         "connections": {"workspace": {"allow_write": False}}},
+        "{env}/slack/policy.json": {"allowed_users": {"U01": "operator"},
+                                    "allowed_channels": {"C01": "#ops", "C02": "#team"},
+                                    "default_channel_policy": "open"},
+        "{env}/slack/service/settings.json": {
+            "allowed_channels": {"C02": {"name": "team", "default_role": "default"}},
+            "auto_answer": {"users": [], "channels": ["C02"]},
+            "defaults": {"worker": "stub"}},
+        ".env.local": "SLACK_BOT_TOKEN=xoxb-test\n"}, ignore=(".env.local",))
+    w.agentkit_list()
+    dry = w.answer(w.manager(root, "migrate"))
+    asked = [q for q in dry["questions"] if q["id"] == "settings.slack.default_channel_policy"]
+    refused = w.error(w.manager(root, "migrate", "--apply", "--answers",
+                                answers_file(w, "chat", {})))
+    applied = w.answer(w.manager(root, "migrate", "--apply", "--answers", answers_file(
+        w, "chat", {"settings": {"slack": {"default_channel_policy": "service"}}})))
+    document = {tuple(path): value for path, value in w.sql(
+        "SELECT path, value FROM capabilities_settings WHERE agent_id = %s AND "
+        "capability = 'slack'", ("prj_dbonly00004",))}
+    _say("slack-one-allow-list", {"questions": dry["questions"], "refused": refused,
+                                  "verify": applied["verify"], "document": {
+                                      ".".join(k): v for k, v in document.items()}})
+    assert asked and asked[0]["choices"] == ["policy", "service"]
+    assert refused["code"] == "question_open"
+    assert applied["state"] == "migrated" and not applied["verify"]["differences"]
+    assert document[("allowed_channels", "C01")] == "#ops"
+    assert document[("allowed_channels", "C02", "default_role")] == "default"
+    assert document[("allowed_users", "U01")] == "operator"
+    assert ("default_channel_policy",) not in document
+    assert not (root / "capabilities" / "slack" / "policy.json").exists()
+    out = {target: w.cap(root, "slack", "read", target, **GARBAGE)
+           for target in ("C01", "C02", "C03")}
+    assert w.error(out["C03"])["code"] == "policy_refusal"
+    for target in ("C01", "C02"):
+        assert w.error(out[target])["code"] != "policy_refusal", target
+    assert w.answer(w.cap(root, "slack", "service", "status"))["initialized"] is True
+
+
+def test_conveyor_moves_into_the_tasks_settings_unless_they_carry_one(world):
+    w = world
+    root = w.agent("queue", "prj_dbonly00005", {
+        "{env}/settings.json": gate("tasks"),
+        "{env}/tasks/conveyor.toml": 'escalate_to = ["Owner"]\n'})
+    w.agentkit_list()
+    applied = w.answer(w.manager(root, "migrate", "--apply", "--answers",
+                                 answers_file(w, "queue", {})))
+    rows = w.sql("SELECT path, value FROM capabilities_settings WHERE agent_id = %s AND "
+                 "capability = 'tasks' ORDER BY path", ("prj_dbonly00005",))
+    _say("tasks-conveyor-folded", {"rows": rows, "verify": applied["verify"]})
+    assert applied["state"] == "migrated" and not applied["verify"]["differences"]
+    # No service settings: the home's seed, with the escalation table.
+    assert rows == [(["escalation", "escalate_to"], ["Owner"]), (["version"], 1)]
+    status = w.answer(w.cap(root, "tasks", "service", "status"))
+    assert status["initialized"] is False
+    init = w.answer(w.cap(root, "tasks", "service", "init"))
+    assert init["written"] and w.sql(
+        "SELECT value FROM capabilities_settings WHERE agent_id = %s AND capability = 'tasks' "
+        "AND path = '{escalation,escalate_to}'", ("prj_dbonly00005",)) == [(["Owner"],)]
+    # Settings that carry the table already keep it; the file is not moved.
+    kept = w.agent("queue-kept", "prj_dbonly00006", {
+        "{env}/settings.json": gate("tasks"),
+        "{env}/tasks/service/config.toml": 'version = 1\n\n[escalation]\n'
+                                           'escalate_to = ["Lead"]\n',
+        "{env}/tasks/conveyor.toml": 'escalate_to = ["Owner"]\n'})
+    w.agentkit_list()
+    dry = w.answer(w.manager(kept, "migrate"))
+    assert any("conveyor.toml is not moved" in line for line in dry["plan"]["warnings"]), dry
+    w.answer(w.manager(kept, "migrate", "--apply", "--answers",
+                       answers_file(w, "queue-kept", {})))
+    assert w.sql("SELECT value FROM capabilities_settings WHERE agent_id = %s AND "
+                 "path = '{escalation,escalate_to}'", ("prj_dbonly00006",)) == [(["Lead"],)]
 
 
 def test_memory_and_the_service_capabilities_read_as_rows(world):
@@ -416,11 +540,9 @@ def test_deployment_counts_settings_rows_and_builds_without_a_database(world):
     found = json.loads(doctor.stdout)
     _say("deployment-doctor-moved", found)
     unconfigured = [f for f in found["findings"] if "is not configured" in f["message"]]
-    # The settings documents the store holds count as configured; slack keeps
-    # its allow-list and no service settings, so it alone is named, in the store.
-    assert unconfigured == [{"severity": "error", "path": "store: slack settings",
-                             "message": "active service 'slack' is not configured; run "
-                                        "`slack service init`"}], unconfigured
+    # The settings documents the store holds count as configured; slack's
+    # allow-list is its settings document now, so none is named.
+    assert unconfigured == [], unconfigured
     out = {}
     for name in ("moved", "files"):
         synced = w.cap(w.roots[name], "deployment", "sync", **GARBAGE)
@@ -440,7 +562,9 @@ def test_deployment_counts_settings_rows_and_builds_without_a_database(world):
     for pattern in ("capabilities/settings.json", "capabilities/*/connections.json",
                     "capabilities/*/identifiers.json", "capabilities/*/service/settings.json",
                     "capabilities/*/service/config.toml", "capabilities/tasks/conveyor.toml",
-                    "capabilities/slack/policy.json"):
+                    "capabilities/slack/policy.json", "capabilities/askproject/profiles/",
+                    "capabilities/*/service/profiles/", "capabilities/tasks/workers/",
+                    "capabilities/tasks/profiles/"):
         assert pattern in ignore.splitlines(), pattern
         assert pattern not in next(v for k, v in files.items()
                                    if k.endswith("dockerignore")).splitlines()
@@ -660,6 +784,84 @@ def test_a_dev_session_keeps_its_records_in_a_schema_of_its_own(world, tmp_path)
         manager("dev", "stop", "dbonly-lane", "--discard-work")
 
 
+def test_a_dev_session_drops_the_schema_it_made_and_no_other(world, tmp_path):
+    """A session's schema goes when the session ends - by finish, stop or gc -
+    and a schema the session found already there, or whose mark is not the
+    session's, stays."""
+    from test_manager_dev_sessions import _commit_all, _consumer_repo, _release_source_repo
+    w = world
+    source, _remote = _release_source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("AGENTKIT_DB_", "CAPABILITIES_")) and k not in (
+               "CLAUDE_PROJECT_DIR", "VIRTUAL_ENV")}
+    env.update({"HOME": str(tmp_path / "outer-home"),
+                "CAPABILITIES_HOME": str(tmp_path / "outer-registry"),
+                "CAPABILITIES_BIN": str(tmp_path / "outer-bin"),
+                "XDG_CONFIG_HOME": str(tmp_path / "outer-config"),
+                "XDG_STATE_HOME": str(tmp_path / "outer-state"),
+                "XDG_DATA_HOME": str(tmp_path / "outer-data"),
+                "XDG_CACHE_HOME": str(tmp_path / "outer-cache"),
+                "AGENT_NODE_NAME": MASTER, "USER": "tester"})
+    w.write(tmp_path / "outer-config" / "agentkit" / "store.json", {
+        "schema": "agentkit.store.v1", "host": "127.0.0.1", "port": w.port,
+        "database": w.database, "user": "pgadmin", "sslmode": "disable",
+        "db_schema": SCHEMA})
+
+    def manager(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([str(MANAGER), *args], cwd=REPO, env=env, text=True,
+                              capture_output=True, timeout=900)
+
+    def schema(name: str):
+        return w.sql("SELECT obj_description(oid, 'pg_namespace') FROM pg_namespace "
+                     "WHERE nspname = %s", (f"dev_{name.replace('-', '_')}",))
+
+    # A schema of a session's name that was there before the session.
+    w.sql("CREATE SCHEMA dev_found_lane")
+    ended = {}
+    for name in ("found-lane", "marked-lane", "stop-lane", "gc-lane", "finish-lane"):
+        started = manager("dev", "start", "askproject", "--source", str(source), "--project",
+                          str(consumer), "--session", name, "--allow-parallel")
+        assert started.returncode == 0, started.stderr
+        probe = manager("dev", "exec", name, "--", "sh", "-c", "echo $AGENTKIT_DB_SCHEMA")
+        assert probe.returncode == 0, probe.stderr
+        assert probe.stdout.split() == [f"dev_{name.replace('-', '_')}"]
+    assert schema("found-lane") == [(None,)]
+    for name in ("marked-lane", "stop-lane", "gc-lane", "finish-lane"):
+        [(mark,)] = schema(name)
+        assert mark.startswith(f"capabilities dev session {name} "), mark
+    w.sql("COMMENT ON SCHEMA dev_marked_lane IS 'someone else''s'")
+    for name in ("found-lane", "marked-lane"):
+        ended[name] = json.loads(manager("dev", "stop", name, "--discard-work").stdout)
+    ended["stop-lane"] = json.loads(manager("dev", "stop", "stop-lane",
+                                            "--discard-work").stdout)
+    listed = json.loads(manager("dev", "list").stdout)
+    finish = next(one for one in listed["sessions"] if one["id"] == "finish-lane")
+    worktree = Path(finish["source_worktree"])
+    (worktree / "README.md").write_text("released from the dev worktree\n")
+    _commit_all(worktree, "Prepare release candidate")
+    finished = manager("dev", "finish", "finish-lane")
+    assert finished.returncode == 0, finished.stderr
+    ended["finish-lane"] = json.loads(finished.stdout)["cleanup"]
+    time.sleep(2)
+    collected = json.loads(manager("dev", "gc", "--older-than", "1s").stdout)
+    ended["gc-lane"] = next(one for one in collected["removed"] if one["session"] == "gc-lane")
+    _say("dev-schema-ends", ended)
+    assert "database_schema" not in ended["found-lane"] and schema("found-lane") == [(None,)]
+    assert ended["marked-lane"]["database_schema"] == {
+        "schema": "dev_marked_lane", "dropped": False,
+        "reason": "it does not carry this session's mark"}
+    assert schema("marked-lane") == [("someone else's",)]
+    for name in ("stop-lane", "gc-lane", "finish-lane"):
+        assert ended[name]["database_schema"] == {
+            "schema": f"dev_{name.replace('-', '_')}", "dropped": True}, name
+        assert schema(name) == [], name
+    # The store's own schema was never touched.
+    assert w.sql("SELECT count(*) FROM pg_namespace WHERE nspname = %s", (SCHEMA,)) == [(1,)]
+    w.sql("DROP SCHEMA dev_found_lane")
+    w.sql("DROP SCHEMA dev_marked_lane")
+
+
 def test_the_machine_scheduler_serves_a_moved_agent(world):
     w = world
     joined = w.answer(run(w, "moved", "automations", "service", "join"))
@@ -766,3 +968,32 @@ def test_the_image_build_steps_run_without_a_database(world, tmp_path, which):
     assert not (tmp_path / "machine" / "config" / "capabilities" / "settings.json").exists()
     assert (box / ".claude" / "settings.json").exists()
     assert "not reachable" in (box / ".claude" / "rules" / "CAPABILITIES.md").read_text()
+
+
+@pytest.mark.parametrize("identity, code", [
+    ({"store": "other"}, "bad_store_mode"),
+    ({"records": "weird"}, "bad_records_mode"),
+    ({"records": "store"}, None),
+])
+def test_init_passes_over_only_an_absent_store(tmp_path, identity, code):
+    """Init's offline part goes on where no store is configured or reachable,
+    and stops, as it always has, on any other refusal of the project's records."""
+    from test_manager_core_tier import _machine_env
+    root = tmp_path / "agent"
+    (root / "capabilities").mkdir(parents=True)
+    (root / "capabilities" / "project.json").write_text(json.dumps({
+        "schema": "capabilities.project.v1", "slug": "agent", "id": "prj_initcheck001",
+        **identity}))
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    env = _machine_env(tmp_path / "machine", "")
+    env.pop("CAPABILITIES_SOURCE")
+    env.pop("AGENT_NODE_NAME", None)
+    ran = subprocess.run([str(MANAGER), "init"], cwd=root, env=env, text=True,
+                         capture_output=True, timeout=300)
+    _say(f"init-{code}", {"exit": ran.returncode, "stderr": ran.stderr[-1500:]})
+    if code is None:
+        assert ran.returncode == 0, ran.stderr
+        assert json.loads(ran.stdout)["gate"].startswith("store:")
+    else:
+        assert ran.returncode == 6
+        assert json.loads(ran.stderr.strip().splitlines()[-1])["error"]["code"] == code

@@ -2,7 +2,7 @@
 
 ## 2026-10-16 — A moved agent's image builds without a database and bakes in no record file
 
-`doctor` counts a service of an agent whose records moved into the store as configured when the store holds its settings document. For such an agent `sync` compiles a Dockerfile whose `capabilities install --allow` and `capabilities init` run without a database and whose `capabilities doctor` moves to the entrypoint, at container start, and a .dockerignore that excludes every record and settings file (`capabilities/settings.json`, `*/connections.json`, `*/identifiers.json`, `*/service/settings.json`, `*/service/config.toml`, `tasks/conveyor.toml`, `slack/policy.json`). Every other project compiles as before.
+`doctor` counts a service of an agent whose records moved into the store as configured when the store holds its settings document. For such an agent `sync` compiles a Dockerfile whose `capabilities install --allow` and `capabilities init` run without a database and whose `capabilities doctor` moves to the entrypoint, at container start, and a .dockerignore that excludes every record and settings file (`capabilities/settings.json`, `*/connections.json`, `*/identifiers.json`, `*/service/settings.json`, `*/service/config.toml`, `tasks/conveyor.toml`, `slack/policy.json`) and the profile and worker folders that moved with them (`askproject/profiles/`, `*/service/profiles/`, `tasks/workers/`, `tasks/profiles/`). Every other project compiles as before.
 
 ## 2026-10-16 — `migrate files` reads runtime.json placement for `capabilities migrate`
 

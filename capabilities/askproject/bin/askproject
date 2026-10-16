@@ -121,6 +121,8 @@ PROFILES
   inherited; a file that is not one flat profile is an error, not a reason to
   look further:
     1. folder    this project's capabilities/askproject/profiles/<name>.toml
+                 (for an agent whose records moved into the store, its harness
+                 profile askproject-<name> at its scope instead)
     2. machine   the library's machine folder, shared by everything that runs
                  on callva-harness-runner:
                  $XDG_CONFIG_HOME/callva-harness-runner/profiles/<name>.toml
@@ -2416,33 +2418,6 @@ def _records_in_store() -> bool:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
-def _settings_named(name: str) -> tuple:
-    """A named settings document `<capability>.<name>` of an agent whose
-    records moved into the store: where it is kept, and the document (None
-    where the agent has none)."""
-    try:
-        records = _records()
-        key = settings_document(NAME, name)
-        return (f"{records.collection_source(NAME, 'setting')} {key}",
-                records.setting_document(key, "project"))
-    except StoreError as e:
-        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
-
-
-def _settings_named_write(name: str, change, check=None) -> dict:
-    """Change a named settings document `<capability>.<name>` of an agent
-    whose records moved into the store, in the store's one transaction:
-    `change` takes the document and returns the new one, `check` returns what
-    is wrong with the result before anything is written."""
-    try:
-        return _records().settings_write(settings_document(NAME, name), "project",
-                                         change, check=check)
-    except StoreError as e:
-        if e.slug == "settings_invalid":
-            _die(6, e.slug, e.message)
-        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
-
-
 def _env_override(*keys: str, value=None):
     """The first of `keys` the environment sets (or `value`, where the caller
     read it elsewhere), naming a file to read records or settings from; for an
@@ -2869,11 +2844,6 @@ HASH_LENGTH = 12
 # separators and anything that would make a key ambiguous to address.
 KEY_RE = re.compile(r"[a-z0-9][a-z0-9._@+-]{0,127}", re.IGNORECASE)
 CAPABILITY_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
-# The document a settings row belongs to: a capability's own settings, or a
-# named document of it, `<capability>.<name>`, for settings it keeps outside its
-# declared homes (tasks' `conveyor`, slack's `policy`). A capability name never
-# holds a dot, so a named document can never be taken for a capability.
-SETTINGS_DOCUMENT_RE = re.compile(r"[a-z][a-z0-9-]{0,63}(?:\.[a-z][a-z0-9-]{0,63})?")
 
 
 class StoreError(Exception):
@@ -3316,16 +3286,6 @@ def _store_check(name: str, value: str, pattern: re.Pattern) -> str:
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise StoreError("bad_name", f"{name} {value!r} must match {pattern.pattern}")
     return value
-
-
-def settings_document(capability: str, name: str | None = None) -> str:
-    """The key a settings document is kept under: the capability's own, or
-    its named document `<capability>.<name>`."""
-    _store_check("capability", capability, CAPABILITY_RE)
-    if name is None:
-        return capability
-    return _store_check("settings document", f"{capability}.{name}",
-                        SETTINGS_DOCUMENT_RE)
 
 
 def _semantics(collection: str) -> str:
@@ -4955,7 +4915,7 @@ class AgentRecords(StoreRecords):
         """One scope's settings document as this node reads it: the rows for
         every node with this node's rows over them. None where neither
         document exists, which a reader takes as the capability's seed."""
-        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         self._scope_root(scope)
         docs, rows = self._settings_rows(capability)
         shared, mine = (scope, None), (scope, self.node)
@@ -5075,7 +5035,7 @@ class AgentRecords(StoreRecords):
         then write the paths that differ, removals first, one trail row each,
         and move the document's generation to the last of them. A refused
         write changes nothing."""
-        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         _refuse_record_write(capability, "setting")
         agent = self._agent(scope)
         who = self.actor_name(actor)
@@ -6188,10 +6148,19 @@ def _profile_folders() -> list[Path]:
     return [env_dir / "profiles"]
 
 
+# An agent whose records moved into the store keeps askproject's profiles as
+# harness profiles named `askproject-<name>` at its project's scope, beside the
+# ones automations, tasks and telegram keep there; askproject lists and
+# resolves only its own, under the name its folder gave them, as it saw only
+# its folder before.
+STORE_PROFILE_PREFIX = "askproject-"
+
+
 def _store_profiles(runner) -> list:
     """This agent's own profiles as the store holds them, for an agent whose
-    records moved there: the active harness profiles at its project's scope,
-    where `capabilities migrate` moved its profiles folder."""
+    records moved there: the active `askproject-<name>` harness profiles at
+    its project's scope, where `capabilities migrate` moved its profiles
+    folder, each by the name it is asked for."""
     if not _records_in_store():
         return []
     from capabilities_contract import db
@@ -6211,12 +6180,16 @@ def _store_profiles(runner) -> list:
             active = []
     finally:
         conn.close()
-    return [one for one in active if one.scope == "project" and one.scope_id == project]
+    return [(one.name[len(STORE_PROFILE_PREFIX):], one)
+            for one in active if one.scope == "project" and one.scope_id == project
+            and one.name.startswith(STORE_PROFILE_PREFIX)
+            and len(one.name) > len(STORE_PROFILE_PREFIX)]
 
 
-def _stored_file(runner, version, shadows: tuple = ()):
-    """A stored profile version as the file a lookup answers."""
-    return runner.ProfileFile(version.name, "store", version.where, version.text(), shadows)
+def _stored_file(runner, name: str, version, shadows: tuple = ()):
+    """A stored profile version as the file a lookup answers, by the name it
+    was asked for."""
+    return runner.ProfileFile(name, "store", version.where, version.text(), shadows)
 
 
 def _find_profile_file(runner, name: str):
@@ -6224,7 +6197,7 @@ def _find_profile_file(runner, name: str):
     records moved into the store, else the library's search of the project
     folder, the machine folder and the shipped set. Raises the library's
     ProfileNotFound or ProfileError."""
-    stored = {one.name: one for one in _store_profiles(runner)}
+    stored = dict(_store_profiles(runner))
     if name in stored:
         runner.check_profile_name(name)
         try:
@@ -6232,7 +6205,7 @@ def _find_profile_file(runner, name: str):
             shadows = (below.path, *below.shadows)
         except runner.ProfileError:
             shadows = ()
-        return _stored_file(runner, stored[name], shadows)
+        return _stored_file(runner, name, stored[name], shadows)
     return runner.find_profile_file(name, _profile_folders())
 
 
@@ -6245,9 +6218,9 @@ def _list_profiles(runner) -> list[dict]:
         return listed
     out = []
     held = {entry["name"]: entry for entry in listed}
-    for version in sorted(stored, key=lambda v: v.name):
-        below = held.pop(version.name, None)
-        out.append({"name": version.name, "source": "store", "path": version.where,
+    for name, version in sorted(stored, key=lambda pair: pair[0]):
+        below = held.pop(name, None)
+        out.append({"name": name, "source": "store", "path": version.where,
                     "harness": version.harness,
                     "shadows": ([below["path"], *below.get("shadows", [])] if below else [])})
     return sorted(out + list(held.values()), key=lambda e: e["name"])
@@ -6255,7 +6228,8 @@ def _list_profiles(runner) -> list[dict]:
 
 def _profile_lookup(runner) -> list[dict]:
     """Where a name is looked for, in order, as the library searches."""
-    first = ([{"source": "store", "dir": "this agent's harness profiles in the store"}]
+    first = ([{"source": "store",
+                "dir": "this agent's askproject-<name> harness profiles in the store"}]
              if _records_in_store() else
              [{"source": "folder", "dir": str(folder)} for folder in _profile_folders()])
     return (first
@@ -6325,18 +6299,21 @@ def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict:
             active = []
         held = {one.name: one for one in active
                 if one.scope == "project" and one.scope_id == project}
+        stored_as = {}
         for path in files:
             name = path.stem
             row = {"kind": "profile", "name": name, "file": str(path)}
+            stored_as[name] = STORE_PROFILE_PREFIX + name
             try:
                 runner.check_profile_name(name)
+                runner.check_profile_name(stored_as[name])
                 knobs = runner.ProfileFile(name, "folder", str(path), path.read_text()).knobs()
                 spec = runner.check_spec(knobs, f"profile {name!r} at {path}")
             except (OSError, UnicodeDecodeError, runner.ProfileError, ValueError,
                     TypeError, KeyError) as exc:
                 refused.append(f"{path}: {exc}")
                 continue
-            version = held.get(name)
+            version = held.get(stored_as[name])
             if version is None:
                 row["outcome"] = {"plan": "would_write", "write": "write",
                                   "verify": "missing"}[action]
@@ -6362,7 +6339,8 @@ def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict:
                     if row["outcome"] != "write":
                         continue
                     version, _created = runner.save_profile(
-                        conn, row["name"], row["spec"], scope="project", scope_id=project,
+                        conn, stored_as[row["name"]], row["spec"], scope="project",
+                        scope_id=project,
                         created_by=f"migrate@{answers.get('_master') or node_name()}",
                         schema=setting.schema)
                     row.update(outcome="written", version=version.id)

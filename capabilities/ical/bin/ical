@@ -2342,33 +2342,6 @@ def _records_in_store() -> bool:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
-def _settings_named(name: str) -> tuple:
-    """A named settings document `<capability>.<name>` of an agent whose
-    records moved into the store: where it is kept, and the document (None
-    where the agent has none)."""
-    try:
-        records = _records()
-        key = settings_document(NAME, name)
-        return (f"{records.collection_source(NAME, 'setting')} {key}",
-                records.setting_document(key, "project"))
-    except StoreError as e:
-        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
-
-
-def _settings_named_write(name: str, change, check=None) -> dict:
-    """Change a named settings document `<capability>.<name>` of an agent
-    whose records moved into the store, in the store's one transaction:
-    `change` takes the document and returns the new one, `check` returns what
-    is wrong with the result before anything is written."""
-    try:
-        return _records().settings_write(settings_document(NAME, name), "project",
-                                         change, check=check)
-    except StoreError as e:
-        if e.slug == "settings_invalid":
-            _die(6, e.slug, e.message)
-        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
-
-
 def _env_override(*keys: str, value=None):
     """The first of `keys` the environment sets (or `value`, where the caller
     read it elsewhere), naming a file to read records or settings from; for an
@@ -2795,11 +2768,6 @@ HASH_LENGTH = 12
 # separators and anything that would make a key ambiguous to address.
 KEY_RE = re.compile(r"[a-z0-9][a-z0-9._@+-]{0,127}", re.IGNORECASE)
 CAPABILITY_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
-# The document a settings row belongs to: a capability's own settings, or a
-# named document of it, `<capability>.<name>`, for settings it keeps outside its
-# declared homes (tasks' `conveyor`, slack's `policy`). A capability name never
-# holds a dot, so a named document can never be taken for a capability.
-SETTINGS_DOCUMENT_RE = re.compile(r"[a-z][a-z0-9-]{0,63}(?:\.[a-z][a-z0-9-]{0,63})?")
 
 
 class StoreError(Exception):
@@ -3242,16 +3210,6 @@ def _store_check(name: str, value: str, pattern: re.Pattern) -> str:
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise StoreError("bad_name", f"{name} {value!r} must match {pattern.pattern}")
     return value
-
-
-def settings_document(capability: str, name: str | None = None) -> str:
-    """The key a settings document is kept under: the capability's own, or
-    its named document `<capability>.<name>`."""
-    _store_check("capability", capability, CAPABILITY_RE)
-    if name is None:
-        return capability
-    return _store_check("settings document", f"{capability}.{name}",
-                        SETTINGS_DOCUMENT_RE)
 
 
 def _semantics(collection: str) -> str:
@@ -4881,7 +4839,7 @@ class AgentRecords(StoreRecords):
         """One scope's settings document as this node reads it: the rows for
         every node with this node's rows over them. None where neither
         document exists, which a reader takes as the capability's seed."""
-        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         self._scope_root(scope)
         docs, rows = self._settings_rows(capability)
         shared, mine = (scope, None), (scope, self.node)
@@ -5001,7 +4959,7 @@ class AgentRecords(StoreRecords):
         then write the paths that differ, removals first, one trail row each,
         and move the document's generation to the last of them. A refused
         write changes nothing."""
-        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
+        _store_check("capability", capability, CAPABILITY_RE)
         _refuse_record_write(capability, "setting")
         agent = self._agent(scope)
         who = self.actor_name(actor)
