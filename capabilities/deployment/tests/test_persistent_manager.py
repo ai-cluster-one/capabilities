@@ -107,7 +107,7 @@ writes = {
     "launcher": bin_dir / "example",
     "sources.json": m.SOURCES_FILE, "global gate": m.GLOBAL_GATE_FILE,
     "machine.json": m.MACHINE_FILE, "source cache": m.SOURCE_CACHE_ROOT,
-    "envelope cache": m.ENVELOPE_CACHE_ROOT, "identity cache": m.IDENTITY_CACHE_ROOT,
+    "envelope cache": m.ENVELOPE_CACHE_ROOT,
     "dev state": m.DEV_STATE_ROOT, "dev data": m.DEV_DATA_ROOT,
     "mutation lock": m.MANAGER_MUTATION_LOCK,
     "release record": m._release_state_path(m.Path("/app"), "main"),

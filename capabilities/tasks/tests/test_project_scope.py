@@ -44,18 +44,23 @@ def declares(tmp_path, monkeypatch):
     """A project on disk that declares itself, the way `capabilities init` leaves
     one. The file is real, so what is exercised is the reader and not a stub.
 
-    Whether a context owner binds the project is the manager's answer, so that
-    one answer is given here: unbound unless a test says what ContextKit holds."""
-    def write(body, *, envelope="capabilities", contextkit=None):
+    Where project.json declares no id and a ContextKit binding is present, the
+    manager is asked for the id it carries over from that binding; that one
+    answer is given here when a test says what the manager answers."""
+    def write(body, *, envelope="capabilities", manager=None):
         root = tmp_path / envelope
         root.mkdir(parents=True, exist_ok=True)
         (root / "project.json").write_text(body if isinstance(body, str)
                                            else json.dumps(body))
+        if manager is not None:
+            (tmp_path / ".contextkit").mkdir(exist_ok=True)
+            (tmp_path / ".contextkit" / "config.toml").write_text("version = 1\n")
         monkeypatch.setattr(mod, "_project_root", lambda: tmp_path)
         monkeypatch.setattr(mod, "_project_capabilities_dir",
                             lambda r: tmp_path / envelope)
-        monkeypatch.setattr(mod, "_context_identity",
-                            lambda r: contextkit or {"bound": False, "id": None})
+        monkeypatch.setattr(mod, "_manager_declared_id",
+                            lambda r: manager if manager is not None
+                            else pytest.fail("the manager was asked for the id"))
         # Resolving hands the id down in this process's environment; keep that
         # inside the test.
         monkeypatch.setenv("CAPABILITIES_PROJECT_ID", "")
@@ -102,33 +107,32 @@ def test_nowhere_and_nothing_declared_are_both_no_project(tmp_path, monkeypatch,
     assert mod._declared_project() is None
 
 
-# --- A ContextKit-bound project declares itself through ContextKit -----------
+# --- project.json is the id's one home ---------------------------------------
 
-def _bound(contextkit_id):
-    return {"bound": True, "id": contextkit_id}
-
-
-def test_a_bound_project_is_the_id_contextkit_answers(declares):
-    declares({"slug": "a-project"}, contextkit=_bound(HERE))
+def test_an_id_only_a_contextkit_binding_holds_comes_through_the_manager(declares):
+    declares({"slug": "a-project"}, manager={"id": HERE})
     assert mod._declared_project() == HERE
-    assert mod._project_id_state()["state"] == "adopted"
+    assert mod._project_id_state()["state"] == "declared"
 
 
-def test_a_project_waiting_for_adoption_keeps_its_copy(declares):
-    declares({"id": HERE, "slug": "a-project"}, contextkit=_bound(None))
+def test_a_project_json_id_is_read_without_asking_the_manager(declares):
+    # The fixture fails the test if the manager is asked.
+    declares({"id": HERE, "slug": "a-project"})
     state = mod._project_id_state()
-    assert (state["state"], state["id"]) == ("pending", HERE)
+    assert (state["state"], state["id"]) == ("declared", HERE)
     assert mod._identity_refusal(state) is None
 
 
-def test_a_mismatch_reads_as_contextkit_and_refuses_writes_naming_both(
+def test_a_handed_down_id_project_json_contradicts_refuses_writes_naming_both(
         declares, monkeypatch, capsys):
-    declares({"id": THERE, "slug": "a-project"}, contextkit=_bound(HERE))
+    root = declares({"id": THERE, "slug": "a-project"})
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID", HERE)
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID_ROOT", str(root))
     state = mod._project_id_state()
-    assert (state["state"], mod._declared_project()) == ("mismatch", HERE)
+    assert (state["state"], mod._declared_project()) == ("mismatch", THERE)
     monkeypatch.setattr(mod, "PROJECT_IDENTITY", state)
     monkeypatch.setattr(mod, "PROJECT", state["id"])
-    assert mod._reading_project(None) == HERE
+    assert mod._reading_project(None) == THERE
     with pytest.raises(SystemExit) as exit_info:
         mod._writing_project()
     assert exit_info.value.code == 6
@@ -137,40 +141,34 @@ def test_a_mismatch_reads_as_contextkit_and_refuses_writes_naming_both(
     assert HERE in error["message"] and THERE in error["message"]
 
 
-def test_a_bound_project_with_no_id_anywhere_refuses_writes(declares, monkeypatch, capsys):
-    declares({"slug": "a-project"}, contextkit=_bound(None))
+def test_a_project_with_no_id_anywhere_refuses_writes(declares, monkeypatch, capsys):
+    declares({"slug": "a-project"}, manager={"id": None})
     state = mod._project_id_state()
+    assert (state["state"], state["id"]) == ("undeclared", None)
     monkeypatch.setattr(mod, "PROJECT_IDENTITY", state)
     monkeypatch.setattr(mod, "PROJECT", state["id"])
     with pytest.raises(SystemExit) as exit_info:
         mod._writing_project()
     assert exit_info.value.code == 6
-    error = _error(capsys)
-    assert error["code"] == "project_id_unassigned"
-    assert "contextkit identity adopt" in error["hint"]
+    assert _error(capsys)["code"] == "no_project"
 
 
-def test_contextkit_that_cannot_answer_leaves_reads_and_refuses_writes(
-        declares, monkeypatch, capsys):
-    failed = {"error": {"code": "contextkit_identity_failed", "message": "no answer",
+def test_a_manager_that_cannot_answer_refuses_writes(declares, monkeypatch, capsys):
+    failed = {"error": {"code": "capabilities_manager_unavailable", "message": "no answer",
                         "hint": "repair it"}}
-    declares({"id": HERE, "slug": "a-project"}, contextkit=failed)
+    declares({"slug": "a-project"}, manager=failed)
     state = mod._project_id_state()
-    assert (state["state"], mod._declared_project()) == ("unresolved", HERE)
+    assert (state["state"], mod._declared_project()) == ("unresolved", None)
     monkeypatch.setattr(mod, "PROJECT_IDENTITY", state)
     monkeypatch.setattr(mod, "PROJECT", state["id"])
     with pytest.raises(SystemExit) as exit_info:
         mod._writing_project()
     assert exit_info.value.code == 6
-    assert _error(capsys)["code"] == "contextkit_identity_failed"
+    assert _error(capsys)["code"] == "capabilities_manager_unavailable"
 
 
-def test_a_handed_down_id_outranks_contextkit_and_is_handed_on(declares, monkeypatch):
-    def never(root):
-        raise AssertionError("ContextKit was asked despite a live hand-down")
-
-    root = declares({"id": HERE, "slug": "a-project"})
-    monkeypatch.setattr(mod, "_context_identity", never)
+def test_a_handed_down_id_is_used_as_given(declares, monkeypatch):
+    root = declares({"slug": "a-project"})
     monkeypatch.setenv("CAPABILITIES_PROJECT_ID", HERE)
     monkeypatch.setenv("CAPABILITIES_PROJECT_ID_ROOT", str(root))
     state = mod._project_id_state()
@@ -179,16 +177,18 @@ def test_a_handed_down_id_outranks_contextkit_and_is_handed_on(declares, monkeyp
 
 
 def test_a_resolved_id_a_write_may_stamp_is_handed_down(declares):
-    root = declares({"id": HERE, "slug": "a-project"}, contextkit=_bound(HERE))
+    root = declares({"id": HERE, "slug": "a-project"})
     mod._project_id_state()
     assert os.environ["CAPABILITIES_PROJECT_ID"] == HERE
     assert os.environ["CAPABILITIES_PROJECT_ID_ROOT"] == str(root)
 
 
-def test_an_id_a_write_may_not_stamp_is_not_handed_down(declares):
-    declares({"id": THERE, "slug": "a-project"}, contextkit=_bound(HERE))
+def test_an_id_a_write_may_not_stamp_is_not_handed_on(declares, monkeypatch):
+    root = declares({"id": THERE, "slug": "a-project"})
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID", HERE)
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID_ROOT", str(root))
     mod._project_id_state()
-    assert os.environ["CAPABILITIES_PROJECT_ID"] == ""
+    assert os.environ["CAPABILITIES_PROJECT_ID"] == HERE  # the launcher's, unchanged
 
 
 # --- What each direction does with it ----------------------------------------

@@ -203,7 +203,13 @@ STORE_CONNECTIONS_TABLE = "capabilities_connections"
 STORE_GRANTS_TABLE = "capabilities_connection_grants"
 STORE_IDENTIFIERS_TABLE = "capabilities_identifiers"
 STORE_POLICY_TABLE = "capabilities_policy"
-STORE_TABLES_VERSION = (1, 1)
+# The kernel's own tables, migrated in the same ledger: the agent registry, the
+# agent's nodes and the one row of facts about the store as a whole. The
+# manager alone writes them.
+STORE_AGENTS_TABLE = "capabilities_agents"
+STORE_AGENT_NODES_TABLE = "capabilities_agent_nodes"
+STORE_GLOBAL_TABLE = "capabilities_global"
+STORE_TABLES_VERSION = (1, 2)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -284,6 +290,107 @@ def record_table_steps() -> list[tuple[str, str]]:
          "CREATE UNIQUE INDEX capabilities_policy_key"
          " ON capabilities_policy"
          " ((coalesce(agent_id, '')), capability, (coalesce(node, '')))"),
+        # The agent registry. `id` is the project id `project.json` declares;
+        # the registry never mints or changes one. An icon and its SHA-256 are
+        # present together or absent together.
+        ("0009-agents",
+         "CREATE TABLE capabilities_agents ("
+         " id text PRIMARY KEY CHECK (id <> ''),"
+         " name text CHECK (name <> ''),"
+         " description text CHECK (description <> ''),"
+         " icon bytea,"
+         " icon_sha text CHECK (icon_sha ~ '^[0-9a-f]{64}$'),"
+         " onboarding_status text CHECK (onboarding_status IN ('pending', 'complete')),"
+         " onboarding_routine text CHECK (onboarding_routine <> ''),"
+         " migrating_since timestamptz,"
+         " migrated_at timestamptz,"
+         " created_at timestamptz NOT NULL DEFAULT now(),"
+         " updated_at timestamptz NOT NULL DEFAULT now(),"
+         " CHECK ((icon IS NULL) = (icon_sha IS NULL)));"
+         " COMMENT ON TABLE capabilities_agents IS"
+         " 'The agent registry: one row per agent, keyed by the project id its"
+         " capabilities/project.json declares. Written by the capabilities manager alone.';"
+         " COMMENT ON COLUMN capabilities_agents.id IS"
+         " 'The project id from capabilities/project.json (prj_<12 hex>, or an older UUID).';"
+         " COMMENT ON COLUMN capabilities_agents.name IS"
+         " 'Display name; null while the agent has none of its own.';"
+         " COMMENT ON COLUMN capabilities_agents.icon IS"
+         " 'The agent''s icon as PNG bytes; null with icon_sha when it has none.';"
+         " COMMENT ON COLUMN capabilities_agents.icon_sha IS"
+         " 'Lowercase hex SHA-256 of icon.';"
+         " COMMENT ON COLUMN capabilities_agents.onboarding_status IS"
+         " 'pending while the agent still runs its onboarding routine, complete once"
+         " it finished; null when no onboarding is tracked.';"
+         " COMMENT ON COLUMN capabilities_agents.onboarding_routine IS"
+         " 'The routine the agent runs while onboarding is pending.';"
+         " COMMENT ON COLUMN capabilities_agents.migrating_since IS"
+         " 'Set while a move of this agent''s records from files into the store is open.';"
+         " COMMENT ON COLUMN capabilities_agents.migrated_at IS"
+         " 'When this agent''s records and settings moved into the store; null while"
+         " they are still read from files.'"),
+        # ContextKit's registry rows, taken over once where that table exists in
+        # the same schema. An empty name or description meant none there.
+        ("0010-agents-from-contextkit",
+         "DO $copy$ BEGIN"
+         " IF to_regclass('contextkit_agents') IS NOT NULL THEN"
+         "  INSERT INTO capabilities_agents"
+         "   (id, name, description, icon, icon_sha, created_at, updated_at)"
+         "  SELECT id, nullif(name, ''), nullif(description, ''),"
+         "   CASE WHEN icon IS NOT NULL AND icon_sha ~ '^[0-9a-f]{64}$' THEN icon END,"
+         "   CASE WHEN icon IS NOT NULL AND icon_sha ~ '^[0-9a-f]{64}$' THEN icon_sha END,"
+         "   created_at, updated_at"
+         "  FROM contextkit_agents WHERE id <> ''"
+         "  ON CONFLICT (id) DO NOTHING;"
+         " END IF;"
+         " END $copy$"),
+        # The machines an agent runs on. Exactly one may be its master, which
+        # the partial index below enforces; a node is removed with its agent.
+        ("0011-agent-nodes",
+         "CREATE TABLE capabilities_agent_nodes ("
+         " agent_id text NOT NULL REFERENCES capabilities_agents (id)"
+         "  ON DELETE CASCADE ON UPDATE CASCADE,"
+         " node text NOT NULL CHECK (node <> ''),"
+         " kind text NOT NULL CHECK (kind IN ('mac', 'server')),"
+         " address text CHECK (address <> ''),"
+         " is_master boolean NOT NULL DEFAULT false,"
+         " may_write boolean NOT NULL DEFAULT false,"
+         " target text CHECK (target <> ''),"
+         " last_seen_at timestamptz,"
+         " PRIMARY KEY (agent_id, node));"
+         " COMMENT ON TABLE capabilities_agent_nodes IS"
+         " 'The nodes an agent runs on, one row per (agent, node). Written by the"
+         " capabilities manager alone. agent_id references capabilities_agents"
+         " because a node exists only as a node of a registered agent.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.node IS"
+         " 'The name the node gives itself in AGENT_NODE_NAME.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.address IS"
+         " 'Host name or IP address the node is reached at, where it is fixed.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.is_master IS"
+         " 'The node that writes the rows every node of the agent inherits; at"
+         " most one per agent.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.may_write IS"
+         " 'Whether a node that is not the master may write rows of its own, marked"
+         " with its node.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.target IS"
+         " 'The deployment target this node is deployed by; null for a node that"
+         " is not deployed, such as a Mac.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.last_seen_at IS"
+         " 'When the node last reported itself.'"),
+        ("0012-agent-nodes-master",
+         "CREATE UNIQUE INDEX capabilities_agent_nodes_master"
+         " ON capabilities_agent_nodes (agent_id) WHERE is_master"),
+        # Facts about the store as a whole, in its one row.
+        ("0013-global",
+         "CREATE TABLE capabilities_global ("
+         " singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),"
+         " global_migrated_at timestamptz);"
+         " INSERT INTO capabilities_global DEFAULT VALUES;"
+         " COMMENT ON TABLE capabilities_global IS"
+         " 'One row of facts about this store as a whole.';"
+         " COMMENT ON COLUMN capabilities_global.singleton IS"
+         " 'Always true; keeps the table at one row.';"
+         " COMMENT ON COLUMN capabilities_global.global_migrated_at IS"
+         " 'When the global records were written into the store; null until then.'"),
     ]
 
 

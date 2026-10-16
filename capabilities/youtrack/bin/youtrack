@@ -467,7 +467,6 @@ def _handed_off_envelope(root: Path) -> str:
 
 
 ENVELOPE_CACHE_VERSION = 1
-IDENTITY_CACHE_VERSION = 1
 
 
 def _record_file(kind: str, key: str) -> Path:
@@ -554,9 +553,9 @@ def _ask_manager(root: Path, *flags: str) -> tuple:
 
     env = dict(os.environ)
     env["CLAUDE_PROJECT_DIR"] = str(root)
-    # Asked at all, the manager answers from ContextKit: a live id hand-down for
-    # this root is used before asking, so any in the environment is this
-    # process's own and must not come back as the answer.
+    # Asked at all, the manager answers from the project itself: a live id
+    # hand-down for this root is used before asking, so any in the environment
+    # is this process's own and must not come back as the answer.
     env.pop("CAPABILITIES_PROJECT_ID", None)
     env.pop("CAPABILITIES_PROJECT_ID_ROOT", None)
     manager = os.environ.get("CAPABILITIES_MANAGER_BIN", "").strip()
@@ -669,74 +668,35 @@ def _project_capabilities_dir(root: Path) -> Path:
     return legacy
 
 
-_CONTEXT_IDENTITY: dict = {}
-
-
-def _context_identity(root: Path) -> dict:
-    """Whether a context owner binds this project, and the id it holds for it.
-
-    The capabilities manager owns the answer, as it owns the envelope's: this
-    reads the manager's record while every input it rests on stands, and asks
-    the manager otherwise. `{"bound", "id"}`, or `{"error"}` when the manager
-    cannot answer, which leaves reads on project.json and refuses writes."""
-    root = root.resolve()
-    known = _CONTEXT_IDENTITY.get(root)
-    if known is not None:
-        return known
-    if not (root / ".contextkit" / "config.toml").is_file():
-        # The binding the manager asks ContextKit about is absent, so the
-        # manager's answer is already known: unbound, with no id of its own.
-        _CONTEXT_IDENTITY[root] = {"bound": False, "id": None}
-        return _CONTEXT_IDENTITY[root]
-    entry = _cached_record("identity", IDENTITY_CACHE_VERSION, root)
-    if (entry is not None and isinstance(entry.get("bound"), bool)
-            and (entry.get("id") is None or isinstance(entry.get("id"), str))):
-        answer = {"bound": entry["bound"], "id": entry.get("id")}
-    else:
-        reply, error = _ask_manager(root, "--identity")
-        state = (reply or {}).get("project_identity")
-        if error or not isinstance(state, dict) or not isinstance(state.get("bound"), bool):
-            answer = {"error": error or {
-                "code": "capabilities_path_malformed",
-                "message": "the capabilities manager returned no project identity"}}
-        else:
-            answer = {"bound": state["bound"], "id": state.get("contextkit_id") or None}
-    _CONTEXT_IDENTITY[root] = answer
-    return answer
-
-
-def _identity_verdict(bound: bool, contextkit_id, cached_id) -> dict:
-    """Which id a project answers to, from the three facts that decide it.
-
-    Unbound, the project's own project.json is the source. Bound, ContextKit's
-    id is authoritative and project.json holds at most its copy; until
-    ContextKit has an id, the copy is the id it will adopt."""
-    if not bound:
-        return {"state": "unbound", "id": cached_id}
-    if contextkit_id is None:
-        return {"state": "pending", "id": cached_id}
-    if cached_id is not None and cached_id != contextkit_id:
-        return {"state": "mismatch", "id": contextkit_id}
-    return {"state": "adopted", "id": contextkit_id}
+def _manager_declared_id(root: Path) -> dict:
+    """The id the capabilities manager answers for a project whose project.json
+    declares none: it carries an id the project's ContextKit binding holds into
+    project.json once and answers it. `{"id"}`, or `{"error"}` when the manager
+    cannot answer."""
+    reply, error = _ask_manager(root, "--identity")
+    state = (reply or {}).get("project_identity")
+    if error or not isinstance(state, dict):
+        return {"error": error or {
+            "code": "capabilities_path_malformed",
+            "message": "the capabilities manager returned no project identity"}}
+    ident = state.get("id")
+    return {"id": ident.strip() if isinstance(ident, str) and ident.strip() else None}
 
 
 def _identity_refusal(state: dict):
     """Why a write may not stamp this project's id, or None when it may.
 
-    An unbound project without an id is left to the caller, whose refusal
-    already names `capabilities init`."""
+    A project without an id is left to the caller, whose refusal already names
+    `capabilities init`."""
     if state["state"] == "unresolved":
         return state["error"]
     if state["state"] == "mismatch":
         return {"code": "project_id_mismatch",
                 "message": f"project.json holds project id {state['project_json_id']}, "
-                           f"but ContextKit answers {state['contextkit_id']}",
-                "hint": "reconcile the two by hand: ContextKit's id is the "
-                        "project's, and project.json keeps only its copy"}
-    if state["state"] == "pending" and not state["id"]:
-        return {"code": "project_id_unassigned",
-                "message": "this project's ContextKit identity has no id yet",
-                "hint": "run `contextkit identity adopt` in the project"}
+                           f"but the process that started this one handed down "
+                           f"{state['handed_id']}",
+                "hint": "start the command again from the project itself, so the id "
+                        "is read from its project.json"}
     return None
 
 
@@ -770,11 +730,14 @@ def _project_id_state():
     """The id of the project this command stands in, where it came from, and
     whether a write may stamp it; None outside a project.
 
-    A live handoff for this root outranks ContextKit, as the envelope handoff
-    outranks the record: the process that handed it verified it. Otherwise the
-    manager's answer decides. An id a write may stamp is handed on to this
-    process's descendants. Reading it asks no records backend: the id is what
-    selects a project's records, so it is read before any of them."""
+    `capabilities/project.json` is the id's one home. A live handoff for this
+    root is that id as the launching process read it, so it is used as given
+    unless project.json now declares another, which a write refuses. Where
+    project.json declares none and the project carries a ContextKit binding,
+    the manager is asked: it copies an id that binding holds into project.json
+    once. An id a write may stamp is handed on to this process's descendants.
+    Reading it asks no records backend: the id is what selects a project's
+    records, so it is read before any of them."""
     root = _project_root()
     if root is None:
         return None
@@ -787,25 +750,25 @@ def _project_id_state_at(root: Path) -> dict:
         declared = json.loads((_project_capabilities_dir(root) / "project.json").read_text())
     except (OSError, ValueError):
         declared = None
-    cached = (str(declared.get("id") or "").strip() or None
-              if isinstance(declared, dict) else None)
+    declared = (str(declared.get("id") or "").strip() or None
+                if isinstance(declared, dict) else None)
     handed = _handed_off_project_id(root)
     if handed and _PROJECT_ID_HANDED.get(str(root)) == handed:
         handed = ""  # this process's own hand-down, not its launcher's
-    if handed:
-        state = _identity_verdict(True, handed, cached)
-        if state["state"] != "mismatch":
-            state["state"] = "handed"
-        state.update(bound=None, contextkit_id=handed)
-    else:
-        context = _context_identity(root)
-        if "error" in context:
-            state = {"state": "unresolved", "id": cached, "bound": True,
-                     "contextkit_id": None, "error": context["error"]}
+    if handed and declared and handed != declared:
+        state = {"state": "mismatch", "id": declared, "handed_id": handed}
+    elif handed:
+        state = {"state": "handed", "id": handed}
+    elif declared is None and (root / ".contextkit" / "config.toml").is_file():
+        answer = _manager_declared_id(root)
+        if "error" in answer:
+            state = {"state": "unresolved", "id": None, "error": answer["error"]}
         else:
-            state = _identity_verdict(context["bound"], context["id"], cached)
-            state.update(bound=context["bound"], contextkit_id=context["id"])
-    state["project_json_id"] = cached
+            declared = answer["id"]
+            state = {"state": "declared" if declared else "undeclared", "id": declared}
+    else:
+        state = {"state": "declared" if declared else "undeclared", "id": declared}
+    state["project_json_id"] = declared
     if not handed and state["id"] and _identity_refusal(state) is None:
         os.environ["CAPABILITIES_PROJECT_ID"] = state["id"]
         os.environ["CAPABILITIES_PROJECT_ID_ROOT"] = str(root)
@@ -819,8 +782,8 @@ def _project_id(write: bool = False, refuse: bool = True):
     A read takes the id in every state. A write that stamps it takes it only
     once it is verified for this invocation, and otherwise exits 6 naming what
     to settle, or, with `refuse=False`, answers None so a read path that would
-    stamp the id can leave that step out instead of refusing. An unbound project
-    that declares no id is still None, left to the caller's own refusal."""
+    stamp the id can leave that step out instead of refusing. A project that
+    declares no id is still None, left to the caller's own refusal."""
     state = _project_id_state()
     if state is None:
         return None
@@ -2606,7 +2569,13 @@ STORE_CONNECTIONS_TABLE = "capabilities_connections"
 STORE_GRANTS_TABLE = "capabilities_connection_grants"
 STORE_IDENTIFIERS_TABLE = "capabilities_identifiers"
 STORE_POLICY_TABLE = "capabilities_policy"
-STORE_TABLES_VERSION = (1, 1)
+# The kernel's own tables, migrated in the same ledger: the agent registry, the
+# agent's nodes and the one row of facts about the store as a whole. The
+# manager alone writes them.
+STORE_AGENTS_TABLE = "capabilities_agents"
+STORE_AGENT_NODES_TABLE = "capabilities_agent_nodes"
+STORE_GLOBAL_TABLE = "capabilities_global"
+STORE_TABLES_VERSION = (1, 2)
 
 # Which collections each store mode keeps in the store. The default pointer is
 # a setting kept with the grants in both.
@@ -2687,6 +2656,107 @@ def record_table_steps() -> list[tuple[str, str]]:
          "CREATE UNIQUE INDEX capabilities_policy_key"
          " ON capabilities_policy"
          " ((coalesce(agent_id, '')), capability, (coalesce(node, '')))"),
+        # The agent registry. `id` is the project id `project.json` declares;
+        # the registry never mints or changes one. An icon and its SHA-256 are
+        # present together or absent together.
+        ("0009-agents",
+         "CREATE TABLE capabilities_agents ("
+         " id text PRIMARY KEY CHECK (id <> ''),"
+         " name text CHECK (name <> ''),"
+         " description text CHECK (description <> ''),"
+         " icon bytea,"
+         " icon_sha text CHECK (icon_sha ~ '^[0-9a-f]{64}$'),"
+         " onboarding_status text CHECK (onboarding_status IN ('pending', 'complete')),"
+         " onboarding_routine text CHECK (onboarding_routine <> ''),"
+         " migrating_since timestamptz,"
+         " migrated_at timestamptz,"
+         " created_at timestamptz NOT NULL DEFAULT now(),"
+         " updated_at timestamptz NOT NULL DEFAULT now(),"
+         " CHECK ((icon IS NULL) = (icon_sha IS NULL)));"
+         " COMMENT ON TABLE capabilities_agents IS"
+         " 'The agent registry: one row per agent, keyed by the project id its"
+         " capabilities/project.json declares. Written by the capabilities manager alone.';"
+         " COMMENT ON COLUMN capabilities_agents.id IS"
+         " 'The project id from capabilities/project.json (prj_<12 hex>, or an older UUID).';"
+         " COMMENT ON COLUMN capabilities_agents.name IS"
+         " 'Display name; null while the agent has none of its own.';"
+         " COMMENT ON COLUMN capabilities_agents.icon IS"
+         " 'The agent''s icon as PNG bytes; null with icon_sha when it has none.';"
+         " COMMENT ON COLUMN capabilities_agents.icon_sha IS"
+         " 'Lowercase hex SHA-256 of icon.';"
+         " COMMENT ON COLUMN capabilities_agents.onboarding_status IS"
+         " 'pending while the agent still runs its onboarding routine, complete once"
+         " it finished; null when no onboarding is tracked.';"
+         " COMMENT ON COLUMN capabilities_agents.onboarding_routine IS"
+         " 'The routine the agent runs while onboarding is pending.';"
+         " COMMENT ON COLUMN capabilities_agents.migrating_since IS"
+         " 'Set while a move of this agent''s records from files into the store is open.';"
+         " COMMENT ON COLUMN capabilities_agents.migrated_at IS"
+         " 'When this agent''s records and settings moved into the store; null while"
+         " they are still read from files.'"),
+        # ContextKit's registry rows, taken over once where that table exists in
+        # the same schema. An empty name or description meant none there.
+        ("0010-agents-from-contextkit",
+         "DO $copy$ BEGIN"
+         " IF to_regclass('contextkit_agents') IS NOT NULL THEN"
+         "  INSERT INTO capabilities_agents"
+         "   (id, name, description, icon, icon_sha, created_at, updated_at)"
+         "  SELECT id, nullif(name, ''), nullif(description, ''),"
+         "   CASE WHEN icon IS NOT NULL AND icon_sha ~ '^[0-9a-f]{64}$' THEN icon END,"
+         "   CASE WHEN icon IS NOT NULL AND icon_sha ~ '^[0-9a-f]{64}$' THEN icon_sha END,"
+         "   created_at, updated_at"
+         "  FROM contextkit_agents WHERE id <> ''"
+         "  ON CONFLICT (id) DO NOTHING;"
+         " END IF;"
+         " END $copy$"),
+        # The machines an agent runs on. Exactly one may be its master, which
+        # the partial index below enforces; a node is removed with its agent.
+        ("0011-agent-nodes",
+         "CREATE TABLE capabilities_agent_nodes ("
+         " agent_id text NOT NULL REFERENCES capabilities_agents (id)"
+         "  ON DELETE CASCADE ON UPDATE CASCADE,"
+         " node text NOT NULL CHECK (node <> ''),"
+         " kind text NOT NULL CHECK (kind IN ('mac', 'server')),"
+         " address text CHECK (address <> ''),"
+         " is_master boolean NOT NULL DEFAULT false,"
+         " may_write boolean NOT NULL DEFAULT false,"
+         " target text CHECK (target <> ''),"
+         " last_seen_at timestamptz,"
+         " PRIMARY KEY (agent_id, node));"
+         " COMMENT ON TABLE capabilities_agent_nodes IS"
+         " 'The nodes an agent runs on, one row per (agent, node). Written by the"
+         " capabilities manager alone. agent_id references capabilities_agents"
+         " because a node exists only as a node of a registered agent.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.node IS"
+         " 'The name the node gives itself in AGENT_NODE_NAME.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.address IS"
+         " 'Host name or IP address the node is reached at, where it is fixed.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.is_master IS"
+         " 'The node that writes the rows every node of the agent inherits; at"
+         " most one per agent.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.may_write IS"
+         " 'Whether a node that is not the master may write rows of its own, marked"
+         " with its node.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.target IS"
+         " 'The deployment target this node is deployed by; null for a node that"
+         " is not deployed, such as a Mac.';"
+         " COMMENT ON COLUMN capabilities_agent_nodes.last_seen_at IS"
+         " 'When the node last reported itself.'"),
+        ("0012-agent-nodes-master",
+         "CREATE UNIQUE INDEX capabilities_agent_nodes_master"
+         " ON capabilities_agent_nodes (agent_id) WHERE is_master"),
+        # Facts about the store as a whole, in its one row.
+        ("0013-global",
+         "CREATE TABLE capabilities_global ("
+         " singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),"
+         " global_migrated_at timestamptz);"
+         " INSERT INTO capabilities_global DEFAULT VALUES;"
+         " COMMENT ON TABLE capabilities_global IS"
+         " 'One row of facts about this store as a whole.';"
+         " COMMENT ON COLUMN capabilities_global.singleton IS"
+         " 'Always true; keeps the table at one row.';"
+         " COMMENT ON COLUMN capabilities_global.global_migrated_at IS"
+         " 'When the global records were written into the store; null until then.'"),
     ]
 
 

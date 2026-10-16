@@ -44,8 +44,9 @@ ENVIRONMENT
                        it is honored wherever it is inherited.
   CAPABILITIES_PROJECT_ID
                        the project id a write may stamp, handed down beside the
-                       envelope by a process that resolved it, so a descendant
-                       uses it without asking ContextKit.
+                       envelope by a process that read it from project.json, so
+                       a descendant uses it as given; one that differs from the
+                       project.json it finds refuses writes.
   CAPABILITIES_PROJECT_ID_ROOT
                        the project root that id answers for, scoping it the way
                        CAPABILITIES_PROJECT_ENVELOPE_ROOT scopes the envelope.
@@ -54,9 +55,9 @@ ENVIRONMENT
                        it starts under the read-only switch: every capability
                        reads but changes nothing (write verbs, project-record
                        writes and service activation exit 4), and this manager
-                       refuses allow, connections import, disable, enable,
-                       inherit, init, quarantine, relabel, set, store set and
-                       store unset.
+                       refuses agent set, allow, connections import, disable,
+                       enable, inherit, init, node add, node remove, node set,
+                       quarantine, relabel, set, store set and store unset.
                        doctor reports it. Unset, `0` or `false` leaves it off.
   AGENTKIT_DB_URL, AGENTKIT_DB_HOST, AGENTKIT_DB_PORT, AGENTKIT_DB_NAME,
   AGENTKIT_DB_USER, AGENTKIT_DB_PASSWORD, AGENTKIT_DB_SCHEMA,
@@ -71,9 +72,14 @@ PROJECT PATH VERB
         project_root, project_envelope, and provider. Plain projects use
         <root>/capabilities. ContextKit-bound projects must return a usable
         absolute in-project path; a broken binding is an error, never a fallback.
-        --identity adds project_identity: the project id, its state (unbound,
-        pending, adopted, mismatch), ContextKit's id and project.json's copy. A
-        bound project whose ContextKit cannot answer is an error.
+        --identity adds project_identity: the project id, read from the
+        envelope's project.json alone, and its state - declared (project.json
+        holds it), undeclared (no id), handed (handed down by the launching
+        process as CAPABILITIES_PROJECT_ID) or mismatch (handed down differently
+        from project.json, which writes refuse; handed_id names it) - with
+        project_json_id. Where project.json declares no id and
+        .contextkit/config.toml holds one under [identity], that id is copied
+        into project.json once (not under the read-only switch) and answered.
 
 THE PROJECT ENVELOPE
   Every project file the system owns — identity, the gate, the state guard,
@@ -413,8 +419,12 @@ PROJECT VERBS (run inside a consuming project)
   init [--claude] [--codex]
         Wire the project: scaffold the durable project identity, the
         manager-owned capabilities/.gitignore, and settings.json only in files
-        mode; in a ContextKit-bound project the identity copies ContextKit's
-        id and mints none while ContextKit has none; per host, wire the
+        mode. The identity's id is written once and never rewritten: an id
+        `.contextkit/config.toml` holds under [identity] is carried over,
+        otherwise one is minted offline. When a database resolves for the
+        project, its agent row is registered in capabilities_agents (the
+        result's `agent`: registered, store_not_configured, or the store's
+        error, which never fails init); per host, wire the
         SessionStart hook and the generated context file and generate the
         skill. No flags defaults to Claude Code wiring; Codex projects must
         pass --codex. Host wiring is manager-owned: each init brings the hook
@@ -430,6 +440,47 @@ PROJECT VERBS (run inside a consuming project)
         moved and are not re-scoped — they never referred to the label; no
         database is touched. Renaming the directory is unrelated and needs no
         command. Idempotent.
+  agent show [--icon-out PATH]
+        This project's row in the agent registry (capabilities_agents in the
+        project's store, keyed by the project.json id): {ok, project,
+        agent_id, registered, agent, store {level, schema}}, where agent is
+        null until the agent is registered, else {id, name, description,
+        icon_sha, icon_bytes, onboarding_status, onboarding_routine,
+        migrating_since, migrated_at, created_at, updated_at}. --icon-out
+        writes the icon's PNG bytes to PATH (exit 6 no_icon without one).
+  agent set [--name TEXT] [--description TEXT] [--icon PNG | --no-icon]
+            [--onboarding-status pending|complete|none]
+            [--onboarding-routine NAME]
+        Register the agent where it is not yet registered and write the
+        fields given; an empty TEXT or NAME, `none` and --no-icon clear a
+        field. --icon takes a PNG file and stores it with its SHA-256.
+        Answers {ok, project, agent_id, created, changed, agent, store};
+        writing the values a row already holds changes nothing.
+  node list
+        The nodes of this project's agent (capabilities_agent_nodes): {ok,
+        project, agent_id, nodes [{node, kind, address, is_master,
+        may_write, target, last_seen_at}], store}.
+  node add <node> --kind mac|server [--address HOST] [--target NAME]
+           [--master] [--may-write]
+        Register a node of this project's agent, registering the agent first
+        where needed. <node> is the name the node gives itself in
+        AGENT_NODE_NAME; --address is its fixed host name or IP, --target the
+        deployment target that deploys it. An agent has at most one master:
+        --master while another node is master exits 6 master_exists naming
+        it. A node already registered exits 6 node_exists. Answers {ok,
+        project, agent_id, node, changed, store}.
+  node set <node> [--kind mac|server] [--address HOST] [--target NAME]
+           [--master | --no-master] [--may-write | --no-may-write]
+        Change a registered node's fields; an empty HOST or NAME clears it.
+        Exit 6 node_unknown for a node not registered, master_exists as for
+        add. Answers as add, changed false when nothing moved.
+  node remove <node>
+        Remove a registered node; answers {ok, project, agent_id, removed,
+        store}. Exit 6 node_unknown for a node not registered.
+        The agent and node verbs need the project's id (exit 6
+        no_project_identity: run init) and a database that resolves for the
+        project (exit 6 store_not_configured, 5 when it cannot be reached);
+        set, add and remove exit 4 under the read-only switch.
   context --claude|--codex|--fragment
         Compose the session injection from the gate + snapshots + project
         envelopes. --fragment prints the manager-owned Markdown block without
@@ -559,9 +610,9 @@ VERIFICATION VERBS
         Reconcile machine registry ↔ snapshots ↔ project gate ↔ gitignore
         guard ↔ deny rules ↔ standalone host wiring, including what keeps
         Codex from loading the capability context ↔ project identity; report
-        drift, and the project's project_identity state. A project.json id
-        that differs from ContextKit's is drift, as is a store-mode project
-        whose store cannot be used. In store mode `information` lists, never
+        drift, and the project's project_identity state (see path
+        --identity). A handed-down id that differs from project.json's is
+        drift, as is a store-mode project whose store cannot be used. In store mode `information` lists, never
         as drift, each agent_id holding grants in the store that ContextKit's
         registry (contextkit_agents) does not know (grant_agent_unknown), or
         that the registry is not in the store (agents_registry_absent).
@@ -646,11 +697,6 @@ ENVELOPE_CACHE_VERSION = 1
 # catch what a stat cannot see — a context owner that starts answering
 # differently without its own program or the project's binding changing.
 ENVELOPE_CACHE_TTL = 3600
-# ContextKit's answer to "which id is this project?", recorded the same way and
-# against the same inputs: the id lives in the binding the envelope record
-# already watches.
-IDENTITY_CACHE_ROOT = _CACHE_HOME / "capabilities" / "identity"
-IDENTITY_CACHE_VERSION = 1
 OFFICIAL_SOURCE_ID = "official"
 OFFICIAL_GIT_URL = "https://github.com/ai-cluster-one/capabilities.git"
 RESERVED_CAPABILITY_NAMES = {"sources"}
@@ -705,7 +751,6 @@ CODEX_HOOKS_REL = Path(".codex") / "hooks.json"
 CONTEXTKIT_CONFIG_REL = Path(".contextkit") / "config.toml"
 CONTEXTKIT_BIN = "contextkit"
 CONTEXTKIT_ENVELOPE_QUERY = ("path", "capabilities")
-CONTEXTKIT_IDENTITY_QUERY = ("identity", "show", "--json", "--project")
 ENVELOPE_ENV = "CAPABILITIES_PROJECT_ENVELOPE"
 ENVELOPE_ROOT_ENV = "CAPABILITIES_PROJECT_ENVELOPE_ROOT"
 PROJECT_ID_ENV = "CAPABILITIES_PROJECT_ID"
@@ -865,8 +910,9 @@ def _store_module():
 # The verbs that write a project record — policy, configuration, the project's
 # identity and its wiring — and the machine ceiling. Under the read-only switch the manager refuses them;
 # whether the switch is on is the store tier's answer, never the manager's own.
-READ_ONLY_REFUSED_VERBS = ("allow", "connections import", "disable", "enable",
-                           "inherit", "init", "quarantine", "relabel", "set",
+READ_ONLY_REFUSED_VERBS = ("agent set", "allow", "connections import", "disable",
+                           "enable", "inherit", "init", "node add", "node remove",
+                           "node set", "quarantine", "relabel", "set",
                            "store set", "store unset")
 
 
@@ -1266,137 +1312,48 @@ def _gate_file(root: Path) -> Path:
     return _project_capabilities_dir(root) / "settings.json"
 
 
-_CONTEXT_IDENTITY: dict[Path, dict] = {}
+def _contextkit_config_id(root: Path) -> str | None:
+    """The id a ContextKit binding holds in `[identity] id`, or None.
 
-
-def _identity_problem(code: str, message: str, hint: str) -> dict:
-    return {"error": {"code": code, "message": message, "hint": hint}}
-
-
-def _contextkit_identity(root: Path) -> dict:
-    """ContextKit's own answer about this project: `{"bound", "id"}`, or
-    `{"error": ...}` when it cannot give one.
-
-    Bound means ContextKit reads a configuration for the project; its id is null
-    until the project is adopted, and is never guessed here."""
+    Read only to carry an id that lives nowhere else into project.json; it is
+    never the project's id while project.json declares one."""
     try:
-        proc = subprocess.run(
-            [CONTEXTKIT_BIN, *CONTEXTKIT_IDENTITY_QUERY, str(root)],
-            cwd=root, capture_output=True, text=True, timeout=10)
-    except FileNotFoundError:
-        return _identity_problem(
-            "contextkit_unavailable",
-            "this project is bound to ContextKit but contextkit is not available",
-            "install/repair ContextKit or remove the broken .contextkit binding")
-    except subprocess.TimeoutExpired:
-        return _identity_problem(
-            "contextkit_timeout",
-            "ContextKit did not answer the project identity within 10 seconds",
-            "repair the project context binding, then retry")
-    except OSError as exc:
-        return _identity_problem(
-            "contextkit_unavailable", f"could not run ContextKit: {exc}",
-            "install/repair ContextKit or remove the broken .contextkit binding")
-    if proc.returncode != 0 and re.search(r"invalid choice: '(identity|show)'",
-                                          proc.stderr or ""):
-        # A ContextKit that has no identity verb cannot hold an id: the project
-        # is bound and waiting for adoption, exactly as if it answered null.
-        return {"bound": True, "id": None}
-    if proc.returncode != 0:
-        return _identity_problem(
-            "contextkit_identity_failed",
-            f"ContextKit could not answer the project identity (exit {proc.returncode})",
-            (proc.stderr or proc.stdout).strip()
-            or "use a ContextKit release that answers `contextkit identity show --json`")
-    try:
-        answer = json.loads(proc.stdout)
-    except ValueError:
-        answer = None
-    ident = answer.get("id") if isinstance(answer, dict) else None
-    if (not isinstance(answer, dict) or "config" not in answer or "id" not in answer
-            or (ident is not None and (not isinstance(ident, str) or not ident.strip()))):
-        return _identity_problem(
-            "contextkit_identity_malformed",
-            "ContextKit returned a malformed project identity",
-            "expected a JSON object carrying `config` and `id`")
-    bound = answer["config"] is not None
-    return {"bound": bound, "id": ident.strip() if bound and ident else None}
+        import tomllib
+        with (root / CONTEXTKIT_CONFIG_REL).open("rb") as handle:
+            config = tomllib.load(handle)
+    except (OSError, ValueError, ImportError):
+        return None
+    identity = config.get("identity") if isinstance(config, dict) else None
+    ident = identity.get("id") if isinstance(identity, dict) else None
+    return ident.strip() if isinstance(ident, str) and ident.strip() else None
 
 
-def _context_identity(root: Path) -> dict:
-    """Whether a context owner binds this project, and the id it holds for it.
-
-    Asked once per invocation and recorded like the envelope, against the same
-    inputs — the project's binding, where ContextKit keeps the id, and the
-    program that answered — so a write never takes an id from a record whose
-    binding has moved since. An unbound project is recorded too, which is what
-    lets a capability learn it without starting the manager. A failed answer is
-    never recorded."""
-    root = root.resolve()
-    known = _CONTEXT_IDENTITY.get(root)
-    if known is not None:
-        return known
-    entry = _cached_record(IDENTITY_CACHE_ROOT, IDENTITY_CACHE_VERSION, root)
-    if (entry is not None and isinstance(entry.get("bound"), bool)
-            and (entry.get("id") is None or isinstance(entry.get("id"), str))):
-        answer = {"bound": entry["bound"], "id": entry.get("id")}
-    else:
-        witness = [_envelope_witness(root / CONTEXTKIT_CONFIG_REL)]
-        if _contextkit_managed(root):
-            program = shutil.which(CONTEXTKIT_BIN)
-            if program:
-                witness.append(_envelope_witness(program))
-            answer = _contextkit_identity(root)
-        else:
-            answer = {"bound": False, "id": None}
-        if "error" not in answer:
-            _write_record(IDENTITY_CACHE_ROOT, IDENTITY_CACHE_VERSION, str(root),
-                          answer, witness)
-    _CONTEXT_IDENTITY[root] = answer
-    return answer
-
-
-def _identity_verdict(bound: bool, contextkit_id: str | None,
-                      cached_id: str | None) -> dict:
-    """Which id a project answers to, from the three facts that decide it.
-
-    Unbound, the project's own project.json is the source. Bound, ContextKit's
-    id is authoritative and project.json holds at most its copy; until
-    ContextKit has an id, the copy is the id it will adopt."""
-    if not bound:
-        return {"state": "unbound", "id": cached_id}
-    if contextkit_id is None:
-        return {"state": "pending", "id": cached_id}
-    if cached_id is not None and cached_id != contextkit_id:
-        return {"state": "mismatch", "id": contextkit_id}
-    return {"state": "adopted", "id": contextkit_id}
-
-
-def _identity_refusal(state: dict) -> dict | None:
-    """Why a write may not stamp this project's id, or None when it may.
-
-    An unbound project without an id is left to the caller, whose refusal
-    already names `capabilities init`."""
-    if state["state"] == "unresolved":
-        return state["error"]
-    if state["state"] == "mismatch":
-        return {"code": "project_id_mismatch",
-                "message": f"project.json holds project id {state['project_json_id']}, "
-                           f"but ContextKit answers {state['contextkit_id']}",
-                "hint": "reconcile the two by hand: ContextKit's id is the "
-                        "project's, and project.json keeps only its copy"}
-    if state["state"] == "pending" and not state["id"]:
-        return {"code": "project_id_unassigned",
-                "message": "this project's ContextKit identity has no id yet",
-                "hint": "run `contextkit identity adopt` in the project"}
-    return None
-
-
-def _cached_project_id(root: Path) -> str | None:
+def _project_json_id(root: Path) -> str | None:
     identity = _read_json(_project_capabilities_dir(root) / PROJECT_IDENTITY_REL)
     if not isinstance(identity, dict):
         return None
     return str(identity.get("id") or "").strip() or None
+
+
+def _adopt_config_id(root: Path) -> str | None:
+    """Carry a ContextKit-held id into project.json, once, where project.json
+    declares none, and answer it. Under the read-only switch the id is
+    answered and nothing is written; the next process without the switch
+    writes it."""
+    ident = _contextkit_config_id(root)
+    if ident is None:
+        return None
+    if _store_module().read_only_switch():
+        return ident
+    identity_file = _project_capabilities_dir(root) / PROJECT_IDENTITY_REL
+    identity = _read_json(identity_file) if identity_file.is_file() else None
+    if not isinstance(identity, dict):
+        identity = {"schema": PROJECT_IDENTITY_SCHEMA, "slug": _default_project_slug(root)}
+    if str(identity.get("id") or "").strip():
+        return str(identity["id"]).strip()
+    identity["id"] = ident
+    _write_json(identity_file, identity)
+    return ident
 
 
 def _handed_off_project_id(root: Path) -> str:
@@ -1420,28 +1377,40 @@ def _handed_off_project_id(root: Path) -> str:
 
 
 def _project_id_state(root: Path) -> dict:
-    """The project's id, where it came from, and whether it can be trusted.
+    """The project's id and where it came from.
 
-    A live handoff for this root outranks ContextKit, as the envelope handoff
-    outranks the record. Reads use `id` in every state;
-    `_project_id_for_write` decides writes."""
-    cached = _cached_project_id(root)
+    `capabilities/project.json` is the id's one home. A live handoff for this
+    root is that id as the launching process read it, so it is used as given
+    unless project.json now declares another, which a write refuses. A project
+    whose project.json declares none takes the id its ContextKit binding holds,
+    copied into project.json once."""
+    declared = _project_json_id(root)
     handed = _handed_off_project_id(root)
-    if handed:
-        state = _identity_verdict(True, handed, cached)
-        if state["state"] != "mismatch":
-            state["state"] = "handed"
-        state.update(bound=None, contextkit_id=handed)
+    if handed and declared and handed != declared:
+        state = {"state": "mismatch", "id": declared, "handed_id": handed}
+    elif handed:
+        state = {"state": "handed", "id": handed}
     else:
-        context = _context_identity(root)
-        if "error" in context:
-            state = {"state": "unresolved", "id": cached, "bound": True,
-                     "contextkit_id": None, "error": context["error"]}
-        else:
-            state = _identity_verdict(context["bound"], context["id"], cached)
-            state.update(bound=context["bound"], contextkit_id=context["id"])
-    state["project_json_id"] = cached
+        if declared is None:
+            declared = _adopt_config_id(root)
+        state = {"state": "declared" if declared else "undeclared", "id": declared}
+    state["project_json_id"] = declared
     return state
+
+
+def _identity_refusal(state: dict) -> dict | None:
+    """Why a write may not stamp this project's id, or None when it may.
+
+    A project without an id is left to the caller, whose refusal already names
+    `capabilities init`."""
+    if state["state"] == "mismatch":
+        return {"code": "project_id_mismatch",
+                "message": f"project.json holds project id {state['project_json_id']}, "
+                           f"but the process that started this one handed down "
+                           f"{state['handed_id']}",
+                "hint": "start the command again from the project itself, so the id "
+                        "is read from its project.json"}
+    return None
 
 
 def _project_id_handoff(root: Path) -> dict[str, str]:
@@ -1455,8 +1424,8 @@ def _project_id_handoff(root: Path) -> dict[str, str]:
 
 
 def _project_id_for_write(root: Path) -> str | None:
-    """The id a write stamps, verified against ContextKit for this invocation,
-    or a refusal. None only where an unbound project declares no id."""
+    """The id a write stamps, or a refusal. None only where the project
+    declares no id."""
     state = _project_id_state(root)
     refusal = _identity_refusal(state)
     if refusal:
@@ -1481,11 +1450,7 @@ def cmd_path(json_output: bool, identity: bool = False) -> None:
         "provider": provider,
     }
     if identity:
-        state = _project_id_state(root)
-        if state["state"] == "unresolved":
-            error = state["error"]
-            _die(6, error["code"], error["message"], error.get("hint"))
-        answer["project_identity"] = state
+        answer["project_identity"] = _project_id_state(root)
     _emit(answer)
 
 
@@ -6128,34 +6093,21 @@ def _ensure_project_identity(capdir: Path, root: Path) -> dict:
     """Who this project is, minted once and committed.
 
     The id travels with the repository, so a laptop and a server resolve to the
-    same project without being told."""
+    same project without being told. project.json is its one home: an id
+    already written is never rewritten. Where it has none, an id a ContextKit
+    binding holds is carried over, and otherwise one is minted here, offline."""
     identity_file = capdir / PROJECT_IDENTITY_REL
     if identity_file.is_file():
-        identity = _read_json(identity_file) or {}
-        # A copy is filled from ContextKit where it has none; an id already
-        # written is never rewritten, even where it disagrees (doctor says so).
-        if (isinstance(identity, dict) and _contextkit_managed(root)
-                and not str(identity.get("id") or "").strip()):
-            context = _context_identity(root)
-            if context.get("bound") and context.get("id"):
-                identity["id"] = context["id"]
-                _write_json(identity_file, identity)
-        return identity
-    identity = {"schema": PROJECT_IDENTITY_SCHEMA, "slug": _default_project_slug(root)}
-    context = (_context_identity(root) if _contextkit_managed(root)
-               else {"bound": False, "id": None})
-    if context.get("bound") or "error" in context:
-        # ContextKit owns a bound project's id, so the copy takes the id it has.
-        # Without one nothing is written: `contextkit identity adopt` reads an
-        # absent file as "no id yet" and refuses one that carries no id, and the
-        # next init after adoption writes the copy.
-        if not context.get("id"):
+        identity = _read_json(identity_file)
+        if not isinstance(identity, dict):
             return {}
-        identity["id"] = context["id"]
+        if str(identity.get("id") or "").strip():
+            return identity
     else:
-        # Twelve hex characters, for the reason a document version has twelve:
-        # an identifier nobody can read is an identifier nobody checks.
-        identity["id"] = "prj_" + secrets.token_hex(6)
+        identity = {"schema": PROJECT_IDENTITY_SCHEMA, "slug": _default_project_slug(root)}
+    # Twelve hex characters, for the reason a document version has twelve:
+    # an identifier nobody can read is an identifier nobody checks.
+    identity["id"] = _contextkit_config_id(root) or "prj_" + secrets.token_hex(6)
     _write_json(identity_file, identity)
     return identity
 
@@ -6194,6 +6146,394 @@ def cmd_relabel(slug: str) -> None:
            "slug": slug, "previous_slug": was,
            "identity": str(_envelope_home(root) / PROJECT_IDENTITY_REL),
            "unchanged": was == slug})
+
+
+# ---------------------------------------------------------------- the kernel: agents and nodes
+
+# The agent registry and the agent's nodes live in the store, in the contract's
+# own tables, keyed by the id project.json declares. The manager alone writes
+# them; `agent` and `node` answer for the project the call runs in.
+AGENT_COLUMNS = ("id", "name", "description", "icon_sha", "onboarding_status",
+                 "onboarding_routine", "migrating_since", "migrated_at",
+                 "created_at", "updated_at")
+AGENT_TEXT_FIELDS = {"--name": "name", "--description": "description",
+                     "--onboarding-routine": "onboarding_routine"}
+ONBOARDING_STATUSES = ("pending", "complete")
+NODE_COLUMNS = ("node", "kind", "address", "is_master", "may_write", "target",
+                "last_seen_at")
+NODE_KINDS = ("mac", "server")
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _kernel_open(root: Path):
+    """(connection, setting) for the project's store with the contract's tables
+    migrated, or the store's refusal. The caller closes the connection."""
+    db = _db_module()
+    store = _store_module()
+    try:
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=store.STORE_OWNER, setting=setting)
+    except db.DbError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    import psycopg
+    try:
+        major, minor = store.STORE_TABLES_VERSION
+        db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
+                   major=major, minor=minor)
+    except db.DbError as exc:
+        conn.close()
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    except psycopg.OperationalError as exc:
+        conn.close()
+        _die(5, "store_unreachable", f"cannot reach the store: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    return conn, setting
+
+
+def _kernel_agent_id(root: Path) -> str:
+    agent_id = _project_id_for_write(root)
+    if not agent_id:
+        _die(6, "no_project_identity",
+             f"{_project_capabilities_dir(root) / PROJECT_IDENTITY_REL} carries no project id",
+             "run `capabilities init` in the project to mint its identity")
+    return agent_id
+
+
+def _kernel_run(root: Path, work):
+    """Run `work(conn, agent_id)` in one transaction against the project's store
+    and answer what it returns, with the store's errors as the manager's exits."""
+    agent_id = _kernel_agent_id(root)
+    conn, setting = _kernel_open(root)
+    import psycopg
+    try:
+        with conn.transaction():
+            return work(conn, agent_id), setting
+    except psycopg.errors.UniqueViolation:
+        raise
+    except psycopg.OperationalError as exc:
+        _die(5, "store_unreachable", f"cannot reach the store: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    except psycopg.Error as exc:
+        _die(5, "store_write_failed", f"the store refused the change: {exc}")
+    finally:
+        conn.close()
+
+
+def _kernel_store_report(setting) -> dict:
+    return {"level": setting.level, "schema": setting.schema}
+
+
+def _agent_row(conn, agent_id: str) -> dict | None:
+    stamp = _store_module()._stamp
+    row = conn.execute(
+        f"SELECT {', '.join(AGENT_COLUMNS)}, octet_length(icon) "
+        "FROM capabilities_agents WHERE id = %s", (agent_id,)).fetchone()
+    if row is None:
+        return None
+    agent = dict(zip(AGENT_COLUMNS, row[:-1]))
+    for key in ("migrating_since", "migrated_at", "created_at", "updated_at"):
+        agent[key] = stamp(agent[key])
+    agent["icon_bytes"] = row[-1]
+    return agent
+
+
+def _ensure_agent_row(conn, agent_id: str) -> bool:
+    """Register the agent with its id alone where it is not yet registered;
+    True when this call registered it."""
+    cur = conn.execute("INSERT INTO capabilities_agents (id) VALUES (%s) "
+                       "ON CONFLICT (id) DO NOTHING", (agent_id,))
+    return cur.rowcount == 1
+
+
+def _register_agent_on_init(root: Path) -> dict:
+    """init's registration of the agent row: written where a database resolves
+    for the project, and otherwise reported, never failing init."""
+    agent_id = _project_json_id(root)
+    if not agent_id:
+        return {"registered": False, "reason": "no_project_identity"}
+    db = _db_module()
+    store = _store_module()
+    try:
+        setting = db.resolve_setting(root)
+    except db.DbError as exc:
+        if exc.slug == "store_not_configured":
+            return {"registered": False, "reason": "store_not_configured"}
+        return {"registered": False, "error": _db_error(exc)}
+    import psycopg
+    try:
+        conn = db.connect(application_name=store.STORE_OWNER, setting=setting)
+    except db.DbError as exc:
+        return {"registered": False, "error": _db_error(exc)}
+    try:
+        major, minor = store.STORE_TABLES_VERSION
+        db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
+                   major=major, minor=minor)
+        with conn.transaction():
+            created = _ensure_agent_row(conn, agent_id)
+        return {"registered": True, "id": agent_id, "created": created,
+                "store": _kernel_store_report(setting)}
+    except db.DbError as exc:
+        return {"registered": False, "error": _db_error(exc)}
+    except psycopg.Error as exc:
+        return {"registered": False,
+                "error": {"code": "store_write_failed",
+                          "message": f"registering the agent failed: {exc}"}}
+    finally:
+        conn.close()
+
+
+def _kernel_options(args: list[str], valued: set[str], flags: set[str],
+                    verb: str) -> tuple[list[str], dict]:
+    """Split a kernel verb's arguments into positionals and options, refusing
+    anything it does not take."""
+    positionals, options, i = [], {}, 0
+    while i < len(args):
+        arg = args[i]
+        name, eq, value = arg.partition("=")
+        if name in valued:
+            if not eq:
+                if i + 1 >= len(args):
+                    _die(6, "input", f"{name} needs a value")
+                value, i = args[i + 1], i + 1
+            if name in options:
+                _die(6, "input", f"{name} given twice")
+            options[name] = value
+        elif arg in flags:
+            options[arg] = True
+        elif arg.startswith("--"):
+            _die(6, "input", f"`capabilities {verb}` does not take {arg}",
+                 "run `capabilities help` for the kernel verbs")
+        else:
+            positionals.append(arg)
+        i += 1
+    return positionals, options
+
+
+def cmd_agent(args: list[str]) -> None:
+    sub = args[0] if args else None
+    root = _require_project()
+    if sub == "show":
+        pos, opts = _kernel_options(args[1:], {"--icon-out"}, {"--json"}, "agent show")
+        if pos:
+            _die(6, "input", "agent show takes no positional argument")
+
+        def show(conn, agent_id):
+            agent = _agent_row(conn, agent_id)
+            icon = None
+            if "--icon-out" in opts:
+                found = conn.execute("SELECT icon FROM capabilities_agents WHERE id = %s",
+                                     (agent_id,)).fetchone()
+                icon = bytes(found[0]) if found and found[0] is not None else None
+            return agent_id, agent, icon
+
+        (agent_id, agent, icon), setting = _kernel_run(root, show)
+        answer = {"ok": True, "project": str(root), "agent_id": agent_id,
+                  "registered": agent is not None, "agent": agent,
+                  "store": _kernel_store_report(setting)}
+        if "--icon-out" in opts:
+            if icon is None:
+                _die(6, "no_icon", f"agent {agent_id} has no icon")
+            out = Path(opts["--icon-out"]).expanduser()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(icon)
+            answer["icon_out"] = str(out.resolve())
+        _emit(answer)
+    elif sub == "set":
+        _read_only_gate("agent set")
+        pos, opts = _kernel_options(
+            args[1:], {*AGENT_TEXT_FIELDS, "--icon", "--onboarding-status"},
+            {"--no-icon", "--json"}, "agent set")
+        if pos:
+            _die(6, "input", "agent set takes no positional argument")
+        values: dict = {}
+        for flag_name, column in AGENT_TEXT_FIELDS.items():
+            if flag_name in opts:
+                values[column] = opts[flag_name].strip() or None
+        if "--onboarding-status" in opts:
+            status = opts["--onboarding-status"].strip()
+            if status not in (*ONBOARDING_STATUSES, "none"):
+                _die(6, "input", f"--onboarding-status {status!r} is not one of "
+                     f"{', '.join(ONBOARDING_STATUSES)} or none")
+            values["onboarding_status"] = None if status == "none" else status
+        if "--icon" in opts and "--no-icon" in opts:
+            _die(6, "input", "agent set takes --icon or --no-icon, not both")
+        if "--icon" in opts:
+            path = Path(opts["--icon"]).expanduser()
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                _die(6, "input", f"--icon {path} cannot be read: {exc}")
+            if not data.startswith(PNG_SIGNATURE):
+                _die(6, "input", f"--icon {path} is not a PNG file")
+            values["icon"] = data
+            values["icon_sha"] = hashlib.sha256(data).hexdigest()
+        elif "--no-icon" in opts:
+            values["icon"] = None
+            values["icon_sha"] = None
+        if not values:
+            _die(6, "input", "agent set needs at least one of --name, --description, "
+                 "--icon, --no-icon, --onboarding-status, --onboarding-routine")
+
+        def write(conn, agent_id):
+            created = _ensure_agent_row(conn, agent_id)
+            columns = list(values)
+            assignments = ", ".join(f"{c} = %s" for c in columns)
+            cur = conn.execute(
+                f"UPDATE capabilities_agents SET {assignments}, updated_at = now() "
+                f"WHERE id = %s AND ({', '.join(columns)}) IS DISTINCT FROM "
+                f"({', '.join(['%s'] * len(columns))})",
+                (*values.values(), agent_id, *values.values()))
+            return agent_id, created, cur.rowcount == 1, _agent_row(conn, agent_id)
+
+        (agent_id, created, changed, agent), setting = _kernel_run(root, write)
+        _emit({"ok": True, "project": str(root), "agent_id": agent_id,
+               "created": created, "changed": created or changed, "agent": agent,
+               "store": _kernel_store_report(setting)})
+    else:
+        _die(6, "input", "agent needs a subcommand: show or set",
+             "run `capabilities help`")
+
+
+def _node_rows(conn, agent_id: str, node: str | None = None) -> list[dict]:
+    stamp = _store_module()._stamp
+    sql = (f"SELECT {', '.join(NODE_COLUMNS)} FROM capabilities_agent_nodes "
+           "WHERE agent_id = %s")
+    params: tuple = (agent_id,)
+    if node is not None:
+        sql, params = sql + " AND node = %s", (agent_id, node)
+    rows = conn.execute(sql + " ORDER BY node", params).fetchall()
+    out = []
+    for row in rows:
+        entry = dict(zip(NODE_COLUMNS, row))
+        entry["last_seen_at"] = stamp(entry["last_seen_at"])
+        out.append(entry)
+    return out
+
+
+def _node_name_arg(pos: list[str], verb: str) -> str:
+    if len(pos) != 1 or not pos[0].strip():
+        _die(6, "input", f"node {verb} needs exactly one node name")
+    return pos[0].strip()
+
+
+def _node_values(opts: dict) -> dict:
+    """The columns a node add or set writes, from its options."""
+    values: dict = {}
+    if "--kind" in opts:
+        kind = opts["--kind"].strip()
+        if kind not in NODE_KINDS:
+            _die(6, "input", f"--kind {kind!r} is not one of {', '.join(NODE_KINDS)}")
+        values["kind"] = kind
+    for flag_name, column in (("--address", "address"), ("--target", "target")):
+        if flag_name in opts:
+            values[column] = opts[flag_name].strip() or None
+    for on, off, column in (("--master", "--no-master", "is_master"),
+                            ("--may-write", "--no-may-write", "may_write")):
+        if on in opts and off in opts:
+            _die(6, "input", f"node takes {on} or {off}, not both")
+        if on in opts:
+            values[column] = True
+        elif off in opts:
+            values[column] = False
+    return values
+
+
+def _refuse_second_master(conn, agent_id: str, node: str) -> None:
+    held = conn.execute(
+        "SELECT node FROM capabilities_agent_nodes WHERE agent_id = %s AND is_master "
+        "AND node <> %s FOR UPDATE", (agent_id, node)).fetchone()
+    if held is not None:
+        raise _KernelRefusal(
+            "master_exists", f"agent {agent_id} already has master node {held[0]}",
+            f"an agent has one master: run `capabilities node set {held[0]} "
+            "--no-master` first, then make this node the master")
+
+
+class _KernelRefusal(Exception):
+    def __init__(self, code: str, message: str, hint: str | None = None):
+        super().__init__(message)
+        self.code, self.message, self.hint = code, message, hint
+
+
+def cmd_node(args: list[str]) -> None:
+    sub = args[0] if args else None
+    root = _require_project()
+    valued = {"--kind", "--address", "--target"}
+    toggles = {"--master", "--no-master", "--may-write", "--no-may-write"}
+    import psycopg
+    if sub == "list":
+        pos, _opts = _kernel_options(args[1:], set(), {"--json"}, "node list")
+        if pos:
+            _die(6, "input", "node list takes no positional argument")
+        (agent_id, nodes), setting = _kernel_run(
+            root, lambda conn, agent_id: (agent_id, _node_rows(conn, agent_id)))
+        _emit({"ok": True, "project": str(root), "agent_id": agent_id,
+               "nodes": nodes, "store": _kernel_store_report(setting)})
+        return
+    if sub not in ("add", "set", "remove"):
+        _die(6, "input", "node needs a subcommand: add, set, list or remove",
+             "run `capabilities help`")
+    _read_only_gate(f"node {sub}")
+    if sub == "remove":
+        pos, _opts = _kernel_options(args[1:], set(), {"--json"}, "node remove")
+        values: dict = {}
+    else:
+        pos, opts = _kernel_options(args[1:], valued, {*toggles, "--json"}, f"node {sub}")
+        values = _node_values(opts)
+    node = _node_name_arg(pos, sub)
+    if sub == "add" and "kind" not in values:
+        _die(6, "input", "node add needs --kind mac|server")
+    if sub == "set" and not values:
+        _die(6, "input", "node set needs at least one of --kind, --address, --target, "
+             "--master, --no-master, --may-write, --no-may-write")
+
+    def work(conn, agent_id):
+        if sub == "add":
+            _ensure_agent_row(conn, agent_id)
+            if _node_rows(conn, agent_id, node):
+                raise _KernelRefusal("node_exists",
+                                     f"agent {agent_id} already has node {node}",
+                                     f"change it with `capabilities node set {node}`")
+            if values.get("is_master"):
+                _refuse_second_master(conn, agent_id, node)
+            columns = ["agent_id", "node", *values]
+            conn.execute(
+                f"INSERT INTO capabilities_agent_nodes ({', '.join(columns)}) "
+                f"VALUES ({', '.join(['%s'] * len(columns))})",
+                (agent_id, node, *values.values()))
+            return agent_id, _node_rows(conn, agent_id, node)[0], True
+        before = _node_rows(conn, agent_id, node)
+        if not before:
+            raise _KernelRefusal("node_unknown", f"agent {agent_id} has no node {node}",
+                                 "run `capabilities node list` to see its nodes")
+        if sub == "remove":
+            conn.execute("DELETE FROM capabilities_agent_nodes "
+                         "WHERE agent_id = %s AND node = %s", (agent_id, node))
+            return agent_id, before[0], True
+        if values.get("is_master"):
+            _refuse_second_master(conn, agent_id, node)
+        assignments = ", ".join(f"{c} = %s" for c in values)
+        conn.execute(f"UPDATE capabilities_agent_nodes SET {assignments} "
+                     "WHERE agent_id = %s AND node = %s",
+                     (*values.values(), agent_id, node))
+        after = _node_rows(conn, agent_id, node)[0]
+        return agent_id, after, after != before[0]
+
+    try:
+        (agent_id, row, changed), setting = _kernel_run(root, work)
+    except _KernelRefusal as exc:
+        _die(6, exc.code, exc.message, exc.hint)
+    except psycopg.errors.UniqueViolation:
+        # Another writer made a master between the check and the write.
+        _die(6, "master_exists", "this agent already has a master node",
+             "run `capabilities node list` to see it")
+    answer = {"ok": True, "project": str(root), "agent_id": agent_id,
+              "store": _kernel_store_report(setting)}
+    if sub == "remove":
+        answer["removed"] = row
+    else:
+        answer.update(node=row, changed=changed)
+    _emit(answer)
 
 
 # ---------------------------------------------------------------- the store setting
@@ -7952,7 +8292,8 @@ def cmd_init(claude: bool, codex: bool) -> None:
     root = _project_root() or Path.cwd().resolve()
     migrated = _ensure_envelope(root)
     result: dict = {"project": str(root),
-                    "gate": str(_gate_file(root))}
+                    "gate": str(_gate_file(root)),
+                    "agent": _register_agent_on_init(root)}
     if migrated:
         result["migrated_from"] = str(root / LEGACY_PROJECT_CAPABILITIES_REL)
         result["migrated_entries"] = migrated
@@ -8239,13 +8580,8 @@ def cmd_doctor() -> None:
     if identity and identity["state"] == "mismatch":
         findings.append(
             f"project: project.json holds project id {identity['project_json_id']}, "
-            f"but ContextKit answers {identity['contextkit_id']} — reconcile them "
-            "by hand; writes that stamp the project id refuse until they agree")
-    elif identity and identity["state"] == "unresolved":
-        findings.append(
-            f"project: ContextKit could not answer the project id "
-            f"({identity['error']['message']}) — writes that stamp the project id "
-            "refuse until it can")
+            f"but this process was handed down {identity['handed_id']} — writes "
+            "that stamp the project id refuse until they agree")
     if root and envelope and ((envelope / "settings.json").is_file()
                               or (envelope / PROJECT_IDENTITY_REL).is_file()):
         store_finding = None
@@ -11395,6 +11731,10 @@ def main() -> None:
         _inherit_gate(pos[0], scope, node=opt("--node"))
     elif cmd == "init":
         cmd_init(flag("--claude"), flag("--codex"))
+    elif cmd == "agent":
+        cmd_agent(rest)
+    elif cmd == "node":
+        cmd_node(rest)
     elif cmd == "relabel":
         if len(pos) != 1:
             _die(6, "input", "relabel needs exactly one new slug")

@@ -2,12 +2,12 @@
   "assets": {
     "DOCTRINE.md": "a96525f48c2fa66053bb6fa29c6f670810fd4bd8924d29e16895a7197b6fbcc1",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "10134719e36024a89a2aa43aba8338ec0ccb51e58e3c153955a889f59d5321a4",
+    "SHEBANG.md": "140c63a7ff1d75447eebc87624a441e9cc62258d4f943dffc890dbe1607c36c3",
     "SOURCES.md": "79e453cf68a08ba2b2e5e460064eb0a5aca8f13071e9d6557be1b7361f1e0075",
     "TEMPLATE.md": "c9818625f5372ba7c53a423be43543f9f485435dae5a71ffbc4b61e5c81617e7",
-    "contract/CHANGELOG.md": "29e2526473078133e2ef8b4e41160c6cef7d4d14f5988fee8e83240949eec7a7",
-    "contract/preamble.py": "28bffb41b29b61abe0f69532bc89d86e4ea590753727868b1283c42084e7fc90",
-    "contract/store.py": "38ea708984e8d46431f09adbeff9a78a5a4edc48a8fb016087b0dc774f19ecdd",
+    "contract/CHANGELOG.md": "7468b016cb95ca2f6d5dc5b26899b73ac6ceaf44592e14183b03a17181ef6f7b",
+    "contract/preamble.py": "4e205bd80078544587dc2582e3749b6ab103fcb1b5e2d68fc3f911225e05b722",
+    "contract/store.py": "b90edfd354c7385096070aaa43cf383c980c564a7a9d66017f910372a7785af6",
     "guides/authoring.md": "e467e5343a54e99c991592d06233fd98b7be13fa32a174d0f27d3a8a06478724",
     "guides/conforming.md": "1c3a44cd7662cb26eec400d05290f6b9f364758387e8d3f974ad8eb74abde93b",
     "guides/contract.md": "72408b3b5d035b15f9d98b5a5dc3d558870f391ed254b8c5f017656be75a13f4",
@@ -18,12 +18,12 @@
     "guides/repositories.md": "0ec2af6dfc92d20aa283fecab82b7888fb22b2480541cbb597e9a52f680ec2f4",
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "1ef3af125747cc9c821843d045a5cf312d00c584d739bfe25d8314674682a838",
+    "manager/CHANGELOG.md": "321679cb530ec146b62f70412c6c3256b26421bed93d5bc623428fc7d4079f75",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "a79a3e420b1c48ace60a16311432f0cb8b36d7f03998136d2b31275e9147cef3"
+    "sha256": "96d9dcb531cdf77479c066f2f93b1a194df72d2d627fac068c810d2a8ed4a805"
   },
   "schema": "capabilities.manager-release.v1"
 }
