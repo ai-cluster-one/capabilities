@@ -678,3 +678,21 @@ def test_the_machine_scheduler_serves_a_moved_agent(world):
     finally:
         run(w, "moved", "automations", "service", "stop", "--machine")
         run(w, "moved", "automations", "service", "leave")
+
+
+@pytest.mark.parametrize("capability", ["tasks", "memory"])
+def test_the_service_starts_and_stops_with_no_settings_file(world, capability):
+    w = world
+    started = run(w, "moved", capability, "service", "start")
+    try:
+        _say(f"{capability}-service-start-moved", {"exit": started.returncode,
+                                                   "stdout": started.stdout[-3000:],
+                                                   "stderr": started.stderr[-3000:]})
+        assert started.returncode == 0, started.stderr
+        status = w.answer(run(w, "moved", capability, "service", "status"))
+        _say(f"{capability}-service-status-moved", status)
+        assert status["running"] is True, status
+    finally:
+        stopped = run(w, "moved", capability, "service", "stop")
+        assert stopped.returncode == 0, stopped.stderr
+    assert w.files_left(w.roots["moved"]) == []
