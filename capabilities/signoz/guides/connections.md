@@ -55,7 +55,9 @@ which name and cascade tier resolved without exposing either secret.
 ## Connection registry
 
 Every setup declares at least one connection in
-`capabilities/signoz/connections.json` (or the user-level registry). Values may
+`capabilities/signoz/connections.json` (or the user-level registry; for an
+agent whose records moved into the store, rows there, written with `signoz
+connection add`, and `signoz help` says which under "Where connections live"). Values may
 remain in the environment cascade; an empty declared entry is enough to use the
 canonical variables and compatibility aliases. A multi-deployment registry
 looks like this:

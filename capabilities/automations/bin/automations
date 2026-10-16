@@ -15,6 +15,11 @@ and in an agent container, and records its runs in the same store.
 Configuration:
   capabilities/automations/service/config.toml holds the scheduler's own
   [engine] settings and the [agents] profiles. The automations are not in it.
+  For an agent whose records moved into the store (`capabilities migrate`)
+  no file holds them: the [engine] settings and agents.default are rows of
+  its `automations` settings document (`automations settings`), and each
+  profile of [agents.workers] is a harness profile `automations-<name>` in
+  harness_profiles, at the agent's scope.
 
 Definitions:
   An automation is a row of automations_definitions in the store the project
@@ -327,7 +332,9 @@ Environment:
                            development).
   AUTOMATIONS_NAMESPACE    Handed to every job as AUTOMATION_NAMESPACE (default:
                            project directory name).
-  AUTOMATIONS_CONFIG       Optional config path override.
+  AUTOMATIONS_CONFIG       Optional config path override; ignored, with a
+                           notice, for an agent whose records moved into the
+                           store.
   AUTOMATIONS_STATE_DIR    Optional state root override. By default project runtime
                            state lives under $XDG_STATE_HOME/capabilities/projects/
                            <project-slug>/automations.
@@ -362,7 +369,9 @@ Scheduling:
 
 Agents:
   A script that needs judgement rather than computation runs one agent turn
-  through `automations agent`. Profiles live in config.toml under [agents];
+  through `automations agent`. Profiles live in config.toml under [agents]
+  (harness profiles `automations-<name>` once the agent moved, see
+  Configuration);
   `sonnet`, `opus` and `haiku` ship with the capability and a project adds its
   own, including codex profiles, under [agents.workers.<name>]. A profile names
   engine, model, effort, mode and timeout_seconds. `mode = "read"` fences the

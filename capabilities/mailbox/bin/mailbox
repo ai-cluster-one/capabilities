@@ -155,7 +155,8 @@ Contract commands (the same on every capability):
   mailbox guide [<topic>]                     Guide topics / one guide body,
                                               fetched live from the docs base.
   mailbox ids list|get <l>|set <l> <v>|rm <l> The project identifiers envelope
-          [--note <text>]                     (capabilities/mailbox/identifiers.json).
+          [--note <text>]                     (capabilities/mailbox/identifiers.json,
+                                               or store rows once the agent moved).
   mailbox refs                                Menu of the project's reference
                                               files for this capability.
   mailbox inventory [--network]               What this capability holds in
@@ -166,7 +167,7 @@ Exit codes:
   0  success
   2  auth (missing credentials, login rejected)
   3  not found (no message with that uid)
-  4  policy refusal — the project gate (capabilities/settings.json) on any
+  4  policy refusal — the project gate (store rows once the agent moved, else capabilities/settings.json) on any
      verb, or a write verb on a read-only connection (allow_write: false).
      Ask the user; never lift a gate yourself.
   5  server / network (IMAP/SMTP unreachable, timeout)

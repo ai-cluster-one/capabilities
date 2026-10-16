@@ -18,7 +18,7 @@ The Telegram assistant service is bundled with the `telegram` capability. The pr
    telegram service init
    ```
 
-3. Edit `capabilities/telegram/service/settings.json`:
+3. Edit the service settings: `capabilities/telegram/service/settings.json` in files mode, or, for an agent whose records moved into the store, its `telegram` settings rows with `telegram settings edit` (or `settings set <key> <value>`):
 
    - Set `connection` to the registry label whose entry carries the intended positive `expected_account_id`, or rely on the registry default.
    - Add `allowed_users` and `allowed_groups`.
@@ -605,7 +605,7 @@ The register is the one exception, and for the same reason replies are. A job ro
 
 Routing changes which rights the worker has, not only where it runs. Beyond the register, the target project's capability gate governs the routed worker, so a capability must be enabled there — `capabilities enable <name> --project` inside that project, or `--global` for every project — before the worker can call it. Replies and progress are unaffected: `telegram send` from a worker is intercepted by the worker shim and delivered by the daemon's own client, so it never depends on the worker's directory or on the target project's policy.
 
-A route is judged twice. Its shape is checked when settings load: a string, absolute after expansion, and inside `$HOME`. Its reachability is checked when a message arrives: the target must exist, be a directory, and carry a project marker (`capabilities/settings.json`, `.contextkit/config.toml`, `.capabilities`, `.env`, `.env.local`, or `.git`). A target that fails at dispatch fails that one request and says so in the chat, because a neighbouring repository that was renamed must not stop the daemon that serves every other channel.
+A route is judged twice. Its shape is checked when settings load: a string, absolute after expansion, and inside `$HOME`. Its reachability is checked when a message arrives: the target must exist, be a directory, and carry a project marker (`capabilities/project.json`, `capabilities/settings.json`, `.contextkit/config.toml`, `.capabilities`, `.env`, `.env.local`, or `.git`). A target that fails at dispatch fails that one request and says so in the chat, because a neighbouring repository that was renamed must not stop the daemon that serves every other channel.
 
 ### General
 

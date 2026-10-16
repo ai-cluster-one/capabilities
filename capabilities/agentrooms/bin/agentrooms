@@ -110,7 +110,8 @@ COMMANDS
         connection ID (default the localpart) and the minted access token
         under AGENTROOMS_<ID>_TOKEN, mode 0600, into the credentials file of
         the same scope: --project (the default) this project's registry and
-        .env.local, --global ~/.config/agentrooms/connections.json and the
+        .env.local, --global ~/.config/agentrooms/connections.json (the
+        store's global rows inside an agent whose records moved there) and the
         user credentials.env. The password is sent once to the homeserver
         (m.login.password) and never stored or printed; nor is the token. The
         homeserver comes from --homeserver, else AGENTROOMS_HOMESERVER. Not
@@ -392,7 +393,8 @@ COMMANDS
         Bind the worker to the selected connection's agent, or, with --room,
         to that agent in that room only, overriding the agent's. NAME must
         have an active version. Writes `worker` or `rooms.<room id>` in the
-        project's `binding.<connection>` setting, in service/settings.json,
+        project's `binding.<connection>` setting, in service/settings.json
+        (in the store's settings rows once the agent's records moved there),
         whether the connection is declared in files or held in the store.
     workers unbind [--room ROOM]
         Take the agent's binding off, or the room's.
@@ -406,7 +408,8 @@ COMMANDS
         turn_timeout and history, admitting every sender as the map did,
         bound in the project's settings; the map is then removed. Without --apply,
         says what it would do. The service does this itself when it takes up
-        a project that still carries the map.
+        a project that still carries the map, except for an agent whose
+        records moved into the store, whose file is neither read nor removed.
   save, remove, bind, unbind, supervisor and import --apply are refused
   (exit 4 policy) inside a turn the service started, which carries
   AGENTROOMS_TURN: a fence the fenced can rewrite is none.

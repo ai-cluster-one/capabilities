@@ -144,7 +144,8 @@ CONTRACT COMMANDS (the same on every capability):
   emta guide [<topic>]                       guide topics / one guide body
                                              (none ship initially)
   emta ids list|get <l>|set <l> <v>|rm <l>   project identifiers envelope
-        [--note <text>]                      (capabilities/emta/identifiers.json)
+        [--note <text>]                      (capabilities/emta/identifiers.json,
+                                              or store rows once the agent moved)
   emta refs                                  menu of the project's reference
                                              files for this capability
   emta inventory [--network]                 What this capability holds in this

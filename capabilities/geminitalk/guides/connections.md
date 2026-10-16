@@ -24,7 +24,7 @@ GEMINITALK_ALLOW_CAPABILITY_DOMAIN_COMMANDS=false
 GEMINITALK_ALLOW_CODEX_TASKS=true
 ```
 
-Use `capabilities/geminitalk/connections.json` (or the user-level registry):
+Use `capabilities/geminitalk/connections.json` (or the user-level registry; an agent whose records moved into the store keeps its connections as rows there instead, written with `geminitalk connection add` - `geminitalk help` says which under "Where connections live"):
 
 ```json
 {

@@ -107,7 +107,8 @@ Contract commands (the same on every capability):
   stripe guide [<topic>]                      Guide topics / one guide body,
                                                fetched live from the docs base.
   stripe ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-              [--note <text>]                  (capabilities/stripe/identifiers.json).
+              [--note <text>]                  (capabilities/stripe/identifiers.json,
+                                                or store rows once the agent moved).
   stripe refs                                 Menu of the project's reference
                                                files for this capability.
   stripe inventory [--network]                What this capability holds in

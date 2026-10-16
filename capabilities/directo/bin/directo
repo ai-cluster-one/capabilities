@@ -26,8 +26,9 @@ Credentials resolve in a 4-tier cascade (first non-empty wins):
   4. process env    DIRECTO_USERNAME / DIRECTO_PASSWORD / DIRECTO_DB / DIRECTO_KOHT / DIRECTO_COOKIE
 Same DIRECTO_* keys at every tier; the project you're in wins, process env is the
 fallback (so a deployed host's injected env governs when no config file is present).
-Configuration resolves as named connections — a project's connections.json registry
-plus `--connection <id>`; `directo help` documents them. Never pass the password on
+Configuration resolves as named connections — a project's connections (its
+connections.json registry, or the store's rows once its records moved there) plus
+`--connection <id>`; `directo help` documents them. Never pass the password on
 the command line outside a throwaway shell.
 """
 from __future__ import annotations

@@ -180,6 +180,7 @@ SERVICE  (memory service <verb> [--machine])
   touched: they stay active and searchable.
 
   memory service init [--force]           write capabilities/memory/service/settings.json
+                                          (the store's rows once the agent moved)
   memory service init --machine [--force] write the machine settings
   memory service run [--machine]          the service in the foreground, for a supervisor
   memory service start [--machine]        start it detached; returns once it runs
@@ -214,7 +215,9 @@ SERVICE  (memory service <verb> [--machine])
     {"version": 1, "max_grooms": 1}   passes running at once on the machine
 
 SETTINGS  (capabilities/memory/service/settings.json, project over global
-           $XDG_CONFIG_HOME/memory/service/settings.json, key by key)
+           $XDG_CONFIG_HOME/memory/service/settings.json, key by key; for an
+           agent whose records moved into the store, its rows and the global
+           rows, read and written with `memory settings`)
   The window is the active, unpinned project-wide entries of the last
   window_days; it fits while it holds at most max_entries and, each entry
   written out at entry_chars, at most block_chars characters. A window that

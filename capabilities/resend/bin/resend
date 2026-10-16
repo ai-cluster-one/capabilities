@@ -92,7 +92,8 @@ Contract commands (the same on every capability):
   resend guide [<topic>]                      Guide topics / one guide body,
                                                fetched live from the docs base.
   resend ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-              [--note <text>]                  (capabilities/resend/identifiers.json).
+              [--note <text>]                  (capabilities/resend/identifiers.json,
+                                                or store rows once the agent moved).
   resend refs                                 Menu of the project's reference
                                                files for this capability.
   resend inventory [--network]                What this capability holds in

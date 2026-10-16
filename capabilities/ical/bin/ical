@@ -128,7 +128,8 @@ Contract commands (the same on every capability):
   ical guide [<topic>]                      Guide topics / one guide body,
                                             fetched live from the docs base.
   ical ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-       [--note <text>]                      (capabilities/ical/identifiers.json).
+       [--note <text>]                      (capabilities/ical/identifiers.json,
+                                             or store rows once the agent moved).
   ical refs                                 Menu of the project's reference
                                             files for this capability.
   ical inventory [--network]                What this capability holds in this

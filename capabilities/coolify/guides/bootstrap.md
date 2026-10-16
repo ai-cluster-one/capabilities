@@ -121,7 +121,7 @@ EOF
 
 Pitfall: `/api/v1/enable` and `/api/v1/servers/{uuid}/validate` take POST only; a GET answers 405 with "This endpoint has changed to a POST request" and changes nothing. Pitfall: never echo the token, paste it, or write it into a prompt; if it is ever shown, revoke it and mint another.
 
-`coolify connect` writes the machine's connection entry (URL and the name of the key that holds the token, nothing secret) to `~/.config/coolify/connections.json` and the token into `~/.config/coolify/credentials.env` at mode 0600, then runs the doctor probe.
+`coolify connect` writes the machine's connection entry (URL and the name of the key that holds the token, nothing secret) to `~/.config/coolify/connections.json` (run inside an agent whose records moved into the store, to the store's global rows instead) and the token into `~/.config/coolify/credentials.env` at mode 0600, then runs the doctor probe.
 
 Reads — `coolify connections`, `coolify --connection <name> doctor`, `coolify servers` — work from any directory on the machine pairing alone, read-only; every write this guide asks for from here on, such as creating a project, a database, or updating an app, runs in a project the user has granted the pairing to, so a setup workspace such as an app's service folder must be such a project.
 

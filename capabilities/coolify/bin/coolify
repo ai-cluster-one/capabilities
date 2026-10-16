@@ -80,7 +80,8 @@ COMMANDS
       credentials file of the same scope, mode 0600, single-quoted so the
       parser reads it back whole: --project (the default) writes this
       project's connection record ("Where connections live" below) and the
-      project's .env.local; --global writes ~/.config/coolify/connections.json and
+      project's .env.local; --global writes ~/.config/coolify/connections.json
+      (the store's global rows inside an agent whose records moved there) and
       ~/.config/coolify/credentials.env. Other entries and other lines are
       kept; an existing entry of the same name is replaced, its grant fields
       kept. --default points the scope's default at it. --url is the instance
@@ -267,7 +268,8 @@ Contract commands (the same on every capability):
   coolify manifest --json                      Machine-readable declaration.
   coolify guide [bootstrap|headless-apps]      Guide topics / one guide body.
   coolify ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-              [--note <text>]                   (capabilities/coolify/identifiers.json).
+              [--note <text>]                   (capabilities/coolify/identifiers.json,
+                                                 or store rows once the agent moved).
   coolify refs                                 Menu of the project's reference files.
   coolify inventory [--network]                What this capability holds in
                                                this project (--network adds
@@ -275,7 +277,7 @@ Contract commands (the same on every capability):
 
 EXIT CODES
   0 success · 2 auth/credentials (401/403, missing token) · 3 not found (404) ·
-  4 policy refusal — the project gate (capabilities/settings.json) on any
+  4 policy refusal — the project gate (store rows once the agent moved, else capabilities/settings.json) on any
   verb, a write verb on a read-only connection, or --reveal without a
   terminal; ask the user, never lift a gate yourself · 5 server/network (timeout, 429 after retries, 5xx) ·
   6 input (a malformed argument, an unknown/ambiguous connection)

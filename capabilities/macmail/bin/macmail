@@ -74,7 +74,8 @@ Contract commands (the same on every capability):
   macmail guide [<topic>]                      Guide topics / one guide body,
                                             fetched live from the docs base.
   macmail ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-       [--note <text>]                      (capabilities/macmail/identifiers.json).
+       [--note <text>]                      (capabilities/macmail/identifiers.json,
+                                             or store rows once the agent moved).
   macmail refs                                 Menu of the project's reference
                                             files for this capability.
   macmail inventory [--network]                What this capability holds in

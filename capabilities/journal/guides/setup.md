@@ -47,7 +47,10 @@ off it. Two things bite most often:
 implied. For a personal store the home is
 `~/.config/journal/connections.json`; a project that owns its own store puts
 the same envelope at `capabilities/journal/connections.json` (project first,
-first found authoritative, never merged):
+first found authoritative, never merged). An agent whose records moved into
+the capabilities store keeps no such file: its connections are rows there,
+written with `journal connection add`, and `journal help` says where this
+project reads them ("Where connections live"):
 
 ```json
 {

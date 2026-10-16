@@ -633,7 +633,8 @@ PROJECT VERBS (run inside a consuming project)
         capabilities/tasks/conveyor.toml (tasks.conveyor) as settings rows,
         and through each capability's `<name> migrate files` what it keeps
         of its own: automations [[automations]] and engine.timezone as
-        definitions, askproject's profiles folder, whatsapp's and tasks'
+        definitions and [agents.workers] as harness profiles
+        automations-<name>, askproject's profiles folder, whatsapp's and tasks'
         profile files and tasks' worker files as store versions, telegram's
         old worker settings as profiles, agentrooms' agents map as workers,
         and deployment's runtime.json service_policy and placement as policy

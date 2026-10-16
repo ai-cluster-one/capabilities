@@ -639,9 +639,10 @@ HOOKS
   moment. The worker's `after` hook may hold the lane longer, never shorter.
 
 ESCALATION
-  A project names, in `capabilities/tasks/conveyor.toml` beside its workers,
-  whom a task that cannot move goes over to. The claim reads it, so it holds
-  with or without the service:
+  A project names, in `capabilities/tasks/conveyor.toml` beside its workers
+  (for an agent whose records moved into the store, its `tasks.conveyor`
+  settings document instead), whom a task that cannot move goes over to. The
+  claim reads it, so it holds with or without the service:
 
     escalate_to = ["supervisor", "owner"]   # in order; the last is a person
     stall_after = "6h"                      # 45m, 6h, 2d or seconds; 6h unsaid
@@ -773,7 +774,8 @@ ESCALATION
 
 SERVICE
   tasks service init [--force]    write capabilities/tasks/service/config.toml
-                                  from the shipped template
+                                  from the shipped template (the store's rows
+                                  once the agent moved)
   tasks service doctor            settings, workers, store and notification,
                                   whether a running daemon holds the declaration
                                   on disk, and whether its planned wake is so
@@ -893,7 +895,9 @@ SERVICE
   `service doctor` reports the store being away as a warning while the daemon
   runs, so a supervisor probing it does not restart the daemon for an outage.
 
-  The settings are capabilities/tasks/service/config.toml:
+  The settings are capabilities/tasks/service/config.toml (for an agent
+  whose records moved into the store, its `tasks` settings document,
+  `tasks settings`):
 
     version = 1
     poll_seconds = 60             # the fallback wake, and when a lapsed lease

@@ -171,7 +171,7 @@ QUIRKS WORTH KNOWING
 
 EXIT CODES
   0 success · 2 auth (key missing or rejected) · 3 not found (404) · 4 policy refusal
-  — the project gate (capabilities/settings.json) on any verb, or a write on a
+  — the project gate (store rows once the agent moved, else capabilities/settings.json) on any verb, or a write on a
   read-only connection; ask the user, never lift a gate yourself · 5 server/network
   (timeout, 5xx, 429 after retries, a write whose outcome is unknown) · 6 input (bad
   arguments, an unknown or ambiguous connection, a request Cal.com refused as
