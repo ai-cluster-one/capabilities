@@ -696,3 +696,73 @@ def test_the_service_starts_and_stops_with_no_settings_file(world, capability):
         stopped = run(w, "moved", capability, "service", "stop")
         assert stopped.returncode == 0, stopped.stderr
     assert w.files_left(w.roots["moved"]) == []
+
+
+def _build_context(root: Path, ignore: str, dest: Path) -> Path:
+    """What `COPY . <project_root>` puts in the image: the agent's tracked files
+    less what the compiled .dockerignore excludes."""
+    import fnmatch
+    patterns = [line.strip() for line in ignore.splitlines()
+                if line.strip() and not line.startswith("#")]
+    tracked = subprocess.run(["git", "-C", str(root), "ls-files"], capture_output=True,
+                             text=True, check=True).stdout.split()
+    for rel in tracked:
+        if any(fnmatch.fnmatch(rel, p.rstrip("/")) or fnmatch.fnmatch(rel, p.rstrip("/") + "/*")
+               or rel.startswith(p.rstrip("/") + "/") for p in patterns):
+            continue
+        if (root / rel).is_file():
+            (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(root / rel, dest / rel)
+    subprocess.run(["git", "init", "-q", str(dest)], check=True)
+    return dest
+
+
+@pytest.mark.parametrize("which", ["moved", "store-mode"])
+def test_the_image_build_steps_run_without_a_database(world, tmp_path, which):
+    """The compiled Dockerfile's build steps - every catalogue capability
+    installed --allow, then `capabilities init --codex --claude` - run in a
+    fresh box holding the agent's tracked files and no database: they succeed,
+    write no gate, and leave the store's reads to container start."""
+    from test_manager_core_tier import CORE, _catalogue, _machine_env
+    w = world
+    root = w.roots["moved"]
+    synced = w.cap(root, "deployment", "sync")
+    assert synced.returncode == 0, synced.stderr
+    bundle = root / "deployment" / "targets" / "production"
+    dockerfile = (bundle / "Dockerfile").read_text()
+    ignore = next(p for p in bundle.iterdir() if p.name.endswith("dockerignore")).read_text()
+    assert 'capabilities install "$name" --allow' in dockerfile
+    assert "&& capabilities init --codex --claude || {" in dockerfile
+    box = _build_context(root, ignore, tmp_path / "app")
+    if which == "store-mode":
+        # A store-mode agent that has not moved builds the same way.
+        identity = box / "capabilities" / "project.json"
+        identity.write_text(json.dumps({"schema": "capabilities.project.v1", "slug": "sm",
+                                        "id": "prj_storemode001", "records": "store"}))
+    assert not list(box.rglob("connections.json")) and not (
+        box / "capabilities" / "settings.json").exists()
+    with _catalogue(tmp_path / "catalogue", CORE, "slack") as source:
+        env = _machine_env(tmp_path / "machine", source)
+        env.pop("AGENT_NODE_NAME", None)
+        steps = {}
+        for name in (CORE, "slack"):
+            steps[f"install {name}"] = subprocess.run(
+                [str(MANAGER), "install", name, "--allow"], cwd=box, env=env, text=True,
+                capture_output=True, stdin=subprocess.DEVNULL, timeout=300)
+        steps["init"] = subprocess.run(
+            [str(MANAGER), "init", "--codex", "--claude"], cwd=box, env=env, text=True,
+            capture_output=True, timeout=300)
+    _say(f"image-build-steps-{which}", {k: {"exit": r.returncode, "stdout": r.stdout[-2000:],
+                                            "stderr": r.stderr[-2000:]}
+                                        for k, r in steps.items()})
+    for key, result in steps.items():
+        assert result.returncode == 0, (key, result.stderr)
+    installed = json.loads(steps[f"install {CORE}"].stdout)
+    assert installed["global_policy"]["pending"] is True
+    init = json.loads(steps["init"].stdout)
+    assert init["agent"]["registered"] is False
+    assert init["gate"].startswith("store:")
+    assert not (box / "capabilities" / "settings.json").exists()
+    assert not (tmp_path / "machine" / "config" / "capabilities" / "settings.json").exists()
+    assert (box / ".claude" / "settings.json").exists()
+    assert "not reachable" in (box / ".claude" / "rules" / "CAPABILITIES.md").read_text()

@@ -7581,8 +7581,25 @@ def _context_contribution(root: Path, name: str, manifest: dict | None) -> list[
             f"`{name} render` rebuilds it.", ""]
 
 
+# Set by `init` alone: its offline part (envelope, identity, host wiring) never
+# needs the database, so where the project's gate is in a store this process
+# cannot reach - an image built without one - the context file says so and is
+# written again by `capabilities context` where the store is.
+_CONTEXT_WITHOUT_STORE = False
+
+
 def _compose_context(root: Path) -> str:
     """Deterministic injection body: gate, snapshots, and resolved records."""
+    if _CONTEXT_WITHOUT_STORE:
+        try:
+            _policy_scopes(root)
+        except _store_module().StoreError as exc:
+            return "\n".join([
+                "# Capabilities", "", CONTEXT_BEGIN, "", CAPABILITIES_CONTEXT_INTRO, "",
+                "This project keeps its gate in the store, which was not reachable when "
+                f"this file was written ({exc.slug}); `capabilities context` writes it "
+                "again where the store is, as the session-start hook does.", "",
+                CONTEXT_END]) + "\n"
     project_caps, global_caps = _policy_views(root)
     names = set(project_caps) | set(global_caps)
     enabled = sorted(
@@ -10754,17 +10771,29 @@ def _wire_claude_hook(root: Path) -> bool:
 
 def cmd_init(claude: bool, codex: bool) -> None:
     # init ESTABLISHES the project root: an existing root wins, else cwd.
+    global _CONTEXT_WITHOUT_STORE
+    _CONTEXT_WITHOUT_STORE = True
     root = _project_root() or Path.cwd().resolve()
     migrated = _ensure_envelope(root)
     # The gate is named where the project keeps it: its settings.json in files
     # mode, the store's policy rows where its records are in the store.
-    adapter = _records_for(root)
+    # Init's offline part never needs the database: where the project keeps its
+    # gate in a store this process cannot reach (an image built without one),
+    # the gate is named as the store's table and read where the store is.
+    store = _store_module()
     try:
-        gate = _gate_source(adapter, root, "project")
-    except _store_module().StoreError as exc:
-        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+        adapter = _open_project_records(root)
+    except store.StoreError:
+        adapter = None
+    try:
+        gate = _gate_source(adapter, root, "project") if adapter is not None else None
+    except store.StoreError:
+        gate = None
     finally:
-        adapter.close()
+        if adapter is not None:
+            adapter.close()
+    if gate is None:
+        gate = "store:capabilities_policy (no database reachable here)"
     result: dict = {"project": str(root),
                     "gate": gate,
                     "agent": _register_agent_on_init(root)}
