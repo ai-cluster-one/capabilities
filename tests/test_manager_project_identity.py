@@ -119,7 +119,8 @@ def test_init_mints_an_id_offline_in_a_plain_project(tmp_path: Path) -> None:
     identity = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
 
     assert minted.startswith("prj_") and len(minted) == 16
-    assert identity == {"state": "declared", "id": minted, "project_json_id": minted}
+    assert identity == {"state": "declared", "id": minted, "project_json_id": minted,
+                        "bound": False, "contextkit_id": None}
     # No database resolves here, so the agent row is reported, not written.
     assert result["agent"] == {"registered": False, "reason": "store_not_configured"}
     assert not log.exists()
@@ -172,7 +173,8 @@ def test_project_json_is_the_id_even_where_contextkit_holds_another(tmp_path: Pa
     relabel = _json(_run(tmp_path, project, "relabel", "other"))
 
     assert identity == {"state": "declared", "id": "prj_0000000000c2",
-                        "project_json_id": "prj_0000000000c2"}
+                        "project_json_id": "prj_0000000000c2",
+                        "bound": True, "contextkit_id": "prj_0000000000c2"}
     assert not [f for f in doctor["findings"] if "project id" in f]
     assert relabel["id"] == "prj_0000000000c2" and _copy(project)["slug"] == "other"
     assert _probe(tmp_path, project)["write"] == "prj_0000000000c2"
@@ -230,7 +232,8 @@ def test_a_project_without_any_id_is_undeclared(tmp_path: Path) -> None:
     identity = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
     relabel = _run(tmp_path, project, "relabel", "other")
 
-    assert identity == {"state": "undeclared", "id": None, "project_json_id": None}
+    assert identity == {"state": "undeclared", "id": None, "project_json_id": None,
+                        "bound": False, "contextkit_id": None}
     assert relabel.returncode == 6 and _error(relabel)["code"] == "no_project_identity"
 
 
@@ -267,7 +270,8 @@ def test_a_handed_down_id_is_used_and_one_project_json_contradicts_refuses_write
                           env=env))["project_identity"]
     assert identity == {"state": "mismatch", "id": "prj_0000000000f2",
                         "handed_id": "prj_0000000000f9",
-                        "project_json_id": "prj_0000000000f2"}
+                        "project_json_id": "prj_0000000000f2",
+                        "bound": False, "contextkit_id": None}
     relabel = _run(tmp_path, project, "relabel", "other", env=env)
     assert relabel.returncode == 6
     error = _error(relabel)
@@ -304,3 +308,64 @@ def test_resolving_the_envelope_alone_hands_the_id_down_beside_it(tmp_path: Path
     assert json.loads(result.stdout) == {
         "CAPABILITIES_PROJECT_ID": "prj_0000000000f3",
         "CAPABILITIES_PROJECT_ID_ROOT": str(project.resolve())}
+
+
+BASE_CONTRACT = Path(__file__).parent / "fixtures" / "contract_identity_base.py"
+
+
+def _base_contract_read(tmp_path: Path, project: Path) -> dict:
+    """The released contract's identity read, run against this manager the way
+    a capability stamped with it runs after a manager self-update."""
+    probe = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "ns = {'__name__': 'base_contract'}\n"
+        f"exec(compile(open({str(BASE_CONTRACT)!r}).read(), 'base_contract', 'exec'), ns)\n"
+        "root = Path(sys.argv[1]).resolve()\n"
+        "ns['_project_capabilities_dir'] = lambda r: r / 'capabilities'\n"
+        "def die(code, slug, message, hint=None):\n"
+        "    raise SystemExit(json.dumps({'exit': code, 'code': slug}))\n"
+        "ns['_die'] = die\n"
+        "state = ns['_project_id_state_at'](root)\n"
+        "refusal = ns['_identity_refusal'](state)\n"
+        "print(json.dumps({'state': state['state'], 'id': state['id'],"
+        " 'write': None if refusal else state['id'],"
+        " 'refusal': refusal and refusal.get('code')}))\n")
+    env = _env(tmp_path, project)
+    env["CAPABILITIES_MANAGER_BIN"] = str(MANAGER)
+    result = subprocess.run([sys.executable, "-c", probe, str(project)], cwd=project,
+                            env=env, text=True, capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout.splitlines()[-1])
+
+
+def test_the_released_contract_still_resolves_and_writes_in_a_bound_project(
+        tmp_path: Path) -> None:
+    project = _project(tmp_path, bound=True, contextkit_id="prj_0000000000b1",
+                       copy={"schema": "capabilities.project.v1", "slug": "p",
+                             "id": "prj_0000000000b1"})
+    _contextkit(tmp_path)
+
+    assert _base_contract_read(tmp_path, project) == {
+        "state": "adopted", "id": "prj_0000000000b1", "write": "prj_0000000000b1",
+        "refusal": None}
+
+
+def test_the_released_contract_still_resolves_an_id_only_the_binding_holds(
+        tmp_path: Path) -> None:
+    project = _project(tmp_path, bound=True, contextkit_id="prj_0000000000b2")
+    _contextkit(tmp_path)
+
+    assert _base_contract_read(tmp_path, project)["write"] == "prj_0000000000b2"
+    assert _copy(project)["id"] == "prj_0000000000b2"
+
+
+def test_the_released_contract_still_resolves_and_writes_in_a_plain_project(
+        tmp_path: Path) -> None:
+    project = _project(tmp_path, bound=False,
+                       copy={"schema": "capabilities.project.v1", "slug": "p",
+                             "id": "prj_0000000000a1"})
+
+    assert _base_contract_read(tmp_path, project) == {
+        "state": "unbound", "id": "prj_0000000000a1", "write": "prj_0000000000a1",
+        "refusal": None}

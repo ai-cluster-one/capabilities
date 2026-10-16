@@ -77,7 +77,10 @@ PROJECT PATH VERB
         holds it), undeclared (no id), handed (handed down by the launching
         process as CAPABILITIES_PROJECT_ID) or mismatch (handed down differently
         from project.json, which writes refuse; handed_id names it) - with
-        project_json_id. Where project.json declares no id and
+        project_json_id, bound (a .contextkit/config.toml is present) and
+        contextkit_id (the id where bound, else null), the two fields
+        capabilities stamped with an earlier contract read. Where project.json
+        declares no id and
         .contextkit/config.toml holds one under [identity], that id is copied
         into project.json once (not under the read-only switch) and answered.
 
@@ -1450,7 +1453,15 @@ def cmd_path(json_output: bool, identity: bool = False) -> None:
         "provider": provider,
     }
     if identity:
-        answer["project_identity"] = _project_id_state(root)
+        state = _project_id_state(root)
+        # Capabilities stamped with an earlier contract read `bound` and take
+        # `contextkit_id` as the id a bound project answers to, so both carry
+        # that meaning here: whether a ContextKit binding is present, and the
+        # project's id (project.json's) where it is, else null.
+        bound = _contextkit_managed(root)
+        state["bound"] = bound
+        state["contextkit_id"] = state["id"] if bound else None
+        answer["project_identity"] = state
     _emit(answer)
 
 
