@@ -49,8 +49,8 @@ turns on `connection add|remove`; `SETUP_FIELDS`, the machine prerequisites,
 which turns on `setup`; `LINK_METHODS`, the interactive ceremonies that link a
 connection; and `SETTINGS`, where the capability's settings live and the keys
 it declares, which turns on `settings`, with an optional
-`_settings_check(scope, document, path)` outside the fences returning the
-problems its own reader finds. Each is absent where it does not apply.
+`_settings_check(scope, document)` outside the fences returning the
+problems its own reader finds in the whole document as it would read it. Each is absent where it does not apply.
 Optionally, beside STATE, `TABLES = True` when the capability keeps tables in
 the machine's store, with a `_tables()` builder outside the fences returning
 `(steps, major, minor)` for the shared database library. Absent or false means
@@ -1010,7 +1010,7 @@ def _records():
                 project_root=root, project_id=_project_id() if in_store else None,
                 application_name=NAME)
         except StoreError as e:
-            _die(6, e.slug, e.message, e.hint)
+            _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     return _RECORDS
 
 
@@ -1897,7 +1897,28 @@ def _settings_home_path(home: dict) -> Path | None:
     return _CONFIG_HOME / NAME / home["path"]
 
 
-def _settings_read(home: dict) -> tuple[Path | None, dict | None, str | None]:
+def _settings_in_rows(home: dict) -> bool:
+    """Whether one home's document is rows of the store: a project or global
+    home of an agent whose records moved there. A machine home stays a file."""
+    if home.get("scope") not in ("project", "global") or _project_root() is None:
+        return False
+    try:
+        return _records().settings_kept() == "store"
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_read(home: dict) -> tuple:
+    """One home's document: where it is kept, the document (None where there
+    is none yet) and what keeps it from being read. Where the home is rows,
+    `where` names the store's table rather than a file."""
+    if _settings_in_rows(home):
+        try:
+            records = _records()
+            return (records.collection_source(NAME, "setting"),
+                    records.setting_document(NAME, home["scope"]), None)
+        except StoreError as e:
+            _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     path = _settings_home_path(home)
     if path is None or not path.is_file():
         return path, None, None
@@ -1915,18 +1936,34 @@ def _settings_read(home: dict) -> tuple[Path | None, dict | None, str | None]:
     return path, document, None
 
 
-def _settings_dig(document, key: str):
-    """The value at a dotted key, and whether it is there."""
+def _settings_parts(key) -> list:
+    """A settings key as the keys from the document root: a dotted path, or a
+    JSON array of keys for a path whose keys contain dots."""
+    if isinstance(key, (list, tuple)):
+        return [str(part) for part in key]
+    if key.startswith("["):
+        try:
+            parts = json.loads(key)
+        except ValueError:
+            parts = None
+        if isinstance(parts, list) and parts and all(
+                isinstance(part, str) and part for part in parts):
+            return parts
+    return key.split(".")
+
+
+def _settings_dig(document, key):
+    """The value at a key, and whether it is there."""
     here = document
-    for part in key.split("."):
+    for part in _settings_parts(key):
         if not isinstance(here, dict) or part not in here:
             return None, False
         here = here[part]
     return here, True
 
 
-def _settings_put(document: dict, key: str, value) -> None:
-    parts = key.split(".")
+def _settings_put(document: dict, key, value) -> None:
+    parts = _settings_parts(key)
     here = document
     for part in parts[:-1]:
         if not isinstance(here.get(part), dict):
@@ -1935,8 +1972,8 @@ def _settings_put(document: dict, key: str, value) -> None:
     here[parts[-1]] = value
 
 
-def _settings_drop(document: dict, key: str) -> bool:
-    parts = key.split(".")
+def _settings_drop(document: dict, key) -> bool:
+    parts = _settings_parts(key)
     here = document
     for part in parts[:-1]:
         here = here.get(part) if isinstance(here, dict) else None
@@ -1996,10 +2033,20 @@ def _toml_dumps(document: dict, prefix: tuple = ()) -> str:
 
 
 def _settings_write(home: dict, path: Path, document: dict) -> None:
-    """Replace one home's document whole: written beside it, checked by the
-    capability where it checks its settings, then renamed over it."""
+    """Replace one home's document whole: checked by the capability where it
+    checks its settings, written beside it, then renamed over it."""
+    try:
+        _records().guard_write(NAME, "setting", home.get("scope"))
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     text = (_toml_dumps(document) if home.get("format") == "toml"
             else json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+    check = globals().get("_settings_check")
+    problems = [str(p) for p in (check(home["scope"], document) or [])] if check else []
+    if problems:
+        _die(6, "settings_invalid",
+             problems[0] if str(path) in problems[0] else f"{path}: {problems[0]}",
+             f"`{NAME} settings` shows the document; `{NAME} help` states the keys")
     path.parent.mkdir(parents=True, exist_ok=True)
     spare = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
@@ -2007,17 +2054,58 @@ def _settings_write(home: dict, path: Path, document: dict) -> None:
         fd = os.open(spare, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
         with os.fdopen(fd, "w") as handle:
             handle.write(text)
-        check = globals().get("_settings_check")
-        problems = [str(p).replace(str(spare), str(path))
-                    for p in (check(home["scope"], document, spare) or [])] if check else []
-        if problems:
-            _die(6, "settings_invalid",
-                 problems[0] if str(path) in problems[0] else f"{path}: {problems[0]}",
-                 f"`{NAME} settings` shows the document; `{NAME} help` states the keys")
         os.replace(spare, path)
     finally:
         if spare.exists():
             spare.unlink()
+
+
+def _settings_rows_write(home: dict, scope: str, change) -> dict:
+    """Change one home's document where it is rows, in the store's one
+    transaction: `change` takes the document and returns the new one, and the
+    capability's check reads the whole result before anything is written."""
+    check = globals().get("_settings_check")
+
+    def checked(document: dict) -> list:
+        return [str(p) for p in (check(scope, document) or [])] if check else []
+    try:
+        return _records().settings_write(NAME, scope, change, check=checked,
+                                         seed=home.get("seed"))
+    except StoreError as e:
+        if e.slug == "not_found":
+            _die(3, e.slug, e.message, e.hint)
+        if e.slug == "settings_invalid":
+            _die(6, e.slug, e.message,
+                 f"`{NAME} settings` shows the document; `{NAME} help` states the keys")
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_diff(before: dict, after: dict) -> list:
+    """What changes between two documents, path by path: `-` removed, `+`
+    added, `~` changed."""
+    def leaves(document, prefix=()):
+        out = {}
+        for key, value in (document or {}).items():
+            if isinstance(value, dict) and value:
+                out.update(leaves(value, (*prefix, key)))
+            else:
+                out[(*prefix, key)] = value
+        return out
+
+    def name(path):
+        return (".".join(path) if all("." not in part for part in path)
+                else json.dumps(list(path), ensure_ascii=False))
+
+    def show(value):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    old, new = leaves(before), leaves(after)
+    lines = [f"- {name(p)}: {show(old[p])}" for p in sorted(set(old) - set(new))]
+    for p in sorted(new):
+        if p not in old:
+            lines.append(f"+ {name(p)}: {show(new[p])}")
+        elif show(old[p]) != show(new[p]):
+            lines.append(f"~ {name(p)}: {show(old[p])} -> {show(new[p])}")
+    return lines
 
 
 def _settings_key_decl(key: str, scope: str | None = None) -> dict | None:
@@ -2046,13 +2134,16 @@ def _settings_value(decl: dict, documents: dict) -> tuple:
 
 
 def _settings_report(scope: str | None) -> dict:
-    homes, documents = [], {}
+    homes, documents, in_rows = [], {}, False
     for home in _settings_homes(scope):
         path, document, error = _settings_read(home)
         documents[home["scope"]] = document
+        rows = _settings_in_rows(home)
+        in_rows = in_rows or rows
         row = {"scope": home["scope"], "format": home.get("format", "json"),
                "path": str(path) if path else None,
-               "exists": bool(path and path.is_file()), "document": document}
+               "exists": (document is not None) if rows else bool(path and path.is_file()),
+               "document": document}
         if home.get("inherits"):
             row["inherits"] = home["inherits"]
         if error:
@@ -2067,18 +2158,90 @@ def _settings_report(scope: str | None) -> dict:
             continue
         value, source = _settings_value(decl, documents)
         keys.append({**decl, "value": value, "from": source})
-    return {"capability": NAME, "declared": bool(globals().get("SETTINGS")),
-            "homes": homes, "keys": keys}
+    report = {"capability": NAME, "declared": bool(globals().get("SETTINGS")),
+              "homes": homes, "keys": keys}
+    if in_rows:
+        # Which state of the store this was assembled from: a reader holding
+        # these generations has read exactly what they name.
+        try:
+            report["generations"] = _records().setting_generations(NAME)
+        except StoreError as e:
+            _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    return report
+
+
+def _settings_checked_put(scope: str, document) -> dict:
+    """A whole document given for `scope`, its declared keys checked."""
+    if not isinstance(document, dict):
+        _die(6, "input", "the settings document must be a JSON object")
+    for each in ((globals().get("SETTINGS") or {}).get("keys")) or []:
+        if each.get("scope") != scope:
+            continue
+        value, found = _settings_dig(document, each["key"])
+        if found:
+            try:
+                _field_value(each, value)
+            except ValueError as e:
+                _die(6, "settings_invalid", str(e))
+    return document
+
+
+def _settings_edit(home: dict, scope: str, current: dict, yes: bool) -> dict:
+    """The document after the person edited it in $VISUAL or $EDITOR, once
+    they confirmed what changes; None where they changed nothing."""
+    import shlex
+    import subprocess
+    import tempfile
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    fd, name = tempfile.mkstemp(prefix=f"{NAME}-settings-{scope}-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(current, ensure_ascii=False, indent=2) + "\n")
+        try:
+            ran = subprocess.run([*shlex.split(editor), name])
+        except OSError as e:
+            _die(6, "editor_failed", f"cannot run the editor {editor!r}: {e}",
+                 "set VISUAL or EDITOR to an editor that waits until the file is closed")
+        if ran.returncode != 0:
+            _die(6, "editor_failed", f"the editor {editor!r} exited {ran.returncode}; "
+                 "nothing was written")
+        try:
+            edited = json.loads(Path(name).read_text())
+        except ValueError as e:
+            _die(6, "input", f"the edited document is not JSON: {e}; nothing was written")
+    finally:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+    edited = _settings_checked_put(scope, edited)
+    diff = _settings_diff(current, edited)
+    if not diff:
+        return None
+    sys.stderr.write("\n".join(diff) + "\n")
+    if not yes:
+        if not sys.stdin.isatty():
+            _die(6, "confirm_required",
+                 f"the edit changes {len(diff)} path(s) and was not written",
+                 f"run `{NAME} settings edit` on a terminal to confirm, or pass --yes")
+        sys.stderr.write("write these changes? [y/N] ")
+        sys.stderr.flush()
+        if sys.stdin.readline().strip().lower() not in ("y", "yes"):
+            _die(6, "not_confirmed", "nothing was written")
+    return edited
 
 
 def _cmd_settings(argv: list[str]) -> None:
     """`settings` reads every settings document the capability keeps, wherever
-    it lives, with its declared keys resolved; `get`, `set`, `unset` and `put`
-    read and write them through one surface."""
+    it lives, with its declared keys resolved; `get`, `set`, `unset`, `put`,
+    `export` and `edit` read and write them through one surface. A key is a
+    dotted path, or a JSON array of keys where a key contains dots."""
     usage = (f"{NAME} settings [show] [--scope S] | get <key> [--scope S] | "
              "set <key> <value> [--scope S] | unset <key> [--scope S] | "
-             "put [--scope S] < document.json")
+             "put [--scope S] < document.json | export [--scope S] | "
+             "edit [--scope S] [--yes]")
     scope = None
+    yes = False
     rest = []
     i = 0
     while i < len(argv):
@@ -2089,21 +2252,25 @@ def _cmd_settings(argv: list[str]) -> None:
             i += 2
         elif argv[i] == "--json":
             i += 1
+        elif argv[i] == "--yes":
+            yes = True
+            i += 1
         else:
             rest.append(argv[i])
             i += 1
     sub = rest[0] if rest else "show"
     if sub == "show" and len(rest) <= 1:
         _emit(_settings_report(scope)); return
-    if sub not in ("get", "set", "unset", "put"):
+    if sub not in ("get", "set", "unset", "put", "export", "edit"):
         _die(6, "input", f"unknown settings subcommand {sub!r}", usage)
     if not globals().get("SETTINGS"):
         _die(6, "settings_undeclared", f"{NAME} declares no settings",
              f"`{NAME} manifest` carries `settings: null`")
-    key = rest[1] if len(rest) > 1 else None
+    key = rest[1] if len(rest) > 1 and sub not in ("export", "edit") else None
     if sub in ("get", "set", "unset") and not key:
         _die(6, "input", f"settings {sub} needs a key", usage)
-    decl = _settings_key_decl(key, scope) if key else None
+    decl_key = ".".join(_settings_parts(key)) if key else None
+    decl = _settings_key_decl(decl_key, scope) if key else None
     if scope is None:
         if decl and decl.get("scope"):
             scope = decl["scope"]
@@ -2117,11 +2284,12 @@ def _cmd_settings(argv: list[str]) -> None:
         _die(6, "unknown_scope", f"{NAME} keeps no settings at scope {scope!r}",
              f"scopes: {', '.join(h['scope'] for h in _settings_homes())}")
     home = homes[0]
+    rows = _settings_in_rows(home)
     path, document, error = _settings_read(home)
     if error:
         _die(6, "settings_unreadable", error)
     if document is None and sub != "put":
-        # A file not written yet starts as the document its home declares.
+        # A document not written yet starts as the document its home declares.
         document = json.loads(json.dumps(home.get("seed") or {}))
     if path is None:
         _die(6, "no_project", f"the {scope} settings live in a project and there is no "
@@ -2133,20 +2301,19 @@ def _cmd_settings(argv: list[str]) -> None:
                 _die(3, "not_found", f"{key} is not set at scope {scope}")
             value = decl.get("default")
         _emit(value if not isinstance(value, str) else json.dumps(value)); return
+    if sub == "export":
+        _emit(document or {}); return
     _read_only_gate(f"`{NAME} settings {sub}`")
     document = dict(document or {})
     previous = None
-    if sub == "put":
-        document = _stdin_document("the settings document")
-        for each in ((globals().get("SETTINGS") or {}).get("keys")) or []:
-            if each.get("scope") != scope:
-                continue
-            value, found = _settings_dig(document, each["key"])
-            if found:
-                try:
-                    _field_value(each, value)
-                except ValueError as e:
-                    _die(6, "settings_invalid", str(e))
+    if sub == "edit":
+        edited = _settings_edit(home, scope, document, yes)
+        if edited is None:
+            _emit({"ok": True, "scope": scope, "path": str(path), "action": sub,
+                   "changed": False}); return
+        new_document = edited
+    elif sub == "put":
+        new_document = _settings_checked_put(scope, _stdin_document("the settings document"))
     elif sub == "set":
         if len(rest) < 3:
             _die(6, "input", "settings set needs a key and a value", usage)
@@ -2163,19 +2330,47 @@ def _cmd_settings(argv: list[str]) -> None:
                                      from_argv=True)
             except ValueError as e:
                 _die(6, "settings_invalid", str(e))
-        previous, _ = _settings_dig(document, key)
-        _settings_put(document, key, value)
-    else:
-        previous, found = _settings_dig(document, key)
-        if not found:
-            _die(3, "not_found", f"{key} is not set at scope {scope}")
-        _settings_drop(document, key)
-    _settings_write(home, path, document)
     out = {"ok": True, "scope": scope, "path": str(path), "action": sub}
-    if key:
-        out.update({"key": key, "previous": previous})
-        if sub == "set":
-            out["value"] = _settings_dig(document, key)[0]
+    if rows:
+        def change(target: dict) -> dict:
+            if sub in ("put", "edit"):
+                return new_document
+            if sub == "set":
+                _settings_put(target, key, value)
+                return target
+            if not _settings_dig(target, key)[1]:
+                raise StoreError("not_found", f"{key} is not set at scope {scope}")
+            _settings_drop(target, key)
+            return target
+        written = _settings_rows_write(home, scope, change)
+        out["path"] = written["source"]
+        if key:
+            out.update({"key": key, "previous": _settings_dig(written["before"], key)[0]})
+            if sub == "set":
+                out["value"] = _settings_dig(written["after"], key)[0]
+        if sub == "edit":
+            out["changed"] = True
+        out["generation"] = written["generation"]
+        if written.get("node"):
+            out["node"] = written["node"]
+    else:
+        if sub in ("put", "edit"):
+            document = new_document
+        elif sub == "set":
+            previous, _ = _settings_dig(document, key)
+            _settings_put(document, key, value)
+        else:
+            previous, found = _settings_dig(document, key)
+            if not found:
+                _die(3, "not_found", f"{key} is not set at scope {scope}")
+            _settings_drop(document, key)
+        _settings_write(home, path, document)
+        if key:
+            out.update({"key": key, "previous": previous})
+            if sub == "set":
+                out["value"] = _settings_dig(document, key)[0]
+        if sub == "edit":
+            out["changed"] = True
     applies = (decl or {}).get("apply") or home.get("apply")
     if applies:
         out["apply"] = applies

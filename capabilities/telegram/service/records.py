@@ -8,7 +8,8 @@ service process takes the adapter and nothing else of the CLI with it.
 
 In a files-mode project the adapter reads the envelope's files and then the
 user's config home's; in a store-mode project it reads connections and grants
-from the project's store. Service settings are files in both.
+from the project's store, and for an agent whose records moved into the store
+everything, service settings included, comes from it.
 """
 from __future__ import annotations
 
@@ -65,15 +66,15 @@ def open_records(envelope: Path, config_home: Path, project_root: Path,
 def service_settings(adapter) -> dict:
     """The service settings, the project's over the config home's key by key.
 
-    Each scope's settings document is the file the adapter names for it, read
-    with the adapter's own loader. The adapter's setting collection also
-    carries the default pointer kept with the connections, which the settings
-    do not include, so reading them never depends on the connections being
-    readable and never reaches the store."""
-    loader = store().FileRecords._load
+    Each scope's settings document is the one the adapter keeps for it: the
+    file in a project whose records are files, the store's rows for an agent
+    whose records moved there. The adapter's setting collection also carries
+    the default pointer kept with the connections, which the settings do not
+    include, so reading them never depends on the connections being
+    readable."""
     merged: dict = {}
     for scope in ("project", "global"):
-        body = loader(Path(adapter.scope_source(NAME, "setting", scope)))
+        body = adapter.setting_document(NAME, scope)
         if isinstance(body, dict):
             for key, value in body.items():
                 merged.setdefault(key, value)

@@ -963,7 +963,7 @@ def _records_for(root: Path, *, project_only: bool = False):
     try:
         return _open_project_records(root, project_only=project_only)
     except store.StoreError as exc:
-        _die(6, exc.slug, exc.message, exc.hint)
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
 
 
 def _guide_menu(guide_dir: Path, command: str) -> list[dict[str, str]]:
@@ -7505,7 +7505,8 @@ def cmd_set(name: str, collection: str, key: str,
                        "key": key, "value": value},
                "records": {"mode": adapter.mode_of(collection, key),
                            "source": (adapter.collection_source(
-                               name, "grant" if collection == "setting" else collection)
+                               name, "grant" if collection == "setting"
+                               and key == "connection.default" else collection)
                                if in_store else adapter.source)}})
     except _store_module().StoreError as exc:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)

@@ -77,11 +77,9 @@ SETTINGS = {
 }
 
 
-def _settings_check(scope, document, path):
-    import tomllib as _t
+def _settings_check(scope, document):
     if scope == "project":
-        held = _t.loads(Path(path).read_text())
-        unknown = sorted(set(held) - {"version", "poll_seconds", "lanes"})
+        unknown = sorted(set(document) - {"version", "poll_seconds", "lanes"})
         if unknown:
             return [f"it names {unknown[0]!r}, which nothing reads"]
     return []
