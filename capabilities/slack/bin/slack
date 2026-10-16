@@ -2286,6 +2286,62 @@ def _settings_rows_write(home: dict, scope: str, change) -> dict:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
+def _records_in_store() -> bool:
+    """Whether this project is an agent whose records and settings moved into
+    the store (its registry row has `migrated_at`): every record and settings
+    document it keeps is then rows, and no file of them is read or written."""
+    if _project_root() is None:
+        return False
+    try:
+        return _records().settings_kept() == "store"
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_named(name: str) -> tuple:
+    """A named settings document `<capability>.<name>` of an agent whose
+    records moved into the store: where it is kept, and the document (None
+    where the agent has none)."""
+    try:
+        records = _records()
+        key = settings_document(NAME, name)
+        return (f"{records.collection_source(NAME, 'setting')} {key}",
+                records.setting_document(key, "project"))
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_named_write(name: str, change, check=None) -> dict:
+    """Change a named settings document `<capability>.<name>` of an agent
+    whose records moved into the store, in the store's one transaction:
+    `change` takes the document and returns the new one, `check` returns what
+    is wrong with the result before anything is written."""
+    try:
+        return _records().settings_write(settings_document(NAME, name), "project",
+                                         change, check=check)
+    except StoreError as e:
+        if e.slug == "settings_invalid":
+            _die(6, e.slug, e.message)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _env_override(*keys: str, value=None):
+    """The first of `keys` the environment sets (or `value`, where the caller
+    read it elsewhere), naming a file to read records or settings from; for an
+    agent whose records moved into the store such a file is not read, so the
+    override is ignored with a one-line notice on stderr, and None returned."""
+    found = value if value is not None else next(
+        (os.environ.get(k) for k in keys if os.environ.get(k)), None)
+    if not found:
+        return None
+    if _records_in_store():
+        named = next((k for k in keys if os.environ.get(k)), keys[0] if keys else "override")
+        sys.stderr.write(f"{NAME}: {named} is ignored: this agent's records and settings "
+                         "are in the store, and no file is read for them\n")
+        return None
+    return found
+
+
 def _settings_diff(before: dict, after: dict) -> list:
     """What changes between two documents, path by path: `-` removed, `+`
     added, `~` changed."""
@@ -6162,17 +6218,31 @@ _POLICY_DEFAULT = {
 }
 
 
+def _policy_where() -> str:
+    """Where the allow-list is kept, as a person edits it: the envelope's
+    policy.json, or the `slack.policy` settings document of an agent whose
+    records moved into the store."""
+    if _records_in_store():
+        return "the slack.policy settings document in the store"
+    return "capabilities/slack/policy.json"
+
+
 def _policy() -> dict:
     envdir = _env_dir()
     if envdir is None:
         return dict(_POLICY_DEFAULT)
-    pfile = envdir / "policy.json"
-    if not pfile.is_file():
-        return dict(_POLICY_DEFAULT)
-    try:
-        data = json.loads(pfile.read_text())
-    except (OSError, ValueError):
-        _die(6, "bad_policy", f"{pfile} is not valid JSON")
+    if _records_in_store():
+        pfile, data = _settings_named("policy")
+        if data is None:
+            return dict(_POLICY_DEFAULT)
+    else:
+        pfile = envdir / "policy.json"
+        if not pfile.is_file():
+            return dict(_POLICY_DEFAULT)
+        try:
+            data = json.loads(pfile.read_text())
+        except (OSError, ValueError):
+            _die(6, "bad_policy", f"{pfile} is not valid JSON")
     if not isinstance(data, dict):
         _die(6, "bad_policy", f"{pfile} must be a JSON object")
     policy = {**_POLICY_DEFAULT, **data}
@@ -6213,7 +6283,7 @@ def _policy_gate(kind: str, ident: str) -> None:
             4,
             "policy_refusal",
             f"direct messages to {ident} are not allowed by policy",
-            "add the user id to allowed_users in capabilities/slack/policy.json, "
+            f"add the user id to allowed_users in {_policy_where()}, "
             'or set direct_messages.mode to "open"',
         )
     else:
@@ -6225,7 +6295,7 @@ def _policy_gate(kind: str, ident: str) -> None:
             4,
             "policy_refusal",
             f"conversation {ident} is not allowed by policy",
-            "add the channel id to allowed_channels in capabilities/slack/policy.json, "
+            f"add the channel id to allowed_channels in {_policy_where()}, "
             'or set default_channel_policy to "open"',
         )
 
@@ -6703,7 +6773,13 @@ def _service_env(root: Path, cid: str, state: Path, bot: str, app: str) -> dict:
     env = dict(os.environ)
     env["CAPABILITIES_PROJECT_ENVELOPE"] = str(_project_capabilities_dir(root))
     env["SLACK_SERVICE_PROJECT_ROOT"] = str(root)
-    env["SLACK_SERVICE_SETTINGS"] = str(_service_settings_path(root))
+    if _records_in_store():
+        # The settings are rows: no file names them, and an override that
+        # names one is said to be ignored.
+        _env_override("SLACK_SERVICE_SETTINGS")
+        env.pop("SLACK_SERVICE_SETTINGS", None)
+    else:
+        env["SLACK_SERVICE_SETTINGS"] = str(_service_settings_path(root))
     # The settings as the records adapter resolves them, so the daemon reads
     # exactly what `_service_settings_strict` judged and opens no file itself.
     env["SLACK_SERVICE_SETTINGS_RESOLVED"] = json.dumps(_service_settings(root))

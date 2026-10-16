@@ -1544,11 +1544,13 @@ class Daemon:
     it, the launcher that starts each job inside the project's own environment,
     and the log, which names the project on every line."""
 
-    def __init__(self, root: Path, config_path: Path, state_dir: Path, *,
+    def __init__(self, root: Path, config_path: Path | None, state_dir: Path, *,
                  slug: str | None = None, loader=None, runs: RunLedger | None = None,
                  launcher=None, log=None):
         self.root = root.resolve()
-        self.config_path = config_path.resolve()
+        # None for an agent whose settings are rows of the store: its
+        # declaration comes through `loader` alone.
+        self.config_path = config_path.resolve() if config_path is not None else None
         self.state_dir = state_dir.resolve()
         self.slug = slug or _project_slug(self.root)
         self._loader = loader
@@ -2721,15 +2723,53 @@ class MachineService:
         self.draining = []
 
 
+# How the CLI tells the daemon it starts that the project's declaration is not
+# a file: the agent's settings are rows of the store, read by the CLI alone.
+DECLARATION_FROM_CLI = "cli"
+
+
+def cli_declaration(root: Path) -> dict[str, Any]:
+    """The declaration of a project whose settings are rows of the store, as
+    the CLI reads it (`automations service declaration`), validated here as a
+    file's would be. Raises ConfigError naming what the CLI said."""
+    env = {**os.environ, "CLAUDE_PROJECT_DIR": str(root)}
+    try:
+        proc = subprocess.run([automations_bin(), "service", "declaration"],
+                              cwd=str(root), env=env, capture_output=True, text=True,
+                              timeout=300, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ConfigError(f"cannot read the declaration through the CLI: {exc}") from exc
+    if proc.returncode != 0:
+        said = (proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = said[-1] if said else f"exit {proc.returncode}"
+        with contextlib.suppress(ValueError, AttributeError, TypeError, KeyError):
+            error = json.loads(detail)["error"]
+            detail = f"{error['code']}: {error['message']}"
+        raise ConfigError(f"the declaration does not load: {detail}")
+    try:
+        raw = json.loads(proc.stdout)
+    except ValueError as exc:
+        raise ConfigError(f"the declaration the CLI printed is not JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigError("the declaration the CLI printed is not an object")
+    return normalise_config(root, raw)
+
+
 def run_from_env() -> None:
     root_raw = os.environ.get("AUTOMATIONS_PROJECT_ROOT")
     config_raw = os.environ.get("AUTOMATIONS_CONFIG")
     state_raw = os.environ.get("AUTOMATIONS_STATE_DIR")
-    if not root_raw or not config_raw or not state_raw:
+    from_cli = os.environ.get("AUTOMATIONS_DECLARATION") == DECLARATION_FROM_CLI
+    if not root_raw or not state_raw or not (config_raw or from_cli):
         raise RuntimeError(
-            "AUTOMATIONS_PROJECT_ROOT, AUTOMATIONS_CONFIG, and AUTOMATIONS_STATE_DIR are required"
+            "AUTOMATIONS_PROJECT_ROOT, AUTOMATIONS_STATE_DIR, and AUTOMATIONS_CONFIG "
+            f"(or AUTOMATIONS_DECLARATION={DECLARATION_FROM_CLI}) are required"
         )
-    Daemon(Path(root_raw), Path(config_raw), Path(state_raw)).run()
+    root = Path(root_raw)
+    if from_cli:
+        Daemon(root, None, Path(state_raw), loader=lambda: cli_declaration(root)).run()
+        return
+    Daemon(root, Path(config_raw), Path(state_raw)).run()
 
 
 if __name__ == "__main__":

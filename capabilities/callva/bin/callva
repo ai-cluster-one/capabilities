@@ -2474,6 +2474,62 @@ def _settings_rows_write(home: dict, scope: str, change) -> dict:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
+def _records_in_store() -> bool:
+    """Whether this project is an agent whose records and settings moved into
+    the store (its registry row has `migrated_at`): every record and settings
+    document it keeps is then rows, and no file of them is read or written."""
+    if _project_root() is None:
+        return False
+    try:
+        return _records().settings_kept() == "store"
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_named(name: str) -> tuple:
+    """A named settings document `<capability>.<name>` of an agent whose
+    records moved into the store: where it is kept, and the document (None
+    where the agent has none)."""
+    try:
+        records = _records()
+        key = settings_document(NAME, name)
+        return (f"{records.collection_source(NAME, 'setting')} {key}",
+                records.setting_document(key, "project"))
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_named_write(name: str, change, check=None) -> dict:
+    """Change a named settings document `<capability>.<name>` of an agent
+    whose records moved into the store, in the store's one transaction:
+    `change` takes the document and returns the new one, `check` returns what
+    is wrong with the result before anything is written."""
+    try:
+        return _records().settings_write(settings_document(NAME, name), "project",
+                                         change, check=check)
+    except StoreError as e:
+        if e.slug == "settings_invalid":
+            _die(6, e.slug, e.message)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _env_override(*keys: str, value=None):
+    """The first of `keys` the environment sets (or `value`, where the caller
+    read it elsewhere), naming a file to read records or settings from; for an
+    agent whose records moved into the store such a file is not read, so the
+    override is ignored with a one-line notice on stderr, and None returned."""
+    found = value if value is not None else next(
+        (os.environ.get(k) for k in keys if os.environ.get(k)), None)
+    if not found:
+        return None
+    if _records_in_store():
+        named = next((k for k in keys if os.environ.get(k)), keys[0] if keys else "override")
+        sys.stderr.write(f"{NAME}: {named} is ignored: this agent's records and settings "
+                         "are in the store, and no file is read for them\n")
+        return None
+    return found
+
+
 def _settings_diff(before: dict, after: dict) -> list:
     """What changes between two documents, path by path: `-` removed, `+`
     added, `~` changed."""

@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "capabilities-contract==0.4.1",
+#     "callva-harness-runner==0.9.0",
 # ]
 # ///
 """automations — project-local scheduler and subprocess runner.
@@ -205,6 +206,10 @@ Machine mode:
   automations service launch -- <command...>
       What the machine process starts each job through, in the job's project;
       not for direct use.
+  automations service declaration
+      The project's declaration as the scheduler loads it - its settings and
+      its agent profiles - as JSON; what the daemon of an agent whose settings
+      are in the store reads at start and on every reload. Not for direct use.
 
   A project opts in by an act of its own: `automations service join`, run in a
   project that enables automations for itself (`capabilities enable
@@ -2602,6 +2607,62 @@ def _settings_rows_write(home: dict, scope: str, change) -> dict:
             _die(6, e.slug, e.message,
                  f"`{NAME} settings` shows the document; `{NAME} help` states the keys")
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _records_in_store() -> bool:
+    """Whether this project is an agent whose records and settings moved into
+    the store (its registry row has `migrated_at`): every record and settings
+    document it keeps is then rows, and no file of them is read or written."""
+    if _project_root() is None:
+        return False
+    try:
+        return _records().settings_kept() == "store"
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_named(name: str) -> tuple:
+    """A named settings document `<capability>.<name>` of an agent whose
+    records moved into the store: where it is kept, and the document (None
+    where the agent has none)."""
+    try:
+        records = _records()
+        key = settings_document(NAME, name)
+        return (f"{records.collection_source(NAME, 'setting')} {key}",
+                records.setting_document(key, "project"))
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_named_write(name: str, change, check=None) -> dict:
+    """Change a named settings document `<capability>.<name>` of an agent
+    whose records moved into the store, in the store's one transaction:
+    `change` takes the document and returns the new one, `check` returns what
+    is wrong with the result before anything is written."""
+    try:
+        return _records().settings_write(settings_document(NAME, name), "project",
+                                         change, check=check)
+    except StoreError as e:
+        if e.slug == "settings_invalid":
+            _die(6, e.slug, e.message)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _env_override(*keys: str, value=None):
+    """The first of `keys` the environment sets (or `value`, where the caller
+    read it elsewhere), naming a file to read records or settings from; for an
+    agent whose records moved into the store such a file is not read, so the
+    override is ignored with a one-line notice on stderr, and None returned."""
+    found = value if value is not None else next(
+        (os.environ.get(k) for k in keys if os.environ.get(k)), None)
+    if not found:
+        return None
+    if _records_in_store():
+        named = next((k for k in keys if os.environ.get(k)), keys[0] if keys else "override")
+        sys.stderr.write(f"{NAME}: {named} is ignored: this agent's records and settings "
+                         "are in the store, and no file is read for them\n")
+        return None
+    return found
 
 
 def _settings_diff(before: dict, after: dict) -> list:
@@ -5742,7 +5803,7 @@ def _inventory(_network: bool) -> dict:
     pid = _read_pid(state / "daemon.pid")
     running = _pid_alive(pid)
     live = ({"state": "running", "detail": f"pid {pid}"} if running else None)
-    if not _config_path(root).is_file():
+    if not _config_initialized(root):
         return {"metrics": [{"label": "automations", "value": 0,
                              "note": "no configuration in this project"}],
                 "service": {**(live or {"state": "not initialized",
@@ -5889,10 +5950,169 @@ def _project_selectors() -> dict:
 
 def _config_path(root: Path) -> Path:
     override = os.environ.get("AUTOMATIONS_CONFIG") or _project_selectors().get("AUTOMATIONS_CONFIG")
+    if override and _records_in_store():
+        _env_override("AUTOMATIONS_CONFIG", value=override)
+        override = None
     if override:
         path = Path(override).expanduser()
         return path if path.is_absolute() else root / path
     return _service_dir(root) / "config.toml"
+
+
+# --- the declaration of an agent whose settings are rows ----------------------
+# An agent whose records moved into the store keeps the scheduler's settings as
+# rows of its `automations` settings document and its agent profiles as harness
+# profiles named `automations-<name>` in `harness_profiles`, beside the ones
+# tasks and telegram keep there. `agents.default` stays a key of the settings
+# document: a profile row has no place for which profile is the default. No
+# file is read for either.
+
+AGENT_PROFILE_PREFIX = "automations-"
+_READ_TOOLS = ["Read", "Glob", "Grep"]
+# How each mode is said in the harness runner's own knobs. `automations agent`
+# still builds the engine's command from the mode, as it always has; the stored
+# profile says the same authority in the runner's terms: read is plan mode with
+# the reading tools alone, write may edit files, act holds the machine.
+_CLAUDE_MODES = {"read": {"permission_mode": "plan", "tools": _READ_TOOLS,
+                          "allowed_tools": _READ_TOOLS},
+                 "write": {"permission_mode": "acceptEdits"},
+                 "act": {"permission_mode": "bypassPermissions"}}
+_CODEX_MODES = {"read": {"codex_config": {"sandbox_mode": "read-only"}},
+                "write": {"codex_config": {"sandbox_mode": "workspace-write"}},
+                "act": {"codex_config": {"sandbox_mode": "danger-full-access"},
+                        "approval_policy": "never"}}
+
+
+def _config_in_rows(root: Path) -> bool:
+    """Whether this project's scheduler settings are rows of the store."""
+    return _records_in_store()
+
+
+def _config_where(root: Path) -> str:
+    """Where this project's scheduler settings are kept, as a person reads it."""
+    if _config_in_rows(root):
+        return _settings_read(_settings_homes("project")[0])[0]
+    return str(_config_path(root))
+
+
+def _config_initialized(root: Path) -> bool:
+    if _config_in_rows(root):
+        return _settings_read(_settings_homes("project")[0])[1] is not None
+    return _config_path(root).is_file()
+
+
+def agent_spec(profile: dict[str, Any]) -> dict[str, Any]:
+    """One automations agent profile as a harness profile's knobs."""
+    engine, mode = profile["engine"], profile.get("mode") or "read"
+    spec: dict[str, Any] = {"harness": engine, "model": profile["model"],
+                            "timeout_seconds": float(profile["timeout_seconds"])}
+    if profile.get("effort"):
+        spec["effort"] = profile["effort"]
+    spec.update(copy.deepcopy((_CLAUDE_MODES if engine == "claude" else _CODEX_MODES)[mode]))
+    if engine == "codex" and profile.get("service_tier"):
+        spec["service_tier"] = profile["service_tier"]
+    return spec
+
+
+def agent_profile(spec: dict[str, Any]) -> dict[str, Any] | None:
+    """The automations agent profile a harness profile's knobs say, or None
+    where they say something no automations profile maps to."""
+    engine = spec.get("harness")
+    modes = _CLAUDE_MODES if engine == "claude" else _CODEX_MODES if engine == "codex" else None
+    if modes is None or not isinstance(spec.get("model"), str):
+        return None
+    for mode in modes:
+        profile = {"engine": engine, "model": spec["model"], "effort": spec.get("effort"),
+                   "mode": mode, "timeout_seconds": spec.get("timeout_seconds", 600.0),
+                   "service_tier": spec.get("service_tier")}
+        try:
+            if agent_spec(profile) == {**spec, "timeout_seconds":
+                                       float(spec.get("timeout_seconds", 600.0))}:
+                return profile
+        except (KeyError, TypeError, ValueError):
+            return None
+    return None
+
+
+def _harness_runner():
+    try:
+        from callva import harness_runner
+    except ImportError as exc:  # pragma: no cover - a broken install, not a path
+        _die(5, "harness_library_missing", f"the harness library is not importable: {exc}",
+             "reinstall the capability; its script header declares callva-harness-runner")
+    return harness_runner
+
+
+def _profile_conn(root: Path):
+    """A connection to the project's store, bound to its schema, and the schema."""
+    from capabilities_contract import db
+    try:
+        setting = db.resolve_setting(root)
+        return db.connect(application_name=NAME, setting=setting), setting.schema
+    except db.DbError as exc:
+        _die(6 if exc.slug in _STORE_CONFIG_SLUGS else 5, exc.slug, exc.message, exc.hint)
+
+
+def _stored_agent_versions(conn, schema: str, project: str) -> list:
+    """Every active `automations-` harness profile a lookup from the project
+    reaches: the project's and the global ones."""
+    runner = _harness_runner()
+    try:
+        active = runner.stored_profiles(conn, project=project, schema=schema)
+    except Exception as exc:
+        if type(exc).__name__ != "UndefinedTable":
+            raise
+        conn.rollback()
+        return []
+    return [one for one in active if one.name.startswith(AGENT_PROFILE_PREFIX)]
+
+
+def _stored_agents(root: Path) -> dict[str, dict[str, Any]]:
+    """This agent's own agent profiles as the store holds them, each as the
+    `[agents.workers.<name>]` table it stands for: the project's version of a
+    name over the global one."""
+    project = _project_id()
+    conn, schema = _profile_conn(root)
+    try:
+        versions = _stored_agent_versions(conn, schema, project)
+    finally:
+        conn.close()
+    found: dict[str, Any] = {}
+    for one in sorted(versions, key=lambda v: 0 if v.scope == "project" else 1):
+        name = one.name[len(AGENT_PROFILE_PREFIX):]
+        if name in found:
+            continue
+        profile = agent_profile(dict(one.spec))
+        if profile is None:
+            raise _ConfigRefusal(f"{one.where} does not say an automations agent profile: "
+                                 "its knobs map to no engine, model and mode")
+        found[name] = {k: v for k, v in profile.items() if v is not None}
+    return found
+
+
+class _ConfigRefusal(Exception):
+    pass
+
+
+def _declaration_rows(root: Path) -> dict[str, Any]:
+    """The declaration of an agent whose settings are rows: its settings
+    document with its agent profiles from the store as `[agents.workers]`.
+    Raises _ConfigRefusal where there is none or it cannot be read."""
+    where, document, error = _settings_read(_settings_homes("project")[0])
+    if error:
+        raise _ConfigRefusal(error)
+    if document is None:
+        raise _ConfigRefusal(f"config not found: {where}")
+    raw = copy.deepcopy(document)
+    agents = raw.get("agents") if isinstance(raw.get("agents"), dict) else {}
+    agents = {k: v for k, v in agents.items() if k != "workers"}
+    workers = _stored_agents(root)
+    if workers:
+        agents["workers"] = workers
+    raw["agents"] = agents
+    if not raw["agents"]:
+        raw.pop("agents")
+    return raw
 
 
 def _state_override(root: Path) -> Path | None:
@@ -6233,7 +6453,15 @@ def _runtime_module():
 def _load_config(runtime, root: Path) -> dict[str, Any]:
     """The declaration as the project's scheduler acts on it, in either mode.
     Raises the runtime's ConfigError."""
-    config = runtime.load_effective_config(root, _config_path(root), _state_path(root))
+    if _config_in_rows(root):
+        # An override naming a config file is said to be ignored, and no file read.
+        _config_path(root)
+        try:
+            config = runtime.normalise_config(root, _declaration_rows(root))
+        except _ConfigRefusal as exc:
+            raise runtime.ConfigError(str(exc)) from None
+    else:
+        config = runtime.load_effective_config(root, _config_path(root), _state_path(root))
     selectors = _project_selectors()
     config["engine"]["environment"] = (
         os.environ.get("AUTOMATIONS_ENVIRONMENT")
@@ -6297,12 +6525,37 @@ def _service_env(root: Path) -> dict[str, str]:
     env.update(
         {
             "AUTOMATIONS_PROJECT_ROOT": str(root),
-            "AUTOMATIONS_CONFIG": str(_config_path(root)),
             "AUTOMATIONS_STATE_DIR": str(_state_path(root)),
             "AUTOMATIONS_NODE_NAME": node_name(),
         }
     )
+    if _config_in_rows(root):
+        # The daemon reads the declaration through this CLI, at start and on
+        # every reload: the settings are rows, which only the contract reads.
+        env.pop("AUTOMATIONS_CONFIG", None)
+        env["AUTOMATIONS_DECLARATION"] = "cli"
+    else:
+        env["AUTOMATIONS_CONFIG"] = str(_config_path(root))
+        env.pop("AUTOMATIONS_DECLARATION", None)
     return env
+
+
+def cmd_service_declaration() -> dict[str, Any]:
+    """The declaration as the scheduler loads it, unnormalised: the daemon of an
+    agent whose settings are rows reads it here and validates it itself. A
+    project whose settings are a file is read from the file, as its daemon
+    reads it."""
+    root = _root_required()
+    if not _config_in_rows(root):
+        try:
+            return tomllib.loads(_config_path(root).read_text())
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            _die(6, "invalid_config", f"cannot read config {_config_path(root)}: {exc}",
+                 "run `automations service init` or repair config.toml")
+    try:
+        return _declaration_rows(root)
+    except _ConfigRefusal as exc:
+        _die(6, "invalid_config", str(exc), "run `automations service init`")
 
 
 def cmd_service_init(force: bool) -> dict[str, Any]:
@@ -6316,7 +6569,23 @@ def cmd_service_init(force: bool) -> dict[str, Any]:
     script_path = _project_capabilities_dir(root) / NAME / "scripts" / "example.py"
     written: list[str] = []
     skipped: list[str] = []
-    for source, target in ((config_template, config_path), (script_template, script_path)):
+    targets = [(script_template, script_path)]
+    if _config_in_rows(root):
+        # The settings are rows: the template is written there, once, and a
+        # document the store already holds is left as it is.
+        home = _settings_homes("project")[0]
+        where, document, _error = _settings_read(home)
+        if document is not None and not force:
+            skipped.append(where)
+        else:
+            seed = tomllib.loads(config_template.read_text())
+            _settings_rows_write(home, "project", lambda _current: seed)
+            written.append(where)
+        config_shown = where
+    else:
+        targets.insert(0, (config_template, config_path))
+        config_shown = str(config_path)
+    for source, target in targets:
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists() and not force:
             skipped.append(str(target))
@@ -6328,7 +6597,7 @@ def cmd_service_init(force: bool) -> dict[str, Any]:
     return {
         "initialized": NAME,
         "project": str(root),
-        "config": str(config_path),
+        "config": config_shown,
         "written": written,
         "skipped": skipped,
         "next": [
@@ -6350,7 +6619,7 @@ def service_status(root: Path) -> dict[str, Any]:
     counts: dict[str, int] = {}
     counts_error: str | None = None
     runtime = _runtime_module()
-    initialized = _config_path(root).is_file()
+    initialized = _config_initialized(root)
     # No runs counted and no store to count them in are different facts, and a
     # report that prints them the same way hides the second one. This swallowed
     # every exception into an empty map for long enough to hide a wrong call
@@ -6385,7 +6654,7 @@ def service_status(root: Path) -> dict[str, Any]:
         # published, which decides what it schedules.
         "node": node_name(),
         "daemon_node": runtime.read_daemon_node(state) if running else None,
-        "config": str(_config_path(root)),
+        "config": _config_where(root),
         "state_dir": str(state),
         # A `running: false` is a statement about one directory, and a reader who
         # cannot see which one has to believe it. These name the place the answer
@@ -7076,7 +7345,105 @@ def cmd_import(apply: bool, nodes: list[str]) -> dict[str, Any]:
 
 # What `capabilities migrate` moves out of config.toml through this mover, and
 # what the manager then leaves out of the settings rows it writes for it.
-_MOVED_BY_MOVER = [["automations"], ["engine", "timezone"]]
+_MOVED_BY_MOVER = [["automations"], ["engine", "timezone"], ["agents", "workers"]]
+
+
+def _migrate_agent_profiles(action: str, root: Path, document: dict, differs: dict,
+                            here: str) -> tuple[list, dict, list]:
+    """`capabilities migrate`'s move of config.toml's `[agents.workers]` into
+    `harness_profiles`, one profile `automations-<name>` per declared worker at
+    the project's scope, each as the scheduler resolves it (a shipped profile's
+    fields under a declared one of its name). A version the store holds
+    differently is a question: `profiles.<name>` is `store` or `files`.
+    Returns the items, the questions and the differences a verify finds."""
+    agents = document.get("agents") if isinstance(document.get("agents"), dict) else {}
+    declared = agents.get("workers") if isinstance(agents.get("workers"), dict) else {}
+    if not declared:
+        return [], {}, []
+    runtime = _runtime_module()
+    try:
+        resolved = runtime.load_agents({"agents": {"workers": declared}})["workers"]
+    except runtime.ConfigError as exc:
+        _die(6, "invalid_config", f"{_config_path(root)}: {exc}",
+             "repair [agents], then run `capabilities migrate` again")
+    wanted = {name: agent_spec(resolved[name]) for name in sorted(declared)}
+    runner = _harness_runner()
+    project = _project_id(write=action == "write")
+    conn, schema = _profile_conn(root)
+    items, questions, differences = [], {}, []
+    try:
+        held = {one.name: one for one in _stored_agent_versions(conn, schema, project)
+                if one.scope == "project" and one.scope_id == project}
+        conn.rollback()
+        for name, spec in wanted.items():
+            profile = AGENT_PROFILE_PREFIX + name
+            try:
+                spec = runner.check_spec(spec, f"agent profile {name!r}")
+            except (runner.ProfileError, ValueError, TypeError, KeyError) as exc:
+                _die(6, "invalid_config", f"{_config_path(root)}: agents.workers.{name} "
+                     f"does not make a harness profile: {exc}")
+            version = held.get(profile)
+            item = {"kind": "agent_profile", "name": name, "profile": profile}
+            if version is None:
+                outcome = "missing"
+            elif dict(version.spec) == spec:
+                outcome = "held"
+            elif differs.get(name) == "store":
+                outcome = "kept"
+            elif differs.get(name) == "files":
+                outcome = "differs_replace"
+            else:
+                outcome = "differs"
+                questions[f"profiles.{name}"] = {
+                    "id": f"{NAME}.profiles.{name}", "answer": f"{NAME}.profiles.{name}",
+                    "choices": ["store", "files"],
+                    "question": f"agent profile {name!r} is in the store as {profile} "
+                                f"version {version.id} and differs from config.toml: keep "
+                                "the store's, or save the file's as a new version?"}
+            if version is not None:
+                item["version"] = version.id
+            item["outcome"] = outcome
+            items.append((item, spec))
+    finally:
+        conn.close()
+    out = []
+    for item, spec in items:
+        if action == "plan" and item["outcome"] in ("missing", "differs_replace"):
+            item["outcome"] = "would_write"
+        if action == "verify" and item["outcome"] not in ("held", "kept"):
+            differences.append(f"agent profile {item['name']}: {item['outcome']}")
+        if action == "write":
+            item["_spec"] = spec
+        out.append(item)
+    return out, questions, differences
+
+
+def _save_agent_profiles(root: Path, items: list, here: str) -> None:
+    """Write the agent profiles `_migrate_agent_profiles` found missing or to
+    replace, in one transaction, once nothing else of the move is open."""
+    pending = [item for item in items if item["outcome"] in ("missing", "differs_replace")]
+    for item in items:
+        spec = item.pop("_spec", None)
+        if item in pending:
+            item["_save"] = spec
+    if not pending:
+        return
+    from capabilities_contract import db
+    runner = _harness_runner()
+    project = _project_id(write=True)
+    conn, schema = _profile_conn(root)
+    try:
+        conn.rollback()
+        db.migrate(conn, runner.PROFILE_STORE_OWNER, runner.PROFILE_STORE_STEPS,
+                   major=runner.PROFILE_STORE_MAJOR, minor=runner.PROFILE_STORE_MINOR)
+        with conn.transaction():
+            for item in pending:
+                version, _created = runner.save_profile(
+                    conn, item["profile"], item.pop("_save"), scope="project",
+                    scope_id=project, created_by=f"migrate@{here}", schema=schema)
+                item.update(outcome="written", version=version.id)
+    finally:
+        conn.close()
 
 
 def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict[str, Any]:
@@ -7102,10 +7469,24 @@ def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict[str, An
         document = {}
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         _die(6, "invalid_config", f"cannot read config {config_path}: {exc}")
+    differs = mine.get("differs") if isinstance(mine.get("differs"), dict) else {}
+    here = str(answers.get("_master") or node_name())
+    profiles = mine.get("profiles") if isinstance(mine.get("profiles"), dict) else {}
+    agent_items, agent_questions, agent_differences = _migrate_agent_profiles(
+        action, root, document, profiles, here)
+    if action == "write" and agent_questions:
+        _die(6, "question_open", f"{len(agent_questions)} question(s) are open: "
+             + "; ".join(q["id"] for q in agent_questions.values()),
+             "answer them in the answers file `capabilities migrate --answers` reads")
+    report["items"] = agent_items
+    report["questions"] = list(agent_questions.values())
     entries = document.get("automations") or []
     if not entries:
+        if action == "write":
+            _save_agent_profiles(root, agent_items, here)
         if action == "verify":
-            report["verified"] = True
+            report["differences"] = agent_differences
+            report["verified"] = not agent_differences
         return report
     if not isinstance(entries, list):
         _die(6, "invalid_config", f"{config_path}: automations must be an array of tables")
@@ -7114,11 +7495,9 @@ def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict[str, An
     environment = (os.environ.get("AUTOMATIONS_ENVIRONMENT")
                    or _project_selectors().get("AUTOMATIONS_ENVIRONMENT")
                    or str(engine.get("environment") or "development"))
-    here = str(answers.get("_master") or node_name())
     known = set(answers.get("_nodes") or [here])
     by_env = mine.get("environments") if isinstance(mine.get("environments"), dict) else {}
     by_slug = mine.get("automations") if isinstance(mine.get("automations"), dict) else {}
-    differs = mine.get("differs") if isinstance(mine.get("differs"), dict) else {}
     questions: dict[str, dict] = {}
 
     def ask(qid: str, question: str, choices: list | None = None) -> None:
@@ -7230,11 +7609,14 @@ def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict[str, An
     except runtime.ConfigError as exc:
         _die(6, "question_open" if questions else "conflict", str(exc),
              "answer the questions `capabilities migrate` lists, then run it again")
-    report["items"] = items + held
-    report["questions"] = list(questions.values())
+    if write:
+        _save_agent_profiles(root, agent_items, here)
+    report["items"] = agent_items + items + held
+    report["questions"] = list(agent_questions.values()) + list(questions.values())
     if action == "verify":
-        report["differences"] = [f"automation {item['name']}: {item['outcome']}"
-                                 for item in items if item["outcome"] not in ("held", "kept")]
+        report["differences"] = agent_differences + [
+            f"automation {item['name']}: {item['outcome']}"
+            for item in items if item["outcome"] not in ("held", "kept")]
         report["verified"] = not report["differences"] and not questions
     return report
 
@@ -7370,7 +7752,8 @@ def cmd_service_reload(timeout: float) -> dict[str, Any]:
         _die(5, "service_not_running", "no automations daemon is running",
              "start it with `automations service start`")
     try:
-        config = runtime.load_effective_config(root, _config_path(root), state)
+        config = (_load_config(runtime, root) if _config_in_rows(root)
+                  else runtime.load_effective_config(root, _config_path(root), state))
     except runtime.DefinitionsNotImported as exc:
         _die(6, "definitions_not_imported", str(exc),
              f"run `{NAME} import` to see what moves, then `{NAME} import --apply`")
@@ -8653,6 +9036,8 @@ def _agents_config(root: Path) -> dict[str, Any]:
     imported: a job running mid-migration still gets its agent turn."""
     runtime = _runtime_module()
     try:
+        if _config_in_rows(root):
+            return _load_config(runtime, root)
         return runtime.load_config(root, _config_path(root), unimported=True)
     except runtime.ConfigError as exc:
         _die(6, "invalid_config", str(exc), "run `automations service init` or repair config.toml")
@@ -8796,6 +9181,7 @@ def main() -> None:
     leave.add_argument("--project")
     launch = service_sub.add_parser("launch", add_help=False)
     launch.add_argument("command", nargs=argparse.REMAINDER)
+    service_sub.add_parser("declaration", add_help=False)
     for verb in (*machine_verbs, reload_parser, stop, service_logs, leave):
         verb.add_argument("--machine", action="store_true")
 
@@ -8899,6 +9285,8 @@ def main() -> None:
             _emit(cmd_service_leave(False, args.project))
         elif args.service_cmd == "launch":
             cmd_service_launch(args.command)
+        elif args.service_cmd == "declaration":
+            _emit(cmd_service_declaration())
 
 
 if __name__ == "__main__":

@@ -116,6 +116,15 @@ class World:
         assert result.returncode == 0, (argv, result.stdout + result.stderr)
 
     def start(self) -> None:
+        # A running cluster given by its loopback port (superuser pgadmin,
+        # trust) is reused, with a database of this run's own.
+        port = os.environ.get("CAPABILITIES_TEST_PG_PORT")
+        if port:
+            self.port, self.external = int(port), True
+            with self.admin() as conn:
+                conn.execute(f"CREATE DATABASE {self.database} ENCODING 'UTF8' "
+                             "TEMPLATE template0")
+            return
         self.pg("initdb", "-D", str(self.data), "-U", ADMIN, "-E", "UTF8",
                 "--locale=en_US.UTF-8", "--auth=trust")
         with (self.data / "postgresql.conf").open("a") as conf:
@@ -127,6 +136,10 @@ class World:
             conn.execute(f"CREATE DATABASE {self.database} ENCODING 'UTF8' TEMPLATE template0")
 
     def stop(self) -> None:
+        if getattr(self, "external", False):
+            with self.admin() as conn:
+                conn.execute(f"DROP DATABASE IF EXISTS {self.database} WITH (FORCE)")
+            return
         subprocess.run(["pg_ctl", "-D", str(self.data), "-m", "immediate", "stop"],
                        capture_output=True, timeout=60,
                        env={**os.environ, "LC_ALL": "en_US.UTF-8"})
@@ -631,11 +644,15 @@ def test_dry_run_reports_and_writes_nothing(world, name):
         assert modified == [str(root / "capabilities" / "telegram" / "service" / "settings.json")]
     elif name == "books":
         assert questions == {"automations.environments.production", "automations.automations.watch"}
-        items = {i["name"]: i["outcome"] for i in plan["movers"]["automations"]["items"]}
-        assert items == {"by-hand": "would_write", "daily-books": "question",
-                         "watch": "question"}
+        items = {(i["kind"], i["name"]): i["outcome"]
+                 for i in plan["movers"]["automations"]["items"]}
+        assert items == {("definition", "by-hand"): "would_write",
+                         ("definition", "daily-books"): "question",
+                         ("definition", "watch"): "question",
+                         ("agent_profile", "books"): "would_write"}
         [settings] = plan["settings"]
-        assert settings["excluded"] == [["automations"], ["engine", "timezone"]]
+        assert settings["excluded"] == [["automations"], ["engine", "timezone"],
+                                        ["agents", "workers"]]
     elif name == "clinic":
         assert not questions
         assert plan["git"][str(root / "capabilities" / "whatsapp" / "connections.json")] \
@@ -684,10 +701,12 @@ def test_apply_moves_everything_and_reads_the_same_through_the_switch(world, nam
     assert after_switch.pop("adapter") == "AgentRecords"
     assert before_switch.pop("adapter") in ("FileRecords", "StoreRecords")
     if name == "books":
-        # [[automations]] and engine.timezone moved into definitions.
+        # [[automations]] and engine.timezone moved into definitions, and the
+        # agent profiles into harness profiles.
         document = before_switch["settings"]["automations"]["document"]
         document.pop("automations")
         document["engine"].pop("timezone")
+        document["agents"].pop("workers")
     if name == "relay":
         # The old worker settings became a profile name.
         defaults = after_switch["settings"]["telegram"]["document"].pop("defaults")
@@ -739,6 +758,12 @@ def test_apply_moves_everything_and_reads_the_same_through_the_switch(world, nam
         assert "bootout gui/" in log and "bootstrap gui/" in log
         assert applied["services"]["launchd"] == ["test.relay.telegram"]
     if name == "books":
+        profiles = world.sql("SELECT name, spec, created_by FROM harness_profiles WHERE "
+                             "scope_id = %s AND active", (IDS[name],))
+        assert profiles == [("automations-books", {
+            "harness": "claude", "model": "sonnet", "timeout_seconds": 600.0, "permission_mode": "plan",
+            "tools": ["Read", "Glob", "Grep"], "allowed_tools": ["Read", "Glob", "Grep"]},
+            f"migrate@{MASTER}")]
         rows = world.sql("SELECT slug, node, schedule, timezone, created_by FROM "
                          "automations_definitions WHERE project_id = %s AND active "
                          "ORDER BY slug", (IDS[name],))

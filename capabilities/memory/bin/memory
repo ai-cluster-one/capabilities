@@ -2488,6 +2488,62 @@ def _settings_rows_write(home: dict, scope: str, change) -> dict:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
+def _records_in_store() -> bool:
+    """Whether this project is an agent whose records and settings moved into
+    the store (its registry row has `migrated_at`): every record and settings
+    document it keeps is then rows, and no file of them is read or written."""
+    if _project_root() is None:
+        return False
+    try:
+        return _records().settings_kept() == "store"
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_named(name: str) -> tuple:
+    """A named settings document `<capability>.<name>` of an agent whose
+    records moved into the store: where it is kept, and the document (None
+    where the agent has none)."""
+    try:
+        records = _records()
+        key = settings_document(NAME, name)
+        return (f"{records.collection_source(NAME, 'setting')} {key}",
+                records.setting_document(key, "project"))
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_named_write(name: str, change, check=None) -> dict:
+    """Change a named settings document `<capability>.<name>` of an agent
+    whose records moved into the store, in the store's one transaction:
+    `change` takes the document and returns the new one, `check` returns what
+    is wrong with the result before anything is written."""
+    try:
+        return _records().settings_write(settings_document(NAME, name), "project",
+                                         change, check=check)
+    except StoreError as e:
+        if e.slug == "settings_invalid":
+            _die(6, e.slug, e.message)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _env_override(*keys: str, value=None):
+    """The first of `keys` the environment sets (or `value`, where the caller
+    read it elsewhere), naming a file to read records or settings from; for an
+    agent whose records moved into the store such a file is not read, so the
+    override is ignored with a one-line notice on stderr, and None returned."""
+    found = value if value is not None else next(
+        (os.environ.get(k) for k in keys if os.environ.get(k)), None)
+    if not found:
+        return None
+    if _records_in_store():
+        named = next((k for k in keys if os.environ.get(k)), keys[0] if keys else "override")
+        sys.stderr.write(f"{NAME}: {named} is ignored: this agent's records and settings "
+                         "are in the store, and no file is read for them\n")
+        return None
+    return found
+
+
 def _settings_diff(before: dict, after: dict) -> list:
     """What changes between two documents, path by path: `-` removed, `+`
     added, `~` changed."""
@@ -5653,8 +5709,9 @@ def _settings() -> dict:
         _die(6, exc.slug, exc.message, exc.hint)
     raw = {key: row["value"] for key, row in rows.items() if key != "connection.default"}
     root = _project_root()
-    where = (str(_settings_path(root)) if root is not None else "settings") + \
-        f" over {_CONFIG_HOME / NAME / 'service' / 'settings.json'}"
+    where = (_settings_where(root) if root is not None else "settings") + (
+        " over the global rows" if root is not None and _records_in_store()
+        else f" over {_CONFIG_HOME / NAME / 'service' / 'settings.json'}")
     try:
         return _engine().read_settings(raw, where)
     except _engine().Refusal as exc:
@@ -5705,6 +5762,15 @@ def _context_path(root: Path) -> Path:
 
 def _settings_path(root: Path) -> Path:
     return _project_capabilities_dir(root) / NAME / "service" / "settings.json"
+
+
+def _settings_where(root: Path) -> str:
+    """Where this project's settings are kept, as a person reads it: the file,
+    or the store's rows for an agent whose records moved there."""
+    home = _settings_homes("project")[0]
+    if _settings_in_rows(home):
+        return str(_settings_read(home)[0])
+    return str(_settings_path(root))
 
 
 def _open_store(root: Path | None):
@@ -6754,6 +6820,17 @@ def _service_here() -> dict:
 
 def cmd_service_init(force: bool) -> dict:
     root = _root()
+    home = _settings_homes("project")[0]
+    if _settings_in_rows(home):
+        # The settings are rows: the seed is written there, once.
+        where, document, _error = _settings_read(home)
+        if document is not None and not force:
+            _die(6, "settings_exist", f"{where} holds this project's {NAME} settings",
+                 f"`{NAME} service init --force` writes them anew")
+        _settings_rows_write(home, "project", lambda _current: {"version": 1})
+        return {"written": str(where), "settings": _settings(),
+                "next": f"set any key `{NAME} help` SETTINGS names with `{NAME} settings "
+                        f"set`; `{NAME} service reload` hands a running service the change"}
     path = _settings_path(root)
     if path.exists() and not force:
         _die(6, "settings_exist", f"{path} exists", f"`{NAME} service init --force` writes it anew")
@@ -7097,7 +7174,7 @@ def cmd_service_doctor(machine: bool) -> None:
         root = _root()
         try:
             settings = _settings()
-            note("settings", {"ok": True, "path": str(_settings_path(root)), **settings})
+            note("settings", {"ok": True, "path": _settings_where(root), **settings})
         except SystemExit:
             settings = None
             note("settings", {"ok": False, "category": 6, "error": "the settings do not load; "
@@ -7154,11 +7231,11 @@ def cmd_doctor() -> None:
                          or "`capabilities doctor` names what to reconcile"})
     try:
         settings = _settings()
-        note("settings", {"ok": True, "path": str(_settings_path(root)),
+        note("settings", {"ok": True, "path": _settings_where(root),
                           "values": settings})
     except SystemExit:
         settings = None
-        note("settings", {"ok": False, "category": 6, "path": str(_settings_path(root)),
+        note("settings", {"ok": False, "category": 6, "path": _settings_where(root),
                           "error": "the settings do not load; run `memory render` to see the key "
                                    "refused"})
     store_row = _doctor_store(root)

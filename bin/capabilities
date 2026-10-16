@@ -107,12 +107,17 @@ MACHINE VERBS
         A capability new to this machine arrives quarantined (see allow);
         --allow installs it allowed. A core capability (see list) new to this
         machine and installed from the official catalogue - no --from, no
-        --source - arrives allowed and enabled at global scope instead, unless
-        the global scope already holds an entry for it, which is kept, or the
-        process runs under CAPABILITIES_READ_ONLY, which opens no gate; JSON
-        then carries global_policy {enabled, gate} naming where the record
-        went. Reinstalling or updating an installed capability keeps its
-        machine state and writes no policy; uninstall drops the machine state.
+        --source - arrives allowed and enabled at global scope instead: as the
+        store's global policy row (every agent, every node) where a database
+        resolves, unless the store already holds a global row for it, which is
+        kept, or the process runs under CAPABILITIES_READ_ONLY, which opens no
+        gate. Install writes no policy file anywhere: where no database
+        resolves or answers, nothing is written and the enable is reported
+        pending, for `capabilities enable <name> --global` on the master. JSON
+        then carries global_policy {enabled, gate} naming the store's table,
+        or {enabled, pending, reason, hint}. Reinstalling or updating an
+        installed capability keeps its machine state and writes no policy;
+        uninstall drops the machine state.
         --from accepts: a script file, a bundle directory holding <name> or
         bin/<name>, a repo directory holding capabilities/<name>/bin/<name>, or
         a URL. Source directories, and script paths inside source directories,
@@ -356,10 +361,21 @@ DEVELOPMENT VERBS
   dev exec <session> [--cwd source] [--inherit-env KEY ...] -- <command>
         Execute one foreground command inside the session environment. Output
         and exit status are passed through. Parent env is denied by default;
-        named keys may be inherited without putting values on argv.
+        named keys may be inherited without putting values on argv. Where this
+        machine resolves a database outside any project (its environment, then
+        its store setting file), the session reaches that database bound to a
+        schema of its own, dev_<session>, through the AGENTKIT_DB_* keys with
+        AGENTKIT_DB_SCHEMA (which then cannot be inherited), and AGENT_NODE_NAME
+        goes with it; without one the lane has no database, as before.
   dev run <session> <capability> [--project-only] -- [<arg> ...]
         Run exactly one session-installed capability against the attached live
         project through a mode-0700, per-invocation selected-input projection.
+        For a project that reads its records from the store, where a database
+        resolves, the projection is that capability's rows - the agent's
+        registry row and nodes, its own and the global policy, connections,
+        grants, identifiers and settings - copied into the session's schema,
+        which the payload reads instead of the store's; otherwise a temporary
+        config home with the selected gate and connection files.
   dev check <session>
         Derive validation scope from the recorded base across committed,
         staged, unstaged and untracked changes, then run each selected direct
@@ -2907,7 +2923,7 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
     except BaseException:
         if fresh or allow:
             _write_machine(name, previous["state"] if previous else None)
-        if global_policy:
+        if global_policy and not global_policy.get("pending"):
             _arrival_global_enable(name, undo=True)
         shutil.rmtree(stage, ignore_errors=True)
         raise
@@ -2936,7 +2952,7 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
             f"until the user runs `capabilities allow {name}`; an agent never "
             "lifts a quarantine itself")
     if global_policy:
-        result["global_policy"] = {"enabled": True, "gate": global_policy}
+        result["global_policy"] = global_policy
     if migrated is not None:
         result["migrate"] = migrated
     if notes:
@@ -4391,6 +4407,119 @@ def cmd_dev_start(name: str, source_ref: str | None, project_ref: str | None,
     })
 
 
+# The database keys a process in a dev session's lane resolves its store from:
+# the machine's database, bound to a schema of the session's own.
+DEV_DB_KEYS = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTKIT_DB_NAME",
+               "AGENTKIT_DB_USER", "AGENTKIT_DB_PASSWORD", "AGENTKIT_DB_SCHEMA",
+               "AGENTKIT_DB_SSLMODE", "AGENTKIT_DB_SSLROOTCERT")
+# The tables a `dev run` projects an attached project's rows of one capability
+# through, each with the column naming the capability.
+DEV_PROJECTED_TABLES = (("capabilities_policy", "capability"),
+                        ("capabilities_connections", "capability"),
+                        ("capabilities_connection_grants", "capability"),
+                        ("capabilities_identifiers", "capability"),
+                        ("capabilities_settings", "capability"),
+                        ("capabilities_settings_documents", "capability"))
+
+
+def _dev_schema(session: dict) -> str:
+    """The schema of the machine's database a dev session keeps as its own."""
+    slug = re.sub(r"[^a-z0-9_]+", "_", str(session["id"]).lower()).strip("_")
+    return ("dev_" + (slug or "session"))[:63]
+
+
+def _dev_database(session: dict):
+    """The machine's database, as the session's lane reaches it: the setting
+    this machine resolves outside any project (its environment, then its store
+    setting file), bound to the session's own schema through the setting's
+    schema field, as the environment keys a process in the lane reads.
+    (setting, keys), or None where no database resolves: the lane then has
+    none, as before."""
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(None)
+    except db.DbError:
+        return None
+    keys = {"AGENTKIT_DB_SCHEMA": _dev_schema(session)}
+    if setting.url is not None:
+        keys["AGENTKIT_DB_URL"] = setting.url
+    else:
+        keys.update({"AGENTKIT_DB_HOST": setting.host, "AGENTKIT_DB_PORT": str(setting.port),
+                     "AGENTKIT_DB_NAME": setting.database, "AGENTKIT_DB_USER": setting.user,
+                     "AGENTKIT_DB_SSLMODE": setting.sslmode})
+        if setting.sslrootcert:
+            keys["AGENTKIT_DB_SSLROOTCERT"] = setting.sslrootcert
+        if setting.password:
+            keys["AGENTKIT_DB_PASSWORD"] = setting.password
+    return setting, keys
+
+
+def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> dict:
+    """Project an attached project's rows of one capability into the session's
+    schema, where a store-reading project's records are read from in the lane:
+    its registry row and nodes, the global marker, and its own and every
+    agent's policy, connections, grants, identifiers and settings of that
+    capability, each table brought to this code's version first. What the
+    session schema held of them is replaced. Answers what was projected."""
+    import dataclasses
+    import psycopg
+    from psycopg import sql
+    db = _db_module()
+    store = _store_module()
+    real = setting.schema
+    session_setting = dataclasses.replace(setting, schema=schema)
+    conn = db.connect(application_name=store.STORE_OWNER, setting=session_setting)
+    counts: dict = {}
+    try:
+        major, minor = store.STORE_TABLES_VERSION
+        db.migrate(conn, store.STORE_OWNER, store.record_table_steps(), major=major,
+                   minor=minor)
+
+        def columns(table: str, where: str) -> list[str]:
+            return [row[0] for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = %s "
+                "AND table_name = %s AND is_generated = 'NEVER' AND identity_generation "
+                "IS NULL ORDER BY ordinal_position", (where, table)).fetchall()]
+
+        def copy(table: str, condition: sql.Composable, params: tuple) -> int:
+            shared = [c for c in columns(table, schema) if c in set(columns(table, real))]
+            if not shared:
+                return 0
+            names = sql.SQL(", ").join(sql.Identifier(c) for c in shared)
+            conn.execute(sql.SQL("DELETE FROM {}.{} WHERE ").format(
+                sql.Identifier(schema), sql.Identifier(table)) + condition, params)
+            return conn.execute(sql.SQL("INSERT INTO {}.{} ({}) SELECT {} FROM {}.{} WHERE ")
+                                .format(sql.Identifier(schema), sql.Identifier(table), names,
+                                        names, sql.Identifier(real), sql.Identifier(table))
+                                + condition, params).rowcount
+        with conn.transaction():
+            counts["capabilities_agents"] = copy(
+                "capabilities_agents", sql.SQL("id = %s"), (agent_id,))
+            counts["capabilities_agent_nodes"] = copy(
+                "capabilities_agent_nodes", sql.SQL("agent_id = %s"), (agent_id,))
+            conn.execute(sql.SQL("UPDATE {}.capabilities_global SET global_migrated_at = "
+                                 "(SELECT global_migrated_at FROM {}.capabilities_global "
+                                 "LIMIT 1)").format(sql.Identifier(schema),
+                                                    sql.Identifier(real)))
+            for table, column in DEV_PROJECTED_TABLES:
+                by_agent = table != "capabilities_connections"
+                condition = sql.SQL("({} = %s OR {} LIKE %s)").format(
+                    sql.Identifier(column), sql.Identifier(column))
+                params: tuple = (capability, capability + ".%")
+                if by_agent:
+                    condition = condition + sql.SQL(
+                        " AND (agent_id IS NULL OR agent_id = %s)")
+                    params = (*params, agent_id)
+                counts[table] = copy(table, condition, params)
+    except (db.DbError, psycopg.Error) as exc:
+        _die(5, "dev_projection_failed",
+             f"cannot project {capability}'s rows into the session schema {schema}: {exc}",
+             "check the store with `capabilities store doctor`")
+    finally:
+        conn.close()
+    return counts
+
+
 def _dev_env(session: dict, inherit: list[str] | None = None) -> dict[str, str]:
     safe_keys = {
         "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "USER", "LOGNAME",
@@ -4419,10 +4548,19 @@ def _dev_env(session: dict, inherit: list[str] | None = None) -> dict[str, str]:
         "PATH": paths["bin"] + os.pathsep + inherited_path,
         "UV_CACHE_DIR": str(Path(paths["cache"]) / "uv"),
     })
+    # Where a database resolves, the lane keeps its records in a schema of its
+    # own in it, instead of a temporary config home with record files; the
+    # node this machine runs as goes with it, since an agent whose records
+    # moved is read per node.
+    database = _dev_database(session)
+    if database is not None:
+        env.update(database[1])
+        if os.environ.get("AGENT_NODE_NAME", "").strip():
+            env["AGENT_NODE_NAME"] = os.environ["AGENT_NODE_NAME"]
     for key in inherit or []:
         if not _dev_safe_env_key(key):
             _die(6, "bad_env_key", f"invalid inherited env key: {key!r}")
-        if key in DEV_MANAGED_ENV_KEYS:
+        if key in DEV_MANAGED_ENV_KEYS or (database is not None and key in DEV_DB_KEYS):
             _die(6, "managed_env_key",
                  f"dev isolation owns environment key {key}; it cannot be inherited")
         if key not in os.environ:
@@ -4821,15 +4959,33 @@ def cmd_dev_run(session_id: str, capability: str, args: list[str],
                 "user" if user_values.get(raw_key) else "process")
             secrets.append(value)
 
+    # Where a database resolves and the attached project reads its records
+    # from the store, the selected capability's rows are projected into the
+    # session's own schema, which the payload reads in place of the store's;
+    # otherwise into a temporary config home as files, as before.
+    database = _dev_database(session)
+    store = _store_module()
+    try:
+        store_project = store.connections_mode(envelope) == "store"
+    except store.StoreError:
+        store_project = False
+    projected = None
+    if database is not None and store_project:
+        agent_id = _project_json_id(project)
+        if agent_id:
+            projected = {"schema": _dev_schema(session),
+                         "rows": _dev_project_rows(database[0], _dev_schema(session),
+                                                   agent_id, capability)}
     projection_parent = Path(tempfile.mkdtemp(prefix="capabilities-dev-run-"))
     projection_parent.chmod(0o700)
     try:
         config = projection_parent / "config"
         config.mkdir(mode=0o700)
-        if gate_tier == "global":
+        if projected is None and gate_tier == "global":
             _write_json(config / "capabilities" / "settings.json",
                         {"capabilities": {capability: global_gate}})
-        if registry_data is not None and registry_mode == "files" and not project_only:
+        if (projected is None and registry_data is not None and registry_mode == "files"
+                and not project_only):
             _write_json(config / capability / "connections.json", registry_data)
         env = _dev_env(session)
         env.update(child_values)
@@ -4854,6 +5010,10 @@ def cmd_dev_run(session_id: str, capability: str, args: list[str],
             "policy_tier": gate_tier, "connection_tier": registry_source,
             "value_tiers": value_tiers,
         }
+        if database is not None:
+            diagnostic["database_schema"] = _dev_schema(session)
+        if projected is not None:
+            diagnostic["projected_rows"] = projected["rows"]
         sys.stderr.write(json.dumps({"dev_run": diagnostic}, sort_keys=True) + "\n")
         sys.stdout.write(_dev_redact(proc.stdout, secrets))
         sys.stderr.write(_dev_redact(proc.stderr, secrets))
@@ -6144,8 +6304,24 @@ def _migrate_legacy_envelope(root: Path) -> list[str]:
     return moved
 
 
+def _refuse_while_moving(root: Path) -> None:
+    """Refuse, before any file is written, a write to an agent whose records
+    are being moved into the store by `capabilities migrate`: until it
+    finishes, only the migration on its master writes them."""
+    store = _store_module()
+    adapter = _records_for(root)
+    try:
+        store._refuse_frozen(adapter._agent_now(), adapter._guard_agent,
+                             getattr(adapter, "actor", None))
+    except store.StoreError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    finally:
+        adapter.close()
+
+
 def _ensure_envelope(root: Path) -> list[str]:
     """Manager-owned project files: migrate, then scaffold gate + state guard."""
+    _refuse_while_moving(root)
     migrated = _migrate_legacy_envelope(root)
     capdir = _envelope_home(root)
     capdir.mkdir(parents=True, exist_ok=True)
@@ -7236,37 +7412,51 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False,
     _emit(result)
 
 
-def _arrival_global_enable(name: str, undo: bool = False) -> str | None:
-    """Write the global enable a core capability arrives with, at the global
-    scope `enable --global` would write from here, and return where it went.
-    An entry already at that scope is the user's and is left as it is, so
-    nothing is written and None is returned. `undo` removes the entry again
-    when the install that wrote it fails."""
+def _arrival_global_enable(name: str, undo: bool = False) -> dict | None:
+    """Write the global enable a core capability arrives with, as the global
+    policy row of the store (the row for every agent and every node), and say
+    where it went. No file is written: where no database resolves, or it does
+    not answer, nothing is written and the enable is reported pending, for the
+    master's `install` (or `capabilities enable --global`) to write. A row the
+    store already holds for it is the user's and is left as it is, so nothing
+    is written and None is returned. `undo` removes the row again when the
+    install that wrote it fails."""
+    db = _db_module()
+    store = _store_module()
     root = _project_root()
-    if root is None:
-        gate = _load_gate_file(GLOBAL_GATE_FILE)
-        if undo:
-            gate["capabilities"].pop(name, None)
-        elif name in gate["capabilities"]:
-            return None
-        else:
-            gate["capabilities"][name] = {"enabled": True}
-        _write_json(GLOBAL_GATE_FILE, gate)
-        return str(GLOBAL_GATE_FILE)
-    adapter = _records_for(root)
+    pending = {"enabled": True, "pending": True,
+               "hint": f"no database answered, so no gate was written: run `capabilities "
+                       f"enable {name} --global` in an agent whose records are in the "
+                       "store, on its master"}
     try:
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=store.STORE_OWNER, setting=setting)
+    except db.DbError as exc:
+        return None if undo else {**pending, "reason": exc.slug}
+    import psycopg
+    try:
+        major, minor = store.STORE_TABLES_VERSION
+        db.migrate(conn, store.STORE_OWNER, store.record_table_steps(), major=major,
+                   minor=minor)
+        with conn.transaction():
+            if undo:
+                conn.execute("DELETE FROM capabilities_policy WHERE agent_id IS NULL AND "
+                             "capability = %s AND node IS NULL", (name,))
+                return None
+            held = conn.execute(
+                "SELECT enabled FROM capabilities_policy WHERE agent_id IS NULL AND "
+                "capability = %s AND node IS NULL", (name,)).fetchone()
+            if held is not None:
+                return None
+            conn.execute("INSERT INTO capabilities_policy (agent_id, capability, node, "
+                         "enabled) VALUES (NULL, %s, NULL, true)", (name,))
+        return {"enabled": True, "gate": f"store:{setting.schema}.capabilities_policy"}
+    except (db.DbError, psycopg.Error) as exc:
         if undo:
-            adapter.delete("capabilities", "policy", name, scope="global")
-        elif name in adapter.resolve_scope("capabilities", "policy", "global"):
             return None
-        else:
-            adapter.set("capabilities", "policy", name, {"enabled": True},
-                        actor="capabilities", scope="global")
-        return _gate_source(adapter, root, "global")
-    except _store_module().StoreError as exc:
-        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+        return {**pending, "reason": getattr(exc, "slug", None) or "store_unreachable"}
     finally:
-        adapter.close()
+        conn.close()
 
 
 def _inherit_gate(name: str, scope: str, node: str | None = None) -> None:
@@ -8735,6 +8925,57 @@ def _migrate_context(root: Path, opts: dict, answers: dict) -> dict:
     return ctx
 
 
+def _migrate_global_home(ctx: dict) -> Path:
+    """The global layer an agent's files are read over while it moves: once
+    the global rows exist, a config home made of them - the gate, the
+    identifiers, and every connection the store holds with its global grant
+    and default - so the plan and the verify read the agent's files over what
+    it will inherit once it moved, and never over this machine's config home,
+    which may hold other files or none (`migrate --discard`). Before the
+    global rows exist, the config home itself."""
+    if not ctx.get("global_migrated_at"):
+        return _CONFIG_HOME
+    if ctx.get("global_home"):
+        return ctx["global_home"]
+    import atexit
+    home = Path(tempfile.mkdtemp(prefix="capabilities-migrate-global-"))
+    home.chmod(0o700)
+    atexit.register(shutil.rmtree, home, True)
+    conn, _setting = _migrate_connect(ctx["root"])
+    try:
+        gate = {name: {"enabled": bool(enabled)} for name, enabled in _migrate_rows(
+            conn, "SELECT capability, enabled FROM capabilities_policy "
+                  "WHERE agent_id IS NULL AND node IS NULL")}
+        identifiers: dict = {}
+        for name, label, value, note in _migrate_rows(
+                conn, "SELECT capability, label, value, note FROM capabilities_identifiers "
+                      "WHERE agent_id IS NULL AND node IS NULL"):
+            identifiers.setdefault(name, {})[label] = {"value": value, "note": note or ""}
+        registries: dict = {}
+        for name, cid, spec in _migrate_rows(
+                conn, "SELECT capability, name, spec FROM capabilities_connections"):
+            registries.setdefault(name, {"connections": {}})["connections"][cid] = dict(spec)
+        for name, cid, allow_write, is_default in _migrate_rows(
+                conn, "SELECT capability, connection, allow_write, is_default FROM "
+                      "capabilities_connection_grants WHERE agent_id IS NULL AND node IS NULL"):
+            entry = registries.get(name, {}).get("connections", {}).get(cid)
+            if entry is None:
+                continue
+            if allow_write is not None:
+                entry["allow_write"] = bool(allow_write)
+            if is_default:
+                registries[name]["default"] = cid
+    finally:
+        conn.close()
+    _write_json(home / "capabilities" / "settings.json", {"capabilities": gate})
+    for name, rows in identifiers.items():
+        _write_json(home / name / "identifiers.json", rows)
+    for name, registry in registries.items():
+        _write_json(home / name / "connections.json", registry)
+    ctx["global_home"] = home
+    return home
+
+
 # --- one agent: the plan ------------------------------------------------------------
 
 def _migrate_records_plan(ctx: dict, answers: dict) -> dict:
@@ -8744,7 +8985,7 @@ def _migrate_records_plan(ctx: dict, answers: dict) -> dict:
     those)."""
     store = _store_module()
     envelope, agent_id, mode = ctx["envelope"], ctx["agent_id"], ctx["mode"]
-    files = store.FileRecords(envelope, _CONFIG_HOME, agent_id, ctx["slug"])
+    files = store.FileRecords(envelope, _migrate_global_home(ctx), agent_id, ctx["slug"])
     plan: dict = {"connections": [], "grants": [], "identifiers": [], "policy": [],
                   "remove": [], "kept": [], "questions": []}
     if mode == "store":
@@ -9378,7 +9619,7 @@ def _migrate_verify(ctx: dict, plan: dict) -> list[str]:
     store = _store_module()
     differences: list[str] = []
     envelope, agent_id = ctx["envelope"], ctx["agent_id"]
-    files = store.FileRecords(envelope, _CONFIG_HOME, agent_id, ctx["slug"])
+    files = store.FileRecords(envelope, _migrate_global_home(ctx), agent_id, ctx["slug"])
     rows = _migrate_writer(ctx)
     rows.actor = None
     try:
@@ -9996,7 +10237,6 @@ def cmd_migrate_global(opts: dict) -> None:
                     "is_default = EXCLUDED.is_default",
                     (row["capability"], row["connection"], row["allow_write"],
                      row["is_default"]))
-            conn.execute("UPDATE capabilities_global SET global_migrated_at = now()")
     except _MigrateRefusal as exc:
         conn.close()
         _migrate_refuse(exc, answer)
@@ -10028,9 +10268,25 @@ def cmd_migrate_global(opts: dict) -> None:
             _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
         finally:
             writer.close()
+    # Only once every global row and every global settings document is written
+    # does the store say the global rows exist: a run that stopped before here
+    # writes them again, and an agent's migration waits for them.
     conn, _setting = _migrate_connect(root)
     try:
+        with conn.transaction():
+            conn.execute("LOCK TABLE capabilities_global IN EXCLUSIVE MODE")
+            if conn.execute("SELECT global_migrated_at FROM capabilities_global"
+                            ).fetchone()[0] is not None:
+                raise _MigrateRefusal("global_migrated", "the global rows were written by "
+                                      "another run meanwhile", exit_code=6)
+            conn.execute("UPDATE capabilities_global SET global_migrated_at = now()")
         answer["global_migrated_at"] = _migrate_global_at(conn)
+    except _MigrateRefusal as exc:
+        conn.close()
+        _migrate_refuse(exc, answer)
+    except psycopg.Error as exc:
+        conn.close()
+        _die(5, "store_write_failed", f"marking the global rows written failed: {exc}")
     finally:
         conn.close()
     answer.update(state="migrated", changed=True, settings_written=settings_written,
@@ -10490,8 +10746,17 @@ def cmd_init(claude: bool, codex: bool) -> None:
     # init ESTABLISHES the project root: an existing root wins, else cwd.
     root = _project_root() or Path.cwd().resolve()
     migrated = _ensure_envelope(root)
+    # The gate is named where the project keeps it: its settings.json in files
+    # mode, the store's policy rows where its records are in the store.
+    adapter = _records_for(root)
+    try:
+        gate = _gate_source(adapter, root, "project")
+    except _store_module().StoreError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    finally:
+        adapter.close()
     result: dict = {"project": str(root),
-                    "gate": str(_gate_file(root)),
+                    "gate": gate,
                     "agent": _register_agent_on_init(root)}
     if migrated:
         result["migrated_from"] = str(root / LEGACY_PROJECT_CAPABILITIES_REL)

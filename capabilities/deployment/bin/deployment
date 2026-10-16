@@ -2567,6 +2567,62 @@ def _settings_rows_write(home: dict, scope: str, change) -> dict:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
+def _records_in_store() -> bool:
+    """Whether this project is an agent whose records and settings moved into
+    the store (its registry row has `migrated_at`): every record and settings
+    document it keeps is then rows, and no file of them is read or written."""
+    if _project_root() is None:
+        return False
+    try:
+        return _records().settings_kept() == "store"
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_named(name: str) -> tuple:
+    """A named settings document `<capability>.<name>` of an agent whose
+    records moved into the store: where it is kept, and the document (None
+    where the agent has none)."""
+    try:
+        records = _records()
+        key = settings_document(NAME, name)
+        return (f"{records.collection_source(NAME, 'setting')} {key}",
+                records.setting_document(key, "project"))
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_named_write(name: str, change, check=None) -> dict:
+    """Change a named settings document `<capability>.<name>` of an agent
+    whose records moved into the store, in the store's one transaction:
+    `change` takes the document and returns the new one, `check` returns what
+    is wrong with the result before anything is written."""
+    try:
+        return _records().settings_write(settings_document(NAME, name), "project",
+                                         change, check=check)
+    except StoreError as e:
+        if e.slug == "settings_invalid":
+            _die(6, e.slug, e.message)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _env_override(*keys: str, value=None):
+    """The first of `keys` the environment sets (or `value`, where the caller
+    read it elsewhere), naming a file to read records or settings from; for an
+    agent whose records moved into the store such a file is not read, so the
+    override is ignored with a one-line notice on stderr, and None returned."""
+    found = value if value is not None else next(
+        (os.environ.get(k) for k in keys if os.environ.get(k)), None)
+    if not found:
+        return None
+    if _records_in_store():
+        named = next((k for k in keys if os.environ.get(k)), keys[0] if keys else "override")
+        sys.stderr.write(f"{NAME}: {named} is ignored: this agent's records and settings "
+                         "are in the store, and no file is read for them\n")
+        return None
+    return found
+
+
 def _settings_diff(before: dict, after: dict) -> list:
     """What changes between two documents, path by path: `-` removed, `+`
     added, `~` changed."""
@@ -6390,7 +6446,22 @@ def _is_checkout(runtime: dict) -> bool:
     return str(runtime.get("profile") or "") in CHECKOUT_PROFILES
 
 
-def _dockerignore_template(has_contextkit: bool, keep: list[str] | None = None) -> str:
+# The record and settings files an agent kept before its records moved into
+# the store. An image of an agent whose records moved carries none of them: what
+# the box enables and uses is the store's, not a file baked in at build.
+RECORD_FILE_PATTERNS = (
+    "capabilities/settings.json",
+    "capabilities/*/connections.json",
+    "capabilities/*/identifiers.json",
+    "capabilities/*/service/settings.json",
+    "capabilities/*/service/config.toml",
+    "capabilities/tasks/conveyor.toml",
+    "capabilities/slack/policy.json",
+)
+
+
+def _dockerignore_template(has_contextkit: bool, keep: list[str] | None = None,
+                           store_records: bool = False) -> str:
     if keep is not None:
         # The Dockerfile copies these files and nothing else, so everything else
         # is context the daemon reads for no reason. Excluding a directory also
@@ -6433,6 +6504,9 @@ def _dockerignore_template(has_contextkit: bool, keep: list[str] | None = None) 
         ".claude/askproject/sessions.json",
         ".claude/settings.local.json",
     ]
+    if store_records:
+        lines += ["", "# Records and settings are the store's; no file of them is baked in.",
+                  *RECORD_FILE_PATTERNS]
     if has_contextkit:
         lines += [
             "",
@@ -6963,7 +7037,8 @@ def _entrypoint_template(project_name: str, supervisor_config: str | None = None
                          has_contextkit: bool = False,
                          body_sync: str | None = None,
                          catalogue_exclude: set[str] | None = None,
-                         checkouts: list[dict] | None = None) -> str:
+                         checkouts: list[dict] | None = None,
+                         store_records: bool = False) -> str:
     identity = _slug(project_name)
     # The image installs the catalogue at build. A capability the catalogue
     # gained since, or one a persisted registry never had, is installed here;
@@ -7007,6 +7082,11 @@ def _entrypoint_template(project_name: str, supervisor_config: str | None = None
                           .replace("__SYNC__", sync)
                           .replace("__INIT__", "\n".join(init))
                           .replace("__DOCTORS__", "\n".join(doctors)))
+    elif store_records:
+        # The image was built without a database, so the manager's readiness
+        # check runs here, where the box has one.
+        checkout_block = ("\n# The manager's readiness check, against the store this box "
+                          "reaches.\n" + _ENTRYPOINT_DOCTORS["capabilities"] + "\n")
     return f"""#!/usr/bin/env bash
 set -euo pipefail
 
@@ -7059,7 +7139,8 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
                          checkout: bool = False,
                          boot_copy: list[str] | None = None,
                          persistent_manager: bool = False,
-                         catalogue_exclude: set[str] | None = None) -> str:
+                         catalogue_exclude: set[str] | None = None,
+                         store_records: bool = False) -> str:
     agent_home = compiler["container"]["agent_home"]
     project_root = compiler["container"]["project_root"]
     username = Path(agent_home).name
@@ -7074,6 +7155,10 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
     contextkit_link = ""
     contextkit_build = ""
     capabilities_init_and_doctor = " && capabilities init --codex --claude \\\n && capabilities doctor"
+    if store_records:
+        # Built without a database: install and init write no gate, and the
+        # doctor runs at container start, against the store the box reaches.
+        capabilities_init_and_doctor = " && capabilities init --codex --claude"
     if has_contextkit:
         contextkit_install = (
             "\n# ContextKit is installed globally via the public installer. Generated host\n"
@@ -7093,7 +7178,7 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
             "# installed capability set is present, so generated context sees the complete runtime.\n"
             "RUN contextkit init \\\n"
             " && capabilities init --codex --claude \\\n"
-            " && capabilities doctor \\\n"
+            + ("" if store_records else " && capabilities doctor \\\n") +
             " && contextkit install-hooks --target codex --target claude \\\n"
             " && contextkit doctor \\\n"
             " && contextkit build --target all \\\n"
@@ -7899,10 +7984,14 @@ def _artifact_texts(root: Path, runtime: dict,
                  + ([body_sync_rel] if body_sync_rel else [])
                  if checkout else None)
     node = _declared_node(root, target) if _bundle_layout(runtime) else None
+    # An agent whose records moved into the store builds without a database
+    # and bakes in none of their files.
+    store_records = _records_in_store()
     raw = {paths["compose"]: _compose_template(
         project_name, runtime, active, build_context, dockerfile_rel, has_contextkit, node)}
     candidates = {
-        "dockerignore": _dockerignore_template(has_contextkit, keep=boot_copy),
+        "dockerignore": _dockerignore_template(has_contextkit, keep=boot_copy,
+                                               store_records=store_records),
         "env_example": _env_example_template(runtime, active, has_contextkit, node),
         "dockerfile": _dockerfile_template(
             has_contextkit, compiler, entrypoint_rel, bool(supervisor_config),
@@ -7910,12 +7999,13 @@ def _artifact_texts(root: Path, runtime: dict,
                     if isinstance(v, dict) and isinstance(v.get("mount"), str)],
             checkout=checkout, boot_copy=boot_copy,
             persistent_manager=_persistent_manager(runtime),
-            catalogue_exclude=catalogue_exclude),
+            catalogue_exclude=catalogue_exclude, store_records=store_records),
         "entrypoint": _entrypoint_template(
             project_name, supervisor_config, checkout=checkout,
             project_root=project_root, has_contextkit=has_contextkit,
             body_sync=body_sync_config, catalogue_exclude=catalogue_exclude,
-            checkouts=compiler["container"].get("checkouts")),
+            checkouts=compiler["container"].get("checkouts"),
+            store_records=store_records),
     }
     if supervisor_path is not None:
         candidates["supervisor"] = _supervisor_template(
@@ -9663,7 +9753,13 @@ def _service_config_path(root: Path, value: str) -> Path:
 
 
 def _service_configured(root: Path, name: str, config: str) -> bool:
-    """A service is configured when its config file exists."""
+    """A service is configured when its config file exists; for an agent whose
+    records moved into the store, when the store holds its settings document."""
+    if _records_in_store():
+        try:
+            return _records().setting_document(name, "project") is not None
+        except StoreError:
+            return False
     return _service_config_path(root, config).exists()
 
 
@@ -9766,7 +9862,9 @@ def cmd_doctor(args) -> None:
             config = service.get("config")
             if (name in enabled_here and isinstance(config, str) and config
                     and not _service_configured(root, name, config)):
-                findings.append({"severity": "error", "path": config,
+                findings.append({"severity": "error",
+                                 "path": (f"store: {name} settings" if _records_in_store()
+                                          else config),
                                  "message": f"active service {name!r} is not configured; run `{name} service init`"})
         compiled_services = (compiled.get("services")
                              if isinstance(compiled.get("services"), dict) else {})

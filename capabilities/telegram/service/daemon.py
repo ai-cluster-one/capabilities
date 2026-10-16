@@ -417,14 +417,40 @@ def _records():
     return _RECORDS
 
 
+def _records_moved():
+    """Whether this daemon's agent keeps its records and settings in the store:
+    no file is read for them then, whatever an override names."""
+    try:
+        return _records().settings_kept() == "store"
+    except records.store().StoreError:
+        return False
+
+
+def _override_ignored(key):
+    """Say once, on the daemon's log, that an override naming a file is not
+    read for an agent whose records are in the store."""
+    sys.stderr.write(f"telegram: {key} is ignored: this agent's records and settings "
+                     "are in the store, and no file is read for them\n")
+    sys.stderr.flush()
+
+
 def _read_record_settings():
     """The service settings, the project's over the config home's key by key,
     read through the records adapter."""
     try:
-        return records.service_settings(_records())
+        settings = records.service_settings(_records())
     except records.store().StoreError as exc:
         raise SettingsError(
             f"Telegram service records are unavailable: {exc.message}") from exc
+    global _SETTINGS_OVERRIDE_SAID
+    if (os.environ.get("TELEGRAM_SERVICE_SETTINGS") and not _SETTINGS_OVERRIDE_SAID
+            and _records_moved()):
+        _SETTINGS_OVERRIDE_SAID = True
+        _override_ignored("TELEGRAM_SERVICE_SETTINGS")
+    return settings
+
+
+_SETTINGS_OVERRIDE_SAID = False
 
 
 def _document_file(key):
@@ -767,11 +793,12 @@ def _config_value(*keys):
 
 
 def _connection_file_override():
-    value = _config_value(
-        "TELEGRAM_SERVICE_CONNECTIONS_FILE",
-        "TG_CONNECTIONS_FILE",
-        "TELEGRAM_CONNECTIONS_FILE",
-    )
+    keys = ("TELEGRAM_SERVICE_CONNECTIONS_FILE", "TG_CONNECTIONS_FILE",
+            "TELEGRAM_CONNECTIONS_FILE")
+    value = _config_value(*keys)
+    if value and _records_moved():
+        _override_ignored(next(key for key in keys if _project_env_value(key)))
+        return None
     return _project_path(value) if value else None
 
 

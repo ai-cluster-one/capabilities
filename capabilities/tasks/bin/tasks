@@ -3926,6 +3926,62 @@ def _settings_rows_write(home: dict, scope: str, change) -> dict:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
 
 
+def _records_in_store() -> bool:
+    """Whether this project is an agent whose records and settings moved into
+    the store (its registry row has `migrated_at`): every record and settings
+    document it keeps is then rows, and no file of them is read or written."""
+    if _project_root() is None:
+        return False
+    try:
+        return _records().settings_kept() == "store"
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_named(name: str) -> tuple:
+    """A named settings document `<capability>.<name>` of an agent whose
+    records moved into the store: where it is kept, and the document (None
+    where the agent has none)."""
+    try:
+        records = _records()
+        key = settings_document(NAME, name)
+        return (f"{records.collection_source(NAME, 'setting')} {key}",
+                records.setting_document(key, "project"))
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _settings_named_write(name: str, change, check=None) -> dict:
+    """Change a named settings document `<capability>.<name>` of an agent
+    whose records moved into the store, in the store's one transaction:
+    `change` takes the document and returns the new one, `check` returns what
+    is wrong with the result before anything is written."""
+    try:
+        return _records().settings_write(settings_document(NAME, name), "project",
+                                         change, check=check)
+    except StoreError as e:
+        if e.slug == "settings_invalid":
+            _die(6, e.slug, e.message)
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+
+
+def _env_override(*keys: str, value=None):
+    """The first of `keys` the environment sets (or `value`, where the caller
+    read it elsewhere), naming a file to read records or settings from; for an
+    agent whose records moved into the store such a file is not read, so the
+    override is ignored with a one-line notice on stderr, and None returned."""
+    found = value if value is not None else next(
+        (os.environ.get(k) for k in keys if os.environ.get(k)), None)
+    if not found:
+        return None
+    if _records_in_store():
+        named = next((k for k in keys if os.environ.get(k)), keys[0] if keys else "override")
+        sys.stderr.write(f"{NAME}: {named} is ignored: this agent's records and settings "
+                         "are in the store, and no file is read for them\n")
+        return None
+    return found
+
+
 def _settings_diff(before: dict, after: dict) -> list:
     """What changes between two documents, path by path: `-` removed, `+`
     added, `~` changed."""
@@ -10451,6 +10507,13 @@ def _conveyor_path() -> Path:
     return _envelope_dir() / _CONVEYOR_FILE
 
 
+def _conveyor_where() -> str:
+    """Where the conveyor settings are kept, as a person reads it: the file, or
+    the `tasks.conveyor` settings document of an agent whose records moved
+    into the store."""
+    return _settings_named("conveyor")[0] if _records_in_store() else str(_conveyor_path())
+
+
 def _seconds_of(value) -> int | None:
     """A duration written as 45m, 6h, 2d, or whole seconds; None when it is not
     one, or not above zero."""
@@ -10468,13 +10531,18 @@ def _read_conveyor() -> tuple[dict | None, list[str]]:
     """The conveyor settings as the file states them, and every way it is not
     readable. None and no problems when the project has no such file."""
     import tomllib
-    path = _conveyor_path()
-    if not path.is_file():
-        return None, []
-    try:
-        raw = tomllib.loads(path.read_text())
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        return None, [f"{path} could not be read: {exc}"]
+    if _records_in_store():
+        path, raw = _settings_named("conveyor")
+        if raw is None:
+            return None, []
+    else:
+        path = _conveyor_path()
+        if not path.is_file():
+            return None, []
+        try:
+            raw = tomllib.loads(path.read_text())
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            return None, [f"{path} could not be read: {exc}"]
     problems = [f"{path}: it names {key!r}, which nothing reads"
                 for key in sorted(set(raw) - set(_CONVEYOR_KEYS))]
     chain = raw.get("escalate_to")
@@ -10548,7 +10616,7 @@ def _conveyor_report() -> tuple[dict | None, list[str], str | None]:
         if enabled:
             warning = (f"no escalation chain is set, so a task its worker keeps holding "
                        f"back or cannot finish stands still with nobody named to move "
-                       f"it; set escalate_to in {_conveyor_path()} (`{NAME} help` "
+                       f"it; set escalate_to in {_conveyor_where()} (`{NAME} help` "
                        "ESCALATION)")
         return None, [], warning
     chain = settings["escalate_to"]
@@ -11550,7 +11618,7 @@ def _retired_workers_file() -> Path | None:
     carries it. Nothing reads it: its presence is reported so the project moves
     its workers rather than believing they still run."""
     path = _envelope_dir() / "workers.toml"
-    return path if path.is_file() else None
+    return path if path.is_file() and not _records_in_store() else None
 
 
 def _retired_refusal(path: Path) -> tuple:
@@ -11566,6 +11634,10 @@ def _unimported_worker_files() -> list[Path]:
     """The worker files a project still carries in its envelope. Nothing reads
     them as workers: a project's workers live in the store, and these wait for
     `workers import`."""
+    if _records_in_store():
+        # An agent whose records moved keeps its workers in the store alone; a
+        # file left behind is not read, and the migration report names it.
+        return []
     folder = _workers_dir()
     return sorted(folder.glob("*.md")) if folder.is_dir() else []
 
@@ -11623,6 +11695,8 @@ def _unimported_profile_files() -> list[Path]:
     """The profile files a project still carries in its envelope. Nothing reads
     them as profiles: a project's profiles live in the store, and these wait
     for `profiles import`."""
+    if _records_in_store():
+        return []
     folder = _profiles_dir()
     return sorted(folder.glob("*.toml")) if folder.is_dir() else []
 
@@ -12806,7 +12880,7 @@ def _import_workers_unasked() -> None:
     read-only switch imports, as it could not by asking. What was imported is
     said on stderr, one line, so the service log carries it."""
     if (not _unimported_worker_files() or _retired_workers_file() or not PROJECT
-            or _worker_execution() or read_only_switch()):
+            or _worker_execution() or read_only_switch() or _records_in_store()):
         return
     import psycopg
     try:
@@ -15338,6 +15412,24 @@ def _service_settings_path() -> Path:
     return _settings_home_path(_service_settings_home())
 
 
+def _service_settings_in_rows() -> bool:
+    """Whether this project's service settings are rows of the store."""
+    return _settings_in_rows(_service_settings_home())
+
+
+def _service_settings_where() -> str:
+    """Where this project's service settings are kept, as a person reads it."""
+    return str(_service_settings_document()[0])
+
+
+def _service_settings_initialized() -> bool:
+    """Whether this project has service settings at all: a document in the
+    store for an agent whose records moved there, else the file."""
+    if _service_settings_in_rows():
+        return _service_settings_document()[1] is not None
+    return _service_settings_path().is_file()
+
+
 def _service_settings_document() -> tuple[Path, dict | None, str | None]:
     """This project's service settings as the contract's settings reader reads
     the project home: its path, the document (None when there is none or it
@@ -15404,7 +15496,7 @@ def _inventory(network: bool) -> dict:
     pid = module.read_pid(state)
     verdict = _inventory_verdict(module)
     if not module.pid_alive(pid):
-        initialized = _service_settings_path().is_file()
+        initialized = _service_settings_initialized()
         return {"service": {"state": "stopped",
                             "detail": "no daemon runs for this project" + (
                                 "" if initialized else "; its settings are not initialized"),
@@ -15562,10 +15654,18 @@ def _service_fingerprint_parts() -> tuple[str, str | None]:
                 parts.append(["profile", name, "absent"])
         return parts
 
-    settings = _service_settings_path()
     retired = _envelope_dir() / "workers.toml"
-    disk: list = [["settings", str(settings), seen(settings)],
-                  ["retired", str(retired), seen(retired)]]
+    if _service_settings_in_rows():
+        # The settings are rows: what they say is the part of the declaration
+        # they stand for, as the settings reader assembles them.
+        where, document, _error = _service_settings_document()
+        disk: list = [["settings", str(where), hashlib.sha256(json.dumps(
+                          document, sort_keys=True, default=str).encode()).hexdigest()
+                       if document is not None else "absent"]]
+    else:
+        settings = _service_settings_path()
+        disk = [["settings", str(settings), seen(settings)],
+                ["retired", str(retired), seen(retired)]]
     files = [_shipped_workers_dir() / f"{DEFAULT_WORKER}.md"]
     if _shipped_workers_dir().is_dir():
         files = sorted(_shipped_workers_dir().glob("*.md"))
@@ -15626,7 +15726,7 @@ def _service_declaration() -> dict:
     reverse. A worker this capability cannot read refuses the whole declaration,
     the way `doctor` refuses it. Raises Refusal."""
     fingerprint = _service_fingerprint()
-    path = _service_settings_path()
+    path = _service_settings_where()
     settings = _read_service_settings()
     retired = _retired_workers_file()
     if retired:
@@ -17149,10 +17249,10 @@ def _service_status(module) -> dict:
     state = _service_state_dir()
     pid = module.read_pid(state)
     running = module.pid_alive(pid)
-    settings = _service_settings_path()
     answer = {"running": running, "pid": pid if running else None,
               "stale_pid": bool(pid and not running), "project": str(_project_here()),
-              "config": str(settings), "initialized": settings.is_file(),
+              "config": _service_settings_where(),
+              "initialized": _service_settings_initialized(),
               "state_dir": str(state), "log_file": str(state / module.LOG_FILE)}
     joined = _joined_here()
     if joined:
@@ -17269,7 +17369,18 @@ def cmd_service_init(args: list[str]) -> None:
              "reinstall the capability from a bundled source")
     target = _service_settings_path()
     written, skipped = [], []
-    if target.exists() and not opts.get("force"):
+    if _service_settings_in_rows():
+        # The settings are rows: the template is written there, once.
+        import tomllib
+        where = _service_settings_where()
+        if _service_settings_initialized() and not opts.get("force"):
+            skipped.append(where)
+        else:
+            seed = tomllib.loads(template.read_text())
+            _settings_rows_write(_service_settings_home(), "project", lambda _current: seed)
+            written.append(where)
+        target = where
+    elif target.exists() and not opts.get("force"):
         skipped.append(str(target))
     else:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -17340,7 +17451,7 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
     module = _service_module()
     problems: list[str] = []
     answer: dict = {"ok": True, "project": str(_project_here()),
-                    "config": str(_service_settings_path())}
+                    "config": _service_settings_where()}
     try:
         declaration = _service_declaration()
         answer["settings"] = {k: v for k, v in declaration["settings"].items() if k != "lanes"}
@@ -18399,7 +18510,7 @@ def _deprecations(workers: list[dict]) -> list[str]:
     said = [f"worker {row['worker']}: {one}" for row in workers
             for one in row.get("deprecated") or []]
     if _service_retry_delay() is not None:
-        said.append(f"{_service_settings_path()}: its retry_delay_seconds is read as the "
+        said.append(f"{_service_settings_where()}: its retry_delay_seconds is read as the "
                     "cool-down of every worker that names none; the service no longer "
                     "waits on it, so set limits.cool_down_seconds on the workers and "
                     "remove it")
