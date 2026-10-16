@@ -8945,8 +8945,11 @@ def _migrate_global_home(ctx: dict) -> Path:
     if ctx.get("global_home"):
         return ctx["global_home"]
     import atexit
-    home = Path(tempfile.mkdtemp(prefix="capabilities-migrate-global-"))
-    home.chmod(0o700)
+    # One place per agent, made afresh by every run, so a run killed before
+    # its exit leaves nothing that accumulates.
+    home = _migrate_home(ctx["agent_id"]) / "global-home"
+    shutil.rmtree(home, ignore_errors=True)
+    home.mkdir(parents=True, mode=0o700)
     atexit.register(shutil.rmtree, home, True)
     conn, _setting = _migrate_connect(ctx["root"])
     try:
