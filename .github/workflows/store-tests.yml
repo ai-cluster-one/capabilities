@@ -160,7 +160,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           uv run --no-project --with pytest --with "psycopg[binary]>=3.2" --with "httpx>=0.27" \
-            --with capabilities-contract==0.4.1 --with callva-harness-runner==0.8.0 \
+            --with capabilities-contract==0.4.1 --with callva-harness-runner==0.9.0 \
             pytest capabilities/askproject/tests -q -rfEs
       - name: whatsapp suite
         if: ${{ !cancelled() }}

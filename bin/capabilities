@@ -8643,6 +8643,7 @@ def _migrate_context(root: Path, opts: dict, answers: dict) -> dict:
     declared = str(identity.get("id") or "").strip() or None
     bound = _contextkit_config_id(root)
     ctx: dict = {"root": root, "envelope": envelope, "identity_file": identity_file,
+                 "given_roots": opts.get("roots") or [],
                  "identity": identity, "blockers": [], "questions": [], "warnings": [],
                  "slug": identity.get("slug") or _default_project_slug(root)}
     agent_id = declared or bound
@@ -8963,7 +8964,7 @@ def _migrate_plan(ctx: dict, answers: dict) -> dict:
                                     "tree is what moves")
     if ctx["mode"] == "store":
         plan["stale"] = _migrate_stale(ctx)
-    plan["verify_only"] = _migrate_siblings(ctx, plan["files"])
+    plan["verify_only"] = _migrate_siblings(ctx, plan["files"], ctx.get("given_roots") or [])
     return plan
 
 
@@ -9006,12 +9007,12 @@ def _migrate_stale(ctx: dict) -> list[str]:
     return out
 
 
-def _migrate_siblings(ctx: dict, files: list[str]) -> list[dict]:
+def _migrate_siblings(ctx: dict, files: list[str], given: list[str]) -> list[dict]:
     """Other roots on this machine holding the same agent - a worktree, a
     deploy checkout: verify-only, their differences named, nothing written."""
     out = []
     here = Path(ctx["root"]).resolve()
-    for entry in _migrate_discover([]):
+    for entry in _migrate_discover(given):
         if entry.get("id") != ctx["agent_id"] or Path(entry["root"]) == here:
             continue
         other = Path(entry["envelope"])
