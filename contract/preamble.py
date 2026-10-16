@@ -56,6 +56,10 @@ Optionally, beside STATE, `TABLES = True` when the capability keeps tables in
 the machine's store, with a `_tables()` builder outside the fences returning
 `(steps, major, minor)` for the shared database library. Absent or false means
 none, and `migrate` is then left to the CLI's own parser.
+Optionally, `_migrate_files_mover(action, answers, all_answers)` outside the
+fences: how `migrate files` moves the capability's own configuration files of a
+project (profiles, workers, definitions) into the store for `capabilities
+migrate`. Absent means the capability has none of its own to move.
 
 The bare `help` verb is dispatched by `_contract` and reads the CLI's help
 body from a module-level `HELP` constant if defined, else the module docstring
@@ -831,7 +835,10 @@ def _gate() -> None:
     `migrate` of a capability that declares `TABLES` acts on the machine's
     store rather than for a project, so it too reads no policy row: it answers
     to the machine ceiling, and `migrate` (not `migrate status`) to the
-    read-only switch.
+    read-only switch. `migrate files` is the manager's `capabilities migrate`
+    moving this capability's files of a project into the store, whether or not
+    the project enabled it: it answers to the machine ceiling, and `migrate
+    files write` to the read-only switch.
 
     Machine administration reads no policy row either: it answers to the
     machine ceiling, and its writes to the read-only switch
@@ -843,6 +850,10 @@ def _gate() -> None:
     if not safe:
         _machine_gate()
     service_action = sys.argv[2] if len(sys.argv) > 2 else None
+    if verb == "migrate" and service_action == "files":
+        if sys.argv[3:4] == ["write"]:
+            _read_only_gate(f"`{NAME} migrate files write`")
+        return
     if verb == "migrate" and _tables_declared():
         if service_action != "status":
             _read_only_gate(f"`{NAME} migrate`")
@@ -989,6 +1000,9 @@ def _env_dir() -> Path | None:
 
 
 _RECORDS = None
+# Who this process writes records as, where it is not the person running it:
+# `migrate` while `migrate files` moves the project's files into the store.
+_RECORDS_ACTOR = None
 
 
 def _records():
@@ -1009,7 +1023,7 @@ def _records():
             _RECORDS = open_records(
                 envelope, _CONFIG_HOME, project_only=project_only,
                 project_root=root, project_id=_project_id() if in_store else None,
-                application_name=NAME)
+                application_name=NAME, actor=_RECORDS_ACTOR)
         except StoreError as e:
             _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     return _RECORDS
@@ -1667,6 +1681,55 @@ def _cmd_migrate(argv: list[str]) -> None:
     _emit(report)
 
 
+MIGRATE_FILES_ACTIONS = ("plan", "write", "verify")
+
+
+def _cmd_migrate_files(argv: list[str]) -> None:
+    """`migrate files plan|write|verify [--answers FILE]` moves this
+    capability's own configuration files of the project into the store, for
+    the manager's `capabilities migrate`, which runs it on the agent's master
+    and owns the order: `plan` says what would be written and every question
+    code cannot answer, writing nothing; `write` writes it, leaving the files
+    for the manager to archive and remove; `verify` reads it back and says
+    whether the store now holds what the files said. The capability's own
+    `_migrate_files_mover(action, answers, all_answers)`, outside the fences,
+    does the moving and returns its report: `items`, `questions`, `files` (the
+    ones it consumed), `verified` and whatever else it names; a capability
+    without one moves nothing here. `--answers` is the person's recorded
+    answers as JSON, keyed by capability. Every record or setting written here
+    is the migration's own (`migrate@<node>`)."""
+    global _RECORDS_ACTOR
+    action = argv[0] if argv else ""
+    rest = argv[1:]
+    answers: dict = {}
+    if rest[:1] == ["--answers"] and len(rest) == 2:
+        try:
+            answers = json.loads(Path(rest[1]).read_text())
+        except (OSError, ValueError) as e:
+            _die(6, "input", f"cannot read the answers file {rest[1]}: {e}")
+        if not isinstance(answers, dict):
+            _die(6, "input", f"the answers file {rest[1]} must hold a JSON object")
+    elif rest:
+        _die(6, "input", f"unknown migrate files arguments {' '.join(rest)!r}",
+             f"{NAME} migrate files plan|write|verify [--answers FILE]")
+    if action not in MIGRATE_FILES_ACTIONS:
+        _die(6, "input", f"migrate files needs one of {', '.join(MIGRATE_FILES_ACTIONS)}",
+             f"{NAME} migrate files plan|write|verify [--answers FILE]")
+    if _project_root() is None:
+        _die(6, "no_project", "migrate files moves a project's files, and this is not one",
+             "run it in the project; `capabilities migrate` does")
+    _RECORDS_ACTOR = "migrate"
+    mover = globals().get("_migrate_files_mover")
+    report = {"capability": NAME, "action": action, "mover": callable(mover),
+              "items": [], "questions": [], "files": [], "warnings": []}
+    if callable(mover):
+        mine = answers.get(NAME) if isinstance(answers.get(NAME), dict) else {}
+        report.update(mover(action, mine, answers) or {})
+    if action == "verify":
+        report.setdefault("verified", True)
+    _emit(report)
+
+
 MACHINE_READ_EFFECT = ("outside any project these verbs use the machine's own "
                        "connections, read-only; inside a project its grants "
                        "alone decide")
@@ -1769,7 +1832,8 @@ def _manifest_core() -> dict:
             "state": STATE, "inventory": _inventory_declaration(),
             "post_install": POST_INSTALL, "tables": _tables_declared(),
             "connections": _connections_declaration(),
-            "settings": _settings_declaration()}
+            "settings": _settings_declaration(),
+            "migrate_files": callable(globals().get("_migrate_files_mover"))}
 
 
 def _field_value(field: dict, raw, from_argv: bool = False):
@@ -2394,6 +2458,8 @@ def _contract(argv: list[str]) -> None:
         _emit(f"{SUMMARY} Run `{NAME} help`.")
     elif cmd == "manifest":
         _emit(_manifest_core())
+    elif cmd == "migrate" and argv[1:2] == ["files"]:
+        _cmd_migrate_files(argv[2:])
     elif cmd == "migrate" and _tables_declared():
         _cmd_migrate(argv[1:])
     elif cmd == "guide":

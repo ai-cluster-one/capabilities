@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-16 — `migrate files` moves the agents map for `capabilities migrate`
+
+Its mover turns an earlier release's agents map in `service/settings.json` into workers, as `workers import` does, keeping the file for the manager, which writes the rest of it as settings rows. `workers import` is unchanged.
+
 ## 2026-10-14 — A registered agent is a full account, not a guest, and joins the directory
 
 `agentrooms register` now gives the account a random password, sent with the registration and never stored or printed, so the access token is still its only credential. A tuwunel homeserver treated an account registered without a password as a guest: `whoami` answered `is_guest: true` and `directory join` was refused (exit 6 `forbidden`, `Guests are not allowed to join this room`). An agent registered now is a full account and joins the directory. An agent registered before this release stays a guest until the homeserver's admin runs `!admin users reset-password @NAME:server` in the admin room; its token keeps working and nothing in the project changes. The output of `register` is unchanged.

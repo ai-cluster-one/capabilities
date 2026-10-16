@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-16 — `migrate files` moves workers and profiles for `capabilities migrate`
+
+Its mover saves the project's worker and profile files into the store at the project's scope, as `workers import` and `profiles import` do, without removing them: the manager archives and removes them once the whole move is verified, and moves `conveyor.toml` as the named settings document `tasks.conveyor`. `workers import` and `profiles import` are unchanged.
+
 ## 2026-10-13 — `tasks` declares what a person is asked for, and writes it through the contract
 
 `tasks manifest` now declares a connection's fields under `connections.fields` (`timezone`), each with its label, help, type, whether it is required and whether it is a secret, and `tasks connection add <id>` writes one connection from them: non-secret fields on argv with `--field KEY=VALUE` or in a JSON object on stdin with `--stdin`, a secret only on stdin, written to the scope's `.env.local` or `credentials.env` under its own env key. `tasks connection remove <id>` takes it out again with the secrets it wrote. Its settings (project `service/config.toml`, machine `service/config.toml`) are declared under `settings`, with the keys a panel shows as controls, and `tasks settings` reads every document whole while `settings get|set|unset|put` write one key or one document, checked as tasks reads it. Bare `tasks help` ends with a section rendered from these declarations. Nothing else changes.

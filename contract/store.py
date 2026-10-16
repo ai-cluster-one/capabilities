@@ -126,6 +126,11 @@ HASH_LENGTH = 12
 # separators and anything that would make a key ambiguous to address.
 KEY_RE = re.compile(r"[a-z0-9][a-z0-9._@+-]{0,127}", re.IGNORECASE)
 CAPABILITY_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
+# The document a settings row belongs to: a capability's own settings, or a
+# named document of it, `<capability>.<name>`, for settings it keeps outside its
+# declared homes (tasks' `conveyor`, slack's `policy`). A capability name never
+# holds a dot, so a named document can never be taken for a capability.
+SETTINGS_DOCUMENT_RE = re.compile(r"[a-z][a-z0-9-]{0,63}(?:\.[a-z][a-z0-9-]{0,63})?")
 
 
 class StoreError(Exception):
@@ -568,6 +573,16 @@ def _store_check(name: str, value: str, pattern: re.Pattern) -> str:
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise StoreError("bad_name", f"{name} {value!r} must match {pattern.pattern}")
     return value
+
+
+def settings_document(capability: str, name: str | None = None) -> str:
+    """The key a settings document is kept under: the capability's own, or
+    its named document `<capability>.<name>`."""
+    _store_check("capability", capability, CAPABILITY_RE)
+    if name is None:
+        return capability
+    return _store_check("settings document", f"{capability}.{name}",
+                        SETTINGS_DOCUMENT_RE)
 
 
 def _semantics(collection: str) -> str:
@@ -2197,7 +2212,7 @@ class AgentRecords(StoreRecords):
         """One scope's settings document as this node reads it: the rows for
         every node with this node's rows over them. None where neither
         document exists, which a reader takes as the capability's seed."""
-        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
         self._scope_root(scope)
         docs, rows = self._settings_rows(capability)
         shared, mine = (scope, None), (scope, self.node)
@@ -2317,7 +2332,7 @@ class AgentRecords(StoreRecords):
         then write the paths that differ, removals first, one trail row each,
         and move the document's generation to the last of them. A refused
         write changes nothing."""
-        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
         _refuse_record_write(capability, "setting")
         agent = self._agent(scope)
         who = self.actor_name(actor)

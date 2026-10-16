@@ -2616,7 +2616,10 @@ def _gate() -> None:
     `migrate` of a capability that declares `TABLES` acts on the machine's
     store rather than for a project, so it too reads no policy row: it answers
     to the machine ceiling, and `migrate` (not `migrate status`) to the
-    read-only switch.
+    read-only switch. `migrate files` is the manager's `capabilities migrate`
+    moving this capability's files of a project into the store, whether or not
+    the project enabled it: it answers to the machine ceiling, and `migrate
+    files write` to the read-only switch.
 
     Machine administration reads no policy row either: it answers to the
     machine ceiling, and its writes to the read-only switch
@@ -2628,6 +2631,10 @@ def _gate() -> None:
     if not safe:
         _machine_gate()
     service_action = sys.argv[2] if len(sys.argv) > 2 else None
+    if verb == "migrate" and service_action == "files":
+        if sys.argv[3:4] == ["write"]:
+            _read_only_gate(f"`{NAME} migrate files write`")
+        return
     if verb == "migrate" and _tables_declared():
         if service_action != "status":
             _read_only_gate(f"`{NAME} migrate`")
@@ -2774,6 +2781,9 @@ def _env_dir() -> Path | None:
 
 
 _RECORDS = None
+# Who this process writes records as, where it is not the person running it:
+# `migrate` while `migrate files` moves the project's files into the store.
+_RECORDS_ACTOR = None
 
 
 def _records():
@@ -2794,7 +2804,7 @@ def _records():
             _RECORDS = open_records(
                 envelope, _CONFIG_HOME, project_only=project_only,
                 project_root=root, project_id=_project_id() if in_store else None,
-                application_name=NAME)
+                application_name=NAME, actor=_RECORDS_ACTOR)
         except StoreError as e:
             _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     return _RECORDS
@@ -3452,6 +3462,55 @@ def _cmd_migrate(argv: list[str]) -> None:
     _emit(report)
 
 
+MIGRATE_FILES_ACTIONS = ("plan", "write", "verify")
+
+
+def _cmd_migrate_files(argv: list[str]) -> None:
+    """`migrate files plan|write|verify [--answers FILE]` moves this
+    capability's own configuration files of the project into the store, for
+    the manager's `capabilities migrate`, which runs it on the agent's master
+    and owns the order: `plan` says what would be written and every question
+    code cannot answer, writing nothing; `write` writes it, leaving the files
+    for the manager to archive and remove; `verify` reads it back and says
+    whether the store now holds what the files said. The capability's own
+    `_migrate_files_mover(action, answers, all_answers)`, outside the fences,
+    does the moving and returns its report: `items`, `questions`, `files` (the
+    ones it consumed), `verified` and whatever else it names; a capability
+    without one moves nothing here. `--answers` is the person's recorded
+    answers as JSON, keyed by capability. Every record or setting written here
+    is the migration's own (`migrate@<node>`)."""
+    global _RECORDS_ACTOR
+    action = argv[0] if argv else ""
+    rest = argv[1:]
+    answers: dict = {}
+    if rest[:1] == ["--answers"] and len(rest) == 2:
+        try:
+            answers = json.loads(Path(rest[1]).read_text())
+        except (OSError, ValueError) as e:
+            _die(6, "input", f"cannot read the answers file {rest[1]}: {e}")
+        if not isinstance(answers, dict):
+            _die(6, "input", f"the answers file {rest[1]} must hold a JSON object")
+    elif rest:
+        _die(6, "input", f"unknown migrate files arguments {' '.join(rest)!r}",
+             f"{NAME} migrate files plan|write|verify [--answers FILE]")
+    if action not in MIGRATE_FILES_ACTIONS:
+        _die(6, "input", f"migrate files needs one of {', '.join(MIGRATE_FILES_ACTIONS)}",
+             f"{NAME} migrate files plan|write|verify [--answers FILE]")
+    if _project_root() is None:
+        _die(6, "no_project", "migrate files moves a project's files, and this is not one",
+             "run it in the project; `capabilities migrate` does")
+    _RECORDS_ACTOR = "migrate"
+    mover = globals().get("_migrate_files_mover")
+    report = {"capability": NAME, "action": action, "mover": callable(mover),
+              "items": [], "questions": [], "files": [], "warnings": []}
+    if callable(mover):
+        mine = answers.get(NAME) if isinstance(answers.get(NAME), dict) else {}
+        report.update(mover(action, mine, answers) or {})
+    if action == "verify":
+        report.setdefault("verified", True)
+    _emit(report)
+
+
 MACHINE_READ_EFFECT = ("outside any project these verbs use the machine's own "
                        "connections, read-only; inside a project its grants "
                        "alone decide")
@@ -3554,7 +3613,8 @@ def _manifest_core() -> dict:
             "state": STATE, "inventory": _inventory_declaration(),
             "post_install": POST_INSTALL, "tables": _tables_declared(),
             "connections": _connections_declaration(),
-            "settings": _settings_declaration()}
+            "settings": _settings_declaration(),
+            "migrate_files": callable(globals().get("_migrate_files_mover"))}
 
 
 def _field_value(field: dict, raw, from_argv: bool = False):
@@ -4179,6 +4239,8 @@ def _contract(argv: list[str]) -> None:
         _emit(f"{SUMMARY} Run `{NAME} help`.")
     elif cmd == "manifest":
         _emit(_manifest_core())
+    elif cmd == "migrate" and argv[1:2] == ["files"]:
+        _cmd_migrate_files(argv[2:])
     elif cmd == "migrate" and _tables_declared():
         _cmd_migrate(argv[1:])
     elif cmd == "guide":
@@ -4273,6 +4335,11 @@ HASH_LENGTH = 12
 # separators and anything that would make a key ambiguous to address.
 KEY_RE = re.compile(r"[a-z0-9][a-z0-9._@+-]{0,127}", re.IGNORECASE)
 CAPABILITY_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
+# The document a settings row belongs to: a capability's own settings, or a
+# named document of it, `<capability>.<name>`, for settings it keeps outside its
+# declared homes (tasks' `conveyor`, slack's `policy`). A capability name never
+# holds a dot, so a named document can never be taken for a capability.
+SETTINGS_DOCUMENT_RE = re.compile(r"[a-z][a-z0-9-]{0,63}(?:\.[a-z][a-z0-9-]{0,63})?")
 
 
 class StoreError(Exception):
@@ -4715,6 +4782,16 @@ def _store_check(name: str, value: str, pattern: re.Pattern) -> str:
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise StoreError("bad_name", f"{name} {value!r} must match {pattern.pattern}")
     return value
+
+
+def settings_document(capability: str, name: str | None = None) -> str:
+    """The key a settings document is kept under: the capability's own, or
+    its named document `<capability>.<name>`."""
+    _store_check("capability", capability, CAPABILITY_RE)
+    if name is None:
+        return capability
+    return _store_check("settings document", f"{capability}.{name}",
+                        SETTINGS_DOCUMENT_RE)
 
 
 def _semantics(collection: str) -> str:
@@ -6344,7 +6421,7 @@ class AgentRecords(StoreRecords):
         """One scope's settings document as this node reads it: the rows for
         every node with this node's rows over them. None where neither
         document exists, which a reader takes as the capability's seed."""
-        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
         self._scope_root(scope)
         docs, rows = self._settings_rows(capability)
         shared, mine = (scope, None), (scope, self.node)
@@ -6464,7 +6541,7 @@ class AgentRecords(StoreRecords):
         then write the paths that differ, removals first, one trail row each,
         and move the document's generation to the last of them. A refused
         write changes nothing."""
-        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
         _refuse_record_write(capability, "setting")
         agent = self._agent(scope)
         who = self.actor_name(actor)
@@ -12627,7 +12704,8 @@ _IMPORT_CLASS = 31325
 
 
 def _import_worker_files(entry, project: str, apply: bool,
-                         raising: bool = False) -> tuple[list[dict], list[str]]:
+                         raising: bool = False,
+                         remove: bool = True) -> tuple[list[dict], list[str]]:
     """Each of this project's worker files as an import would take it, and
     every reason the import is refused; with `apply` and nothing refusing, each
     is saved and its file removed, all of them or none.
@@ -12636,7 +12714,9 @@ def _import_worker_files(entry, project: str, apply: bool,
     one identical to the version the store holds is already there. One that
     differs from it is never saved over it - the store's is what runs - and,
     like a file that cannot be read, refuses the import, naming it. Raises
-    Refusal when `raising` and the store cannot be reached."""
+    Refusal when `raising` and the store cannot be reached. `remove` False
+    leaves the files where they are, for `capabilities migrate` to archive and
+    remove once it has verified the whole move."""
     with _connect(entry, raising=raising) as conn, conn.cursor() as cur:
         if apply:
             cur.execute("select pg_advisory_lock(%s, hashtext(%s))",
@@ -12682,12 +12762,13 @@ def _import_worker_files(entry, project: str, apply: bool,
                                                   one["body"], None)
                     one["version"] = str(row["id"])
         conn.commit()
-        if apply:
+        if apply and remove:
             for one in plan:
                 one["path"].unlink()
             folder = _workers_dir()
             if folder.is_dir() and not any(folder.iterdir()):
                 folder.rmdir()
+        if apply:
             _forget_workers()
     return plan, refused
 
@@ -12951,6 +13032,30 @@ def _profiles_import(entry, project: str, apply: bool) -> None:
     version; one identical to the version the project holds is already there.
     One that differs from it is never saved over it - the store's is what runs
     - and, like a file that cannot be read, refuses the import, naming it."""
+    plan, refused = _import_profile_files(entry, project, apply)
+    if refused:
+        _die(6, "profile_invalid",
+             f"{len(refused)} profile file(s) cannot be imported, so none is: "
+             + "; ".join(refused),
+             "repair or remove them, then import again")
+    answer: dict = {"applied": apply,
+                    "profiles": [{"profile": one["name"], "file": str(one["path"]),
+                                  "outcome": one["outcome"] if apply
+                                  else f"would_be_{one['outcome']}",
+                                  **({"version": one["version"]} if one.get("version")
+                                     else {})}
+                                 for one in plan]}
+    if apply:
+        answer["removed"] = [str(one["path"]) for one in plan]
+    _emit(answer)
+
+
+def _import_profile_files(entry, project: str, apply: bool,
+                          remove: bool = True) -> tuple[list[dict], list[str]]:
+    """Each of this project's profile files as an import takes it, and every
+    reason the import is refused; with `apply` and nothing refusing, each is
+    saved, all of them or none, and its file removed unless `remove` is
+    False."""
     runner = _profile_store()
     files = _unimported_profile_files()
     plan, refused = [], []
@@ -12988,10 +13093,7 @@ def _profiles_import(entry, project: str, apply: bool) -> None:
                                f"{one['path']}`, or remove the file")
         if refused:
             conn.rollback()
-            _die(6, "profile_invalid",
-                 f"{len(refused)} profile file(s) cannot be imported, so none is: "
-                 + "; ".join(refused),
-                 "repair or remove them, then import again")
+            return plan, refused
         if apply:
             for one in plan:
                 if one["outcome"] == "imported":
@@ -13004,25 +13106,71 @@ def _profiles_import(entry, project: str, apply: bool) -> None:
                         _profile_refusal(wrong, one["name"])
                     one["version"] = version.id
         conn.commit()
-    removed = []
-    if apply:
+    if apply and remove:
         for one in plan:
             one["path"].unlink()
-            removed.append(str(one["path"]))
         folder = _profiles_dir()
         if folder.is_dir() and not any(folder.iterdir()):
             folder.rmdir()
-        _forget_profiles()
-    answer: dict = {"applied": apply,
-                    "profiles": [{"profile": one["name"], "file": str(one["path"]),
-                                  "outcome": one["outcome"] if apply
-                                  else f"would_be_{one['outcome']}",
-                                  **({"version": one["version"]} if one.get("version")
-                                     else {})}
-                                 for one in plan]}
     if apply:
-        answer["removed"] = removed
-    _emit(answer)
+        _forget_profiles()
+    return plan, refused
+
+
+def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict:
+    """`capabilities migrate`'s move of this project's worker and profile files
+    into the store at the project's scope, through the import `workers import`
+    and `profiles import` perform, without removing the files: the manager
+    archives and removes them once the whole move is verified. `verify` finds
+    each file held by the store exactly as written; a version the store holds
+    and no file does is named, never refused, since a worker saved in the
+    store is the store's."""
+    globals()["PROJECT_IDENTITY"] = _project_id_state()
+    globals()["PROJECT"] = _declared_project()
+    worker_files, profile_files = _unimported_worker_files(), _unimported_profile_files()
+    files = [str(p) for p in worker_files + profile_files]
+    if not files:
+        return {"items": [], "files": [], **({"verified": True} if action == "verify" else {})}
+    project = PROJECT
+    if not project:
+        _die(6, "no_project_identity", "this project declares no id",
+             "run `capabilities init` in the project")
+    setting = _store_setting()
+    globals().update(SCHEMA=setting.schema, _STORE_PINNED=setting)
+    write = action == "write"
+    if write:
+        _migrate_profile_tables()
+    try:
+        workers, refused = _import_worker_files(None, project, write, raising=True,
+                                                remove=False)
+        profiles, refused_profiles = _import_profile_files(None, project, write,
+                                                           remove=False)
+    except Refusal as refused_store:
+        _die(refused_store.exit_code, refused_store.code, refused_store.message,
+             refused_store.hint)
+    refused = refused + refused_profiles
+    if refused and action != "verify":
+        _die(6, "files_not_movable",
+             f"{len(refused)} worker or profile file(s) cannot be moved, so none is: "
+             + "; ".join(refused),
+             "repair or remove them, then run `capabilities migrate` again")
+    outcome = {"imported": "would_write" if action == "plan" else
+               "written" if write else "missing", "already": "held"}
+    items = ([{"kind": "worker", "name": one["name"], "file": str(one["path"]),
+               "outcome": outcome[one["outcome"]], **({"version": one["version"]}
+                                                       if one.get("version") else {})}
+              for one in workers]
+             + [{"kind": "profile", "name": one["name"], "file": str(one["path"]),
+                 "outcome": outcome[one["outcome"]], **({"version": one["version"]}
+                                                         if one.get("version") else {})}
+                for one in profiles])
+    report = {"items": items, "files": files}
+    if action == "verify":
+        report["differences"] = refused + [
+            f"{item['kind']} {item['name']}: the store does not hold {item['file']}"
+            for item in items if item["outcome"] != "held"]
+        report["verified"] = not report["differences"]
+    return report
 
 
 # --- What the turn is told ---------------------------------------------------

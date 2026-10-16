@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-16 — `migrate files` reads runtime.json placement for `capabilities migrate`
+
+Its mover names one node per target that declares one, for the master to register, and the policy rows that place on each node the services runtime.json's service_policy and placement run there today; a target that names no node is a question (`deployment.targets.<name>`). The manager writes the rows; runtime.json stays.
+
 ## 2026-10-15 — A target declares the node its server runs as
 
 A deployment target takes an optional `node` field: the name its server runs as in the gate. `deployment sync` writes it into the target's bundle as `AGENT_NODE_NAME` in the Compose file's shared environment, as a literal every container receives whatever the server's environment holds, the bundle's `.env.example` names it as the target's instead of asking for it, and `deployment deploy` sends the same value to the application's environment rather than the deploying machine's own. `deployment node status` reports it as `declared_node_name` beside the `node_name` the node answers to, with the error `node_name_mismatch` while they differ. The target is the one home of the name: `sync` and `doctor` refuse a `services.<name>.environment_defaults` setting `AGENT_NODE_NAME` beside it (`node_declared_twice`) and a malformed value (`node_invalid`); a runtime that names its own artifact paths compiles no bundle and reports a declared node as `node_not_compiled`. A target without `node` compiles, deploys and reports exactly as before. To move a server's name onto its target, add `node`, remove `AGENT_NODE_NAME` from any `environment_defaults`, run `deployment sync` and redeploy.

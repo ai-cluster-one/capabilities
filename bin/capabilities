@@ -608,6 +608,74 @@ PROJECT VERBS (run inside a consuming project)
         {project|global {imported, unchanged}}, files_kept}. Exit 4 under the
         read-only switch, 5 when the store cannot be reached.
 
+  migrate [--dry-run|--apply] [--answers FILE]
+        Move this agent's file-held configuration into the store, on its
+        master node, as one deliberate run: its connections, grants and
+        default pointer, identifiers and gate (as rows naming the agent), the
+        settings of every capability's project home and the named documents
+        capabilities/slack/policy.json (slack.policy) and
+        capabilities/tasks/conveyor.toml (tasks.conveyor) as settings rows,
+        and through each capability's `<name> migrate files` what it keeps
+        of its own: automations [[automations]] and engine.timezone as
+        definitions, askproject's profiles folder, whatsapp's and tasks'
+        profile files and tasks' worker files as store versions, telegram's
+        old worker settings as profiles, agentrooms' agents map as workers,
+        and deployment's runtime.json service_policy and placement as policy
+        rows naming each node. The default is a dry run, which writes
+        nothing: what each part would write, every row the store already
+        holds differently, each settings value naming a host path, each file
+        that differs from its committed copy, each other root of the agent
+        on this machine (verify-only, differences named), one node per
+        deployment target, and every question code cannot answer - a node
+        for a legacy automation, a connection whose stored spec differs, a
+        node to register, an id project.json and .contextkit/config.toml
+        disagree on. Each question names the path in the --answers JSON its
+        answer goes to. --apply refuses (exit 6, nothing written) without a
+        database (its own code), without AGENT_NODE_NAME (node_unnamed), on a
+        node other than the answers' or the open migration's (node_mismatch)
+        or other than the agent's master (not_master), before `migrate
+        --global` (global_not_migrated), with a payload older than this
+        contract (payload_outdated) or with a question open (question_open).
+        It registers the agent and this node as its master on the first
+        run, sets migrating_since (from then only this migration writes the
+        agent's records and settings, on any node), archives every file git
+        does not hold as committed at 0600 under the state home, stops the
+        agent's launchd agents here and pauses its services that pause,
+        registers the target nodes answered, writes, then reads everything
+        back through the store and compares it both ways with what the files
+        resolve (exit 7 verify_failed, the agent left frozen). Finalize
+        refuses while a target's node is unregistered
+        (target_node_unregistered), else sets migrated_at, clears
+        migrating_since, writes "records": "store", removes the files (a git
+        change to commit) and resumes what it stopped. A journal under the
+        state home makes a run interrupted anywhere resume on the next
+        --apply; a run on an agent already moved changes nothing. An agent
+        whose records were already in the store keeps them: its stale files
+        are named, never fail the run, and are removed. JSON {ok, project,
+        agent_id, node, mode, applied, state, blockers, questions, plan,
+        would_write | registered, movers, records_written,
+        settings_written, verify, migrated_at, removed, archive, services}.
+  migrate --global [--dry-run|--apply] [--answers FILE]
+        Write the config home's gate, identifiers, connections, grants (a
+        grant's allow_write only, never enabled), default pointer and global
+        settings as the global rows every agent inherits, converging the
+        store's global rows on them, and set global_migrated_at; the dry run
+        lists each row it would add, change or remove and every agent whose
+        effective gate would flip (gate_flips). Once set, it changes nothing.
+  migrate --discard
+        On a node that is not the global master: delete the config home's
+        record and settings files without reading them. Refused before
+        global_migrated_at (global_not_migrated) or while an agent on this
+        machine has not moved (agents_unmigrated).
+  migrate --report [--root PATH]...
+        What remains on this machine and why: each agent root found in the
+        machine services' join lists, AgentKit's agent list, the roots
+        given, the project here and their git worktrees, read through each
+        one's body root - its state, its record and settings files left, an
+        open migration's journal, and the lines of its own text that read
+        those files directly or name a retired import verb - and the config
+        home's files.
+
 VERIFICATION VERBS
   doctor
         Reconcile machine registry ↔ snapshots ↔ project gate ↔ gitignore
@@ -8014,6 +8082,2124 @@ def cmd_connections_import() -> None:
            "files_kept": sorted(str(p) for p in kept)})
 
 
+# ---------------------------------------------------------------- migrate
+
+# `capabilities migrate` moves one agent's file-held configuration into the
+# store, on the agent's master node, by deliberate action: a dry run that
+# writes nothing and lists every question code cannot answer; a write under
+# the agent's `migrating_since` freeze; a verify that reads everything back
+# through the store and compares it both ways with what the files resolved
+# to; and a finalize that switches the agent with `migrated_at`, writes
+# "records": "store", archives what git does not hold, removes the files and
+# resumes the services it stopped. A journal per agent in the state home
+# drives a run that was interrupted to its end.
+MIGRATE_ACTOR = "migrate"
+MIGRATE_JOURNAL_SCHEMA = "capabilities.migrate-journal.v1"
+# Settings a capability keeps outside its declared homes, moved as the named
+# documents `<capability>.<name>` of the settings rows.
+MIGRATE_NAMED_SETTINGS = {("slack", "policy"): ("policy.json", "json"),
+                          ("tasks", "conveyor"): ("conveyor.toml", "toml")}
+# The marker of a payload stamped with the contract that carries `migrate files`.
+MIGRATE_CONTRACT_MARKER = "def _cmd_migrate_files("
+MIGRATE_MOVER_TIMEOUT = 600
+MIGRATE_SERVICE_TIMEOUT = 120
+# What a host path in a settings value looks like: it names one machine's disk.
+MIGRATE_HOST_PATH = re.compile(r"^(?:/Users/|/home/|/Volumes/|/private/|~/)")
+# Text a consumer that reads a record or settings file directly carries.
+MIGRATE_CONSUMER_PATTERNS = ("connections.json", "identifiers.json", "service/settings.json",
+                             "service/config.toml", "conveyor.toml", "migrate-profiles",
+                             "connections import", "workers import", "profiles import",
+                             "automations import")
+MIGRATE_CONSUMER_SUFFIXES = (".py", ".md", ".toml", ".sh", ".swift", ".ts", ".js",
+                             ".yaml", ".yml")
+MIGRATE_CONSUMER_SKIP = (".git", "node_modules", ".venv", "venv", "__pycache__",
+                         ".contextkit", "dist", "build", "_tmp")
+
+
+class _MigrateRefusal(Exception):
+    def __init__(self, code: str, message: str, hint: str | None = None,
+                 exit_code: int = 6, detail: dict | None = None):
+        super().__init__(message)
+        self.code, self.message, self.hint = code, message, hint
+        self.exit_code, self.detail = exit_code, detail or {}
+
+
+def _migrate_refuse(exc: "_MigrateRefusal", answer: dict | None = None) -> NoReturn:
+    """A refusal on stderr in the error envelope, carrying what the run found
+    so far, so a person sees why and what remains."""
+    body = {"code": exc.code, "message": exc.message}
+    if exc.hint:
+        body["hint"] = exc.hint
+    if exc.detail:
+        body["detail"] = exc.detail
+    if answer is not None:
+        body["report"] = answer
+    sys.stderr.write(json.dumps({"error": body}, ensure_ascii=False, default=str) + "\n")
+    sys.exit(exc.exit_code)
+
+
+def _migrate_home(agent_id: str | None = None) -> Path:
+    base = _STATE_HOME / "capabilities" / "migrate"
+    return base / agent_id if agent_id else base
+
+
+def _migrate_journal(agent_id: str) -> dict | None:
+    found = _read_json(_migrate_home(agent_id) / "journal.json")
+    return found if isinstance(found, dict) else None
+
+
+def _migrate_journal_save(agent_id: str, journal: dict) -> None:
+    path = _migrate_home(agent_id) / "journal.json"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    journal["updated_at"] = _utc_now()
+    tmp = path.with_name(f".journal.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(journal, ensure_ascii=False, indent=2, sort_keys=True,
+                              default=str) + "\n")
+    tmp.chmod(0o600)
+    tmp.replace(path)
+
+
+def _utc_now() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _migrate_options(args: list[str]) -> dict:
+    opts: dict = {"roots": []}
+    flags = {"--dry-run": "dry_run", "--apply": "apply", "--global": "global",
+             "--discard": "discard", "--report": "report", "--json": "json"}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        name, eq, value = arg.partition("=")
+        if arg in flags:
+            opts[flags[arg]] = True
+        elif name in ("--answers", "--root"):
+            if not eq:
+                if i + 1 >= len(args):
+                    _die(6, "input", f"{name} needs a value")
+                value, i = args[i + 1], i + 1
+            if name == "--answers":
+                if "answers" in opts:
+                    _die(6, "input", "--answers given twice")
+                opts["answers"] = value
+            else:
+                opts["roots"].append(value)
+        else:
+            _die(6, "input", f"`capabilities migrate` does not take {arg}",
+                 "capabilities migrate [--dry-run|--apply] [--answers FILE] | --global "
+                 "[--dry-run|--apply] [--answers FILE] | --discard | --report [--root PATH]")
+        i += 1
+    modes = [m for m in ("global", "discard", "report") if opts.get(m)]
+    if len(modes) > 1:
+        _die(6, "input", f"--{modes[0]} and --{modes[1]} are separate runs")
+    if opts.get("dry_run") and opts.get("apply"):
+        _die(6, "input", "--dry-run and --apply are opposites; give one")
+    if (opts.get("discard") or opts.get("report")) and (opts.get("apply") or opts.get("answers")):
+        _die(6, "input", "--discard and --report take no --apply or --answers")
+    return opts
+
+
+def _migrate_answers(path: str | None) -> dict:
+    if not path:
+        return {}
+    try:
+        found = json.loads(Path(path).expanduser().read_text())
+    except (OSError, ValueError) as exc:
+        _die(6, "input", f"cannot read the answers file {path}: {exc}")
+    if not isinstance(found, dict):
+        _die(6, "input", f"the answers file {path} must hold a JSON object")
+    return found
+
+
+def _migrate_dig(answers: dict, dotted: str):
+    """One answer by the dotted id its question names; a key that itself holds
+    a dot is matched whole at its level."""
+    here = answers
+    parts = dotted.split(".")
+    i = 0
+    while i < len(parts):
+        if not isinstance(here, dict):
+            return None
+        for j in range(len(parts), i, -1):
+            key = ".".join(parts[i:j])
+            if key in here:
+                here, i = here[key], j
+                break
+        else:
+            return None
+    return here
+
+
+# --- where an agent's files are ---------------------------------------------------
+
+def _migrate_body_envelope(root: Path) -> Path:
+    """The envelope a root keeps, read through its body root without asking
+    any program: `[body] root` of .contextkit/config.toml, else the root."""
+    try:
+        import tomllib
+        config = tomllib.loads((root / CONTEXTKIT_CONFIG_REL).read_text())
+        body = (config.get("body") or {}).get("root")
+    except (OSError, ValueError, AttributeError):
+        body = None
+    base = root / body if isinstance(body, str) and body.strip() else root
+    return base / PROJECT_CAPABILITIES_REL
+
+
+def _migrate_root_id(envelope: Path, root: Path) -> str | None:
+    identity = _read_json(envelope / PROJECT_IDENTITY_REL)
+    found = str((identity or {}).get("id") or "").strip() if isinstance(identity, dict) else ""
+    return found or _contextkit_config_id(root)
+
+
+def _migrate_discover(given: list[str]) -> list[dict]:
+    """Every agent root this machine knows: the machine services' join lists,
+    AgentKit's agent list where it is readable, the roots given, the project
+    here, and every git worktree of those; each with its envelope read through
+    its body root and its id."""
+    found: dict[str, dict] = {}
+
+    def add(raw, source: str) -> None:
+        if not raw:
+            return
+        try:
+            root = Path(str(raw)).expanduser().resolve()
+        except OSError:
+            return
+        if not root.is_dir():
+            return
+        entry = found.setdefault(str(root), {"root": str(root), "sources": []})
+        if source not in entry["sources"]:
+            entry["sources"].append(source)
+
+    for listing in sorted(_CONFIG_HOME.glob("*/service/projects.*")):
+        name = listing.parent.parent.name
+        try:
+            if listing.suffix == ".toml":
+                import tomllib
+                body = tomllib.loads(listing.read_text())
+            elif listing.suffix == ".json":
+                body = json.loads(listing.read_text())
+            else:
+                continue
+        except (OSError, ValueError):
+            continue
+        for entry in ((body or {}).get("projects") or {}).values():
+            if isinstance(entry, dict):
+                add(entry.get("root"), f"{name} service")
+    agents = Path.home() / "Library" / "Application Support" / "AgentKit" / "agents.plist"
+    if agents.is_file():
+        try:
+            import plistlib
+            listed = plistlib.loads(agents.read_bytes())
+        except Exception:
+            listed = []
+        for entry in listed if isinstance(listed, list) else []:
+            if isinstance(entry, dict):
+                add(entry.get("path"), "agentkit")
+    for raw in given:
+        add(raw, "given")
+    here = _project_root()
+    if here is not None:
+        add(here, "here")
+    for entry in list(found.values()):
+        try:
+            proc = subprocess.run(["git", "-C", entry["root"], "worktree", "list",
+                                   "--porcelain"], capture_output=True, text=True,
+                                  timeout=20)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        for line in proc.stdout.splitlines() if proc.returncode == 0 else []:
+            if line.startswith("worktree "):
+                add(line[len("worktree "):], f"worktree of {entry['root']}")
+    out = []
+    for key in sorted(found):
+        entry = found[key]
+        root = Path(entry["root"])
+        envelope = _migrate_body_envelope(root)
+        if not envelope.is_dir():
+            continue
+        entry.update(envelope=str(envelope), id=_migrate_root_id(envelope, root))
+        out.append(entry)
+    return out
+
+
+# --- the store, read without writing ----------------------------------------------
+
+def _migrate_connect(root: Path):
+    """(connection, setting) for the root's database, the contract's tables
+    left as they are; raises _MigrateRefusal with the store's own code."""
+    db = _db_module()
+    store = _store_module()
+    try:
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=store.STORE_OWNER, setting=setting)
+    except db.DbError as exc:
+        raise _MigrateRefusal(exc.slug, exc.message, exc.hint,
+                              exit_code=_store_error_exit(exc)) from None
+    return conn, setting
+
+
+def _migrate_rows(conn, query: str, params: tuple = ()) -> list[tuple]:
+    """Rows of a read that answers nothing where the table is not there yet."""
+    import psycopg
+    try:
+        rows = conn.execute(query, params).fetchall()
+    except psycopg.errors.UndefinedTable:
+        conn.rollback()
+        return []
+    conn.rollback()
+    return rows
+
+
+def _migrate_global_at(conn) -> str | None:
+    rows = _migrate_rows(conn, "SELECT global_migrated_at FROM capabilities_global")
+    return _store_module()._stamp(rows[0][0]) if rows and rows[0][0] else None
+
+
+def _migrate_agent_state(conn, agent_id: str) -> dict | None:
+    import psycopg
+    try:
+        state = _store_module()._agent_state(conn, agent_id)
+    except psycopg.Error:
+        conn.rollback()
+        return None
+    conn.rollback()
+    return state
+
+
+def _migrate_node_rows(conn, agent_id: str) -> dict:
+    return {row[0]: dict(zip(NODE_COLUMNS, row)) for row in _migrate_rows(
+        conn, f"SELECT {', '.join(NODE_COLUMNS)} FROM capabilities_agent_nodes "
+              "WHERE agent_id = %s", (agent_id,))}
+
+
+def _migrate_policy_rows(conn, agent_id: str | None) -> dict:
+    return {(cap, node): enabled for cap, node, enabled in _migrate_rows(
+        conn, "SELECT capability, node, enabled FROM capabilities_policy "
+              "WHERE coalesce(agent_id, '') = coalesce(%s::text, '')", (agent_id,))}
+
+
+def _migrate_identifier_rows(conn, agent_id: str | None) -> dict:
+    return {(cap, label): (value, note or "") for cap, label, value, note in _migrate_rows(
+        conn, "SELECT capability, label, value, note FROM capabilities_identifiers "
+              "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND node IS NULL",
+        (agent_id,))}
+
+
+def _migrate_grant_rows(conn, agent_id: str | None) -> dict:
+    return {(cap, cid): (enabled, allow_write, bool(is_default))
+            for cap, cid, enabled, allow_write, is_default in _migrate_rows(
+                conn, "SELECT capability, connection, enabled, allow_write, is_default "
+                      "FROM capabilities_connection_grants "
+                      "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') "
+                      "AND node IS NULL", (agent_id,))}
+
+
+def _migrate_connection_rows(conn) -> dict:
+    return {(cap, name): spec for cap, name, spec in _migrate_rows(
+        conn, "SELECT capability, name, spec FROM capabilities_connections")}
+
+
+def _migrate_setting_rows(conn, agent_id: str | None, document: str) -> dict | None:
+    """One settings document as its shared rows hold it, or None where the
+    document does not exist."""
+    store = _store_module()
+    exists = _migrate_rows(
+        conn, "SELECT generation FROM capabilities_settings_documents "
+              "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
+              "AND node IS NULL", (agent_id, document))
+    rows = _migrate_rows(
+        conn, "SELECT path, value FROM capabilities_settings "
+              "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
+              "AND node IS NULL", (agent_id, document))
+    if not exists and not rows:
+        return None
+    return store.settings_tree([(list(path), value) for path, value in rows])
+
+
+# --- what the files say -------------------------------------------------------------
+
+def _migrate_manifests() -> dict:
+    """Each installed capability's manifest: the one its install left in the
+    registry, else the one its payload answers."""
+    out: dict = {}
+    for name in sorted(_installed()):
+        manifest = _read_json(CAP_HOME / name / "manifest.json")
+        if not isinstance(manifest, dict):
+            rc, stdout, _err = _run_script(CAP_HOME / name / name, ["manifest", "--json"],
+                                           timeout=120)
+            try:
+                manifest = json.loads(stdout) if rc == 0 else None
+            except ValueError:
+                manifest = None
+        out[name] = manifest if isinstance(manifest, dict) else {}
+    return out
+
+
+def _migrate_outdated(names) -> list[str]:
+    """Installed payloads stamped before the contract carried `migrate files`."""
+    stale = []
+    for name in sorted(names):
+        try:
+            text = (CAP_HOME / name / name).read_text(errors="replace")
+        except OSError:
+            stale.append(name)
+            continue
+        if MIGRATE_CONTRACT_MARKER not in text:
+            stale.append(name)
+    return stale
+
+
+def _migrate_settings_homes(manifests: dict, scope: str) -> list[tuple[str, dict]]:
+    out = []
+    for name, manifest in sorted(manifests.items()):
+        for home in ((manifest.get("settings") or {}).get("homes") or []):
+            if isinstance(home, dict) and home.get("scope") == scope and home.get("path"):
+                out.append((name, home))
+    return out
+
+
+def _migrate_read_document(path: Path, fmt: str) -> tuple[dict | None, str | None]:
+    """A settings file as the document its reader takes: (document, problem)."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        return None, f"cannot read {path}: {exc}"
+    try:
+        if fmt == "toml":
+            import tomllib
+            document = tomllib.loads(text)
+        else:
+            document = json.loads(text) if text.strip() else {}
+    except ValueError as exc:
+        return None, f"cannot read {path}: {exc}"
+    if not isinstance(document, dict):
+        return None, f"{path} does not hold an object"
+    try:
+        return json.loads(json.dumps(document, default=_migrate_toml_value)), None
+    except (TypeError, ValueError) as exc:
+        return None, f"{path} holds a value JSON cannot keep: {exc}"
+
+
+def _migrate_toml_value(value):
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    raise TypeError(f"{type(value).__name__} is not JSON")
+
+
+def _migrate_without(document: dict, paths: list) -> dict:
+    out = json.loads(json.dumps(document))
+    for path in paths or []:
+        here = out
+        for part in path[:-1]:
+            here = here.get(part) if isinstance(here, dict) else None
+        if isinstance(here, dict):
+            here.pop(path[-1], None)
+    return out
+
+
+def _migrate_host_paths(document, prefix: tuple = ()) -> list[str]:
+    found = []
+    if isinstance(document, dict):
+        for key, value in document.items():
+            found.extend(_migrate_host_paths(value, (*prefix, str(key))))
+    elif isinstance(document, list):
+        for index, value in enumerate(document):
+            found.extend(_migrate_host_paths(value, (*prefix, str(index))))
+    elif isinstance(document, str) and MIGRATE_HOST_PATH.match(document):
+        found.append(f"{'.'.join(prefix)} = {document}")
+    return found
+
+
+def _migrate_git_state(root: Path, paths: list[Path]) -> dict[str, str]:
+    """Each path as git holds it: `tracked` (as committed), `modified`
+    (working tree differs from the commit), `untracked`, `ignored`, or `none`
+    where the root is no repository."""
+    out = {str(p): "none" for p in paths}
+    if not paths:
+        return out
+    try:
+        inside = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                                capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return out
+    if inside.returncode != 0:
+        return out
+    for path in paths:
+        try:
+            tracked = subprocess.run(["git", "-C", str(root), "ls-files", "--error-unmatch",
+                                      "--", str(path)], capture_output=True, timeout=20)
+            if tracked.returncode == 0:
+                changed = subprocess.run(["git", "-C", str(root), "diff", "--quiet", "HEAD",
+                                          "--", str(path)], capture_output=True, timeout=20)
+                out[str(path)] = "modified" if changed.returncode != 0 else "tracked"
+                continue
+            ignored = subprocess.run(["git", "-C", str(root), "check-ignore", "-q", "--",
+                                      str(path)], capture_output=True, timeout=20)
+            out[str(path)] = "ignored" if ignored.returncode == 0 else "untracked"
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return out
+
+
+def _migrate_record_files(envelope: Path, manifests: dict) -> list[Path]:
+    """Every record and settings file the envelope holds that the store keeps
+    once the agent has moved: the gate, each capability's connections and
+    identifiers, its project settings home and its named settings documents."""
+    files = [envelope / "settings.json"]
+    files += sorted(envelope.glob("*/connections.json"))
+    files += sorted(envelope.glob("*/identifiers.json"))
+    for name, home in _migrate_settings_homes(manifests, "project"):
+        files.append(envelope / name / home["path"])
+    for (name, _doc), (filename, _fmt) in MIGRATE_NAMED_SETTINGS.items():
+        files.append(envelope / name / filename)
+    seen, out = set(), []
+    for path in files:
+        if path.is_file() and str(path) not in seen:
+            seen.add(str(path))
+            out.append(path)
+    return out
+
+
+# --- the capabilities' own movers ---------------------------------------------------
+
+def _migrate_movers(manifests: dict) -> list[str]:
+    return [name for name, manifest in sorted(manifests.items())
+            if manifest.get("migrate_files")]
+
+
+def _migrate_mover_env(root: Path, agent_id: str | None = None) -> dict:
+    """A capability's environment in the agent's project, its envelope and its
+    id handed down so it asks the manager for neither, and so nothing writes
+    the id into project.json before the migration does."""
+    env = dict(os.environ)
+    env["CLAUDE_PROJECT_DIR"] = str(root)
+    env[ENVELOPE_ENV] = str(_project_capabilities_dir(root))
+    env[ENVELOPE_ROOT_ENV] = str(root)
+    if agent_id:
+        env["CAPABILITIES_PROJECT_ID"] = agent_id
+        env["CAPABILITIES_PROJECT_ID_ROOT"] = str(root)
+    return env
+
+
+def _migrate_run_movers(root: Path, names: list[str], action: str,
+                        answers_file: Path, agent_id: str | None = None) -> dict:
+    """`<name> migrate files <action>` for each capability that moves files of
+    its own, in the project; a mover that refuses is reported with its error."""
+    out: dict = {}
+    for name in names:
+        rc, stdout, stderr = _run_script(
+            CAP_HOME / name / name, ["migrate", "files", action, "--answers",
+                                     str(answers_file)],
+            cwd=root, env=_migrate_mover_env(root, agent_id), timeout=MIGRATE_MOVER_TIMEOUT)
+        report = None
+        try:
+            report = json.loads(stdout) if rc == 0 else None
+        except ValueError:
+            report = None
+        if rc != 0 or not isinstance(report, dict):
+            error = None
+            for line in reversed((stderr or "").splitlines()):
+                try:
+                    error = json.loads(line).get("error")
+                    break
+                except (ValueError, AttributeError):
+                    continue
+            out[name] = {"ok": False, "exit": rc,
+                         "error": error or {"code": "mover_failed",
+                                            "message": (stderr or stdout or "").strip()[-2000:]}}
+            continue
+        report["ok"] = True
+        out[name] = report
+    return out
+
+
+def _migrate_mover_answers(ctx: dict, answers: dict) -> Path:
+    """The answers file handed to the movers, removed by the caller: the
+    person's answers, with the master and every node of the agent added for
+    them to map to."""
+    body = {**answers, "_master": ctx["node"], "_nodes": sorted(ctx["known_nodes"])}
+    with tempfile.NamedTemporaryFile("w", delete=False, prefix="capabilities-migrate-",
+                                     suffix=".json") as handle:
+        handle.write(json.dumps(body, ensure_ascii=False))
+    path = Path(handle.name)
+    path.chmod(0o600)
+    return path
+
+
+# --- one agent: preflight -----------------------------------------------------------
+
+def _migrate_context(root: Path, opts: dict, answers: dict) -> dict:
+    """What a run on this agent stands on, and each reason it may not write:
+    `blockers` in the order a write refuses them."""
+    store = _store_module()
+    envelope = _project_capabilities_dir(root)
+    identity_file = envelope / PROJECT_IDENTITY_REL
+    identity = _read_json(identity_file)
+    identity = identity if isinstance(identity, dict) else {}
+    declared = str(identity.get("id") or "").strip() or None
+    bound = _contextkit_config_id(root)
+    ctx: dict = {"root": root, "envelope": envelope, "identity_file": identity_file,
+                 "identity": identity, "blockers": [], "questions": [], "warnings": [],
+                 "slug": identity.get("slug") or _default_project_slug(root)}
+    agent_id = declared or bound
+    if declared and bound and declared != bound:
+        wanted = answers.get("id")
+        if wanted in (declared, bound):
+            agent_id = wanted
+        else:
+            ctx["questions"].append({
+                "id": "id", "answer": "id", "choices": [declared, bound],
+                "question": f"{identity_file} declares id {declared} and "
+                            f"{root / CONTEXTKIT_CONFIG_REL} declares {bound}: which id is "
+                            "this agent's? The other is left behind"})
+    if not agent_id:
+        raise _MigrateRefusal("no_project_identity",
+                              f"{identity_file} carries no project id and no "
+                              f"{CONTEXTKIT_CONFIG_REL} holds one",
+                              "give the agent an id with `capabilities init`, or archive it")
+    ctx["agent_id"] = agent_id
+    ctx["id_write"] = agent_id if agent_id != declared else None
+    try:
+        ctx["mode"] = ("store" if store.records_mode(envelope) == "store"
+                       else "connections" if store.connections_mode(envelope) == "store"
+                       else "files")
+    except store.StoreError as exc:
+        raise _MigrateRefusal(exc.slug, exc.message, exc.hint) from None
+    node = os.environ.get(store.NODE_NAME_ENV, "").strip()
+    ctx["node"] = node or None
+    if not node:
+        ctx["blockers"].append(_MigrateRefusal(
+            "node_unnamed", f"{store.NODE_NAME_ENV} is not set: a migration names the node "
+            "it runs on, the agent's master", f"set {store.NODE_NAME_ENV} for this machine "
+            "(its shells and its launchd services), then run it again"))
+    named = answers.get("node")
+    if node and named is not None and named != node:
+        ctx["blockers"].append(_MigrateRefusal(
+            "node_mismatch", f"the answers name node {named!r} and this process runs as "
+            f"{node!r} ({store.NODE_NAME_ENV})", "run it on the node the answers name, or "
+            "correct the answers"))
+    journal = _migrate_journal(agent_id)
+    ctx["journal"] = journal
+    if node and journal and journal.get("node") and journal["node"] != node \
+            and journal.get("phase") != "finalized":
+        ctx["blockers"].append(_MigrateRefusal(
+            "node_mismatch", f"the open migration of {agent_id} was started on node "
+            f"{journal['node']!r}, and this process runs as {node!r}",
+            f"finish it on {journal['node']}"))
+    conn, setting = _migrate_connect(root)
+    ctx["setting"] = setting
+    try:
+        import psycopg
+        try:
+            conn.execute("SELECT 1").fetchone()
+            conn.rollback()
+        except psycopg.Error as exc:
+            raise _MigrateRefusal("store_unreachable", f"the store does not answer: {exc}",
+                                  "check it with `capabilities store doctor`",
+                                  exit_code=5) from None
+        ctx["state"] = _migrate_agent_state(conn, agent_id)
+        ctx["nodes"] = _migrate_node_rows(conn, agent_id)
+        ctx["global_migrated_at"] = _migrate_global_at(conn)
+    finally:
+        conn.close()
+    state = ctx["state"] or {}
+    master = state.get("master")
+    ctx["master"] = master
+    if node and master and master != node:
+        ctx["blockers"].append(_MigrateRefusal(
+            "not_master", f"node {node} is not the master of agent {agent_id}; its master "
+            f"is {master}", f"run `capabilities migrate` on {master}"))
+    if not ctx["global_migrated_at"]:
+        ctx["blockers"].append(_MigrateRefusal(
+            "global_not_migrated", "the global records are not in the store yet: an "
+            "agent's migration needs the rows every agent inherits",
+            "run `capabilities migrate --global --apply` on the global master first"))
+    manifests = _migrate_manifests()
+    ctx["manifests"] = manifests
+    outdated = _migrate_outdated(manifests)
+    if outdated:
+        ctx["blockers"].append(_MigrateRefusal(
+            "payload_outdated", f"{len(outdated)} installed payload(s) are stamped with a "
+            f"contract before `migrate files`: {', '.join(outdated)}",
+            "update them with `capabilities update`, then run it again",
+            detail={"payloads": outdated}))
+    ctx["known_nodes"] = set(ctx["nodes"]) | ({node} if node else set())
+    for name, answer in (answers.get("nodes") or {}).items():
+        if isinstance(answer, dict) and answer.get("register") is True:
+            ctx["known_nodes"].add(name)
+    return ctx
+
+
+# --- one agent: the plan ------------------------------------------------------------
+
+def _migrate_records_plan(ctx: dict, answers: dict) -> dict:
+    """The records rows this agent's files resolve to at its own scope, and
+    what the store holds of them: connections, grants and the default pointer
+    (where the files hold them), identifiers and the gate (where they hold
+    those)."""
+    store = _store_module()
+    envelope, agent_id, mode = ctx["envelope"], ctx["agent_id"], ctx["mode"]
+    files = store.FileRecords(envelope, _CONFIG_HOME, agent_id, ctx["slug"])
+    plan: dict = {"connections": [], "grants": [], "identifiers": [], "policy": [],
+                  "remove": [], "kept": [], "questions": []}
+    if mode == "store":
+        plan["kept"] = ["connection", "grant", "identifier", "policy"]
+        return plan
+    conn, _setting = _migrate_connect(ctx["root"])
+    try:
+        held_specs = _migrate_connection_rows(conn)
+        held_grants = _migrate_grant_rows(conn, agent_id)
+        held_ids = _migrate_identifier_rows(conn, agent_id)
+        held_policy = _migrate_policy_rows(conn, agent_id)
+    finally:
+        conn.close()
+    if mode == "files":
+        try:
+            wanted, _skipped = _import_plan(files, _import_names(envelope))
+        except _ImportRefused as exc:
+            raise _MigrateRefusal(exc.code, exc.message, exc.hint) from None
+        for name, entry in sorted(wanted.items()):
+            for cid, spec in sorted(entry["connections"].items()):
+                held = held_specs.get((name, cid))
+                qid = f"connections.{name}/{cid}"
+                if held is None:
+                    outcome = "write"
+                elif held == spec:
+                    outcome = "held"
+                else:
+                    choice = _migrate_dig(answers, qid)
+                    outcome = {"files": "replace", "store": "kept"}.get(choice, "differs")
+                    if outcome == "differs":
+                        plan["questions"].append({
+                            "id": qid, "answer": qid, "choices": ["files", "store"],
+                            "question": f"{name} connection {cid!r} is in the store as "
+                                        f"{json.dumps(held, sort_keys=True)} and in this "
+                                        f"agent's files as {json.dumps(spec, sort_keys=True)}; "
+                                        "every agent granted it reads the store's: keep "
+                                        "the store's, or replace it with the files'?"})
+                plan["connections"].append({"capability": name, "name": cid, "spec": spec,
+                                            "store": held, "outcome": outcome})
+            for cid, grant in sorted(entry["grants"].items()):
+                row = (grant["enabled"], grant["allow_write"], grant["is_default"])
+                held = held_grants.pop((name, cid), None)
+                plan["grants"].append({"capability": name, "connection": cid,
+                                       "enabled": row[0], "allow_write": row[1],
+                                       "is_default": row[2],
+                                       "outcome": "held" if held == row else "write"})
+        for (name, cid), _row in sorted(held_grants.items()):
+            plan["remove"].append({"kind": "grant", "capability": name, "name": cid})
+    for name in _import_identifier_names(envelope):
+        try:
+            rows = files.resolve_scope(name, "identifier", "project")
+        except store.StoreError as exc:
+            raise _MigrateRefusal("files_unreadable", f"{name} identifiers: {exc.message}",
+                                  "repair them (`capabilities doctor` names the faults)")
+        for label, row in sorted(rows.items()):
+            wanted = (row["value"], row["note"] or "")
+            held = held_ids.pop((name, label), None)
+            plan["identifiers"].append({"capability": name, "label": label,
+                                        "value": wanted[0], "note": wanted[1],
+                                        "outcome": "held" if held == wanted else "write"})
+    for (name, label), _row in sorted(held_ids.items()):
+        plan["remove"].append({"kind": "identifier", "capability": name, "name": label})
+    try:
+        gate = files.resolve_scope("capabilities", "policy", "project")
+    except store.StoreError as exc:
+        raise _MigrateRefusal("files_unreadable", f"policy: {exc.message}",
+                              "repair it (`capabilities doctor` names the faults)")
+    for name, row in sorted(gate.items()):
+        value = row["value"]
+        if (not isinstance(value, dict) or set(value) != {"enabled"}
+                or not isinstance(value.get("enabled"), bool)):
+            raise _MigrateRefusal("files_unreadable", f"the project gate for {name!r} is "
+                                  'not {"enabled": true|false}',
+                                  "repair it (`capabilities doctor` names the faults)")
+        held = held_policy.pop((name, None), None)
+        plan["policy"].append({"capability": name, "node": None,
+                               "enabled": value["enabled"],
+                               "outcome": "held" if held == value["enabled"] else "write"})
+    ctx["held_node_policy"] = {key: value for key, value in held_policy.items() if key[1]}
+    for (name, node), _enabled in sorted(held_policy.items(), key=lambda k: (k[0][0], k[0][1] or "")):
+        if node is None:
+            plan["remove"].append({"kind": "policy", "capability": name, "name": name})
+    if mode == "connections":
+        plan["kept"] = ["connection", "grant"]
+    return plan
+
+
+def _migrate_settings_plan(ctx: dict, excludes: dict) -> list[dict]:
+    """Each settings document this agent keeps in files - every capability's
+    project home and named document - as the rows it would become."""
+    root, envelope = ctx["root"], ctx["envelope"]
+    conn, _setting = _migrate_connect(root)
+    sources: list[tuple[str, Path, str, list]] = []
+    for name, home in _migrate_settings_homes(ctx["manifests"], "project"):
+        sources.append((name, envelope / name / home["path"], home.get("format") or "json",
+                        excludes.get(name) or []))
+    for (name, doc), (filename, fmt) in sorted(MIGRATE_NAMED_SETTINGS.items()):
+        sources.append((f"{name}.{doc}", envelope / name / filename, fmt, []))
+    out = []
+    try:
+        for document_key, path, fmt, exclude in sources:
+            document, problem = _migrate_read_document(path, fmt)
+            if problem:
+                raise _MigrateRefusal("settings_unreadable", problem,
+                                      "repair the file, then run it again")
+            if document is None:
+                continue
+            wanted = _migrate_without(document, exclude)
+            held = _migrate_setting_rows(conn, ctx["agent_id"], document_key)
+            out.append({"document": document_key, "file": str(path), "format": fmt,
+                        "excluded": exclude, "document_value": wanted,
+                        "outcome": "held" if held == wanted else "write",
+                        "host_paths": _migrate_host_paths(wanted)})
+    finally:
+        conn.close()
+    return out
+
+
+def _migrate_plan(ctx: dict, answers: dict) -> dict:
+    """Everything a write would do for this agent, every question open, and
+    every finding a person should see first. Writes nothing."""
+    root = ctx["root"]
+    plan: dict = {"questions": list(ctx["questions"]), "warnings": list(ctx["warnings"])}
+    names = _migrate_movers(ctx["manifests"])
+    answers_file = _migrate_mover_answers(ctx, answers)
+    try:
+        movers = _migrate_run_movers(root, names, "plan", answers_file, ctx["agent_id"])
+    finally:
+        answers_file.unlink(missing_ok=True)
+    plan["movers"] = movers
+    excludes: dict = {}
+    nodes: dict = {}
+    policy: list = []
+    for name, report in movers.items():
+        if not report.get("ok"):
+            continue
+        plan["questions"].extend(report.get("questions") or [])
+        plan["warnings"].extend(f"{name}: {w}" for w in report.get("warnings") or [])
+        if report.get("settings_exclude"):
+            excludes[name] = report["settings_exclude"]
+        for entry in report.get("nodes") or []:
+            nodes[entry["node"]] = entry
+        policy.extend(report.get("policy") or [])
+    failed = {name: r["error"] for name, r in movers.items() if not r.get("ok")}
+    plan["mover_failures"] = failed
+    # One node per deployment target: registered by the master once a person
+    # says so, since only then may placement name it.
+    plan["nodes"] = []
+    for node, entry in sorted(nodes.items()):
+        registered = node in ctx["nodes"]
+        given = (answers.get("nodes") or {}).get(node)
+        register = given.get("register") if isinstance(given, dict) else None
+        row = {**entry, "registered": registered,
+               "address": (given or {}).get("address") if isinstance(given, dict) else None,
+               "outcome": "held" if registered else
+               "register" if register is True else
+               "later" if register == "later" else "open"}
+        plan["nodes"].append(row)
+        if row["outcome"] == "open":
+            plan["questions"].append({
+                "id": f"nodes.{node}", "answer": f"nodes.{node}",
+                "choices": [{"register": True, "address": "<host or IP, optional>"},
+                            {"register": "later"}],
+                "question": f"deployment target {entry.get('target')!r} runs as node "
+                            f"{node!r}: register it as a server node of this agent now, or "
+                            "later with `capabilities node add` before the migration can "
+                            "finish?"})
+    # A node the answers say to register - one a legacy automation runs on,
+    # say - is registered with the rest.
+    declared = {row["node"] for row in plan["nodes"]}
+    for node, given in sorted((answers.get("nodes") or {}).items()):
+        if node in declared or node in ctx["nodes"] or node == ctx["node"] \
+                or not isinstance(given, dict) or given.get("register") is not True:
+            continue
+        plan["nodes"].append({"node": node, "kind": given.get("kind") or "server",
+                              "target": given.get("target"), "registered": False,
+                              "address": given.get("address"), "outcome": "register"})
+        declared.add(node)
+    # A node placement names that no target declares is a node to register
+    # all the same.
+    for node in sorted({row["node"] for row in policy} - declared - set(ctx["nodes"])
+                       - {ctx["node"]}):
+        given = (answers.get("nodes") or {}).get(node)
+        register = given.get("register") if isinstance(given, dict) else None
+        row = {"node": node, "kind": "server", "target": None, "registered": False,
+               "address": given.get("address") if isinstance(given, dict) else None,
+               "outcome": "register" if register is True else
+               "later" if register == "later" else "open"}
+        plan["nodes"].append(row)
+        if row["outcome"] == "open":
+            plan["questions"].append({
+                "id": f"nodes.{node}", "answer": f"nodes.{node}",
+                "choices": [{"register": True, "address": "<host or IP, optional>"},
+                            {"register": "later"}],
+                "question": f"services are placed on node {node!r}, which is not a node "
+                            "of this agent: register it now, or later?"})
+    waiting = {row["node"] for row in plan["nodes"] if row["outcome"] in ("later", "open")}
+    plan["placement"] = [dict(row, outcome="write" if row["node"] in ctx["known_nodes"]
+                              and row["node"] not in waiting else "deferred")
+                         for row in policy]
+    plan["records"] = _migrate_records_plan(ctx, answers)
+    plan["questions"].extend(plan["records"].pop("questions"))
+    plan["settings"] = _migrate_settings_plan(ctx, excludes)
+    for entry in plan["settings"]:
+        for found in entry["host_paths"]:
+            plan["warnings"].append(f"{entry['document']} settings carry a host path, which "
+                                    f"every node will read: {found}")
+    files = _migrate_record_files(ctx["envelope"], ctx["manifests"])
+    mover_files = [Path(p) for r in movers.values() if r.get("ok")
+                   for p in (r.get("files") or [])]
+    plan["files"] = [str(p) for p in files + [p for p in mover_files if p not in files]]
+    git = _migrate_git_state(root, [Path(p) for p in plan["files"]])
+    plan["git"] = git
+    for path, state in sorted(git.items()):
+        if state == "modified":
+            plan["warnings"].append(f"{path} differs from its committed copy; the working "
+                                    "tree is what moves")
+    if ctx["mode"] == "store":
+        plan["stale"] = _migrate_stale(ctx)
+    plan["verify_only"] = _migrate_siblings(ctx, plan["files"])
+    return plan
+
+
+def _migrate_stale(ctx: dict) -> list[str]:
+    """For an agent whose records were already in the store: where its files
+    still say otherwise. Never a failure; they are removed."""
+    store = _store_module()
+    envelope = ctx["envelope"]
+    out = []
+    try:
+        files = store.FileRecords(envelope, _CONFIG_HOME, ctx["agent_id"], ctx["slug"],
+                                  include_global=False)
+        stored = store.StoreRecords(envelope, _CONFIG_HOME, ctx["agent_id"], ctx["slug"],
+                                    include_global=False, project_root=ctx["root"])
+        try:
+            for name in sorted(set(_import_names(envelope))
+                               | set(_import_identifier_names(envelope))):
+                for collection in ("connection", "identifier"):
+                    left = {k: r["value"] for k, r in
+                            files.resolve_scope(name, collection, "project").items()}
+                    right = {k: r["value"] for k, r in
+                             stored.resolve_scope(name, collection, "project").items()}
+                    for key in sorted(left):
+                        if left.get(key) != right.get(key):
+                            out.append(f"{name} {collection} {key}: the file says "
+                                       f"{json.dumps(left.get(key), sort_keys=True)}, the "
+                                       f"store {json.dumps(right.get(key), sort_keys=True)}")
+            left = {k: r["value"] for k, r in
+                    files.resolve_scope("capabilities", "policy", "project").items()}
+            right = {k: r["value"] for k, r in
+                     stored.resolve_scope("capabilities", "policy", "project").items()}
+            for key in sorted(left):
+                if left.get(key) != right.get(key):
+                    out.append(f"policy {key}: the file says {json.dumps(left.get(key))}, "
+                               f"the store {json.dumps(right.get(key))}")
+        finally:
+            stored.close()
+    except store.StoreError as exc:
+        out.append(f"the stale files could not all be read: {exc.message}")
+    return out
+
+
+def _migrate_siblings(ctx: dict, files: list[str]) -> list[dict]:
+    """Other roots on this machine holding the same agent - a worktree, a
+    deploy checkout: verify-only, their differences named, nothing written."""
+    out = []
+    here = Path(ctx["root"]).resolve()
+    for entry in _migrate_discover([]):
+        if entry.get("id") != ctx["agent_id"] or Path(entry["root"]) == here:
+            continue
+        other = Path(entry["envelope"])
+        differences = []
+        for path in files:
+            try:
+                relative = Path(path).relative_to(ctx["envelope"])
+            except ValueError:
+                continue
+            mine, theirs = Path(path), other / relative
+            if not theirs.is_file():
+                differences.append(f"{relative}: absent there")
+            elif theirs.read_bytes() != mine.read_bytes():
+                differences.append(f"{relative}: differs")
+        out.append({"root": entry["root"], "sources": entry["sources"],
+                    "differences": differences})
+    return out
+
+
+# --- one agent: the write -----------------------------------------------------------
+
+def _migrate_archive(ctx: dict, journal: dict, files: list[str], git: dict) -> None:
+    """Copy every file git does not hold as it stands - untracked, ignored, or
+    changed since its commit - into the agent's archive in the state home, each
+    0600, before anything changes it."""
+    if journal.get("archive"):
+        return
+    stamp = _utc_now().replace(":", "")
+    archive = _migrate_home(ctx["agent_id"]) / "archive" / stamp
+    kept = []
+    for path in files:
+        if git.get(path) == "tracked":
+            continue
+        source = Path(path)
+        if not source.is_file():
+            continue
+        try:
+            relative = source.relative_to(ctx["root"])
+        except ValueError:
+            relative = Path(source.name)
+        target = archive / relative
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.copyfile(source, target)
+        target.chmod(0o600)
+        kept.append(str(target))
+    journal["archive"] = {"dir": str(archive), "files": kept}
+
+
+def _migrate_launchd_plists(root: Path) -> list[tuple[str, Path]]:
+    """The launchd agents of this user that run something of this root."""
+    library = Path.home() / "Library" / "LaunchAgents"
+    out = []
+    if not library.is_dir():
+        return out
+    import plistlib
+    marker = str(root.resolve())
+    for path in sorted(library.glob("*.plist")):
+        try:
+            text = path.read_bytes()
+            body = plistlib.loads(text)
+        except Exception:
+            continue
+        if marker.encode() not in text or not isinstance(body, dict):
+            continue
+        label = body.get("Label")
+        if isinstance(label, str) and label:
+            out.append((label, path))
+    return out
+
+
+def _migrate_answer_paused(answer) -> bool:
+    """Whether a service's status says it holds a pause already: `paused`
+    true, or a `pause` naming when it was set, every lane, or some lanes."""
+    if isinstance(answer, list):
+        return any(_migrate_answer_paused(value) for value in answer)
+    if not isinstance(answer, dict):
+        return False
+    if answer.get("paused") is True:
+        return True
+    pause = answer.get("pause")
+    if isinstance(pause, dict) and (pause.get("at") or pause.get("all") or pause.get("lanes")):
+        return True
+    return any(_migrate_answer_paused(value) for value in answer.values()
+               if isinstance(value, (dict, list)))
+
+
+def _migrate_stop_services(ctx: dict, journal: dict) -> None:
+    """Stop this agent's launchd agents on this machine and pause its services
+    that take a pause, recording each in the journal so finalize undoes
+    exactly what this did. A service already paused by someone is left as it
+    is and stays paused."""
+    if journal.get("services") is not None:
+        return
+    root = ctx["root"]
+    done: dict = {"launchd": [], "paused": [], "left": []}
+    launchctl = shutil.which("launchctl")
+    if launchctl:
+        domain = f"gui/{os.getuid()}"
+        for label, plist in _migrate_launchd_plists(root):
+            loaded = subprocess.run([launchctl, "print", f"{domain}/{label}"],
+                                    capture_output=True, text=True, timeout=30)
+            if loaded.returncode != 0:
+                continue
+            stopped = subprocess.run([launchctl, "bootout", f"{domain}/{label}"],
+                                     capture_output=True, text=True, timeout=60)
+            done["launchd"].append({"label": label, "plist": str(plist),
+                                    "stopped": stopped.returncode == 0,
+                                    **({} if stopped.returncode == 0 else
+                                       {"error": (stopped.stderr or stopped.stdout).strip()})})
+    for name, manifest in sorted(ctx["manifests"].items()):
+        verbs = ((manifest.get("service") or {}).get("verbs") or [])
+        if "pause" not in verbs or "resume" not in verbs:
+            continue
+        script = CAP_HOME / name / name
+        env = _migrate_mover_env(root, ctx["agent_id"])
+        rc, stdout, _err = _run_script(script, ["service", "status"], cwd=root, env=env,
+                                       timeout=MIGRATE_SERVICE_TIMEOUT)
+        try:
+            status = json.loads(stdout) if rc == 0 else None
+        except ValueError:
+            status = None
+        if status is None:
+            done["left"].append({"capability": name, "reason": "no service status here"})
+            continue
+        if _migrate_answer_paused(status):
+            done["left"].append({"capability": name, "reason": "already paused"})
+            continue
+        rc, _out, err = _run_script(script, ["service", "pause", "--reason",
+                                             f"capabilities migrate of {ctx['agent_id']}"],
+                                    cwd=root, env=env, timeout=MIGRATE_SERVICE_TIMEOUT)
+        if rc == 0:
+            done["paused"].append(name)
+        else:
+            done["left"].append({"capability": name, "reason": (err or "").strip()[-500:]})
+    journal["services"] = done
+
+
+def _migrate_resume_services(ctx: dict, journal: dict) -> dict:
+    services = journal.get("services") or {}
+    resumed: dict = {"launchd": [], "resumed": [], "failed": []}
+    launchctl = shutil.which("launchctl")
+    for entry in services.get("launchd") or []:
+        if not entry.get("stopped") or not launchctl:
+            continue
+        rc = subprocess.run([launchctl, "bootstrap", f"gui/{os.getuid()}", entry["plist"]],
+                            capture_output=True, text=True, timeout=60)
+        (resumed["launchd"] if rc.returncode == 0 else resumed["failed"]).append(entry["label"])
+    for name in services.get("paused") or []:
+        rc, _out, err = _run_script(CAP_HOME / name / name, ["service", "resume"],
+                                    cwd=ctx["root"],
+                                    env=_migrate_mover_env(ctx["root"], ctx["agent_id"]),
+                                    timeout=MIGRATE_SERVICE_TIMEOUT)
+        (resumed["resumed"] if rc == 0 else resumed["failed"]).append(name)
+    journal["services_resumed"] = resumed
+    return resumed
+
+
+def _migrate_writer(ctx: dict):
+    """The records adapter the migration writes settings through: this agent
+    on its master, as `migrate`."""
+    store = _store_module()
+    conn, _setting = _migrate_connect(ctx["root"])
+    try:
+        state = _migrate_agent_state(conn, ctx["agent_id"]) or {}
+    finally:
+        conn.close()
+    return store.AgentRecords(ctx["envelope"], _CONFIG_HOME, ctx["agent_id"], ctx["slug"],
+                              agent=state, node=ctx["node"], project_root=ctx["root"],
+                              actor=MIGRATE_ACTOR)
+
+
+def _migrate_kernel(ctx: dict, work):
+    """`work(conn)` in one transaction on the agent's store, its tables
+    brought to this code's version first."""
+    store = _store_module()
+    db = _db_module()
+    conn, _setting = _migrate_connect(ctx["root"])
+    import psycopg
+    try:
+        major, minor = store.STORE_TABLES_VERSION
+        db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
+                   major=major, minor=minor)
+        with conn.transaction():
+            return work(conn)
+    except db.DbError as exc:
+        raise _MigrateRefusal(exc.slug, exc.message, exc.hint,
+                              exit_code=_store_error_exit(exc)) from None
+    except psycopg.OperationalError as exc:
+        raise _MigrateRefusal("store_unreachable", f"cannot reach the store: {exc}",
+                              "check it with `capabilities store doctor`", exit_code=5) from None
+    except psycopg.Error as exc:
+        raise _MigrateRefusal("store_write_failed", f"the store refused the write: {exc}",
+                              exit_code=5) from None
+    finally:
+        conn.close()
+
+
+def _migrate_register(ctx: dict, plan: dict) -> dict:
+    """The agent row and its master: registered on the first run, the row
+    marked `migrating_since` from here until finalize; and each target node a
+    person said to register."""
+    agent_id, node = ctx["agent_id"], ctx["node"]
+    name = None
+    try:
+        import tomllib
+        config = tomllib.loads((ctx["root"] / CONTEXTKIT_CONFIG_REL).read_text())
+        name = ((config.get("identity") or {}).get("name") or "").strip() or None
+    except (OSError, ValueError, AttributeError):
+        pass
+    kind = "mac" if sys.platform == "darwin" else "server"
+
+    def work(conn):
+        created = _ensure_agent_row(conn, agent_id)
+        if name:
+            conn.execute("UPDATE capabilities_agents SET name = %s WHERE id = %s "
+                         "AND name IS NULL", (name, agent_id))
+        master = conn.execute("SELECT node FROM capabilities_agent_nodes "
+                              "WHERE agent_id = %s AND is_master", (agent_id,)).fetchone()
+        registered = []
+        if master is None:
+            conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node, kind, "
+                         "is_master) VALUES (%s, %s, %s, true) ON CONFLICT (agent_id, node) "
+                         "DO UPDATE SET is_master = true", (agent_id, node, kind))
+            registered.append({"node": node, "kind": kind, "master": True})
+        elif master[0] != node:
+            raise _MigrateRefusal("not_master", f"node {node} is not the master of agent "
+                                  f"{agent_id}; its master is {master[0]}",
+                                  f"run `capabilities migrate` on {master[0]}")
+        for row in plan["nodes"]:
+            if row["outcome"] != "register":
+                continue
+            conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node, kind, address, "
+                         "target) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (agent_id, node) "
+                         "DO NOTHING", (agent_id, row["node"], row.get("kind") or "server",
+                                        row.get("address"), row.get("target")))
+            registered.append({"node": row["node"], "kind": row.get("kind") or "server",
+                               "target": row.get("target")})
+        conn.execute("UPDATE capabilities_agents SET migrating_since = now(), "
+                     "updated_at = now() WHERE id = %s AND migrating_since IS NULL",
+                     (agent_id,))
+        since = conn.execute("SELECT migrating_since FROM capabilities_agents WHERE id = %s",
+                             (agent_id,)).fetchone()[0]
+        return {"agent_created": created, "nodes_registered": registered,
+                "migrating_since": _store_module()._stamp(since)}
+    return _migrate_kernel(ctx, work)
+
+
+def _migrate_write_records(ctx: dict, plan: dict) -> dict:
+    """The agent's records rows, as planned, in one transaction: connection
+    specs, its grants and default, its identifiers and its gate, and the
+    placement rows naming registered nodes; rows of the agent the files do not
+    hold are removed."""
+    agent_id = ctx["agent_id"]
+    records = plan["records"]
+    written = {"connections": 0, "grants": 0, "identifiers": 0, "policy": 0,
+               "placement": 0, "removed": 0}
+
+    def work(conn):
+        for row in records["connections"]:
+            if row["outcome"] not in ("write", "replace"):
+                continue
+            conn.execute("INSERT INTO capabilities_connections (capability, name, spec) "
+                         "VALUES (%s, %s, %s::jsonb) ON CONFLICT (capability, name) "
+                         "DO UPDATE SET spec = EXCLUDED.spec",
+                         (row["capability"], row["name"],
+                          json.dumps(row["spec"], ensure_ascii=False)))
+            written["connections"] += 1
+        for entry in records["remove"]:
+            kind, name, key = entry["kind"], entry["capability"], entry["name"]
+            if kind == "grant":
+                conn.execute("DELETE FROM capabilities_connection_grants WHERE agent_id = %s "
+                             "AND capability = %s AND connection = %s AND node IS NULL",
+                             (agent_id, name, key))
+            elif kind == "identifier":
+                conn.execute("DELETE FROM capabilities_identifiers WHERE agent_id = %s "
+                             "AND capability = %s AND label = %s AND node IS NULL",
+                             (agent_id, name, key))
+            else:
+                conn.execute("DELETE FROM capabilities_policy WHERE agent_id = %s "
+                             "AND capability = %s AND node IS NULL", (agent_id, name))
+            written["removed"] += 1
+        for row in records["grants"]:
+            if row["outcome"] != "write":
+                continue
+            if row["is_default"]:
+                conn.execute("UPDATE capabilities_connection_grants SET is_default = false "
+                             "WHERE agent_id = %s AND capability = %s AND node IS NULL "
+                             "AND connection <> %s AND is_default",
+                             (agent_id, row["capability"], row["connection"]))
+            conn.execute(
+                "INSERT INTO capabilities_connection_grants (agent_id, capability, "
+                "connection, node, enabled, allow_write, is_default) "
+                "VALUES (%s, %s, %s, NULL, %s, %s, %s) "
+                "ON CONFLICT ((coalesce(agent_id, '')), capability, connection, "
+                "(coalesce(node, ''))) DO UPDATE SET enabled = EXCLUDED.enabled, "
+                "allow_write = EXCLUDED.allow_write, is_default = EXCLUDED.is_default",
+                (agent_id, row["capability"], row["connection"], row["enabled"],
+                 row["allow_write"], row["is_default"]))
+            written["grants"] += 1
+        for row in records["identifiers"]:
+            if row["outcome"] != "write":
+                continue
+            conn.execute(
+                "INSERT INTO capabilities_identifiers (agent_id, capability, node, label, "
+                "value, note) VALUES (%s, %s, NULL, %s, %s::jsonb, %s) "
+                "ON CONFLICT ((coalesce(agent_id, '')), capability, label, "
+                "(coalesce(node, ''))) DO UPDATE SET value = EXCLUDED.value, "
+                "note = EXCLUDED.note, updated_at = now()",
+                (agent_id, row["capability"], row["label"],
+                 json.dumps(row["value"], ensure_ascii=False), row["note"]))
+            written["identifiers"] += 1
+        for row in records["policy"] + [r for r in plan["placement"] if r["outcome"] == "write"]:
+            if row.get("outcome") == "held":
+                continue
+            conn.execute(
+                "INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT ((coalesce(agent_id, '')), capability, "
+                "(coalesce(node, ''))) DO UPDATE SET enabled = EXCLUDED.enabled, "
+                "updated_at = now()", (agent_id, row["capability"], row["node"],
+                                       row["enabled"]))
+            written["placement" if row["node"] else "policy"] += 1
+        return written
+    return _migrate_kernel(ctx, work)
+
+
+def _migrate_write_settings(ctx: dict, plan: dict) -> dict:
+    """Each settings document as rows, through the adapter's one writer: the
+    trail names `migrate@<node>`, and a document the rows already hold as
+    the file says is left alone."""
+    store = _store_module()
+    writer = _migrate_writer(ctx)
+    written = {}
+    try:
+        for entry in plan["settings"]:
+            # The file is read again here: a mover may have rewritten it.
+            document, problem = _migrate_read_document(Path(entry["file"]), entry["format"])
+            if problem:
+                raise _MigrateRefusal("settings_unreadable", problem)
+            if document is None:
+                continue
+            wanted = _migrate_without(document, entry["excluded"])
+            result = writer.settings_write(entry["document"], "project",
+                                           lambda _current, wanted=wanted: wanted,
+                                           actor=MIGRATE_ACTOR)
+            written[entry["document"]] = {"changed": result["changed"],
+                                          "generation": result["generation"]}
+    except store.StoreError as exc:
+        raise _MigrateRefusal(exc.slug, exc.message, exc.hint,
+                              exit_code=_store_error_exit(exc)) from None
+    finally:
+        writer.close()
+    return written
+
+
+# --- one agent: verify --------------------------------------------------------------
+
+def _migrate_verify(ctx: dict, plan: dict) -> list[str]:
+    """Read everything back through the store as this agent's master will read
+    it once it has moved, and compare it both ways with what its files
+    resolve: connections and their grants and default, identifiers, the gate,
+    each settings document, the placement rows. An agent whose records were
+    already in the store compares only what moved now."""
+    store = _store_module()
+    differences: list[str] = []
+    envelope, agent_id = ctx["envelope"], ctx["agent_id"]
+    files = store.FileRecords(envelope, _CONFIG_HOME, agent_id, ctx["slug"])
+    rows = _migrate_writer(ctx)
+    rows.actor = None
+    try:
+        mode = ctx["mode"]
+        if mode == "files":
+            names = sorted(set(_import_names(envelope))
+                           | {r["capability"] for r in plan["records"]["grants"]})
+            for name in names:
+                for write_default in (False, True):
+                    before = files.connections(name, write_default=write_default,
+                                               include_disabled=True)
+                    after = rows.connections(name, write_default=write_default,
+                                             include_disabled=True)
+                    usable_before = {cid: (e["value"], e["allow_write"])
+                                     for cid, e in before.items() if e["enabled"]}
+                    usable_after = {cid: (e["value"], e["allow_write"])
+                                    for cid, e in after.items() if e["enabled"]}
+                    for cid in sorted(set(usable_before) | set(usable_after)):
+                        if usable_before.get(cid) != usable_after.get(cid):
+                            differences.append(
+                                f"{name} connection {cid} (write default {write_default}): "
+                                f"the files resolve {usable_before.get(cid)}, the store "
+                                f"{usable_after.get(cid)}")
+                left = files.get(name, "setting", "connection.default")
+                right = rows.get(name, "setting", "connection.default")
+                if left != right:
+                    differences.append(f"{name} default: the files point to {left!r}, the "
+                                       f"store to {right!r}")
+        if mode in ("files", "connections"):
+            names = sorted(set(_import_identifier_names(envelope))
+                           | {r["capability"] for r in plan["records"]["identifiers"]})
+            for name in names:
+                left = {k: (r["value"], r["note"] or "")
+                        for k, r in files.resolve(name, "identifier").items()}
+                right = {k: (r["value"], r["note"] or "")
+                         for k, r in rows.resolve(name, "identifier").items()}
+                for key in sorted(set(left) | set(right)):
+                    if left.get(key) != right.get(key):
+                        differences.append(f"{name} identifier {key}: the files resolve "
+                                           f"{left.get(key)}, the store {right.get(key)}")
+            left = {k: r["value"] for k, r in files.resolve("capabilities", "policy").items()}
+            right = {k: r["value"] for k, r in rows.resolve("capabilities", "policy").items()}
+            for key in sorted(set(left) | set(right)):
+                if left.get(key) != right.get(key):
+                    differences.append(f"gate {key}: the files resolve {left.get(key)}, "
+                                       f"the store {right.get(key)}")
+        moved = set()
+        for entry in plan["settings"]:
+            document, _problem = _migrate_read_document(Path(entry["file"]), entry["format"])
+            wanted = _migrate_without(document or {}, entry["excluded"])
+            held = rows.setting_document(entry["document"], "project")
+            moved.add(entry["document"])
+            if held != wanted:
+                differences.append(f"{entry['document']} settings: the file says "
+                                   f"{json.dumps(wanted, sort_keys=True)[:400]}, the store "
+                                   f"{json.dumps(held, sort_keys=True)[:400]}")
+        conn, _setting = _migrate_connect(ctx["root"])
+        try:
+            extra = {doc for (doc,) in _migrate_rows(
+                conn, "SELECT DISTINCT capability FROM capabilities_settings_documents "
+                      "WHERE agent_id = %s AND node IS NULL", (agent_id,))}
+            placed = _migrate_policy_rows(conn, agent_id)
+        finally:
+            conn.close()
+        for doc in sorted(extra - moved):
+            differences.append(f"{doc} settings: the store holds a document for this agent "
+                               "that no file of it says")
+        for row in plan["placement"]:
+            if row["outcome"] == "write" and \
+                    placed.get((row["capability"], row["node"])) is not row["enabled"]:
+                differences.append(f"placement {row['capability']}@{row['node']}: the store "
+                                   "does not hold it")
+    except store.StoreError as exc:
+        differences.append(f"reading back failed: {exc.message}")
+    finally:
+        rows.close()
+    return differences
+
+
+# --- one agent: finalize -------------------------------------------------------------
+
+def _migrate_remove_files(ctx: dict, files: list[str]) -> list[str]:
+    removed = []
+    folders = set()
+    for path in files:
+        target = Path(path)
+        if target.is_file():
+            target.unlink()
+            removed.append(path)
+            folders.add(target.parent)
+    envelope = Path(ctx["envelope"]).resolve()
+    for folder in sorted(folders, key=lambda p: len(p.parts), reverse=True):
+        here = folder
+        while here.resolve() != envelope and envelope in here.resolve().parents:
+            try:
+                here.rmdir()
+            except OSError:
+                break
+            here = here.parent
+    return removed
+
+
+def _migrate_finalize(ctx: dict, plan: dict | None, journal: dict) -> dict:
+    """Switch the agent: every target's node registered, then `migrated_at`
+    set and `migrating_since` cleared in one transaction, `"records":
+    "store"` in project.json, the files removed, the services resumed."""
+    agent_id = ctx["agent_id"]
+    targets = journal.get("target_nodes") or []
+
+    def work(conn):
+        held = {row[0] for row in conn.execute(
+            "SELECT node FROM capabilities_agent_nodes WHERE agent_id = %s",
+            (agent_id,)).fetchall()}
+        missing = [node for node in targets if node not in held]
+        if missing:
+            raise _MigrateRefusal(
+                "target_node_unregistered",
+                f"the deployment target node(s) {', '.join(missing)} of agent {agent_id} "
+                "are not registered, and placement can name only a registered node",
+                "register each with `capabilities node add <node> --kind server --target "
+                "<target>` on this master, then run `capabilities migrate --apply` again",
+                detail={"nodes": missing})
+        moved = conn.execute("UPDATE capabilities_agents SET migrated_at = coalesce("
+                             "migrated_at, now()), migrating_since = NULL, updated_at = now() "
+                             "WHERE id = %s RETURNING migrated_at", (agent_id,)).fetchone()
+        return _store_module()._stamp(moved[0])
+    migrated_at = _migrate_kernel(ctx, work)
+    journal["phase"] = "finalizing"
+    journal["migrated_at"] = migrated_at
+    _migrate_journal_save(agent_id, journal)
+    identity = _read_json(ctx["identity_file"])
+    identity = identity if isinstance(identity, dict) else {}
+    store = _store_module()
+    if identity.get(store.RECORDS_MODE_KEY) != "store" or store.CONNECTIONS_MODE_KEY in identity:
+        identity[store.RECORDS_MODE_KEY] = "store"
+        identity.pop(store.CONNECTIONS_MODE_KEY, None)
+        _write_json(ctx["identity_file"], identity)
+    removed = _migrate_remove_files(ctx, journal.get("files") or [])
+    journal["removed"] = sorted(set(journal.get("removed") or []) | set(removed))
+    resumed = _migrate_resume_services(ctx, journal)
+    journal["phase"] = "finalized"
+    journal["finished_at"] = _utc_now()
+    _migrate_journal_save(agent_id, journal)
+    return {"migrated_at": migrated_at, "removed": journal["removed"],
+            "archive": journal.get("archive"), "services": resumed,
+            "identity": str(ctx["identity_file"])}
+
+
+# --- one agent: the run ---------------------------------------------------------------
+
+def _migrate_summary(plan: dict) -> dict:
+    """The plan as a person reads it, without the documents' whole values."""
+    settings = [{k: v for k, v in entry.items() if k != "document_value"}
+                for entry in plan.get("settings") or []]
+    records = {key: value for key, value in (plan.get("records") or {}).items()}
+    movers = {}
+    for name, report in (plan.get("movers") or {}).items():
+        movers[name] = {k: v for k, v in report.items()
+                        if k not in ("capability", "action", "mover")}
+    return {**{k: v for k, v in plan.items() if k not in ("settings", "records", "movers")},
+            "settings": settings, "records": records, "movers": movers}
+
+
+def cmd_migrate_agent(opts: dict) -> None:
+    root = _require_project()
+    answers = _migrate_answers(opts.get("answers"))
+    apply = bool(opts.get("apply"))
+    if apply:
+        _read_only_gate("migrate --apply")
+    try:
+        ctx = _migrate_context(root, opts, answers)
+    except _MigrateRefusal as exc:
+        _migrate_refuse(exc)
+    state = ctx["state"] or {}
+    journal = ctx["journal"]
+    answer: dict = {"ok": True, "project": str(root), "agent_id": ctx["agent_id"],
+                    "node": ctx["node"], "mode": ctx["mode"],
+                    "applied": apply, "store": {"level": ctx["setting"].level,
+                                                "schema": ctx["setting"].schema}}
+    if state.get("migrated_at"):
+        unfinished = (journal is not None and journal.get("phase") == "finalizing"
+                      and journal.get("node") == ctx["node"])
+        if unfinished and apply:
+            # Interrupted after the switch: finish what finalize had left.
+            for blocker in ctx["blockers"]:
+                if blocker.code in ("node_unnamed", "node_mismatch", "not_master"):
+                    _migrate_refuse(blocker, answer)
+            try:
+                answer.update(state="migrated", resumed=True,
+                              **_migrate_finalize(ctx, None, journal))
+            except _MigrateRefusal as exc:
+                _migrate_refuse(exc, answer)
+            _emit(answer)
+            return
+        left = [str(p) for p in _migrate_record_files(ctx["envelope"], ctx["manifests"])]
+        answer.update(state="migrated", migrated_at=state["migrated_at"], changed=False,
+                      files_left=left)
+        if unfinished:
+            answer["finalize_pending"] = True
+            answer["hint"] = "`capabilities migrate --apply` finishes the finalize"
+        elif left:
+            answer["hint"] = ("these files are no longer read; remove them, or run "
+                              "`capabilities migrate --report`")
+        _emit(answer)
+        return
+    answer["state"] = ("migrating" if state.get("migrating_since") else
+                       "registered" if state else "unregistered")
+    if state.get("migrating_since"):
+        answer["migrating_since"] = state["migrating_since"]
+    answer["blockers"] = [{"code": b.code, "message": b.message, "hint": b.hint}
+                          for b in ctx["blockers"]]
+    if ctx["id_write"]:
+        answer["identity_write"] = {"file": str(ctx["identity_file"]), "id": ctx["id_write"]}
+    if apply and ctx["blockers"]:
+        _migrate_refuse(ctx["blockers"][0], answer)
+    if not ctx["node"]:
+        # A dry run without a node cannot say what each node would hold.
+        _emit(answer)
+        return
+    try:
+        plan = _migrate_plan(ctx, answers)
+    except _MigrateRefusal as exc:
+        _migrate_refuse(exc, answer)
+    answer["plan"] = _migrate_summary(plan)
+    answer["questions"] = plan["questions"]
+    if plan["mover_failures"]:
+        failure = _MigrateRefusal(
+            "mover_failed", f"{len(plan['mover_failures'])} capability mover(s) could not "
+            f"say what they would move: {', '.join(sorted(plan['mover_failures']))}",
+            "each one's error is under detail; repair it and run it again",
+            detail=plan["mover_failures"])
+        if apply:
+            _migrate_refuse(failure, answer)
+        answer["blockers"].append({"code": failure.code, "message": failure.message,
+                                   "detail": failure.detail})
+    if not apply:
+        answer["would_write"] = not plan["questions"] and not answer["blockers"]
+        _emit(answer)
+        return
+    if plan["questions"]:
+        _migrate_refuse(_MigrateRefusal(
+            "question_open", f"{len(plan['questions'])} question(s) are open and nothing was "
+            "written: " + "; ".join(q["id"] for q in plan["questions"]),
+            "answer each in a JSON file at the path its `answer` names and pass it with "
+            "--answers"), answer)
+    agent_id = ctx["agent_id"]
+    waiting = [row["node"] for row in plan["nodes"]
+               if row["outcome"] in ("later", "open") and not row["registered"]]
+    if waiting and journal and journal.get("phase") in ("written", "verified"):
+        # Everything is written and only finalize waits, for a node nobody
+        # registered yet: nothing more to do until someone does.
+        _migrate_refuse(_MigrateRefusal(
+            "target_node_unregistered",
+            f"the deployment target node(s) {', '.join(waiting)} of agent {agent_id} are "
+            "not registered, and the migration finishes only once they are",
+            "register each with `capabilities node add <node> --kind server --target "
+            "<target>` on this master, then run `capabilities migrate --apply` again",
+            detail={"nodes": waiting}), answer)
+    journal = journal if journal and journal.get("phase") != "finalized" else None
+    journal = journal or {"schema": MIGRATE_JOURNAL_SCHEMA, "agent_id": agent_id,
+                          "root": str(root), "node": ctx["node"], "phase": "writing",
+                          "started_at": _utc_now()}
+    journal["files"] = sorted(set(journal.get("files") or []) | set(plan["files"]))
+    journal["target_nodes"] = sorted(row["node"] for row in plan["nodes"])
+    try:
+        if ctx["id_write"]:
+            identity = _read_json(ctx["identity_file"]) or {}
+            identity["id"] = ctx["id_write"]
+            identity.setdefault("schema", PROJECT_IDENTITY_SCHEMA)
+            identity.setdefault("slug", ctx["slug"])
+            _write_json(ctx["identity_file"], identity)
+            answer["identity_written"] = ctx["id_write"]
+        _migrate_archive(ctx, journal, plan["files"], plan["git"])
+        _migrate_journal_save(agent_id, journal)
+        answer["registered"] = _migrate_register(ctx, plan)
+        ctx["nodes"] = {**ctx["nodes"], **{r["node"]: r for r in
+                                           answer["registered"]["nodes_registered"]}}
+        _migrate_stop_services(ctx, journal)
+        _migrate_journal_save(agent_id, journal)
+        answers_file = _migrate_mover_answers(ctx, answers)
+        try:
+            written = _migrate_run_movers(root, _migrate_movers(ctx["manifests"]), "write",
+                                          answers_file, agent_id)
+        finally:
+            answers_file.unlink(missing_ok=True)
+        failed = {name: r["error"] for name, r in written.items() if not r.get("ok")}
+        answer["movers"] = {name: {k: v for k, v in r.items()
+                                   if k not in ("capability", "action", "mover")}
+                            for name, r in written.items()}
+        if failed:
+            raise _MigrateRefusal("mover_failed", f"{len(failed)} capability mover(s) did "
+                                  f"not write: {', '.join(sorted(failed))}",
+                                  "repair the cause and run `capabilities migrate --apply` "
+                                  "again; the migration resumes", detail=failed)
+        # A mover may have changed the files the manager moves - a binding
+        # written as an identifier, old settings rewritten - so its own part
+        # is planned again from the files as they stand now.
+        excludes = {name: r["settings_exclude"] for name, r in plan["movers"].items()
+                    if r.get("ok") and r.get("settings_exclude")}
+        plan["records"] = _migrate_records_plan(ctx, answers)
+        late = plan["records"].pop("questions")
+        if late:
+            raise _MigrateRefusal("question_open", f"{len(late)} question(s) arose once the "
+                                  "capabilities had moved their own files: "
+                                  + "; ".join(q["id"] for q in late),
+                                  "answer them and run `capabilities migrate --apply` again; "
+                                  "the migration resumes", detail={"questions": late})
+        plan["settings"] = _migrate_settings_plan(ctx, excludes)
+        now = [str(p) for p in _migrate_record_files(ctx["envelope"], ctx["manifests"])]
+        journal["files"] = sorted(set(journal["files"]) | set(now))
+        answer["records_written"] = _migrate_write_records(ctx, plan)
+        answer["settings_written"] = _migrate_write_settings(ctx, plan)
+        journal["phase"] = "written"
+        _migrate_journal_save(agent_id, journal)
+        answers_file = _migrate_mover_answers(ctx, answers)
+        try:
+            checked = _migrate_run_movers(root, _migrate_movers(ctx["manifests"]), "verify",
+                                          answers_file, agent_id)
+        finally:
+            answers_file.unlink(missing_ok=True)
+        differences = []
+        for name, report in checked.items():
+            if not report.get("ok"):
+                differences.append(f"{name}: its mover could not verify: {report['error']}")
+            elif not report.get("verified", True):
+                differences.extend(f"{name}: {d}" for d in report.get("differences") or
+                                   ["its mover found the store short of the files"])
+        differences.extend(_migrate_verify(ctx, plan))
+        answer["verify"] = {"differences": differences}
+        if differences:
+            raise _MigrateRefusal("verify_failed", f"{len(differences)} difference(s) between "
+                                  "the files and the store; the agent stays frozen in its "
+                                  "migration", "correct the cause and run `capabilities "
+                                  "migrate --apply` again, which resumes",
+                                  exit_code=7, detail={"differences": differences})
+        journal["phase"] = "verified"
+        _migrate_journal_save(agent_id, journal)
+        answer.update(_migrate_finalize(ctx, plan, journal))
+    except _MigrateRefusal as exc:
+        _migrate_journal_save(agent_id, journal)
+        _migrate_refuse(exc, answer)
+    answer["state"] = "migrated"
+    answer["commit"] = ("the removed envelope files are deletions for this project to "
+                        "commit")
+    _emit(answer)
+
+
+# --- global ---------------------------------------------------------------------------
+
+def _migrate_effective(project: dict, global_rows: dict, name: str, node: str | None):
+    """A capability's gate as policy rows decide it: the agent's row for this
+    node, its row for every node, then the global ones the same way."""
+    for rows in (project, global_rows):
+        for at in ((node, None) if node else (None,)):
+            if (name, at) in rows:
+                return rows[(name, at)]
+    return None
+
+
+def _migrate_global_plan(conn, manifests: dict, answers: dict) -> dict:
+    """The config home's records and global settings as global rows, and what
+    the store holds of them now: each row it would add, change or remove."""
+    store = _store_module()
+    files = store.FileRecords(_CONFIG_HOME / "no-project", _CONFIG_HOME)
+    plan: dict = {"policy": [], "identifiers": [], "connections": [], "grants": [],
+                  "settings": [], "remove": [], "questions": []}
+    try:
+        gate = files.resolve_scope("capabilities", "policy", "global")
+    except store.StoreError as exc:
+        raise _MigrateRefusal("files_unreadable", f"global gate: {exc.message}") from None
+    held_policy = _migrate_policy_rows(conn, None)
+    for name, row in sorted(gate.items()):
+        value = row["value"]
+        if (not isinstance(value, dict) or not isinstance(value.get("enabled"), bool)):
+            raise _MigrateRefusal("files_unreadable", f"the global gate for {name!r} is not "
+                                  '{"enabled": true|false}')
+        held = held_policy.pop((name, None), None)
+        plan["policy"].append({"capability": name, "enabled": value["enabled"],
+                               "store": held,
+                               "outcome": "held" if held == value["enabled"] else
+                               "add" if held is None else "change"})
+    for (name, node), enabled in sorted(held_policy.items(), key=lambda k: (k[0][0], k[0][1] or "")):
+        if node is None:
+            plan["remove"].append({"kind": "policy", "capability": name, "name": name,
+                                   "store": enabled})
+    held_ids = _migrate_identifier_rows(conn, None)
+    names = sorted(p.parent.name for p in _CONFIG_HOME.glob("*/identifiers.json")
+                   if store.CAPABILITY_RE.fullmatch(p.parent.name))
+    for name in names:
+        for label, row in sorted(files.resolve_scope(name, "identifier", "global").items()):
+            wanted = (row["value"], row["note"] or "")
+            held = held_ids.pop((name, label), None)
+            plan["identifiers"].append({"capability": name, "label": label,
+                                        "value": wanted[0], "note": wanted[1],
+                                        "outcome": "held" if held == wanted else
+                                        "add" if held is None else "change"})
+    for (name, label), _held in sorted(held_ids.items()):
+        plan["remove"].append({"kind": "identifier", "capability": name, "name": label})
+    held_specs = _migrate_connection_rows(conn)
+    held_grants = _migrate_grant_rows(conn, None)
+    for path in sorted(_CONFIG_HOME.glob("*/connections.json")):
+        name = path.parent.name
+        if not store.CAPABILITY_RE.fullmatch(name):
+            continue
+        identities = files.resolve_scope(name, "connection", "global")
+        grants = files.resolve_scope(name, "grant", "global")
+        default = (files.resolve_scope(name, "setting", "global")
+                   .get("connection.default") or {}).get("value")
+        for cid, row in sorted(identities.items()):
+            spec = row["value"]
+            held = held_specs.get((name, cid))
+            qid = f"connections.{name}/{cid}"
+            outcome = "held" if held == spec else "add" if held is None else None
+            if outcome is None:
+                choice = _migrate_dig(answers, qid)
+                outcome = {"files": "change", "store": "kept"}.get(choice, "differs")
+                if outcome == "differs":
+                    plan["questions"].append({
+                        "id": qid, "answer": qid, "choices": ["files", "store"],
+                        "question": f"{name} connection {cid!r} is in the store as "
+                                    f"{json.dumps(held, sort_keys=True)} and in the config "
+                                    f"home as {json.dumps(spec, sort_keys=True)}: keep the "
+                                    "store's, or replace it with the config home's?"})
+            plan["connections"].append({"capability": name, "name": cid, "spec": spec,
+                                        "store": held, "outcome": outcome})
+            allow_write = (grants.get(cid) or {}).get("value", {}).get("allow_write")
+            is_default = cid == default
+            if allow_write is None and not is_default:
+                continue
+            row_wanted = (None, allow_write, is_default)
+            got = held_grants.pop((name, cid), None)
+            plan["grants"].append({"capability": name, "connection": cid,
+                                   "allow_write": allow_write, "is_default": is_default,
+                                   "outcome": "held" if got == row_wanted else
+                                   "add" if got is None else "change"})
+    for (name, cid), _row in sorted(held_grants.items()):
+        plan["remove"].append({"kind": "grant", "capability": name, "name": cid})
+    for name, home in _migrate_settings_homes(manifests, "global"):
+        path = _CONFIG_HOME / name / home["path"]
+        document, problem = _migrate_read_document(path, home.get("format") or "json")
+        if problem:
+            raise _MigrateRefusal("settings_unreadable", problem)
+        if document is None:
+            continue
+        held = _migrate_setting_rows(conn, None, name)
+        plan["settings"].append({"document": name, "file": str(path),
+                                 "document_value": document,
+                                 "outcome": "held" if held == document else
+                                 "add" if held is None else "change",
+                                 "host_paths": _migrate_host_paths(document)})
+    return plan
+
+
+def _migrate_gate_flips(conn, plan: dict, given: list[str]) -> list[dict]:
+    """Every agent whose effective gate would change once the global rows say
+    what the config home says: an agent that reads its gate from the store
+    already - its records are there, or it moved - for this node and every
+    node."""
+    store = _store_module()
+    before = _migrate_policy_rows(conn, None)
+    after = {key: value for key, value in before.items() if key[1] is not None}
+    for row in plan["policy"]:
+        after[(row["capability"], None)] = row["enabled"]
+    agents: dict[str, dict] = {}
+    for agent_id, migrated in _migrate_rows(
+            conn, "SELECT id, migrated_at FROM capabilities_agents"):
+        agents[agent_id] = {"agent_id": agent_id, "reads": "store" if migrated else None}
+    for entry in _migrate_discover(given):
+        if not entry.get("id"):
+            continue
+        try:
+            mode = store.records_mode(Path(entry["envelope"]))
+        except store.StoreError:
+            continue
+        found = agents.setdefault(entry["id"], {"agent_id": entry["id"], "reads": None})
+        found["root"] = entry["root"]
+        if mode == "store":
+            found["reads"] = "store"
+    node = os.environ.get(store.NODE_NAME_ENV, "").strip() or None
+    names = sorted({key[0] for key in before} | {key[0] for key in after})
+    flips = []
+    for agent_id, entry in sorted(agents.items()):
+        if entry["reads"] != "store":
+            continue
+        project = _migrate_policy_rows(conn, agent_id)
+        changed = []
+        for name in names:
+            was = _migrate_effective(project, before, name, node)
+            now = _migrate_effective(project, after, name, node)
+            if bool(was) != bool(now):
+                changed.append({"capability": name, "was": bool(was), "now": bool(now)})
+        if changed:
+            flips.append({**entry, "flips": changed})
+    return flips
+
+
+def cmd_migrate_global(opts: dict) -> None:
+    """`migrate --global`: the config home's gate, identifiers, connections,
+    grants, default and global settings become the global rows every agent
+    inherits, and the store records `global_migrated_at`."""
+    answers = _migrate_answers(opts.get("answers"))
+    apply = bool(opts.get("apply"))
+    if apply:
+        _read_only_gate("migrate --global --apply")
+    root = _project_root() or Path.cwd()
+    try:
+        conn, setting = _migrate_connect(root)
+    except _MigrateRefusal as exc:
+        _migrate_refuse(exc)
+    manifests = _migrate_manifests()
+    answer: dict = {"ok": True, "scope": "global", "config_home": str(_CONFIG_HOME),
+                    "applied": apply, "store": {"level": setting.level,
+                                                "schema": setting.schema}}
+    refused = None
+    try:
+        answer["global_migrated_at"] = _migrate_global_at(conn)
+        plan = _migrate_global_plan(conn, manifests, answers)
+        flips = _migrate_gate_flips(conn, plan, opts.get("roots") or [])
+    except _MigrateRefusal as exc:
+        refused = exc
+    finally:
+        conn.close()
+    if refused is not None:
+        _migrate_refuse(refused, answer)
+    answer["plan"] = {**{k: v for k, v in plan.items() if k not in ("settings", "questions")},
+                      "settings": [{k: v for k, v in e.items() if k != "document_value"}
+                                   for e in plan["settings"]]}
+    answer["gate_flips"] = flips
+    answer["questions"] = plan["questions"]
+    warnings = [f"{e['document']} global settings carry a host path: {p}"
+                for e in plan["settings"] for p in e["host_paths"]]
+    if warnings:
+        answer["warnings"] = warnings
+    if answer["global_migrated_at"]:
+        answer["state"] = "migrated"
+        answer["changed"] = False
+        if apply:
+            answer["hint"] = ("the global rows were written at "
+                              f"{answer['global_migrated_at']}; change one with its own verb")
+        _emit(answer)
+        return
+    if not apply:
+        answer["would_write"] = not plan["questions"]
+        _emit(answer)
+        return
+    if plan["questions"]:
+        _migrate_refuse(_MigrateRefusal(
+            "question_open", f"{len(plan['questions'])} question(s) are open and nothing was "
+            "written: " + "; ".join(q["id"] for q in plan["questions"]),
+            "answer each in a JSON file and pass it with --answers"), answer)
+    store = _store_module()
+    db = _db_module()
+    import psycopg
+    conn, _setting = _migrate_connect(root)
+    try:
+        major, minor = store.STORE_TABLES_VERSION
+        db.migrate(conn, store.STORE_OWNER, store.record_table_steps(), major=major, minor=minor)
+        with conn.transaction():
+            conn.execute("LOCK TABLE capabilities_global IN EXCLUSIVE MODE")
+            if conn.execute("SELECT global_migrated_at FROM capabilities_global"
+                            ).fetchone()[0] is not None:
+                raise _MigrateRefusal("global_migrated", "the global rows were written by "
+                                      "another run meanwhile", exit_code=6)
+            for row in plan["remove"]:
+                if row["kind"] == "policy":
+                    conn.execute("DELETE FROM capabilities_policy WHERE agent_id IS NULL "
+                                 "AND capability = %s AND node IS NULL", (row["capability"],))
+                elif row["kind"] == "identifier":
+                    conn.execute("DELETE FROM capabilities_identifiers WHERE agent_id IS NULL "
+                                 "AND capability = %s AND label = %s AND node IS NULL",
+                                 (row["capability"], row["name"]))
+                else:
+                    conn.execute("DELETE FROM capabilities_connection_grants WHERE "
+                                 "agent_id IS NULL AND capability = %s AND connection = %s "
+                                 "AND node IS NULL", (row["capability"], row["name"]))
+            for row in plan["policy"]:
+                if row["outcome"] != "held":
+                    conn.execute(
+                        "INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
+                        "VALUES (NULL, %s, NULL, %s) ON CONFLICT ((coalesce(agent_id, '')), "
+                        "capability, (coalesce(node, ''))) DO UPDATE SET enabled = "
+                        "EXCLUDED.enabled, updated_at = now()",
+                        (row["capability"], row["enabled"]))
+            for row in plan["identifiers"]:
+                if row["outcome"] != "held":
+                    conn.execute(
+                        "INSERT INTO capabilities_identifiers (agent_id, capability, node, "
+                        "label, value, note) VALUES (NULL, %s, NULL, %s, %s::jsonb, %s) "
+                        "ON CONFLICT ((coalesce(agent_id, '')), capability, label, "
+                        "(coalesce(node, ''))) DO UPDATE SET value = EXCLUDED.value, "
+                        "note = EXCLUDED.note, updated_at = now()",
+                        (row["capability"], row["label"],
+                         json.dumps(row["value"], ensure_ascii=False), row["note"]))
+            for row in plan["connections"]:
+                if row["outcome"] in ("add", "change"):
+                    conn.execute(
+                        "INSERT INTO capabilities_connections (capability, name, spec) "
+                        "VALUES (%s, %s, %s::jsonb) ON CONFLICT (capability, name) "
+                        "DO UPDATE SET spec = EXCLUDED.spec",
+                        (row["capability"], row["name"],
+                         json.dumps(row["spec"], ensure_ascii=False)))
+            for row in plan["grants"]:
+                if row["outcome"] == "held":
+                    continue
+                if row["is_default"]:
+                    conn.execute("UPDATE capabilities_connection_grants SET is_default = "
+                                 "false WHERE agent_id IS NULL AND capability = %s AND "
+                                 "node IS NULL AND is_default", (row["capability"],))
+                conn.execute(
+                    "INSERT INTO capabilities_connection_grants (agent_id, capability, "
+                    "connection, node, enabled, allow_write, is_default) VALUES (NULL, %s, "
+                    "%s, NULL, NULL, %s, %s) ON CONFLICT ((coalesce(agent_id, '')), "
+                    "capability, connection, (coalesce(node, ''))) DO UPDATE SET "
+                    "enabled = NULL, allow_write = EXCLUDED.allow_write, "
+                    "is_default = EXCLUDED.is_default",
+                    (row["capability"], row["connection"], row["allow_write"],
+                     row["is_default"]))
+            conn.execute("UPDATE capabilities_global SET global_migrated_at = now()")
+    except _MigrateRefusal as exc:
+        conn.close()
+        _migrate_refuse(exc, answer)
+    except db.DbError as exc:
+        conn.close()
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    except psycopg.Error as exc:
+        conn.close()
+        _die(5, "store_write_failed", f"writing the global rows failed: {exc}")
+    conn.close()
+    # Settings go through the adapter's writer, one document at a time, each
+    # with its trail.
+    settings_written = {}
+    if plan["settings"]:
+        writer = store.AgentRecords(_CONFIG_HOME / "no-project", _CONFIG_HOME,
+                                    "global-migration", None, agent={},
+                                    node=os.environ.get(store.NODE_NAME_ENV, "").strip()
+                                    or "global", project_root=root, actor=MIGRATE_ACTOR)
+        writer._authority = lambda _conn, _scope, wanted, _actor: wanted
+        try:
+            for entry in plan["settings"]:
+                if entry["outcome"] == "held":
+                    continue
+                result = writer.settings_write(entry["document"], "global",
+                                               lambda _c, v=entry["document_value"]: v,
+                                               actor=MIGRATE_ACTOR)
+                settings_written[entry["document"]] = result["generation"]
+        except store.StoreError as exc:
+            _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+        finally:
+            writer.close()
+    conn, _setting = _migrate_connect(root)
+    try:
+        answer["global_migrated_at"] = _migrate_global_at(conn)
+    finally:
+        conn.close()
+    answer.update(state="migrated", changed=True, settings_written=settings_written,
+                  files_kept=("the config home's files stay until every agent on this "
+                              "machine has moved; agents not yet moved still read them"))
+    _emit(answer)
+
+
+# --- discard and report -----------------------------------------------------------------
+
+def _migrate_config_files(manifests: dict) -> list[Path]:
+    files = [_CONFIG_HOME / "capabilities" / "settings.json"]
+    files += sorted(_CONFIG_HOME.glob("*/connections.json"))
+    files += sorted(_CONFIG_HOME.glob("*/identifiers.json"))
+    files += [_CONFIG_HOME / name / home["path"]
+              for name, home in _migrate_settings_homes(manifests, "global")]
+    seen, out = set(), []
+    for path in files:
+        if path.is_file() and str(path) not in seen:
+            seen.add(str(path))
+            out.append(path)
+    return out
+
+
+def _migrate_agent_states(entries: list[dict]) -> list[dict]:
+    """Each discovered agent with what its store says of it."""
+    out = []
+    for entry in entries:
+        row = {**entry, "state": "unknown"}
+        if not entry.get("id"):
+            row["state"] = "no_id"
+            out.append(row)
+            continue
+        try:
+            conn, _setting = _migrate_connect(Path(entry["root"]))
+        except _MigrateRefusal as exc:
+            row["store"] = {"code": exc.code, "message": exc.message}
+            out.append(row)
+            continue
+        try:
+            state = _migrate_agent_state(conn, entry["id"]) or {}
+            row["global_migrated_at"] = _migrate_global_at(conn)
+        finally:
+            conn.close()
+        row["state"] = ("migrated" if state.get("migrated_at") else
+                        "migrating" if state.get("migrating_since") else
+                        "registered" if state else "unregistered")
+        row["migrated_at"] = state.get("migrated_at")
+        out.append(row)
+    return out
+
+
+def cmd_migrate_discard(opts: dict) -> None:
+    """`migrate --discard`: a node that is not the global master deletes its
+    config home's record and settings files without reading them, once the
+    global rows exist and no agent here still reads them."""
+    _read_only_gate("migrate --discard")
+    root = _project_root() or Path.cwd()
+    try:
+        conn, _setting = _migrate_connect(root)
+    except _MigrateRefusal as exc:
+        _migrate_refuse(exc)
+    try:
+        at = _migrate_global_at(conn)
+    finally:
+        conn.close()
+    if not at:
+        _migrate_refuse(_MigrateRefusal(
+            "global_not_migrated", "the global records are not in the store, so these "
+            "files are still their only copy", "run `capabilities migrate --global --apply` "
+            "on the global master first"))
+    agents = _migrate_agent_states(_migrate_discover(opts.get("roots") or []))
+    waiting = [a for a in agents if a["state"] not in ("migrated",)
+               and a.get("id")]
+    if waiting:
+        _migrate_refuse(_MigrateRefusal(
+            "agents_unmigrated", f"{len(waiting)} agent(s) on this machine have not moved "
+            "and still read the config home's files: "
+            + ", ".join(f"{a['root']} ({a['state']})" for a in waiting),
+            "migrate them on their master first", detail={"agents": waiting}))
+    removed = []
+    for path in _migrate_config_files(_migrate_manifests()):
+        path.unlink()
+        removed.append(str(path))
+    _emit({"ok": True, "scope": "global", "global_migrated_at": at,
+           "config_home": str(_CONFIG_HOME), "removed": removed})
+
+
+def _migrate_consumers(root: Path, limit: int = 200) -> list[str]:
+    """Lines in the project's own text that read a record or settings file
+    directly or name a retired import verb."""
+    hits: list[str] = []
+    for current, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in MIGRATE_CONSUMER_SKIP and not d.startswith(".")
+                   or d in (".claude", ".codex")]
+        for name in names:
+            if not name.endswith(MIGRATE_CONSUMER_SUFFIXES):
+                continue
+            path = Path(current) / name
+            try:
+                if path.stat().st_size > 512 * 1024:
+                    continue
+                lines = path.read_text(errors="replace").splitlines()
+            except OSError:
+                continue
+            for number, line in enumerate(lines, 1):
+                if any(pattern in line for pattern in MIGRATE_CONSUMER_PATTERNS):
+                    hits.append(f"{path.relative_to(root)}:{number}: {line.strip()[:200]}")
+                    if len(hits) >= limit:
+                        return hits
+    return hits
+
+
+def cmd_migrate_report(opts: dict) -> None:
+    """`migrate --report`: what remains on this machine and why - each agent's
+    record and settings files, the config home's, an open migration's
+    journal, and the project text that still reads those files directly."""
+    manifests = _migrate_manifests()
+    agents = []
+    for entry in _migrate_agent_states(_migrate_discover(opts.get("roots") or [])):
+        envelope = Path(entry["envelope"])
+        files = [str(p) for p in _migrate_record_files(envelope, manifests)]
+        state = entry["state"]
+        reason = {
+            "migrated": "the agent's records are in the store; these files are no longer "
+                        "read: remove them",
+            "migrating": "a migration is open: finish it with `capabilities migrate "
+                         "--apply` on the master",
+        }.get(state, "the agent has not moved: run `capabilities migrate` on its master")
+        journal = _migrate_journal(entry["id"]) if entry.get("id") else None
+        agents.append({**entry, "files": files, "reason": reason if files else None,
+                       "journal": ({k: journal.get(k) for k in
+                                    ("phase", "node", "started_at", "updated_at", "archive")}
+                                   if journal else None),
+                       "consumers": _migrate_consumers(Path(entry["root"]))})
+    config = [str(p) for p in _migrate_config_files(manifests)]
+    at = None
+    here = _project_root() or Path.cwd()
+    try:
+        conn, _setting = _migrate_connect(here)
+        try:
+            at = _migrate_global_at(conn)
+        finally:
+            conn.close()
+    except _MigrateRefusal:
+        pass
+    _emit({"ok": True, "agents": agents,
+           "config_home": {"dir": str(_CONFIG_HOME), "files": config,
+                           "global_migrated_at": at,
+                           "reason": (None if not config else
+                                      "the global rows are in the store; agents not yet "
+                                      "moved still read these, and a node that is not the "
+                                      "global master discards them with `capabilities "
+                                      "migrate --discard`" if at else
+                                      "the global records are not in the store yet: run "
+                                      "`capabilities migrate --global` on the global master")}})
+
+
+def cmd_migrate(args: list[str]) -> None:
+    opts = _migrate_options(args)
+    if opts.get("global"):
+        cmd_migrate_global(opts)
+    elif opts.get("discard"):
+        cmd_migrate_discard(opts)
+    elif opts.get("report"):
+        cmd_migrate_report(opts)
+    else:
+        cmd_migrate_agent(opts)
+
+
 # A TOML table header; every key after the first one belongs to that table.
 _TOML_TABLE_HEADER = re.compile(r"^[ \t]*\[{1,2}[^\[\]\n]+\]{1,2}[ \t]*(?:#.*)?$", re.M)
 
@@ -11769,6 +13955,8 @@ def main() -> None:
         if not pos:
             _die(6, "input", "ids needs a capability name")
         cmd_ids(pos[0])
+    elif cmd == "migrate":
+        cmd_migrate(rest)
     elif cmd == "connections":
         if rest != ["import"]:
             _die(6, "input", "connections needs the subcommand import, and nothing else",

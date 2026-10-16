@@ -1,5 +1,9 @@
 # askproject — change log
 
+## 2026-10-16 — `migrate files` moves the profiles folder into the store for `capabilities migrate`
+
+Its mover saves each profile in the project's `askproject/profiles/` folder into the store as a harness profile at the project's scope, all of them or none, refusing one the store holds differently, and leaves the files for the manager to archive and remove. The harness runner is pinned at 0.9.0, the release that keeps profiles in a store.
+
 ## 2026-10-13 — A caller's sessions are kept under the node's declared name
 
 The host a caller's peer sessions are recorded under is the node's name as the contract gives it: the value of `AGENT_NODE_NAME` where the machine declares one, and its host name as before where it declares none. A container node that declares its name resumes the sessions it recorded before a redeploy instead of starting new ones; a store-mode grant naming the node is matched against the same name.

@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-16 — `migrate files` turns old worker settings into profiles for `capabilities migrate`
+
+Where the project's settings still carry a worker key, its mover runs what `service migrate-profiles --apply` does before the manager writes the settings as rows, and its verify finds no worker key left. `service migrate-profiles` is unchanged.
+
 ## 2026-10-16 — `telegram service doctor` runs the live harness turn only when asked with `--live`
 
 `telegram service doctor` no longer starts a claude or codex session: under `workers` it reports each distinct profile the settings name as `resolved`, with the harness, model, layer and version it resolved to, or `failed` with why when it does not resolve or fit, and spends nothing. `telegram service doctor --live` runs the one live turn per profile it ran before, held to `defaults.worker_timeout`, and reports the harness's own verdict in place of `resolved` (`accepted`, `model_refused`, `quota_exhausted`, `not_authenticated`, `binary_missing`, `timed_out`, `incompatible_harness` or `failed`). `workers` now carries `live`, saying which of the two ran. A doctor called by a watchdog or a control panel no longer leaves a session behind on every call; the deploy descriptor's doctor command is unchanged, so it no longer probes either. `ok`, the exit codes and every other key are as before.

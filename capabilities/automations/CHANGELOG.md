@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-16 — `migrate files` moves [[automations]] into definitions for `capabilities migrate`
+
+Its mover saves config.toml's `[[automations]]`, with `engine.timezone` on each, as definitions, as `import` does, and leaves the file to the manager, which writes the rest of it as settings rows without them. The environment in force here is the master; a node another environment runs on, or the one node of an automation whose environments reach two, is a question (`automations.environments.<env>`, `automations.automations.<slug>`), as is a definition the store holds differently (`automations.differs.<slug>`: `store` or `files`). `[agents]` stays in the settings. `import` is unchanged.
+
 ## 2026-10-13 — `automations` declares what a person is asked for, and writes it through the contract
 
 Its settings (project `service/config.toml`, machine `service/config.toml`) are declared under `settings`, with the keys a panel shows as controls, and `automations settings` reads every document whole while `settings get|set|unset|put` write one key or one document, checked as automations reads it. Bare `automations help` ends with a section rendered from these declarations. Nothing else changes.

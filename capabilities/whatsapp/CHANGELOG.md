@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-10-16 — `migrate files` moves profile files for `capabilities migrate`
+
+Its mover saves the project's profile files into the store at the project's scope, as `profiles import` does, without removing them; the manager archives and removes them once the whole move is verified. `profiles import` is unchanged.
+
 ## 2026-10-13 — Outside any project, `whatsapp pair` links a connection declared globally
 
 Run outside any project, `whatsapp pair` (with or without `--events`) uses the machine's own connections as `connections` and `doctor` do, so a connection added with `whatsapp connection add <id> --global` is linked on the machine, where `pair` used to refuse with exit 4 `connection_not_granted`. The verb a `connections.link` method runs is the one that is lent them; no project and no agent is granted anything, a connection whose grant is switched off is still refused, the connection stays read-only there, and the read-only switch still refuses `pair`. Inside a project nothing changes; its grants alone decide.

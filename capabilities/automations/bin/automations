@@ -1294,7 +1294,10 @@ def _gate() -> None:
     `migrate` of a capability that declares `TABLES` acts on the machine's
     store rather than for a project, so it too reads no policy row: it answers
     to the machine ceiling, and `migrate` (not `migrate status`) to the
-    read-only switch.
+    read-only switch. `migrate files` is the manager's `capabilities migrate`
+    moving this capability's files of a project into the store, whether or not
+    the project enabled it: it answers to the machine ceiling, and `migrate
+    files write` to the read-only switch.
 
     Machine administration reads no policy row either: it answers to the
     machine ceiling, and its writes to the read-only switch
@@ -1306,6 +1309,10 @@ def _gate() -> None:
     if not safe:
         _machine_gate()
     service_action = sys.argv[2] if len(sys.argv) > 2 else None
+    if verb == "migrate" and service_action == "files":
+        if sys.argv[3:4] == ["write"]:
+            _read_only_gate(f"`{NAME} migrate files write`")
+        return
     if verb == "migrate" and _tables_declared():
         if service_action != "status":
             _read_only_gate(f"`{NAME} migrate`")
@@ -1452,6 +1459,9 @@ def _env_dir() -> Path | None:
 
 
 _RECORDS = None
+# Who this process writes records as, where it is not the person running it:
+# `migrate` while `migrate files` moves the project's files into the store.
+_RECORDS_ACTOR = None
 
 
 def _records():
@@ -1472,7 +1482,7 @@ def _records():
             _RECORDS = open_records(
                 envelope, _CONFIG_HOME, project_only=project_only,
                 project_root=root, project_id=_project_id() if in_store else None,
-                application_name=NAME)
+                application_name=NAME, actor=_RECORDS_ACTOR)
         except StoreError as e:
             _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     return _RECORDS
@@ -2130,6 +2140,55 @@ def _cmd_migrate(argv: list[str]) -> None:
     _emit(report)
 
 
+MIGRATE_FILES_ACTIONS = ("plan", "write", "verify")
+
+
+def _cmd_migrate_files(argv: list[str]) -> None:
+    """`migrate files plan|write|verify [--answers FILE]` moves this
+    capability's own configuration files of the project into the store, for
+    the manager's `capabilities migrate`, which runs it on the agent's master
+    and owns the order: `plan` says what would be written and every question
+    code cannot answer, writing nothing; `write` writes it, leaving the files
+    for the manager to archive and remove; `verify` reads it back and says
+    whether the store now holds what the files said. The capability's own
+    `_migrate_files_mover(action, answers, all_answers)`, outside the fences,
+    does the moving and returns its report: `items`, `questions`, `files` (the
+    ones it consumed), `verified` and whatever else it names; a capability
+    without one moves nothing here. `--answers` is the person's recorded
+    answers as JSON, keyed by capability. Every record or setting written here
+    is the migration's own (`migrate@<node>`)."""
+    global _RECORDS_ACTOR
+    action = argv[0] if argv else ""
+    rest = argv[1:]
+    answers: dict = {}
+    if rest[:1] == ["--answers"] and len(rest) == 2:
+        try:
+            answers = json.loads(Path(rest[1]).read_text())
+        except (OSError, ValueError) as e:
+            _die(6, "input", f"cannot read the answers file {rest[1]}: {e}")
+        if not isinstance(answers, dict):
+            _die(6, "input", f"the answers file {rest[1]} must hold a JSON object")
+    elif rest:
+        _die(6, "input", f"unknown migrate files arguments {' '.join(rest)!r}",
+             f"{NAME} migrate files plan|write|verify [--answers FILE]")
+    if action not in MIGRATE_FILES_ACTIONS:
+        _die(6, "input", f"migrate files needs one of {', '.join(MIGRATE_FILES_ACTIONS)}",
+             f"{NAME} migrate files plan|write|verify [--answers FILE]")
+    if _project_root() is None:
+        _die(6, "no_project", "migrate files moves a project's files, and this is not one",
+             "run it in the project; `capabilities migrate` does")
+    _RECORDS_ACTOR = "migrate"
+    mover = globals().get("_migrate_files_mover")
+    report = {"capability": NAME, "action": action, "mover": callable(mover),
+              "items": [], "questions": [], "files": [], "warnings": []}
+    if callable(mover):
+        mine = answers.get(NAME) if isinstance(answers.get(NAME), dict) else {}
+        report.update(mover(action, mine, answers) or {})
+    if action == "verify":
+        report.setdefault("verified", True)
+    _emit(report)
+
+
 MACHINE_READ_EFFECT = ("outside any project these verbs use the machine's own "
                        "connections, read-only; inside a project its grants "
                        "alone decide")
@@ -2232,7 +2291,8 @@ def _manifest_core() -> dict:
             "state": STATE, "inventory": _inventory_declaration(),
             "post_install": POST_INSTALL, "tables": _tables_declared(),
             "connections": _connections_declaration(),
-            "settings": _settings_declaration()}
+            "settings": _settings_declaration(),
+            "migrate_files": callable(globals().get("_migrate_files_mover"))}
 
 
 def _field_value(field: dict, raw, from_argv: bool = False):
@@ -2857,6 +2917,8 @@ def _contract(argv: list[str]) -> None:
         _emit(f"{SUMMARY} Run `{NAME} help`.")
     elif cmd == "manifest":
         _emit(_manifest_core())
+    elif cmd == "migrate" and argv[1:2] == ["files"]:
+        _cmd_migrate_files(argv[2:])
     elif cmd == "migrate" and _tables_declared():
         _cmd_migrate(argv[1:])
     elif cmd == "guide":
@@ -2951,6 +3013,11 @@ HASH_LENGTH = 12
 # separators and anything that would make a key ambiguous to address.
 KEY_RE = re.compile(r"[a-z0-9][a-z0-9._@+-]{0,127}", re.IGNORECASE)
 CAPABILITY_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
+# The document a settings row belongs to: a capability's own settings, or a
+# named document of it, `<capability>.<name>`, for settings it keeps outside its
+# declared homes (tasks' `conveyor`, slack's `policy`). A capability name never
+# holds a dot, so a named document can never be taken for a capability.
+SETTINGS_DOCUMENT_RE = re.compile(r"[a-z][a-z0-9-]{0,63}(?:\.[a-z][a-z0-9-]{0,63})?")
 
 
 class StoreError(Exception):
@@ -3393,6 +3460,16 @@ def _store_check(name: str, value: str, pattern: re.Pattern) -> str:
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise StoreError("bad_name", f"{name} {value!r} must match {pattern.pattern}")
     return value
+
+
+def settings_document(capability: str, name: str | None = None) -> str:
+    """The key a settings document is kept under: the capability's own, or
+    its named document `<capability>.<name>`."""
+    _store_check("capability", capability, CAPABILITY_RE)
+    if name is None:
+        return capability
+    return _store_check("settings document", f"{capability}.{name}",
+                        SETTINGS_DOCUMENT_RE)
 
 
 def _semantics(collection: str) -> str:
@@ -5022,7 +5099,7 @@ class AgentRecords(StoreRecords):
         """One scope's settings document as this node reads it: the rows for
         every node with this node's rows over them. None where neither
         document exists, which a reader takes as the capability's seed."""
-        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
         self._scope_root(scope)
         docs, rows = self._settings_rows(capability)
         shared, mine = (scope, None), (scope, self.node)
@@ -5142,7 +5219,7 @@ class AgentRecords(StoreRecords):
         then write the paths that differ, removals first, one trail row each,
         and move the document's generation to the last of them. A refused
         write changes nothing."""
-        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
         _refuse_record_write(capability, "setting")
         agent = self._agent(scope)
         who = self.actor_name(actor)
@@ -6995,6 +7072,171 @@ def cmd_import(apply: bool, nodes: list[str]) -> dict[str, Any]:
         else:
             answer["config_rewritten"] = False
     return answer
+
+
+# What `capabilities migrate` moves out of config.toml through this mover, and
+# what the manager then leaves out of the settings rows it writes for it.
+_MOVED_BY_MOVER = [["automations"], ["engine", "timezone"]]
+
+
+def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict[str, Any]:
+    """`capabilities migrate`'s move of config.toml's [[automations]] (with
+    engine.timezone) into the store as definitions, as `import` moves them,
+    leaving the file to the manager, which writes the rest of it as this
+    project's settings rows and removes it once everything is verified.
+
+    Which node an automation runs on is a question when its environments do
+    not say it: the environment in force here is this node, the master; the
+    person answers `environments.<environment>` with a node of the agent, or
+    `automations.<slug>` for one automation whose environments reach two. A
+    definition the store already holds differently is a question too:
+    `differs.<slug>` is `store` (keep the stored one) or `files` (save the
+    file's as a new version). Nothing is written while a question is open."""
+    root = _root_required()
+    report: dict[str, Any] = {"items": [], "files": [], "questions": [],
+                              "settings_exclude": _MOVED_BY_MOVER}
+    config_path = _config_path(root)
+    try:
+        document = tomllib.loads(config_path.read_text())
+    except FileNotFoundError:
+        document = {}
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        _die(6, "invalid_config", f"cannot read config {config_path}: {exc}")
+    entries = document.get("automations") or []
+    if not entries:
+        if action == "verify":
+            report["verified"] = True
+        return report
+    if not isinstance(entries, list):
+        _die(6, "invalid_config", f"{config_path}: automations must be an array of tables")
+    runtime = _runtime_module()
+    engine = document.get("engine") if isinstance(document.get("engine"), dict) else {}
+    environment = (os.environ.get("AUTOMATIONS_ENVIRONMENT")
+                   or _project_selectors().get("AUTOMATIONS_ENVIRONMENT")
+                   or str(engine.get("environment") or "development"))
+    here = str(answers.get("_master") or node_name())
+    known = set(answers.get("_nodes") or [here])
+    by_env = mine.get("environments") if isinstance(mine.get("environments"), dict) else {}
+    by_slug = mine.get("automations") if isinstance(mine.get("automations"), dict) else {}
+    differs = mine.get("differs") if isinstance(mine.get("differs"), dict) else {}
+    questions: dict[str, dict] = {}
+
+    def ask(qid: str, question: str, choices: list | None = None) -> None:
+        questions.setdefault(qid, {"id": f"{NAME}.{qid}", "question": question,
+                                   "answer": f"{NAME}.{qid}",
+                                   **({"choices": choices} if choices else {})})
+
+    def node_ok(qid: str, node) -> bool:
+        if isinstance(node, str) and node in known:
+            return True
+        ask(qid, f"{node!r} is not a node of this agent; answer with one of "
+                 f"{', '.join(sorted(known))}", sorted(known))
+        return False
+
+    held: list[dict] = []
+    mapping = {environment: here}
+    for env, node in by_env.items():
+        if node_ok(f"environments.{env}", node):
+            mapping[env] = node
+    definitions, refused = [], []
+    for index, item in enumerate(entries):
+        if not isinstance(item, dict):
+            refused.append(f"automations[{index}] must be a table")
+            continue
+        slug = item.get("id")
+        envs = item.get("environments") or []
+        envs = envs if isinstance(envs, list) else []
+        if slug in by_slug:
+            if not node_ok(f"automations.{slug}", by_slug[slug]):
+                held.append({"kind": "definition", "name": slug, "outcome": "question"})
+                continue
+            single = {key: value for key, value in item.items() if key != "environments"}
+            found, wrong = runtime.legacy_definitions(
+                root, {"engine": engine, "automations": [single]}, environment,
+                by_slug[slug], {})
+        else:
+            reached = ({mapping[env] for env in envs if env in mapping} if envs
+                       else {here})
+            unmapped = [env for env in envs if env not in mapping]
+            enabled = item.get("enabled", True)
+            if unmapped and (enabled or reached):
+                for env in unmapped:
+                    ask(f"environments.{env}",
+                        f"which node runs environment {env!r}? automation {slug!r} "
+                        f"runs under {', '.join(envs)}, and the environment in force "
+                        f"here is {environment!r} on {here}", sorted(known))
+            if len(reached) > 1 or (unmapped and len(envs) > 1 and (enabled or reached)):
+                ask(f"automations.{slug}",
+                    f"automation {slug!r} runs under {', '.join(envs)}, and an "
+                    "automation is scheduled on one node: which?", sorted(known))
+            if len(reached) > 1 or (unmapped and (enabled or reached)):
+                held.append({"kind": "definition", "name": slug, "outcome": "question"})
+                continue
+            found, wrong = runtime.legacy_definitions(
+                root, {"engine": engine, "automations": [item]}, environment, here,
+                {env: node for env, node in mapping.items() if env != environment})
+        definitions.extend(found)
+        refused.extend(wrong)
+    if refused:
+        _die(6, "definitions_not_importable",
+             f"{len(refused)} automation(s) in {config_path} cannot be moved: "
+             + "; ".join(refused), "repair config.toml, then run `capabilities migrate` again")
+    write = action == "write"
+    if write and questions:
+        _die(6, "question_open", f"{len(questions)} question(s) are open: "
+             + "; ".join(q["id"] for q in questions.values()),
+             "answer them in the answers file `capabilities migrate --answers` reads")
+    items = []
+    ledger = _write_ledger(runtime, root)
+    try:
+        with ledger:
+            with ledger.transaction():
+                for one in definitions:
+                    slug = one["slug"]
+                    active = ledger.definition(slug)
+                    item = {"kind": "definition", "name": slug,
+                            "node": one["fields"]["node"],
+                            "schedule": one["fields"]["schedule"]}
+                    if active is None:
+                        outcome = "missing"
+                    elif _definition_fields(runtime, active) == one["fields"]:
+                        outcome = "held"
+                    elif differs.get(slug) == "store":
+                        outcome = "kept"
+                    elif differs.get(slug) == "files":
+                        outcome = "differs_replace"
+                    else:
+                        outcome = "differs"
+                        ask(f"differs.{slug}",
+                            f"automation {slug!r} is in the store as version "
+                            f"{active['id']} and differs from config.toml: keep the "
+                            "store's, or save the file's as a new version?",
+                            ["store", "files"])
+                    if write and outcome in ("missing", "differs_replace"):
+                        row, _created = ledger.save_definition(slug, one["fields"],
+                                                               by=f"migrate@{here}")
+                        item["version"] = row["id"]
+                        outcome = "written"
+                    elif active is not None:
+                        item["version"] = active["id"]
+                    if action == "plan" and outcome in ("missing", "differs_replace"):
+                        outcome = "would_write"
+                    item["outcome"] = outcome
+                    items.append(item)
+                if write and questions:
+                    raise runtime.ConfigError("a definition differs from the store")
+    except runtime.StoreUnavailable as exc:
+        _store_refusal(exc)
+    except runtime.ConfigError as exc:
+        _die(6, "question_open" if questions else "conflict", str(exc),
+             "answer the questions `capabilities migrate` lists, then run it again")
+    report["items"] = items + held
+    report["questions"] = list(questions.values())
+    if action == "verify":
+        report["differences"] = [f"automation {item['name']}: {item['outcome']}"
+                                 for item in items if item["outcome"] not in ("held", "kept")]
+        report["verified"] = not report["differences"] and not questions
+    return report
 
 
 def cmd_run(automation_id: str) -> dict[str, Any]:

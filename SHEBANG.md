@@ -39,6 +39,7 @@ Every script implements the same contract verbs alongside its domain verbs. This
 | `setup` | Only for a capability that declares `SETUP_FIELDS`: report, write or remove the machine's prerequisites. |
 | `settings` | Only for a capability that declares `SETTINGS`: read every settings document whole, and write one key or one document, wherever it lives. |
 | `migrate` / `migrate status` | Only for a capability that declares `TABLES`: apply its pending migration steps to its tables in the project's database / report where they stand, without a lock, changing nothing (see [runtime state in the store](#runtime-state-in-the-store)). |
+| `migrate files plan\|write\|verify` | Every capability, for the manager's `capabilities migrate`: move the capability's own configuration files of a project into the store through its `_migrate_files_mover`, report what would be or was written and every question, or verify it; reads no policy row. |
 
 The declaration facts feed the contract from **constants at the top of the script** — one home each. Guide topics are the exception: their one home is the set of shipped Markdown filenames. Contract verbs render from these sources so they cannot disagree with one another:
 

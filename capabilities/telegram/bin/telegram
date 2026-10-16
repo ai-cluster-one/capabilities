@@ -1375,7 +1375,10 @@ def _gate() -> None:
     `migrate` of a capability that declares `TABLES` acts on the machine's
     store rather than for a project, so it too reads no policy row: it answers
     to the machine ceiling, and `migrate` (not `migrate status`) to the
-    read-only switch.
+    read-only switch. `migrate files` is the manager's `capabilities migrate`
+    moving this capability's files of a project into the store, whether or not
+    the project enabled it: it answers to the machine ceiling, and `migrate
+    files write` to the read-only switch.
 
     Machine administration reads no policy row either: it answers to the
     machine ceiling, and its writes to the read-only switch
@@ -1387,6 +1390,10 @@ def _gate() -> None:
     if not safe:
         _machine_gate()
     service_action = sys.argv[2] if len(sys.argv) > 2 else None
+    if verb == "migrate" and service_action == "files":
+        if sys.argv[3:4] == ["write"]:
+            _read_only_gate(f"`{NAME} migrate files write`")
+        return
     if verb == "migrate" and _tables_declared():
         if service_action != "status":
             _read_only_gate(f"`{NAME} migrate`")
@@ -1533,6 +1540,9 @@ def _env_dir() -> Path | None:
 
 
 _RECORDS = None
+# Who this process writes records as, where it is not the person running it:
+# `migrate` while `migrate files` moves the project's files into the store.
+_RECORDS_ACTOR = None
 
 
 def _records():
@@ -1553,7 +1563,7 @@ def _records():
             _RECORDS = open_records(
                 envelope, _CONFIG_HOME, project_only=project_only,
                 project_root=root, project_id=_project_id() if in_store else None,
-                application_name=NAME)
+                application_name=NAME, actor=_RECORDS_ACTOR)
         except StoreError as e:
             _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
     return _RECORDS
@@ -2211,6 +2221,55 @@ def _cmd_migrate(argv: list[str]) -> None:
     _emit(report)
 
 
+MIGRATE_FILES_ACTIONS = ("plan", "write", "verify")
+
+
+def _cmd_migrate_files(argv: list[str]) -> None:
+    """`migrate files plan|write|verify [--answers FILE]` moves this
+    capability's own configuration files of the project into the store, for
+    the manager's `capabilities migrate`, which runs it on the agent's master
+    and owns the order: `plan` says what would be written and every question
+    code cannot answer, writing nothing; `write` writes it, leaving the files
+    for the manager to archive and remove; `verify` reads it back and says
+    whether the store now holds what the files said. The capability's own
+    `_migrate_files_mover(action, answers, all_answers)`, outside the fences,
+    does the moving and returns its report: `items`, `questions`, `files` (the
+    ones it consumed), `verified` and whatever else it names; a capability
+    without one moves nothing here. `--answers` is the person's recorded
+    answers as JSON, keyed by capability. Every record or setting written here
+    is the migration's own (`migrate@<node>`)."""
+    global _RECORDS_ACTOR
+    action = argv[0] if argv else ""
+    rest = argv[1:]
+    answers: dict = {}
+    if rest[:1] == ["--answers"] and len(rest) == 2:
+        try:
+            answers = json.loads(Path(rest[1]).read_text())
+        except (OSError, ValueError) as e:
+            _die(6, "input", f"cannot read the answers file {rest[1]}: {e}")
+        if not isinstance(answers, dict):
+            _die(6, "input", f"the answers file {rest[1]} must hold a JSON object")
+    elif rest:
+        _die(6, "input", f"unknown migrate files arguments {' '.join(rest)!r}",
+             f"{NAME} migrate files plan|write|verify [--answers FILE]")
+    if action not in MIGRATE_FILES_ACTIONS:
+        _die(6, "input", f"migrate files needs one of {', '.join(MIGRATE_FILES_ACTIONS)}",
+             f"{NAME} migrate files plan|write|verify [--answers FILE]")
+    if _project_root() is None:
+        _die(6, "no_project", "migrate files moves a project's files, and this is not one",
+             "run it in the project; `capabilities migrate` does")
+    _RECORDS_ACTOR = "migrate"
+    mover = globals().get("_migrate_files_mover")
+    report = {"capability": NAME, "action": action, "mover": callable(mover),
+              "items": [], "questions": [], "files": [], "warnings": []}
+    if callable(mover):
+        mine = answers.get(NAME) if isinstance(answers.get(NAME), dict) else {}
+        report.update(mover(action, mine, answers) or {})
+    if action == "verify":
+        report.setdefault("verified", True)
+    _emit(report)
+
+
 MACHINE_READ_EFFECT = ("outside any project these verbs use the machine's own "
                        "connections, read-only; inside a project its grants "
                        "alone decide")
@@ -2313,7 +2372,8 @@ def _manifest_core() -> dict:
             "state": STATE, "inventory": _inventory_declaration(),
             "post_install": POST_INSTALL, "tables": _tables_declared(),
             "connections": _connections_declaration(),
-            "settings": _settings_declaration()}
+            "settings": _settings_declaration(),
+            "migrate_files": callable(globals().get("_migrate_files_mover"))}
 
 
 def _field_value(field: dict, raw, from_argv: bool = False):
@@ -2938,6 +2998,8 @@ def _contract(argv: list[str]) -> None:
         _emit(f"{SUMMARY} Run `{NAME} help`.")
     elif cmd == "manifest":
         _emit(_manifest_core())
+    elif cmd == "migrate" and argv[1:2] == ["files"]:
+        _cmd_migrate_files(argv[2:])
     elif cmd == "migrate" and _tables_declared():
         _cmd_migrate(argv[1:])
     elif cmd == "guide":
@@ -3032,6 +3094,11 @@ HASH_LENGTH = 12
 # separators and anything that would make a key ambiguous to address.
 KEY_RE = re.compile(r"[a-z0-9][a-z0-9._@+-]{0,127}", re.IGNORECASE)
 CAPABILITY_RE = re.compile(r"[a-z][a-z0-9-]{0,63}")
+# The document a settings row belongs to: a capability's own settings, or a
+# named document of it, `<capability>.<name>`, for settings it keeps outside its
+# declared homes (tasks' `conveyor`, slack's `policy`). A capability name never
+# holds a dot, so a named document can never be taken for a capability.
+SETTINGS_DOCUMENT_RE = re.compile(r"[a-z][a-z0-9-]{0,63}(?:\.[a-z][a-z0-9-]{0,63})?")
 
 
 class StoreError(Exception):
@@ -3474,6 +3541,16 @@ def _store_check(name: str, value: str, pattern: re.Pattern) -> str:
     if not isinstance(value, str) or not pattern.fullmatch(value):
         raise StoreError("bad_name", f"{name} {value!r} must match {pattern.pattern}")
     return value
+
+
+def settings_document(capability: str, name: str | None = None) -> str:
+    """The key a settings document is kept under: the capability's own, or
+    its named document `<capability>.<name>`."""
+    _store_check("capability", capability, CAPABILITY_RE)
+    if name is None:
+        return capability
+    return _store_check("settings document", f"{capability}.{name}",
+                        SETTINGS_DOCUMENT_RE)
 
 
 def _semantics(collection: str) -> str:
@@ -5103,7 +5180,7 @@ class AgentRecords(StoreRecords):
         """One scope's settings document as this node reads it: the rows for
         every node with this node's rows over them. None where neither
         document exists, which a reader takes as the capability's seed."""
-        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
         self._scope_root(scope)
         docs, rows = self._settings_rows(capability)
         shared, mine = (scope, None), (scope, self.node)
@@ -5223,7 +5300,7 @@ class AgentRecords(StoreRecords):
         then write the paths that differ, removals first, one trail row each,
         and move the document's generation to the last of them. A refused
         write changes nothing."""
-        _store_check("capability", capability, CAPABILITY_RE)
+        _store_check("settings document", capability, SETTINGS_DOCUMENT_RE)
         _refuse_record_write(capability, "setting")
         agent = self._agent(scope)
         who = self.actor_name(actor)
@@ -9419,6 +9496,35 @@ def cmd_service_migrate_profiles(connection_flag: str | None, session_flag: str 
         report["instruction"] = ("Some combinations make no profile a turn can run on "
                                  "(see `refused`); the positions naming them are left as "
                                  "they are. Fix those settings and run this again.")
+    return report
+
+
+def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict:
+    """`capabilities migrate`'s move of the old worker settings to profile
+    names, as `service migrate-profiles` makes it, before the manager writes
+    the project's settings as rows: it runs only where the settings still
+    carry a worker key, and `verify` finds none left. The service is stopped
+    by the manager first, as `--apply` requires."""
+    root = _project_root()
+    report: dict = {"items": [], "files": [], "warnings": []}
+    schema = _settings_schema_module()
+    left = schema.old_worker_keys(_service_settings(root))
+    if action == "verify":
+        report["differences"] = [f"settings still carry {place}" for place in left]
+        report["verified"] = not left
+        return report
+    if not left:
+        return report
+    moved = cmd_service_migrate_profiles(None, None, action == "write")
+    outcome = "written" if action == "write" else "would_write"
+    report["items"] = ([{"kind": "profile", "name": row["profile"], "outcome": outcome}
+                        for row in moved.get("profiles") or []]
+                       + [{"kind": "setting", "name": key, "outcome": outcome}
+                          for key in (moved.get("settings") or {}).get("keys_written") or []])
+    report["profiles"] = moved
+    if moved.get("refused"):
+        report["warnings"].append("some worker settings make no profile a turn can run "
+                                  "on and are left as they are; see profiles.refused")
     return report
 
 
