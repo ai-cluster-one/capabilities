@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-16 — The service leaves a moved agent's settings file alone
+
+For an agent whose records moved into the store, the service no longer imports an agents map from service/settings.json when it takes the project up, nor removes the file: the migration moved it. Every other project behaves as before.
+
 ## 2026-10-16 — `migrate files` moves the agents map for `capabilities migrate`
 
 Its mover turns an earlier release's agents map in `service/settings.json` into workers, as `workers import` does, keeping the file for the manager, which writes the rest of it as settings rows. `workers import` is unchanged.

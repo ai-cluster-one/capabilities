@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-16 — A moved agent's scheduler settings and agent profiles are the store's
+
+For an agent whose records moved into the store, the declaration is its `automations` settings document (`[engine]`, `agents.default`) with its agent profiles read from `harness_profiles` as `automations-<name>` at the agent's scope; no config.toml is read. The mode is said in the runner's terms (read: plan with Read, Glob and Grep; write: acceptEdits; act: bypassPermissions, or codex `sandbox_mode` read-only, workspace-write and danger-full-access with approval never), and `automations agent` still builds the engine's command from the mode as before. `service init` writes the template as rows once, `service status` and `inventory` judge the document, the daemon starts without `AUTOMATIONS_CONFIG` and loads and reloads its declaration through the new `automations service declaration`, and `AUTOMATIONS_CONFIG` is ignored with a notice. `migrate files` now also moves `[agents.workers]` into harness profiles (a stored version that differs is the question `automations.profiles.<name>`), and the manager leaves `agents.workers` out of the settings rows. The CLI pins callva-harness-runner 0.9.0. Every other project reads config.toml as before.
+
 ## 2026-10-16 — `migrate files` moves [[automations]] into definitions for `capabilities migrate`
 
 Its mover saves config.toml's `[[automations]]`, with `engine.timezone` on each, as definitions, as `import` does, and leaves the file to the manager, which writes the rest of it as settings rows without them. The environment in force here is the master; a node another environment runs on, or the one node of an automation whose environments reach two, is a question (`automations.environments.<env>`, `automations.automations.<slug>`), as is a definition the store holds differently (`automations.differs.<slug>`: `store` or `files`). `[agents]` stays in the settings. `import` is unchanged.

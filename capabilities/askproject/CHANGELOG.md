@@ -1,5 +1,9 @@
 # askproject — change log
 
+## 2026-10-16 — A moved agent's profiles are read from the store
+
+For an agent whose records moved into the store, a profile name resolves to its harness profile at the agent's scope first, then the machine folder and the shipped set; `profiles` lists it with `source: store` and `profiles show` prints its text. No profiles folder is read for it. Every other project reads its folder as before.
+
 ## 2026-10-16 — `migrate files` moves the profiles folder into the store for `capabilities migrate`
 
 Its mover saves each profile in the project's `askproject/profiles/` folder into the store as a harness profile at the project's scope, all of them or none, refusing one the store holds differently, and leaves the files for the manager to archive and remove. The harness runner is pinned at 0.9.0, the release that keeps profiles in a store.

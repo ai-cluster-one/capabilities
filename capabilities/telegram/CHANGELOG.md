@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-16 — File overrides are ignored for a moved agent
+
+For an agent whose records moved into the store, the daemon is started without `TELEGRAM_SERVICE_SETTINGS`, and `TELEGRAM_SERVICE_SETTINGS`, `TELEGRAM_SERVICE_CONNECTIONS_FILE`, `TG_CONNECTIONS_FILE` and `TELEGRAM_CONNECTIONS_FILE` are ignored with a notice on the daemon's log; connections and settings come from the store. Every other project behaves as before.
+
 ## 2026-10-16 — `migrate files` turns old worker settings into profiles for `capabilities migrate`
 
 Where the project's settings still carry a worker key, its mover runs what `service migrate-profiles --apply` does before the manager writes the settings as rows, and its verify finds no worker key left. `service migrate-profiles` is unchanged.

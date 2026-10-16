@@ -6310,14 +6310,20 @@ def _refuse_while_moving(root: Path) -> None:
     are being moved into the store by `capabilities migrate`: until it
     finishes, only the migration on its master writes them."""
     store = _store_module()
-    adapter = _records_for(root)
     try:
-        store._refuse_frozen(adapter._agent_now(), adapter._guard_agent,
-                             getattr(adapter, "actor", None))
-    except store.StoreError as exc:
-        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+        adapter = _open_project_records(root)
+    except store.StoreError:
+        return  # what keeps the records from opening is the write's own to say
+    try:
+        state = adapter._agent_now()
+    except store.StoreError:
+        state = None
     finally:
         adapter.close()
+    try:
+        store._refuse_frozen(state, adapter._guard_agent, getattr(adapter, "actor", None))
+    except store.StoreError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
 
 
 def _ensure_envelope(root: Path) -> list[str]:

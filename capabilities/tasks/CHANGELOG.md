@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-16 — A moved agent's conveyor and service settings are rows
+
+For an agent whose records moved into the store, the escalation chain is its `tasks.conveyor` settings document, `service init` writes the template as rows once, `service status`, `service doctor` and `inventory` judge the document and name the store, and the service's fingerprint covers the document's content. Worker, profile and retired workers.toml files left in such an agent are neither read, imported nor removed, by `run` or by the service. Every other project behaves as before.
+
 ## 2026-10-16 — `migrate files` moves workers and profiles for `capabilities migrate`
 
 Its mover saves the project's worker and profile files into the store at the project's scope, as `workers import` and `profiles import` do, without removing them: the manager archives and removes them once the whole move is verified, and moves `conveyor.toml` as the named settings document `tasks.conveyor`. `workers import` and `profiles import` are unchanged.

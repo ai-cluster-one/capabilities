@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-10-16 — `service init` writes a moved agent's settings as rows
+
+For an agent whose records moved into the store, `service init` writes `{"version": 1}` as its settings rows, refusing as `settings_exist` (naming the store) where they exist already, and the doctor and settings errors name the store. Every other project writes service/settings.json as before.
+
 ## 2026-10-13 — `memory` declares what a person is asked for, and writes it through the contract
 
 Its settings (project `service/settings.json`, global `service/settings.json`, machine `service/config.json`) are declared under `settings`, with the keys a panel shows as controls, and `memory settings` reads every document whole while `settings get|set|unset|put` write one key or one document, checked as memory reads it. Bare `memory help` ends with a section rendered from these declarations. Nothing else changes.

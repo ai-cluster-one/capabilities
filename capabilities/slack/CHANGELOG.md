@@ -1,5 +1,9 @@
 # slack — change log
 
+## 2026-10-16 — A moved agent's allow-list is its slack.policy settings document
+
+For an agent whose records moved into the store, `slack read` and `post` judge conversations by its `slack.policy` settings document, and a refusal names it; the daemon is started without `SLACK_SERVICE_SETTINGS`, which is ignored with a notice. Every other project reads policy.json as before.
+
 ## 2026-10-13 — Outside any project, `slack connections` and `slack doctor` read the machine's own connections
 
 `slack` declares `connections` and `doctor` as machine reads. Run outside any project, `slack connections` lists the connections declared globally whose grant is not switched off, each under `machine_reads` with the scope `machine`, and `slack doctor` checks their health, where both used to refuse with `connection_not_granted`. Each such connection is read-only there: a write through it exits 4 `read_only`, and every other verb outside a project is refused the machine's connections as before. Inside a project nothing changes; its grants alone decide.
