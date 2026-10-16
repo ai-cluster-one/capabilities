@@ -635,8 +635,9 @@ PROJECT VERBS (run inside a consuming project)
         settings of every capability's project home as settings rows - with
         capabilities/tasks/conveyor.toml folded in as the tasks settings'
         `escalation` table and capabilities/slack/policy.json merged into
-        the slack settings' allow-list (the service's entries kept, a mode
-        the two disagree on asked) - and through each capability's `<name> migrate files` what it keeps
+        the slack settings' allow-list (an entry both hold keeps the
+        service's; each entry only one holds, and each mode the two
+        disagree on, asked) - and through each capability's `<name> migrate files` what it keeps
         of its own: automations [[automations]] and engine.timezone as
         definitions and [agents.workers] as harness profiles
         automations-<name>, askproject's profiles folder, whatsapp's and tasks'
@@ -651,8 +652,9 @@ PROJECT VERBS (run inside a consuming project)
         deployment target, and every question code cannot answer - a node
         for a legacy automation, a connection whose stored spec differs, a
         node to register, an id project.json and .contextkit/config.toml
-        disagree on, an allow-list mode policy.json and the slack service
-        settings disagree on. Each question names the path in the --answers JSON its
+        disagree on, a slack user or channel only one of policy.json and the
+        service settings holds (keep or drop), a slack mode the two disagree
+        on. Each question names the path in the --answers JSON its
         answer goes to. --apply refuses (exit 6, nothing written) without a
         database (its own code), without AGENT_NODE_NAME (node_unnamed), on a
         node other than the answers' or the open migration's (node_mismatch)
@@ -9231,12 +9233,9 @@ def _migrate_fold(name: str, document: dict | None, folded: dict | None,
     where neither holds anything."""
     questions: list = []
     warnings: list = []
+    if name == "slack":
+        return _migrate_fold_slack(name, document, folded, answers, where)
     if folded is None:
-        if name == "slack" and document is not None and any(
-                key in document for key in MIGRATE_SLACK_LISTS):
-            warnings.append(f"slack: {where} carries no policy.json, so `slack read` and "
-                            "`post` will reach the conversations its service settings "
-                            "admit, its one allow-list once it has moved")
         return document, questions, warnings
     if name == "tasks":
         out = json.loads(json.dumps(document if document is not None
@@ -9247,29 +9246,58 @@ def _migrate_fold(name: str, document: dict | None, folded: dict | None,
         else:
             out["escalation"] = folded
         return out, questions, warnings
-    # slack: one allow-list. An entry the service settings hold keeps its
-    # meaning - their own entry, with its role - and an entry only the
-    # policy held is added; a mode the two read differently is asked.
-    if document is None:
-        return json.loads(json.dumps(folded)), questions, warnings
-    out = json.loads(json.dumps(document))
+    return document, questions, warnings
+
+
+def _migrate_fold_slack(name: str, document: dict | None, folded: dict | None,
+                        answers: dict, where: str) -> tuple:
+    """slack's one allow-list, from its policy.json (what `slack read` and
+    `post` may reach) and its service settings (what the service admits).
+    A file that is absent holds nothing. An entry both hold keeps the service
+    settings' own, with its role; an entry only one holds would newly be
+    reached or admitted through the other, so each is asked - kept for both,
+    or dropped from both - and nothing is written until it is answered; a
+    mode the two read differently is asked too."""
+    questions: list = []
+    if folded is None and document is None:
+        return None, questions, []
+    policy, service = folded or {}, document or {}
+    out = json.loads(json.dumps(service))
+    modes = {key.split(".", 1)[0] for key in MIGRATE_SLACK_MODES}
+    for key, value in policy.items():
+        # The lists and modes are settled below, entry by entry.
+        if key not in MIGRATE_SLACK_LISTS and key not in modes and key not in out:
+            out[key] = json.loads(json.dumps(value))
     for key in MIGRATE_SLACK_LISTS:
-        if key not in folded:
+        if key not in policy and key not in service:
             continue
-        theirs, ours = folded[key], out.get(key)
-        if key not in out:
-            out[key] = theirs
-        elif isinstance(theirs, dict) and isinstance(ours, dict):
-            out[key] = {**theirs, **ours}
-        elif theirs != ours:
-            choice = _migrate_dig(answers, f"settings.{name}.{key}")
-            if choice == "policy":
+        theirs, ours = policy.get(key, {}), service.get(key, {})
+        if not isinstance(theirs, dict) or not isinstance(ours, dict):
+            if key not in service:
                 out[key] = theirs
-            elif choice != "service":
-                questions.append(_migrate_fold_question(name, key, theirs, ours, where))
+            elif key in policy and theirs != ours:
+                choice = _migrate_dig(answers, f"settings.{name}.{key}")
+                if choice == "policy":
+                    out[key] = theirs
+                elif choice != "service":
+                    questions.append(_migrate_fold_question(name, key, theirs, ours, where))
+            continue
+        merged = {}
+        for ident in sorted(set(theirs) | set(ours)):
+            if ident in ours and ident in theirs:
+                merged[ident] = ours[ident]
+                continue
+            qid = f"settings.{name}.{key}.{ident}"
+            choice = _migrate_dig(answers, qid)
+            if choice == "keep":
+                merged[ident] = ours[ident] if ident in ours else theirs[ident]
+            elif choice != "drop":
+                questions.append(_migrate_entry_question(qid, key, ident, ident in ours,
+                                                         where))
+        out[key] = merged
     for key, fallback in MIGRATE_SLACK_MODES.items():
-        theirs = _migrate_fold_value(folded, key, fallback)
-        ours = _migrate_fold_value(out, key, fallback)
+        theirs = _migrate_fold_value(policy, key, fallback)
+        ours = _migrate_fold_value(service, key, fallback)
         if theirs == ours:
             continue
         qid = f"settings.{name}.{key}"
@@ -9277,8 +9305,31 @@ def _migrate_fold(name: str, document: dict | None, folded: dict | None,
         if choice == "policy":
             _migrate_fold_put(out, key, theirs)
         elif choice != "service":
+            # The service's stands as its settings say it, a mode left out
+            # reading as its default.
             questions.append(_migrate_fold_question(name, key, theirs, ours, where))
-    return out, questions, warnings
+    return out, questions, []
+
+
+def _migrate_entry_question(qid: str, key: str, ident: str, in_service: bool,
+                            where: str) -> dict:
+    """The question for an allow-list entry only one of slack's two files
+    holds: what keeping it would newly open, or dropping it close."""
+    what = "user" if key == "allowed_users" else "channel"
+    if in_service:
+        held = (f"is in the service settings ({where}) only: the service admits "
+                "it today and `slack read` and `post` cannot reach it")
+        newly = f"`slack read` and `post` would newly reach this {what}"
+    else:
+        held = ("is in policy.json only: `slack read` and `post` reach it today and "
+                "the service does not admit it")
+        newly = ("the service would newly admit its direct messages" if what == "user"
+                 else "the service would newly admit its mentions and catch up on its "
+                      "history")
+    return {"id": qid, "answer": qid, "choices": ["keep", "drop"],
+            "question": f"slack {what} {ident} {held}. Once the agent has moved one "
+                        f"allow-list decides both: keep it, and {newly}; or drop it, and "
+                        "neither reaches it?"}
 
 
 def _migrate_fold_value(document: dict, dotted: str, fallback):

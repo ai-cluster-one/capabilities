@@ -96,10 +96,11 @@ An agent whose records moved into the store keeps one allow-list instead: the
 `direct_messages`, `allowed_users`, `allowed_channels` and
 `default_channel_policy` of its slack settings decide both what the service
 admits and what `slack read` and `slack post` may access, and `slack settings
-set` edits them. Its move folds `policy.json` into them: an entry the service
-settings already held is kept as it was, with its role, an entry only
-`policy.json` held is added, and where the two disagree on a mode the move
-asks which one stands.
+set` edits them. Its move folds `policy.json` into them: an entry both held
+keeps the service settings' own, with its role; an entry only one of them held
+- which the one allow-list would newly let the service admit, or `slack read`
+and `post` reach - is asked about, kept for both or dropped from both, and so
+is a mode the two disagree on; nothing is written until each is answered.
 
 ## Runtime behavior
 

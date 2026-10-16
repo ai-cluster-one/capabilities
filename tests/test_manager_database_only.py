@@ -169,7 +169,11 @@ def build(w: Machine) -> None:
         assert result.returncode == 0, (name, result.stderr)
     w.agentkit_list()
     w.answer(w.manager(w.roots["moved"], "migrate", "--global", "--apply"))
-    answers = {"moved": answers_file(w, "moved", {"nodes": {"srv-dbonly": {"register": True}}}),
+    answers = {"moved": answers_file(w, "moved", {
+                   "nodes": {"srv-dbonly": {"register": True}},
+                   # policy.json's entries, which the slack service would newly admit.
+                   "settings": {"slack": {"allowed_users": {"U01": "keep"},
+                                          "allowed_channels": {"C01": "keep"}}}}),
                "fresh": answers_file(w, "fresh", {})}
     for name in ("moved", "fresh"):
         applied = w.answer(w.manager(w.roots[name], "migrate", "--apply", "--answers",
@@ -391,9 +395,12 @@ def test_slack_reads_its_allow_list_as_rows(world):
 
 
 def test_policy_and_service_settings_move_as_one_allow_list(world):
-    """The move folds policy.json into the slack settings: the service's own
-    entries stay as they were, with their roles, an entry only the policy held
-    is added, and a mode the two read differently is asked."""
+    """The move folds policy.json into the slack settings: an entry both held
+    keeps the service's own, with its role; every user or channel only one of
+    them held - which the one allow-list would newly let the service admit, or
+    `slack read` and `post` reach - is asked, and so is a mode they disagree
+    on; nothing is written until each is answered, and the answer keeps the
+    entry for both or drops it from both."""
     w = world
     root = w.agent("chat", "prj_dbonly00004", {
         "{env}/settings.json": gate("slack"),
@@ -403,34 +410,55 @@ def test_policy_and_service_settings_move_as_one_allow_list(world):
                                     "allowed_channels": {"C01": "#ops", "C02": "#team"},
                                     "default_channel_policy": "open"},
         "{env}/slack/service/settings.json": {
-            "allowed_channels": {"C02": {"name": "team", "default_role": "default"}},
+            "allowed_users": {"U05": {"name": "lead", "role": "supervisor"}},
+            "allowed_channels": {"C02": {"name": "team", "default_role": "default"},
+                                 "C03": {"name": "watch", "default_role": "default"}},
             "auto_answer": {"users": [], "channels": ["C02"]},
             "defaults": {"worker": "stub"}},
         ".env.local": "SLACK_BOT_TOKEN=xoxb-test\n"}, ignore=(".env.local",))
     w.agentkit_list()
     dry = w.answer(w.manager(root, "migrate"))
-    asked = [q for q in dry["questions"] if q["id"] == "settings.slack.default_channel_policy"]
+    asked = {q["id"]: q for q in dry["questions"] if q["id"].startswith("settings.slack.")}
+    before = w.everything()
     refused = w.error(w.manager(root, "migrate", "--apply", "--answers",
                                 answers_file(w, "chat", {})))
+    unwritten = w.everything() == before
     applied = w.answer(w.manager(root, "migrate", "--apply", "--answers", answers_file(
-        w, "chat", {"settings": {"slack": {"default_channel_policy": "service"}}})))
+        w, "chat", {"settings": {"slack": {
+            "default_channel_policy": "service",
+            "allowed_users": {"U01": "drop", "U05": "keep"},
+            "allowed_channels": {"C01": "keep", "C03": "drop"}}}})))
     document = {tuple(path): value for path, value in w.sql(
         "SELECT path, value FROM capabilities_settings WHERE agent_id = %s AND "
         "capability = 'slack'", ("prj_dbonly00004",))}
-    _say("slack-one-allow-list", {"questions": dry["questions"], "refused": refused,
+    _say("slack-one-allow-list", {"questions": asked, "refused": refused,
                                   "verify": applied["verify"], "document": {
                                       ".".join(k): v for k, v in document.items()}})
-    assert asked and asked[0]["choices"] == ["policy", "service"]
-    assert refused["code"] == "question_open"
+    assert set(asked) == {"settings.slack.default_channel_policy",
+                          "settings.slack.allowed_users.U01",
+                          "settings.slack.allowed_users.U05",
+                          "settings.slack.allowed_channels.C01",
+                          "settings.slack.allowed_channels.C03"}
+    assert asked["settings.slack.allowed_users.U01"]["choices"] == ["keep", "drop"]
+    assert "newly admit its direct messages" in asked[
+        "settings.slack.allowed_users.U01"]["question"]
+    assert "newly admit its mentions" in asked[
+        "settings.slack.allowed_channels.C01"]["question"]
+    assert "`slack read` and `post` would newly reach this channel" in asked[
+        "settings.slack.allowed_channels.C03"]["question"]
+    assert refused["code"] == "question_open" and unwritten
     assert applied["state"] == "migrated" and not applied["verify"]["differences"]
     assert document[("allowed_channels", "C01")] == "#ops"
     assert document[("allowed_channels", "C02", "default_role")] == "default"
-    assert document[("allowed_users", "U01")] == "operator"
+    assert document[("allowed_users", "U05", "role")] == "supervisor"
+    assert not [k for k in document if k[:2] in (("allowed_users", "U01"),
+                                                 ("allowed_channels", "C03"))]
     assert ("default_channel_policy",) not in document
     assert not (root / "capabilities" / "slack" / "policy.json").exists()
     out = {target: w.cap(root, "slack", "read", target, **GARBAGE)
-           for target in ("C01", "C02", "C03")}
-    assert w.error(out["C03"])["code"] == "policy_refusal"
+           for target in ("C01", "C02", "C03", "U01")}
+    for target in ("C03", "U01"):
+        assert w.error(out[target])["code"] == "policy_refusal", target
     for target in ("C01", "C02"):
         assert w.error(out[target])["code"] != "policy_refusal", target
     assert w.answer(w.cap(root, "slack", "service", "status"))["initialized"] is True
