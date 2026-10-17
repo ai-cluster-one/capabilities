@@ -648,7 +648,10 @@ PROJECT VERBS (run inside a consuming project)
         and deployment's runtime.json service_policy and placement as policy
         rows naming each node. The default is a dry run, which writes
         nothing: what each part would write, every row the store already
-        holds differently, each settings value naming a host path, each file
+        holds differently, the steps that would bring the contract's tables
+        to this code's version (tables_to_upgrade; a dry run changes nothing
+        in the store, its schema included, and reads it as those steps would
+        leave it), each settings value naming a host path, each file
         that differs from its committed copy, each other root of the agent
         on this machine (verify-only, differences named), one node per
         deployment target, and every question code cannot answer - a node
@@ -699,9 +702,11 @@ PROJECT VERBS (run inside a consuming project)
         store's global rows on them, and set global_migrated_at; the dry run
         lists each row it would add, change or remove and every agent whose
         effective gate would flip (gate_flips), counting only agents that
-        read the same database. Both first bring the contract's tables to
-        this code's version, as every kernel verb does, and name the steps
-        applied (tables_upgraded). Once set, it changes nothing.
+        read the same database. --apply first brings the contract's tables
+        to this code's version and names the steps it ran (tables_upgraded);
+        the dry run changes nothing, the schema included, names the steps an
+        apply would run (tables_to_upgrade) and plans as if they had run.
+        Once set, it changes nothing.
   migrate --discard [--root PATH]...
         On a node that is not the global master: delete the config home's
         record and settings files without reading them. The roots it weighs
@@ -8788,6 +8793,45 @@ def _migrate_rows(conn, query: str, params: tuple = ()) -> list[tuple]:
     return rows
 
 
+def _migrate_tables_pending(conn) -> dict | None:
+    """What bringing the contract's tables to this code's version would run,
+    read without a lock or a write: {from, to, steps}, None where they are
+    current."""
+    store = _store_module()
+    db = _db_module()
+    import psycopg
+    major, minor = store.STORE_TABLES_VERSION
+    try:
+        conn.rollback()
+        status = db.status(conn, store.STORE_OWNER, store.record_table_steps(),
+                           major=major, minor=minor)
+    except db.DbError as exc:
+        raise _MigrateRefusal(exc.slug, exc.message, exc.hint,
+                              exit_code=_store_error_exit(exc)) from None
+    except psycopg.OperationalError as exc:
+        raise _MigrateRefusal("store_unreachable", f"cannot reach the store: {exc}",
+                              "check it with `capabilities store doctor`", exit_code=5) from None
+    if status.state == "current":
+        return None
+    if status.state != "pending":
+        raise _MigrateRefusal(status.state, f"the store's {store.STORE_OWNER} tables cannot "
+                              f"be brought to {major}.{minor}: {status.state}",
+                              "check them with `capabilities store doctor`")
+    stored = (f"{status.stored_major}.{status.stored_minor}"
+              if status.stored_major is not None else None)
+    return {"from": stored, "to": f"{major}.{minor}", "steps": list(status.pending)}
+
+
+def _migrate_read_only() -> None:
+    """From here on every connection this process and the capabilities it
+    runs open is read-only, so a dry run cannot change the store, its schema
+    included, whatever it reaches."""
+    flag = "-c default_transaction_read_only=on"
+    current = os.environ.get("PGOPTIONS", "")
+    if flag not in current:
+        os.environ["PGOPTIONS"] = f"{current} {flag}".strip()
+
+
 def _migrate_upgrade_tables(conn) -> list[str]:
     """The contract's tables brought to this code's version on an idle
     connection: the steps it applied, none where they were current."""
@@ -8814,6 +8858,9 @@ def _migrate_global_at(conn) -> str | None:
 
 
 def _migrate_agent_state(conn, agent_id: str) -> dict | None:
+    """The agent's registry row and nodes; on a store whose tables predate
+    the registry, the row the upgrade would copy from ContextKit's registry,
+    so a dry run there reads what the upgraded store would hold."""
     import psycopg
     try:
         state = _store_module()._agent_state(conn, agent_id)
@@ -8821,6 +8868,12 @@ def _migrate_agent_state(conn, agent_id: str) -> dict | None:
         conn.rollback()
         return None
     conn.rollback()
+    if state is None and not _migrate_rows(
+            conn, "SELECT 1 WHERE to_regclass('capabilities_agents') IS NOT NULL") \
+            and _migrate_rows(conn, "SELECT 1 FROM contextkit_agents WHERE id = %s",
+                              (agent_id,)):
+        state = {"id": agent_id, "migrating_since": None, "migrated_at": None,
+                 "nodes": {}, "master": None}
     return state
 
 
@@ -8838,8 +8891,9 @@ def _migrate_policy_rows(conn, agent_id: str | None) -> dict:
 
 def _migrate_identifier_rows(conn, agent_id: str | None) -> dict:
     return {(cap, label): (value, note or "") for cap, label, value, note in _migrate_rows(
-        conn, "SELECT capability, label, value, note FROM capabilities_identifiers "
-              "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND node IS NULL",
+        conn, "SELECT capability, label, value, note FROM capabilities_identifiers i "
+              "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') "
+              "AND to_jsonb(i) ->> 'node' IS NULL",
         (agent_id,))}
 
 
@@ -9162,6 +9216,7 @@ def _migrate_context(root: Path, opts: dict, answers: dict) -> dict:
         ctx["state"] = _migrate_agent_state(conn, agent_id)
         ctx["nodes"] = _migrate_node_rows(conn, agent_id)
         ctx["global_migrated_at"] = _migrate_global_at(conn)
+        ctx["tables_to_upgrade"] = _migrate_tables_pending(conn)
     finally:
         conn.close()
     state = ctx["state"] or {}
@@ -9218,8 +9273,8 @@ def _migrate_global_home(ctx: dict) -> Path:
                   "WHERE agent_id IS NULL AND node IS NULL")}
         identifiers: dict = {}
         for name, label, value, note in _migrate_rows(
-                conn, "SELECT capability, label, value, note FROM capabilities_identifiers "
-                      "WHERE agent_id IS NULL AND node IS NULL"):
+                conn, "SELECT capability, label, value, note FROM capabilities_identifiers i "
+                      "WHERE agent_id IS NULL AND to_jsonb(i) ->> 'node' IS NULL"):
             identifiers.setdefault(name, {})[label] = {"value": value, "note": note or ""}
         registries: dict = {}
         for name, cid, spec in _migrate_rows(
@@ -10378,6 +10433,8 @@ def cmd_migrate_agent(opts: dict) -> None:
     apply = bool(opts.get("apply"))
     if apply:
         _read_only_gate("migrate --apply")
+    else:
+        _migrate_read_only()
     try:
         ctx = _migrate_context(root, opts, answers)
     except _MigrateRefusal as exc:
@@ -10388,6 +10445,8 @@ def cmd_migrate_agent(opts: dict) -> None:
                     "node": ctx["node"], "mode": ctx["mode"],
                     "applied": apply, "store": {"level": ctx["setting"].level,
                                                 "schema": ctx["setting"].schema}}
+    if ctx.get("tables_to_upgrade") and not apply:
+        answer["tables_to_upgrade"] = ctx["tables_to_upgrade"]
     main = _migrate_main_checkout(ctx)
     if main is not None:
         # A second checkout of the agent only verifies: whatever its files
@@ -10766,6 +10825,8 @@ def cmd_migrate_global(opts: dict) -> None:
     apply = bool(opts.get("apply"))
     if apply:
         _read_only_gate("migrate --global --apply")
+    else:
+        _migrate_read_only()
     root = _project_root() or Path.cwd()
     try:
         conn, setting = _migrate_connect(root)
@@ -10775,17 +10836,24 @@ def cmd_migrate_global(opts: dict) -> None:
     answer: dict = {"ok": True, "scope": "global", "config_home": str(_CONFIG_HOME),
                     "applied": apply, "store": {"level": setting.level,
                                                 "schema": setting.schema}}
-    # The plan reads the global rows as this code keeps them, so the
-    # contract's tables are brought to its version first, as every kernel
-    # verb does; the dry run names what that applied.
+    # The plan reads the global rows as this code keeps them. A dry run
+    # changes nothing, the tables' schema included: it names the steps an
+    # apply would run and reads the store as they would leave it. An apply
+    # runs them first.
     try:
-        upgraded = _migrate_upgrade_tables(conn)
+        if apply:
+            upgraded = _migrate_upgrade_tables(conn)
+            if upgraded:
+                major, minor = _store_module().STORE_TABLES_VERSION
+                answer["tables_upgraded"] = {"steps": upgraded,
+                                             "version": f"{major}.{minor}"}
+        else:
+            pending = _migrate_tables_pending(conn)
+            if pending:
+                answer["tables_to_upgrade"] = pending
     except _MigrateRefusal as exc:
         conn.close()
         _migrate_refuse(exc, answer)
-    if upgraded:
-        major, minor = _store_module().STORE_TABLES_VERSION
-        answer["tables_upgraded"] = {"steps": upgraded, "version": f"{major}.{minor}"}
     refused = None
     try:
         answer["global_migrated_at"] = _migrate_global_at(conn)

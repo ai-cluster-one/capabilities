@@ -153,21 +153,67 @@ def state(w: World, agent_id: str) -> tuple:
 
 # --- D1: the global rows on a store whose contract tables are at 1.1 ---------------
 
-def test_global_runs_on_a_store_at_1_1(world):
+def store_snapshot(w: World) -> dict:
+    """The store's schema - every column, index and constraint - and every
+    table's rows, the ledger and the version table among them."""
+    return {
+        "columns": w.sql("SELECT table_name, column_name, data_type, is_nullable, "
+                         "column_default FROM information_schema.columns WHERE "
+                         "table_schema = %s ORDER BY 1, 2", (SCHEMA,)),
+        "indexes": w.sql("SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s "
+                         "ORDER BY 1", (SCHEMA,)),
+        "constraints": w.sql("SELECT conrelid::regclass::text, conname, "
+                             "pg_get_constraintdef(c.oid) FROM pg_constraint c JOIN "
+                             "pg_namespace n ON n.oid = c.connamespace WHERE n.nspname = %s "
+                             "ORDER BY 1, 2", (SCHEMA,)),
+        "rows": w.tables(),
+    }
+
+
+def dry_runs_change_nothing(w: World, version: str) -> dict:
+    """A global and an agent dry run on the store as it stands: neither
+    crashes, both name the steps an apply would run, and the store - schema,
+    ledger and rows - is byte-identical afterwards."""
+    root = w.roots["first"]
+    before = store_snapshot(w)
+    result = w.manager(root, "migrate", "--global", "--dry-run")
+    assert "Traceback" not in result.stderr, result.stderr[-2000:]
+    dry = w.answer(result)
+    assert dry["applied"] is False and dry["would_write"] is True
+    assert dry["tables_to_upgrade"]["from"] == version
+    assert dry["tables_to_upgrade"]["to"] == "1.3"
+    assert "tables_upgraded" not in dry
+    assert {r["capability"] for r in dry["plan"]["policy"]} == {"coolify", "memory"}
+    assert store_snapshot(w) == before
+    result = w.manager(root, "migrate", "--dry-run")
+    assert "Traceback" not in result.stderr, result.stderr[-2000:]
+    agent = w.answer(result)
+    assert agent["tables_to_upgrade"] == dry["tables_to_upgrade"]
+    assert [b["code"] for b in agent["blockers"]] == ["global_not_migrated"]
+    assert not agent["plan"]["mover_failures"], agent["plan"]["mover_failures"]
+    assert {(c["name"], c["outcome"]) for c in agent["plan"]["records"]["connections"]} \
+        == {("shared", "write"), ("ops", "write")}
+    assert store_snapshot(w) == before
+    return dry
+
+
+def test_dry_runs_on_a_store_at_1_1_or_1_2_change_nothing_and_apply_upgrades(world):
     root = world.roots["first"]
     assert world.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
         == [(1, 1)]
-    dry = world.manager(root, "migrate", "--global", "--dry-run")
-    assert "Traceback" not in dry.stderr, dry.stderr[-2000:]
-    dry = world.answer(dry)
-    assert dry["applied"] is False and dry["would_write"] is True
-    assert dry["tables_upgraded"]["version"] == "1.3"
-    assert dry["tables_upgraded"]["steps"][0].startswith("0009")
-    assert {r["capability"] for r in dry["plan"]["policy"]} == {"coolify", "memory"}
-    assert world.sql("SELECT global_migrated_at FROM capabilities_global") == [(None,)]
+    dry = dry_runs_change_nothing(world, "1.1")
+    assert dry["tables_to_upgrade"]["steps"][0].startswith("0009")
+    # At 1.2: the registry is there, the node on identifiers and the
+    # settings tables are not.
+    upgrade_to(world, 13, 1, 2)
+    dry = dry_runs_change_nothing(world, "1.2")
+    assert dry["tables_to_upgrade"]["steps"][0].startswith("0014")
     applied = world.answer(world.manager(root, "migrate", "--global", "--apply"))
     assert applied["state"] == "migrated" and applied["changed"] is True
-    assert "tables_upgraded" not in applied
+    assert applied["tables_upgraded"]["version"] == "1.3"
+    assert applied["tables_upgraded"]["steps"][0].startswith("0014")
+    assert world.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
+        == [(1, 3)]
     # Each capability's own tables, as its install migrated them.
     for name in ("automations", "whatsapp", "memory"):
         result = world.cap(root, name, "migrate")
