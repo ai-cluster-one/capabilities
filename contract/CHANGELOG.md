@@ -1,5 +1,9 @@
 # contract — change log
 
+## 2026-10-17 — `migrate files plan` creates and upgrades no table
+
+The plan a capability gives `capabilities migrate` changes nothing in the store, its own tables and every other owner's included: every connection the capability opens through the shared database layer during `migrate files plan` is one connection per database inside a transaction that is never committed, a migration on it runs the steps it would apply inside that transaction and records them, and the transaction is rolled back when the plan ends, so the capability reads its tables as an upgrade would leave them whether they are missing or behind. The steps are named by owner under the report's `tables_to_upgrade`. Every capability carries the change through `sync-contract`.
+
 ## 2026-10-16 — Helpers for a moved agent: whether its records are rows, and retired overrides
 
 The preamble gains `_records_in_store()` (whether this project is an agent whose records and settings moved into the store) and `_env_override(*keys)`, which returns an override naming a record or settings file and, for a moved agent, ignores it with a one-line notice on stderr. Every capability carries the change through `sync-contract`.

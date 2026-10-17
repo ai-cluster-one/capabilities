@@ -5,8 +5,8 @@
     "SHEBANG.md": "70cb33811ab72ee291d3a3796f901764cd925566a72cc69f532effaf5be8da24",
     "SOURCES.md": "79e453cf68a08ba2b2e5e460064eb0a5aca8f13071e9d6557be1b7361f1e0075",
     "TEMPLATE.md": "c9818625f5372ba7c53a423be43543f9f485435dae5a71ffbc4b61e5c81617e7",
-    "contract/CHANGELOG.md": "bd74aba4a3fd6f5fb3a776774acfe01aba40cd1a0be832893a5b35f4c0b6b663",
-    "contract/preamble.py": "337f75795e260cbc84d53c49429afd85fb92fb97ca755ddd8a5bd2139c7b8ed7",
+    "contract/CHANGELOG.md": "974660498cc07108d916c6b188505f391581c35ff34399c098520f9b608c107e",
+    "contract/preamble.py": "0053b01603fae01b74e312755b4f78a2af13a9e3b5b4eaf864b3927956eb9938",
     "contract/store.py": "9ca69d1f6ca3ae7e82042d6492f62c709c1655d9cbd310e180f60d918e140980",
     "guides/authoring.md": "e467e5343a54e99c991592d06233fd98b7be13fa32a174d0f27d3a8a06478724",
     "guides/conforming.md": "1c3a44cd7662cb26eec400d05290f6b9f364758387e8d3f974ad8eb74abde93b",
@@ -18,7 +18,7 @@
     "guides/repositories.md": "0ec2af6dfc92d20aa283fecab82b7888fb22b2480541cbb597e9a52f680ec2f4",
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "d3d3b1f2cc76cfc9e7e0c4aaf0954132ebaee31687915aba95ed8e4422654915",
+    "manager/CHANGELOG.md": "f7de8ab8cd6d72fc03e1db7889fc2f898e38752d12e68c0507ccfa2b442c2f58",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {

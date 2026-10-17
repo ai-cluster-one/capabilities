@@ -1,9 +1,5 @@
 # tasks — change log
 
-## 2026-10-17 — `migrate files plan` reads the store as it stands and changes nothing
-
-The plan `capabilities migrate` asks of tasks no longer migrates the tasks or harness profile tables: it reads them as they stand, a table not made yet as holding nothing, and names the steps a write would run under `tables_to_upgrade`, so a dry run on a store whose tables are missing or behind plans the same moves without writing.
-
 ## 2026-10-16 — The escalation is a table of the tasks settings
 
 The escalation chain and its ceiling are the `escalation` table of the tasks settings document - `escalation.escalate_to` and `escalation.stall_after`, declared keys edited with `tasks settings set` and checked by it as the claim reads them - in the project's `service/config.toml`, or in its rows for an agent whose records moved into the store. A project whose settings carry no `escalation` table and whose records have not moved still has its `conveyor.toml` read, so such a project behaves as before; `doctor`'s warning for a project with enabled workers and no chain names the settings verb. `service init` writes the template beside an escalation set before it, and `--force` keeps that table.
