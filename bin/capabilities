@@ -8659,7 +8659,7 @@ def _migrate_scan(base: Path, depth: int = MIGRATE_SCAN_DEPTH) -> list[Path]:
     an envelope's gate or identity or a ContextKit binding: a root that may
     read this machine's config home."""
     out = []
-    if depth < 0:
+    if depth <= 0:
         return out
     try:
         children = sorted(p for p in base.iterdir() if p.is_dir() and not p.is_symlink())
