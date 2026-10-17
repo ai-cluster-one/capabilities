@@ -208,8 +208,10 @@ MACHINE VERBS
         row carries `machine` ("allowed" or
         "quarantined") and `machine_connections`, the connections this
         machine's global scope declares for it less those whose grant there
-        is disabled; a quarantined row is effective "disabled" with source
-        "machine".
+        is disabled - once the config home holds no connections file and the
+        store's global rows exist, the connections the store holds for it
+        less those whose global grant is disabled; a quarantined row is
+        effective "disabled" with source "machine".
   search [QUERY] [--source ID]
         Search cached catalogues from the official and registered sources.
         Listing never executes catalogue capability code. JSON {matches [{name,
@@ -650,8 +652,11 @@ PROJECT VERBS (run inside a consuming project)
         that differs from its committed copy, each other root of the agent
         on this machine (verify-only, differences named), one node per
         deployment target, and every question code cannot answer - a node
-        for a legacy automation, a connection whose stored spec differs, a
-        node to register, an id project.json and .contextkit/config.toml
+        for a legacy automation, a connection whose stored spec differs
+        ("store": the agent adopts the stored spec; "files": the stored spec
+        is replaced; {"rename": "<name>"}: the agent's own is written under
+        that name and its grants, default and settings `connection` follow
+        it, the stored one left to the others), a node to register, an id project.json and .contextkit/config.toml
         disagree on, a slack user or channel only one of policy.json and the
         service settings holds (keep or drop), a slack mode the two disagree
         on. Each question names the path in the --answers JSON its
@@ -661,6 +666,13 @@ PROJECT VERBS (run inside a consuming project)
         or other than the agent's master (not_master), before `migrate
         --global` (global_not_migrated), with a payload older than this
         contract (payload_outdated) or with a question open (question_open).
+        A second checkout of the agent - a linked git worktree of its main
+        checkout, a root other than the one its open migration started in,
+        or a root whose files are behind another root of the same id that
+        already keeps the records in the store - only verifies: it names its
+        main checkout and differences (second_checkout), writes, removes
+        and freezes nothing, and until the agent has moved refuses
+        (second_checkout) naming the main checkout.
         It registers the agent and this node as its master on the first
         run, sets migrating_since (from then only this migration writes the
         agent's records and settings, on any node), archives every file git
@@ -686,19 +698,30 @@ PROJECT VERBS (run inside a consuming project)
         settings as the global rows every agent inherits, converging the
         store's global rows on them, and set global_migrated_at; the dry run
         lists each row it would add, change or remove and every agent whose
-        effective gate would flip (gate_flips). Once set, it changes nothing.
-  migrate --discard
+        effective gate would flip (gate_flips), counting only agents that
+        read the same database. Both first bring the contract's tables to
+        this code's version, as every kernel verb does, and name the steps
+        applied (tables_upgraded). Once set, it changes nothing.
+  migrate --discard [--root PATH]...
         On a node that is not the global master: delete the config home's
-        record and settings files without reading them. Refused before
-        global_migrated_at (global_not_migrated) or while an agent on this
-        machine has not moved (agents_unmigrated).
+        record and settings files without reading them. The roots it weighs
+        are the ones --report finds plus every root holding an envelope or a
+        ContextKit binding below the folders those sit in and below each
+        --root. Refused without AGENT_NODE_NAME (node_unnamed), on the master
+        node of any of those agents (master_node), before global_migrated_at
+        (global_not_migrated), or while one of those roots has not moved or
+        has no id (agents_unmigrated, each root named with where it was
+        found).
   migrate --report [--root PATH]...
         What remains on this machine and why: each agent root found in the
         machine services' join lists, AgentKit's agent list, the roots
         given, the project here and their git worktrees, read through each
         one's body root - its state, its record and settings files left, an
         open migration's journal, and the lines of its own text that read
-        those files directly or name a retired import verb - and the config
+        those files directly or name a retired import verb (consumers) apart
+        from historical notes that only quote them - assets/, memory/ and
+        snapshots/ at the root or body root, and change logs - which are
+        counted (historical_notes) and left as they are - and the config
         home's files.
 
 VERIFICATION VERBS
@@ -3788,6 +3811,7 @@ def cmd_list() -> None:
     entries = []
     root = _project_root()
     project_caps, global_caps = _policy_views(root)
+    held = _machine_connections_store(root)
     for name, meta in _installed().items():
         stub, manifest = _load_snapshots(name)
         entry: dict = {"name": name,
@@ -3803,7 +3827,8 @@ def cmd_list() -> None:
         entry["effective"] = effective
         entry["source"] = source
         entry["machine"] = _machine_state(name)
-        entry["machine_connections"] = _machine_connections(name)
+        entry["machine_connections"] = (_machine_connections(name) if held is None
+                                        else held.get(name, 0))
         entries.append(entry)
     known = set(global_caps) | (set(project_caps) if root else set())
     enabled_not_installed = []
@@ -6259,6 +6284,38 @@ def _write_machine(name: str, state: str | None, record: bool = False) -> bool:
         return _write_machine_locked(name, state, record)
 
 
+def _machine_connections_store(root: Path | None) -> dict | None:
+    """{capability: count} of the connections the store holds as the global
+    layer - every connection row, less those whose global grant is switched
+    off - where the config home holds no connections file any more (it was
+    discarded, or never held one) and the store's global rows exist; None
+    where the files still answer or no store does."""
+    if any(_CONFIG_HOME.glob("*/connections.json")):
+        return None
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting)
+    except Exception:
+        return None
+    try:
+        if not _migrate_global_at(conn):
+            return None
+        out: dict = {}
+        for name, count in _migrate_rows(
+                conn, "SELECT c.capability, count(*) FROM capabilities_connections c "
+                      "WHERE NOT EXISTS (SELECT 1 FROM capabilities_connection_grants g "
+                      "WHERE g.agent_id IS NULL AND g.node IS NULL AND "
+                      "g.capability = c.capability AND g.connection = c.name AND "
+                      "g.enabled IS FALSE) GROUP BY c.capability"):
+            out[name] = int(count)
+        return out
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
 def _machine_connections(name: str) -> int:
     """How many connections this machine's global scope declares for `name`,
     leaving out those whose grant there resolves to disabled. Reads the
@@ -8453,6 +8510,8 @@ MIGRATE_CONSUMER_SUFFIXES = (".py", ".md", ".toml", ".sh", ".swift", ".ts", ".js
                              ".yaml", ".yml")
 MIGRATE_CONSUMER_SKIP = (".git", "node_modules", ".venv", "venv", "__pycache__",
                          ".contextkit", "dist", "build", "_tmp")
+MIGRATE_HISTORICAL_DIRS = ("assets", "memory", "snapshots")
+MIGRATE_HISTORICAL_NAMES = ("CHANGELOG", "CHANGES", "HISTORY")
 
 
 class _MigrateRefusal(Exception):
@@ -8591,11 +8650,38 @@ def _migrate_root_id(envelope: Path, root: Path) -> str | None:
     return found or _contextkit_config_id(root)
 
 
-def _migrate_discover(given: list[str]) -> list[dict]:
+MIGRATE_SCAN_DEPTH = 3
+MIGRATE_SCAN_SKIP = ("node_modules", "venv", "__pycache__", "Library", "dist", "build")
+
+
+def _migrate_scan(base: Path, depth: int = MIGRATE_SCAN_DEPTH) -> list[Path]:
+    """Every directory under `base`, `depth` levels down at most, that holds
+    an envelope's gate or identity or a ContextKit binding: a root that may
+    read this machine's config home."""
+    out = []
+    if depth < 0:
+        return out
+    try:
+        children = sorted(p for p in base.iterdir() if p.is_dir() and not p.is_symlink())
+    except OSError:
+        return out
+    for child in children:
+        if child.name.startswith(".") or child.name in MIGRATE_SCAN_SKIP:
+            continue
+        if ((child / PROJECT_CAPABILITIES_REL / "project.json").is_file()
+                or (child / PROJECT_CAPABILITIES_REL / "settings.json").is_file()
+                or (child / CONTEXTKIT_CONFIG_REL).is_file()):
+            out.append(child)
+        out.extend(_migrate_scan(child, depth - 1))
+    return out
+
+
+def _migrate_discover(given: list[str], scan: bool = False) -> list[dict]:
     """Every agent root this machine knows: the machine services' join lists,
     AgentKit's agent list where it is readable, the roots given, the project
     here, and every git worktree of those; each with its envelope read through
-    its body root and its id."""
+    its body root and its id. With `scan`, also every root found below the
+    folders those roots sit in and below each root given."""
     found: dict[str, dict] = {}
 
     def add(raw, source: str) -> None:
@@ -8641,6 +8727,17 @@ def _migrate_discover(given: list[str]) -> list[dict]:
     here = _project_root()
     if here is not None:
         add(here, "here")
+    if scan:
+        homes = {Path.home().resolve(), Path("/")}
+        bases = {Path(entry["root"]).parent for entry in found.values()}
+        for raw in given:
+            try:
+                bases.add(Path(str(raw)).expanduser().resolve())
+            except OSError:
+                continue
+        for base in sorted(bases - homes):
+            for root in _migrate_scan(base):
+                add(root, f"found under {base}")
     for entry in list(found.values()):
         try:
             proc = subprocess.run(["git", "-C", entry["root"], "worktree", "list",
@@ -8689,6 +8786,26 @@ def _migrate_rows(conn, query: str, params: tuple = ()) -> list[tuple]:
         return []
     conn.rollback()
     return rows
+
+
+def _migrate_upgrade_tables(conn) -> list[str]:
+    """The contract's tables brought to this code's version on an idle
+    connection: the steps it applied, none where they were current."""
+    store = _store_module()
+    db = _db_module()
+    import psycopg
+    try:
+        conn.rollback()
+        major, minor = store.STORE_TABLES_VERSION
+        result = db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
+                            major=major, minor=minor)
+    except db.DbError as exc:
+        raise _MigrateRefusal(exc.slug, exc.message, exc.hint,
+                              exit_code=_store_error_exit(exc)) from None
+    except psycopg.OperationalError as exc:
+        raise _MigrateRefusal("store_unreachable", f"cannot reach the store: {exc}",
+                              "check it with `capabilities store doctor`", exit_code=5) from None
+    return list(result.applied)
 
 
 def _migrate_global_at(conn) -> str | None:
@@ -9157,29 +9274,49 @@ def _migrate_records_plan(ctx: dict, answers: dict) -> dict:
             wanted, _skipped = _import_plan(files, _import_names(envelope))
         except _ImportRefused as exc:
             raise _MigrateRefusal(exc.code, exc.message, exc.hint) from None
+        renames = _migrate_renames(answers)
         for name, entry in sorted(wanted.items()):
             for cid, spec in sorted(entry["connections"].items()):
-                held = held_specs.get((name, cid))
                 qid = f"connections.{name}/{cid}"
+                renamed = renames.get((name, cid))
+                if renamed is not None:
+                    problem = _migrate_rename_problem(name, cid, renamed, entry)
+                    if problem:
+                        raise _MigrateRefusal("input", f"the answer {qid} cannot rename the "
+                                              f"connection: {problem}",
+                                              "answer it with another name")
+                held = held_specs.get((name, renamed or cid))
                 if held is None:
                     outcome = "write"
                 elif held == spec:
                     outcome = "held"
                 else:
-                    choice = _migrate_dig(answers, qid)
+                    choice = None if renamed else _migrate_dig(answers, qid)
+                    choice = choice if isinstance(choice, str) else None
                     outcome = {"files": "replace", "store": "kept"}.get(choice, "differs")
                     if outcome == "differs":
                         plan["questions"].append({
-                            "id": qid, "answer": qid, "choices": ["files", "store"],
-                            "question": f"{name} connection {cid!r} is in the store as "
-                                        f"{json.dumps(held, sort_keys=True)} and in this "
-                                        f"agent's files as {json.dumps(spec, sort_keys=True)}; "
-                                        "every agent granted it reads the store's: keep "
-                                        "the store's, or replace it with the files'?"})
-                plan["connections"].append({"capability": name, "name": cid, "spec": spec,
-                                            "store": held, "outcome": outcome})
+                            "id": qid, "answer": qid,
+                            "choices": ["files", "store", {"rename": "<a new name>"}],
+                            "question": f"{name} connection {(renamed or cid)!r} is in the "
+                                        f"store as {json.dumps(held, sort_keys=True)} and "
+                                        f"{cid!r} is in this agent's files as "
+                                        f"{json.dumps(spec, sort_keys=True)}; every agent "
+                                        "granted it reads the store's: keep the store's "
+                                        "(this agent then uses it too), replace it with the "
+                                        "files', or keep the store's for the others and "
+                                        "give this agent's its own name?"})
+                row = {"capability": name, "name": renamed or cid,
+                       "spec": held if outcome == "kept" else spec,
+                       "store": held, "outcome": outcome}
+                if renamed:
+                    row["renamed_from"] = cid
+                if outcome == "kept":
+                    row["files_spec"] = spec
+                plan["connections"].append(row)
             for cid, grant in sorted(entry["grants"].items()):
                 row = (grant["enabled"], grant["allow_write"], grant["is_default"])
+                cid = renames.get((name, cid)) or cid
                 held = held_grants.pop((name, cid), None)
                 plan["grants"].append({"capability": name, "connection": cid,
                                        "enabled": row[0], "allow_write": row[1],
@@ -9224,6 +9361,39 @@ def _migrate_records_plan(ctx: dict, answers: dict) -> dict:
     if mode == "connections":
         plan["kept"] = ["connection", "grant"]
     return plan
+
+
+def _migrate_renames(answers: dict) -> dict:
+    """{(capability, connection): new name} for every connection a person
+    answered to rename: `connections.<capability>/<connection>` =
+    {"rename": "<new name>"}."""
+    out = {}
+    for key, value in ((answers or {}).get("connections") or {}).items():
+        name, _slash, cid = str(key).partition("/")
+        if cid and isinstance(value, dict) and isinstance(value.get("rename"), str):
+            out[(name, cid)] = value["rename"].strip()
+    return out
+
+
+def _migrate_rename_problem(name: str, cid: str, renamed: str, entry: dict) -> str | None:
+    store = _store_module()
+    if not store.KEY_RE.fullmatch(renamed):
+        return f"{renamed!r} is not a connection name"
+    if renamed == cid:
+        return "the new name is the name it has"
+    if renamed in entry["connections"]:
+        return f"this agent's files already hold a {name} connection {renamed!r}"
+    return None
+
+
+def _migrate_rename_references(name: str, document, renames: dict):
+    """A settings document whose `connection` names a connection renamed for
+    this agent, naming it by its new name."""
+    if isinstance(document, dict) and isinstance(document.get("connection"), str):
+        new = renames.get((name, document["connection"]))
+        if new:
+            document = {**document, "connection": new}
+    return document
 
 
 def _migrate_fold(name: str, document: dict | None, folded: dict | None,
@@ -9370,15 +9540,18 @@ def _migrate_settings_document(entry: dict, answers: dict) -> tuple:
         return None, problem, [], []
     if document is not None:
         document = _migrate_without(document, entry["excluded"])
+    renames = _migrate_renames(answers)
     fold = MIGRATE_FOLDED_SETTINGS.get(entry["document"])
     if fold is None:
-        return document, None, [], []
+        return (_migrate_rename_references(entry["document"], document, renames),
+                None, [], [])
     folded, problem = _migrate_read_document(Path(entry["fold"]), fold["format"])
     if problem:
         return None, problem, [], []
     document, questions, warnings = _migrate_fold(entry["document"], document, folded, fold,
                                                   answers, entry["file"])
-    return document, None, questions, warnings
+    return (_migrate_rename_references(entry["document"], document, renames),
+            None, questions, warnings)
 
 
 def _migrate_settings_plan(ctx: dict, excludes: dict, answers: dict | None = None) -> dict:
@@ -9585,6 +9758,95 @@ def _migrate_siblings(ctx: dict, files: list[str], given: list[str]) -> list[dic
                 differences.append(f"{relative}: differs")
         out.append({"root": entry["root"], "sources": entry["sources"],
                     "differences": differences})
+    return out
+
+
+def _migrate_git_main(root: Path) -> Path | None:
+    """The main working tree of the repository a linked git worktree belongs
+    to; None where the root is no linked worktree."""
+    try:
+        dirs = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute",
+                               "--git-dir", "--git-common-dir"], capture_output=True,
+                              text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    lines = dirs.stdout.split()
+    if dirs.returncode != 0 or len(lines) != 2:
+        return None
+    if Path(lines[0]).resolve() == Path(lines[1]).resolve():
+        return None
+    try:
+        listed = subprocess.run(["git", "-C", str(root), "worktree", "list", "--porcelain"],
+                                capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in listed.stdout.splitlines() if listed.returncode == 0 else []:
+        if line.startswith("worktree "):
+            return Path(line[len("worktree "):]).resolve()
+    return None
+
+
+_MIGRATE_MODE_RANK = {"files": 0, "connections": 1, "store": 2}
+
+
+def _migrate_main_checkout(ctx: dict) -> dict | None:
+    """The agent's main checkout, where this root is a second one of it: a
+    linked git worktree of a checkout holding the same id, another root whose
+    open migration journal names it, or another root of the same id whose
+    records already went further into the store than this one's. A second
+    checkout only verifies; its files never write, remove or freeze the
+    agent's rows. None where this root is the agent's own."""
+    store = _store_module()
+    here = Path(ctx["root"]).resolve()
+    agent_id = ctx["agent_id"]
+    main = _migrate_git_main(here)
+    if main is not None and main != here:
+        envelope = _migrate_body_envelope(main)
+        if _migrate_root_id(envelope, main) == agent_id:
+            return {"root": str(main), "envelope": str(envelope),
+                    "why": f"{here} is a linked git worktree of {main}"}
+    journal = ctx.get("journal") or {}
+    started = journal.get("root")
+    if started and journal.get("phase") != "finalized":
+        started_at = Path(started).resolve()
+        if started_at != here and started_at.is_dir():
+            return {"root": str(started_at),
+                    "envelope": str(_migrate_body_envelope(started_at)),
+                    "why": f"the open migration of {agent_id} was started in {started_at}"}
+    mine = _MIGRATE_MODE_RANK.get(ctx["mode"], 0)
+    for entry in _migrate_discover(ctx.get("given_roots") or []):
+        other = Path(entry["root"]).resolve()
+        if entry.get("id") != agent_id or other == here or _migrate_git_main(other):
+            continue
+        envelope = Path(entry["envelope"])
+        try:
+            theirs = ("store" if store.records_mode(envelope) == "store"
+                      else "connections" if store.connections_mode(envelope) == "store"
+                      else "files")
+        except store.StoreError:
+            continue
+        if _MIGRATE_MODE_RANK[theirs] > mine:
+            return {"root": str(other), "envelope": str(envelope),
+                    "why": f"{other} already keeps the agent's records in the store "
+                           f"({theirs}) and this root's files do not"}
+    return None
+
+
+def _migrate_checkout_differences(ctx: dict, main: dict) -> list[str]:
+    """Where this second checkout's record and settings files differ from the
+    main checkout's: named, never written."""
+    out = []
+    mine_env, theirs_env = Path(ctx["envelope"]), Path(main["envelope"])
+    mine = {p.relative_to(mine_env) for p in _migrate_record_files(mine_env, ctx["manifests"])}
+    theirs = {p.relative_to(theirs_env)
+              for p in _migrate_record_files(theirs_env, ctx["manifests"])}
+    for relative in sorted(mine | theirs):
+        if relative not in theirs:
+            out.append(f"{relative}: only here")
+        elif relative not in mine:
+            out.append(f"{relative}: only in the main checkout")
+        elif (mine_env / relative).read_bytes() != (theirs_env / relative).read_bytes():
+            out.append(f"{relative}: differs")
     return out
 
 
@@ -9942,12 +10204,22 @@ def _migrate_verify(ctx: dict, plan: dict) -> list[str]:
         if mode == "files":
             names = sorted(set(_import_names(envelope))
                            | {r["capability"] for r in plan["records"]["grants"]})
+            # What the agent reads once it moved: a connection renamed for it
+            # under its new name, and one whose store spec it kept as the
+            # store holds it.
+            renames = _migrate_renames(ctx.get("answers") or {})
+            kept = {(r["capability"], r["name"]): r["store"]
+                    for r in plan["records"]["connections"] if r["outcome"] == "kept"}
             for name in names:
                 for write_default in (False, True):
                     before = files.connections(name, write_default=write_default,
                                                include_disabled=True)
                     after = rows.connections(name, write_default=write_default,
                                              include_disabled=True)
+                    before = {renames.get((name, cid)) or cid: e for cid, e in before.items()}
+                    before = {cid: ({**e, "value": kept[(name, cid)]}
+                                    if (name, cid) in kept else e)
+                              for cid, e in before.items()}
                     usable_before = {cid: (e["value"], e["allow_write"])
                                      for cid, e in before.items() if e["enabled"]}
                     usable_after = {cid: (e["value"], e["allow_write"])
@@ -9959,6 +10231,7 @@ def _migrate_verify(ctx: dict, plan: dict) -> list[str]:
                                 f"the files resolve {usable_before.get(cid)}, the store "
                                 f"{usable_after.get(cid)}")
                 left = files.get(name, "setting", "connection.default")
+                left = renames.get((name, left)) or left
                 right = rows.get(name, "setting", "connection.default")
                 if left != right:
                     differences.append(f"{name} default: the files point to {left!r}, the "
@@ -10115,8 +10388,17 @@ def cmd_migrate_agent(opts: dict) -> None:
                     "node": ctx["node"], "mode": ctx["mode"],
                     "applied": apply, "store": {"level": ctx["setting"].level,
                                                 "schema": ctx["setting"].schema}}
+    main = _migrate_main_checkout(ctx)
+    if main is not None:
+        # A second checkout of the agent only verifies: whatever its files
+        # say, the agent's rows are written, removed and frozen from its main
+        # checkout alone.
+        answer["second_checkout"] = {
+            "main": main["root"], "why": main["why"],
+            "differences": _migrate_checkout_differences(ctx, main)}
     if state.get("migrated_at"):
-        unfinished = (journal is not None and journal.get("phase") == "finalizing"
+        unfinished = (main is None and journal is not None
+                      and journal.get("phase") == "finalizing"
                       and journal.get("node") == ctx["node"])
         if unfinished and apply:
             # Interrupted after the switch: finish what finalize had left.
@@ -10145,12 +10427,24 @@ def cmd_migrate_agent(opts: dict) -> None:
                        "registered" if state else "unregistered")
     if state.get("migrating_since"):
         answer["migrating_since"] = state["migrating_since"]
+    if main is not None:
+        ctx["blockers"].insert(0, _MigrateRefusal(
+            "second_checkout", f"{root} is a second checkout of agent {ctx['agent_id']} "
+            f"({main['why']}): it only verifies, and the agent's records move from its "
+            f"main checkout {main['root']}, which has not moved yet",
+            f"run `capabilities migrate` in {main['root']} first; this checkout then "
+            "reads the agent's rows, and its leftover files are removed as a git change "
+            "here", detail={"main": main["root"]}))
     answer["blockers"] = [{"code": b.code, "message": b.message, "hint": b.hint}
                           for b in ctx["blockers"]]
     if ctx["id_write"]:
         answer["identity_write"] = {"file": str(ctx["identity_file"]), "id": ctx["id_write"]}
     if apply and ctx["blockers"]:
         _migrate_refuse(ctx["blockers"][0], answer)
+    if main is not None:
+        answer["would_write"] = False
+        _emit(answer)
+        return
     if not ctx["node"]:
         # A dry run without a node cannot say what each node would hold.
         _emit(answer)
@@ -10397,12 +10691,30 @@ def _migrate_global_plan(conn, manifests: dict, answers: dict) -> dict:
     return plan
 
 
-def _migrate_gate_flips(conn, plan: dict, given: list[str]) -> list[dict]:
+def _migrate_database(setting) -> tuple:
+    """The database a setting reaches - host, port, database and schema - so
+    two roots can be told to read the same rows or not."""
+    if setting.url is not None:
+        try:
+            from psycopg.conninfo import conninfo_to_dict
+            params = conninfo_to_dict(setting.url)
+        except Exception:
+            return ("url", setting.url, setting.schema)
+        host, port, database = params.get("host"), params.get("port"), params.get("dbname")
+    else:
+        host, port, database = setting.host, setting.port, setting.database
+    return (str(host or "").lower(), str(port or 5432), str(database or ""), setting.schema)
+
+
+def _migrate_gate_flips(conn, plan: dict, given: list[str], setting=None) -> list[dict]:
     """Every agent whose effective gate would change once the global rows say
     what the config home says: an agent that reads its gate from the store
     already - its records are there, or it moved - for this node and every
-    node."""
+    node. A root on this machine that reads another database is not one of
+    them: these global rows never reach it."""
     store = _store_module()
+    db = _db_module()
+    here = _migrate_database(setting) if setting is not None else None
     before = _migrate_policy_rows(conn, None)
     after = {key: value for key, value in before.items() if key[1] is not None}
     for row in plan["policy"]:
@@ -10414,6 +10726,12 @@ def _migrate_gate_flips(conn, plan: dict, given: list[str]) -> list[dict]:
     for entry in _migrate_discover(given):
         if not entry.get("id"):
             continue
+        if here is not None:
+            try:
+                if _migrate_database(db.resolve_setting(Path(entry["root"]))) != here:
+                    continue
+            except db.DbError:
+                continue
         try:
             mode = store.records_mode(Path(entry["envelope"]))
         except store.StoreError:
@@ -10457,11 +10775,22 @@ def cmd_migrate_global(opts: dict) -> None:
     answer: dict = {"ok": True, "scope": "global", "config_home": str(_CONFIG_HOME),
                     "applied": apply, "store": {"level": setting.level,
                                                 "schema": setting.schema}}
+    # The plan reads the global rows as this code keeps them, so the
+    # contract's tables are brought to its version first, as every kernel
+    # verb does; the dry run names what that applied.
+    try:
+        upgraded = _migrate_upgrade_tables(conn)
+    except _MigrateRefusal as exc:
+        conn.close()
+        _migrate_refuse(exc, answer)
+    if upgraded:
+        major, minor = _store_module().STORE_TABLES_VERSION
+        answer["tables_upgraded"] = {"steps": upgraded, "version": f"{major}.{minor}"}
     refused = None
     try:
         answer["global_migrated_at"] = _migrate_global_at(conn)
         plan = _migrate_global_plan(conn, manifests, answers)
-        flips = _migrate_gate_flips(conn, plan, opts.get("roots") or [])
+        flips = _migrate_gate_flips(conn, plan, opts.get("roots") or [], setting)
     except _MigrateRefusal as exc:
         refused = exc
     finally:
@@ -10659,6 +10988,7 @@ def _migrate_agent_states(entries: list[dict]) -> list[dict]:
                         "migrating" if state.get("migrating_since") else
                         "registered" if state else "unregistered")
         row["migrated_at"] = state.get("migrated_at")
+        row["master"] = state.get("master")
         out.append(row)
     return out
 
@@ -10666,8 +10996,18 @@ def _migrate_agent_states(entries: list[dict]) -> list[dict]:
 def cmd_migrate_discard(opts: dict) -> None:
     """`migrate --discard`: a node that is not the global master deletes its
     config home's record and settings files without reading them, once the
-    global rows exist and no agent here still reads them."""
+    global rows exist and no agent here still reads them. Every root that may
+    read them counts: the ones the machine lists, the ones given, and every
+    one found below the folders those sit in; a node that is the master of
+    any of them is a master the files were read on, and keeps them."""
     _read_only_gate("migrate --discard")
+    store = _store_module()
+    node = os.environ.get(store.NODE_NAME_ENV, "").strip()
+    if not node:
+        _migrate_refuse(_MigrateRefusal(
+            "node_unnamed", f"{store.NODE_NAME_ENV} is not set: a discard names the node it "
+            "runs on, so it can tell this node is no agent's master",
+            f"set {store.NODE_NAME_ENV} for this machine, then run it again"))
     root = _project_root() or Path.cwd()
     try:
         conn, _setting = _migrate_connect(root)
@@ -10682,15 +11022,24 @@ def cmd_migrate_discard(opts: dict) -> None:
             "global_not_migrated", "the global records are not in the store, so these "
             "files are still their only copy", "run `capabilities migrate --global --apply` "
             "on the global master first"))
-    agents = _migrate_agent_states(_migrate_discover(opts.get("roots") or []))
-    waiting = [a for a in agents if a["state"] not in ("migrated",)
-               and a.get("id")]
+    agents = _migrate_agent_states(_migrate_discover(opts.get("roots") or [], scan=True))
+    mastered = [a for a in agents if a.get("master") == node]
+    if mastered:
+        _migrate_refuse(_MigrateRefusal(
+            "master_node", f"node {node} is the master of {len(mastered)} agent(s) on this "
+            "machine, which read this config home: "
+            + ", ".join(f"{a['root']} ({a['id']})" for a in mastered),
+            "the config home's files stay on a master; discard them on a node that is "
+            "no agent's master", detail={"agents": mastered}))
+    waiting = [a for a in agents if a["state"] not in ("migrated",)]
     if waiting:
         _migrate_refuse(_MigrateRefusal(
-            "agents_unmigrated", f"{len(waiting)} agent(s) on this machine have not moved "
+            "agents_unmigrated", f"{len(waiting)} root(s) on this machine have not moved "
             "and still read the config home's files: "
-            + ", ".join(f"{a['root']} ({a['state']})" for a in waiting),
-            "migrate them on their master first", detail={"agents": waiting}))
+            + ", ".join(f"{a['root']} ({a['state']}; {', '.join(a['sources'])})"
+                        for a in waiting),
+            "migrate each on its master first, give one without an id an id with "
+            "`capabilities init` or archive it", detail={"agents": waiting}))
     removed = []
     for path in _migrate_config_files(_migrate_manifests()):
         path.unlink()
@@ -10699,10 +11048,29 @@ def cmd_migrate_discard(opts: dict) -> None:
            "config_home": str(_CONFIG_HOME), "removed": removed})
 
 
-def _migrate_consumers(root: Path, limit: int = 200) -> list[str]:
+def _migrate_historical(relative: Path, body: tuple) -> bool:
+    """Whether a file of the project is a historical note rather than a live
+    reader: under its evidence, memory or snapshot folders (at the root or at
+    its body root), or a change log."""
+    parts = relative.parts
+    if body and parts[:len(body)] == body:
+        parts = parts[len(body):]
+    if len(parts) > 1 and parts[0] in MIGRATE_HISTORICAL_DIRS:
+        return True
+    return relative.name.upper().startswith(MIGRATE_HISTORICAL_NAMES)
+
+
+def _migrate_consumers(root: Path, limit: int = 200) -> tuple[list[str], int]:
     """Lines in the project's own text that read a record or settings file
-    directly or name a retired import verb."""
+    directly or name a retired import verb: (live readers, how many lines are
+    historical notes - evidence, memory, snapshots, change logs - that only
+    quote those names and are left as they are)."""
     hits: list[str] = []
+    historical = 0
+    try:
+        body = _migrate_body_envelope(root).parent.relative_to(root).parts
+    except ValueError:
+        body = ()
     for current, dirs, names in os.walk(root):
         dirs[:] = [d for d in dirs if d not in MIGRATE_CONSUMER_SKIP and not d.startswith(".")
                    or d in (".claude", ".codex")]
@@ -10716,12 +11084,17 @@ def _migrate_consumers(root: Path, limit: int = 200) -> list[str]:
                 lines = path.read_text(errors="replace").splitlines()
             except OSError:
                 continue
+            relative = path.relative_to(root)
+            past = _migrate_historical(relative, body)
             for number, line in enumerate(lines, 1):
                 if any(pattern in line for pattern in MIGRATE_CONSUMER_PATTERNS):
-                    hits.append(f"{path.relative_to(root)}:{number}: {line.strip()[:200]}")
+                    if past:
+                        historical += 1
+                        continue
+                    hits.append(f"{relative}:{number}: {line.strip()[:200]}")
                     if len(hits) >= limit:
-                        return hits
-    return hits
+                        return hits, historical
+    return hits, historical
 
 
 def cmd_migrate_report(opts: dict) -> None:
@@ -10741,11 +11114,12 @@ def cmd_migrate_report(opts: dict) -> None:
                          "--apply` on the master",
         }.get(state, "the agent has not moved: run `capabilities migrate` on its master")
         journal = _migrate_journal(entry["id"]) if entry.get("id") else None
+        consumers, historical = _migrate_consumers(Path(entry["root"]))
         agents.append({**entry, "files": files, "reason": reason if files else None,
                        "journal": ({k: journal.get(k) for k in
                                     ("phase", "node", "started_at", "updated_at", "archive")}
                                    if journal else None),
-                       "consumers": _migrate_consumers(Path(entry["root"]))})
+                       "consumers": consumers, "historical_notes": historical})
     config = [str(p) for p in _migrate_config_files(manifests)]
     at = None
     here = _project_root() or Path.cwd()

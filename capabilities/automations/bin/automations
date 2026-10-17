@@ -7425,8 +7425,10 @@ def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict[str, An
     `automations.<slug>` for one automation whose environments reach two. A
     definition the store already holds differently is a question too:
     `differs.<slug>` is `store` (keep the stored one) or `files` (save the
-    file's as a new version). Nothing is written while a question is open."""
-    root = _root_required()
+    file's as a new version). Nothing is written while a question is open.
+    An envelope holding nothing of automations' moves nothing, and that is
+    no refusal."""
+    root = _project_root()
     report: dict[str, Any] = {"items": [], "files": [], "questions": [],
                               "settings_exclude": _MOVED_BY_MOVER}
     config_path = _config_path(root)

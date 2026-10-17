@@ -661,7 +661,9 @@ def test_an_agent_made_after_discard_migrates_without_the_config_home(blank):
     w = blank
     first = w.answer(w.manager(w.roots["first"], "migrate", "--apply"))
     assert first["state"] == "migrated" and not first["verify"]["differences"]
-    discarded = w.answer(w.manager(w.roots["first"], "migrate", "--discard"))
+    # Discarded on a node that is no agent's master, as a server's config home is.
+    discarded = w.answer(w.manager(w.roots["first"], "migrate", "--discard",
+                                   AGENT_NODE_NAME="srv-discard"))
     assert discarded["removed"] and not (w.config / "capabilities" / "settings.json").exists()
     # A new agent, using the global connection by its own grant and inheriting
     # the global gate, identifiers and default.

@@ -930,14 +930,22 @@ def test_report_and_discard(world):
     assert agents["relay"]["state"] == "migrated" and not agents["relay"]["files"]
     assert report["config_home"]["files"] and report["config_home"]["global_migrated_at"]
     before = world.everything()
+    # The master of these agents keeps the files.
     error = world.error(world.manager(root, "migrate", "--discard"))
+    _say("discard-refused-master", error)
+    assert error["code"] == "master_node" and world.everything() == before
+    # A node that is no agent's master discards them, once no agent here
+    # still reads them.
+    error = world.error(world.manager(root, "migrate", "--discard",
+                                      AGENT_NODE_NAME="srv-discard"))
     _say("discard-refused", error)
     assert error["code"] == "agents_unmigrated" and world.everything() == before
     # Once `other` is gone from this machine, the files go without being read.
     shutil.rmtree(root)
     del world.roots["other"]
     world.agentkit_list()
-    discarded = world.answer(world.manager(world.roots["relay"], "migrate", "--discard"))
+    discarded = world.answer(world.manager(world.roots["relay"], "migrate", "--discard",
+                                           AGENT_NODE_NAME="srv-discard"))
     _say("discard", discarded)
     assert sorted(Path(p).relative_to(world.config).as_posix() for p in discarded["removed"]) \
         == ["capabilities/settings.json", "coolify/connections.json",
