@@ -17,7 +17,7 @@
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "ebfbe03a0a3aba3f76e6ae4d076f83047df2d92aaa9edbd4bdcd71398fee56a2",
+      "payload_sha256": "72b88d732ab7c2cebcb4aaaf477edf3f14a4da53edcfa2cfba7f4e6f6ea8cd55",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {
@@ -152,7 +152,7 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "c3d67978a3c8431454fa8d221181162624ee3c9a65bf2e2450d3c0146ae6da23",
+      "payload_sha256": "303dc4144fdc6c505bbca41aff1837088e37ffe24f7e90ec26597c4a00b996d2",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {

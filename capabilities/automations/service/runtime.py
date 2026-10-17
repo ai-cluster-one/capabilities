@@ -893,20 +893,23 @@ def store_key(setting) -> tuple:
 
 
 def open_ledger(root: Path, config: dict[str, Any] | None = None,
-                strict: bool = True) -> "RunLedger":
+                strict: bool = True, migrating: bool = True) -> "RunLedger":
     """The ledger of this project's runs, open on the store. The caller closes it.
 
     A run is recorded under the project's id, the one the launching CLI resolves
     for a write. A read path passes `strict` False and reads under the id the
     project declares even where it may not be stamped; a project with no id at
-    all reads as empty, never as every project."""
+    all reads as empty, never as every project. `migrating` False opens it
+    on the tables as they stand, changing nothing, for a read that must not
+    write: what an upgrade would run is then in its link's `pending`."""
     identity = _project_identity(root)
     project_id = _registration_id(root, identity, strict)
     if not strict:
         project_id = project_id or _handed_project_id(root) or identity.get("id") or ""
     elif not project_id:
         raise ConfigError("this project declares no id to record its runs under")
-    return RunLedger(project_id, root=root).open()
+    return RunLedger(project_id, link=StoreLink(root=root, migrating=migrating),
+                     root=root, owns_link=True).open()
 
 
 class StoreLink:
@@ -929,9 +932,12 @@ class StoreLink:
     open, because what was announced while the link was down is lost and every
     project on it has to read its definitions again."""
 
-    def __init__(self, setting=None, root: Path | None = None):
+    def __init__(self, setting=None, root: Path | None = None, migrating: bool = True):
         self.setting = setting
         self.root = root
+        self.migrating = migrating
+        self.pending: list[str] = []
+        self.stored: str | None = None
         self.conn = None
         self.warnings: list[str] = []
         self.in_transaction = False
@@ -952,8 +958,15 @@ class StoreLink:
         except db.DbError as exc:
             raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
         try:
-            result = db.migrate(conn, LEDGER_OWNER, LEDGER_STEPS,
-                                major=LEDGER_MAJOR, minor=LEDGER_MINOR)
+            if self.migrating:
+                result = db.migrate(conn, LEDGER_OWNER, LEDGER_STEPS,
+                                    major=LEDGER_MAJOR, minor=LEDGER_MINOR)
+            else:
+                result = db.status(conn, LEDGER_OWNER, LEDGER_STEPS,
+                                   major=LEDGER_MAJOR, minor=LEDGER_MINOR)
+                self.pending = list(result.pending)
+                self.stored = (None if result.stored_major is None else
+                               f"{result.stored_major}.{result.stored_minor}")
             conn.autocommit = True
             conn.add_notify_handler(self._announced)
             conn.execute("LISTEN automations_changed")
@@ -1018,11 +1031,11 @@ class RunLedger:
     depend on how the store keeps them."""
 
     def __init__(self, project_id: str, link: StoreLink | None = None,
-                 root: Path | None = None):
+                 root: Path | None = None, owns_link: bool | None = None):
         self.project_id = project_id
         self.node = NODE_NAME()
         self.host = socket.gethostname()
-        self._owns_link = link is None
+        self._owns_link = link is None if owns_link is None else owns_link
         self.link = link if link is not None else StoreLink(root=root)
 
     @property

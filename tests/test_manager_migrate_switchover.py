@@ -25,13 +25,14 @@ from pathlib import Path
 
 import pytest
 
-from test_manager_migrate import MASTER, SCHEMA, World, answers_file, gate
+from test_manager_migrate import MASTER, REPO, SCHEMA, WORKER, World, answers_file, gate
 
 
-NAMES = ("automations", "coolify", "memory", "whatsapp")
+NAMES = ("automations", "coolify", "memory", "tasks", "whatsapp")
 IDS = {"main": "prj_5a5a5a5a5a51", "empty": "prj_5a5a5a5a5a52", "first": "prj_5a5a5a5a5a53",
        "second": "prj_5a5a5a5a5a54", "third": "prj_5a5a5a5a5a55", "foreign": "prj_5a5a5a5a5a56",
-       "stray": "prj_5a5a5a5a5a57"}
+       "stray": "prj_5a5a5a5a5a57", "sched": "prj_5a5a5a5a5a58",
+       "hidden": "prj_5a5a5a5a5a59", "bound": "prj_5a5a5a5a5a5a"}
 OTHER_NODE = "srv-discard"
 
 
@@ -129,6 +130,14 @@ def build(w: World) -> None:
         "{env}/settings.json": gate("whatsapp"),
         "{env}/whatsapp/connections.json": wa("+10000000003"),
     })
+    # An agent with an automation and a worker, whose movers read their
+    # capabilities' own tables.
+    w.agent("sched", IDS["sched"], {
+        "{env}/settings.json": gate("automations", "tasks"),
+        "{env}/automations/service/config.toml":
+            'version = 1\n\n[[automations]]\nid = "nightly"\nscript = "x.py"\n',
+        "{env}/tasks/workers/reviewer.md": WORKER,
+    })
     w.agentkit_list()
     w.listed = list(w.roots)
     # A root reading a database of its own, and a root no list names: both
@@ -142,6 +151,25 @@ def build(w: World) -> None:
     (foreign / ".env.local").write_text(f"AGENTKIT_DB_URL={url}\nAGENTKIT_DB_SCHEMA={SCHEMA}\n")
     w.roots["foreign"] = foreign
     w.agent("stray", IDS["stray"], {"{env}/settings.json": gate("memory")})
+    # A root bound by ContextKit alone, with no envelope folder, beside them.
+    w.agent("bound", None, {}, bound_id=IDS["bound"])
+    shutil.rmtree(w.roots["bound"] / "capabilities")
+    # An agent kept in the store from a checkout no list names and no run is
+    # given, and a clone of it in files mode.
+    hidden = w.tmp / "hidden" / "main"
+    hidden.parent.mkdir(parents=True)
+    w.write(hidden / "capabilities" / "project.json",
+            {"schema": "capabilities.project.v1", "slug": "hidden", "id": IDS["hidden"]})
+    w.write(hidden / "capabilities" / "settings.json", gate("coolify"))
+    w.write(hidden / "capabilities" / "coolify" / "identifiers.json",
+            {"app": {"value": "app-h", "note": ""}})
+    subprocess.run(["git", "init", "-q", str(hidden)], check=True)
+    subprocess.run(["git", "-C", str(hidden), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(hidden), "-c", "user.email=t@example.org", "-c",
+                    "user.name=t", "commit", "-qm", "agent"], check=True)
+    subprocess.run(["git", "clone", "-q", str(hidden), str(w.tmp / "hidden" / "clone")],
+                   check=True)
+    w.roots["hidden"], w.roots["hidden-clone"] = hidden, w.tmp / "hidden" / "clone"
     upgrade_to(w, 8, 1, 1)
 
 
@@ -176,19 +204,30 @@ def dry_runs_change_nothing(w: World, version: str) -> dict:
     ledger and rows - is byte-identical afterwards."""
     root = w.roots["first"]
     before = store_snapshot(w)
+    # The capabilities' own tables, not made yet or behind: planned as if
+    # they stood at this code's version, their steps named, nothing written.
+    result = w.manager(w.roots["sched"], "migrate", "--dry-run")
+    sched = w.answer(result)
+    assert not sched["plan"]["mover_failures"], sched["plan"]["mover_failures"]
+    items = {name: [(i["name"], i["outcome"]) for i in report["items"]]
+             for name, report in sched["plan"]["movers"].items() if report["items"]}
+    assert items == {"automations": [("nightly", "would_write")],
+                     "tasks": [("reviewer", "would_write")]}
+    assert {"capabilities", "automations", "tasks", "harness"} <= set(sched["tables_to_upgrade"])
+    assert store_snapshot(w) == before
     result = w.manager(root, "migrate", "--global", "--dry-run")
     assert "Traceback" not in result.stderr, result.stderr[-2000:]
     dry = w.answer(result)
     assert dry["applied"] is False and dry["would_write"] is True
-    assert dry["tables_to_upgrade"]["from"] == version
-    assert dry["tables_to_upgrade"]["to"] == "1.3"
+    assert dry["tables_to_upgrade"]["capabilities"]["from"] == version
+    assert dry["tables_to_upgrade"]["capabilities"]["to"] == "1.3"
     assert "tables_upgraded" not in dry
     assert {r["capability"] for r in dry["plan"]["policy"]} == {"coolify", "memory"}
     assert store_snapshot(w) == before
     result = w.manager(root, "migrate", "--dry-run")
     assert "Traceback" not in result.stderr, result.stderr[-2000:]
     agent = w.answer(result)
-    assert agent["tables_to_upgrade"] == dry["tables_to_upgrade"]
+    assert agent["tables_to_upgrade"]["capabilities"] == dry["tables_to_upgrade"]["capabilities"]
     assert [b["code"] for b in agent["blockers"]] == ["global_not_migrated"]
     assert not agent["plan"]["mover_failures"], agent["plan"]["mover_failures"]
     assert {(c["name"], c["outcome"]) for c in agent["plan"]["records"]["connections"]} \
@@ -197,17 +236,41 @@ def dry_runs_change_nothing(w: World, version: str) -> dict:
     return dry
 
 
+def automations_ledger_behind(w: World) -> str:
+    """automations' own tables made by all but their last step."""
+    import importlib.util
+    import sys
+    from capabilities_contract import db
+    spec = importlib.util.spec_from_file_location(
+        "automations_runtime_under_test",
+        REPO / "capabilities" / "automations" / "service" / "runtime.py")
+    runtime = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = runtime
+    spec.loader.exec_module(runtime)
+    setting = db.Setting(url=w.url(), schema=SCHEMA, level="environment")
+    conn = db.connect(application_name="automations", setting=setting)
+    try:
+        db.migrate(conn, runtime.LEDGER_OWNER, runtime.LEDGER_STEPS[:-1], major=1, minor=0)
+    finally:
+        conn.close()
+    return runtime.LEDGER_STEPS[-1][0]
+
+
 def test_dry_runs_on_a_store_at_1_1_or_1_2_change_nothing_and_apply_upgrades(world):
     root = world.roots["first"]
     assert world.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
         == [(1, 1)]
     dry = dry_runs_change_nothing(world, "1.1")
-    assert dry["tables_to_upgrade"]["steps"][0].startswith("0009")
+    assert dry["tables_to_upgrade"]["capabilities"]["steps"][0].startswith("0009")
     # At 1.2: the registry is there, the node on identifiers and the
-    # settings tables are not.
+    # settings tables are not; automations' tables are one step behind.
     upgrade_to(world, 13, 1, 2)
+    last = automations_ledger_behind(world)
     dry = dry_runs_change_nothing(world, "1.2")
-    assert dry["tables_to_upgrade"]["steps"][0].startswith("0014")
+    assert dry["tables_to_upgrade"]["capabilities"]["steps"][0].startswith("0014")
+    sched = world.answer(world.manager(world.roots["sched"], "migrate", "--dry-run"))
+    assert sched["tables_to_upgrade"]["automations"] == {"from": "1.0", "to": "1.1",
+                                                         "steps": [last]}
     applied = world.answer(world.manager(root, "migrate", "--global", "--apply"))
     assert applied["state"] == "migrated" and applied["changed"] is True
     assert applied["tables_upgraded"]["version"] == "1.3"
@@ -215,7 +278,7 @@ def test_dry_runs_on_a_store_at_1_1_or_1_2_change_nothing_and_apply_upgrades(wor
     assert world.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
         == [(1, 3)]
     # Each capability's own tables, as its install migrated them.
-    for name in ("automations", "whatsapp", "memory"):
+    for name in ("automations", "tasks", "whatsapp", "memory"):
         result = world.cap(root, name, "migrate")
         assert result.returncode == 0, (name, result.stderr)
 
@@ -253,6 +316,34 @@ def test_a_second_checkout_never_writes_the_agents_rows(world):
         assert again["state"] == "migrated" and again["changed"] is False
         assert again["second_checkout"]["main"] == str(main.resolve())
         assert world.everything() == before
+
+
+def test_a_clone_whose_main_checkout_is_nowhere_found_writes_nothing(world):
+    ensure_global(world)
+    hidden, clone = world.roots["hidden"], world.roots["hidden-clone"]
+    # The agent's records went into the store from its own checkout, which no
+    # list names and this run is not given.
+    world.answer(world.manager(hidden, "connections", "import"))
+    world.answer(world.cap(hidden, "coolify", "ids", "set", "extra", "x-h", "--note", "later"))
+    before = world.everything()
+    rows = store_snapshot(world)
+    applied = world.manager(clone, "migrate", "--apply")
+    assert store_snapshot(world) == rows, applied.stdout[-3000:]
+    assert world.everything() == before
+    error = world.error(applied)
+    assert error["code"] == "second_checkout", error
+    assert state(world, IDS["hidden"]) == (None, None)
+    dry = world.answer(world.manager(clone, "migrate"))
+    [question] = dry["questions"]
+    assert question["id"] == "checkout" and question["choices"] == [str(clone.resolve())]
+    assert dry["would_write"] is False and "plan" not in dry
+    # A person who says this clone is the agent's checkout gets its plan.
+    answers = answers_file(world, "hidden-clone", {"checkout": str(clone.resolve())})
+    planned = world.answer(world.manager(clone, "migrate", "--answers", answers))
+    assert "second_checkout" not in planned and planned["plan"]["records"]["remove"]
+    assert store_snapshot(world) == rows
+    assert world.sql("SELECT label FROM capabilities_identifiers WHERE agent_id = %s "
+                     "ORDER BY label", (IDS["hidden"],)) == [("app",), ("extra",)]
 
 
 # --- D3: an empty envelope folder moves nothing -----------------------------------------
@@ -384,13 +475,17 @@ def test_discard_weighs_every_root_found_near_the_listed_ones(world):
     waiting = {a["root"]: a for a in error["detail"]["agents"]}
     stray = waiting[str(world.roots["stray"].resolve())]
     assert stray["sources"][0] == f"found under {(world.tmp / 'agents').resolve()}"
+    # A root bound by ContextKit alone reads the config home all the same.
+    bound = waiting[str(world.roots["bound"].resolve())]
+    assert bound["id"] == IDS["bound"] and bound["state"] != "migrated"
     assert config_files(world) == before
 
 
 def test_discard_refuses_on_a_master_node(world):
     ensure_global(world)
-    applied = world.answer(world.manager(world.roots["stray"], "migrate", "--apply"))
-    assert applied["state"] == "migrated"
+    for name in ("stray", "bound", "sched"):
+        applied = world.answer(world.manager(world.roots[name], "migrate", "--apply"))
+        assert applied["state"] == "migrated", name
     before = config_files(world)
     # Run on this agent's master, every root it weighs moved.
     listing_only(world, ["first"])

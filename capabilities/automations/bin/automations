@@ -7535,13 +7535,32 @@ def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict[str, An
              + "; ".join(q["id"] for q in questions.values()),
              "answer them in the answers file `capabilities migrate --answers` reads")
     items = []
-    ledger = _write_ledger(runtime, root)
+    if action == "plan":
+        # A plan changes nothing in the store, the ledger's tables included:
+        # it reads them as they stand, and tables not made yet hold nothing.
+        try:
+            ledger = runtime.open_ledger(root, None, migrating=False)
+        except runtime.StoreUnavailable as exc:
+            _store_refusal(exc)
+        except runtime.ConfigError as exc:
+            _die(6, "no_project_identity", str(exc), "run `capabilities init` in the project")
+        link = ledger.link
+        if link.pending:
+            report["tables_to_upgrade"] = {runtime.LEDGER_OWNER: {
+                "from": link.stored,
+                "to": f"{runtime.LEDGER_MAJOR}.{runtime.LEDGER_MINOR}",
+                "steps": list(link.pending)}}
+        made = ledger.conn.execute(
+            "SELECT to_regclass('automations_definitions') IS NOT NULL").fetchone()[0]
+    else:
+        ledger = _write_ledger(runtime, root)
+        made = True
     try:
         with ledger:
             with ledger.transaction():
                 for one in definitions:
                     slug = one["slug"]
-                    active = ledger.definition(slug)
+                    active = ledger.definition(slug) if made else None
                     item = {"kind": "definition", "name": slug,
                             "node": one["fields"]["node"],
                             "schedule": one["fields"]["schedule"]}

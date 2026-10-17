@@ -649,9 +649,10 @@ PROJECT VERBS (run inside a consuming project)
         rows naming each node. The default is a dry run, which writes
         nothing: what each part would write, every row the store already
         holds differently, the steps that would bring the contract's tables
-        to this code's version (tables_to_upgrade; a dry run changes nothing
-        in the store, its schema included, and reads it as those steps would
-        leave it), each settings value naming a host path, each file
+        and each capability's own tables to theirs (tables_to_upgrade, by
+        owner; a dry run changes nothing in the store, its schema included,
+        and reads it as those steps would leave it, a table not made yet as
+        empty), each settings value naming a host path, each file
         that differs from its committed copy, each other root of the agent
         on this machine (verify-only, differences named), one node per
         deployment target, and every question code cannot answer - a node
@@ -675,7 +676,10 @@ PROJECT VERBS (run inside a consuming project)
         already keeps the records in the store - only verifies: it names its
         main checkout and differences (second_checkout), writes, removes
         and freezes nothing, and until the agent has moved refuses
-        (second_checkout) naming the main checkout.
+        (second_checkout) naming the main checkout. A root in files mode
+        whose agent the store already keeps records of, with no checkout of
+        it found, refuses the same way and asks `checkout`: answered with
+        this root's path, it moves the agent from here.
         It registers the agent and this node as its master on the first
         run, sets migrating_since (from then only this migration writes the
         agent's records and settings, on any node), archives every file git
@@ -705,7 +709,8 @@ PROJECT VERBS (run inside a consuming project)
         read the same database. --apply first brings the contract's tables
         to this code's version and names the steps it ran (tables_upgraded);
         the dry run changes nothing, the schema included, names the steps an
-        apply would run (tables_to_upgrade) and plans as if they had run.
+        apply would run (tables_to_upgrade, by owner) and plans as if they
+        had run.
         Once set, it changes nothing.
   migrate --discard [--root PATH]...
         On a node that is not the global master: delete the config home's
@@ -8758,7 +8763,9 @@ def _migrate_discover(given: list[str], scan: bool = False) -> list[dict]:
         entry = found[key]
         root = Path(entry["root"])
         envelope = _migrate_body_envelope(root)
-        if not envelope.is_dir():
+        # A root with only a ContextKit binding reads this machine's config
+        # home as much as one with an envelope; the discard weighs it.
+        if not envelope.is_dir() and not (scan and _contextkit_config_id(root)):
             continue
         entry.update(envelope=str(envelope), id=_migrate_root_id(envelope, root))
         out.append(entry)
@@ -9884,6 +9891,35 @@ def _migrate_main_checkout(ctx: dict) -> dict | None:
             return {"root": str(other), "envelope": str(envelope),
                     "why": f"{other} already keeps the agent's records in the store "
                            f"({theirs}) and this root's files do not"}
+    # Whether or not the checkout that put them there is on this disk: rows
+    # this root's files do not keep there were written from another checkout,
+    # and these files would overwrite and remove them.
+    if ctx["mode"] == "store" or ((ctx.get("state") or {}).get("migrated_at")):
+        return None
+    if started and Path(started).resolve() == here:
+        return None
+    if str(here) == str((ctx.get("answers") or {}).get("checkout") or ""):
+        return None
+    conn, _setting = _migrate_connect(ctx["root"])
+    try:
+        held = {}
+        for collection, table in (("grant", "capabilities_connection_grants"),
+                                  ("identifier", "capabilities_identifiers"),
+                                  ("policy", "capabilities_policy")):
+            if ctx["mode"] == "connections" and collection == "grant":
+                continue
+            rows = _migrate_rows(conn, f"SELECT count(*) FROM {table} WHERE agent_id = %s",
+                                 (agent_id,))
+            if rows and rows[0][0]:
+                held[collection] = int(rows[0][0])
+    finally:
+        conn.close()
+    if held:
+        return {"root": None, "envelope": None, "held": held,
+                "why": f"the store already keeps agent {agent_id}'s records ("
+                       + ", ".join(f"{n} {c} row(s)" for c, n in sorted(held.items()))
+                       + f") that this root's files ({ctx['mode']}) do not keep there, "
+                       "written from a checkout of the agent this run cannot find"}
     return None
 
 
@@ -9891,6 +9927,8 @@ def _migrate_checkout_differences(ctx: dict, main: dict) -> list[str]:
     """Where this second checkout's record and settings files differ from the
     main checkout's: named, never written."""
     out = []
+    if main.get("envelope") is None:
+        return out
     mine_env, theirs_env = Path(ctx["envelope"]), Path(main["envelope"])
     mine = {p.relative_to(mine_env) for p in _migrate_record_files(mine_env, ctx["manifests"])}
     theirs = {p.relative_to(theirs_env)
@@ -10446,7 +10484,7 @@ def cmd_migrate_agent(opts: dict) -> None:
                     "applied": apply, "store": {"level": ctx["setting"].level,
                                                 "schema": ctx["setting"].schema}}
     if ctx.get("tables_to_upgrade") and not apply:
-        answer["tables_to_upgrade"] = ctx["tables_to_upgrade"]
+        answer["tables_to_upgrade"] = {_store_module().STORE_OWNER: ctx["tables_to_upgrade"]}
     main = _migrate_main_checkout(ctx)
     if main is not None:
         # A second checkout of the agent only verifies: whatever its files
@@ -10486,7 +10524,23 @@ def cmd_migrate_agent(opts: dict) -> None:
                        "registered" if state else "unregistered")
     if state.get("migrating_since"):
         answer["migrating_since"] = state["migrating_since"]
-    if main is not None:
+    if main is not None and main["root"] is None:
+        # No checkout of the agent is known here: a person says whether this
+        # one is the agent's, before its files replace and remove any row.
+        here = str(Path(root).resolve())
+        answer["questions"] = [{
+            "id": "checkout", "answer": "checkout", "choices": [here],
+            "question": f"{main['why']}. Is {here} the agent's main checkout, whose "
+                        "files are to replace the store's rows and remove those they do "
+                        f"not hold? Answer `checkout` with {here} to move the agent from "
+                        "here; otherwise run `capabilities migrate` in the checkout that "
+                        "keeps its records in the store"}]
+        ctx["blockers"].insert(0, _MigrateRefusal(
+            "second_checkout", f"{root} may be a second checkout of agent "
+            f"{ctx['agent_id']}: {main['why']}; nothing is written until a person "
+            "answers `checkout`", "answer the question `checkout`, or run `capabilities "
+            "migrate` in the agent's main checkout", detail={"held": main["held"]}))
+    elif main is not None:
         ctx["blockers"].insert(0, _MigrateRefusal(
             "second_checkout", f"{root} is a second checkout of agent {ctx['agent_id']} "
             f"({main['why']}): it only verifies, and the agent's records move from its "
@@ -10514,6 +10568,12 @@ def cmd_migrate_agent(opts: dict) -> None:
         _migrate_refuse(exc, answer)
     answer["plan"] = _migrate_summary(plan)
     answer["questions"] = plan["questions"]
+    if not apply:
+        # The capabilities' own tables a write would make or bring forward,
+        # as each mover read them without changing them.
+        for report in plan["movers"].values():
+            for owner, pending in (report.get("tables_to_upgrade") or {}).items():
+                answer.setdefault("tables_to_upgrade", {})[owner] = pending
     if plan["mover_failures"]:
         failure = _MigrateRefusal(
             "mover_failed", f"{len(plan['mover_failures'])} capability mover(s) could not "
@@ -10850,7 +10910,7 @@ def cmd_migrate_global(opts: dict) -> None:
         else:
             pending = _migrate_tables_pending(conn)
             if pending:
-                answer["tables_to_upgrade"] = pending
+                answer["tables_to_upgrade"] = {_store_module().STORE_OWNER: pending}
     except _MigrateRefusal as exc:
         conn.close()
         _migrate_refuse(exc, answer)

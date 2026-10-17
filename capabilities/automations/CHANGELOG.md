@@ -2,7 +2,7 @@
 
 ## 2026-10-17 — `migrate files` moves nothing, without refusing, from an envelope holding nothing
 
-An agent whose envelope folder holds neither a gate nor an identity has nothing of automations' to move, and `migrate files` now says so instead of refusing `no_envelope`, so `capabilities migrate` can move such an agent.
+An agent whose envelope folder holds neither a gate nor an identity has nothing of automations' to move, and `migrate files` now says so instead of refusing `no_envelope`, so `capabilities migrate` can move such an agent. Its plan no longer migrates the ledger's tables: it reads them as they stand, a table not made yet as holding no definition, and names the steps a write would run under `tables_to_upgrade`.
 
 ## 2026-10-16 — A moved agent's scheduler settings and agent profiles are the store's
 

@@ -12577,6 +12577,29 @@ def _workers_write_gate(action: str) -> None:
              "a person saves workers, outside any turn")
 
 
+def _table_made(cur, table: str) -> bool:
+    """Whether the store holds `table` in this capability's schema yet."""
+    cur.execute("select to_regclass(%s) is not null as made", (f"{SCHEMA}.{table}",))
+    return bool(_rows(cur)[0]["made"])
+
+
+def _tables_pending() -> dict:
+    """{owner: {from, to, steps}} for this capability's tables and the harness
+    library's profile table where a migration would change them, read without
+    changing anything."""
+    out = {}
+    with _connect(None, migrating=False) as conn:
+        for owner in (_profile_tables()[0], NAME):
+            status = _tables_status(conn, owner)
+            if status.state == "current":
+                continue
+            out[owner] = {"from": None if status.stored_major is None
+                          else f"{status.stored_major}.{status.stored_minor}",
+                          "to": f"{status.major}.{status.minor}",
+                          "steps": list(status.pending)}
+    return out
+
+
 def _active_row(cur, project: str, name: str, lock: bool = False) -> dict | None:
     cur.execute(f"""select * from {SCHEMA}.tasks_workers
                      where project_id = %s and name = %s and active
@@ -12786,8 +12809,8 @@ _IMPORT_CLASS = 31325
 
 
 def _import_worker_files(entry, project: str, apply: bool,
-                         raising: bool = False,
-                         remove: bool = True) -> tuple[list[dict], list[str]]:
+                         raising: bool = False, remove: bool = True,
+                         planning: bool = False) -> tuple[list[dict], list[str]]:
     """Each of this project's worker files as an import would take it, and
     every reason the import is refused; with `apply` and nothing refusing, each
     is saved and its file removed, all of them or none.
@@ -12798,8 +12821,11 @@ def _import_worker_files(entry, project: str, apply: bool,
     like a file that cannot be read, refuses the import, naming it. Raises
     Refusal when `raising` and the store cannot be reached. `remove` False
     leaves the files where they are, for `capabilities migrate` to archive and
-    remove once it has verified the whole move."""
-    with _connect(entry, raising=raising) as conn, conn.cursor() as cur:
+    remove once it has verified the whole move. `planning` reads the tables
+    as they stand, changing nothing; tables not made yet hold no worker."""
+    with _connect(entry, raising=raising, migrating=not planning) as conn, \
+            conn.cursor() as cur:
+        made = not planning or _table_made(cur, "tasks_workers")
         if apply:
             cur.execute("select pg_advisory_lock(%s, hashtext(%s))",
                         (_IMPORT_CLASS, _presence_key(SCHEMA, project)))
@@ -12823,7 +12849,7 @@ def _import_worker_files(entry, project: str, apply: bool,
             plan.append({"name": name, "path": path, "spec": spec, "body": body,
                          "missing": missing})
         for one in plan:
-            active = _active_row(cur, project, one["name"], lock=apply)
+            active = _active_row(cur, project, one["name"], lock=apply) if made else None
             if active is None:
                 one["outcome"] = "imported"
             elif active["spec"] == one["spec"] and (active["body"] or "") == one["body"]:
@@ -13132,12 +13158,12 @@ def _profiles_import(entry, project: str, apply: bool) -> None:
     _emit(answer)
 
 
-def _import_profile_files(entry, project: str, apply: bool,
-                          remove: bool = True) -> tuple[list[dict], list[str]]:
+def _import_profile_files(entry, project: str, apply: bool, remove: bool = True,
+                          planning: bool = False) -> tuple[list[dict], list[str]]:
     """Each of this project's profile files as an import takes it, and every
     reason the import is refused; with `apply` and nothing refusing, each is
     saved, all of them or none, and its file removed unless `remove` is
-    False."""
+    False. `planning` reads the tables as they stand, changing nothing."""
     runner = _profile_store()
     files = _unimported_profile_files()
     plan, refused = [], []
@@ -13159,10 +13185,13 @@ def _import_profile_files(entry, project: str, apply: bool,
             refused.append(wrong.message)
             continue
         plan.append({"name": name, "path": path, "spec": spec})
-    with _connect(entry) as conn:
+    with _connect(entry, migrating=not planning) as conn:
+        with conn.cursor() as cur:
+            made = not planning or _table_made(cur, "harness_profiles")
         for one in plan:
             active = runner.active_profile(conn, one["name"], scope="project",
-                                           scope_id=project, schema=SCHEMA, lock=apply)
+                                           scope_id=project, schema=SCHEMA,
+                                           lock=apply) if made else None
             if active is None:
                 one["outcome"] = "imported"
             elif active.spec == one["spec"]:
@@ -13223,10 +13252,12 @@ def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict:
     if write:
         _migrate_profile_tables()
     try:
+        planning = action == "plan"
         workers, refused = _import_worker_files(None, project, write, raising=True,
-                                                remove=False)
+                                                remove=False, planning=planning)
         profiles, refused_profiles = _import_profile_files(None, project, write,
-                                                           remove=False)
+                                                           remove=False, planning=planning)
+        pending = _tables_pending() if planning else {}
     except Refusal as refused_store:
         _die(refused_store.exit_code, refused_store.code, refused_store.message,
              refused_store.hint)
@@ -13247,6 +13278,8 @@ def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict:
                                                          if one.get("version") else {})}
                 for one in profiles])
     report = {"items": items, "files": files}
+    if pending:
+        report["tables_to_upgrade"] = pending
     if action == "verify":
         report["differences"] = refused + [
             f"{item['kind']} {item['name']}: the store does not hold {item['file']}"
