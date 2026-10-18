@@ -136,6 +136,11 @@ def test_turn_counts_reset_a_room_after_quiet_and_skip_refusals(store):
     assert store.turn_counts("p", "alpha", "!r", ["@s:x"], window=3600, quiet=900,
                              room_cap=10)["senders"] == {"@s:x": 1}
     assert not store.refused("p", "alpha", "!r", "@b:x", 60)
+    # So is one a project worker named `refusal` ran: it is held to its limits.
+    store.start_turn("t6", "p", "alpha", "!r", "refusal", None, ["@q:x"], ["mention"])
+    assert store.turn_counts("p", "alpha", "!r", ["@q:x"], window=3600, quiet=900,
+                             room_cap=10)["senders"] == {"@q:x": 1}
+    assert not store.refused("p", "alpha", "!r", "@q:x", 60)
     store.end_turn("t0", "answered")
     assert store.execute("SELECT outcome FROM agentrooms_turns WHERE id = 't0'", fetch="one") == ("answered",)
     assert store.answered_by("p", "alpha", "$a") is None

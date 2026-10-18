@@ -979,10 +979,11 @@ class Store:
 
     # -- turns ----------------------------------------------------------------
 
-    # A turn a worker ran, as opposed to a refusal: one recorded under the
-    # refusal's name, or under `default` by an earlier release, whose refusal was
-    # the default worker and whose ids it began with `default:`.
-    A_TURN = f"NOT (worker = '{REFUSAL}' OR id LIKE '{DEFAULT_WORKER}:%%')"
+    # A turn a worker ran, as opposed to a refusal. A refusal's id begins with
+    # `refusal:`, or `default:` from an earlier release, whose refusal was the
+    # default worker; a worker's turn id is a bare uuid, so a project worker
+    # that happens to be named `refusal` is still held to its limits.
+    A_TURN = f"NOT (id LIKE '{REFUSAL}:%%' OR id LIKE '{DEFAULT_WORKER}:%%')"
 
     def start_turn(self, turn: str, project: str, agent: str, room_id: str, worker: str,
                    worker_id: str | None, senders: list[str], kinds: list[str]) -> None:
