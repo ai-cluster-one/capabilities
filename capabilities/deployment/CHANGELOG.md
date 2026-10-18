@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-18 — Each boot brings the capabilities to the catalogue the image names
+
+A container's entrypoint installed at boot only the catalogue capabilities its registry lacked, so a node whose manager home persists (`compiler.container.persistent_manager`) kept the payloads an earlier image installed through every redeploy. Each boot now brings them to the catalogue at `CAPABILITIES_SOURCE`: a capability the registry lacks is installed as before; one installed from another catalogue is installed again from this one with `capabilities install <name>`, keeping its machine state; one already from this catalogue is updated with `capabilities update <name>` where `capabilities update --check` finds a different payload there; one installed from a local path or a registered source is left as it is. Where the manager's home persists, the manager is first brought to the release this catalogue carries with `capabilities self-update`, since an older manager refuses newer payloads. A boot already at the catalogue changes nothing. Run `deployment sync` and redeploy to pick it up.
+
 ## 2026-10-18 — One working connection per process, and none for a runner whose service is not running
 
 `deployment` uses `capabilities-contract` 0.5.1. Every connection it opens on the transaction path is the process's one working connection, which the library lends to each operation and keeps until the process exits, so a command connects once rather than once per read; a connect that fails is tried again, and a working connection the store or the network lost is replaced, a statement that lost it before anything of its transaction reached the store running once more on the new one and a commit never sent twice. A runner whose service is running keeps its working connection for the lease renewals; one whose service is not running here closes it after each reconcile and holds no connection between them.

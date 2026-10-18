@@ -278,9 +278,8 @@ FILES
       compiler.container supplies agent_home and project_root for portable mounts;
       compiler.container.persistent_manager true (container profiles) keeps the
       capabilities manager's whole home on named volumes, its launcher
-      directory first on PATH: the node keeps the tools it installs and
-      updates, a redeploy no longer upgrades them, and each boot installs only
-      the catalogue capabilities the registry lacks;
+      directory first on PATH: the node keeps the tools it installs, and each
+      boot brings the catalogue capabilities to the image's catalogue;
       compiler.container.checkouts (agent-box-checkout) lists other
       repositories the box works on, each {path, url, branch, register}: each
       boot clones one whose path is absent or empty, never touches one already
@@ -311,11 +310,15 @@ FILES
       The image installs every capability in the official catalogue at
       CAPABILITIES_REF (default main) with `capabilities install <name>
       --allow`, a core one arriving enabled by the manager's first-install
-      rule, and each boot installs any catalogue capability the registry lacks
-      and leaves installed ones as they are. Whether a capability is usable is
-      its gate's and its connections' answer, not whether it is installed. The
-      runtime's capabilities.exclude list keeps operator-only tools out of the
-      image without changing their project policy on the host.
+      rule, and each boot brings the registry to that catalogue: it installs
+      any catalogue capability the registry lacks, reinstalls from it one
+      installed from another catalogue, updates one whose payload differs from
+      it, and leaves one installed from elsewhere as it is, so a node whose
+      manager home persists runs the catalogue its image names. Whether a
+      capability is usable is its gate's and its connections' answer, not
+      whether it is installed. The runtime's capabilities.exclude list keeps
+      operator-only tools out of the image without changing their project
+      policy on the host.
 
   capabilities/deployment/reference/*.md
       Optional project-specific operational models. Reference files are neither
@@ -7115,19 +7118,55 @@ def _body_sync_template(project_name: str, project_root: str) -> str:
             .replace("__QUIET__", SYNC_QUIET_ENV))
 
 
+# On a manager home kept on volumes the manager is the one an earlier image
+# installed, and an older manager refuses newer payloads, so it is brought to the
+# release this image's catalogue carries before any capability is.
+_MANAGER_UPDATE = """# The manager's home persists, so it may be older than this image's catalogue.
+if capabilities self-update --check < /dev/null 2>/dev/null \\
+     | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("update_available") else 1)'; then
+  echo "[entrypoint] updating the capabilities manager to the release the catalogue this image names carries"
+  if ! capabilities self-update < /dev/null > /dev/null; then
+    echo "[entrypoint] WARN: could not update the capabilities manager; the box runs the manager it has" >&2
+  fi
+fi
+"""
+
 _CATALOGUE_BLOCK = """
-# --- Catalogue capabilities this node's registry lacks -----------------------
-# A node holds the whole catalogue; whether a capability is usable is its gate's
-# and its connections' answer. One already installed is left as it is.
-registry="${CAPABILITIES_HOME:-$HOME/.capabilities}"
-if names="$(__NAMES__)"; then
-  for name in $names; do
-    if [ -f "$registry/$name/$name" ]; then continue; fi
-    echo "[entrypoint] installing $name: the catalogue carries it and this node's registry lacks it"
-    if ! capabilities install "$name" --allow < /dev/null > /dev/null; then
-      echo "[entrypoint] WARN: could not install $name; the box runs without it" >&2
-    fi
-  done
+# --- Catalogue capabilities at the catalogue this image names ----------------
+# A node holds the whole catalogue at CAPABILITIES_SOURCE; whether a capability
+# is usable is its gate's and its connections' answer. One the registry lacks is
+# installed; one installed from another catalogue is installed again from this
+# one; one already from this catalogue is updated only where the manager finds a
+# different payload there. One installed from anywhere else is left as it is.
+__MANAGER__registry="${CAPABILITIES_HOME:-$HOME/.capabilities}"
+if plan="$(__PLAN__)"; then
+  recorded=""
+  while read -r state name; do
+    case "$state" in
+      missing)
+        echo "[entrypoint] installing $name: the catalogue carries it and this node's registry lacks it"
+        if ! capabilities install "$name" --allow < /dev/null > /dev/null; then
+          echo "[entrypoint] WARN: could not install $name; the box runs without it" >&2
+        fi
+        ;;
+      moved)
+        echo "[entrypoint] updating $name: it was installed from another catalogue than the one this image names"
+        if ! capabilities install "$name" < /dev/null > /dev/null; then
+          echo "[entrypoint] WARN: could not update $name; the box runs the payload it has" >&2
+        fi
+        ;;
+      recorded) recorded="$recorded $name" ;;
+    esac
+  done <<< "$plan"
+  if [ -n "$recorded" ]; then
+    behind="$(capabilities update --check < /dev/null 2>/dev/null | python3 -c __BEHIND__ $recorded || true)"
+    for name in $behind; do
+      echo "[entrypoint] updating $name: the catalogue this image names carries a different payload"
+      if ! capabilities update "$name" < /dev/null > /dev/null; then
+        echo "[entrypoint] WARN: could not update $name; the box runs the payload it has" >&2
+      fi
+    done
+  fi
 else
   echo "[entrypoint] WARN: could not read the capability catalogue; the box runs with the capabilities it has" >&2
 fi
@@ -7262,14 +7301,17 @@ def _entrypoint_template(project_name: str, supervisor_config: str | None = None
                          body_sync: str | None = None,
                          catalogue_exclude: set[str] | None = None,
                          checkouts: list[dict] | None = None,
-                         store_records: bool = False) -> str:
+                         store_records: bool = False,
+                         persistent_manager: bool = False) -> str:
     identity = _slug(project_name)
-    # The image installs the catalogue at build. A capability the catalogue
-    # gained since, or one a persisted registry never had, is installed here;
-    # one already installed is left as it is, so a redeploy never takes back a
-    # tool the node updated.
-    manager_block = _CATALOGUE_BLOCK.replace(
-        "__NAMES__", _catalogue_names(catalogue_exclude))
+    # The image installs the catalogue at build. A persisted registry still
+    # holds what an earlier image installed, so each boot brings the catalogue
+    # capabilities to the catalogue this image names - and, where the manager's
+    # own home persists, the manager first, since only there can it be older.
+    manager_block = (_CATALOGUE_BLOCK
+                     .replace("__MANAGER__", _MANAGER_UPDATE if persistent_manager else "")
+                     .replace("__PLAN__", _catalogue_plan(catalogue_exclude))
+                     .replace("__BEHIND__", shlex.quote(_CATALOGUE_BEHIND)))
     default_command = (
         f"exec /usr/bin/supervisord -c {shlex.quote(supervisor_config)}"
         if supervisor_config else
@@ -8146,6 +8188,35 @@ def _catalogue_names(exclude: set[str] | None = None) -> str:
             f" | python3 -c {shlex.quote(program)}{args}")
 
 
+def _catalogue_plan(exclude: set[str] | None = None) -> str:
+    """A shell command printing `<state> <name>` for every capability the
+    catalogue at CAPABILITIES_SOURCE carries less the runtime's exclusions:
+    `missing` where the registry lacks it, `moved` where its recorded source is
+    the same capability in another catalogue, `recorded` where it is this
+    catalogue's. One installed from anywhere else is not printed."""
+    program = (
+        'import json,os,sys\n'
+        'reg, base, ex = sys.argv[1], sys.argv[2], set(sys.argv[3:])\n'
+        'for n in sorted(json.load(sys.stdin)["capabilities"]):\n'
+        '    if n in ex: continue\n'
+        '    if not os.path.isfile(os.path.join(reg, n, n)): print("missing", n); continue\n'
+        '    try: meta = json.load(open(os.path.join(reg, n, "meta.json")))\n'
+        '    except (OSError, ValueError): continue\n'
+        '    src, rel = str(meta.get("source") or ""), "/capabilities/%s/bin/%s" % (n, n)\n'
+        '    if meta.get("source_id") or not src.startswith(("http://", "https://")) or not src.endswith(rel): continue\n'
+        '    print("recorded" if src == base + rel else "moved", n)\n')
+    args = "".join(" " + shlex.quote(name) for name in sorted(exclude or ()))
+    return ('curl -fsSL "${CAPABILITIES_SOURCE}/.capability-source/catalog.json"'
+            f' | python3 -c {shlex.quote(program)} "$registry" "${{CAPABILITIES_SOURCE}}"{args}')
+
+
+# Reads `capabilities update --check` and prints each capability named on the
+# command line whose recorded source carries a different payload.
+_CATALOGUE_BEHIND = ('import json,sys; want=set(sys.argv[1:]); '
+                     'rows=json.load(sys.stdin).get("checked") or []; '
+                     '[print(r["name"]) for r in rows if r.get("name") in want and r.get("update_available")]')
+
+
 def _mark_generated(path: Path, text: str) -> str:
     marker = f"# {GENERATED_MARKER}; do not edit this file directly."
     if text.startswith("#!"):
@@ -8229,7 +8300,8 @@ def _artifact_texts(root: Path, runtime: dict,
             project_root=project_root, has_contextkit=has_contextkit,
             body_sync=body_sync_config, catalogue_exclude=catalogue_exclude,
             checkouts=compiler["container"].get("checkouts"),
-            store_records=store_records),
+            store_records=store_records,
+            persistent_manager=_persistent_manager(runtime)),
     }
     if supervisor_path is not None:
         candidates["supervisor"] = _supervisor_template(

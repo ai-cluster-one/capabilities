@@ -170,7 +170,8 @@ def test_runtime_capability_exclusions_only_trim_the_image_catalogue(tmp_path: P
     program = ('[print(n) for n in sorted(json.load(sys.stdin)["capabilities"]) '
                "if n not in ex]' deployment")
     assert program in (root / BUNDLE / "Dockerfile").read_text()
-    assert program in (root / BUNDLE / "entrypoint.sh").read_text()
+    assert '"$registry" "${CAPABILITIES_SOURCE}" deployment)"; then' in (
+        root / BUNDLE / "entrypoint.sh").read_text()
     compiled = json.loads(runtime_path.read_text())
     assert compiled["capabilities"]["exclude"] == ["deployment"]
 

@@ -4,8 +4,8 @@ With compiler.container.persistent_manager the capabilities manager's whole
 writable home is compiled onto named volumes. What is proven here: every
 directory the manager writes sits on exactly one of them and every rename it
 makes keeps both ends on one; the image puts the launcher directory first on
-PATH and installs the catalogue there; each boot installs only what the registry
-lacks; a capability service's own state mount keeps working beside them; and a
+PATH and installs the catalogue there; each boot brings the registry to the
+catalogue the image names; a capability service's own state mount keeps working beside them; and a
 runtime that does not opt in compiles exactly as it did.
 """
 from __future__ import annotations
@@ -170,8 +170,9 @@ def test_the_image_puts_the_launchers_on_a_volume_first_on_path(tmp_path: Path, 
 
 
 def _boot_block(entrypoint: str) -> str:
-    start = entrypoint.index("# --- Catalogue capabilities this node's registry lacks")
-    end = entrypoint.index("\nfi\n", start) + len("\nfi\n")
+    start = entrypoint.index("# --- Catalogue capabilities at the catalogue this image names")
+    end = entrypoint.index("\nfi\n", entrypoint.index(
+        "could not read the capability catalogue", start)) + len("\nfi\n")
     block = entrypoint[start:end]
     assert '"${CAPABILITIES_SOURCE}/.capability-source/catalog.json"' in block
     return block
@@ -199,6 +200,7 @@ def test_each_boot_installs_only_the_catalogue_the_registry_lacks(
     fake.parent.mkdir()
     fake.write_text(f"""#!/usr/bin/env bash
 echo "$*" >> {box}/calls
+if [ "$1 $2" = "self-update --check" ]; then echo '{{"update_available": false}}'; exit 0; fi
 [ "$2" = broken ] && exit 5
 mkdir -p "$CAPABILITIES_HOME/$2" && echo installed > "$CAPABILITIES_HOME/$2/$2"
 """)
@@ -219,21 +221,92 @@ cat {catalogue}
     assert first.returncode == 0, first.stderr
     assert (box / "fetched").read_text().split() == [
         "-fsSL", "https://catalogue.invalid/ref/.capability-source/catalog.json"]
-    assert (box / "calls").read_text().splitlines() == ["install added --allow", "install broken --allow"]
+    # Only a manager whose home persists can be older than the image's.
+    manager = ["self-update --check"] if persistent else []
+    assert (box / "calls").read_text().splitlines() == manager + [
+        "install added --allow", "install broken --allow"]
     assert "could not install broken" in first.stderr
     # What the node updated is never reinstalled over.
     assert (registry / "kept" / "kept").read_text() == "updated on the node\n"
     (box / "calls").unlink()
     second = subprocess.run(["bash", str(script)], env=run_env, capture_output=True, text=True)
     assert second.returncode == 0
-    assert (box / "calls").read_text().splitlines() == ["install broken --allow"]
+    assert (box / "calls").read_text().splitlines() == manager + ["install broken --allow"]
     # A catalogue that cannot be read still boots the box on what it has.
     (box / "calls").unlink()
     (box / "offline").touch()
     third = subprocess.run(["bash", str(script)], env=run_env, capture_output=True, text=True)
     assert third.returncode == 0, third.stderr
-    assert not (box / "calls").exists()
+    calls = box / "calls"
+    assert (calls.read_text().splitlines() if calls.exists() else []) == manager
     assert "could not read the capability catalogue" in third.stderr
+
+
+@pytest.mark.parametrize("persistent", (False, True))
+def test_each_boot_brings_installed_capabilities_to_the_catalogue_the_image_names(
+        tmp_path: Path, persistent: bool) -> None:
+    root, env = _project(tmp_path, ("telegram",))
+    _setup(root, env, "agent-box")
+    if persistent:
+        assert _opt_in(root, env).returncode == 0
+    entrypoint = (root / BUNDLE / "entrypoint.sh").read_text()
+    box = tmp_path / "box"
+    registry = box / "registry"
+    image = "https://catalogue.invalid/new"
+
+    def payload(name: str, source: str | None, **meta: str) -> None:
+        (registry / name).mkdir(parents=True)
+        (registry / name / name).write_text(f"{name}\n")
+        if source is not None:
+            (registry / name / "meta.json").write_text(json.dumps({"source": source, **meta}))
+
+    payload("older", "https://catalogue.invalid/old/capabilities/older/bin/older")
+    payload("behind", f"{image}/capabilities/behind/bin/behind")
+    payload("level", f"{image}/capabilities/level/bin/level")
+    payload("local", "/somewhere/capabilities/local")
+    payload("registered", f"{image}/capabilities/registered/bin/registered", source_id="dev")
+    (box / "bin").mkdir(parents=True)
+    (box / "catalog.json").write_text(json.dumps({"capabilities": {
+        name: {} for name in ("older", "behind", "level", "local", "registered")}}))
+    (box / "check.json").write_text(json.dumps({"checked": [
+        {"name": name, "update_available": True}
+        for name in ("behind", "local", "registered")] + [
+        {"name": "level", "update_available": False}]}))
+    (box / "manager.json").write_text(json.dumps({"update_available": True}))
+    fake = box / "bin" / "capabilities"
+    fake.write_text(f"""#!/usr/bin/env bash
+echo "$*" >> {box}/calls
+if [ "$1 $2" = "self-update --check" ]; then cat {box}/manager.json; exit 0; fi
+if [ "$1 $2" = "update --check" ]; then cat {box}/check.json; exit 0; fi
+""")
+    fake.chmod(0o755)
+    curl = box / "bin" / "curl"
+    curl.write_text(f"#!/usr/bin/env bash\ncat {box / 'catalog.json'}\n")
+    curl.chmod(0o755)
+    script = box / "boot.sh"
+    script.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + _boot_block(entrypoint))
+    run_env = {**os.environ, "PATH": f"{fake.parent}{os.pathsep}{os.environ['PATH']}",
+               "CAPABILITIES_HOME": str(registry), "CAPABILITIES_SOURCE": image}
+    booted = subprocess.run(["bash", str(script)], env=run_env, capture_output=True, text=True)
+    assert booted.returncode == 0, booted.stderr
+    # The manager comes first, since an older one refuses newer payloads. One
+    # from another catalogue is installed again from this one, keeping its
+    # machine state; one from this catalogue is updated only where the manager
+    # finds a different payload; one from elsewhere is never touched.
+    manager = ["self-update --check", "self-update"] if persistent else []
+    assert (box / "calls").read_text().splitlines() == manager + [
+        "install older", "update --check", "update behind"]
+    # A registry already at the catalogue does no update work.
+    (box / "calls").unlink()
+    (box / "manager.json").write_text(json.dumps({"update_available": False}))
+    (box / "check.json").write_text(json.dumps({"checked": [
+        {"name": name, "update_available": False} for name in ("older", "behind", "level")]}))
+    (registry / "older" / "meta.json").write_text(json.dumps(
+        {"source": f"{image}/capabilities/older/bin/older"}))
+    again = subprocess.run(["bash", str(script)], env=run_env, capture_output=True, text=True)
+    assert again.returncode == 0, again.stderr
+    assert (box / "calls").read_text().splitlines() == manager[:1] + ["update --check"]
+    assert "updating" not in again.stdout
 
 
 def test_a_service_state_mount_inside_the_manager_state_keeps_its_own_volume(tmp_path: Path) -> None:
