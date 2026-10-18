@@ -797,7 +797,8 @@ AUTHORING
         Without a topic, list manager guides with their titles, previews, and
         exact read commands. With a topic, print that guide's Markdown body.
         Start here for capability authoring, repositories, contract work,
-        development, review, sanitizing, and publishing.
+        development, review, sanitizing, and publishing, and for moving
+        agents from files to the database (migrate-to-database).
 
 I/O CONTRACT
   Success: JSON on stdout, except the documented Markdown renderers
@@ -994,8 +995,8 @@ _AUTHORING_ASSETS = (
     "contract/preamble.py", "contract/store.py",
 )
 _MANAGER_GUIDE_TOPICS = (
-    "authoring", "conforming", "contract", "dev", "grooming", "publishing",
-    "reporting", "repositories", "sanitizing", "surfaces",
+    "authoring", "conforming", "contract", "dev", "grooming",
+    "migrate-to-database", "publishing", "reporting", "repositories", "sanitizing", "surfaces",
 )
 SKILL_ASSET = "skill/SKILL.md"
 # Each thing that ships keeps its own change log in its own home: a capability

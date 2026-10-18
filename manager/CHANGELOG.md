@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-18 — A guide for moving agents from files to the database
+
+New guide `capabilities guide migrate-to-database`, shipped with the manager: how an agent walks a person through moving their agents' configuration from files into their own PostgreSQL database - the prerequisites (updated tools, a database and its address behind a pooler, a backup, `AGENT_NODE_NAME` for shells and the service manager), the order (the global layer, each live server target's `node`, each agent's dry run, questions, apply and commit, restarting what predates the node name, other machines and `--discard`), what each kind of dry-run question means, recovery from an interrupted, frozen or failed-verify run, and done as a `migrate --report` with nothing left on every machine. No verb changes.
+
 ## 2026-10-18 — A store may name a transaction address
 
 The manager uses `capabilities-contract` 0.5.0. A store setting may name a transaction address beside its address - `AGENTKIT_DB_TRANSACTION_HOST` and `AGENTKIT_DB_TRANSACTION_PORT` at the project and environment levels, `transaction_host` and `transaction_port` in the machine file, written by `store set --transaction-host H --transaction-port P` - the same store at another endpoint, typically a transaction-mode pooler, with the level's own credentials, database and schema. Every connection the manager opens is a transaction connection, dialled there when one is named and at the one address otherwise. `store show` reports it under `transaction`, `store doctor` proves it with a `transaction` check (skipped for a store with one address), and a dev session's lane is handed it. A transaction pooler the library refuses as the address is accepted as the transaction address. With no transaction address the store is reached as before.

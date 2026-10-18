@@ -29,6 +29,7 @@ def test_manager_guide_menu_uses_the_capability_guide_shape() -> None:
         "contract",
         "dev",
         "grooming",
+        "migrate-to-database",
         "publishing",
         "reporting",
         "repositories",

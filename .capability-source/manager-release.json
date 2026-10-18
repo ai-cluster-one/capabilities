@@ -13,17 +13,18 @@
     "guides/contract.md": "72408b3b5d035b15f9d98b5a5dc3d558870f391ed254b8c5f017656be75a13f4",
     "guides/dev.md": "f280bf39242b065fa30060a332ccdf9e32999e3f9b61c86f934062cb425a18c6",
     "guides/grooming.md": "a3ed64a86c4c0efbd2232cb42521f556452ffb1d1211f9599203360916b317bc",
+    "guides/migrate-to-database.md": "9b206a2326b399e3c92590ca189ebd887f7e9a0cb17b6135e8f040455833c05b",
     "guides/publishing.md": "afe771c3d708ce65092a2e63ccf8360966ce0149c268275bac70e3ee8c46ebf8",
     "guides/reporting.md": "5492d5058213e19738a70ab2be013c62a154238c1bf8c24bfb947bf34d1d0836",
     "guides/repositories.md": "0ec2af6dfc92d20aa283fecab82b7888fb22b2480541cbb597e9a52f680ec2f4",
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "e372035bda5844df49bd6cb68840dc7a5c723d4038653a67f9c1019bdf0a55fc",
+    "manager/CHANGELOG.md": "ce697cceacdbe6ed54d508c2bb69bef692c4689093679e4929c85b7d4963a35b",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "556f48a56d37fa9d25a8a7e64032de804d561203f2c6613f7cef60c1c2f567f6"
+    "sha256": "3432f994a5808faa221ff096b9cc234f5b6f82c6cfd0f891ccd5e572ad8d690d"
   },
   "schema": "capabilities.manager-release.v1"
 }
