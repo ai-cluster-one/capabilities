@@ -1758,17 +1758,23 @@ def test_a_dedupe_collision_still_yields_rather_than_raising(tmp_path, ledger_en
 
 def test_a_dropped_connection_is_noticed_and_reopened(tmp_path, ledger_env):
     """The store is across a network; a connection the server ends between
-    statements is replaced by the database library on the next one, which
-    carries on, and one it ends inside a transaction is noticed as lost, not
-    taken for a fault in the work, and a new one carries on."""
+    statements, or inside a transaction that has only read, is replaced by the
+    database library on the next one, which carries on, and one it ends inside
+    a transaction that took a lock is noticed as lost, not taken for a fault in
+    the work, and a new one carries on."""
     led = ledger_env()
     led.claim("nightly", tmp_path, trigger="manual")
     ended = led.conn.info.backend_pid
     ledger_env().conn.execute("SELECT pg_terminate_backend(%s)", [ended])
     assert len(led.list()) == 1
     assert not led.lost() and led.conn.info.backend_pid != ended
-    with pytest.raises(Exception), led.transaction():
+    with led.transaction():
         led.list()
+        ledger_env().conn.execute("SELECT pg_terminate_backend(%s)",
+                                  [led.conn.info.backend_pid])
+        assert len(led.list()) == 1
+    with pytest.raises(Exception), led.transaction():
+        led.conn.execute("SELECT pg_advisory_xact_lock(1)")
         ledger_env().conn.execute("SELECT pg_terminate_backend(%s)",
                                   [led.conn.info.backend_pid])
         led.list()

@@ -2,7 +2,7 @@
 
 ## 2026-10-18 — A command connects to the store once
 
-The manager uses `capabilities-contract` 0.5.1. Every connection it opens on the transaction path is the process's one working connection, which the library lends to each operation and keeps until the process exits, so a command connects once rather than once per read; a connect that fails is tried again, and a working connection the store or the network lost is replaced, a statement that lost it before anything of its transaction reached the store running once more on the new one and a commit never sent twice. `doctor` gives the connection back after proving the store answers rather than holding it while it checks the grants. SHEBANG.md's rule on connections states one working connection per process.
+The manager uses `capabilities-contract` 0.5.1. Every connection it opens on the transaction path is the process's one working connection, which the library lends to each operation and keeps until the process exits, so a command connects once rather than once per read; a connect that fails is tried again, and a working connection the store or the network lost is replaced, a statement that lost it before anything of its transaction reached the store running once more on the new one and a commit never sent twice. `doctor` gives the connection back after proving the store answers rather than holding it while it checks the grants. SHEBANG.md's rule on connections states one working connection per process. A store connection lost where the manager catches nothing ends the command as `store_unreachable`, exit 5, rather than with a traceback.
 
 ## 2026-10-18 — A guide for moving agents from files to the database
 

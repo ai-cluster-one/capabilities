@@ -460,6 +460,32 @@ def _die(exit_code: int, code: str, message: str,
     sys.exit(exit_code)
 
 
+def _store_lost(kind, exc, trace) -> None:
+    """A store connection lost where nothing caught it ends the command as the
+    store being unreachable, exit 5, rather than with a traceback: the database
+    library has already tried again everything it safely could."""
+    driver = sys.modules.get("psycopg")
+    if driver is None or not isinstance(exc, driver.OperationalError):
+        _UNCAUGHT[0](kind, exc, trace)
+        return
+    try:
+        _die(5, "store_unreachable",
+             "the store stopped answering: " + " ".join(str(exc).split())[:300],
+             "check the database setting with `capabilities store doctor`")
+    except SystemExit:
+        pass
+    import atexit
+    import os
+    atexit._run_exitfuncs()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(5)
+
+
+_UNCAUGHT = [sys.excepthook]
+sys.excepthook = _store_lost
+
+
 def _emit(value) -> None:
     if _EVENTS_ON[0]:
         sys.stdout.write(json.dumps({"event": "done", "result": value},
@@ -5988,12 +6014,24 @@ def _guarded():
         raise
 
 
-def _render_here(store, project: str, root: Path, by: str) -> dict:
+def _settings_ahead() -> dict | None:
+    """The settings a write renders the block with, read before the store is
+    opened, so the render asks nothing on a second connection; None when they
+    do not load, which the render then says."""
+    try:
+        return _settings()
+    except SystemExit:
+        return None
+
+
+def _render_here(store, project: str, root: Path, by: str,
+                 settings: dict | None = None) -> dict:
     """Render this project's block after a write; a failure is said and leaves
     the write standing."""
     try:
         return {"rendered": True, **_engine().render_project(
-            store, project, _settings(), _context_path(root), rendered_by=by)}
+            store, project, settings if settings is not None else _settings(),
+            _context_path(root), rendered_by=by)}
     except SystemExit:
         return {"rendered": False, "error": "the settings do not load; `memory doctor` says why"}
     except Exception as exc:
@@ -6082,12 +6120,13 @@ def cmd_add(args) -> None:
         title = engine.check_title(args.title)
         body = engine.check_body(_text_arg(args.text))
         scope = (args.scope or "").strip() or None
+        settings = _settings_ahead()
         with _open_store(root) as store:
             row, created = store.add(project, title, body, scope=scope, pinned=args.pin,
                                      actor=_actor(), node=node_name())
             out = {"created": created, "entry": engine.entry_out(row, with_body=False)}
             if created:
-                out["context"] = _render_here(store, project, root, "`memory add`")
+                out["context"] = _render_here(store, project, root, "`memory add`", settings)
     _emit(out)
 
 
@@ -6101,10 +6140,11 @@ def cmd_supersede(args) -> None:
     with _guarded():
         news = [(engine.check_title(title), engine.check_body(_text_arg(text)))
                 for text, title in zip(args.with_, args.title)]
+        settings = _settings_ahead()
         with _open_store(root) as store:
             out = store.supersede(project, args.ids, news, reason=args.reason, pin=args.pin,
                                   actor=_actor(), node=node_name())
-            out["context"] = _render_here(store, project, root, "`memory supersede`")
+            out["context"] = _render_here(store, project, root, "`memory supersede`", settings)
     _emit(out)
 
 
@@ -6115,10 +6155,11 @@ def cmd_drop(args) -> None:
     if not reason:
         _die(6, "input", "a drop says why the entry no longer holds", "pass --reason TEXT")
     with _guarded():
+        settings = _settings_ahead()
         with _open_store(root) as store:
             out = store.drop(project, args.id, reason=reason, to=(args.to or None),
                              purge=args.purge, actor=_actor(), node=node_name())
-            out["context"] = _render_here(store, project, root, "`memory drop`")
+            out["context"] = _render_here(store, project, root, "`memory drop`", settings)
     _emit(out)
 
 
@@ -6126,11 +6167,13 @@ def cmd_pin(args, pinned: bool) -> None:
     project = _project(write=True)
     root = _root()
     with _guarded():
+        settings = _settings_ahead()
         with _open_store(root) as store:
             out = store.set_pin(project, args.id, pinned, actor=_actor(), node=node_name())
             if out["changed"]:
                 out["context"] = _render_here(store, project, root,
-                                              f"`memory {'pin' if pinned else 'unpin'}`")
+                                              f"`memory {'pin' if pinned else 'unpin'}`",
+                                              settings)
     _emit(out)
 
 

@@ -2,7 +2,7 @@
 
 ## 2026-10-18 — The store tier uses one working connection per process
 
-The store tier pins `capabilities-contract` 0.5.1. `StoreRecords` and `AgentRecords` borrow the process's working connection for each read or write and give it back after, so every read and write of a command runs on one connection the library opened once and keeps until the process exits. A records write whose connection was lost before its commit was sent runs once more on a new connection; one lost while committing is reported as `store_unreachable` and never written again. Every capability carries the change through `sync-contract`.
+The store tier pins `capabilities-contract` 0.5.1. `StoreRecords` and `AgentRecords` borrow the process's working connection for each read or write and give it back after, so every read and write of a command runs on one connection the library opened once and keeps until the process exits. A records write whose connection was lost before its commit was sent runs once more on a new connection; one lost while committing is reported as `store_unreachable` and never written again. Every capability carries the change through `sync-contract`. A store connection lost where the capability catches nothing ends the command as `store_unreachable`, exit 5, through `_store_lost`, the capability core's handler of uncaught exceptions, rather than with a traceback.
 
 ## 2026-10-18 — A records adapter holds a connection only while it reads or writes
 

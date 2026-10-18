@@ -274,6 +274,32 @@ def _die(exit_code: int, code: str, message: str,
     sys.exit(exit_code)
 
 
+def _store_lost(kind, exc, trace) -> None:
+    """A store connection lost where nothing caught it ends the command as the
+    store being unreachable, exit 5, rather than with a traceback: the database
+    library has already tried again everything it safely could."""
+    driver = sys.modules.get("psycopg")
+    if driver is None or not isinstance(exc, driver.OperationalError):
+        _UNCAUGHT[0](kind, exc, trace)
+        return
+    try:
+        _die(5, "store_unreachable",
+             "the store stopped answering: " + " ".join(str(exc).split())[:300],
+             "check the database setting with `capabilities store doctor`")
+    except SystemExit:
+        pass
+    import atexit
+    import os
+    atexit._run_exitfuncs()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(5)
+
+
+_UNCAUGHT = [sys.excepthook]
+sys.excepthook = _store_lost
+
+
 def _emit(value) -> None:
     if _EVENTS_ON[0]:
         sys.stdout.write(json.dumps({"event": "done", "result": value},
