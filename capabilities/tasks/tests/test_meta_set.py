@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.5.0"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.5.1"]
 # ///
 """`meta set` with several keys: one write that lands whole or not at all.
 
@@ -15,7 +15,7 @@ runs the CLI as a project would, so the write gate and the read-only switch are
 met where the command applies them.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' \\
-        --with 'capabilities-contract==0.5.0' python -m pytest capabilities/tasks/tests -q
+        --with 'capabilities-contract==0.5.1' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations

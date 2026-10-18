@@ -1,5 +1,9 @@
 # contract — change log
 
+## 2026-10-18 — The store tier uses one working connection per process
+
+The store tier pins `capabilities-contract` 0.5.1. `StoreRecords` and `AgentRecords` borrow the process's working connection for each read or write and give it back after, so every read and write of a command runs on one connection the library opened once and keeps until the process exits. A records write whose connection was lost before its commit was sent runs once more on a new connection; one lost while committing is reported as `store_unreachable` and never written again. Every capability carries the change through `sync-contract`.
+
 ## 2026-10-18 — A records adapter holds a connection only while it reads or writes
 
 The store tier pins `capabilities-contract` 0.5.0 and every connection it opens is a transaction connection (`connect(..., transaction=True)`): at the store's transaction address where its setting names one, with no prepared statement, the schema bound for each transaction and no session state. `StoreRecords` and `AgentRecords` open one for each read or write and close it once the operation ends, serving what they read from their cache for `STORE_READ_SECONDS`; `open_records()` closes the connection it reads the agent registry on rather than handing it to the adapter, and `_store_connect()` and `migrate`/`migrate status` use transaction connections too. A connection handed in stays the caller's. During `migrate files plan` the plan's one link is kept between operations (`_HOLD_RECORDS_CONNECTION`), since closing it would undo the plan, and it stays a session connection. Every capability carries the change through `sync-contract`.

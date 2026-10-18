@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-18 — One working connection per process
+
+`automations` uses `capabilities-contract` 0.5.1. Every connection it opens on the transaction path is the process's one working connection, which the library lends to each operation and keeps until the process exits, so a command connects once rather than once per read; a connect that fails is tried again, and a working connection the store or the network lost is replaced, a statement that lost it before anything of its transaction reached the store running once more on the new one and a commit never sent twice. The scheduler keeps its working connection beside its listener.
+
 ## 2026-10-18 — A command no longer listens, and the scheduler waits out a store that is away
 
 `automations` uses `capabilities-contract` 0.5.0. Only the scheduler's link, project or machine, listens for changed definitions, on one session connection that also carries its questions; every command's ledger and the profile lookups connect on a transaction connection, at the store's transaction address where one is named, and listen to nothing. A scheduler whose store does not answer when it starts asks again on a doubling interval from 1s to 30s, saying so once, instead of exiting for its supervisor to start it again, and one that loses its store asks for it again on the same interval rather than on every tick. A container is handed `AGENTKIT_DB_TRANSACTION_HOST` and `AGENTKIT_DB_TRANSACTION_PORT`.

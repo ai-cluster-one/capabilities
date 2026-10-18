@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.5.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.5.1",
 #                 "callva-harness-runner==0.9.0",
 #                 "pyyaml>=6"]
 # ///
@@ -20,7 +20,7 @@ run` children on the stand-in harness. The store-backed checks read
 TASKS_TEST_DSN and skip when it is unset.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
-        --with 'capabilities-contract==0.5.0' \\
+        --with 'capabilities-contract==0.5.1' \\
         --with 'callva-harness-runner==0.9.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -240,11 +240,13 @@ def test_a_turn_started_while_the_store_is_away_waits_for_it(lab, relay):
 @needs_store
 def test_a_turn_outlives_a_store_outage_and_its_lease_never_lapses(lab, relay):
     """The store goes away for 8s in the middle of a turn, under a retry window
-    of 10s: the worker's own `tasks` calls wait for it, the beat cannot reach
-    it, and still the lease the turn holds never runs out and the turn settles
-    as if nothing happened."""
+    of 10s: a worker's `tasks` call waits for it, the beat cannot reach it, and
+    still the lease the turn holds never runs out, the beat renews it once the
+    store is back, and the turn settles as if nothing happened. The turn runs
+    on past the outage, so the renewal is not raced by the turn's close, which
+    a command reaching the store again at once can win."""
     schema = schema_of(lab)
-    lab["env"]["FAKE_ENGINE_SLEEP"] = "6"
+    lab["env"]["FAKE_ENGINE_SLEEP"] = "16"
     add(lab, "t-turn")
     relayed(lab, relay, 10)        # a beat every 2s, a lease of 16s
     turn = start_run(lab)
@@ -259,6 +261,9 @@ def test_a_turn_outlives_a_store_outage_and_its_lease_never_lapses(lab, relay):
     assert before["lease_until"] > first["lease_until"], "the beat never renewed it"
 
     relay.down()
+    waiter = subprocess.Popen([str(_cli.CLI_PATH), "list", "--limit", "1"],
+                              cwd=lab["project"], env=lab["env"], text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     left = []
     away_until = time.monotonic() + 8
     while time.monotonic() < away_until:
@@ -267,6 +272,9 @@ def test_a_turn_outlives_a_store_outage_and_its_lease_never_lapses(lab, relay):
             left.append(row["left"])
         time.sleep(0.25)
     relay.up()
+    waited, said = waiter.communicate(timeout=60)
+    assert waiter.returncode == 0, said
+    assert json.loads(waited)
 
     out, err = turn.communicate(timeout=120)
     assert turn.returncode == 0, err
@@ -322,8 +330,10 @@ def test_a_killed_turn_is_cut_off_within_its_short_lease_and_its_task_returns(la
 def test_a_renewal_cut_mid_flight_is_tried_again_and_the_lease_is_kept(lab, relay):
     """The connection three renewals in a row are sent on is cut after the query
     has passed and before its answer is back. Each is tried again on a new
-    connection within a second, the lease never runs out, each failure is said,
-    and the turn settles as if nothing happened."""
+    connection - the first and the third by the database library at once, the
+    renewal it tried again and lost to the second cut by the beat within a
+    second - the lease never runs out, the failure is said, and the turn
+    settles as if nothing happened."""
     schema = schema_of(lab)
     lab["env"]["FAKE_ENGINE_SLEEP"] = "10"
     add(lab, "t-cut")
@@ -348,8 +358,8 @@ def test_a_renewal_cut_mid_flight_is_tried_again_and_the_lease_is_kept(lab, rela
     assert turn.returncode == 0, err
     report = json.loads(out)
     assert report["claimed"] == "t-cut" and "lease_lost" not in report
-    assert report["beat_failures"] >= 3
-    assert err.count('"beat_failed"') >= 3
+    assert report["beat_failures"] == 1
+    assert err.count('"beat_failed"') == 1
     settled = raise_of(schema, "t-cut")
     assert (settled["status"], settled["task_status"]) == ("ok", "complete")
 

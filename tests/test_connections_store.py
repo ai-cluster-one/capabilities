@@ -892,9 +892,10 @@ def test_a_store_holding_the_gate_that_cannot_be_reached_refuses_with_exit_5(lab
 
 # --- the connections the records reader holds ---------------------------------------
 
-def test_the_records_reader_holds_no_connection_between_reads(lab, monkeypatch):
-    """Each read opens a connection for itself and closes it; what was read is
-    served from the adapter's cache, and nothing stays open between reads."""
+def test_the_records_reader_reads_on_the_one_working_connection(lab, monkeypatch):
+    """Each read borrows the process's working connection and gives it back;
+    what was read is served from the adapter's cache, the adapter holds no
+    connection between reads, and the process keeps one, idle, for the next."""
     _import(lab)
     monkeypatch.setenv("AGENTKIT_DB_URL", lab["cluster"].url(lab["database"]))
     monkeypatch.setenv("AGENTKIT_DB_SCHEMA", "lab")
@@ -917,10 +918,12 @@ def test_the_records_reader_holds_no_connection_between_reads(lab, monkeypatch):
         assert opened and all(kind is True for kind in opened)
         with lab["cluster"].admin(lab["database"]) as admin:
             assert admin.execute(
-                "SELECT count(*) FROM pg_stat_activity WHERE datname = %s "
-                "AND pid <> pg_backend_pid()", (lab["database"],)).fetchone() == (0,)
+                "SELECT state, count(*) FROM pg_stat_activity WHERE datname = %s "
+                "AND pid <> pg_backend_pid() GROUP BY state",
+                (lab["database"],)).fetchall() == [("idle", 1)]
     finally:
         records.close()
+        db.disconnect()
 
 
 def test_the_records_reader_reaches_the_store_at_its_transaction_address(lab):

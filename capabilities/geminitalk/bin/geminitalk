@@ -4,7 +4,7 @@
 # dependencies = [
 #     "google-genai>=1.36.0",
 #     "sounddevice>=0.5.1",
-#     "capabilities-contract==0.5.0",
+#     "capabilities-contract==0.5.1",
 # ]
 # ///
 """geminitalk - Gemini Live voice companion for the current project.
@@ -4107,8 +4107,9 @@ class StoreRecords(FileRecords):
 
     The store is reached through the shared database library, on first use
     only, so a call that reads nothing the store holds never connects, and
-    each read or write holds its own transaction connection only while it
-    runs. A connection handed in belongs to the caller and stays open."""
+    each read or write borrows the process's working connection while it
+    runs and gives it back after. A connection handed in belongs to the
+    caller and stays open."""
 
     def __init__(self, envelope: Path, global_dir: Path,
                  project_id: str | None = None, project: str | None = None,
@@ -4212,8 +4213,8 @@ class StoreRecords(FileRecords):
         return None
 
     def _begin(self) -> Any:
-        """The connection for one operation, opened for it unless one is
-        running; `_end` closes it once the last operation on it ends."""
+        """The connection for one operation, borrowed for it unless one is
+        running; `_end` gives it back once the last operation on it ends."""
         self._depth += 1
         try:
             return self._db()
@@ -4281,7 +4282,9 @@ class StoreRecords(FileRecords):
     def _write(self, work: Any) -> Any:
         """Run `work(conn)` in one transaction, the tables migrated first. A
         connection handed in belongs to a caller holding its own transaction,
-        which this neither migrates nor commits."""
+        which this neither migrates nor commits. A write whose connection was
+        lost before its commit was sent runs once more on a new one; one lost
+        while committing is never written again."""
         conn = self._begin()
         import psycopg
         from capabilities_contract import db
@@ -4290,10 +4293,21 @@ class StoreRecords(FileRecords):
                 if not self._owns_conn:
                     return work(conn)
                 major, minor = STORE_TABLES_VERSION
-                db.migrate(conn, STORE_OWNER, record_table_steps(),
-                           major=major, minor=minor)
-                with conn.transaction():
-                    return work(conn)
+                for attempt in (0, 1):
+                    committing = False
+                    try:
+                        db.migrate(conn, STORE_OWNER, record_table_steps(),
+                                   major=major, minor=minor)
+                        with conn.transaction():
+                            done = work(conn)
+                            committing = True
+                        return done
+                    except psycopg.OperationalError:
+                        if attempt or committing or self._depth != 1 \
+                                or not getattr(conn, "broken", False):
+                            raise
+                    self.close()
+                    conn = self._db()
             except db.DbError as exc:
                 raise StoreError(exc.slug, exc.message, exc.hint) from None
             except psycopg.OperationalError as exc:

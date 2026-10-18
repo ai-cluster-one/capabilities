@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-18 — One working connection per process
+
+`agentrooms` uses `capabilities-contract` 0.5.1. Every connection it opens on the transaction path is the process's one working connection, which the library lends to each operation and keeps until the process exits, so a command connects once rather than once per read; a connect that fails is tried again, and a working connection the store or the network lost is replaced, a statement that lost it before anything of its transaction reached the store running once more on the new one and a commit never sent twice. The service keeps its working connection beside the listeners.
+
 ## 2026-10-18 — The service holds no connection between statements
 
 `agentrooms` uses `capabilities-contract` 0.5.0. The service's store opens a transaction connection for each statement or transaction and closes it after, at the store's transaction address where one is named, so it holds no connection while it waits on a sync; its tables are migrated when it starts. `watch` listens on a session connection. With one address everything reaches it as before.

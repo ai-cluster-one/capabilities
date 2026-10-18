@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.5.0",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.5.1",
 #                 "callva-harness-runner==0.9.0",
 #                 "pyyaml>=6"]
 # ///
@@ -19,7 +19,7 @@ between the daemon and the store being closed and opened again, so no test
 stops a server it did not start.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
-        --with 'capabilities-contract==0.5.0' \\
+        --with 'capabilities-contract==0.5.1' \\
         --with 'callva-harness-runner==0.9.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -1045,11 +1045,12 @@ def backend(conn) -> int:
 
 
 @needs_store
-def test_the_questions_of_a_pass_go_on_one_connection_closed_at_its_end(
+def test_the_questions_of_every_pass_go_on_the_one_working_connection(
         project, store, capsys, monkeypatch):
     """Idle on a one-second poll with two lanes, the daemon holds its listener
-    and nothing else: each pass puts all its questions on one connection opened
-    for that pass and closed at its end."""
+    and one working connection: each pass borrows the process's working
+    connection for all its questions and gives it back at its end, so every
+    pass asks on the same connection, kept between passes."""
     entry, schema, conn = store
     write_settings(project, "version = 1\npoll_seconds = 1\n")
     opened = []
@@ -1074,10 +1075,9 @@ def test_the_questions_of_a_pass_go_on_one_connection_closed_at_its_end(
         listener = backend(store_.listener)
         passes = set(asked)
         assert listener not in passes
-        # Start and three polls, each asking both lanes on a connection of its own.
-        assert len(asked) >= 6 and len(passes) >= 4
-        assert all(asked.count(pid) >= 2 for pid in passes)
-        assert len(opened) == 1 + len(passes)
+        # Start and three polls, each asking both lanes, all on one connection.
+        assert len(asked) >= 6 and len(passes) == 1
+        assert len(opened) >= 4
         assert "poll" in h.daemon.last_wake["reasons"]
         [row] = h.daemon.status()["stores"]
         from psycopg.conninfo import conninfo_to_dict
@@ -1088,7 +1088,7 @@ def test_the_questions_of_a_pass_go_on_one_connection_closed_at_its_end(
         assert row["last_opened_at"]
         live = conn.execute("select pid from pg_stat_activity where pid = any(%s)",
                             (sorted(passes | {listener}),)).fetchall()
-        assert live == [(listener,)]
+        assert sorted(live) == sorted((pid,) for pid in passes | {listener})
 
 
 @needs_store
@@ -1176,7 +1176,17 @@ def test_a_lost_listener_is_asked_for_again_on_the_doubling_interval(
     h = quick(Harness(project, entry, through))
     attempts = []
     listen = h.host.listen
-    h.host.listen = lambda: attempts.append(time.monotonic()) or listen()
+
+    def timed():
+        # The wait between attempts is the daemon's: from the end of one to the
+        # start of the next, whatever each spent trying to connect.
+        began = time.monotonic()
+        try:
+            return listen()
+        finally:
+            attempts.append((began, time.monotonic()))
+
+    h.host.listen = timed
     with h:
         h.dispatcher.step()
         store_ = h.daemon.store
@@ -1184,8 +1194,9 @@ def test_a_lost_listener_is_asked_for_again_on_the_doubling_interval(
         relay.refuse()
         conn.execute("select pg_terminate_backend(%s)", (backend(store_.listener),))
         h.steps(lambda: h.daemon.listener is None, seconds=5)
-        h.settle(3.0)
-        gaps = gaps_of(attempts[1:])
+        h.settle(5.0)
+        tried = attempts[1:]
+        gaps = [round(nxt[0] - prev[1], 2) for prev, nxt in zip(tried, tried[1:])]
         assert len(gaps) >= 3 and gaps[0] < gaps[1], gaps
         assert 0.3 < gaps[0] < 0.6 and all(0.6 < gap < 1.2 for gap in gaps[1:]), gaps
         assert h.daemon.status()["stores"][0]["listening"] is False

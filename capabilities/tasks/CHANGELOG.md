@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-18 — The service keeps one working connection beside its listener
+
+`tasks` uses `capabilities-contract` 0.5.1. Every connection it opens on the transaction path is the process's one working connection, which the library lends to each operation and keeps until the process exits, so a command connects once rather than once per read; a connect that fails is tried again, and a working connection the store or the network lost is replaced, a statement that lost it before anything of its transaction reached the store running once more on the new one and a commit never sent twice. The service's passes run on its working connection, kept between passes beside the listener, which also carries the presence lock.
+
 ## 2026-10-18 — The service holds only its listener between passes
 
 `tasks` uses `capabilities-contract` 0.5.0. The service listens on a session connection, which also carries its presence lock, and puts the questions of each pass on a transaction connection opened for that pass and closed at its end, each transaction cut off by `statement_timeout` as before; between passes it holds only the listener. Every command connects on a transaction connection, at the store's transaction address where one is named; `watch` and `workers import --apply`, which hold `LISTEN` or a session lock, keep a session connection. A turn the service starts is handed the transaction address with the rest of the store, and a container is handed `AGENTKIT_DB_TRANSACTION_HOST` and `AGENTKIT_DB_TRANSACTION_PORT`. With one address everything reaches it as before.

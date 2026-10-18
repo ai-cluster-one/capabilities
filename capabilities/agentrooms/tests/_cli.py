@@ -5,7 +5,7 @@ installed bundle at the bundle root, so the path is resolved rather than named.
 
 Run with:
   uv run --no-project --with pytest --with httpx --with "psycopg[binary]" \
-      --with capabilities-contract==0.5.0 --with callva-harness-runner==0.9.0 --with pyyaml \
+      --with capabilities-contract==0.5.1 --with callva-harness-runner==0.9.0 --with pyyaml \
       pytest capabilities/agentrooms/tests -q
 
 The store-backed cases read AGENTROOMS_TEST_DSN, a libpq URL for a throwaway

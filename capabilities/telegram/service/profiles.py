@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "callva-harness-runner==0.10.0",
-#     "capabilities-contract==0.5.0",
+#     "capabilities-contract==0.5.1",
 # ]
 # ///
 """The harness profiles a telegram worker may run on, where each comes from,

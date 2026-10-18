@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-10-18 — The service keeps one working connection beside its listener
+
+`memory` uses `capabilities-contract` 0.5.1. Every connection it opens on the transaction path is the process's one working connection, which the library lends to each operation and keeps until the process exits, so a command connects once rather than once per read; a connect that fails is tried again, and a working connection the store or the network lost is replaced, a statement that lost it before anything of its transaction reached the store running once more on the new one and a commit never sent twice. The service's steps run on its working connection, kept between steps beside the listener.
+
 ## 2026-10-18 — The service holds only its listener between steps
 
 `memory` uses `capabilities-contract` 0.5.0. The service listens on a session connection and puts each step's questions on a transaction connection opened when the step first asks one and closed when it ends; the tables are migrated once, when it first connects. Every command connects on a transaction connection, at the store's transaction address where one is named, except `groom`, whose pass holds its lock on a session connection. A container is handed `AGENTKIT_DB_TRANSACTION_HOST` and `AGENTKIT_DB_TRANSACTION_PORT`. With one address everything reaches it as before.

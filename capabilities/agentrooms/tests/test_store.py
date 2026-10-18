@@ -200,9 +200,10 @@ def test_held_wakes_wait_for_the_operator_and_a_grant_releases_them(store):
                               "room": "!r"} for n in said)
 
 
-def test_the_store_holds_no_connection_between_operations(store):
-    """Each statement and each transaction runs on a connection opened for it
-    and closed after it, so a service waiting on a sync holds none."""
+def test_the_store_keeps_one_working_connection_between_operations(store):
+    """Each statement and each transaction borrows the process's working
+    connection and gives it back after, so the store holds no connection of
+    its own between operations and every operation runs on the same one."""
     import psycopg
     assert store.conn is None
     assert store.acquire("p", "alpha", "h1", "n1", 1) is None
@@ -212,10 +213,8 @@ def test_the_store_holds_no_connection_between_operations(store):
         inside = cur.fetchone()[0]
         assert store.execute("SELECT pg_backend_pid()", fetch="one")[0] == inside
     assert store.conn is None
-    import time
+    assert store.execute("SELECT pg_backend_pid()", fetch="one")[0] == inside
+    assert store.conn is None
     with psycopg.connect(DSN, autocommit=True) as admin:
-        deadline = time.monotonic() + 5
-        while admin.execute("SELECT count(*) FROM pg_stat_activity WHERE pid = %s",
-                            (inside,)).fetchone() != (0,):
-            assert time.monotonic() < deadline, "the connection stayed open"
-            time.sleep(0.05)
+        assert admin.execute("SELECT state FROM pg_stat_activity WHERE pid = %s",
+                             (inside,)).fetchone() == ("idle",)

@@ -1,5 +1,9 @@
 # askproject — change log
 
+## 2026-10-18 — One working connection per process
+
+`askproject` uses `capabilities-contract` 0.5.1. Every connection it opens on the transaction path is the process's one working connection, which the library lends to each operation and keeps until the process exits, so a command connects once rather than once per read; a connect that fails is tried again, and a working connection the store or the network lost is replaced, a statement that lost it before anything of its transaction reached the store running once more on the new one and a commit never sent twice.
+
 ## 2026-10-18 — Connections go to the store's transaction address
 
 `askproject` uses `capabilities-contract` 0.5.0. Its session map and its commands connect on transaction connections, at the store's transaction address where one is named. With one address everything reaches it as before.

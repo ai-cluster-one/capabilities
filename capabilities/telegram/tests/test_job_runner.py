@@ -509,9 +509,10 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_store_connection_ended_under_the_runner_is_reopened(self):
         """The store or the network ends the register's connection while the
-        Telegram session stays up. The next tick opens a new one and the queue
-        drains, rather than the runner retrying a dead connection until the
-        session happens to end."""
+        Telegram session stays up. The next tick carries on on a new one - the
+        database library replaces a connection lost between statements - and
+        the queue drains, rather than the runner retrying a dead connection
+        until the session happens to end."""
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
@@ -525,24 +526,18 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             client = FakeClient([])
             task = asyncio.create_task(daemon.run_session(client))
             await client.started.wait()
-            dead = daemon._JOB_STORE
+            ended = daemon._JOB_STORE.conn.info.backend_pid
             store, cli = self.as_cli(daemon)
             try:
-                store._execute("select pg_terminate_backend(?)",
-                               (dead.conn.info.backend_pid,))
-                await wait_until(lambda: any(
-                    "jobs: lost the store connection" in line
-                    for line in daemon._test_logs), timeout=6)
-                self.assertTrue(dead.lost())
-                self.assertIsNot(daemon.job_register(), None)
-                self.assertIsNot(daemon._JOB_STORE, dead,
-                                 "a lost connection is replaced, not reused")
+                store._execute("select pg_terminate_backend(?)", (ended,))
                 queued(cli, channel_key="123", requested_by="777",
                        description="after the drop", engine="stub")
             finally:
                 store.close()
             await wait_until(lambda: seen, timeout=6)
             self.assertEqual(seen, ["after the drop"])
+            self.assertNotEqual(daemon._JOB_STORE.conn.info.backend_pid, ended,
+                                "a lost connection is replaced, not reused")
             self.assertFalse(any("runner tick failed" in line
                                  for line in daemon._test_logs))
             await self.stop_session(client, task)

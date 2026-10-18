@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.5.0"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.5.1"]
 # ///
 """Under CAPABILITIES_READ_ONLY the task tracker reads and records nothing.
 
@@ -13,7 +13,7 @@ a project would, against TASKS_TEST_DSN in a schema of their own that they
 drop, and skip when it is unset.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' \\
-        --with 'capabilities-contract==0.5.0' python -m pytest capabilities/tasks/tests -q
+        --with 'capabilities-contract==0.5.1' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations

@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-18 — One working connection per process, and none for a runner whose service is not running
+
+`deployment` uses `capabilities-contract` 0.5.1. Every connection it opens on the transaction path is the process's one working connection, which the library lends to each operation and keeps until the process exits, so a command connects once rather than once per read; a connect that fails is tried again, and a working connection the store or the network lost is replaced, a statement that lost it before anything of its transaction reached the store running once more on the new one and a commit never sent twice. A runner whose service is running keeps its working connection for the lease renewals; one whose service is not running here closes it after each reconcile and holds no connection between them.
+
 ## 2026-10-18 — A runner holds no connection, and the watchdog waits for a store that is away
 
 `deployment` uses `capabilities-contract` 0.5.0. A runner opens a transaction connection for each lease take, renewal, release or read and closes it after, and its gate read connects only while it reads, so a runner holds no connection between reconciles; once it knows it holds no lease, a runner whose service is not placed here does not ask the store about the lease at all. The watchdog does not restart a service whose doctor fails because the store does not answer (`store_unreachable`): it reports `waiting for the store` and asks that doctor again after a pause that starts at its interval and doubles while the store stays away, up to 30 minutes, opening nothing meanwhile; any other failure is counted and restarted as before.

@@ -428,7 +428,7 @@ def _held_across(port: int, database: str, seconds: float) -> set[int]:
     return held
 
 
-def test_a_runner_holds_no_connection_between_reconciles(tmp_path: Path, cluster) -> None:
+def test_a_runner_holds_a_connection_only_while_its_service_runs(tmp_path: Path, cluster) -> None:
     database, rows = _database(cluster)
     env = _env(tmp_path / "home")
     dotenv = (f"AGENTKIT_DB_URL=postgresql://{ADMIN}@127.0.0.1:{cluster}/{database}"
@@ -447,9 +447,9 @@ def test_a_runner_holds_no_connection_between_reconciles(tmp_path: Path, cluster
         _manager(root, env, "enable", "fixture", "--project", "--node", "node-a")
         running = runner.until(lambda s: s.get("running"))
         assert running["lease"]["state"] == "held"
-        # Placed, it renews the lease every reconcile, each on a connection
-        # opened for the renewal.
-        assert _held_across(cluster, database, 3 * int(EVERY)) == set()
+        # Placed, it renews the lease every reconcile on its one working
+        # connection, kept between the renewals.
+        assert len(_held_across(cluster, database, 3 * int(EVERY))) == 1
         assert runner.state()["lease"]["state"] == "held"
     finally:
         runner.stop()

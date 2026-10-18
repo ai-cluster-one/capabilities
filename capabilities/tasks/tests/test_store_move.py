@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.5.0"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.5.1"]
 # ///
 """The store is the machine's: tasks reaches it through the store setting and
 keeps its tables in the setting's schema under its own ledger.
@@ -18,7 +18,7 @@ schema the previous release used is one name, `tasks`, so the cases that build
 it drop it before and after; each case binds a schema of its own.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' \\
-        --with 'capabilities-contract==0.5.0' python -m pytest capabilities/tasks/tests -q
+        --with 'capabilities-contract==0.5.1' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
