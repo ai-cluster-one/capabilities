@@ -43,6 +43,8 @@ class FakeHomeserver:
         self.refuse_kick: set[str] = set()
         self.aliases: dict[str, str] = {}
         self.claimed: set[str] = set()
+        self.served: dict[str, dict] = {}
+        self.profiles: dict[str, dict] = {}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -84,6 +86,44 @@ class FakeHomeserver:
             return httpx.Response(401, json={"errcode": "M_UNKNOWN_TOKEN", "error": "unknown"})
         if path == "/_matrix/client/v3/account/whoami":
             return httpx.Response(200, json={"user_id": f"@alpha:{SERVER}", "device_id": "DEV1"})
+        if "/account_data/agentrooms.served" in path:
+            room = unquote(path.split("/rooms/")[1].split("/")[0])
+            if request.method == "PUT":
+                self.served[room] = body
+                return httpx.Response(200, json={})
+            if room in self.served:
+                return httpx.Response(200, json=self.served[room])
+            return httpx.Response(404, json={"errcode": "M_NOT_FOUND", "error": "no data"})
+        if path.startswith("/_matrix/client/v3/profile/"):
+            parts = [unquote(part) for part in path[len("/_matrix/client/v3/profile/"):].split("/")]
+            user = parts[0]
+            profile = self.profiles.setdefault(user, {"displayname": user[1:].split(":")[0]})
+            if len(parts) == 1:
+                return httpx.Response(200, json=profile)
+            if request.method != "GET" and user != f"@alpha:{SERVER}":
+                return httpx.Response(403, json={"errcode": "M_FORBIDDEN",
+                                                 "error": "Cannot set another user's profile"})
+            if request.method == "PUT":
+                profile[parts[1]] = body[parts[1]]
+            elif request.method == "DELETE":
+                if parts[1] not in profile:
+                    return httpx.Response(404, json={"errcode": "M_NOT_FOUND", "error": "unset"})
+                profile.pop(parts[1])
+            elif parts[1] not in profile:
+                return httpx.Response(404, json={"errcode": "M_NOT_FOUND", "error": "unset"})
+            else:
+                return httpx.Response(200, json={parts[1]: profile[parts[1]]})
+            return httpx.Response(200, json={})
+        if "/state/m.room.member/" in path:
+            room = unquote(path.split("/rooms/")[1].split("/")[0])
+            user = unquote(path.rsplit("/", 1)[1])
+            found = [e for e in self.state.get(room, []) if e.get("type") == "m.room.member"
+                     and e.get("state_key") == user]
+            if found:
+                return httpx.Response(200, json=found[-1].get("content") or {})
+            if user == f"@alpha:{SERVER}" and room in self.joined:
+                return httpx.Response(200, json={"membership": "join"})
+            return httpx.Response(404, json={"errcode": "M_NOT_FOUND", "error": "no member"})
         if path == "/_matrix/client/v3/sync":
             self.sync_params.append(dict(request.url.params))
             answer = self.syncs.pop(0)
@@ -172,7 +212,17 @@ class FakeHomeserver:
             self.joined.add(room)
             return httpx.Response(200, json={"room_id": room})
         if path.endswith("/leave") or path.endswith("/invite"):
+            if path.endswith("/leave"):
+                room = unquote(path.split("/rooms/")[1].split("/")[0])
+                self.joined.discard(room)
+                for event in self.state.get(room, []) if room in self.aliases.values() else []:
+                    if event.get("type") == "m.room.member" and \
+                            event.get("state_key") == f"@alpha:{SERVER}":
+                        event["content"] = {**event["content"], "membership": "leave"}
             return httpx.Response(200, json={"room_id": "!joined"})
+        if path.startswith("/_matrix/client/v1/media/download/"):
+            return httpx.Response(200, content=b"\x89PNG avatar",
+                                  headers={"content-type": "image/png"})
         if "/account_data/agentrooms.marked" in path:
             return httpx.Response(200, json={})
         if "/account_data/agentrooms.grant" in path:
@@ -248,6 +298,13 @@ def run(cli, capsys, *argv) -> tuple[int, dict | None, dict | None]:
     return code, parse(out), parse(err.strip().splitlines()[-1]) if err.strip() else None
 
 
+def homeserver_profile(cli, user=f"@alpha:{SERVER}") -> dict:
+    """The profile the fake homeserver holds for `user`, read back through it."""
+    import httpx as _httpx
+    with _httpx.Client(base_url=HS, headers={"Authorization": f"Bearer {TOKEN}"}) as client:
+        return client.get(f"/_matrix/client/v3/profile/{user}").json()
+
+
 def connect(project: Path, allow_write: bool) -> None:
     conns = project / "capabilities" / "agentrooms"
     conns.mkdir(parents=True, exist_ok=True)
@@ -280,12 +337,32 @@ def test_register_writes_connection_and_token(cli, project, homeserver, capsys, 
     assert [b["password"] for _m, p, b in homeserver.requests if p.endswith("/register")] == \
         [password, password]
     assert password not in json.dumps(out) + json.dumps(err) + env_file.read_text()
+    # The homeserver has no directory yet: the agent is registered, and not visible.
+    assert out["visible"] is False and "no directory" in out["visible_unset"]
     # A second registration of the same connection id is refused before the network.
     code, _out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS)
     assert code == 6 and err["error"]["code"] == "connection_exists"
     # A taken name is the homeserver's refusal.
     code, _out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS, "--as", "other")
     assert code == 6 and err["error"]["code"] == "user_in_use"
+
+
+def test_a_registered_agent_is_visible_and_names_its_supervisor(cli, project, homeserver, capsys,
+                                                                 monkeypatch):
+    monkeypatch.setenv("AGENTROOMS_REGISTRATION_TOKEN", "reg-token")
+    homeserver.aliases[DIRECTORY] = "!dir"
+    code, _out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS,
+                          "--supervisor", "not-a-user")
+    assert code == 6 and err["error"]["code"] == "bad_user"
+    code, out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS,
+                         "--supervisor", f"@boss:{SERVER}")
+    assert code == 0 and out["visible"] is True and "!dir" in homeserver.joined, err
+    assert out["supervisor"] == f"@boss:{SERVER}"
+    entry = json.loads((project / "capabilities" / "agentrooms" / "connections.json").read_text())
+    assert entry["connections"]["alpha"]["supervisor"] == f"@boss:{SERVER}"
+    assert homeserver_profile(cli)["agentrooms.supervisor"] == f"@boss:{SERVER}"
+    code, out, _err = run(cli, capsys, "connections")
+    assert out["connections"]["alpha"]["supervisor"] == f"@boss:{SERVER}"
 
 
 def test_register_needs_the_registration_token(cli, project, homeserver, capsys):
@@ -535,7 +612,8 @@ Keep the lab tidy.
 
 @needs_store
 def test_workers_are_saved_as_versions_and_bound_in_the_projects_settings(cli, project, stored,
-                                                                          capsys, tmp_path):
+                                                                          capsys, tmp_path,
+                                                                          homeserver):
     connect(project, allow_write=True)
     doc = tmp_path / "lab.md"
     doc.write_text(ROLE)
@@ -566,19 +644,49 @@ def test_workers_are_saved_as_versions_and_bound_in_the_projects_settings(cli, p
     code, out, _err = run(cli, capsys, "workers", "bind", "lab", "--room", "!lab:example.org")
     assert out["rooms"] == {"!lab:example.org": "lab"}
     code, out, _err = run(cli, capsys, "workers", "supervisor", "@boss:example.org")
-    assert out["supervisor"] == "@boss:example.org"
+    assert out["supervisor"] == "@boss:example.org" and out["published"] is True
+    code, _out, err = run(cli, capsys, "workers", "supervisor", "@boss:elsewhere.org")
+    assert code == 6 and err["error"]["code"] == "bad_user"
+    # The supervisor is the connection's, published in the agent's profile.
+    assert homeserver_profile(cli)["agentrooms.supervisor"] == "@boss:example.org"
     settings = json.loads((project / "capabilities" / "agentrooms" / "service"
                            / "settings.json").read_text())
-    assert settings["binding.alpha"] == {"worker": "lab", "rooms": {"!lab:example.org": "lab"},
-                                         "supervisor": "@boss:example.org"}
+    assert settings["binding.alpha"] == {"worker": "lab", "rooms": {"!lab:example.org": "lab"}}
     entry = json.loads((project / "capabilities" / "agentrooms" / "connections.json").read_text())
     alpha = entry["connections"]["alpha"]
-    assert "worker" not in alpha and "supervisor" not in alpha
+    assert "worker" not in alpha and alpha["supervisor"] == "@boss:example.org"
     assert alpha["allow_write"] is True and alpha["secret_env"] == "AGENTROOMS_ALPHA_TOKEN"
+    # The rooms the agent opens start off, the rooms it accepts on, until set.
+    code, out, _err = run(cli, capsys, "workers", "defaults")
+    assert (out["opened"], out["accepted"]) == (False, True)
+    code, out, err = run(cli, capsys, "workers", "defaults", "--opened", "on", "--accepted", "off")
+    assert code == 0 and (out["opened"], out["accepted"]) == (True, False), err
     code, out, _err = run(cli, capsys, "workers", "list")
     names = {w["worker"]: w for w in out["workers"]}
     assert names["lab"]["source"] == "store" and names["default"]["source"] == "shipped"
+    assert names["default"]["answers"] is True and "answers" not in names["lab"]
     assert out["bindings"]["alpha"]["rooms"] == {"!lab:example.org": "lab"}
+    assert out["bindings"]["alpha"]["supervisor"] == "@boss:example.org"
+    assert (out["bindings"]["alpha"]["opened"], out["bindings"]["alpha"]["accepted"]) == \
+        (True, False)
+    code, _out, err = run(cli, capsys, "settings", "set", "binding.alpha.opened", "yes")
+    assert code == 6
+    # The shipped default reads as a whole worker; a project's `default` replaces it.
+    code, out, _err = run(cli, capsys, "workers", "show", "default")
+    assert out["source"] == "shipped" and out["spec"]["accepts_from"] == ["*"]
+    assert out["spec"]["limits"]["turn_timeout"] == 900 and out["spec"]["enabled"] is True
+    doc.write_text("---\nenabled: false\n---\n")
+    code, out, err = run(cli, capsys, "workers", "save", "default", str(doc))
+    assert code == 0 and out["created"] is True, err
+    code, out, _err = run(cli, capsys, "workers", "list")
+    defaults = [w for w in out["workers"] if w["worker"] == "default"]
+    assert [(w["source"], w["answers"]) for w in defaults] == [("store", False)]
+    code, _out, err = run(cli, capsys, "workers", "bind", "default")
+    assert code == 6
+    code, out, _err = run(cli, capsys, "workers", "remove", "default")
+    assert code == 0 and out["removed"]
+    code, out, _err = run(cli, capsys, "workers", "show", "default")
+    assert out["source"] == "shipped"
     code, out, _err = run(cli, capsys, "workers", "unbind", "--room", "!lab:example.org")
     assert out["rooms"] == {}
     os.environ["AGENTROOMS_TURN"] = "t1"
@@ -629,17 +737,19 @@ def test_a_binding_an_earlier_release_left_on_the_connection_holds_and_moves_at_
     assert out["bindings"]["alpha"]["supervisor"] == "@boss:example.org"
     code, out, err = run(cli, capsys, "workers", "bind", "lab", "--room", "!lab:example.org")
     assert code == 0 and out["worker"] == "lab", err
+    # The worker moves off the connection; the supervisor is the connection's own.
     alpha = json.loads(path.read_text())["connections"]["alpha"]
-    assert "worker" not in alpha and "supervisor" not in alpha and alpha["allow_write"] is True
+    assert "worker" not in alpha and alpha["supervisor"] == "@boss:example.org"
+    assert alpha["allow_write"] is True
     settings = json.loads((project / "capabilities" / "agentrooms" / "service"
                            / "settings.json").read_text())
-    assert settings["binding.alpha"] == {"worker": "lab", "rooms": {"!lab:example.org": "lab"},
-                                         "supervisor": "@boss:example.org"}
+    assert settings["binding.alpha"] == {"worker": "lab", "rooms": {"!lab:example.org": "lab"}}
 
 
 @needs_store
 def test_a_connection_held_in_the_store_is_bound_in_this_projects_settings(cli, project, stored,
-                                                                           capsys, tmp_path):
+                                                                           capsys, tmp_path,
+                                                                           homeserver):
     identity = project / "capabilities" / "project.json"
     identity.write_text(json.dumps({"id": "prj_test", "slug": "project", "connections": "store"}))
     (project / ".env.local").write_text(f"AGENTROOMS_ALPHA_TOKEN={TOKEN}\n")
@@ -653,14 +763,25 @@ def test_a_connection_held_in_the_store_is_bound_in_this_projects_settings(cli, 
     assert code == 0, err
     code, out, err = run(cli, capsys, "--connection", "alpha", "workers", "bind", "lab")
     assert code == 0 and out["worker"] == "lab", err
+    # An earlier release kept the supervisor in this project's binding setting:
+    # it holds, and moves onto the connection at the next binding write.
+    records.set("agentrooms", "setting", "binding.alpha",
+                {"worker": "lab", "supervisor": "@old:example.org"}, scope="project")
+    code, out, _err = run(cli, capsys, "workers", "supervisor")
+    assert out["supervisor"] == "@old:example.org"
+    code, out, err = run(cli, capsys, "workers", "bind", "lab")
+    assert code == 0, err
+    cli._RECORDS = None
+    spec = cli._records().resolve("agentrooms", "connection")["alpha"]["value"]
+    assert "worker" not in spec and spec["supervisor"] == "@old:example.org"
     code, out, _err = run(cli, capsys, "workers", "supervisor", "@boss:example.org")
     assert out["supervisor"] == "@boss:example.org"
     settings = json.loads((project / "capabilities" / "agentrooms" / "service"
                            / "settings.json").read_text())
-    assert settings["binding.alpha"] == {"worker": "lab", "supervisor": "@boss:example.org"}
+    assert settings["binding.alpha"] == {"worker": "lab"}
     cli._RECORDS = None
     spec = cli._records().resolve("agentrooms", "connection")["alpha"]["value"]
-    assert "worker" not in spec and "supervisor" not in spec
+    assert "worker" not in spec and spec["supervisor"] == "@boss:example.org"
     code, out, _err = run(cli, capsys, "workers", "list")
     assert out["bindings"]["alpha"]["worker"] == "lab"
     code, out, _err = run(cli, capsys, "workers", "unbind")
@@ -934,10 +1055,17 @@ def test_an_invite_waits_for_the_operator_and_accepting_grants_the_inviter(
     code, out, err = run(cli, capsys, "join", "!inv")
     assert code == 0, err
     assert out == {"room_id": "!inv", "joined": True,
-                   "grant": {"everyone": False, "users": [OWNER], "recorded": True}}
+                   "grant": {"everyone": False, "users": [OWNER], "recorded": True},
+                   "served": True}
     order = [(m, p) for m, p, _b in homeserver.requests
-             if "agentrooms.grant" in p or "/join/" in p]
-    assert [m for m, _p in order] == ["PUT", "POST"]
+             if "agentrooms.grant" in p or "agentrooms.served" in p or "/join/" in p]
+    # The grant and the switch - a room accepted starts served, as the agent's
+    # `accepted` default says - are written before the join, so the service's
+    # first sync of the room reads both.
+    assert [(m, p.rsplit("/", 1)[1]) for m, p in order] == [
+        ("PUT", "agentrooms.grant"), ("PUT", "agentrooms.served"), ("POST", "%21inv")] or \
+        [m for m, _p in order] == ["PUT", "PUT", "POST"]
+    assert homeserver.served["!inv"] == {"served": True}
     # A homeserver that refuses account data for a room not joined gets it after.
     homeserver.grants.clear()
     homeserver.refuse_grant_before_join = True
@@ -948,6 +1076,17 @@ def test_an_invite_waits_for_the_operator_and_accepting_grants_the_inviter(
     homeserver.syncs.append({"next_batch": "n"})
     code, out, err = run(cli, capsys, "join", "!public")
     assert code == 0 and out["grant"] == {"everyone": True, "users": [], "recorded": False}, err
+    # An agent whose accepted rooms start off: the switch says so, and a room it
+    # is in already keeps the switch it has.
+    code, out, err = run(cli, capsys, "workers", "defaults", "--accepted", "off")
+    assert code == 0 and out["accepted"] is False, err
+    homeserver.syncs.append(_invited("!three", me))
+    code, out, err = run(cli, capsys, "join", "!three")
+    assert code == 0 and out["served"] is False, err
+    assert homeserver.served["!three"] == {"served": False}
+    homeserver.syncs.append({"next_batch": "n"})
+    code, out, err = run(cli, capsys, "join", "!inv")
+    assert code == 0 and out["served"] is True and homeserver.served["!inv"] == {"served": True}
     # Outside a turn, declining is the operator's leave.
     monkeypatch.setenv("AGENTROOMS_TURN", "")
     code, out, err = run(cli, capsys, "leave", "!other")
@@ -1284,7 +1423,8 @@ def test_the_directory_is_created_once_and_lists_every_member_with_its_card(
     code, _, err = run(cli, capsys, "directory", "list")
     assert code == 6 and err["error"]["code"] == "not_in_directory"
     code, out, _ = run(cli, capsys, "directory", "join")
-    assert code == 0 and out == {"room_id": "!new", "alias": DIRECTORY, "joined": True}
+    assert code == 0 and out == {"room_id": "!new", "alias": DIRECTORY, "joined": True,
+                                 "visible": True}
     member = lambda user, name, membership="join": {  # noqa: E731
         "type": "m.room.member", "state_key": user, "sender": user,
         "content": {"membership": membership, "displayname": name}}
@@ -1299,54 +1439,174 @@ def test_the_directory_is_created_once_and_lists_every_member_with_its_card(
         card(f"@gone:{SERVER}", {"name": "Gone"}),
         card("bee", {"name": "keyed by no user"}, sender=f"@cee:{SERVER}"),
     ]
-    code, out, _ = run(cli, capsys, "card", "set", "--name", "Alpha", "--about", "Plans releases.")
+    homeserver.profiles[f"@dee:{SERVER}"] = {"displayname": "Dee"}
+    homeserver.state["!new"].append(member(f"@dee:{SERVER}", "Dee"))
+    code, out, err = run(cli, capsys, "card", "set", "--name", "Alpha", "--about", "Plans releases.")
     assert code == 0 and out == {"user_id": f"@alpha:{SERVER}", "card": {
-        "name": "Alpha", "about": "Plans releases.", "supervisor": None}}
+        "name": "Alpha", "about": "Plans releases.", "supervisor": None, "avatar": None}}, err
+    # The card is the agent's profile: every Matrix client shows the name it set.
+    assert homeserver_profile(cli)["displayname"] == "Alpha"
+    assert homeserver_profile(cli)["agentrooms.about"] == "Plans releases."
     code, out, _ = run(cli, capsys, "directory", "list")
     assert code == 0 and out["room_id"] == "!new" and out["alias"] == DIRECTORY
+    # A card an earlier release published, not yet moved by its agent, reads back unchanged.
     assert out["members"] == [
         {"user_id": f"@alpha:{SERVER}", "display_name": "Alpha",
-         "card": {"name": "Alpha", "about": "Plans releases.", "supervisor": None}},
+         "card": {"name": "Alpha", "about": "Plans releases.", "supervisor": None,
+                  "avatar": None}},
         {"user_id": f"@bee:{SERVER}", "display_name": "Bee",
          "card": {"name": "Bee", "about": "Reviews pull requests.",
-                  "supervisor": f"@operator:{SERVER}"}},
-        {"user_id": f"@cee:{SERVER}", "display_name": "Cee", "card": None}]
+                  "supervisor": f"@operator:{SERVER}", "avatar": None}},
+        {"user_id": f"@cee:{SERVER}", "display_name": "Cee", "card": None},
+        {"user_id": f"@dee:{SERVER}", "display_name": "Dee",
+         "card": {"name": "Dee", "about": None, "supervisor": None, "avatar": None}}]
     code, out, _ = run(cli, capsys, "card", "show", f"@bee:{SERVER}")
-    assert code == 0 and out["card"]["about"] == "Reviews pull requests."
+    assert code == 0 and out["card"]["about"] == "Reviews pull requests." and out["visible"] is True
+    code, out, _ = run(cli, capsys, "card", "show", f"@gone:{SERVER}")
+    assert code == 0 and out["visible"] is False
+    # Invisible: out of the directory, the agent does not see who is in it.
+    code, out, err = run(cli, capsys, "directory", "leave")
+    assert code == 0 and out == {"room_id": "!new", "alias": DIRECTORY, "left": True,
+                                 "visible": False}, err
+    code, _, err = run(cli, capsys, "directory", "list")
+    assert code == 6 and err["error"]["code"] == "not_in_directory"
+    code, out, _ = run(cli, capsys, "card", "show")
+    assert code == 0 and out["visible"] is False and out["card"]["name"] == "Alpha"
+    code, out, _ = run(cli, capsys, "card", "show", f"@bee:{SERVER}")
+    assert code == 0 and out["visible"] is None
 
 
-def test_an_agent_sets_changes_and_clears_its_own_card_only(cli, project, homeserver, capsys):
+def test_an_agent_sets_changes_and_clears_its_own_card_only(cli, project, homeserver, capsys,
+                                                             tmp_path):
     connect(project, allow_write=False)
     code, _, err = run(cli, capsys, "card", "set", "--name", "Alpha")
     assert code == 4 and err["error"]["code"] == "read_only"
     code, _, err = run(cli, capsys, "directory", "join")
     assert code == 4 and err["error"]["code"] == "read_only"
+    code, _, err = run(cli, capsys, "directory", "leave")
+    assert code == 4 and err["error"]["code"] == "read_only"
     connect(project, allow_write=True)
-    code, _, err = run(cli, capsys, "card", "set", "--name", "Alpha")
-    assert code == 3 and err["error"]["code"] == "no_directory"
-    homeserver.aliases[DIRECTORY] = "!dir"
     code, _, err = run(cli, capsys, "card", "set")
     assert code == 6 and err["error"]["code"] == "invalid_arguments"
     code, _, err = run(cli, capsys, "card", "set", "--about", "x" * 501)
     assert code == 6 and err["error"]["code"] == "invalid_arguments"
     code, _, err = run(cli, capsys, "card", "set", "--name", "  ")
     assert code == 6 and err["error"]["code"] == "invalid_arguments"
-    code, out, _ = run(cli, capsys, "card", "set", "--name", "Alpha")
-    assert code == 0 and "!dir" in homeserver.joined
-    code, out, _ = run(cli, capsys, "card", "set", "--about", "Plans releases.",
-                       "--supervisor", f"@operator:{SERVER}")
-    assert out["card"] == {"name": "Alpha", "about": "Plans releases.",
-                           "supervisor": f"@operator:{SERVER}"}
-    puts = [(m, p) for m, p, _ in homeserver.requests if m == "PUT" and "agentrooms.card" in p]
-    assert puts and all(p.endswith(f"/state/agentrooms.card/@alpha:{SERVER}") for _, p in puts)
+    code, _, err = run(cli, capsys, "card", "set", "--supervisor", f"@operator:{SERVER}")
+    assert code == 6 and err["error"]["code"] == "invalid_arguments"
+    assert "workers supervisor" in err["error"]["hint"]
+    # A card needs no directory: it is the profile, and setting it joins nothing.
+    code, out, err = run(cli, capsys, "card", "set", "--name", "Alpha")
+    assert code == 0 and out["card"]["name"] == "Alpha" and not homeserver.joined, err
+    text = tmp_path / "notes.txt"
+    text.write_text("not an image")
+    code, _, err = run(cli, capsys, "card", "set", "--avatar", str(text))
+    assert code == 6 and err["error"]["code"] == "bad_avatar"
+    image = tmp_path / "face.png"
+    image.write_bytes(b"\x89PNG avatar")
+    code, out, err = run(cli, capsys, "card", "set", "--about", "Plans releases.",
+                         "--avatar", str(image))
+    assert code == 0 and out["card"] == {"name": "Alpha", "about": "Plans releases.",
+                                         "supervisor": None,
+                                         "avatar": {"mxc": f"mxc://{SERVER}/abc"}}, err
+    assert homeserver_profile(cli)["avatar_url"] == f"mxc://{SERVER}/abc"
+    writes = [p for m, p, _ in homeserver.requests if m in ("PUT", "DELETE") and "/profile/" in p]
+    assert writes and all(f"/profile/@alpha:{SERVER}/" in p for p in writes)
+    saved = tmp_path / "out" / "face.png"
+    code, out, err = run(cli, capsys, "card", "avatar", "--out", str(saved))
+    assert code == 0 and out == {"user_id": f"@alpha:{SERVER}", "mxc": f"mxc://{SERVER}/abc",
+                                 "path": str(saved), "mimetype": "image/png",
+                                 "size": len(b"\x89PNG avatar")}, err
+    assert saved.read_bytes() == b"\x89PNG avatar"
+    code, _, err = run(cli, capsys, "card", "avatar", f"@nobody:{SERVER}", "--out", str(saved))
+    assert code == 3 and err["error"]["code"] == "avatar_not_found"
     code, out, _ = run(cli, capsys, "card", "show")
-    assert code == 0 and out["card"]["name"] == "Alpha"
+    assert code == 0 and out["card"]["name"] == "Alpha" and out["visible"] is False
     code, out, _ = run(cli, capsys, "card", "clear")
     assert code == 0 and out == {"user_id": f"@alpha:{SERVER}", "card": None}
-    assert homeserver.requests[-1][2] == {}
+    assert homeserver_profile(cli) == {"displayname": "alpha", "avatar_url": ""}
     code, out, _ = run(cli, capsys, "card", "show")
-    assert code == 0 and out == {"user_id": f"@alpha:{SERVER}", "card": None}
+    assert code == 0 and out == {"user_id": f"@alpha:{SERVER}", "card": None, "visible": False}
     code, out, _ = run(cli, capsys, "card", "show", f"@nobody:{SERVER}")
-    assert code == 0 and out["card"] is None
+    assert code == 0 and out["card"] is None and out["visible"] is None
     code, _, err = run(cli, capsys, "card", "show", "@bee:other.org")
     assert code == 6 and err["error"]["code"] == "federation_refused"
+
+
+def test_a_card_published_in_the_directory_moves_into_the_profile(cli, project, homeserver,
+                                                                  capsys):
+    connect(project, allow_write=True)
+    me = f"@alpha:{SERVER}"
+    homeserver.aliases[DIRECTORY] = "!dir"
+    homeserver.joined.add("!dir")
+    homeserver.profiles[me] = {"displayname": "alpha (new)"}
+    homeserver.state["!dir"] = [
+        {"type": "m.room.member", "state_key": me, "sender": me,
+         "content": {"membership": "join", "displayname": "alpha (new)"}},
+        {"type": "agentrooms.card", "state_key": me, "sender": me,
+         "content": {"name": "Alpha", "about": "Plans releases.",
+                     "supervisor": f"@operator:{SERVER}"}}]
+    # Before it moves, it reads back unchanged.
+    code, out, _ = run(cli, capsys, "card", "show")
+    assert out["card"] == {"name": "Alpha", "about": "Plans releases.",
+                           "supervisor": f"@operator:{SERVER}", "avatar": None}
+    # The agent's own token moves it, the card's name over the suffixed one, and
+    # its supervisor onto the connection, then clears what the directory held.
+    lines = cli._take_up({**cli._cfg(None, "card"), "supervisor": None})
+    assert any("moved" in line for line in lines), lines
+    assert homeserver_profile(cli) == {"displayname": "Alpha",
+                                       "agentrooms.about": "Plans releases.",
+                                       "agentrooms.supervisor": f"@operator:{SERVER}"}
+    legacy = [e for e in homeserver.state["!dir"] if e["type"] == "agentrooms.card"]
+    assert legacy[-1]["content"] == {}
+    entry = json.loads((project / "capabilities" / "agentrooms" / "connections.json").read_text())
+    assert entry["connections"]["alpha"]["supervisor"] == f"@operator:{SERVER}"
+    code, out, _ = run(cli, capsys, "card", "show")
+    assert out["card"] == {"name": "Alpha", "about": "Plans releases.",
+                           "supervisor": f"@operator:{SERVER}", "avatar": None}
+    # Nothing is left to move the second time.
+    assert cli._take_up({**cli._cfg(None, "card"), "supervisor": f"@operator:{SERVER}"}) == []
+
+
+def test_a_room_is_switched_on_and_off_and_opened_rooms_start_as_the_default_says(
+        cli, project, homeserver, capsys, monkeypatch):
+    connect(project, allow_write=True)
+    me = f"@alpha:{SERVER}"
+    # A room the agent opens is left to interactive use until its defaults say otherwise.
+    code, out, err = run(cli, capsys, "open", "lab", "--invite", f"@b:{SERVER}")
+    assert code == 0 and out["served"] is False and homeserver.served["!new"] == \
+        {"served": False}, err
+    code, out, err = run(cli, capsys, "workers", "defaults", "--opened", "on")
+    assert code == 0 and out["opened"] is True, err
+    code, out, err = run(cli, capsys, "open", "lab", "--invite", f"@b:{SERVER}")
+    assert code == 0 and out["served"] is True and homeserver.served["!new"] == {"served": True}
+    # Switching on records the moment, so what arrived while it was off wakes nothing.
+    code, _, err = run(cli, capsys, "serve", "!lab", "on")
+    assert code == 6 and err["error"]["code"] == "not_member"
+    homeserver.joined.add("!lab")
+    code, out, err = run(cli, capsys, "serve", "!lab", "off")
+    assert code == 0 and out == {"room_id": "!lab", "served": False}, err
+    code, out, err = run(cli, capsys, "serve", "!lab", "on")
+    assert code == 0 and out == {"room_id": "!lab", "served": True}, err
+    assert homeserver.served["!lab"] == {"served": True, "since": 1_700_000_000_003}
+    homeserver.encrypted.add("!lab")
+    code, _, err = run(cli, capsys, "serve", "!lab", "off")
+    assert code == 6 and err["error"]["code"] == "encrypted_room"
+    homeserver.encrypted.discard("!lab")
+    monkeypatch.setenv("AGENTROOMS_TURN", "t1")
+    code, _, err = run(cli, capsys, "serve", "!lab", "off")
+    assert code == 4 and err["error"]["code"] == "policy"
+    monkeypatch.delenv("AGENTROOMS_TURN")
+    connect(project, allow_write=False)
+    code, _, err = run(cli, capsys, "serve", "!lab", "off")
+    assert code == 4 and err["error"]["code"] == "read_only"
+    # `rooms` shows each room's switch; a room with none is served.
+    homeserver.syncs.append({"next_batch": "n", "rooms": {"join": {
+        "!lab": {"summary": {"m.joined_member_count": 3}, "account_data": {"events": [
+            {"type": "agentrooms.served", "content": {"served": False}}]}},
+        "!other": {"summary": {"m.joined_member_count": 3}}}}})
+    code, out, err = run(cli, capsys, "rooms")
+    assert code == 0, err
+    assert {r["room_id"]: r["served"] for r in out["joined"]} == {"!lab": False, "!other": True}
+    assert "agentrooms.served" in json.loads(homeserver.sync_params[-1]["filter"])[
+        "room"]["account_data"]["types"]

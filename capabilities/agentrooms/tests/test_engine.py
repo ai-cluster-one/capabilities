@@ -240,7 +240,7 @@ class FakeStore:
                            session_id=session_id, node=node)
 
     def turn_counts(self, project, agent, room, senders, *, window, quiet, room_cap):
-        ran = [r for r in self.turn_log if r["worker"] != "default"]
+        ran = [r for r in self.turn_log if r["worker"] != engine.REFUSAL]
         room_n, since = 0, time.time()
         for row in sorted((r for r in ran if r["room"] == room), key=lambda r: -r["at"]):
             if since - row["at"] >= quiet:
@@ -249,8 +249,8 @@ class FakeStore:
         return {"agent": len(ran), "room": room_n,
                 "senders": {s: sum(1 for r in ran if s in r["senders"]) for s in senders}}
 
-    def default_answered(self, project, agent, room, sender, window):
-        return any(r["worker"] == "default" and r["room"] == room and sender in r["senders"]
+    def refused(self, project, agent, room, sender, window):
+        return any(r["worker"] == engine.REFUSAL and r["room"] == room and sender in r["senders"]
                    for r in self.turn_log)
 
     def ready(self, project):
@@ -291,13 +291,25 @@ class NotFound(Exception):
 
 
 class FakeMatrix:
-    def __init__(self, room_events):
+    def __init__(self, room_events, grant=None):
         self.room_events = room_events
         self.posted: list[tuple[str, dict]] = []
         self.left: list[tuple[str, dict]] = []
+        # Each room's switch, and the grant every room records (None: none).
+        self.served: dict[str, dict] = {}
+        self.grant = {"everyone": True, "users": []} if grant is None else grant
 
     def call(self, method, path, params=None, body=None):
         from urllib.parse import unquote
+        if f"/account_data/{engine.SERVED_TYPE}" in path:
+            room = unquote(path.split("/rooms/")[1].split("/")[0])
+            if room not in self.served:
+                raise NotFound("no switch")
+            return self.served[room]
+        if f"/account_data/{engine.GRANT_TYPE}" in path:
+            if not self.grant:
+                raise NotFound("no grant")
+            return self.grant
         if path.endswith("/leave"):
             self.left.append((unquote(path.split("/rooms/")[1].split("/")[0]), body))
             return {}
@@ -653,11 +665,13 @@ class SyncMatrix:
     """Answers the agent's syncs from a list, and its reads of the room from
     pages keyed by their `from` token, as the homeserver did."""
 
-    def __init__(self, syncs, pages, grant=None):
+    def __init__(self, syncs, pages, grant=None, served=None):
         self.syncs, self.pages = list(syncs), pages
         self.reads: list[dict] = []
         self.grant_reads: list[str] = []
+        self.served_reads: list[str] = []
         self.grant = grant
+        self.served = served
 
     def call(self, method, path, params=None, body=None):
         if path == "/_matrix/client/v3/sync":
@@ -672,6 +686,11 @@ class SyncMatrix:
             if self.grant is None:
                 raise NotFound("no grant")
             return self.grant
+        if path.endswith(f"/account_data/{engine.SERVED_TYPE}"):
+            self.served_reads.append(path)
+            if self.served is None:
+                raise NotFound("no switch")
+            return self.served
         raise AssertionError(path)
 
 
@@ -680,14 +699,20 @@ class SyncStore:
         self.position = None
         self.wakes: dict = {}
         self.grants: list = []
+        self.unserved: list = []
 
     def next_batch(self, project, agent, user_id):
         return self.position
 
-    def save_sync(self, project, agent, user_id, holder, next_batch, wakes, grants=None):
+    def save_sync(self, project, agent, user_id, holder, next_batch, wakes, grants=None,
+                  unserved=None):
+        for room_id in unserved or ():  # what no turn claimed in a room switched off
+            self.wakes = {k: w for k, w in self.wakes.items()
+                          if k[0] != room_id or w.get("held")}
         for wake in wakes:  # the table's key, ON CONFLICT DO NOTHING
             self.wakes.setdefault((wake["room_id"], wake["key"]), wake)
         self.grants.append(dict(grants or {}))
+        self.unserved.append(sorted(unserved or ()))
         self.position = next_batch
         return True
 
@@ -796,7 +821,7 @@ def test_a_restarted_agent_reads_a_rooms_grant_before_it_judges_a_wake(tmp_path)
     assert "held: the room's grant does not name the sender" in log and "the grant changed" in log
 
 
-# ── workers: who is admitted, what the default worker answers, the limits ────
+# ── workers: who is admitted, what the refusal answers, the limits ───────────
 
 STRANGER = "@stranger:example.org"
 
@@ -825,8 +850,13 @@ def test_worker_documents_are_checked_whole():
         engine.split_document("no front matter", "x")
     text = engine.worker_text({"accepts_from": ["*"]}, "Role.")
     assert engine.split_document(text, "t") == ({"accepts_from": ["*"]}, "Role.")
+    refusal = engine.load_refusal()
+    assert refusal["limits"]["window_seconds"] == 86400 and "$supervisor" in refusal["body"]
+    # The shipped default is a whole worker that answers whoever the grant admits.
     default = engine.load_default()
-    assert default["limits"]["window_seconds"] == 86400 and "$supervisor" in default["body"]
+    assert default["enabled"] and default["accepts_from"] == ["*"]
+    assert default["profile"] == "agentrooms-claude" and default["history"] == 30
+    assert default["limits"]["turn_timeout"] == 900 and default["body"] == ""
 
 
 def test_a_default_answer_never_wakes_an_agent():
@@ -839,11 +869,44 @@ def test_a_default_answer_never_wakes_an_agent():
     assert [w["event_id"] for w in wakes] == ["$2"]
 
 
-def test_an_agent_with_no_worker_gets_only_the_default_answer_once(tmp_path):
+def test_an_agent_with_no_worker_is_answered_by_the_shipped_default(tmp_path):
+    matrix = FakeMatrix([message("$1", STRANGER, f"{ME} hello")])
+    runner = FakeRunner(["hello back"])
+    eng, slot = make_engine(tmp_path, matrix, runner, workers={}, binding={})
+    slot.store.add("!r", "$1", sender=STRANGER)
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert len(runner.calls) == 1 and eng.host.profiles_asked == ["agentrooms-claude"]
+    assert matrix.posted[0][1]["body"] == "hello back"
+    assert engine.DATA_KEY not in matrix.posted[0][1]
+    assert slot.store.turn_log[0]["worker"] == "default"
+    assert slot.store.turn_log[0]["outcome"] == "answered"
+
+
+def test_a_project_saved_default_replaces_the_shipped_one(tmp_path):
+    matrix = FakeMatrix([message("$1", STRANGER, f"{ME} hello")])
+    runner = FakeRunner(["from the project's default"])
+    workers = {"default": ({**WORKER, "accepts_from": ["*"], "profile": "agentrooms-codex"},
+                           "Project role.")}
+    eng, slot = make_engine(tmp_path, matrix, runner, workers=workers, binding={})
+    slot.store.add("!r", "$1", sender=STRANGER)
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert eng.host.profiles_asked == ["agentrooms-codex"]
+    assert runner.calls[0]["profile"].append_system_prompt.endswith("Project role.")
+    # Saved switched off, it answers nobody: the refusal answers the sender.
+    workers["default"] = ({"enabled": False}, "")
+    slot.store.add("!r", "$2", sender="@other:example.org")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert len(runner.calls) == 1 and matrix.posted[-1][1][engine.DATA_KEY] == engine.DEFAULT_MARK
+    assert "the project's worker 'default' is switched off" in (
+        tmp_path / engine.LOG_FILE).read_text()
+
+
+def test_a_room_without_a_recorded_grant_gets_only_the_refusal_once(tmp_path):
     events = [message("$1", STRANGER, f"{ME} hello"), message("$2", STRANGER, f"{ME} again")]
-    matrix = FakeMatrix(events)
+    matrix = FakeMatrix(events, grant={})
     runner = FakeRunner([])
-    eng, slot = make_engine(tmp_path, matrix, runner, binding={"supervisor": "@boss:example.org"})
+    eng, slot = make_engine(tmp_path, matrix, runner, workers={},
+                            binding={"supervisor": "@boss:example.org"})
     slot.store.add("!r", "$1", sender=STRANGER)
     eng.turn(engine.Turn(slot, "alpha", "!r"))
     assert runner.calls == []
@@ -856,10 +919,11 @@ def test_an_agent_with_no_worker_gets_only_the_default_answer_once(tmp_path):
     eng.turn(engine.Turn(slot, "alpha", "!r"))
     assert len(matrix.posted) == 1 and slot.store.wakes == []
     log = (tmp_path / engine.LOG_FILE).read_text()
-    assert "no worker is bound to this agent" in log and "already answered" in log
+    assert "the room has no recorded grant" in log and "already answered" in log
+    assert [r["worker"] for r in slot.store.turn_log] == [engine.REFUSAL]
 
 
-def test_a_worker_admits_its_senders_and_the_default_answers_the_rest(tmp_path):
+def test_a_worker_admits_its_senders_and_the_refusal_answers_the_rest(tmp_path):
     events = [message("$1", "@b:example.org", f"{ME} hi"), message("$2", STRANGER, f"{ME} me too")]
     matrix = FakeMatrix(events)
     runner = FakeRunner(["for b"])
@@ -899,7 +963,7 @@ def test_what_a_worker_does_not_wake_on_and_strangers_in_marked_rooms_are_only_l
     assert "does not wake on marked" in log
 
 
-def test_a_worker_switched_off_or_missing_leaves_the_default_worker(tmp_path):
+def test_a_bound_worker_switched_off_or_missing_leaves_the_refusal(tmp_path):
     for workers, said in (({"w": ({"enabled": False}, "")}, "is switched off"),
                           ({}, "has no active version")):
         matrix = FakeMatrix([message("$1", "@b:example.org", f"{ME} hi")])
@@ -1002,3 +1066,104 @@ def test_hooks_hold_escalate_and_follow_a_turn(tmp_path):
     env = (tmp_path / "after.env").read_text()
     assert "AGENTROOMS_OUTCOME=answered" in env and "AGENTROOMS_EVENT_ID=$posted1" in env
     assert eng.held("prj", "alpha", "!elsewhere")
+
+
+# ── the room's switch: a room switched off is left wholly to interactive use ──
+
+
+def served_data(**content):
+    return {"type": engine.SERVED_TYPE, "content": content}
+
+
+def test_a_room_switched_off_wakes_nothing_and_switched_on_only_what_follows():
+    rooms: dict = {}
+    unserved: set = set()
+    grants: dict = {}
+    off = sync(join={
+        "!off": {"summary": {"m.joined_member_count": 2},
+                 "account_data": {"events": [served_data(served=False),
+                                             {"type": engine.GRANT_TYPE,
+                                              "content": {"everyone": False, "users": []}}]},
+                 "timeline": {"events": [message("$1", STRANGER, f"{ME} hello"),
+                                         message("$2", "@b:example.org", "a direct message")]}},
+        "!on": {"summary": {"m.joined_member_count": 2},
+                "timeline": {"events": [message("$3", "@b:example.org", "dm")]}}})
+    wakes, _ = engine.read_sync(off, ME, rooms, initial=False, member_count=lambda r: 2,
+                                grants=grants, unserved=unserved, served_of=lambda r: None)
+    # Nothing from the room switched off - not a turn, not a held wake.
+    assert [(w["room_id"], w["event_id"]) for w in wakes] == [("!on", "$3")]
+    assert unserved == {"!off"}
+    # Switched on, only what arrived after the moment it was switched on wakes.
+    later = sync(join={"!off": {
+        "summary": {"m.joined_member_count": 2},
+        "account_data": {"events": [served_data(served=True, since=1_700_000_000_500)]},
+        "timeline": {"events": [message("$4", "@b:example.org", "sent while off"),
+                                {**message("$5", "@b:example.org", "sent after"),
+                                 "origin_server_ts": 1_700_000_000_900}]}}})
+    unserved.clear()
+    wakes, _ = engine.read_sync(later, ME, rooms, initial=False, member_count=lambda r: 2,
+                                grant_of=lambda r: None, unserved=unserved)
+    assert [w["event_id"] for w in wakes] == ["$5"] and unserved == set()
+
+
+def test_a_restarted_agent_reads_a_rooms_switch_before_it_judges_a_wake(tmp_path):
+    eng, slot = make_engine(tmp_path, None, FakeRunner([]))
+    slot.store = SyncStore()
+    slot.store.position = "s0"  # served before: account data is not sent again
+    agent = engine.Agent(slot, slot.plan["agents"]["alpha"])
+    direct = {"next_batch": "s1", "rooms": {"join": {ROOM: {
+        "summary": {"m.joined_member_count": 2},
+        "timeline": {"events": [said("$dm", "hello", 9_000)]}}}}}
+    regrant = {"next_batch": "s2", "rooms": {"join": {ROOM: {
+        **grant_data(everyone=True, users=[]),
+        "timeline": {"events": [said("$dm2", "hello again", 9_500)]}}}}}
+    matrix = SyncMatrix([direct, regrant], {}, grant={"everyone": False, "users": []},
+                        served={"served": False})
+    agent.sync_once(matrix)
+    agent.sync_once(matrix)
+    # Asked once; nothing recorded, and a grant in the room releases nothing.
+    assert slot.store.wakes == {} and len(matrix.served_reads) == 1
+    assert slot.store.grants == [{}, {}]
+
+
+def test_a_room_switched_off_runs_no_turn_and_posts_no_refusal(tmp_path):
+    for workers, sender in (({"w": (WORKER, "")}, "@b:example.org"), ({}, STRANGER)):
+        where = tmp_path / sender[1:4]
+        where.mkdir()
+        matrix = FakeMatrix([message("$1", sender, f"{ME} hi")])
+        matrix.served["!r"] = {"served": False}
+        runner = FakeRunner(["never"])
+        eng, slot = make_engine(where, matrix, runner, workers=workers)
+        slot.store.add("!r", "$1", sender=sender)
+        eng.turn(engine.Turn(slot, "alpha", "!r"))
+        assert runner.calls == [] and matrix.posted == [] and slot.store.wakes == []
+        assert slot.store.turn_log == []
+        assert "is switched off" in (where / engine.LOG_FILE).read_text()
+
+
+def test_an_answer_is_not_posted_in_a_room_switched_off_during_the_turn(tmp_path):
+    matrix = FakeMatrix([message("$1", "@b:example.org", f"{ME} hi")])
+    runner = FakeRunner(["late answer"])
+    eng, slot = make_engine(tmp_path, matrix, runner)
+    original = runner.run
+
+    def switch_off_meanwhile(*args, **kwargs):
+        matrix.served["!r"] = {"served": False}
+        return original(*args, **kwargs)
+
+    runner.run = switch_off_meanwhile
+    slot.store.add("!r", "$1")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert len(runner.calls) == 1 and matrix.posted == []
+    assert slot.store.turn_log[0]["outcome"] == "not_posted"
+    assert "switched off during the turn" in (tmp_path / engine.LOG_FILE).read_text()
+
+
+def test_the_agent_is_taken_up_once(tmp_path):
+    eng, slot = make_engine(tmp_path, None, FakeRunner([]))
+    asked = []
+    eng.host.take_up = lambda entry, cid: asked.append(cid) or ["its card moved"]
+    agent = engine.Agent(slot, slot.plan["agents"]["alpha"])
+    agent.take_up()
+    assert asked == ["alpha"] and agent.taken_up
+    assert "alpha: its card moved" in (tmp_path / engine.LOG_FILE).read_text()

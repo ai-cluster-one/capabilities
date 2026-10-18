@@ -116,18 +116,26 @@ def test_workers_are_versions_and_history_is_never_edited(store):
     assert store.workers("p") == []
 
 
-def test_turn_counts_reset_a_room_after_quiet_and_skip_default_answers(store):
+def test_turn_counts_reset_a_room_after_quiet_and_skip_refusals(store):
     for n, ago in enumerate((10, 20, 2000)):
         store.start_turn(f"t{n}", "p", "alpha", "!r", "w", None, ["@b:x"], ["mention"])
         store.execute("UPDATE agentrooms_turns SET started_at = now() - make_interval(secs => %s) "
                       "WHERE id = %s", (ago, f"t{n}"))
-    store.start_turn("d1", "p", "alpha", "!r", "default", None, ["@s:x"], ["direct"])
+    # A refusal, and one an earlier release recorded as the default worker's.
+    store.start_turn("refusal:t9:@s:x", "p", "alpha", "!r", "refusal", None, ["@s:x"], ["direct"])
+    store.start_turn("default:t8:@o:x", "p", "alpha", "!r", "default", None, ["@o:x"], ["direct"])
     counts = store.turn_counts("p", "alpha", "!r", ["@b:x", "@s:x"], window=3600, quiet=900,
                                room_cap=10)
     assert counts == {"agent": 3, "room": 2, "senders": {"@b:x": 3, "@s:x": 0}}
     assert store.turn_counts("p", "alpha", "!r", [], window=15, quiet=5, room_cap=10)["room"] == 0
-    assert store.default_answered("p", "alpha", "!r", "@s:x", 60)
-    assert not store.default_answered("p", "alpha", "!other", "@s:x", 60)
+    assert store.refused("p", "alpha", "!r", "@s:x", 60)
+    assert store.refused("p", "alpha", "!r", "@o:x", 60)
+    assert not store.refused("p", "alpha", "!other", "@s:x", 60)
+    # A turn the default worker ran is a turn, and counts.
+    store.start_turn("t7", "p", "alpha", "!r", "default", None, ["@s:x"], ["mention"])
+    assert store.turn_counts("p", "alpha", "!r", ["@s:x"], window=3600, quiet=900,
+                             room_cap=10)["senders"] == {"@s:x": 1}
+    assert not store.refused("p", "alpha", "!r", "@b:x", 60)
     store.end_turn("t0", "answered")
     assert store.execute("SELECT outcome FROM agentrooms_turns WHERE id = 't0'", fetch="one") == ("answered",)
     assert store.answered_by("p", "alpha", "$a") is None

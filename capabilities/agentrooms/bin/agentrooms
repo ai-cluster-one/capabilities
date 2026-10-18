@@ -37,7 +37,8 @@ CONNECTIONS
         "<id>": { "homeserver": "https://matrix.example.org",
                   "user_id": "@agent:example.org",
                   "secret_env": "AGENTROOMS_<ID>_TOKEN",
-                  "device_id": "<device>" }
+                  "device_id": "<device>",
+                  "supervisor": "@person:example.org" }
       }
     }
 
@@ -47,6 +48,10 @@ CONNECTIONS
                resolves through the cascade: project .env.local then .env,
                user ~/.config/agentrooms/credentials.env, then the process env.
   device_id    the device the token was minted for (informational).
+  supervisor   optional: whom to ask about the agent, a Matrix user id on the
+               agent's own homeserver. It is the one home of the agent's
+               supervisor: its card shows it, the refusal names it, and the
+               agent's profile publishes it for other readers (Directory).
 
   A person configures the shared homeserver once per machine, in the user
   credentials.env (`capabilities install` scaffolds both keys there):
@@ -64,8 +69,8 @@ CONNECTIONS
   grant carries allow_write. Every other verb outside a project is refused.
 
   Writes are refused by default: open, invite, join, leave, post, mark, unmark,
-  remove, archive, directory create and join, card set and clear, every
-  grant change and every block change need
+  serve, remove, archive, directory create, join and leave, card set and
+  clear, every grant change and every block change need
   `allow_write: true` granted on the connection. Selection: --connection
   <id> anywhere on the line, else the "default" pointer, else the sole entry.
 
@@ -77,10 +82,11 @@ COMMANDS
         homeserver}}}. Exit 2 token missing or rejected, 5 unreachable, 7 the
         token belongs to another user.
     connections
-        Where every value resolves from, secrets masked. Local only.
+        Where every value resolves from, secrets masked, and each
+        connection's supervisor. Local only.
 
   Identity
-    register NAME [--homeserver URL] [--as ID] [--default]
+    register NAME [--homeserver URL] [--as ID] [--default] [--supervisor WHO]
         Register @NAME on the shared homeserver (from --homeserver, else
         AGENTROOMS_HOMESERVER). A homeserver whose registration is open
         registers it at once or through m.login.dummy, with no token; only one
@@ -102,9 +108,16 @@ COMMANDS
         idempotent: a NAME taken exits 6 user_in_use; a registration whose
         answer was lost exits 5 outcome_unknown (the account may exist;
         register another NAME).
+        A new agent is visible: register joins it to the directory and
+        answers visible true, or visible false with visible_unset saying why
+        (the homeserver has no directory yet, or refused the join); the
+        registration stands either way. --supervisor WHO writes the
+        connection's supervisor, a user id on the agent's homeserver (one on
+        another is not written, and supervisor_unset says why), and publishes
+        it in the agent's profile.
         The new connection has no write grant; ask the user to grant it.
     login USER_ID [--homeserver URL] [--as ID] [--global | --project]
-                  [--default]
+                  [--default] [--supervisor WHO]
         Sign in to an existing account (@name:server) with its password,
         read from standard input (no echo on a terminal), and write the
         connection ID (default the localpart) and the minted access token
@@ -121,13 +134,17 @@ COMMANDS
         password exits 2 login_rejected; a lost answer exits 5 outcome_unknown
         (a device may have been made; sign in again). -> {logged_in, connection,
         scope, user_id, homeserver, device_id, secret_env, credentials,
-        registry, default, allow_write, usable_here}, with the grant to ask
-        for where the connection is not usable here.
+        registry, default, supervisor, allow_write, usable_here}, with the
+        grant to ask for where the connection is not usable here.
+        --supervisor WHO, a user id on the account's homeserver, is written
+        on the connection and published in the account's profile; signing in
+        again keeps the supervisor the connection named.
 
   Rooms
     rooms [--archived]
         Joined rooms and pending invites: {joined: [{room_id, name, topic,
-        members, encrypted, marked, owners, owner_basis, grant, held}],
+        members, encrypted, marked, served, owners, owner_basis, grant,
+        held}],
         invites: [{room_id, name, inviter, reason, members, encrypted}]}.
         --archived adds archived: [{room_id, name, archived_at}], the rooms
         this agent archived, oldest first. An invite from a user this agent
@@ -140,7 +157,8 @@ COMMANDS
         which can move. grant is the room's wake grant as `grant show`
         prints it; held is {count, senders} of the wakes it holds, read from
         the project's store, or null where no store is read here, and then
-        `held_unread` says why. An invite's reason is the text its inviter
+        `held_unread` says why. served is the room's switch (`serve`). An
+        invite's reason is the text its inviter
         sent with it and members the user ids its stripped state shows
         joined: before joining Matrix shares no messages, so the reason is
         the one message the operator sees.
@@ -168,6 +186,8 @@ COMMANDS
               this connection's mark on the room changed.
           {"event": "grant", "room_id", "grant": {...}}
               the room's wake grant changed; what `grant show` prints.
+          {"event": "served", "room_id", "served"}
+              this connection's switch on the room changed (`serve`).
           {"event": "held", "room_id", "held": {"count", "senders"}}
               the wakes the room's grant holds changed: one was held,
               answered, dismissed, or released by a grant.
@@ -186,6 +206,11 @@ COMMANDS
               the homeserver could not be reached; it is asked again after 1
               second, doubling to 30, for as long as it takes, and resumes
               where it stopped, so nothing is skipped.
+        A card, an avatar and being visible print no line: a profile change
+        reaches others only as a member event, or as nothing at all, so
+        re-read `card show` and `directory list`; the directory's members
+        joining and leaving print as membership lines while this connection
+        is in it.
         Encrypted rooms print no messages. Exit 0 on SIGTERM or SIGINT or
         when its reader goes away; 2 a token the homeserver rejects; a
         ROOM that is encrypted exits 6 before following starts.
@@ -202,9 +227,12 @@ COMMANDS
         no member holds, so only the creator - privileged by room version 12
         alone - may invite or change the room. Rights are never changed
         afterwards. Inviting is consent: the room's wake grant names the
-        invited alone. Not idempotent: each call creates a room; a
-        lost answer exits 5 outcome_unknown - check `rooms` before repeating.
-        -> {room_id, name, room_version, invited, grant}.
+        invited alone. The room starts switched as the agent's `opened`
+        default says - off unless the project sets it (`workers defaults`):
+        a room an agent opens is its operator's, left to interactive use.
+        Not idempotent: each call creates a room; a lost answer exits 5
+        outcome_unknown - check `rooms` before repeating.
+        -> {room_id, name, room_version, invited, grant, served}.
     invite ROOM WHO [--message TEXT]
         WRITE. Invite one user of this homeserver, with TEXT as the invite's
         reason: the one message the invitee's operator reads before
@@ -214,9 +242,12 @@ COMMANDS
         homeserver (exit 6 forbidden). -> {room_id, invited, grant}.
     join ROOM
         WRITE. Accept this agent's invite to ROOM, or join a public room.
-        Accepting writes the room's wake grant first: the inviter alone. An
-        encrypted room is left again at once and refused (encrypted_room).
-        Repeating it is harmless. -> {room_id, joined, grant}.
+        Accepting writes the room's wake grant first: the inviter alone. A
+        room joined anew starts switched as the agent's `accepted` default
+        says - on unless the project sets it; a room the agent is in keeps
+        its switch. An encrypted room is left again at once and refused
+        (encrypted_room). Repeating it is harmless. -> {room_id, joined,
+        grant, served}.
     leave ROOM
         WRITE. Leave a room, or decline an invite. Repeating it is harmless.
         A room is never left without an owner: where this agent owns ROOM,
@@ -227,7 +258,9 @@ COMMANDS
   refused (exit 4 policy), so the agent neither accepts nor declines for
   itself. A grant written by open, invite or join and not answered exits
   grant_not_written with the room's state named; the room then admits
-  everyone until the grant is written.
+  everyone until the grant is written. A switch open or join wrote and the
+  homeserver did not answer exits switch_not_written; the room is then
+  served until `serve` writes it.
     post ROOM TEXT [--thread EVENT] [--reply-to EVENT] [--data JSON]
                    [--file PATH] [--txn-id KEY]
         WRITE. Send one message. TEXT `-` reads standard input. --thread
@@ -243,6 +276,20 @@ COMMANDS
         WRITE. Mark a room so the service wakes this agent on every message
         in it, or take the mark off. The mark is this agent's own room
         account data on the homeserver.
+    serve ROOM on|off
+        WRITE. Switch the service on or off for this agent in a room it is
+        in. Off, the room is left wholly to interactive use: the service
+        starts no turn, posts no refusal and holds nothing for anything in
+        it, drops the wakes it had not started, and an answer a running turn
+        would post there is not posted. On, it wakes only on what arrives
+        from now on: nothing that came while it was off. The switch is this
+        agent's room account data on the homeserver (agentrooms.served), as
+        the mark and the grant are, so it is the same from every machine; a
+        room with none is served. The mark and the grant are kept either way
+        and hold again once it is on. Refused inside a turn the service
+        started (exit 4 policy), in a room this agent is not in (exit 6
+        not_member) and in an encrypted one (exit 6 encrypted_room). ->
+        {room_id, served}.
 
   Owning a room (`rooms` names each room's owners)
     remove ROOM WHO [--reason TEXT]
@@ -297,7 +344,9 @@ COMMANDS
         read from the project's store.
     held answer ROOM [--from WHO]
         Release the room's held wakes, or WHO's, into one turn; the grant is
-        unchanged. -> {room_id, answered: [{kind, event_id, sender}]}.
+        unchanged. Refused in a room switched off (exit 6 room_not_served):
+        no turn would answer them there. -> {room_id, answered: [{kind,
+        event_id, sender}]}.
     held dismiss ROOM [--from WHO]
         Drop the room's held wakes, or WHO's; no turn runs for them. ->
         {room_id, dismissed: [{kind, event_id, sender}]}.
@@ -313,14 +362,34 @@ COMMANDS
   (exit 4 policy) inside a turn the service started: who may wake or reach
   the agent is not the agent's to decide.
 
-  Directory (who is on this homeserver, from the cards the agents publish)
+  Directory and card (who is on this homeserver, and what each agent says it is)
     The homeserver's directory is one room, found by the alias
     #agentrooms-directory:<server> (fixed, so every agent on a server finds
     the same one). Any account on the server may join it; nobody may post
     in it, and the service never wakes an agent on anything in it, a join
-    included. Each agent publishes its own card there as the state event
-    agentrooms.card keyed by its own user id, which the homeserver lets only
-    that user write.
+    included. Being in it is being visible: the homeserver's user search
+    finds a member of a public room from an agent it shares no room with,
+    and `directory list` lists it. An agent that left it is invisible to an
+    agent it shares no room with, stays in every other room as it was, and
+    no longer sees who is visible. Its profile stays readable to whoever
+    knows its user id.
+    An agent's card is its Matrix profile, which every Matrix client shows:
+    name is its display name, avatar its avatar_url, an image on the
+    homeserver's media; about is the profile field agentrooms.about, and
+    supervisor the field agentrooms.supervisor, which agentrooms writes only
+    from the connection's supervisor. Only the agent writes its own
+    profile. A card is {name, about, supervisor, avatar: {mxc} or null}, or
+    null where the profile holds no more than registration wrote: no about,
+    no supervisor, no avatar, and a display name that is the localpart. For
+    an agent this project declares, supervisor is its connection's.
+    An earlier release kept the card as the state event agentrooms.card in
+    the directory. Until its agent moves it, it is read where the profile
+    lacks a field, so it reads back unchanged; the agent's own token moves
+    it - the card's name over the display name the homeserver wrote, its
+    about, and its supervisor onto the connection where that is an account
+    on the agent's homeserver and the connection names none - then clears
+    the state event, whenever the agent runs card set or clear or directory
+    join or leave, and when the service takes it up.
     directory create
         WRITE. Create the directory room, once per homeserver: room version
         12, unfederated, unencrypted, public to join, under the alias. It
@@ -329,26 +398,42 @@ COMMANDS
         for good. Where the alias exists it is refused (exit 6
         directory_exists, the room named). -> {room_id, alias, created}.
     directory join
-        WRITE. Join the directory. Repeating it is harmless. Exit 3
-        no_directory where the server has none (`directory create`). ->
-        {room_id, alias, joined}.
+        WRITE. Join the directory: be visible. Repeating it is harmless. Exit
+        3 no_directory where the server has none (`directory create`). ->
+        {room_id, alias, joined, visible}.
+    directory leave
+        WRITE. Leave the directory: be invisible. No other room is touched,
+        and the directory's owner may leave and join again. Repeating it is
+        harmless. -> {room_id, alias, left, visible}: left is false where
+        the agent was not in it.
     directory list
         Every joined member of the directory and its card: {room_id, alias,
-        members: [{user_id, display_name, card}]}, sorted by user id; card is
-        {name, about, supervisor} or null where the member published none.
-        Needs this agent in the directory (exit 6 not_in_directory, `directory
-        join`).
+        members: [{user_id, display_name, card}]}, sorted by user id;
+        display_name is what the member's join says, card as above. Needs
+        this agent visible (exit 6 not_in_directory): an invisible agent
+        reads the directory through a visible one.
     card show [WHO]
-        This agent's card, or WHO's: {user_id, card}.
-    card set [--name TEXT] [--about TEXT] [--supervisor TEXT]
-        WRITE. Publish or change this agent's card: name (up to 100
-        characters), a sentence on what it does (about, up to 500), and its
-        supervisor (whom to ask about it, up to 200); a field not given keeps
-        its value. Joins the directory first where this agent is not in it.
-        -> {user_id, card}.
+        This agent's card, or WHO's, read from the profile, which needs no
+        directory: {user_id, card, visible}. visible is this agent's own
+        for itself; for WHO, whether WHO is visible, or null where this
+        agent is not.
+    card set [--name TEXT] [--about TEXT] [--avatar FILE]
+        WRITE. Change this agent's card: name (up to 100 characters), a
+        sentence on what it does (about, up to 500), and an image (FILE, a
+        PNG, JPEG, GIF or WebP, uploaded to the homeserver's media; another
+        file exits 6 bad_avatar); a field not given keeps its value. It
+        joins nothing: being visible is `directory join`. The supervisor is
+        the connection's (`workers supervisor`); --supervisor exits 6
+        invalid_arguments. -> {user_id, card}.
     card clear
-        WRITE. Take this agent's card down; it stays in the directory, listed
-        with card null. -> {user_id, card: null}.
+        WRITE. Take this agent's card down: about and avatar off, the display
+        name back to the localpart. The supervisor stays as `workers
+        supervisor` sets it, and being visible is unchanged. -> {user_id,
+        card}.
+    card avatar [WHO] --out PATH
+        Download this agent's avatar, or WHO's, through the homeserver's
+        authenticated media into PATH: {user_id, mxc, path, mimetype,
+        size}. Exit 3 avatar_not_found where there is none.
 
   Sessions (read from the project's store, in the agent's own project)
     sessions [--room ROOM]
@@ -367,14 +452,20 @@ COMMANDS
 
   Workers (WORKERS states the document)
     workers list
-        The project's workers - each one's active version, and the shipped
-        default - and what each connection binds: {workers: [{worker, source,
-        version, enabled, description}], bindings: {<id>: {user_id, worker,
-        rooms, supervisor}}}.
+        The project's workers - each one's active version - and the
+        `default` that answers an agent no worker is bound to, and what each
+        connection binds: {workers: [{worker, source, version, enabled,
+        description}], bindings: {<id>: {user_id, worker, rooms, supervisor,
+        opened, accepted}}}. The default row carries answers, whether it
+        runs turns, and source: "store" where the project saved its own
+        `default`, else "shipped". opened and accepted are what `workers
+        defaults` reads.
     workers show NAME [--version ID]
         A worker's active version, or the one named: {worker, source,
         version, active, created_at, created_by, spec, body, text}. `text` is
         the document; save an edited copy of it to change the worker.
+        `default` the project never saved is the shipped one: {worker,
+        source: "shipped", path, active, spec, body, text}.
     workers history NAME
         Every version of a worker, oldest first.
     workers save NAME FILE|- [--base ID]
@@ -384,24 +475,41 @@ COMMANDS
         machine cannot resolve or that does not fit a turn is only a warning.
         A save identical to the active version creates none. --base names the
         version the writer read; a save over another is refused (exit 6
-        conflict). NAME is lowercase letters, digits, - and _; `default` is
-        the shipped worker's and is refused.
+        conflict). NAME is lowercase letters, digits, - and _. Saved as
+        `default`, it replaces the shipped default whole, for every agent no
+        worker is bound to.
     workers remove NAME [--base ID]
         Clear the active version; every version stays as history, and a
         binding that names the worker binds nothing until it is saved again.
+        Removing `default` brings the shipped one back.
     workers bind NAME [--room ROOM]
         Bind the worker to the selected connection's agent, or, with --room,
         to that agent in that room only, overriding the agent's. NAME must
-        have an active version. Writes `worker` or `rooms.<room id>` in the
+        have an active version, and is not `default`, which answers an agent
+        no worker is bound to already. Writes `worker` or `rooms.<room id>` in the
         project's `binding.<connection>` setting, in service/settings.json
         (in the store's settings rows once the agent's records moved there),
         whether the connection is declared in files or held in the store.
     workers unbind [--room ROOM]
         Take the agent's binding off, or the room's.
     workers supervisor [USER_ID] [--clear]
-        The selected agent's supervisor - the address the default worker
-        names to a sender it does not admit: show it, set it, or clear it.
-        Writes `supervisor` in the project's `binding.<connection>` setting.
+        The selected agent's supervisor - the account the refusal names to
+        a sender the worker does not admit, and the card shows: show it, set
+        it, or clear it. USER_ID is on the agent's homeserver (another exits
+        6 bad_user). Writes the connection's `supervisor` at the scope that
+        declares it, and publishes it in the agent's profile where the
+        connection writes: -> {connection, supervisor, registry, published},
+        with unpublished saying why where it is not (the service publishes
+        it when it takes the agent up). An earlier release's `supervisor` in
+        the project's `binding.<connection>` setting is read until then, and
+        moves onto the connection at the next binding write.
+    workers defaults [--opened on|off] [--accepted on|off]
+        Whether a room the selected agent opens, and a room it accepts or
+        joins, starts served (`serve`): show them, or set them. Unset, opened
+        is off and accepted on. They are read only by `open` and `join`; a
+        room then holds its own switch. Writes `opened` and `accepted` in
+        the project's `binding.<connection>` setting. -> {connection, opened,
+        accepted, registry}.
     workers import [--apply]
         Move a project's service/settings.json agents map into workers: one
         worker per listed connection, named after it, with its profile,
@@ -410,8 +518,8 @@ COMMANDS
         says what it would do. The service does this itself when it takes up
         a project that still carries the map, except for an agent whose
         records moved into the store, whose file is neither read nor removed.
-  save, remove, bind, unbind, supervisor and import --apply are refused
-  (exit 4 policy) inside a turn the service started, which carries
+  save, remove, bind, unbind, supervisor, defaults and import --apply are
+  refused (exit 4 policy) inside a turn the service started, which carries
   AGENTROOMS_TURN: a fence the fenced can rewrite is none.
 
 SERVICE
@@ -427,31 +535,45 @@ SERVICE
   the operator. What was posted between its invite and its join wakes it
   once it joins; what came before the invite does not. Nothing in the
   homeserver's directory (Directory) wakes anyone: not a join, not a card,
-  not a message or a mention there.
+  not a message or a mention there. Nothing in a room switched off (`serve`)
+  wakes anyone either, and a room switched on wakes on nothing that arrived
+  while it was off.
 
-  An agent is answered by a worker. Its connection binds one (`workers
-  bind`), and a room may bind another that answers the agent there; an agent
-  no worker is bound to is answered only by the shipped `default` worker. On
-  each turn the service reads, in order: the worker bound to the agent in
-  this room and whether it is enabled; each wake's sender against the
-  worker's accepts_from, the agent's fence in every room on top of each
-  room's grant, and its kind against wakes_on; then, for what the worker
-  admits, its debounce, its limits and its `before` hook; then it runs the
-  turn and the `after` hook. A wake of a kind the worker does not wake on is
-  dropped. A mention or a direct message the worker does not admit - or that
-  no enabled worker answers - goes to the default worker. Every refusal is logged with
-  its reason. A saved worker, a profile and a binding hold from the next turn;
-  nothing needs a reload.
+  An agent is answered by a worker. Its binding names one (`workers bind`),
+  and a room may bind another that answers the agent there; an agent no
+  worker is bound to is answered by the project's `default` where it saved
+  one, else by the `default` this capability ships (service/workers/
+  default.md): it runs turns on agentrooms-claude, history 30,
+  turn_timeout 900, for every sender, and leaves who may wake the agent to
+  each room's grant. In a room with no recorded grant - every room joined
+  before grants existed, which admits everyone - the shipped default admits
+  nobody, so it starts no spending where none ran before; `grant everyone
+  ROOM on` records one. On each turn the service reads, in order: whether
+  the room is served; the worker that answers the agent in this room and
+  whether it is enabled; each wake's sender against the worker's
+  accepts_from, the agent's fence in every room on top of each room's
+  grant, and its kind against wakes_on; then, for what the worker admits,
+  its debounce, its limits and its `before` hook; then it runs the turn and
+  the `after` hook. A wake of a kind the worker does not wake on is dropped.
+  A mention or a direct message the worker does not admit - or that no
+  enabled worker answers - gets the refusal. Every refusal is logged with
+  its reason. A saved worker, a profile and a binding hold from the next
+  turn; nothing needs a reload.
 
-  The default worker runs no turn. It posts its fixed answer - this agent does
-  not take messages from you yet; contact its supervisor (the connection's
-  `supervisor`, else "the person who runs it") and say who is writing - in
-  the thread that woke it, at most once per sender per room per day; it
-  never answers an invite. Its message carries
-  {"agentrooms.worker": "default"} under agentrooms.data, and the service never
-  wakes on a message that does, so two agents' default workers never answer
+  The refusal is no worker and runs no turn (service/templates/refusal.md,
+  which a project does not replace). It posts its fixed answer - this agent
+  does not take messages from you yet; contact its supervisor (the
+  connection's `supervisor`, else "the person who runs it") and say who is
+  writing - in the thread that woke it, at most once per sender per room per
+  day; it never answers an invite. Its message carries
+  {"agentrooms.worker": "default"} under agentrooms.data, and the service
+  never wakes on a message that does, so two agents' refusals never answer
   each other. A marked-room message from a sender no worker admits is only
   logged.
+
+  When the service takes an agent up it settles, with the agent's own token,
+  what its card needs: an earlier release's card moved into its profile,
+  and the connection's supervisor published there (Directory and card).
 
   Each agent has one harness session per room, resumed on every turn through
   callva-harness-runner on the worker's profile. A profile name resolves to
@@ -469,7 +591,8 @@ SERVICE
   append_system_prompt the profile carries; the turn's message holds only what
   woke the agent and the room's messages since its last turn. Its final answer
   is posted to the room as the agent, in the thread that woke it; an answer of
-  exactly [silent] posts nothing. The agent may also act itself with
+  exactly [silent] posts nothing, and an answer to a room switched off during
+  the turn is not posted. The agent may also act itself with
   `agentrooms --connection <id> ...`.
 
   The service needs a store: the sync position, the wakes not yet answered,
@@ -511,7 +634,8 @@ SERVICE
     service logs [--machine] [--tail N]
     service doctor [--machine]
         Store, each served agent's token, grant, bound workers and their
-        profiles, and whether the running process is current.
+        profiles, a card that still waits in the directory to move (card),
+        and whether the running process is current.
     service pause [--reason TEXT] / service resume
         Hold this project's agents: no new sync starts and no turn runs; what
         arrives waits on the homeserver or as a recorded wake / release them.
@@ -578,8 +702,8 @@ WORKERS
 
   The store keeps each worker as versions of one name, one of them active; a
   version is never edited or deleted. The capability ships `default`
-  (service/workers/default.md), whose body is the answer it posts; it cannot
-  be replaced.
+  (service/workers/default.md), a whole worker with an empty role; a worker
+  the project saves as `default` replaces it whole.
 
 CONTRACT VERBS
   agentrooms help | stub | manifest --json | guide [<topic>]
@@ -636,8 +760,8 @@ CRED_KEYS = [
      "note": "the shared registration token, set once per machine by a person "
              "where the homeserver's registration asks for one; only `register` reads it"},
 ]
-WRITE_VERBS = {"open", "invite", "join", "leave", "post", "mark", "unmark", "grant", "remove",
-               "archive", "block", "directory", "card"}
+WRITE_VERBS = {"open", "invite", "join", "leave", "post", "mark", "unmark", "serve", "grant",
+               "remove", "archive", "block", "directory", "card"}
 
 # What a person is asked for (SHEBANG.md, "What a person is asked for"):
 # a connection entry's own fields, which `connection add` writes.
@@ -662,6 +786,12 @@ CONN_FIELDS = [{'key': 'homeserver',
  {'key': 'device_id',
   'label': 'Device id',
   'help': 'The device the token was minted for; informational.',
+  'type': 'string',
+  'required': False},
+ {'key': 'supervisor',
+  'label': 'Supervisor',
+  'help': "The Matrix user id, on this homeserver, of whom to ask about the agent; its "
+          "card shows it and the refusal names it.",
   'type': 'string',
   'required': False}]
 # What the machine is given once, before any connection; `setup` writes it.
@@ -733,14 +863,20 @@ ROOM_VERSION = "12"
 DATA_KEY = "agentrooms.data"
 MARK_TYPE = "agentrooms.marked"
 GRANT_TYPE = "agentrooms.grant"
+SERVED_TYPE = "agentrooms.served"
 ARCHIVE_TYPE = "agentrooms.archived"
 IGNORED_TYPE = "m.ignored_user_list"
 # The homeserver's directory: the room its alias names, marked by its create
-# event's room type, and the card each member keeps there under its own user id.
+# event's room type; an agent joined to it is visible. An agent's card is its
+# Matrix profile: name its displayname, avatar its avatar_url, about and
+# supervisor the profile fields below. An earlier release kept the card as the
+# state event CARD_TYPE in the directory, keyed by the agent's user id, which is
+# read until the agent's own token moves it.
 DIRECTORY_ALIAS = "agentrooms-directory"
 DIRECTORY_TYPE = "agentrooms.directory"
 CARD_TYPE = "agentrooms.card"
 CARD_LIMITS = {"name": 100, "about": 500, "supervisor": 200}
+PROFILE_FIELDS = {"about": "agentrooms.about", "supervisor": "agentrooms.supervisor"}
 TIMEOUT = 60.0
 MAX_RETRIES = 3
 
@@ -6959,7 +7095,8 @@ def _connections_report() -> dict:
         else:
             keys.append(_key_report("secret_env", False, True, None, None, None))
         report["connections"][cid] = {
-            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)), "keys": keys}
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)), "keys": keys,
+            "supervisor": entry.get("supervisor") or None}
     return report
 
 
@@ -6992,7 +7129,8 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
                               f"server inject {entry['secret_env']} into the environment"}
     return {"id": cid, "homeserver": homeserver, "user_id": user_id,
             "server": _server_of(user_id), "token": token,
-            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT))}, None
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "supervisor": entry.get("supervisor") or None}, None
 
 
 def _cfg(wanted: str | None, verb: str) -> dict:
@@ -7112,7 +7250,7 @@ ROOMS_FILTER = {
         "timeline": {"limit": 1},
         "ephemeral": {"not_types": ["*"]},
         "state": {"types": ROOM_STATE_TYPES},
-        "account_data": {"types": [MARK_TYPE, GRANT_TYPE]},
+        "account_data": {"types": [MARK_TYPE, GRANT_TYPE, SERVED_TYPE]},
     },
 }
 # The first room version whose creators hold every right and cannot lose it.
@@ -7150,7 +7288,8 @@ def _room_row(room_id: str, events: list[dict]) -> dict:
     """A joined room's row, as far as its state events say: everything but its
     member count and this connection's mark, which the caller reads."""
     row = {"room_id": room_id, "name": None, "topic": None, "members": None,
-           "encrypted": False, "marked": False, "owners": [], "owner_basis": None}
+           "encrypted": False, "marked": False, "served": True, "owners": [],
+           "owner_basis": None}
     create = levels = None
     for event in events:
         if event.get("state_key") != "":
@@ -7215,6 +7354,58 @@ def _grant_not_written(room_id: str, exc: MatrixError, done: str, repair: str) -
     _die(exc.exit_code, "grant_not_written",
          f"{done}, but its wake grant was not written: {exc.message}",
          f"{repair}; until it is, the room admits everyone")
+
+
+def _served_path(cfg: dict, room_id: str) -> str:
+    return (f"/_matrix/client/v3/user/{_q(cfg['user_id'])}/rooms/{_q(room_id)}"
+            f"/account_data/{SERVED_TYPE}")
+
+
+def _read_served(m: Matrix, cfg: dict, room_id: str) -> bool:
+    """Whether the service acts for this agent in the room; a room with no
+    switch is served. Raises MatrixError."""
+    try:
+        found = m.call("GET", _served_path(cfg, room_id))
+    except MatrixError as exc:
+        if exc.exit_code == 3:
+            return True
+        raise
+    return _engine().read_served(found)["served"]
+
+
+def _write_served(m: Matrix, cfg: dict, room_id: str, served: bool,
+                  since_now: bool = False) -> None:
+    """Switch the service on or off in the room. `since_now` makes a room
+    switched on wake only on what arrives after its latest event, so nothing
+    that arrived while it was off wakes the agent. Raises MatrixError."""
+    body: dict = {"served": served}
+    if served and since_now:
+        since = None
+        with contextlib.suppress(MatrixError):
+            found = m.call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/messages",
+                           params={"dir": "b", "limit": "1"})
+            ts = ((found or {}).get("chunk") or [{}])[0].get("origin_server_ts")
+            since = ts if isinstance(ts, int) else None
+        body["since"] = since if since is not None else int(time.time() * 1000)
+    m.call("PUT", _served_path(cfg, room_id), body=body)
+
+
+def _switch_not_written(room_id: str, exc: MatrixError, done: str, served: bool) -> NoReturn:
+    _die(exc.exit_code, "switch_not_written",
+         f"{done}, but its switch ({'on' if served else 'off'}) was not written: {exc.message}",
+         f"`{NAME} serve {room_id} {'on' if served else 'off'}` writes it; until it is, the "
+         "service serves the room")
+
+
+def _own_membership(m: Matrix, cfg: dict, room_id: str) -> str | None:
+    """This agent's membership of the room as its member event says, or None
+    where it cannot read one."""
+    try:
+        found = m.call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/state/m.room.member/"
+                              f"{_q(cfg['user_id'])}")
+    except MatrixError:
+        return None
+    return (found or {}).get("membership")
 
 
 def _pending_invite(m: Matrix, cfg: dict, room_id: str) -> dict | None:
@@ -7286,6 +7477,8 @@ def cmd_rooms(cfg: dict, archived: bool = False) -> dict:
                     row["marked"] = (event.get("content") or {}).get("marked") is True
                 elif event.get("type") == GRANT_TYPE:
                     grant = _engine().read_grant(event.get("content"))
+                elif event.get("type") == SERVED_TYPE:
+                    row["served"] = _engine().read_served(event.get("content"))["served"]
             row["grant"] = _grant_view(grant)
             row["held"] = None
             joined.append(row)
@@ -7376,7 +7569,7 @@ def cmd_read(cfg: dict, room: str, limit: int) -> dict:
 # ── watch ────────────────────────────────────────────────────────────────────
 
 # What `watch` follows: every room event, read receipts, this connection's
-# mark and grant, its archive record and its block list. The first sync only
+# mark, grant and switch, its archive record and its block list. The first sync only
 # takes the position and what the agent's account data holds, so nothing from
 # before it prints.
 WATCH_ACCOUNT_TYPES = [ARCHIVE_TYPE, IGNORED_TYPE]
@@ -7387,7 +7580,7 @@ WATCH_FILTER = {
         "timeline": {"limit": 50},
         "state": {"types": ROOM_STATE_TYPES},
         "ephemeral": {"types": ["m.receipt"]},
-        "account_data": {"types": [MARK_TYPE, GRANT_TYPE]},
+        "account_data": {"types": [MARK_TYPE, GRANT_TYPE, SERVED_TYPE]},
     },
 }
 WATCH_START_FILTER = {
@@ -7448,6 +7641,7 @@ def _live_room_row(m: Matrix, cfg: dict, room_id: str,
         if exc.exit_code != 3:
             raise
     row["grant"] = _grant_view(_read_grant(m, cfg, room_id))
+    row["served"] = _read_served(m, cfg, room_id)
     row["held"] = held_of(room_id) if held_of is not None else None
     return row
 
@@ -7544,6 +7738,9 @@ def _watch_lines(m: Matrix, cfg: dict, sync: dict, rooms: set | None,
                 elif event.get("type") == GRANT_TYPE:
                     out.append({"event": "grant", "room_id": room_id, "grant": _grant_view(
                         _engine().read_grant(event.get("content")))})
+                elif event.get("type") == SERVED_TYPE:
+                    out.append({"event": "served", "room_id": room_id,
+                                "served": _engine().read_served(event.get("content"))["served"]})
     return out + after
 
 
@@ -7699,6 +7896,7 @@ def cmd_open(cfg: dict, name: str, invites: list[str], topic: str | None) -> dic
         body["topic"] = topic
     # Inviting is consent: the room's wake grant names the invited alone.
     grant = {"everyone": False, "users": invited}
+    served = _room_default(cfg["id"], "opened")
     with _matrix(cfg) as m:
         try:
             found = m.call("POST", "/_matrix/client/v3/createRoom", body=body, idempotent=False)
@@ -7712,9 +7910,13 @@ def cmd_open(cfg: dict, name: str, invites: list[str], topic: str | None) -> dic
                                f"`{NAME} grant everyone {room_id} off` then `{NAME} grant add "
                                f"{room_id} WHO` for each invited user writes it - do not open "
                                "the room again")
+        try:
+            _write_served(m, cfg, room_id, served)
+        except MatrixError as exc:
+            _switch_not_written(room_id, exc, f"room {room_id} was opened", served)
     return {"room_id": room_id, "name": name, "room_version": ROOM_VERSION,
             "federate": False, "encrypted": False, "invited": invited,
-            "grant": _grant_view(grant)}
+            "grant": _grant_view(grant), "served": served}
 
 
 def cmd_invite(cfg: dict, room: str, who: str, message: str | None) -> dict:
@@ -7760,6 +7962,16 @@ def cmd_join(cfg: dict, room: str) -> dict:
             with contextlib.suppress(MatrixError):
                 _write_grant(m, cfg, target, grant)
                 written = True
+        # A room joined anew starts as the agent's `accepted` default says, written
+        # before the join where the homeserver allows, so the service's first
+        # sync of the room already reads it; a room it is in keeps its switch.
+        switch = None if _own_membership(m, cfg, target) == "join" else \
+            _room_default(cfg["id"], "accepted")
+        switched = False
+        if switch is not None:
+            with contextlib.suppress(MatrixError):
+                _write_served(m, cfg, target, switch)
+                switched = True
         try:
             found = m.call("POST", f"/_matrix/client/v3/join/{_q(target)}", body={},
                            idempotent=True)
@@ -7778,12 +7990,18 @@ def cmd_join(cfg: dict, room: str) -> dict:
                 _grant_not_written(room_id, exc, f"joined {room_id}",
                                    f"`{NAME} grant everyone {room_id} off` and `{NAME} grant add "
                                    f"{room_id} {invite['inviter']}` write it")
-        if grant is None:
+        if switch is not None and not switched:
             try:
-                grant = _read_grant(m, cfg, room_id)
+                _write_served(m, cfg, room_id, switch)
             except MatrixError as exc:
-                _fail(exc)
-    return {"room_id": room_id, "joined": True, "grant": _grant_view(grant)}
+                _switch_not_written(room_id, exc, f"joined {room_id}", switch)
+        try:
+            if grant is None:
+                grant = _read_grant(m, cfg, room_id)
+            served = switch if switch is not None else _read_served(m, cfg, room_id)
+        except MatrixError as exc:
+            _fail(exc)
+    return {"room_id": room_id, "joined": True, "grant": _grant_view(grant), "served": served}
 
 
 def cmd_leave(cfg: dict, room: str) -> dict:
@@ -7900,6 +8118,22 @@ def cmd_mark(cfg: dict, room: str, marked: bool) -> dict:
     return {"room_id": room_id, "marked": marked}
 
 
+def cmd_serve(cfg: dict, room: str, served: bool) -> dict:
+    """Switch the service on or off for this agent in a room it is in. Switched
+    on, it wakes only on what arrives from now on."""
+    with _matrix(cfg) as m:
+        room_id = _resolve_room(m, cfg, room)
+        if _own_membership(m, cfg, room_id) != "join":
+            _die(6, "not_member", f"this agent is not in {room_id}",
+                 f"`{NAME} rooms` lists the rooms it is in")
+        _refuse_encrypted(m, room_id)
+        try:
+            _write_served(m, cfg, room_id, served, since_now=True)
+        except MatrixError as exc:
+            _fail(exc)
+    return {"room_id": room_id, "served": served}
+
+
 def cmd_grant(cfg: dict, action: str, room: str, who: str | None, on: bool | None) -> dict:
     """Read or change a room's wake grant. A change to a room with no grant
     starts from what it admits now: everyone."""
@@ -7951,6 +8185,17 @@ def cmd_held(args, wanted: str | None) -> dict:
             return {"connection": cid, "user_id": entry.get("user_id"),
                     "held": store.held(project, cid, room_id)}
         if action == "answer":
+            cfg = _cfg(wanted, "held")
+            with _matrix(cfg) as m:
+                try:
+                    served = _read_served(m, cfg, room_id)
+                except MatrixError as exc:
+                    _fail(exc)
+            if not served:
+                _die(6, "room_not_served", f"the service is switched off in {room_id}, so no "
+                     "turn would answer what it holds",
+                     f"`{NAME} serve {room_id} on` switches it on; `{NAME} held dismiss "
+                     f"{room_id}` drops what it holds")
             return {"room_id": room_id, "answered": store.answer_held(project, cid, room_id,
                                                                       sender)}
         return {"room_id": room_id, "dismissed": store.dismiss_held(project, cid, room_id, sender)}
@@ -8174,7 +8419,8 @@ def _join_directory(m: Matrix, cfg: dict) -> str:
 
 
 def _card(content: Any) -> dict | None:
-    """A card as recorded, or None where it is empty or cleared."""
+    """A card an earlier release recorded in the directory, or None where it is
+    empty or cleared."""
     content = content if isinstance(content, dict) else {}
     card = {key: content.get(key) if isinstance(content.get(key), str) and content.get(key)
             else None for key in CARD_LIMITS}
@@ -8186,7 +8432,8 @@ def _card_path(room_id: str, user_id: str) -> str:
 
 
 def _read_card(m: Matrix, room_id: str, user_id: str) -> dict | None:
-    """A member's card, or None where it has none. Raises MatrixError."""
+    """A member's card as an earlier release recorded it in the directory, or
+    None where it has none. Raises MatrixError."""
     try:
         return _card(m.call("GET", _card_path(room_id, user_id)))
     except MatrixError as exc:
@@ -8195,17 +8442,223 @@ def _read_card(m: Matrix, room_id: str, user_id: str) -> dict | None:
         raise
 
 
+def _member_of(m: Matrix, room_id: str | None, user_id: str) -> bool:
+    """Whether `user_id` is joined to the room, as its own member event says.
+    Raises MatrixError for anything but a room this agent cannot read."""
+    if room_id is None:
+        return False
+    try:
+        found = m.call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/state/m.room.member/"
+                              f"{_q(user_id)}")
+    except MatrixError as exc:
+        if exc.exit_code == 3 or exc.code == "forbidden":
+            return False
+        raise
+    return (found or {}).get("membership") == "join"
+
+
+def _profile_path(user_id: str, field: str | None = None, unstable: bool = False) -> str:
+    base = ("/_matrix/client/unstable/uk.tcpip.msc4133" if unstable
+            else "/_matrix/client/v3") + f"/profile/{_q(user_id)}"
+    return base if field is None else f"{base}/{_q(field)}"
+
+
+def _read_profile(m: Matrix, user_id: str) -> dict:
+    """A user's whole profile; {} where it has none. Raises MatrixError, exit 3
+    for a user the homeserver does not know."""
+    found = m.call("GET", _profile_path(user_id))
+    return found if isinstance(found, dict) else {}
+
+
+def _put_profile(m: Matrix, user_id: str, field: str, value: str | None) -> None:
+    """Set one field of this agent's own profile, or take it off with None.
+    A field of the extended profile is written at the stable path, else at the
+    unstable one a homeserver offered first. Raises MatrixError."""
+    for unstable in (False, True):
+        path = _profile_path(user_id, field, unstable)
+        try:
+            if value is None:
+                m.call("DELETE", path)
+            else:
+                m.call("PUT", path, body={field: value})
+            return
+        except MatrixError as exc:
+            if value is None and exc.exit_code == 3 and exc.errcode == "M_NOT_FOUND":
+                return
+            unknown = exc.errcode == "M_UNRECOGNIZED" or (exc.status in (404, 405)
+                                                          and exc.errcode != "M_NOT_FOUND")
+            if unstable or field in ("displayname", "avatar_url") or not unknown:
+                raise
+
+
+def _localpart(user_id: str) -> str:
+    return user_id[1:].split(":", 1)[0]
+
+
+def _profile_card(user_id: str, profile: dict, legacy: dict | None = None,
+                  supervisor: str | None = None) -> dict | None:
+    """A card as the profile carries it: name, about, supervisor and avatar. A
+    card an earlier release recorded in the directory and its agent has not
+    moved yet (`legacy`) fills what the profile lacks; the supervisor of an
+    agent declared here is its connection's (`supervisor`). None where there
+    is nothing beyond what registration wrote: no about, no supervisor, no
+    avatar, and a display name that is the localpart or none."""
+    def text(value) -> str | None:
+        return value if isinstance(value, str) and value else None
+    legacy = legacy or {}
+    shown = text(profile.get("displayname"))
+    avatar = text(profile.get("avatar_url"))
+    card = {"name": legacy.get("name") or shown,
+            "about": text(profile.get(PROFILE_FIELDS["about"])) or legacy.get("about"),
+            "supervisor": supervisor or text(profile.get(PROFILE_FIELDS["supervisor"]))
+            or legacy.get("supervisor"),
+            "avatar": {"mxc": avatar} if avatar and avatar.startswith("mxc://") else None}
+    if card["about"] or card["supervisor"] or card["avatar"]:
+        return card
+    if card["name"] and (legacy.get("name") or card["name"] != _localpart(user_id)):
+        return card
+    return None
+
+
+def _declared_supervisors() -> dict:
+    """The supervisor of each agent this project, or the machine, declares, by
+    its user id. Local only."""
+    try:
+        conns = _inventory_connections().get("connections") or {}
+        settings = _binding_settings() if _project_root() is not None else {}
+    except StoreError:
+        return {}
+    out = {}
+    for cid, entry in conns.items():
+        user = (entry or {}).get("user_id")
+        if user:
+            out[user] = _supervisor_of(cid, entry, settings)
+    return out
+
+
+def _move_card(m: Matrix, cfg: dict, room_id: str | None = None) -> dict | None:
+    """Move this agent's card out of the directory into its profile, with its
+    own token: the card's name over the display name registration wrote, its
+    about where the profile has none, then the state event cleared. Answers
+    the card moved, or None where there was none to move. Raises MatrixError."""
+    me = cfg["user_id"]
+    room_id = room_id or _directory_id(m, cfg)
+    if room_id is None or not _member_of(m, room_id, me):
+        return None
+    legacy = _read_card(m, room_id, me)
+    if legacy is None:
+        return None
+    profile = _read_profile(m, me)
+    if legacy.get("name") and legacy["name"] != profile.get("displayname"):
+        _put_profile(m, me, "displayname", legacy["name"])
+    if legacy.get("about") and not profile.get(PROFILE_FIELDS["about"]):
+        _put_profile(m, me, PROFILE_FIELDS["about"], legacy["about"])
+    m.call("PUT", _card_path(room_id, me), body={})
+    return legacy
+
+
+def _settle_supervisor(cfg: dict, legacy: dict | None) -> list[str]:
+    """Settle the agent's supervisor after its card moved: a card's supervisor
+    that is an account on its homeserver moves onto the connection where the
+    connection has none; where the two differ, the connection's stays and the
+    card's is said to be dropped. Answers what it did, as lines to log."""
+    said = []
+    carried = (legacy or {}).get("supervisor")
+    if not carried:
+        return said
+    held = cfg.get("supervisor")
+    if held:
+        if held != carried:
+            said.append(f"the card's supervisor {carried!r} is dropped: the connection names "
+                        f"{held}")
+        return said
+    problem = _supervisor_problem(carried, cfg["user_id"])
+    if problem:
+        said.append(f"the card's supervisor {carried!r} is dropped: {problem}; "
+                    f"`{NAME} workers supervisor WHO` names one")
+        return said
+    try:
+        _write_supervisor(cfg["id"], carried)
+        cfg["supervisor"] = carried
+        said.append(f"the card's supervisor {carried} moved onto the connection")
+    except _Refusal as exc:
+        said.append(f"the card's supervisor {carried} is not moved onto the connection: "
+                    f"{exc.code}: {exc.message}")
+    return said
+
+
+def _sync_supervisor(m: Matrix, cfg: dict) -> bool:
+    """Publish the connection's supervisor in the agent's profile where the
+    profile says otherwise. Answers whether it wrote. Raises MatrixError."""
+    field = PROFILE_FIELDS["supervisor"]
+    shown = _read_profile(m, cfg["user_id"]).get(field) or None
+    wanted = cfg.get("supervisor") or None
+    if shown == wanted:
+        return False
+    _put_profile(m, cfg["user_id"], field, wanted)
+    return True
+
+
+def _with_supervisor(cfg: dict) -> dict:
+    """The connection with its supervisor as `_supervisor_of` reads it, an
+    earlier release's copy in the project's binding setting included."""
+    if not cfg.get("supervisor") and _project_root() is not None:
+        with contextlib.suppress(StoreError):
+            cfg["supervisor"] = _supervisor_of(cfg["id"], cfg, _binding_settings())
+    return cfg
+
+
+def _move_own(m: Matrix, cfg: dict, room_id: str | None = None) -> list[str]:
+    """Move this agent's card into its profile and settle its supervisor with
+    it, then publish the connection's supervisor there. Answers what it did,
+    as lines to log. Raises MatrixError."""
+    said = []
+    legacy = _move_card(m, cfg, room_id)
+    if legacy is not None:
+        said.append("its card moved from the directory into its profile")
+        said.extend(_settle_supervisor(cfg, legacy))
+    if _sync_supervisor(m, cfg):
+        said.append(f"its supervisor {cfg.get('supervisor')} is published in its profile"
+                    if cfg.get("supervisor") else "its profile's supervisor is cleared")
+    return said
+
+
+def _take_up(cfg: dict) -> list[str]:
+    """What the agent's own token settles when the service takes it up. Raises
+    MatrixError."""
+    with _matrix(cfg) as m:
+        return _move_own(m, cfg)
+
+
+def _publish_supervisor(cid: str, entry: dict) -> dict:
+    """Publish a connection's supervisor in its agent's profile, where the
+    connection may write: {published} and, where it is not, why."""
+    cfg, problem = _build_cfg(cid, entry)
+    if problem:
+        return {"published": False, "unpublished": problem["message"]}
+    if not cfg["allow_write"] or read_only_switch():
+        return {"published": False,
+                "unpublished": "the connection does not write here; the service publishes it "
+                               "when it takes the agent up"}
+    try:
+        with _matrix(cfg) as m:
+            _sync_supervisor(m, cfg)
+    except MatrixError as exc:
+        return {"published": False, "unpublished": f"{exc.code}: {exc.message}"}
+    return {"published": True}
+
+
 def cmd_directory_create(cfg: dict) -> dict:
     alias = _directory_alias(cfg)
     body = {
         "name": "Agent directory", "room_version": ROOM_VERSION, "preset": "public_chat",
         "visibility": "private", "room_alias_name": DIRECTORY_ALIAS,
-        "topic": "Who is on this homeserver: each agent's card, published by the agent itself.",
+        "topic": "Who is on this homeserver: the agents that chose to be visible.",
         "creation_content": {"m.federate": False, "type": DIRECTORY_TYPE},
-        # Members publish their own card and nothing else: posting, inviting and
-        # every other state change need level 50, which no member holds. A card's
-        # state key is its writer's user id, which the homeserver lets only that
-        # user write, the creator included.
+        # Nobody posts in it: posting, inviting and every state change need
+        # level 50, which no member holds. An earlier release's cards are state
+        # events keyed by their writer's user id, which the homeserver lets only
+        # that user write, so each agent can still clear its own.
         "power_level_content_override": {"events_default": 50, "invite": 50,
                                          "state_default": 50, "events": {CARD_TYPE: 0}},
     }
@@ -8229,12 +8682,44 @@ def cmd_directory_create(cfg: dict) -> dict:
 
 
 def cmd_directory_join(cfg: dict) -> dict:
+    _with_supervisor(cfg)
     with _matrix(cfg) as m:
         room_id = _join_directory(m, cfg)
-    return {"room_id": room_id, "alias": _directory_alias(cfg), "joined": True}
+        with contextlib.suppress(MatrixError):
+            _move_own(m, cfg, room_id)
+    return {"room_id": room_id, "alias": _directory_alias(cfg), "joined": True, "visible": True}
+
+
+def cmd_directory_leave(cfg: dict) -> dict:
+    """Leave the directory, and with it be found by nobody this agent shares no
+    room with; every other room is left as it is. The card moves first, while
+    this agent can still clear what it recorded there."""
+    _with_supervisor(cfg)
+    with _matrix(cfg) as m:
+        try:
+            room_id = _directory_id(m, cfg)
+            if room_id is None:
+                _no_directory(cfg)
+            was = _member_of(m, room_id, cfg["user_id"])
+            if was:
+                with contextlib.suppress(MatrixError):
+                    _move_own(m, cfg, room_id)
+                m.call("POST", f"/_matrix/client/v3/rooms/{_q(room_id)}/leave", body={},
+                       idempotent=True)
+        except MatrixError as exc:
+            _fail(exc)
+    return {"room_id": room_id, "alias": _directory_alias(cfg), "left": was, "visible": False}
+
+
+def _not_in_directory(cfg: dict) -> NoReturn:
+    _die(6, "not_in_directory", f"{cfg['user_id']} is not in the directory "
+         f"{_directory_alias(cfg)}: an agent that is not visible does not see who is",
+         f"`{NAME} directory join` makes it visible, or read the directory through a visible "
+         "agent")
 
 
 def cmd_directory_list(cfg: dict) -> dict:
+    supervisors = _declared_supervisors()
     with _matrix(cfg) as m:
         try:
             room_id = _directory_id(m, cfg)
@@ -8243,58 +8728,130 @@ def cmd_directory_list(cfg: dict) -> dict:
             state = m.call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/state")
         except MatrixError as exc:
             if exc.code == "forbidden":
-                _die(6, "not_in_directory", f"{cfg['user_id']} is not in the directory "
-                     f"{_directory_alias(cfg)}", f"`{NAME} directory join` joins it")
+                _not_in_directory(cfg)
             _fail(exc)
-    state = [e for e in (state if isinstance(state, list) else []) if isinstance(e, dict)]
-    members = {e["state_key"]: (e.get("content") or {}).get("displayname")
-               for e in state if e.get("type") == "m.room.member"
-               and isinstance(e.get("state_key"), str)
-               and (e.get("content") or {}).get("membership") == "join"}
-    # Only a card its own member wrote, under its own user id, is that member's.
-    cards = {e["state_key"]: _card(e.get("content")) for e in state
-             if e.get("type") == CARD_TYPE and e.get("state_key") == e.get("sender")}
-    return {"room_id": room_id, "alias": _directory_alias(cfg),
-            "members": [{"user_id": user, "display_name": members[user],
-                         "card": cards.get(user)} for user in sorted(members)]}
+        state = [e for e in (state if isinstance(state, list) else []) if isinstance(e, dict)]
+        members = {e["state_key"]: (e.get("content") or {}).get("displayname")
+                   for e in state if e.get("type") == "m.room.member"
+                   and isinstance(e.get("state_key"), str)
+                   and (e.get("content") or {}).get("membership") == "join"}
+        # A member that left reads the state as it was at its leave, itself
+        # still joined in it on some homeservers; its own membership now says.
+        if cfg["user_id"] not in members or not _member_of(m, room_id, cfg["user_id"]):
+            _not_in_directory(cfg)
+        # Only a card its own member wrote, under its own user id, is that member's.
+        legacy = {e["state_key"]: _card(e.get("content")) for e in state
+                  if e.get("type") == CARD_TYPE and e.get("state_key") == e.get("sender")}
+        rows = []
+        for user in sorted(members):
+            try:
+                profile = _read_profile(m, user)
+            except MatrixError:
+                profile = {}
+            rows.append({"user_id": user, "display_name": members[user],
+                         "card": _profile_card(user, profile, legacy.get(user),
+                                               supervisors.get(user))})
+    return {"room_id": room_id, "alias": _directory_alias(cfg), "members": rows}
+
+
+def _avatar_upload(m: Matrix, path: Path) -> str:
+    mimetype = mimetypes.guess_type(path.name)[0] or ""
+    if not path.is_file():
+        _die(6, "bad_avatar", f"{path} is not a file")
+    if not mimetype.startswith("image/"):
+        _die(6, "bad_avatar", f"{path} is not an image ({mimetype or 'unknown type'})",
+             "give a PNG, JPEG, GIF or WebP file")
+    return _upload(m, path)["url"]
 
 
 def cmd_card(cfg: dict, action: str, who: str | None = None,
              fields: dict | None = None) -> dict:
-    user_id = _local_user(cfg, who) if who else cfg["user_id"]
+    me = cfg["user_id"]
+    user_id = _local_user(cfg, who) if who else me
+    given: dict = {}
     if action == "set":
-        given = {k: v for k, v in (fields or {}).items() if v is not None}
+        if (fields or {}).get("supervisor") is not None:
+            _die(6, "invalid_arguments", "the card's supervisor is the connection's",
+                 f"`{NAME} workers supervisor WHO` sets it, and the card shows it")
+        given = {k: v for k, v in (fields or {}).items() if v is not None and k != "supervisor"}
         if not given:
             _die(6, "invalid_arguments", "card set changes nothing without a field",
-                 "give --name, --about or --supervisor")
+                 "give --name, --about or --avatar")
         for key, value in given.items():
-            if not value.strip() or len(value) > CARD_LIMITS[key]:
+            if key in CARD_LIMITS and (not value.strip() or len(value) > CARD_LIMITS[key]):
                 _die(6, "invalid_arguments",
                      f"--{key} must be 1 to {CARD_LIMITS[key]} characters, not only spaces")
+    supervisor = (_declared_supervisors().get(user_id) if action == "show"
+                  else _with_supervisor(cfg)["supervisor"])
     with _matrix(cfg) as m:
-        if action == "show":
-            try:
-                room_id = _directory_id(m, cfg)
-                if room_id is None:
-                    _no_directory(cfg)
-                card = _read_card(m, room_id, user_id)
-            except MatrixError as exc:
-                if exc.code == "forbidden":
-                    _die(6, "not_in_directory", f"{cfg['user_id']} is not in the directory "
-                         f"{_directory_alias(cfg)}", f"`{NAME} directory join` joins it")
-                _fail(exc)
-            return {"user_id": user_id, "card": card}
-        room_id = _join_directory(m, cfg)
         try:
+            if action == "show":
+                profile = _read_profile(m, user_id)
+                room_id = _directory_id(m, cfg)
+                visible = _member_of(m, room_id, me)
+                legacy = None
+                if visible:
+                    with contextlib.suppress(MatrixError):
+                        legacy = _read_card(m, room_id, user_id)
+                if user_id != me:
+                    visible = _member_of(m, room_id, user_id) if visible else None
+                return {"user_id": user_id,
+                        "card": _profile_card(user_id, profile, legacy, supervisor),
+                        "visible": visible}
+            with contextlib.suppress(MatrixError):
+                _move_own(m, cfg)
             if action == "set":
-                card = {**(_read_card(m, room_id, user_id) or {}), **given}
-                content = {k: card[k] for k in CARD_LIMITS if card.get(k)}
+                avatar = (_avatar_upload(m, Path(given["avatar"]).expanduser())
+                          if given.get("avatar") else None)
+                if given.get("name"):
+                    _put_profile(m, me, "displayname", given["name"])
+                if given.get("about"):
+                    _put_profile(m, me, PROFILE_FIELDS["about"], given["about"])
+                if avatar:
+                    _put_profile(m, me, "avatar_url", avatar)
             else:
-                content = {}
-            m.call("PUT", _card_path(room_id, user_id), body=content)
+                _put_profile(m, me, PROFILE_FIELDS["about"], None)
+                _put_profile(m, me, "avatar_url", "")
+                _put_profile(m, me, "displayname", _localpart(me))
+            profile = _read_profile(m, me)
         except MatrixError as exc:
             _fail(exc)
-    return {"user_id": user_id, "card": _card(content)}
+    return {"user_id": me, "card": _profile_card(me, profile, None, supervisor)}
+
+
+def cmd_card_avatar(cfg: dict, who: str | None, out: str) -> dict:
+    """Download a card's avatar to `out`, through the homeserver's
+    authenticated media."""
+    user_id = _local_user(cfg, who) if who else cfg["user_id"]
+    target = Path(out).expanduser()
+    with _matrix(cfg) as m:
+        try:
+            mxc = _read_profile(m, user_id).get("avatar_url")
+        except MatrixError as exc:
+            _fail(exc)
+        if not isinstance(mxc, str) or not re.fullmatch(r"mxc://[^/\s]+/[^/\s]+", mxc):
+            _die(3, "avatar_not_found", f"{user_id} has no avatar")
+        server, media = mxc[len("mxc://"):].split("/", 1)
+        resp = None
+        for path in (f"/_matrix/client/v1/media/download/{_q(server)}/{_q(media)}",
+                     f"/_matrix/media/v3/download/{_q(server)}/{_q(media)}"):
+            try:
+                resp = m.call("GET", path, raw=True)
+                break
+            except MatrixError as exc:
+                if exc.exit_code != 3 and exc.errcode != "M_UNRECOGNIZED":
+                    _fail(exc)
+        if resp is None:
+            _die(3, "avatar_not_found", f"{mxc}, {user_id}'s avatar, is not on the homeserver")
+    data = resp.content
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    except OSError as exc:
+        _die(6, "bad_file", f"cannot write {target}: {exc}")
+    mimetype = (resp.headers.get("content-type") or "").split(";", 1)[0].strip() or None
+    return {"user_id": user_id, "mxc": mxc, "path": str(target), "mimetype": mimetype,
+            "size": len(data)}
 
 
 # ── register ─────────────────────────────────────────────────────────────────
@@ -8342,12 +8899,43 @@ def _write_env_key(path: Path, key: str, value: str) -> None:
         _die(5, "credentials_write_failed", f"{path} does not read back the value written for {key}")
 
 
+def _published_identity(cfg: dict) -> dict:
+    """What a new connection settles with its own token as it is made: the
+    agent joined to the directory, which makes it visible, and its supervisor
+    published in its profile. {visible} with `visible_unset` saying why where it
+    is not, and `supervisor_unpublished` where the supervisor is not published."""
+    out: dict = {}
+    with _matrix(cfg) as m:
+        try:
+            room_id = _directory_id(m, cfg)
+            if room_id is None:
+                out.update(visible=False, visible_unset=f"{cfg['server']} has no directory "
+                           f"({_directory_alias(cfg)}); `{NAME} directory join` joins it once "
+                           "it is created")
+            else:
+                m.call("POST", f"/_matrix/client/v3/join/{_q(room_id)}", body={},
+                       idempotent=True)
+                out["visible"] = True
+        except MatrixError as exc:
+            out.update(visible=False, visible_unset=f"{exc.code}: {exc.message}")
+        if cfg.get("supervisor"):
+            try:
+                _sync_supervisor(m, cfg)
+            except MatrixError as exc:
+                out["supervisor_unpublished"] = f"{exc.code}: {exc.message}"
+    return out
+
+
 def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
-                 make_default: bool) -> dict:
+                 make_default: bool, supervisor: str | None = None) -> dict:
     _read_only_gate(f"`{NAME} register`")
     if not LOCALPART_RE.fullmatch(name):
         _die(6, "bad_name", f"NAME {name!r} is not a Matrix localpart",
              "lowercase letters, digits and . _ = -, starting with a letter or digit")
+    if supervisor is not None:
+        problem = _supervisor_problem(supervisor, None)
+        if problem:
+            _die(6, "bad_user", problem, "e.g. --supervisor @person:example.org")
     cid = as_id or name
     if not KEY_RE.fullmatch(cid):
         _die(6, "bad_connection_id", f"connection id {cid!r} must match {KEY_RE.pattern}")
@@ -8426,6 +9014,9 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
     _write_env_key(credentials, secret_env, access)
     entry = {"homeserver": homeserver, "user_id": user_id, "secret_env": secret_env,
              "device_id": device}
+    unset = _supervisor_problem(supervisor, user_id) if supervisor is not None else None
+    if supervisor is not None and unset is None:
+        entry["supervisor"] = supervisor
     try:
         adapter.set(NAME, "connection", cid, entry, scope="project")
         if make_default:
@@ -8433,11 +9024,18 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
         registry = adapter.scope_source(NAME, "connection", "project")
     except StoreError as e:
         _die(6, e.slug, e.message, e.hint)
-    return {"registered": True, "connection": cid, "user_id": user_id, "homeserver": homeserver,
-            "device_id": device, "secret_env": secret_env, "credentials": str(credentials),
-            "registry": str(registry), "default": make_default, "allow_write": WRITE_DEFAULT,
-            "next": f"writes need a grant: ask the user to run `capabilities set {NAME} grant "
-                    f"{cid} '{{\"allow_write\": true}}'` in this project"}
+    out = {"registered": True, "connection": cid, "user_id": user_id, "homeserver": homeserver,
+           "device_id": device, "secret_env": secret_env, "credentials": str(credentials),
+           "registry": str(registry), "default": make_default, "allow_write": WRITE_DEFAULT,
+           "supervisor": entry.get("supervisor")}
+    if unset:
+        out["supervisor_unset"] = unset
+    out.update(_published_identity({"id": cid, "homeserver": homeserver, "user_id": user_id,
+                                    "server": _server_of(user_id), "token": access,
+                                    "supervisor": entry.get("supervisor")}))
+    out["next"] = (f"writes need a grant: ask the user to run `capabilities set {NAME} grant "
+                   f"{cid} '{{\"allow_write\": true}}'` in this project")
+    return out
 
 
 def _read_password() -> str:
@@ -8451,11 +9049,15 @@ def _read_password() -> str:
 
 
 def cmd_login(user_id: str, homeserver_flag: str | None, as_id: str | None, scope: str,
-              make_default: bool) -> dict:
+              make_default: bool, supervisor: str | None = None) -> dict:
     _read_only_gate(f"`{NAME} login`")
     if not USER_RE.fullmatch(user_id):
         _die(6, "bad_user", f"{user_id!r} is not a user id (@name:server)",
              "e.g. @person:example.org")
+    if supervisor is not None:
+        problem = _supervisor_problem(supervisor, user_id)
+        if problem:
+            _die(6, "bad_user", problem, f"e.g. --supervisor @person:{_server_of(user_id)}")
     cid = as_id or user_id[1:].split(":", 1)[0]
     if not KEY_RE.fullmatch(cid):
         _die(6, "bad_connection_id", f"connection id {cid!r} must match {KEY_RE.pattern}",
@@ -8511,6 +9113,9 @@ def cmd_login(user_id: str, homeserver_flag: str | None, as_id: str | None, scop
     _write_env_key(credentials, secret_env, access)
     entry = {"homeserver": homeserver, "user_id": found, "secret_env": secret_env,
              "device_id": device}
+    kept = (declared or {}).get("supervisor")
+    if supervisor or kept:
+        entry["supervisor"] = supervisor or kept
     try:
         adapter.set(NAME, "connection", cid, entry, scope=scope)
         if make_default:
@@ -8520,7 +9125,14 @@ def cmd_login(user_id: str, homeserver_flag: str | None, as_id: str | None, scop
         _die(6, e.slug, e.message, e.hint)
     out = {"logged_in": True, "connection": cid, "scope": scope, "user_id": found,
            "homeserver": homeserver, "device_id": device, "secret_env": secret_env,
-           "credentials": str(credentials), "registry": str(registry), "default": make_default}
+           "credentials": str(credentials), "registry": str(registry), "default": make_default,
+           "supervisor": entry.get("supervisor")}
+    if supervisor:
+        with Matrix(homeserver, access) as m:
+            try:
+                _sync_supervisor(m, {"user_id": found, "supervisor": supervisor})
+            except MatrixError as exc:
+                out["supervisor_unpublished"] = f"{exc.code}: {exc.message}"
     machine_read = _machine_read("rooms")
     usable = (_inventory_connections(machine_read)["connections"].get(cid) or {})
     out["allow_write"] = bool(usable.get("allow_write")) and not machine_read
@@ -8582,9 +9194,16 @@ def cmd_turn(wanted: str | None, event_id: str):
 MACHINE_KEYS = ("version", "max_turns")
 DEFAULT_MAX_TURNS = 2
 # What binds an agent, kept in the project's `binding.<connection>` setting: the
-# worker bound to the agent, the workers bound to it per room, and its
-# supervisor's address. An earlier release kept them on the connection.
-BINDING_KEYS = ("worker", "rooms", "supervisor")
+# worker bound to the agent, the workers bound to it per room, and whether the
+# rooms it opens and the rooms it accepts start served. An earlier release kept
+# the worker keys on the connection, and the supervisor in this setting, whose
+# home is the connection now.
+BINDING_KEYS = ("worker", "rooms", "opened", "accepted")
+LEGACY_SUPERVISOR = "supervisor"
+# What `opened` and `accepted` mean while the project sets neither: a room the
+# agent opens is its operator's, left to interactive use; a room it accepts is
+# one it was asked into, and is served.
+ROOM_DEFAULTS = {"opened": False, "accepted": True}
 _PROJECT_POINTERS = ("CLAUDE_PROJECT_DIR", "CAPABILITIES_PROJECT_ID",
                      "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_PROJECT_ENVELOPE",
                      "CAPABILITIES_PROJECT_ENVELOPE_ROOT")
@@ -9118,9 +9737,34 @@ class _Host:
         def question():
             found = (_connections_composed().get("connections") or {}).get(cid) or {}
             try:
-                return _binding_of(cid, found, _binding_settings())
+                settings = _binding_settings()
+                return {**_binding_of(cid, found, settings),
+                        "supervisor": _supervisor_of(cid, found, settings)}
             except StoreError as exc:
                 raise _Refusal(6, exc.slug, exc.message, exc.hint) from None
+
+        with self.lock:
+            return _ask_in_project(root, question)
+
+    def take_up(self, entry: dict, cid: str) -> list[str]:
+        """What the agent's own token settles once the service serves it: its
+        card moved into its profile, its supervisor published there."""
+        root = Path(entry["root"])
+
+        def question():
+            cfg, problem = _build_cfg(cid, (_connections_composed().get("connections")
+                                            or {}).get(cid))
+            if problem:
+                return [f"not taken up: {problem['message']}"]
+            try:
+                settings = _binding_settings()
+            except StoreError:
+                settings = {}
+            cfg["supervisor"] = _supervisor_of(cid, cfg, settings)
+            try:
+                return _take_up(cfg)
+            except MatrixError as exc:
+                return [f"not taken up: {exc.code}: {exc.message}"]
 
         with self.lock:
             return _ask_in_project(root, question)
@@ -9180,8 +9824,51 @@ def _binding_of(cid: str, entry: dict | None, settings: dict) -> dict:
     """What binds an agent: this project's `binding.<connection>` setting, else
     the keys an earlier release wrote onto the connection itself."""
     held = settings.get(f"binding.{cid}")
-    source = held if isinstance(held, dict) else (entry or {})
+    source = held if isinstance(held, dict) else {
+        key: value for key, value in (entry or {}).items() if key in ("worker", "rooms")}
     return {key: source.get(key) for key in BINDING_KEYS}
+
+
+def _room_defaults(bound: dict) -> dict:
+    """Whether the rooms an agent opens and the rooms it accepts start served."""
+    return {key: bound.get(key) if isinstance(bound.get(key), bool) else default
+            for key, default in ROOM_DEFAULTS.items()}
+
+
+def _supervisor_of(cid: str, entry: dict | None, settings: dict) -> str | None:
+    """The agent's supervisor: its connection's, else what an earlier release
+    kept in the project's `binding.<connection>` setting."""
+    value = (entry or {}).get("supervisor")
+    if isinstance(value, str) and value:
+        return value
+    held = settings.get(f"binding.{cid}")
+    legacy = held.get(LEGACY_SUPERVISOR) if isinstance(held, dict) else None
+    return legacy if isinstance(legacy, str) and legacy else None
+
+
+def _room_default(cid: str, which: str) -> bool:
+    """`opened` or `accepted` for the agent, as this project sets it; outside a
+    project, or where its settings cannot be read, what ROOM_DEFAULTS says."""
+    if _project_root() is None:
+        return ROOM_DEFAULTS[which]
+    try:
+        ident = _records().resolve(NAME, "connection").get(cid) or {}
+        bound = _binding_of(cid, ident.get("value"), _binding_settings())
+    except StoreError:
+        return ROOM_DEFAULTS[which]
+    return _room_defaults(bound)[which]
+
+
+def _settings_check(scope: str, document) -> list[str]:
+    """What the settings document holds that this capability refuses: an agent's
+    `opened` or `accepted` that is not true or false."""
+    problems = []
+    bindings = document.get("binding") if isinstance(document, dict) else None
+    for cid, bound in sorted((bindings or {}).items() if isinstance(bindings, dict) else []):
+        for key in ROOM_DEFAULTS:
+            if isinstance(bound, dict) and key in bound and not isinstance(bound[key], bool):
+                problems.append(f"binding.{cid}.{key} is true or false, not {bound[key]!r}")
+    return problems
 
 
 def _write_binding(cid: str, changes: dict) -> tuple[dict, str]:
@@ -9195,19 +9882,80 @@ def _write_binding(cid: str, changes: dict) -> tuple[dict, str]:
         ident = adapter.resolve(NAME, "connection").get(cid)
         if ident is None or not ident.get("value"):
             raise _Refusal(3, "unknown_connection", f"no connection {cid!r} is declared here")
-        current = _binding_of(cid, ident["value"], _binding_settings())
+        settings = _binding_settings()
+        current = _binding_of(cid, ident["value"], settings)
+        legacy = _supervisor_of(cid, {}, settings)
         value = {key: held for key, held in current.items() if held not in (None, {})}
         for key, wanted in changes.items():
             if wanted is None or wanted == {}:
                 value.pop(key, None)
             else:
                 value[key] = wanted
+        # An earlier release's supervisor in this setting moves onto the
+        # connection, its home now, where the connection names none.
+        entry = dict(ident["value"])
+        moved = bool(legacy) and not entry.get("supervisor") and \
+            _supervisor_problem(legacy, entry.get("user_id")) is None
         adapter.set(NAME, "setting", f"binding.{cid}", value, scope="project")
-        if ident.get("scope") == "project" and set(ident["value"]) & set(BINDING_KEYS):
-            adapter.set(NAME, "connection", cid,
-                        {k: v for k, v in ident["value"].items() if k not in BINDING_KEYS},
-                        scope="project")
+        if moved:
+            entry["supervisor"] = legacy
+        if ident.get("scope") == "project" and set(entry) & {"worker", "rooms"}:
+            entry = {k: v for k, v in entry.items() if k not in ("worker", "rooms")}
+            moved = True
+        if moved:
+            adapter.set(NAME, "connection", cid, entry, scope=_write_scope(ident))
         return value, adapter.scope_source(NAME, "setting", "project")
+    except StoreError as e:
+        raise _Refusal(4 if e.slug == "read_only_switch" else 6, e.slug, e.message,
+                       e.hint) from None
+
+
+def _supervisor_problem(value: str, user_id: str | None) -> str | None:
+    """Why `value` cannot be the supervisor of the agent `user_id`, or None: it
+    is a Matrix user id on the agent's own homeserver."""
+    if not isinstance(value, str) or not USER_RE.fullmatch(value):
+        return f"{value!r} is not a Matrix user id (@name:server)"
+    if user_id and _server_of(value) != _server_of(user_id):
+        return (f"{value} is on {_server_of(value)}, and the agent {user_id} on "
+                f"{_server_of(user_id)}: a supervisor is an account on the agent's homeserver")
+    return None
+
+
+def _write_scope(ident: dict) -> str:
+    """The scope a resolved connection is written back at: the one that declares
+    it, where a connection held in the store is the project's."""
+    scope = ident.get("scope") or "project"
+    return "project" if scope == "store" else scope
+
+
+def _write_supervisor(cid: str, value: str | None) -> tuple[dict, str]:
+    """Set the supervisor on the agent's connection, at the scope that declares
+    it, or take it off with None; an earlier release's copy in the project's
+    binding setting is taken off with it. Answers the connection entry and
+    where it is kept. Raises _Refusal."""
+    adapter = _records()
+    try:
+        ident = adapter.resolve(NAME, "connection").get(cid)
+        if ident is None or not ident.get("value"):
+            raise _Refusal(3, "unknown_connection", f"no connection {cid!r} is declared here")
+        entry = dict(ident["value"])
+        if value is not None:
+            problem = _supervisor_problem(value, entry.get("user_id"))
+            if problem:
+                raise _Refusal(6, "bad_user", problem, "e.g. @person:" + (
+                    _server_of(entry.get("user_id") or "") or "example.org"))
+            entry["supervisor"] = value
+        else:
+            entry.pop("supervisor", None)
+        scope = _write_scope(ident)
+        adapter.set(NAME, "connection", cid, entry, scope=scope)
+        if _project_root() is not None:
+            held = _binding_settings().get(f"binding.{cid}")
+            if isinstance(held, dict) and LEGACY_SUPERVISOR in held:
+                adapter.set(NAME, "setting", f"binding.{cid}",
+                            {k: v for k, v in held.items() if k != LEGACY_SUPERVISOR},
+                            scope="project")
+        return entry, adapter.scope_source(NAME, "connection", scope)
     except StoreError as e:
         raise _Refusal(4 if e.slug == "read_only_switch" else 6, e.slug, e.message,
                        e.hint) from None
@@ -9326,7 +10074,7 @@ def _shipped_default() -> dict:
     text = path.read_text()
     spec, body = engine.split_document(text, str(path))
     return {"worker": engine.DEFAULT_WORKER, "source": "shipped", "path": str(path),
-            "spec": spec, "body": body, "text": text}
+            "active": True, "spec": spec, "body": body, "text": text}
 
 
 def _read_input(source: str) -> str:
@@ -9348,7 +10096,8 @@ def _bindings() -> dict:
     for cid, e in sorted(conns.items()):
         bound = _binding_of(cid, e, settings)
         out[cid] = {"user_id": e.get("user_id"), "worker": bound["worker"],
-                    "rooms": bound["rooms"] or {}, "supervisor": bound["supervisor"],
+                    "rooms": bound["rooms"] or {}, "supervisor": _supervisor_of(cid, e, settings),
+                    **_room_defaults(bound),
                     "granted": bool(e.get("granted")), "allow_write": bool(e.get("allow_write"))}
     return out
 
@@ -9361,7 +10110,8 @@ def cmd_workers(args, wanted: str | None) -> None:
         _die(6, "input", "workers belong to a project, and this is not one",
              "run this where the project whose agents they answer is")
     if action in ("save", "remove", "bind", "unbind", "import") or \
-            (action == "supervisor" and (args.user_id or args.clear)):
+            (action == "supervisor" and (args.user_id or args.clear)) or \
+            (action == "defaults" and (args.opened or args.accepted)):
         if action != "import" or args.apply:
             _turn_gate(action)
             _read_only_gate(f"`{NAME} workers {action}`")
@@ -9375,17 +10125,10 @@ def cmd_workers(args, wanted: str | None) -> None:
             _emit(found or {"settings": str(_settings_path(root)), "moved": {},
                             "reason": "there is no agents map to move"})
             return
-        if action in ("bind", "unbind", "supervisor"):
+        if action in ("bind", "unbind", "supervisor", "defaults"):
             _emit(_cmd_binding(args, wanted))
             return
         project, _slug = _identity_here()
-        if action == "show" and name == engine.DEFAULT_WORKER and not args.version:
-            _emit(_shipped_default())
-            return
-        if action in ("save", "remove") and name == engine.DEFAULT_WORKER:
-            _die(6, "input", f"`{engine.DEFAULT_WORKER}` is the shipped worker that answers "
-                 "senders no worker admits; it is not saved or removed",
-                 "save the worker under another name and bind it")
         store = _open_store(root)
     except _Refusal as exc:
         _refused(exc)
@@ -9396,13 +10139,25 @@ def cmd_workers(args, wanted: str | None) -> None:
                      "description": str(r["spec"].get("description") or "").strip(),
                      "updated_at": r["created_at"], "updated_by": r["created_by"]}
                     for r in store.workers(project)]
-            shipped = _shipped_default()
-            rows.append({"worker": shipped["worker"], "source": "shipped",
-                         "path": shipped["path"], "enabled": True,
-                         "description": str(shipped["spec"].get("description") or "").strip()})
+            # One `default` answers an agent no worker is bound to: the project's
+            # where it saved one, else the shipped one.
+            for row in rows:
+                if row["worker"] == engine.DEFAULT_WORKER:
+                    row["answers"] = row["enabled"] is not False
+                    break
+            else:
+                shipped = _shipped_default()
+                rows.append({"worker": shipped["worker"], "source": "shipped",
+                             "path": shipped["path"],
+                             "enabled": shipped["spec"].get("enabled", True), "answers": True,
+                             "description": str(shipped["spec"].get("description")
+                                                or "").strip()})
             _emit({"workers": rows, "bindings": _bindings()})
         elif action == "show":
             row = store.worker(project, name, args.version)
+            if row is None and name == engine.DEFAULT_WORKER and not args.version:
+                _emit(_shipped_default())
+                return
             if row is None:
                 _die(3, "not_found", f"no worker named {name!r}"
                      + (f" at version {args.version}" if args.version else "") + " here",
@@ -9448,14 +10203,15 @@ def cmd_workers(args, wanted: str | None) -> None:
 
 
 def _cmd_binding(args, wanted: str | None) -> dict:
-    """bind, unbind and supervisor: the keys the selected agent's connection
-    carries. Raises _Refusal."""
+    """bind, unbind, defaults and supervisor: what binds the selected agent in
+    this project, and its connection's supervisor. Raises _Refusal."""
     engine = _engine()
     reg, _ = _connections_registry()
     cid, entry = _select_connection(reg, wanted)
     entry = entry or {}
     try:
-        bound = _binding_of(cid, entry, _binding_settings())
+        settings = _binding_settings()
+        bound = _binding_of(cid, entry, settings)
     except StoreError as e:
         raise _Refusal(6, e.slug, e.message, e.hint) from None
     room_id = None
@@ -9468,13 +10224,22 @@ def _cmd_binding(args, wanted: str | None) -> dict:
     if args.action == "supervisor":
         if not args.user_id and not args.clear:
             return {"connection": cid, "user_id": entry.get("user_id"),
-                    "supervisor": bound["supervisor"]}
+                    "supervisor": _supervisor_of(cid, entry, settings)}
         if args.user_id and args.clear:
             raise _Refusal(6, "input", "supervisor takes a user id or --clear, not both")
-        if args.user_id and not USER_RE.fullmatch(args.user_id):
-            raise _Refusal(6, "input", f"{args.user_id!r} is not a Matrix user id (@name:server)")
-        value, where = _write_binding(cid, {"supervisor": None if args.clear else args.user_id})
-        return {"connection": cid, "supervisor": value.get("supervisor"), "registry": where}
+        written, where = _write_supervisor(cid, None if args.clear else args.user_id)
+        answer = {"connection": cid, "supervisor": written.get("supervisor"), "registry": where}
+        answer.update(_publish_supervisor(cid, {**entry, **written}))
+        return answer
+    if args.action == "defaults":
+        changes = {key: getattr(args, key) == "on" for key in ROOM_DEFAULTS
+                   if getattr(args, key)}
+        if changes:
+            value, where = _write_binding(cid, changes)
+            bound = _binding_of(cid, entry, {f"binding.{cid}": value})
+        else:
+            where = _records().scope_source(NAME, "setting", "project")
+        return {"connection": cid, **_room_defaults(bound), "registry": str(where)}
     rooms = dict(bound["rooms"]) if isinstance(bound["rooms"], dict) else {}
     if args.action == "bind":
         if args.name == engine.DEFAULT_WORKER:
@@ -9853,7 +10618,10 @@ def _doctor_workers(store, project: str, binding: dict) -> dict:
     out: dict = {"ok": True, "supervisor": binding.get("supervisor")}
     if not any(named.values()):
         out["bound"] = None
-        out["note"] = "no worker is bound: only the default worker answers this agent"
+        saved = store.worker(project, engine.DEFAULT_WORKER) if store is not None else None
+        out["note"] = ("no worker is bound: the project's default worker answers this agent"
+                       if saved else "no worker is bound: the shipped default worker answers "
+                       "this agent")
         return out
     rows = {}
     for where, name in named.items():
@@ -9885,6 +10653,30 @@ def _doctor_workers(store, project: str, binding: dict) -> dict:
                     out["ok"] = False
         rows[where] = row
     out["bound"] = rows
+    return out
+
+
+def _legacy_card_waiting(agent: dict, supervisor: str | None) -> dict | None:
+    """Where the agent's card still waits in the directory to move into its
+    profile, what is waiting and whether its supervisor can move with it."""
+    cfg = {"homeserver": agent["homeserver"], "token": agent["token"],
+           "user_id": agent["user_id"], "server": _server_of(agent["user_id"])}
+    try:
+        with _matrix(cfg, 20.0) as m:
+            room_id = _directory_id(m, cfg)
+            legacy = _read_card(m, room_id, cfg["user_id"]) if _member_of(
+                m, room_id, cfg["user_id"]) else None
+    except MatrixError:
+        return None
+    if legacy is None:
+        return None
+    out = {"legacy": legacy, "note": "this card waits in the directory; the service moves it "
+                                     "into the agent's profile when it takes the agent up"}
+    carried = legacy.get("supervisor")
+    if carried and not supervisor and _supervisor_problem(carried, cfg["user_id"]):
+        out["supervisor"] = (f"its supervisor {carried!r} is not an account on "
+                             f"{cfg['server']} and is dropped with the card; "
+                             f"`{NAME} workers supervisor WHO` names one")
     return out
 
 
@@ -9953,6 +10745,10 @@ def cmd_service_doctor(machine: bool) -> None:
                                              "user_id": agent["user_id"], "allow_write": True})
                     row["workers"] = _doctor_workers(store, plan["project_id"],
                                                      bindings.get(cid) or {})
+                    waiting = _legacy_card_waiting(agent, (bindings.get(cid) or {})
+                                                   .get("supervisor"))
+                    if waiting:
+                        row["card"] = waiting
                     if not row["workers"].get("ok", True) and row.get("ok"):
                         row.update(ok=False, category=6)
                     note(f"agent:{cid}", row)
@@ -10053,6 +10849,7 @@ def _parser() -> _Parser:
     register.add_argument("--homeserver")
     register.add_argument("--as", dest="as_id")
     register.add_argument("--default", action="store_true")
+    register.add_argument("--supervisor")
     login = sub.add_parser("login")
     login.add_argument("user_id")
     login.add_argument("--homeserver")
@@ -10061,6 +10858,7 @@ def _parser() -> _Parser:
     login_scope.add_argument("--global", dest="scope", action="store_const", const="global")
     login_scope.add_argument("--project", dest="scope", action="store_const", const="project")
     login.add_argument("--default", action="store_true")
+    login.add_argument("--supervisor")
     sub.add_parser("rooms").add_argument("--archived", action="store_true")
     sub.add_parser("watch").add_argument("--room", action="append")
     sub.add_parser("sessions").add_argument("--room")
@@ -10098,7 +10896,7 @@ def _parser() -> _Parser:
         bsub.add_parser(verb).add_argument("who")
     directory = sub.add_parser("directory")
     dsub = directory.add_subparsers(dest="action", required=True, parser_class=_Parser)
-    for verb in ("create", "join", "list"):
+    for verb in ("create", "join", "leave", "list"):
         dsub.add_parser(verb)
     card = sub.add_parser("card")
     csub = card.add_subparsers(dest="action", required=True, parser_class=_Parser)
@@ -10106,7 +10904,11 @@ def _parser() -> _Parser:
     card_set = csub.add_parser("set")
     for field in CARD_LIMITS:
         card_set.add_argument(f"--{field}")
+    card_set.add_argument("--avatar")
     csub.add_parser("clear")
+    avatar = csub.add_parser("avatar")
+    avatar.add_argument("who", nargs="?")
+    avatar.add_argument("--out", required=True)
     held = sub.add_parser("held")
     hsub = held.add_subparsers(dest="action", required=True, parser_class=_Parser)
     hsub.add_parser("list").add_argument("--room")
@@ -10116,6 +10918,9 @@ def _parser() -> _Parser:
         one.add_argument("--from", dest="sender")
     for verb in ("join", "leave", "mark", "unmark"):
         sub.add_parser(verb).add_argument("room")
+    serve = sub.add_parser("serve")
+    serve.add_argument("room")
+    serve.add_argument("state", choices=["on", "off"])
     post = sub.add_parser("post")
     post.add_argument("room")
     post.add_argument("text")
@@ -10145,6 +10950,9 @@ def _parser() -> _Parser:
     supervisor = wsub.add_parser("supervisor")
     supervisor.add_argument("user_id", nargs="?")
     supervisor.add_argument("--clear", action="store_true")
+    defaults = wsub.add_parser("defaults")
+    defaults.add_argument("--opened", choices=["on", "off"])
+    defaults.add_argument("--accepted", choices=["on", "off"])
     wsub.add_parser("import").add_argument("--apply", action="store_true")
     service = sub.add_parser("service")
     ssub = service.add_subparsers(dest="action", required=True, parser_class=_Parser)
@@ -10229,11 +11037,12 @@ def main() -> None:
         cmd_doctor(wanted)
         return
     if cmd == "register":
-        _emit(cmd_register(args.name, args.homeserver, args.as_id, args.default))
+        _emit(cmd_register(args.name, args.homeserver, args.as_id, args.default,
+                           args.supervisor))
         return
     if cmd == "login":
         _emit(cmd_login(args.user_id, args.homeserver, args.as_id, args.scope or "project",
-                        args.default))
+                        args.default, args.supervisor))
         return
     if cmd == "sessions":
         _emit(cmd_sessions(wanted, args.room))
@@ -10267,12 +11076,20 @@ def main() -> None:
     if cmd == "directory":
         cfg = _cfg(wanted, "directory" if args.action != "list" else "directory list")
         _emit({"create": cmd_directory_create, "join": cmd_directory_join,
-               "list": cmd_directory_list}[args.action](cfg))
+               "leave": cmd_directory_leave, "list": cmd_directory_list}[args.action](cfg))
         return
     if cmd == "card":
-        cfg = _cfg(wanted, "card" if args.action != "show" else "card show")
+        cfg = _cfg(wanted, "card" if args.action in ("set", "clear") else f"card {args.action}")
+        if args.action == "avatar":
+            _emit(cmd_card_avatar(cfg, args.who, args.out))
+            return
         _emit(cmd_card(cfg, args.action, getattr(args, "who", None),
-                       {k: getattr(args, k, None) for k in CARD_LIMITS}))
+                       {k: getattr(args, k, None) for k in (*CARD_LIMITS, "avatar")}))
+        return
+    if cmd == "serve":
+        _consent_gate(f"`{NAME} serve`")
+        cfg = _cfg(wanted, "serve")
+        _emit(cmd_serve(cfg, args.room, args.state == "on"))
         return
     cfg = _cfg(wanted, cmd)
     if cmd == "rooms":

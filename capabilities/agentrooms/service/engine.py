@@ -23,9 +23,11 @@ room account data on the homeserver and read from its syncs; a wake from a
 sender the grant does not name is recorded held and starts no turn until the
 operator answers it once or grants the sender. A worker then admits and limits
 an agent's turns. Which worker answers an agent in a
-room is read from the agent's connection at every turn, and the worker and its
+room is read from the agent's binding at every turn, and the worker and its
 profile from the store, so a saved worker or a new binding holds from the next
-turn on.
+turn on; an agent no worker is bound to is answered by the project's `default`,
+else the one this capability ships. Whether the service acts in a room at all is
+the room's switch, kept beside its grant: nothing in a room switched off wakes.
 """
 
 from __future__ import annotations
@@ -222,6 +224,10 @@ MARK_TYPE = "agentrooms.marked"
 # The room account data the operator's wake grant is kept in: {"everyone": bool,
 # "users": [user id]}. A room with none admits everyone.
 GRANT_TYPE = "agentrooms.grant"
+# The room account data that switches the service on or off in a room: {"served":
+# bool, "since": ms}. A room with none is served. A room switched on wakes only on
+# what arrived after `since`, the moment it was switched on.
+SERVED_TYPE = "agentrooms.served"
 # The room type the homeserver's directory is created with: nothing in it wakes
 # an agent.
 DIRECTORY_TYPE = "agentrooms.directory"
@@ -244,7 +250,7 @@ SYNC_FILTER = {
     "room": {
         "timeline": {"limit": 50},
         "ephemeral": {"not_types": ["*"]},
-        "account_data": {"types": [MARK_TYPE, GRANT_TYPE]},
+        "account_data": {"types": [MARK_TYPE, GRANT_TYPE, SERVED_TYPE]},
     },
 }
 
@@ -255,18 +261,24 @@ SYNC_FILTER = {
 # and the content is the project's; a key the contract does not name is refused.
 
 WORKER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+# The worker that answers an agent no worker is bound to: the project's own
+# `default` where it saved one, else the one this capability ships.
 DEFAULT_WORKER = "default"
 DEFAULT_WORKER_PATH = Path(__file__).resolve().parent / "workers" / "default.md"
+# The fixed answer to a sender the answering worker does not admit. It is no
+# worker and runs no turn; its posts are recorded as turns of this name.
+REFUSAL = "refusal"
+REFUSAL_PATH = Path(__file__).resolve().parent / "templates" / "refusal.md"
 # The kinds a worker may name in wakes_on. `invite` stays a valid name so a
 # worker saved before invites waited for the operator still loads; no invite
 # wakes an agent now.
 WAKE_KINDS = ("mention", "direct", "invite", "marked")
-# The kinds the default worker can answer: a signal addressed to the agent. A
-# message in a room the agent marked is addressed to nobody.
+# The kinds the refusal answers: a signal addressed to the agent. A message in a
+# room the agent marked is addressed to nobody.
 ADDRESSED_KINDS = ("mention", "direct")
 WORKER_KEYS = ("enabled", "description", "profile", "history", "accepts_from",
                "invites_from", "wakes_on", "limits", "hooks")
-DEFAULT_KEYS = ("description", "limits")
+REFUSAL_KEYS = ("description", "limits")
 DEFAULT_PROFILE = "agentrooms-claude"
 DEFAULT_HISTORY = 30
 # Each limit: its default, its least and its greatest value.
@@ -279,7 +291,7 @@ LIMITS = {
     "turns_per_room": (30, 1, 100000),
     "quiet_seconds": (900, 1, 7 * 86400),
 }
-DEFAULT_LIMITS = {"window_seconds": (86400, 60, 30 * 86400)}
+REFUSAL_LIMITS = {"window_seconds": (86400, 60, 30 * 86400)}
 # A worker's hooks, the seconds each may take, and what each answers by its exit
 # - the tasks hook contract: 0 go; 75 hold, until the moment on its last stdout
 # line; 76 escalate, its last line the reason. Any other ending is a hold with
@@ -289,8 +301,10 @@ HOOK_TIMEOUTS = {"before": 30, "after": 60}
 HOOK_HOLD = 75
 HOOK_ESCALATE = 76
 HOLD_SECONDS = 60
-# What the default worker's answer carries in `agentrooms.data`, and what the
-# service never wakes on, so two agents' default workers never answer each other.
+# What the refusal carries in `agentrooms.data`, and what the service never wakes
+# on, so two agents' refusals never answer each other. It names `default`, the
+# worker that posted it before the refusal was its own, so an earlier release on
+# another machine still never wakes on it.
 DEFAULT_MARK = {"agentrooms.worker": DEFAULT_WORKER}
 
 
@@ -413,25 +427,40 @@ def read_worker(name: str, spec: dict, body: str, where: str) -> dict:
             "body": (body or "").strip()}
 
 
-def read_default(spec: dict, body: str, where: str) -> dict:
-    """The shipped default worker: its window and its answer. It runs no turn, so
-    it carries no profile, no role and no hooks."""
+def read_refusal(spec: dict, body: str, where: str) -> dict:
+    """The shipped refusal: its window and its answer. It runs no turn, so it
+    carries no profile, no role and no hooks."""
     problems: list[str] = []
     wrong = problems.append
-    for key in sorted(set(map(str, spec)) - set(DEFAULT_KEYS)):
-        wrong(f"it names {key!r}, which the default worker does not read")
-    limits = _limits(spec.get("limits"), DEFAULT_LIMITS, wrong)
+    for key in sorted(set(map(str, spec)) - set(REFUSAL_KEYS)):
+        wrong(f"it names {key!r}, which the refusal does not read")
+    limits = _limits(spec.get("limits"), REFUSAL_LIMITS, wrong)
     if not (body or "").strip():
         wrong("its body is the answer it posts, and it is empty")
     if problems:
         raise WorkerInvalid(f"{where}: " + "; ".join(problems))
-    return {"name": DEFAULT_WORKER, "description": str(spec.get("description") or "").strip(),
+    return {"name": REFUSAL, "description": str(spec.get("description") or "").strip(),
             "limits": limits, "body": body.strip(), "wakes_on": list(ADDRESSED_KINDS)}
 
 
+def load_refusal() -> dict:
+    spec, body = split_document(REFUSAL_PATH.read_text(), str(REFUSAL_PATH))
+    return read_refusal(spec, body, str(REFUSAL_PATH))
+
+
 def load_default() -> dict:
+    """The shipped default worker, whole and checked."""
     spec, body = split_document(DEFAULT_WORKER_PATH.read_text(), str(DEFAULT_WORKER_PATH))
-    return read_default(spec, body, str(DEFAULT_WORKER_PATH))
+    return read_worker(DEFAULT_WORKER, spec, body, str(DEFAULT_WORKER_PATH))
+
+
+def read_served(content) -> dict:
+    """A room's switch as recorded: served or not, and since when. A record that
+    is not a switch serves the room, as no record does."""
+    content = content if isinstance(content, dict) else {}
+    since = content.get("since")
+    return {"served": content.get("served") is not False,
+            "since": since if isinstance(since, int) and not isinstance(since, bool) else None}
 
 
 def admits(patterns: list[str], sender: str | None) -> bool:
@@ -443,7 +472,7 @@ def is_default_answer(content: dict) -> bool:
     return isinstance(data, dict) and all(data.get(k) == v for k, v in DEFAULT_MARK.items())
 
 
-def default_answer(template: str, *, user_id: str, sender: str | None,
+def refusal_answer(template: str, *, user_id: str, sender: str | None,
                    supervisor: str | None) -> str:
     return Template(template).safe_substitute(
         user_id=user_id, sender=sender or "someone",
@@ -684,15 +713,23 @@ class Store:
 
     def save_sync(self, project: str, agent: str, user_id: str, holder: str,
                   next_batch: str, wakes: list[dict],
-                  grants: dict[str, dict | None] | None = None) -> bool:
+                  grants: dict[str, dict | None] | None = None,
+                  unserved: set[str] | None = None) -> bool:
         """Record the wakes a sync brought and the position after it, in one
         transaction, only while this process still holds the agent. A wake the
         room's grant refused is recorded held. Each room whose grant the sync
         brought (`grants`) has its held wakes from the senders that grant now
-        names released, so granting a sender answers what it was held for."""
+        names released, so granting a sender answers what it was held for. Each
+        room the sync switched off (`unserved`) has the wakes no turn claimed yet
+        dropped; what it holds for the operator stays held."""
         with self.transaction() as cur:
             if not self.holds(cur, project, agent, holder):
                 return False
+            if unserved:
+                cur.execute(
+                    "DELETE FROM agentrooms_wakes WHERE project_id = %s AND agent = %s "
+                    "AND room_id = ANY(%s) AND claimed_by IS NULL AND held_at IS NULL",
+                    (project, agent, sorted(unserved)))
             for wake in wakes:
                 cur.execute(
                     "INSERT INTO agentrooms_wakes (project_id, agent, room_id, wake_key, kind, "
@@ -942,6 +979,11 @@ class Store:
 
     # -- turns ----------------------------------------------------------------
 
+    # A turn a worker ran, as opposed to a refusal: one recorded under the
+    # refusal's name, or under `default` by an earlier release, whose refusal was
+    # the default worker and whose ids it began with `default:`.
+    A_TURN = f"NOT (worker = '{REFUSAL}' OR id LIKE '{DEFAULT_WORKER}:%%')"
+
     def start_turn(self, turn: str, project: str, agent: str, room_id: str, worker: str,
                    worker_id: str | None, senders: list[str], kinds: list[str]) -> None:
         self.execute("INSERT INTO agentrooms_turns (id, project_id, agent, room_id, worker, "
@@ -972,26 +1014,26 @@ class Store:
 
     def turn_counts(self, project: str, agent: str, room_id: str, senders: list[str], *,
                     window: int, quiet: int, room_cap: int) -> dict:
-        """What the limits count, over the turns a worker ran (never the default
-        worker's answers): the agent's turns and each sender's in the window, and
-        the room's since it was last quiet for `quiet` seconds - at most
-        `room_cap`, since that is all the room limit asks."""
+        """What the limits count, over the turns a worker ran (never a refusal):
+        the agent's turns and each sender's in the window, and the room's since it
+        was last quiet for `quiet` seconds - at most `room_cap`, since that is all
+        the room limit asks."""
         agent_n = self.execute(
             "SELECT count(*) FROM agentrooms_turns WHERE project_id = %s AND agent = %s "
-            "AND worker <> %s AND started_at > now() - make_interval(secs => %s)",
-            (project, agent, DEFAULT_WORKER, window), fetch="one")[0]
+            f"AND {self.A_TURN} AND started_at > now() - make_interval(secs => %s)",
+            (project, agent, window), fetch="one")[0]
         per_sender = {}
         for sender in senders:
             per_sender[sender] = self.execute(
                 "SELECT count(*) FROM agentrooms_turns WHERE project_id = %s AND agent = %s "
-                "AND worker <> %s AND %s = ANY(senders) "
+                f"AND {self.A_TURN} AND %s = ANY(senders) "
                 "AND started_at > now() - make_interval(secs => %s)",
-                (project, agent, DEFAULT_WORKER, sender, window), fetch="one")[0]
+                (project, agent, sender, window), fetch="one")[0]
         rows = self.execute(
             "SELECT extract(epoch FROM now() - started_at) FROM agentrooms_turns "
-            "WHERE project_id = %s AND agent = %s AND room_id = %s AND worker <> %s "
+            f"WHERE project_id = %s AND agent = %s AND room_id = %s AND {self.A_TURN} "
             "ORDER BY started_at DESC LIMIT %s",
-            (project, agent, room_id, DEFAULT_WORKER, room_cap), fetch="all")
+            (project, agent, room_id, room_cap), fetch="all")
         room_n, since = 0, 0.0
         for (age,) in rows:
             if float(age) - since >= quiet:
@@ -1000,13 +1042,14 @@ class Store:
         return {"agent": int(agent_n), "room": room_n,
                 "senders": {s: int(n) for s, n in per_sender.items()}}
 
-    def default_answered(self, project: str, agent: str, room_id: str, sender: str,
-                         window: int) -> bool:
+    def refused(self, project: str, agent: str, room_id: str, sender: str,
+                window: int) -> bool:
+        """Whether the refusal answered `sender` in the room within the window."""
         return self.execute(
             "SELECT 1 FROM agentrooms_turns WHERE project_id = %s AND agent = %s "
-            "AND room_id = %s AND worker = %s AND %s = ANY(senders) "
+            f"AND room_id = %s AND NOT {self.A_TURN} AND %s = ANY(senders) "
             "AND started_at > now() - make_interval(secs => %s) LIMIT 1",
-            (project, agent, room_id, DEFAULT_WORKER, sender, window), fetch="one") is not None
+            (project, agent, room_id, sender, window), fetch="one") is not None
 
     def stored_profiles(self, library, project: str) -> list:
         """Every active harness profile a lookup from the project reaches, read
@@ -1039,7 +1082,7 @@ class RoomView:
     message, an encrypted room, a marked room and the directory apart, and whom
     the room's grant admits. Nothing a member said."""
 
-    __slots__ = ("members", "encrypted", "marked", "name", "grant", "directory")
+    __slots__ = ("members", "encrypted", "marked", "name", "grant", "served", "directory")
 
     def __init__(self):
         self.members: int | None = None
@@ -1047,6 +1090,8 @@ class RoomView:
         self.marked = False
         self.name: str | None = None
         self.grant: Any = UNREAD
+        # The room's switch, as read_served reads it, or UNREAD.
+        self.served: Any = UNREAD
         # None until the room's create event has been seen or asked for.
         self.directory: bool | None = None
 
@@ -1165,6 +1210,8 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
               grant_of: Callable[[str], dict | None] | None = None,
               grants: dict[str, dict | None] | None = None,
               room_type: Callable[[str], str | None] | None = None,
+              served_of: Callable[[str], dict | None] | None = None,
+              unserved: set[str] | None = None,
               ) -> tuple[list[dict], list[str]]:
     """The wakes one sync response brings for `user_id`, and notes about what it
     passed over. `rooms` is updated in place. History before the agent was first
@@ -1180,7 +1227,13 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
     `grant_of(room_id)` (None: the room has none), never assumed open.
 
     Nothing in the homeserver's directory wakes: a room whose create event no
-    sync has brought is asked once through `room_type(room_id)`."""
+    sync has brought is asked once through `room_type(room_id)`.
+
+    Nothing in a room switched off wakes, not even held, and a room switched on
+    wakes only on what arrived after the moment it was switched on. A switch
+    the sync brings off is recorded in `unserved`; a room whose switch no sync
+    has brought is asked once through `served_of(room_id)` (None: the room has
+    none, and is served)."""
     wakes: list[dict] = []
     notes: list[str] = []
     groups = response.get("rooms") or {}
@@ -1206,6 +1259,10 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
                 view.grant = read_grant(event.get("content"))
                 if grants is not None:
                     grants[room_id] = view.grant
+            elif event.get("type") == SERVED_TYPE:
+                view.served = read_served(event.get("content"))
+                if unserved is not None and not view.served["served"]:
+                    unserved.add(room_id)
         if initial:
             continue
         events = timeline
@@ -1231,6 +1288,14 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
                 if found is not UNREAD:
                     view.directory = found == DIRECTORY_TYPE
             if view.directory:
+                continue
+            if view.served is UNREAD:
+                found = served_of(room_id) if served_of is not None else None
+                view.served = found if found is not None else read_served(None)
+            if not view.served["served"]:
+                continue
+            since = view.served["since"]
+            if since is not None and (event.get("origin_server_ts") or 0) <= since:
                 continue
             kind = None
             if mentions(content, user_id):
@@ -1370,6 +1435,7 @@ class Agent:
         self.last_sync: str | None = None
         self.last_check = 0.0
         self.last_renew = 0.0
+        self.taken_up = False
 
     @property
     def engine(self) -> "Engine":
@@ -1413,6 +1479,21 @@ class Agent:
                        f"{held.get('expires_at')})")
         return False
 
+    def take_up(self) -> None:
+        """What the agent's own token settles once it is served: its card moved
+        out of the directory into its profile, and its supervisor published
+        there. A failure is logged and asked again when the service next takes
+        the agent up; it never keeps the agent from being served."""
+        self.taken_up = True
+        take_up = getattr(self.engine.host, "take_up", None)
+        if take_up is None:
+            return
+        try:
+            for line in take_up(self.slot.entry, self.cid) or []:
+                self.log(line)
+        except Exception as exc:
+            self.log(f"taking the agent up: {getattr(exc, 'code', type(exc).__name__)}: {exc}")
+
     def loop(self) -> None:
         matrix = None
         backoff = 1.0
@@ -1437,6 +1518,8 @@ class Agent:
                 if matrix is None:
                     matrix = self.engine.host.matrix(self.plan["homeserver"], self.plan["token"],
                                                      timeout=SYNC_TIMEOUT_MS / 1000 + 30)
+                if not self.taken_up:
+                    self.take_up()
                 self.sync_once(matrix)
                 self.state, self.reason = "served", None
                 backoff = 1.0
@@ -1503,6 +1586,16 @@ class Agent:
                 raise
             return read_grant(found)
 
+        def served_of(room_id: str) -> dict | None:
+            try:
+                found = matrix.call("GET", f"/_matrix/client/v3/user/{quote(self.plan['user_id'])}"
+                                           f"/rooms/{quote(room_id)}/account_data/{SERVED_TYPE}")
+            except Exception as exc:
+                if getattr(exc, "exit_code", None) == 3:
+                    return None
+                raise
+            return read_served(found)
+
         def room_type(room_id: str):
             try:
                 found = matrix.call("GET", f"/_matrix/client/v3/rooms/{quote(room_id)}"
@@ -1514,16 +1607,24 @@ class Agent:
             return (found or {}).get("type")
 
         grants: dict[str, dict | None] = {}
+        unserved: set[str] = set()
         wakes, notes = read_sync(response, self.plan["user_id"], self.rooms, initial=initial,
                                  member_count=member_count, before_join=before_join,
-                                 grant_of=grant_of, grants=grants, room_type=room_type)
+                                 grant_of=grant_of, grants=grants, room_type=room_type,
+                                 served_of=served_of, unserved=unserved)
         for note in notes:
             self.log(note)
+        # A grant in a room switched off releases nothing: what it holds waits
+        # for the operator until the room is served again.
+        for room_id in list(grants):
+            view = self.rooms.get(room_id)
+            if view is not None and view.served is not UNREAD and not view.served["served"]:
+                grants.pop(room_id)
         next_batch = response.get("next_batch")
         if not next_batch:
             raise RuntimeError("the homeserver answered a sync without next_batch")
         if not store.save_sync(self.slot.project_id, self.cid, self.plan["user_id"],
-                               self.engine.holder, next_batch, wakes, grants):
+                               self.engine.holder, next_batch, wakes, grants, unserved):
             self.lease = False
             raise RuntimeError("the lease on this agent was lost before the sync was recorded")
         self.last_sync = now_iso()
@@ -1539,6 +1640,9 @@ class Agent:
                         else ""))
         for room_id in grants:
             self.log(f"{room_id}: the grant changed; held wakes it now admits are released")
+        for room_id in sorted(unserved):
+            self.log(f"{room_id}: switched off; nothing in it wakes the agent, and the wakes "
+                     "no turn claimed are dropped")
         if wakes or grants:
             self.engine.poke()
 
@@ -1711,6 +1815,7 @@ class Engine:
         # agent's in every room, keyed (project, agent, None): a debounce still
         # waiting, or a hook's hold.
         self.holds: dict[tuple, float] = {}
+        self._refusal: dict | None = None
         self._default: dict | None = None
 
     # -- small parts ----------------------------------------------------------
@@ -1917,10 +2022,15 @@ class Engine:
     def hold(self, key: tuple, seconds: float) -> None:
         self.holds[key] = max(self.holds.get(key, 0.0), time.monotonic() + max(seconds, 0.0))
 
-    def default_worker(self) -> dict:
+    def refusal(self) -> dict:
+        if self._refusal is None:
+            self._refusal = load_refusal()
+        return self._refusal
+
+    def shipped_default(self) -> dict:
         if self._default is None:
             self._default = load_default()
-        return self._default
+        return dict(self._default)
 
     # -- one turn -------------------------------------------------------------
 
@@ -1957,35 +2067,71 @@ class Engine:
     def bound_worker(self, slot: Slot, cid: str, room_id: str,
                      binding: dict) -> tuple[dict | None, str]:
         """The worker that answers this agent in this room - the room's binding,
-        else the agent's - or None and why there is none."""
+        else the agent's, else the project's `default`, else the shipped one -
+        or None and why there is none. A worker carries `source`: store or
+        shipped."""
         rooms = binding.get("rooms") if isinstance(binding.get("rooms"), dict) else {}
         name = rooms.get(room_id) or binding.get("worker")
-        if not name:
-            return None, "no worker is bound to this agent"
+        bound = bool(name)
+        name = name or DEFAULT_WORKER
+        what = f"its bound worker {name!r}" if bound else f"the project's worker {name!r}"
         row = slot.store.worker(slot.project_id, name)
         if row is None:
-            return None, f"its bound worker {name!r} has no active version"
+            if bound:
+                return None, f"{what} has no active version"
+            worker = self.shipped_default()
+            worker.update(version=None, source="shipped")
+            return worker, ""
         try:
             worker = read_worker(name, row["spec"], row["body"],
                                  f"worker {name!r} version {row['id']}")
         except WorkerInvalid as exc:
-            return None, f"its bound worker is refused: {exc}"
+            return None, f"{what} is refused: {exc}"
         if not worker["enabled"]:
-            return None, f"its bound worker {name!r} is switched off"
-        worker["version"] = row["id"]
+            return None, f"{what} is switched off"
+        worker.update(version=row["id"], source="store")
         return worker, ""
 
+    @staticmethod
+    def room_record(matrix, user_id: str, room_id: str, kind: str):
+        """The agent's room account data of `kind`, or None where it has none."""
+        try:
+            return matrix.call("GET", f"/_matrix/client/v3/user/{quote(user_id)}/rooms/"
+                                      f"{quote(room_id)}/account_data/{kind}")
+        except Exception as exc:
+            if getattr(exc, "exit_code", None) == 3:
+                return None
+            raise
+
+    def room_served(self, matrix, user_id: str, room_id: str) -> bool:
+        return read_served(self.room_record(matrix, user_id, room_id, SERVED_TYPE))["served"]
+
     def serve(self, turn: Turn, agent: dict, wakes: list[dict]) -> None:
-        """Admit the claimed wakes and answer them, in order: the bound worker and
-        whether it is on, each sender against who it admits, the kinds it wakes
-        on; what it does not admit goes to the default worker. Then, for what it
+        """Admit the claimed wakes and answer them, in order: whether the room is
+        served, the answering worker and whether it is on, each sender against who
+        it admits, the kinds it wakes on; what it does not admit goes to the
+        refusal. Then, for what it
         admits, the debounce, the limits and the `before` hook; then the turn and
         the `after` hook. Every refusal is logged with its reason. Wakes a hold or
         the debounce puts off are handed back; every other claimed wake is done."""
         slot, cid, room_id = turn.slot, turn.cid, turn.room_id
+        matrix = self.host.matrix(agent["homeserver"], agent["token"], timeout=60.0)
+        try:
+            if not self.room_served(matrix, agent["user_id"], room_id):
+                slot.log(f"{cid}: {room_id} is switched off; {len(wakes)} wake(s) dropped")
+                return
+            recorded = self.room_record(matrix, agent["user_id"], room_id, GRANT_TYPE) is not None
+        finally:
+            with contextlib.suppress(Exception):
+                matrix.close()
         binding = self.host.binding(slot.entry, cid) or {}
         worker, why_none = self.bound_worker(slot, cid, room_id, binding)
-        default = self.default_worker()
+        if worker is not None and worker.get("source") == "shipped" and not recorded:
+            # A room joined before grants existed admits everyone; the shipped
+            # worker starts no spending there that did not run before.
+            worker, why_none = None, ("the room has no recorded grant, and the shipped default "
+                                      "worker answers only where the operator recorded one")
+        default = self.refusal()
         admitted: list[dict] = []
         defaulted: dict[str, tuple[dict, str]] = {}
         for wake in wakes:
@@ -2007,44 +2153,44 @@ class Engine:
                 reason = why_none
             if kind not in default["wakes_on"]:
                 slot.log(f"{cid}: {kind} in {room_id} from {sender} refused: {reason}; the "
-                         "default worker answers only what is addressed to the agent")
+                         "refusal answers only what is addressed to the agent")
                 continue
             if sender and sender not in defaulted:
                 defaulted[sender] = (wake, reason)
         for sender, (wake, reason) in defaulted.items():
             slot.log(f"{cid}: {wake['kind']} in {room_id} from {sender} refused: {reason}; "
-                     "the default worker answers")
-            self.answer_default(turn, agent, binding, wake, default)
+                     "the refusal answers")
+            self.answer_refusal(turn, agent, binding, wake, default)
         if not admitted or worker is None:
             return
         self.admit_and_run(turn, agent, worker, admitted)
 
-    def answer_default(self, turn: Turn, agent: dict, binding: dict, wake: dict,
-                       default: dict) -> None:
-        """The default worker's answer to one sender: a fixed text and no turn, at
-        most once per sender per room per window."""
+    def answer_refusal(self, turn: Turn, agent: dict, binding: dict, wake: dict,
+                       refusal: dict) -> None:
+        """The refusal to one sender: a fixed text and no turn, at most once per
+        sender per room per window."""
         slot, cid, room_id = turn.slot, turn.cid, turn.room_id
         store = slot.store
         sender = wake.get("sender")
-        window = default["limits"]["window_seconds"]
-        if store.default_answered(slot.project_id, cid, room_id, sender, window):
-            slot.log(f"{cid}: default worker already answered {sender} in {room_id} within "
+        window = refusal["limits"]["window_seconds"]
+        if store.refused(slot.project_id, cid, room_id, sender, window):
+            slot.log(f"{cid}: the refusal already answered {sender} in {room_id} within "
                      f"{window}s; nothing sent")
             return
-        text = default_answer(default["body"], user_id=agent["user_id"], sender=sender,
+        text = refusal_answer(refusal["body"], user_id=agent["user_id"], sender=sender,
                               supervisor=binding.get("supervisor"))
-        mark = f"default:{turn.id}:{sender}"
-        store.start_turn(mark, slot.project_id, cid, room_id, DEFAULT_WORKER, None,
+        mark = f"{REFUSAL}:{turn.id}:{sender}"
+        store.start_turn(mark, slot.project_id, cid, room_id, REFUSAL, None,
                          [sender], [wake["kind"]])
         matrix = self.host.matrix(agent["homeserver"], agent["token"], timeout=60.0)
         try:
             thread = thread_root(self.wake_content(matrix, room_id, wake.get("event_id")))
             event_id = self.post(matrix, room_id, text, thread, data=dict(DEFAULT_MARK))
             store.end_turn(mark, "answered")
-            slot.log(f"{cid}: default worker answered {sender} in {room_id} as {event_id}")
+            slot.log(f"{cid}: the refusal answered {sender} in {room_id} as {event_id}")
         except Exception as exc:
             store.end_turn(mark, "failed")
-            slot.log(f"{cid}: default worker's answer to {sender} in {room_id} not sent: "
+            slot.log(f"{cid}: the refusal to {sender} in {room_id} not sent: "
                      f"{getattr(exc, 'code', type(exc).__name__)}: {exc}")
         finally:
             with contextlib.suppress(Exception):
@@ -2235,6 +2381,16 @@ class Engine:
             refusal = self.host.check(slot.entry, cid)
             if refusal:
                 slot.log(f"{cid}: answer in {room_id} not posted: {refusal[0]}: {refusal[1]}")
+                return {**ended, "outcome": "not_posted", "said": answer}
+            try:
+                served = self.room_served(matrix, agent["user_id"], room_id)
+            except Exception as exc:
+                slot.log(f"{cid}: answer in {room_id} not posted: whether the room is served "
+                         f"is not read: {getattr(exc, 'code', type(exc).__name__)}: {exc}")
+                return {**ended, "outcome": "not_posted", "said": answer}
+            if not served:
+                slot.log(f"{cid}: answer in {room_id} not posted: the room was switched off "
+                         "during the turn")
                 return {**ended, "outcome": "not_posted", "said": answer}
             thread = self.answer_thread(events, wakes)
             try:

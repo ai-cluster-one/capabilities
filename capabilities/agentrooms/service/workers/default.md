@@ -1,6 +1,22 @@
 ---
-description: Answers every sender no worker of the agent admits, with how to be admitted, once per sender per room per window; it runs no turn.
+enabled: true
+description: Answers every sender the room's wake grant admits through a turn on agentrooms-claude; a project replaces it whole by saving a worker named default.
+profile: agentrooms-claude
+history: 30
+accepts_from:
+  - "*"
+invites_from:
+  - "*"
+wakes_on:
+  - mention
+  - direct
+  - marked
 limits:
-  window_seconds: 86400
+  debounce_seconds: 0
+  turn_timeout: 900
+  window_seconds: 3600
+  turns_per_agent: 120
+  turns_per_sender: 30
+  turns_per_room: 30
+  quiet_seconds: 900
 ---
-This agent ($user_id) does not take messages from you ($sender) yet. Contact $supervisor and say who is writing, so a worker can be set up for you on the receiving side; until then nothing you send reaches it.
