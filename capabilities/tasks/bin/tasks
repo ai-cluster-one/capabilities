@@ -1466,15 +1466,23 @@ ORDER  (list, search)
   --sort created        newest created first: created_at, newest first
   --sort pickup         soonest pickup first: pickup_at, earliest first, and
                         tasks with no pickup last
+  --sort title          by title, in text order
+  --sort type           by type, in text order
+  --sort assignee       by assignee, in text order, and unassigned tasks last
+  --sort status         by the status a reader is shown, in lifecycle order:
+                        draft, todo, in_progress, waiting, complete, closed
+  --sort cost           most spent first: the row's runs.cost_usd, and tasks
+                        with no recorded cost last
 
   --order asc|desc      turn the sort either way: its key in that direction, and
                         ties by id in the same direction, so one direction is
                         the exact mirror of the other - except that tasks with
-                        no pickup stay last both ways. Needs --sort
+                        no pickup stay last both ways, as do unassigned tasks
+                        for assignee and uncosted ones for cost. Needs --sort
 
   A sort is applied before the page is cut, so page 1 holds the first rows of
   everything matching. Without --order each sort runs the way it is listed and
-  ties go to the higher id first. Those four are the accepted sorts, and asc
+  ties go to the higher id first. Those nine are the accepted sorts, and asc
   and desc the accepted orders. Unsaid, `list` answers soonest pickup first and
   `search` earliest created first.
 
@@ -8625,16 +8633,21 @@ _LIST_BOOLS = ("pickup-set", "pickup-unset", "full", "assigned-here")
 # `ready` is the queue one project's worker consumes, so the whole store is a
 # question only the two scans answer.
 _SCAN_BOOLS = _LIST_BOOLS + ("all-projects",)
-# The order a scan may be asked for. Each verb keeps its own order unsaid.
-_SORTS = {"touched": "last_touched_at desc, id desc",
-          "updated": "updated_at desc, id desc",
-          "created": "created_at desc, id desc",
-          "pickup": "pickup_at asc nulls last, id desc"}
-# Each sort's key, for `--order` to turn either way. Unsaid, a sort answers as
-# `_SORTS` states it; said, the key and its tie-break go the same way, so one
-# direction is the exact mirror of the other.
+# The order a scan may be asked for, as the way each sort runs unsaid. Each verb
+# keeps its own order unsaid.
+_SORTS = {"touched": "desc", "updated": "desc", "created": "desc", "pickup": "asc",
+          "title": "asc", "type": "asc", "assignee": "asc", "status": "asc",
+          "cost": "desc"}
+# Each sort's key, for `--order` to turn either way. Unsaid, a sort runs the way
+# `_SORTS` states and ties go to the higher id; said, the key and its tie-break
+# go the same way, so one direction is the exact mirror of the other. `status`
+# and `cost` are read from the store as the row is, so `_sort_key` answers them.
 _SORT_KEYS = {"touched": "last_touched_at", "updated": "updated_at",
-              "created": "created_at", "pickup": "pickup_at"}
+              "created": "created_at", "pickup": "pickup_at", "title": "t.title",
+              "type": "t.type", "assignee": "nullif(btrim(t.assignee), '')"}
+# The keys a task can have no value on - no pickup, nobody assigned, no recorded
+# cost - which stay last whichever way the others run.
+_SORT_NULLS_LAST = ("pickup", "assignee", "cost")
 _DIRECTIONS = ("asc", "desc")
 _SCAN_FLAGS = _LIST_FLAGS + ("sort", "order")
 # What `counts` narrows by: the filters `list` takes, and nothing that shapes rows.
@@ -8674,6 +8687,14 @@ def _touched() -> str:
             f"and {_a_raise()}))")
 
 
+# What one raise `e` recorded as its cost, and the sum of those that recorded one.
+_COST = "e.metrics -> 'cost_usd'"
+
+
+def _cost_sum() -> str:
+    return f"sum(({_COST})::text::float8) filter (where jsonb_typeof({_COST}) = 'number')"
+
+
 def _rollup_columns() -> str:
     """A task's runs and blockers, summed from the store as the row is read.
 
@@ -8685,14 +8706,14 @@ def _rollup_columns() -> str:
     `blocked_by_status` gives each id the task's `blocked_by` column lists the
     status of the task it names, null for an id matching no task; the column
     itself is one of the row's fields."""
-    cost = "e.metrics -> 'cost_usd'"
+    cost = _COST
     runs = (f"(select jsonb_build_object("
             f"'count', coalesce(sum(g.n), 0), "
             f"'by_worker', coalesce(jsonb_object_agg(g.worker, g.n), '{{}}'::jsonb), "
             f"'cost_usd', sum(g.cost), "
             f"'without_cost', coalesce(sum(g.uncosted), 0)) "
             f"from (select coalesce(e.worker, '') as worker, count(*) as n, "
-            f"sum(({cost})::text::float8) filter (where jsonb_typeof({cost}) = 'number') as cost, "
+            f"{_cost_sum()} as cost, "
             f"count(*) filter (where jsonb_typeof({cost}) is distinct from 'number') as uncosted "
             f"from {SCHEMA}.tasks_executions e where e.task_id = t.id "
             f"and {_a_raise()} group by 1) g) as runs")
@@ -8709,8 +8730,9 @@ def _order(opts: dict, unsaid: str) -> str:
     cut, so the first page holds the first rows of everything that matched and
     not of one page of it.
 
-    A task with no pickup has no place on that axis in either direction, so it
-    stays last whichever way the pickups run."""
+    A task with no pickup, nobody assigned or no recorded cost has no place on
+    that axis in either direction, so it stays last whichever way the others
+    run."""
     wanted, direction = opts.get("sort"), opts.get("order")
     if direction is not None and wanted is None:
         _die(6, "input", "--order needs a --sort to turn; accepted: --sort "
@@ -8721,13 +8743,25 @@ def _order(opts: dict, unsaid: str) -> str:
     if wanted not in _SORTS:
         _die(6, "input", f"unknown sort {wanted!r}",
              f"accepted: {', '.join(sorted(_SORTS))}")
-    if direction is None:
-        return _SORTS[wanted]
-    if direction not in _DIRECTIONS:
+    if direction is not None and direction not in _DIRECTIONS:
         _die(6, "input", f"unknown order {direction!r}; accepted: "
              f"{', '.join(_DIRECTIONS)}", f"accepted: {', '.join(_DIRECTIONS)}")
-    nulls = " nulls last" if wanted == "pickup" else ""
-    return f"{_SORT_KEYS[wanted]} {direction}{nulls}, id {direction}"
+    nulls = " nulls last" if wanted in _SORT_NULLS_LAST else ""
+    key = f"{_sort_key(wanted)} {direction or _SORTS[wanted]}{nulls}"
+    return f"{key}, id {direction or 'desc'}"
+
+
+def _sort_key(wanted: str) -> str:
+    """The key `--sort` names, read from `t`, the tasks table. `status` is the
+    one a reader is shown, in the order of the lifecycle the store declares,
+    and `cost` the sum a row carries as `runs.cost_usd`."""
+    if wanted == "status":
+        lifecycle = ", ".join(f"'{s}'" for s in STATUSES)
+        return f"array_position(array[{lifecycle}], {_shown_status('t')})"
+    if wanted == "cost":
+        return (f"(select {_cost_sum()} from {SCHEMA}.tasks_executions e "
+                f"where e.task_id = t.id and {_a_raise()})")
+    return _SORT_KEYS[wanted]
 
 
 def _where(opts: dict, tz=None) -> tuple[str, list]:

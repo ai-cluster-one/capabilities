@@ -101,10 +101,11 @@ def test_unsaid_each_scan_keeps_its_own_order():
 
 
 def test_every_sort_breaks_ties_by_id():
-    for value, order in mod._SORTS.items():
-        assert order.endswith(", id desc"), value
-    assert set(mod._SORTS) == {"touched", "updated", "created", "pickup"}
-    assert mod._SORTS["pickup"].startswith("pickup_at asc nulls last")
+    for value in mod._SORTS:
+        assert mod._order({"sort": value}, "").endswith(", id desc"), value
+    assert set(mod._SORTS) == {"touched", "updated", "created", "pickup", "title",
+                               "type", "assignee", "status", "cost"}
+    assert mod._order({"sort": "pickup"}, "").startswith("pickup_at asc nulls last")
 
 
 # --- Counts ------------------------------------------------------------------
@@ -165,7 +166,7 @@ def test_the_help_documents_every_new_surface_beside_its_neighbours():
     assert "tasks counts [filters]" in reading and "`--sort`" in reading
     assert "FILTERS  (list, ready, search, counts)" in doc
     order = doc.split("ORDER  (list, search)")[1].split("PAGING")[0]
-    for value in ("touched", "updated", "created", "pickup"):
+    for value in mod._SORTS:
         assert f"--sort {value}" in order
     assert "no pickup last" in order and "before the page is cut" in order
     collections = doc.split("\nCOLLECTIONS\n")[1].split("\nACTIVITY\n")[0]
@@ -581,7 +582,11 @@ def test_only_the_two_scans_take_an_order(call, no_store, capsys):
 
 
 def test_without_an_order_every_sort_runs_as_it_did():
-    for value, order in mod._SORTS.items():
+    was = {"touched": "last_touched_at desc, id desc",
+           "updated": "updated_at desc, id desc",
+           "created": "created_at desc, id desc",
+           "pickup": "pickup_at asc nulls last, id desc"}
+    for value, order in was.items():
         assert mod._order({"sort": value}, "unsaid") == order
     assert mod._order({}, "unsaid") == "unsaid"
 
@@ -721,6 +726,86 @@ def test_the_help_documents_the_touched_filters_beside_updated():
         .split("ORDER  (list, search)")[0]
     assert "--updated-after WHEN  --updated-before WHEN\n  --touched-after WHEN  " \
         "--touched-before WHEN" in filters and "last_touched_at" in filters
+
+
+# --- Sorts by what a task says -------------------------------------------------
+
+@pytest.fixture
+def described(four_orders):
+    """The four orders, with titles, types and assignees that follow neither
+    the creation order nor its reverse, and costs recorded on closed raises:
+    h-1's open raise from `four_orders` records none and shows it in_progress,
+    which sorts after todo by the lifecycle and before it alphabetically."""
+    entry, ids = four_orders
+    import psycopg
+    schema = mod.SCHEMA
+    said = {"h-0": ("title c", "beta", "worker-b"), "h-1": ("title a", "alpha", None),
+            "h-2": ("title e", "delta", "worker-a"), "h-3": ("title b", "gamma", "someone"),
+            "h-4": ("title d", "alpha", "")}
+    costs = {"h-0": [("w-a", 0.2), ("w-b", 0.3)], "h-2": [("w-a", 1.5)],
+             "h-3": [("w-a", 0.1), ("w-b", None)]}
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        for key, (title, kind, assignee) in said.items():
+            conn.execute(f"update {schema}.tasks_tasks set title = %s, type = %s, "
+                         f"assignee = %s where unique_key = %s", (title, kind, assignee, key))
+        for key, raises in costs.items():
+            for attempt, (worker, cost) in enumerate(raises, start=2):
+                metrics = json.dumps({} if cost is None else {"cost_usd": cost})
+                conn.execute(f"insert into {schema}.tasks_executions (task_id, attempt, "
+                             f"worker, status, metrics, started_at, ended_at) values "
+                             f"(%s, %s, %s, 'ok', %s::jsonb, '2026-01-01T00:00Z', "
+                             f"'2026-01-01T01:00Z')", (ids[key], attempt, worker, metrics))
+    return entry, ids
+
+
+@needs_store
+@pytest.mark.parametrize("scope", ("project", "all"))
+@pytest.mark.parametrize("verb", ("list", "search"))
+def test_both_directions_of_every_new_sort_across_pages(described, capsys, scope, verb):
+    entry, ids = described
+    there = ["t-0", "t-1"] if scope == "all" else []
+    by_id = lambda keys, down: sorted(keys, key=ids.get, reverse=down)
+    nobody = ["h-1", "h-4"] + there
+    uncosted = ["h-1", "h-4"] + there
+    lifecycle_up = (["h-2"] + by_id(["h-0"] + there[:1], False) + ["h-1", "h-3", "h-4"]
+                    + there[1:])
+    expected = {
+        ("title", "asc"): ["h-1", "h-3", "h-0", "h-4", "h-2"] + there,
+        ("type", "asc"): (by_id(["h-1", "h-4"], False) + ["h-0", "h-2", "h-3"]
+                          + by_id(there, False)),
+        ("assignee", "asc"): ["h-3", "h-2", "h-0"] + by_id(nobody, False),
+        ("assignee", "desc"): ["h-0", "h-2", "h-3"] + by_id(nobody, True),
+        ("status", "asc"): lifecycle_up,
+        ("cost", "asc"): ["h-3", "h-0", "h-2"] + by_id(uncosted, False),
+        ("cost", "desc"): ["h-2", "h-0", "h-3"] + by_id(uncosted, True),
+    }
+    for value in ("title", "type", "status"):
+        expected[(value, "desc")] = expected[(value, "asc")][::-1]
+    call = {"list": mod.cmd_list, "search": mod.cmd_search}[verb]
+    lead = ["title"] if verb == "search" else []
+    narrow = ["--all-projects"] if scope == "all" else ["--project", HERE]
+    for (value, direction), keys in expected.items():
+        walked = _walk(call, entry, capsys,
+                       [*lead, *narrow, "--sort", value, "--order", direction], 2)
+        assert walked == keys, (value, direction)
+    # Unsaid, each runs the way the help lists it, ties to the higher id.
+    unsaid = {"title": expected[("title", "asc")],
+              "type": (by_id(["h-1", "h-4"], True) + ["h-0", "h-2", "h-3"]
+                       + by_id(there, True)),
+              "assignee": ["h-3", "h-2", "h-0"] + by_id(nobody, True),
+              "cost": expected[("cost", "desc")]}
+    for value, keys in unsaid.items():
+        assert _walk(call, entry, capsys, [*lead, *narrow, "--sort", value], 2) == keys, value
+
+
+@needs_store
+def test_cost_orders_by_the_sum_the_row_carries(described, capsys):
+    entry, _ids = described
+    mod.cmd_list(entry, ["--project", HERE, "--sort", "cost"])
+    rows = _answer(capsys)["tasks"]
+    costs = [t["runs"]["cost_usd"] for t in rows]
+    assert costs[:3] == pytest.approx([1.5, 0.5, 0.1]) and costs[3:] == [None, None]
+    assert [t["status"] for t in rows if t["unique_key"] == "h-1"] == ["in_progress"]
 
 
 if __name__ == "__main__":

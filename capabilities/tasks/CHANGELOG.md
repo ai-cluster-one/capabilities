@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-18 — `list` and `search` sort by title, type, assignee, status and cost
+
+`--sort` also takes `title` and `type`, in text order; `assignee`, in text order with unassigned tasks last; `status`, the status a reader is shown, in the lifecycle order the store declares (draft, todo, in_progress, waiting, complete, closed); and `cost`, the sum a row carries as `runs.cost_usd`, most spent first, with tasks that recorded no cost last. Each is applied before the page is cut and turned by `--order` like the others, its ties going by id in the same direction; unassigned and uncosted tasks stay last both ways. The four existing sorts, each verb's default order and the rows are unchanged.
+
 ## 2026-10-18 — The service keeps one working connection beside its listener
 
 `tasks` uses `capabilities-contract` 0.5.1. Every connection it opens on the transaction path is the process's one working connection, which the library lends to each operation and keeps until the process exits, so a command connects once rather than once per read; a connect that fails is tried again, and a working connection the store or the network lost is replaced, a statement that lost it before anything of its transaction reached the store running once more on the new one and a commit never sent twice. The service's passes run on its working connection, kept between passes beside the listener, which also carries the presence lock. A command whose store connection is lost reports `store_unreachable`, exit 5, where it reported `store_error`.
