@@ -81,8 +81,8 @@ which is the ordinary case and the simpler one.
 
 **What still comes from the image.** Under both profiles the image installs
 every capability in the official catalogue at `CAPABILITIES_REF`, and every boot
-installs any catalogue capability the registry lacks, so a capability the
-catalogue gains reaches the box without a change to the project. Whether one is
+brings the registry to that catalogue, so a capability the catalogue gains or
+changes reaches the box without a change to the project. Whether one is
 usable is its gate's and its connections' answer, not whether it is installed.
 Only the project travels through Git.
 
@@ -107,12 +107,10 @@ own `ENV`, installs the catalogue there at build, and creates each mount point o
 by the agent; the agent CLIs keep their links in the image's `~/.local/bin`.
 
 A fresh volume is seeded from the image, so the first deploy starts from the
-tools the image installed. From then on the volumes are what runs: a redeploy
-no longer upgrades a capability the box already has, and the box keeps its tools
-current through its own `capabilities update` and source releases. On every boot
-the entrypoint installs each catalogue capability the registry lacks, so one the
-catalogue gains still reaches the box, and it leaves an installed one exactly as
-it is, so a redeploy never takes back a tool the box updated. A capability service's own state mount under
+tools the image installed. From then on the volumes are what runs, and every boot
+brings them to the catalogue the image names: the manager first, then each
+capability the registry lacks, installed from another catalogue or behind it.
+A capability installed from a local path or a registered source is left as it is. A capability service's own state mount under
 `~/.local/state/capabilities` - `~/.local/state/capabilities/projects` - sits
 inside `capabilities_state` as a volume of its own; Docker mounts the parent
 before the child, the manager never writes under `projects`, and the service

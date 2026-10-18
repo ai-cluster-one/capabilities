@@ -204,8 +204,8 @@ capability that ref's catalogue (`.capability-source/catalog.json`) carries,
 less `capabilities.exclude`, and fail when one cannot be installed; a core
 capability arrives enabled by the manager's first-install rule. They then
 initialize project contexts with `capabilities init` and verify the capability
-set with `capabilities doctor`. Every boot installs any catalogue capability the
-registry lacks and leaves installed ones as they are; a catalogue that cannot be
+set with `capabilities doctor`. Every boot brings the registry to the catalogue
+the image names, installing what it lacks and updating what is behind; a catalogue that cannot be
 read at boot leaves the box running with what it has.
 
 Generated agent-box images install Codex from the complete pinned release
