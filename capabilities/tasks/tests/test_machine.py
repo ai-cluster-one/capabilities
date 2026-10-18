@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.1",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.5.0",
 #                 "callva-harness-runner==0.9.0",
 #                 "pyyaml>=6"]
 # ///
@@ -18,7 +18,7 @@ checks read TASKS_TEST_DSN and skip when it is unset; every run works in a
 schema of its own and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
-        --with 'capabilities-contract==0.4.1' \\
+        --with 'capabilities-contract==0.5.0' \\
         --with 'callva-harness-runner==0.9.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -609,9 +609,10 @@ def test_one_machine_process_serves_three_projects_each_as_itself(farm):
         farm.roots["kiln"].name == "pottery-shed"
     assert all(row["present"] and row["enabled_explicitly"] and row["current"]
                for row in status["projects"])
-    # Every project on one store: one listener and one question connection.
-    assert [(store["listening"], store["connections_opened"])
-            for store in status["stores"]] == [(True, 2)]
+    # Every project on one store: one listener, and each pass's questions on a
+    # connection of their own.
+    assert [(store["listening"], store["connections_opened"] >= 2)
+            for store in status["stores"]] == [(True, True)]
     assert [sorted(store["projects"]) for store in status["stores"]] == [
         ["kiln", "mill", "orchard"]]
 
@@ -635,9 +636,10 @@ def test_one_machine_process_serves_three_projects_each_as_itself(farm):
         assert own == {f"{name.upper()}_ONLY"}
         assert "CLAUDE_PROJECT_DIR" not in turn["env"] or \
             Path(turn["env"]["CLAUDE_PROJECT_DIR"]).resolve() == farm.roots[name]
-    # Still the same connections, after turns started and ended.
+    # Still the one listener, after turns started and ended.
     status = farm.machine()
-    assert [store["connections_opened"] for store in status["stores"]] == [2]
+    assert [(store["listening"], store["error"]) for store in status["stores"]] == [
+        (True, None)]
     # The log: one line per thing, each naming its project, and each project's
     # lines in its own daemon.log too.
     lines = farm.log()

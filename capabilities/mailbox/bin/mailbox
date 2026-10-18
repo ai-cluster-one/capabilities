@@ -5,7 +5,7 @@
 #     "imap-tools>=1.13",
 #     "httpx>=0.27",
 #     "fpdf2>=2.7",
-#     "capabilities-contract==0.4.1",
+#     "capabilities-contract==0.5.0",
 # ]
 # ///
 """
@@ -1821,7 +1821,7 @@ def _cmd_migrate(argv: list[str]) -> None:
              f"run {NAME} through its own script header, which pins it")
     conn = None
     try:
-        conn = db.connect(application_name=NAME)
+        conn = db.connect(application_name=NAME, transaction=True)
         if argv:
             found = db.status(conn, NAME, steps, major=major, minor=minor)
             stored = (None if found.stored_major is None
@@ -1932,6 +1932,9 @@ def _plan_store() -> None:
 
     def plan_connect(*, application_name: str, project_root = None,
                      setting = None, **kwargs):
+        # A plan holds one transaction open on its link for the whole run, so
+        # the link is a session connection whichever kind the caller asked for.
+        kwargs.pop("transaction", None)
         setting = setting if setting is not None else db.resolve_setting(project_root)
         key = (repr(sorted(setting.connect_kwargs().items())), setting.schema)
         link = _PLAN_LINKS.get(key)
@@ -1998,6 +2001,7 @@ def _plan_store() -> None:
 
     db.connect, db.migrate, db.status = plan_connect, plan_migrate, plan_status
     here = globals()
+    here["_HOLD_RECORDS_CONNECTION"] = True
     for name, value in list(here.items()):
         for real, planned in ((real_connect, plan_connect), (real_migrate, plan_migrate),
                               (real_status, plan_status)):
@@ -3029,6 +3033,11 @@ STORE_ENVIRONMENT_SLUGS = frozenset({"store_unreachable", "store_busy"})
 # long-running service sees a changed grant, or a store that came back, at once.
 STORE_READ_SECONDS = 2.0
 
+# Whether an adapter keeps its connection between operations. Only a migration
+# plan sets it: the plan's one link holds a transaction open for the whole run,
+# and closing it after an operation would undo what the plan did so far.
+_HOLD_RECORDS_CONNECTION = False
+
 
 def record_table_steps() -> list[tuple[str, str]]:
     """The migration steps of the contract's tables. `enabled` and
@@ -3991,7 +4000,9 @@ class StoreRecords(FileRecords):
     one node.
 
     The store is reached through the shared database library, on first use
-    only, so a call that reads nothing the store holds never connects."""
+    only, so a call that reads nothing the store holds never connects, and
+    each read or write holds its own transaction connection only while it
+    runs. A connection handed in belongs to the caller and stays open."""
 
     def __init__(self, envelope: Path, global_dir: Path,
                  project_id: str | None = None, project: str | None = None,
@@ -4011,6 +4022,9 @@ class StoreRecords(FileRecords):
         self.node = node_name()
         self._conn = connection
         self._owns_conn = connection is None
+        # How many operations are running on the owned connection: it is closed
+        # when the last of them ends.
+        self._depth = 0
         self._schema = schema
         self._failure: StoreError | None = None
         self._failed_at = 0.0
@@ -4036,7 +4050,7 @@ class StoreRecords(FileRecords):
         if not self._guard_agent or not self._owns_conn:
             return None
         try:
-            conn = self._db()
+            conn = self._begin()
         except StoreError:
             return None
         import psycopg
@@ -4045,8 +4059,12 @@ class StoreRecords(FileRecords):
         except psycopg.OperationalError as exc:
             raise self._unreachable(exc) from None
         finally:
-            if self._owns_conn and self._conn is not None:
-                self._conn.rollback()
+            if self._conn is not None and self._depth == 1:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+            self._end()
 
     def _held(self, collection: str, key: str | None = None) -> bool:
         return (collection in self.collections
@@ -4087,6 +4105,21 @@ class StoreRecords(FileRecords):
             return held[1]
         return None
 
+    def _begin(self) -> Any:
+        """The connection for one operation, opened for it unless one is
+        running; `_end` closes it once the last operation on it ends."""
+        self._depth += 1
+        try:
+            return self._db()
+        except BaseException:
+            self._end()
+            raise
+
+    def _end(self) -> None:
+        self._depth = max(0, self._depth - 1)
+        if self._depth == 0 and not _HOLD_RECORDS_CONNECTION:
+            self.close()
+
     def _db(self) -> Any:
         """The connection, opened on first use. A refusal to connect stands for
         STORE_READ_SECONDS, so one command does not wait on it twice."""
@@ -4106,14 +4139,20 @@ class StoreRecords(FileRecords):
         try:
             setting = db.resolve_setting(self.project_root)
             self._conn = db.connect(application_name=self.application_name,
-                                    setting=setting)
+                                    setting=setting, transaction=True)
         except db.DbError as exc:
             raise self._fail(StoreError(exc.slug, exc.message, exc.hint)) from None
         self._schema = setting.schema
         return self._conn
 
     def _read(self, query: str, params: Sequence[Any]) -> list[tuple]:
-        conn = self._db()
+        conn = self._begin()
+        try:
+            return self._read_on(conn, query, params)
+        finally:
+            self._end()
+
+    def _read_on(self, conn: Any, query: str, params: Sequence[Any]) -> list[tuple]:
         import psycopg
         try:
             rows = conn.execute(query, params).fetchall()
@@ -4137,7 +4176,7 @@ class StoreRecords(FileRecords):
         """Run `work(conn)` in one transaction, the tables migrated first. A
         connection handed in belongs to a caller holding its own transaction,
         which this neither migrates nor commits."""
-        conn = self._db()
+        conn = self._begin()
         import psycopg
         from capabilities_contract import db
         try:
@@ -4158,9 +4197,12 @@ class StoreRecords(FileRecords):
                                  f"writing records to the store failed: {exc}") from None
         finally:
             self._cache.clear()
+            self._end()
 
     def _table_source(self, collection: str) -> str:
-        self._db()
+        if self._schema is None:
+            self._begin()
+            self._end()
         return f"store:{self._schema}.{STORE_TABLES.get(collection, STORE_CONNECTIONS_TABLE)}"
 
     # -- reading ---------------------------------------------------------------
@@ -4599,8 +4641,8 @@ _ACTOR_RE = re.compile(r"migrate|[a-z][a-z0-9-]{0,62}-service")
 
 def _store_connect(project_root: Path, application_name: str,
                    timeout: int | None = None) -> tuple[Any, str]:
-    """A connection to the database resolved for `project_root`, and its
-    schema. Raises StoreError."""
+    """A transaction connection to the database resolved for `project_root`,
+    and its schema, for one operation the caller closes. Raises StoreError."""
     try:
         from capabilities_contract import db
     except ImportError:
@@ -4611,7 +4653,8 @@ def _store_connect(project_root: Path, application_name: str,
     try:
         setting = db.resolve_setting(project_root)
         extra = {"connect_timeout": timeout} if timeout else {}
-        conn = db.connect(application_name=application_name, setting=setting, **extra)
+        conn = db.connect(application_name=application_name, setting=setting,
+                          transaction=True, **extra)
     except db.DbError as exc:
         raise StoreError(exc.slug, exc.message, exc.hint) from None
     return conn, setting.schema
@@ -5508,15 +5551,13 @@ def open_records(envelope: Path | str, global_dir: Path | str,
                 "store_unreachable", f"cannot read the agent registry: {exc}",
                 "check the database setting with `capabilities store doctor`")
         return legacy
+    conn.close()
     if not state or not state.get("migrated_at"):
         if in_store:
-            legacy._conn, legacy._schema = conn, schema
-        else:
-            conn.close()
+            legacy._schema = schema
         return legacy
     node = os.environ.get(NODE_NAME_ENV, "").strip()
     if not node or node not in state["nodes"]:
-        conn.close()
         if not node:
             raise StoreError(
                 "node_unnamed",
@@ -5533,7 +5574,7 @@ def open_records(envelope: Path | str, global_dir: Path | str,
                            actor=actor)
     adapter._guard_root = root
     adapter._guard_application = application_name
-    adapter._conn, adapter._schema = conn, schema
+    adapter._schema = schema
     return adapter
 
 # <<< contract: store <<<

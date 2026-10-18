@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract==0.4.1",
+#     "capabilities-contract==0.5.0",
 # ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
@@ -143,7 +143,13 @@ USAGE
       that answer no. A supervisor restarts what died; this is for what is
       alive and doing nothing, which it cannot see. Two consecutive bad
       answers are required before a restart, and a cooldown keeps a service
-      that a restart does not fix from being restarted every interval.
+      that a restart does not fix from being restarted every interval. A
+      service whose doctor fails because the store does not answer
+      (store_unreachable) is never restarted for it, since a restart cannot
+      bring the store back and every restart opens its connections again: the
+      watchdog waits, asking that doctor again after a pause that starts at the
+      interval and doubles each time the store is still away, up to 30
+      minutes, and the service reconnects by itself once the store returns.
       `deployment sync` installs this as its own launchd agent on the
       host-agents profile; run it by hand with --dry-run to see what it would
       do. Settings live under `compiler.host.watchdog` in runtime.json.
@@ -164,7 +170,7 @@ USAGE
       Background, which runs
       `deployment machine watchdog`: one pass asking each machine service's
       `service.machine.doctor`, with the project watchdog's failure count,
-      timeout and cooldown, and `launchctl kickstart -k` after repeated
+      timeout, cooldown and wait for a store that does not answer, and `launchctl kickstart -k` after repeated
       failures. A loaded machine agent with no pid is never kickstarted: it is
       reported as `outside_launchd` with the pid when its doctor says the
       service runs as a copy started outside launchd, as `stopped` when it
@@ -478,6 +484,11 @@ WATCHDOG_DEFAULTS = {
     "probe_timeout_seconds": 30,
     "restart_cooldown_seconds": 300,
 }
+# A doctor that fails because the store does not answer is not a reason to
+# restart: the watchdog asks it again after a pause that starts at the interval
+# and doubles while the store stays away, up to this long.
+WATCHDOG_STORE_WAIT_LONGEST_SECONDS = 1800
+WATCHDOG_STORE_SLUG = "store_unreachable"
 PROVIDERS = ("coolify", "dockerhost", "manual")
 PROVIDER_CAPABILITIES = {"coolify": "coolify", "dockerhost": "dockerhost"}
 # A container runtime compiles one bundle per target: everything a build of that
@@ -2079,7 +2090,7 @@ def _cmd_migrate(argv: list[str]) -> None:
              f"run {NAME} through its own script header, which pins it")
     conn = None
     try:
-        conn = db.connect(application_name=NAME)
+        conn = db.connect(application_name=NAME, transaction=True)
         if argv:
             found = db.status(conn, NAME, steps, major=major, minor=minor)
             stored = (None if found.stored_major is None
@@ -2190,6 +2201,9 @@ def _plan_store() -> None:
 
     def plan_connect(*, application_name: str, project_root = None,
                      setting = None, **kwargs):
+        # A plan holds one transaction open on its link for the whole run, so
+        # the link is a session connection whichever kind the caller asked for.
+        kwargs.pop("transaction", None)
         setting = setting if setting is not None else db.resolve_setting(project_root)
         key = (repr(sorted(setting.connect_kwargs().items())), setting.schema)
         link = _PLAN_LINKS.get(key)
@@ -2256,6 +2270,7 @@ def _plan_store() -> None:
 
     db.connect, db.migrate, db.status = plan_connect, plan_migrate, plan_status
     here = globals()
+    here["_HOLD_RECORDS_CONNECTION"] = True
     for name, value in list(here.items()):
         for real, planned in ((real_connect, plan_connect), (real_migrate, plan_migrate),
                               (real_status, plan_status)):
@@ -3287,6 +3302,11 @@ STORE_ENVIRONMENT_SLUGS = frozenset({"store_unreachable", "store_busy"})
 # long-running service sees a changed grant, or a store that came back, at once.
 STORE_READ_SECONDS = 2.0
 
+# Whether an adapter keeps its connection between operations. Only a migration
+# plan sets it: the plan's one link holds a transaction open for the whole run,
+# and closing it after an operation would undo what the plan did so far.
+_HOLD_RECORDS_CONNECTION = False
+
 
 def record_table_steps() -> list[tuple[str, str]]:
     """The migration steps of the contract's tables. `enabled` and
@@ -4249,7 +4269,9 @@ class StoreRecords(FileRecords):
     one node.
 
     The store is reached through the shared database library, on first use
-    only, so a call that reads nothing the store holds never connects."""
+    only, so a call that reads nothing the store holds never connects, and
+    each read or write holds its own transaction connection only while it
+    runs. A connection handed in belongs to the caller and stays open."""
 
     def __init__(self, envelope: Path, global_dir: Path,
                  project_id: str | None = None, project: str | None = None,
@@ -4269,6 +4291,9 @@ class StoreRecords(FileRecords):
         self.node = node_name()
         self._conn = connection
         self._owns_conn = connection is None
+        # How many operations are running on the owned connection: it is closed
+        # when the last of them ends.
+        self._depth = 0
         self._schema = schema
         self._failure: StoreError | None = None
         self._failed_at = 0.0
@@ -4294,7 +4319,7 @@ class StoreRecords(FileRecords):
         if not self._guard_agent or not self._owns_conn:
             return None
         try:
-            conn = self._db()
+            conn = self._begin()
         except StoreError:
             return None
         import psycopg
@@ -4303,8 +4328,12 @@ class StoreRecords(FileRecords):
         except psycopg.OperationalError as exc:
             raise self._unreachable(exc) from None
         finally:
-            if self._owns_conn and self._conn is not None:
-                self._conn.rollback()
+            if self._conn is not None and self._depth == 1:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+            self._end()
 
     def _held(self, collection: str, key: str | None = None) -> bool:
         return (collection in self.collections
@@ -4345,6 +4374,21 @@ class StoreRecords(FileRecords):
             return held[1]
         return None
 
+    def _begin(self) -> Any:
+        """The connection for one operation, opened for it unless one is
+        running; `_end` closes it once the last operation on it ends."""
+        self._depth += 1
+        try:
+            return self._db()
+        except BaseException:
+            self._end()
+            raise
+
+    def _end(self) -> None:
+        self._depth = max(0, self._depth - 1)
+        if self._depth == 0 and not _HOLD_RECORDS_CONNECTION:
+            self.close()
+
     def _db(self) -> Any:
         """The connection, opened on first use. A refusal to connect stands for
         STORE_READ_SECONDS, so one command does not wait on it twice."""
@@ -4364,14 +4408,20 @@ class StoreRecords(FileRecords):
         try:
             setting = db.resolve_setting(self.project_root)
             self._conn = db.connect(application_name=self.application_name,
-                                    setting=setting)
+                                    setting=setting, transaction=True)
         except db.DbError as exc:
             raise self._fail(StoreError(exc.slug, exc.message, exc.hint)) from None
         self._schema = setting.schema
         return self._conn
 
     def _read(self, query: str, params: Sequence[Any]) -> list[tuple]:
-        conn = self._db()
+        conn = self._begin()
+        try:
+            return self._read_on(conn, query, params)
+        finally:
+            self._end()
+
+    def _read_on(self, conn: Any, query: str, params: Sequence[Any]) -> list[tuple]:
         import psycopg
         try:
             rows = conn.execute(query, params).fetchall()
@@ -4395,7 +4445,7 @@ class StoreRecords(FileRecords):
         """Run `work(conn)` in one transaction, the tables migrated first. A
         connection handed in belongs to a caller holding its own transaction,
         which this neither migrates nor commits."""
-        conn = self._db()
+        conn = self._begin()
         import psycopg
         from capabilities_contract import db
         try:
@@ -4416,9 +4466,12 @@ class StoreRecords(FileRecords):
                                  f"writing records to the store failed: {exc}") from None
         finally:
             self._cache.clear()
+            self._end()
 
     def _table_source(self, collection: str) -> str:
-        self._db()
+        if self._schema is None:
+            self._begin()
+            self._end()
         return f"store:{self._schema}.{STORE_TABLES.get(collection, STORE_CONNECTIONS_TABLE)}"
 
     # -- reading ---------------------------------------------------------------
@@ -4857,8 +4910,8 @@ _ACTOR_RE = re.compile(r"migrate|[a-z][a-z0-9-]{0,62}-service")
 
 def _store_connect(project_root: Path, application_name: str,
                    timeout: int | None = None) -> tuple[Any, str]:
-    """A connection to the database resolved for `project_root`, and its
-    schema. Raises StoreError."""
+    """A transaction connection to the database resolved for `project_root`,
+    and its schema, for one operation the caller closes. Raises StoreError."""
     try:
         from capabilities_contract import db
     except ImportError:
@@ -4869,7 +4922,8 @@ def _store_connect(project_root: Path, application_name: str,
     try:
         setting = db.resolve_setting(project_root)
         extra = {"connect_timeout": timeout} if timeout else {}
-        conn = db.connect(application_name=application_name, setting=setting, **extra)
+        conn = db.connect(application_name=application_name, setting=setting,
+                          transaction=True, **extra)
     except db.DbError as exc:
         raise StoreError(exc.slug, exc.message, exc.hint) from None
     return conn, setting.schema
@@ -5766,15 +5820,13 @@ def open_records(envelope: Path | str, global_dir: Path | str,
                 "store_unreachable", f"cannot read the agent registry: {exc}",
                 "check the database setting with `capabilities store doctor`")
         return legacy
+    conn.close()
     if not state or not state.get("migrated_at"):
         if in_store:
-            legacy._conn, legacy._schema = conn, schema
-        else:
-            conn.close()
+            legacy._schema = schema
         return legacy
     node = os.environ.get(NODE_NAME_ENV, "").strip()
     if not node or node not in state["nodes"]:
-        conn.close()
         if not node:
             raise StoreError(
                 "node_unnamed",
@@ -5791,7 +5843,7 @@ def open_records(envelope: Path | str, global_dir: Path | str,
                            actor=actor)
     adapter._guard_root = root
     adapter._guard_application = application_name
-    adapter._conn, adapter._schema = conn, schema
+    adapter._schema = schema
     return adapter
 
 # <<< contract: store <<<
@@ -8499,15 +8551,38 @@ def _probe_service(command: list[str], root: Path, timeout: int) -> dict:
         return {"ok": False, "detail": f"doctor did not answer in {timeout}s"}
     except OSError as exc:
         return {"ok": None, "detail": f"cannot run doctor: {exc}"[:200]}
+    store_away = _names_store_away(result.stdout, result.stderr)
     if result.returncode != 0:
-        return {"ok": False, "detail": f"doctor exited {result.returncode}"}
+        return {"ok": False, "detail": f"doctor exited {result.returncode}",
+                "store_unreachable": store_away}
     try:
         body = json.loads(result.stdout)
     except ValueError:
         return {"ok": True, "detail": "doctor exited 0"}
     if isinstance(body, dict) and body.get("ok") is False:
-        return {"ok": False, "detail": "doctor reported ok=false"}
+        return {"ok": False, "detail": "doctor reported ok=false",
+                "store_unreachable": store_away}
     return {"ok": True, "detail": "doctor reported ok"}
+
+
+def _names_store_away(*outputs: str) -> bool:
+    """Whether a failing doctor said the store does not answer: an error code
+    or check code `store_unreachable` anywhere in what it printed."""
+    def found(value) -> bool:
+        if isinstance(value, dict):
+            return any((key in ("code", "slug") and item == WATCHDOG_STORE_SLUG)
+                       or found(item) for key, item in value.items())
+        if isinstance(value, list):
+            return any(found(item) for item in value)
+        return False
+    for text in outputs:
+        for chunk in [text or "", *(text or "").splitlines()]:
+            try:
+                if found(json.loads(chunk)):
+                    return True
+            except ValueError:
+                continue
+    return False
 
 
 def _kickstart(label: str) -> dict:
@@ -8635,13 +8710,38 @@ def _watchdog_check(name: str, label: str, doctor: list[str], cwd: Path,
         state.pop(name, None)
         return entry
 
+    record = state.get(name) if isinstance(state.get(name), dict) else {}
+    waiting = float(record.get("store_wait_until") or 0)
+    if stamp < waiting:
+        # The store was away when last asked; the doctor is asked again only
+        # once the pause is over, so a watchdog pass opens no connection for it.
+        entry.update({"action": "waiting for the store", "ok": False,
+                      "detail": (f"the store did not answer its doctor; asking again in "
+                                 f"{int(waiting - stamp)}s"),
+                      "store_waits": int(record.get("store_waits") or 0)})
+        return entry
+
     probe = _probe_service(doctor, cwd, config["probe_timeout_seconds"])
     entry.update({"ok": probe["ok"], "detail": probe["detail"]})
     if probe["ok"] is not False:
         state.pop(name, None)
         return entry
 
-    record = state.get(name) if isinstance(state.get(name), dict) else {}
+    if probe.get("store_unreachable"):
+        # A restart cannot bring the store back, and every restart opens the
+        # service's connections again; the service reconnects by itself.
+        waits = int(record.get("store_waits") or 0) + 1
+        pause = min(config["interval_seconds"] * 2 ** (waits - 1),
+                    WATCHDOG_STORE_WAIT_LONGEST_SECONDS)
+        entry.update({"action": "waiting for the store", "store_waits": waits,
+                      "detail": (f"{probe['detail']}: the store does not answer "
+                                 f"({WATCHDOG_STORE_SLUG}); not restarting, asking again "
+                                 f"in {int(pause)}s")})
+        state[name] = {"failures": int(record.get("failures") or 0),
+                       "last_restart": float(record.get("last_restart") or 0),
+                       "store_waits": waits, "store_wait_until": stamp + pause}
+        return entry
+
     failures = int(record.get("failures") or 0) + 1
     entry["failures"] = failures
     last_restart = float(record.get("last_restart") or 0)
@@ -10171,12 +10271,22 @@ class _Lease:
     capability) naming the node that holds it and when that hold expires. The
     holder renews it every reconcile; another node takes it only once it has
     expired or been released. With no database resolvable for the project,
-    no lease can be taken and the lease is `unavailable`."""
+    no lease can be taken and the lease is `unavailable`.
+
+    Each take, renewal, release or read is one transaction on a transaction
+    connection opened for it and closed after it, so a runner holds no
+    connection between reconciles. `maybe_held` is whether this node may hold
+    the lease as far as this runner knows: unknown at first, so the first
+    release asks the store; a release is skipped while it is known not to be
+    held, so a runner whose service is not placed here does not reach the
+    store for its lease at all."""
 
     def __init__(self, root: Path, project: str, node: str, ttl: int = 0):
         self.root, self.project, self.node, self.ttl = root, project, node, ttl
         self.conn = None
         self.mine_until: float | None = None
+        self.maybe_held = True
+        self._migrated = False
 
     def _connect(self):
         if self.conn is not None:
@@ -10193,20 +10303,23 @@ class _Lease:
             state = "unavailable" if exc.slug in _STORE_SETTING_SLUGS else "unreachable"
             raise _LeaseProblem(state, exc.slug, exc.message) from None
         try:
-            conn = db.connect(application_name=NAME, setting=setting)
+            conn = db.connect(application_name=NAME, setting=setting, transaction=True)
         except db.DbError as exc:
             raise _LeaseProblem("unreachable", exc.slug, exc.message) from None
-        try:
-            steps, major, minor = _tables()
-            db.migrate(conn, NAME, steps, major=major, minor=minor)
-        except db.DbError as exc:
-            conn.close()
-            raise _LeaseProblem("unreachable", exc.slug, exc.message) from None
+        if not self._migrated:
+            try:
+                steps, major, minor = _tables()
+                db.migrate(conn, NAME, steps, major=major, minor=minor)
+            except db.DbError as exc:
+                conn.close()
+                raise _LeaseProblem("unreachable", exc.slug, exc.message) from None
+            self._migrated = True
         self.conn = conn
         return conn
 
     def _run(self, work):
-        """`work(conn)` in one transaction; a failure drops the connection."""
+        """`work(conn)` in one transaction on a connection opened for it and
+        closed after it."""
         try:
             conn = self._connect()
         except _LeaseProblem as problem:
@@ -10215,14 +10328,11 @@ class _Lease:
             with conn.transaction():
                 return work(conn)
         except Exception as exc:  # psycopg.Error, or a connection that went away
-            try:
-                conn.close()
-            except Exception:
-                pass
-            self.conn = None
             return {"state": "unreachable", "error": {
                 "code": "store_unreachable",
                 "message": " ".join(f"{type(exc).__name__}: {exc}".split())[:300]}}
+        finally:
+            self.close()
 
     @staticmethod
     def _holding(row, node: str) -> dict:
@@ -10258,8 +10368,12 @@ class _Lease:
         found = self._run(work)
         if found.get("state") == "held":
             self.mine_until = time.monotonic() + self.ttl
-        elif found.get("state") != "unreachable":
+            self.maybe_held = True
+        elif found.get("state") == "unreachable":
+            self.maybe_held = True
+        else:
             self.mine_until = None
+            self.maybe_held = found.get("state") not in ("held_elsewhere", "free")
         return found
 
     def release(self, capability: str) -> dict:
@@ -10279,7 +10393,15 @@ class _Lease:
         found = self._run(work)
         if found.get("state") != "unreachable":
             self.mine_until = None
+            self.maybe_held = False
         return found
+
+    def release_if_held(self, capability: str, known: dict) -> dict:
+        """`release`, unless this node is known not to hold the lease: then
+        `known`, the lease as last seen, and the store is not asked."""
+        if not self.maybe_held:
+            return known
+        return self.release(capability)
 
     def read(self, capability: str) -> dict:
         def work(conn):
@@ -10545,7 +10667,7 @@ class _Runner:
                        f"{POLICY_REFUSAL_EXIT} ({detail}); it is tried again when the "
                        f"gate answer for {self.node} changes or the runner restarts")
         self.say(self.reason)
-        self.lease_state = self.lease.release(self.name)
+        self.lease_state = self.lease.release_if_held(self.name, self.lease_state)
         if self.lease_state.get("released"):
             self.say(f"released the lease for {self.name}")
         self.save()
@@ -10577,7 +10699,7 @@ class _Runner:
         if placed and self.refusal is not None:
             want, key = False, ("refused",)
             reason = self.reason if self.reason.startswith("held idle") else "held idle"
-            lease = self.lease.release(self.name)
+            lease = self.lease.release_if_held(self.name, self.lease_state)
             self.placed, self.want, self.reason, self.lease_state = placed, want, reason, lease
             self.converge()
             self.save()
@@ -10625,8 +10747,9 @@ class _Runner:
         if not placed:
             # A node the gate turned off gives the service up once it has
             # stopped it, so the node it was moved to need not wait for the
-            # hold to run out, and never starts it beside this one.
-            self.lease_state = self.lease.release(self.name)
+            # hold to run out, and never starts it beside this one. Once it
+            # knows it holds none, it asks the store nothing more.
+            self.lease_state = self.lease.release_if_held(self.name, self.lease_state)
             if self.lease_state.get("released"):
                 self.say(f"released the lease for {self.name}")
         self.save()

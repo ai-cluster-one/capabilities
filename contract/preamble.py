@@ -1657,7 +1657,7 @@ def _cmd_migrate(argv: list[str]) -> None:
              f"run {NAME} through its own script header, which pins it")
     conn = None
     try:
-        conn = db.connect(application_name=NAME)
+        conn = db.connect(application_name=NAME, transaction=True)
         if argv:
             found = db.status(conn, NAME, steps, major=major, minor=minor)
             stored = (None if found.stored_major is None
@@ -1768,6 +1768,9 @@ def _plan_store() -> None:
 
     def plan_connect(*, application_name: str, project_root = None,
                      setting = None, **kwargs):
+        # A plan holds one transaction open on its link for the whole run, so
+        # the link is a session connection whichever kind the caller asked for.
+        kwargs.pop("transaction", None)
         setting = setting if setting is not None else db.resolve_setting(project_root)
         key = (repr(sorted(setting.connect_kwargs().items())), setting.schema)
         link = _PLAN_LINKS.get(key)
@@ -1834,6 +1837,7 @@ def _plan_store() -> None:
 
     db.connect, db.migrate, db.status = plan_connect, plan_migrate, plan_status
     here = globals()
+    here["_HOLD_RECORDS_CONNECTION"] = True
     for name, value in list(here.items()):
         for real, planned in ((real_connect, plan_connect), (real_migrate, plan_migrate),
                               (real_status, plan_status)):

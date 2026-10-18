@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-10-18 — The service holds only its listener between steps
+
+`memory` uses `capabilities-contract` 0.5.0. The service listens on a session connection and puts each step's questions on a transaction connection opened when the step first asks one and closed when it ends; the tables are migrated once, when it first connects. Every command connects on a transaction connection, at the store's transaction address where one is named, except `groom`, whose pass holds its lock on a session connection. A container is handed `AGENTKIT_DB_TRANSACTION_HOST` and `AGENTKIT_DB_TRANSACTION_PORT`. With one address everything reaches it as before.
+
 ## 2026-10-16 — `service init` writes a moved agent's settings as rows
 
 For an agent whose records moved into the store, `service init` writes `{"version": 1}` as its settings rows, refusing as `settings_exist` (naming the store) where they exist already, and the doctor and settings errors name the store. Every other project writes service/settings.json as before.

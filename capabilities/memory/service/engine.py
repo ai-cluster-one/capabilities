@@ -375,11 +375,17 @@ class Store:
     """One connection to the store a project resolves, bound to its schema.
     Every write runs in one transaction, serialised per project, and leaves
     an event; the store announces each event on `memory_changed` when the
-    transaction commits."""
+    transaction commits.
 
-    def __init__(self, setting, application_name: str = "memory"):
+    It is a transaction connection, at the store's transaction address where
+    one is named and carrying no session state, unless `session` asks for a
+    session connection: a grooming pass does, for the lock it holds across its
+    transactions."""
+
+    def __init__(self, setting, application_name: str = "memory", session: bool = False):
         self.setting = setting
         self.application_name = application_name
+        self.session = session
         self.conn = None
 
     @property
@@ -390,7 +396,7 @@ class Store:
         db = database()
         try:
             self.conn = db.connect(application_name=self.application_name,
-                                   setting=self.setting)
+                                   setting=self.setting, transaction=not self.session)
             if migrate:
                 db.migrate(self.conn, LEDGER_OWNER, LEDGER_STEPS, major=LEDGER_MAJOR,
                            minor=LEDGER_MINOR)
@@ -1400,20 +1406,39 @@ def default_node() -> str:
 
 
 class StoreLink:
-    """The service's two connections to one store, shared by every project on
-    it: the one its questions go on and the one that listens."""
+    """The service's connections to one store, shared by every project on it:
+    the session connection that listens, held, and the transaction connection
+    its questions go on, opened when a step first asks one and closed when the
+    step ends (`release`), so between steps it holds only the listener. The
+    tables are migrated once, when the link first connects."""
 
     def __init__(self, setting):
         self.setting = setting
-        self.store: Store | None = None
+        self._store: Store | None = None
+        self.migrated = False
         self.listener = None
         self.error: str | None = None
         self.retry_at = 0.0
         self.delay = RECONNECT_FIRST
 
     @property
+    def store(self) -> Store:
+        """The questions' connection for this step, opened on first use."""
+        if self._store is None:
+            self._store = Store(self.setting, application_name="memory-service").open(
+                migrate=not self.migrated)
+            self.migrated = True
+        return self._store
+
+    def release(self) -> None:
+        """Close the questions' connection at the end of a step."""
+        if self._store is not None:
+            self._store.close()
+        self._store = None
+
+    @property
     def connected(self) -> bool:
-        return self.store is not None and self.listener is not None
+        return self.migrated and self.listener is not None
 
     def ensure(self, log: Callable[[str], None]) -> bool:
         if self.connected:
@@ -1421,8 +1446,8 @@ class StoreLink:
         if time.monotonic() < self.retry_at:
             return False
         try:
-            if self.store is None:
-                self.store = Store(self.setting, application_name="memory-service").open()
+            if not self.migrated:
+                self.store  # noqa: B018 - opens it, migrating the tables once
             if self.listener is None:
                 conn = database().connect(application_name="memory-listen",
                                           setting=self.setting)
@@ -1452,9 +1477,7 @@ class StoreLink:
         self.retry_at = time.monotonic() + self.delay
 
     def drop(self) -> None:
-        if self.store is not None:
-            self.store.close()
-        self.store = None
+        self.release()
         if self.listener is not None:
             with contextlib.suppress(Exception):
                 self.listener.close()
@@ -1472,7 +1495,7 @@ class StoreLink:
 
     def row(self) -> dict:
         return {"store": store_label(self.setting), "schema": self.setting.schema,
-                "connected": self.store is not None, "listening": self.listener is not None,
+                "connected": self.connected, "listening": self.listener is not None,
                 "error": self.error}
 
 
@@ -1908,6 +1931,8 @@ class Engine:
             if time.monotonic() >= slot.next_groom_check:
                 if slot.consider_groom(self.grooming(), cap):
                     slot.start_groom()
+        for link in self.links.values():
+            link.release()
         self.publish(force=self.changed)
 
     def listen(self) -> None:

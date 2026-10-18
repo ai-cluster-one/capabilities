@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.4.1",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.5.0",
 #                 "callva-harness-runner==0.9.0",
 #                 "pyyaml>=6"]
 # ///
@@ -19,7 +19,7 @@ between the daemon and the store being closed and opened again, so no test
 stops a server it did not start.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
-        --with 'capabilities-contract==0.4.1' \\
+        --with 'capabilities-contract==0.5.0' \\
         --with 'callva-harness-runner==0.9.0' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -1045,11 +1045,11 @@ def backend(conn) -> int:
 
 
 @needs_store
-def test_every_question_goes_on_one_held_connection_beside_the_listener(
+def test_the_questions_of_a_pass_go_on_one_connection_closed_at_its_end(
         project, store, capsys, monkeypatch):
-    """Idle on a one-second poll with two lanes, the daemon opens its listener
-    and the connection its questions go on, and nothing else, however many
-    times it asks."""
+    """Idle on a one-second poll with two lanes, the daemon holds its listener
+    and nothing else: each pass puts all its questions on one connection opened
+    for that pass and closed at its end."""
     entry, schema, conn = store
     write_settings(project, "version = 1\npoll_seconds = 1\n")
     opened = []
@@ -1070,29 +1070,33 @@ def test_every_question_goes_on_one_held_connection_beside_the_listener(
     with h:
         h.settle(3.6)
         store_ = h.daemon.store
-        held = {backend(store_.listener), backend(store_.query)}
-        assert len(opened) == 2 and len(held) == 2
-        # Start and three polls, each asking both lanes, all on the one connection.
-        assert len(asked) >= 6 and set(asked) == {backend(store_.query)}
+        assert store_.query is None
+        listener = backend(store_.listener)
+        passes = set(asked)
+        assert listener not in passes
+        # Start and three polls, each asking both lanes on a connection of its own.
+        assert len(asked) >= 6 and len(passes) >= 4
+        assert all(asked.count(pid) >= 2 for pid in passes)
+        assert len(opened) == 1 + len(passes)
         assert "poll" in h.daemon.last_wake["reasons"]
         [row] = h.daemon.status()["stores"]
         from psycopg.conninfo import conninfo_to_dict
         info = conninfo_to_dict(DSN)
         assert row["store"] == f"{info['host']}:{info['port']}/{info['dbname']}"
-        assert (row["listening"], row["connections_opened"], row["error"]) == (True, 2, None)
+        assert (row["listening"], row["connections_opened"], row["error"]) == \
+            (True, len(opened), None)
         assert row["last_opened_at"]
-        live = conn.execute("select count(*) from pg_stat_activity where pid = any(%s)",
-                            (sorted(held),)).fetchone()[0]
-        assert live == 2
+        live = conn.execute("select pid from pg_stat_activity where pid = any(%s)",
+                            (sorted(passes | {listener}),)).fetchall()
+        assert live == [(listener,)]
 
 
 @needs_store
-def test_a_lost_question_connection_is_asked_for_again_on_the_doubling_interval(
+def test_a_question_connection_the_store_refuses_is_asked_for_again_on_the_doubling_interval(
         project, store, relay, capsys):
-    """The backend under the question connection is terminated while the store
-    takes no new connection: the daemon keeps its listener, asks for the other
-    at a doubling interval, and the moment it has it asks for the work it
-    missed."""
+    """The store takes no new connection: the daemon keeps its listener, and the
+    pass a notification wakes asks for a connection for its questions at a
+    doubling interval, and the moment it has one asks for the work it missed."""
     entry, schema, conn = store
     write_settings(project, "version = 1\npoll_seconds = 3600\n")
     through = _cli.store_setting(schema, host="127.0.0.1", port=relay.port)
@@ -1104,30 +1108,31 @@ def test_a_lost_question_connection_is_asked_for_again_on_the_doubling_interval(
         h.dispatcher.step()
         store_ = h.daemon.store
         assert store_.connections_opened == 2 and len(attempts) == 1
+        assert store_.query is None
         listening = backend(store_.listener)
         relay.refuse()
-        conn.execute("select pg_terminate_backend(%s)", (backend(store_.query),))
         add(entry, capsys, "alpha")
-        h.steps(lambda: store_.query is None, seconds=5)
+        h.steps(lambda: store_.query_error is not None, seconds=5)
         assert "notify" in h.daemon.last_wake["reasons"]
         h.settle(3.0)
         assert h.running() == 0
         [row] = h.daemon.status()["stores"]
         assert row["listening"] is True and row["error"]
-        # Asked again 0.2s after it was lost, then after 0.4s, then 0.8s from then on.
+        # Asked again 0.2s after it was refused, then after 0.4s, then 0.8s from then on.
         gaps = gaps_of(attempts[1:])
-        assert len(gaps) >= 3 and gaps[0] < gaps[1], gaps
-        assert 0.3 < gaps[0] < 0.6 and all(0.6 < gap < 1.2 for gap in gaps[1:]), gaps
+        assert len(gaps) >= 4 and gaps[0] < gaps[1] < gaps[2], gaps
+        assert 0.1 < gaps[0] < 0.35 and 0.3 < gaps[1] < 0.6, gaps
+        assert all(0.6 < gap < 1.2 for gap in gaps[2:]), gaps
 
         relay.up()
         h.steps(lambda: h.running("alpha") == 1, seconds=5)
         assert "reconnect" in h.daemon.last_wake["reasons"]
-        assert store_.connections_opened == 3
+        assert store_.connections_opened >= 3
         assert backend(store_.listener) == listening
         [row] = h.daemon.status()["stores"]
         assert row["error"] is None
         log = (h.daemon.state_dir / "daemon.log").read_text()
-        assert log.count("lost the store connection its questions go on") == 1
+        assert log.count("cannot connect to the store to ask it for work") == 1
         assert "connected to the store again for its questions" in log
 
 
@@ -1135,9 +1140,9 @@ def test_a_lost_question_connection_is_asked_for_again_on_the_doubling_interval(
 def test_connections_the_path_dropped_are_severed_and_asked_for_again(
         project, store, relay, capsys):
     """Every connection through the relay stops carrying anything while staying
-    open: the question that goes unanswered, and the listener's round trip, are
-    severed within the bound rather than waited on, no pass of the loop holds
-    longer, and both connections are opened again and the work is taken."""
+    open: the listener's round trip is severed within the bound rather than
+    waited on, no pass of the loop holds longer, the questions go on connections
+    of their own opened for each pass, and the work is taken."""
     entry, schema, conn = store
     write_settings(project, "version = 1\npoll_seconds = 1\n")
     through = _cli.store_setting(schema, host="127.0.0.1", port=relay.port)
@@ -1156,10 +1161,9 @@ def test_connections_the_path_dropped_are_severed_and_asked_for_again(
 
         h.steps(taken, seconds=10)
         assert max(gaps_of(passes)) < 3.0, gaps_of(passes)
-        assert store_.connections_opened >= 4
-        assert store_.listener is not None and store_.query is not None
+        assert store_.connections_opened >= 3
+        h.steps(lambda: store_.listener is not None, seconds=5)
         log = (h.daemon.state_dir / "daemon.log").read_text()
-        assert "lost the store connection its questions go on" in log
         assert "lost the store's notification" in log
 
 
@@ -1176,7 +1180,7 @@ def test_a_lost_listener_is_asked_for_again_on_the_doubling_interval(
     with h:
         h.dispatcher.step()
         store_ = h.daemon.store
-        asking = backend(store_.query)
+        assert store_.query is None
         relay.refuse()
         conn.execute("select pg_terminate_backend(%s)", (backend(store_.listener),))
         h.steps(lambda: h.daemon.listener is None, seconds=5)
@@ -1192,8 +1196,8 @@ def test_a_lost_listener_is_asked_for_again_on_the_doubling_interval(
         add(entry, capsys, "beta")
         took = h.steps(lambda: h.running("beta") == 1, seconds=5)
         assert took < 3 and "notify" in h.daemon.last_wake["reasons"]
-        assert store_.connections_opened == 3
-        assert backend(store_.query) == asking
+        assert store_.connections_opened >= 4
+        assert store_.query is None
         [row] = h.daemon.status()["stores"]
         assert (row["listening"], row["error"]) == (True, None)
 
@@ -1228,11 +1232,11 @@ def test_a_question_that_hangs_is_cut_off_and_the_daemon_carries_on(project, sto
             blocker.close()
         add(entry, capsys, "alpha")
         h.steps(lambda: h.running("alpha") == 1, seconds=5)
-        assert store_.connections_opened == 3
+        assert store_.connections_opened >= 4
 
 
 @needs_store
-def test_the_held_connections_carry_a_round_trip_on_the_ping_interval(
+def test_the_listener_carries_a_round_trip_on_the_ping_interval(
         project, store, capsys):
     entry, schema, conn = store
     write_settings(project, "version = 1\npoll_seconds = 3600\n")
@@ -1246,8 +1250,9 @@ def test_the_held_connections_carry_a_round_trip_on_the_ping_interval(
         listener = [at for pid, at in pings if pid == backend(store_.listener)]
         assert 4 <= len(listener) <= 6, listener
         assert all(0.4 < gap < 0.8 for gap in gaps_of(listener)), gaps_of(listener)
-        # The question connection carries nothing on an hour's poll but its pings.
-        assert [pid for pid, _at in pings if pid == backend(store_.query)]
+        # No question connection is held between passes, so nothing else is pinged.
+        assert store_.query is None
+        assert {pid for pid, _at in pings} == {backend(store_.listener)}
         last = conn.execute("select query from pg_stat_activity where pid = %s",
                             (backend(store_.listener),)).fetchone()[0]
         assert last == "select 1"

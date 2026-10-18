@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-18 — Connections go to the store's transaction address
+
+`telegram` uses `capabilities-contract` 0.5.0. The job store and the profile lookups connect on transaction connections, at the store's transaction address where one is named. With one address everything reaches it as before.
+
 ## 2026-10-16 — File overrides are ignored for a moved agent
 
 For an agent whose records moved into the store, the daemon is started without `TELEGRAM_SERVICE_SETTINGS`, and `TELEGRAM_SERVICE_SETTINGS`, `TELEGRAM_SERVICE_CONNECTIONS_FILE`, `TG_CONNECTIONS_FILE` and `TELEGRAM_CONNECTIONS_FILE` are ignored with a notice on the daemon's log; connections and settings come from the store. Where the store cannot say whether the agent's records moved, the daemon refuses rather than read the file an override names. Every other project behaves as before.

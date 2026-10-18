@@ -1,5 +1,9 @@
 # askproject — change log
 
+## 2026-10-18 — Connections go to the store's transaction address
+
+`askproject` uses `capabilities-contract` 0.5.0. Its session map and its commands connect on transaction connections, at the store's transaction address where one is named. With one address everything reaches it as before.
+
 ## 2026-10-16 — A moved agent's profiles are read from the store
 
 For an agent whose records moved into the store, a profile name `<name>` resolves to its own harness profile `askproject-<name>` at the agent's scope first, then the machine folder and the shipped set; `profiles` lists only those, by the name asked for, with `source: store`, and `profiles show` prints its text. Harness profiles other capabilities keep at the agent's scope are neither listed nor resolved, as the folder held only askproject's. No profiles folder is read for it. Every other project reads its folder as before.

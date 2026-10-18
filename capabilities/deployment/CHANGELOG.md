@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-18 — A runner holds no connection, and the watchdog waits for a store that is away
+
+`deployment` uses `capabilities-contract` 0.5.0. A runner opens a transaction connection for each lease take, renewal, release or read and closes it after, and its gate read connects only while it reads, so a runner holds no connection between reconciles; once it knows it holds no lease, a runner whose service is not placed here does not ask the store about the lease at all. The watchdog does not restart a service whose doctor fails because the store does not answer (`store_unreachable`): it reports `waiting for the store` and asks that doctor again after a pause that starts at its interval and doubles while the store stays away, up to 30 minutes, opening nothing meanwhile; any other failure is counted and restarted as before.
+
 ## 2026-10-16 — A moved agent's image builds without a database and bakes in no record file
 
 `doctor` counts a service of an agent whose records moved into the store as configured when the store holds its settings document. For such an agent `sync` compiles a Dockerfile whose `capabilities install --allow` and `capabilities init` run without a database and whose `capabilities doctor` moves to the entrypoint, at container start, and a .dockerignore that excludes every record and settings file (`capabilities/settings.json`, `*/connections.json`, `*/identifiers.json`, `*/service/settings.json`, `*/service/config.toml`, `tasks/conveyor.toml`, `slack/policy.json`) and the profile and worker folders that moved with them (`askproject/profiles/`, `*/service/profiles/`, `tasks/workers/`, `tasks/profiles/`). Every other project compiles as before.

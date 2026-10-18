@@ -198,3 +198,24 @@ def test_held_wakes_wait_for_the_operator_and_a_grant_releases_them(store):
     listener.close()
     assert said and all(n == {"schema": store.setting.schema, "project": "p", "agent": "alpha",
                               "room": "!r"} for n in said)
+
+
+def test_the_store_holds_no_connection_between_operations(store):
+    """Each statement and each transaction runs on a connection opened for it
+    and closed after it, so a service waiting on a sync holds none."""
+    import psycopg
+    assert store.conn is None
+    assert store.acquire("p", "alpha", "h1", "n1", 1) is None
+    assert store.conn is None
+    with store.transaction() as cur:
+        cur.execute("SELECT pg_backend_pid()")
+        inside = cur.fetchone()[0]
+        assert store.execute("SELECT pg_backend_pid()", fetch="one")[0] == inside
+    assert store.conn is None
+    import time
+    with psycopg.connect(DSN, autocommit=True) as admin:
+        deadline = time.monotonic() + 5
+        while admin.execute("SELECT count(*) FROM pg_stat_activity WHERE pid = %s",
+                            (inside,)).fetchone() != (0,):
+            assert time.monotonic() < deadline, "the connection stayed open"
+            time.sleep(0.05)

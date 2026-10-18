@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-18 — The service holds only its listener between passes
+
+`tasks` uses `capabilities-contract` 0.5.0. The service listens on a session connection, which also carries its presence lock, and puts the questions of each pass on a transaction connection opened for that pass and closed at its end, each transaction cut off by `statement_timeout` as before; between passes it holds only the listener. Every command connects on a transaction connection, at the store's transaction address where one is named; `watch` and `workers import --apply`, which hold `LISTEN` or a session lock, keep a session connection. A turn the service starts is handed the transaction address with the rest of the store, and a container is handed `AGENTKIT_DB_TRANSACTION_HOST` and `AGENTKIT_DB_TRANSACTION_PORT`. With one address everything reaches it as before.
+
 ## 2026-10-16 — The escalation is a table of the tasks settings
 
 The escalation chain and its ceiling are the `escalation` table of the tasks settings document - `escalation.escalate_to` and `escalation.stall_after`, declared keys edited with `tasks settings set` and checked by it as the claim reads them - in the project's `service/config.toml`, or in its rows for an agent whose records moved into the store. A project whose settings carry no `escalation` table and whose records have not moved still has its `conveyor.toml` read, so such a project behaves as before; `doctor`'s warning for a project with enabled workers and no chain names the settings verb. `service init` writes the template beside an escalation set before it, and `--force` keeps that table.

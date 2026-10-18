@@ -158,3 +158,27 @@ def test_the_service_grooms_a_window_that_no_longer_fits(world, tmp_path):
     groom = next(e for e in log if e["kind"] == "groom")
     assert groom["reason"].startswith("service:")
     assert groom["actor"].startswith("memory service on ")
+
+
+def test_between_steps_the_service_holds_only_its_listener(world):
+    """The service listens on one session connection and puts each step's
+    questions on a connection opened for that step and closed at its end."""
+    import psycopg
+    from _cli import DSN
+    root = world.project("p")
+    world.ok(root, "add", "first", "--title", "one")
+    start(world, root)
+    until(lambda: sidecar(root).get("rendered_by") == "the memory service")
+    seen: dict = {}
+    with psycopg.connect(DSN, autocommit=True) as admin:
+        began = time.monotonic()
+        while time.monotonic() - began < 6.0:
+            now = time.monotonic()
+            for pid, name in admin.execute(
+                    "SELECT pid, application_name FROM pg_stat_activity "
+                    "WHERE application_name LIKE 'memory-%%' AND datname = current_database()"):
+                first, _last, _name = seen.get(pid, (now, now, name))
+                seen[pid] = (first, now, name)
+            time.sleep(0.2)
+    held = sorted(name for first, last, name in seen.values() if last - first >= 4.0)
+    assert held == ["memory-listen"], seen

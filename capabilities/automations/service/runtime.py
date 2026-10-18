@@ -893,8 +893,9 @@ def store_key(setting) -> tuple:
 
 
 def open_ledger(root: Path, config: dict[str, Any] | None = None,
-                strict: bool = True) -> "RunLedger":
+                strict: bool = True, listen: bool = False) -> "RunLedger":
     """The ledger of this project's runs, open on the store. The caller closes it.
+    `listen` is the scheduler's: its link listens for changed definitions.
 
     A run is recorded under the project's id, the one the launching CLI resolves
     for a write. A read path passes `strict` False and reads under the id the
@@ -906,7 +907,7 @@ def open_ledger(root: Path, config: dict[str, Any] | None = None,
         project_id = project_id or _handed_project_id(root) or identity.get("id") or ""
     elif not project_id:
         raise ConfigError("this project declares no id to record its runs under")
-    return RunLedger(project_id, root=root).open()
+    return RunLedger(project_id, root=root, listen=listen).open()
 
 
 class StoreLink:
@@ -923,15 +924,20 @@ class StoreLink:
     resolves the store for `root` when it first opens. `error` is why the link
     is down, while it is.
 
-    It listens on `automations_changed`, which the store announces on every
-    definition saved or removed: the projects it names are collected in
-    `changed` as the connection reads them, and `generation` moves on every
-    open, because what was announced while the link was down is lost and every
-    project on it has to read its definitions again."""
+    A scheduler's link (`listen`) listens on `automations_changed`, which the
+    store announces on every definition saved or removed: the projects it
+    names are collected in `changed` as the connection reads them, and
+    `generation` moves on every open, because what was announced while the
+    link was down is lost and every project on it has to read its definitions
+    again. Its one session connection carries the scheduler's questions too,
+    so a scheduler holds one connection to its store. Any other link - a
+    command's - is a transaction connection, at the store's transaction
+    address where one is named, and listens to nothing."""
 
-    def __init__(self, setting=None, root: Path | None = None):
+    def __init__(self, setting=None, root: Path | None = None, listen: bool = False):
         self.setting = setting
         self.root = root
+        self.listen = listen
         self.conn = None
         self.warnings: list[str] = []
         self.in_transaction = False
@@ -948,15 +954,17 @@ class StoreLink:
         if self.setting is None:
             self.setting = resolve_store(self.root)
         try:
-            conn = db.connect(application_name=LEDGER_OWNER, setting=self.setting)
+            conn = db.connect(application_name=LEDGER_OWNER, setting=self.setting,
+                              transaction=not self.listen)
         except db.DbError as exc:
             raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
         try:
             result = db.migrate(conn, LEDGER_OWNER, LEDGER_STEPS,
                                 major=LEDGER_MAJOR, minor=LEDGER_MINOR)
             conn.autocommit = True
-            conn.add_notify_handler(self._announced)
-            conn.execute("LISTEN automations_changed")
+            if self.listen:
+                conn.add_notify_handler(self._announced)
+                conn.execute("LISTEN automations_changed")
         except db.DbError as exc:
             conn.close()
             raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
@@ -1018,12 +1026,12 @@ class RunLedger:
     depend on how the store keeps them."""
 
     def __init__(self, project_id: str, link: StoreLink | None = None,
-                 root: Path | None = None):
+                 root: Path | None = None, listen: bool = False):
         self.project_id = project_id
         self.node = NODE_NAME()
         self.host = socket.gethostname()
         self._owns_link = link is None
-        self.link = link if link is not None else StoreLink(root=root)
+        self.link = link if link is not None else StoreLink(root=root, listen=listen)
 
     @property
     def conn(self):
@@ -1393,6 +1401,11 @@ PUBLISH_SECONDS = 30.0
 ADMIT_SECONDS = 1.0
 # The longest the machine process sleeps between passes.
 LONGEST_SLEEP_SECONDS = 1.0
+# How soon a store that went away, or did not answer when the scheduler
+# started, is asked for again: the first interval, doubled after each attempt
+# that fails, up to the longest.
+RECONNECT_FIRST_SECONDS = 1.0
+RECONNECT_LONGEST_SECONDS = 30.0
 
 
 def log_line(project: str, message: str) -> str:
@@ -1563,10 +1576,13 @@ class Daemon:
         self.pause: dict | None = None
         self.definition_problems: list[str] = []
         self._generation = -1
+        # A lost store is asked for again on a doubling interval, not on every tick.
+        self._reopen_at = 0.0
+        self._reopen_delay = RECONNECT_FIRST_SECONDS
         # The file's part is read first, so a declaration that does not load is
         # refused before the store is opened for it.
         file_config = self._load_file()
-        self.runs = runs if runs is not None else open_ledger(self.root)
+        self.runs = runs if runs is not None else open_ledger(self.root, listen=True)
         self.config = self.load(file_config)
         self.by_id = automation_map(self.config)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -2090,11 +2106,20 @@ class Daemon:
         except Exception as exc:
             if not self.runs.lost():
                 raise
+            now = time.monotonic()
+            if now < self._reopen_at:
+                return
             self.log(f"lost the store connection, reconnecting: {exc}")
             try:
                 self.runs.reopen()
             except StoreUnavailable as again:
-                self.log(f"the store is still unavailable: {again.message}")
+                self.log(f"the store is still unavailable, asking again in "
+                         f"{self._reopen_delay:g}s: {again.message}")
+                self._reopen_at = now + self._reopen_delay
+                self._reopen_delay = min(self._reopen_delay * 2, RECONNECT_LONGEST_SECONDS)
+            else:
+                self._reopen_at = 0.0
+                self._reopen_delay = RECONNECT_FIRST_SECONDS
 
 
 # --- machine mode ----------------------------------------------------------------
@@ -2551,7 +2576,7 @@ class MachineService:
         key = store_key(setting)
         link = self.links.get(key)
         if link is None:
-            link = self.links[key] = StoreLink(setting)
+            link = self.links[key] = StoreLink(setting, listen=True)
             try:
                 link.open()
             except StoreUnavailable as exc:
@@ -2767,9 +2792,34 @@ def run_from_env() -> None:
         )
     root = Path(root_raw)
     if from_cli:
-        Daemon(root, None, Path(state_raw), loader=lambda: cli_declaration(root)).run()
+        _daemon_when_the_store_answers(
+            lambda: Daemon(root, None, Path(state_raw),
+                           loader=lambda: cli_declaration(root))).run()
         return
-    Daemon(root, Path(config_raw), Path(state_raw)).run()
+    _daemon_when_the_store_answers(
+        lambda: Daemon(root, Path(config_raw), Path(state_raw))).run()
+
+
+def _daemon_when_the_store_answers(make) -> "Daemon":
+    """The scheduler, made once its store answers. A store that does not
+    answer when it starts is asked for again on a doubling interval, said once,
+    rather than ending the process for its supervisor to start again; a store
+    setting that cannot be used still ends it."""
+    delay, said = RECONNECT_FIRST_SECONDS, None
+    tag = _project_slug(Path(os.environ.get("AUTOMATIONS_PROJECT_ROOT") or "."))
+    while True:
+        try:
+            return make()
+        except StoreUnavailable as exc:
+            if exc.slug not in ("store_unreachable", "store_busy"):
+                raise
+            if exc.message != said:
+                said = exc.message
+                sys.stderr.write(log_line(tag, f"the store is unavailable, asking again: "
+                                               f"{exc.slug}: {exc.message}"))
+                sys.stderr.flush()
+            time.sleep(delay)
+            delay = min(delay * 2, RECONNECT_LONGEST_SECONDS)
 
 
 if __name__ == "__main__":

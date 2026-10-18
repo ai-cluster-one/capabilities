@@ -34,16 +34,15 @@ On the connection it listens on it holds, for each project it serves, the
 lock that says a service serves that project, which another project reads
 before it assigns a task there; it goes with the connection.
 
-It holds its connections to the store rather than opening one per question:
-one it listens on, and one every question it asks is put to, each question cut
-off by the store when it runs past `QUESTION_TIMEOUT_SECONDS`. A question or a
-round trip whose answer is not back within `ROUND_TRIP_SECONDS` has its
-connection severed and counted lost, so a connection the path dropped under it
-holds the loop, and a stop, no longer than that. They are kept per
-store in a pool, so whoever asks of the same store shares the same two. The
-listener carries a round trip of its own every `PING_SECONDS`, and so does the
-question connection when nothing else went over it for that long, so a proxy in
-front of the store does not close either as idle.
+It holds one connection to the store, the session connection it listens on,
+and puts the questions of each pass on a transaction connection opened for that
+pass and closed at its end, each question cut off by the store when it runs
+past `QUESTION_TIMEOUT_SECONDS`. A question or a round trip whose answer is not
+back within `ROUND_TRIP_SECONDS` has its connection severed and counted lost,
+so a connection the path dropped under it holds the loop, and a stop, no longer
+than that. They are kept per store in a pool, so whoever asks of the same store
+shares the same ones. The listener carries a round trip of its own every
+`PING_SECONDS`, so a proxy in front of the store does not close it as idle.
 
 It outlives the store being away. A connection it loses, or cannot open, is
 asked for again on a doubling interval until the store answers, and the moment
@@ -1492,6 +1491,10 @@ class Dispatcher:
         for slot in self.slots:
             slot.publish()
         self.after_pass()
+        # The questions of a pass go on a connection held for that pass alone:
+        # between passes the daemon holds only its listener.
+        for store in self.stores():
+            self._drop_query(store)
         if wait and not self.stop_requested:
             deadlines = [d for slot in self.slots for d in slot.deadlines()]
             for store in self.stores():

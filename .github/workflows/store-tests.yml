@@ -109,7 +109,7 @@ jobs:
             --deselect tests/test_manager_bundle_install.py::test_telegram_daemon_sigterm_stops_without_traceback
           )
           uv run --no-project --with pytest --with "psycopg[binary]>=3.2" --with "httpx>=0.27" \
-            --with capabilities-contract==0.4.1 \
+            --with capabilities-contract==0.5.0 \
             pytest tests -q -rfEs "${excluded[@]}"
 
       # Each capability suite runs on its own: collected together, their
@@ -131,19 +131,19 @@ jobs:
             --deselect capabilities/tasks/tests/test_store_outage.py::test_doctor_proves_the_store_as_it_is_now
           )
           uv run --no-project --with pytest --with "psycopg[binary]>=3.2" --with "pyyaml>=6" \
-            --with capabilities-contract==0.4.1 --with callva-harness-runner==0.9.0 \
+            --with capabilities-contract==0.5.0 --with callva-harness-runner==0.9.0 \
             pytest capabilities/tasks/tests -q -rfEs "${excluded[@]}"
       - name: memory suite
         if: ${{ !cancelled() }}
         run: |
           uv run --no-project --with pytest --with "psycopg[binary]>=3.2" \
-            --with capabilities-contract==0.4.1 --with callva-harness-runner==0.9.0 \
+            --with capabilities-contract==0.5.0 --with callva-harness-runner==0.9.0 \
             pytest capabilities/memory/tests -q -rfEs
       - name: agentrooms suite
         if: ${{ !cancelled() }}
         run: |
           uv run --no-project --with pytest --with "psycopg[binary]>=3.2" --with "httpx>=0.27" --with "pyyaml>=6" \
-            --with capabilities-contract==0.4.1 --with callva-harness-runner==0.9.0 \
+            --with capabilities-contract==0.5.0 --with callva-harness-runner==0.9.0 \
             pytest capabilities/agentrooms/tests -q -rfEs
       - name: automations suite
         if: ${{ !cancelled() }}
@@ -154,13 +154,13 @@ jobs:
             --deselect capabilities/automations/tests/test_automations.py::AutomationsTests::test_agent_command_hands_only_act_the_machine
           )
           uv run --no-project --with pytest --with "psycopg[binary]>=3.2" \
-            --with capabilities-contract==0.4.1 \
+            --with capabilities-contract==0.5.0 \
             pytest capabilities/automations/tests -q -rfEs "${excluded[@]}"
       - name: askproject suite
         if: ${{ !cancelled() }}
         run: |
           uv run --no-project --with pytest --with "psycopg[binary]>=3.2" --with "httpx>=0.27" \
-            --with capabilities-contract==0.4.1 --with callva-harness-runner==0.9.0 \
+            --with capabilities-contract==0.5.0 --with callva-harness-runner==0.9.0 \
             pytest capabilities/askproject/tests -q -rfEs
       - name: whatsapp suite
         if: ${{ !cancelled() }}
@@ -173,7 +173,7 @@ jobs:
             --capture=no
           )
           uv run --no-project --with pytest --with "psycopg[binary]>=3.2" --with "httpx>=0.27" \
-            --with "puremagic>=1.28" --with "qrcode>=7.4" --with capabilities-contract==0.4.1 \
+            --with "puremagic>=1.28" --with "qrcode>=7.4" --with capabilities-contract==0.5.0 \
             --with callva-harness-runner==0.9.0 \
             --with "neonize @ https://github.com/ai-cluster-one/neonize/releases/download/v0.5.2-histsync.1/neonize-0.5.2-py3-none-any.whl" \
             pytest capabilities/whatsapp/tests -q -rfEs "${excluded[@]}"
@@ -183,5 +183,5 @@ jobs:
           uv run --no-project --with pytest --with "psycopg[binary]>=3.2" --with "httpx>=0.27" \
             --with "qrcode>=7.4" --with telethon==1.45.0 --with jsonschema \
             --with "google-genai>=1.36.0" --with "openai>=3.16.0" --with "psycopg2-binary>=2.9" \
-            --with capabilities-contract==0.4.1 --with callva-harness-runner==0.10.0 \
+            --with capabilities-contract==0.5.0 --with callva-harness-runner==0.10.0 \
             pytest capabilities/telegram/tests -q -rfEs

@@ -1,5 +1,9 @@
 # contract — change log
 
+## 2026-10-18 — A records adapter holds a connection only while it reads or writes
+
+The store tier pins `capabilities-contract` 0.5.0 and every connection it opens is a transaction connection (`connect(..., transaction=True)`): at the store's transaction address where its setting names one, with no prepared statement, the schema bound for each transaction and no session state. `StoreRecords` and `AgentRecords` open one for each read or write and close it once the operation ends, serving what they read from their cache for `STORE_READ_SECONDS`; `open_records()` closes the connection it reads the agent registry on rather than handing it to the adapter, and `_store_connect()` and `migrate`/`migrate status` use transaction connections too. A connection handed in stays the caller's. During `migrate files plan` the plan's one link is kept between operations (`_HOLD_RECORDS_CONNECTION`), since closing it would undo the plan, and it stays a session connection. Every capability carries the change through `sync-contract`.
+
 ## 2026-10-17 — `migrate files plan` creates and upgrades no table
 
 The plan a capability gives `capabilities migrate` changes nothing in the store, its own tables and every other owner's included: every connection the capability opens through the shared database layer during `migrate files plan` is one connection per database inside a transaction that is never committed, a migration on it runs the steps it would apply inside that transaction and records them, and the transaction is rolled back when the plan ends, so the capability reads its tables as an upgrade would leave them whether they are missing or behind. The steps are named by owner under the report's `tables_to_upgrade`. Every capability carries the change through `sync-contract`.

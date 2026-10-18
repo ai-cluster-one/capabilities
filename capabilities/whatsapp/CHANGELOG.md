@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-10-18 — Connections go to the store's transaction address
+
+`whatsapp` uses `capabilities-contract` 0.5.0. The capture store, the profile lookups and `migrate files` connect on transaction connections, at the store's transaction address where one is named; the outbox listener keeps its session connection. With one address everything reaches it as before.
+
 ## 2026-10-16 — `migrate files` moves profile files for `capabilities migrate`
 
 Its mover saves the project's profile files into the store at the project's scope, as `profiles import` does, without removing them; the manager archives and removes them once the whole move is verified. `profiles import` is unchanged.

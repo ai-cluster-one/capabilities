@@ -438,7 +438,7 @@ def open_register(envelope: Path, environment: str, surface: str = "telegram",
         setting = store_setting(project_root)
     from capabilities_contract.db import DbError, connect, migrate
     try:
-        conn = connect(application_name=STORE_OWNER, setting=setting)
+        conn = connect(application_name=STORE_OWNER, setting=setting, transaction=True)
     except DbError as exc:
         raise JobError(exc.slug, exc.message, exc.hint) from exc
     try:

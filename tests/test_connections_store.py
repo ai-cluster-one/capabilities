@@ -888,3 +888,60 @@ def test_a_store_holding_the_gate_that_cannot_be_reached_refuses_with_exit_5(lab
                    _manager(lab, "enable", "coolify", "--project")):
         assert result.returncode == 5, result.stdout + result.stderr
         assert _error(result)["code"] == "store_unreachable"
+
+
+# --- the connections the records reader holds ---------------------------------------
+
+def test_the_records_reader_holds_no_connection_between_reads(lab, monkeypatch):
+    """Each read opens a connection for itself and closes it; what was read is
+    served from the adapter's cache, and nothing stays open between reads."""
+    _import(lab)
+    monkeypatch.setenv("AGENTKIT_DB_URL", lab["cluster"].url(lab["database"]))
+    monkeypatch.setenv("AGENTKIT_DB_SCHEMA", "lab")
+    opened = []
+    from capabilities_contract import db
+    real = db.connect
+
+    def counted(**kwargs):
+        opened.append(kwargs.get("transaction"))
+        return real(**kwargs)
+
+    monkeypatch.setattr(db, "connect", counted)
+    records = S.open_records(lab["envelope"], lab["config"] / "coolify")
+    try:
+        first = records.connections("coolify")
+        assert records._conn is None
+        assert records.connections("coolify") == first  # from the cache
+        assert records.mode_of("connection") == "store"
+        assert records._conn is None
+        assert opened and all(kind is True for kind in opened)
+        with lab["cluster"].admin(lab["database"]) as admin:
+            assert admin.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = %s "
+                "AND pid <> pg_backend_pid()", (lab["database"],)).fetchone() == (0,)
+    finally:
+        records.close()
+
+
+def test_the_records_reader_reaches_the_store_at_its_transaction_address(lab):
+    """The store's address names a port nothing answers on and its transaction
+    address the store itself: a capability resolves its connections from the
+    store, so none of its connections went to the address."""
+    _import(lab)
+    before = _ok(_coolify(lab, "connections"))
+    dead = _free_port()
+    (lab["project"] / ".env").write_text(
+        f"AGENTKIT_DB_URL={lab['cluster'].url(lab['database'], port=dead)}\n"
+        f"AGENTKIT_DB_TRANSACTION_PORT={lab['cluster'].port}\n"
+        "AGENTKIT_DB_SCHEMA=lab\nCOOLIFY_TOKEN=test-token-1234\n")
+    after = _ok(_coolify(lab, "connections"))
+    assert after == before
+    assert _ok(_manager(lab, "get", "coolify", "grant", "box"))["enabled"] is True
+    # With the transaction address gone too, the store does not answer.
+    (lab["project"] / ".env").write_text(
+        f"AGENTKIT_DB_URL={lab['cluster'].url(lab['database'])}\n"
+        f"AGENTKIT_DB_TRANSACTION_PORT={dead}\n"
+        "AGENTKIT_DB_SCHEMA=lab\nCOOLIFY_TOKEN=test-token-1234\n")
+    refused = _coolify(lab, "connections")
+    assert refused.returncode != 0
+    assert "store_unreachable" in refused.stdout + refused.stderr

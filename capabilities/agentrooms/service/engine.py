@@ -560,28 +560,40 @@ def ts_iso(ms: int | None) -> str | None:
 
 
 class Store:
-    """One held connection to a project's store, migrated on open. Every query
-    names the project it is about; the connection is shared by the process's
-    threads, one statement or transaction at a time."""
+    """A project's store, its tables migrated on open. Every query names the
+    project it is about. Each statement or transaction runs on a transaction
+    connection opened for it and closed after it, at the store's transaction
+    address where one is named, so the process holds no connection between
+    them; the process's threads take it one statement or transaction at a
+    time."""
 
     def __init__(self, setting):
         self.setting = setting
         self.conn = None
         self.lock = threading.RLock()
+        self._depth = 0
 
-    def open(self) -> "Store":
+    def _connect(self):
         db = database()
         try:
-            conn = db.connect(application_name=LEDGER_OWNER, setting=self.setting)
+            conn = db.connect(application_name=LEDGER_OWNER, setting=self.setting,
+                              transaction=True)
         except db.DbError as exc:
             raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
-        try:
-            db.migrate(conn, LEDGER_OWNER, LEDGER_STEPS, major=LEDGER_MAJOR, minor=LEDGER_MINOR)
-            conn.autocommit = True
-        except db.DbError as exc:
-            conn.close()
-            raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
-        self.conn = conn
+        conn.autocommit = True
+        return conn
+
+    def open(self) -> "Store":
+        """Reach the store once and bring its tables to this code's version."""
+        db = database()
+        with self._operation() as conn:
+            try:
+                conn.autocommit = False
+                db.migrate(conn, LEDGER_OWNER, LEDGER_STEPS, major=LEDGER_MAJOR,
+                           minor=LEDGER_MINOR)
+                conn.autocommit = True
+            except db.DbError as exc:
+                raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
         return self
 
     def close(self) -> None:
@@ -591,29 +603,36 @@ class Store:
                     self.conn.close()
                 self.conn = None
 
-    def _reopen_if_lost(self) -> None:
-        if self.conn is None or self.conn.closed or self.conn.broken:
-            self.close()
-            self.open()
+    @contextlib.contextmanager
+    def _operation(self):
+        """The connection for one operation: opened for it unless one is
+        running, and closed when the outermost operation ends."""
+        with self.lock:
+            if self.conn is not None and (self.conn.closed or self.conn.broken):
+                self.close()
+            if self.conn is None:
+                self.conn = self._connect()
+            self._depth += 1
+            try:
+                yield self.conn
+            finally:
+                self._depth -= 1
+                if self._depth == 0:
+                    self.close()
 
     def execute(self, sql: str, params=(), *, fetch: str | None = None):
-        with self.lock:
-            self._reopen_if_lost()
-            with self.conn.cursor() as cur:
-                cur.execute(sql, params)
-                if fetch == "one":
-                    return cur.fetchone()
-                if fetch == "all":
-                    return cur.fetchall()
-                return cur.rowcount
+        with self._operation() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            if fetch == "one":
+                return cur.fetchone()
+            if fetch == "all":
+                return cur.fetchall()
+            return cur.rowcount
 
     @contextlib.contextmanager
     def transaction(self):
-        with self.lock:
-            self._reopen_if_lost()
-            with self.conn.transaction():
-                with self.conn.cursor() as cur:
-                    yield cur
+        with self._operation() as conn, conn.transaction(), conn.cursor() as cur:
+            yield cur
 
     # -- leases ---------------------------------------------------------------
 
@@ -993,10 +1012,9 @@ class Store:
         """Every active harness profile a lookup from the project reaches, read
         from the table the harness library owns. A store whose tables hold no
         profiles yet holds none."""
-        with self.lock:
-            self._reopen_if_lost()
+        with self._operation() as conn:
             try:
-                return library.stored_profiles(self.conn, project=project,
+                return library.stored_profiles(conn, project=project,
                                                schema=self.setting.schema)
             except Exception as exc:
                 if type(exc).__name__ == "UndefinedTable":

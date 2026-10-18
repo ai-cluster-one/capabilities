@@ -399,3 +399,58 @@ def test_a_store_mode_project_compiles_every_service_and_retires_the_switches(
     assert "placement" not in rewritten["services"]["agent"]
     assert "placement" not in rewritten["services"]["telegram"]
     assert json.loads(deployment("sync", "--check").stdout)["retired"] == []
+
+
+def _backends(port: int, database: str) -> dict[int, str]:
+    """Every connection to `database` other than this one: pid to state."""
+    import psycopg
+    with psycopg.connect(host="127.0.0.1", port=port, user=ADMIN, dbname=database,
+                         autocommit=True) as conn:
+        return dict(conn.execute(
+            "SELECT pid, state FROM pg_stat_activity WHERE datname = %s "
+            "AND pid <> pg_backend_pid()", (database,)).fetchall())
+
+
+def _held_across(port: int, database: str, seconds: float) -> set[int]:
+    """The connections to `database` seen at the start and still there after
+    `seconds`, sampled throughout: a connection opened for one read, write or
+    renewal and closed after it is never seen twice so far apart."""
+    first = time.monotonic()
+    seen: dict[int, float] = {}
+    held: set[int] = set()
+    while time.monotonic() - first < seconds:
+        now = time.monotonic()
+        for pid in _backends(port, database):
+            seen.setdefault(pid, now)
+            if now - seen[pid] >= 2.0:
+                held.add(pid)
+        time.sleep(0.2)
+    return held
+
+
+def test_a_runner_holds_no_connection_between_reconciles(tmp_path: Path, cluster) -> None:
+    database, rows = _database(cluster)
+    env = _env(tmp_path / "home")
+    dotenv = (f"AGENTKIT_DB_URL=postgresql://{ADMIN}@127.0.0.1:{cluster}/{database}"
+              "?sslmode=disable\nAGENTKIT_DB_SCHEMA=lab\n")
+    root = _project(tmp_path / "a", {"id": PROJECT_ID, "slug": "lab", "records": "store"},
+                    dotenv=dotenv)
+    _manager(root, env, "enable", "deployment", "--project")
+    _manager(root, env, "enable", "fixture", "--project")
+    runner = Runner(root, env, "node-a", tmp_path / "a.log")
+    try:
+        idle = runner.until(lambda s: "row for every node answers" in (s.get("reason") or ""))
+        assert idle["running"] is False
+        # Its service not placed here, the runner reads the gate every reconcile
+        # and holds nothing between the reads.
+        assert _held_across(cluster, database, 3 * int(EVERY)) == set()
+        _manager(root, env, "enable", "fixture", "--project", "--node", "node-a")
+        running = runner.until(lambda s: s.get("running"))
+        assert running["lease"]["state"] == "held"
+        # Placed, it renews the lease every reconcile, each on a connection
+        # opened for the renewal.
+        assert _held_across(cluster, database, 3 * int(EVERY)) == set()
+        assert runner.state()["lease"]["state"] == "held"
+    finally:
+        runner.stop()
+    assert rows("SELECT * FROM deployment_service_leases") == []

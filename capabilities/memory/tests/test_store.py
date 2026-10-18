@@ -201,14 +201,22 @@ def test_a_plan_whose_entries_changed_is_skipped(store):
 
 
 def test_one_pass_at_a_time_per_project(store):
-    other = E.Store(store.setting).open()
+    """The pass's lock is a session lock, so a pass holds it on a session
+    connection; a transaction connection refuses to take one."""
+    from capabilities_contract import db
+    one = E.Store(store.setting, session=True).open()
+    other = E.Store(store.setting, session=True).open()
     try:
-        assert store.try_groom_lock(P)
+        assert one.try_groom_lock(P)
         assert not other.try_groom_lock(P)
         assert other.try_groom_lock(OTHER)
-        store.groom_unlock(P)
+        one.groom_unlock(P)
         assert other.try_groom_lock(P)
+        with pytest.raises(db.DbError) as refused:
+            store.try_groom_lock(P)
+        assert refused.value.slug == "session_state"
     finally:
+        one.close()
         other.close()
 
 

@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-18 — The service holds no connection between statements
+
+`agentrooms` uses `capabilities-contract` 0.5.0. The service's store opens a transaction connection for each statement or transaction and closes it after, at the store's transaction address where one is named, so it holds no connection while it waits on a sync; its tables are migrated when it starts. `watch` listens on a session connection. With one address everything reaches it as before.
+
 ## 2026-10-16 — The service leaves a moved agent's settings file alone
 
 For an agent whose records moved into the store, the service no longer imports an agents map from service/settings.json when it takes the project up, nor removes the file: the migration moved it. Every other project behaves as before.

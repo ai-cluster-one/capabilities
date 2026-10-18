@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract==0.4.1",
+#     "capabilities-contract==0.5.0",
 # ]
 # ///
 """
@@ -61,7 +61,8 @@ ENVIRONMENT
                        doctor reports it. Unset, `0` or `false` leaves it off.
   AGENTKIT_DB_URL, AGENTKIT_DB_HOST, AGENTKIT_DB_PORT, AGENTKIT_DB_NAME,
   AGENTKIT_DB_USER, AGENTKIT_DB_PASSWORD, AGENTKIT_DB_SCHEMA,
-  AGENTKIT_DB_SSLMODE, AGENTKIT_DB_SSLROOTCERT
+  AGENTKIT_DB_SSLMODE, AGENTKIT_DB_SSLROOTCERT, AGENTKIT_DB_TRANSACTION_HOST,
+  AGENTKIT_DB_TRANSACTION_PORT
                        the environment level of the database cascade, below a
                        project's .env.local/.env and above the machine's store
                        setting (see STORE VERBS).
@@ -283,12 +284,26 @@ STORE VERBS
                  $XDG_CONFIG_HOME/agentkit/store.json
                  (~/.config/agentkit/store.json when XDG_CONFIG_HOME is unset),
                  an agentkit.store.v1 document holding host, port, database,
-                 user, password, sslmode, an optional sslrootcert and an
-                 optional db_schema (default agentkit), at mode 0600. Its
+                 user, password, sslmode, an optional sslrootcert, an
+                 optional db_schema (default agentkit) and an optional
+                 transaction_host and transaction_port, at mode 0600. Its
                  format is SHEBANG.md's "The store setting".
   Within the project or environment level AGENTKIT_DB_URL, a postgresql://
-  URL, wins over that level's separate keys; AGENTKIT_DB_SCHEMA applies
-  beside it. Records (the gate, settings, identifiers, references, and the
+  URL, wins over that level's separate keys; AGENTKIT_DB_SCHEMA and the
+  transaction address apply beside it.
+  A store has one address unless the level in force also names a transaction
+  address (AGENTKIT_DB_TRANSACTION_HOST and AGENTKIT_DB_TRANSACTION_PORT, or
+  transaction_host and transaction_port in the file): the same store at
+  another endpoint, typically a transaction-mode pooler, with the level's own
+  credentials, database and schema; one naming only a port keeps the host.
+  Then only the processes that hold LISTEN - a service's listener, a watch -
+  connect to the address; every other connection - each command, the
+  records reader, a lease renewal, a service's questions - goes to the
+  transaction address and carries no session state. A hosted store with a
+  session-mode and a transaction-mode pooler on one host takes the session
+  pooler as its address and the transaction pooler's port as
+  --transaction-port; a known transaction pooler as the address itself is
+  refused (exit 6 transaction_pooler). Records (the gate, settings, identifiers, references, and the
   connections and grants of a project in files mode) are files and never in
   the database; the database holds only the tables capabilities migrate for
   themselves and, for a project in store mode, the contract's two connection
@@ -296,6 +311,7 @@ STORE VERBS
   store set --host H --database D --user U [--port P]
             [--sslmode require|verify-ca|verify-full|disable]
             [--sslrootcert PATH|system] [--schema NAME]
+            [--transaction-host H] [--transaction-port P]
             (--password-stdin | --password-file PATH | --password-env KEY)
         Write the machine level: the setting file whole (a temporary file
         renamed over it, mode 0600) under the manager's lock, in the format
@@ -310,7 +326,10 @@ STORE VERBS
         prefer are refused (exit 6 sslmode_too_weak). --schema names the
         schema the setting binds: a lowercase identifier, never public,
         information_schema or pg_* (exit 6 bad_schema_name); without it the
-        file names none and binds agentkit. Exit 4 under the read-only
+        file names none and binds agentkit. --transaction-host and
+        --transaction-port name the store's transaction address (either one
+        alone keeps the other from the address); without them the store has
+        one address. Exit 4 under the read-only
         switch. Answers as `store show` does for the current project, with
         changed.
   store show [--project PATH] [--json]
@@ -322,8 +341,9 @@ STORE VERBS
         setting, error, levels {project {asked, answers, setting, error},
         environment {answers, setting, error}, machine {path, exists,
         answers, setting, error}}}: setting is the library's report of the
-        level in force {level, sources, schema, url{...} | host, port,
-        database, user, sslmode, sslrootcert, password}; error {code,
+        level in force {level, sources, schema, transaction {host, port}?,
+        url{...} | host, port, database, user, sslmode, sslrootcert,
+        password}; error {code,
         message, hint} names a level the library refuses. Output is always
         JSON, so --json changes nothing.
   store doctor [--project PATH] [--json]
@@ -336,12 +356,17 @@ STORE VERBS
         database when it does not yet, since the first migration creates it.
         A database on a local host is not reached across a network: its
         plain-text check is skipped (skipped true), and with sslmode disable
-        a working connection without TLS passes the tls check. Never prints
-        a secret. JSON {ok, project, in_force, setting, levels, sslmode,
-        db_schema, checks {tls {ok, server_version?, tls {version, cipher}?,
-        reason?, error?}, plain_text_refused {ok, reason, skipped?}, schema
-        {ok, name, exists, reason}}}, setting and levels as `store show`.
-        Exit 0 when all three hold, 7 when any fails, 3 no_store_setting when
+        a working connection without TLS passes the tls check. A store
+        that names a transaction address is also proven there: a transaction
+        connection opened at it, over TLS unless sslmode is disable, runs a
+        transaction bound to the setting's schema; a store with one address
+        skips that check. Never prints a secret. JSON {ok, project,
+        in_force, setting, levels, sslmode, db_schema, checks {tls {ok,
+        server_version?, tls {version, cipher}?, reason?, error?},
+        plain_text_refused {ok, reason, skipped?}, schema {ok, name, exists,
+        reason}, transaction {ok, skipped?, host?, port?, tls?, reason?,
+        error?}}}, setting and levels as `store show`.
+        Exit 0 when all four hold, 7 when any fails, 3 no_store_setting when
         no level answers, 6 with the library's code when the level in force
         is refused.
   store unset
@@ -4458,7 +4483,8 @@ def cmd_dev_start(name: str, source_ref: str | None, project_ref: str | None,
 # the machine's database, bound to a schema of the session's own.
 DEV_DB_KEYS = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTKIT_DB_NAME",
                "AGENTKIT_DB_USER", "AGENTKIT_DB_PASSWORD", "AGENTKIT_DB_SCHEMA",
-               "AGENTKIT_DB_SSLMODE", "AGENTKIT_DB_SSLROOTCERT")
+               "AGENTKIT_DB_SSLMODE", "AGENTKIT_DB_SSLROOTCERT",
+               "AGENTKIT_DB_TRANSACTION_HOST", "AGENTKIT_DB_TRANSACTION_PORT")
 # The tables a `dev run` projects an attached project's rows of one capability
 # through, each with the column naming the capability.
 DEV_PROJECTED_TABLES = (("capabilities_policy", "capability"),
@@ -4489,6 +4515,10 @@ def _dev_database(session: dict):
         return None
     _dev_claim_schema(session, setting)
     keys = {"AGENTKIT_DB_SCHEMA": _dev_schema(session)}
+    if setting.transaction_host is not None:
+        keys["AGENTKIT_DB_TRANSACTION_HOST"] = setting.transaction_host
+    if setting.transaction_port is not None:
+        keys["AGENTKIT_DB_TRANSACTION_PORT"] = str(setting.transaction_port)
     if setting.url is not None:
         keys["AGENTKIT_DB_URL"] = setting.url
     else:
@@ -4523,7 +4553,8 @@ def _dev_claim_schema(session: dict, setting) -> None:
     schema = _dev_schema(session)
     try:
         conn = db.connect(application_name="capabilities-dev",
-                          setting=dataclasses.replace(setting, schema=schema))
+                          setting=dataclasses.replace(setting, schema=schema),
+                          transaction=True)
     except db.DbError:
         return
     try:
@@ -4569,7 +4600,8 @@ def _dev_drop_schema(session: dict) -> dict | None:
         return {**out, "reason": "it is the machine's own store schema"}
     try:
         conn = db.connect(application_name="capabilities-dev",
-                          setting=dataclasses.replace(setting, schema=schema))
+                          setting=dataclasses.replace(setting, schema=schema),
+                          transaction=True)
     except db.DbError as exc:
         return {**out, "reason": f"the database cannot be reached: {exc.message}"}
     try:
@@ -4603,7 +4635,8 @@ def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> d
     store = _store_module()
     real = setting.schema
     session_setting = dataclasses.replace(setting, schema=schema)
-    conn = db.connect(application_name=store.STORE_OWNER, setting=session_setting)
+    conn = db.connect(application_name=store.STORE_OWNER, setting=session_setting,
+                      transaction=True)
     counts: dict = {}
     try:
         major, minor = store.STORE_TABLES_VERSION
@@ -6305,7 +6338,8 @@ def _machine_connections_store(root: Path | None) -> dict | None:
     db = _db_module()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting)
+        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+                          transaction=True)
     except Exception:
         return None
     try:
@@ -6603,7 +6637,8 @@ def _kernel_open(root: Path):
     store = _store_module()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting)
+        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+                          transaction=True)
     except db.DbError as exc:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     import psycopg
@@ -6692,7 +6727,8 @@ def _register_agent_on_init(root: Path) -> dict:
         return {"registered": False, "error": _db_error(exc)}
     import psycopg
     try:
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting)
+        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+                          transaction=True)
     except db.DbError as exc:
         return {"registered": False, "error": _db_error(exc)}
     try:
@@ -6972,6 +7008,7 @@ def cmd_node(args: list[str]) -> None:
 STORE_VALUE_OPTIONS = {
     "--host": "host", "--port": "port", "--database": "database",
     "--user": "user", "--sslmode": "sslmode", "--sslrootcert": "sslrootcert",
+    "--transaction-host": "transaction_host", "--transaction-port": "transaction_port",
 }
 STORE_SCHEMA_OPTION = "--schema"
 STORE_PASSWORD_OPTIONS = ("--password-stdin", "--password-file", "--password-env")
@@ -7204,8 +7241,9 @@ def _store_setting_document(values: dict, schema: str | None) -> dict:
     a value the library would refuse is refused here, in the library's words."""
     db = _db_module()
     document = {"schema": db.SETTING_FORMAT, **values}
-    if isinstance(document.get("port"), str) and document["port"].isdigit():
-        document["port"] = int(document["port"])
+    for field in ("port", "transaction_port"):
+        if isinstance(document.get(field), str) and document[field].isdigit():
+            document[field] = int(document[field])
     document.setdefault("port", 5432)
     if schema is not None:
         document["db_schema"] = schema
@@ -7306,7 +7344,7 @@ def _store_scrub(text, setting) -> str:
 
 def _store_connect(setting, sslmode: str | None = None):
     """One connection with the setting, `sslmode` replacing its own, through
-    the arguments the library connects with."""
+    the arguments the library connects with, to the store's session address."""
     import psycopg
     kwargs = setting.connect_kwargs()
     if sslmode is not None:
@@ -7379,6 +7417,47 @@ def _store_schema_check(setting) -> dict:
     return out
 
 
+def _store_transaction_check(setting, plain_allowed: bool) -> dict:
+    """Whether the store's transaction address works as the library uses it: a
+    transaction connection opened there, over TLS unless the setting allows
+    plain text, runs a transaction bound to the setting's schema. A store with
+    one address has nothing more to prove."""
+    if not setting.has_transaction_address:
+        return {"ok": True, "skipped": True,
+                "reason": "the store has one address: every connection uses it"}
+    db = _db_module()
+    import psycopg
+    shown = setting.report().get("transaction") or {}
+    out = {"ok": False, "host": shown.get("host"), "port": shown.get("port")}
+    try:
+        conn = db.connect(application_name="capabilities", setting=setting,
+                          transaction=True)
+    except db.DbError as exc:
+        out["error"] = f"{exc.slug}: {_store_scrub(exc.message, setting)}"
+        return out
+    try:
+        found = conn.execute("SELECT current_setting('search_path')").fetchone()[0]
+        conn.rollback()
+        tls = bool(conn.pgconn.ssl_in_use)
+    except psycopg.Error as exc:
+        out["error"] = _store_scrub(exc, setting)
+        return out
+    finally:
+        conn.close()
+    out["tls"] = tls
+    if not tls and not plain_allowed:
+        out["error"] = "the transaction address was reached without TLS"
+        return out
+    if found != setting.schema:
+        out["error"] = (f"a transaction there was bound to {found!r}, not to the "
+                        f"setting's schema {setting.schema!r}")
+        return out
+    out["ok"] = True
+    out["reason"] = (f"a transaction connection there runs bound to schema "
+                     f"{setting.schema}")
+    return out
+
+
 def _host_is_local(host: object) -> bool:
     """Whether the host is this machine, as the library judges it for the TLS
     rule: a Unix socket directory, `localhost` or a loopback address."""
@@ -7442,11 +7521,13 @@ def cmd_store_doctor(project: str | None) -> None:
         schema = {"ok": False, "name": setting.schema, "exists": None,
                   "reason": "not checked: no connection to the database"
                   if plain_allowed else "not checked: no TLS connection to the database"}
-    out = {"ok": tls["ok"] and plain["ok"] and schema["ok"],
+    transaction = _store_transaction_check(setting, plain_allowed)
+    out = {"ok": tls["ok"] and plain["ok"] and schema["ok"] and transaction["ok"],
            "project": report["project"], "in_force": report["in_force"],
            "setting": report["setting"], "levels": report["levels"],
            "sslmode": sslmode, "db_schema": setting.schema,
-           "checks": {"tls": tls, "plain_text_refused": plain, "schema": schema}}
+           "checks": {"tls": tls, "plain_text_refused": plain, "schema": schema,
+                      "transaction": transaction}}
     _emit(out)
     if not out["ok"]:
         sys.exit(7)
@@ -7606,7 +7687,8 @@ def _arrival_global_enable(name: str, undo: bool = False) -> dict | None:
                        "store, on its master"}
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting)
+        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+                          transaction=True)
     except db.DbError as exc:
         return None if undo else {**pending, "reason": exc.slug}
     import psycopg
@@ -8417,7 +8499,8 @@ def cmd_connections_import() -> None:
     db = _db_module()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting)
+        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+                          transaction=True)
     except db.DbError as exc:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     import psycopg
@@ -8781,7 +8864,8 @@ def _migrate_connect(root: Path):
     store = _store_module()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting)
+        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+                          transaction=True)
     except db.DbError as exc:
         raise _MigrateRefusal(exc.slug, exc.message, exc.hint,
                               exit_code=_store_error_exit(exc)) from None
@@ -11806,7 +11890,8 @@ def _grant_agents_information(root: Path) -> list[dict]:
     may not exist in this store at all."""
     db = _db_module()
     try:
-        conn = db.connect(application_name="capabilities", project_root=root)
+        conn = db.connect(application_name="capabilities", project_root=root,
+                          transaction=True)
     except db.DbError:
         return []
     import psycopg

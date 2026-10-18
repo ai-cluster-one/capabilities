@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-18 — A command no longer listens, and the scheduler waits out a store that is away
+
+`automations` uses `capabilities-contract` 0.5.0. Only the scheduler's link, project or machine, listens for changed definitions, on one session connection that also carries its questions; every command's ledger and the profile lookups connect on a transaction connection, at the store's transaction address where one is named, and listen to nothing. A scheduler whose store does not answer when it starts asks again on a doubling interval from 1s to 30s, saying so once, instead of exiting for its supervisor to start it again, and one that loses its store asks for it again on the same interval rather than on every tick. A container is handed `AGENTKIT_DB_TRANSACTION_HOST` and `AGENTKIT_DB_TRANSACTION_PORT`.
+
 ## 2026-10-17 — `migrate files` moves nothing, without refusing, from an envelope holding nothing
 
 An agent whose envelope folder holds neither a gate nor an identity has nothing of automations' to move, and `migrate files` now says so instead of refusing `no_envelope`, so `capabilities migrate` can move such an agent.

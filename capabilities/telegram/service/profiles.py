@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "callva-harness-runner==0.10.0",
-#     "capabilities-contract==0.4.1",
+#     "capabilities-contract==0.5.0",
 # ]
 # ///
 """The harness profiles a telegram worker may run on, where each comes from,
@@ -788,7 +788,8 @@ def _connect(project_root: str | None):
     except jobs.JobError as exc:
         raise Refusal(6, exc.slug, exc.message, exc.hint) from None
     try:
-        return connect(application_name="telegram", setting=setting), setting.schema
+        return connect(application_name="telegram", setting=setting,
+                       transaction=True), setting.schema
     except DbError as exc:
         raise Refusal(5, exc.slug, exc.message, exc.hint) from None
 

@@ -139,6 +139,79 @@ def test_recovering_clears_the_count(watchdog):
     assert watchdog._test_calls["kickstarts"] == []
 
 
+STORE_AWAY = {"ok": False, "detail": "doctor exited 5", "store_unreachable": True}
+
+
+def test_a_store_that_does_not_answer_is_waited_for_never_restarted(watchdog):
+    """A doctor failing because the store is away is not cured by a restart,
+    which would only open the service's connections again: the watchdog waits,
+    asking again after a pause that starts at the interval and doubles."""
+    asked = []
+    watchdog._test_calls["probe"] = STORE_AWAY
+    original = watchdog._probe_service
+
+    def probe(*args, **kwargs):
+        asked.append(True)
+        return original(*args, **kwargs)
+
+    watchdog._probe_service = probe
+    moments, pauses = [], []
+    now = 1000.0
+    for _ in range(40):
+        entry = _one(watchdog.cmd_watchdog(dry_run=False, now=now))
+        assert entry["action"] == "waiting for the store"
+        if "store_wait_until" in _state(watchdog)["telegram"] and \
+                (not moments or _state(watchdog)["telegram"]["store_wait_until"] != moments[-1]):
+            moments.append(_state(watchdog)["telegram"]["store_wait_until"])
+            pauses.append(moments[-1] - now)
+        now += 60.0
+    assert watchdog._test_calls["kickstarts"] == []
+    # The doctor is asked only when a pause is over, each pause twice the last.
+    assert pauses[:5] == [60.0, 120.0, 240.0, 480.0, 960.0]
+    assert len(asked) == len(pauses) < 40
+    assert _state(watchdog)["telegram"]["failures"] == 0
+
+
+def test_the_pause_for_the_store_stops_growing(watchdog):
+    watchdog._test_calls["probe"] = STORE_AWAY
+    now, waits = 0.0, []
+    for _ in range(12):
+        state = _state(watchdog).get("telegram") or {}
+        now = max(now, float(state.get("store_wait_until") or 0))
+        watchdog.cmd_watchdog(dry_run=False, now=now)
+        state = _state(watchdog)["telegram"]
+        waits.append(state["store_wait_until"] - now)
+    assert max(waits) == watchdog.WATCHDOG_STORE_WAIT_LONGEST_SECONDS
+    assert watchdog._test_calls["kickstarts"] == []
+
+
+def test_once_the_store_answers_the_service_is_watched_as_before(watchdog):
+    watchdog._test_calls["probe"] = STORE_AWAY
+    watchdog.cmd_watchdog(dry_run=False, now=1000.0)
+    watchdog._test_calls["probe"] = {"ok": True, "detail": "fine"}
+    entry = _one(watchdog.cmd_watchdog(dry_run=False, now=1060.0))
+    assert entry["action"] == "none"
+    assert _state(watchdog) == {}
+    watchdog._test_calls["probe"] = {"ok": False, "detail": "doctor exited 1"}
+    watchdog.cmd_watchdog(dry_run=False, now=1120.0)
+    entry = _one(watchdog.cmd_watchdog(dry_run=False, now=1180.0))
+    assert entry["action"] == "restarted"
+
+
+@pytest.mark.parametrize("stdout, stderr, away", [
+    ("", '{"error": {"code": "store_unreachable", "message": "cannot reach the store"}}\n',
+     True),
+    ('{"ok": false, "checks": [{"name": "store", "ok": false, '
+     '"code": "store_unreachable"}]}', "", True),
+    ('{"ok": false, "store": {"error": {"code": "store_unreachable"}}}', "", True),
+    ("", '{"error": {"code": "store_not_configured", "message": "no database"}}\n', False),
+    ('{"ok": false, "detail": "the listener is wedged"}', "", False),
+    ("not json", "store_unreachable in prose", False),
+])
+def test_a_doctor_names_the_store_away_by_its_code(stdout, stderr, away):
+    assert _module()._names_store_away(stdout, stderr) is away
+
+
 def test_a_probe_that_cannot_run_is_not_evidence_of_anything(watchdog):
     """Not knowing is not the same as knowing it is broken."""
     watchdog._test_calls["probe"] = {"ok": None, "detail": "cannot run doctor"}

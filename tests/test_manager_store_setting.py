@@ -644,6 +644,50 @@ def _cluster_url(cluster: Cluster, database: str = "app", host: str = REMOTE_NAM
             f"{database}?sslmode=require")
 
 
+# --- the transaction address ---------------------------------------------------
+
+def test_set_names_a_transaction_address_the_library_reads(tmp_path):
+    env = _env(tmp_path)
+    payload = _ok(_set(env, "--transaction-port", "6543"))
+    assert _written(env)["transaction_port"] == 6543
+    assert "transaction_host" not in _written(env)
+    assert payload["setting"]["transaction"] == {"host": None, "port": 6543}
+    read = _library_reads(env)
+    assert (read.host, read.port, read.transaction_host, read.transaction_port) == (
+        "db.example.test", 5432, None, 6543)
+    assert read.transaction_kwargs()["port"] == 6543
+    _ok(_set(env, "--transaction-host", "pool.example.test", "--transaction-port", "6432"))
+    read = _library_reads(env)
+    assert (read.transaction_host, read.transaction_port) == ("pool.example.test", 6432)
+
+
+def test_set_without_a_transaction_address_writes_none(tmp_path):
+    env = _env(tmp_path)
+    payload = _ok(_set(env))
+    assert not {"transaction_host", "transaction_port"} & set(_written(env))
+    assert "transaction" not in payload["setting"]
+    assert _library_reads(env).has_transaction_address is False
+
+
+@pytest.mark.parametrize("args", [("--transaction-port", "0"), ("--transaction-port", "x"),
+                                  ("--transaction-host", "a b")])
+def test_set_refuses_a_transaction_address_that_is_not_one(tmp_path, args):
+    env = _env(tmp_path)
+    result = _set(env, *args)
+    assert result.returncode == 6 and _error(result)["code"] == "bad_store_setting"
+    assert _nothing_written(env)
+
+
+def test_the_environment_level_names_a_transaction_address(tmp_path):
+    env = _env(tmp_path)
+    payload = _ok(_manager(env, "store", "show", extra={
+        "AGENTKIT_DB_URL": "postgresql://agent@db.example.test/app",
+        "AGENTKIT_DB_TRANSACTION_PORT": "6543"}))
+    assert payload["in_force"] == "environment"
+    assert payload["setting"]["transaction"] == {"host": None, "port": 6543}
+    assert "AGENTKIT_DB_TRANSACTION_PORT" in payload["setting"]["sources"]
+
+
 # --- doctor -----------------------------------------------------------------------
 
 def test_doctor_passes_when_tls_works_and_plain_text_is_refused(tmp_path, enforced):
@@ -784,6 +828,42 @@ def test_doctor_fails_when_the_server_accepts_plain_text(tmp_path, enforced):
     assert payload["checks"]["tls"]["ok"] is True
     plain = payload["checks"]["plain_text_refused"]
     assert plain["ok"] is False and "plain-text connection" in plain["reason"]
+
+
+def test_doctor_with_one_address_skips_the_transaction_check(tmp_path, enforced):
+    env = _env(tmp_path)
+    _set_cluster(env, enforced)
+    payload = _ok(_manager(env, "store", "doctor"))
+    assert payload["checks"]["transaction"] == {
+        "ok": True, "skipped": True,
+        "reason": "the store has one address: every connection uses it"}
+
+
+def test_doctor_proves_the_transaction_address(tmp_path, enforced):
+    """The transaction address names the same server at another name: a
+    transaction connection opened there runs bound to the setting's schema."""
+    env = _env(tmp_path)
+    _set_cluster(env, enforced, "--schema", "lab", "--transaction-host", "localhost",
+                 "--transaction-port", str(enforced.port))
+    result = _manager(env, "store", "doctor")
+    _no_secret(result)
+    payload = _ok(result)
+    check = payload["checks"]["transaction"]
+    assert check["ok"] is True and check["tls"] is True
+    assert (check["host"], check["port"]) == ("localhost", enforced.port)
+    assert "schema lab" in check["reason"]
+
+
+def test_doctor_fails_when_the_transaction_address_does_not_answer(tmp_path, enforced):
+    env = _env(tmp_path)
+    _set_cluster(env, enforced, "--transaction-port", str(_free_port()))
+    result = _manager(env, "store", "doctor")
+    _no_secret(result)
+    assert result.returncode == 7, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["checks"]["tls"]["ok"] is True
+    check = payload["checks"]["transaction"]
+    assert check["ok"] is False and check["error"].startswith("store_unreachable")
 
 
 def test_doctor_without_a_setting_is_not_found(tmp_path):
