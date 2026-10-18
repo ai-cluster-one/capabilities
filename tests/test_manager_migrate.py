@@ -562,6 +562,65 @@ def test_global_dry_run_lists_rows_and_gate_flips_and_writes_nothing(world):
     assert [s["document"] for s in dry["plan"]["settings"]] == ["memory"]
 
 
+# --- a dry run through a transaction-mode pooler ---------------------------------------
+
+PGBOUNCER_ENV = "CAPABILITIES_TEST_PGBOUNCER"
+
+
+@pytest.fixture(scope="module")
+def pooler(world):
+    """PgBouncer in pool_mode=transaction in front of the world's database, as
+    the store's transaction address. Skipped unless CAPABILITIES_TEST_PGBOUNCER
+    names a pgbouncer executable."""
+    import time
+    binary = os.environ.get(PGBOUNCER_ENV)
+    if not binary or not Path(binary).is_file():
+        pytest.skip(f"{PGBOUNCER_ENV} does not name a pgbouncer executable")
+    folder = world.tmp / "pooler"
+    folder.mkdir(exist_ok=True)
+    port = _free_port()
+    (folder / "users.txt").write_text(f'"{ADMIN}" ""\n')
+    (folder / "pgbouncer.ini").write_text(
+        "[databases]\n"
+        f"{world.database} = host=127.0.0.1 port={world.port} dbname={world.database}\n"
+        "[pgbouncer]\n"
+        f"listen_addr = 127.0.0.1\nlisten_port = {port}\nunix_socket_dir =\n"
+        f"auth_type = trust\nauth_file = {folder / 'users.txt'}\n"
+        "pool_mode = transaction\ndefault_pool_size = 2\nmax_prepared_statements = 0\n"
+        "server_reset_query =\n"
+        f"logfile = {folder / 'pgbouncer.log'}\n")
+    proc = subprocess.Popen([binary, str(folder / "pgbouncer.ini")],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            break
+        except OSError:
+            assert time.monotonic() < deadline and proc.poll() is None
+            time.sleep(0.1)
+    yield str(port)
+    proc.kill()
+    proc.wait(timeout=10)
+
+
+def _pooled_dry_run(world, pooler, root, *args):
+    """The same dry run at one address and with the pooler as the transaction
+    address: both answer alike, neither changes the store."""
+    before = world.everything()
+    direct = world.answer(world.manager(root, "migrate", *args))
+    pooled = world.answer(world.manager(root, "migrate", *args,
+                                        AGENTKIT_DB_TRANSACTION_PORT=pooler))
+    assert world.everything() == before
+    assert pooled == direct
+    return pooled
+
+
+def test_a_global_dry_run_works_through_a_transaction_pooler(world, pooler):
+    dry = _pooled_dry_run(world, pooler, world.roots["other"], "--global")
+    assert dry["applied"] is False and dry["would_write"] is True
+
+
 def test_global_apply_writes_the_rows_once(world):
     root = world.roots["other"]
     applied = world.answer(world.manager(root, "migrate", "--global", "--apply"))
@@ -686,6 +745,12 @@ def test_dry_run_reports_and_writes_nothing(world, name):
         assert dry["would_write"] is False
         assert world.error(world.manager(root, "migrate", "--apply"))["code"] == "question_open"
         assert world.everything() == before
+
+
+@pytest.mark.parametrize("name", ("relay", "books"))
+def test_an_agents_dry_run_works_through_a_transaction_pooler(world, pooler, name):
+    dry = _pooled_dry_run(world, pooler, world.roots[name])
+    assert dry["applied"] is False and not dry["blockers"], dry["blockers"]
 
 
 @pytest.mark.parametrize("name", AGENTS)
