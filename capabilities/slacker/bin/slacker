@@ -8,7 +8,7 @@
 # ]
 # ///
 """
-slackuser — read a Slack workspace as the linked user, over their own session.
+slacker — read a Slack workspace as the linked user, over their own session.
 
 Agent-invoked, read-only. Links the person's OWN Slack account by its web-client
 session (the workspace `xoxc-` token plus the shared `d` cookie), the way the
@@ -22,10 +22,10 @@ This capability never writes to Slack. It sends no messages, sets no presence,
 joins no channels, and marks nothing read; it has no write verb at all. The
 session is the person's own, used transparently as one more of their browser
 sessions — there is no concealment, no monitoring bypass, and no client-identity
-spoofing. Run `slackuser doctor` first to prove the session and the workspace.
+spoofing. Run `slacker doctor` first to prove the session and the workspace.
 
 Startup protocol
-  1. `slackuser doctor` — proves the session authorises (`auth.test`), resolves
+  1. `slacker doctor` — proves the session authorises (`auth.test`), resolves
      the linked user and the workspace, and matches the connection's binding.
   2. Exit 2 means the session is invalid or expired (`invalid_auth`): the person
      links the connection again (its `d` cookie is short-lived; there is no
@@ -38,13 +38,13 @@ Connections
   env vars that hold the session secrets (token_env, cookie_env), never the
   secret values, plus the non-secret workspace identity. A machine with several
   workspaces declares one connection each. Secrets resolve through the 4-tier
-  cascade (flags > project .env(.local) > ~/.config/slackuser/credentials.env >
+  cascade (flags > project .env(.local) > ~/.config/slacker/credentials.env >
   process env); selection is `--connection <id>` (-c), else the registry's
   default, else the sole entry.
 
 Store
   Conversations, messages, thread replies, reactions, users and the sync cursor
-  live in the project's Postgres database, in slackuser_* tables keyed by the
+  live in the project's Postgres database, in slacker_* tables keyed by the
   workspace account (the team id), created and migrated on first use. The
   capture belongs to the account, not to one project: an account has one history
   in a database, whichever project on the machine reads it, so the tables carry
@@ -54,42 +54,42 @@ Store
   the capture exits 6; help, contract and connections still answer.
 
 Commands
-  slackuser help                       Print this usage block
-  slackuser doctor [--connection ID]   Prove the session, the user and the
-                                       workspace; match the binding.
-  slackuser whoami [--connection ID]   The linked identity and workspace, named.
-  slackuser conversations [--types ...] [--limit N] [--search TERM]
-                                       List the conversations the account can
-                                       see (im, mpim, public_channel,
-                                       private_channel), newest activity first.
-  slackuser history <channel> [--limit N] [--oldest TS] [--latest TS] [--fresh]
-                                       Read a conversation. Answers from the
-                                       store, and fetches from Slack when it
-                                       cannot cover the request.
-  slackuser thread <channel> <thread_ts> [--fresh]
-                                       Read a thread's replies. Answers from the
-                                       store once it holds every reply the
-                                       parent counts, else fetches from Slack.
-  slackuser sync [--channel ID] [--full] [--limit N]
-                                       Bring the store forward: fetch every
-                                       message of each member conversation newer
-                                       than the stored cursor, deduplicating on
-                                       the message timestamp. --limit bounds how
-                                       far back a first sync or --full reaches.
-  slackuser service ...                The bundled live-capture listener (see
-                                       `slackuser service help`).
+  slacker help                       Print this usage block
+  slacker doctor [--connection ID]   Prove the session, the user and the
+                                     workspace; match the binding.
+  slacker whoami [--connection ID]   The linked identity and workspace, named.
+  slacker conversations [--types ...] [--limit N] [--search TERM]
+                                     List the conversations the account can
+                                     see (im, mpim, public_channel,
+                                     private_channel), newest activity first.
+  slacker history <channel> [--limit N] [--oldest TS] [--latest TS] [--fresh]
+                                     Read a conversation. Answers from the
+                                     store, and fetches from Slack when it
+                                     cannot cover the request.
+  slacker thread <channel> <thread_ts> [--fresh]
+                                     Read a thread's replies. Answers from the
+                                     store once it holds every reply the
+                                     parent counts, else fetches from Slack.
+  slacker sync [--channel ID] [--full] [--limit N]
+                                     Bring the store forward: fetch every
+                                     message of each member conversation newer
+                                     than the stored cursor, deduplicating on
+                                     the message timestamp. --limit bounds how
+                                     far back a first sync or --full reaches.
+  slacker service ...                The bundled live-capture listener (see
+                                     `slacker service help`).
 
 Contract commands (shared by every capability)
-  slackuser connections                Resolve every connection, secrets masked
-  slackuser stub                       One-line summary
-  slackuser manifest [--json]          The capability's declaration, with the
-                                       bundled capture service
-  slackuser guide [topic]              The guide menu, or one guide
-  slackuser ids list|get|set|rm        Durable, non-secret project identifiers
-  slackuser refs                       What this project reads for connections
-  slackuser inventory [--network]      What this capability holds here, local
-                                       and secret-free
-  slackuser migrate [status]           Apply or report the slackuser_* tables
+  slacker connections                Resolve every connection, secrets masked
+  slacker stub                       One-line summary
+  slacker manifest [--json]          The capability's declaration, with the
+                                     bundled capture service
+  slacker guide [topic]              The guide menu, or one guide
+  slacker ids list|get|set|rm        Durable, non-secret project identifiers
+  slacker refs                       What this project reads for connections
+  slacker inventory [--network]      What this capability holds here, local
+                                     and secret-free
+  slacker migrate [status]           Apply or report the slacker_* tables
 
 Success is JSON on stdout; structured errors are JSON on stderr. Exit 4 is a
 policy refusal.
@@ -103,7 +103,7 @@ from typing import Any, NoReturn
 
 from capabilities_contract.db import DbError, Step, connect, migrate, resolve_setting
 
-NAME = 'slackuser'
+NAME = 'slacker'
 SUMMARY = ("Slack CLI that reads the linked user's own workspace over their web "
            "session (xoxc token + d cookie) — list conversations (DMs, group "
            "DMs, public and private channels), read message history and thread "
@@ -115,10 +115,10 @@ SCOPE = "user"      # the session is the person's own account, machine-wide
 # the CONN_FIELDS below (env-templated), exactly as calcomc's secret_env relates
 # to its CRED_KEYS CAL_API_KEY. Never a value here — only the key names.
 CRED_KEYS = [
-    {"key": "SLACK_USER_TOKEN", "secret": True, "required": True,
+    {"key": "SLACKER_TOKEN", "secret": True, "required": True,
      "note": "the workspace web-session token (xoxc-...); the conventional key "
              "name a connection's token_env points at"},
-    {"key": "SLACK_USER_COOKIE", "secret": True, "required": True,
+    {"key": "SLACKER_COOKIE", "secret": True, "required": True,
      "note": "the session `d` cookie value; the conventional key name a "
              "connection's cookie_env points at"},
 ]
@@ -130,21 +130,21 @@ CONN_FIELDS = [
     {'key': 'token_env',
      'label': 'Session token env',
      'help': "Names the env var holding this connection's xoxc- web-session "
-             "token (e.g. SLACK_USER_TOKEN). The value lives in the credential "
+             "token (e.g. SLACKER_TOKEN). The value lives in the credential "
              "cascade, never in the registry.",
      'type': 'string',
      'secret': True,
      'required': True,
-     'env': 'SLACKUSER_{ID}_TOKEN'},
+     'env': 'SLACKER_{ID}_TOKEN'},
     {'key': 'cookie_env',
      'label': 'Session cookie env',
      'help': "Names the env var holding this connection's `d` session cookie "
-             "value (e.g. SLACK_USER_COOKIE). A '+' in the value is sent as-is; "
+             "value (e.g. SLACKER_COOKIE). A '+' in the value is sent as-is; "
              "paste it exactly as the browser holds it.",
      'type': 'string',
      'secret': True,
      'required': True,
-     'env': 'SLACKUSER_{ID}_COOKIE'},
+     'env': 'SLACKER_{ID}_COOKIE'},
     {'key': 'team_id',
      'label': 'Workspace (team) id',
      'help': "The workspace this session belongs to (e.g. T01234567). `doctor` "
@@ -174,9 +174,9 @@ WRITE_VERBS: set = set()   # this capability has no verb that writes to Slack
 WRITE_DEFAULT = False
 MACHINE_READS = ("connections", "doctor")   # outside a project: read-only machine reads
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
-             "main/capabilities/slackuser/guides/")
+             "main/capabilities/slacker/guides/")
 STATE = True        # the live-capture service keeps control files on this machine
-TABLES = True       # slackuser_* tables in the project's database, built by _tables()
+TABLES = True       # slacker_* tables in the project's database, built by _tables()
 INVENTORY = {"network": "none"}   # the service's state is files on this machine
 POST_INSTALL: list[dict] = []
 SERVICE = {
@@ -187,19 +187,19 @@ SERVICE = {
                 "arrives, backfilling through the sync cursor on each reconnect "
                 "so a drop loses no channel message and duplicates nothing."),
     "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs"],
-    "config": "capabilities/slackuser/service",
+    "config": "capabilities/slacker/service",
     "state": "<account-state>/service",
     "deploy": {
         "schema": "capabilities.service.deploy.v1",
         "default_policy": "auto",
-        "command": ["slackuser", "service", "run"],
+        "command": ["slacker", "service", "run"],
         "environment": {"required": [], "optional": []},
         "mounts": [
-            {"name": "slackuser_state", "kind": "state",
-             "target": "{agent_home}/.local/state/slackuser"},
+            {"name": "slacker_state", "kind": "state",
+             "target": "{agent_home}/.local/state/slacker"},
         ],
         "restart": "unless-stopped",
-        "doctor": ["slackuser", "service", "doctor"],
+        "doctor": ["slacker", "service", "doctor"],
     },
 }
 
@@ -6314,8 +6314,8 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
     (cfg, problem) — problem is an error dict instead of a die, so doctor can
     report every connection rather than stopping at the first."""
     entry = entry if isinstance(entry, dict) else {}
-    token_env = entry.get("token_env") or "SLACK_USER_TOKEN"
-    cookie_env = entry.get("cookie_env") or "SLACK_USER_COOKIE"
+    token_env = entry.get("token_env") or "SLACKER_TOKEN"
+    cookie_env = entry.get("cookie_env") or "SLACKER_COOKIE"
     token = _unquote(_resolve_env_key(token_env)[0])
     cookie = _resolve_cookie(_resolve_env_key(cookie_env)[0])
     if not token:
@@ -6379,8 +6379,8 @@ def _connections_report() -> dict:
         entry = entry if isinstance(entry, dict) else {}
         origin = reg["sources"][cid]
         keys = []
-        for field, template in (("token_env", "SLACK_USER_TOKEN"),
-                                ("cookie_env", "SLACK_USER_COOKIE")):
+        for field, template in (("token_env", "SLACKER_TOKEN"),
+                                ("cookie_env", "SLACKER_COOKIE")):
             name = entry.get(field) or template
             value, tier, source = _resolve_env_key(name)
             keys.append(_key_report(name, True, True, value, tier, source))
@@ -6441,7 +6441,7 @@ def _normalize_channel_id(value: str) -> str:
     value = (value or "").strip()
     if not value:
         _refuse(6, "bad_channel", "a channel id is required",
-                "pass a conversation id from `slackuser conversations`")
+                "pass a conversation id from `slacker conversations`")
     return value
 
 
@@ -6472,12 +6472,12 @@ _TS_PARAM = "to_timestamp(%s::double precision)"
 # one account's history across every project that read it.
 STORE_STEPS = [
     Step("0001-meta", """
-CREATE TABLE slackuser_meta (
+CREATE TABLE slacker_meta (
   account text NOT NULL CHECK (account <> ''),
   key text NOT NULL, value text,
   PRIMARY KEY (account, key))"""),
     Step("0002-conversations", """
-CREATE TABLE slackuser_conversations (
+CREATE TABLE slacker_conversations (
   account text NOT NULL CHECK (account <> ''),
   id text NOT NULL,
   kind text CHECK (kind IN ('im','mpim','private_channel','public_channel')),
@@ -6488,7 +6488,7 @@ CREATE TABLE slackuser_conversations (
   updated_at timestamptz,
   PRIMARY KEY (account, id))"""),
     Step("0003-messages", """
-CREATE TABLE slackuser_messages (
+CREATE TABLE slacker_messages (
   account text NOT NULL CHECK (account <> ''),
   channel_id text NOT NULL, ts text NOT NULL, ts_at timestamptz,
   thread_ts text, user_id text, type text, subtype text, text text,
@@ -6500,46 +6500,46 @@ CREATE TABLE slackuser_messages (
   captured_at timestamptz,
   PRIMARY KEY (account, channel_id, ts))"""),
     Step("0004-messages-by-time", """
-CREATE INDEX slackuser_messages_by_time
-  ON slackuser_messages (account, channel_id, ts_at)"""),
+CREATE INDEX slacker_messages_by_time
+  ON slacker_messages (account, channel_id, ts_at)"""),
     Step("0005-messages-by-thread", """
-CREATE INDEX slackuser_messages_by_thread
-  ON slackuser_messages (account, channel_id, thread_ts)
+CREATE INDEX slacker_messages_by_thread
+  ON slacker_messages (account, channel_id, thread_ts)
   WHERE thread_ts IS NOT NULL"""),
     Step("0006-users", """
-CREATE TABLE slackuser_users (
+CREATE TABLE slacker_users (
   account text NOT NULL CHECK (account <> ''),
   id text NOT NULL, name text, real_name text, display_name text,
   is_bot boolean DEFAULT false, deleted boolean DEFAULT false,
   updated_at timestamptz,
   PRIMARY KEY (account, id))"""),
     Step("0007-comments", """
-COMMENT ON TABLE slackuser_meta IS
+COMMENT ON TABLE slacker_meta IS
   'Per-account key/value: schema version, the linked user, workspace name.';
-COMMENT ON TABLE slackuser_conversations IS
+COMMENT ON TABLE slacker_conversations IS
   'Conversations the linked account can see, with the per-conversation incremental-sync cursor (synced_oldest/synced_newest).';
-COMMENT ON COLUMN slackuser_conversations.synced_newest IS
+COMMENT ON COLUMN slacker_conversations.synced_newest IS
   'The newest ts the store covers for this conversation; the next incremental sync asks only for what is newer.';
-COMMENT ON TABLE slackuser_messages IS
+COMMENT ON TABLE slacker_messages IS
   'Captured messages keyed by the Slack ts within a channel; a deletion is a soft flag and reactions are a {name: [user_id]} jsonb the table does not interpret.';
-COMMENT ON COLUMN slackuser_messages.ts IS
+COMMENT ON COLUMN slacker_messages.ts IS
   'The Slack message timestamp string, unique within a channel: the natural message id and the dedup key.';
-COMMENT ON COLUMN slackuser_messages.raw IS
+COMMENT ON COLUMN slacker_messages.raw IS
   'The whole Slack message object as received, opaque to the table, kept so a parser fix can rebuild the typed columns.';
-COMMENT ON TABLE slackuser_users IS
+COMMENT ON TABLE slacker_users IS
   'Users seen in the capture, resolved from users.info on demand.'"""),
     Step("0008-conversations-open-gap", """
-ALTER TABLE slackuser_conversations
+ALTER TABLE slacker_conversations
   ADD COLUMN gap_newest text, ADD COLUMN gap_latest text;
-COMMENT ON COLUMN slackuser_conversations.gap_newest IS
+COMMENT ON COLUMN slacker_conversations.gap_newest IS
   'While a sync from the cursor is unfinished: the newest ts it fetched, where the cursor moves once the gap below is closed.';
-COMMENT ON COLUMN slackuser_conversations.gap_latest IS
+COMMENT ON COLUMN slacker_conversations.gap_latest IS
   'While a sync from the cursor is unfinished: the oldest ts it reached; everything from here to gap_newest is stored, and the next sync resumes below it.'"""),
 ]
 
 
 def _tables():
-    """The steps and version of the slackuser_* tables, for the contract's
+    """The steps and version of the slacker_* tables, for the contract's
     `migrate` (and the manager's install-time migration)."""
     return STORE_STEPS, STORE_SCHEMA_MAJOR, STORE_SCHEMA_MINOR
 
@@ -6687,14 +6687,14 @@ def _open_store(cfg: dict) -> _Store:
 
 def _get_meta(db: _Store, key: str) -> str | None:
     row = db.execute(
-        "SELECT value FROM slackuser_meta WHERE account = %s AND key = %s",
+        "SELECT value FROM slacker_meta WHERE account = %s AND key = %s",
         (db.account, key)).fetchone()
     return row["value"] if row else None
 
 
 def _set_meta(db: _Store, key: str, value: str) -> None:
     db.execute(
-        """INSERT INTO slackuser_meta (account, key, value) VALUES (%s, %s, %s)
+        """INSERT INTO slacker_meta (account, key, value) VALUES (%s, %s, %s)
            ON CONFLICT (account, key) DO UPDATE SET value = excluded.value""",
         (db.account, key, value))
 
@@ -6716,22 +6716,22 @@ def _upsert_conversation(db: _Store, conv: dict) -> None:
     last_f = _ts_float(last_ts)
     with _writing(db):
         db.execute(
-            f"""INSERT INTO slackuser_conversations
+            f"""INSERT INTO slacker_conversations
                   (account, id, kind, name, user_id, is_member, is_archived,
                    last_ts, last_ts_at, updated_at)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,
                         {_TS_PARAM if last_f is not None else 'NULL'}, now())
                 ON CONFLICT (account, id) DO UPDATE SET
                   kind = excluded.kind,
-                  name = COALESCE(NULLIF(excluded.name,''), slackuser_conversations.name),
-                  user_id = COALESCE(excluded.user_id, slackuser_conversations.user_id),
+                  name = COALESCE(NULLIF(excluded.name,''), slacker_conversations.name),
+                  user_id = COALESCE(excluded.user_id, slacker_conversations.user_id),
                   is_member = excluded.is_member,
                   is_archived = excluded.is_archived,
                   last_ts = CASE WHEN excluded.last_ts IS NOT NULL
-                       AND (slackuser_conversations.last_ts IS NULL
-                            OR excluded.last_ts > slackuser_conversations.last_ts)
-                       THEN excluded.last_ts ELSE slackuser_conversations.last_ts END,
-                  last_ts_at = GREATEST(slackuser_conversations.last_ts_at,
+                       AND (slacker_conversations.last_ts IS NULL
+                            OR excluded.last_ts > slacker_conversations.last_ts)
+                       THEN excluded.last_ts ELSE slacker_conversations.last_ts END,
+                  last_ts_at = GREATEST(slacker_conversations.last_ts_at,
                                         excluded.last_ts_at),
                   updated_at = now()""",
             [db.account, cid, _conv_kind(conv), _conv_name(conv) or "",
@@ -6749,20 +6749,20 @@ def _advance_cursor(db: _Store, channel_id: str, oldest: str | None,
     listed, so the cursor is never lost."""
     with _writing(db):
         db.execute(
-            """INSERT INTO slackuser_conversations
+            """INSERT INTO slacker_conversations
                  (account, id, synced_oldest, synced_newest, synced_at, updated_at)
                VALUES (%s, %s, %s, %s, now(), now())
                ON CONFLICT (account, id) DO UPDATE SET
-                 synced_oldest = CASE WHEN slackuser_conversations.synced_oldest IS NULL
+                 synced_oldest = CASE WHEN slacker_conversations.synced_oldest IS NULL
                       OR (excluded.synced_oldest IS NOT NULL
-                          AND excluded.synced_oldest < slackuser_conversations.synced_oldest)
+                          AND excluded.synced_oldest < slacker_conversations.synced_oldest)
                       THEN excluded.synced_oldest
-                      ELSE slackuser_conversations.synced_oldest END,
-                 synced_newest = CASE WHEN slackuser_conversations.synced_newest IS NULL
+                      ELSE slacker_conversations.synced_oldest END,
+                 synced_newest = CASE WHEN slacker_conversations.synced_newest IS NULL
                       OR (excluded.synced_newest IS NOT NULL
-                          AND excluded.synced_newest > slackuser_conversations.synced_newest)
+                          AND excluded.synced_newest > slacker_conversations.synced_newest)
                       THEN excluded.synced_newest
-                      ELSE slackuser_conversations.synced_newest END,
+                      ELSE slacker_conversations.synced_newest END,
                  synced_at = now()""",
             (db.account, channel_id, oldest, newest))
 
@@ -6811,16 +6811,16 @@ def _upsert_message(db: _Store, channel_id: str, msg: dict, sync_type: str,
                json.dumps(v["raw"]), v["sync_type"]]
     conflict = ("""DO UPDATE SET
                   text = excluded.text, subtype = excluded.subtype,
-                  thread_ts = COALESCE(excluded.thread_ts, slackuser_messages.thread_ts),
+                  thread_ts = COALESCE(excluded.thread_ts, slacker_messages.thread_ts),
                   edited_at = excluded.edited_at,
-                  reply_count = GREATEST(slackuser_messages.reply_count,
+                  reply_count = GREATEST(slacker_messages.reply_count,
                                          excluded.reply_count),
                   reactions = excluded.reactions, raw = excluded.raw,
                   sync_type = excluded.sync_type, captured_at = now()"""
                 if authoritative else "DO NOTHING")
     with _writing(db):
         cur = db.execute(
-            f"""INSERT INTO slackuser_messages
+            f"""INSERT INTO slacker_messages
                   (account, channel_id, ts, ts_at, thread_ts, user_id, type,
                    subtype, text, edited_at, reply_count, reactions, raw,
                    sync_type, captured_at)
@@ -6847,7 +6847,7 @@ def _apply_replied(db: _Store, channel_id: str, parent: dict) -> None:
         return
     with _writing(db):
         cur = db.execute(
-            """UPDATE slackuser_messages SET
+            """UPDATE slacker_messages SET
                  thread_ts = COALESCE(thread_ts, %s),
                  reply_count = GREATEST(reply_count, %s), captured_at = now()
                WHERE account = %s AND channel_id = %s AND ts = %s""",
@@ -6860,7 +6860,7 @@ def _apply_replied(db: _Store, channel_id: str, parent: dict) -> None:
 def _apply_delete(db: _Store, channel_id: str, deleted_ts: str) -> None:
     with _writing(db):
         db.execute(
-            """UPDATE slackuser_messages SET deleted = true, captured_at = now()
+            """UPDATE slacker_messages SET deleted = true, captured_at = now()
                WHERE account = %s AND channel_id = %s AND ts = %s""",
             (db.account, channel_id, deleted_ts))
 
@@ -6872,7 +6872,7 @@ def _apply_reaction(db: _Store, channel_id: str, ts: str, name: str,
     nothing to attach it to, and it will arrive with the message on backfill."""
     with _writing(db):
         row = db.execute(
-            "SELECT reactions FROM slackuser_messages "
+            "SELECT reactions FROM slacker_messages "
             "WHERE account = %s AND channel_id = %s AND ts = %s FOR UPDATE",
             (db.account, channel_id, ts)).fetchone()
         if not row:
@@ -6890,7 +6890,7 @@ def _apply_reaction(db: _Store, channel_id: str, ts: str, name: str,
         else:
             reactions.pop(name, None)
         db.execute(
-            "UPDATE slackuser_messages SET reactions = %s, captured_at = now() "
+            "UPDATE slacker_messages SET reactions = %s, captured_at = now() "
             "WHERE account = %s AND channel_id = %s AND ts = %s",
             (json.dumps(reactions), db.account, channel_id, ts))
 
@@ -6902,7 +6902,7 @@ def _upsert_user(db: _Store, user: dict) -> None:
     profile = user.get("profile") or {}
     with _writing(db):
         db.execute(
-            """INSERT INTO slackuser_users
+            """INSERT INTO slacker_users
                  (account, id, name, real_name, display_name, is_bot, deleted,
                   updated_at)
                VALUES (%s,%s,%s,%s,%s,%s,%s, now())
@@ -7140,14 +7140,14 @@ def _store_messages(db: _Store, channel_id: str, limit: int,
         params.append(latest)
     params.append(limit)
     rows = db.execute(
-        f"SELECT * FROM slackuser_messages WHERE {' AND '.join(where)} "
+        f"SELECT * FROM slacker_messages WHERE {' AND '.join(where)} "
         f"ORDER BY ts DESC LIMIT %s", params).fetchall()
     return [_row_to_message(r) for r in reversed(rows)]
 
 
 def _store_covers_newest(db: _Store, channel_id: str) -> str | None:
     row = db.execute(
-        "SELECT synced_newest FROM slackuser_conversations "
+        "SELECT synced_newest FROM slacker_conversations "
         "WHERE account = %s AND id = %s", (db.account, channel_id)).fetchone()
     return row["synced_newest"] if row else None
 
@@ -7156,7 +7156,7 @@ def _open_gap(db: _Store, channel_id: str) -> tuple[str | None, str | None]:
     """The unfinished part of a sync from the cursor, as (gap_newest,
     gap_latest), or (None, None) when no sync stopped short."""
     row = db.execute(
-        "SELECT gap_newest, gap_latest FROM slackuser_conversations "
+        "SELECT gap_newest, gap_latest FROM slacker_conversations "
         "WHERE account = %s AND id = %s", (db.account, channel_id)).fetchone()
     return (row["gap_newest"], row["gap_latest"]) if row else (None, None)
 
@@ -7165,7 +7165,7 @@ def _set_gap(db: _Store, channel_id: str, newest: str | None,
              latest: str | None) -> None:
     with _writing(db):
         db.execute(
-            "UPDATE slackuser_conversations SET gap_newest = %s, gap_latest = %s "
+            "UPDATE slacker_conversations SET gap_newest = %s, gap_latest = %s "
             "WHERE account = %s AND id = %s",
             (newest, latest, db.account, channel_id))
 
@@ -7259,7 +7259,7 @@ def _sync_channel(db: _Store, client: SlackClient, channel_id: str,
 
 def _member_channels(db: _Store) -> list[str]:
     rows = db.execute(
-        "SELECT id FROM slackuser_conversations "
+        "SELECT id FROM slacker_conversations "
         "WHERE account = %s AND is_member = true AND is_archived = false",
         (db.account,)).fetchall()
     return [r["id"] for r in rows]
@@ -7603,7 +7603,7 @@ def _inventory(network: bool) -> dict:
         "service": {"state": service_state},
         "deferred": [{"label": "captured message counts",
                       "reason": "needs a project database and a connection; "
-                                "read with `slackuser history` or `sync`"}],
+                                "read with `slacker history` or `sync`"}],
     }
 
 
@@ -7655,7 +7655,7 @@ def cmd_service(args) -> dict | None:
 
 
 _SERVICE_HELP = (
-    "slackuser service — the bundled live-capture listener\n\n"
+    "slacker service — the bundled live-capture listener\n\n"
     "  service init [--connection ID]     Seed the service's control files\n"
     "  service run  [--connection ID]     Run the listener in the foreground\n"
     "                                     (the deploy command). Exit 7 when the\n"

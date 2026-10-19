@@ -3,7 +3,7 @@
 dedup that makes a redelivery harmless, edits, deletions and reactions, the
 incremental-sync cursor, and the reconnect that must lose and double nothing.
 
-These cases need a throwaway Postgres named by SLACKUSER_TEST_DSN and skip
+These cases need a throwaway Postgres named by SLACKER_TEST_DSN and skip
 without one. Each writes under an account of its own."""
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ class StoreRoundTrip(unittest.TestCase):
         self.addCleanup(self.db.close)
 
     def _count(self, channel="C1", deleted=None):
-        q = ("SELECT count(*) AS n FROM slackuser_messages "
+        q = ("SELECT count(*) AS n FROM slacker_messages "
              "WHERE account = %s AND channel_id = %s")
         p = [self.db.account, channel]
         if deleted is not None:
@@ -98,7 +98,7 @@ class StoreRoundTrip(unittest.TestCase):
         self.addCleanup(other.close)
         self.assertEqual(self._count(), 1)
         self.assertEqual(
-            other.execute("SELECT count(*) AS n FROM slackuser_messages "
+            other.execute("SELECT count(*) AS n FROM slacker_messages "
                           "WHERE account = %s", (other.account,)).fetchone()["n"], 0)
 
     def test_a_message_reads_back_with_its_fields(self):
@@ -233,7 +233,7 @@ class IncrementalSyncAndReconnect(unittest.TestCase):
 
     def _count(self, channel="C1"):
         return self.db.execute(
-            "SELECT count(*) AS n FROM slackuser_messages "
+            "SELECT count(*) AS n FROM slacker_messages "
             "WHERE account = %s AND channel_id = %s",
             (self.db.account, channel)).fetchone()["n"]
 

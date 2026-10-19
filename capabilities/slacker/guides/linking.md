@@ -15,10 +15,10 @@ Browser-driven extraction (driving a real browser with Playwright or rod, lettin
 
 ## Declaring the connection
 
-The two secrets are named by the env var that holds them, resolved through the credential cascade (flags → project `.env(.local)` → `~/.config/slackuser/credentials.env` → process env):
+The two secrets are named by the env var that holds them, resolved through the credential cascade (flags → project `.env(.local)` → `~/.config/slacker/credentials.env` → process env):
 
-- `token_env` — the env var holding the `xoxc-` token (default `SLACK_USER_TOKEN`).
-- `cookie_env` — the env var holding the `d` cookie value (default `SLACK_USER_COOKIE`).
+- `token_env` — the env var holding the `xoxc-` token (default `SLACKER_TOKEN`).
+- `cookie_env` — the env var holding the `d` cookie value (default `SLACKER_COOKIE`).
 
 The non-secret identity, kept in the connection registry:
 
@@ -29,16 +29,16 @@ The non-secret identity, kept in the connection registry:
 Write the connection and its secrets through the contract, so the secret values land in the credentials file and never in the registry:
 
 ```
-slackuser connection add mine --stdin
-{"token_env": "SLACK_USER_TOKEN", "cookie_env": "SLACK_USER_COOKIE",
+slacker connection add mine --stdin
+{"token_env": "SLACKER_TOKEN", "cookie_env": "SLACKER_COOKIE",
  "team_id": "T01234567", "workspace": "my-workspace",
- "SLACK_USER_TOKEN": "xoxc-…", "SLACK_USER_COOKIE": "…"}
+ "SLACKER_TOKEN": "xoxc-…", "SLACKER_COOKIE": "…"}
 ```
 
 Then prove it:
 
 ```
-slackuser doctor --connection mine
+slacker doctor --connection mine
 ```
 
 A healthy `doctor` resolves the linked user and the workspace and matches the bindings. `invalid_auth` (exit 2) means the session expired or was signed out — link again. The `d` cookie is short-lived relative to its nominal expiry, and there is no silent refresh.

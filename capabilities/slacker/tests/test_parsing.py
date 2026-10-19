@@ -71,8 +71,8 @@ class ConnectionConfig(unittest.TestCase):
         su._resolve_env_key = self._fake_resolve  # type: ignore
 
     def _fake_resolve(self, key):
-        store = {"SLACK_USER_TOKEN": self._token,
-                 "SLACK_USER_COOKIE": self._cookie}
+        store = {"SLACKER_TOKEN": self._token,
+                 "SLACKER_COOKIE": self._cookie}
         return store.get(key), ("env" if store.get(key) else None), None
 
     def test_a_full_connection_resolves(self):

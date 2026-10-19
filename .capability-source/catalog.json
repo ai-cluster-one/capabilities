@@ -145,9 +145,9 @@
       "payload_sha256": "0cc69db8d7170adb97d97e6d378b6f938a626d1a2711fa98d975d08702e06439",
       "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy."
     },
-    "slackuser": {
-      "path": "capabilities/slackuser",
-      "payload_sha256": "3036ec8ec0fe29f6caa4b3b34653c69e17de12cec580af05cc1ec0917d5ca3e3",
+    "slacker": {
+      "path": "capabilities/slacker",
+      "payload_sha256": "9b7a16ba713daa50aa3a2c5b24f5501a5479ffa988a0d99ae54412d6ee5fd26e",
       "summary": "Slack CLI that reads the linked user's own workspace over their web session (xoxc token + d cookie) — list conversations (DMs, group DMs, public and private channels), read message history and thread replies, keep an incremental-synced Postgres store, and capture live. Read-only: it never writes to Slack."
     },
     "stripe": {

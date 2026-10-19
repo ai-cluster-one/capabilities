@@ -7,7 +7,7 @@ are imported lazily by the script, so everything below the network — the store
 the parser, the event handler, the sync cursor — is reachable with no Slack
 dependency present and no network.
 
-The capture lives in Postgres. The store-backed cases read SLACKUSER_TEST_DSN, a
+The capture lives in Postgres. The store-backed cases read SLACKER_TEST_DSN, a
 throwaway database's URL, given to the capability as AGENTKIT_DB_URL, and skip
 when it is unset; each case writes under an account of its own, so cases never
 see each other's rows.
@@ -25,10 +25,10 @@ from pathlib import Path
 
 CAPABILITY_DIR = Path(__file__).resolve().parents[1]
 CLI_PATH = next(
-    (path for path in (CAPABILITY_DIR / "bin" / "slackuser",
-                       CAPABILITY_DIR / "slackuser")
+    (path for path in (CAPABILITY_DIR / "bin" / "slacker",
+                       CAPABILITY_DIR / "slacker")
      if path.is_file()),
-    CAPABILITY_DIR / "bin" / "slackuser")
+    CAPABILITY_DIR / "bin" / "slacker")
 
 
 class _Unused:
@@ -49,7 +49,7 @@ def load() -> object:
     for name in ("slack_sdk", "slack_sdk.errors", "websocket"):
         if name not in sys.modules:
             sys.modules[name] = _Unused()
-    spec = importlib.util.spec_from_loader("slackuser_cli", loader=None)
+    spec = importlib.util.spec_from_loader("slacker_cli", loader=None)
     module = importlib.util.module_from_spec(spec)
     module.__file__ = str(CLI_PATH)
     source = CLI_PATH.read_text()
@@ -60,7 +60,7 @@ def load() -> object:
     return module
 
 
-STORE_DSN = os.environ.get("SLACKUSER_TEST_DSN")
+STORE_DSN = os.environ.get("SLACKER_TEST_DSN")
 
 # Every key the database cascade reads, so a case can hide each one it inherits.
 from capabilities_contract.db import KEYS as DB_KEYS  # noqa: E402
@@ -68,7 +68,7 @@ from capabilities_contract.db import KEYS as DB_KEYS  # noqa: E402
 
 def needs_store(case):
     """Skip a store-backed case where no throwaway database is named."""
-    return unittest.skipUnless(STORE_DSN, "SLACKUSER_TEST_DSN is unset")(case)
+    return unittest.skipUnless(STORE_DSN, "SLACKER_TEST_DSN is unset")(case)
 
 
 def no_db_env() -> dict:

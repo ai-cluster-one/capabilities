@@ -1,10 +1,10 @@
 # Operational model
 
-`slackuser` reads one Slack workspace as the person who links their own account, the way the `whatsapp` and `telegram` capabilities read as their vendor's own client. It lists the conversations that account can already see, reads their history and threads, keeps them in the project's Postgres store, syncs them forward, and captures them live. It never writes to Slack.
+`slacker` reads one Slack workspace as the person who links their own account, the way the `whatsapp` and `telegram` capabilities read as their vendor's own client. It lists the conversations that account can already see, reads their history and threads, keeps them in the project's Postgres store, syncs them forward, and captures them live. It never writes to Slack.
 
 ## What it is
 
-A Slack web client holds a session as an `xoxc-` token for one workspace plus a `d` cookie shared across the person's workspaces. A program holding that pair is, to Slack, one more of the person's own browser sessions. `slackuser` uses the pair exactly as the browser does, over the public Web API at `https://slack.com/api/<method>`, with the token as a bearer and the cookie beside it. There is no app to install, no admin approval, no bot, and no OAuth token. The session is the person's own; this capability adds no concealment, no monitoring bypass, and no client-identity spoofing.
+A Slack web client holds a session as an `xoxc-` token for one workspace plus a `d` cookie shared across the person's workspaces. A program holding that pair is, to Slack, one more of the person's own browser sessions. `slacker` uses the pair exactly as the browser does, over the public Web API at `https://slack.com/api/<method>`, with the token as a bearer and the cookie beside it. There is no app to install, no admin approval, no bot, and no OAuth token. The session is the person's own; this capability adds no concealment, no monitoring bypass, and no client-identity spoofing.
 
 ## What it reads, and only reads
 
@@ -21,12 +21,12 @@ There is no verb that sends a message, sets presence, joins a channel, or marks 
 
 ## The store
 
-Captured data lives in the project's Postgres database, in `slackuser_*` tables keyed by the workspace account (its team id), created and migrated on first use. The capture belongs to the account, not to one project: an account has one history in a database, whichever project on the machine reads it, so the tables carry no project id — the same choice the `whatsapp` capability's capture makes, and for the same reason.
+Captured data lives in the project's Postgres database, in `slacker_*` tables keyed by the workspace account (its team id), created and migrated on first use. The capture belongs to the account, not to one project: an account has one history in a database, whichever project on the machine reads it, so the tables carry no project id — the same choice the `whatsapp` capability's capture makes, and for the same reason.
 
-- `slackuser_conversations` — one row per conversation, its kind, membership, latest activity, the incremental-sync cursor (`synced_oldest` / `synced_newest`), and the open gap of a sync from the cursor that was cut short (`gap_newest` / `gap_latest`).
-- `slackuser_messages` — one row per message, keyed by `(account, channel_id, ts)`; the Slack `ts` is the natural id and the dedup key. A deletion is a soft `deleted` flag; reactions are a `{name: [user_id]}` jsonb; the whole original object is kept in `raw` so a parser fix can rebuild the typed columns.
-- `slackuser_users` — users seen in the capture, resolved from `users.info` on demand.
-- `slackuser_meta` — the schema version and the linked identity.
+- `slacker_conversations` — one row per conversation, its kind, membership, latest activity, the incremental-sync cursor (`synced_oldest` / `synced_newest`), and the open gap of a sync from the cursor that was cut short (`gap_newest` / `gap_latest`).
+- `slacker_messages` — one row per message, keyed by `(account, channel_id, ts)`; the Slack `ts` is the natural id and the dedup key. A deletion is a soft `deleted` flag; reactions are a `{name: [user_id]}` jsonb; the whole original object is kept in `raw` so a parser fix can rebuild the typed columns.
+- `slacker_users` — users seen in the capture, resolved from `users.info` on demand.
+- `slacker_meta` — the schema version and the linked identity.
 
 ## Incremental sync and live capture
 

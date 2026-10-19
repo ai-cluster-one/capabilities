@@ -1,0 +1,7 @@
+{
+  "connection": "",
+  "_help": {
+    "connection": "The connection id the capture service runs on. Empty means the registry's default, else the sole connection. The service reads the connection and its session secrets through the same cascade every verb uses; it keeps no settings of its own in this pilot.",
+    "model": "The pilot capture service is read-only: it holds the linked account's Slack event stream and writes new messages, edits, deletions, thread replies and reactions into the store, backfilling through the sync cursor on every reconnect. It answers nothing and sends nothing. The foreground deploy command is `slacker service run`; keeping it running is the deployment capability's job."
+  }
+}
