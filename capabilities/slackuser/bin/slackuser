@@ -67,7 +67,9 @@ Commands
                                        store, and fetches from Slack when it
                                        cannot cover the request.
   slackuser thread <channel> <thread_ts> [--fresh]
-                                       Read a thread's replies.
+                                       Read a thread's replies. Answers from the
+                                       store once it holds every reply the
+                                       parent counts, else fetches from Slack.
   slackuser sync [--channel ID] [--full] [--limit N]
                                        Bring the store forward: fetch every
                                        message of each member conversation newer
@@ -6282,17 +6284,28 @@ def _log(message: str) -> None:
 
 # --- Connections (capability-specific) ---------------------------------------
 
+def _unquote(value: str | None) -> str | None:
+    """A pasted secret without the quote marks a browser console prints around
+    a string. The realtime gateway refuses a quoted value that REST accepts."""
+    if value is None:
+        return None
+    value = str(value).strip()
+    while len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
+
 def _resolve_cookie(raw: str | None) -> str | None:
     """The `d` cookie value, however the person pasted it: a bare value, or a
-    `d=...` pair, or a whole Cookie header carrying `d=`. Returns the value
-    alone; the client re-wraps it as a `d=` cookie."""
+    `d=...` pair, or a whole Cookie header carrying `d=`, each possibly quoted.
+    Returns the value alone; the client re-wraps it as a `d=` cookie."""
+    raw = _unquote(raw)
     if not raw:
         return None
-    raw = raw.strip()
     for part in raw.split(";"):
         part = part.strip()
         if part.startswith("d="):
-            return part[2:].strip()
+            return _unquote(part[2:])
     return raw
 
 
@@ -6303,7 +6316,7 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
     entry = entry if isinstance(entry, dict) else {}
     token_env = entry.get("token_env") or "SLACK_USER_TOKEN"
     cookie_env = entry.get("cookie_env") or "SLACK_USER_COOKIE"
-    token = _resolve_env_key(token_env)[0]
+    token = _unquote(_resolve_env_key(token_env)[0])
     cookie = _resolve_cookie(_resolve_env_key(cookie_env)[0])
     if not token:
         return None, {
@@ -6825,6 +6838,25 @@ def _apply_edit(db: _Store, channel_id: str, msg: dict) -> None:
     _upsert_message(db, channel_id, msg, "live", authoritative=True)
 
 
+def _apply_replied(db: _Store, channel_id: str, parent: dict) -> None:
+    """A message_replied event: Slack re-sends the thread's parent to say it
+    gained a reply. Only the parent's reply metadata moves; its text and kind
+    stay as stored. An unknown parent is stored from the event as it stands."""
+    v = _message_values(channel_id, parent, "live")
+    if v is None:
+        return
+    with _writing(db):
+        cur = db.execute(
+            """UPDATE slackuser_messages SET
+                 thread_ts = COALESCE(thread_ts, %s),
+                 reply_count = GREATEST(reply_count, %s), captured_at = now()
+               WHERE account = %s AND channel_id = %s AND ts = %s""",
+            (v["thread_ts"], v["reply_count"], db.account, channel_id, v["ts"]))
+        updated = cur.rowcount
+    if not updated:
+        _upsert_message(db, channel_id, parent, "live", authoritative=False)
+
+
 def _apply_delete(db: _Store, channel_id: str, deleted_ts: str) -> None:
     with _writing(db):
         db.execute(
@@ -6902,6 +6934,10 @@ def _handle_event(db: _Store, event: dict) -> dict | None:
         if subtype == "message_changed" and isinstance(event.get("message"), dict):
             _apply_edit(db, channel, event["message"])
             return {"change": "edit", "channel": channel,
+                    "ts": event["message"].get("ts")}
+        if subtype == "message_replied" and isinstance(event.get("message"), dict):
+            _apply_replied(db, channel, event["message"])
+            return {"change": "replied", "channel": channel,
                     "ts": event["message"].get("ts")}
         if subtype == "message_deleted" and event.get("deleted_ts"):
             _apply_delete(db, channel, event["deleted_ts"])
@@ -6992,13 +7028,16 @@ class SlackClient:
         return self._call("users.info", user=user).get("user", {})
 
     def conversations(self, types: str, limit: int = 1000):
+        """The linked user's own conversations. users.conversations answers
+        only those the user is in and omits is_member on a channel, so each is
+        marked a member here."""
         cursor = None
         while True:
             data = self._call("users.conversations", types=types,
                               limit=min(limit, 1000), cursor=cursor,
                               exclude_archived=False)
             for conv in data.get("channels", []):
-                yield conv
+                yield {**conv, "is_member": True}
             cursor = (data.get("response_metadata") or {}).get("next_cursor")
             if not cursor:
                 return
@@ -7315,13 +7354,22 @@ def cmd_history(args) -> dict:
             "messages": messages}
 
 
+def _thread_covered(stored: list[dict], thread_ts: str) -> bool:
+    """Whether the stored thread already holds every reply its parent counts.
+    A history sync stores the parent alone, so a parent with no stored replies
+    is never taken as the whole thread."""
+    parent = next((m for m in stored if m["ts"] == thread_ts), None)
+    replies = len(stored) - (1 if parent else 0)
+    return bool(parent and replies and replies >= (parent["reply_count"] or 0))
+
+
 def cmd_thread(args) -> dict:
     cfg = get_config(args)
     channel = _normalize_channel_id(args.channel)
     db = _open_store(cfg)
     fetched = 0
     stored = _store_messages(db, channel, 1000, None, None, thread_ts=args.thread_ts)
-    if args.fresh or not stored:
+    if args.fresh or not _thread_covered(stored, args.thread_ts):
         client = SlackClient(cfg)
         for msg in client.replies(channel, args.thread_ts, limit=1000):
             _upsert_message(db, channel, msg, "history", authoritative=False)
@@ -7376,6 +7424,9 @@ def _service_read(home: Path, name: str) -> dict | None:
 # from the shortest backoff.
 _CAPTURE_STEADY_SECONDS = 30.0
 
+# The origin the web client's realtime socket carries.
+_WEB_ORIGIN = "https://app.slack.com"
+
 
 class _Capture:
     """The listener's state for one account: the store, the Slack client, the
@@ -7393,8 +7444,10 @@ class _Capture:
         self.stop = threading.Event()
         self.events = 0
         self.last_event_at: str | None = None
+        self.state = "starting"
 
     def health(self, state: str, extra: dict | None = None) -> None:
+        self.state = state
         _service_write(self.home, "health.json", {
             "state": state, "pid": os.getpid(), "at": _iso_now(),
             "events": self.events, "last_event_at": self.last_event_at,
@@ -7415,14 +7468,16 @@ class _Capture:
 
     def _ws_url(self) -> str:
         """The session's realtime gateway. The web client dials
-        wss-primary.slack.com with the session token; the exact handshake is the
-        one point the live trial must verify against current upstream, so it is
-        isolated here."""
-        team = self.cfg.get("account_binding") or ""
+        wss-primary.slack.com with the session token, and the socket carries the
+        `d` cookie (`_ws_header`) and the web client's origin; the live trial
+        found the gateway refuses the session without them, and refuses a
+        gateway_server naming the team id."""
         token = self.cfg["token"]
         return (f"wss://wss-primary.slack.com/?token={token}"
-                f"&gateway_server={team}&slack_client=desktop"
-                f"&batch_presence_aware=1")
+                f"&slack_client=desktop&batch_presence_aware=1")
+
+    def _ws_header(self) -> list[str]:
+        return [f"Cookie: d={self.cfg['cookie']}"]
 
     def _on_message(self, _ws, raw: str) -> None:
         try:
@@ -7433,6 +7488,7 @@ class _Capture:
         if change:
             self.events += 1
             self.last_event_at = _iso_now()
+            self.health(self.state)
 
     def run(self) -> int:
         """Foreground capture with reconnect/backoff. Returns the process exit
@@ -7478,26 +7534,46 @@ class _Capture:
 
     def _listen(self) -> float:
         """Hold the realtime socket until it closes or fails, and return the
-        seconds it was open, 0 when the handshake failed. A failure is logged by
-        its kind and HTTP status, never its text, which can carry the request."""
+        seconds it was connected, 0 when the handshake failed. The gateway can
+        accept the socket and then refuse the session with an error frame, so
+        the connection counts from its first other frame (normally `hello`),
+        not from the socket opening. A failure is logged by its kind and HTTP
+        status or the gateway's error code, never its text, which can carry the
+        request."""
         import websocket
         opened: list[float] = []
         errors: list[str] = []
-
-        def on_open(_ws) -> None:
-            opened.append(time.monotonic())
-            self.health("connected")
 
         def on_error(_ws, exc) -> None:
             status = getattr(exc, "status_code", None)
             errors.append(type(exc).__name__
                           + (f" (HTTP {status})" if status else ""))
 
+        def on_message(ws, raw: str) -> None:
+            with contextlib.suppress(ValueError, AttributeError):
+                frame = json.loads(raw)
+                if frame.get("type") == "error":
+                    error = frame.get("error")
+                    error = error if isinstance(error, dict) else {"msg": error}
+                    code = re.sub(r"[^A-Za-z0-9_.-]", "", str(error.get("msg") or ""))
+                    status = re.sub(r"[^0-9]", "", str(error.get("code") or ""))
+                    errors.append(f"gateway error {code or 'unknown'}"
+                                  + (f" ({status})" if status else ""))
+                    ws.close()
+                    return
+            if not opened and not errors:
+                opened.append(time.monotonic())
+                self.health("connected")
+            self._on_message(ws, raw)
+
         self.ws = websocket.WebSocketApp(
-            self._ws_url(), on_open=on_open, on_message=self._on_message,
+            self._ws_url(), header=self._ws_header(), on_message=on_message,
             on_error=on_error)
         # run_forever returns on close or error; the outer loop reconnects.
-        self.ws.run_forever(ping_interval=20, ping_timeout=10)
+        # The origin goes through websocket-client's own option: an Origin in
+        # the header list would be sent beside the one the library adds.
+        self.ws.run_forever(ping_interval=20, ping_timeout=10,
+                            origin=_WEB_ORIGIN)
         reason = errors[-1] if errors else "no error reported"
         if not opened:
             _log(f"realtime handshake failed: {reason}")

@@ -199,6 +199,24 @@ class EventHandling(unittest.TestCase):
         rows = su._store_messages(self.db, "C1", 10, None, None)
         self.assertEqual(rows[0]["reactions"]["tada"], ["U2"])
 
+    def test_a_replied_event_updates_only_the_parents_reply_metadata(self):
+        su._handle_event(self.db, {"type": "message", "channel": "C1",
+                                   "ts": "1.0", "user": "U1", "text": "parent"})
+        # Slack announces a reply by re-sending the parent under message_replied.
+        change = su._handle_event(self.db, {
+            "type": "message", "subtype": "message_replied", "hidden": True,
+            "channel": "C1", "ts": "1.0", "event_ts": "2.0",
+            "message": {"type": "message", "ts": "1.0", "user": "U1",
+                        "text": "parent", "thread_ts": "1.0",
+                        "reply_count": 1, "latest_reply": "2.0"}})
+        self.assertEqual(change["change"], "replied")
+        rows = su._store_messages(self.db, "C1", 10, None, None)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["text"], "parent")
+        self.assertIsNone(rows[0]["subtype"])
+        self.assertEqual(rows[0]["reply_count"], 1)
+        self.assertEqual(rows[0]["thread_ts"], "1.0")
+
     def test_an_unknown_event_changes_nothing(self):
         self.assertIsNone(su._handle_event(self.db, {"type": "user_typing"}))
 
@@ -314,6 +332,68 @@ class IncrementalSyncAndReconnect(unittest.TestCase):
         self.assertEqual(self._count("C3"), 60)
         self.assertEqual(su._store_covers_newest(self.db, "C1"), _ts(3009))
         self.assertEqual(su._open_gap(self.db, "C1"), (None, None))
+
+
+class _Members(su.SlackClient):
+    """users.conversations as Slack answers it, with no is_member on a channel."""
+
+    def __init__(self):
+        pass
+
+    def _call(self, method: str, **kwargs) -> dict:
+        assert method == "users.conversations", method
+        return {"ok": True, "channels": [
+            {"id": "C1", "is_channel": True, "name": "general"},
+            {"id": "D1", "is_im": True, "user": "U2"}]}
+
+
+class _Thread(su.SlackClient):
+    """conversations.replies for one thread: the parent and its replies."""
+
+    def __init__(self, messages: list[dict]):
+        self.messages = messages
+        self.calls = 0
+
+    def _call(self, method: str, **kwargs) -> dict:
+        assert method == "conversations.replies", method
+        self.calls += 1
+        return {"ok": True, "messages": self.messages, "has_more": False}
+
+
+@_cli.needs_store
+class ConversationsAndThreads(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, _cli.store_env())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cfg = _cli.store_cfg()
+        self.db = su._open_store(self.cfg)
+        self.addCleanup(self.db.close)
+
+    def test_every_listed_channel_is_synced_as_a_member_channel(self):
+        for conv in _Members().conversations("im,public_channel"):
+            su._upsert_conversation(self.db, conv)
+        self.assertEqual(sorted(su._member_channels(self.db)), ["C1", "D1"])
+
+    def test_a_thread_read_fetches_replies_the_store_does_not_hold(self):
+        # The parent was stored by a history sync, which carries no replies.
+        su._upsert_message(self.db, "C1", _msg("1.0", "parent", thread_ts="1.0",
+                                               reply_count=2), "history")
+        client = _Thread([_msg("1.0", "parent", thread_ts="1.0", reply_count=2),
+                          _msg("2.0", "r1", thread_ts="1.0"),
+                          _msg("3.0", "r2", thread_ts="1.0")])
+        args = argparse.Namespace(channel="C1", thread_ts="1.0", fresh=False,
+                                  connection=None)
+        with mock.patch.object(su, "get_config", return_value=self.cfg), \
+                mock.patch.object(su, "_open_store", return_value=_Unclosed(self.db)), \
+                mock.patch.object(su, "SlackClient", return_value=client):
+            result = su.cmd_thread(args)
+            self.assertEqual([m["text"] for m in result["messages"]],
+                             ["parent", "r1", "r2"])
+            # Once the store holds the replies the parent counts, it answers.
+            again = su.cmd_thread(args)
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(again["count"], 3)
 
 
 class _Unclosed:

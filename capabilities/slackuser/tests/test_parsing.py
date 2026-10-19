@@ -94,11 +94,40 @@ class ConnectionConfig(unittest.TestCase):
         _cfg, problem = su._build_cfg("mine", {})
         self.assertEqual(problem["exit"], 2)
 
+    def test_quote_marks_around_a_pasted_secret_are_stripped(self):
+        # A browser console prints a string quoted; the pair is pasted as shown.
+        self._token = '"xoxc-123"'
+        self._cookie = "'xoxd-abc+def'"
+        cfg, problem = su._build_cfg("mine", {})
+        self.assertIsNone(problem)
+        self.assertEqual(cfg["token"], "xoxc-123")
+        self.assertEqual(cfg["cookie"], "xoxd-abc+def")
+
     def test_a_bot_token_is_refused_as_the_wrong_route(self):
         self._token = "xoxb-999"
         _cfg, problem = su._build_cfg("mine", {})
         self.assertEqual(problem["exit"], 6)
         self.assertEqual(problem["code"], "not_a_session_token")
+
+
+class _Listing(su.SlackClient):
+    """users.conversations as Slack answers it: the caller's own conversations,
+    with no is_member on a channel."""
+
+    def __init__(self):
+        pass
+
+    def _call(self, method: str, **kwargs) -> dict:
+        assert method == "users.conversations", method
+        return {"ok": True, "channels": [
+            {"id": "C1", "is_channel": True, "name": "general"},
+            {"id": "G1", "is_group": True, "is_private": True, "name": "team"}]}
+
+
+class MemberConversations(unittest.TestCase):
+    def test_a_channel_users_conversations_returns_is_a_member_channel(self):
+        convs = list(_Listing().conversations("public_channel,private_channel"))
+        self.assertEqual([c["is_member"] for c in convs], [True, True])
 
 
 class MessageValues(unittest.TestCase):

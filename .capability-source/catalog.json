@@ -147,7 +147,7 @@
     },
     "slackuser": {
       "path": "capabilities/slackuser",
-      "payload_sha256": "f6add56196fefd136a9ff0fa8d8795662ed18443696479b8ab9a0b15f4b5a58b",
+      "payload_sha256": "3036ec8ec0fe29f6caa4b3b34653c69e17de12cec580af05cc1ec0917d5ca3e3",
       "summary": "Slack CLI that reads the linked user's own workspace over their web session (xoxc token + d cookie) — list conversations (DMs, group DMs, public and private channels), read message history and thread replies, keep an incremental-synced Postgres store, and capture live. Read-only: it never writes to Slack."
     },
     "stripe": {

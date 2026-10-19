@@ -13,7 +13,7 @@ The verb surface is small and entirely read-only:
 - `doctor` / `whoami` — prove the session (`auth.test`), the linked user, and the workspace, and check the connection's `team_id` / `expect_user` bindings.
 - `conversations` — list what the account can see: direct messages (`im`), group direct messages (`mpim`), and the public and private channels it belongs to.
 - `history <channel>` — read a conversation, answering from the store and fetching from Slack only what the store cannot cover.
-- `thread <channel> <thread_ts>` — read a thread's replies.
+- `thread <channel> <thread_ts>` — read a thread's replies, from the store once it holds every reply the parent counts, otherwise from Slack.
 - `sync` — bring the store forward incrementally for every member conversation, or one named channel.
 - `service run` — hold the session's event stream and capture live.
 
@@ -34,7 +34,7 @@ Captured data lives in the project's Postgres database, in `slackuser_*` tables 
 
 The `capture` service holds the session's realtime event stream and writes each new message, edit, deletion, thread reply and reaction into the store as it arrives. On a dropped connection it reconnects with backoff and, before resuming the live stream, backfills each member conversation from its cursor, so the window it was disconnected for is closed through the same dedup path. No channel message is lost and nothing is doubled, because the store's `ts` key is the single source of identity for both the live and the backfill writes. A thread reply posted during the drop is the exception: Slack's channel history carries no thread replies except those also sent to the channel, so the backfill does not reach it, and `thread <channel> <thread_ts> --fresh` reads it.
 
-Until a realtime connection has held for 30 seconds, each reconnect doubles the backoff, up to a minute, and the log names why the connection ended: a refused handshake is logged as `realtime handshake failed` with its HTTP status. The service's health reads `connecting` until the socket opens and `connected` only once it has.
+Until a realtime connection has held for 30 seconds, each reconnect doubles the backoff, up to a minute, and the log names why the connection ended: a refused handshake is logged as `realtime handshake failed` with its HTTP status. The socket carries the session's `d` cookie and the web client's origin. The gateway can accept the socket and then refuse the session with an error frame; that is logged as `realtime handshake failed` with the gateway's error code and counts as a failed connect. The service's health reads `connecting` until the gateway's first other frame and `connected` from then, and it counts each captured event (`events`, `last_event_at`) as it is written.
 
 ## Session lifetime
 
