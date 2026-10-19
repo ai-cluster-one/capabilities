@@ -171,6 +171,31 @@ def test_doctor_finds_a_block_behind_the_store(world):
 
 
 @needs_store
+def test_a_render_that_changes_nothing_leaves_the_block_as_written(world):
+    root = world.project("p")
+    entry = world.ok(root, "add", "x", "--title", "t")["entry"]
+    context = root / "capabilities" / "memory" / "state" / "context.md"
+    head, _, stamp = context.read_text().rpartition("_Rendered ")
+    context.write_text(head + "_Rendered 2000-01-01 00:00" + stamp[len("2000-01-01 00:00"):])
+    written = context.read_bytes()
+    world.ok(root, "render")
+    assert context.read_bytes() == written
+    # A change in the store that leaves the block the same: the doctor finds the
+    # block behind the store, and a render brings it current without a rewrite.
+    from _cli import engine, setting
+    with engine().Store(setting(world.schema)).open() as store:
+        store.set_pin(project_id(root), entry["id"], True, actor="elsewhere",
+                      node="another-node")
+    assert world.run(root, "doctor").returncode == 7
+    assert world.ok(root, "render")["last_event"] == world.ok(root, "status")["last_event"]
+    assert context.read_bytes() == written
+    assert world.ok(root, "doctor")["context"]["current"]
+    world.ok(root, "add", "y", "--title", "u")
+    text = context.read_text()
+    assert "2 active entries" in text and "2000-01-01" not in text
+
+
+@needs_store
 def test_settings_shape_the_block_and_bad_ones_refuse(world):
     root = world.project("p")
     settings = root / "capabilities" / "memory" / "service" / "settings.json"

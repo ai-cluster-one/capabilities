@@ -1061,10 +1061,33 @@ def write_atomic(path: Path, text: str) -> None:
     os.replace(spare, path)
 
 
+def _same_block(context: Path, rows: list[dict], settings: dict, *, now: _dt.datetime,
+                max_bytes: int) -> bool:
+    """Whether the block already written is the one these rows render, its own
+    provenance line put in place of the new one."""
+    try:
+        written = context.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return False
+    provenance = written.rstrip("\n").rpartition("\n")[2]
+    if not provenance.startswith("_Rendered "):
+        return False
+    try:
+        again, _report = render_block(rows, settings, now=now, provenance=provenance,
+                                      max_bytes=max_bytes)
+    except ValueError:
+        return False
+    return again == written
+
+
 def render_project(store: Store, project: str, settings: dict, context: Path, *,
                    rendered_by: str, max_bytes: int = CONTRIBUTION_MAX_BYTES) -> dict:
     """Render one project's block from the store into its contribution file,
-    with a sidecar saying what it holds and which event it is current to."""
+    with a sidecar saying what it holds and which event it is current to.
+
+    A block that differs from the one already written only in its provenance
+    line leaves the file as it is, its render time included, so a context
+    built from it does not change; the sidecar is written either way."""
     now = now_utc()
     last = store.last_event(project)
     rows = store.render_rows(project)
@@ -1073,7 +1096,8 @@ def render_project(store: Store, project: str, settings: dict, context: Path, *,
                   "`memory doctor` says what is wrong when it is stale or missing._")
     text, report = render_block(rows, settings, now=now, provenance=provenance,
                                 max_bytes=max_bytes)
-    write_atomic(context, text)
+    if not _same_block(context, rows, settings, now=now, max_bytes=max_bytes):
+        write_atomic(context, text)
     sidecar = {"rendered_at": iso(now), "rendered_by": rendered_by, "last_event": last,
                "project_id": project, "store": store_label(store.setting), **report}
     write_atomic(context.with_suffix(".json"), json.dumps(sidecar, indent=2) + "\n")
