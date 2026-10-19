@@ -902,6 +902,33 @@ def test_an_id_project_json_and_contextkit_disagree_on_is_a_question(world):
         == IDS["split-bound"]
 
 
+def test_store_mode_with_no_rows_in_this_store_asks_which_is_the_truth(world):
+    # project.json says "records": "store" from an import into another store;
+    # the store in force holds none of the agent's rows and its files hold some.
+    root = world.agent("foreign", "prj_99999999fff1", {
+        "{env}/settings.json": gate("coolify"),
+        "{env}/coolify/identifiers.json": {"app": {"value": "foreign-app", "note": ""}}})
+    identity = root / "capabilities" / "project.json"
+    world.write(identity, {**json.loads(identity.read_text()), "records": "store"})
+    subprocess.run(["git", "-C", str(root), "-c", "user.email=t@example.org",
+                    "-c", "user.name=t", "commit", "-qam", "store"], check=True)
+    before = world.everything()
+    dry = world.answer(world.manager(root, "migrate"))
+    _say("dry-run-foreign", dry)
+    [question] = dry["questions"]
+    assert question["id"] == "records" and question["choices"] == ["files", "store"]
+    error = world.error(world.manager(root, "migrate", "--apply"))
+    assert error["code"] == "question_open" and world.everything() == before
+    answers = answers_file(world, "foreign", {"records": "files"})
+    applied = world.answer(world.manager(root, "migrate", "--apply", "--answers", answers))
+    _say("apply-foreign", applied)
+    assert applied["state"] == "migrated" and not applied["verify"]["differences"]
+    assert world.sql("SELECT value FROM capabilities_identifiers WHERE agent_id = %s",
+                     ("prj_99999999fff1",)) == [("foreign-app",)]
+    assert world.sql("SELECT enabled FROM capabilities_policy WHERE agent_id = %s AND "
+                     "capability = 'coolify'", ("prj_99999999fff1",)) == [(True,)]
+
+
 # --- interrupted ---------------------------------------------------------------------------
 
 KILLER = """#!/bin/sh

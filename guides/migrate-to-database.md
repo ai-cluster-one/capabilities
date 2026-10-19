@@ -31,6 +31,10 @@ capabilities update --check        # update_available false
 
 A migration refuses with `payload_outdated` while any installed capability is older than the manager's contract; `capabilities update` is the fix.
 
+### Quarantined capabilities
+
+A capability new to a machine - one an update brought in, say - arrives quarantined, and a quarantined capability is disabled in every project whatever its gate says. `capabilities list` shows each one's machine state. Lifting a quarantine is the person's decision: **ask the person** about each quarantined capability the agents use, and run `capabilities allow <name>` only for those they allow.
+
 ### A database
 
 ```sh
@@ -48,11 +52,15 @@ Choose the address:
 Write the machine's setting. The password never goes on the command line:
 
 ```sh
-capabilities store set --host <host> --port <port> --database <database> --user <user> --password-stdin
+capabilities store set --host <host> --port <port> --database <database> --user <user> --sslmode require --password-stdin
 capabilities store doctor
 ```
 
+`--sslmode` defaults to `require` (`verify-full` with `--sslrootcert`). A local server without TLS - on `localhost`, a loopback address or a Unix socket - needs `--sslmode disable`; `disable` is refused for any other host.
+
 `--password-file PATH` and `--password-env KEY` are the other ways in. If the person pasted a password into the conversation, set it through `--password-stdin`, then ask them to rotate it at the database provider and set the new one with the same command.
+
+Secrets stay where they are: each capability's `credentials.env` in the config home and the agents' own environment files hold the keys connections name, and the migration neither moves them into the database nor removes them; `migrate --report` does not count them among `config_home.files`.
 
 Behind a session pooler, the store can also be given its transaction address, so that short commands do not hold session-pooler connections: `capabilities store set ... --transaction-host <host> --transaction-port <port>` on a machine, or `AGENTKIT_DB_TRANSACTION_HOST` and `AGENTKIT_DB_TRANSACTION_PORT` beside the other `AGENTKIT_DB_*` keys in a server's environment. Set it only once every tool on that machine is at a manager and contract release that reads these fields: `capabilities changelog --manager --all` carries the entry "A store may name a transaction address", and `capabilities update --check` shows nothing behind. `store doctor` then proves it under `checks.transaction`.
 
@@ -97,6 +105,8 @@ Read `gate_flips` with the person: each entry is an agent whose effective gate w
 ### Step 2 - servers: give each live target its node
 
 Do this before the agents' dry runs; otherwise the dry run asks no node question for that server and the server is left out.
+
+The dry run reads targets only where the agent has a `deployment/runtime.json`. Every target that declares a `node` gives a node question (`nodes.<node>`) until that node is registered. A target with no `node` gives a question (`deployment.targets.<target>`) only when the runtime's profile runs in a container; under the `host-agents` profile the services are placed on the master and no target is asked about, whatever its provider. An agent whose gate is already in the store gets no target question either.
 
 For each agent that deploys to a server, and for each of its deployment targets **that has a live deployment**:
 
@@ -171,6 +181,7 @@ Each question names what code cannot decide. Read it to the person in plain word
 - **A node for a legacy automation**: which node it runs on.
 - **A connection whose stored spec differs** from the agent's files: `"store"` (the agent adopts the stored spec), `"files"` (the stored spec is replaced; a connection row is shared by every agent granted it) or `{"rename": "<name>"}` (the agent's own is written under that name, and its grants, default and settings follow it). **Ask the person**: this is an access choice.
 - **An id that project.json and the ContextKit binding disagree on**: which id the agent keeps.
+- **Records said to be in a store that holds none of them** (`records`, choices `"files"` or `"store"`): `capabilities/project.json` says `"records": "store"`, but the database in force holds none of the agent's grants, identifiers or gate, while its files hold some - typically left by an earlier import into another database. `"files"`: the files are the truth and are written, as for an agent in files mode. `"store"`: the store is kept as it is and the files are removed. **Ask the person**; whichever side is dropped, git history or the run's `archive` keeps a copy of the files.
 - **A checkout** (`checkout`): the database already holds this agent and no checkout of it was found; answer with this root's path to move the agent from here.
 - **Allow-list entries or modes that two settings files disagree on**: keep or drop each; **ask the person**, as these decide who the agent answers.
 

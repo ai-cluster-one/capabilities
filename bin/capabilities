@@ -303,11 +303,11 @@ STORE VERBS
   session-mode and a transaction-mode pooler on one host takes the session
   pooler as its address and the transaction pooler's port as
   --transaction-port; a known transaction pooler as the address itself is
-  refused (exit 6 transaction_pooler). Records (the gate, settings, identifiers, references, and the
-  connections and grants of a project in files mode) are files and never in
-  the database; the database holds only the tables capabilities migrate for
-  themselves and, for a project in store mode, the contract's two connection
-  tables. These verbs never create a table.
+  refused (exit 6 transaction_pooler). An agent's records - its gate,
+  connections, grants, identifiers and settings - are files only until it
+  has moved into the store (see migrate); from then they are rows of the
+  contract's tables in the store, beside the tables each capability migrates
+  for itself. These verbs never create a table.
   store set --host H --database D --user U [--port P]
             [--sslmode require|verify-ca|verify-full|disable]
             [--sslrootcert PATH|system] [--schema NAME]
@@ -720,7 +720,11 @@ PROJECT VERBS (run inside a consuming project)
         state home makes a run interrupted anywhere resume on the next
         --apply; a run on an agent already moved changes nothing. An agent
         whose records were already in the store keeps them: its stale files
-        are named, never fail the run, and are removed. JSON {ok, project,
+        are named, never fail the run, and are removed. One whose project.json
+        says "records": "store" while the store in force holds none of its
+        grants, identifiers or gate, and its files hold some, is asked
+        `records`: "files" writes the files as for an agent in files mode,
+        "store" keeps the store and removes them. JSON {ok, project,
         agent_id, node, mode, applied, state, blockers, questions, plan,
         would_write | registered, movers, records_written,
         settings_written, verify, migrated_at, removed, archive, services}.
@@ -9334,8 +9338,27 @@ def _migrate_context(root: Path, opts: dict, answers: dict) -> dict:
         ctx["nodes"] = _migrate_node_rows(conn, agent_id)
         ctx["global_migrated_at"] = _migrate_global_at(conn)
         ctx["tables_to_upgrade"] = _migrate_tables_pending(conn)
+        held = (_migrate_agent_rows_held(conn, agent_id)
+                if ctx["mode"] == "store" and not (ctx["state"] or {}).get("migrated_at")
+                else True)
     finally:
         conn.close()
+    if not held and _migrate_files_hold_records(ctx):
+        # "records": "store" was written against another store: the one in
+        # force holds none of this agent's rows, and its files hold some. A
+        # person says which is the truth before either is lost.
+        choice = answers.get("records")
+        if choice == "files":
+            ctx["mode"] = "files"
+        elif choice != "store":
+            ctx["questions"].append({
+                "id": "records", "answer": "records", "choices": ["files", "store"],
+                "question": f"{envelope / PROJECT_IDENTITY_REL} says the agent's records "
+                            "are in the store, but the store in force holds none of its "
+                            "connections, grants, identifiers or gate, and its files hold "
+                            "some: are the files the truth (written to the store, as for an "
+                            "agent in files mode) or the store (kept as it is, and the "
+                            "files removed)?"})
     state = ctx["state"] or {}
     master = state.get("master")
     ctx["master"] = master
@@ -9362,6 +9385,39 @@ def _migrate_context(root: Path, opts: dict, answers: dict) -> dict:
         if isinstance(answer, dict) and answer.get("register") is True:
             ctx["known_nodes"].add(name)
     return ctx
+
+
+def _migrate_agent_rows_held(conn, agent_id: str) -> bool:
+    """Whether the store holds any grant, identifier or gate row of this
+    agent."""
+    for table in ("capabilities_connection_grants", "capabilities_identifiers",
+                  "capabilities_policy"):
+        rows = _migrate_rows(conn, f"SELECT 1 FROM {table} WHERE agent_id = %s LIMIT 1",
+                             (agent_id,))
+        if rows:
+            return True
+    return False
+
+
+def _migrate_files_hold_records(ctx: dict) -> bool:
+    """Whether this agent's own files resolve any connection, identifier or
+    gate entry."""
+    store = _store_module()
+    envelope = ctx["envelope"]
+    try:
+        files = store.FileRecords(envelope, _CONFIG_HOME, ctx["agent_id"], ctx["slug"],
+                                  include_global=False)
+        if files.resolve_scope("capabilities", "policy", "project"):
+            return True
+        for name in sorted(set(_import_names(envelope))
+                           | set(_import_identifier_names(envelope))):
+            for collection in ("connection", "identifier"):
+                if files.resolve_scope(name, collection, "project"):
+                    return True
+    except store.StoreError as exc:
+        raise _MigrateRefusal("files_unreadable", exc.message,
+                              "repair them (`capabilities doctor` names the faults)") from None
+    return False
 
 
 def _migrate_global_home(ctx: dict) -> Path:

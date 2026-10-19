@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-19 — A migration asks before an agent's files are lost to a store that never held them
+
+An agent whose `capabilities/project.json` says `"records": "store"` - left by an earlier import into another database - while the store in force holds none of its grants, identifiers or gate and its files hold some, is no longer planned as stale files to remove: the dry run asks `records`, and `--apply` refuses `question_open` until it is answered. `"files"` writes the files as for an agent in files mode and verifies them; `"store"` keeps the store and removes the files, as before. An agent whose rows are in the store is planned as before. `capabilities help` no longer says records are never in the database. The guide `migrate-to-database` adds quarantined capabilities to the prerequisites, shows `--sslmode` in `store set` (a local server without TLS needs `disable`), says which deployment targets give a dry-run question, says secrets stay in their `credentials.env` and environment files, and names the `records` question.
+
 ## 2026-10-18 — A command connects to the store once
 
 The manager uses `capabilities-contract` 0.5.1. Every connection it opens on the transaction path is the process's one working connection, which the library lends to each operation and keeps until the process exits, so a command connects once rather than once per read; a connect that fails is tried again, and a working connection the store or the network lost is replaced, a statement that lost it before anything of its transaction reached the store running once more on the new one and a commit never sent twice. `doctor` gives the connection back after proving the store answers rather than holding it while it checks the grants. SHEBANG.md's rule on connections states one working connection per process. A store connection lost where the manager catches nothing ends the command as `store_unreachable`, exit 5, rather than with a traceback.
