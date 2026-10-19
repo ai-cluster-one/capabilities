@@ -8,6 +8,7 @@ without one. Each writes under an account of its own."""
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import unittest
@@ -24,10 +25,16 @@ def _msg(ts: str, text: str = "hi", **extra) -> dict:
     return {"type": "message", "ts": ts, "user": "U1", "text": text, **extra}
 
 
-class _FakeClient:
-    """A Slack session with no socket: it serves a canned per-channel history,
-    respecting `oldest` as Slack does (exclusive), so a sync asks it only for
-    what is newer than the stored cursor."""
+def _ts(i: int) -> str:
+    """The i-th message's ts, fixed-width as Slack's are."""
+    return f"{1700000000 + i}.000100"
+
+
+class _FakeClient(su.SlackClient):
+    """A Slack session with no socket, paged by the capability's own
+    SlackClient.history: it answers conversations.history from a canned
+    per-channel history as Slack does - newest first, `oldest` and `latest`
+    exclusive, at most `limit` per page behind a next_cursor."""
 
     def __init__(self, history: dict[str, list[dict]]):
         self._history = history
@@ -35,13 +42,19 @@ class _FakeClient:
     def set(self, channel: str, messages: list[dict]) -> None:
         self._history[channel] = messages
 
-    def history(self, channel, oldest=None, latest=None, limit=200, pages=10):
-        for msg in sorted(self._history.get(channel, []), key=lambda m: float(m["ts"])):
-            if oldest is not None and float(msg["ts"]) <= float(oldest):
-                continue
-            if latest is not None and float(msg["ts"]) > float(latest):
-                continue
-            yield msg
+    def _call(self, method: str, **kwargs) -> dict:
+        assert method == "conversations.history", method
+        oldest, latest = kwargs.get("oldest"), kwargs.get("latest")
+        pool = sorted(
+            (m for m in self._history.get(kwargs["channel"], [])
+             if (oldest is None or float(m["ts"]) > float(oldest))
+             and (latest is None or float(m["ts"]) < float(latest))),
+            key=lambda m: -float(m["ts"]))
+        start = int(kwargs.get("cursor") or 0)
+        end = start + kwargs["limit"]
+        more = end < len(pool)
+        return {"ok": True, "messages": pool[start:end], "has_more": more,
+                "response_metadata": {"next_cursor": str(end) if more else ""}}
 
 
 @_cli.needs_store
@@ -183,7 +196,8 @@ class IncrementalSyncAndReconnect(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, _cli.store_env())
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.db = su._open_store(_cli.store_cfg())
+        self.cfg = _cli.store_cfg()
+        self.db = su._open_store(self.cfg)
         self.addCleanup(self.db.close)
 
     def _count(self, channel="C1"):
@@ -231,6 +245,52 @@ class IncrementalSyncAndReconnect(unittest.TestCase):
         client = _FakeClient({"C1": [_msg("1.0"), _msg("2.0")]})
         result = su._sync_channel(self.db, client, "C1", full=True, limit=100)
         self.assertEqual(result["new"], 2)          # ignored the cursor
+
+    def test_a_gap_larger_than_the_limit_is_closed_whole(self):
+        # More messages arrive between two syncs than one sync's limit.
+        client = _FakeClient({"C1": [_msg(_ts(i)) for i in range(1, 11)]})
+        su._sync_channel(self.db, client, "C1", full=False, limit=1000)
+        client.set("C1", [_msg(_ts(i)) for i in range(1, 1211)])
+        su._sync_channel(self.db, client, "C1", full=False, limit=1000)
+        self.assertEqual(self._count(), 1210)
+        self.assertEqual(su._store_covers_newest(self.db, "C1"), _ts(1210))
+
+    def test_a_reconnect_backfill_after_a_long_drop_loses_nothing(self):
+        client = _FakeClient({"C1": [_msg(_ts(i)) for i in range(1, 11)]})
+        su._sync_channel(self.db, client, "C1", full=False, limit=500)
+        # 600 messages arrive while the capture is disconnected.
+        client.set("C1", [_msg(_ts(i)) for i in range(1, 611)])
+        su._sync_channel(self.db, client, "C1", full=False, limit=500)
+        self.assertEqual(self._count(), 610)
+
+    def test_a_limited_fresh_read_leaves_the_cursor_for_the_next_sync(self):
+        client = _FakeClient({"C1": [_msg(_ts(i)) for i in range(1, 11)]})
+        su._sync_channel(self.db, client, "C1", full=False, limit=1000)
+        client.set("C1", [_msg(_ts(i)) for i in range(1, 61)])
+        args = argparse.Namespace(channel="C1", fresh=True, limit=5,
+                                  oldest=None, latest=None, connection=None)
+        with mock.patch.object(su, "get_config", return_value=self.cfg), \
+                mock.patch.object(su, "_open_store", return_value=_Unclosed(self.db)), \
+                mock.patch.object(su, "SlackClient", return_value=client):
+            su.cmd_history(args)
+        # The five newest are stored, but they do not join the covered range.
+        self.assertEqual(su._store_covers_newest(self.db, "C1"), _ts(10))
+        su._sync_channel(self.db, client, "C1", full=False, limit=1000)
+        self.assertEqual(self._count(), 60)
+        self.assertEqual(su._store_covers_newest(self.db, "C1"), _ts(60))
+
+
+class _Unclosed:
+    """The case's store handed to a verb that closes what it opened."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def close(self) -> None:
+        pass
 
 
 if __name__ == "__main__":

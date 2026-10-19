@@ -30,9 +30,11 @@ Captured data lives in the project's Postgres database, in `slackuser_*` tables 
 
 ## Incremental sync and live capture
 
-`sync` fetches, per conversation, only the messages newer than the stored `synced_newest` cursor (or everything, with `--full`), writes them deduplicated on `ts`, and advances the cursor over exactly the range it fetched. A message already held is never re-fetched and never doubled.
+`sync` fetches, per conversation, every message newer than the stored `synced_newest` cursor, however many, and writes them deduplicated on `ts`. `--limit` bounds only how far back a conversation's first sync, or `--full`, reaches. The cursor moves only over a range that joins what the store already covers: a fetch that stops short of it — a limited `history --fresh`, a `--full` cut by its limit, a sync interrupted by a rate limit — leaves the cursor where it was, so the next sync still asks for every message it did not reach. A message already held is never doubled.
 
-The `capture` service holds the session's realtime event stream and writes each new message, edit, deletion, thread reply and reaction into the store as it arrives. On a dropped connection it reconnects with backoff and, before resuming the live stream, backfills each member conversation from its cursor, so the window it was disconnected for is closed through the same dedup path. Nothing is lost and nothing is doubled, because the store's `ts` key is the single source of identity for both the live and the backfill writes.
+The `capture` service holds the session's realtime event stream and writes each new message, edit, deletion, thread reply and reaction into the store as it arrives. On a dropped connection it reconnects with backoff and, before resuming the live stream, backfills each member conversation from its cursor, so the window it was disconnected for is closed through the same dedup path. No channel message is lost and nothing is doubled, because the store's `ts` key is the single source of identity for both the live and the backfill writes. A thread reply posted during the drop is the exception: Slack's channel history carries no thread replies except those also sent to the channel, so the backfill does not reach it, and `thread <channel> <thread_ts> --fresh` reads it.
+
+Until a realtime connection has held for 30 seconds, each reconnect doubles the backoff, up to a minute, and the log names why the connection ended: a refused handshake is logged as `realtime handshake failed` with its HTTP status. The service's health reads `connecting` until the socket opens and `connected` only once it has.
 
 ## Session lifetime
 

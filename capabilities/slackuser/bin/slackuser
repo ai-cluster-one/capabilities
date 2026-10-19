@@ -69,10 +69,11 @@ Commands
   slackuser thread <channel> <thread_ts> [--fresh]
                                        Read a thread's replies.
   slackuser sync [--channel ID] [--full] [--limit N]
-                                       Bring the store forward: fetch each
-                                       member conversation's messages newer than
-                                       the stored cursor (or all, with --full),
-                                       deduplicating on the message timestamp.
+                                       Bring the store forward: fetch every
+                                       message of each member conversation newer
+                                       than the stored cursor, deduplicating on
+                                       the message timestamp. --limit bounds how
+                                       far back a first sync or --full reaches.
   slackuser service ...                The bundled live-capture listener (see
                                        `slackuser service help`).
 
@@ -182,7 +183,7 @@ SERVICE = {
                 "web-session event stream and writes every new message, edit, "
                 "deletion, thread reply and reaction into the store as it "
                 "arrives, backfilling through the sync cursor on each reconnect "
-                "so a drop loses and duplicates nothing."),
+                "so a drop loses no channel message and duplicates nothing."),
     "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs"],
     "config": "capabilities/slackuser/service",
     "state": "<account-state>/service",
@@ -6996,21 +6997,32 @@ class SlackClient:
                 return
 
     def history(self, channel: str, oldest: str | None = None,
-                latest: str | None = None, limit: int = 200, pages: int = 10):
+                latest: str | None = None, limit: int | None = 200,
+                pages: int | None = 10):
+        """Messages strictly between oldest and latest, in Slack's order (newest
+        first), until `limit` messages or `pages` pages, or every one when both
+        are None. Once consumed, `history_complete` says whether Slack had no
+        more: only a complete fetch covers the whole range it asked for."""
+        self.history_complete = False
         cursor = None
-        seen = 0
-        for _ in range(max(1, pages)):
+        seen = page = 0
+        while pages is None or page < max(1, pages):
+            page += 1
             data = self._call("conversations.history", channel=channel,
                               oldest=oldest, latest=latest,
-                              limit=min(limit, 200), cursor=cursor,
-                              inclusive=False)
-            for msg in data.get("messages", []):
+                              limit=200 if limit is None else min(limit, 200),
+                              cursor=cursor, inclusive=False)
+            cursor = (data.get("response_metadata") or {}).get("next_cursor")
+            more = bool(data.get("has_more") and cursor)
+            messages = data.get("messages", [])
+            for i, msg in enumerate(messages):
                 yield msg
                 seen += 1
-                if seen >= limit:
+                if limit is not None and seen >= limit:
+                    self.history_complete = i == len(messages) - 1 and not more
                     return
-            cursor = (data.get("response_metadata") or {}).get("next_cursor")
-            if not (data.get("has_more") and cursor):
+            if not more:
+                self.history_complete = True
                 return
 
     def replies(self, channel: str, thread_ts: str, limit: int = 200):
@@ -7096,18 +7108,22 @@ def _store_covers_newest(db: _Store, channel_id: str) -> str | None:
 
 # --- Sync --------------------------------------------------------------------
 
-def _sync_channel(db: _Store, client: SlackClient, channel_id: str,
-                  full: bool, limit: int) -> dict:
-    """Fetch what the store does not yet cover for one channel and write it,
-    deduplicated on ts, advancing the cursor over exactly the range fetched."""
-    oldest = None if full else _store_covers_newest(db, channel_id)
+def _fetch_into_store(db: _Store, client: SlackClient, channel_id: str,
+                      sync_type: str, oldest: str | None, latest: str | None,
+                      limit: int | None) -> dict:
+    """Fetch one range of a conversation into the store, deduplicated on ts.
+    The cursor moves only over coverage that joins what the store already
+    covered: a fetch that stopped short of the stored cursor leaves it where it
+    was, so the next sync still asks for the messages this one did not reach."""
+    prior = _store_covers_newest(db, channel_id)
     fetched = new = 0
-    newest_seen = oldest
-    oldest_seen = None
-    for msg in client.history(channel_id, oldest=oldest, limit=limit,
-                              pages=max(1, (limit + 199) // 200)):
+    oldest_seen = newest_seen = None
+    for msg in client.history(channel_id, oldest=oldest, latest=latest,
+                              limit=limit,
+                              pages=None if limit is None
+                              else max(1, (limit + 199) // 200)):
         fetched += 1
-        if _upsert_message(db, channel_id, msg, "backfill", authoritative=False):
+        if _upsert_message(db, channel_id, msg, sync_type, authoritative=False):
             new += 1
         ts = msg.get("ts")
         if ts:
@@ -7115,8 +7131,25 @@ def _sync_channel(db: _Store, client: SlackClient, channel_id: str,
                 newest_seen = ts
             if oldest_seen is None or ts < oldest_seen:
                 oldest_seen = ts
-    _advance_cursor(db, channel_id, oldest_seen or oldest, newest_seen)
-    return {"channel": channel_id, "fetched": fetched, "new": new}
+    joined = (prior is None
+              or (oldest_seen is not None
+                  and _ts_float(oldest_seen) <= _ts_float(prior))
+              or (client.history_complete
+                  and (oldest is None or _ts_float(oldest) <= _ts_float(prior))))
+    if joined:
+        _advance_cursor(db, channel_id, oldest_seen or oldest, newest_seen)
+    return {"fetched": fetched, "new": new}
+
+
+def _sync_channel(db: _Store, client: SlackClient, channel_id: str,
+                  full: bool, limit: int) -> dict:
+    """Bring one conversation forward. With a stored cursor every message newer
+    than it is fetched, however many, so a gap is closed whole or the cursor
+    stays; `limit` bounds only how far back a first sync or `--full` reaches."""
+    prior = None if full else _store_covers_newest(db, channel_id)
+    result = _fetch_into_store(db, client, channel_id, "backfill", prior, None,
+                               limit if prior is None else None)
+    return {"channel": channel_id, **result}
 
 
 def _member_channels(db: _Store) -> list[str]:
@@ -7206,20 +7239,9 @@ def cmd_history(args) -> dict:
     db = _open_store(cfg)
     fetched = 0
     if args.fresh or _store_covers_newest(db, channel) is None:
-        client = SlackClient(cfg)
-        oldest_seen = newest_seen = None
-        for msg in client.history(channel, oldest=args.oldest, latest=args.latest,
-                                  limit=args.limit,
-                                  pages=max(1, (args.limit + 199) // 200)):
-            _upsert_message(db, channel, msg, "history", authoritative=False)
-            fetched += 1
-            ts = msg.get("ts")
-            if ts:
-                if newest_seen is None or ts > newest_seen:
-                    newest_seen = ts
-                if oldest_seen is None or ts < oldest_seen:
-                    oldest_seen = ts
-        _advance_cursor(db, channel, oldest_seen or args.oldest, newest_seen)
+        fetched = _fetch_into_store(db, SlackClient(cfg), channel, "history",
+                                    args.oldest, args.latest,
+                                    args.limit)["fetched"]
     messages = _store_messages(db, channel, args.limit, args.oldest, args.latest)
     db.close()
     return {"connection": cfg["id"], "channel": channel,
@@ -7284,10 +7306,17 @@ def _service_read(home: Path, name: str) -> dict | None:
         return None
 
 
+# How long a realtime connection must hold before a reconnect starts again
+# from the shortest backoff.
+_CAPTURE_STEADY_SECONDS = 30.0
+
+
 class _Capture:
     """The listener's state for one account: the store, the Slack client, the
     control files, and the backoff that closes a reconnect's gap through the
-    sync cursor so a drop loses and duplicates nothing."""
+    sync cursor, so a drop doubles nothing and loses no channel message; a
+    thread reply posted during the drop is not in Slack's channel history and
+    is read with `thread --fresh`."""
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -7358,9 +7387,11 @@ class _Capture:
         while not self.stop.is_set():
             try:
                 self._backfill()
-                self.health("connected")
-                backoff = 2.0
-                self._listen()
+                self.health("connecting")
+                # Only a connection that held resets the backoff: a refused
+                # handshake or a socket closed at once keeps doubling it.
+                if self._listen() >= _CAPTURE_STEADY_SECONDS:
+                    backoff = 2.0
             except _Refusal as refusal:
                 if refusal.exit_code == 2:
                     self.health("unlinked", {"error": refusal.message})
@@ -7379,14 +7410,35 @@ class _Capture:
         self.db.close()
         return 0
 
-    def _listen(self) -> None:
+    def _listen(self) -> float:
+        """Hold the realtime socket until it closes or fails, and return the
+        seconds it was open, 0 when the handshake failed. A failure is logged by
+        its kind and HTTP status, never its text, which can carry the request."""
         import websocket
+        opened: list[float] = []
+        errors: list[str] = []
+
+        def on_open(_ws) -> None:
+            opened.append(time.monotonic())
+            self.health("connected")
+
+        def on_error(_ws, exc) -> None:
+            status = getattr(exc, "status_code", None)
+            errors.append(type(exc).__name__
+                          + (f" (HTTP {status})" if status else ""))
+
         self.ws = websocket.WebSocketApp(
-            self._ws_url(), on_message=self._on_message)
+            self._ws_url(), on_open=on_open, on_message=self._on_message,
+            on_error=on_error)
         # run_forever returns on close or error; the outer loop reconnects.
-        while not self.stop.is_set():
-            self.ws.run_forever(ping_interval=20, ping_timeout=10)
-            return
+        self.ws.run_forever(ping_interval=20, ping_timeout=10)
+        reason = errors[-1] if errors else "no error reported"
+        if not opened:
+            _log(f"realtime handshake failed: {reason}")
+            return 0.0
+        held = time.monotonic() - opened[0]
+        _log(f"realtime connection closed after {held:.0f}s: {reason}")
+        return held
 
 
 def _inventory(network: bool) -> dict:
