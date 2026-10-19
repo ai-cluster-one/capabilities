@@ -81,7 +81,7 @@ SETUP_FIELDS = [{'key': 'SIMPLBOOKS_WORKER',
   'type': 'string',
   'required': False}]
 WRITE_VERBS = {"create", "update", "delete", "unbind", "bind", "send-payment", "save",
-               "submit", "amend", "regenerate", "import"}
+               "submit", "amend", "regenerate", "import", "attachment-delete"}
 WRITE_DEFAULT = False    # writes create legal invoices / stage real bank payments;
                          # granted per connection, explicitly, via allow_write: true
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
