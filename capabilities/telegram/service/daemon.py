@@ -5609,7 +5609,7 @@ DIALOGUE_HANDOFF_GRACE_SECONDS = 8
 def call_recording_lifecycle(*, calls, client, recording_output,
                              require_conference_chain, conference_audio_map,
                              refresh_conference_audio_map, conference_others,
-                             voice_call_busy):
+                             conference_holds_me, voice_call_busy):
     """One recorder slot, and the lifecycle of the attempts that pass through it.
 
     The p2p and conference recorder holds one attempt at a time. Starting one
@@ -6048,14 +6048,20 @@ def call_recording_lifecycle(*, calls, client, recording_output,
         """Close a conference recording once its capture stops growing.
 
         A normal hangup arrives as a chat update, but being removed from a
-        conference emits nothing at all. The MP3 encoder writes continuously
-        while the call is up — silence included — so a file that stops
-        growing is the call being over, and it is the only end signal a
-        kicked conference gives us."""
+        conference emits nothing at all, so a file that stops growing is the
+        only end signal a kicked conference gives us.
+
+        It is not proof on its own: when every incoming channel lapses at
+        once the encoder stops writing while the call is still up, and a
+        recorder that closed then left a live conference its caller was
+        still in. So a stalled conference asks Telegram whether this account
+        is still listed in the call, keeps recording while it is, and closes
+        when it is not or the question cannot be put."""
         still = 0.0
         last_size = -1
         joined_at = time.monotonic()
         first_frames = False
+        held = False
         while active_recording["caller_id"] == caller_id:
             await asyncio.sleep(CAPTURE_STALL_INTERVAL)
             size = capture.stat().st_size if capture.exists() else 0
@@ -6066,9 +6072,21 @@ def call_recording_lifecycle(*, calls, client, recording_output,
             if size != last_size:
                 last_size = size
                 still = 0.0
+                held = False
                 continue
             still += CAPTURE_STALL_INTERVAL
             if still >= CAPTURE_STALL_TIMEOUT and size > 0:
+                if (active_recording["mode"] == "conference"
+                        and await conference_holds_me(caller_id)):
+                    if not held:
+                        log(f"call: capture stopped growing for {still:.0f}s "
+                            f"at {size} bytes, but this account is still in "
+                            f"the call — keeping the recording")
+                    held = True
+                    still = 0.0
+                    continue
+                if active_recording["caller_id"] != caller_id:
+                    return
                 log(f"call: capture stopped growing for {still:.0f}s "
                     f"at {size} bytes — closing the recording")
                 await finalize_call_recording("capture_stalled")
@@ -9618,8 +9636,8 @@ async def run_session(client):
                 return
             await finalize_call_recording("call_closed")
 
-        async def conference_others(chat_id: int):
-            """Who Telegram still lists in this call, besides this account.
+        async def conference_participants(chat_id: int):
+            """Who Telegram still lists in this call, this account included.
 
             Asked fresh: the library answers from the participants it already
             holds, which is the same staleness the audio map has to work around,
@@ -9640,8 +9658,23 @@ async def run_session(client):
                 log(f"call: could not ask who is in the call "
                     f"({type(exc).__name__}: {exc})")
                 return None
-            return [p for p in (participants or [])
+            return list(participants or [])
+
+        async def conference_others(chat_id: int):
+            """Who Telegram still lists in this call, besides this account;
+            None when the question could not be put."""
+            participants = await conference_participants(chat_id)
+            if participants is None:
+                return None
+            return [p for p in participants
                     if int(getattr(p, "user_id", 0)) != int(me.id)]
+
+        async def conference_holds_me(chat_id: int):
+            """Whether Telegram still lists this account in the call; False
+            when it does not and when the question could not be put."""
+            participants = await conference_participants(chat_id)
+            return any(int(getattr(p, "user_id", 0)) == int(me.id)
+                       for p in (participants or []))
 
         recording = call_recording_lifecycle(
             calls=calls, client=client,
@@ -9650,6 +9683,7 @@ async def run_session(client):
             conference_audio_map=conference_audio_map,
             refresh_conference_audio_map=refresh_conference_audio_map,
             conference_others=conference_others,
+            conference_holds_me=conference_holds_me,
             voice_call_busy=voice_call_busy)
         active_recording = recording.active_recording
         start_call_recording = recording.start_call_recording

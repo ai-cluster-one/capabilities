@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-20 — A conference recording outlasts a pause in incoming audio
+
+When a conference's capture stops growing, the recorder asks Telegram whether this account is still listed in the call and keeps recording while it is, logging once that it held on. It closes the recording as `capture_stalled` only when the account is no longer listed or the question cannot be answered, so a pause in which every incoming channel lapsed no longer ends a recording the caller is still in. Direct calls are unchanged.
+
 ## 2026-10-18 — One working connection per process
 
 `telegram` uses `capabilities-contract` 0.5.1. Every connection it opens on the transaction path is the process's one working connection, which the library lends to each operation and keeps until the process exits, so a command connects once rather than once per read; a connect that fails is tried again, and a working connection the store or the network lost is replaced, a statement that lost it before anything of its transaction reached the store running once more on the new one and a commit never sent twice.

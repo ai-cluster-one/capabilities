@@ -7255,7 +7255,7 @@ class RecordingAttemptLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.messages.append((chat_id, text))
             return SimpleNamespace(id=31)
 
-    def lifecycle(self, daemon, td, calls, client, *, chains=None):
+    def lifecycle(self, daemon, td, calls, client, *, chains=None, holds_me=None):
         folder = Path(td) / "recordings"
 
         async def require_conference_chain(caller_id, invite_msg_id):
@@ -7267,6 +7267,9 @@ class RecordingAttemptLifecycleTests(unittest.IsolatedAsyncioTestCase):
         async def conference_others(chat_id):
             return [SimpleNamespace(user_id=99)]
 
+        async def conference_holds_me(chat_id):
+            return holds_me(chat_id) if holds_me else False
+
         return daemon.call_recording_lifecycle(
             calls=calls, client=client,
             recording_output=lambda caller_id, mode: folder / f"{mode}-{caller_id}.ogg",
@@ -7274,6 +7277,7 @@ class RecordingAttemptLifecycleTests(unittest.IsolatedAsyncioTestCase):
             conference_audio_map=lambda chat_id: None,
             refresh_conference_audio_map=refresh_conference_audio_map,
             conference_others=conference_others,
+            conference_holds_me=conference_holds_me,
             voice_call_busy=lambda: False)
 
     def watchdogs(self):
@@ -7370,6 +7374,52 @@ class RecordingAttemptLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
             await asyncio.gather(*spawned, return_exceptions=True)
 
+
+    async def test_a_stalled_conference_stays_while_this_account_is_still_in_the_call(self):
+        # Every incoming channel lapsing at once stops the encoder while the
+        # call is still up; the recorder closed then and left a live call.
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            daemon.CAPTURE_STALL_INTERVAL = 0.01
+            daemon.CAPTURE_STALL_TIMEOUT = 0.03
+            sent = self.deliverable(daemon)
+            listed = {"me": True}
+            asked = []
+
+            def holds_me(chat_id):
+                asked.append(chat_id)
+                return listed["me"]
+
+            calls, client = self.Calls(), self.Client()
+            recording = self.lifecycle(daemon, td, calls, client, holds_me=holds_me)
+            slot = recording.active_recording
+
+            await recording.start_call_recording(
+                4242, "conference", daemon.CallConfig(conference=77))
+            await slot["task"]
+            spawned = list(self.watchdogs().values())
+            stall = self.watchdogs()["watch_capture_stall"]
+            slot["capture"].write_bytes(b"x" * 4096)
+
+            for _ in range(200):
+                if len(asked) >= 2:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertGreaterEqual(len(asked), 2)
+            self.assertEqual(slot["caller_id"], 4242)
+            self.assertEqual(calls.left, [])
+
+            metadata_path = slot["metadata_path"]
+            listed["me"] = False
+            await asyncio.wait_for(stall, 2)
+
+            self.assertEqual(calls.left, [4242])
+            self.assertEqual([chat for chat, _ in sent], [4242])
+            self.assertEqual(json.loads(metadata_path.read_text())["stop_reason"],
+                             "capture_stalled")
+            for task in spawned:
+                task.cancel()
+            await asyncio.gather(*spawned, return_exceptions=True)
 
 class StitchedRecordingTests(unittest.IsolatedAsyncioTestCase):
     """A call split by a crash is one conversation, and is delivered as one."""
