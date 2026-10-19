@@ -880,6 +880,8 @@ def test_no_manager_verb_writes_a_record_into_the_store(tmp_path, enforced):
     _set_cluster(env, enforced)
     root = _project(tmp_path, f"AGENTKIT_DB_URL={_cluster_url(enforced)}\n")
     (root / "capabilities").mkdir()
+    # An existing agent in files mode: a new one would start in the store.
+    (root / "capabilities" / "settings.json").write_text('{"capabilities": {}}\n')
     project_env = {**env, "CLAUDE_PROJECT_DIR": str(root)}
     for args in (("init",), ("enable", "slack", "--project"), ("list",),
                  ("relabel", "renamed-fixture"), ("store", "show"), ("store", "doctor"),

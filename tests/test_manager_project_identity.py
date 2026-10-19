@@ -46,6 +46,12 @@ def _contextkit(tmp_path: Path) -> Path:
     return log
 
 
+def _in_files_mode(project: Path) -> None:
+    """An existing agent in files mode: a new one would start in the store."""
+    (project / "capabilities").mkdir(exist_ok=True)
+    (project / "capabilities" / "settings.json").write_text('{"capabilities": {}}\n')
+
+
 def _env(tmp_path: Path, project: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.update({
@@ -112,6 +118,7 @@ def _probe(tmp_path: Path, project: Path, env: dict | None = None) -> dict:
 
 def test_init_mints_an_id_offline_in_a_plain_project(tmp_path: Path) -> None:
     project = _project(tmp_path, bound=False)
+    _in_files_mode(project)
     log = _contextkit(tmp_path)
 
     result = _json(_run(tmp_path, project, "init"))
@@ -128,6 +135,7 @@ def test_init_mints_an_id_offline_in_a_plain_project(tmp_path: Path) -> None:
 
 def test_init_carries_a_contextkit_held_id_into_a_new_identity(tmp_path: Path) -> None:
     project = _project(tmp_path, bound=True, contextkit_id="prj_0000000000a1")
+    _in_files_mode(project)
     log = _contextkit(tmp_path)
 
     _json(_run(tmp_path, project, "init"))
@@ -140,6 +148,7 @@ def test_init_carries_a_contextkit_held_id_into_a_new_identity(tmp_path: Path) -
 
 def test_init_mints_for_a_bound_project_whose_binding_holds_no_id(tmp_path: Path) -> None:
     project = _project(tmp_path, bound=True)
+    _in_files_mode(project)
     log = _contextkit(tmp_path)
 
     _json(_run(tmp_path, project, "init"))
@@ -369,3 +378,33 @@ def test_the_released_contract_still_resolves_and_writes_in_a_plain_project(
     assert _base_contract_read(tmp_path, project) == {
         "state": "unbound", "id": "prj_0000000000a1", "write": "prj_0000000000a1",
         "refusal": None}
+
+
+def test_a_new_agent_without_a_node_name_is_refused_before_anything_is_written(
+        tmp_path: Path) -> None:
+    project = _project(tmp_path, bound=False)
+    _contextkit(tmp_path)
+    env = _env(tmp_path, project)
+    env.pop("AGENT_NODE_NAME", None)
+
+    result = _run(tmp_path, project, "init", env=env)
+
+    assert result.returncode == 6
+    assert _error(result)["code"] == "node_unnamed"
+    assert not (project / "capabilities").exists()
+
+
+def test_a_new_agent_without_a_store_is_refused_before_anything_is_written(
+        tmp_path: Path) -> None:
+    project = _project(tmp_path, bound=False)
+    _contextkit(tmp_path)
+    env = _env(tmp_path, project)
+    env["AGENT_NODE_NAME"] = "test-node"
+    for key in [key for key in env if key.startswith("AGENTKIT_DB_")]:
+        env.pop(key)
+
+    result = _run(tmp_path, project, "init", env=env)
+
+    assert result.returncode == 6
+    assert _error(result)["code"] == "store_not_configured"
+    assert not (project / "capabilities").exists()

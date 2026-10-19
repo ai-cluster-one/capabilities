@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-19 — A new agent starts in the store
+
+`capabilities init` in a project with no identity, no settings file and no legacy envelope creates a new agent in the store: its `project.json` declares `"records": "store"`, no `settings.json` is written, and its registry row is registered with `migrated_at` and this node (`AGENT_NODE_NAME`) as its master, under `agent.migrated`. Before writing anything init refuses such a project without `AGENT_NODE_NAME` (`node_unnamed`), without a store (`store_not_configured`), on a store that does not answer (exit 5), and on a store whose global records have not moved (`global_not_migrated`, run `capabilities migrate --global --apply` first); a registration that fails ends init with exit 5. An existing project, in files mode or moved, is initialised as before, and the import verbs and files mode keep working. Run `capabilities help` for the details.
+
 ## 2026-10-19 — A migration asks before an agent's files are lost to a store that never held them
 
 An agent whose `capabilities/project.json` says `"records": "store"` - left by an earlier import into another database - while the store in force holds none of its grants, identifiers or gate and its files hold some, is no longer planned as stale files to remove: the dry run asks `records`, and `--apply` refuses `question_open` until it is answered. `"files"` writes the files as for an agent in files mode and verifies them; `"store"` keeps the store and removes the files, as before. An agent whose rows are in the store is planned as before. `capabilities help` no longer says records are never in the database. The guide `migrate-to-database` adds quarantined capabilities to the prerequisites, shows `--sslmode` in `store set` (a local server without TLS needs `disable`), says which deployment targets give a dry-run question, says secrets stay in their `credentials.env` and environment files, and names the `records` question.

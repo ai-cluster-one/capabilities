@@ -17,6 +17,12 @@ def _stderr_error(result: subprocess.CompletedProcess[str]) -> dict:
     return json.loads(line)["error"]
 
 
+def _in_files_mode(envelope: Path) -> None:
+    """An existing agent in files mode: a new one would start in the store."""
+    envelope.mkdir(parents=True, exist_ok=True)
+    (envelope / "settings.json").write_text('{"capabilities": {}}\n')
+
+
 def _project(tmp_path: Path, contextkit: bool, body_root: str | None = None) -> Path:
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
@@ -103,6 +109,7 @@ def test_contextkit_body_root_relocates_the_whole_envelope(tmp_path: Path) -> No
     project = _project(tmp_path, contextkit=True, body_root="agent")
     envelope = project / "agent" / "capabilities"
     log = _fake_contextkit(tmp_path, envelope)
+    _in_files_mode(envelope)
 
     init = _json(_run(tmp_path, project, "init"))
     enabled = _json(_run(tmp_path, project, "enable", "asana", "--project"))
@@ -143,6 +150,7 @@ def test_capability_reads_the_gate_from_the_resolved_envelope(tmp_path: Path) ->
 def test_contextkit_without_body_root_keeps_the_root_envelope(tmp_path: Path) -> None:
     project = _project(tmp_path, contextkit=True)
     log = _fake_contextkit(tmp_path, project / "capabilities")
+    _in_files_mode(project / "capabilities")
 
     init = _json(_run(tmp_path, project, "init"))
 
@@ -154,6 +162,7 @@ def test_contextkit_without_body_root_keeps_the_root_envelope(tmp_path: Path) ->
 def test_project_without_contextkit_never_asks(tmp_path: Path) -> None:
     project = _project(tmp_path, contextkit=False)
     log = _fake_contextkit(tmp_path, project / "agent" / "capabilities")
+    _in_files_mode(project / "capabilities")
 
     init = _json(_run(tmp_path, project, "init"))
 
@@ -222,6 +231,7 @@ def test_supplied_envelope_replaces_the_lookup(tmp_path: Path) -> None:
     log = _fake_contextkit(tmp_path, project / "capabilities")
     env = _env(tmp_path, project)
     env["CAPABILITIES_PROJECT_ENVELOPE"] = str(envelope)
+    _in_files_mode(envelope)
 
     init = _json(_run(tmp_path, project, "init", env=env))
 

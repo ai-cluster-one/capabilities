@@ -13,6 +13,9 @@ MANAGER = Path(__file__).parents[1] / "bin" / "capabilities"
 def _project(tmp_path: Path) -> Path:
     project = tmp_path / "project"
     (project / ".git").mkdir(parents=True)
+    # An existing agent in files mode: a new one would start in the store.
+    (project / "capabilities").mkdir()
+    (project / "capabilities" / "settings.json").write_text('{"capabilities": {}}\n')
     return project
 
 

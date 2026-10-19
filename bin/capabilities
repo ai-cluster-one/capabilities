@@ -469,7 +469,14 @@ PROJECT VERBS (run inside a consuming project)
   init [--claude] [--codex]
         Wire the project: scaffold the durable project identity, the
         manager-owned capabilities/.gitignore, and settings.json only in files
-        mode. The identity's id is written once and never rewritten: an id
+        mode. A new project - no identity, no settings file, no legacy
+        envelope - is a new agent and starts in the store: its identity
+        declares records "store", its row is registered migrated with this
+        node as master, and init refuses it, writing nothing, without
+        AGENT_NODE_NAME (node_unnamed), without a store
+        (store_not_configured), or on a store whose global records have not
+        moved (global_not_migrated). An existing project is initialised as
+        before. The identity's id is written once and never rewritten: an id
         `.contextkit/config.toml` holds under [identity] is carried over,
         otherwise one is minted offline. When a database resolves for the
         project, its agent row is registered in capabilities_agents (the
@@ -6559,8 +6566,10 @@ def _refuse_while_moving(root: Path) -> None:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
 
 
-def _ensure_envelope(root: Path) -> list[str]:
-    """Manager-owned project files: migrate, then scaffold gate + state guard."""
+def _ensure_envelope(root: Path, new_agent: bool = False) -> list[str]:
+    """Manager-owned project files: migrate, then scaffold gate + state guard.
+    A new agent's identity declares its records in the store, so it gets no
+    settings file."""
     _refuse_while_moving(root)
     migrated = _migrate_legacy_envelope(root)
     capdir = _envelope_home(root)
@@ -6570,7 +6579,10 @@ def _ensure_envelope(root: Path) -> list[str]:
         existing = gi.read_text() if gi.exists() else ""
         gi.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n")
                       + GITIGNORE_BODY)
-    _ensure_project_identity(capdir, root)
+    identity = _ensure_project_identity(capdir, root)
+    if new_agent and identity.get(_store_module().RECORDS_MODE_KEY) != "store":
+        identity[_store_module().RECORDS_MODE_KEY] = "store"
+        _write_json(capdir / PROJECT_IDENTITY_REL, identity)
     gate_file = capdir / "settings.json"
     # The file gate exists only in files mode; a project whose records are in
     # the store keeps its policy there and is marked by project.json.
@@ -6741,9 +6753,51 @@ def _ensure_agent_row(conn, agent_id: str) -> bool:
     return cur.rowcount == 1
 
 
-def _register_agent_on_init(root: Path) -> dict:
+def _new_agent_project(root: Path) -> bool:
+    """Whether init is creating this agent: no identity, no settings file and
+    no legacy envelope yet, so it has no records anywhere to move."""
+    capdir = _envelope_home(root)
+    return not (capdir / PROJECT_IDENTITY_REL).exists() \
+        and not (capdir / "settings.json").exists() \
+        and not (root / LEGACY_PROJECT_CAPABILITIES_REL).exists()
+
+
+def _preflight_new_agent(root: Path) -> None:
+    """A new agent starts in the store, so init refuses one before writing
+    anything where it could not work there: no node name, no store, or a store
+    whose global records have not moved from this machine's files."""
+    store = _store_module()
+    if not os.environ.get(store.NODE_NAME_ENV, "").strip():
+        _die(6, "node_unnamed",
+             f"{store.NODE_NAME_ENV} is not set: a new agent keeps its records in the "
+             "store, read per node, and this machine names no node",
+             f"set {store.NODE_NAME_ENV} to this machine's node name, then run "
+             "`capabilities init` again")
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+                          transaction=True)
+    except db.DbError as exc:
+        hint = ("a new agent keeps its records in the store: configure it with "
+                "`capabilities store set`, then run `capabilities init` again"
+                if exc.slug == "store_not_configured" else exc.hint)
+        _die(5 if exc.slug != "store_not_configured" else 6, exc.slug, exc.message, hint)
+    try:
+        global_at = _migrate_global_at(conn)
+    finally:
+        conn.close()
+    if not global_at:
+        _die(6, "global_not_migrated",
+             "this store does not hold the global records yet, so a new agent "
+             "started in it would not see this machine's global connections",
+             "run `capabilities migrate --global --apply`, then `capabilities init` again")
+
+
+def _register_agent_on_init(root: Path, new_agent: bool = False) -> dict:
     """init's registration of the agent row: written where a database resolves
-    for the project, and otherwise reported, never failing init."""
+    for the project, and otherwise reported, never failing init. A new agent
+    is registered migrated with this node as its master."""
     agent_id = _project_json_id(root)
     if not agent_id:
         return {"registered": False, "reason": "no_project_identity"}
@@ -6765,9 +6819,20 @@ def _register_agent_on_init(root: Path) -> dict:
         major, minor = store.STORE_TABLES_VERSION
         db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
                    major=major, minor=minor)
+        node = os.environ.get(store.NODE_NAME_ENV, "").strip()
         with conn.transaction():
             created = _ensure_agent_row(conn, agent_id)
+            if new_agent and node:
+                conn.execute("UPDATE capabilities_agents SET migrated_at = now(), updated_at = now() "
+                             "WHERE id = %s AND migrated_at IS NULL AND migrating_since IS NULL", (agent_id,))
+                conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node, kind, "
+                             "is_master) SELECT %s, %s, %s, true WHERE NOT EXISTS (SELECT 1 "
+                             "FROM capabilities_agent_nodes WHERE agent_id = %s AND is_master) "
+                             "ON CONFLICT (agent_id, node) DO NOTHING",
+                             (agent_id, node, "mac" if sys.platform == "darwin" else "server",
+                              agent_id))
         return {"registered": True, "id": agent_id, "created": created,
+                "migrated": new_agent and bool(node),
                 "store": _kernel_store_report(setting)}
     except db.DbError as exc:
         return {"registered": False, "error": _db_error(exc)}
@@ -11739,7 +11804,19 @@ def cmd_init(claude: bool, codex: bool) -> None:
     global _CONTEXT_WITHOUT_STORE
     _CONTEXT_WITHOUT_STORE = True
     root = _project_root() or Path.cwd().resolve()
-    migrated = _ensure_envelope(root)
+    new_agent = _new_agent_project(root)
+    if new_agent:
+        _preflight_new_agent(root)
+    migrated = _ensure_envelope(root, new_agent=new_agent)
+    registration = _register_agent_on_init(root, new_agent=new_agent)
+    if new_agent and not registration.get("migrated"):
+        # Its identity was written by this init alone: removing it leaves the
+        # project new, so the next init creates the agent again.
+        (_envelope_home(root) / PROJECT_IDENTITY_REL).unlink(missing_ok=True)
+        error = registration.get("error") or {}
+        _die(5, error.get("code") or "store_write_failed",
+             error.get("message") or "the new agent could not be registered in the store",
+             "run `capabilities init` again once the store answers")
     # The gate is named where the project keeps it: its settings.json in files
     # mode, the store's policy rows where its records are in the store.
     # Init's offline part never needs the database: where the project keeps its
@@ -11767,7 +11844,7 @@ def cmd_init(claude: bool, codex: bool) -> None:
         gate = "store:capabilities_policy (no database reachable here)"
     result: dict = {"project": str(root),
                     "gate": gate,
-                    "agent": _register_agent_on_init(root)}
+                    "agent": registration}
     if migrated:
         result["migrated_from"] = str(root / LEGACY_PROJECT_CAPABILITIES_REL)
         result["migrated_entries"] = migrated

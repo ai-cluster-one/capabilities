@@ -271,6 +271,9 @@ def test_contextkit_init_retires_only_legacy_capabilities_wiring(tmp_path: Path)
 
 def test_standalone_project_keeps_capabilities_owned_wiring(tmp_path: Path) -> None:
     project = _project(tmp_path, contextkit=False)
+    # An existing agent in files mode: a new one would start in the store.
+    (project / "capabilities").mkdir()
+    (project / "capabilities" / "settings.json").write_text('{"capabilities": {}}\n')
 
     result = _json(_run(tmp_path, project, "init", "--claude"))
 

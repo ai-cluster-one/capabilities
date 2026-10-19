@@ -229,6 +229,32 @@ def test_init_registers_the_agent_row(lab):
     assert lab.ok("init")["agent"]["created"] is False
 
 
+def test_a_new_agent_starts_in_the_store_with_this_node_as_master(lab):
+    (lab.project / "capabilities" / "project.json").unlink()
+    node = {"AGENT_NODE_NAME": "lab-node"}
+
+    code, error = lab.refused("init", **node)
+    assert (code, error["code"]) == (6, "global_not_migrated")
+    assert list((lab.project / "capabilities").iterdir()) == []
+
+    migrated = lab.run("migrate", "--global", "--apply", **node)
+    assert migrated.returncode == 0, migrated.stderr
+    first = lab.run("init", **node)
+    assert first.returncode == 0, first.stderr
+    assert json.loads(first.stdout)["agent"]["migrated"] is True
+    again = lab.run("init", **node)
+    assert again.returncode == 0, again.stderr
+    assert json.loads(again.stdout)["agent"]["created"] is False
+
+    identity = json.loads((lab.project / "capabilities" / "project.json").read_text())
+    assert identity["records"] == "store"
+    assert not (lab.project / "capabilities" / "settings.json").exists()
+    assert lab.sql(f"SELECT migrated_at IS NOT NULL FROM {SCHEMA}.capabilities_agents "
+                   "WHERE id = %s", (identity["id"],)) == [(True,)]
+    assert lab.sql(f"SELECT node, is_master FROM {SCHEMA}.capabilities_agent_nodes "
+                   "WHERE agent_id = %s", (identity["id"],)) == [("lab-node", True)]
+
+
 def test_agent_show_and_set(lab, tmp_path):
     shown = lab.ok("agent", "show")
     assert (shown["agent_id"], shown["registered"], shown["agent"]) == (PROJECT_ID, False, None)
