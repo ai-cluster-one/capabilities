@@ -6436,7 +6436,7 @@ def _normalize_channel_id(value: str) -> str:
 
 STORE_VERSION = "1"
 STORE_SCHEMA_MAJOR = 1
-STORE_SCHEMA_MINOR = 0
+STORE_SCHEMA_MINOR = 1
 
 # A store setting that cannot be used is a configuration fault (exit 6); a store
 # that cannot be reached or refuses the migration is the environment's (exit 5).
@@ -6515,6 +6515,13 @@ COMMENT ON COLUMN slackuser_messages.raw IS
   'The whole Slack message object as received, opaque to the table, kept so a parser fix can rebuild the typed columns.';
 COMMENT ON TABLE slackuser_users IS
   'Users seen in the capture, resolved from users.info on demand.'"""),
+    Step("0008-conversations-open-gap", """
+ALTER TABLE slackuser_conversations
+  ADD COLUMN gap_newest text, ADD COLUMN gap_latest text;
+COMMENT ON COLUMN slackuser_conversations.gap_newest IS
+  'While a sync from the cursor is unfinished: the newest ts it fetched, where the cursor moves once the gap below is closed.';
+COMMENT ON COLUMN slackuser_conversations.gap_latest IS
+  'While a sync from the cursor is unfinished: the oldest ts it reached; everything from here to gap_newest is stored, and the next sync resumes below it.'"""),
 ]
 
 
@@ -7106,6 +7113,24 @@ def _store_covers_newest(db: _Store, channel_id: str) -> str | None:
     return row["synced_newest"] if row else None
 
 
+def _open_gap(db: _Store, channel_id: str) -> tuple[str | None, str | None]:
+    """The unfinished part of a sync from the cursor, as (gap_newest,
+    gap_latest), or (None, None) when no sync stopped short."""
+    row = db.execute(
+        "SELECT gap_newest, gap_latest FROM slackuser_conversations "
+        "WHERE account = %s AND id = %s", (db.account, channel_id)).fetchone()
+    return (row["gap_newest"], row["gap_latest"]) if row else (None, None)
+
+
+def _set_gap(db: _Store, channel_id: str, newest: str | None,
+             latest: str | None) -> None:
+    with _writing(db):
+        db.execute(
+            "UPDATE slackuser_conversations SET gap_newest = %s, gap_latest = %s "
+            "WHERE account = %s AND id = %s",
+            (newest, latest, db.account, channel_id))
+
+
 # --- Sync --------------------------------------------------------------------
 
 def _fetch_into_store(db: _Store, client: SlackClient, channel_id: str,
@@ -7141,14 +7166,55 @@ def _fetch_into_store(db: _Store, client: SlackClient, channel_id: str,
     return {"fetched": fetched, "new": new}
 
 
+def _close_gap(db: _Store, client: SlackClient, channel_id: str,
+               prior: str) -> dict:
+    """Fetch every message newer than the cursor, resuming below what an
+    unfinished earlier attempt already stored. The lower edge reached is kept
+    as the fetch goes, so an attempt a refusal cuts short still moves the next
+    one on, and the cursor moves to the gap's top only once the gap is closed."""
+    newest, latest = _open_gap(db, channel_id)
+    if latest is None:
+        newest = None
+    resumed = latest is not None
+    fetched = new = 0
+    try:
+        for msg in client.history(channel_id, oldest=prior, latest=latest,
+                                  limit=None, pages=None):
+            fetched += 1
+            if _upsert_message(db, channel_id, msg, "backfill",
+                               authoritative=False):
+                new += 1
+            ts = msg.get("ts")
+            if ts and (newest is None or ts > newest):
+                newest = ts
+            if ts and (latest is None or ts < latest):
+                latest = ts
+    finally:
+        if not client.history_complete and latest is not None:
+            _set_gap(db, channel_id, newest, latest)
+    _advance_cursor(db, channel_id, None, newest)
+    _set_gap(db, channel_id, None, None)
+    return {"fetched": fetched, "new": new, "resumed": resumed}
+
+
 def _sync_channel(db: _Store, client: SlackClient, channel_id: str,
                   full: bool, limit: int) -> dict:
     """Bring one conversation forward. With a stored cursor every message newer
     than it is fetched, however many, so a gap is closed whole or the cursor
-    stays; `limit` bounds only how far back a first sync or `--full` reaches."""
+    stays, and an attempt cut short resumes where it stopped; `limit` bounds
+    only how far back a first sync or `--full` reaches."""
     prior = None if full else _store_covers_newest(db, channel_id)
-    result = _fetch_into_store(db, client, channel_id, "backfill", prior, None,
-                               limit if prior is None else None)
+    if prior is None:
+        result = _fetch_into_store(db, client, channel_id, "backfill", None,
+                                   None, limit)
+    else:
+        result = _close_gap(db, client, channel_id, prior)
+        if result.pop("resumed"):
+            # What arrived above the top of the attempt that was resumed.
+            more = _close_gap(db, client, channel_id,
+                              _store_covers_newest(db, channel_id))
+            more.pop("resumed")
+            result = {k: result[k] + more[k] for k in result}
     return {"channel": channel_id, **result}
 
 

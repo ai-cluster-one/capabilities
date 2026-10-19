@@ -57,6 +57,19 @@ class _FakeClient(su.SlackClient):
                 "response_metadata": {"next_cursor": str(end) if more else ""}}
 
 
+class _Budgeted(_FakeClient):
+    """A Slack session that refuses conversations.history as rate-limited
+    once `budget` calls are spent."""
+
+    budget = 10**6
+
+    def _call(self, method: str, **kwargs) -> dict:
+        if self.budget <= 0:
+            su._refuse(5, "rate_limited", "Slack rate-limited the session")
+        self.budget -= 1
+        return super()._call(method, **kwargs)
+
+
 @_cli.needs_store
 class StoreRoundTrip(unittest.TestCase):
     def setUp(self):
@@ -278,6 +291,29 @@ class IncrementalSyncAndReconnect(unittest.TestCase):
         su._sync_channel(self.db, client, "C1", full=False, limit=1000)
         self.assertEqual(self._count(), 60)
         self.assertEqual(su._store_covers_newest(self.db, "C1"), _ts(60))
+
+    def test_a_gap_deeper_than_the_rate_budget_closes_over_rounds(self):
+        client = _Budgeted({c: [_msg(_ts(i)) for i in range(10)]
+                            for c in ("C1", "C2", "C3")})
+        for c in ("C1", "C2", "C3"):
+            su._sync_channel(self.db, client, c, full=False, limit=1000)
+        # A drop: C1 falls 3000 behind, C2 and C3 50 each; Slack allows
+        # 10 history calls per backfill round.
+        client.set("C1", [_msg(_ts(i)) for i in range(3010)])
+        client.set("C2", [_msg(_ts(i)) for i in range(60)])
+        client.set("C3", [_msg(_ts(i)) for i in range(60)])
+        for _ in range(4):
+            client.budget = 10
+            for c in ("C1", "C2", "C3"):
+                try:
+                    su._sync_channel(self.db, client, c, full=False, limit=500)
+                except su._Refusal:
+                    pass
+        self.assertEqual(self._count("C1"), 3010)
+        self.assertEqual(self._count("C2"), 60)
+        self.assertEqual(self._count("C3"), 60)
+        self.assertEqual(su._store_covers_newest(self.db, "C1"), _ts(3009))
+        self.assertEqual(su._open_gap(self.db, "C1"), (None, None))
 
 
 class _Unclosed:
