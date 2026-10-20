@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-20 — The daemon exits when its environment leaves the disk
+
+A uv cache prune deletes the environment the daemon runs from while it keeps running, and every worker turn it starts then dies on the missing interpreter, each message ending as a silent `ignore`. On every periodic sync the daemon now checks that its interpreter and the harness launcher are still on disk; when one is gone it marks its health `unhealthy` with the missing path and exits non-zero, so a supervisor that restarts a failed service (launchd's `KeepAlive`, a container's restart policy) starts it again on a rebuilt environment.
+
 ## 2026-10-20 — A conference recording outlasts a pause in incoming audio
 
 When a conference's capture stops growing, the recorder asks Telegram whether this account is still listed in the call and keeps recording while it is, logging once that it held on. It closes the recording as `capture_stalled` only when the account is no longer listed or the question cannot be answered, so a pause in which every incoming channel lapsed no longer ends a recording the caller is still in. Direct calls are unchanged.

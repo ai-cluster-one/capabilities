@@ -3178,6 +3178,27 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(health["state"], "unhealthy")
             self.assertIn("TL decode failed", health["last_error"])
 
+    async def test_a_vanished_interpreter_ends_the_session_for_a_restart(self):
+        """A uv cache prune deletes the environment under the running daemon;
+        every turn it launches would then die on the missing interpreter, so
+        the session ends instead and the supervisor restarts the service."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td),
+                settings(sync_interval=0.02, sync_stale_after=0.2),
+            )
+            gone = Path(td) / "env" / "bin" / "python3"
+            client = FakeClient([])
+            with mock.patch.object(daemon.sys, "executable", str(gone)):
+                task = asyncio.create_task(daemon.run_session(client))
+                await client.started.wait()
+                with self.assertRaises(daemon.RuntimeVanished):
+                    await asyncio.wait_for(task, timeout=3)
+            health = json.loads(daemon.HEALTH_FILE.read_text())
+            self.assertEqual(health["state"], "unhealthy")
+            self.assertIn(str(gone), health["last_error"])
+            self.assertIsNone(daemon._vanished_runtime())
+
     async def test_telethon_compatibility_version_is_pinned_across_bundle(self):
         expected = '"telethon==1.45.0"'
         for path in (

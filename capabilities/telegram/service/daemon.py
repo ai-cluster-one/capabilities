@@ -5582,6 +5582,24 @@ class SessionUnhealthy(Exception):
     """The MTProto client is alive but no longer decoding Telegram updates reliably."""
 
 
+class RuntimeVanished(Exception):
+    """A file every worker turn starts from is gone from disk under the running daemon."""
+
+
+def _vanished_runtime():
+    """The first file worker turns start from that is no longer on disk, or None.
+
+    The interpreter and the harness launcher live in uv's environment cache. A cache
+    prune deletes them under the running daemon, which keeps going on what it already
+    loaded while every turn it launches dies on the missing path; only a restart
+    rebuilds the environment."""
+    paths = [Path(sys.executable)]
+    with contextlib.suppress(Exception):
+        from callva.harness_runner import launch
+        paths.append(launch.LAUNCHER)
+    return next((str(path) for path in paths if not path.exists()), None)
+
+
 class IdentityMismatch(Exception):
     """The durable session belongs to a different Telegram account."""
 
@@ -8266,6 +8284,10 @@ async def run_session(client):
     async def periodic_sync():
         while True:
             await asyncio.sleep(SYNC_INTERVAL)
+            vanished = _vanished_runtime()
+            if vanished is not None:
+                write_health("unhealthy", last_error=f"runtime file gone: {vanished}")
+                raise RuntimeVanished(vanished)
             try:
                 # Ask Telethon to run the protocol-native getDifference path, then
                 # reconcile bounded recent history by our durable watermarks. The
@@ -10387,6 +10409,10 @@ async def main():
                 log(f"{e}; reconnecting in {backoff}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
+            except RuntimeVanished as e:
+                log(f"{e} is gone from disk, so no worker turn can start; exiting "
+                    f"for the supervisor to restart the service on a rebuilt environment")
+                raise
             except IdentityMismatch as e:
                 write_health("unhealthy", last_error=str(e),
                              expected_account_id=EXPECTED_ACCOUNT_ID)
