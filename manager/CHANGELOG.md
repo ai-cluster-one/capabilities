@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-20 — `context` is a core capability
+
+`context` joins the catalogue's core tier beside `askproject`, `automations`, `deployment`, `memory` and `tasks`: `capabilities list` shows it as `tier` "core", and its first install from the official catalogue on a machine arrives allowed and enabled at global scope, where that scope holds no entry for it yet. A machine that already has it installed keeps its quarantine, allowance and gates as they are; after arrival it is gated, enabled and granted as before.
+
 ## 2026-10-20 — The manager builds an agent's context from its store
 
 `capabilities build` composes the inline and stub context of an agent that keeps context documents in its store - unretired rows of the `context` capability's `context_documents` with their active `context_versions` - from those versions instead of the context folder, byte for byte the text the folder gives, and the global documents from the store too when the binding names global context and the store holds them. It reads the tables directly in a read-only transaction, so the `context` capability need not be installed. While the context folder is still there beside the documents, one generation warning says the store is used and the folder can be removed. An agent with no documents in its store, a store without the tables, or no store builds from the folder as before; a store that does not answer, or a stored document that does not read, leaves the folder in use with a warning, and a store that already failed earlier in the same build is not tried again. `session-start` builds the same way. Run `capabilities help` for the details.
