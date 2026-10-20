@@ -591,6 +591,45 @@ PROJECT VERBS (run inside a consuming project)
         foreign_instructions, warnings}. An output that is not generated
         context exits 6 output_not_generated. No update notice is composed.
         A project without a ContextKit binding exits 6 not_contextkit_bound.
+  session-start --host claude|codex
+        What a ContextKit-bound agent's SessionStart hook runs: rebuilds the
+        generated context as `build` does and prints a notice to the host only
+        when the session must be told - the context was just created or its
+        host link just made, it changed since the session loaded it, it could
+        not be rebuilt, or the host cannot load it (Codex: a root AGENTS.md or
+        AGENTS.override.md, or .contextkit.md not linked; Claude:
+        .claude/rules/CONTEXT.md not linked). It always exits 0 and the
+        context reaches the agent through the host's own file loading. In a
+        project without a binding it gives the notice `context` gives as a
+        hook.
+  hooks install [--claude] [--codex]
+        In a ContextKit-bound project, point the SessionStart hooks at
+        `capabilities session-start`: the Claude hook in .claude/settings.json
+        becomes `/bin/bash -lc 'capabilities session-start --host claude'`
+        (a new settings file also gets autoMemoryEnabled false), and the Codex
+        hook keeps its entry in .codex/hooks.json - the one Codex trusts by
+        hash - while its script .codex/hooks/build-context.sh runs
+        `capabilities session-start --host codex`. For Codex it also sets
+        project_doc_fallback_filenames to list .contextkit.md and
+        project_doc_max_bytes to at least 524288 in .codex/config.toml, and
+        records the folder and hook trust in $CODEX_HOME/config.toml (default
+        ~/.codex). Every other key and hook is left as it is; a duplicate
+        session-start hook is dropped. It then builds the context and links
+        the hosts. Without a flag it takes over the hosts already wired (exit
+        6 no_host_wired when none is). Rerunning changes nothing. Answers
+        {project, hosts, codex, claude, build}. Exit 6 not_contextkit_bound
+        without a binding, host_settings_unreadable for a host file it cannot
+        read, codex_config_blocked where the Codex settings cannot be edited
+        safely.
+  hooks check
+        Report, as JSON, whether each wired host of a ContextKit-bound project
+        delivers its context, wired by ContextKit or by `hooks install`:
+        {ok, project, output, hosts, foreign_instructions, problems}. Per
+        host: the hook present once and running a program found on PATH
+        (`runs`, `program`), the host link resolving to the generated context,
+        and for Codex the adapter script, the project-doc settings and byte
+        budget, root AGENTS files and the trust records. Exit 7 when any
+        problem is found; 6 not_contextkit_bound without a binding.
   inventory [NAME ...] [--detail] [--network]
         What this project's capabilities are and what they hold. One row per
         effective-enabled capability: its tier (as in `list`), gate and the
@@ -858,7 +897,7 @@ import tarfile
 import tempfile
 import time
 import zlib
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Callable, NoReturn
 
@@ -11763,13 +11802,7 @@ def _session_notice(host: str) -> str | None:
             if host == "codex":
                 blockers += _codex_delivery_blockers(root)
     except (SystemExit, Exception) as exc:
-        reason = str(exc) if not isinstance(exc, SystemExit) else "unknown error"
-        for line in reversed(errors.getvalue().splitlines()):
-            try:
-                reason = json.loads(line)["error"]["message"]
-                break
-            except (ValueError, KeyError, TypeError):
-                continue
+        reason = _hook_failure_reason(exc, errors.getvalue())
         notice = (f"The capabilities manager could not rebuild the capability "
                   f"context: {_md_escape(reason)}. This session may carry a stale "
                   f"or missing copy. Tell the user; `capabilities doctor` names "
@@ -11836,6 +11869,8 @@ CK_HOST_LINKS = {
 }
 CK_FOREIGN_INSTRUCTION_NAMES = ("AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md")
 CK_CLAUDE_HOOK_NEEDLES = ("contextkit session-start --host claude", "contextkit build --target claude")
+# The command a hook runs once `capabilities hooks install` has taken it over.
+SESSION_START_NEEDLE = "capabilities session-start --host {host}"
 CK_COLLABORATION_MODES = ("ask", "direct")
 CK_ONBOARDING_STATES = ("pending", "complete")
 CK_ROUTINE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -12360,7 +12395,8 @@ def _ck_installed_hosts(root: Path) -> list[str]:
     container = claude.get("hooks") if isinstance(claude, dict) else None
     session = container.get("SessionStart") if isinstance(container, dict) else None
     if any(any(needle in (str(hook.get("command", "")) if isinstance(hook, dict) else "")
-               for needle in CK_CLAUDE_HOOK_NEEDLES)
+               for needle in (*CK_CLAUDE_HOOK_NEEDLES,
+                              SESSION_START_NEEDLE.format(host="claude")))
            for entry in (session if isinstance(session, list) else [])
            if isinstance(entry, dict) for hook in entry.get("hooks") or []):
         hosts.append("claude")
@@ -12406,6 +12442,12 @@ def cmd_build(print_only: bool, json_output: bool) -> None:
         else:
             sys.stdout.write(text)
         return
+    _emit(_ck_write(root, text, warnings, binding))
+
+
+def _ck_write(root: Path, text: str, warnings: list[str], binding: dict) -> dict:
+    """Replace the generated context whole and link each installed host to it."""
+    output = root / binding["output"]
     if output.is_symlink() or (output.exists() and not _ck_generated(output)):
         _die(6, "output_not_generated",
              f"{output} exists and is not ContextKit-generated context; it is left as it is",
@@ -12424,10 +12466,850 @@ def cmd_build(print_only: bool, json_output: bool) -> None:
              for host in _ck_installed_hosts(root)}
     warnings += [f"{host} link {status}" for host, status in links.items()
                  if status.startswith("blocked")]
-    _emit({"project": str(root), "output": str(output), "created": previous is None,
-           "changed": previous is not None and previous != text, "links": links,
-           "foreign_instructions": _ck_foreign_instruction_files(root, binding["output"]),
-           "warnings": warnings})
+    return {"project": str(root), "output": str(output), "created": previous is None,
+            "changed": previous is not None and previous != text, "links": links,
+            "foreign_instructions": _ck_foreign_instruction_files(root, binding["output"]),
+            "warnings": warnings}
+
+
+# ---------------------------------------------------------------- session start and hooks: an agent's host bindings
+
+# `session-start` is what a ContextKit-bound agent's SessionStart hooks run: it
+# rebuilds the generated context through `build` and prints a notice only when
+# the session must be told. `hooks install` points the hooks ContextKit wrote at
+# it, and `hooks check` reports what ContextKit's delivery checks report. The
+# Codex project-doc settings, trust records and TOML editing below are
+# ContextKit's, carried so a project rewired here reads as ContextKit left it.
+CK_CODEX_DOC_MAX_BYTES = 524288
+CK_CODEX_DEFAULT_DOC_MAX_BYTES = 32768
+CK_LEGACY_CODEX_OUTPUT = Path(".codex") / "generated" / "context.md"
+CK_CODEX_ADAPTER_REL = Path(".codex") / "hooks" / "build-context.sh"
+# The Codex hook entry runs the adapter script. Codex trusts a hook by a hash of
+# its entry, so the entry stays ContextKit's and the script is what changes.
+CK_CODEX_HOOK_COMMAND = (
+    "/bin/bash -lc 'root=$(git rev-parse --show-toplevel 2>/dev/null || pwd); "
+    "/bin/bash \"$root/.codex/hooks/build-context.sh\"'")
+SESSION_START_CLAUDE_COMMAND = "/bin/bash -lc 'capabilities session-start --host claude'"
+SESSION_START_ADAPTER = """#!/usr/bin/env bash
+set -uo pipefail
+
+# Generated by `capabilities hooks install`; do not edit by hand.
+# Codex loads the generated context itself through `.contextkit.md`; this hook
+# refreshes it and prints a notice only when the session needs one.
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+ROOT="$(cd "$ROOT" && pwd -P)"
+cd "$ROOT"
+
+exec capabilities session-start --host codex
+"""
+CK_CODEX_ADAPTER_NEEDLE = "contextkit session-start --host codex"
+
+
+def _hooks_repair(host: str) -> str:
+    return f"run `capabilities hooks install --{host}`"
+
+
+def _hook_failure_reason(exc: BaseException, stderr_text: str) -> str:
+    """The message a failed step gave: the manager's error line, else the exception."""
+    reason = str(exc) if not isinstance(exc, SystemExit) else "unknown error"
+    for line in reversed(stderr_text.splitlines()):
+        try:
+            return json.loads(line)["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            continue
+    return reason
+
+
+def _ck_codex_delivery_blockers(root: Path, output: Path) -> list[str]:
+    """Name what keeps Codex from loading the generated context through its link."""
+    blockers: list[str] = []
+    for name in ("AGENTS.override.md", "AGENTS.md"):
+        if (root / name).exists():
+            blockers.append(
+                f"Codex loads the root `{name}` instead of `{CK_HOST_LINKS['codex'].as_posix()}`; "
+                "move its content into the ContextKit body or remove it")
+            break
+    if not _ck_is_link(root, CK_HOST_LINKS["codex"], output):
+        blockers.append(f"`{CK_HOST_LINKS['codex'].as_posix()}` does not link to the generated "
+                        f"context; {_hooks_repair('codex')}")
+    return blockers
+
+
+def _ck_session_notice(root: Path, host: str) -> str:
+    """Rebuild the generated context and return what this host session must be told.
+
+    A failure becomes the notice: session start never breaks."""
+    errors = io.StringIO()
+    try:
+        with redirect_stderr(errors), redirect_stdout(io.StringIO()):
+            text, warnings, binding = _ck_compose(root)
+            build = _ck_write(root, text, warnings, binding)
+    except (SystemExit, Exception) as exc:
+        reason = _hook_failure_reason(exc, errors.getvalue())
+        return ("# ContextKit Session Notice\n\n"
+                f"ContextKit could not rebuild the generated context: {_ck_one_line(reason)}\n\n"
+                "This session may carry a stale or missing copy. Tell the user; "
+                "`capabilities hooks check` names the repair.\n")
+    output = binding["output"]
+    if host == "codex":
+        blockers = _ck_codex_delivery_blockers(root, output)
+    else:
+        link = CK_HOST_LINKS["claude"]
+        blockers = ([] if _ck_is_link(root, link, output)
+                    else [f"`{link.as_posix()}` does not link to the generated context"])
+    if blockers:
+        notice = ("The ContextKit project context did not load in this session: "
+                  + "; ".join(blockers)
+                  + ". Tell the user; `capabilities hooks check` names the repair.")
+    elif build["created"] or build["links"].get(host) == "linked":
+        notice = ("ContextKit created the project context after this session started, so this "
+                  "session has none loaded. Tell the user; a new or resumed session loads it.")
+    elif build["changed"]:
+        notice = ("The project context changed after this session loaded it, so the loaded copy "
+                  "is stale. Tell the user; a new or resumed session loads the update.")
+    else:
+        return ""
+    return "# ContextKit Session Notice\n\n" + notice + "\n"
+
+
+def cmd_session_start(host: str) -> None:
+    # A project without a binding keeps the manager's own session notice.
+    root = _project_root()
+    if root is None or not _contextkit_managed(root):
+        notice = _session_notice(host)
+    else:
+        notice = _ck_session_notice(root.resolve(), host)
+    if notice:
+        sys.stdout.write(notice)
+
+
+def _ck_toml(path: Path) -> dict:
+    """A TOML document as ContextKit reads one: absent is empty, invalid refuses."""
+    import tomllib
+    if not path.exists():
+        return {}
+    try:
+        return tomllib.loads(path.read_text())
+    except Exception as exc:  # noqa: BLE001 - the message is the answer
+        raise ValueError(f"invalid config TOML at {path}: {exc}") from None
+
+
+def _ck_toml_string_end(text: str, index: int) -> int:
+    """The offset after the TOML string starting at `index`, or -1."""
+    quote = text[index]
+    if text.startswith(quote * 3, index):
+        end = text.find(quote * 3, index + 3)
+        return -1 if end < 0 else end + 3
+    cursor = index + 1
+    while cursor < len(text):
+        char = text[cursor]
+        if char == "\\" and quote == '"':
+            cursor += 2
+            continue
+        if char == quote:
+            return cursor + 1
+        if char == "\n":
+            return -1
+        cursor += 1
+    return -1
+
+
+def _ck_toml_value_end(text: str, index: int) -> int:
+    """The offset after the TOML value starting at `index`, or -1."""
+    depth = 0
+    end = index
+    cursor = index
+    while cursor < len(text):
+        char = text[cursor]
+        if char in "\"'":
+            closed = _ck_toml_string_end(text, cursor)
+            if closed < 0:
+                return -1
+            cursor = end = closed
+            continue
+        if char == "#":
+            newline = text.find("\n", cursor)
+            cursor = len(text) if newline < 0 else newline
+            continue
+        if char in "[{":
+            depth += 1
+            cursor += 1
+            end = cursor
+            continue
+        if char in "]}":
+            depth -= 1
+            if depth < 0:
+                return -1
+            cursor += 1
+            end = cursor
+            if depth == 0:
+                return end
+            continue
+        if char == "\n":
+            if depth == 0:
+                return end
+            cursor += 1
+            continue
+        if not char.isspace():
+            end = cursor + 1
+        cursor += 1
+    return end if depth == 0 else -1
+
+
+def _ck_toml_top_level_assignments(text: str) -> tuple[dict, bool]:
+    """Every top-level key mapped to (statement start, value start, value end);
+    False when the document cannot be scanned confidently."""
+    bare_key = re.compile(r"[A-Za-z0-9_-]+")
+    assignments: dict = {}
+    cursor = 0
+    size = len(text)
+    while cursor < size:
+        char = text[cursor]
+        if char.isspace():
+            cursor += 1
+            continue
+        if char == "#":
+            newline = text.find("\n", cursor)
+            cursor = size if newline < 0 else newline + 1
+            continue
+        if char == "[":
+            return assignments, True
+        start = cursor
+        parts: list[str] = []
+        while True:
+            if cursor < size and text[cursor] in "\"'":
+                closed = _ck_toml_string_end(text, cursor)
+                if closed < 0:
+                    return assignments, False
+                parts.append(text[cursor + 1:closed - 1])
+                cursor = closed
+            else:
+                match = bare_key.match(text, cursor)
+                if match is None:
+                    return assignments, False
+                parts.append(match.group(0))
+                cursor = match.end()
+            while cursor < size and text[cursor] in " \t":
+                cursor += 1
+            if cursor < size and text[cursor] == ".":
+                cursor += 1
+                while cursor < size and text[cursor] in " \t":
+                    cursor += 1
+                continue
+            break
+        if cursor >= size or text[cursor] != "=":
+            return assignments, False
+        cursor += 1
+        while cursor < size and text[cursor] in " \t":
+            cursor += 1
+        value_start = cursor
+        value_end = _ck_toml_value_end(text, cursor)
+        if value_end < 0:
+            return assignments, False
+        assignments.setdefault(".".join(parts), (start, value_start, value_end))
+        cursor = value_end
+    return assignments, True
+
+
+def _ck_planned_codex_config(path: Path) -> dict:
+    """Plan the Codex project-doc settings that load the generated context: list
+    the `.contextkit.md` link as a fallback filename, drop the path entry an
+    earlier release left, and raise a smaller byte budget, touching nothing else.
+    An assignment that cannot be located confidently blocks the plan."""
+    import tomllib
+    config_text = path.read_text() if path.exists() else ""
+    config_raw = _ck_toml(path)
+    plan: dict = {"text": config_text, "changed": False, "blocked": None}
+    link = CK_HOST_LINKS["codex"].as_posix()
+    legacy = CK_LEGACY_CODEX_OUTPUT.as_posix()
+    fallback = config_raw.get("project_doc_fallback_filenames")
+    max_bytes = config_raw.get("project_doc_max_bytes")
+    wanted: dict = {}
+    if not isinstance(fallback, list) or link not in fallback or legacy in fallback:
+        current = [item for item in fallback if item != legacy] if isinstance(fallback, list) else []
+        wanted["project_doc_fallback_filenames"] = current if link in current else [*current, link]
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) \
+            or max_bytes < CK_CODEX_DOC_MAX_BYTES:
+        wanted["project_doc_max_bytes"] = CK_CODEX_DOC_MAX_BYTES
+    if not wanted:
+        return plan
+    assignments, scanned = _ck_toml_top_level_assignments(config_text)
+    blocked = (
+        f"the Codex project-doc settings in {path} cannot be updated safely; the existing "
+        f"config is left as it is. Set `project_doc_fallback_filenames` to include \"{link}\" "
+        f"and `project_doc_max_bytes = {CK_CODEX_DOC_MAX_BYTES}` by hand, then install the "
+        "Codex hook again.")
+    if not scanned:
+        plan["blocked"] = blocked
+        return plan
+    edits: list[tuple[int, int, str]] = []
+    inserts: list[str] = []
+    for key, value in wanted.items():
+        literal = json.dumps(value, ensure_ascii=False)
+        span = assignments.get(key)
+        if span is not None:
+            edits.append((span[1], span[2], literal))
+        elif key in config_raw:
+            plan["blocked"] = blocked
+            return plan
+        else:
+            inserts.append(f"{key} = {literal}\n")
+    next_text = config_text
+    for start, end, literal in sorted(edits, reverse=True):
+        next_text = next_text[:start] + literal + next_text[end:]
+    next_text = "".join(inserts) + next_text
+    try:
+        parsed = tomllib.loads(next_text)
+    except tomllib.TOMLDecodeError:
+        plan["blocked"] = blocked
+        return plan
+    if any(parsed.get(key) != value for key, value in wanted.items()):
+        plan["blocked"] = blocked
+        return plan
+    plan["text"] = next_text
+    plan["changed"] = next_text != config_text
+    return plan
+
+
+def _ck_codex_home() -> Path:
+    value = os.environ.get("CODEX_HOME")
+    return Path(value).expanduser() if value else Path.home() / ".codex"
+
+
+def _ck_codex_hook_hash(matcher, hook: dict) -> str:
+    """The trust hash Codex computes for one SessionStart command hook: the
+    canonical JSON of the event, the group matcher and the normalised handler."""
+    timeout = hook.get("timeout")
+    handler: dict = {
+        "type": "command",
+        "command": str(hook.get("command", "")),
+        "timeout": (max(timeout, 1) if isinstance(timeout, int) and not isinstance(timeout, bool)
+                    else 600),
+        "async": hook.get("async") is True,
+    }
+    if isinstance(hook.get("statusMessage"), str):
+        handler["statusMessage"] = hook["statusMessage"]
+    limit = hook.get("additionalContextLimit")
+    if isinstance(limit, int) and not isinstance(limit, bool) and limit != 2500:
+        handler["additionalContextLimit"] = limit
+    identity: dict = {"event_name": "session_start", "hooks": [handler]}
+    if isinstance(matcher, str):
+        identity["matcher"] = matcher
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _ck_codex_session_hooks(hooks) -> list[tuple[dict, dict]]:
+    """Every Codex SessionStart hook that runs the adapter script."""
+    if not isinstance(hooks, dict):
+        return []
+    container = hooks.get("hooks")
+    session = container.get("SessionStart") if isinstance(container, dict) else None
+    found = []
+    for entry in session if isinstance(session, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        for hook in entry.get("hooks") or []:
+            if isinstance(hook, dict) and "build-context.sh" in str(hook.get("command", "")):
+                found.append((entry, hook))
+    return found
+
+
+def _ck_claude_session_hooks(settings) -> list[tuple[dict, dict]]:
+    """Every Claude SessionStart hook that runs ContextKit or `session-start`."""
+    if not isinstance(settings, dict):
+        return []
+    container = settings.get("hooks")
+    session = container.get("SessionStart") if isinstance(container, dict) else None
+    needles = (*CK_CLAUDE_HOOK_NEEDLES, SESSION_START_NEEDLE.format(host="claude"))
+    found = []
+    for entry in session if isinstance(session, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        for hook in entry.get("hooks") or []:
+            command = str(hook.get("command", "")) if isinstance(hook, dict) else ""
+            if any(needle in command for needle in needles):
+                found.append((entry, hook))
+    return found
+
+
+def _ck_codex_trust_records(root: Path) -> list[tuple[list[str], str, str]]:
+    """The Codex user-config records a session needs for this binding: the folder
+    trusted, and the recorded hash of each hook that runs the adapter."""
+    records = [(["projects", str(root)], "trust_level", "trusted")]
+    hooks_path = root / CODEX_HOOKS_REL
+    hooks = _read_json(hooks_path)
+    container = hooks.get("hooks") if isinstance(hooks, dict) else None
+    session = container.get("SessionStart") if isinstance(container, dict) else None
+    for group_index, entry in enumerate(session if isinstance(session, list) else []):
+        if not isinstance(entry, dict):
+            continue
+        for handler_index, hook in enumerate(entry.get("hooks") or []):
+            if isinstance(hook, dict) and "build-context.sh" in str(hook.get("command", "")):
+                key = f"{hooks_path}:session_start:{group_index}:{handler_index}"
+                records.append((["hooks", "state", key], "trusted_hash",
+                                _ck_codex_hook_hash(entry.get("matcher"), hook)))
+    return records
+
+
+def _ck_toml_lookup(value, table: list[str], key: str):
+    for part in table:
+        value = value.get(part) if isinstance(value, dict) else None
+    return value.get(key) if isinstance(value, dict) else None
+
+
+def _ck_toml_without(value: dict, table: list[str], key: str) -> dict:
+    """`value` without `key`, pruning tables left empty along its path."""
+    copy = json.loads(json.dumps(value, default=str))
+    chain = [copy]
+    for part in table:
+        node = chain[-1].get(part)
+        if not isinstance(node, dict):
+            return copy
+        chain.append(node)
+    chain[-1].pop(key, None)
+    for depth in range(len(table), 0, -1):
+        if chain[depth]:
+            break
+        chain[depth - 1].pop(table[depth - 1], None)
+    return copy
+
+
+def _ck_toml_lines(text: str) -> list[str]:
+    return re.findall(r"[^\n]*\n|[^\n]+\Z", text)
+
+
+def _ck_toml_section_headers(lines: list[str]) -> list[tuple[int, list[str]]]:
+    import tomllib
+    header_line = re.compile(r"^\s*\[(?!\[)(.*)\]\s*(#.*)?$")
+    headers = []
+    for index, line in enumerate(lines):
+        match = header_line.match(line.rstrip("\n"))
+        if not match:
+            continue
+        try:
+            parsed = tomllib.loads(f"[{match.group(1)}]\n")
+        except tomllib.TOMLDecodeError:
+            continue
+        path: list[str] = []
+        node = parsed
+        while isinstance(node, dict) and len(node) == 1:
+            name = next(iter(node))
+            path.append(name)
+            node = node[name]
+        headers.append((index, path))
+    return headers
+
+
+def _ck_toml_set_table_value(text: str, table: list[str], key: str, value: str) -> str | None:
+    """Set one string `key` in the `[table]` section, appending the section when
+    absent; None unless the result parses and differs only in that value."""
+    import tomllib
+    try:
+        before = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    literal = f"{key} = {json.dumps(value, ensure_ascii=False)}"
+    lines = _ck_toml_lines(text)
+    headers = _ck_toml_section_headers(lines)
+    section = next((index for index, path in headers if path == table), None)
+    if section is None:
+        header = ".".join(part if re.fullmatch(r"[A-Za-z0-9_-]+", part)
+                          else json.dumps(part, ensure_ascii=False) for part in table)
+        prefix = text if not text or text.endswith("\n") else text + "\n"
+        next_text = prefix + ("\n" if prefix.strip() else "") + f"[{header}]\n{literal}\n"
+    else:
+        end = next((index for index, _path in headers if index > section), len(lines))
+        assignment = re.compile(rf"^\s*{re.escape(key)}\s*=")
+        any_assignment = re.compile(r"^\s*(?:[A-Za-z0-9_-]+|\"[^\"]*\"|'[^']*')\s*=")
+        target = next((index for index in range(section + 1, end)
+                       if assignment.match(lines[index])), None)
+        if target is not None:
+            lines[target] = literal + "\n"
+        else:
+            last = max((index for index in range(section + 1, end)
+                        if any_assignment.match(lines[index])), default=section)
+            lines.insert(last + 1, literal + "\n")
+        next_text = "".join(lines)
+    try:
+        after = tomllib.loads(next_text)
+    except tomllib.TOMLDecodeError:
+        return None
+    if _ck_toml_lookup(after, table, key) != value:
+        return None
+    if _ck_toml_without(after, table, key) != _ck_toml_without(before, table, key):
+        return None
+    return next_text
+
+
+def _ck_codex_trust_status(root: Path) -> dict:
+    """This binding's trust records compared with the Codex user config."""
+    config = _ck_codex_home() / "config.toml"
+    try:
+        raw = _ck_toml(config)
+    except ValueError as exc:
+        return {"config": str(config), "error": _ck_one_line(str(exc)), "missing": [],
+                "untrusted": False}
+    records = _ck_codex_trust_records(root)
+    missing = [record for record in records
+               if _ck_toml_lookup(raw, record[0], record[1]) != record[2]]
+    untrusted = _ck_toml_lookup(raw, ["projects", str(root)], "trust_level") == "untrusted"
+    return {"config": str(config), "error": None, "missing": missing, "untrusted": untrusted}
+
+
+def _ck_record_codex_trust(root: Path) -> dict:
+    """Record the folder and hook trust Codex needs, in the Codex user config."""
+    status = _ck_codex_trust_status(root)
+    config = Path(status["config"])
+    result: dict = {"config": str(config), "recorded": [], "skipped": None}
+    if status["error"]:
+        result["skipped"] = status["error"]
+        return result
+    if not config.parent.is_dir():
+        result["skipped"] = f"Codex home not found: {config.parent}"
+        return result
+    text = config.read_text() if config.exists() else ""
+    for table, key, value in status["missing"]:
+        if table[0] == "projects" and status["untrusted"]:
+            result["skipped"] = ("Codex marks this project folder untrusted; that decision "
+                                 "is left to you")
+            continue
+        next_text = _ck_toml_set_table_value(text, table, key, value)
+        if next_text is None:
+            result["skipped"] = (f"cannot update {config} safely; approve the project and its "
+                                 "hook in Codex instead")
+            return result
+        text = next_text
+        result["recorded"].append(".".join(table) + "." + key)
+    if result["recorded"]:
+        created = not config.exists()
+        # A config linked from a dotfiles checkout stays linked; write its target.
+        _atomic_write_text(config.resolve() if config.is_symlink() else config, text)
+        if created:
+            # The Codex user config can hold credentials; keep a new one private.
+            config.chmod(0o600)
+    return result
+
+
+def _hooks_session_list(container: dict, path: Path, label: str) -> None:
+    """Refuse a host file whose SessionStart hooks are not shaped as hosts read them."""
+    def refuse(what: str) -> NoReturn:
+        _die(6, "host_settings_unreadable", f"{label} {what}: {path}",
+             "repair it, then rerun `capabilities hooks install`; the file is left as it is")
+    if "hooks" not in container:
+        return
+    hooks = container["hooks"]
+    if not isinstance(hooks, dict):
+        refuse("hooks must be a JSON object")
+    session = hooks.get("SessionStart", [])
+    if not isinstance(session, list):
+        refuse("hooks.SessionStart must be a JSON array")
+    for entry in session:
+        if not isinstance(entry, dict):
+            refuse("SessionStart entries must be JSON objects")
+        entry_hooks = entry.get("hooks", [])
+        if not isinstance(entry_hooks, list):
+            refuse("SessionStart entry hooks must be a JSON array")
+        for hook in entry_hooks:
+            if not isinstance(hook, dict):
+                refuse("hook entries must be JSON objects")
+            if "command" in hook and not isinstance(hook["command"], str):
+                refuse("hook commands must be strings")
+
+
+def _hooks_host_file(path: Path, label: str) -> tuple[dict, bool]:
+    existed = path.exists()
+    value = _read_json(path) if existed else {}
+    if not isinstance(value, dict):
+        _die(6, "host_settings_unreadable", f"{label} must be a valid JSON object: {path}",
+             "repair it, then rerun `capabilities hooks install`; the file is left as it is")
+    _hooks_session_list(value, path, label)
+    return value, existed
+
+
+def _hooks_take_over(session: list, managed: list[tuple[dict, dict]], command: str) -> bool:
+    """Point the first managed hook at `command` and drop the others; True on a change."""
+    changed = False
+    for index, (entry, hook) in enumerate(managed):
+        if index:
+            # One refresh per session start is enough; a duplicate only repeats it.
+            entry["hooks"] = [item for item in (entry.get("hooks") or []) if item is not hook]
+            if not entry["hooks"] and entry in session:
+                session.remove(entry)
+            changed = True
+            continue
+        if hook.get("command") != command:
+            hook["command"] = command
+            changed = True
+    return changed
+
+
+def _hooks_install_codex(root: Path, plan: dict, hooks: dict) -> dict:
+    adapter = root / CK_CODEX_ADAPTER_REL
+    try:
+        existing = adapter.read_text() if adapter.is_file() else None
+    except OSError:
+        existing = None
+    if existing != SESSION_START_ADAPTER:
+        _atomic_write_text(adapter, SESSION_START_ADAPTER)
+    mode = adapter.stat().st_mode
+    if mode & 0o111 != 0o111:
+        adapter.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    config = root / CODEX_CONFIG_REL
+    if plan["changed"]:
+        _atomic_write_text(config, plan["text"])
+    session = hooks.setdefault("hooks", {}).setdefault("SessionStart", [])
+    managed = _ck_codex_session_hooks(hooks)
+    hook_changed = _hooks_take_over(session, managed, CK_CODEX_HOOK_COMMAND)
+    if managed:
+        entry, hook = managed[0]
+        if "additionalContextLimit" in hook:
+            # Codex loads the context itself; the hook emits only short notices.
+            del hook["additionalContextLimit"]
+            hook_changed = True
+        owned = all("build-context.sh" in str((item or {}).get("command", ""))
+                    for item in (entry.get("hooks") or []))
+        if owned and entry.get("matcher") != CODEX_SESSION_MATCHER:
+            entry["matcher"] = CODEX_SESSION_MATCHER
+            hook_changed = True
+    else:
+        session.append({"matcher": CODEX_SESSION_MATCHER, "hooks": [{
+            "type": "command", "command": CK_CODEX_HOOK_COMMAND, "timeout": 30,
+            "statusMessage": "Regenerating ContextKit context"}]})
+    if hook_changed or not managed:
+        _write_json(root / CODEX_HOOKS_REL, hooks)
+    return {"adapter": str(adapter), "adapter_changed": existing != SESSION_START_ADAPTER,
+            "config": str(config), "config_changed": plan["changed"],
+            "hooks": str(root / CODEX_HOOKS_REL), "hook_added": not managed,
+            "hook_changed": hook_changed, "trust": _ck_record_codex_trust(root)}
+
+
+def _hooks_install_claude(root: Path, settings: dict, existed: bool) -> dict:
+    path = root / ".claude" / "settings.json"
+    auto_memory_disabled = False
+    if not existed:
+        settings["autoMemoryEnabled"] = False
+        auto_memory_disabled = True
+    session = settings.setdefault("hooks", {}).setdefault("SessionStart", [])
+    managed = _ck_claude_session_hooks(settings)
+    hook_changed = _hooks_take_over(session, managed, SESSION_START_CLAUDE_COMMAND)
+    if not managed:
+        session.append({"hooks": [{"type": "command", "command": SESSION_START_CLAUDE_COMMAND}]})
+    if hook_changed or not managed:
+        _write_json(path, settings)
+    return {"settings": str(path), "hook_added": not managed, "hook_changed": hook_changed,
+            "auto_memory_disabled": auto_memory_disabled}
+
+
+def _require_bound(verb: str) -> Path:
+    root = _require_project().resolve()
+    if not _contextkit_managed(root):
+        _die(6, "not_contextkit_bound",
+             f"{root} has no ContextKit binding ({CONTEXTKIT_CONFIG_REL.as_posix()}), "
+             f"so it has no agent hooks to {verb}",
+             "run `capabilities init --claude` or `--codex` for a project without one")
+    return root
+
+
+def cmd_hooks_install(claude: bool, codex: bool) -> None:
+    root = _require_bound("install")
+    if claude or codex:
+        hosts = (["codex"] if codex else []) + (["claude"] if claude else [])
+    else:
+        hosts = _ck_installed_hosts(root)
+        if not hosts:
+            _die(6, "no_host_wired",
+                 f"{root} has no SessionStart hook for Claude or Codex to take over",
+                 "name the host: `capabilities hooks install --claude` or `--codex`")
+    # Every host file is read and planned before any of them is written.
+    if "codex" in hosts:
+        try:
+            plan = _ck_planned_codex_config(root / CODEX_CONFIG_REL)
+        except ValueError as exc:
+            _die(6, "codex_config_invalid", str(exc),
+                 "repair .codex/config.toml, then rerun `capabilities hooks install`")
+        if plan["blocked"]:
+            _die(6, "codex_config_blocked", plan["blocked"])
+        codex_hooks, _ = _hooks_host_file(root / CODEX_HOOKS_REL, "Codex hooks")
+    if "claude" in hosts:
+        settings, existed = _hooks_host_file(root / ".claude" / "settings.json",
+                                             "Claude settings")
+    result: dict = {"project": str(root), "hosts": hosts}
+    if "codex" in hosts:
+        result["codex"] = _hooks_install_codex(root, plan, codex_hooks)
+    if "claude" in hosts:
+        result["claude"] = _hooks_install_claude(root, settings, existed)
+    # Hosts read the generated context before their hook runs, so the binding
+    # is complete only once the context and its host links exist.
+    text, warnings, binding = _ck_compose(root)
+    result["build"] = _ck_write(root, text, warnings, binding)
+    _emit(result)
+
+
+def _hooks_program(root: Path, runs: str | None) -> dict:
+    """Which program a hook runs and where it resolves, as the hook's PATH would."""
+    if runs == "capabilities":
+        found = shutil.which("capabilities")
+    elif runs == "contextkit":
+        bundled = root / ".contextkit" / "manager" / "contextkit"
+        found = str(bundled) if bundled.is_file() else shutil.which("contextkit")
+    else:
+        found = None
+    return {"runs": runs, "program": found}
+
+
+def _hooks_codex_report(root: Path, output: Path) -> dict:
+    repair = _hooks_repair("codex")
+    hooks_path = root / CODEX_HOOKS_REL
+    adapter = root / CK_CODEX_ADAPTER_REL
+    hooks = _read_json(hooks_path) if hooks_path.exists() else None
+    delivering = _ck_codex_session_hooks(hooks)
+    report: dict = {"hooks": str(hooks_path), "adapter": str(adapter),
+                    "link": str(root / CK_HOST_LINKS["codex"])}
+    problems: list[str] = []
+    if hooks_path.exists() and not isinstance(hooks, dict):
+        problems.append(f"Codex hooks file is not a readable JSON object: {hooks_path}; {repair}")
+    elif not delivering:
+        problems.append(f"Codex SessionStart hook does not call the build adapter; {repair}")
+    else:
+        if len(delivering) > 1:
+            problems.append(f"{len(delivering)} Codex SessionStart hooks call the build adapter, "
+                            f"so every session start runs it more than once; {repair}")
+        if any("additionalContextLimit" in hook for _entry, hook in delivering):
+            problems.append("Codex SessionStart hook is from a release that delivered the context "
+                            f"through the hook, which duplicates it on resume; {repair}")
+        moments = CODEX_SESSION_MATCHER.split("|")
+        covered = {moment for entry, _hook in delivering
+                   for moment in (moments if not isinstance(entry.get("matcher"), str)
+                                  else str(entry["matcher"]).split("|"))}
+        missing = [moment for moment in moments if moment not in covered]
+        if missing:
+            shared = any(len(entry.get("hooks") or []) > 1 for entry, _hook in delivering
+                         if not isinstance(entry.get("matcher"), str)
+                         or [m for m in moments if m not in str(entry["matcher"]).split("|")])
+            route = ("give the hook its own SessionStart entry, then " + repair
+                     if shared else repair)
+            problems.append(f"Codex SessionStart hook does not run at: {', '.join(missing)}; "
+                            f"{route}")
+    runs = None
+    if not adapter.exists():
+        problems.append(f"Codex build adapter is missing: {adapter}; {repair}")
+    elif not adapter.is_file():
+        problems.append(f"Codex build adapter is not a file: {adapter}; {repair}")
+    else:
+        try:
+            body = adapter.read_text()
+        except OSError as exc:
+            problems.append(f"cannot read Codex build adapter {adapter}: "
+                            f"{_ck_one_line(str(exc))}; {repair}")
+        else:
+            if body == SESSION_START_ADAPTER:
+                runs = "capabilities"
+            elif CK_CODEX_ADAPTER_NEEDLE in body:
+                runs = "contextkit"
+            else:
+                problems.append(f"Codex build adapter runs neither `capabilities session-start` "
+                                f"nor ContextKit: {adapter}; {repair}")
+    report.update(_hooks_program(root, runs))
+    if runs and report["program"] is None:
+        problems.append(f"the Codex hook runs `{runs}`, which is not on PATH")
+    config = root / CODEX_CONFIG_REL
+    try:
+        plan = _ck_planned_codex_config(config)
+        raw = _ck_toml(config)
+    except ValueError as exc:
+        problems.append(str(exc))
+    else:
+        link = CK_HOST_LINKS["codex"].as_posix()
+        fallback = raw.get("project_doc_fallback_filenames")
+        if plan["blocked"]:
+            problems.append(plan["blocked"])
+        elif not isinstance(fallback, list) or link not in fallback:
+            problems.append(f"Codex project_doc_fallback_filenames does not list {link}, so Codex "
+                            f"never loads the generated context; {repair}")
+        elif CK_LEGACY_CODEX_OUTPUT.as_posix() in fallback:
+            problems.append("Codex project_doc_fallback_filenames still lists "
+                            f"{CK_LEGACY_CODEX_OUTPUT.as_posix()}, a path Codex ignores; {repair}")
+        if not plan["blocked"]:
+            max_bytes = raw.get("project_doc_max_bytes")
+            budget = (max_bytes if isinstance(max_bytes, int) and not isinstance(max_bytes, bool)
+                      else CK_CODEX_DEFAULT_DOC_MAX_BYTES)
+            try:
+                size = (root / output).stat().st_size
+            except OSError:
+                size = 0
+            if size > budget:
+                problems.append(f"generated context is {size} bytes and Codex truncates project "
+                                f"docs beyond project_doc_max_bytes = {budget}; {repair}")
+    problems += _ck_codex_delivery_blockers(root, output)
+    status = _ck_codex_trust_status(root)
+    report["trust_config"] = status["config"]
+    if status["error"]:
+        problems.append(f"cannot read the Codex user config: {status['error']}")
+    for table, _key, _value in status["missing"]:
+        if table[0] == "projects":
+            problems.append(
+                "Codex marks this project folder untrusted, so it skips `.codex/config.toml` and "
+                "never loads the generated context; trust the folder in Codex"
+                if status["untrusted"] else
+                "Codex has no trust record for this project folder, so it skips "
+                f"`.codex/config.toml` and never loads the generated context; {repair}")
+        else:
+            problems.append("Codex has no trust record for the current hook, so the hook does "
+                            f"not run and the generated context is not refreshed; {repair}")
+    report["problems"] = problems
+    return report
+
+
+def _hooks_claude_report(root: Path, output: Path) -> dict:
+    repair = _hooks_repair("claude")
+    managed = _ck_claude_session_hooks(_read_json(root / ".claude" / "settings.json"))
+    link = CK_HOST_LINKS["claude"]
+    report: dict = {"settings": str(root / ".claude" / "settings.json"), "link": str(root / link)}
+    problems: list[str] = []
+    current = (SESSION_START_NEEDLE.format(host="claude"), CK_CLAUDE_HOOK_NEEDLES[0])
+    commands = [str(hook.get("command", "")) for _entry, hook in managed]
+    runs = ("capabilities" if current[0] in commands[0] else
+            "contextkit" if current[1] in commands[0] else None)
+    if any(not any(needle in command for needle in current) for command in commands):
+        problems.append(f"Claude SessionStart hook is not the current session-start hook; {repair}")
+    report.update(_hooks_program(root, runs))
+    if runs and report["program"] is None:
+        problems.append(f"the Claude hook runs `{runs}`, which is not on PATH")
+    if len(managed) > 1:
+        problems.append(f"{len(managed)} Claude SessionStart hooks run session start; {repair}")
+    if not _ck_is_link(root, link, output):
+        problems.append(f"`{link.as_posix()}` does not link to the generated context; {repair}")
+    report["problems"] = problems
+    return report
+
+
+def cmd_hooks_check() -> None:
+    root = _require_bound("check")
+    binding = _ck_binding(root)
+    output = binding["output"]
+    hosts = _ck_installed_hosts(root)
+    problems: list[str] = []
+    if hosts and not (root / output).is_file():
+        problems.append(f"generated context is missing: {root / output}; run `capabilities build`")
+    reports: dict = {}
+    for host in hosts:
+        report = (_hooks_codex_report if host == "codex" else _hooks_claude_report)(root, output)
+        reports[host] = report
+        problems += report["problems"]
+    if "codex" not in hosts:
+        try:
+            _ck_toml(root / CODEX_CONFIG_REL)
+        except ValueError as exc:
+            problems.append(str(exc))
+    result = {"ok": not problems, "project": str(root), "output": str(root / output),
+              "hosts": reports,
+              "foreign_instructions": _ck_foreign_instruction_files(root, output),
+              "problems": problems}
+    _emit(result)
+    if problems:
+        sys.exit(7)
 
 
 # ---------------------------------------------------------------- init
@@ -15957,6 +16839,20 @@ def main() -> None:
             cmd_context("codex")
         else:
             _die(6, "input", "context needs --claude, --codex, or --fragment")
+    elif cmd == "session-start":
+        host = opt("--host")
+        if host not in ("claude", "codex") or [a for a in rest if a not in ("--host", host, f"--host={host}")]:
+            _die(6, "input", "session-start needs --host claude or --host codex, and nothing else")
+        cmd_session_start(host)
+    elif cmd == "hooks":
+        sub = pos[0] if pos else None
+        if sub == "install" and len(pos) == 1 and all(a in ("install", "--claude", "--codex") for a in rest):
+            cmd_hooks_install(flag("--claude"), flag("--codex"))
+        elif sub == "check" and rest == ["check"]:
+            cmd_hooks_check()
+        else:
+            _die(6, "input", "hooks needs install [--claude] [--codex], or check",
+                 "run `capabilities help` for the hooks verbs")
     elif cmd == "build":
         if pos:
             _die(6, "input", f"unknown build argument {pos[0]!r}",
