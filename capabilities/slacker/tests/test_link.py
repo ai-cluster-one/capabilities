@@ -193,6 +193,43 @@ class AwaitsSignInAgainstARealEndpoint(unittest.TestCase):
         self.addCleanup(lambda: setattr(su, "_Cdp", original))
 
 
+class DialsDevToolsAsALocalClient(unittest.TestCase):
+    def _record_dial(self, raises=None):
+        ws = sys.modules["websocket"]
+        calls = []
+
+        def dial(url, **kw):
+            calls.append(kw)
+            if raises:
+                raise raises
+            return object()
+
+        original = getattr(ws, "create_connection", None)
+        ws.create_connection = dial
+        self.addCleanup(lambda: setattr(ws, "create_connection", original))
+        return calls
+
+    def test_the_socket_carries_no_origin_chrome_would_refuse(self):
+        calls = self._record_dial()
+        su._Cdp("ws://127.0.0.1:1/x")
+        self.assertIs(calls[0].get("suppress_origin"), True)
+
+    def test_a_refused_handshake_is_a_refusal_not_a_traceback(self):
+        ws = sys.modules["websocket"]
+
+        class BadStatus(Exception):
+            status_code = 403
+
+        original = getattr(ws, "WebSocketBadStatusException", None)
+        ws.WebSocketBadStatusException = BadStatus
+        self.addCleanup(lambda: setattr(ws, "WebSocketBadStatusException", original))
+        self._record_dial(raises=BadStatus())
+        with self.assertRaises(su._Refusal) as caught:
+            su._Cdp("ws://127.0.0.1:1/x")
+        self.assertEqual(caught.exception.code, "devtools_refused")
+        self.assertIn("paste", (caught.exception.hint or ""))
+
+
 class LinkRefusesCleanly(unittest.TestCase):
     class _Args:
         def __init__(self, **kw):

@@ -6495,8 +6495,17 @@ class _Cdp:
 
     def __init__(self, ws_url: str):
         import websocket
-        self._ws = websocket.create_connection(
-            ws_url, timeout=10, max_size=64 * 1024 * 1024)
+        # Chrome refuses a DevTools socket whose Origin it was not told to
+        # allow; a socket with no Origin is a local client and is accepted.
+        try:
+            self._ws = websocket.create_connection(
+                ws_url, timeout=10, max_size=64 * 1024 * 1024,
+                suppress_origin=True)
+        except websocket.WebSocketBadStatusException as exc:
+            _refuse(5, "devtools_refused",
+                    f"Chrome refused the DevTools connection "
+                    f"(HTTP {getattr(exc, 'status_code', '?')})",
+                    "link by paste (`slacker connection add <id> --stdin`)")
         self._id = 0
 
     def call(self, method: str, **params) -> dict:
@@ -6574,7 +6583,8 @@ def _launch_chrome(chrome: str, profile: Path, url: str) -> tuple:
     import subprocess
     args = [chrome, f"--user-data-dir={profile}", "--remote-debugging-port=0",
             "--no-first-run", "--no-default-browser-check", "--no-service-autorun",
-            "--disable-features=Translate", "--new-window", url]
+            "--disable-features=Translate", "--use-mock-keychain",
+            "--new-window", url]
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     port_file = profile / "DevToolsActivePort"
     deadline = time.monotonic() + 30
