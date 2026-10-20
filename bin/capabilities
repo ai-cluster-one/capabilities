@@ -467,7 +467,7 @@ POLICY VERBS
         which stops a service placed there by it.
 
 PROJECT VERBS (run inside a consuming project)
-  init [--claude] [--codex]
+  init [--claude] [--codex] [--with-layers | --with-template]
         Wire the project: scaffold the durable project identity, the
         manager-owned capabilities/.gitignore, and settings.json only in files
         mode. A new project - no identity, no settings file, no legacy
@@ -492,6 +492,47 @@ PROJECT VERBS (run inside a consuming project)
         envelope and skill setup but skips host wiring: ContextKit owns it.
         A legacy project `.capabilities/` envelope is preflighted and migrated
         into visible `capabilities/`; content conflicts refuse before writes.
+        --with-layers first lays, in the folder init runs in, the body
+        ContextKit's `init --with-layers` lays - .contextkit/config.toml,
+        .contextkit/README.md, .gitignore lines, .env.local and the body
+        layer folders, each written only where missing - and
+        --with-template adds ContextKit's starter context files; the answer
+        adds {body_root, created, changed, skipped}.
+  init --template <id> [--name <name>]
+        Create a new agent in an empty folder (a .git or .DS_Store aside)
+        from one of ContextKit's agent templates, as `contextkit init
+        --template` does: git init, the body --with-layers lays (through the
+        new-agent path above, so it starts in the store and is refused
+        there), the template's files, its icon (.contextkit/icon-<sha>.png)
+        and name - --name, or one the template offers - description and
+        onboarding in the agent row, its capabilities enabled for the
+        project and confirmed through `list`, both hosts wired by `hooks
+        install`, and the first build. Answers {project, created, template,
+        ok, git, identity, onboarding, capabilities [{name, result,
+        effective, detail}], hooks, build}; exits 1 with the agent created
+        when a capability could not be enabled. Exit 6 folder_not_empty,
+        unknown_template, template_invalid.
+  templates [--json]
+        What `contextkit templates --json` answers: {source, starter [{path,
+        title, description}], agents [{id, name, description, icon,
+        capabilities, routines, onboarding, agent_names, path}]}. Templates
+        are read where ContextKit reads them: the folder
+        CONTEXTKIT_TEMPLATES_DIR names, beside the `contextkit` on PATH (its
+        install or checkout), then ~/.contextkit/templates; exit 6
+        templates_not_found when none is there.
+  identity set [--name <n>] [--description <d>] [--icon <png>] [--project <dir>]
+        In a ContextKit-bound project, write the agent's name, description or
+        icon to its row as `agent set` does, checked as ContextKit checks
+        them (one line; name 120, description 500 characters; a square PNG of
+        64-1024 pixels, kept as .contextkit/icon-<sha>.png, other such icons
+        removed).
+  bootstrap [--target claude|codex]... [--yes]
+        Bind the project as `contextkit bootstrap` does: a Git repository
+        (where the folder holds files and none, a checkpoint commit of them
+        first, which needs --yes), `init --with-layers`, `hooks install` for
+        each target (both by default) and the build. Answers {project,
+        targets, git, init, hooks, build}; ContextKit's doctor and audit are
+        not run.
   relabel <slug>
         Give this project a new label, keeping its id: the label lives in the
         project identity, and that file is the one write. Records are not
@@ -7016,24 +7057,30 @@ def cmd_agent(args: list[str]) -> None:
             _die(6, "input", "agent set needs at least one of --name, --description, "
                  "--icon, --no-icon, --onboarding-status, --onboarding-routine")
 
-        def write(conn, agent_id):
-            created = _ensure_agent_row(conn, agent_id)
-            columns = list(values)
-            assignments = ", ".join(f"{c} = %s" for c in columns)
-            cur = conn.execute(
-                f"UPDATE capabilities_agents SET {assignments}, updated_at = now() "
-                f"WHERE id = %s AND ({', '.join(columns)}) IS DISTINCT FROM "
-                f"({', '.join(['%s'] * len(columns))})",
-                (*values.values(), agent_id, *values.values()))
-            return agent_id, created, cur.rowcount == 1, _agent_row(conn, agent_id)
-
-        (agent_id, created, changed, agent), setting = _kernel_run(root, write)
-        _emit({"ok": True, "project": str(root), "agent_id": agent_id,
-               "created": created, "changed": created or changed, "agent": agent,
-               "store": _kernel_store_report(setting)})
+        _emit(_agent_set(root, values))
     else:
         _die(6, "input", "agent needs a subcommand: show or set",
              "run `capabilities help`")
+
+
+def _agent_set(root: Path, values: dict) -> dict:
+    """Write `values` (column: value) to this project's agent row, registering it
+    first where it is not yet registered, and answer what `agent set` answers."""
+    def write(conn, agent_id):
+        created = _ensure_agent_row(conn, agent_id)
+        columns = list(values)
+        assignments = ", ".join(f"{c} = %s" for c in columns)
+        cur = conn.execute(
+            f"UPDATE capabilities_agents SET {assignments}, updated_at = now() "
+            f"WHERE id = %s AND ({', '.join(columns)}) IS DISTINCT FROM "
+            f"({', '.join(['%s'] * len(columns))})",
+            (*values.values(), agent_id, *values.values()))
+        return agent_id, created, cur.rowcount == 1, _agent_row(conn, agent_id)
+
+    (agent_id, created, changed, agent), setting = _kernel_run(root, write)
+    return {"ok": True, "project": str(root), "agent_id": agent_id,
+            "created": created, "changed": created or changed, "agent": agent,
+            "store": _kernel_store_report(setting)}
 
 
 def _node_rows(conn, agent_id: str, node: str | None = None) -> list[dict]:
@@ -13122,6 +13169,11 @@ def cmd_hooks_install(claude: bool, codex: bool) -> None:
             _die(6, "no_host_wired",
                  f"{root} has no SessionStart hook for Claude or Codex to take over",
                  "name the host: `capabilities hooks install --claude` or `--codex`")
+    _emit(_hooks_install(root, hosts))
+
+
+def _hooks_install(root: Path, hosts: list[str]) -> dict:
+    """Wire `hosts` ("codex", "claude") to `capabilities session-start` and build."""
     # Every host file is read and planned before any of them is written.
     if "codex" in hosts:
         try:
@@ -13144,7 +13196,7 @@ def cmd_hooks_install(claude: bool, codex: bool) -> None:
     # is complete only once the context and its host links exist.
     text, warnings, binding = _ck_compose(root)
     result["build"] = _ck_write(root, text, warnings, binding)
-    _emit(result)
+    return result
 
 
 def _hooks_program(root: Path, runs: str | None) -> dict:
@@ -13331,15 +13383,34 @@ def _wire_claude_hook(root: Path) -> bool:
     return True
 
 
-def cmd_init(claude: bool, codex: bool) -> None:
-    # init ESTABLISHES the project root: an existing root wins, else cwd.
+def cmd_init(claude: bool, codex: bool, layers: bool = False, starter: bool = False) -> None:
+    _emit(_init(claude, codex, layers, starter))
+
+
+def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False) -> dict:
+    """What `init` does, answered rather than printed. With `layers` or
+    `starter` it first lays the body ContextKit's `init --with-layers` /
+    `--with-template` lays, in the folder it runs in."""
+    # init ESTABLISHES the project root: an existing root wins, else cwd. A body
+    # is laid where it is asked for, as ContextKit lays it: in the folder itself.
     global _CONTEXT_WITHOUT_STORE
     _CONTEXT_WITHOUT_STORE = True
-    root = _project_root() or Path.cwd().resolve()
+    with_body = layers or starter
+    root = Path.cwd().resolve() if with_body else (_project_root() or Path.cwd().resolve())
     new_agent = _new_agent_project(root)
     if new_agent:
         _preflight_new_agent(root)
+    body: dict = {}
+    if with_body:
+        body = {"created": [], "changed": [], "skipped": []}
+        _ck_write_if_missing(root / CONTEXTKIT_CONFIG_REL, CK_CONFIG_BODY, body)
+        # The binding now names where the envelope lives.
+        _ENVELOPE_HOME.pop(root, None)
+        identity_file = _envelope_home(root) / PROJECT_IDENTITY_REL
+        had_identity = identity_file.exists()
     migrated = _ensure_envelope(root, new_agent=new_agent)
+    if with_body and not had_identity and identity_file.exists():
+        body["created"].append(str(identity_file))
     registration = _register_agent_on_init(root, new_agent=new_agent)
     if new_agent and not registration.get("migrated"):
         # Its identity was written by this init alone: removing it leaves the
@@ -13377,6 +13448,8 @@ def cmd_init(claude: bool, codex: bool) -> None:
     result: dict = {"project": str(root),
                     "gate": gate,
                     "agent": registration}
+    if with_body:
+        result.update(_ck_lay_body(root, starter, body))
     if migrated:
         result["migrated_from"] = str(root / LEGACY_PROJECT_CAPABILITIES_REL)
         result["migrated_entries"] = migrated
@@ -13389,8 +13462,7 @@ def cmd_init(claude: bool, codex: bool) -> None:
         if retired:
             result["retired_capabilities_wiring"] = retired
         _sync_skill(force_claude=claude, force_codex=codex)
-        _emit(result)
-        return
+        return result
     # Refuse an unreadable host settings file before either host is touched.
     if claude:
         _read_host_settings(root / ".claude" / "settings.json")
@@ -13407,7 +13479,600 @@ def cmd_init(claude: bool, codex: bool) -> None:
             result["codex_migration_findings"] = migration["findings"]
         result["codex"] = _wire_codex(root)
     _sync_skill(force_claude=claude, force_codex=codex)
+    return result
+
+
+# ---------------------------------------------------------------- agent creation: ContextKit's body and agent templates
+
+# `init --with-layers` and `--with-template` lay the body ContextKit's `init`
+# lays, `init --template` creates a new agent from one of ContextKit's agent
+# templates, and `identity set` and `bootstrap` carry the rest of the way
+# AgentKit creates an empty agent. The templates are ContextKit's and are read
+# where ContextKit reads them; the files, their text and the template format
+# below are ContextKit's, carried so an agent made here reads as one it made.
+# The agent itself goes through `init`'s new-agent path, so it starts in the
+# store and is refused where that path refuses it.
+CK_TEMPLATES_ENV = "CONTEXTKIT_TEMPLATES_DIR"
+CK_README_REL = Path(".contextkit") / "README.md"
+CK_AGENT_TEMPLATE_MANIFEST = "template.toml"
+CK_AGENT_TEMPLATE_LAYERS = ("context", "assets", "routines")
+CK_AGENT_TEMPLATE_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
+CK_CAPABILITY_NAME = re.compile(r"[a-z][a-z0-9-]*")
+# Entries that leave a folder empty for a new agent: a Finder marker and a repository.
+CK_EMPTY_FOLDER_IGNORED = (".DS_Store", ".git")
+CK_IDENTITY_LIMITS = {"name": 120, "description": 500}
+CK_ICON_MAX_BYTES = 1024 * 1024
+CK_ICON_MIN_PX, CK_ICON_MAX_PX = 64, 1024
+CK_GITIGNORE_LINES = (".env", ".env.local", ".env.*.local", ".contextkit/generated/",
+                      ".contextkit.md", ".claude/rules/CONTEXT.md", "__pycache__/", "*.pyc",
+                      ".DS_Store")
+CK_CONFIG_BODY = """\
+version = 1
+type = "agent-project"
+
+[body]
+# Visible folder that holds the agent body. Use `.` to keep the layers at
+# the project root, or a folder name to collapse them into one home.
+# root = "agent"
+
+[sources]
+# Optional shared doctrine outside this project:
+# global_context = "~/contextkit-global"
+
+[output]
+# Generated context file every host reads through its own link.
+context = ".contextkit/generated/context.md"
+"""
+CK_ENV_LOCAL_BODY = """# Local machine-only environment for this agent project.
+# Keep secrets and machine-local overrides here. This file is ignored by git.
+#
+# Examples:
+# CAPABILITIES_HOME=/Users/you/.capabilities
+# CONTEXTKIT_ENV=local
+"""
+
+
+def _ck_binding_readme(layers: dict) -> str:
+    return f"""# ContextKit Binding
+
+This repository is managed by ContextKit, a local manager for agent project structure and runtime context.
+
+The agent body stays in this repository: live context, supporting assets,
+repeatable routines, and capability envelopes. ContextKit owns the shape,
+compiler, templates, host bindings, guides, and audit tooling that turn that
+body into Codex and Claude runtime context.
+
+Common commands:
+
+- `contextkit bootstrap`
+- `contextkit init --with-layers`
+- `contextkit init --with-template`
+- `contextkit build --target codex`
+- `contextkit build --target claude`
+- `contextkit build --target all`
+- `contextkit doctor`
+- `contextkit audit`
+- `contextkit guide authoring`
+- `contextkit guide global-context`
+
+Add durable project context under `{layers['context']}/`. Configure optional cross-project doctrine with `sources.global_context`. Put historical or supporting material under `{layers['assets']}/`. Put repeatable procedures under `{layers['routines']}/`. Put installed tool envelopes under `{layers['capabilities']}/`.
+
+Run `contextkit doctor` for the resolved body layout.
+"""
+
+
+def _ck_write_if_missing(path: Path, text: str, report: dict) -> None:
+    if path.exists():
+        report["skipped"].append(str(path))
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    report["created"].append(str(path))
+
+
+def _ck_layer_paths(root: Path) -> dict:
+    """Each body layer as the project-relative path ContextKit's config names."""
+    return {name: _ck_rel(root, path) for name, path in _project_body(root)["layers"].items()}
+
+
+def _ck_lay_body(root: Path, starter: bool, report: dict) -> dict:
+    """The rest of ContextKit's `init --with-layers` (and, with `starter`,
+    `--with-template`) once the binding config is in place."""
+    layers = _ck_layer_paths(root)
+    _ck_write_if_missing(root / CK_README_REL, _ck_binding_readme(layers), report)
+    gitignore = root / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text("# ContextKit local and generated files\n"
+                             + "\n".join(CK_GITIGNORE_LINES) + "\n")
+        report["created"].append(str(gitignore))
+    else:
+        text = gitignore.read_text()
+        present = {line.strip() for line in text.splitlines()
+                   if line.strip() and not line.strip().startswith("#")}
+        missing = [line for line in CK_GITIGNORE_LINES if line not in present]
+        if missing:
+            gitignore.write_text(text.rstrip("\n") + "\n\n# ContextKit local and generated files\n"
+                                 + "\n".join(missing) + "\n")
+            report["changed"].append(str(gitignore))
+    _ck_write_if_missing(root / ".env.local", CK_ENV_LOCAL_BODY, report)
+    assets = Path(layers["assets"])
+    for rel in ((Path(".contextkit") / "audits").as_posix(), layers["context"],
+                (assets / "sessions").as_posix(), (assets / "plans").as_posix(),
+                (assets / "research").as_posix(), layers["routines"], layers["capabilities"]):
+        path = root / rel
+        if path.exists():
+            report["skipped"].append(str(path))
+        else:
+            path.mkdir(parents=True, exist_ok=True)
+            report["created"].append(str(path))
+    if starter:
+        base = _ck_template_root() / "context"
+        for source in _ck_starter_files():
+            _ck_write_if_missing(root / layers["context"] / source.relative_to(base),
+                                 source.read_text(), report)
+    return {"body_root": _project_body(root)["body_root"].as_posix(), **report}
+
+
+def _ck_template_candidates() -> list[Path]:
+    """Where ContextKit looks for its templates, in its order: the folder
+    CONTEXTKIT_TEMPLATES_DIR names, beside the installed `contextkit` (its
+    install or its checkout), then ~/.contextkit/templates."""
+    candidates: list[Path] = []
+    named = os.environ.get(CK_TEMPLATES_ENV)
+    if named:
+        candidates.append(Path(named).expanduser())
+    program = shutil.which("contextkit")
+    if program:
+        script = Path(program).resolve()
+        candidates += [script.parent.parent / "templates", script.parent / "templates"]
+    candidates.append(Path.home() / ".contextkit" / "templates")
+    out: list[Path] = []
+    for candidate in candidates:
+        if candidate not in out:
+            out.append(candidate)
+    return out
+
+
+def _ck_template_root() -> Path:
+    for candidate in _ck_template_candidates():
+        if candidate.is_dir():
+            return candidate
+    _die(6, "templates_not_found",
+         "ContextKit's templates were not found; searched: "
+         + ", ".join(str(path) for path in _ck_template_candidates()),
+         f"set {CK_TEMPLATES_ENV}, or install ContextKit")
+
+
+def _ck_starter_files() -> list[Path]:
+    base = _ck_template_root() / "context"
+    return sorted(path for path in base.rglob("*.md") if path.is_file()) if base.is_dir() else []
+
+
+def _ck_identity_text(value, owner: str, limit: int, code: str = "input") -> str:
+    """A trimmed one-line display value within `limit`, or the refusal."""
+    if not isinstance(value, str) or not value.strip():
+        _die(6, code, f"invalid {owner}: expected a non-empty string")
+    if "\n" in value or "\r" in value:
+        _die(6, code, f"invalid {owner}: expected one line",
+             "display names and descriptions are single-line")
+    if len(value.strip()) > limit:
+        _die(6, code, f"invalid {owner}: keep it within {limit} characters")
+    return value.strip()
+
+
+def _ck_written_identity_text(key: str, value: str, flag_name: str) -> str:
+    import unicodedata
+    text = _ck_identity_text(value, flag_name, CK_IDENTITY_LIMITS[key])
+    for char in value:
+        if unicodedata.category(char) in {"Cc", "Zl", "Zp"}:
+            _die(6, "input", f"invalid {flag_name}: contains control or line-separator "
+                 f"character U+{ord(char):04X}", "display names and descriptions are single-line")
+    return text
+
+
+def _ck_agent_template_dirs() -> dict:
+    base = _ck_template_root() / "agents"
+    if not base.is_dir():
+        return {}
+    return {path.name: path for path in sorted(base.iterdir())
+            if path.is_dir() and (path / CK_AGENT_TEMPLATE_MANIFEST).is_file()}
+
+
+def _ck_agent_template(path: Path) -> dict:
+    """One agent template, read and checked as ContextKit checks it."""
+    import tomllib
+    manifest = path / CK_AGENT_TEMPLATE_MANIFEST
+    owner = f"agent template {manifest}"
+
+    def invalid(detail: str) -> NoReturn:
+        _die(6, "template_invalid", f"invalid {owner}: {detail}",
+             "run `contextkit guide bootstrap` for the agent template format")
+
+    try:
+        raw = tomllib.loads(manifest.read_text())
+    except (OSError, ValueError) as exc:
+        invalid(f"cannot be read: {exc}")
+    template_id = raw.get("id")
+    if not isinstance(template_id, str) or not CK_AGENT_TEMPLATE_ID.fullmatch(template_id) \
+            or template_id != path.name:
+        invalid("`id` must be lowercase letters, digits, and hyphens, and equal the template folder name")
+    name = _ck_identity_text(raw.get("name"), f"{owner}: name", CK_IDENTITY_LIMITS["name"],
+                             "template_invalid")
+    description = _ck_identity_text(raw.get("description"), f"{owner}: description",
+                                    CK_IDENTITY_LIMITS["description"], "template_invalid")
+    icon_rel = raw.get("icon")
+    if not isinstance(icon_rel, str) or Path(icon_rel).is_absolute() or ".." in Path(icon_rel).parts \
+            or Path(icon_rel).suffix.lower() != ".png" or not (path / icon_rel).is_file():
+        invalid("`icon` must name a PNG file inside the template folder")
+    capabilities = raw.get("capabilities", [])
+    if not isinstance(capabilities, list) or len(set(map(str, capabilities))) != len(capabilities) \
+            or not all(isinstance(item, str) and CK_CAPABILITY_NAME.fullmatch(item)
+                       for item in capabilities):
+        invalid("`capabilities` must be a list of distinct capability names")
+    agent_names = raw.get("agent_names")
+    if not isinstance(agent_names, list) or not agent_names:
+        invalid("`agent_names` must be a non-empty list of names")
+    agent_names = [_ck_identity_text(item, f"{owner}: agent_names", CK_IDENTITY_LIMITS["name"],
+                                     "template_invalid") for item in agent_names]
+    files: list[str] = []
+    for file in sorted(path.rglob("*")):
+        rel = file.relative_to(path)
+        if not file.is_file() or any(part.startswith(".") for part in rel.parts):
+            continue
+        if rel.as_posix() in {CK_AGENT_TEMPLATE_MANIFEST, Path(icon_rel).as_posix()}:
+            continue
+        if len(rel.parts) < 2 or rel.parts[0] not in CK_AGENT_TEMPLATE_LAYERS:
+            invalid(f"`{rel.as_posix()}` is outside the body layers a template carries "
+                    f"({', '.join(CK_AGENT_TEMPLATE_LAYERS)})")
+        files.append(rel.as_posix())
+    routines: list[dict] = []
+    for rel in files:
+        if not rel.startswith("routines/") or not rel.endswith(".md"):
+            continue
+        try:
+            fm, _body = _ck_frontmatter((path / rel).read_text())
+        except OSError:
+            fm = {}
+        routine_name = fm.get("name", "").strip()
+        routine_description = fm.get("description", "").strip()
+        if routine_name != Path(rel).stem or not routine_description:
+            invalid(f"routine `{rel}` needs front matter `name` equal to its file stem and a `description`")
+        title = _ck_one_line(fm.get("title", "").strip())
+        routines.append({"name": routine_name, "title": title or routine_name,
+                         "description": _ck_one_line(routine_description)})
+    onboarding = raw.get("onboarding")
+    if onboarding is not None:
+        routine = onboarding.get("routine") if isinstance(onboarding, dict) else None
+        if routine not in {item["name"] for item in routines}:
+            invalid("`[onboarding] routine` must name a routine the template carries")
+        onboarding = {"routine": routine}
+    return {"id": template_id, "name": name, "description": description,
+            "icon": str(path / icon_rel), "capabilities": capabilities, "routines": routines,
+            "onboarding": onboarding, "agent_names": agent_names, "path": str(path),
+            "files": files}
+
+
+def cmd_templates() -> None:
+    """What `contextkit templates --json` answers: the starter context files
+    and the agent templates, from where ContextKit reads them."""
+    root = _ck_template_root()
+    starter = []
+    for path in _ck_starter_files():
+        fm, _body = _ck_frontmatter(path.read_text())
+        starter.append({"path": path.relative_to(root).as_posix(),
+                        "title": fm.get("title", path.stem),
+                        "description": fm.get("description", "").strip()})
+    agents = [_ck_agent_template(path) for path in _ck_agent_template_dirs().values()]
+    _emit({"source": str(root), "starter": starter,
+           "agents": [{key: item[key] for key in (
+               "id", "name", "description", "icon", "capabilities", "routines", "onboarding",
+               "agent_names", "path")} for item in agents]})
+
+
+def _ck_stage_icon(root: Path, source: str) -> tuple[Path, bytes]:
+    """Copy a square PNG into the binding folder under its content's name."""
+    origin = Path(source).expanduser()
+    if not origin.is_file():
+        _die(6, "input", f"icon file not found: {source}")
+    data = origin.read_bytes()
+    if not data:
+        _die(6, "input", f"icon file is empty: {source}")
+    if len(data) > CK_ICON_MAX_BYTES:
+        _die(6, "input", f"icon file is larger than {CK_ICON_MAX_BYTES // 1024} KiB: {source}")
+    if not data.startswith(PNG_SIGNATURE) or data[12:16] != b"IHDR" or len(data) < 24:
+        _die(6, "input", f"unsupported icon format: {source}", "the icon is a PNG image")
+    width, height = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if width != height or not CK_ICON_MIN_PX <= width <= CK_ICON_MAX_PX:
+        _die(6, "input", f"unsupported icon size {width}x{height}: {source}",
+             f"the icon is square, {CK_ICON_MIN_PX} to {CK_ICON_MAX_PX} pixels per side")
+    destination = root / CONTEXTKIT_CONFIG_REL.parent / \
+        f"icon-{hashlib.sha256(data).hexdigest()[:12]}.png"
+    if not destination.is_file():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+    return destination, data
+
+
+def _ck_git(root: Path, *args: str) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(["git", *args], cwd=root, text=True, capture_output=True,
+                              timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _die(6, "git_failed", f"git {args[0]} failed in {root}: {exc}")
+
+
+def _ck_prepare_git(root: Path, yes: bool) -> dict:
+    """ContextKit's git step: a repository, and where the folder already holds
+    files and none, a checkpoint commit of them first (with `yes`)."""
+    if (root / ".git").exists():
+        return {"present": True, "initialized": False, "path": str(root / ".git"),
+                "checkpoint": {"required": False, "created": False}}
+    try:
+        files = [child for child in root.iterdir() if child.name not in CK_EMPTY_FOLDER_IGNORED]
+    except OSError:
+        files = [root]
+    if files and not yes:
+        _die(6, "checkpoint_unconfirmed",
+             f"{root} holds files and no Git repository; bootstrap commits them as a "
+             "checkpoint (git init, git add -A, git commit) before it changes them",
+             "rerun with --yes to create the checkpoint")
+    proc = _ck_git(root, "init")
+    if proc.returncode != 0:
+        _die(6, "git_failed", f"git init failed in {root}: {(proc.stderr or proc.stdout).strip()}")
+    git = {"present": True, "initialized": True, "path": str(root / ".git"),
+           "checkpoint": {"required": False, "created": False, "reason": "empty directory"}}
+    if not files:
+        return git
+    exclude = root / ".git" / "info" / "exclude"
+    text = exclude.read_text() if exclude.is_file() else ""
+    present = {line.strip() for line in text.splitlines()
+               if line.strip() and not line.strip().startswith("#")}
+    missing = [line for line in CK_GITIGNORE_LINES if line not in present]
+    if missing:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text(text.rstrip("\n") + "\n# ContextKit local and generated files\n"
+                           + "\n".join(missing) + "\n")
+    message = "ContextKit pre-bootstrap checkpoint"
+    if _ck_git(root, "add", "-A").returncode != 0:
+        _die(6, "git_failed", f"pre-bootstrap git add failed in {root}")
+    staged = _ck_git(root, "diff", "--cached", "--quiet")
+    if staged.returncode == 0:
+        git["checkpoint"] = {"required": True, "created": False,
+                             "reason": "no tracked files after git add"}
+        return git
+    named = all(_ck_git(root, "config", "--get", key).stdout.strip()
+                for key in ("user.name", "user.email"))
+    identity = [] if named else ["-c", "user.name=ContextKit", "-c", "user.email=contextkit@local"]
+    commit = _ck_git(root, *identity, "commit", "-m", message)
+    if commit.returncode != 0:
+        _die(6, "git_failed", f"pre-bootstrap checkpoint commit failed in {root}: "
+             f"{(commit.stderr or commit.stdout).strip()}")
+    rev = _ck_git(root, "rev-parse", "--short", "HEAD")
+    git["checkpoint"] = {"required": True, "created": True, "message": message,
+                         "commit": rev.stdout.strip() if rev.returncode == 0 else ""}
+    return git
+
+
+def _ck_manager_message(proc: subprocess.CompletedProcess) -> str:
+    for stream in (proc.stderr, proc.stdout):
+        for line in reversed((stream or "").splitlines()):
+            try:
+                message = json.loads(line)["error"]["message"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            if isinstance(message, str) and message.strip():
+                return _ck_one_line(message)
+    return _ck_one_line(proc.stderr or proc.stdout)[:300] or f"exited {proc.returncode}"
+
+
+def _ck_enable_capabilities(root: Path, names: list[str]) -> list[dict]:
+    """Enable each capability for the project as `capabilities enable --project`
+    does, then count it enabled only where `capabilities list` reports it
+    effective here, so one missing or quarantined on this machine is reported
+    failed with the reason."""
+    if not names:
+        return []
+    me = [sys.executable, str(Path(__file__).resolve())]
+    env = {**os.environ, "CLAUDE_PROJECT_DIR": str(root)}
+
+    def run(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([*me, *args], cwd=root, env=env, text=True,
+                              capture_output=True, timeout=120)
+
+    errors: dict = {}
+    for name in names:
+        try:
+            proc = run("enable", name, "--project")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors[name] = f"the manager could not run: {_ck_one_line(str(exc))}"
+            continue
+        if proc.returncode != 0:
+            errors[name] = _ck_manager_message(proc)
+    rows: dict = {}
+    listing_error = None
+    try:
+        proc = run("list", "--json")
+        if proc.returncode != 0:
+            listing_error = _ck_manager_message(proc)
+        else:
+            rows = {row["name"]: row for row in json.loads(proc.stdout).get("installed", [])
+                    if isinstance(row, dict) and isinstance(row.get("name"), str)}
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError) as exc:
+        listing_error = _ck_one_line(str(exc))
+    results = []
+    for name in names:
+        row = rows.get(name)
+        effective = row.get("effective") if row else None
+        if name in errors:
+            detail = errors[name]
+        elif listing_error is not None:
+            detail = f"could not confirm through `capabilities list`: {listing_error}"
+        elif row is None:
+            detail = f"not installed on this machine; install it with `capabilities install {name}`"
+        elif effective != "enabled":
+            detail = (f"policy written, but the capability is {effective} here "
+                      f"(decided by {row.get('source')})")
+            if row.get("machine") == "quarantined":
+                detail += (f"; it is quarantined on this machine until the user allows it "
+                           f"with `capabilities allow {name}`")
+        else:
+            detail = None
+        results.append({"name": name, "result": "failed" if detail else "enabled",
+                        "effective": effective, "detail": detail})
+    return results
+
+
+def cmd_init_template(template_id: str, name: str | None) -> None:
+    """Create a new agent in the empty folder this runs in from one of
+    ContextKit's agent templates, named `name` or one the template offers."""
+    root = Path.cwd().resolve()
+    templates = _ck_agent_template_dirs()
+    if template_id not in templates:
+        _die(6, "unknown_template", f"unknown agent template: {template_id}; available: "
+             + (", ".join(templates) or "none"), "run `capabilities templates` to see them")
+    template = _ck_agent_template(templates[template_id])
+    if name is not None:
+        name = _ck_written_identity_text("name", name, "--name")
+    present = sorted(entry.name for entry in root.iterdir()
+                     if entry.name not in CK_EMPTY_FOLDER_IGNORED)
+    if present:
+        _die(6, "folder_not_empty",
+             f"`init --template` creates a new agent and needs an empty folder; {root} holds: "
+             + ", ".join(present[:5]) + (", ..." if len(present) > 5 else ""),
+             "nothing was changed; choose an empty folder, or bind an existing project "
+             "with `capabilities bootstrap`")
+    # The agent starts in the store: refuse it before the repository is made.
+    _preflight_new_agent(root)
+    git = _ck_prepare_git(root, yes=True)
+    result = _init(claude=True, codex=False, layers=True)
+    layers = _ck_layer_paths(root)
+    base = Path(template["path"])
+    for rel in template["files"]:
+        layer, *rest = Path(rel).parts
+        destination = root / layers[layer] / Path(*rest)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((base / rel).read_bytes())
+        result["created"].append(str(destination))
+    icon, data = _ck_stage_icon(root, template["icon"])
+    result["created"].append(str(icon))
+    if name is None:
+        name = secrets.choice(template["agent_names"])
+    values = {"name": name, "description": template["description"], "icon": data,
+              "icon_sha": hashlib.sha256(data).hexdigest()}
+    if template["onboarding"]:
+        values.update(onboarding_status="pending",
+                      onboarding_routine=template["onboarding"]["routine"])
+    row = _agent_set(root, values)["agent"] or {}
+    capabilities = _ck_enable_capabilities(root, template["capabilities"])
+    # A Claude or Codex session in the new agent's folder loads its context only through these bindings.
+    hooks = _hooks_install(root, ["codex", "claude"])
+    build = hooks.pop("build")
+    failed = [item for item in capabilities if item["result"] != "enabled"]
+    result.update({
+        "template": template_id, "ok": not failed, "git": git,
+        "identity": {"id": row.get("id"), "name": row.get("name"),
+                     "description": row.get("description"), "icon": str(icon)},
+        "onboarding": {"status": row.get("onboarding_status") or "none",
+                       "routine": row.get("onboarding_routine")},
+        "capabilities": capabilities, "hooks": hooks, "build": build})
     _emit(result)
+    if failed:
+        sys.stderr.write(
+            "The agent body is in place, but these capabilities are not enabled for it:\n"
+            + "".join(f"- {item['name']}: {item['detail']}\n" for item in failed)
+            + "Repair them with `capabilities install` or `capabilities allow`, then run "
+            "`capabilities build`.\n")
+        sys.exit(1)
+
+
+def cmd_identity_set(args: list[str]) -> None:
+    """Set the agent's name, description or icon in its registry row, the
+    icon kept beside the binding config under its content's name."""
+    _read_only_gate("identity set")
+    pos, opts = _kernel_options(args, {"--name", "--description", "--icon", "--project"},
+                                {"--json"}, "identity set")
+    if pos:
+        _die(6, "input", "identity set takes no positional argument")
+    if "--project" in opts:
+        root = Path(opts["--project"]).expanduser().resolve()
+        if not root.is_dir():
+            _die(6, "input", f"project directory not found: {opts['--project']}")
+    else:
+        root = _require_project().resolve()
+    if not _contextkit_managed(root):
+        _die(6, "not_contextkit_bound",
+             f"{root} has no ContextKit binding ({CONTEXTKIT_CONFIG_REL.as_posix()})",
+             "run `capabilities init --with-template` first, or use `capabilities agent set`")
+    values: dict = {}
+    for key in ("name", "description"):
+        if f"--{key}" in opts:
+            values[key] = _ck_written_identity_text(key, opts[f"--{key}"], f"--{key}")
+    icon = None
+    if "--icon" in opts:
+        icon, data = _ck_stage_icon(root, opts["--icon"])
+        values.update(icon=data, icon_sha=hashlib.sha256(data).hexdigest())
+    if not values:
+        _die(6, "input", "nothing to set: pass --name, --description, or --icon")
+    answer = _agent_set(root, values)
+    removed = []
+    if icon is not None:
+        for path in sorted(icon.parent.glob("icon-*.png")):
+            if path != icon and re.fullmatch(r"icon-[0-9a-f]{12}\.png", path.name):
+                path.unlink()
+                removed.append(_ck_rel(root, path))
+    row = answer["agent"] or {}
+    _emit({"project": str(root), "config": str(root / CONTEXTKIT_CONFIG_REL),
+           "id": answer["agent_id"], "name": row.get("name"),
+           "description": row.get("description"),
+           "icon": str(icon) if icon is not None else None,
+           "changed": answer["changed"], "removed": removed, "store": answer["store"]})
+
+
+def cmd_bootstrap(args: list[str]) -> None:
+    """ContextKit's bootstrap of a folder: its repository (a checkpoint commit
+    of files already there, with --yes), the body `init --with-layers` lays,
+    the host hooks `hooks install` wires for each --target, and the build."""
+    targets: list[str] = []
+    i, yes = 0, False
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--target", "--target=") or arg.startswith("--target="):
+            value = arg.partition("=")[2]
+            if not value:
+                if i + 1 >= len(args):
+                    _die(6, "input", "--target needs a value")
+                i, value = i + 1, args[i + 1]
+            if value not in ("claude", "codex"):
+                _die(6, "input", f"--target {value!r} is not claude or codex")
+            if value not in targets:
+                targets.append(value)
+        elif arg == "--yes":
+            yes = True
+        elif arg != "--json":
+            _die(6, "input", f"`capabilities bootstrap` does not take {arg}",
+                 "run `capabilities help` for the bootstrap verb")
+        i += 1
+    targets = targets or ["codex", "claude"]
+    root = (_project_root() or Path.cwd()).resolve()
+    # Every host file is read before anything is written.
+    if "codex" in targets:
+        try:
+            plan = _ck_planned_codex_config(root / CODEX_CONFIG_REL)
+        except ValueError as exc:
+            _die(6, "codex_config_invalid", str(exc), "repair .codex/config.toml, then rerun")
+        if plan["blocked"]:
+            _die(6, "codex_config_blocked", plan["blocked"])
+        _hooks_host_file(root / CODEX_HOOKS_REL, "Codex hooks")
+    if "claude" in targets:
+        _hooks_host_file(root / ".claude" / "settings.json", "Claude settings")
+    git = _ck_prepare_git(root, yes)
+    os.chdir(root)
+    init = _init(claude="claude" in targets, codex="codex" in targets, layers=True)
+    hooks = _hooks_install(root, targets)
+    build = hooks.pop("build")
+    _emit({"project": str(root), "targets": targets, "git": git, "init": init,
+           "hooks": hooks, "build": build})
+
 
 # ---------------------------------------------------------------- skill
 
@@ -16816,7 +17481,31 @@ def main() -> None:
         scope = _gate_scope(flag("--project"), flag("--global"))
         _inherit_gate(pos[0], scope, node=opt("--node"))
     elif cmd == "init":
-        cmd_init(flag("--claude"), flag("--codex"))
+        template = opt("--template")
+        name = opt("--name")
+        layers, starter = flag("--with-layers"), flag("--with-template")
+        if template is not None:
+            if flag("--claude") or flag("--codex") or layers or starter:
+                _die(6, "input", "init --template takes only --name and --json: it wires "
+                     "both hosts itself")
+            cmd_init_template(template, name)
+        elif name is not None:
+            _die(6, "input", "--name applies only to `init --template`, which names the new agent",
+                 "set an existing agent's name with `capabilities identity set --name`")
+        else:
+            cmd_init(flag("--claude"), flag("--codex"), layers, starter)
+    elif cmd == "templates":
+        if pos:
+            _die(6, "input", f"unknown templates argument {pos[0]!r}")
+        cmd_templates()
+    elif cmd == "identity":
+        if not rest or rest[0] != "set":
+            _die(6, "input", "identity needs a subcommand: set",
+                 "run `capabilities help`; `capabilities agent show` reads the identity")
+        cmd_identity_set(rest[1:])
+    elif cmd == "bootstrap":
+        _read_only_gate("bootstrap")
+        cmd_bootstrap(rest)
     elif cmd == "agent":
         cmd_agent(rest)
     elif cmd == "node":

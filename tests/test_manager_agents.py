@@ -349,3 +349,135 @@ def test_writes_are_refused_under_the_read_only_switch(lab):
     result = lab.run("node", "list", CAPABILITIES_READ_ONLY="1")
     assert result.returncode == 0, result.stderr
     assert [n["node"] for n in json.loads(result.stdout)["nodes"]] == ["x"]
+
+
+# --- agent creation from ContextKit's templates --------------------------------
+
+def _square_png(side: int = 64) -> bytes:
+    import struct
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    rows = b"".join(b"\x00" + b"\x10\x20\x30" * side for _ in range(side))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+AGENT_MD = "---\ntitle: Agent\ndescription: Who the agent is.\nload: inline\norder: 2\n---\n\n# Agent\n"
+
+
+def _templates(tmp_path: Path) -> Path:
+    """A ContextKit templates folder: one starter context file and one agent template."""
+    root = tmp_path / "templates"
+    (root / "context" / "identity").mkdir(parents=True)
+    (root / "context" / "identity" / "MISSION.md").write_text(
+        "---\ntitle: Mission\ndescription: What the agent is for.\nload: inline\norder: 1\n---\n\n"
+        "# Mission\n")
+    agent = root / "agents" / "demo"
+    (agent / "context" / "identity").mkdir(parents=True)
+    (agent / "routines").mkdir()
+    (agent / "template.toml").write_text(
+        'id = "demo"\nname = "Demo"\ndescription = "A demo agent."\nicon = "icon.png"\n'
+        'capabilities = ["absent-cap"]\nagent_names = ["Ada"]\n\n[onboarding]\nroutine = "onboarding"\n')
+    (agent / "icon.png").write_bytes(_square_png())
+    (agent / "context" / "identity" / "AGENT.md").write_text(AGENT_MD)
+    (agent / "routines" / "onboarding.md").write_text(
+        "---\nname: onboarding\ndescription: Get to know the owner.\n---\n\n# Onboarding\n")
+    return root
+
+
+class Creation:
+    """A new, empty agent folder in the lab's store, with the global records moved."""
+
+    def __init__(self, lab: Lab, tmp_path: Path):
+        self.lab = lab
+        self.folder = tmp_path / "agent"
+        self.folder.mkdir()
+        self.extra = {"AGENT_NODE_NAME": "lab-node", "CLAUDE_PROJECT_DIR": str(self.folder),
+                      "CONTEXTKIT_TEMPLATES_DIR": str(_templates(tmp_path)),
+                      "AGENTKIT_DB_URL": lab.cluster.url(lab.database),
+                      "AGENTKIT_DB_SCHEMA": SCHEMA}
+        migrated = lab.run("migrate", "--global", "--apply", **self.extra)
+        assert migrated.returncode == 0, migrated.stderr
+
+    def run(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(MANAGER), *args], cwd=self.folder,
+                              env=self.lab.env(**self.extra), text=True, capture_output=True,
+                              timeout=120)
+
+
+def test_init_template_creates_an_agent_from_a_contextkit_template(lab, tmp_path):
+    made = Creation(lab, tmp_path)
+    listed = made.run("templates", "--json")
+    assert listed.returncode == 0, listed.stderr
+    templates = json.loads(listed.stdout)
+    assert [s["path"] for s in templates["starter"]] == ["context/identity/MISSION.md"]
+    assert [(a["id"], a["capabilities"], a["onboarding"]) for a in templates["agents"]] == [
+        ("demo", ["absent-cap"], {"routine": "onboarding"})]
+
+    result = made.run("init", "--template=demo", "--name=Probe", "--json")
+    # The agent is created; the capability this machine does not have is reported.
+    assert result.returncode == 1, result.stderr
+    answer = json.loads(result.stdout)
+    assert [(c["name"], c["result"]) for c in answer["capabilities"]] == [("absent-cap", "failed")]
+    folder = made.folder
+    assert (folder / ".git").is_dir()
+    assert (folder / ".contextkit" / "config.toml").read_text().startswith(
+        'version = 1\ntype = "agent-project"\n')
+    assert (folder / "context" / "identity" / "AGENT.md").read_text() == AGENT_MD
+    assert (folder / "routines" / "onboarding.md").is_file()
+    assert not (folder / "context" / "identity" / "MISSION.md").exists()
+    for layer in ("assets/sessions", "assets/plans", "assets/research", ".contextkit/audits"):
+        assert (folder / layer).is_dir()
+    icon = _square_png()
+    import hashlib
+    sha = hashlib.sha256(icon).hexdigest()
+    assert (folder / ".contextkit" / f"icon-{sha[:12]}.png").read_bytes() == icon
+
+    identity = json.loads((folder / "capabilities" / "project.json").read_text())
+    assert identity["records"] == "store"
+    assert lab.sql(f"SELECT name, description, icon_sha, onboarding_status, onboarding_routine, "
+                   f"migrated_at IS NOT NULL FROM {SCHEMA}.capabilities_agents WHERE id = %s",
+                   (identity["id"],)) == [("Probe", "A demo agent.", sha, "pending", "onboarding", True)]
+    assert lab.sql(f"SELECT node, is_master FROM {SCHEMA}.capabilities_agent_nodes "
+                   "WHERE agent_id = %s", (identity["id"],)) == [("lab-node", True)]
+
+    # Both hosts are wired to the manager, and the first build is made.
+    claude = json.loads((folder / ".claude" / "settings.json").read_text())
+    assert claude["hooks"]["SessionStart"][0]["hooks"][0]["command"] == \
+        "/bin/bash -lc 'capabilities session-start --host claude'"
+    assert "exec capabilities session-start --host codex" in \
+        (folder / ".codex" / "hooks" / "build-context.sh").read_text()
+    assert (folder / ".contextkit" / "generated" / "context.md").is_file()
+    assert answer["build"]["links"] == {"codex": "linked", "claude": "linked"}
+
+
+def test_init_template_refuses_a_folder_that_is_not_empty(lab, tmp_path):
+    made = Creation(lab, tmp_path)
+    (made.folder / "notes.txt").write_text("mine")
+    result = made.run("init", "--template", "demo")
+    assert (result.returncode, json.loads(result.stderr)["error"]["code"]) == (6, "folder_not_empty")
+    assert sorted(p.name for p in made.folder.iterdir()) == ["notes.txt"]
+
+
+def test_the_empty_agent_is_laid_named_and_bootstrapped(lab, tmp_path):
+    made = Creation(lab, tmp_path)
+    for args in (("init", "--with-template", "--json"),
+                 ("identity", "set", "--name=Probe", "--json"),
+                 ("bootstrap", "--target", "claude", "--target", "codex", "--yes", "--json")):
+        result = made.run(*args)
+        assert result.returncode == 0, (args, result.stderr)
+    folder = made.folder
+    assert (folder / "context" / "identity" / "MISSION.md").is_file()
+    assert (folder / ".env.local").is_file() and (folder / ".contextkit" / "README.md").is_file()
+    identity = json.loads((folder / "capabilities" / "project.json").read_text())
+    assert lab.sql(f"SELECT name, migrated_at IS NOT NULL FROM {SCHEMA}.capabilities_agents "
+                   "WHERE id = %s", (identity["id"],)) == [("Probe", True)]
+    log = subprocess.run(["git", "log", "--format=%s"], cwd=folder, text=True,
+                         capture_output=True)
+    assert log.stdout.strip() == "ContextKit pre-bootstrap checkpoint"
+    assert "capabilities session-start --host claude" in \
+        (folder / ".claude" / "settings.json").read_text()
+    assert (folder / ".contextkit.md").is_symlink()
