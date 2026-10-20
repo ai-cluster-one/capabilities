@@ -622,7 +622,14 @@ PROJECT VERBS (run inside a consuming project)
         `contextkit build` does: its runtime and collaboration texts, guide
         menu, onboarding, foreign instruction files, inline and stub context
         (global context included), routine index and this manager's own
-        capabilities block, composed in this process. --print writes the text
+        capabilities block, composed in this process. When the agent keeps
+        context documents in its store (the `context` capability's tables),
+        the inline and stub context is composed from their active versions,
+        read-only, instead of the context folder - global documents too when
+        the binding names global context and the store holds them - with a
+        warning while the folder is still there; a store that does not answer,
+        or a stored document that does not read, leaves the folder in use with
+        a warning. --print writes the text
         to stdout and writes nothing; with --json it answers {project, output,
         text, warnings}. Without --print it replaces the configured output
         (`[output] context`, default .contextkit/generated/context.md) whole
@@ -12115,37 +12122,124 @@ def _ck_collect_context(root: Path, base: Path, source: str) -> list[dict]:
     for path in sorted(base.rglob("*.md")):
         rel = Path(_ck_rel(root, path))
         try:
-            fm, body = _ck_frontmatter(path.read_text())
+            text = path.read_text()
         except OSError as exc:
             errors.append(f"cannot read {rel}: {exc}")
             continue
-        title = fm.get("title", "").strip()
-        description = fm.get("description", "").strip()
-        load = fm.get("load", "").strip()
-        order_raw = fm.get("order", "").strip()
-        problems = []
-        if not title:
-            problems.append(f"Missing frontmatter title: {rel}")
-        if not description:
-            problems.append(f"Missing frontmatter description: {rel}")
-        if load not in {"inline", "stub"}:
-            problems.append(f"Missing frontmatter load: {rel}" if not load
-                            else f"Invalid frontmatter load in {rel}: {load}")
-        try:
-            order = int(order_raw)
-        except ValueError:
-            order = 0
-            problems.append(f"Invalid frontmatter order in {rel}: {order_raw or '<missing>'}")
-        if problems:
-            errors += problems
-            continue
-        files.append({"path": path, "rel": rel, "title": title, "description": description,
-                      "load": load, "order": order, "body": body, "source": source})
+        _ck_context_item(path, rel, text, source, files, errors)
     if errors:
         _die(6, "context_file_invalid", "; ".join(errors),
              "repair the context files' frontmatter, then build again")
     files.sort(key=lambda item: (item["order"], item["rel"].as_posix()))
     return files
+
+
+def _ck_context_item(path: Path, rel: Path, text: str, source: str,
+                     files: list[dict], errors: list[str]) -> None:
+    """One context file's item, appended to `files`, or its problems to `errors`."""
+    fm, body = _ck_frontmatter(text)
+    title = fm.get("title", "").strip()
+    description = fm.get("description", "").strip()
+    load = fm.get("load", "").strip()
+    order_raw = fm.get("order", "").strip()
+    problems = []
+    if not title:
+        problems.append(f"Missing frontmatter title: {rel}")
+    if not description:
+        problems.append(f"Missing frontmatter description: {rel}")
+    if load not in {"inline", "stub"}:
+        problems.append(f"Missing frontmatter load: {rel}" if not load
+                        else f"Invalid frontmatter load in {rel}: {load}")
+    try:
+        order = int(order_raw)
+    except ValueError:
+        order = 0
+        problems.append(f"Invalid frontmatter order in {rel}: {order_raw or '<missing>'}")
+    if problems:
+        errors += problems
+        return
+    files.append({"path": path, "rel": rel, "title": title, "description": description,
+                  "load": load, "order": order, "body": body, "source": source})
+
+
+def _ck_stored_rows(root: Path, want_global: bool) -> list[tuple] | None:
+    """The active versions of this project's unretired context documents in its
+    store - and of the global ones when `want_global` - as (global, name, title,
+    description, load, position, body), read in a read-only transaction; None
+    where the project keeps none there: no store, no project id, no tables, or
+    no project document."""
+    project = _project_id_state(root)["id"]
+    if not project:
+        return None
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(root)
+    except db.DbError as exc:
+        if exc.slug == "store_not_configured":
+            return None
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    try:
+        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+                          transaction=True)
+    except db.DbError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    import psycopg
+    try:
+        conn.read_only = True
+        rows = conn.execute(
+            "SELECT d.project_id IS NULL, d.name, v.title, v.description, v.load, v.position, "
+            "v.body FROM context_documents d JOIN context_versions v "
+            "ON v.document_id = d.id AND v.active WHERE d.retired_at IS NULL "
+            "AND (d.project_id = %s OR (%s AND d.project_id IS NULL))",
+            (project, want_global)).fetchall()
+    except psycopg.errors.UndefinedTable:
+        return None
+    finally:
+        conn.close()
+    if not any(not row[0] for row in rows):
+        return None
+    return rows
+
+
+def _ck_stored_context(root: Path, binding: dict, warnings: list[str],
+                       store: dict) -> dict | None:
+    """The context items this agent keeps in its store, as {"project": [...],
+    "global": [...] or None where the store holds no global document}; None
+    where the build reads the folder - the agent keeps no document in the store,
+    the store already failed earlier in this build (nothing is tried, and its
+    warning stands), the store did not answer, or a document does not read,
+    either of which adds a warning."""
+    if store["failed"]:
+        return None
+    want_global = binding["global_context"] is not None
+    code, rows, err = _ck_in_process(lambda: _ck_stored_rows(root, want_global))
+    if code != 0:
+        detail = _ck_one_line(err)[:300]
+        warnings.append("context documents not read from the store, so the context folder "
+                        f"is used: exited {code}" + (f": {detail}" if detail else ""))
+        return None
+    if rows is None:
+        return None
+    context_dir = root / binding["layers"]["context"]
+    found: dict = {"project": [], "global": []}
+    errors: list[str] = []
+    for is_global, name, title, description, load, position, body in rows:
+        base = binding["global_context"] if is_global else context_dir
+        path = base / f"{name}.md"
+        text = (f"---\ntitle: {title}\ndescription: {description}\n"
+                f"load: {load}\norder: {position}\n---\n{body}")
+        _ck_context_item(path, Path(_ck_rel(root, path)), text,
+                         "global" if is_global else "project",
+                         found["global" if is_global else "project"], errors)
+    if errors:
+        warnings.append("context documents not read from the store, so the context folder "
+                        f"is used: {'; '.join(errors)}")
+        return None
+    for items in found.values():
+        items.sort(key=lambda item: (item["order"], item["rel"].as_posix()))
+    if not found["global"]:
+        found["global"] = None
+    return found
 
 
 def _ck_reference(item: dict) -> str:
@@ -12209,7 +12303,8 @@ def _ck_in_process(work):
         return 1, None, err.getvalue() + f"{type(exc).__name__}: {exc}"
 
 
-def _ck_capability_context(root: Path, capabilities_dir: Path, warnings: list[str]) -> str:
+def _ck_capability_context(root: Path, capabilities_dir: Path, warnings: list[str],
+                           store: dict) -> str:
     if not (root / capabilities_dir).is_dir():
         warnings.append(f"capability layer not present; add `{capabilities_dir.as_posix()}/` "
                         "or run `contextkit guide capabilities`")
@@ -12224,6 +12319,7 @@ def _ck_capability_context(root: Path, capabilities_dir: Path, warnings: list[st
         else:
             os.environ["CLAUDE_PROJECT_DIR"] = held
     if code != 0:
+        store["failed"] = store["failed"] or code == 5
         detail = _ck_one_line(err)[:300]
         suffix = f": {detail}" if detail else ""
         warnings.append("capability context omitted: `capabilities context --fragment` exited "
@@ -12264,10 +12360,11 @@ def _ck_registry_onboarding(root: Path) -> dict | None:
     return None
 
 
-def _ck_onboarding(root: Path, binding: dict, warnings: list[str]) -> dict | None:
+def _ck_onboarding(root: Path, binding: dict, warnings: list[str], store: dict) -> dict | None:
     code, answer, err = _ck_in_process(lambda: _ck_registry_onboarding(root))
     if code == 0:
         return answer or binding["onboarding"]
+    store["failed"] = store["failed"] or code == 5
     slug, message = "manager_failed", ""
     for line in reversed(err.splitlines()):
         try:
@@ -12353,25 +12450,36 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
     binding = _ck_binding(root)
     layers = binding["layers"]
     context_dir, routines_dir = layers["context"], layers["routines"]
-    project_files = _ck_collect_context(root, root / context_dir, "project")
-    global_files = (_ck_collect_context(root, binding["global_context"], "global")
-                    if binding["global_context"] is not None else [])
-    files = sorted([*global_files, *project_files],
-                   key=lambda item: (item["order"], 0 if item["source"] == "global" else 1,
-                                     item["rel"].as_posix()))
     warnings: list[str] = []
-    inline = [item for item in files if item["load"] == "inline"]
-    stubs = [item for item in files if item["load"] == "stub"]
+    store = {"failed": False}
     routine_index = _ck_routine_index(root, routines_dir, warnings)
-    capability_context = _ck_capability_context(root, layers["capabilities"], warnings)
+    capability_context = _ck_capability_context(root, layers["capabilities"], warnings, store)
     memory_rel = binding["body_root"] / "memory"
     if (root / memory_rel).is_dir() or (root / memory_rel).is_symlink():
         warnings.append(f"legacy memory folder `{memory_rel.as_posix()}/`: ContextKit does not "
                         "compile project memory; run `memory adopt` to carry it into the "
                         "`memory` capability")
-    onboarding = _ck_onboarding(root, binding, warnings)
+    onboarding = _ck_onboarding(root, binding, warnings, store)
     onboarding_block = (_ck_onboarding_block(root, binding, onboarding, warnings)
                         if onboarding and onboarding["status"] == "pending" else "")
+    stored = _ck_stored_context(root, binding, warnings, store)
+    if stored is None:
+        project_files = _ck_collect_context(root, root / context_dir, "project")
+    else:
+        project_files = stored["project"]
+        if (root / context_dir).exists():
+            warnings.append(f"context documents are read from the store; the context folder "
+                            f"`{context_dir.as_posix()}/` is no longer read and can be removed")
+    if stored is not None and stored["global"] is not None:
+        global_files = stored["global"]
+    else:
+        global_files = (_ck_collect_context(root, binding["global_context"], "global")
+                        if binding["global_context"] is not None else [])
+    files = sorted([*global_files, *project_files],
+                   key=lambda item: (item["order"], 0 if item["source"] == "global" else 1,
+                                     item["rel"].as_posix()))
+    inline = [item for item in files if item["load"] == "inline"]
+    stubs = [item for item in files if item["load"] == "stub"]
 
     out = ["# Project Context", "", CK_GENERATED_MARKER,
            f"Source config: `{CONTEXTKIT_CONFIG_REL.as_posix()}`", "Rebuild: `contextkit build`", ""]

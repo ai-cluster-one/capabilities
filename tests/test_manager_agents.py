@@ -481,3 +481,113 @@ def test_the_empty_agent_is_laid_named_and_bootstrapped(lab, tmp_path):
     assert "capabilities session-start --host claude" in \
         (folder / ".claude" / "settings.json").read_text()
     assert (folder / ".contextkit.md").is_symlink()
+
+
+# --- the context documents a build composes ---------------------------------------
+
+
+_CONTEXT_FILES = {
+    "identity/MISSION": ("Mission", "What the agent is for.", "inline", 10, "\n# Mission\n\nServe.\n"),
+    "guidelines/STYLE": ('"Style"', "How it writes.", "stub", 20, "\n# Style\n"),
+    "guidelines/ORDER": ("Order", "Same order, sorted by path.", "inline", 10, "\n# Order\n"),
+}
+
+
+def _context_text(title, description, load, order, body) -> str:
+    return (f"---\ntitle: {title}\ndescription: {description}\nload: {load}\norder: {order}\n"
+            f"---\n{body}")
+
+
+def _seed_context_documents(lab: Lab, documents: list[tuple]) -> None:
+    """The `context` capability's two tables, holding `documents`:
+    (project_id, name, retired, [(title, description, load, position, body, active)])."""
+    with lab.cluster.connect(lab.database) as conn:
+        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+        conn.execute(f"CREATE TABLE {SCHEMA}.context_documents (id uuid PRIMARY KEY "
+                     "DEFAULT gen_random_uuid(), project_id text, name text NOT NULL, "
+                     "created_at timestamptz NOT NULL DEFAULT now(), created_by text NOT NULL, "
+                     "retired_at timestamptz)")
+        conn.execute(f"CREATE TABLE {SCHEMA}.context_versions (id uuid PRIMARY KEY "
+                     "DEFAULT gen_random_uuid(), document_id uuid NOT NULL REFERENCES "
+                     f"{SCHEMA}.context_documents (id), title text NOT NULL, description text "
+                     "NOT NULL, load text NOT NULL, position integer NOT NULL, body text NOT NULL, "
+                     "active boolean NOT NULL DEFAULT true, created_at timestamptz NOT NULL "
+                     "DEFAULT now(), created_by text NOT NULL, note text)")
+        for project, name, retired, versions in documents:
+            (document,) = conn.execute(
+                f"INSERT INTO {SCHEMA}.context_documents (project_id, name, created_by, retired_at) "
+                "VALUES (%s, %s, 'tester@lab', CASE WHEN %s THEN now() END) RETURNING id",
+                (project, name, retired)).fetchone()
+            for version in versions:
+                conn.execute(f"INSERT INTO {SCHEMA}.context_versions (document_id, title, "
+                             "description, load, position, body, active, created_by) "
+                             "VALUES (%s, %s, %s, %s, %s, %s, %s, 'tester@lab')",
+                             (document, *version))
+
+
+def test_build_composes_the_context_from_the_documents_in_the_store(lab, tmp_path):
+    project = lab.project
+    (project / ".contextkit").mkdir()
+    (project / ".contextkit" / "config.toml").write_text(
+        f'version = 1\ntype = "agent-project"\n\n[sources]\nglobal_context = '
+        f'"{tmp_path / "global"}"\n\n[identity]\nid = "{PROJECT_ID}"\n')
+    for name, fields in _CONTEXT_FILES.items():
+        (project / "context" / name).parent.mkdir(parents=True, exist_ok=True)
+        (project / "context" / f"{name}.md").write_text(_context_text(*fields))
+    (tmp_path / "global").mkdir()
+    shared = ("Shared", "Doctrine every agent shares.", "inline", 5, "\n# Shared\n")
+    (tmp_path / "global" / "SHARED.md").write_text(_context_text(*shared))
+
+    def build() -> str:
+        result = lab.run("build", "--print")
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    from_folder = build()
+    assert "## Global Source:" in from_folder and "**Style** (`context/guidelines/STYLE.md`)" \
+        in from_folder
+
+    # The store holds the same documents, beside a retired one, a version no
+    # longer active, another project's document and a global one.
+    _seed_context_documents(lab, [
+        *[(PROJECT_ID, name, False, [(*fields[:3], fields[3], fields[4], True)])
+          for name, fields in _CONTEXT_FILES.items() if name != "identity/MISSION"],
+        (PROJECT_ID, "identity/MISSION", False,
+         [("Old", "Before.", "stub", 99, "\n# Old\n", False),
+          (*_CONTEXT_FILES["identity/MISSION"], True)]),
+        (PROJECT_ID, "identity/GONE", True, [("Gone", "Retired.", "inline", 1, "\n# Gone\n", True)]),
+        ("prj_000000000000", "identity/OTHER", False,
+         [("Other", "Not this agent's.", "inline", 1, "\n# Other\n", True)]),
+        (None, "SHARED", False, [(*shared, True)]),
+    ])
+    warning = ("- context documents are read from the store; the context folder `context/` "
+               "is no longer read and can be removed")
+    beside_folder = build()
+    assert warning in beside_folder.splitlines()
+    assert beside_folder.replace(warning + "\n", "", 1) == from_folder
+
+    # Without the folders the store alone composes the same context.
+    shutil.rmtree(project / "context")
+    shutil.rmtree(tmp_path / "global")
+    assert build() == from_folder
+
+
+def test_a_document_that_does_not_read_leaves_the_build_on_the_folder(lab):
+    project = lab.project
+    (project / ".contextkit").mkdir()
+    (project / ".contextkit" / "config.toml").write_text(
+        f'version = 1\ntype = "agent-project"\n\n[identity]\nid = "{PROJECT_ID}"\n')
+    (project / "context" / "identity").mkdir(parents=True)
+    (project / "context" / "identity" / "MISSION.md").write_text(
+        _context_text(*_CONTEXT_FILES["identity/MISSION"]))
+    from_folder = lab.run("build", "--print")
+    assert from_folder.returncode == 0, from_folder.stderr
+    _seed_context_documents(lab, [
+        (PROJECT_ID, "identity/MISSION", False, [("Stored", "In the store.", "bogus", 1,
+                                                  "\n# Stored\n", True)])])
+    result = lab.run("build", "--print")
+    assert result.returncode == 0, result.stderr
+    warning = ("- context documents not read from the store, so the context folder is used: "
+               "Invalid frontmatter load in context/identity/MISSION.md: bogus")
+    assert warning in result.stdout.splitlines()
+    assert result.stdout.replace(warning + "\n", "", 1) == from_folder.stdout
