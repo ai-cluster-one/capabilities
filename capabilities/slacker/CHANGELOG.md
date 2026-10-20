@@ -1,5 +1,9 @@
 # slacker — change log
 
+## 2026-10-20 — A read is a transaction of its own in one round trip
+
+`slacker` uses `capabilities-contract` 0.6.0. On its working connection a plain read that would open a transaction, and any statement in autocommit, reaches the store in one round trip - the transaction's start, the schema binding and the commit go with it - and leaves the connection idle, never `idle in transaction`, so a transaction-mode pooler hands its server session on as soon as the store answers; a write still opens a transaction that its commit closes, and a write whose commit may have reached the store is never sent twice. A connect that fails is tried again after jittered, doubling pauses, and once a store did not answer, a further connect to it is refused at once as `store_unreachable` for a doubling pause of at most 30 seconds rather than dialled again on every statement.
+
 ## 2026-10-20 — `search` finds messages by their text
 
 `slacker search <query> [--limit N] [--sort score|timestamp]` searches message text across every conversation the linked account can see, through Slack's own search (`search.messages`), so it reaches messages the store never captured and needs neither the store nor a running capture. Slack's query modifiers (`in:`, `from:` and the rest) apply as they do in the client. Each match names its conversation (`channel`, `channel_name`, `kind`), its `ts` and time, its `thread_ts` — read from the permalink when Slack leaves it off a reply — its author and its permalink, so `history <channel>` and `thread <channel> <thread_ts>` read it in place. No match is a successful answer with `count` 0; an invalid session exits 2, a refused read 6, and an unreachable Slack 5 (`slack_unreachable`). Proven in the lane against a local Slack Web API; a search of the person's own workspace is the owner's check after release.

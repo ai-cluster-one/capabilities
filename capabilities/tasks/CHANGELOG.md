@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-20 — A read is a transaction of its own in one round trip
+
+`tasks` uses `capabilities-contract` 0.6.0. On its working connection a plain read that would open a transaction, and any statement in autocommit, reaches the store in one round trip - the transaction's start, the schema binding and the commit go with it - and leaves the connection idle, never `idle in transaction`, so a transaction-mode pooler hands its server session on as soon as the store answers; a write still opens a transaction that its commit closes, and a write whose commit may have reached the store is never sent twice. A connect that fails is tried again after jittered, doubling pauses, and once a store did not answer, a further connect to it is refused at once as `store_unreachable` for a doubling pause of at most 30 seconds rather than dialled again on every statement.
+
 ## 2026-10-18 — `list` and `search` sort by title, type, assignee, status and cost
 
 `--sort` also takes `title` and `type`, in text order; `assignee`, in text order with unassigned tasks last; `status`, the status a reader is shown, in the lifecycle order the store declares (draft, todo, in_progress, waiting, complete, closed); and `cost`, the sum a row carries as `runs.cost_usd`, most spent first, with tasks that recorded no cost last. Each is applied before the page is cut and turned by `--order` like the others, its ties going by id in the same direction; unassigned and uncosted tasks stay last both ways. The four existing sorts, each verb's default order and the rows are unchanged.

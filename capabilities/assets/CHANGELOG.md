@@ -1,5 +1,9 @@
 # assets — change log
 
+## 2026-10-20 — A read is a transaction of its own in one round trip
+
+`assets` uses `capabilities-contract` 0.6.0. On its working connection a plain read that would open a transaction, and any statement in autocommit, reaches the store in one round trip - the transaction's start, the schema binding and the commit go with it - and leaves the connection idle, never `idle in transaction`, so a transaction-mode pooler hands its server session on as soon as the store answers; a write still opens a transaction that its commit closes, and a write whose commit may have reached the store is never sent twice. A connect that fails is tried again after jittered, doubling pauses, and once a store did not answer, a further connect to it is refused at once as `store_unreachable` for a doubling pause of at most 30 seconds rather than dialled again on every statement.
+
 ## 2026-10-20 — A project's text assets as versioned documents in its store
 
 `assets` keeps an agent's markdown assets - plans, research, sessions, meetings, journal, digests, reports and notes - as documents in the PostgreSQL the project resolves, in the tables `assets_documents` and `assets_versions` under its own migration ledger. A document is named by its path under `assets/` without `.md`, and its top folder gives its kind. Every save adds a version and leaves one active; versions are never edited or deleted, and the store refuses both. `save` takes an optional base and is refused with exit 7 `stale_base` when another save came first; `retire` hides a document without deleting anything. `list`, `show`, `history`, `diff` and full-text `search` read them, `import` reads an assets folder into the store, listing every file that is not markdown as skipped, and `export` writes the active versions back byte for byte.

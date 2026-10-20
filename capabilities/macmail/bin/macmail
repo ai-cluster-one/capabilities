@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract==0.5.1",
+#     "capabilities-contract==0.6.0",
 # ]
 # ///
 """
@@ -4156,6 +4156,32 @@ class StoreRecords(FileRecords):
             conn.rollback()
         return rows
 
+    def _read_many(self, statements: Sequence[tuple[str, Sequence[Any]]]) -> list[list]:
+        """The rows of each of `statements`, independent reads, as `_read` gives
+        them, sent to the store together on one connection. A table that is
+        not there is read as `_read` reads it, one statement at a time."""
+        import psycopg
+        conn = self._begin()
+        try:
+            if not self._owns_conn:
+                # A caller's transaction: read as `_read` reads in it.
+                return [self._read_on(conn, query, params) for query, params in statements]
+            try:
+                found = _read_together(conn, statements)
+            except psycopg.errors.UndefinedTable:
+                conn.rollback()
+                return [self._read_on(conn, query, params) for query, params in statements]
+            except psycopg.OperationalError as exc:
+                raise self._unreachable(exc) from None
+            except psycopg.Error as exc:
+                conn.rollback()
+                raise StoreError("store_read_failed",
+                                 f"reading records from the store failed: {exc}") from None
+            conn.rollback()
+            return found
+        finally:
+            self._end()
+
     def _write(self, work: Any) -> Any:
         """Run `work(conn)` in one transaction, the tables migrated first. A
         connection handed in belongs to a caller holding its own transaction,
@@ -4657,17 +4683,35 @@ def _store_connect(project_root: Path, application_name: str,
     return conn, setting.schema
 
 
+def _read_together(conn: Any, statements: Sequence[tuple[str, Sequence[Any]]]) -> list[list]:
+    """The rows of each of `statements`, independent reads on `conn`, sent to the
+    store together and answered in one round trip where the shared database
+    library offers it (`db.batch`), else one after another."""
+    from capabilities_contract import db
+    together = getattr(db, "batch", None)
+    if together is None:
+        return [conn.execute(query, params).fetchall() for query, params in statements]
+    return together(conn, list(statements))
+
+
 def _agent_state(conn: Any, agent_id: str) -> dict | None:
     """The agent's registry row and its nodes, or None where the store holds
     no such row or no registry at all."""
     import psycopg
+    from capabilities_contract import db
+    agent = ("SELECT migrating_since, migrated_at FROM capabilities_agents WHERE id = %s",
+             (agent_id,))
+    nodes_of = ("SELECT node, is_master, may_write FROM capabilities_agent_nodes "
+                "WHERE agent_id = %s ORDER BY node", (agent_id,))
     try:
-        row = conn.execute(
-            "SELECT migrating_since, migrated_at FROM capabilities_agents WHERE id = %s",
-            (agent_id,)).fetchone()
-        nodes = conn.execute(
-            "SELECT node, is_master, may_write FROM capabilities_agent_nodes "
-            "WHERE agent_id = %s ORDER BY node", (agent_id,)).fetchall() if row else []
+        if getattr(db, "batch", None) is not None:
+            # Both in one round trip; the nodes are read whether or not the
+            # row is there, and count only where it is.
+            rows, nodes = db.batch(conn, [agent, nodes_of])
+            row = rows[0] if rows else None
+        else:
+            row = conn.execute(*agent).fetchone()
+            nodes = conn.execute(*nodes_of).fetchall() if row else []
     except psycopg.errors.UndefinedTable:
         conn.rollback()
         return None
@@ -4910,6 +4954,18 @@ class AgentRecords(StoreRecords):
             raise StoreError("store_read_failed",
                              f"reading records from the store failed: {exc}") from None
 
+    def _read_many(self, statements: Sequence[tuple[str, Sequence[Any]]]) -> list[list]:
+        if not self._txn:
+            return super()._read_many(statements)
+        import psycopg
+        try:
+            return _read_together(self._db(), statements)
+        except psycopg.OperationalError as exc:
+            raise self._unreachable(exc) from None
+        except psycopg.Error as exc:
+            raise StoreError("store_read_failed",
+                             f"reading records from the store failed: {exc}") from None
+
     def guard_write(self, capability: str, collection: str,
                     scope: str | None = None) -> None:
         _refuse_record_write(capability, collection)
@@ -5006,17 +5062,17 @@ class AgentRecords(StoreRecords):
         if held is None:
             docs: dict[tuple, int] = {}
             rows: dict[tuple, list] = {}
-            for agent_id, node, generation in self._read(
-                    "SELECT agent_id, node, generation FROM capabilities_settings_documents "
-                    "WHERE capability = %s AND (agent_id IS NULL OR agent_id = %s) "
-                    "AND (node IS NULL OR node = %s)",
-                    (capability, self.project_id, self.node)):
+            where = (capability, self.project_id, self.node)
+            documents, leaves = self._read_many([
+                ("SELECT agent_id, node, generation FROM capabilities_settings_documents "
+                 "WHERE capability = %s AND (agent_id IS NULL OR agent_id = %s) "
+                 "AND (node IS NULL OR node = %s)", where),
+                ("SELECT agent_id, node, path, value FROM capabilities_settings "
+                 "WHERE capability = %s AND (agent_id IS NULL OR agent_id = %s) "
+                 "AND (node IS NULL OR node = %s) ORDER BY path", where)])
+            for agent_id, node, generation in documents:
                 docs[("global" if agent_id is None else "project", node)] = int(generation)
-            for agent_id, node, path, value in self._read(
-                    "SELECT agent_id, node, path, value FROM capabilities_settings "
-                    "WHERE capability = %s AND (agent_id IS NULL OR agent_id = %s) "
-                    "AND (node IS NULL OR node = %s) ORDER BY path",
-                    (capability, self.project_id, self.node)):
+            for agent_id, node, path, value in leaves:
                 rows.setdefault(("global" if agent_id is None else "project", node),
                                 []).append((list(path), value))
             held = (docs, rows)
@@ -5124,16 +5180,14 @@ class AgentRecords(StoreRecords):
 
     def _document_rows(self, conn: Any, agent: str | None, capability: str,
                        node: str | None) -> tuple[dict[tuple, Any], int | None]:
-        rows = conn.execute(
-            "SELECT path, value FROM capabilities_settings "
-            "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
-            "AND coalesce(node, '') = coalesce(%s::text, '')",
-            (agent, capability, node)).fetchall()
-        found = conn.execute(
-            "SELECT generation FROM capabilities_settings_documents "
-            "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
-            "AND coalesce(node, '') = coalesce(%s::text, '')",
-            (agent, capability, node)).fetchone()
+        rows, documents = _read_together(conn, [
+            ("SELECT path, value FROM capabilities_settings "
+             "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
+             "AND coalesce(node, '') = coalesce(%s::text, '')", (agent, capability, node)),
+            ("SELECT generation FROM capabilities_settings_documents "
+             "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
+             "AND coalesce(node, '') = coalesce(%s::text, '')", (agent, capability, node))])
+        found = documents[0] if documents else None
         return ({tuple(path): value for path, value in rows},
                 int(found[0]) if found else None)
 

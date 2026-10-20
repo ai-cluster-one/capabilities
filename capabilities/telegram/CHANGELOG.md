@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-20 — A read is a transaction of its own in one round trip
+
+`telegram` uses `capabilities-contract` 0.6.0. On its working connection a plain read that would open a transaction, and any statement in autocommit, reaches the store in one round trip - the transaction's start, the schema binding and the commit go with it - and leaves the connection idle, never `idle in transaction`, so a transaction-mode pooler hands its server session on as soon as the store answers; a write still opens a transaction that its commit closes, and a write whose commit may have reached the store is never sent twice. A connect that fails is tried again after jittered, doubling pauses, and once a store did not answer, a further connect to it is refused at once as `store_unreachable` for a doubling pause of at most 30 seconds rather than dialled again on every statement.
+
 ## 2026-10-20 — The daemon exits when its environment leaves the disk
 
 A uv cache prune deletes the environment the daemon runs from while it keeps running, and every worker turn it starts then dies on the missing interpreter, each message ending as a silent `ignore`. On every periodic sync the daemon now checks that its interpreter and the harness launcher are still on disk; when one is gone it marks its health `unhealthy` with the missing path and exits non-zero, so a supervisor that restarts a failed service (launchd's `KeepAlive`, a container's restart policy) starts it again on a rebuilt environment.

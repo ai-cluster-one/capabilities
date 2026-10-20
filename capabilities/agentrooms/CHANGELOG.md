@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-20 — A read is a transaction of its own in one round trip
+
+`agentrooms` uses `capabilities-contract` 0.6.0. On its working connection a plain read that would open a transaction, and any statement in autocommit, reaches the store in one round trip - the transaction's start, the schema binding and the commit go with it - and leaves the connection idle, never `idle in transaction`, so a transaction-mode pooler hands its server session on as soon as the store answers; a write still opens a transaction that its commit closes, and a write whose commit may have reached the store is never sent twice. A connect that fails is tried again after jittered, doubling pauses, and once a store did not answer, a further connect to it is refused at once as `store_unreachable` for a doubling pause of at most 30 seconds rather than dialled again on every statement.
+
 ## 2026-10-20 — `watch --no-held` follows Matrix holding no store connection
 
 `agentrooms watch --no-held` follows the rooms as `watch` does but not the held wakes: it opens no listener and rereads nothing in the project's store, and closes the store connection that resolving the connection in a project borrowed before it prints its ready line, so a running watch holds no connection to the store. Its ready line says `held: false`, it prints no `held` line, and a `room` row's `held` is null; every other line is as before. A caller that reads held wakes from the store itself needs only this. Without the flag `watch` is unchanged.

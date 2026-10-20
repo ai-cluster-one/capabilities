@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-10-20 — A read is a transaction of its own in one round trip
+
+`memory` uses `capabilities-contract` 0.6.0. On its working connection a plain read that would open a transaction, and any statement in autocommit, reaches the store in one round trip - the transaction's start, the schema binding and the commit go with it - and leaves the connection idle, never `idle in transaction`, so a transaction-mode pooler hands its server session on as soon as the store answers; a write still opens a transaction that its commit closes, and a write whose commit may have reached the store is never sent twice. A connect that fails is tried again after jittered, doubling pauses, and once a store did not answer, a further connect to it is refused at once as `store_unreachable` for a doubling pause of at most 30 seconds rather than dialled again on every statement.
+
 ## 2026-10-19 — A render that changes nothing leaves the block as written
 
 `memory render`, the service and every write that renders leave `state/context.md` as it is, its `_Rendered` line included, when the block they render differs from the one already written only in that line, so a context built from it does not change when nothing in it did. A block whose content changed is written with a new render time as before. `context.json` is written on every render as before, naming that render and the event it is current to, so `memory doctor` and `memory status` judge the block current or stale as they did. The block's format and the render report are unchanged.

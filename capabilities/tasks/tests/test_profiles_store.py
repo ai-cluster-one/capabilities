@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.5.1",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.6.0",
 #                 "callva-harness-runner==0.9.0", "pyyaml>=6"]
 # ///
 """A project's harness profiles kept in the store as versions.
@@ -18,7 +18,7 @@ a consuming project drives them, through the CLI, against a store in
 TASKS_TEST_DSN, and the checks skip when it is unset.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
-        --with 'capabilities-contract==0.5.1' \\
+        --with 'capabilities-contract==0.6.0' \\
         --with 'callva-harness-runner==0.9.0' python -m pytest capabilities/tasks/tests -q
 """
 
