@@ -15,6 +15,11 @@
       "payload_sha256": "49bc901c4fca7482b875e6ecf57ef033d23aba9e4cc65d371fb233754f0b0ae5",
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project under a read or act profile, and return its answer with cost, token, and files-changed traceability."
     },
+    "assets": {
+      "path": "capabilities/assets",
+      "payload_sha256": "d5d37ade3408d2f83c34de98418187092d5cb03b918310e6cd2b9ddef9bee102",
+      "summary": "Text assets as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text, diffed between versions, and imported from and exported to an agent's assets folder byte for byte."
+    },
     "automations": {
       "path": "capabilities/automations",
       "payload_sha256": "492dfc43c3cc3125dafa8b9f5b2ed994578fdbc1b28a7f828022200934ef598f",
