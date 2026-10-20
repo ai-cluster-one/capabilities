@@ -3,14 +3,16 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "capabilities-contract==0.5.1",
+#     "psycopg[binary]>=3.2",
 # ]
 # ///
 """routine — project routine helper.
 
 Routine is the project-side mechanism for repeatable procedures: one markdown
 file per recipe under `.routines/`, with front matter surfaced into every
-session as an index. This CLI is intentionally small: it lists, validates, and
-renders that index. It does not execute routines.
+session as an index. This CLI lists, validates, and renders that index, and
+keeps routines as versioned documents in the project's store. It does not
+execute routines.
 
 USAGE
   routine <command> [options]
@@ -40,6 +42,91 @@ Commands:
       of the whole `.routines/` corpus. Judgment stays with the calling agent;
       this command supplies the target inventory and review flow.
 
+Routines in the store:
+  A routine in the store is a document of the project the command runs in, by
+  the project's durable id: a name, which is its front matter's `name` and
+  its file's stem, and its versions. A version holds the title, description
+  and body, with who saved it, when, and why. One version is active; a save
+  adds a new version and never changes an old one, and retiring a routine
+  deletes nothing, so every version stays readable - a task or automation
+  that followed a routine names the version id it followed. Reads answer
+  plain text by default and JSON with --json; writes answer JSON. Without a
+  store every verb below exits 6 `store_not_configured`.
+
+  The file form, read and written byte for byte:
+
+    ---
+    name: <name>
+    title: <one line>            (optional)
+    description: <one line>
+    ---
+    <body>
+
+  The keys in this order, each once, each `key: value` on one line; the body
+  is every byte after the closing `---` line, kept exactly. Values are taken
+  as written: a quoted value keeps its quotes. `name` must equal the routine's
+  name. Input that does not read back byte for byte is refused (exit 6
+  `not_canonical`, naming the line), with one exception ContextKit makes too:
+  front matter whose keys stand in another order, or that carries keys other
+  than these three, is read for name, title and description, the other keys
+  dropped; the answer marks that routine `normalised` and says what changed,
+  because its export is the canonical form rather than the file read.
+
+  routine list --store [--json]
+      Every routine in the store with its active version: name, version,
+      title, description.
+  routine show <name> [--version ID] [--json]
+      The active version, or the version ID names, in the file form. --json
+      adds the version id, who saved it, when, and its note; the version id is
+      what `save --base` names and what a follower records.
+  routine history <name> [--json]
+      Every version, newest first: id, when, by whom, the note, and which one
+      is active.
+  routine diff <name> [A] [B]
+      A unified diff of two versions in the file form. Bare: the active
+      version against the one saved before it (against nothing when it is the
+      only one). With A alone: A against the active version.
+
+  ID, A and B are a version's whole id or a prefix of six or more characters
+  that names one version of the routine.
+
+  Writing (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY):
+  routine save <name> --from FILE|- [--base ID] [--note TEXT]
+      Save the file form read from FILE, or stdin with `-`, as the routine's
+      new active version; a name not in use starts a new routine. --base names
+      the version the edit was made from: the save is refused (exit 7
+      `stale_base`, naming the active version) when it is no longer the active
+      one, because another save came first. Without --base the active version
+      at the time of the save is the base. --note says why. Safe to repeat:
+      content equal to the active version's adds no version and answers
+      `"changed": false`.
+  routine retire <name>
+      Retire the routine: it leaves list, show and export, its versions stay
+      in the store, and its name is free for a new routine. Not idempotent: a
+      repeat finds no routine of that name and exits 3.
+  routine import [DIR]
+      Read every `*.md` file under DIR, subfolders included, into the store as
+      the routine its stem names: a new routine with one version, a new
+      version where the active version differs, nothing where it is equal. DIR
+      defaults to the project's routines layer, as `capabilities path --json`
+      names it under layers.routines. Every file is read and checked before
+      anything is written, and all of it is written in one transaction; any
+      file that does not read, or two files of one name, refuse the whole
+      import, naming each. Other files are reported as skipped. Routines in
+      the store with no file in DIR are left as they are. Safe to repeat.
+  routine export [DIR]
+      Write each routine's active version into DIR in the file form: into the
+      one file under DIR, subfolders included, whose stem is its name, else as
+      DIR/<name>.md; a file already equal is left alone. DIR defaults as for
+      import. Files in DIR that hold no routine are reported and left alone.
+      Export reads the store and writes only DIR.
+
+  The tables are routine_documents (one row per routine: project, name,
+  created, retired) and routine_versions (one row per version), in the schema
+  the project's store setting names, migrated under the `routine` ledger. One
+  version per routine is active, which the store enforces; it refuses any
+  change to a version other than clearing `active`, and any delete.
+
 Contract commands:
   routine stub
   routine manifest --json
@@ -48,14 +135,19 @@ Contract commands:
   routine ids list|get|set|rm
   routine refs
   routine inventory [--network]
+  routine migrate [status]      bring the store tables up to this version / report
 
 Exit codes:
-  0 success · 3 not found · 4 disabled by project policy · 6 input/validation
+  0 success · 3 not found · 4 disabled by project policy, the read-only switch ·
+  5 store unreachable or busy · 6 input/validation, no store, no project
+  identity · 7 stale base
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import difflib
 import json
 import os
 import re
@@ -68,14 +160,19 @@ from typing import NoReturn
 
 NAME = "routine"
 SUMMARY = ("Routine CLI for project repeatable procedures — list, validate, "
-           "and render `.routines` recipes.")
+           "and render `.routines` recipes, and keep routines as versioned documents "
+           "in the project's store: show, save with a base, history, diff, retire, "
+           "and import and export the routines folder byte for byte.")
 SCOPE = "project"
 CRED_KEYS: list = []
-WRITE_VERBS: set = set()
-WRITE_DEFAULT = False
+# Every verb that changes the store's routines; each is refused under the
+# read-only switch. `export` reads the store and writes only the folder named.
+WRITE_VERBS = {"save", "retire", "import"}
+WRITE_DEFAULT = True
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/routine/guides/")
 STATE = False
+TABLES = True        # routine_* tables in the project's store, built by _tables()
 INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
 POST_INSTALL: list = []
 
@@ -5677,6 +5774,617 @@ def cmd_groom(args) -> None:
     sys.stdout.write(_groom_markdown(selected, args.all))
 
 
+# ── routines in the store: the tables ───────────────────────────────────────
+
+# A routine is a head row holding what never changes, and its versions. The
+# versions reference their routine by a foreign key: both tables are this
+# capability's own and a routine is retired rather than deleted, so the key
+# never blocks a write and refuses only a version of no routine.
+LEDGER_MAJOR, LEDGER_MINOR = 1, 0
+_STORE_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+LEDGER_STEPS = [
+    ("0001-documents", f"""
+    CREATE TABLE routine_documents (
+        id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        project_id  text NOT NULL CHECK (project_id <> ''),
+        name        text NOT NULL CHECK (name ~ '{_STORE_NAME_PATTERN}' AND name !~ '[.]md$'),
+        created_at  timestamptz NOT NULL DEFAULT now(),
+        created_by  text NOT NULL CHECK (created_by <> ''),
+        retired_at  timestamptz
+    );
+    CREATE UNIQUE INDEX routine_documents_name ON routine_documents (project_id, name)
+        WHERE retired_at IS NULL;
+    COMMENT ON TABLE routine_documents IS
+        'One routine of a project: what never changes about it. Its content is in routine_versions.';
+    COMMENT ON COLUMN routine_documents.project_id IS
+        'The project''s declared id.';
+    COMMENT ON COLUMN routine_documents.name IS
+        'The routine''s front-matter name, equal to its file''s stem; unique per project among unretired routines.';
+    COMMENT ON COLUMN routine_documents.retired_at IS
+        'When the routine was retired; a retired routine keeps its versions and frees its name.';
+    """),
+    ("0002-versions", """
+    CREATE TABLE routine_versions (
+        id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        document_id  uuid NOT NULL REFERENCES routine_documents (id),
+        title        text CHECK (title <> ''),
+        description  text NOT NULL CHECK (description <> ''),
+        body         text NOT NULL,
+        active       boolean NOT NULL DEFAULT true,
+        created_at   timestamptz NOT NULL DEFAULT now(),
+        created_by   text NOT NULL CHECK (created_by <> ''),
+        note         text
+    );
+    CREATE UNIQUE INDEX routine_versions_active ON routine_versions (document_id)
+        WHERE active;
+    CREATE INDEX routine_versions_document ON routine_versions (document_id, created_at DESC);
+    COMMENT ON TABLE routine_versions IS
+        'Every version of a routine; immutable but for active, which one save clears as it adds the next. A task or automation that followed a routine names the version id it followed.';
+    COMMENT ON COLUMN routine_versions.title IS
+        'The front matter''s optional title; NULL when the routine has none.';
+    COMMENT ON COLUMN routine_versions.description IS
+        'The front matter''s one-line description: the routine''s index entry.';
+    COMMENT ON COLUMN routine_versions.body IS
+        'The procedure: every byte after the closing front-matter line, kept exactly.';
+    COMMENT ON COLUMN routine_versions.active IS
+        'The version in force; at most one per routine.';
+    COMMENT ON COLUMN routine_versions.created_by IS
+        'Who saved the version: user@node.';
+    COMMENT ON COLUMN routine_versions.note IS
+        'Why the version was saved.';
+    """),
+    ("0003-versions-guard", """
+    CREATE FUNCTION routine_versions_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF tg_op IN ('DELETE', 'TRUNCATE') THEN
+            RAISE EXCEPTION 'routine versions are never deleted: retire the routine instead'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF (to_jsonb(new) - 'active') IS DISTINCT FROM (to_jsonb(old) - 'active') THEN
+            RAISE EXCEPTION 'a routine version is immutable: save a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.active AND NOT old.active THEN
+            RAISE EXCEPTION 'a routine version is not made active again: save its content as a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $$;
+    CREATE TRIGGER routine_versions_guard BEFORE UPDATE OR DELETE ON routine_versions
+        FOR EACH ROW EXECUTE FUNCTION routine_versions_guard();
+    CREATE TRIGGER routine_versions_truncate BEFORE TRUNCATE ON routine_versions
+        FOR EACH STATEMENT EXECUTE FUNCTION routine_versions_guard();
+    """),
+]
+
+
+def _tables():
+    """The steps and version of routine's tables, for the contract's `migrate`."""
+    return LEDGER_STEPS, LEDGER_MAJOR, LEDGER_MINOR
+
+
+# ── routines in the store: the file form ────────────────────────────────────
+
+FRONT_KEYS = ("name", "title", "description")
+_STORE_NAME_RE = re.compile(_STORE_NAME_PATTERN)
+_OTHER_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+
+
+class Unreadable(Exception):
+    """A file or input that does not read as the file form."""
+
+
+def render(version: dict) -> str:
+    """A version in the file form: the front matter, then the body as kept."""
+    title = f"title: {version['title']}\n" if version.get("title") is not None else ""
+    return (f"---\nname: {version['name']}\n{title}"
+            f"description: {version['description']}\n---\n{version['body']}")
+
+
+def parse(text: str) -> tuple[dict, list]:
+    """The fields of the file form and what reading them normalised.
+
+    Canonical input reads back byte for byte and normalises nothing. Front
+    matter whose keys stand in another order, or carry keys other than name,
+    title and description, is read for those three and the rest dropped, each
+    change named; anything else that would not read back is refused."""
+    if "\x00" in text:
+        raise Unreadable("it holds a NUL character")
+    if not text.startswith("---\n"):
+        raise Unreadable("line 1 is not `---`: the file opens with its front matter")
+    end = text.find("\n---\n", 3)
+    if end < 0:
+        raise Unreadable("the front matter has no closing `---` line")
+    fields: dict = {}
+    order: list = []
+    dropped: list = []
+    for number, line in enumerate(text[4:end].split("\n") if end > 3 else [], start=2):
+        key, sep, value = line.partition(": ")
+        if not sep or not _OTHER_KEY_RE.fullmatch(key):
+            raise Unreadable(f"line {number} is not one `key: value` line")
+        if key in fields or key in dropped:
+            raise Unreadable(f"line {number} repeats `{key}`")
+        if value != value.strip():
+            raise Unreadable(f"line {number}: the value of `{key}` starts or ends with a space")
+        if key not in FRONT_KEYS:
+            dropped.append(key)
+            continue
+        fields[key] = value
+        order.append(key)
+    for key in ("name", "description"):
+        if key not in fields:
+            raise Unreadable(f"the front matter has no {key}")
+    for key in fields:
+        if not fields[key].strip():
+            raise Unreadable(f"`{key}` is empty")
+    version = {"name": fields["name"], "title": fields.get("title"),
+               "description": fields["description"], "body": text[end + 5:]}
+    normalised = []
+    if dropped:
+        normalised.append(f"dropped the front matter's {', '.join(dropped)}")
+    if order != [key for key in FRONT_KEYS if key in fields]:
+        normalised.append(f"put {', '.join(order)} in the order {', '.join(FRONT_KEYS)}")
+    canonical = render(version)
+    if not normalised and canonical != text:
+        for number, (got, want) in enumerate(zip(text.split("\n"), canonical.split("\n")),
+                                             start=1):
+            if got != want:
+                raise Unreadable(f"line {number} reads {got!r} where the file form writes "
+                                 f"{want!r}")
+        raise Unreadable("it does not read back as the file form")
+    return version, normalised
+
+
+def _same(a: dict, b: dict) -> bool:
+    return all(a[key] == b[key] for key in ("title", "description", "body"))
+
+
+def _check_name(name: str) -> str:
+    if not _STORE_NAME_RE.fullmatch(name) or name.endswith(".md"):
+        _die(6, "input", f"{name!r} is no routine name",
+             "a name is the routine file's stem: letters, digits, '.', '_' and '-'")
+    return name
+
+
+def _read_text(path: Path) -> str:
+    data = path.read_bytes()
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise Unreadable(f"it is not UTF-8 ({exc.reason} at byte {exc.start})") from None
+
+
+# ── routines in the store: the project and the store ────────────────────────
+
+_SETTING_SLUGS = frozenset({
+    "store_not_configured", "store_not_postgres", "store_setting_unreadable",
+    "store_setting_too_new", "bad_store_setting", "sslmode_too_weak",
+    "bad_schema_name", "driver_missing", "transaction_pooler"})
+_STORE_HINT = ("set AGENTKIT_DB_URL (or AGENTKIT_DB_HOST, AGENTKIT_DB_NAME, AGENTKIT_DB_USER, "
+               "AGENTKIT_DB_PASSWORD) in the project's .env.local or the environment, or run "
+               "`capabilities store set`")
+
+
+def _scope(write: bool) -> str:
+    """The project id the routines belong to."""
+    if _project_root() is None:
+        _die(6, "no_project", f"{NAME} keeps a project's routines; run it inside a project",
+             "cd into the project or set CLAUDE_PROJECT_DIR")
+    project = _project_id(write=write)
+    if not project:
+        _die(6, "no_project_identity", "this project has no durable id",
+             "run `capabilities init` in the project")
+    return str(project)
+
+
+def _actor() -> str:
+    user = os.environ.get("USER") or os.environ.get("LOGNAME")
+    if not user:
+        with contextlib.suppress(Exception):
+            import pwd
+            user = pwd.getpwuid(os.getuid()).pw_name
+    return f"{user or 'unknown'}@{node_name()}"
+
+
+def _db():
+    try:
+        from capabilities_contract import db
+    except ImportError:
+        _die(6, "driver_missing",
+             "the shared database library capabilities-contract is not installed",
+             f"run {NAME} through its own script header, which pins it")
+    return db
+
+
+def _db_refused(exc) -> NoReturn:
+    if exc.slug == "store_not_configured":
+        _die(6, "store_not_configured",
+             f"{NAME} keeps routines in a store, and none is configured here", _STORE_HINT)
+    _die(6 if exc.slug in _SETTING_SLUGS else 5, exc.slug, exc.message, exc.hint)
+
+
+def _open():
+    """The working connection to the project's store, its tables migrated."""
+    db = _db()
+    conn = None
+    try:
+        setting = db.resolve_setting(_project_root())
+        conn = db.connect(application_name=NAME, setting=setting, transaction=True)
+        db.migrate(conn, NAME, LEDGER_STEPS, major=LEDGER_MAJOR, minor=LEDGER_MINOR)
+        conn.autocommit = True
+    except db.DbError as exc:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+        _db_refused(exc)
+    return conn
+
+
+@contextlib.contextmanager
+def _store():
+    """A connection for one command; a lost store or a store refusal becomes
+    the error envelope."""
+    import psycopg
+    conn = _open()
+    try:
+        yield conn
+    except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+        _die(5, "store_unreachable", f"the store stopped answering: {exc}",
+             f"`{NAME} list --store` proves the store")
+    except psycopg.errors.UniqueViolation:
+        _die(7, "stale_base", "another save changed this routine at the same moment",
+             f"read it again with `{NAME} show` and save with its version as --base")
+    except psycopg.errors.CheckViolation as exc:
+        _die(6, "refused_by_store", str(exc).splitlines()[0])
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
+def _rows(conn, sql: str, params=()) -> list[dict]:
+    from psycopg.rows import dict_row
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        return list(cur.fetchall()) if cur.description else []
+
+
+def _one(conn, sql: str, params=()) -> dict | None:
+    rows = _rows(conn, sql, params)
+    return rows[0] if rows else None
+
+
+_VERSION_COLUMNS = ("d.name, v.id, v.document_id, v.title, v.description, v.body, v.active, "
+                    "v.created_at, v.created_by, v.note")
+_VERSIONS = "routine_versions v JOIN routine_documents d ON d.id = v.document_id"
+
+
+def _document(conn, project: str, name: str, lock: bool = False) -> dict | None:
+    return _one(conn, "SELECT id, project_id, name, created_at, created_by FROM routine_documents "
+                "WHERE project_id = %s AND name = %s AND retired_at IS NULL"
+                + (" FOR UPDATE" if lock else ""), (project, name))
+
+
+def _need_document(conn, project: str, name: str, lock: bool = False) -> dict:
+    found = _document(conn, project, name, lock)
+    if found is None:
+        _die(3, "not_found", f"no routine {name!r} in this project's store",
+             f"`{NAME} list --store` shows the routines")
+    return found
+
+
+def _active(conn, document_id) -> dict | None:
+    return _one(conn, f"SELECT {_VERSION_COLUMNS} FROM {_VERSIONS} "
+                "WHERE v.document_id = %s AND v.active", (document_id,))
+
+
+def _version(conn, document: dict, ref: str) -> dict:
+    """One version of the routine by its whole id or a prefix of six or more."""
+    ref = ref.strip().lower()
+    if len(ref) < 6 or not re.fullmatch(r"[0-9a-f-]+", ref):
+        _die(6, "input", f"{ref!r} names no version",
+             "a version id is its whole id or a prefix of six or more characters")
+    found = _rows(conn, f"SELECT {_VERSION_COLUMNS} FROM {_VERSIONS} "
+                  "WHERE v.document_id = %s AND v.id::text LIKE %s ORDER BY v.created_at",
+                  (document["id"], ref + "%"))
+    if not found:
+        _die(3, "not_found", f"{document['name']!r} has no version {ref!r}",
+             f"`{NAME} history {document['name']}` lists its versions")
+    if len(found) > 1:
+        _die(6, "ambiguous_version", f"{ref!r} names {len(found)} versions of "
+             f"{document['name']!r}", "give more of the id")
+    return found[0]
+
+
+def _moment(moment) -> str:
+    return moment.astimezone().strftime("%Y-%m-%dT%H:%M:%S%z") if moment else None
+
+
+def _version_view(version: dict, with_body: bool = True) -> dict:
+    view = {"version": str(version["id"]), "active": version["active"],
+            "title": version["title"], "description": version["description"],
+            "created_at": _moment(version["created_at"]), "created_by": version["created_by"],
+            "note": version["note"]}
+    if with_body:
+        view["body"] = version["body"]
+        view["rendered"] = render(version)
+    return view
+
+
+# ── routines in the store: reading ──────────────────────────────────────────
+
+def cmd_store_list(args) -> None:
+    project = _scope(write=False)
+    with _store() as conn:
+        rows = _rows(conn, "SELECT d.name, v.id, v.title, v.description, v.created_at "
+                     "FROM routine_documents d JOIN routine_versions v "
+                     "ON v.document_id = d.id AND v.active "
+                     "WHERE d.project_id = %s AND d.retired_at IS NULL "
+                     "ORDER BY d.name", (project,))
+    if args.json:
+        _emit({"project": project, "count": len(rows),
+               "routines": [{"name": r["name"], "version": str(r["id"]), "title": r["title"],
+                             "description": r["description"],
+                             "saved_at": _moment(r["created_at"])} for r in rows]})
+        return
+    if not rows:
+        _emit("no routines in this project's store")
+        return
+    width = max(len(r["name"]) for r in rows)
+    _emit("\n".join(f"{r['name']:<{width}}  {str(r['id'])[:8]}  {r['description']}"
+                    for r in rows))
+
+
+def cmd_show(args) -> None:
+    name = _check_name(args.name)
+    project = _scope(write=False)
+    with _store() as conn:
+        document = _need_document(conn, project, name)
+        version = (_version(conn, document, args.version) if args.version
+                   else _active(conn, document["id"]))
+    if args.json:
+        _emit({"name": name, "project": project, **_version_view(version)})
+        return
+    sys.stdout.write(render(version))
+
+
+def cmd_history(args) -> None:
+    name = _check_name(args.name)
+    project = _scope(write=False)
+    with _store() as conn:
+        document = _need_document(conn, project, name)
+        versions = _rows(conn, f"SELECT {_VERSION_COLUMNS} FROM {_VERSIONS} "
+                         "WHERE v.document_id = %s ORDER BY v.created_at DESC, v.id",
+                         (document["id"],))
+    if args.json:
+        _emit({"name": name, "project": project, "count": len(versions),
+               "versions": [_version_view(v, with_body=False) for v in versions]})
+        return
+    _emit("\n".join(
+        f"{v['id']} {_moment(v['created_at'])} {v['created_by']}"
+        + (" (active)" if v["active"] else "") + (f" - {v['note']}" if v["note"] else "")
+        for v in versions))
+
+
+def cmd_diff(args) -> None:
+    name = _check_name(args.name)
+    project = _scope(write=False)
+    with _store() as conn:
+        document = _need_document(conn, project, name)
+        active = _active(conn, document["id"])
+        if args.a and args.b:
+            old, new = _version(conn, document, args.a), _version(conn, document, args.b)
+        elif args.a:
+            old, new = _version(conn, document, args.a), active
+        else:
+            new = active
+            old = _one(conn, f"SELECT {_VERSION_COLUMNS} FROM {_VERSIONS} "
+                       "WHERE v.document_id = %s AND v.id <> %s AND v.created_at <= %s "
+                       "ORDER BY v.created_at DESC, v.id LIMIT 1",
+                       (document["id"], active["id"], active["created_at"]))
+    label = f"{name}.md"
+    lines = difflib.unified_diff(
+        render(old).splitlines(keepends=True) if old else [],
+        render(new).splitlines(keepends=True),
+        fromfile=f"{label}@{str(old['id'])[:8]}" if old else "/dev/null",
+        tofile=f"{label}@{str(new['id'])[:8]}")
+    out = "".join(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
+                  for line in lines)
+    if not out:
+        _emit(f"no difference between {str(old['id'])[:8]} and {str(new['id'])[:8]}")
+        return
+    sys.stdout.write(out)
+
+
+# ── routines in the store: writing ──────────────────────────────────────────
+
+def _save_version(conn, project: str, name: str, fields: dict, base: str | None,
+                  note: str | None, by: str) -> dict:
+    """Add `fields` as the routine's active version inside the caller's
+    transaction, the head row locked so saves of one routine run one at a
+    time. The outcome is created, versioned or unchanged."""
+    document = _document(conn, project, name, lock=True)
+    if document is None:
+        if base is not None:
+            _die(7, "stale_base", f"--base names a version of {name!r}, which is no longer a "
+                 "routine", f"`{NAME} list --store` shows the routines; save without --base "
+                 "to start it again")
+        document = _one(conn, "INSERT INTO routine_documents (project_id, name, created_by) "
+                        "VALUES (%s, %s, %s) RETURNING id, name", (project, name, by))
+        active = None
+    else:
+        active = _active(conn, document["id"])
+        if base is not None:
+            based = _version(conn, document, base)
+            if active is None or based["id"] != active["id"]:
+                _die(7, "stale_base", f"--base {base} is not the active version of {name!r}: "
+                     f"{active['id'] if active else 'none'} was saved after it",
+                     f"`{NAME} diff {name} {base}` shows what changed since; save again "
+                     "with --base naming the active version")
+        if active is not None and _same(active, fields):
+            return {"name": name, "outcome": "unchanged", "version": str(active["id"])}
+        if active is not None:
+            _rows(conn, "UPDATE routine_versions SET active = false WHERE id = %s AND active",
+                  (active["id"],))
+    created = _one(conn, "INSERT INTO routine_versions (document_id, title, description, body, "
+                   "created_by, note) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                   (document["id"], fields["title"], fields["description"], fields["body"],
+                    by, note))
+    return {"name": name, "outcome": "created" if active is None else "versioned",
+            "version": str(created["id"]),
+            "base": str(active["id"]) if active is not None else None}
+
+
+def _name_matches(fields: dict, name: str) -> None:
+    if fields["name"] != name:
+        raise Unreadable(f"its front matter names {fields['name']!r}, not {name!r}")
+
+
+def cmd_save(args) -> None:
+    name = _check_name(args.name)
+    project = _scope(write=True)
+    try:
+        text = (sys.stdin.read() if args.source == "-"
+                else _read_text(Path(args.source)))
+        fields, normalised = parse(text)
+        _name_matches(fields, name)
+    except OSError as exc:
+        _die(6, "input", f"--from {args.source}: {exc.strerror or exc}")
+    except Unreadable as exc:
+        _die(6, "not_canonical", f"--from {args.source} is not the file form: {exc}",
+             f"`{NAME} help` shows the file form; `{NAME} show {name}` prints one")
+    note = args.note.strip() if args.note and args.note.strip() else None
+    with _store() as conn:
+        with conn.transaction():
+            outcome = _save_version(conn, project, name, fields, args.base, note, _actor())
+    if normalised:
+        outcome["normalised"] = normalised
+    _emit({"project": project, "changed": outcome["outcome"] != "unchanged", **outcome})
+
+
+def cmd_retire(args) -> None:
+    name = _check_name(args.name)
+    project = _scope(write=True)
+    with _store() as conn:
+        with conn.transaction():
+            document = _need_document(conn, project, name, lock=True)
+            _rows(conn, "UPDATE routine_documents SET retired_at = now() WHERE id = %s",
+                  (document["id"],))
+    _emit({"name": name, "project": project, "retired": True, "document": str(document["id"])})
+
+
+def _folder(given: str | None) -> Path:
+    """The folder import and export work on: the one named, else the project's
+    routines layer as the manager resolves it."""
+    if given:
+        return Path(given).expanduser().resolve()
+    root = _project_root()
+    answer, error = _ask_manager(root)
+    if error:
+        _die(error["exit"], error["code"], error["message"], error.get("hint"))
+    layer = (answer.get("layers") or {}).get("routines")
+    if not layer:
+        _die(6, "no_routines_layer", "the capabilities manager names no routines layer here",
+             "name the folder: DIR")
+    return Path(layer)
+
+
+def _files(folder: Path) -> tuple[list, list]:
+    """The markdown files under `folder`, subfolders included, as (name,
+    path, relative path), and every other file as skipped."""
+    found, skipped = [], []
+    for path in sorted(folder.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(folder).as_posix()
+        if path.suffix != ".md":
+            skipped.append({"path": rel, "outcome": "skipped", "reason": "not a .md file"})
+            continue
+        found.append((path.name[:-3], path, rel))
+    return found, skipped
+
+
+def cmd_import(args) -> None:
+    project = _scope(write=True)
+    folder = _folder(args.dir)
+    if not folder.is_dir():
+        _die(6, "input", f"{folder} is not a folder")
+    files, skipped = _files(folder)
+    read, refused, seen = [], [], {}
+    for name, path, rel in files:
+        if name in seen:
+            refused.append({"path": rel, "reason": f"{seen[name]} already names {name!r}"})
+            continue
+        seen[name] = rel
+        if not _STORE_NAME_RE.fullmatch(name) or name.endswith(".md"):
+            refused.append({"path": rel, "reason": "its stem makes no routine name"})
+            continue
+        try:
+            fields, normalised = parse(_read_text(path))
+            _name_matches(fields, name)
+            read.append((name, rel, fields, normalised))
+        except (OSError, Unreadable) as exc:
+            refused.append({"path": rel, "reason": str(exc)})
+    if refused:
+        sys.stderr.write(json.dumps({"refused": refused}, ensure_ascii=False) + "\n")
+        _die(6, "not_canonical", f"{len(refused)} of {len(files)} files under {folder} do not "
+             "read as the file form; nothing was imported: "
+             + "; ".join(f"{r['path']}: {r['reason']}" for r in refused),
+             f"`{NAME} help` shows the file form")
+    by = _actor()
+    outcomes = []
+    with _store() as conn:
+        with conn.transaction():
+            for name, rel, fields, normalised in read:
+                outcome = _save_version(conn, project, name, fields, None,
+                                        f"imported from {rel}", by)
+                outcome["path"] = rel
+                if normalised:
+                    outcome["normalised"] = normalised
+                outcomes.append(outcome)
+    counts: dict = {}
+    for item in outcomes + skipped:
+        counts[item["outcome"]] = counts.get(item["outcome"], 0) + 1
+    _emit({"project": project, "folder": str(folder), "counts": counts,
+           "routines": outcomes, "skipped": skipped})
+
+
+def cmd_export(args) -> None:
+    project = _scope(write=False)
+    folder = _folder(args.dir)
+    with _store() as conn:
+        rows = _rows(conn, f"SELECT {_VERSION_COLUMNS} FROM {_VERSIONS} "
+                     "WHERE v.active AND d.project_id = %s AND d.retired_at IS NULL "
+                     "ORDER BY d.name", (project,))
+    present, _skipped = _files(folder) if folder.is_dir() else ([], [])
+    where: dict = {}
+    for name, path, _rel in present:
+        where.setdefault(name, []).append(path)
+    outcomes, names = [], set()
+    for row in rows:
+        names.add(row["name"])
+        held = where.get(row["name"], [])
+        path = held[0] if len(held) == 1 else folder / f"{row['name']}.md"
+        data = render(row).encode("utf-8")
+        item = {"name": row["name"], "path": str(path), "version": str(row["id"])}
+        try:
+            if path.is_file() and path.read_bytes() == data:
+                item["outcome"] = "unchanged"
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                item["outcome"] = "written"
+        except OSError as exc:
+            item.update(outcome="error", error=str(exc))
+        outcomes.append(item)
+    counts: dict = {}
+    for item in outcomes:
+        counts[item["outcome"]] = counts.get(item["outcome"], 0) + 1
+    _emit({"project": project, "folder": str(folder), "counts": counts, "routines": outcomes,
+           "not_in_store": [rel for name, _path, rel in present if name not in names]})
+    if counts.get("error"):
+        sys.exit(6)
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     _gate()
@@ -5687,6 +6395,7 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("doctor", add_help=False).set_defaults(fn=cmd_doctor)
     p_list = sub.add_parser("list", add_help=False)
     p_list.add_argument("--json", action="store_true")
+    p_list.add_argument("--store", action="store_true")
     p_list.set_defaults(fn=cmd_list)
     p_val = sub.add_parser("validate", add_help=False)
     p_val.add_argument("--json", action="store_true")
@@ -5698,9 +6407,44 @@ def main(argv: list[str] | None = None) -> None:
     p_groom.add_argument("target", nargs="?")
     p_groom.add_argument("--all", action="store_true")
     p_groom.set_defaults(fn=cmd_groom)
+
+    # The store's verbs refuse a malformed call as the contract's input error.
+    def refuse(message: str) -> NoReturn:
+        _die(6, "input", message, f"`{NAME} help` shows every verb and its arguments")
+
+    def store_verb(name: str, fn) -> argparse.ArgumentParser:
+        one = sub.add_parser(name, add_help=False, allow_abbrev=False)
+        one.error = refuse
+        one.set_defaults(fn=fn)
+        return one
+
+    show = store_verb("show", cmd_show)
+    show.add_argument("name")
+    show.add_argument("--version")
+    show.add_argument("--json", action="store_true")
+    history = store_verb("history", cmd_history)
+    history.add_argument("name")
+    history.add_argument("--json", action="store_true")
+    diff = store_verb("diff", cmd_diff)
+    diff.add_argument("name")
+    diff.add_argument("a", nargs="?")
+    diff.add_argument("b", nargs="?")
+    save = store_verb("save", cmd_save)
+    save.add_argument("name")
+    save.add_argument("--from", dest="source", required=True)
+    save.add_argument("--base")
+    save.add_argument("--note")
+    store_verb("retire", cmd_retire).add_argument("name")
+    store_verb("import", cmd_import).add_argument("dir", nargs="?")
+    store_verb("export", cmd_export).add_argument("dir", nargs="?")
     args, extra = parser.parse_known_args(argv)
     if extra:
         _die(6, "input", f"unknown arguments: {' '.join(extra)}")
+    if args.cmd in WRITE_VERBS:
+        _read_only_gate(f"`{NAME} {args.cmd}`")
+    if args.cmd == "list" and args.store:
+        cmd_store_list(args)
+        return
     args.fn(args)
 
 
