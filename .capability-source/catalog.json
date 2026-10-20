@@ -2,7 +2,7 @@
   "capabilities": {
     "agentrooms": {
       "path": "capabilities/agentrooms",
-      "payload_sha256": "6fc67312c9c184eb9ae8abc40f95fdcf10e8e09fef3fe5acc5cd68fe97701110",
+      "payload_sha256": "9ad5fde62b988c0bfcf278b9da90f72725cce5baee8321db61b88d0e8e55e052",
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room."
     },
     "asana": {

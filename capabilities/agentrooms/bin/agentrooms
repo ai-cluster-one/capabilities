@@ -162,11 +162,15 @@ COMMANDS
         sent with it and members the user ids its stripped state shows
         joined: before joining Matrix shares no messages, so the reason is
         the one message the operator sees.
-    watch [--room ROOM ...]
+    watch [--room ROOM ...] [--no-held]
         A read that does not end: it follows the rooms the selected
         connection sees, or only the ROOMs named, from now on - nothing from
         before it started - and prints one JSON object per line, flushed as
-        written, until it is stopped. Each line's `event` names its shape:
+        written, until it is stopped. --no-held follows Matrix alone and
+        holds no connection to the project's store: it follows no held
+        wakes, closes what resolving the connection read from the store
+        before the ready line, and so prints no `held` line, held false
+        and a `room` row's held null. Each line's `event` names its shape:
           {"event": "ready", "connection", "user_id", "rooms", "held"}
               first, once following; rooms is the --room filter or null;
               held says whether held wakes are followed, which needs the
@@ -7820,7 +7824,7 @@ def _follow_held(cfg: dict, rooms: set | None):
     return held_of, start
 
 
-def cmd_watch(cfg: dict, rooms_named: list[str] | None) -> None:
+def cmd_watch(cfg: dict, rooms_named: list[str] | None, held: bool = True) -> None:
     previous = {sig: signal.signal(sig, _watch_stop) for sig in (signal.SIGTERM, signal.SIGINT)}
     try:
         with _matrix(cfg) as m:
@@ -7840,7 +7844,13 @@ def cmd_watch(cfg: dict, rooms_named: list[str] | None) -> None:
             since = (first or {}).get("next_batch")
             joined = set(((first or {}).get("rooms") or {}).get("join") or {})
             account = _account_seen(first)
-            followed = _follow_held(cfg, rooms)
+            followed = _follow_held(cfg, rooms) if held else None
+            if not held:
+                # Following Matrix alone: what resolving the connection borrowed
+                # from the store is closed, not kept idle until the process exits.
+                with contextlib.suppress(ImportError):
+                    from capabilities_contract import db
+                    db.disconnect()
             held_of = followed[0] if followed else None
             _watch_line({"event": "ready", "connection": cfg["id"], "user_id": cfg["user_id"],
                          "rooms": sorted(rooms) if rooms is not None else None,
@@ -10860,7 +10870,9 @@ def _parser() -> _Parser:
     login.add_argument("--default", action="store_true")
     login.add_argument("--supervisor")
     sub.add_parser("rooms").add_argument("--archived", action="store_true")
-    sub.add_parser("watch").add_argument("--room", action="append")
+    watch = sub.add_parser("watch")
+    watch.add_argument("--room", action="append")
+    watch.add_argument("--no-held", dest="held", action="store_false")
     sub.add_parser("sessions").add_argument("--room")
     sub.add_parser("turn").add_argument("event")
     read = sub.add_parser("read")
@@ -11101,7 +11113,7 @@ def main() -> None:
     elif cmd == "read":
         _emit(cmd_read(cfg, args.room, args.limit))
     elif cmd == "watch":
-        cmd_watch(cfg, args.room)
+        cmd_watch(cfg, args.room, args.held)
     elif cmd == "open":
         _emit(cmd_open(cfg, args.name, args.invite, args.topic))
     elif cmd == "invite":

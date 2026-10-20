@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-20 — `watch --no-held` follows Matrix holding no store connection
+
+`agentrooms watch --no-held` follows the rooms as `watch` does but not the held wakes: it opens no listener and rereads nothing in the project's store, and closes the store connection that resolving the connection in a project borrowed before it prints its ready line, so a running watch holds no connection to the store. Its ready line says `held: false`, it prints no `held` line, and a `room` row's `held` is null; every other line is as before. A caller that reads held wakes from the store itself needs only this. Without the flag `watch` is unchanged.
+
 ## 2026-10-18 — A room switch, a default worker that answers, the card as the agent's profile, and a visibility switch
 
 `agentrooms serve ROOM on|off` switches the service on or off for the agent in a room, kept as the agent's room account data `agentrooms.served` beside its mark and grant. In a room switched off the service starts no turn, posts no refusal and holds nothing, drops the wakes it had not started, and does not post an answer a running turn would post there; switched on, it wakes on nothing that arrived while it was off. A room with no switch is served, so every existing room behaves as before. `rooms` rows and `open` and `join` answers gain `served`, `watch` prints `{"event": "served", "room_id", "served"}`, and `held answer` in a room switched off exits 6 `room_not_served`. A room the agent opens starts off and a room it accepts or joins starts on, unless `agentrooms workers defaults --opened on|off --accepted on|off` says otherwise; `workers list` bindings gain `opened` and `accepted`.

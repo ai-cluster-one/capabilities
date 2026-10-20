@@ -1216,6 +1216,42 @@ def test_watch_follows_the_held_wakes_in_the_store(cli, project, stored, homeser
         {"event": "held", "room_id": "!r", "held": {"count": 0, "senders": []}}]
 
 
+@needs_store
+def test_watch_no_held_follows_matrix_holding_no_store_connection(cli, project, stored,
+                                                                 homeserver, capsys):
+    # The connection is resolved from the store, as in a project whose
+    # connections moved there; following then holds nothing of the store.
+    import psycopg
+    identity = project / "capabilities" / "project.json"
+    identity.write_text(json.dumps({"id": "prj_test", "slug": "project", "connections": "store"}))
+    (project / ".env.local").write_text(f"AGENTROOMS_ALPHA_TOKEN={TOKEN}\n")
+    records = cli._records()
+    records.set("agentrooms", "connection", "alpha", {
+        "homeserver": HS, "user_id": f"@alpha:{SERVER}", "secret_env": "AGENTROOMS_ALPHA_TOKEN"})
+    records.set("agentrooms", "grant", "alpha", {"enabled": True, "allow_write": False})
+    held_open = []
+
+    def backends(named):
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            return {pid for (pid,) in conn.execute(
+                "SELECT pid FROM pg_stat_activity WHERE application_name LIKE %s "
+                "AND pid <> pg_backend_pid()", (named,))}
+
+    # An earlier watch in this test process may still be listening.
+    listening = backends("agentrooms-watch")
+
+    def count_backends():
+        held_open.append(len(backends("agentrooms%") - listening))
+        return {"next_batch": "b1"}
+
+    homeserver.syncs += [{"next_batch": "b0"}, count_backends, cli._WatchStopped()]
+    code, lines, err = run_stream(cli, capsys, "--connection", "alpha", "watch", "--no-held")
+    assert code == 0, err
+    assert lines == [{"event": "ready", "connection": "alpha", "user_id": f"@alpha:{SERVER}",
+                      "rooms": None, "held": False}]
+    assert held_open == [0]
+
+
 def _member(who, membership):
     return {"type": "m.room.member", "state_key": who, "sender": who,
             "content": {"membership": membership}}
