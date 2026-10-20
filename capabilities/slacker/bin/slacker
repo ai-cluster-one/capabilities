@@ -90,6 +90,15 @@ Commands
                                      Read a thread's replies. Answers from the
                                      store once it holds every reply the
                                      parent counts, else fetches from Slack.
+  slacker search <query> [--limit N] [--sort score|timestamp]
+                                     Search message text across every
+                                     conversation the account can see, as
+                                     Slack's own search answers it (its query
+                                     modifiers such as in: and from: apply),
+                                     the store not needed. Each match names
+                                     its channel, ts and thread_ts, which
+                                     `history` and `thread` read. No match is
+                                     count 0 at exit 0.
   slacker sync [--channel ID] [--full] [--limit N]
                                      Bring the store forward: fetch every
                                      message of each member conversation newer
@@ -7497,6 +7506,35 @@ class SlackClient:
             if not (data.get("has_more") and cursor):
                 return
 
+    def search(self, query: str, limit: int = 20, sort: str = "score"):
+        """Messages matching `query` across every conversation the user can see,
+        as Slack's own search answers it, until `limit` matches. Once consumed,
+        `search_total` is the number Slack counts. A network failure is Slack
+        being unreachable, so an empty answer always means no match."""
+        self.search_total = 0
+        page = 1
+        seen = 0
+        while True:
+            try:
+                data = self._call("search.messages", query=query,
+                                  count=min(limit, 100), page=page, sort=sort,
+                                  sort_dir="desc")
+            except OSError as exc:
+                _refuse(5, "slack_unreachable",
+                        f"Slack could not be reached: {exc}",
+                        "check the network and run the search again")
+            found = data.get("messages") or {}
+            self.search_total = found.get("total") or 0
+            for match in found.get("matches") or []:
+                yield match
+                seen += 1
+                if seen >= limit:
+                    return
+            paging = found.get("paging") or {}
+            if page >= (paging.get("pages") or 1):
+                return
+            page += 1
+
 
 # --- Reads -------------------------------------------------------------------
 
@@ -7795,6 +7833,41 @@ def cmd_thread(args) -> dict:
     return {"connection": cfg["id"], "channel": channel,
             "thread_ts": args.thread_ts, "fetched_from_slack": fetched,
             "count": len(stored), "messages": stored}
+
+
+def _search_hit(match: dict) -> dict:
+    """One search match as a row that names where it lives: the conversation,
+    the ts, and the thread it sits in. Slack carries a reply's thread only in
+    its permalink, so the thread is read from there when the match lacks it."""
+    from urllib.parse import parse_qs, urlparse
+    conv = match.get("channel") or {}
+    thread_ts = match.get("thread_ts")
+    if not thread_ts and match.get("permalink"):
+        thread_ts = (parse_qs(urlparse(match["permalink"]).query)
+                     .get("thread_ts") or [None])[0]
+    ts_at = None
+    if _ts_float(match.get("ts")) is not None:
+        whole, _, frac = match["ts"].partition(".")
+        ts_at = datetime.datetime.fromtimestamp(
+            int(whole), datetime.timezone.utc).replace(
+            microsecond=int((frac or "0")[:6].ljust(6, "0"))).isoformat()
+    return {"channel": conv.get("id"), "channel_name": _conv_name(conv),
+            "kind": _conv_kind(conv), "ts": match.get("ts"),
+            "ts_at": ts_at, "thread_ts": thread_ts,
+            "user": match.get("user"), "username": match.get("username"),
+            "text": match.get("text"), "permalink": match.get("permalink")}
+
+
+def cmd_search(args) -> dict:
+    query = " ".join(args.query).strip()
+    if not query:
+        _refuse(6, "invalid_arguments", "a search query is required",
+                f"run `{NAME} search <text>`")
+    cfg = get_config(args)
+    client = SlackClient(cfg)
+    hits = [_search_hit(m) for m in client.search(query, args.limit, args.sort)]
+    return {"connection": cfg["id"], "query": query,
+            "total": client.search_total, "count": len(hits), "messages": hits}
 
 
 def cmd_sync(args) -> dict:
@@ -8139,6 +8212,11 @@ def _build_parser() -> argparse.ArgumentParser:
     t.add_argument("thread_ts")
     t.add_argument("--fresh", action="store_true")
 
+    se = _leaf("search")
+    se.add_argument("query", nargs="+")
+    se.add_argument("--limit", "-n", type=_positive_int, default=20)
+    se.add_argument("--sort", choices=["score", "timestamp"], default="score")
+
     sy = _leaf("sync")
     sy.add_argument("--channel", help="one channel id (default: every member channel)")
     sy.add_argument("--full", action="store_true",
@@ -8209,7 +8287,8 @@ def main() -> None:
     args = _build_parser().parse_args(argv)
     handlers = {
         "whoami": cmd_whoami, "conversations": cmd_conversations,
-        "history": cmd_history, "thread": cmd_thread, "sync": cmd_sync,
+        "history": cmd_history, "thread": cmd_thread, "search": cmd_search,
+        "sync": cmd_sync,
         "service": cmd_service, "link": cmd_link,
     }
     handler = handlers.get(args.command)

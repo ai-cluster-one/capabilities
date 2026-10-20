@@ -1,5 +1,9 @@
 # slacker — change log
 
+## 2026-10-20 — `search` finds messages by their text
+
+`slacker search <query> [--limit N] [--sort score|timestamp]` searches message text across every conversation the linked account can see, through Slack's own search (`search.messages`), so it reaches messages the store never captured and needs neither the store nor a running capture. Slack's query modifiers (`in:`, `from:` and the rest) apply as they do in the client. Each match names its conversation (`channel`, `channel_name`, `kind`), its `ts` and time, its `thread_ts` — read from the permalink when Slack leaves it off a reply — its author and its permalink, so `history <channel>` and `thread <channel> <thread_ts>` read it in place. No match is a successful answer with `count` 0; an invalid session exits 2, a refused read 6, and an unreachable Slack 5 (`slack_unreachable`). Proven in the lane against a local Slack Web API; a search of the person's own workspace is the owner's check after release.
+
 ## 2026-10-20 — `link` reaches a real Chrome
 
 `slacker link` dials Chrome's DevTools socket without an `Origin` header, which a real Chrome requires of a client it was not told to allow; before this, Chrome answered 403 and `link` stopped with an unhandled error before the sign-in page could be used. A handshake Chrome still refuses is now the refusal `devtools_refused`, pointing to the paste route. The Chrome it opens uses a mock keychain, so the temporary profile never asks for the macOS keychain.

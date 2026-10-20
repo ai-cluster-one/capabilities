@@ -130,6 +130,53 @@ class MemberConversations(unittest.TestCase):
         self.assertEqual([c["is_member"] for c in convs], [True, True])
 
 
+class _Searching(su.SlackClient):
+    """search.messages as Slack answers it, over pages of `per` matches; a
+    reply carries its thread only in its permalink."""
+
+    def __init__(self, matches, per=2):
+        self.matches, self.per, self.pages_read = matches, per, 0
+
+    def _call(self, method: str, **kwargs) -> dict:
+        assert method == "search.messages", method
+        self.pages_read += 1
+        page = kwargs["page"]
+        pages = max(1, -(-len(self.matches) // self.per))
+        return {"ok": True, "messages": {
+            "total": len(self.matches),
+            "matches": self.matches[(page - 1) * self.per:page * self.per],
+            "paging": {"page": page, "pages": pages}}}
+
+
+class MessageSearch(unittest.TestCase):
+    def test_a_reply_match_names_its_conversation_and_its_thread(self):
+        client = _Searching([{
+            "ts": "1700000002.000200", "user": "U1", "text": "the rollout plan",
+            "channel": {"id": "C1", "name": "general", "is_channel": True},
+            "permalink": "https://x.slack.com/archives/C1/p1700000002000200"
+                         "?thread_ts=1700000001.000100&cid=C1"}])
+        hits = [su._search_hit(m) for m in client.search("rollout")]
+        self.assertEqual(
+            {k: hits[0][k] for k in ("channel", "kind", "ts", "thread_ts")},
+            {"channel": "C1", "kind": "public_channel",
+             "ts": "1700000002.000200", "thread_ts": "1700000001.000100"})
+        self.assertEqual(hits[0]["ts_at"], "2023-11-14T22:13:22.000200+00:00")
+        self.assertEqual(client.search_total, 1)
+
+    def test_matches_are_read_across_pages_up_to_the_limit(self):
+        matches = [{"ts": f"170000000{i}.0", "channel": {"id": "C1"}}
+                   for i in range(5)]
+        client = _Searching(matches)
+        self.assertEqual(len(list(client.search("x", limit=3))), 3)
+        self.assertEqual(client.pages_read, 2)
+        self.assertEqual(len(list(_Searching(matches).search("x", limit=50))), 5)
+
+    def test_no_match_is_an_empty_answer(self):
+        client = _Searching([])
+        self.assertEqual(list(client.search("nothing")), [])
+        self.assertEqual(client.search_total, 0)
+
+
 class MessageValues(unittest.TestCase):
     def test_a_message_becomes_a_row_dict(self):
         v = su._message_values("C1", {

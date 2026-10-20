@@ -14,6 +14,7 @@ The verb surface is small and entirely read-only:
 - `conversations` — list what the account can see: direct messages (`im`), group direct messages (`mpim`), and the public and private channels it belongs to.
 - `history <channel>` — read a conversation, answering from the store and fetching from Slack only what the store cannot cover.
 - `thread <channel> <thread_ts>` — read a thread's replies, from the store once it holds every reply the parent counts, otherwise from Slack.
+- `search <query>` — search message text across every conversation the account can see, through Slack's own search (`search.messages`), so it finds messages the store has never captured and needs no store or running capture. Each match carries its `channel`, `ts` and `thread_ts`, which `history` and `thread` read; no match is a `count` of 0 at exit 0, while an invalid session, a refused read or an unreachable Slack exits non-zero.
 - `sync` — bring the store forward incrementally for every member conversation, or one named channel.
 - `service run` — hold the session's event stream and capture live.
 
