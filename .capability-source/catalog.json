@@ -45,6 +45,11 @@
       "payload_sha256": "2f1939dcc799483287ce9824cf1eee5a6e73822e096b2c13028be7c78d8362d4",
       "summary": "ClickUp CLI over the REST API — read/create/update/comment-on tasks and subtasks, complete via status, manage assignees, tags, dependencies, custom fields, attachments, and webhooks across spaces and lists."
     },
+    "context": {
+      "path": "capabilities/context",
+      "payload_sha256": "11a443369ab75bb3fdee0e2b5a3f68a9dbbeaa5afae058f0f696eecca86363ac",
+      "summary": "An agent's doctrine as versioned documents in the project's PostgreSQL store - list, show, save with a base, history, diff and retire, and import and export the context folder byte for byte."
+    },
     "coolify": {
       "path": "capabilities/coolify",
       "payload_sha256": "3c5781757168079e3c2ea05ca50e208cde6cf01fa98d9e2f8929ce1691181598",
