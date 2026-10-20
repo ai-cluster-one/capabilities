@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-20 — The manager builds a ContextKit-bound agent's context
+
+`capabilities build [--print] [--json]` composes a ContextKit-bound agent's generated host context as `contextkit build` does - the runtime and collaboration texts, the guide menu, onboarding, foreign instruction files, inline and stub context with global context, the routine index and the manager's own capabilities block, composed in its own process - byte for byte the text ContextKit composes, without its update notice. `--print` writes the text to stdout and writes nothing; without it the configured output (default `.contextkit/generated/context.md`) is replaced whole and each host ContextKit has a hook for is linked to it (`.contextkit.md`, `.claude/rules/CONTEXT.md`). A project without a ContextKit binding is refused as `not_contextkit_bound` (exit 6). Every other verb, `capabilities context` and the hooks are unchanged. Run `capabilities help` for the details.
+
 ## 2026-10-20 — The manager reads where an agent's body lives
 
 In a project bound by `.contextkit/config.toml`, the manager reads the envelope's location from the binding itself - `[body] root` and `[sources] capabilities` inside it, `.capabilities` naming the legacy project-root envelope - instead of running `contextkit path capabilities`, so a bound project resolves without ContextKit on PATH and without starting it. A binding that names an absolute, hidden or out-of-project body or layer is refused as `body_path_invalid` (exit 6) where ContextKit's answer used to be refused as `contextkit_unavailable`, `contextkit_path_failed`, `contextkit_path_malformed` or `project_envelope_outside_project`. `capabilities path --json` adds `body_root` and `layers` (`context`, `assets`, `routines`, `capabilities`, each absolute), the same paths `contextkit path --json` gives. Every project resolves to the envelope it resolved to before. Run `capabilities help` for the details.
