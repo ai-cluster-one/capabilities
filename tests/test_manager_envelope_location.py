@@ -1,4 +1,6 @@
-"""The project envelope location: asked of ContextKit, defaulted otherwise."""
+"""The project envelope location: read from a ContextKit binding, defaulted otherwise.
+
+A stand-in `contextkit` that logs each call proves the manager never asks it."""
 
 import json
 import os
@@ -47,23 +49,6 @@ def _fake_contextkit(tmp_path: Path, envelope: Path | None, exit_code: int = 0) 
         body += f'printf "%s\\n" "{envelope}"\n'
     body += f"exit {exit_code}\n"
     script.write_text(body)
-    script.chmod(0o755)
-    return log
-
-
-def _binding_reading_contextkit(tmp_path: Path) -> Path:
-    """A stand-in `contextkit` that answers out of the project's own binding."""
-    bin_dir = tmp_path / "fakebin"
-    bin_dir.mkdir(exist_ok=True)
-    log = tmp_path / "contextkit-calls.log"
-    script = bin_dir / "contextkit"
-    script.write_text(
-        "#!/bin/sh\n"
-        f'echo "$@" >> "{log}"\n'
-        "here=$(pwd)\n"
-        "body=$(sed -n 's/^root = \"\\(.*\\)\"$/\\1/p' .contextkit/config.toml)\n"
-        'if [ -n "$body" ]; then printf "%s/%s/capabilities\\n" "$here" "$body"\n'
-        'else printf "%s/capabilities\\n" "$here"; fi\n')
     script.chmod(0o755)
     return log
 
@@ -121,8 +106,7 @@ def test_contextkit_body_root_relocates_the_whole_envelope(tmp_path: Path) -> No
     gate = json.loads((envelope / "settings.json").read_text())
     assert gate["capabilities"]["asana"]["enabled"] is True
     assert enabled["gate"] == str(envelope.resolve() / "settings.json")
-    # One lookup covers both invocations: the second reads the first's record.
-    assert _envelope_lookups(log) == ["path capabilities"]
+    assert _envelope_lookups(log) == []
 
     listed = _json(_run(tmp_path, project, "list"))
     assert listed["project_envelope"] == str(envelope.resolve())
@@ -156,7 +140,7 @@ def test_contextkit_without_body_root_keeps_the_root_envelope(tmp_path: Path) ->
 
     assert init["gate"] == str((project / "capabilities" / "settings.json").resolve())
     assert (project / "capabilities" / "settings.json").is_file()
-    assert _envelope_lookups(log) == ["path capabilities"]
+    assert _envelope_lookups(log) == []
 
 
 def test_project_without_contextkit_never_asks(tmp_path: Path) -> None:
@@ -171,43 +155,36 @@ def test_project_without_contextkit_never_asks(tmp_path: Path) -> None:
     assert not log.exists()
 
 
-def test_contextkit_absent_from_path_is_a_structured_error(tmp_path: Path) -> None:
+def test_a_bound_project_resolves_without_contextkit_on_path(tmp_path: Path) -> None:
     project = _project(tmp_path, contextkit=True, body_root="agent")
     (tmp_path / "fakebin").mkdir()
     env = _env(tmp_path, project)
     env["PATH"] = str(tmp_path / "fakebin")
 
-    result = _run(tmp_path, project, "init", env=env)
+    answer = _json(_run(tmp_path, project, "path", "--json", env=env))
 
-    assert result.returncode == 6
-    assert json.loads(result.stderr)["error"]["code"] == "contextkit_unavailable"
-    assert not (project / "capabilities").exists()
-    assert not (project / "agent").exists()
+    assert answer["project_envelope"] == str((project / "agent" / "capabilities").resolve())
+    assert answer["body_root"] == "agent"
 
 
-def test_failing_contextkit_is_a_structured_error(tmp_path: Path) -> None:
-    project = _project(tmp_path, contextkit=True, body_root="agent")
-    log = _fake_contextkit(tmp_path, None, exit_code=1)
-
-    result = _run(tmp_path, project, "init")
-
-    assert log.exists()
-    assert result.returncode == 6
-    assert json.loads(result.stderr)["error"]["code"] == "contextkit_path_failed"
-    assert not (project / "capabilities").exists()
-    assert not (project / "agent").exists()
-
-
-def test_answer_outside_the_project_is_a_structured_error(tmp_path: Path) -> None:
-    project = _project(tmp_path, contextkit=True)
-    outside = tmp_path / "elsewhere" / "capabilities"
-    _fake_contextkit(tmp_path, outside)
+def test_a_body_root_outside_the_project_is_refused(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=True, body_root="../elsewhere")
 
     result = _run(tmp_path, project, "init")
 
     assert result.returncode == 6
-    assert json.loads(result.stderr)["error"]["code"] == "project_envelope_outside_project"
-    assert not outside.exists()
+    assert json.loads(result.stderr)["error"]["code"] == "body_path_invalid"
+    assert not (project / "capabilities").exists()
+    assert not (tmp_path / "elsewhere").exists()
+
+
+def test_a_hidden_body_root_is_refused(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=True, body_root=".agent")
+
+    result = _run(tmp_path, project, "path", "--json")
+
+    assert result.returncode == 6
+    assert json.loads(result.stderr)["error"]["code"] == "body_path_invalid"
 
 
 def test_fragment_composed_for_a_context_owner_never_calls_it_back(tmp_path: Path) -> None:
@@ -248,6 +225,9 @@ def test_path_json_reports_plain_project_provenance(tmp_path: Path) -> None:
         "project_root": str(project.resolve()),
         "project_envelope": str((project / "capabilities").resolve()),
         "provider": "default",
+        "body_root": ".",
+        "layers": {name: str((project / name).resolve())
+                   for name in ("context", "assets", "routines", "capabilities")},
     }
 
 
@@ -261,6 +241,8 @@ def test_path_json_reports_contextkit_provenance(tmp_path: Path) -> None:
     assert answer["project_root"] == str(project.resolve())
     assert answer["project_envelope"] == str(envelope.resolve())
     assert answer["provider"] == "contextkit"
+    assert answer["body_root"] == "agent"
+    assert answer["layers"]["context"] == str((project / "agent" / "context").resolve())
 
 
 def test_path_json_reports_handoff_provenance_without_contextkit(tmp_path: Path) -> None:
@@ -305,7 +287,7 @@ def test_a_second_process_reads_the_recorded_answer(tmp_path: Path) -> None:
 
     assert first == second
     assert second["project_envelope"] == str(envelope.resolve())
-    assert log.read_text().splitlines() == ["path capabilities"]
+    assert not log.exists()
     assert _record(tmp_path)["root"] == str(project.resolve())
 
 
@@ -338,7 +320,6 @@ def test_a_capability_reads_the_record_without_starting_the_manager(tmp_path: Pa
 
 def test_a_changed_context_binding_is_resolved_again(tmp_path: Path) -> None:
     project = _project(tmp_path, contextkit=True, body_root="agent")
-    log = _binding_reading_contextkit(tmp_path)
     first = _json(_run(tmp_path, project, "path", "--json"))
     assert first["project_envelope"] == str((project / "agent" / "capabilities").resolve())
 
@@ -348,24 +329,9 @@ def test_a_changed_context_binding_is_resolved_again(tmp_path: Path) -> None:
     answer = _json(_run(tmp_path, project, "path", "--json"))
 
     assert answer["project_envelope"] == str((project / "workbench" / "capabilities").resolve())
-    assert log.read_text().splitlines() == ["path capabilities"] * 2
 
 
-def test_a_replaced_context_owner_is_resolved_again(tmp_path: Path) -> None:
-    project = _project(tmp_path, contextkit=True, body_root="agent")
-    log = _fake_contextkit(tmp_path, project / "agent" / "capabilities")
-    _json(_run(tmp_path, project, "path", "--json"))
-
-    _fake_contextkit(tmp_path, project / "elsewhere-entirely" / "capabilities")
-
-    answer = _json(_run(tmp_path, project, "path", "--json"))
-
-    assert answer["project_envelope"] == str(
-        (project / "elsewhere-entirely" / "capabilities").resolve())
-    assert log.read_text().splitlines() == ["path capabilities"] * 2
-
-
-def test_a_damaged_record_costs_a_lookup_rather_than_the_answer(tmp_path: Path) -> None:
+def test_a_damaged_record_costs_a_reading_rather_than_the_answer(tmp_path: Path) -> None:
     project = _project(tmp_path, contextkit=True, body_root="agent")
     envelope = project / "agent" / "capabilities"
     log = _fake_contextkit(tmp_path, envelope)
@@ -375,7 +341,7 @@ def test_a_damaged_record_costs_a_lookup_rather_than_the_answer(tmp_path: Path) 
     answer = _json(_run(tmp_path, project, "path", "--json"))
 
     assert answer["project_envelope"] == str(envelope.resolve())
-    assert log.read_text().splitlines() == ["path capabilities"] * 2
+    assert not log.exists()
 
 
 def test_each_project_root_keeps_its_own_record(tmp_path: Path) -> None:
@@ -404,3 +370,24 @@ def test_a_handed_off_answer_is_never_recorded(tmp_path: Path) -> None:
     assert answer["provider"] == "handoff"
     assert not log.exists()
     assert _records(tmp_path) == []
+
+
+def test_a_layer_naming_the_body_itself_is_refused(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=True)
+    config = project / ".contextkit" / "config.toml"
+    config.write_text(config.read_text() + '\n[sources]\ncapabilities = "."\n')
+
+    result = _run(tmp_path, project, "path", "--json")
+
+    assert result.returncode == 6
+    assert json.loads(result.stderr)["error"]["code"] == "body_path_invalid"
+
+
+def test_the_legacy_envelope_is_named_in_any_spelling(tmp_path: Path) -> None:
+    project = _project(tmp_path, contextkit=True, body_root="agent")
+    config = project / ".contextkit" / "config.toml"
+    config.write_text(config.read_text() + '\n[sources]\ncapabilities = "./.capabilities/"\n')
+
+    answer = _json(_run(tmp_path, project, "path", "--json"))
+
+    assert answer["project_envelope"] == str((project / ".capabilities").resolve())

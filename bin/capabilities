@@ -91,12 +91,13 @@ THE PROJECT ENVELOPE
   state — sits in one envelope; records are kept in files, except the
   connections, grants, identifiers and policy of a project in store mode,
   which its store holds (see `connections import`). In a project
-  bound by `.contextkit/config.toml` its location
-  belongs to ContextKit and is asked for, never assumed or stored:
-  `contextkit path capabilities`, once per invocation. Without that binding the
-  envelope is <root>/capabilities and the project depends on nothing outside
-  itself. A configured ContextKit binding that cannot return exactly one
-  absolute in-project path is an error; it never silently selects another tree.
+  bound by `.contextkit/config.toml` its location is read from that binding:
+  `[body] root`, the folder holding the agent's body, and `[sources]
+  capabilities` inside it (`.capabilities` names the legacy project-root
+  envelope). Without that binding the envelope is <root>/capabilities. A
+  binding that names an absolute, hidden or out-of-project path is an error
+  (body_path_invalid); it never silently selects another tree. `path --json`
+  reports the body root and each layer.
 
 MACHINE VERBS
   install <name> [--from <path|url> | --source ID] [--yes] [--allow]
@@ -915,8 +916,6 @@ CODEX_RETIRED_FALLBACKS = (CODEX_CAPABILITIES_REL.as_posix(),
 CODEX_CONFIG_REL = Path(".codex") / "config.toml"
 CODEX_HOOKS_REL = Path(".codex") / "hooks.json"
 CONTEXTKIT_CONFIG_REL = Path(".contextkit") / "config.toml"
-CONTEXTKIT_BIN = "contextkit"
-CONTEXTKIT_ENVELOPE_QUERY = ("path", "capabilities")
 ENVELOPE_ENV = "CAPABILITIES_PROJECT_ENVELOPE"
 ENVELOPE_ROOT_ENV = "CAPABILITIES_PROJECT_ENVELOPE_ROOT"
 PROJECT_ID_ENV = "CAPABILITIES_PROJECT_ID"
@@ -1419,51 +1418,78 @@ def _record_envelope(key: str, envelope: Path, witness: list[dict]) -> None:
                   {"envelope": str(envelope)}, witness)
 
 
+BODY_LAYERS = ("context", "assets", "routines", "capabilities")
+
+
+def _body_path(raw, what: str, config_file: Path, root_allowed: bool = False) -> Path:
+    """One relative, visible path inside the project, as a binding names it;
+    the project root itself only where `root_allowed` (the body root)."""
+    if not isinstance(raw, str) or not raw.strip():
+        _die(6, "body_path_invalid", f"{config_file} declares {what} {raw!r}",
+             "name a non-empty relative path inside the project")
+    candidate = Path(raw.strip())
+    if not candidate.parts or candidate.as_posix() == ".":
+        if root_allowed:
+            return Path(".")
+        _die(6, "body_path_invalid", f"{config_file} declares {what} {raw!r}",
+             "a layer is a folder inside the body, not the body itself")
+    if candidate.is_absolute() or ".." in candidate.parts or candidate.parts[0].startswith("."):
+        _die(6, "body_path_invalid", f"{config_file} declares {what} {raw!r}",
+             "the body and its layers are visible folders inside the project, "
+             'such as `root = "agent"`')
+    return candidate
+
+
+def _project_body(root: Path) -> dict:
+    """Where the agent's body lives: its root folder and each layer in it.
+
+    A ContextKit binding names them - `[body] root`, and `[sources] <layer>`
+    inside it, the legacy `.capabilities` envelope fixed at the project root -
+    and is read here directly; every other project keeps its layers at the
+    project root."""
+    body_root, declared = Path("."), {}
+    config_file = root / CONTEXTKIT_CONFIG_REL
+    if _contextkit_managed(root):
+        import tomllib
+        try:
+            raw = tomllib.loads(config_file.read_text())
+        except (OSError, ValueError) as exc:
+            _die(6, "contextkit_config_invalid", f"{config_file} cannot be read: {exc}",
+                 "repair the project context binding, then retry")
+        body = raw.get("body") if isinstance(raw.get("body"), dict) else {}
+        body_root = _body_path(body.get("root", "."), "body.root", config_file,
+                               root_allowed=True)
+        declared = raw.get("sources") if isinstance(raw.get("sources"), dict) else {}
+    layers = {}
+    for name in BODY_LAYERS:
+        value = declared.get(name, name)
+        if name == "capabilities" and isinstance(value, str) and value.strip() \
+                and Path(value.strip()).as_posix() == LEGACY_PROJECT_CAPABILITIES_REL.as_posix():
+            layers[name] = root / LEGACY_PROJECT_CAPABILITIES_REL
+        else:
+            layers[name] = root / body_root / _body_path(value, f"sources.{name}", config_file)
+    return {"body_root": body_root, "layers": layers}
+
+
 def _contextkit_envelope(root: Path) -> Path:
-    """Where ContextKit keeps this project's envelope, or a structured error."""
+    """Where this project's ContextKit binding puts its envelope."""
     override = _handed_off_envelope(root)
     if override:
         return _validated_envelope(root, override, "environment handoff")
-    try:
-        proc = subprocess.run([CONTEXTKIT_BIN, *CONTEXTKIT_ENVELOPE_QUERY],
-                              cwd=root, capture_output=True, text=True,
-                              timeout=10)
-    except FileNotFoundError:
-        _die(6, "contextkit_unavailable",
-             "this project is bound to ContextKit but contextkit is not available",
-             "install/repair ContextKit or remove the broken .contextkit binding")
-    except subprocess.TimeoutExpired:
-        _die(6, "contextkit_timeout",
-             "ContextKit did not resolve the capabilities envelope within 10 seconds",
-             "repair the project context binding, then retry")
-    except OSError as exc:
-        _die(6, "contextkit_unavailable",
-             f"could not run ContextKit: {exc}",
-             "install/repair ContextKit or remove the broken .contextkit binding")
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip()
-        _die(6, "contextkit_path_failed",
-             f"ContextKit could not resolve the capabilities envelope (exit {proc.returncode})",
-             detail or "repair the project context binding, then retry")
-    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-    if len(lines) != 1:
-        _die(6, "contextkit_path_malformed",
-             "ContextKit returned a malformed capabilities envelope answer",
-             "expected exactly one absolute path")
-    return _validated_envelope(root, lines[0], "ContextKit")
+    return _validated_envelope(root, str(_project_body(root)["layers"]["capabilities"]),
+                               "the ContextKit binding")
 
 
 def _envelope_home(root: Path) -> Path:
     """The project's capabilities envelope, resolved once per invocation.
 
-    ContextKit owns the location of the projects it manages, so it is asked
-    rather than assumed. Broken configured bindings fail closed. Every other
-    project keeps the envelope at <root>/capabilities.
+    A ContextKit binding names where the projects it binds keep it, and is read
+    for it. Broken configured bindings fail closed. Every other project keeps
+    the envelope at <root>/capabilities.
 
     An answer this manager resolved itself is recorded against the inputs it
-    rests on — the project's context binding and the program that answered — so
-    the next process on this machine reads it instead of starting an interpreter
-    to ask the same question. A handed-off answer is the caller's assertion about
+    rests on — the project's context binding — so the next process on this
+    machine reads it instead of reading the binding again. A handed-off answer is the caller's assertion about
     one invocation, so it outranks the record and is never written into it.
     """
     cached = _ENVELOPE_HOME.get(root)
@@ -1477,9 +1503,6 @@ def _envelope_home(root: Path) -> Path:
         if home is None:
             witness = [_envelope_witness(root / CONTEXTKIT_CONFIG_REL)]
             if _contextkit_managed(root):
-                program = shutil.which(CONTEXTKIT_BIN)
-                if program:
-                    witness.append(_envelope_witness(program))
                 home = _contextkit_envelope(root)
             else:
                 home = root / PROJECT_CAPABILITIES_REL
@@ -1635,10 +1658,13 @@ def cmd_path(json_output: bool, identity: bool = False) -> None:
         provider = "contextkit"
     else:
         provider = "default"
+    body = _project_body(root)
     answer = {
         "project_root": str(root),
         "project_envelope": str(envelope),
         "provider": provider,
+        "body_root": body["body_root"].as_posix(),
+        "layers": {name: str(path.resolve()) for name, path in body["layers"].items()},
     }
     if identity:
         state = _project_id_state(root)

@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-20 — The manager reads where an agent's body lives
+
+In a project bound by `.contextkit/config.toml`, the manager reads the envelope's location from the binding itself - `[body] root` and `[sources] capabilities` inside it, `.capabilities` naming the legacy project-root envelope - instead of running `contextkit path capabilities`, so a bound project resolves without ContextKit on PATH and without starting it. A binding that names an absolute, hidden or out-of-project body or layer is refused as `body_path_invalid` (exit 6) where ContextKit's answer used to be refused as `contextkit_unavailable`, `contextkit_path_failed`, `contextkit_path_malformed` or `project_envelope_outside_project`. `capabilities path --json` adds `body_root` and `layers` (`context`, `assets`, `routines`, `capabilities`, each absolute), the same paths `contextkit path --json` gives. Every project resolves to the envelope it resolved to before. Run `capabilities help` for the details.
+
 ## 2026-10-19 — A new agent starts in the store
 
 `capabilities init` in a project with no identity, no settings file and no legacy envelope creates a new agent in the store: its `project.json` declares `"records": "store"`, no `settings.json` is written, and its registry row is registered with `migrated_at` and this node (`AGENT_NODE_NAME`) as its master, under `agent.migrated`. Before writing anything init refuses such a project without `AGENT_NODE_NAME` (`node_unnamed`), without a store (`store_not_configured`), on a store that does not answer (exit 5), and on a store whose global records have not moved (`global_not_migrated`, run `capabilities migrate --global --apply` first); a registration that fails ends init with exit 5. An existing project, in files mode or moved, is initialised as before, and the import verbs and files mode keep working. Run `capabilities help` for the details.
