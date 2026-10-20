@@ -9,9 +9,29 @@ The pair the web client holds:
 - the workspace token, an `xoxc-...` string, one per workspace;
 - the `d` cookie value, shared across the person's workspaces.
 
-The person reads both from a browser they are already signed in to. In the browser's developer tools: the token is `localStorage["localConfig_v2"].teams[<team-id>].token`, and the `d` cookie is under Application → Cookies for `slack.com`. Paste the `d` value exactly as the browser holds it; a `+` in it is part of the value.
+There are two ways to put that pair into a connection: sign in through a Chrome window the tool opens, or paste it by hand. Both land the two secrets only in the credentials file, never in the registry, a log, or output.
 
-Browser-driven extraction (driving a real browser with Playwright or rod, letting the person complete password, magic code, SSO and 2FA, then reading the pair out) is how `slackdump` and `wee-slack` collect it. That ceremony is a deferred step for the human trial; the pilot links by paste, which needs no extra dependency.
+## Link by signing in through Chrome
+
+`slacker link` reads the session out of a Chrome you sign in to, so you copy nothing:
+
+```
+slacker link [<id>] [--workspace <team-id|domain|name>] [--default]
+```
+
+It opens the installed Google Chrome with a fresh temporary profile and Chrome's remote-debugging channel, loads the Slack sign-in page, and waits while you sign in normally — password, magic code, SSO, 2FA. The tool types and clicks nothing; it only watches. Once you are in, it reads the workspace `xoxc-` token from the page's own `localStorage["localConfig_v2"]` and the `d` cookie over Chrome's DevTools protocol, writes them as the connection, closes the window, deletes the temporary profile, and proves the link with the same check `doctor` runs.
+
+- `<id>` is the connection id to write; it defaults to the workspace's domain.
+- With several workspaces signed in, name which to link with `--workspace` (its team id, domain or name), or pass an `<id>` that matches one; otherwise the tool lists them and asks.
+- Your everyday Chrome profile is never touched — the window runs on a throwaway profile you sign in to just for this. No browser is bundled and no dependency is added: the DevTools channel is spoken over the websocket library `slacker` already ships.
+
+It needs an installed Google Chrome and a display to sign in on. With no Chrome, a closed window, or a sign-in that times out, it refuses and leaves no partial connection — link by paste instead.
+
+Browser-driven extraction like this is also how `slackdump` and `wee-slack` collect the session.
+
+## Link by paste
+
+Read both values from a browser you are already signed in to. In the browser's developer tools: the token is `localStorage["localConfig_v2"].teams[<team-id>].token`, and the `d` cookie is under Application → Cookies for `slack.com`. Paste the `d` value exactly as the browser holds it; a `+` in it is part of the value.
 
 ## Declaring the connection
 

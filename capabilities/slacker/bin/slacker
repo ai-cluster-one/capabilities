@@ -42,6 +42,13 @@ Connections
   process env); selection is `--connection <id>` (-c), else the registry's
   default, else the sole entry.
 
+  Two ways to link. `slacker link` signs you in through a Chrome window it
+  opens and reads the session out for you (needs an installed Chrome and a
+  display). Or paste: read the xoxc- token and the `d` cookie from a browser
+  you are already signed in to and run `connection add <id> --stdin` (see
+  `slacker guide linking`). Either way the two secrets land only in the
+  credentials file, never in the registry, a log, or output.
+
 Store
   Conversations, messages, thread replies, reactions, users and the sync cursor
   live in the project's Postgres database, in slacker_* tables keyed by the
@@ -55,6 +62,19 @@ Store
 
 Commands
   slacker help                       Print this usage block
+  slacker link [<id>] [--workspace W] [--default] [--replace] [--timeout S]
+               [--global|--project] [--events]
+                                     Link a workspace by signing in through a
+                                     Chrome window it opens: it waits while you
+                                     sign in (typing and clicking nothing),
+                                     reads the xoxc- token and the `d` cookie
+                                     over Chrome's DevTools protocol, writes
+                                     them as a connection, closes the window
+                                     and deletes the temporary profile, then
+                                     proves the link. Several workspaces: pass
+                                     `--workspace` (team id, domain or name) or
+                                     an id that matches one. No Chrome or no
+                                     display: link by paste instead.
   slacker doctor [--connection ID]   Prove the session, the user and the
                                      workspace; match the binding.
   slacker whoami [--connection ID]   The linked identity and workspace, named.
@@ -163,11 +183,22 @@ CONN_FIELDS = [
      'type': 'string',
      'required': False},
 ]
-# No interactive link ceremony: the pilot links through the contract's own
-# `connection add <id> --stdin`, pasting the two values the person reads from
-# their signed-in browser. Browser-driven extraction (Playwright/rod, as
-# slackdump and wee-slack do) and the JSON-event ceremony that would wrap it are
-# a deferred step for the human trial. See guides/linking.md.
+# `link` signs the person in through a Chrome window it opens and reads the
+# session out itself, so nobody copies a token or a cookie. The contract's own
+# `connection add <id> --stdin` stays as the paste fallback for a machine with
+# no Chrome or no display. The ceremony drives no bundled browser and needs no
+# new dependency: it speaks Chrome's own DevTools protocol over the websocket
+# library slacker already ships. See guides/linking.md.
+LINK_METHODS = [{
+    'id': 'browser',
+    'label': 'Sign in through a Chrome window',
+    'argv': ['slacker', 'link', '--events'],
+    'help': "Opens the installed Google Chrome with a fresh temporary profile, "
+            "waits while you sign in to your workspace normally (password, "
+            "magic code, SSO, 2FA — the tool types and clicks nothing), reads "
+            "the session out over Chrome's DevTools protocol, closes the window "
+            "and deletes the profile. Needs a Chrome and a display; with "
+            "neither, link by paste (`connection add --stdin`)."}]
 WRITE_VERBS: set = set()   # this capability has no verb that writes to Slack
 # No write leaves the system because nothing writes at all. The gate never fires
 # (WRITE_VERBS is empty); a read-only surface is reported as allow_write:false.
@@ -6400,6 +6431,380 @@ def _cmd_connections() -> None:
     _emit(_connections_report())
 
 
+# --- Browser linking (Chrome DevTools) ---------------------------------------
+#
+# `link` reads the person's own workspace session out of a Chrome they signed
+# in to, so nobody copies a token or a cookie. The tool opens the installed
+# Chrome with a throwaway profile and Chrome's remote-debugging channel, opens
+# the Slack app, and waits — typing and clicking nothing — while the person
+# signs in normally. It then reads the workspace xoxc- token from the page's
+# own localStorage (`localConfig_v2`) and the shared `d` cookie over the
+# DevTools protocol, closes the window and deletes the profile. The protocol is
+# spoken over the websocket library slacker already ships; no browser is
+# bundled and no dependency is added. The person's everyday Chrome profile is
+# never read: the window runs on a fresh profile they sign in to just for this.
+
+SLACK_APP_URL = "https://app.slack.com/"
+# How long `link` waits for the person to finish signing in before it gives up.
+LINK_TIMEOUT = 300
+# Where an installed Chrome is looked for; SLACKER_CHROME overrides.
+_CHROME_NAMES = ("google-chrome", "google-chrome-stable", "google-chrome-beta",
+                 "chromium", "chromium-browser", "chrome")
+_CHROME_MAC = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium")
+
+
+class _BrowserGone(Exception):
+    """The debugging endpoint stopped answering — the window was closed."""
+
+
+def _find_chrome() -> str | None:
+    """The installed Chrome to drive, or None. An explicit SLACKER_CHROME wins;
+    otherwise the first known binary on PATH, then the macOS app bundle."""
+    import shutil
+    override = _unquote(os.environ.get("SLACKER_CHROME"))
+    if override:
+        return override if (Path(override).is_file() or shutil.which(override)) else None
+    for name in _CHROME_NAMES:
+        found = shutil.which(name)
+        if found:
+            return found
+    for path in _CHROME_MAC:
+        if Path(path).is_file():
+            return path
+    return None
+
+
+def _cdp_http(port: int, path: str) -> Any:
+    """Read one of Chrome's DevTools HTTP endpoints (/json/...). A refused
+    connection means the window is gone."""
+    import urllib.error
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise _BrowserGone(str(exc))
+
+
+class _Cdp:
+    """One DevTools websocket, talking to a page target. Each command is a JSON
+    object with a rising id; the reply carrying that id (and only it) is
+    returned, so events arriving on the connection are skipped."""
+
+    def __init__(self, ws_url: str):
+        import websocket
+        self._ws = websocket.create_connection(
+            ws_url, timeout=10, max_size=64 * 1024 * 1024)
+        self._id = 0
+
+    def call(self, method: str, **params) -> dict:
+        self._id += 1
+        mid = self._id
+        self._ws.send(json.dumps({"id": mid, "method": method, "params": params}))
+        while True:
+            try:
+                msg = json.loads(self._ws.recv())
+            except Exception as exc:
+                raise _BrowserGone(str(exc))
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    _refuse(5, "cdp_error",
+                            f"Chrome DevTools refused {method}: "
+                            f"{(msg['error'] or {}).get('message')}")
+                return msg.get("result") or {}
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._ws.close()
+
+
+def _slack_page(port: int) -> dict | None:
+    """A Slack page target to talk to, or None while none has loaded yet."""
+    for target in _cdp_http(port, "/json/list"):
+        if target.get("type") == "page" \
+                and "slack.com" in (target.get("url") or "") \
+                and target.get("webSocketDebuggerUrl"):
+            return target
+    return None
+
+
+def _read_teams(cdp: "_Cdp") -> list[dict]:
+    """Every workspace signed in on the page, read from its own localStorage
+    `localConfig_v2`. Each is {id, name, domain, token}, token an xoxc-."""
+    result = cdp.call("Runtime.evaluate",
+                      expression="window.localStorage.getItem('localConfig_v2')",
+                      returnByValue=True)
+    raw = (result.get("result") or {}).get("value")
+    if not raw:
+        return []
+    try:
+        teams = json.loads(raw).get("teams") or {}
+    except (ValueError, AttributeError):
+        return []
+    out = []
+    for tid, team in (teams.items() if isinstance(teams, dict) else []):
+        team = team or {}
+        token = _unquote(team.get("token"))
+        if not token or not str(token).startswith("xoxc-"):
+            continue
+        out.append({"id": team.get("id") or tid,
+                    "name": team.get("name") or team.get("domain") or tid,
+                    "domain": team.get("domain"),
+                    "token": str(token)})
+    return out
+
+
+def _read_d_cookie(cdp: "_Cdp") -> str | None:
+    """The shared `d` cookie, read over the protocol — it is httpOnly, so the
+    page's own script cannot see it."""
+    cdp.call("Network.enable")
+    for cookie in cdp.call("Network.getAllCookies").get("cookies") or []:
+        if cookie.get("name") == "d" \
+                and (cookie.get("domain") or "").endswith("slack.com"):
+            return cookie.get("value")
+    return None
+
+
+def _launch_chrome(chrome: str, profile: Path, url: str) -> tuple:
+    """Start Chrome on a throwaway profile with its remote-debugging channel on
+    a free port, and return (process, port). The port Chrome chose is read from
+    the profile's DevToolsActivePort file."""
+    import subprocess
+    args = [chrome, f"--user-data-dir={profile}", "--remote-debugging-port=0",
+            "--no-first-run", "--no-default-browser-check", "--no-service-autorun",
+            "--disable-features=Translate", "--new-window", url]
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    port_file = profile / "DevToolsActivePort"
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            _refuse(5, "chrome_exited",
+                    "Chrome exited before its debugging port was ready",
+                    "run `slacker link` again, or link by paste")
+        if port_file.is_file():
+            try:
+                return proc, int(port_file.read_text().splitlines()[0].strip())
+            except (ValueError, IndexError):
+                pass
+        time.sleep(0.25)
+    _refuse(5, "chrome_no_port",
+            "Chrome did not open its debugging port within 30s",
+            "run `slacker link` again, or link by paste")
+
+
+def _end_chrome(proc, profile: Path) -> None:
+    """Close the window and delete the throwaway profile, whatever happened."""
+    import shutil
+    import subprocess
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=5)
+    shutil.rmtree(profile, ignore_errors=True)
+
+
+def _await_session(port: int, timeout: int) -> tuple:
+    """Wait while the person signs in, then read the workspaces and the `d`
+    cookie out. Returns (teams, cookie). The window closing or the time running
+    out is a refusal that leaves nothing behind."""
+    deadline = time.monotonic() + timeout
+    announced = False
+    while time.monotonic() < deadline:
+        try:
+            target = _slack_page(port)
+            if target is not None:
+                cdp = _Cdp(target["webSocketDebuggerUrl"])
+                try:
+                    teams = _read_teams(cdp)
+                    if teams:
+                        cookie = _read_d_cookie(cdp)
+                        if cookie:
+                            return teams, cookie
+                finally:
+                    cdp.close()
+        except _BrowserGone:
+            _refuse(5, "window_closed",
+                    "the Chrome window was closed before sign-in finished",
+                    "run `slacker link` again, or link by paste "
+                    "(`slacker connection add <id> --stdin`)")
+        if not announced:
+            _event("progress", stage="waiting_for_signin", url=SLACK_APP_URL)
+            announced = True
+        time.sleep(1.5)
+    _refuse(6, "link_timeout",
+            f"no signed-in Slack workspace appeared within {timeout}s",
+            "sign in during the window `slacker link` opens, or link by paste "
+            "(`slacker connection add <id> --stdin`)")
+
+
+def _match_team(teams: list[dict], wanted: str) -> dict | None:
+    """The one workspace whose id, domain or name matches `wanted`, or None."""
+    low = wanted.lower()
+    for team in teams:
+        if low in (str(team["id"]).lower(), (team.get("domain") or "").lower(),
+                   (team.get("name") or "").lower()):
+            return team
+    return None
+
+
+def _link_connection_id(given: str | None, team: dict) -> str:
+    """The connection id a link writes to: the one asked for, else one made
+    from the workspace's own domain or name."""
+    if given:
+        return given
+    base = team.get("domain") or team.get("name") or team["id"]
+    cid = re.sub(r"[^a-z0-9._@+-]", "-", str(base).lower()).strip("-")
+    return (cid or "slack")[:128]
+
+
+def _persist_link(cid: str, scope: str, token: str, cookie: str, team: dict,
+                  default: bool, replace: bool) -> dict:
+    """Write the linked session through the connection surface: the two secrets
+    into the scope's credentials file under this connection's own env keys,
+    the non-secret workspace identity into the registry. Mirrors the write
+    `connection add` makes, so link and paste leave the same shape."""
+    declared = {f["key"]: f for f in (globals().get("CONN_FIELDS") or [])}
+    token_env = _connection_env_name(declared["token_env"], cid)
+    cookie_env = _connection_env_name(declared["cookie_env"], cid)
+    adapter = _records()
+    try:
+        held = adapter.resolve_scope(NAME, "connection", scope).get(cid)
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    if held is not None and not replace:
+        _die(6, "connection_exists",
+             f"a {scope} connection {cid!r} already exists; link writes over it "
+             "only when asked to",
+             "pass --replace to re-link it, or give a different id")
+    entry = dict((held or {}).get("value") or {})
+    entry.update({"token_env": token_env, "cookie_env": cookie_env,
+                  "team_id": team["id"]})
+    if team.get("domain") or team.get("name"):
+        entry["workspace"] = team.get("domain") or team.get("name")
+    credentials = _scope_credentials(scope)
+    _env_file_write(credentials, {token_env: token, cookie_env: cookie})
+    try:
+        adapter.set(NAME, "connection", cid, entry, scope=scope)
+        if default:
+            adapter.set(NAME, "setting", "connection.default", cid, scope=scope)
+        source = adapter.scope_source(NAME, "connection", scope)
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    return {"registry": source, "credentials": str(credentials),
+            "token_env": token_env, "cookie_env": cookie_env}
+
+
+def cmd_link(args) -> dict | None:
+    """Open Chrome, wait while the person signs in, read the session out, and
+    write it as a connection — proving it with the same check `doctor` runs.
+    No secret value ever reaches stdout, the log or the registry."""
+    if getattr(args, "events", False):
+        _events_begin()
+    wanted_scope = getattr(args, "scope", None)   # project | global | machine | None
+    root = _project_root()
+    has_envelope = root is not None and _project_capabilities_dir(root).is_dir()
+    if wanted_scope == "project":
+        if not has_envelope:
+            _die(6, "no_envelope",
+                 "--project needs a capabilities/ envelope in this project",
+                 "run `capabilities init` first, or link with --global")
+        scope = "project"
+    elif wanted_scope in ("global", "machine"):
+        scope = "global"
+    else:
+        scope = "project" if has_envelope else "global"
+    _read_only_gate("`slacker link`")
+
+    chrome = _find_chrome()
+    if chrome is None:
+        _refuse(6, "no_chrome",
+                "no Google Chrome is installed to sign in through",
+                "install Google Chrome, or link by paste: read the xoxc- token "
+                "and the `d` cookie from a signed-in browser and run "
+                "`slacker connection add <id> --stdin` (`slacker guide linking`)")
+
+    import tempfile
+    timeout = getattr(args, "timeout", None) or LINK_TIMEOUT
+    profile = Path(tempfile.mkdtemp(prefix="slacker-link-"))
+    proc = None
+    _event("progress", stage="launching_chrome")
+    _log(f"Opening Chrome to {SLACK_APP_URL} — sign in to your workspace; "
+         "slacker reads the session and closes the window.")
+    try:
+        proc, port = _launch_chrome(chrome, profile, SLACK_APP_URL)
+        teams, cookie = _await_session(port, timeout)
+    finally:
+        _end_chrome(proc, profile)
+
+    wanted_conn = getattr(args, "connection", None)
+    given_id = getattr(args, "id", None) or wanted_conn
+    selector = getattr(args, "workspace", None) or given_id
+    if len(teams) == 1:
+        team = teams[0]
+    else:
+        team = _match_team(teams, selector) if selector else None
+        if team is None:
+            listed = [{"team_id": t["id"], "name": t["name"], "domain": t.get("domain")}
+                      for t in teams]
+            if _EVENTS_ON[0]:
+                answer = _event_answer("workspace_needed", workspaces=listed).strip()
+                team = _match_team(teams, answer)
+                if team is None:
+                    _refuse(6, "unknown_workspace",
+                            f"no signed-in workspace matches {answer!r}",
+                            "answer workspace_needed with a team id, domain or "
+                            "name from the list")
+            else:
+                names = ", ".join(f"{t['name']} ({t.get('domain') or t['id']})"
+                                  for t in teams)
+                _refuse(6, "several_workspaces",
+                        f"{len(teams)} workspaces are signed in: {names}",
+                        "say which with `--workspace <team-id|domain|name>` (or "
+                        "`-c <id>` matching one), or sign in to just one")
+
+    cid = _link_connection_id(given_id, team)
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._@+-]{0,127}", cid, re.IGNORECASE):
+        _refuse(6, "bad_connection_id",
+                f"connection id {cid!r} is not a valid id",
+                "pass one with a leading letter or digit: letters, digits and "
+                ". _ @ + -")
+
+    cfg = {"id": cid, "token": team["token"], "cookie": cookie,
+           "team_id": team["id"], "account_binding": _digits_or_text(team["id"]),
+           "workspace": team.get("domain") or team.get("name"),
+           "expect_user": None, "allow_write": False}
+    _event("progress", stage="verifying")
+    proof = _check_connection(cfg)
+    if not proof.get("ok"):
+        _refuse(proof.get("category") or 2, "link_unverified",
+                "the session read from Chrome did not authorise: "
+                f"{proof.get('error')}",
+                proof.get("hint") or "finish signing in before the window is "
+                "read, then run `slacker link` again")
+
+    default = getattr(args, "default", False)
+    written = _persist_link(cid, scope, team["token"], cookie, team, default,
+                            getattr(args, "replace", False))
+    _event("linked", connection=cid, workspace=cfg["workspace"],
+           user=proof.get("user"))
+    return {"ok": True, "action": "link", "connection": cid, "scope": scope,
+            "registry": written["registry"], "credentials": written["credentials"],
+            "default": default, "verified": True,
+            "workspace": {"team_id": team["id"], "name": team["name"],
+                          "domain": team.get("domain")},
+            "user": proof.get("user"), "user_id": proof.get("user_id"),
+            "team": proof.get("team"), "url": proof.get("url"),
+            "secrets": {"token_env": written["token_env"],
+                        "cookie_env": written["cookie_env"]},
+            "next": f"`slacker doctor --connection {cid}` re-proves it"}
+
+
 # --- Slack values ------------------------------------------------------------
 
 _CONV_KINDS = ("im", "mpim", "private_channel", "public_channel")
@@ -7734,6 +8139,26 @@ def _build_parser() -> argparse.ArgumentParser:
     sv.add_argument("service_command",
                     choices=["init", "doctor", "run", "start", "stop", "reload",
                              "status", "logs", "help"])
+
+    ln = _leaf("link")
+    ln.add_argument("id", nargs="?",
+                    help="the connection id to write (default: the workspace domain)")
+    ln.add_argument("--workspace", "-w",
+                    help="which signed-in workspace to link, by team id, domain or name")
+    ln.add_argument("--events", action="store_true",
+                    help="drive the ceremony as a JSON event stream on stdout/stdin")
+    ln.add_argument("--global", dest="scope", action="store_const", const="global",
+                    help="write the connection at global (machine-wide) scope")
+    ln.add_argument("--project", dest="scope", action="store_const", const="project",
+                    help="write it in this project's capabilities/ envelope")
+    ln.add_argument("--machine", dest="scope", action="store_const", const="machine",
+                    help="write the machine's connection (global scope)")
+    ln.add_argument("--default", action="store_true",
+                    help="make this the default connection")
+    ln.add_argument("--replace", action="store_true",
+                    help="re-link an existing connection id, writing over it")
+    ln.add_argument("--timeout", type=_positive_int,
+                    help=f"seconds to wait for sign-in (default {LINK_TIMEOUT})")
     return p
 
 
@@ -7763,11 +8188,11 @@ def main() -> None:
         _cmd_help()
         return
 
-    reg, _ = _connections_registry()
     if cleaned[0] == "doctor":
         if len(cleaned) > 1:
             _die(6, "invalid_arguments",
                  f"doctor takes only --connection <id>, not {cleaned[1]!r}")
+        reg, _ = _connections_registry()
         cmd_doctor(reg, wanted_conn)
         return
 
@@ -7775,7 +8200,7 @@ def main() -> None:
     handlers = {
         "whoami": cmd_whoami, "conversations": cmd_conversations,
         "history": cmd_history, "thread": cmd_thread, "sync": cmd_sync,
-        "service": cmd_service,
+        "service": cmd_service, "link": cmd_link,
     }
     handler = handlers.get(args.command)
     if handler is None:
