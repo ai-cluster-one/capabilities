@@ -5,6 +5,11 @@
       "payload_sha256": "9ad5fde62b988c0bfcf278b9da90f72725cce5baee8321db61b88d0e8e55e052",
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room."
     },
+    "agenttemplates": {
+      "path": "capabilities/agenttemplates",
+      "payload_sha256": "1eade9d05390df404d641d7cb03c04b105835edcc76f2c2d00e07bfea99f7a6b",
+      "summary": "The agent templates a new agent is made from - the starter context files and each agent template (its manifest, icon, context, routines) - carried as files in this capability's bundle; list them and show one, and the manager's `templates` and `init --template` read them from here."
+    },
     "asana": {
       "path": "capabilities/asana",
       "payload_sha256": "305df2fb1ca0ff8ba2192461f90a0cadb0556b3dd919b3464143a32acf248a49",

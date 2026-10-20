@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-20 — The manager reads agent templates from `agenttemplates`
+
+With the `agenttemplates` capability installed, `capabilities templates`, `init --with-template` and `init --template` read the starter context files and the agent templates from its installed bundle and answer as before, whether or not a project has it enabled. Without it they read where ContextKit reads them, unchanged.
+
 ## 2026-10-20 — `context` is a core capability
 
 `context` joins the catalogue's core tier beside `askproject`, `automations`, `deployment`, `memory` and `tasks`: `capabilities list` shows it as `tier` "core", and its first install from the official catalogue on a machine arrives allowed and enabled at global scope, where that scope holds no entry for it yet. A machine that already has it installed keeps its quarantine, allowance and gates as they are; after arrival it is gated, enabled and granted as before.

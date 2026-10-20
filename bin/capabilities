@@ -516,10 +516,13 @@ PROJECT VERBS (run inside a consuming project)
         What `contextkit templates --json` answers: {source, starter [{path,
         title, description}], agents [{id, name, description, icon,
         capabilities, routines, onboarding, agent_names, path}]}. Templates
-        are read where ContextKit reads them: the folder
+        are read from the agenttemplates capability's installed bundle
+        (~/.capabilities/agenttemplates/templates) when it is installed, and
+        otherwise where ContextKit reads them: the folder
         CONTEXTKIT_TEMPLATES_DIR names, beside the `contextkit` on PATH (its
         install or checkout), then ~/.contextkit/templates; exit 6
-        templates_not_found when none is there.
+        templates_not_found when none is there. `init --with-template` and
+        `init --template` read the same folder.
   identity set [--name <n>] [--description <d>] [--icon <png>] [--project <dir>]
         In a ContextKit-bound project, write the agent's name, description or
         icon to its row as `agent set` does, checked as ContextKit checks
@@ -13595,12 +13598,14 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
 # `init --with-layers` and `--with-template` lay the body ContextKit's `init`
 # lays, `init --template` creates a new agent from one of ContextKit's agent
 # templates, and `identity set` and `bootstrap` carry the rest of the way
-# AgentKit creates an empty agent. The templates are ContextKit's and are read
-# where ContextKit reads them; the files, their text and the template format
-# below are ContextKit's, carried so an agent made here reads as one it made.
+# AgentKit creates an empty agent. The templates are read from the
+# agenttemplates capability's bundle when it is installed, and otherwise where
+# ContextKit reads them; the files, their text and the template format below
+# are ContextKit's, carried so an agent made here reads as one it made.
 # The agent itself goes through `init`'s new-agent path, so it starts in the
 # store and is refused where that path refuses it.
 CK_TEMPLATES_ENV = "CONTEXTKIT_TEMPLATES_DIR"
+CK_TEMPLATES_CAPABILITY = "agenttemplates"
 CK_README_REL = Path(".contextkit") / "README.md"
 CK_AGENT_TEMPLATE_MANIFEST = "template.toml"
 CK_AGENT_TEMPLATE_LAYERS = ("context", "assets", "routines")
@@ -13741,7 +13746,20 @@ def _ck_template_candidates() -> list[Path]:
     return out
 
 
+def _ck_capability_templates() -> Path | None:
+    """The `templates/` folder the installed agenttemplates capability carries
+    in its bundle, read from its registry payload as `changelog` reads a
+    bundle's change log; None when it is not installed."""
+    if not _script_path(CK_TEMPLATES_CAPABILITY).is_file():
+        return None
+    folder = _registry_dir(CK_TEMPLATES_CAPABILITY) / "templates"
+    return folder if folder.is_dir() else None
+
+
 def _ck_template_root() -> Path:
+    bundled = _ck_capability_templates()
+    if bundled is not None:
+        return bundled
     for candidate in _ck_template_candidates():
         if candidate.is_dir():
             return candidate

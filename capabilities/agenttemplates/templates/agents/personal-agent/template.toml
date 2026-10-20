@@ -1,0 +1,9 @@
+id = "personal-agent"
+name = "Personal Agent"
+description = "A personal assistant that gets to know its supervisor from mail, chats, and calendar, keeps track of the people and projects in the supervisor's life, and can be reshaped into another role at any time."
+icon = "icon.png"
+capabilities = ["mailbox", "whatsapp", "telegram", "calendar", "tasks", "automations"]
+agent_names = ["Albert", "Arthur", "Bruno", "Edgar", "Elliot", "Emil", "Felix", "Gustav", "Leon", "Lucas", "Oliver", "Oscar", "Roman", "Simon", "Theo", "Victor"]
+
+[onboarding]
+routine = "onboarding"

@@ -462,6 +462,49 @@ def test_init_template_refuses_a_folder_that_is_not_empty(lab, tmp_path):
     assert sorted(p.name for p in made.folder.iterdir()) == ["notes.txt"]
 
 
+def _install_agenttemplates(registry: Path, templates: Path) -> Path:
+    """An installed agenttemplates payload carrying `templates` in its bundle."""
+    payload = registry / "agenttemplates"
+    payload.mkdir(parents=True)
+    (payload / "agenttemplates").write_text("#!/bin/sh\n")
+    return shutil.copytree(templates, payload / "templates")
+
+
+def test_templates_are_read_from_agenttemplates_when_it_is_installed(tmp_path):
+    bundled = _templates(tmp_path / "bundled")
+    contextkit = shutil.copytree(bundled, tmp_path / "contextkit" / "templates")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CAPABILITIES_", "CLAUDE"))}
+    env.update({"HOME": str(tmp_path / "home"), "XDG_CONFIG_HOME": str(tmp_path / "config"),
+                "XDG_CACHE_HOME": str(tmp_path / "cache"), "XDG_STATE_HOME": str(tmp_path / "state"),
+                "CAPABILITIES_HOME": str(tmp_path / "registry"),
+                "CONTEXTKIT_TEMPLATES_DIR": str(contextkit)})
+
+    def templates() -> str:
+        result = subprocess.run([sys.executable, str(MANAGER), "templates", "--json"],
+                                cwd=tmp_path, env=env, text=True, capture_output=True,
+                                timeout=120)
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    fallback = templates()
+    assert json.loads(fallback)["source"] == str(contextkit)
+    bundled = _install_agenttemplates(tmp_path / "registry", bundled)
+    answer = templates()
+    assert json.loads(answer)["source"] == str(bundled)
+    # The same set answers the same bytes; only the folder it names differs.
+    assert answer == fallback.replace(str(contextkit), str(bundled))
+
+
+def test_init_template_reads_the_template_from_agenttemplates(lab, tmp_path):
+    made = Creation(lab, tmp_path)
+    _install_agenttemplates(tmp_path / "registry", Path(made.extra["CONTEXTKIT_TEMPLATES_DIR"]))
+    made.extra["CONTEXTKIT_TEMPLATES_DIR"] = str(tmp_path / "nothing-here")
+    result = made.run("init", "--template=demo", "--name=Probe", "--json")
+    assert result.returncode == 1, result.stderr
+    assert json.loads(result.stdout)["template"] == "demo"
+    assert (made.folder / "context" / "identity" / "AGENT.md").read_text() == AGENT_MD
+
+
 def test_the_empty_agent_is_laid_named_and_bootstrapped(lab, tmp_path):
     made = Creation(lab, tmp_path)
     for args in (("init", "--with-template", "--json"),
