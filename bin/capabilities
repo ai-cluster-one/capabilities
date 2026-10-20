@@ -621,11 +621,14 @@ PROJECT VERBS (run inside a consuming project)
         point to `contextkit build`, while --fragment remains the read-only
         provider surface ContextKit calls.
   build [--print] [--json]
-        Compose a ContextKit-bound agent's generated host context as
-        `contextkit build` does: its runtime and collaboration texts, guide
-        menu, onboarding, foreign instruction files, inline and stub context
+        Compose a ContextKit-bound agent's generated host context in the
+        shape `contextkit build` gives it: runtime and collaboration texts
+        that route the agent to this manager and to the `context`, `assets`
+        and `routine` capabilities, a guide menu of only the guides those
+        own, onboarding, foreign instruction files, inline and stub context
         (global context included), routine index and this manager's own
-        capabilities block, composed in this process. When the agent keeps
+        capabilities block, whose refresh line names `build`, composed in
+        this process. When the agent keeps
         context documents in its store (the `context` capability's tables),
         the inline and stub context is composed from their active versions,
         read-only, instead of the context folder - global documents too when
@@ -1033,6 +1036,13 @@ CODEX_SESSION_MATCHER = "startup|resume|clear"
 CODEX_ROOT_DOCS = ("AGENTS.override.md", "AGENTS.md")
 # How long a host mode waits for a harness hook's payload on stdin.
 HOOK_PAYLOAD_WAIT_SECONDS = 0.5
+# Where the default prompt sends an agent to refresh its context. The fragment
+# ContextKit reads keeps this route; `build` names itself instead.
+CONTEXT_PROMPT_REFRESH = (
+    "through its project context owner: `contextkit build` in a ContextKit-bound "
+    "project, otherwise `capabilities context --claude` or `capabilities context "
+    "--codex`"
+)
 DEFAULT_CONTEXT_PROMPT = (
     "Identifiers are durable, non-secret project lookups discovered while using "
     "a capability: ids, codes, labels, classifications, account handles, "
@@ -1040,13 +1050,12 @@ DEFAULT_CONTEXT_PROMPT = (
     "one, check `capabilities ids <name>` or `<name> ids list` before "
     "rediscovering it. When you discover a reusable value that future sessions "
     "should not rediscover, persist it with `<name> ids set <label> <value> "
-    "--note \"<what it is>\"`, then refresh this generated context through its "
-    "project context owner: `contextkit build` in a ContextKit-bound project, "
-    "otherwise `capabilities context --claude` or `capabilities context "
-    "--codex`. Do not "
-    "store secrets, prose, workflows, volatile run results, or one-off record "
+    f"--note \"<what it is>\"`, then refresh this generated context {CONTEXT_PROMPT_REFRESH}. "
+    "Do not store secrets, prose, workflows, volatile run results, or one-off record "
     "ids here."
 )
+BUILD_CONTEXT_PROMPT = DEFAULT_CONTEXT_PROMPT.replace(
+    CONTEXT_PROMPT_REFRESH, "with `capabilities build`")
 SERVICE_SUPERVISION_CAPABILITY = "deployment"
 # A deliberate exception to "pointers flow down, an asset never names its
 # consumer". Someone who installs the manager and one service capability has
@@ -1914,12 +1923,12 @@ def _project_env(root: Path) -> dict[str, str]:
     return merged
 
 
-def _context_prompt(root: Path) -> str:
+def _context_prompt(root: Path, build: bool = False) -> str:
     prompt = (_project_env(root).get(CONTEXT_PROMPT_ENV)
               or os.environ.get(CONTEXT_PROMPT_ENV))
     if prompt and prompt.strip():
         return prompt.replace("\\n", "\n").strip()
-    return DEFAULT_CONTEXT_PROMPT
+    return BUILD_CONTEXT_PROMPT if build else DEFAULT_CONTEXT_PROMPT
 
 
 def _contextkit_managed(root: Path) -> bool:
@@ -8079,8 +8088,9 @@ def _store_absent(exc) -> bool:
         exc.slug in _store_module().STORE_ENVIRONMENT_SLUGS
 
 
-def _compose_context(root: Path) -> str:
-    """Deterministic injection body: gate, snapshots, and resolved records."""
+def _compose_context(root: Path, build: bool = False) -> str:
+    """Deterministic injection body: gate, snapshots, and resolved records;
+    with build, the block `build` composes, whose refresh route is itself."""
     if _CONTEXT_WITHOUT_STORE:
         try:
             _policy_scopes(root)
@@ -8109,7 +8119,7 @@ def _compose_context(root: Path) -> str:
                   "ask whether the user wants `capabilities enable <name> "
                   "--project` for this project or `--global` for every project.", ""]
     else:
-        lines += [_context_prompt(root), ""]
+        lines += [_context_prompt(root, build), ""]
     adapter = _records_for(root)
     try:
         for name in enabled:
@@ -11913,11 +11923,13 @@ def cmd_context(host: str) -> None:
 
 # ---------------------------------------------------------------- build: an agent's generated context
 
-# `build` composes a ContextKit-bound agent's generated host context exactly as
-# `contextkit build` does - its runtime and collaboration texts, guide menu,
-# inline and stub context, routines and this manager's own capabilities block -
-# and writes it with the host links ContextKit makes. The texts below are
-# ContextKit's, carried byte for byte so the two compose the same file.
+# `build` composes a ContextKit-bound agent's generated host context in the
+# shape `contextkit build` gives it - runtime and collaboration texts, guide
+# menu, inline and stub context, routines and this manager's own capabilities
+# block - and writes it with the host links ContextKit makes. The texts below
+# route the agent to the surfaces that own each part today: this manager, and
+# the `context`, `assets` and `routine` capabilities. The marker stays
+# ContextKit's, since it is what either builder recognises as its own output.
 CK_GENERATED_MARKER = "<!-- Generated by ContextKit. Do not edit by hand. -->"
 CK_DEFAULT_OUTPUT = Path(".contextkit") / "generated" / "context.md"
 CK_HOST_LINKS = {
@@ -11934,9 +11946,9 @@ CK_ROUTINE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 CK_RUNTIME_TEXT = """\
 # Operating Runtime
 
-You are operating inside a ContextKit-managed project.
+You are operating inside a project whose agent context the capabilities manager composes.
 
-ContextKit gives the project a visible source body, generated host runtime context, on-demand guides, routines, and capability awareness. Source truth lives in the project body and owning tools. Generated host files are delivery output.
+The project has a visible source body, generated host runtime context, on-demand guides, routines, and capability awareness. Source truth lives in the project body and owning tools. Generated host files are delivery output.
 
 ## Operating Rules
 
@@ -11953,23 +11965,25 @@ ContextKit gives the project a visible source body, generated host runtime conte
 
 ## Source Body
 
-`.contextkit/` is technical binding, config, and ContextKit-native artifacts. It is not project doctrine.
+`.contextkit/` is technical binding, config, and generated output. It is not project doctrine.
 
-Layer names below are canonical. A project may hold them under a configured visible body root, so resolve a layer's actual location with `contextkit path <layer>` before assuming it sits at the project root.
+Layer names below are canonical. A project may hold them under a configured visible body root, so resolve a layer's actual location with `capabilities path --json` (its `layers`) before assuming it sits at the project root.
 
-`context/` is live project doctrine. Use `contextkit guide authoring`.
+The context, assets and routines layers live either as folders or in the project's store as versioned documents. Where the store holds a layer, read it through the capability that owns it rather than the folder.
 
-Configured global context is shared live doctrine outside the project that compiles through the same context-file contract. Use `contextkit guide global-context`.
+`context/` is live project doctrine. In the store, `context list` and `context show <name>` read it.
 
-`assets/` is historical evidence: sessions, plans, research, and raw records. Use `contextkit guide assets`.
+Configured global context is shared live doctrine outside the project that compiles through the same context-file contract. In the store, the `context` verbs reach it with `--global`.
 
-`routines/` is repeatable procedure. Use `contextkit guide routines`.
+`assets/` is historical evidence: sessions, plans, research, and raw records. In the store, `assets list`, `assets search <terms>` and `assets show <name>` read it.
 
-`capabilities/` is the project envelope for enabled tools. ContextKit inserts the capabilities manager's context block unchanged; capability awareness and internals remain tool-owned. Use `contextkit guide capabilities` and the tool's own help or doctor surface.
+`routines/` is repeatable procedure. Use `routine guide authoring`. In the store, `routine list --store` and `routine show <name>` read it.
+
+`capabilities/` is the project envelope for enabled tools. The capabilities manager composes its own context block below; capability awareness and internals remain tool-owned. Use `capabilities help` and the tool's own help or doctor surface.
 
 ## Discovery
 
-Use `contextkit help` for exact command syntax.
+Use `capabilities help` for exact command syntax.
 
 Use the generated Guide Menu to choose on-demand rule-source guides.
 
@@ -11979,29 +11993,18 @@ Command outputs name their rule sources. Load the named guide before repairing t
 
 Before editing, search for the existing owner.
 
-When changing project body, routines, hooks, or capability envelopes, load `contextkit guide validation` and follow its live sequence.
+When changing project body, routines, hooks, or capability envelopes, rerun `capabilities build` and read its warnings, and prove the host wiring with `capabilities hooks check`.
 
 Repair the owning source or tool surface, then rerun the command that exposed the problem."""
 CK_COLLABORATION_TEXT = """\
 ## Collaboration Mode
 
-Before non-trivial work that changes behavior or durable project material, spans multiple files or surfaces, or requires substantive judgment, offer the user Direct or Agent Team mode once unless the user has already selected a mode. In Agent Team mode, remain the task setter and orchestrator, give execution to one subagent, give independent review to another subagent, and load `contextkit guide agent-team` before starting."""
-# (topic, title, summary) of each guide, in ContextKit's menu order.
+Before non-trivial work that changes behavior or durable project material, spans multiple files or surfaces, or requires substantive judgment, offer the user Direct or Agent Team mode once unless the user has already selected a mode. In Agent Team mode, remain the task setter and orchestrator, give execution to one subagent, and give independent review to another subagent."""
+# (command, title, summary) of each guide the menu offers. Only a guide that
+# has a home in this manager or in the capability that owns its layer is
+# offered; ContextKit's other topics have none yet and are left out.
 CK_GUIDE_MENU = (
-    ('bootstrap', 'Bootstrap Guide', 'Use this guide when initializing or adopting a ContextKit project body.'),
-    ('authoring', 'ContextKit Authoring Guide', 'Use this guide when creating, moving, or repairing project body material.'),
-    ('agent-team', 'Agent Team Guide', 'Use this guide after the user selects Agent Team mode for non-trivial work, or when the user wants to change whether the mode is offered.'),
-    ('workbench', 'Workbench Guide', "Use this guide when you need to inspect or repair a ContextKit-managed project from an isolated context-manager session instead of operating as the project's worker agent."),
-    ('global-context', 'Global Context Guide', 'Use this guide when configuring, authoring, validating, or repairing live doctrine shared by multiple ContextKit projects.'),
-    ('validation', 'Validation Guide', 'Use this guide after initialization, migration, hook changes, or meaningful edits to `context/`, `assets/`, `routines/`, or `capabilities/`.'),
-    ('assets', 'Assets Guide', 'Use this guide when writing evidence records, research notes, session records, plans, and promotion notes.'),
-    ('routines', 'Routines Guide', 'Use this guide when writing repeatable procedures under `routines/`.'),
-    ('audit', 'Audit Guide', 'Use this guide when reviewing a ContextKit project body or applying audit findings.'),
-    ('groom', 'Semantic Grooming Guide', 'Use this guide when reviewing a ContextKit-managed project for duplicated facts, misplaced meaning, ambiguous ownership, stale live doctrine, or material whose artifact type does not match its job.'),
-    ('destructive', 'Destructive Operations Guide', 'Use this guide before running commands that erase, overwrite, or irreversibly mutate project data.'),
-    ('migration', 'Migration Guide', 'Use this guide when converting an existing project into a ContextKit agent body.'),
-    ('hooks', 'Hooks Guide', 'Use this guide when installing, reviewing, or repairing host bindings.'),
-    ('capabilities', 'Capabilities Guide', 'Use this guide when a ContextKit project has enabled external tools under `capabilities/`.'),
+    ('routine guide authoring', 'Routines Guide', 'Use this guide when writing repeatable procedures, in `routines/` or in the store; the `routine` capability owns it.'),
 )
 
 
@@ -12252,7 +12255,7 @@ def _ck_reference(item: dict) -> str:
 def _ck_routine_entries(root: Path, routines_dir: Path, warnings: list[str]) -> list | None:
     if not (root / routines_dir).is_dir():
         warnings.append(f"routine layer not present; add `{routines_dir.as_posix()}/` "
-                        "or run `contextkit guide routines`")
+                        "or run `routine guide authoring`")
         return None
     routines = []
     for path in sorted((root / routines_dir).rglob("*.md")):
@@ -12310,12 +12313,12 @@ def _ck_capability_context(root: Path, capabilities_dir: Path, warnings: list[st
                            store: dict) -> str:
     if not (root / capabilities_dir).is_dir():
         warnings.append(f"capability layer not present; add `{capabilities_dir.as_posix()}/` "
-                        "or run `contextkit guide capabilities`")
+                        "or run `capabilities help`")
         return ""
     held = os.environ.get("CLAUDE_PROJECT_DIR")
     os.environ["CLAUDE_PROJECT_DIR"] = str(root)
     try:
-        code, text, err = _ck_in_process(lambda: _compose_context(root))
+        code, text, err = _ck_in_process(lambda: _compose_context(root, build=True))
     finally:
         if held is None:
             os.environ.pop("CLAUDE_PROJECT_DIR", None)
@@ -12459,8 +12462,8 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
     capability_context = _ck_capability_context(root, layers["capabilities"], warnings, store)
     memory_rel = binding["body_root"] / "memory"
     if (root / memory_rel).is_dir() or (root / memory_rel).is_symlink():
-        warnings.append(f"legacy memory folder `{memory_rel.as_posix()}/`: ContextKit does not "
-                        "compile project memory; run `memory adopt` to carry it into the "
+        warnings.append(f"legacy memory folder `{memory_rel.as_posix()}/`: the generated context does "
+                        "not compile project memory; run `memory adopt` to carry it into the "
                         "`memory` capability")
     onboarding = _ck_onboarding(root, binding, warnings, store)
     onboarding_block = (_ck_onboarding_block(root, binding, onboarding, warnings)
@@ -12485,7 +12488,7 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
     stubs = [item for item in files if item["load"] == "stub"]
 
     out = ["# Project Context", "", CK_GENERATED_MARKER,
-           f"Source config: `{CONTEXTKIT_CONFIG_REL.as_posix()}`", "Rebuild: `contextkit build`", ""]
+           f"Source config: `{CONTEXTKIT_CONFIG_REL.as_posix()}`", "Rebuild: `capabilities build`", ""]
     if warnings:
         out += ["Generation warnings:", ""]
         out += [f"- {warning}" for warning in warnings]
@@ -12499,8 +12502,10 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
                 f"`{layers['assets'].as_posix()}/`, `{routines_dir.as_posix()}/`.", ""]
     out += ["---", "", "# Guide Menu", "",
             "Guides are on-demand. Load the guide only when the task needs that workflow or surface.", ""]
-    out += [f"- `contextkit guide {topic}` - {title}: {summary}"
-            for topic, title, summary in CK_GUIDE_MENU]
+    out += [f"- `{command}` - {title}: {summary}"
+            for command, title, summary in CK_GUIDE_MENU]
+    out.append("- `<name> guide <topic>` - Capability Guides: each enabled capability's own "
+               "guides, listed beside it under Capabilities below.")
     out += ["", "---", ""]
     if onboarding_block:
         out += [onboarding_block, "", "---", ""]

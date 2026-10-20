@@ -558,7 +558,10 @@ def test_build_composes_the_bound_agents_context(tmp_path: Path) -> None:
              "# Capabilities", "## asana", "Create and update work in Asana."]
     positions = [text.index(marker) for marker in order]
     assert positions == sorted(positions)
-    assert text.count("- `contextkit guide ") == 14
+    assert "`contextkit " not in text
+    assert "Rebuild: `capabilities build`" in text
+    assert "- `routine guide authoring` - Routines Guide" in text
+    assert "refresh this generated context with `capabilities build`" in text
     assert "Generation warnings" not in text
 
     built = _json(_run(tmp_path, project, "build", "--json"))
