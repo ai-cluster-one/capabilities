@@ -3,16 +3,21 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "capabilities-contract==0.6.0",
+#     "httpx>=0.27",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
-"""assets — a project's text assets as documents in the project's store.
+"""assets — a project's assets: text as documents in the project's store, every
+other file in an S3-compatible bucket.
 
-An asset is a markdown document an agent keeps beside its work: a plan, a
+An asset is what an agent keeps beside its work. A markdown asset - a plan, a
 research note, a session record, meeting notes, a journal entry, a digest, a
-report. Each document keeps every version it ever had; one version is active,
-and a version is never edited or deleted. A save adds a version; retiring a
-document hides it from list, search and export and deletes nothing.
+report - is a document: it keeps every version it ever had; one version is
+active, and a version is never edited or deleted. A save adds a version;
+retiring a document hides it from list, search and export and deletes nothing.
+Any other file - an image, a log, a data file - is a file: its bytes are kept
+in the bucket of the project's file store connection and its record in the
+store, and a replaced file is a new record beside the retired old one.
 Agent-invoked: every answer is JSON on stdout.
 
 Assets live in the PostgreSQL the project resolves (the AGENTKIT_DB_* keys in
@@ -33,6 +38,38 @@ ADDRESSING
   `# ` heading, else the name's last segment.
   A version ID is the whole id or its first 6 or more characters, as
   `history` shows it, resolved among the document's own versions.
+  A file is named by its whole path under assets/, extension included:
+  `research/x/crash.ips` is assets/research/x/crash.ips. The segments follow
+  the document rule, and a name ending in `.md` is a document's, not a file's.
+
+THE FILE STORE CONNECTION
+  Only the file verbs need it: without one every documents verb works as it
+  does with one, `import` lists every file that is not markdown as skipped
+  with the reason, `export` writes the documents and lists the files it could
+  not fetch, and `doctor` proves the store alone. A connection is any
+  S3-compatible bucket (Cloudflare R2, AWS S3, Backblaze B2, MinIO and the
+  like), addressed path-style (<endpoint>/<bucket>/<key>) and signed with AWS
+  Signature Version 4. Declare one with `assets connection add <id>`; its
+  entry, kept where `capabilities` keeps the project's connections, holds:
+    endpoint               the store's S3 API URL, e.g.
+                           https://<account>.r2.cloudflarestorage.com
+    region                 the region requests are signed for: auto for R2,
+                           the bucket's region for AWS S3, us-east-1 for most
+                           others
+    bucket                 the bucket, e.g. example-bucket
+    access_key_id_env      the env key holding the access key id
+    secret_access_key_env  the env key holding the secret access key
+  The two keys never sit in the entry and have no flag: each resolves through
+  the cascade, first non-empty wins - the project's .env.local then .env, then
+  $XDG_CONFIG_HOME/assets/credentials.env, then the process environment.
+  `connection add` takes them on stdin and writes them to the project's
+  .env.local as ASSETS_<ID>_ACCESS_KEY_ID and ASSETS_<ID>_SECRET_ACCESS_KEY.
+  A file of the project is the object <project id>/<file id>/<name> in the
+  bucket; its record carries its size and sha256, and every read checks both.
+  Selection: --connection <id> on the verbs that reach the bucket; unflagged,
+  the default pointer, else the sole connection. Writing to the bucket is a
+  write: a connection whose allow_write is false refuses `files add` and an
+  `import` that has files to keep with exit 4 `read_only`.
 
 READING
   assets list
@@ -72,28 +109,67 @@ WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
       Retire the document: it leaves list, search and export, its versions stay
       readable through `show --version`, and its name is free for a new
       document. Not idempotent: a repeat finds no unretired document (exit 3).
-  assets import [DIR]
+  assets import [DIR] [--connection ID]
       Read an agent's assets folder (DIR, default the project's assets/) into
-      the store, in one transaction: every `.md` file becomes the document its
-      path names, saved as `save` saves it, and every other file is listed
-      under `skipped` with the reason. Each file's outcome is reported:
-      `created`, `saved` (a new version) or `unchanged`. Safe to repeat.
-  assets export [DIR]
+      the store: every `.md` file becomes the document its path names, saved
+      as `save` saves it, in one transaction; with a file store connection
+      every other file is kept as `files add` keeps it, its bytes put in the
+      bucket before that transaction and its record written in it. Without a
+      connection, every file that is not markdown is listed under `skipped`
+      with the reason, as is a markdown file that is not UTF-8 text or a path
+      no name can carry. Each outcome is reported: a document `created`,
+      `saved` (a new version) or `unchanged`; a file `created`, `replaced` (a
+      new record, the old one retired) or `unchanged` (the same sha256), with
+      the document it belongs to: the one document that links to it by a
+      relative path, else the one document in its folder, else the document
+      its folder is named after, else none. Safe to repeat.
+  assets files add <name> --from FILE|- [--document NAME] [--connection ID]
+      Keep FILE (`-` reads stdin) as the file <name>: its bytes are put in the
+      bucket under a new key and its record written, retiring the record of
+      the file it replaces. --document names the document it belongs to.
+      Safe to repeat: bytes identical to the current file's put nothing and
+      answer `"outcome": "unchanged"`, the record and its document as they
+      were. A single put carries at most 5 GiB.
+
+FILES  (reading; `files list` reads the store only)
+  assets files list
+      Every unretired file of this project, by name: media type, size,
+      sha256, storage key, the document it belongs to, who kept it and when.
+  assets files get <name> --out PATH|- [--connection ID]
+      Fetch the file from the bucket, check its size and sha256 against its
+      record, and write it to PATH (`-` writes the bytes alone to stdout, with
+      no JSON). A mismatch writes nothing and exits 8. A PATH that already
+      holds those bytes is `unchanged`; one holding anything else is refused
+      (exit 6 `output_exists`) and left as it is.
+
+EXPORT  (writes no store record and puts nothing in the bucket, so it runs
+  under the read-only switch)
+  assets export [DIR] [--connection ID]
       Write the active version of every unretired document to DIR (default the
-      project's assets/) as <DIR>/<name>.md, byte for byte. A file already
-      holding those bytes is `unchanged`; a file holding anything else is
-      `kept` and left as it is (save it, or move it away, then export again),
-      and `complete` is false. Files the store does not hold are left alone.
-      Writes no store record, so it runs under the read-only switch.
+      project's assets/) as <DIR>/<name>.md, and every unretired file to
+      <DIR>/<name>, byte for byte, each file's size and sha256 checked before
+      it is written. A path already holding those bytes is `unchanged`; one
+      holding anything else is `kept` and left as it is (save it, or move it
+      away, then export again), and `complete` is false. Without a connection
+      a file is `skipped` with the reason and `complete` is false. Paths the
+      store does not hold are left alone.
 
 CONTRACT
-  assets doctor
+  assets doctor [--connection ID]
       Proves the store: the setting in force (secrets redacted), whether the
-      tables are current, the project id and how many documents it holds.
+      tables are current, the project id and how many documents it holds; and
+      with a file store connection, each connection's bucket (or the one
+      named) by an authenticated listing under the project's prefix. Without
+      a connection `connections` is {} and the store alone decides.
   assets migrate [status]
       Apply pending steps to the assets_* tables / report where they stand.
   assets connections
-      Reports no connections: the store is the project's, not a connection.
+      Where each file store connection's values resolve from, secrets masked;
+      exit 6 `connections_required` when the project declares none.
+  assets connection add|remove <id> [--project|--global] [--default]
+      [--replace] [--field KEY=VALUE ...] [--stdin]   (also --machine)
+      Write or remove a file store connection from its declared fields; the
+      two keys only in the JSON object on stdin.
   assets stub | assets manifest --json | assets help
   assets guide [topic]          no guides ship
   assets ids list|get|set|rm    the project identifiers envelope
@@ -101,21 +177,29 @@ CONTRACT
   assets inventory              empty: what assets holds is the store's
 
 I/O CONTRACT
-  Success is JSON on stdout; failure is {"error": {"code", "message",
-  "hint"?}} on stderr.
+  Success is JSON on stdout (`files get --out -` writes the file's bytes
+  instead); failure is {"error": {"code", "message", "hint"?}} on stderr.
 
 EXIT CODES
   0 success
-  3 not found: no unretired document of that name, no such version, no DIR
-  4 policy: assets not enabled here, or the read-only switch on a write
-  5 the store cannot be reached
+  2 the file store refused the connection's keys, or a key is unset
+  3 not found: no unretired document or file of that name, no such version,
+    no DIR, no such bucket
+  4 policy: assets not enabled here, the read-only switch on a write, a write
+    through a connection without allow_write, a connection not granted here
+  5 the store or the file store cannot be reached
   6 input: a malformed name or version, a body that is not UTF-8 text, no
-    project, no store configured
-  7 stale_base: the version --base names is no longer the active one
+    project, no store configured, no file store connection
+    (`connections_required`), an incomplete connection
+  7 stale_base: the version --base names is no longer the active one, or
+    another write of the same name came first
+  8 the bucket does not hold what the record says: `object_missing`, or
+    `sha256_mismatch` when the bytes it returns differ in size or sha256
 """
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
 import re
@@ -124,20 +208,48 @@ from pathlib import Path
 from typing import NoReturn
 
 NAME = 'assets'
-SUMMARY = ("Text assets as versioned documents in the project's PostgreSQL store - plans, "
-           "research, sessions, meetings, journal, digests and reports saved one version at "
-           "a time, searched in full text, diffed between versions, and imported from and "
-           "exported to an agent's assets folder byte for byte.")
+SUMMARY = ("A project's assets: markdown as versioned documents in the project's PostgreSQL "
+           "store - plans, research, sessions, meetings, journal, digests and reports saved "
+           "one version at a time, searched in full text and diffed between versions - and "
+           "every other file kept byte for byte in an S3-compatible bucket, sha256-checked, "
+           "both imported from and exported to an agent's assets folder.")
 SCOPE = "project"
-CRED_KEYS = []
-WRITE_VERBS = {"save", "retire", "import"}
-WRITE_DEFAULT = True
+CRED_KEYS = [       # a file store connection names its own keys; only the file verbs need one
+    {"key": "ASSETS_ACCESS_KEY_ID", "secret": True, "required": False,
+     "note": "S3 access key id of the file store; a connection names its own key via "
+             "access_key_id_env"},
+    {"key": "ASSETS_SECRET_ACCESS_KEY", "secret": True, "required": False,
+     "note": "S3 secret access key of the file store; a connection names its own key via "
+             "secret_access_key_env"},
+]
+WRITE_VERBS = {"save", "retire", "import", "files add"}
+WRITE_DEFAULT = True    # the bucket, like the store, is the consumer's own
 DOCS_BASE = ""
 STATE = False
-TABLES = True       # assets_documents and assets_versions in the project's store, built by _tables()
+TABLES = True       # assets_documents, assets_versions and assets_files, built by _tables()
 INVENTORY = None    # what assets holds is in the store; reading it is `assets list`
 POST_INSTALL: list[dict] = []
-CONN_FIELDS: list[dict] = []
+
+# What a person is asked for (SHEBANG.md, "What a person is asked for"):
+# a file store connection's own fields, which `connection add` writes.
+CONN_FIELDS: list[dict] = [
+    {"key": "endpoint", "label": "Endpoint",
+     "help": "The S3 API URL of the store, e.g. https://<account>.r2.cloudflarestorage.com.",
+     "type": "url", "required": True},
+    {"key": "region", "label": "Region",
+     "help": "The region requests are signed for: auto for Cloudflare R2, the bucket's "
+             "region for AWS S3, us-east-1 for most other stores.",
+     "type": "string", "required": True},
+    {"key": "bucket", "label": "Bucket",
+     "help": "The bucket the project's files are kept in, under a prefix of the project id.",
+     "type": "string", "required": True},
+    {"key": "access_key_id_env", "label": "Access key id",
+     "help": "The S3 access key id.", "type": "string", "secret": True, "required": True,
+     "env": "ASSETS_{ID}_ACCESS_KEY_ID"},
+    {"key": "secret_access_key_env", "label": "Secret access key",
+     "help": "The S3 secret access key.", "type": "string", "secret": True,
+     "required": True, "env": "ASSETS_{ID}_SECRET_ACCESS_KEY"},
+]
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
@@ -5558,10 +5670,994 @@ def open_records(envelope: Path | str, global_dir: Path | str,
 
 # <<< contract: store <<<
 
+
+# >>> contract: connections (generated — edit contract/preamble.py, run `capabilities sync-contract`) >>>
+
+def _resolve_env_key(key: str) -> tuple[str | None, str | None, Path | None]:
+    """Resolve one env key through cascade tiers 2-4: project .env(.local) →
+    user credentials.env → process env. Returns (value, tier, source)."""
+    root = _project_root()
+    if root is not None:
+        for fname in (".env.local", ".env"):
+            val = _parse_env_file(root / fname).get(key)
+            if val:
+                return val, "project", root / fname
+    val = _parse_env_file(CREDENTIALS_ENV).get(key)
+    if val:
+        return val, "user", CREDENTIALS_ENV
+    val = os.environ.get(key)
+    if val:
+        return val, "env", None
+    return None, None, None
+
+
+def _mask(value: str) -> str:
+    return ("…" + value[-4:]) if len(value) >= 8 else "****"
+
+
+def _grant_hint(cid: str) -> str:
+    """One wording for the one way a project grants an inherited connection.
+
+    Same shape as `_write_gate`'s: the gate is the human's to lift, never the
+    agent's, and the hint carries the exact command rather than a description
+    of one. Where no project resolves there is no scope to grant in, so the
+    hint names the command that makes one and then the grant, in the order they
+    have to happen."""
+    grant = f"`capabilities set {NAME} grant {cid} '{{\"enabled\": true}}'`"
+    if _project_root() is None:
+        return ("Do not lift the gate yourself — ask the user; run "
+                f"`capabilities init` in the project that should use {NAME}, "
+                f"then {grant} there.")
+    return ("Do not lift the gate yourself — ask the user; granting is "
+            f"{grant} run inside this project.")
+
+
+# The connections the machine lent this process for a machine read, by id, each
+# with the file it was declared in; empty in every other process.
+_MACHINE_LENT: dict = {}
+
+
+def _grant_gate(reg: dict, cid: str) -> None:
+    """Refuse a connection this project may not use, for read as for write.
+
+    A connection declared outside the project is not the project's to use until
+    the project itself says so, and one the project switched off is off;
+    nothing in the cascade lifts either. Outside a project there is no scope in
+    which anything could have said so, which is a different situation and says
+    so rather than asserting a project that is not there."""
+    entry = (reg.get("withheld") or {}).get(cid)
+    if entry is None:
+        return
+    if entry.get("scope") == "project":
+        message = f"connection {cid!r} is disabled in this project"
+    elif _machine_read():
+        message = (f"connection {cid!r} is switched off on this machine by "
+                   f"its grant")
+    elif _project_root() is None:
+        message = (f"connection {cid!r} is declared globally and there is no "
+                   f"project here to grant it in")
+    else:
+        message = (f"connection {cid!r} is declared outside this project and "
+                   f"this project has not granted it")
+    _die(4, "connection_not_granted", message, _grant_hint(cid))
+
+
+def _connections_composed() -> dict:
+    """The connections envelope shape, composed out of resolved records.
+
+    Deliberately reconstituted rather than returned in some store-shaped form:
+    selection, the write gate and the `connections` report all read the envelope
+    shape, and they should not learn where the rows came from. What changes here
+    is the source, never the shape.
+
+    The permission a project was granted is folded back onto the entry as
+    `allow_write`, which is where the rest of the contract looks for it.
+
+    A connection this project may not use is kept apart under `withheld`, not
+    dropped: `connections` holds exactly what may be acted on — which is what
+    every capability's own report iterates — while selection still has the name
+    it needs to explain a refusal instead of pretending the connection was
+    never declared.
+
+    `sources` names, per connection, the file its identity was read out of. An
+    identity is taken whole from one scope, so each connection has exactly one
+    origin, and a project that merely granted an inherited connection is not
+    where that connection's values are written. It is kept beside the entries
+    rather than folded into them because it describes a record rather than
+    configuring one: nothing resolves through it, and its one reader is each
+    capability's own report, naming the origin of its `connection`-tier keys."""
+    adapter = _records()
+    machine = _machine_read()
+    _MACHINE_LENT.clear()
+    try:
+        effective = adapter.connections(NAME, write_default=WRITE_DEFAULT,
+                                        include_disabled=True,
+                                        machine_read=machine)
+        default = adapter.get(NAME, "setting", "connection.default")
+        source = adapter.collection_source(NAME, "connection")
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    if not effective:
+        _die(6, "connections_required",
+             f"{NAME} requires an explicit connections registry and "
+             f"{source} holds none",
+             'expected {"default": "<id>", "connections": {"<id>": { ... }}}')
+    usable = {cid: e for cid, e in effective.items() if e["enabled"]}
+    withheld = {cid: e for cid, e in effective.items() if not e["enabled"]}
+    if not usable:
+        named = ", ".join(sorted(withheld))
+        if machine:
+            refusal = (f"every {NAME} connection this machine declares is "
+                       f"switched off by its grant: {named}")
+        elif _project_root() is None:
+            refusal = (f"there is no project here to use a {NAME} connection in, "
+                       f"so every connection declared globally stays "
+                       f"withheld: {named}")
+        else:
+            refusal = (f"no {NAME} connection is usable in this project; every "
+                       f"one it can see is withheld: {named}")
+        _die(4, "connection_not_granted", refusal, _grant_hint("<id>"))
+    sources = {cid: adapter.scope_source(NAME, "connection", entry["scope"][0])
+               for cid, entry in usable.items()}
+    _MACHINE_LENT.update({cid: sources[cid] for cid, entry in usable.items()
+                          if entry.get("machine_read")})
+    return {
+        "default": default,
+        "connections": {cid: {**entry["value"], "allow_write": entry["allow_write"]}
+                        for cid, entry in usable.items()},
+        "sources": sources,
+        "withheld": {cid: {"scope": entry["scope"][0]}
+                     for cid, entry in withheld.items()},
+    }
+
+
+def _inventory_connections(machine_read: bool | None = None) -> dict:
+    """Every connection this project declares, granted or not.
+
+    An inventory reports where selection refuses, so this is deliberately the
+    one connection read that never dies: no registry is zero connections, and
+    a connection the project may not act on is still a connection worth
+    showing. `granted` carries which is which. `machine_read` asks as one of
+    the capability's machine reads would, else as the invoked verb does."""
+    machine = _machine_read() if machine_read is None else bool(machine_read)
+    try:
+        adapter = _records()
+        effective = adapter.connections(NAME, write_default=WRITE_DEFAULT,
+                                        include_disabled=True,
+                                        machine_read=machine) or {}
+        default = adapter.get(NAME, "setting", "connection.default")
+    except StoreError:
+        return {"default": None, "connections": {}}
+    return {"default": default,
+            "connections": {
+                cid: {**entry["value"], "allow_write": entry["allow_write"],
+                      "granted": bool(entry["enabled"])}
+                for cid, entry in effective.items()}}
+
+
+def _connections_registry() -> tuple[dict | None, Path | str | None]:
+    """The connections envelope and where it came from.
+
+    Composed from the two records a connection is kept as -- who it is, and
+    what this project may do with it -- and handed on in the shape the rest of
+    the contract already reads, so selection, the write gate and the report
+    never learn which source answered.
+
+    The path returned beside it answers for the collection -- where this project
+    reads connections from. Where one connection's own values came from is a
+    question about that connection, and `reg["sources"][cid]` is what answers
+    it."""
+    return _connections_composed(), _records().collection_source(NAME, "connection")
+
+
+def _select_connection(reg: dict | None, wanted: str | None) -> tuple[str, dict | None]:
+    """flag → default pointer → sole entry → die 6. A connection's own
+    `address` field selects it too (used where a
+    connection carries a human-recognizable address; absent fields never match).
+
+    A connection the project was never granted is refused here rather than
+    reported missing, so the one enforcement point every capability already
+    routes through is also the one that answers "why not"."""
+    if reg is None:
+        _die(6, "connections_required",
+             f"{NAME} requires an explicit connections registry")
+    conns = reg["connections"]
+    if wanted:
+        if wanted in conns:
+            return wanted, conns[wanted]
+        for cid, entry in conns.items():
+            if (entry or {}).get("address", "").lower() == wanted.lower():
+                return cid, entry
+        _grant_gate(reg, wanted)
+        _die(6, "unknown_connection", f"no connection matches {wanted!r}",
+             f"known: {', '.join(conns)}")
+    default = reg.get("default")
+    if default:
+        if default not in conns:
+            _grant_gate(reg, default)
+            _die(6, "bad_default", f"default points to unknown connection {default!r}",
+                 f"known: {', '.join(conns)}")
+        return default, conns[default]
+    if len(conns) == 1:
+        cid = next(iter(conns))
+        return cid, conns[cid]
+    _die(6, "ambiguous_connection",
+         f"registry defines {len(conns)} connections and no default; "
+         f"pass --connection <id>",
+         f"known: {', '.join(conns)}")
+
+
+def _write_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """Policy from the committed registry; nothing in the cascade lifts it.
+    The read-only switch closes it for every connection and names itself."""
+    if verb in WRITE_VERBS:
+        _read_only_gate(f"write verb {verb!r} on connection {conn_id!r}")
+    if verb in WRITE_VERBS and not allow_write and conn_id in _MACHINE_LENT:
+        _die(4, "read_only",
+             f"connection {conn_id!r} is the machine's, lent read-only to a "
+             f"machine read outside any project",
+             "Do not lift the gate yourself — ask the user; a write runs "
+             "inside a project that grants this connection.")
+    if verb in WRITE_VERBS and not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes",
+             "Do not lift the gate yourself — ask the user; granting is "
+             f"`capabilities set {NAME} grant {conn_id} '{{\"allow_write\": true}}'` "
+             "run inside this project.")
+
+
+def _key_report(key: str, secret: bool, required: bool,
+                value: str | None, tier: str | None, source) -> dict:
+    return {"key": key, "secret": secret, "required": required,
+            "set": bool(value), "tier": tier if value else None,
+            "source": str(source) if (value and source) else None,
+            "value": (_mask(value) if secret else value) if value else None}
+
+
+def _missing_required(keys: list) -> list:
+    """Required report rows (from _key_report) that did not resolve through the
+    cascade — empty ⇒ credentials present. The primitive behind doctor's
+    network-free readiness gate, read from the same per-key resolution
+    `connections` reports, so the gate and the report can never disagree."""
+    return [k["key"] for k in keys if k["required"] and not k["set"]]
+
+
+def _doctor_gate(report: dict, wanted: str | None) -> None:
+    """doctor's network-free readiness gate. Refuse with exit 2 — naming the
+    unresolved required keys, before any round-trip — when a connection under
+    test cannot resolve its required config through the cascade, so readiness is
+    judged by the same resolution `connections` reports, never a parallel check.
+    Checks the selected connection, else every connection in the report."""
+    conns = report.get("connections") or {}
+    targets = [wanted] if (wanted and wanted in conns) else list(conns)
+    problems: dict = {}
+    for cid in targets:
+        miss = _missing_required((conns.get(cid) or {}).get("keys") or [])
+        if miss:
+            problems[cid] = miss
+    if problems:
+        detail = "; ".join(f"{c}: {', '.join(ks)}" for c, ks in sorted(problems.items()))
+        _die(2, "credentials_missing",
+             f"unresolved required config — {detail}",
+             f"set each in the project .env/.env.local, the user credentials.env, "
+             f"or process env; `{NAME} connections` shows where every value resolves")
+
+
+# --- Writing connections and the machine's setup -----------------------------
+#
+# `connection add|remove` and `setup` are the one way every capability takes a
+# connection or a machine prerequisite from a person: the fields are the ones
+# the script declares (CONN_FIELDS, SETUP_FIELDS), a secret arrives on standard
+# input and never on argv, and it is written to the credentials file of the
+# scope the record lands in - the project's .env.local, or the capability's
+# credentials.env in the user's config home - never into a record.
+
+def _env_file_key(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    key = stripped.split("=", 1)[0].strip()
+    if key.startswith("export "):
+        key = key[len("export "):].strip()
+    return key
+
+
+def _env_file_write(path: Path, values: dict) -> None:
+    """Set or drop keys in an env file, keeping every other line as it was.
+
+    A value of None drops its key. Values are written single-quoted, which the
+    contract's parser reads back whole, the file is replaced atomically at mode
+    0600, and every write is proven by reading it back through that parser."""
+    for key, value in values.items():
+        if value is not None and ("'" in value or "\n" in value or "\r" in value):
+            _die(6, "input", f"the value for {key} holds a quote or a line break, "
+                 "which an env file cannot carry")
+    lines = path.read_text().splitlines() if path.exists() else []
+    out, done = [], set()
+    for line in lines:
+        key = _env_file_key(line)
+        if key in values:
+            if key not in done and values[key] is not None:
+                out.append(f"{key}='{values[key]}'")
+            done.add(key)
+            continue
+        out.append(line)
+    for key, value in values.items():
+        if key not in done and value is not None:
+            out.append(f"{key}='{value}'")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    spare = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(spare, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write("\n".join(out) + ("\n" if out else ""))
+        os.chmod(spare, 0o600)
+        os.replace(spare, path)
+    finally:
+        if spare.exists():
+            spare.unlink()
+    os.chmod(path, 0o600)
+    held = _parse_env_file(path)
+    for key, value in values.items():
+        if held.get(key) != value and not (value is None and key not in held):
+            _die(5, "credentials_write_failed",
+                 f"{path} does not read back what was written for {key}")
+
+
+def _field_args(argv: list[str], usage: str) -> tuple[dict, list[str], bool]:
+    """`--field KEY=VALUE` pairs, the remaining words, and whether `--stdin`
+    was asked for."""
+    fields, words, stdin = {}, [], False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--field":
+            if i + 1 >= len(argv) or "=" not in argv[i + 1]:
+                _die(6, "input", "--field takes KEY=VALUE", usage)
+            key, value = argv[i + 1].split("=", 1)
+            fields[key.strip()] = value
+            i += 2
+        elif arg.startswith("--field="):
+            pair = arg[len("--field="):]
+            if "=" not in pair:
+                _die(6, "input", "--field takes KEY=VALUE", usage)
+            key, value = pair.split("=", 1)
+            fields[key.strip()] = value
+            i += 1
+        elif arg == "--stdin":
+            stdin = True
+            i += 1
+        else:
+            words.append(arg)
+            i += 1
+    return fields, words, stdin
+
+
+def _declared_values(declared: list, argv_values: dict, stdin: bool,
+                     what: str) -> dict:
+    """The values a person gave, each checked against its declared field: argv
+    carries no secret, stdin carries a JSON object, and null clears a field."""
+    by_key = {f["key"]: f for f in declared}
+    given: dict = {}
+    for key, raw in argv_values.items():
+        field = by_key.get(key)
+        if field is None:
+            _die(6, "unknown_field", f"{NAME} declares no {what} field {key!r}",
+                 f"fields: {', '.join(by_key) or 'none'}")
+        if field.get("secret"):
+            _die(6, "secret_on_argv", f"{key} is a secret and is never taken on argv",
+                 "pass it in the JSON object on stdin with --stdin")
+        try:
+            given[key] = _field_value(field, raw, from_argv=True)
+        except ValueError as e:
+            _die(6, "bad_field", str(e))
+    if stdin:
+        for key, raw in _stdin_document(f"the {what} fields").items():
+            field = by_key.get(key)
+            if field is None:
+                _die(6, "unknown_field", f"{NAME} declares no {what} field {key!r}",
+                     f"fields: {', '.join(by_key) or 'none'}")
+            if raw is None:
+                given[key] = None
+                continue
+            try:
+                given[key] = _field_value(field, raw)
+            except ValueError as e:
+                _die(6, "bad_field", str(e))
+    return given
+
+
+def _connection_env_name(field: dict, cid: str) -> str:
+    """The env key a secret field's value is written under for one connection."""
+    import re as _re
+    ident = _re.sub(r"[^A-Z0-9]", "_", cid.upper())
+    template = field.get("env") or (
+        f"{_re.sub(r'[^A-Z0-9]', '_', NAME.upper())}_{{ID}}_"
+        f"{_re.sub(r'[^A-Z0-9]', '_', field['key'].upper().removesuffix('_ENV'))}")
+    return template.replace("{ID}", ident)
+
+
+def _connection_scope(words: list[str], usage: str) -> tuple[str, list[str]]:
+    """The scope a connection is written at. `--machine` is the machine's
+    scope, `--global`'s, named as administration of the machine
+    (`_machine_administration`), so it cannot be asked of a project."""
+    scope = "project"
+    rest = []
+    for word in words:
+        if word in ("--project", "--global", "--machine"):
+            scope = word[2:]
+        else:
+            rest.append(word)
+    if "--machine" in words and "--project" in words:
+        _die(6, "input", "--machine writes the machine's connection, --project this "
+             "project's; pass one", usage)
+    return ("global" if scope == "machine" else scope), rest
+
+
+def _connection_grantees(adapter, cid: str, scope: str, root) -> list:
+    """The projects a connection removed at `scope` is granted to and would be
+    taken from: every project the store holds an enabling grant for, for a
+    connection kept in the store; the project the call runs in, for a
+    connection of the machine it grants and does not declare itself. A
+    project's own connection in its files is granted to no other project."""
+    if scope == "global":
+        if root is None or adapter.mode_of("grant") != "files":
+            return []
+        grant = (adapter.resolve_scope(NAME, "grant", "project").get(cid) or {}).get("value")
+        own = (adapter.resolve_scope(NAME, "connection", "project").get(cid) or {}).get("value")
+        if isinstance(grant, dict) and grant.get("enabled") is True and not own:
+            return [str(root)]
+        return []
+    if adapter.mode_of("connection") == "store":
+        return adapter.grantees(NAME, cid)
+    return []
+
+
+def _scope_credentials(scope: str) -> Path:
+    if scope == "global":
+        return CREDENTIALS_ENV
+    return _project_root() / ".env.local"
+
+
+def _cmd_connection(argv: list[str]) -> None:
+    """`connection add <id>` writes one connection from its declared fields,
+    its secrets into the scope's credentials file; `connection remove <id>`
+    takes it out again with the secrets it wrote."""
+    usage = (f"{NAME} connection add <id> [--project|--global|--machine] [--default] "
+             "[--replace] [--field KEY=VALUE ...] [--stdin] | "
+             f"{NAME} connection remove <id> [--project|--global|--machine]")
+    import re as _re
+    sub = argv[0] if argv else ""
+    if sub not in ("add", "remove"):
+        _die(6, "input", f"unknown connection subcommand {sub!r}", usage)
+    argv_values, words, stdin = _field_args(argv[1:], usage)
+    default = "--default" in words
+    replace = "--replace" in words
+    if replace and sub != "add":
+        _die(6, "input", "--replace is an option of connection add", usage)
+    words = [w for w in words if w not in ("--default", "--replace")]
+    scope, rest = _connection_scope(words, usage)
+    flags = [w for w in rest if w.startswith("--")]
+    if flags:
+        _die(6, "input", f"unknown connection option {flags[0]!r}", usage)
+    if len(rest) != 1:
+        _die(6, "input", f"connection {sub} names one connection id", usage)
+    cid = rest[0]
+    if not _re.fullmatch(r"[a-z0-9][a-z0-9._@+-]{0,127}", cid, _re.IGNORECASE):
+        _die(6, "input", f"connection id {cid!r} is letters, digits and . _ @ + -")
+    _read_only_gate(f"`{NAME} connection {sub}`")
+    declared = globals().get("CONN_FIELDS")
+    if declared is None:
+        _die(6, "connection_fields_undeclared",
+             f"{NAME} does not declare its connection fields",
+             f"`{NAME} help` says how its connections are written")
+    root = _project_root()
+    if scope == "project":
+        if root is None:
+            _die(6, "no_project", f"--project writes this project's {NAME} connection "
+                 "and there is no project here", "run it inside the project, or pass --global")
+        if not _project_capabilities_dir(root).is_dir():
+            _die(6, "no_envelope", "no capabilities/ envelope in this project",
+                 "run `capabilities init` first")
+    adapter = _records()
+    try:
+        held = adapter.resolve_scope(NAME, "connection", scope).get(cid)
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    existing = dict((held or {}).get("value") or {})
+    credentials = _scope_credentials(scope)
+
+    if sub == "remove":
+        if held is None:
+            _die(3, "unknown_connection", f"no {scope} connection {cid!r}",
+                 f"`{NAME} connections` lists them")
+        try:
+            grantees = _connection_grantees(adapter, cid, scope, root)
+        except StoreError as e:
+            _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+        if grantees:
+            _die(6, "connection_granted",
+                 f"connection {cid!r} is granted to {len(grantees)} project(s), so "
+                 f"removing it would take it from them: {', '.join(grantees)}",
+                 "ask the user; each project switches its grant off first, with "
+                 f"`capabilities set {NAME} grant {cid} '{{\"enabled\": false}}'` "
+                 "run in that project")
+        others = {}
+        try:
+            for other, row in adapter.resolve_scope(NAME, "connection", scope).items():
+                if other != cid:
+                    others[other] = row.get("value") or {}
+            pointer = adapter.resolve_scope(NAME, "setting", scope).get("connection.default")
+            adapter.delete(NAME, "connection", cid, scope=scope)
+            was_default = bool(pointer and pointer.get("value") == cid)
+            if was_default:
+                adapter.delete(NAME, "setting", "connection.default", scope=scope)
+            source = adapter.scope_source(NAME, "connection", scope)
+        except StoreError as e:
+            _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+        removed, kept = [], []
+        for field in declared:
+            env_key = existing.get(field["key"]) if field.get("secret") else None
+            if not isinstance(env_key, str) or not env_key:
+                continue
+            shared = any(entry.get(field["key"]) == env_key for entry in others.values())
+            if env_key == _connection_env_name(field, cid) and not shared \
+                    and env_key in _parse_env_file(credentials):
+                removed.append(env_key)
+            else:
+                kept.append(env_key)
+        if removed:
+            _env_file_write(credentials, {key: None for key in removed})
+        _emit({"ok": True, "action": "remove", "connection": cid, "scope": scope,
+               "registry": source, "default_cleared": was_default,
+               "credentials": str(credentials) if removed else None,
+               "secrets_removed": removed, "secrets_kept": kept})
+        return
+
+    if held is not None and not replace:
+        _die(6, "connection_exists",
+             f"a {scope} connection {cid!r} already exists, and connection add "
+             "writes over it only when asked to",
+             f"pass --replace to change it, keeping every field not given; "
+             f"`{NAME} connections` shows it as it resolves")
+    given = _declared_values(declared, argv_values, stdin, "connection")
+    entry = dict(existing)
+    secrets: dict = {}
+    for field in declared:
+        key = field["key"]
+        if key in given:
+            value = given[key]
+            if value is None:
+                entry.pop(key, None)
+            elif field.get("secret"):
+                # Always this connection's own key: a key the entry named
+                # before may be shared with another connection.
+                env_key = _connection_env_name(field, cid)
+                secrets[env_key] = value
+                entry[key] = env_key
+            else:
+                entry[key] = value
+        elif key not in entry and field.get("secret") and field.get("required"):
+            env_key = _connection_env_name(field, cid)
+            if _resolve_env_key(env_key)[0]:
+                entry[key] = env_key
+        elif key not in entry and field.get("default") is not None and field.get("required"):
+            entry[key] = field["default"]
+    missing = [f["key"] for f in declared if f.get("required") and entry.get(f["key"]) in (None, "")]
+    if missing:
+        _die(6, "fields_required", f"connection {cid!r} needs: {', '.join(missing)}",
+             f"`{NAME} manifest` lists the fields; secrets go in the JSON object on stdin")
+    if secrets:
+        _env_file_write(credentials, secrets)
+    try:
+        adapter.set(NAME, "connection", cid, entry, scope=scope)
+        if default:
+            adapter.set(NAME, "setting", "connection.default", cid, scope=scope)
+        source = adapter.scope_source(NAME, "connection", scope)
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    report = []
+    for field in declared:
+        value = entry.get(field["key"])
+        row = {"key": field["key"], "secret": bool(field.get("secret")),
+               "set": value not in (None, "")}
+        if field.get("secret") and isinstance(value, str) and value:
+            resolved, tier, where = _resolve_env_key(value)
+            row.update({"env": value, "set": bool(resolved), "tier": tier,
+                        "source": str(where) if where else None,
+                        "value": _mask(resolved) if resolved else None})
+        else:
+            row["value"] = value
+        report.append(row)
+    out = {"ok": True, "action": "add" if held is None else "update",
+           "connection": cid, "scope": scope, "registry": source,
+           "credentials": str(credentials) if secrets else None,
+           "default": default, "fields": report,
+           "next": f"`{NAME} doctor --connection {cid}` proves it"}
+    methods = globals().get("LINK_METHODS") or []
+    if methods:
+        out["link"] = [m.get("id") for m in methods]
+        out["next"] = (f"link it with one of `{NAME} manifest`'s connections.link "
+                       f"methods, adding --connection {cid}")
+    if scope == "global" and root is not None:
+        out["hint"] = _grant_hint(cid)
+    _emit(out)
+
+
+def _cmd_setup(argv: list[str]) -> None:
+    """`setup` reports the machine prerequisites the capability declares and
+    where each resolves from; `setup set` writes them to the capability's
+    credentials.env, secrets from stdin; `setup unset` takes them out.
+    `--machine` names a write as administration of the machine
+    (`_machine_administration`)."""
+    usage = (f"{NAME} setup [show] | setup set [--machine] [--field KEY=VALUE ...] "
+             "[--stdin] | setup unset [--machine] <KEY> ...")
+    declared = list(globals().get("SETUP_FIELDS") or [])
+    sub = argv[0] if argv and not argv[0].startswith("--") else "show"
+    rest = argv[1:] if argv and argv[0] == sub else argv
+    if sub not in ("show", "set", "unset"):
+        _die(6, "input", f"unknown setup subcommand {sub!r}", usage)
+    if sub != "show":
+        rest = [w for w in rest if w != "--machine"]
+    changed: list = []
+    if sub == "set":
+        argv_values, words, stdin = _field_args(rest, usage)
+        if words:
+            _die(6, "input", f"unexpected {words[0]!r}", usage)
+        _read_only_gate(f"`{NAME} setup set`")
+        given = _declared_values(declared, argv_values, stdin, "setup")
+        if not given:
+            _die(6, "input", "setup set was given nothing to set", usage)
+        _env_file_write(CREDENTIALS_ENV, {
+            key: (None if value is None else
+                  ("true" if value is True else "false" if value is False else
+                   json.dumps(value) if isinstance(value, (list, dict)) else str(value)))
+            for key, value in given.items()})
+        changed = sorted(given)
+    elif sub == "unset":
+        keys = [w for w in rest if not w.startswith("--")]
+        known = {f["key"] for f in declared}
+        unknown = [k for k in keys if k not in known]
+        if not keys or unknown:
+            _die(6, "unknown_field" if unknown else "input",
+                 f"{NAME} declares no setup field {unknown[0]!r}" if unknown
+                 else "setup unset names the keys to remove", usage)
+        _read_only_gate(f"`{NAME} setup unset`")
+        _env_file_write(CREDENTIALS_ENV, {key: None for key in keys})
+        changed = sorted(keys)
+    fields = []
+    for field in declared:
+        value, tier, source = _resolve_env_key(field["key"])
+        secret = bool(field.get("secret"))
+        fields.append({**field, "set": bool(value), "tier": tier if value else None,
+                       "source": str(source) if (value and source) else None,
+                       "value": (_mask(value) if secret else value) if value else None})
+    out = {"capability": NAME, "credentials": str(CREDENTIALS_ENV),
+           "ready": all(f["set"] for f in fields if f.get("required")),
+           "fields": fields}
+    if sub != "show":
+        out.update({"ok": True, "action": sub, "changed": changed})
+    _emit(out)
+
+# <<< contract: connections <<<
+
+
+# ── the file store connection ────────────────────────────────────────────────
+
+BUCKET_FIELDS = ("endpoint", "region", "bucket")
+SECRET_FIELDS = ("access_key_id_env", "secret_access_key_env")
+_BUCKET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
+_REGION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+_CONNECTION_HINT = (f"`{NAME} connection add <id> --field endpoint=<url> --field region=<region> "
+                    "--field bucket=<bucket> --stdin` with the two keys in the JSON object on "
+                    "stdin; `capabilities set` grants it")
+
+
+def _connections_report() -> dict:
+    """The resolution report: every file store connection, every value, its
+    winning tier and source, the two keys masked. Local only. Without a
+    registry the registry read refuses `connections_required`, as for every
+    connection-bearing capability."""
+    reg, _ = _connections_registry()
+    conns = reg["connections"]
+    report: dict = {
+        "default": reg.get("default") or (next(iter(conns)) if len(conns) == 1 else None),
+        "connections": {}}
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        origin = (reg.get("sources") or {}).get(cid)
+        keys = []
+        for field in BUCKET_FIELDS:
+            value = entry.get(field)
+            value = str(value) if value not in (None, "") else None
+            keys.append(_key_report(field, False, True, value, "connection", origin))
+        for field in SECRET_FIELDS:
+            env_key = entry.get(field)
+            if env_key:
+                value, tier, source = _resolve_env_key(str(env_key))
+                keys.append(_key_report(str(env_key), True, True, value, tier, source))
+            else:
+                keys.append(_key_report(field, False, True, None, None, None))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)), "keys": keys}
+    return report
+
+
 def _cmd_connections() -> None:
-    """Assets reaches no system of its own: the store is the project's, resolved
-    through the shared library, so there is nothing to resolve here."""
-    _emit({"default": None, "connections": {}})
+    _emit(_connections_report())
+
+
+class _BucketError(Exception):
+    """A refusal from, or on the way to, the bucket: raised rather than died
+    with, so a verb over many files can report it per file."""
+
+    def __init__(self, exit_code: int, code: str, message: str,
+                 hint: str | None = None, status: int | None = None):
+        super().__init__(message)
+        self.exit_code, self.code, self.message = exit_code, code, message
+        self.hint, self.status = hint, status
+
+    def out(self) -> dict:
+        return {k: v for k, v in (("code", self.code), ("error", self.message),
+                                  ("hint", self.hint), ("status", self.status)) if v is not None}
+
+
+def _bucket_refused(exc: _BucketError) -> NoReturn:
+    _die(exc.exit_code, exc.code, exc.message, exc.hint, exc.status)
+
+
+def _usable_connections() -> tuple[int, int]:
+    """How many file store connections this project could see, and how many of
+    them it may use - read as the registry is read, so a record that cannot be
+    read refuses here as it would there; only an absent registry is zero."""
+    try:
+        effective = _records().connections(NAME, write_default=WRITE_DEFAULT,
+                                           include_disabled=True,
+                                           machine_read=_machine_read()) or {}
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    return len(effective), sum(1 for entry in effective.values() if entry.get("enabled"))
+
+
+def _file_store(wanted: str | None, verb: str, *, required: bool):
+    """The bucket of the selected file store connection, or (None, why) when
+    none is configured and the verb can do without one. A verb that cannot -
+    or a --connection given - selects as every capability selects, so the
+    refusal is the contract's own."""
+    if not required and not wanted:
+        seen, usable = _usable_connections()
+        if not seen:
+            return None, "no file store connection is configured"
+        if not usable:
+            return None, "no file store connection is granted to this project"
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    _write_gate(cid, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), verb)
+    try:
+        return _Bucket.of(cid, entry or {}), None
+    except _BucketError as exc:
+        _bucket_refused(exc)
+
+
+# ── the bucket: S3 over HTTP, path-style, AWS Signature Version 4 ────────────
+
+S3_TIMEOUT = 60.0
+S3_RETRIES = 3
+SINGLE_PUT_MAX = 5 * 1024 ** 3      # the largest object one S3 PUT carries
+STORAGE_KEY_MAX = 1024              # S3's limit on an object key, in UTF-8 bytes
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+
+
+def _uri_encode(text: str) -> str:
+    """SigV4's URI encoding: every byte but the unreserved characters."""
+    from urllib.parse import quote
+    return quote(text, safe="-_.~")
+
+
+def _s3_error(body: bytes) -> tuple[str | None, str | None]:
+    text = body.decode("utf-8", "replace")
+    code = re.search(r"<Code>([^<]*)</Code>", text)
+    message = re.search(r"<Message>([^<]*)</Message>", text)
+    return (code.group(1) if code else None), (message.group(1) if message else None)
+
+
+class _Bucket:
+    """One file store connection, resolved: where the bucket is and the keys
+    that sign for it. Every request is signed whole - the payload's sha256 is
+    in the signature, so the store refuses bytes that changed on the way."""
+
+    def __init__(self, cid: str, endpoint: str, region: str, bucket: str,
+                 access_key: str, secret_key: str):
+        from urllib.parse import urlsplit
+        parts = urlsplit(endpoint)
+        self.cid, self.endpoint, self.region, self.bucket = cid, endpoint, region, bucket
+        self.scheme = parts.scheme
+        self.host = parts.hostname.lower() if parts.hostname else ""
+        default_port = {"http": 80, "https": 443}[parts.scheme]
+        self.netloc = self.host if parts.port in (None, default_port) else \
+            f"{self.host}:{parts.port}"
+        if ":" in self.host:        # an IPv6 literal keeps its brackets in Host
+            self.netloc = f"[{self.host}]" + ("" if parts.port in (None, default_port)
+                                              else f":{parts.port}")
+        self.prefix = "/".join(_uri_encode(p) for p in parts.path.rstrip("/").split("/"))
+        self._access, self._secret = access_key, secret_key
+        self._client = None
+
+    @classmethod
+    def of(cls, cid: str, entry: dict) -> "_Bucket":
+        missing = [f for f in BUCKET_FIELDS if entry.get(f) in (None, "")]
+        if missing:
+            raise _BucketError(6, "incomplete_connection",
+                               f"file store connection {cid!r} is missing: "
+                               f"{', '.join(missing)}", _CONNECTION_HINT)
+        from urllib.parse import urlsplit
+        endpoint = str(entry["endpoint"]).strip()
+        parts = urlsplit(endpoint)
+        if parts.scheme not in ("http", "https") or not parts.hostname \
+                or parts.query or parts.fragment or parts.username or parts.password:
+            raise _BucketError(6, "bad_endpoint",
+                               f"connection {cid!r}: endpoint {endpoint!r} is not an http(s) "
+                               "URL of a host, with no query, fragment or credentials",
+                               "e.g. https://<account>.r2.cloudflarestorage.com")
+        try:
+            parts.port
+        except ValueError:
+            raise _BucketError(6, "bad_endpoint",
+                               f"connection {cid!r}: endpoint {endpoint!r} has a bad port")
+        bucket, region = str(entry["bucket"]).strip(), str(entry["region"]).strip()
+        if not _BUCKET_NAME.fullmatch(bucket):
+            raise _BucketError(6, "bad_bucket", f"connection {cid!r}: {bucket!r} is not a "
+                               "bucket name", "letters, digits, `.`, `-` and `_`, e.g. "
+                               "example-bucket")
+        if not _REGION_NAME.fullmatch(region):
+            raise _BucketError(6, "bad_region", f"connection {cid!r}: {region!r} is not a "
+                               "region", "auto for R2, the bucket's region for AWS S3, "
+                               "us-east-1 for most other stores")
+        keys = []
+        for field in SECRET_FIELDS:
+            env_key = entry.get(field)
+            if not env_key:
+                raise _BucketError(6, "no_secret_env",
+                                   f"file store connection {cid!r} is missing: {field}",
+                                   _CONNECTION_HINT)
+            value = _resolve_env_key(str(env_key))[0]
+            if not value:
+                raise _BucketError(2, "missing_credentials",
+                                   f"env var {env_key} (for connection {cid!r}) is unset",
+                                   f"set {env_key} in the project's .env.local or .env, "
+                                   f"{CREDENTIALS_ENV}, or the environment")
+            keys.append(value)
+        return cls(cid, endpoint, region, bucket, *keys)
+
+    def _path(self, key: str | None) -> str:
+        path = f"{self.prefix}/{_uri_encode(self.bucket)}"
+        if key is not None:
+            path += "/" + "/".join(_uri_encode(part) for part in key.split("/"))
+        return path
+
+    def _signed(self, method: str, path: str, query: str, payload_sha: str,
+                extra: dict) -> dict:
+        import datetime
+        import hmac
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stamp, day = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
+        signed = {"host": self.netloc, "x-amz-content-sha256": payload_sha,
+                  "x-amz-date": stamp}
+        names = ";".join(sorted(signed))
+        canonical = "\n".join([method, path, query,
+                               "".join(f"{k}:{signed[k]}\n" for k in sorted(signed)),
+                               names, payload_sha])
+        scope = f"{day}/{self.region}/s3/aws4_request"
+        to_sign = "\n".join(["AWS4-HMAC-SHA256", stamp, scope,
+                             hashlib.sha256(canonical.encode()).hexdigest()])
+        key = ("AWS4" + self._secret).encode()
+        for part in (day, self.region, "s3", "aws4_request"):
+            key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+        signature = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
+        return {"Host": self.netloc, "x-amz-content-sha256": payload_sha,
+                "x-amz-date": stamp, **extra,
+                "Authorization": f"AWS4-HMAC-SHA256 Credential={self._access}/{scope}, "
+                                 f"SignedHeaders={names}, Signature={signature}"}
+
+    def _request(self, method: str, key: str | None, *, query: dict | None = None,
+                 body: bytes = b"", payload_sha: str = _EMPTY_SHA256,
+                 headers: dict | None = None, missing: str = "no_such_key"):
+        """One request with bounded, backed-off retries of what is transient:
+        a timeout, a lost connection, 429 and 5xx. Every attempt is signed
+        afresh. A 4xx is the store's answer and is not retried."""
+        import time
+        import httpx
+        if self._client is None:
+            self._client = httpx.Client(timeout=httpx.Timeout(S3_TIMEOUT),
+                                        follow_redirects=False)
+        path = self._path(key)
+        qs = "&".join(f"{_uri_encode(k)}={_uri_encode(v)}"
+                      for k, v in sorted((query or {}).items()))
+        url = f"{self.scheme}://{self.netloc}{path}" + (f"?{qs}" if qs else "")
+        what = f"{method} {self.bucket}/{key}" if key is not None else f"{method} {self.bucket}"
+        status = None
+        for attempt in range(1, S3_RETRIES + 1):
+            try:
+                resp = self._client.request(
+                    method, url, content=body if method == "PUT" else None,
+                    headers=self._signed(method, path, qs, payload_sha, headers or {}))
+            except httpx.TimeoutException:
+                if attempt < S3_RETRIES:
+                    time.sleep(attempt * 1.5)
+                    continue
+                raise _BucketError(5, "timeout", f"the file store did not answer: {what}",
+                                   f"check that {self.endpoint} is reachable")
+            except httpx.RequestError as exc:
+                if attempt < S3_RETRIES:
+                    time.sleep(attempt * 1.5)
+                    continue
+                raise _BucketError(5, "network_error", f"cannot reach the file store "
+                                   f"{self.endpoint}: {exc}", "check connectivity")
+            status = resp.status_code
+            if status == 429 or status >= 500:
+                if attempt < S3_RETRIES:
+                    try:
+                        pause = float(resp.headers.get("Retry-After", ""))
+                    except ValueError:
+                        pause = attempt * 1.5
+                    time.sleep(min(pause, 30.0))
+                    continue
+                code, message = _s3_error(resp.content)
+                raise _BucketError(5, "rate_limited" if status == 429 else "server_error",
+                                   f"the file store answered {status} to {what}"
+                                   + (f": {code} {message or ''}".rstrip() if code else ""),
+                                   status=status)
+            if status < 300:
+                return resp
+            code, message = _s3_error(resp.content)
+            said = f"{code}: {message}" if code and message else (code or message or
+                                                                  f"HTTP {status}")
+            if status in (401, 403):
+                raise _BucketError(2, "unauthorized", f"the file store refused {what}: {said}",
+                                   f"check the keys connection {self.cid!r} names, the "
+                                   "region it signs for, and the machine's clock; "
+                                   f"`{NAME} connections` shows where they resolve",
+                                   status=status)
+            if status == 404 and code == "NoSuchBucket":
+                raise _BucketError(3, "no_such_bucket", f"the file store has no bucket "
+                                   f"{self.bucket!r}", f"create it, or name the bucket "
+                                   f"connection {self.cid!r} should use", status=status)
+            if status == 404 and method != "PUT" and missing == "object_missing":
+                raise _BucketError(8, "object_missing", f"the bucket holds no object for "
+                                   f"{key!r}, which its record says is there",
+                                   "the file's record is kept; put its bytes again with "
+                                   f"`{NAME} files add`", status=status)
+            raise _BucketError(3 if status == 404 else 6, "not_found" if status == 404
+                               else "bucket_refused", f"the file store refused {what}: {said}",
+                               status=status)
+        raise _BucketError(5, "exhausted_retries", f"{S3_RETRIES} attempts at {what} failed",
+                           status=status)
+
+    def put(self, key: str, data: bytes, sha256: str, media_type: str) -> None:
+        self._request("PUT", key, body=data, payload_sha=sha256,
+                      headers={"Content-Type": media_type})
+
+    def get(self, key: str, *, size: int, sha256: str) -> bytes:
+        """The object's bytes, checked against the size and sha256 its record
+        carries; a mismatch is refused, never returned."""
+        data = self._request("GET", key, missing="object_missing").content
+        found = hashlib.sha256(data).hexdigest()
+        if len(data) != size or found != sha256:
+            raise _BucketError(8, "sha256_mismatch",
+                               f"the bucket's object {key!r} is {len(data)} bytes with sha256 "
+                               f"{found}, and its record says {size} bytes with sha256 "
+                               f"{sha256}", "nothing was written; the record is kept - put "
+                               f"the file's bytes again with `{NAME} files add`")
+        return data
+
+    def probe(self, prefix: str) -> dict:
+        """The cheapest authenticated round trip: list at most one key under
+        the project's prefix."""
+        resp = self._request("GET", None, query={"list-type": "2", "max-keys": "1",
+                                                 "prefix": prefix})
+        return {"ok": True, "endpoint": self.endpoint, "bucket": self.bucket,
+                "region": self.region, "prefix": prefix,
+                "objects_under_prefix": "<Key>" in resp.text}
 
 
 # ── the tables ───────────────────────────────────────────────────────────────
@@ -5569,7 +6665,10 @@ def _cmd_connections() -> None:
 # Versions reference their document with a foreign key: both tables are this
 # capability's own, a document is never deleted (its guard refuses it), so the
 # key costs nothing and keeps a version from naming a document that is not there.
-TABLES_MAJOR, TABLES_MINOR = 1, 0
+# A file references the document it belongs to the same way; its bytes are in the
+# bucket, so the row is what says the file exists, and its size and sha256 are
+# what every read of the bytes is checked against.
+TABLES_MAJOR, TABLES_MINOR = 1, 1
 TABLE_STEPS = [
     ("0001-documents", """
     CREATE TABLE assets_documents (
@@ -5663,6 +6762,64 @@ TABLE_STEPS = [
         FOR EACH ROW EXECUTE FUNCTION assets_documents_guard();
     CREATE TRIGGER assets_documents_truncate BEFORE TRUNCATE ON assets_documents
         FOR EACH STATEMENT EXECUTE FUNCTION assets_documents_guard();
+    """),
+    ("0004-files", """
+    CREATE TABLE assets_files (
+        project_id   text NOT NULL CHECK (project_id <> ''),
+        id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        document_id  uuid REFERENCES assets_documents (id),
+        name         text NOT NULL CHECK (name <> ''),
+        media_type   text NOT NULL CHECK (media_type ~ '^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$'),
+        bytes        bigint NOT NULL CHECK (bytes >= 0),
+        sha256       text NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+        storage_key  text NOT NULL CHECK (storage_key = project_id || '/' || id::text || '/' || name),
+        created_at   timestamptz NOT NULL DEFAULT now(),
+        created_by   text NOT NULL CHECK (created_by <> ''),
+        retired_at   timestamptz
+    );
+    CREATE UNIQUE INDEX assets_files_name ON assets_files (project_id, name)
+        WHERE retired_at IS NULL;
+    COMMENT ON TABLE assets_files IS
+        'A file of a project that is not a markdown document: its bytes are the object storage_key in the bucket of the project''s file store connection, this row says it exists. Immutable: a replaced file is a new row and the old one is retired.';
+    COMMENT ON COLUMN assets_files.document_id IS
+        'The document the file belongs to, when it sits beside one or is linked from one; null when it belongs to none.';
+    COMMENT ON COLUMN assets_files.name IS
+        'The path under the agent''s assets/ folder, extension included, e.g. research/x/crash.ips; unique per project among unretired files.';
+    COMMENT ON COLUMN assets_files.media_type IS
+        'The media type the object was put with, from the name''s extension; application/octet-stream when none is known.';
+    COMMENT ON COLUMN assets_files.bytes IS
+        'The size of the object in bytes; a read of it is checked against this.';
+    COMMENT ON COLUMN assets_files.sha256 IS
+        'The lowercase hex SHA-256 of the bytes; a read of the object is checked against this.';
+    COMMENT ON COLUMN assets_files.storage_key IS
+        'The object key in the bucket: <project_id>/<id>/<name>, so no two rows share an object.';
+    COMMENT ON COLUMN assets_files.retired_at IS
+        'Set when the file is replaced or retired; the row and its object stay, and the name is free for a new row.';
+    """),
+    ("0005-files-guard", """
+    CREATE FUNCTION assets_files_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF tg_op IN ('DELETE', 'TRUNCATE') THEN
+            RAISE EXCEPTION 'asset files are never deleted: retire them'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.id <> old.id OR new.project_id <> old.project_id
+                OR new.document_id IS DISTINCT FROM old.document_id
+                OR new.name <> old.name OR new.media_type <> old.media_type
+                OR new.bytes <> old.bytes OR new.sha256 <> old.sha256
+                OR new.storage_key <> old.storage_key OR new.created_at <> old.created_at
+                OR new.created_by <> old.created_by
+                OR old.retired_at IS NOT NULL
+                   AND new.retired_at IS DISTINCT FROM old.retired_at THEN
+            RAISE EXCEPTION 'an asset file changes only by being retired, once: keep the new bytes as a new file'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $$;
+    CREATE TRIGGER assets_files_guard BEFORE UPDATE OR DELETE ON assets_files
+        FOR EACH ROW EXECUTE FUNCTION assets_files_guard();
+    CREATE TRIGGER assets_files_truncate BEFORE TRUNCATE ON assets_files
+        FOR EACH STATEMENT EXECUTE FUNCTION assets_files_guard();
     """),
 ]
 
@@ -5979,6 +7136,145 @@ def _refused_by_store(exc) -> NoReturn:
     _die(6, "refused_by_store", str(exc).splitlines()[0])
 
 
+# ── files ────────────────────────────────────────────────────────────────────
+
+FILE_COLUMNS = ("id, project_id, document_id, name, media_type, bytes, sha256, storage_key, "
+                "created_at, created_by, retired_at")
+_LINK = re.compile(r"\]\(\s*(?:<([^>\n]*)>|([^)\s]+))|^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*<?([^>\s]+)",
+                   re.MULTILINE)
+
+
+def _file_name_problem(name: str, project: str) -> str | None:
+    """Why `name` addresses no file, or None when it does: the document rule
+    for segments, a name a document would own refused, and a storage key S3
+    can carry."""
+    if not name:
+        return "a file name is not empty"
+    for part in name.split("/"):
+        if part in ("", ".", "..") or not _SEGMENT.fullmatch(part):
+            return (f"{name!r} is not a file name: each `/`-separated segment is "
+                    "non-empty, not `.` or `..`, with no backslash or control character")
+    if name.endswith(".md"):
+        return f"{name!r} ends in .md: a markdown file is a document; `{NAME} save` it"
+    if len(_storage_key(project, "00000000-0000-0000-0000-000000000000", name).encode()) \
+            > STORAGE_KEY_MAX:
+        return f"{name!r} is too long: its storage key would pass S3's {STORAGE_KEY_MAX} bytes"
+    return None
+
+
+def _checked_file_name(name: str, project: str) -> str:
+    problem = _file_name_problem(name, project)
+    if problem:
+        _die(6, "bad_name", problem,
+             "name it by its path under assets/ with its extension, e.g. research/x/crash.ips")
+    return name
+
+
+def _storage_key(project: str, file_id: str, name: str) -> str:
+    return f"{project}/{file_id}/{name}"
+
+
+def _media_type(name: str) -> str:
+    """The media type of the name's extension in Python's own table, never the
+    machine's, so one name has one type wherever it is kept."""
+    import mimetypes
+    suffix = Path(name.rsplit("/", 1)[-1]).suffix.lower()
+    table = mimetypes.MimeTypes()
+    return (table.types_map[True].get(suffix) or table.types_map[False].get(suffix)
+            or "application/octet-stream")
+
+
+def _file_out(row: dict, document: str | None = None) -> dict:
+    return {"id": str(row["id"]), "name": row["name"], "media_type": row["media_type"],
+            "bytes": row["bytes"], "sha256": row["sha256"], "storage_key": row["storage_key"],
+            "document": document,
+            "document_id": str(row["document_id"]) if row["document_id"] else None,
+            "created_at": _iso(row["created_at"]), "created_by": row["created_by"],
+            "retired_at": _iso(row["retired_at"])}
+
+
+def _current_file(conn, project: str, name: str, *, lock: bool = False) -> dict | None:
+    return _one(conn, f"SELECT {FILE_COLUMNS} FROM assets_files WHERE project_id = %s "
+                      "AND name = %s AND retired_at IS NULL" + (" FOR UPDATE" if lock else ""),
+                (project, name))
+
+
+class _StaleFile(Exception):
+    """The file's current record changed between the put and the write."""
+
+
+def _upload(bucket, project: str, name: str, data: bytes, sha: str) -> dict:
+    """Put the bytes in the bucket under a key no row names yet; the record
+    that says the file exists is written after, in the caller's transaction."""
+    import uuid
+    file_id = str(uuid.uuid4())
+    key = _storage_key(project, file_id, name)
+    media = _media_type(name)
+    bucket.put(key, data, sha, media)
+    return {"id": file_id, "storage_key": key, "media_type": media}
+
+
+def _write_file_row(conn, project: str, name: str, sha: str, size: int, put: dict | None,
+                 document_id, actor: str, seen: dict | None) -> tuple[str, dict, dict | None]:
+    """Write a file's record inside the caller's transaction: retire the
+    current one and insert the new one, or nothing when the current one has
+    these bytes. `seen` is the record read before the put; a different one
+    now means another writer came first."""
+    current = _current_file(conn, project, name, lock=True)
+    if current is not None and current["sha256"] == sha and current["bytes"] == size:
+        return "unchanged", current, None
+    if (current["id"] if current else None) != (seen["id"] if seen else None) or put is None:
+        raise _StaleFile(name)
+    if current is not None:
+        _rows(conn, "UPDATE assets_files SET retired_at = now() WHERE id = %s",
+              (current["id"],))
+    row = _one(conn, "INSERT INTO assets_files (project_id, id, document_id, name, media_type, "
+                     "bytes, sha256, storage_key, created_by) VALUES (%s, %s, %s, %s, %s, %s, "
+                     f"%s, %s, %s) RETURNING {FILE_COLUMNS}",
+               (project, put["id"], document_id, name, put["media_type"], size, sha,
+                put["storage_key"], actor))
+    return ("replaced" if current is not None else "created"), row, current
+
+
+def _links(document: str, body: str) -> set[str]:
+    """The names under assets/ a document's body links to by a relative path:
+    inline links and images, and reference definitions."""
+    import posixpath
+    from urllib.parse import unquote
+    folder = posixpath.dirname(document)
+    out = set()
+    for match in _LINK.finditer(body):
+        target = next(g for g in match.groups() if g is not None).strip()
+        if not target or target.startswith(("#", "/")) \
+                or re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", target):
+            continue
+        target = unquote(re.split(r"[?#]", target, maxsplit=1)[0])
+        name = posixpath.normpath(posixpath.join(folder, target))
+        if name and name != "." and not name.startswith("../") and name != "..":
+            out.add(name)
+    return out
+
+
+def _belongs_to(name: str, documents: dict[str, str]) -> str | None:
+    """The document a file belongs to, among `documents` (name -> body): the
+    one that links to it, else the one in its folder, else the one its folder
+    is named after; none when no rule names exactly one."""
+    import posixpath
+    linking = [doc for doc, body in documents.items() if name in _links(doc, body)]
+    if linking:
+        return linking[0] if len(linking) == 1 else None
+    folder = posixpath.dirname(name)
+    beside = [doc for doc in documents if posixpath.dirname(doc) == folder]
+    if beside:
+        return beside[0] if len(beside) == 1 else None
+    return folder if folder in documents else None
+
+
+def _stale_file_refusal(name: str) -> NoReturn:
+    _die(7, "stale_base", f"another write of the file {name!r} came first",
+         f"read it with `{NAME} files list` and write again")
+
+
 # ── verbs ────────────────────────────────────────────────────────────────────
 
 def cmd_list(_args) -> None:
@@ -6155,7 +7451,7 @@ def cmd_import(args) -> None:
     if not folder.is_dir():
         _die(3, "not_found", f"no folder {folder}",
              "name the assets folder to import, or run it in a project that has assets/")
-    files, skipped = [], []
+    files, others, skipped = [], [], []
     for here, dirs, names in os.walk(folder):
         here_path = Path(here)
         for d in sorted(dirs):
@@ -6167,7 +7463,7 @@ def cmd_import(args) -> None:
             path = here_path / n
             rel = path.relative_to(folder).as_posix()
             if not n.endswith(".md"):
-                skipped.append({"path": rel, "reason": "not markdown"})
+                others.append((rel, path))
                 continue
             name = rel[:-len(".md")]
             problem = _name_problem(name)
@@ -6182,13 +7478,44 @@ def cmd_import(args) -> None:
                 skipped.append({"path": rel, "reason": why})
                 continue
             files.append((rel, name, body))
-    skipped.sort(key=lambda row: row["path"])
+    bucket, why = (_file_store(args.connection, "import", required=False)
+                   if others or args.connection else (None, None))
+    if bucket is None:
+        skipped += [{"path": rel, "reason": f"not markdown and {why}"} for rel, _p in others]
+        others = []
     conn = _open(_root())
     actor = _actor()
     import psycopg
-    out = []
+    # The bytes go to the bucket first, each under a key no record names yet;
+    # the records are written in the one transaction with the documents, so
+    # an import that stops on the way leaves only objects nothing points at.
+    planned = []
+    for rel, path in others:
+        problem = _file_name_problem(rel, project)
+        try:
+            data = path.read_bytes() if not problem else b""
+        except OSError as exc:
+            problem = f"unreadable: {exc}"
+        if not problem and len(data) > SINGLE_PUT_MAX:
+            problem = f"larger than the {SINGLE_PUT_MAX} bytes one put carries"
+        if problem:
+            skipped.append({"path": rel, "reason": problem})
+            continue
+        sha = hashlib.sha256(data).hexdigest()
+        seen = _current_file(conn, project, rel)
+        put = None
+        if seen is None or seen["sha256"] != sha or seen["bytes"] != len(data):
+            try:
+                put = _upload(bucket, project, rel, data, sha)
+            except _BucketError as exc:
+                _bucket_refused(exc)
+        planned.append((rel, sha, len(data), put, seen))
+        del data
+    skipped.sort(key=lambda row: row["path"])
+    out, kept = [], []
     try:
         with conn.transaction():
+            documents = {}
             for rel, name, body in sorted(files):
                 saved = _save(conn, project, name, body, base=None,
                               note=f"imported from {rel}", actor=actor)
@@ -6196,12 +7523,40 @@ def cmd_import(args) -> None:
                            "created" if saved.get("document_created") else "saved")
                 out.append({"path": rel, "name": name, "kind": saved["document"]["kind"],
                             "outcome": outcome, "version": saved["version"]["id"]})
+                documents[name] = (saved["document"]["id"], body)
+            bodies = {name: body for name, (_id, body) in documents.items()}
+            for rel, sha, size, put, seen in planned:
+                owner = _belongs_to(rel, bodies)
+                outcome, row, old = _write_file_row(
+                    conn, project, rel, sha, size, put,
+                    documents[owner][0] if owner else None, actor, seen)
+                kept.append({"path": rel, "name": rel, "outcome": outcome, "id": str(row["id"]),
+                             "bytes": row["bytes"], "sha256": row["sha256"],
+                             "document": owner if outcome != "unchanged" else
+                             _document_name(conn, row["document_id"]),
+                             "replaced": str(old["id"]) if old else None})
+    except _StaleFile as exc:
+        _stale_file_refusal(str(exc))
+    except psycopg.errors.UniqueViolation as exc:
+        _die(7, "stale_base", f"another write came first: {str(exc).splitlines()[0]}",
+             f"run `{NAME} import` again")
     except psycopg.errors.CheckViolation as exc:
         _refused_by_store(exc)
     counts = {key: sum(1 for row in out if row["outcome"] == key)
               for key in ("created", "saved", "unchanged")}
-    _emit({"dir": str(folder), "project": project, "documents": out,
-           "skipped": skipped, "counts": {**counts, "skipped": len(skipped)}})
+    file_counts = {key: sum(1 for row in kept if row["outcome"] == key)
+                   for key in ("created", "replaced", "unchanged")}
+    _emit({"dir": str(folder), "project": project, "documents": out, "files": kept,
+           "skipped": skipped, "counts": {**counts, "skipped": len(skipped)},
+           "file_counts": file_counts,
+           "file_store": bucket.cid if bucket is not None else None})
+
+
+def _document_name(conn, document_id) -> str | None:
+    if document_id is None:
+        return None
+    row = _one(conn, "SELECT name FROM assets_documents WHERE id = %s", (document_id,))
+    return row["name"] if row else None
 
 
 def _write_bytes(path: Path, data: bytes) -> None:
@@ -6214,6 +7569,14 @@ def _write_bytes(path: Path, data: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def cmd_export(args) -> None:
     project = _project(write=False)
     folder = _folder(args.dir)
@@ -6224,6 +7587,10 @@ def cmd_export(args) -> None:
                        "assets_versions v ON v.document_id = d.id AND v.active "
                        "WHERE d.project_id = %s AND d.retired_at IS NULL ORDER BY d.name",
                  (project,))
+    file_rows = _rows(conn, f"SELECT {FILE_COLUMNS} FROM assets_files WHERE project_id = %s "
+                            "AND retired_at IS NULL ORDER BY name", (project,))
+    bucket, why = (_file_store(args.connection, "export", required=False)
+                   if file_rows or args.connection else (None, None))
     out = []
     for row in rows:
         path = folder / f"{row['name']}.md"
@@ -6246,15 +7613,163 @@ def cmd_export(args) -> None:
         out.append(item)
     counts = {key: sum(1 for row in out if row["outcome"] == key)
               for key in ("written", "unchanged", "kept", "failed")}
+    files, fail_exit = [], 6 if counts["failed"] else 0
+    for row in file_rows:
+        path = folder / row["name"]
+        item = {"name": row["name"], "path": str(path), "id": str(row["id"]),
+                "sha256": row["sha256"]}
+        try:
+            if path.is_file():
+                if path.stat().st_size == row["bytes"] and _sha256_of(path) == row["sha256"]:
+                    item["outcome"] = "unchanged"
+                else:
+                    item.update(outcome="kept", reason="the file differs from the store's; "
+                                f"`{NAME} files add` it or move it away, then export again")
+            elif path.exists() or path.is_symlink():
+                item.update(outcome="kept", reason="something other than a file is there")
+            elif bucket is None:
+                item.update(outcome="skipped", reason=why)
+            else:
+                _write_bytes(path, bucket.get(row["storage_key"], size=row["bytes"],
+                                              sha256=row["sha256"]))
+                item["outcome"] = "written"
+        except _BucketError as exc:
+            item.update(outcome="failed", reason=exc.message, code=exc.code)
+            fail_exit = fail_exit or exc.exit_code
+        except OSError as exc:
+            item.update(outcome="failed", reason=str(exc))
+            fail_exit = fail_exit or 6
+        files.append(item)
+    file_counts = {key: sum(1 for row in files if row["outcome"] == key)
+                   for key in ("written", "unchanged", "kept", "skipped", "failed")}
     _emit({"dir": str(folder), "project": project, "documents": out, "counts": counts,
-           "complete": counts["kept"] == 0 and counts["failed"] == 0})
-    if counts["failed"]:
-        sys.exit(6)
+           "files": files, "file_counts": file_counts,
+           "complete": counts["kept"] == 0 and counts["failed"] == 0
+                       and file_counts["kept"] == 0 and file_counts["skipped"] == 0
+                       and file_counts["failed"] == 0})
+    if fail_exit:
+        sys.exit(fail_exit)
 
 
-def cmd_doctor(_wanted: str | None = None) -> None:
+def _read_file(source: str) -> bytes:
+    if source == "-":
+        return sys.stdin.buffer.read()
+    path = Path(source).expanduser()
+    try:
+        if path.is_file() and path.stat().st_size > SINGLE_PUT_MAX:
+            _die(6, "too_large", f"{path} is larger than the {SINGLE_PUT_MAX} bytes one put "
+                 "carries")
+        return path.read_bytes()
+    except FileNotFoundError:
+        _die(3, "not_found", f"no file {path}")
+    except OSError as exc:
+        _die(6, "input", f"cannot read {path}: {exc}")
+
+
+def cmd_files_add(args) -> None:
+    project = _project(write=True)
+    name = _checked_file_name(args.name, project)
+    document = _checked_name(args.document) if args.document is not None else None
+    bucket, _why = _file_store(args.connection, "files add", required=True)
+    data = _read_file(args.source)
+    if len(data) > SINGLE_PUT_MAX:
+        _die(6, "too_large", f"the file is larger than the {SINGLE_PUT_MAX} bytes one put "
+             "carries")
+    sha = hashlib.sha256(data).hexdigest()
+    conn = _open(_root())
+    owner = _need_document(conn, project, document) if document is not None else None
+    seen = _current_file(conn, project, name)
+    put = None
+    if seen is None or seen["sha256"] != sha or seen["bytes"] != len(data):
+        try:
+            put = _upload(bucket, project, name, data, sha)
+        except _BucketError as exc:
+            _bucket_refused(exc)
+    import psycopg
+    try:
+        with conn.transaction():
+            outcome, row, old = _write_file_row(conn, project, name, sha, len(data), put,
+                                             owner["id"] if owner else None, _actor(), seen)
+    except _StaleFile:
+        _stale_file_refusal(name)
+    except psycopg.errors.UniqueViolation:
+        _stale_file_refusal(name)
+    except psycopg.errors.CheckViolation as exc:
+        _refused_by_store(exc)
+    _emit({"file": _file_out(row, _document_name(conn, row["document_id"])),
+           "outcome": outcome, "replaced": str(old["id"]) if old else None,
+           "file_store": bucket.cid})
+
+
+def cmd_files_list(_args) -> None:
+    project = _project(write=False)
+    conn = _open(_root())
+    rows = _rows(conn, "SELECT f.*, d.name AS document FROM assets_files f LEFT JOIN "
+                       "assets_documents d ON d.id = f.document_id WHERE f.project_id = %s "
+                       "AND f.retired_at IS NULL ORDER BY f.name", (project,))
+    _emit({"project": project, "count": len(rows),
+           "files": [_file_out(row, row["document"]) for row in rows]})
+
+
+def cmd_files_get(args) -> None:
+    project = _project(write=False)
+    name = _checked_file_name(args.name, project)
+    out = None if args.out == "-" else Path(args.out).expanduser()
+    if out is not None and out.exists() and not out.is_file():
+        _die(6, "output_exists", f"{out} is there and is not a file", "name another --out")
+    bucket, _why = _file_store(args.connection, "files get", required=True)
+    conn = _open(_root())
+    row = _current_file(conn, project, name)
+    if row is None:
+        _die(3, "not_found", f"no unretired file {name!r} in this project",
+             f"`{NAME} files list` names the files there are")
+    described = _file_out(row, _document_name(conn, row["document_id"]))
+    if out is not None and out.is_file():
+        if out.stat().st_size == row["bytes"] and _sha256_of(out) == row["sha256"]:
+            _emit({"file": described, "path": str(out), "outcome": "unchanged"})
+            return
+        _die(6, "output_exists", f"{out} holds other bytes than the file {name!r}",
+             "move it away, or name another --out")
+    try:
+        data = bucket.get(row["storage_key"], size=row["bytes"], sha256=row["sha256"])
+    except _BucketError as exc:
+        _bucket_refused(exc)
+    if out is None:
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+        return
+    try:
+        _write_bytes(out, data)
+    except OSError as exc:
+        _die(6, "input", f"cannot write {out}: {exc}")
+    _emit({"file": described, "path": str(out), "outcome": "written"})
+
+
+def _doctor_connections(wanted: str | None, project: str | None) -> tuple[dict, int]:
+    """Each file store connection's bucket (or the one named) by an
+    authenticated round trip, after the cascade gate; none configured is
+    nothing to prove. Returns the findings by id and the first failure's exit."""
+    if not wanted and not _usable_connections()[1]:
+        return {}, 0
+    _doctor_gate(_connections_report(), wanted)
+    reg, _ = _connections_registry()
+    if wanted:
+        targets = [_select_connection(reg, wanted)]
+    else:
+        targets = list(reg["connections"].items())
+    found, fail_exit = {}, 0
+    for cid, entry in targets:
+        try:
+            found[cid] = _Bucket.of(cid, entry or {}).probe(f"{project}/" if project else "")
+        except _BucketError as exc:
+            found[cid] = {"ok": False, **exc.out()}
+            fail_exit = fail_exit or exc.exit_code
+    return found, fail_exit
+
+
+def cmd_doctor(wanted: str | None = None) -> None:
     """Whether assets works here now: the project's id, the store setting in
-    force, and where the tables stand."""
+    force, where the tables stand, and each file store connection's bucket."""
     root = _root()
     findings: dict = {}
     project = _project_id(write=True, refuse=False)
@@ -6293,6 +7808,8 @@ def cmd_doctor(_wanted: str | None = None) -> None:
         if conn is not None:
             conn.close()
     findings["store"] = store
+    findings["connections"], bucket_exit = _doctor_connections(wanted, project)
+    exit_code = exit_code or bucket_exit
     _emit({"ok": exit_code == 0, **findings})
     if exit_code:
         sys.exit(exit_code)
@@ -6325,7 +7842,8 @@ def _limit(value: str) -> int:
 def _parser() -> _Parser:
     parser = _Parser(prog=NAME)
     sub = parser.add_subparsers(dest="cmd", required=True, parser_class=_Parser)
-    sub.add_parser("doctor")
+    one = sub.add_parser("doctor")
+    one.add_argument("--connection")
     sub.add_parser("list")
     one = sub.add_parser("show")
     one.add_argument("name")
@@ -6348,8 +7866,22 @@ def _parser() -> _Parser:
     one.add_argument("name")
     one = sub.add_parser("import")
     one.add_argument("dir", nargs="?")
+    one.add_argument("--connection")
     one = sub.add_parser("export")
     one.add_argument("dir", nargs="?")
+    one.add_argument("--connection")
+    files = sub.add_parser("files").add_subparsers(dest="files_cmd", required=True,
+                                                   parser_class=_Parser)
+    one = files.add_parser("add")
+    one.add_argument("name")
+    one.add_argument("--from", dest="source", required=True)
+    one.add_argument("--document")
+    one.add_argument("--connection")
+    one = files.add_parser("get")
+    one.add_argument("name")
+    one.add_argument("--out", required=True)
+    one.add_argument("--connection")
+    files.add_parser("list")
     return parser
 
 
@@ -6361,11 +7893,14 @@ def main() -> None:
         _cmd_help()
         return
     args = _parser().parse_args(argv)
-    if args.cmd in WRITE_VERBS:
-        _read_only_gate(f"`{NAME} {args.cmd}`")
-    {"doctor": lambda _a: cmd_doctor(), "list": cmd_list, "show": cmd_show,
+    verb = f"files {args.files_cmd}" if args.cmd == "files" else args.cmd
+    if verb in WRITE_VERBS:
+        _read_only_gate(f"`{NAME} {verb}`")
+    {"doctor": lambda a: cmd_doctor(a.connection), "list": cmd_list, "show": cmd_show,
      "history": cmd_history, "diff": cmd_diff, "search": cmd_search, "save": cmd_save,
-     "retire": cmd_retire, "import": cmd_import, "export": cmd_export}[args.cmd](args)
+     "retire": cmd_retire, "import": cmd_import, "export": cmd_export,
+     "files add": cmd_files_add, "files get": cmd_files_get,
+     "files list": cmd_files_list}[verb](args)
 
 
 if __name__ == "__main__":

@@ -160,7 +160,7 @@ def test_import_then_export_reproduces_every_markdown_file(world, tmp_path):  # 
     skipped = {row["path"]: row["reason"] for row in imported["skipped"]}
     assert set(skipped) == {"research/topic/data.json", "research/topic/run.py",
                             "plans/.gitkeep", "reports/table.tsv", "reports/latin1.md"}
-    assert skipped["plans/.gitkeep"] == "not markdown"
+    assert skipped["plans/.gitkeep"] == "not markdown and no file store connection is configured"
     assert skipped["reports/latin1.md"].startswith("not UTF-8")
     listed = {d["name"]: d for d in world.ok(root, "list")["documents"]}
     assert listed["research/topic/analysis"]["kind"] == "research"

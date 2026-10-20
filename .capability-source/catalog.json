@@ -22,8 +22,8 @@
     },
     "assets": {
       "path": "capabilities/assets",
-      "payload_sha256": "46c5c41fa2f6ba5c575ccc1252629b0dfbe3e0edd59143ea8eebfd1ac8c9b752",
-      "summary": "Text assets as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text, diffed between versions, and imported from and exported to an agent's assets folder byte for byte."
+      "payload_sha256": "33c46e7074791e6f03d1e0dabad20ef7324760f5599fe9134570ae284b95e311",
+      "summary": "A project's assets: markdown as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text and diffed between versions - and every other file kept byte for byte in an S3-compatible bucket, sha256-checked, both imported from and exported to an agent's assets folder."
     },
     "automations": {
       "path": "capabilities/automations",
