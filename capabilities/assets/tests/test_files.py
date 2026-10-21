@@ -196,6 +196,40 @@ def test_import_and_export_carry_every_file_byte_for_byte(world, gateway, tmp_pa
 
 
 @needs_gateway
+def test_a_file_kept_without_a_document_is_linked_to_one_after(world, gateway, tmp_path):  # noqa: F811
+    root = connected(world.project(), gateway)
+    (root / "assets" / "research" / "x-sources").mkdir(parents=True)
+    (root / "assets" / "research" / "x.md").write_text("# X\n")
+    (root / "assets" / "research" / "y.md").write_text("# Y\n")
+    (root / "assets" / "research" / "x-sources" / "crash.ips").write_bytes(PNG)
+    kept = world.ok(root, "import")["files"][0]
+    assert kept["name"] == "research/x-sources/crash.ips" and kept["document"] is None
+    linked = world.ok(root, "files", "link", "research/x-sources/crash.ips",
+                      "--document", "research/x")
+    assert linked["outcome"] == "linked" and linked["replaced"] == kept["id"]
+    assert linked["file"]["document"] == "research/x" and linked["file"]["sha256"] == sha(PNG)
+    assert (gateway.bucket / linked["file"]["storage_key"]).read_bytes() == PNG
+    assert world.ok(root, "files", "list")["files"][0]["document"] == "research/x"
+    assert world.ok(root, "show", "research/x")["files"] == ["research/x-sources/crash.ips"]
+    assert world.ok(root, "files", "link", "research/x-sources/crash.ips", "--document",
+                    "research/x")["outcome"] == "unchanged"
+    out = tmp_path / "exported"
+    assert world.ok(root, "export", str(out))["complete"]
+    again = world.ok(root, "import", str(out))["files"][0]
+    assert again["outcome"] == "unchanged" and again["document"] == "research/x"
+    unlinked = world.ok(root, "files", "link", "research/x-sources/crash.ips", "--none")
+    assert unlinked["outcome"] == "unlinked" and unlinked["file"]["document"] is None
+    assert world.ok(root, "show", "research/x")["files"] == []
+    with connect(world.schema) as conn:
+        rows = conn.execute("SELECT retired_at IS NOT NULL FROM assets_files "
+                            "ORDER BY created_at").fetchall()
+    assert rows == [(True,), (True,), (False,)]
+    missing = world.run(root, "files", "link", "research/x-sources/crash.ips",
+                        "--document", "research/z")
+    assert missing.returncode == 3 and error(missing)["code"] == "not_found"
+
+
+@needs_gateway
 def test_doctor_proves_the_bucket(world, gateway):  # noqa: F811
     root = connected(world.project(), gateway)
     healthy = world.ok(root, "doctor")
@@ -235,6 +269,9 @@ def test_writing_to_the_bucket_is_a_write(world, gateway, tmp_path):  # noqa: F8
     read = world.run(root, "files", "get", "a.bin", "--out", "-")
     assert read.returncode == 0 and read.stdout == b"a"
     assert world.ok(root, "files", "list")["count"] == 1
+    world.ok(root, "save", "plans/p", "--from", "-", stdin=b"# P\n")
+    unlinkable = world.run(root, "files", "link", "a.bin", "--document", "plans/p")
+    assert unlinkable.returncode == 4 and error(unlinkable)["code"] == "read_only"
 
 
 def test_without_a_connection_only_the_file_verbs_need_one(world, tmp_path):  # noqa: F811

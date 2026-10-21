@@ -71,15 +71,16 @@ THE FILE STORE CONNECTION
   bucket; its record carries its size and sha256, and every read checks both.
   Selection: --connection <id> on the verbs that reach the bucket; unflagged,
   the default pointer, else the sole connection. Writing to the bucket is a
-  write: a connection whose allow_write is false refuses `files add` and an
-  `import` that has files to keep with exit 4 `read_only`.
+  write: a connection whose allow_write is false refuses `files add`,
+  `files link` and an `import` that has files to keep with exit 4 `read_only`.
 
 READING
   assets list
       Every unretired document of this project, by name: its kind, the active
       version's id and title, and when the document was created and last saved.
   assets show <name> [--version ID]
-      One document and its active version with the body whole; --version
+      One document and its active version with the body whole, and under
+      `files` the names of the unretired files that belong to it; --version
       answers any version of the document, a retired one's included.
   assets history <name>
       Every version of the document, newest first: id, title, whether it is
@@ -133,6 +134,13 @@ WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
       Safe to repeat: bytes identical to the current file's put nothing and
       answer `"outcome": "unchanged"`, the record and its document as they
       were. A single put carries at most 5 GiB.
+  assets files link <name> (--document NAME | --none) [--connection ID]
+      Set the document the file belongs to, or with --none clear it. Recorded
+      as any change to a file is: its bytes are copied in the bucket to a new
+      key and a new record is written, retiring the current one, the bytes
+      checked against their record on the way. Answers `linked`, `unlinked`,
+      or `unchanged` - already so, nothing read or written - with the record
+      it `replaced`.
 
 FILES  (reading; `files list` reads the store only)
   assets files list
@@ -229,7 +237,7 @@ CRED_KEYS = [       # a file store connection names its own keys; only the file 
      "note": "S3 secret access key of the file store; a connection names its own key via "
              "secret_access_key_env"},
 ]
-WRITE_VERBS = {"save", "retire", "import", "files add"}
+WRITE_VERBS = {"save", "retire", "import", "files add", "files link"}
 WRITE_DEFAULT = True    # the bucket, like the store, is the consumer's own
 DOCS_BASE = ""
 STATE = False
@@ -7317,15 +7325,22 @@ def _write_file_row(conn, project: str, name: str, sha: str, size: int, put: dic
         return "unchanged", current, None
     if (current["id"] if current else None) != (seen["id"] if seen else None) or put is None:
         raise _StaleFile(name)
+    row = _replace_file_row(conn, project, name, sha, size, put, document_id, actor, current)
+    return ("replaced" if current is not None else "created"), row, current
+
+
+def _replace_file_row(conn, project: str, name: str, sha: str, size: int, put: dict,
+                      document_id, actor: str, current: dict | None) -> dict:
+    """Retire `current`, when there is one, and insert the record of the
+    object `put` names: the one way a file's record changes."""
     if current is not None:
         _rows(conn, "UPDATE assets_files SET retired_at = now() WHERE id = %s",
               (current["id"],))
-    row = _one(conn, "INSERT INTO assets_files (project_id, id, document_id, name, media_type, "
-                     "bytes, sha256, storage_key, created_by) VALUES (%s, %s, %s, %s, %s, %s, "
-                     f"%s, %s, %s) RETURNING {FILE_COLUMNS}",
-               (project, put["id"], document_id, name, put["media_type"], size, sha,
-                put["storage_key"], actor))
-    return ("replaced" if current is not None else "created"), row, current
+    return _one(conn, "INSERT INTO assets_files (project_id, id, document_id, name, media_type, "
+                      "bytes, sha256, storage_key, created_by) VALUES (%s, %s, %s, %s, %s, %s, "
+                      f"%s, %s, %s) RETURNING {FILE_COLUMNS}",
+                (project, put["id"], document_id, name, put["media_type"], size, sha,
+                 put["storage_key"], actor))
 
 
 def _links(document: str, body: str) -> set[str]:
@@ -7413,8 +7428,11 @@ def cmd_show(args) -> None:
             _die(6, "ambiguous_version", f"{args.version!r} names {len(hits)} versions",
                  "give more characters of the id")
         document, version = hits[0]
+    files = _rows(conn, "SELECT name FROM assets_files WHERE document_id = %s "
+                        "AND retired_at IS NULL ORDER BY name", (document["id"],))
     _emit({"document": _document_out(document),
-           "version": _version_out(version, body=True) if version else None})
+           "version": _version_out(version, body=True) if version else None,
+           "files": [row["name"] for row in files]})
 
 
 def cmd_history(args) -> None:
@@ -7802,6 +7820,46 @@ def cmd_files_add(args) -> None:
            "file_store": bucket.cid})
 
 
+def cmd_files_link(args) -> None:
+    project = _project(write=True)
+    name = _checked_file_name(args.name, project)
+    document = _checked_name(args.document) if args.document is not None else None
+    conn = _open(_root())
+    owner = _need_document(conn, project, document) if document is not None else None
+    wanted = owner["id"] if owner else None
+    seen = _current_file(conn, project, name)
+    if seen is None:
+        _die(3, "not_found", f"no unretired file {name!r} in this project",
+             f"`{NAME} files list` names the files there are")
+    if seen["document_id"] == wanted:
+        _emit({"file": _file_out(seen, document), "outcome": "unchanged", "replaced": None,
+               "file_store": None})
+        return
+    # The record is immutable and names its object by its own id, so a new
+    # document is a new record over a copy of the bytes, as any change is.
+    bucket, _why = _file_store(args.connection, "files link", required=True)
+    try:
+        data = bucket.get(seen["storage_key"], size=seen["bytes"], sha256=seen["sha256"])
+        put = _upload(bucket, project, name, data, seen["sha256"])
+    except _BucketError as exc:
+        _bucket_refused(exc)
+    del data
+    import psycopg
+    try:
+        with conn.transaction():
+            current = _current_file(conn, project, name, lock=True)
+            if current is None or current["id"] != seen["id"]:
+                raise _StaleFile(name)
+            row = _replace_file_row(conn, project, name, seen["sha256"], seen["bytes"], put,
+                                    wanted, _actor(), current)
+    except (_StaleFile, psycopg.errors.UniqueViolation):
+        _stale_file_refusal(name)
+    except psycopg.errors.CheckViolation as exc:
+        _refused_by_store(exc)
+    _emit({"file": _file_out(row, document), "outcome": "linked" if owner else "unlinked",
+           "replaced": str(seen["id"]), "file_store": bucket.cid})
+
+
 def cmd_files_list(_args) -> None:
     project = _project(write=False)
     conn = _open(_root())
@@ -7994,6 +8052,12 @@ def _parser() -> _Parser:
     one.add_argument("--from", dest="source", required=True)
     one.add_argument("--document")
     one.add_argument("--connection")
+    one = files.add_parser("link")
+    one.add_argument("name")
+    target = one.add_mutually_exclusive_group(required=True)
+    target.add_argument("--document")
+    target.add_argument("--none", action="store_true")
+    one.add_argument("--connection")
     one = files.add_parser("get")
     one.add_argument("name")
     one.add_argument("--out", required=True)
@@ -8016,7 +8080,7 @@ def main() -> None:
     {"doctor": lambda a: cmd_doctor(a.connection), "list": cmd_list, "show": cmd_show,
      "history": cmd_history, "diff": cmd_diff, "search": cmd_search, "save": cmd_save,
      "retire": cmd_retire, "import": cmd_import, "export": cmd_export,
-     "files add": cmd_files_add, "files get": cmd_files_get,
+     "files add": cmd_files_add, "files link": cmd_files_link, "files get": cmd_files_get,
      "files list": cmd_files_list}[verb](args)
 
 

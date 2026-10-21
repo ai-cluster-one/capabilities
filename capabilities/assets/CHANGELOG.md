@@ -1,5 +1,9 @@
 # assets — change log
 
+## 2026-10-21 — A kept file is linked to its document after the fact
+
+`files link <name> --document NAME` sets the document a kept file belongs to, and `files link <name> --none` clears it, so a file imported with no document - its folder beside the write-up rather than under it - can be attached to it afterwards. The file's record stays immutable: the bytes are copied in the bucket to a new key, checked against their size and sha256 on the way, and a new record is written that retires the current one, as any change to a file is recorded. It answers `linked`, `unlinked` or `unchanged` with the record it `replaced`; an unchanged link reads and writes nothing. It is a write, under the write gate and the read-only switch. `show` lists under `files` the names of the unretired files that belong to the document.
+
 ## 2026-10-21 — doctor proves the bucket as a file verb uses it, and import leaves OS litter behind
 
 `doctor` proves each file store connection by a put, head and delete of one throwaway object under the project's prefix, the round trips a file verb makes, and reports them under `proof`; a connection that may not be written, a run under the read-only switch, and a project without an id keep the authenticated listing (`proof: ["list"]`). A connection this project can see but may not use - added but not granted, or switched off - is named under `connections` as `connection_not_granted` with the grant it needs, where doctor answered `{}`; it fails nothing, since a machine's connection is withheld in every project that never asked for it. `import` skips `.DS_Store` and `.gitkeep`, listing each under `skipped`, rather than keeping them in the bucket as project files. `connection add` says whether this project may use the connection it wrote (`granted`) and names the grant a store-mode project still needs.
