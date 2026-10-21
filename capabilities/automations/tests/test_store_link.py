@@ -1,13 +1,15 @@
 """Which connection each link holds, and a scheduler that starts while its store is away.
 
-Only the scheduler's link listens, on a session connection; a command's link is a
-transaction connection that listens to nothing. A scheduler whose store does not
+No link listens: every one is a transaction connection, and the scheduler's follows
+changed definitions by polling the store's change versions. A saved definition still
+notifies, for a scheduler of an earlier release that listens. A scheduler whose store does not
 answer when it starts waits for it on a doubling interval instead of exiting. The
 store-backed checks read AUTOMATIONS_TEST_DSN and skip when it is unset."""
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import uuid
@@ -77,24 +79,42 @@ def _setting(schema: str):
 
 
 @needs_store
-def test_only_the_schedulers_link_listens(runtime):
+def test_no_link_listens_and_the_schedulers_follows_saved_definitions(runtime):
     import psycopg
     schema = "automations_links_" + uuid.uuid4().hex[:8]
     command = runtime.StoreLink(_setting(schema)).open()
-    scheduler = runtime.StoreLink(_setting(schema), listen=True).open()
+    scheduler = runtime.StoreLink(_setting(schema), follow=True).open()
     try:
-        assert command.conn.execute("SELECT pg_listening_channels()").fetchall() == []
-        assert scheduler.conn.execute("SELECT pg_listening_channels()").fetchall() == [
-            ("automations_changed",)]
-        # A command's link prepares nothing and binds its schema per transaction.
-        for _ in range(8):
-            command.conn.execute("SELECT count(*) FROM automations_runs").fetchone()
-        assert command.conn.execute(
-            "SELECT count(*) FROM pg_prepared_statements").fetchone() == (0,)
-        assert command.conn.execute("SHOW search_path").fetchone() == (schema,)
-        with pytest.raises(Exception) as refused:
-            command.conn.execute("LISTEN automations_changed")
-        assert getattr(refused.value, "slug", None) == "session_state"
+        for link in (command, scheduler):
+            assert link.conn.execute("SELECT pg_listening_channels()").fetchall() == []
+            # A link prepares nothing and binds its schema per transaction.
+            for _ in range(8):
+                link.conn.execute("SELECT count(*) FROM automations_runs").fetchone()
+            assert link.conn.execute(
+                "SELECT count(*) FROM pg_prepared_statements").fetchone() == (0,)
+            assert link.conn.execute("SHOW search_path").fetchone() == (schema,)
+            with pytest.raises(Exception) as refused:
+                link.conn.execute("LISTEN automations_changed")
+            assert getattr(refused.value, "slug", None) == "session_state"
+
+        # What a scheduler of an earlier release does: listen on a session.
+        with psycopg.connect(DSN, autocommit=True) as earlier:
+            earlier.execute("LISTEN automations_changed")
+            with psycopg.connect(DSN) as writer:
+                writer.execute(f'SET search_path TO "{schema}"')
+                writer.execute("INSERT INTO automations_definitions (project_id, slug, "
+                               "script_path) VALUES ('prj_a', 'kept', 'job.py')")
+                writer.commit()
+                writer.execute("INSERT INTO automations_definitions (project_id, slug, "
+                               "script_path) VALUES ('prj_b', 'undone', 'job.py')")
+                writer.rollback()
+            said = [json.loads(n.payload) for n in earlier.notifies(timeout=1, stop_after=1)]
+        assert said == [{"schema": schema, "project": "prj_a", "slug": "kept"}]
+
+        scheduler._polled_at = None
+        assert scheduler.take_changed("prj_a") is True
+        assert scheduler.take_changed("prj_a") is False
+        assert scheduler.take_changed("prj_b") is False
     finally:
         command.close()
         scheduler.close()

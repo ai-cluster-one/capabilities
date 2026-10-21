@@ -683,9 +683,16 @@ def legacy_definitions(root: Path, raw: dict[str, Any], here_environment: str,
 # The definitions are versions (`0003-definitions`): a body kept in the store
 # has no git history, so a run names the exact version it ran as
 # `definition_id`, and the version names who saved it.
+#
+# A saved or removed definition raises the project's version of the
+# `automations_changed` channel in the store's change versions, in the same
+# transaction (`0005-definitions-versions`), and a scheduler follows that
+# channel by polling. The trigger still sends its `pg_notify` beside the raise,
+# for a scheduler of an earlier release still listening on another machine.
 LEDGER_OWNER = "automations"
 LEDGER_MAJOR = 1
-LEDGER_MINOR = 1
+LEDGER_MINOR = 2
+CHANGED_CHANNEL = "automations_changed"
 LEDGER_STEPS = [
     ("0001-runs", """
     CREATE TABLE automations_runs (
@@ -828,6 +835,20 @@ LEDGER_STEPS = [
         'Rows from before definitions moved into the store: the environment selector; '
         'since then the node.';
     """),
+    ("0005-definitions-versions", r"""
+    CREATE OR REPLACE FUNCTION automations_definitions_announce() RETURNS trigger AS $$
+    BEGIN
+      PERFORM pg_notify('automations_changed', json_build_object(
+          'schema', tg_table_schema, 'project', new.project_id, 'slug', new.slug)::text);
+      EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version) '
+                     'VALUES (%L, $1, 1) ON CONFLICT (channel, scope) '
+                     'DO UPDATE SET version = c.version + 1',
+                     tg_table_schema, 'automations_changed')
+          USING new.project_id;
+      RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql;
+    """),
 ]
 
 
@@ -893,9 +914,9 @@ def store_key(setting) -> tuple:
 
 
 def open_ledger(root: Path, config: dict[str, Any] | None = None,
-                strict: bool = True, listen: bool = False) -> "RunLedger":
+                strict: bool = True, follow: bool = False) -> "RunLedger":
     """The ledger of this project's runs, open on the store. The caller closes it.
-    `listen` is the scheduler's: its link listens for changed definitions.
+    `follow` is the scheduler's: its link follows changed definitions.
 
     A run is recorded under the project's id, the one the launching CLI resolves
     for a write. A read path passes `strict` False and reads under the id the
@@ -907,7 +928,7 @@ def open_ledger(root: Path, config: dict[str, Any] | None = None,
         project_id = project_id or _handed_project_id(root) or identity.get("id") or ""
     elif not project_id:
         raise ConfigError("this project declares no id to record its runs under")
-    return RunLedger(project_id, root=root, listen=listen).open()
+    return RunLedger(project_id, root=root, follow=follow).open()
 
 
 class StoreLink:
@@ -924,26 +945,32 @@ class StoreLink:
     resolves the store for `root` when it first opens. `error` is why the link
     is down, while it is.
 
-    A scheduler's link (`listen`) listens on `automations_changed`, which the
-    store announces on every definition saved or removed: the projects it
-    names are collected in `changed` as the connection reads them, and
-    `generation` moves on every open, because what was announced while the
-    link was down is lost and every project on it has to read its definitions
-    again. Its one session connection carries the scheduler's questions too,
-    so a scheduler holds one connection to its store. Any other link - a
-    command's - is a transaction connection, at the store's transaction
-    address where one is named, and listens to nothing."""
+    Every link is a transaction connection, at the store's transaction address
+    where one is named, and holds no session state. A scheduler's link
+    (`follow`) follows the `automations_changed` versions, which the store
+    raises for a project on every definition of it saved or removed: when a
+    project asks whether it changed, it polls them, at most once every
+    FOLLOW_INTERVAL_SECONDS of the library, in one query on a working
+    connection of the library's beside its own, and collects the projects
+    whose version moved in `changed`. Its first poll is
+    taken when it opens, before any definition is read, and is only where it
+    starts from. `generation` moves on every open, so every project on the
+    link reads its definitions again after the link was down. A poll that
+    does not reach the store is taken again at the next, which reports every
+    project that moved meanwhile."""
 
-    def __init__(self, setting=None, root: Path | None = None, listen: bool = False):
+    def __init__(self, setting=None, root: Path | None = None, follow: bool = False):
         self.setting = setting
         self.root = root
-        self.listen = listen
+        self.follow = follow
         self.conn = None
         self.warnings: list[str] = []
         self.in_transaction = False
         self.error: str | None = None
         self.changed: set[str] = set()
         self.generation = 0
+        self.follower = None
+        self._polled_at: float | None = None
 
     @property
     def name(self) -> str:
@@ -955,38 +982,66 @@ class StoreLink:
             self.setting = resolve_store(self.root)
         try:
             conn = db.connect(application_name=LEDGER_OWNER, setting=self.setting,
-                              transaction=not self.listen)
+                              transaction=True)
         except db.DbError as exc:
             raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
         try:
             result = db.migrate(conn, LEDGER_OWNER, LEDGER_STEPS,
                                 major=LEDGER_MAJOR, minor=LEDGER_MINOR)
             conn.autocommit = True
-            if self.listen:
-                conn.add_notify_handler(self._announced)
-                conn.execute("LISTEN automations_changed")
         except db.DbError as exc:
             conn.close()
             raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
         except BaseException:
             conn.close()
             raise
+        if self.follow:
+            try:
+                if self.follower is None:
+                    self.follower = db.Follower([CHANGED_CHANNEL],
+                                                application_name=LEDGER_OWNER,
+                                                setting=self.setting)
+                self._poll()
+            except db.DbError as exc:
+                conn.close()
+                raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
+            # Every project on the link reads its definitions after an open,
+            # so this poll is only where the next one starts from.
+            self.changed.clear()
         self.conn = conn
         self.warnings = list(result.warnings)
         self.generation += 1
         return self
 
-    def _announced(self, notify) -> None:
+    def _poll(self) -> None:
+        """Take the followed versions once; one that does not reach the store
+        is left for the next, as the library's own follower leaves it."""
+        import psycopg
+        db = _database()
+        self._polled_at = time.monotonic()
         try:
-            said = json.loads(notify.payload)
-        except ValueError:
+            moved = self.follower.poll()
+        except db.DbError as exc:
+            if exc.slug != "store_unreachable":
+                raise
             return
-        if isinstance(said, dict) and said.get("schema") == self.setting.schema \
-                and isinstance(said.get("project"), str):
-            self.changed.add(said["project"])
+        except psycopg.OperationalError:
+            return
+        self.changed.update(scope for _channel, scope in moved)
+
+    def behind(self, project_id: str) -> bool:
+        """Whether a definition of the project changed since last asked, polled
+        now rather than at the next interval, and left to be taken."""
+        if self.follower is not None:
+            self._poll()
+        return project_id in self.changed
 
     def take_changed(self, project_id: str) -> bool:
-        """Whether a definition of the project was announced since last asked."""
+        """Whether a definition of the project changed since last asked."""
+        if self.follower is not None and (
+                self._polled_at is None
+                or time.monotonic() - self._polled_at >= _database().FOLLOW_INTERVAL_SECONDS):
+            self._poll()
         if project_id in self.changed:
             self.changed.discard(project_id)
             return True
@@ -1026,12 +1081,12 @@ class RunLedger:
     depend on how the store keeps them."""
 
     def __init__(self, project_id: str, link: StoreLink | None = None,
-                 root: Path | None = None, listen: bool = False):
+                 root: Path | None = None, follow: bool = False):
         self.project_id = project_id
         self.node = NODE_NAME()
         self.host = socket.gethostname()
         self._owns_link = link is None
-        self.link = link if link is not None else StoreLink(root=root, listen=listen)
+        self.link = link if link is not None else StoreLink(root=root, follow=follow)
 
     @property
     def conn(self):
@@ -1582,7 +1637,7 @@ class Daemon:
         # The file's part is read first, so a declaration that does not load is
         # refused before the store is opened for it.
         file_config = self._load_file()
-        self.runs = runs if runs is not None else open_ledger(self.root, listen=True)
+        self.runs = runs if runs is not None else open_ledger(self.root, follow=True)
         self.config = self.load(file_config)
         self.by_id = automation_map(self.config)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -1730,6 +1785,11 @@ class Daemon:
                 slug = row["automation_slug"]
                 item = self.by_id.get(slug)
                 if item is None or not runs_here(item, self.node):
+                    # A run queued just after its definition changed is not
+                    # skipped on a declaration the last poll left behind: it
+                    # waits for the next tick, which reads the definitions first.
+                    if self.runs.link.behind(self.runs.project_id):
+                        continue
                     self.runs.update(
                         row["id"], status="skipped", finished_at=iso(),
                         summary="automation missing, disabled, or scheduled on another node")
@@ -2576,7 +2636,7 @@ class MachineService:
         key = store_key(setting)
         link = self.links.get(key)
         if link is None:
-            link = self.links[key] = StoreLink(setting, listen=True)
+            link = self.links[key] = StoreLink(setting, follow=True)
             try:
                 link.open()
             except StoreUnavailable as exc:

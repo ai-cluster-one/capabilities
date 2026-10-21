@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract==0.6.0",
+#     "capabilities-contract==0.7.0",
 #     "callva-harness-runner==0.9.0",
 # ]
 # ///
@@ -38,7 +38,7 @@ Definitions:
   A node schedules the enabled definitions that name it, by the node name its
   service runs under (AGENT_NODE_NAME, else the host name). Every definition
   saved is announced on the store, so a running daemon on any machine takes
-  the change up within a tick without a reload, and moving an automation to
+  the change up within a second without a reload, and moving an automation to
   another node touches no file of either. A row the store holds that does
   not validate is skipped and named by `list` and `doctor`, and the others
   run.

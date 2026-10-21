@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-21 — A daemon follows changed definitions by polling, and holds no session for it
+
+`automations` uses `capabilities-contract` 0.7.0. A saved or removed definition raises the project's version of the `automations_changed` channel in the store's change versions, in the same transaction as the save (ledger step `0005-definitions-versions`, schema 1.2), and still sends its `pg_notify`, so a daemon of an earlier release that listens on another machine takes it up as before. A daemon of this release, project or machine, no longer listens: every link is a transaction connection, and a scheduler's link polls the versions once a second, in one query on a working connection of the library's beside its own, so a change reaches it within a second and one started after a change reads it at once. A run queued just after its definition moved to this node is no longer skipped on a declaration the last poll left behind; it waits for the next tick, which reads the definitions first.
+
 ## 2026-10-20 — A read is a transaction of its own in one round trip
 
 `automations` uses `capabilities-contract` 0.6.0. On its working connection a plain read that would open a transaction, and any statement in autocommit, reaches the store in one round trip - the transaction's start, the schema binding and the commit go with it - and leaves the connection idle, never `idle in transaction`, so a transaction-mode pooler hands its server session on as soon as the store answers; a write still opens a transaction that its commit closes, and a write whose commit may have reached the store is never sent twice. A connect that fails is tried again after jittered, doubling pauses, and once a store did not answer, a further connect to it is refused at once as `store_unreachable` for a doubling pause of at most 30 seconds rather than dialled again on every statement.
