@@ -950,8 +950,8 @@ class StoreLink:
     (`follow`) follows the `automations_changed` versions, which the store
     raises for a project on every definition of it saved or removed: when a
     project asks whether it changed, it polls them, at most once every
-    FOLLOW_INTERVAL_SECONDS of the library, in one query on a working
-    connection of the library's beside its own, and collects the projects
+    FOLLOW_INTERVAL_SECONDS of the library, in one query on the link's own
+    connection, so following holds no second one, and collects the projects
     whose version moved in `changed`. Its first poll is
     taken when it opens, before any definition is read, and is only where it
     starts from. `generation` moves on every open, so every project on the
@@ -1001,7 +1001,7 @@ class StoreLink:
                     self.follower = db.Follower([CHANGED_CHANNEL],
                                                 application_name=LEDGER_OWNER,
                                                 setting=self.setting)
-                self._poll()
+                self._poll(conn)
             except db.DbError as exc:
                 conn.close()
                 raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
@@ -1013,14 +1013,15 @@ class StoreLink:
         self.generation += 1
         return self
 
-    def _poll(self) -> None:
-        """Take the followed versions once; one that does not reach the store
-        is left for the next, as the library's own follower leaves it."""
+    def _poll(self, conn=None) -> None:
+        """Take the followed versions once, on the link's connection; one that
+        does not reach the store is left for the next, as the library's own
+        follower leaves it."""
         import psycopg
         db = _database()
         self._polled_at = time.monotonic()
         try:
-            moved = self.follower.poll()
+            moved = self.follower.poll(conn if conn is not None else self.conn)
         except db.DbError as exc:
             if exc.slug != "store_unreachable":
                 raise

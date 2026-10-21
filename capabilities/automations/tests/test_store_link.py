@@ -120,3 +120,27 @@ def test_no_link_listens_and_the_schedulers_follows_saved_definitions(runtime):
         scheduler.close()
         with psycopg.connect(DSN, autocommit=True) as admin:
             admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+@needs_store
+def test_a_scheduler_that_follows_holds_one_connection_to_its_store(runtime):
+    import psycopg
+    from capabilities_contract import db
+    schema = "automations_links_" + uuid.uuid4().hex[:8]
+    db.disconnect()
+    scheduler = runtime.StoreLink(_setting(schema), follow=True).open()
+    try:
+        for _ in range(3):
+            scheduler._polled_at = None
+            assert scheduler.take_changed("prj_a") is False
+        with scheduler.conn.transaction():
+            assert scheduler.behind("prj_a") is False
+        with psycopg.connect(DSN, autocommit=True) as admin:
+            held = admin.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                "AND backend_type = 'client backend' AND pid <> pg_backend_pid()").fetchone()
+        assert held == (1,)
+    finally:
+        scheduler.close()
+        with psycopg.connect(DSN, autocommit=True) as admin:
+            admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

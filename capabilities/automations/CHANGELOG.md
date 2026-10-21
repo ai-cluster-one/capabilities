@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-21 — A daemon follows changed definitions on its own connection
+
+`automations` uses `capabilities-contract` 0.7.1. A scheduler's link, project or machine, polls the `automations_changed` versions on its own connection instead of a working connection of the library's beside it, so a daemon that follows definitions holds one connection per store, not two. A poll is still one query and one round trip, at most once a second, and a change still reaches the daemon within a second.
+
 ## 2026-10-21 — A daemon follows changed definitions by polling, and holds no session for it
 
 `automations` uses `capabilities-contract` 0.7.0. A saved or removed definition raises the project's version of the `automations_changed` channel in the store's change versions, in the same transaction as the save (ledger step `0005-definitions-versions`, schema 1.2), and still sends its `pg_notify`, so a daemon of an earlier release that listens on another machine takes it up as before. A daemon of this release, project or machine, no longer listens: every link is a transaction connection, and a scheduler's link polls the versions once a second, in one query on a working connection of the library's beside its own, so a change reaches it within a second and one started after a change reads it at once. A run queued just after its definition moved to this node is no longer skipped on a declaration the last poll left behind; it waits for the next tick, which reads the definitions first.
