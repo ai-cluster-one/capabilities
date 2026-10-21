@@ -198,3 +198,22 @@ def test_capabilities_bin_still_decides_when_it_is_set(tmp_path):
     assert install.returncode == 0, install.stderr
     assert (chosen / NAME).is_symlink()
     assert not (lab["home_bin"] / NAME).exists()
+
+
+def test_the_library_refresh_reaches_every_link_the_capability_is_run_by(tmp_path, monkeypatch):
+    # uv keys a script's environment by the path it is run as, so a refresh
+    # of the registry script alone never reaches `<name>` run from PATH.
+    script = tmp_path / "registry" / NAME / NAME
+    script.parent.mkdir(parents=True)
+    script.write_text("")
+    dirs = [tmp_path / "local-bin", tmp_path / "home-bin"]
+    for directory in dirs:
+        directory.mkdir()
+        (directory / NAME).symlink_to(script)
+    synced = []
+    monkeypatch.setattr(M, "_link_dirs", lambda: dirs)
+    monkeypatch.setattr(M.shutil, "which", lambda _: "uv")
+    monkeypatch.setattr(M.subprocess, "run", lambda argv, **_: synced.append(
+        argv[argv.index("--script") + 1]) or subprocess.CompletedProcess(argv, 0, "", ""))
+    M._refresh_contract_library(script)
+    assert synced == [str(script), *(str(d / NAME) for d in dirs)]

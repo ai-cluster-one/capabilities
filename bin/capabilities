@@ -3015,21 +3015,31 @@ def _refresh_contract_library(script: Path) -> None:
     """Bring the contract library in an installed capability's environment to
     the newest release its declared range admits. uv keeps a script's
     environment while it still satisfies the script's requirements, so without
-    this a library release would reach only an environment made after it."""
+    this a library release would reach only an environment made after it.
+
+    uv keys that environment by the path the script is run as, so the links
+    the capability is run through on PATH are refreshed as well as the
+    registry script they point at."""
     uv = shutil.which("uv")
     if uv is None:
         return
-    try:
-        proc = subprocess.run(
-            [uv, "sync", "--quiet", "--script", str(script),
-             "--upgrade-package", CONTRACT_LIBRARY, "--refresh-package", CONTRACT_LIBRARY],
-            capture_output=True, text=True, timeout=300, env=_snapshot_env())
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        _warn(f"{script.name}: {CONTRACT_LIBRARY} was not refreshed: {exc}")
-        return
-    if proc.returncode != 0:
-        detail = (proc.stderr.strip().splitlines() or ["uv sync failed"])[-1]
-        _warn(f"{script.name}: {CONTRACT_LIBRARY} was not refreshed: {detail}")
+    paths = [script]
+    for bin_dir in _link_dirs():
+        link = bin_dir / script.name
+        if link.is_symlink() and link.resolve() == script.resolve():
+            paths.append(link)
+    for path in paths:
+        try:
+            proc = subprocess.run(
+                [uv, "sync", "--quiet", "--script", str(path),
+                 "--upgrade-package", CONTRACT_LIBRARY, "--refresh-package", CONTRACT_LIBRARY],
+                capture_output=True, text=True, timeout=300, env=_snapshot_env())
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _warn(f"{path}: {CONTRACT_LIBRARY} was not refreshed: {exc}")
+            continue
+        if proc.returncode != 0:
+            detail = (proc.stderr.strip().splitlines() or ["uv sync failed"])[-1]
+            _warn(f"{path}: {CONTRACT_LIBRARY} was not refreshed: {detail}")
 
 
 def _payload_sha256(reg: Path, script: str | None = None) -> str:
