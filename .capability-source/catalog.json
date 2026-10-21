@@ -22,7 +22,7 @@
     },
     "assets": {
       "path": "capabilities/assets",
-      "payload_sha256": "a83271175d3ab2945cc5356a4b3c7b6d4a3fbaea072db3a3d16fd551230cfd02",
+      "payload_sha256": "c1d29609f4625647ffe55f1db09fa0bb80c5137f3b8222b6bfc36b814f6a0d82",
       "summary": "A project's assets: markdown as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text and diffed between versions - and every other file kept byte for byte in an S3-compatible bucket, sha256-checked, both imported from and exported to an agent's assets folder."
     },
     "automations": {
@@ -172,7 +172,7 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "a18ff316c455609559816c2e2e9d9290ada0d0da5fc35830fed0ea376a000844",
+      "payload_sha256": "91089f290a0d78a42d8f19b914f3f4515e2b4340273ae80d8a2256b93bdb6f46",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {

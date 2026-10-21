@@ -148,9 +148,13 @@ def rows(conn, schema: str, table: str) -> list[tuple]:
 
 
 def tables_in(conn, schema: str) -> list[str]:
+    """The schema's tables, without the store library's channel table: the
+    library makes it from 0.7.0 on, so whether it stands depends on the library
+    version the suite runs with, not on anything tasks does."""
     return [row[0] for row in conn.execute(
         """select c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace
-            where n.nspname = %s and c.relkind = 'r' order by 1""", (schema,)).fetchall()]
+            where n.nspname = %s and c.relkind = 'r' order by 1""", (schema,)).fetchall()
+            if row[0] != "schema_channel"]
 
 
 def catalog(conn, schema: str) -> dict:
@@ -220,9 +224,8 @@ def test_a_fresh_store_gets_every_table_under_the_tasks_prefix(fresh_schema):
                             "0004-profiles", "0005-workers-history"]
     with raw() as conn:
         assert tables_in(conn, fresh_schema) == [
-            "harness_profiles", "schema_channel", "schema_ledger", "schema_version",
-            "tasks_activities", "tasks_changes", "tasks_executions", "tasks_tasks",
-            "tasks_workers"]
+            "harness_profiles", "schema_ledger", "schema_version", "tasks_activities",
+            "tasks_changes", "tasks_executions", "tasks_tasks", "tasks_workers"]
         assert conn.execute("select to_regnamespace('tasks')").fetchone()[0] is None
     assert migrate(fresh_schema).applied == []
 
@@ -332,9 +335,8 @@ def test_a_store_holding_the_new_tables_beside_the_old_is_refused_and_left_as_fo
         left_as_found(conn, old_store, before)
         # The harness library's table is its own, migrated under its own ledger
         # before the tasks steps are tried, and stands whatever they find.
-        assert tables_in(conn, old_store) == ["harness_profiles", "schema_channel",
-                                              "schema_ledger", "schema_version",
-                                              "tasks_tasks"]
+        assert tables_in(conn, old_store) == ["harness_profiles", "schema_ledger",
+                                              "schema_version", "tasks_tasks"]
 
 
 @pytest.mark.parametrize("behind, named", [
@@ -367,8 +369,8 @@ def test_a_store_not_at_the_previous_releases_shape_is_refused_and_left_as_found
     assert "previous release's `tasks migrate --apply`" in message
     with raw() as conn:
         left_as_found(conn, old_store, before)
-        assert tables_in(conn, old_store) == ["harness_profiles", "schema_channel",
-                                              "schema_ledger", "schema_version"]
+        assert tables_in(conn, old_store) == ["harness_profiles", "schema_ledger",
+                                              "schema_version"]
 
 
 # --- Through the CLI -------------------------------------------------------------
