@@ -1,5 +1,9 @@
 # assets — change log
 
+## 2026-10-21 — A connection whose network flow died fails in seconds
+
+`assets` uses `capabilities-contract` 0.7.2. Its store connections give a network flow up once data sent on it has gone unacknowledged for 20 seconds (`tcp_user_timeout`), which keepalives cannot notice since none is sent while data waits, and send keepalives after 15 seconds idle, every 5 seconds, 3 probes: a connection whose flow stopped carrying packets without a FIN or a reset fails in about 20 seconds as a lost connection instead of waiting until the store ends the session, and a plain read that loses it that way runs once more on a new connection. A connection lost where `assets` catches nothing ends the command as `store_unreachable`, exit 5, as before.
+
 ## 2026-10-21 — A kept file is linked to its document after the fact
 
 `files link <name> --document NAME` sets the document a kept file belongs to, and `files link <name> --none` clears it, so a file imported with no document - its folder beside the write-up rather than under it - can be attached to it afterwards. The file's record stays immutable: the bytes are copied in the bucket to a new key, checked against their size and sha256 on the way, and a new record is written that retires the current one, as any change to a file is recorded. It answers `linked`, `unlinked` or `unchanged` with the record it `replaced`; an unchanged link reads and writes nothing. It is a write, under the write gate and the read-only switch. `show` lists under `files` the names of the unretired files that belong to the document.

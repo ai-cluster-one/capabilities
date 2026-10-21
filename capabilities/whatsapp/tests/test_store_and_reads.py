@@ -252,7 +252,7 @@ class StoreSchema(StoreCase):
                 WHERE n.nspname = current_schema()""").fetchall()
         # The profile table is the harness library's, made under its own ledger
         # by `profiles import`, and shared by every capability that reads it.
-        platform = ("schema_ledger", "schema_version", "harness_")
+        platform = ("schema_ledger", "schema_version", "schema_channel", "harness_")
         names = sorted(r["relname"] for r in rows
                        if not r["relname"].startswith(platform))
         self.assertEqual([n for n in names if not n.startswith("whatsapp_")], [])

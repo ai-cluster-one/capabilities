@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract==0.6.0",
+#     "capabilities-contract==0.7.2",
 # ]
 # ///
 """journal — agent-first CLI for a PostgreSQL voice-journal store.

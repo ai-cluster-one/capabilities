@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract==0.6.0",
+#     "capabilities-contract==0.7.2",
 # ]
 # ///
 """stripe — read-only Stripe fetch CLI. Emits a neutral JSON contract of what

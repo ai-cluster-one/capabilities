@@ -1,5 +1,9 @@
 # contract — change log
 
+## 2026-10-21 — Every capability uses capabilities-contract 0.7.2: a connection whose network flow died fails in seconds
+
+Every capability script, bundled service file and capability test pins `capabilities-contract` 0.7.2, whose connections give a network flow up once data sent on it has gone unacknowledged for 20 seconds (libpq's `tcp_user_timeout`) and send TCP keepalives after 15 seconds idle, every 5 seconds, 3 probes, so a store connection whose flow stopped carrying packets fails in about 20 seconds as a lost connection rather than waiting until the store ends the session; a plain read that loses its connection that way runs once more on a new one, as any lost plain read does. A capability that was on 0.6.0 also carries 0.7.0's `schema_channel`, which its `migrate` creates where the role may create in the schema. The manager (`bin/capabilities`) stays on 0.5.1, and the store-tests workflow is left as it is. The contract files are unchanged.
+
 ## 2026-10-21 — `connection add` says whether the project may use what it wrote
 
 Inside a project, the answer of `<name> connection add` carries `granted`: whether this project may use the connection it just wrote, read through the records adapter as selection reads it. Where it may not, the answer carries the grant it still needs, as it already did for a global connection - which covers a project in store mode, whose own `--project` connection is usable only once a grant row names it. A registry that cannot be read after the write leaves `granted` out rather than refusing a write that happened. Every capability carries the change through `sync-contract`.

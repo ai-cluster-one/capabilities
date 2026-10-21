@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.6.0"]
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract==0.7.2"]
 # ///
 """`watch` holds one connection and prints one JSON line per change a scope
 reads, catches up after a lost connection, and ends cleanly.
@@ -10,7 +10,7 @@ These run the CLI as a project would, against TASKS_TEST_DSN in a schema of
 their own that they drop, and skip when it is unset.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' \\
-        --with 'capabilities-contract==0.6.0' python -m pytest capabilities/tasks/tests -q
+        --with 'capabilities-contract==0.7.2' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations

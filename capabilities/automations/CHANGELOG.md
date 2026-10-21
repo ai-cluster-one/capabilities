@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-21 — A connection whose network flow died fails in seconds
+
+`automations` uses `capabilities-contract` 0.7.2. Its store connections give a network flow up once data sent on it has gone unacknowledged for 20 seconds (`tcp_user_timeout`), which keepalives cannot notice since none is sent while data waits, and send keepalives after 15 seconds idle, every 5 seconds, 3 probes: a connection whose flow stopped carrying packets without a FIN or a reset fails in about 20 seconds as a lost connection instead of waiting until the store ends the session, and a plain read that loses it that way runs once more on a new connection. A connection lost where `automations` catches nothing ends the command as `store_unreachable`, exit 5, as before.
+
 ## 2026-10-21 — A run records a result in the store, and the next run receives it
 
 A job records a result on its own run with the new `automations result <text|->`, and every run is handed `AUTOMATION_LAST_RESULT`, the result the latest started run of the same automation recorded, on whichever node it ran; the variable is unset when none has. The result is a new `result` column of `automations_runs` (ledger step `0006-runs-result`, schema 1.3), non-empty and at most 64 KiB, which `show` and `runs` report, so state a later run needs no longer has to live in `AUTOMATION_STATE_DIR` on one node. Definitions, path scripts and `AUTOMATION_STATE_DIR` are unchanged. The authoring guide gains a section on self-contained bodies.
