@@ -635,7 +635,12 @@ PROJECT VERBS (run inside a consuming project)
         the binding names global context and the store holds them - with a
         warning while the folder is still there; a store that does not answer,
         or a stored document that does not read, leaves the folder in use with
-        a warning. --print writes the text
+        a warning. Likewise, when the agent keeps routines in its store (the
+        `routine` capability's tables), the routine index lists their active
+        versions by name, each pointing to `routine show <name>`, instead of
+        the routines folder, with a warning while the folder is still there; a
+        store that does not answer leaves the folder in use with a warning.
+        --print writes the text
         to stdout and writes nothing; with --json it answers {project, output,
         text, warnings}. Without --print it replaces the configured output
         (`[output] context`, default .contextkit/generated/context.md) whole
@@ -12168,12 +12173,10 @@ def _ck_context_item(path: Path, rel: Path, text: str, source: str,
                   "load": load, "order": order, "body": body, "source": source})
 
 
-def _ck_stored_rows(root: Path, want_global: bool) -> list[tuple] | None:
-    """The active versions of this project's unretired context documents in its
-    store - and of the global ones when `want_global` - as (global, name, title,
-    description, load, position, body), read in a read-only transaction; None
-    where the project keeps none there: no store, no project id, no tables, or
-    no project document."""
+def _ck_store_read(root: Path, query) -> list[tuple] | None:
+    """The rows `query(conn, project)` reads from this project's store in a
+    read-only transaction; None where there is nothing to read: no project id,
+    no store, or no such table."""
     project = _project_id_state(root)["id"]
     if not project:
         return None
@@ -12192,17 +12195,26 @@ def _ck_stored_rows(root: Path, want_global: bool) -> list[tuple] | None:
     import psycopg
     try:
         conn.read_only = True
-        rows = conn.execute(
-            "SELECT d.project_id IS NULL, d.name, v.title, v.description, v.load, v.position, "
-            "v.body FROM context_documents d JOIN context_versions v "
-            "ON v.document_id = d.id AND v.active WHERE d.retired_at IS NULL "
-            "AND (d.project_id = %s OR (%s AND d.project_id IS NULL))",
-            (project, want_global)).fetchall()
+        return query(conn, project)
     except psycopg.errors.UndefinedTable:
         return None
     finally:
         conn.close()
-    if not any(not row[0] for row in rows):
+
+
+def _ck_stored_rows(root: Path, want_global: bool) -> list[tuple] | None:
+    """The active versions of this project's unretired context documents in its
+    store - and of the global ones when `want_global` - as (global, name, title,
+    description, load, position, body), read in a read-only transaction; None
+    where the project keeps none there: no store, no project id, no tables, or
+    no project document."""
+    rows = _ck_store_read(root, lambda conn, project: conn.execute(
+        "SELECT d.project_id IS NULL, d.name, v.title, v.description, v.load, v.position, "
+        "v.body FROM context_documents d JOIN context_versions v "
+        "ON v.document_id = d.id AND v.active WHERE d.retired_at IS NULL "
+        "AND (d.project_id = %s OR (%s AND d.project_id IS NULL))",
+        (project, want_global)).fetchall())
+    if rows is None or not any(not row[0] for row in rows):
         return None
     return rows
 
@@ -12278,11 +12290,57 @@ def _ck_routine_entries(root: Path, routines_dir: Path, warnings: list[str]) -> 
     return routines
 
 
-def _ck_routine_index(root: Path, routines_dir: Path, warnings: list[str]) -> str:
+def _ck_stored_routine_rows(root: Path) -> list[tuple] | None:
+    """The active versions of this project's unretired routines in its store, as
+    (name, description), read in a read-only transaction; None where the
+    project keeps none there: no store, no project id, no tables, or no
+    routine."""
+    rows = _ck_store_read(root, lambda conn, project: conn.execute(
+        "SELECT d.name, v.description FROM routine_documents d JOIN routine_versions v "
+        "ON v.document_id = d.id AND v.active WHERE d.retired_at IS NULL "
+        "AND d.project_id = %s", (project,)).fetchall())
+    return rows or None
+
+
+def _ck_stored_routines(root: Path, routines_dir: Path, warnings: list[str],
+                        store: dict) -> list | None:
+    """The routines this agent keeps in its store, as (name, one-line
+    description) ordered by name; None where the build reads the folder - the
+    agent keeps no routine in the store, the store already failed earlier in
+    this build, or the store did not answer, which adds a warning."""
+    if store["failed"]:
+        return None
+    code, rows, err = _ck_in_process(lambda: _ck_stored_routine_rows(root))
+    if code != 0:
+        store["failed"] = store["failed"] or code == 5
+        detail = _ck_one_line(err)[:300]
+        warnings.append("routines not read from the store, so the routines folder is used: "
+                        f"exited {code}" + (f": {detail}" if detail else ""))
+        return None
+    if rows is None:
+        return None
+    if (root / routines_dir).exists():
+        warnings.append(f"routines are read from the store; the routines folder "
+                        f"`{routines_dir.as_posix()}/` is no longer read and can be removed")
+    return sorted((name, _ck_one_line(description)) for name, description in rows)
+
+
+def _ck_routine_index(root: Path, routines_dir: Path, warnings: list[str], store: dict) -> str:
+    stored = _ck_stored_routines(root, routines_dir, warnings, store)
+    if stored is not None:
+        lines = ["<!-- Routine index - generated from the store's active routine versions. -->", "",
+                 "# Routines (repeatable procedures)", "",
+                 "Each is a self-contained recipe. Run `routine show <name>` for its text when you "
+                 "need to run that procedure.", ""]
+        lines += [f"- **{name}** (`routine show {name}`) - {description}"
+                  for name, description in stored]
+        lines.append("")
+        return "\n".join(lines)
     routines = _ck_routine_entries(root, routines_dir, warnings)
     if routines is None:
         return ""
-    lines = ["# Routines (repeatable procedures)", "",
+    lines = [f"<!-- Routine index - generated from {routines_dir.as_posix()} front matter. -->", "",
+             "# Routines (repeatable procedures)", "",
              "Each is a self-contained recipe. Load its file when you need to run that procedure.", ""]
     if not routines:
         lines += ["No routines are declared in this project.", ""]
@@ -12458,7 +12516,7 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
     context_dir, routines_dir = layers["context"], layers["routines"]
     warnings: list[str] = []
     store = {"failed": False}
-    routine_index = _ck_routine_index(root, routines_dir, warnings)
+    routine_index = _ck_routine_index(root, routines_dir, warnings, store)
     capability_context = _ck_capability_context(root, layers["capabilities"], warnings, store)
     memory_rel = binding["body_root"] / "memory"
     if (root / memory_rel).is_dir() or (root / memory_rel).is_symlink():
@@ -12536,8 +12594,7 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
     else:
         out += ["No stub context files.", ""]
     if routine_index:
-        out += ["---", "", f"<!-- Routine index - generated from {routines_dir.as_posix()} front matter. -->",
-                "", routine_index.strip(), ""]
+        out += ["---", "", routine_index.strip(), ""]
     if capability_context:
         out += ["---", "", capability_context.rstrip(), ""]
     return "\n".join(out).rstrip() + "\n", warnings, binding

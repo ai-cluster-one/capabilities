@@ -634,3 +634,81 @@ def test_a_document_that_does_not_read_leaves_the_build_on_the_folder(lab):
                "Invalid frontmatter load in context/identity/MISSION.md: bogus")
     assert warning in result.stdout.splitlines()
     assert result.stdout.replace(warning + "\n", "", 1) == from_folder.stdout
+
+
+def _seed_routines(lab: Lab, routines: list[tuple]) -> None:
+    """The `routine` capability's two tables, holding `routines`:
+    (project_id, name, retired, [(description, body, active)])."""
+    with lab.cluster.connect(lab.database) as conn:
+        conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+        conn.execute(f"CREATE TABLE {SCHEMA}.routine_documents (id uuid PRIMARY KEY "
+                     "DEFAULT gen_random_uuid(), project_id text NOT NULL, name text NOT NULL, "
+                     "created_at timestamptz NOT NULL DEFAULT now(), created_by text NOT NULL, "
+                     "retired_at timestamptz)")
+        conn.execute(f"CREATE TABLE {SCHEMA}.routine_versions (id uuid PRIMARY KEY "
+                     "DEFAULT gen_random_uuid(), document_id uuid NOT NULL REFERENCES "
+                     f"{SCHEMA}.routine_documents (id), title text, description text NOT NULL, "
+                     "body text NOT NULL, active boolean NOT NULL DEFAULT true, created_at "
+                     "timestamptz NOT NULL DEFAULT now(), created_by text NOT NULL, note text)")
+        for project, name, retired, versions in routines:
+            (document,) = conn.execute(
+                f"INSERT INTO {SCHEMA}.routine_documents (project_id, name, created_by, retired_at) "
+                "VALUES (%s, %s, 'tester@lab', CASE WHEN %s THEN now() END) RETURNING id",
+                (project, name, retired)).fetchone()
+            for version in versions:
+                conn.execute(f"INSERT INTO {SCHEMA}.routine_versions (document_id, description, "
+                             "body, active, created_by) VALUES (%s, %s, %s, %s, 'tester@lab')",
+                             (document, *version))
+
+
+def test_build_composes_the_routine_index_from_the_routines_in_the_store(lab):
+    project = lab.project
+    (project / ".contextkit").mkdir()
+    (project / ".contextkit" / "config.toml").write_text(
+        f'version = 1\ntype = "agent-project"\n\n[identity]\nid = "{PROJECT_ID}"\n')
+    (project / "context" / "identity").mkdir(parents=True)
+    (project / "context" / "identity" / "MISSION.md").write_text(
+        _context_text(*_CONTEXT_FILES["identity/MISSION"]))
+    (project / "routines" / "ops").mkdir(parents=True)
+    (project / "routines" / "zeta.md").write_text(
+        "---\nname: zeta\ndescription: Run last by name.\nload: inline\norder: 1\n---\n# Zeta\n")
+    (project / "routines" / "ops" / "alpha.md").write_text(
+        "---\nname: alpha\ndescription: Run first by name.\n---\n# Alpha\n")
+
+    def build() -> str:
+        result = lab.run("build", "--print")
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    from_folder = build()
+    assert "- **[alpha](routines/ops/alpha.md)** - Run first by name." in from_folder
+
+    # The store holds both, beside a version no longer active, a retired
+    # routine and another project's routine.
+    _seed_routines(lab, [
+        (PROJECT_ID, "zeta", False, [("Before.", "# Old\n", False),
+                                     ("Run last by name.", "# Zeta\n", True)]),
+        (PROJECT_ID, "alpha", False, [("Run first by name.", "# Alpha\n", True)]),
+        (PROJECT_ID, "gone", False, []),
+        (PROJECT_ID, "retired", True, [("Retired.", "# Retired\n", True)]),
+        ("prj_000000000000", "other", False, [("Not this agent's.", "# Other\n", True)]),
+    ])
+    index = ("<!-- Routine index - generated from the store's active routine versions. -->\n\n"
+             "# Routines (repeatable procedures)\n\n"
+             "Each is a self-contained recipe. Run `routine show <name>` for its text when you "
+             "need to run that procedure.\n\n"
+             "- **alpha** (`routine show alpha`) - Run first by name.\n"
+             "- **zeta** (`routine show zeta`) - Run last by name.\n")
+    warning = ("- routines are read from the store; the routines folder `routines/` "
+               "is no longer read and can be removed")
+    beside_folder = build()
+    assert warning in beside_folder.splitlines()
+    assert index in beside_folder
+    assert "routines/ops/alpha.md" not in beside_folder
+
+    # Without the folder the store alone composes the same index, and no
+    # warning says the routine layer is missing.
+    shutil.rmtree(project / "routines")
+    from_store = build()
+    assert from_store == beside_folder.replace(f"Generation warnings:\n\n{warning}\n\n", "", 1)
+    assert "routine layer not present" not in from_store

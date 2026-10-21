@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-21 — The manager builds an agent's routine index from its store
+
+`capabilities build` composes the routine index of an agent that keeps routines in its store - unretired rows of the `routine` capability's `routine_documents` with their active `routine_versions` - from those versions instead of the routines folder, ordered by routine name, each entry pointing to `routine show <name>` rather than a file. It reads the tables directly in a read-only transaction, so the `routine` capability need not be installed or enabled. While the routines folder is still there beside them, one generation warning says the store is used and the folder can be removed. An agent with no routines in its store, a store without the tables, or no store builds the index from the folder exactly as before; a store that does not answer leaves the folder in use with a warning. `session-start` builds the same way. Run `capabilities help` for the details.
+
 ## 2026-10-20 — The manager reads agent templates from `agenttemplates`
 
 With the `agenttemplates` capability installed, `capabilities templates`, `init --with-template` and `init --template` read the starter context files and the agent templates from its installed bundle and answer as before, whether or not a project has it enabled. Without it they read where ContextKit reads them, unchanged.
