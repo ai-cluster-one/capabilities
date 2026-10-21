@@ -56,6 +56,12 @@ Scripts:
   AUTOMATION_ATTEMPT, AUTOMATION_TRIGGER, AUTOMATION_ENVIRONMENT,
   AUTOMATION_NAMESPACE, AUTOMATION_PROJECT_ROOT, and AUTOMATION_STATE_DIR.
 
+  AUTOMATION_STATE_DIR is a folder on the node that runs the job. State a
+  later run needs on any node is recorded with `automations result`: each run
+  also receives AUTOMATION_LAST_RESULT, the result the latest started run of
+  the same automation recorded, on whichever node it ran, and none when no
+  run of it has recorded one.
+
 Commands:
   automations help
   automations doctor [--repair]
@@ -137,6 +143,15 @@ Commands:
       Cancel a pending run or request termination of a running process.
   automations retry <run-id>
       Enqueue a new attempt for a completed run, as `run` places it.
+  automations result <text|->
+      From inside a job: record a result on the job's own run (AUTOMATION_RUN_ID),
+      handed to the next run of the automation as AUTOMATION_LAST_RESULT. `-`
+      reads it from stdin, kept exactly as given. It is non-empty text of at
+      most 65536 bytes (exit 6 `invalid_result`); recording again replaces
+      it. Exit 6 `not_in_a_run` outside a job and `run_not_active` when the
+      run is no longer starting or running; refused by the read-only switch.
+      Answers {"recorded", "run_id", "automation", "bytes"}; `show` and
+      `runs` carry it as `result`.
   automations agents
       List agent profiles and which one is the default.
   automations agent <prompt|-> [--profile NAME] [--schema PATH] [--timeout SEC]
@@ -7964,6 +7979,32 @@ def cmd_retry(run_id: str) -> dict[str, Any]:
     return {"queued": True, "run": row}
 
 
+def cmd_result(raw: str) -> dict[str, Any]:
+    run_id = os.environ.get("AUTOMATION_RUN_ID", "").strip()
+    if not run_id:
+        _die(6, "not_in_a_run", "AUTOMATION_RUN_ID is unset, so there is no run to record on",
+             "call `automations result` from inside a job the scheduler started")
+    text = sys.stdin.read() if raw == "-" else raw
+    root = _root_required()
+    runtime, config = _load(root, definitions=False)
+    size = len(text.encode("utf-8"))
+    if not text or size > runtime.RESULT_MAX_BYTES:
+        _die(6, "invalid_result",
+             f"a result is non-empty text of at most {runtime.RESULT_MAX_BYTES} bytes; "
+             f"this one is {size}",
+             "record a smaller result, and keep anything larger where a capability keeps it")
+    try:
+        before, recorded = runtime.record_result(root, config, run_id, text)
+    except runtime.StoreUnavailable as exc:
+        _store_refusal(exc)
+    if before is None:
+        _die(3, "not_found", f"unknown run {run_id!r}")
+    if recorded is None:
+        _die(6, "run_not_active", f"run {run_id} is {before['status']}, so it records no result")
+    return {"recorded": True, "run_id": run_id, "automation": recorded["automation_slug"],
+            "bytes": size}
+
+
 def cmd_service_start() -> dict[str, Any]:
     root = _root_required()
     _joined_refusal("start")
@@ -9425,6 +9466,8 @@ def main() -> None:
     cancel.add_argument("run_id")
     retry = sub.add_parser("retry", add_help=False)
     retry.add_argument("run_id")
+    result = sub.add_parser("result", add_help=False)
+    result.add_argument("result")
     sub.add_parser("agents", add_help=False)
     agent = sub.add_parser("agent", add_help=False)
     agent.add_argument("prompt")
@@ -9464,8 +9507,9 @@ def main() -> None:
         verb.add_argument("--machine", action="store_true")
 
     args = parser.parse_args(argv)
-    if args.cmd in ("run", "cancel", "retry"):
-        # Each starts or stops a job, which is the work the scheduler does.
+    if args.cmd in ("run", "cancel", "retry", "result"):
+        # Each starts or stops a job, which is the work the scheduler does, or
+        # writes on its run.
         _read_only_gate(f"`{NAME} {args.cmd}`")
     if args.cmd == "help":
         _cmd_help()
@@ -9496,6 +9540,8 @@ def main() -> None:
         _emit(cmd_cancel(args.run_id))
     elif args.cmd == "retry":
         _emit(cmd_retry(args.run_id))
+    elif args.cmd == "result":
+        _emit(cmd_result(args.result))
     elif args.cmd == "agents":
         _emit(cmd_agents())
     elif args.cmd == "agent":

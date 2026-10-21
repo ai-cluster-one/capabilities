@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-21 — A run records a result in the store, and the next run receives it
+
+A job records a result on its own run with the new `automations result <text|->`, and every run is handed `AUTOMATION_LAST_RESULT`, the result the latest started run of the same automation recorded, on whichever node it ran; the variable is unset when none has. The result is a new `result` column of `automations_runs` (ledger step `0006-runs-result`, schema 1.3), non-empty and at most 64 KiB, which `show` and `runs` report, so state a later run needs no longer has to live in `AUTOMATION_STATE_DIR` on one node. Definitions, path scripts and `AUTOMATION_STATE_DIR` are unchanged. The authoring guide gains a section on self-contained bodies.
+
 ## 2026-10-21 — A daemon follows changed definitions on its own connection
 
 `automations` uses `capabilities-contract` 0.7.1. A scheduler's link, project or machine, polls the `automations_changed` versions on its own connection instead of a working connection of the library's beside it, so a daemon that follows definitions holds one connection per store, not two. A poll is still one query and one round trip, at most once a second, and a change still reaches the daemon within a second.

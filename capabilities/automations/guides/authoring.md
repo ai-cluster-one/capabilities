@@ -42,3 +42,38 @@ Where detection sits is decided by the surface, not by taste. A surface that dif
 Getting that backwards is expensive in both directions. Code against a surface that does not diff goes blind exactly where the answer was, and reports the blindness as silence. An agent against a surface that does diff pays a turn to re-derive what comparing two fields already knew.
 
 The recurring shape of this choice is a monitor; `automations guide monitors` owns what one has to get right.
+
+## Self-contained bodies
+
+A body kept in the store runs on whichever node its definition names, from a file written for that one run, with nothing beside it. Everything it needs is therefore either inside the body or reached through something every node can reach: the store, through a capability.
+
+Keep the brief and the schema as text inside the script. A brief is a string the script fills with its evidence; a schema is a literal the script writes to a temporary file for the one turn, because `automations agent --schema` takes a path:
+
+```python
+SCHEMA = {"type": "object", "required": ["changed"],
+          "properties": {"changed": {"type": "boolean"}, "note": {"type": "string"}}}
+
+with tempfile.NamedTemporaryFile("w", suffix=".json") as schema:
+    json.dump(SCHEMA, schema)
+    schema.flush()
+    result = subprocess.run(
+        [os.environ["AUTOMATIONS_BIN"], "agent", "--schema", schema.name, "-"],
+        input=BRIEF.format(evidence=evidence), cwd=os.environ["AUTOMATION_PROJECT_ROOT"],
+        capture_output=True, text=True, timeout=700)
+answer = json.loads(result.stdout)["answer"]
+```
+
+Keep what the next run needs on the run record, not in a file. `AUTOMATION_STATE_DIR` is a folder on the node that ran the job, so what is kept there is lost when the automation moves to another node or its server is rebuilt. A run records its result with `automations result`, and the next run of the same automation receives the last one recorded as `AUTOMATION_LAST_RESULT`, whichever node ran it; a run that records nothing leaves the previous result to be handed on. Each run's result stays on its own row, so `automations runs` and `automations show` read the history:
+
+```python
+last = json.loads(os.environ.get("AUTOMATION_LAST_RESULT", "{}"))
+seen = set(last.get("seen", []))
+# ... the work, comparing against what the last run saw ...
+subprocess.run([os.environ["AUTOMATIONS_BIN"], "result", "-"],
+               input=json.dumps({"seen": sorted(seen)}), text=True,
+               capture_output=True, check=True)
+```
+
+A result is text of at most 64 KiB. Record what the comparison needs - cursors, keys already seen, the last value - and keep anything larger where a capability keeps it. Capture the command's output as above: its answer printed to the run log would become the run's summary.
+
+Reach project content through the capability that owns it rather than through a path in the checkout: files through `assets`, recorded conclusions through `memory`. A body that reads a file from the checkout only runs where that checkout is, which is the property a path script already has.

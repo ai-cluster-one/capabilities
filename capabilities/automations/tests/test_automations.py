@@ -1515,6 +1515,29 @@ environments = ["production"]
         self.assertEqual(list((Path(started["state_dir"]) / "bodies").iterdir()), [])
 
     @needs_store
+    def test_a_run_receives_the_result_the_last_run_recorded(self) -> None:
+        # A run records its result on its own row; the next run of the same
+        # automation is handed the last one recorded, and a run that records
+        # nothing (here, once the result is two long) hands nothing new on.
+        self.define("counter", script_body="#!/bin/sh\n"
+                    "echo \"got:${AUTOMATION_LAST_RESULT-none}\"\n"
+                    "[ \"${#AUTOMATION_LAST_RESULT}\" -ge 2 ] && exit 0\n"
+                    "\"$AUTOMATIONS_BIN\" result \"n${AUTOMATION_LAST_RESULT-}\" >/dev/null\n",
+                    node=self.node)
+        self.cli("service", "start")
+        rows = []
+        for _ in range(3):
+            run = json.loads(self.cli("run", "counter").stdout)["run"]
+            rows.append(self.wait_status(run["id"], {"succeeded", "failed"}))
+        self.assertEqual([row["status"] for row in rows], ["succeeded"] * 3, rows)
+        self.assertEqual([row["summary"] for row in rows],
+                         ["got:none", "got:n", "got:nn"])
+        self.assertEqual([row["result"] for row in rows], ["n", "nn", None])
+        # Outside a job there is no run to record on.
+        outside = self.cli("result", "x", check=False)
+        self.assertEqual(outside.returncode, 6, outside.stdout)
+
+    @needs_store
     def test_two_machines_on_one_store_never_take_each_others_runs(self) -> None:
         # A second machine is a checkout of its own of the same project, with a
         # state root and a node name of its own, on the same store. Each node

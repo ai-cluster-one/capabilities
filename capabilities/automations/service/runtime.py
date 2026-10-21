@@ -689,9 +689,16 @@ def legacy_definitions(root: Path, raw: dict[str, Any], here_environment: str,
 # transaction (`0005-definitions-versions`), and a scheduler follows that
 # channel by polling. The trigger still sends its `pg_notify` beside the raise,
 # for a scheduler of an earlier release still listening on another machine.
+#
+# A run may record a result on its own row (`0006-runs-result`), and the next
+# run of the automation is handed the last one recorded, whichever node ran
+# it, so state between runs lives in the store rather than on one machine.
 LEDGER_OWNER = "automations"
 LEDGER_MAJOR = 1
-LEDGER_MINOR = 2
+LEDGER_MINOR = 3
+# The most a run may record: it is handed to the next run as one environment
+# variable, which the kernel caps at 128 KiB.
+RESULT_MAX_BYTES = 65536
 CHANGED_CHANNEL = "automations_changed"
 LEDGER_STEPS = [
     ("0001-runs", """
@@ -848,6 +855,19 @@ LEDGER_STEPS = [
       RETURN NULL;
     END;
     $$ LANGUAGE plpgsql;
+    """),
+    ("0006-runs-result", """
+    ALTER TABLE automations_runs ADD COLUMN result text
+        CONSTRAINT automations_runs_result_bounded
+        CHECK (result <> '' AND octet_length(result) <= 65536);
+    CREATE INDEX automations_runs_result_idx
+        ON automations_runs (project_id, automation_slug, started_at DESC NULLS LAST)
+        WHERE result IS NOT NULL;
+    COMMENT ON COLUMN automations_runs.result IS
+        'What the run recorded for the next run of its automation, through '
+        '`automations result`; the next run is handed the result of the latest '
+        'started run that recorded one, whichever node ran it. At most 64 KiB, '
+        'since it is handed over as one environment variable.';
     """),
 ]
 
@@ -1271,6 +1291,24 @@ class RunLedger:
             self._execute(f"UPDATE automations_runs SET {assignments}" + clause,
                           list(columns.values()) + params + [run_id])
 
+    def record_result(self, run_id: str, result: str) -> dict[str, Any] | None:
+        """Record `result` on a run that is starting or running, and give the
+        row back; None when the run is not one of these."""
+        clause, params = self._where("id = %s", "status IN ('starting', 'running')")
+        with self.transaction():
+            changed = self._execute("UPDATE automations_runs SET result = %s" + clause,
+                                    [result] + params + [run_id]).rowcount
+        return self.get(run_id) if changed else None
+
+    def last_result(self, slug: str) -> str | None:
+        """The result the latest started run of the automation recorded, on
+        any node, or None when no run of it has recorded one."""
+        clause, params = self._where("automation_slug = %s", "result IS NOT NULL")
+        row = self._execute("SELECT result FROM automations_runs" + clause
+                            + " ORDER BY started_at DESC NULLS LAST LIMIT 1",
+                            params + [slug]).fetchone()
+        return row[0] if row else None
+
     def take(self, run_id: str) -> bool:
         """Move one pending run to starting, unless another dispatcher did."""
         clause, params = self._where("id = %s", "status = 'pending'")
@@ -1394,6 +1432,17 @@ def request_cancel(root: Path, config: dict[str, Any], run_id: str) -> dict[str,
         elif row["status"] in {"starting", "running"}:
             ledger.update(run_id, cancel_requested=True)
         return ledger.get(run_id)
+
+
+def record_result(root: Path, config: dict[str, Any], run_id: str,
+                  result: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Record `result` on the run, as `(run as it was, run as recorded)`; the
+    second is None when the run is not starting or running."""
+    with open_ledger(root, config) as ledger:
+        row = ledger.get(run_id)
+        if row is None:
+            return None, None
+        return row, ledger.record_result(run_id, result)
 
 
 def retry_run(root: Path, config: dict[str, Any], state_dir: Path,
@@ -1799,6 +1848,9 @@ class Daemon:
                         self.runs.count_for(slug, "running") >= 1:
                     continue
                 if self.runs.take(row["id"]):
+                    # Read with the claim, so starting the job asks the store
+                    # nothing more.
+                    row["last_result"] = self.runs.last_result(slug)
                     return row
             return None
 
@@ -1870,6 +1922,11 @@ class Daemon:
             "AUTOMATION_STATE_DIR": str(self.state_dir),
             "AUTOMATIONS_BIN": automations_bin(),
         })
+        # Only the answer the claim read reaches the job, never one this
+        # process inherited.
+        env.pop("AUTOMATION_LAST_RESULT", None)
+        if row.get("last_result") is not None:
+            env["AUTOMATION_LAST_RESULT"] = row["last_result"]
         # In project mode this process already carries the project's
         # environment and the job is started as declared. The machine service
         # carries none, so its launcher puts the project's own environment
