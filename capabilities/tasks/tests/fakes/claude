@@ -15,6 +15,9 @@ init event and a result document. It does no work.
                        link it with `origin` tasks and `origin_ref`, and say so
                        on the named task's trail
   FAKE_ENGINE_SLEEP    seconds to hold the turn open before answering
+  FAKE_ENGINE_DETACH   a file: before holding the turn open, start a daemon the
+                       way `pg_ctl start` starts a postmaster - forked twice, in
+                       a session of its own, its parent gone - and write its pid
   FAKE_ENGINE_FAIL     `idle`: answer with an error at once, having written
                        nothing; `ordinary`: write an activity through
                        FAKE_ENGINE_TASKS, then answer with an error
@@ -65,6 +68,20 @@ for line in sys.stdin:
         with open(record, "a") as fh:
             fh.write(json.dumps({"argv": argv, "cwd": os.getcwd(),
                                  "env": dict(os.environ), "prompt": prompt}) + "\n")
+    if os.environ.get("FAKE_ENGINE_DETACH"):
+        if os.fork() == 0:
+            os.setsid()
+            if os.fork() == 0:
+                with open(os.environ["FAKE_ENGINE_DETACH"], "w") as fh:
+                    fh.write(str(os.getpid()))
+                # Its output goes where pg_ctl sends a postmaster's, away from
+                # the harness's pipes.
+                null = os.open(os.devnull, os.O_RDWR)
+                for fd in (0, 1, 2):
+                    os.dup2(null, fd)
+                os.execvp("sleep", ["sleep", "300"])
+            os._exit(0)
+        os.wait()
     if os.environ.get("FAKE_ENGINE_SLEEP"):
         time.sleep(float(os.environ["FAKE_ENGINE_SLEEP"]))
     tasks = os.environ.get("FAKE_ENGINE_TASKS")

@@ -231,6 +231,11 @@ USAGE
       `lease` and any `refusal`; node_name is the name the node answers to in
       the gate. A target that declares `node` adds declared_node_name, and an
       error node_name_mismatch while the node answers to another name.
+      leftovers is what no service accounts for, read in the container:
+      processes that are neither a Supervisor program nor descended from one
+      (pid, ppid, age_seconds, command), development sessions open longer than
+      a day or damaged (id, capability, age_hours, damaged), and the size of
+      /tmp and of the uv cache in bytes.
 
   deployment doctor [--target <name>]
       Validate deployment/runtime.json, deployment/targets/*.json, and the deployment
@@ -11746,8 +11751,9 @@ def _node_ssh_argv(host, *, tty=False, user="root"):
     return argv + [f"{user}@{host['address']}"]
 
 
-def _node_ssh(root, host, script, *, stdin=None):
-    return _node_run(_node_ssh_argv(host) + [script], root, stdin=stdin).stdout.strip()
+def _node_ssh(root, host, script, *, stdin=None, timeout=120):
+    return _node_run(_node_ssh_argv(host) + [script], root, stdin=stdin,
+                     timeout=timeout).stdout.strip()
 
 
 def _node_app(root, target, required=True):
@@ -11776,8 +11782,9 @@ def _node_container(root, host, uuid):
     return containers[0]
 
 
-def _node_exec(root, host, container, argv):
-    return _node_ssh(root, host, "docker exec " + shlex.quote(container) + " " + shlex.join(argv))
+def _node_exec(root, host, container, argv, timeout=120):
+    return _node_ssh(root, host, "docker exec " + shlex.quote(container) + " " + shlex.join(argv),
+                     timeout=timeout)
 
 
 def _node_branch(root):
@@ -12283,6 +12290,74 @@ print(json.dumps(out))
 """
 
 
+_NODE_LEFTOVERS_PROBE = """
+import json, os, re, subprocess, sys, time
+out = {"processes": [], "dev_sessions": [], "sizes": {}, "errors": []}
+def run(argv, seconds):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=seconds).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        out["errors"].append({"command": argv[0], "message": str(exc)[:200]})
+        return ""
+rows = {}
+for line in run(["ps", "-eo", "pid=,ppid=,etimes=,args="], 20).splitlines():
+    parts = line.split(None, 3)
+    if len(parts) >= 3 and all(p.isdigit() for p in parts[:3]):
+        rows[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3] if len(parts) > 3 else "")
+served = {int(p) for p in sys.argv[1:]} | {os.getpid()}
+mine = set()
+pid = os.getpid()
+while pid in rows and pid not in mine:
+    mine.add(pid)
+    pid = rows[pid][0]
+def inside(pid):
+    seen = set()
+    while pid in rows and pid not in seen:
+        if pid in served:
+            return True
+        seen.add(pid)
+        pid = rows[pid][0]
+    return False
+for pid, (ppid, age, args) in sorted(rows.items()):
+    if pid != 1 and pid not in mine and not inside(pid):
+        out["processes"].append({"pid": pid, "ppid": ppid, "age_seconds": age,
+                                 "command": args[:160]})
+try:
+    listed = json.loads(run(["capabilities", "dev", "list"], 60) or "{}").get("sessions") or []
+except ValueError:
+    listed = []
+    out["errors"].append({"command": "capabilities", "message": "dev list was not JSON"})
+now = time.time()
+for session in listed:
+    created = session.get("created_at")
+    if created is None:
+        with_data = session.get("preserved_data") or session.get("preserved_state")
+        try:
+            created = os.stat(with_data).st_mtime if with_data else None
+        except OSError:
+            created = None
+    if created is None or now - created > 86400:
+        out["dev_sessions"].append({"id": session.get("id"), "capability": session.get("capability"),
+            "age_hours": None if created is None else round((now - created) / 3600, 1),
+            "damaged": bool(session.get("damaged"))})
+cache = (run(["uv", "cache", "dir"], 20).strip() or os.path.expanduser("~/.cache/uv"))
+for name, path in (("tmp", "/tmp"), ("uv_cache", cache)):
+    said = run(["du", "-sk", "-x", path], 110).split()
+    out["sizes"][name] = {"path": path,
+                          "bytes": int(said[0]) * 1024 if said and said[0].isdigit() else None}
+print(json.dumps(out))
+"""
+
+
+def _node_leftovers(root, host, container, services):
+    """What the node holds that no service accounts for: processes that are no
+    service and descend from none, development sessions open longer than a day,
+    and the size of /tmp and of the uv cache, read in its container."""
+    pids = re.findall(r"\bpid (\d+)", services)
+    return json.loads(_node_exec(root, host, container,
+                                 ["python3", "-c", _NODE_LEFTOVERS_PROBE, *pids], timeout=300))
+
+
 def _node_database(root, host, container):
     from capabilities_contract import __version__
     return json.loads(_node_exec(root, host, container, [
@@ -12301,6 +12376,7 @@ def cmd_node_status(args):
     runtime = _load_runtime(root)
     node_services = {}
     host = container = None
+    services = ""
     try:
         host = _node_host(root, target)
         report["instance"]["url"] = host["url"]
@@ -12328,6 +12404,14 @@ def cmd_node_status(args):
         report["store"].update(_node_database(root, host, container))
     except NodeFailure as e:
         report["errors"].append({"code": e.code, "message": e.message})
+    if container is not None:
+        try:
+            report["leftovers"] = _node_leftovers(root, host, container, services)
+        except NodeFailure as e:
+            report["errors"].append({"code": e.code, "message": e.message})
+        except ValueError:
+            report["errors"].append({"code": "node_leftovers_unreadable",
+                                     "message": "the leftovers probe on the node returned malformed JSON"})
     # What the gate on the node answers for each service, whether its runner
     # runs it, and who holds its lease, as the node itself reads them.
     remote: dict = {}

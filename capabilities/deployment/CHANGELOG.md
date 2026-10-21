@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-21 — `node status` reports what the node holds that no service accounts for
+
+`deployment node status` carries `leftovers`, read in the node's container: the processes that are neither a Supervisor program nor descended from one, with pid, parent, age and command; the development sessions open longer than a day, or damaged; and the size of /tmp and of the uv cache. Nothing is ended or removed.
+
 ## 2026-10-21 — A connection whose network flow died fails in seconds
 
 `deployment` uses `capabilities-contract` 0.7.2. Its store connections give a network flow up once data sent on it has gone unacknowledged for 20 seconds (`tcp_user_timeout`), which keepalives cannot notice since none is sent while data waits, and send keepalives after 15 seconds idle, every 5 seconds, 3 probes: a connection whose flow stopped carrying packets without a FIN or a reset fails in about 20 seconds as a lost connection instead of waiting until the store ends the session, and a plain read that loses it that way runs once more on a new connection. A connection lost where `deployment` catches nothing ends the command as `store_unreachable`, exit 5, as before.

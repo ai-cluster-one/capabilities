@@ -424,6 +424,13 @@ WORKERS
   the profile's `timeout_seconds`; a profile without one needs
   `limits.lease_seconds`.
 
+  Every process a turn starts ends with the turn, however it ends - answered,
+  failed, handed back, past its `timeout_seconds`, or ended by the service:
+  test databases, fake servers and commands sent to the background included.
+  On Linux that covers a daemon that detached into a session of its own, as
+  `pg_ctl start` does, since the turn's `run` receives its orphans; elsewhere
+  only what stays in the turn's tree, its groups or its sessions is reached.
+
   A routine name resolves to `routines/<name>.md` at the project root. The first
   routine is the procedure; a worker naming none leaves the turn to choose one
   by the routines' descriptions, or to work from the project's doctrine, and to
@@ -14910,14 +14917,52 @@ def _boot(worker: dict, prompt: str, execution: str, cwd: Path, session, cancel=
     needs in order to decide whether an attempt was spent.
 
     `cancel`, once set, ends the turn and kills what it started: the beat sets
-    it when the raise is lost."""
+    it when the raise is lost.
+
+    However the turn ends - answered, failed, timed out or cancelled - every
+    process it started ends with it, `_end_what_it_left` says how."""
     import time
     runner = _harness_runner()
+    _adopt_orphans()
     started = time.monotonic()
-    result = runner.run(prompt, worker["profile"], str(cwd), session=session,
-                        environ=os.environ, extra_env={"TASKS_EXECUTION": execution},
-                        cancel=cancel)
+    try:
+        result = runner.run(prompt, worker["profile"], str(cwd), session=session,
+                            environ=os.environ, extra_env={"TASKS_EXECUTION": execution},
+                            cancel=cancel)
+    finally:
+        _end_what_it_left()
     return result, int((time.monotonic() - started) * 1000)
+
+
+def _adopt_orphans() -> None:
+    """Make this process the one a turn's orphans are handed to, on Linux.
+
+    A command that detaches - `pg_ctl start`, a daemon that forks twice and
+    calls setsid - leaves the harness's tree, its process group and its session
+    at once, and would be handed to init and outlive the turn. As a child
+    subreaper this process receives it instead, so it is still a descendant
+    when the turn ends. Elsewhere there is no such thing, and only what stays a
+    descendant, in a group or in a session of one is found."""
+    if not sys.platform.startswith("linux"):
+        return
+    import contextlib
+    import ctypes
+    with contextlib.suppress(Exception):
+        ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
+
+
+def _end_what_it_left() -> None:
+    """End every process the turn left behind: test databases, fake servers,
+    commands sent to the background.
+
+    Everything descended from this process, and every group and session one of
+    them leads, is ended; this process's own group and session are not, so a
+    run by hand never reaches the shell it was started from. A service that
+    ends this process first ends the same tree, found while it still lived."""
+    import contextlib
+    with contextlib.suppress(Exception):
+        from callva.harness_runner.tree import kill_tree
+        kill_tree([os.getpid()])
 
 
 def _beat_lease() -> tuple[int, int]:

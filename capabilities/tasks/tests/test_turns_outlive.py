@@ -23,6 +23,7 @@ TASKS_TEST_DSN and skip when it is unset.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import json
 import os
@@ -396,3 +397,59 @@ def test_a_turn_left_running_or_adopted_is_never_claimed_twice(lab):
     assert raised["status"] == "running"
     complete(lab, "t-once")
     assert [r["status"] for r in runs(lab, "t-once")] == ["ok"]
+
+
+# --- What a turn started ends with it ---------------------------------------
+
+def running(pid: int) -> bool:
+    """Whether `pid` is a live process; a zombie already ended."""
+    said = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                          text=True).stdout.strip()
+    return bool(said) and not said.startswith("Z")
+
+
+def detached(path: Path) -> int:
+    return int(poll_for(lambda: path.exists() and path.read_text().strip(), 30))
+
+
+@needs_store
+@pytest.mark.parametrize("ending", ["finished", "timed_out"])
+def test_a_turn_ends_the_daemon_it_detached(lab, ending):
+    # The stand-in starts a daemon the way `pg_ctl start` starts a postmaster:
+    # out of the harness's tree, group and session, its parent gone.
+    pidfile = lab["tmp"] / "detached.pid"
+    lab["env"]["FAKE_ENGINE_DETACH"] = str(pidfile)
+    if ending == "timed_out":
+        lab["env"]["FAKE_ENGINE_SLEEP"] = "60"
+        (base._cli.profile_docs(lab["project"]) / "plain.toml").write_text(
+            base.PROFILE.replace("timeout_seconds = 600", "timeout_seconds = 3")
+            + f'cli_path = "{base.FAKE_CLAUDE}"\n')
+    add(lab, "t-detach")
+    ran = cli(lab, "run", "alpha", "--apply")
+    assert ran.returncode == 0, ran.stderr
+    pid = detached(pidfile)
+    try:
+        assert not running(pid)
+    finally:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+@needs_store
+def test_a_turn_ended_by_the_service_ends_the_daemon_it_detached(lab):
+    pidfile = lab["tmp"] / "detached.pid"
+    lab["env"]["FAKE_ENGINE_DETACH"] = str(pidfile)
+    held_lab(lab, grace=2, held=40)
+    answer_of(cli(lab, "service", "start"))
+    add(lab, "t-detach")
+    row = working(lab, "t-detach")
+    pid = detached(pidfile)
+    try:
+        assert running(pid)
+        stopped = cli(lab, "service", "stop", "--end-turns")
+        assert stopped.returncode == 0, stopped.stderr
+        assert not alive(row["pid"])
+        poll_for(lambda: not running(pid), 10)
+    finally:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)

@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-21 — A turn ends everything it started
+
+However a turn ends - answered, failed, handed back, past its profile's `timeout_seconds`, or ended by the service - every process it started ends with it, test databases, fake servers and commands sent to the background included. `tasks run --apply` makes itself the child subreaper of what it starts on Linux, so a daemon that detaches into a session of its own the way `pg_ctl start` starts a postmaster is handed to the turn rather than to init, and ends, with the rest of the turn's tree, its groups and its sessions, once the harness returns; a service that ends a running turn ends the same tree, found while the turn lives. Elsewhere only what stays in the turn's tree, its groups or its sessions is reached.
+
 ## 2026-10-21 — A connection whose network flow died fails in seconds
 
 `tasks` uses `capabilities-contract` 0.7.2. Its store connections give a network flow up once data sent on it has gone unacknowledged for 20 seconds (`tcp_user_timeout`), which keepalives cannot notice since none is sent while data waits, and send keepalives after 15 seconds idle, every 5 seconds, 3 probes: a connection whose flow stopped carrying packets without a FIN or a reset fails in about 20 seconds as a lost connection instead of waiting until the store ends the session, and a plain read that loses it that way runs once more on a new connection. A connection lost where `tasks` catches nothing ends the command as `store_unreachable`, exit 5, as before.

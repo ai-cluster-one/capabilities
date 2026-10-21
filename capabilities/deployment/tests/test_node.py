@@ -109,6 +109,14 @@ print(json.dumps(fixtures[key]))
         if 'capabilities-contract==' in script: return json.dumps({"configured": True,
             "setting": {"level": "environment", "sources": ["AGENTKIT_DB_URL"], "schema": "agentkit"},
             "reachable": True, "tls_enforced": True})
+        if 'dev_sessions' in script: return json.dumps({
+            "processes": [{"pid": 4242, "ppid": 1, "age_seconds": 123000,
+                           "command": "postgres -D /tmp/fixture_pg"}],
+            "dev_sessions": [{"id": "fixture-20260101-000000-1", "capability": "fixture",
+                              "age_hours": 30.0, "damaged": False}],
+            "sizes": {"tmp": {"path": "/tmp", "bytes": 2048},
+                      "uv_cache": {"path": "/home/agent/.cache/uv", "bytes": 4096}},
+            "errors": []})
         return ""
     monkeypatch.setattr(m, "_node_ssh", ssh)
     monkeypatch.setattr(m, "_launchd_status", lambda label: {"loaded": False})
@@ -229,6 +237,13 @@ def test_status_reports_actual_fixture_facts(node, capsys):
     assert services["telegram"]["lease"]["holder"] == "node-a"
     read = next(script for script, _ in node.ssh if "deployment services" in script)
     assert read.startswith("docker exec aabbccddeeff sh -c ") and "cd /app && exec" in read
+    # What no service accounts for, read in the container with the pids of
+    # the supervisor's programs.
+    leftovers = next(script for script, _ in node.ssh if "dev_sessions" in script)
+    assert leftovers.startswith("docker exec aabbccddeeff python3 -c ") and leftovers.endswith(" 1")
+    assert data["leftovers"]["processes"][0]["command"] == "postgres -D /tmp/fixture_pg"
+    assert data["leftovers"]["dev_sessions"][0]["age_hours"] == 30.0
+    assert set(data["leftovers"]["sizes"]) == {"tmp", "uv_cache"}
     assert data["errors"] == []
 
 
@@ -858,3 +873,40 @@ def test_a_target_node_reaches_the_application_and_status(node, monkeypatch, cap
 def test_status_of_a_target_without_a_node_reports_no_declaration(node, capsys):
     node.m.cmd_node_status(node.args)
     assert "declared_node_name" not in json.loads(capsys.readouterr().out)
+
+
+def test_the_leftovers_probe_names_a_planted_process_and_spares_a_service(node, tmp_path):
+    import signal
+    import sys
+    import time
+    service = subprocess.Popen(["sleep", "60"])
+    pidfile = tmp_path / "planted.pid"
+    # Planted the way a test database is left behind: forked twice, in a
+    # session of its own, its parent gone.
+    subprocess.run([sys.executable, "-c", (
+        "import os\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    if os.fork() == 0:\n"
+        f"        open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+        "        os.execvp('sleep', ['sleep', '60'])\n"
+        "    os._exit(0)\n"
+        "os.wait()\n")], check=True)
+    deadline = time.monotonic() + 10
+    while not (pidfile.exists() and pidfile.read_text()) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    planted = int(pidfile.read_text())
+    try:
+        env = {**os.environ, "UV_CACHE_DIR": str(tmp_path / "uv-cache")}
+        (tmp_path / "uv-cache").mkdir()
+        said = subprocess.run([sys.executable, "-c", node.m._NODE_LEFTOVERS_PROBE,
+                               str(service.pid)], capture_output=True, text=True, env=env,
+                              timeout=120)
+        report = json.loads(said.stdout)
+        pids = {row["pid"] for row in report["processes"]}
+        assert planted in pids and service.pid not in pids
+        assert report["sizes"]["uv_cache"]["path"] == str(tmp_path / "uv-cache")
+        assert isinstance(report["sizes"]["tmp"]["bytes"], int)
+    finally:
+        service.kill()
+        os.kill(planted, signal.SIGKILL)
