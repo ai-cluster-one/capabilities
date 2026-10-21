@@ -278,6 +278,37 @@ def test_add_writes_the_entry_and_its_secret_and_remove_takes_both(lab):
     assert _env_file(env_local) == {}
 
 
+def test_a_secret_field_can_name_a_key_already_set_and_nothing_is_copied(lab):
+    env_local = lab["project"] / ".env.local"
+    env_local.write_text("SHARED_TOKEN=tok-shared-0001\n")
+    result = _run(lab, "connection", "add", "work", "--field", "url=https://a.example",
+                  "--env", "secret_env=SHARED_TOKEN")
+    assert result.returncode == 0, result.stderr
+    answer = json.loads(result.stdout)
+    assert answer["credentials"] is None
+    secret = next(f for f in answer["fields"] if f["key"] == "secret_env")
+    assert secret["env"] == "SHARED_TOKEN" and secret["set"] and secret["value"] == "…0001"
+    assert _registry(lab)["connections"]["work"]["secret_env"] == "SHARED_TOKEN"
+    assert env_local.read_text() == "SHARED_TOKEN=tok-shared-0001\n"
+
+    # A name the cascade does not resolve is refused, and not echoed.
+    result = _run(lab, "connection", "add", "other", "--field", "url=https://a.example",
+                  "--env", "secret_env=NOT_SET_ANYWHERE")
+    assert result.returncode == 6 and _error(result)["code"] == "env_key_unset"
+    assert "NOT_SET_ANYWHERE" not in result.stderr
+    assert "other" not in _registry(lab)["connections"]
+
+    # Only a secret field takes a name.
+    result = _run(lab, "connection", "add", "other", "--env", "url=SHARED_TOKEN")
+    assert result.returncode == 6 and _error(result)["code"] == "input"
+
+    # Removing the connection keeps the key it did not write.
+    result = _run(lab, "connection", "remove", "work")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["secrets_kept"] == ["SHARED_TOKEN"]
+    assert env_local.read_text() == "SHARED_TOKEN=tok-shared-0001\n"
+
+
 def test_a_global_connection_keeps_its_secret_in_credentials_env(lab):
     result = _run(lab, "connection", "add", "home", "--global", "--stdin",
                   stdin=json.dumps({"url": "https://b.example", "secret_env": "g-tok-0001"}))

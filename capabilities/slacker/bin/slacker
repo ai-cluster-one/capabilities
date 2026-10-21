@@ -1508,7 +1508,7 @@ def _declared_section() -> str:
     if conns and conns.get("fields") is not None:
         out += (f"\n## Connections, written through the contract\n\n"
                 f"  {NAME} connection add <id> [--project|--global|--machine] [--default] "
-                "[--replace] [--field KEY=VALUE ...] [--stdin]\n"
+                "[--replace] [--field KEY=VALUE ...] [--env KEY=ENV_KEY ...] [--stdin]\n"
                 "      Write one connection from the fields below. --project (the default)\n"
                 "      writes this project's record, --global the machine's, and --machine\n"
                 "      the machine's as administration of the machine: from anywhere, with\n"
@@ -1516,9 +1516,12 @@ def _declared_section() -> str:
                 "      taken only from the JSON object on stdin (--stdin), never from argv, and\n"
                 "      written to that scope's credentials file - the project's .env.local, or\n"
                 f"      {CREDENTIALS_ENV} - under its own env key, which the\n"
-                "      entry names. A connection that exists is refused (exit 6\n"
-                "      connection_exists) unless --replace is given; it then keeps every\n"
-                "      field not given, and null in the JSON object clears one. --default\n"
+                "      entry names. --env KEY=ENV_KEY instead names, for a secret field, a\n"
+                "      key already set in the cascade, and writes no value for it (exit 6\n"
+                "      env_key_unset where it resolves nowhere). A connection that exists\n"
+                "      is refused (exit 6 connection_exists) unless --replace is given; it\n"
+                "      then keeps every field not given, and null in the JSON object clears\n"
+                "      one. --default\n"
                 "      points the scope's default at it. Answers the fields as they now\n"
                 "      resolve, secrets masked.\n"
                 f"  {NAME} connection remove <id> [--project|--global|--machine]\n"
@@ -6115,13 +6118,33 @@ def _cmd_connection(argv: list[str]) -> None:
     its secrets into the scope's credentials file; `connection remove <id>`
     takes it out again with the secrets it wrote."""
     usage = (f"{NAME} connection add <id> [--project|--global|--machine] [--default] "
-             "[--replace] [--field KEY=VALUE ...] [--stdin] | "
+             "[--replace] [--field KEY=VALUE ...] [--env KEY=ENV_KEY ...] [--stdin] | "
              f"{NAME} connection remove <id> [--project|--global|--machine]")
     import re as _re
     sub = argv[0] if argv else ""
     if sub not in ("add", "remove"):
         _die(6, "input", f"unknown connection subcommand {sub!r}", usage)
-    argv_values, words, stdin = _field_args(argv[1:], usage)
+    # `--env KEY=ENV_KEY` names, for a secret field, an env key already set,
+    # so the entry points at it and no value is copied.
+    named: dict = {}
+    rest_argv: list = []
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--env" or arg.startswith("--env="):
+            pair = arg[len("--env="):] if arg.startswith("--env=") else (
+                argv[i + 1] if i + 1 < len(argv) else "")
+            if "=" not in pair:
+                _die(6, "input", "--env takes KEY=ENV_KEY", usage)
+            key, env_key = pair.split("=", 1)
+            named[key.strip()] = env_key.strip()
+            i += 1 if arg.startswith("--env=") else 2
+        else:
+            rest_argv.append(arg)
+            i += 1
+    if named and sub != "add":
+        _die(6, "input", "--env is an option of connection add", usage)
+    argv_values, words, stdin = _field_args(rest_argv, usage)
     default = "--default" in words
     replace = "--replace" in words
     if replace and sub != "add":
@@ -6212,11 +6235,33 @@ def _cmd_connection(argv: list[str]) -> None:
              f"pass --replace to change it, keeping every field not given; "
              f"`{NAME} connections` shows it as it resolves")
     given = _declared_values(declared, argv_values, stdin, "connection")
+    by_key = {f["key"]: f for f in declared}
+    for key, env_key in named.items():
+        if key not in by_key:
+            _die(6, "unknown_field", f"{NAME} declares no connection field {key!r}",
+                 f"fields: {', '.join(by_key) or 'none'}")
+        if not by_key[key].get("secret"):
+            _die(6, "input", f"--env names the env key of a secret field, and {key} is "
+                 "not one", f"give {key} with --field {key}=VALUE")
+        if key in given:
+            _die(6, "input", f"{key} is given both as a value and as an env key name",
+                 "pass one")
+        # The name is not echoed: a secret given here by mistake stays off the output.
+        if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_key):
+            _die(6, "bad_field", f"--env {key} takes the name of an env key")
+        if not _resolve_env_key(env_key)[0]:
+            _die(6, "env_key_unset",
+                 f"the env key --env names for {key} is set in none of the project's "
+                 f".env.local or .env, {CREDENTIALS_ENV}, or the environment",
+                 "set it there first, or give the secret itself in the JSON object "
+                 "on stdin")
     entry = dict(existing)
     secrets: dict = {}
     for field in declared:
         key = field["key"]
-        if key in given:
+        if key in named:
+            entry[key] = named[key]
+        elif key in given:
             value = given[key]
             if value is None:
                 entry.pop(key, None)
