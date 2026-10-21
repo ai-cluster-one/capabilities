@@ -144,6 +144,7 @@ def _mixed_folder(base: Path) -> dict[str, bytes]:
         "plans/rollout.md": b"# Rollout\n",
         "plans/rollout/diagram.svg": b"<svg/>\n",
         "plans/.gitkeep": b"",
+        "research/topic/.DS_Store": b"\x00\x00\x00\x01Bud1",
         "top.bin": bytes(range(256)),
     }
     for rel, data in files.items():
@@ -162,7 +163,10 @@ def test_import_and_export_carry_every_file_byte_for_byte(world, gateway, tmp_pa
     root = connected(world.project(), gateway)
     source = _mixed_folder(root / "assets")
     imported = world.ok(root, "import")
-    assert imported["skipped"] == []
+    litter = {"plans/.gitkeep", "research/topic/.DS_Store"}
+    assert {r["path"] for r in imported["skipped"]} == litter
+    for rel in litter:
+        del source[rel]
     assert {r["path"]: r["outcome"] for r in imported["documents"]} == {
         "research/topic/analysis.md": "created", "plans/rollout.md": "created"}
     kept = {r["name"]: r for r in imported["files"]}
@@ -172,7 +176,6 @@ def test_import_and_export_carry_every_file_byte_for_byte(world, gateway, tmp_pa
     assert kept["logs/run.log"]["document"] == "research/topic/analysis"
     assert kept["research/topic/data.json"]["document"] == "research/topic/analysis"
     assert kept["plans/rollout/diagram.svg"]["document"] == "plans/rollout"
-    assert kept["plans/.gitkeep"]["document"] == "plans/rollout"
     assert kept["top.bin"]["document"] is None
     again = world.ok(root, "import")
     assert {r["outcome"] for r in again["documents"] + again["files"]} == {"unchanged"}
@@ -183,7 +186,7 @@ def test_import_and_export_carry_every_file_byte_for_byte(world, gateway, tmp_pa
     assert set(changed.values()) == {"unchanged"}
     out = tmp_path / "exported"
     exported = world.ok(root, "export", str(out))
-    assert exported["complete"] and exported["file_counts"]["written"] == 6
+    assert exported["complete"] and exported["file_counts"]["written"] == 5
     assert _tree(out) == source
     (out / "top.bin").write_bytes(b"local edit")
     repeat = world.ok(root, "export", str(out))
@@ -198,6 +201,14 @@ def test_doctor_proves_the_bucket(world, gateway):  # noqa: F811
     healthy = world.ok(root, "doctor")
     assert healthy["ok"] and healthy["connections"]["files"]["ok"]
     assert healthy["connections"]["files"]["bucket"] == BUCKET
+    assert healthy["connections"]["files"]["proof"] == ["put", "head", "delete"]
+    assert not [p for p in gateway.bucket.rglob("*") if p.is_file()]
+    connected(root, gateway, allow_write=False)
+    listed = world.ok(root, "doctor")["connections"]["files"]
+    assert listed["ok"] and listed["proof"] == ["list"]
+    connected(root, gateway, enabled=False)
+    withheld = world.ok(root, "doctor")
+    assert withheld["ok"] and withheld["connections"]["files"]["code"] == "connection_not_granted"
     connected(root, gateway, secret="not-the-secret")
     refused = world.run(root, "doctor")
     assert refused.returncode == 2

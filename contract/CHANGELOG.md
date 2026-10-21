@@ -1,5 +1,9 @@
 # contract — change log
 
+## 2026-10-21 — `connection add` says whether the project may use what it wrote
+
+Inside a project, the answer of `<name> connection add` carries `granted`: whether this project may use the connection it just wrote, read through the records adapter as selection reads it. Where it may not, the answer carries the grant it still needs, as it already did for a global connection - which covers a project in store mode, whose own `--project` connection is usable only once a grant row names it. A registry that cannot be read after the write leaves `granted` out rather than refusing a write that happened. Every capability carries the change through `sync-contract`.
+
 ## 2026-10-20 — The store tier sends independent reads together, each read one round trip
 
 The store tier pins `capabilities-contract` 0.6.0, on whose transaction connection a plain read that would open a transaction, and any statement in autocommit, reaches the store in one round trip and leaves the connection idle, and a store that did not answer is not dialled again before a doubling pause. Independent reads the tier sent one after another on one connection now go to the store together through the library's `batch` and are answered in one round trip: the agent registry's row and its nodes (`_agent_state`, which `open_records()` reads in every process standing in a project with an id), a moved agent's settings documents and their rows (`AgentRecords._settings_rows`), and one settings document's rows and generation inside a settings write (`AgentRecords._document_rows`). The tier adds `_read_together()` and `StoreRecords._read_many()`, which a moved agent's adapter reads inside its own write transaction too; a table that is not there is read one statement at a time as before, and with a library that offers no `batch` every read goes one after another as before. Every capability carries the change through `sync-contract`.

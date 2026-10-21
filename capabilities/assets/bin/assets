@@ -120,7 +120,7 @@ WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
       bucket before that transaction and its record written in it. Without a
       connection, every file that is not markdown is listed under `skipped`
       with the reason, as is a markdown file that is not UTF-8 text or a path
-      no name can carry. Each outcome is reported: a document `created`,
+      no name can carry; `.DS_Store` and `.gitkeep` are always skipped. Each outcome is reported: a document `created`,
       `saved` (a new version) or `unchanged`; a file `created`, `replaced` (a
       new record, the old one retired) or `unchanged` (the same sha256), with
       the document it belongs to: the one document that links to it by a
@@ -162,8 +162,12 @@ CONTRACT
       Proves the store: the setting in force (secrets redacted), whether the
       tables are current, the project id and how many documents it holds; and
       with a file store connection, each connection's bucket (or the one
-      named) by an authenticated listing under the project's prefix. Without
-      a connection `connections` is {} and the store alone decides.
+      named) by a put, head and delete of one throwaway object under the
+      project's prefix - by an authenticated listing where the connection may
+      not be written, under the read-only switch, or without a project id. A
+      connection this project may not use is named `connection_not_granted`
+      with the grant it needs, and fails nothing. Without a connection
+      `connections` is {} and the store alone decides.
   assets migrate [status]
       Apply pending steps to the assets_* tables / report where they stand.
   assets connections
@@ -6327,8 +6331,20 @@ def _cmd_connection(argv: list[str]) -> None:
         out["link"] = [m.get("id") for m in methods]
         out["next"] = (f"link it with one of `{NAME} manifest`'s connections.link "
                        f"methods, adding --connection {cid}")
-    if scope == "global" and root is not None:
-        out["hint"] = _grant_hint(cid)
+    if root is not None:
+        # Whether this project may use what was just written: a project in
+        # store mode keeps even its own connection usable only through a grant.
+        # The write has happened, so a registry that cannot be read here
+        # leaves the answer unsaid rather than refusing it.
+        try:
+            usable = adapter.connections(NAME, write_default=WRITE_DEFAULT,
+                                         include_disabled=True).get(cid)
+        except StoreError:
+            usable = None
+        if usable is not None:
+            out["granted"] = bool(usable.get("enabled"))
+        if scope == "global" or out.get("granted") is False:
+            out["hint"] = _grant_hint(cid)
     _emit(out)
 
 
@@ -6454,17 +6470,24 @@ def _bucket_refused(exc: _BucketError) -> NoReturn:
     _die(exc.exit_code, exc.code, exc.message, exc.hint, exc.status)
 
 
-def _usable_connections() -> tuple[int, int]:
-    """How many file store connections this project could see, and how many of
-    them it may use - read as the registry is read, so a record that cannot be
-    read refuses here as it would there; only an absent registry is zero."""
+def _connection_grants() -> dict:
+    """Every file store connection this project could see, by id, and whether
+    it may use it - read as the registry is read, so a record that cannot be
+    read refuses here as it would there; only an absent registry is none."""
     try:
         effective = _records().connections(NAME, write_default=WRITE_DEFAULT,
                                            include_disabled=True,
                                            machine_read=_machine_read()) or {}
     except StoreError as e:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
-    return len(effective), sum(1 for entry in effective.values() if entry.get("enabled"))
+    return {cid: bool(entry.get("enabled")) for cid, entry in effective.items()}
+
+
+def _usable_connections() -> tuple[int, int]:
+    """How many file store connections this project could see, and how many of
+    them it may use."""
+    grants = _connection_grants()
+    return len(grants), sum(grants.values())
 
 
 def _file_store(wanted: str | None, verb: str, *, required: bool):
@@ -6704,8 +6727,29 @@ class _Bucket:
         resp = self._request("GET", None, query={"list-type": "2", "max-keys": "1",
                                                  "prefix": prefix})
         return {"ok": True, "endpoint": self.endpoint, "bucket": self.bucket,
-                "region": self.region, "prefix": prefix,
+                "region": self.region, "prefix": prefix, "proof": ["list"],
                 "objects_under_prefix": "<Key>" in resp.text}
+
+    def prove(self, prefix: str) -> dict:
+        """The round trips a file verb makes, with the keys it would make them
+        with: put one throwaway object under the project's prefix, read its
+        head, delete it."""
+        import uuid
+        key = f"{prefix}.assets-doctor-{uuid.uuid4().hex}"
+        data = b"assets doctor\n"
+        self.put(key, data, hashlib.sha256(data).hexdigest(), "text/plain")
+        try:
+            self._request("HEAD", key)
+        except _BucketError:
+            try:
+                self._request("DELETE", key)
+            except _BucketError:
+                pass
+            raise
+        self._request("DELETE", key)
+        return {"ok": True, "endpoint": self.endpoint, "bucket": self.bucket,
+                "region": self.region, "prefix": prefix,
+                "proof": ["put", "head", "delete"]}
 
 
 # ── the tables ───────────────────────────────────────────────────────────────
@@ -7493,6 +7537,11 @@ def _folder(given: str | None) -> Path:
     return _root() / "assets"
 
 
+# What an operating system or a version control habit leaves in a folder, not
+# a file of the project: import never keeps it.
+IMPORT_LITTER = frozenset({".DS_Store", ".gitkeep"})
+
+
 def cmd_import(args) -> None:
     project = _project(write=True)
     folder = _folder(args.dir)
@@ -7510,6 +7559,10 @@ def cmd_import(args) -> None:
         for n in sorted(names):
             path = here_path / n
             rel = path.relative_to(folder).as_posix()
+            if n in IMPORT_LITTER:
+                skipped.append({"path": rel, "reason": "operating system or version "
+                                "control litter, not a project file"})
+                continue
             if not n.endswith(".md"):
                 others.append((rel, path))
                 continue
@@ -7794,11 +7847,22 @@ def cmd_files_get(args) -> None:
 
 
 def _doctor_connections(wanted: str | None, project: str | None) -> tuple[dict, int]:
-    """Each file store connection's bucket (or the one named) by an
-    authenticated round trip, after the cascade gate; none configured is
-    nothing to prove. Returns the findings by id and the first failure's exit."""
-    if not wanted and not _usable_connections()[1]:
-        return {}, 0
+    """Each file store connection's bucket (or the one named) by the round
+    trips a file verb makes, after the cascade gate: a put, head and delete
+    under the project's prefix, or a listing where the connection may not be
+    written or there is no project prefix to write under. A connection this
+    project may not use is named with the grant it needs, and fails nothing:
+    a machine's connection is withheld in every project that never asked for
+    it. None configured is nothing to prove. Returns the findings by id and
+    the first failure's exit."""
+    grants = {} if wanted else _connection_grants()
+    withheld = {cid: {"ok": False, "code": "connection_not_granted",
+                      "error": f"connection {cid!r} is not granted to this project, so "
+                               "no file verb may use it",
+                      "hint": _grant_hint(cid)}
+                for cid, usable in grants.items() if not usable}
+    if not wanted and not any(grants.values()):
+        return withheld, 0
     _doctor_gate(_connections_report(), wanted)
     reg, _ = _connections_registry()
     if wanted:
@@ -7807,12 +7871,17 @@ def _doctor_connections(wanted: str | None, project: str | None) -> tuple[dict, 
         targets = list(reg["connections"].items())
     found, fail_exit = {}, 0
     for cid, entry in targets:
+        entry = entry or {}
         try:
-            found[cid] = _Bucket.of(cid, entry or {}).probe(f"{project}/" if project else "")
+            bucket = _Bucket.of(cid, entry)
+            if project and entry.get("allow_write", WRITE_DEFAULT) and not read_only_switch():
+                found[cid] = bucket.prove(f"{project}/")
+            else:
+                found[cid] = bucket.probe(f"{project}/" if project else "")
         except _BucketError as exc:
             found[cid] = {"ok": False, **exc.out()}
             fail_exit = fail_exit or exc.exit_code
-    return found, fail_exit
+    return {**found, **withheld}, fail_exit
 
 
 def cmd_doctor(wanted: str | None = None) -> None:

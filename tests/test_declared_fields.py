@@ -313,7 +313,8 @@ def test_a_global_connection_keeps_its_secret_in_credentials_env(lab):
     result = _run(lab, "connection", "add", "home", "--global", "--stdin",
                   stdin=json.dumps({"url": "https://b.example", "secret_env": "g-tok-0001"}))
     assert result.returncode == 0, result.stderr
-    assert "hint" in json.loads(result.stdout)   # a global connection still needs a grant here
+    added = json.loads(result.stdout)   # a global connection still needs a grant here
+    assert "hint" in added and added["granted"] is False
     credentials = lab["config"] / NAME / "credentials.env"
     assert _env_file(credentials) == {"DECLFIX_HOME_TOKEN": "g-tok-0001"}
     assert stat.S_IMODE(credentials.stat().st_mode) == 0o600

@@ -3371,8 +3371,20 @@ def _cmd_connection(argv: list[str]) -> None:
         out["link"] = [m.get("id") for m in methods]
         out["next"] = (f"link it with one of `{NAME} manifest`'s connections.link "
                        f"methods, adding --connection {cid}")
-    if scope == "global" and root is not None:
-        out["hint"] = _grant_hint(cid)
+    if root is not None:
+        # Whether this project may use what was just written: a project in
+        # store mode keeps even its own connection usable only through a grant.
+        # The write has happened, so a registry that cannot be read here
+        # leaves the answer unsaid rather than refusing it.
+        try:
+            usable = adapter.connections(NAME, write_default=WRITE_DEFAULT,
+                                         include_disabled=True).get(cid)
+        except StoreError:
+            usable = None
+        if usable is not None:
+            out["granted"] = bool(usable.get("enabled"))
+        if scope == "global" or out.get("granted") is False:
+            out["hint"] = _grant_hint(cid)
     _emit(out)
 
 

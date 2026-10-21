@@ -554,6 +554,18 @@ def test_a_store_connection_is_written_over_only_with_replace(lab):
     assert spec["base_url"] == lab["url"] + "/x"
 
 
+def test_a_store_connection_added_without_a_grant_says_so(lab):
+    _import(lab)
+    added = _ok(_coolify(lab, "connection", "add", "fresh", "--project",
+                         "--field", f"base_url={lab['url']}",
+                         "--env", "secret_env=COOLIFY_TOKEN"))
+    assert added["granted"] is False
+    assert "capabilities set coolify grant fresh" in added["hint"]
+    replaced = _ok(_coolify(lab, "connection", "add", "box", "--replace",
+                            "--field", f"base_url={lab['url']}"))
+    assert replaced["granted"] is True and "hint" not in replaced
+
+
 def test_a_read_only_grant_refuses_a_write_verb(lab):
     _import(lab)
     _ok(_coolify(lab, "deploy", "some-app"))
