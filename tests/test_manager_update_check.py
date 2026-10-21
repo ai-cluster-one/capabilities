@@ -196,8 +196,8 @@ def _write_release(tmp: Path) -> tuple[Path, dict]:
     manager.parent.mkdir(parents=True)
     shutil.copy2(MANAGER, manager)
     assets = {
-        "contract/preamble.py": (REPO / "contract" / "preamble.py").read_bytes(),
-        "contract/store.py": (REPO / "contract" / "store.py").read_bytes(),
+        "SHEBANG.md": (REPO / "SHEBANG.md").read_bytes(),
+        "contract/CHANGELOG.md": (REPO / "contract" / "CHANGELOG.md").read_bytes(),
         "manager/CHANGELOG.md": b"# capabilities - change log\n\n## 2026-03-01 - Incoming\n",
     }
     for rel, body in assets.items():

@@ -48,8 +48,7 @@ PROJECT_ID = "prj_" + "0a1b2c3d4e5f"
 MASTER = "mac1"
 SERVER = "srv1"
 
-sys.path.insert(0, str(REPO / "contract"))
-import store as S  # noqa: E402
+from capabilities_contract.capability import store as S  # noqa: E402
 
 
 # --- a throwaway PostgreSQL ------------------------------------------------------

@@ -139,8 +139,7 @@ def test_authoring_workspace_is_canonical_and_install_is_strict(tmp_path):
     assert (workspace / ".git").is_dir()
     assert (workspace / "AUTHORING.md").is_file()
     assert (workspace / "AGENTS.md").is_file()
-    assert (workspace / "contract" / "preamble.py").read_bytes() == \
-        (REPO / "contract" / "preamble.py").read_bytes()
+    assert not (workspace / "contract").exists()
     listed = json.loads(_run(env, "source", "list").stdout)
     assert listed["workspace_root"] == str(tmp_path / "registry" / "sources")
 
@@ -157,14 +156,15 @@ def test_authoring_workspace_is_canonical_and_install_is_strict(tmp_path):
         env, "new", "demo", "--source", "personal").stdout)
     script = Path(created["executable"])
     source_text = script.read_text()
-    assert "# >>> contract: capability core" in source_text
-    assert "# >>> contract: connections" in source_text
+    assert '_contract_bind(globals(), "core")' in source_text
+    assert '_contract_bind(globals(), "connections")' in source_text
+    assert '"capabilities-contract>=0.8,<1"' in source_text
     assert "PROTOCOL" not in source_text
     core_created = json.loads(_run(
         env, "new", "localtool", "--source", "personal", "--core-only").stdout)
     core_text = Path(core_created["executable"]).read_text()
-    assert "# >>> contract: capability core" in core_text
-    assert "# >>> contract: connections" not in core_text
+    assert '_contract_bind(globals(), "core")' in core_text
+    assert '_contract_bind(globals(), "connections")' not in core_text
     for path in (script, Path(core_created["executable"])):
         finalized = path.read_text().replace(
             "TODO: describe the capability's smallest useful surface.",
@@ -190,48 +190,44 @@ def test_authoring_workspace_is_canonical_and_install_is_strict(tmp_path):
     assert "protocol" not in manifest
 
     script.write_text(source_text.replace(
-        "# --- Error reporting", "# hand-edited generated region"))
+        '"capabilities-contract>=0.8,<1"', '"capabilities-contract==0.7.2"'))
     rejected = _run(env, "install", "demo", "--from", str(script), check=False)
     assert rejected.returncode == 7
-    assert json.loads(rejected.stderr.splitlines()[-1])["error"]["code"] == \
-        "install_validation_failed"
+    refusal = json.loads(rejected.stderr.splitlines()[-1])["error"]
+    assert refusal["code"] == "install_validation_failed"
+    assert "older than 0.8" in refusal["hint"]
     assert installed_script.read_bytes() == before
+    script.write_text(source_text.replace(
+        '"capabilities-contract>=0.8,<1"', '"capabilities-contract>=0.8,<0.9"'))
+    narrower = json.loads(_run(
+        env, "install", "demo", "--from", str(script)).stdout)
+    assert subprocess.run(
+        [str(Path(narrower["registry"]) / "demo"), "stub"], env=env, text=True,
+        capture_output=True, check=True, timeout=60,
+    ).stdout.strip().endswith("`demo help`.")
+    script.write_text(source_text)
     synced = json.loads(_run(env, "source", "sync", "personal").stdout)
-    assert synced["stamped"] == [{
-        "capability": "demo", "regions": ["capability core"]}]
+    assert synced["ok"] is True
     _run(env, "source", "index", "personal")
     assert json.loads(_run(
         env, "source", "check", "personal").stdout)["ok"] is True
 
 
-def test_source_sync_inserts_a_new_required_contract_region(tmp_path):
+def test_a_script_that_does_not_bind_the_store_tier_is_refused(tmp_path):
     env = _env(tmp_path)
     _run(env, "source", "init", "personal")
     created = json.loads(_run(
         env, "new", "legacy", "--source", "personal", "--core-only").stdout)
     script = Path(created["executable"])
-    text = script.read_text()
-    start = text.index("# >>> contract: store")
-    close = "# <<< contract: store <<<"
-    end = text.index(close, start) + len(close)
-    while end < len(text) and text[end] == "\n":
-        end += 1
-    script.write_text(
-        text[:start] + text[end:] +
-        "\n\ndef _check(a, b, c, d, e):\n"
-        "    return (a, b, c, d, e)\n")
+    script.write_text(script.read_text().replace(
+        '_contract_bind(globals(), "store")\n', ""))
 
-    synced = json.loads(_run(env, "source", "sync", "personal").stdout)
+    refused = _run(env, "install", "legacy", "--from", str(script), check=False)
 
-    assert {"capability": "legacy", "regions": ["store"]} in synced["stamped"]
-    repaired = script.read_text()
-    assert repaired.index("# >>> contract: capability core") < \
-        repaired.index("# >>> contract: store")
-    assert "def _store_check(" in repaired
-    assert "def _check(a, b, c, d, e):" in repaired
-    _run(env, "source", "index", "personal")
-    checked = json.loads(_run(env, "source", "check", "personal").stdout)
-    assert checked["ok"] is True
+    assert refused.returncode == 7
+    refusal = json.loads(refused.stderr.splitlines()[-1])["error"]
+    assert refusal["code"] == "install_validation_failed"
+    assert "does not bind the store tier" in refusal["hint"]
 
 
 def test_remote_source_catalog_search_and_install(tmp_path):
@@ -311,7 +307,6 @@ def test_standalone_manager_has_complete_authoring_kit(tmp_path):
     shutil.copy2(MANAGER, standalone)
     for relative in (
         "SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md", "ROUTINES.md",
-        "contract/preamble.py", "contract/store.py",
         "guides/authoring.md", "guides/conforming.md",
         "guides/contract.md", "guides/dev.md", "guides/grooming.md",
         "guides/publishing.md", "guides/repositories.md", "guides/sanitizing.md",
@@ -329,7 +324,7 @@ def test_standalone_manager_has_complete_authoring_kit(tmp_path):
     assert initialized["path"] == str(
         tmp_path / "registry" / "sources" / "friend")
     assert Path(initialized["path"], "AUTHORING.md").is_file()
-    assert Path(initialized["path"], "contract", "preamble.py").is_file()
+    assert not Path(initialized["path"], "contract").exists()
 
 
 def test_standalone_manager_selfcheck_reports_missing_source_without_traceback(tmp_path):
@@ -340,7 +335,6 @@ def test_standalone_manager_selfcheck_reports_missing_source_without_traceback(t
     shutil.copy2(MANAGER, standalone)
     for relative in (
         "SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md", "ROUTINES.md",
-        "contract/preamble.py", "contract/store.py",
         "guides/authoring.md", "guides/conforming.md",
         "guides/contract.md", "guides/dev.md", "guides/grooming.md",
         "guides/publishing.md", "guides/repositories.md", "guides/sanitizing.md",

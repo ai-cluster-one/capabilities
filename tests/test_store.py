@@ -4,14 +4,11 @@ the two scopes, held to the files a project and the user's config home keep.
 Every question is put through `FileRecords`, written at the scope it names and
 read back as the capability reads it."""
 
-import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parents[1] / "contract"))
-
-from store import FileRecords, StoreError  # noqa: E402
+from capabilities_contract.capability.store import FileRecords, StoreError
 
 ATLAS_ID = "3f1c9b4e-0000-4d92-9a11-0c5e8f2d6a44"
 

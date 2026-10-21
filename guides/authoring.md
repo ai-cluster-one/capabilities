@@ -12,8 +12,8 @@ capabilities new <name> --source <id>
 ```
 
 Add `--core-only` only when the capability genuinely has no connections. The
-manager writes `capabilities/<name>/bin/<name>` and stamps the generated
-contract fences.
+manager writes `capabilities/<name>/bin/<name>`, which binds the shared
+contract code from the `capabilities-contract` library.
 
 ## Decide before creating
 
@@ -33,8 +33,8 @@ authentication shape, and where the capability will be used.
 - Declare state when credentials mint sessions or caches.
 - Keep success on stdout and structured failures on stderr.
 
-Implement declarations, doctor, and domain verbs outside the generated
-contract fences. Use placeholders in examples and resolve consumer-specific
+Implement declarations, doctor, and domain verbs in the capability's own code
+around the contract binds. Use placeholders in examples and resolve consumer-specific
 values through the standard configuration surfaces.
 
 ## Verify and release

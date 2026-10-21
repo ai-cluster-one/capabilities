@@ -3,7 +3,8 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract==0.5.1",
+#     "capabilities-contract>=0.8,<1",
+#     "packaging>=23",
 # ]
 # ///
 """
@@ -136,6 +137,12 @@ MACHINE VERBS
   update [<name>]
         Re-fetch one capability (or all) from its recorded source; refresh
         snapshots; regenerate the skill.
+        Install, update and the release that reconciles this machine bring
+        capabilities-contract in each capability's environment to the newest
+        release its declared range admits (uv sync --script), so a release of
+        the shared code reaches an installed capability without an edit to
+        it; where uv cannot, a warning says so and the capability runs on the
+        library it has.
         Install, update and the release that reconciles this machine run
         `<name> migrate` once the payload is in place, when its manifest
         declares tables in the machine's store, and report it as `migrate`
@@ -242,7 +249,7 @@ MACHINE VERBS
         cannot be reached.
   source init ID [--remote GIT_URL]
         Create the canonical editable source workspace at
-        ~/.capabilities/sources/ID, initialize git, vendor the authoring contract,
+        ~/.capabilities/sources/ID, initialize git, copy the authoring law,
         register it, and emit the exact authoring/publishing path.
   source add ID GIT_URL [--ref REF]
         Register and fetch a remote capability source into the manager-owned
@@ -900,13 +907,9 @@ VERIFICATION VERBS
   audit <name> [--from <path>]
         Contract conformance: call the contract verbs, validate output
         shapes, exercise the gate (enabled / disabled / absent) in a
-        sandbox, and byte-check the vendored preamble against
-        contract/preamble.py. Exit 0 pass, 7 failures (incl. drift) found.
-  sync-contract [--check]
-        Stamp the canonical shared helpers from contract/preamble.py into the
-        fenced regions (`capability core`, `store`, `connections`) of every
-        capabilities/*/bin/*. The manager never participates. Idempotent.
-        --check reports drift and exits 7 without writing.
+        sandbox, and check that the script binds the shared code from the
+        capabilities-contract library by a range this manager supports
+        (contract-range). Exit 0 pass, 7 failures found.
   selfcheck
         Prove the repo's own wholeness (the inward companion to audit): the
         enforcer parses, both audit branches (core-only / connection-bearing)
@@ -917,8 +920,9 @@ VERIFICATION VERBS
 
 AUTHORING
   new <name> --source ID [--core-only]
-        Create a canonical capability skeleton in that source; generated
-        contract regions are stamped by the manager.
+        Create a canonical capability skeleton in that source; it binds the
+        shared code from the capabilities-contract library by the range this
+        manager supports.
   guide [<topic>]
         Without a topic, list manager guides with their titles, previews, and
         exact read commands. With a topic, print that guide's Markdown body.
@@ -940,7 +944,6 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import fcntl
-import importlib.util
 import io
 import json
 import os
@@ -1106,23 +1109,19 @@ CAPABILITIES_CONTEXT_INTRO = (
 
 _MANAGER_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _MANAGER_DIR.parent
-_ASSET_ROOT = _REPO_ROOT if (_REPO_ROOT / "contract" / "preamble.py").is_file() \
+_ASSET_ROOT = _REPO_ROOT if (_REPO_ROOT / "SHEBANG.md").is_file() \
     else _MANAGER_DIR
-_PREAMBLE = _ASSET_ROOT / "contract" / "preamble.py"
-_CONTRACT_REGIONS = ("capability core", "store", "connections")
-_REQUIRED_CONTRACT_REGIONS = ("capability core", "store")
-# A region names the file it is canonical in. The store tier lives apart from
-# the preamble because it is large enough to test on its own, and a body that
-# can be imported is a body that can be tested; the preamble's cannot, since its
-# helpers close over names only a carrying capability defines.
-_REGION_SOURCE_REL = {
-    "capability core": "contract/preamble.py",
-    "connections": "contract/preamble.py",
-    "store": "contract/store.py",
-}
+# The code every capability shares is the capabilities-contract library's
+# (SHEBANG.md, "The contract verbs"). A capability declares the library in its PEP 723
+# header and binds the tiers it carries; the manager accepts a capability whose
+# declared range admits a version inside the range it supports, and never one
+# that admits a version older than the first to carry the shared code.
+CONTRACT_LIBRARY = "capabilities-contract"
+CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
+_CONTRACT_TIERS = ("core", "store", "connections")
+_REQUIRED_CONTRACT_TIERS = ("core", "store")
 _AUTHORING_ASSETS = (
     "SHEBANG.md", "DOCTRINE.md", "TEMPLATE.md", "SOURCES.md", "ROUTINES.md",
-    "contract/preamble.py", "contract/store.py",
 )
 _MANAGER_GUIDE_TOPICS = (
     "authoring", "conforming", "contract", "dev", "grooming",
@@ -1193,26 +1192,18 @@ _STORE_MODULE = None
 
 
 def _store_module():
-    """Load the canonical records tier from the manager's shipped assets.
-
-    Capability executables carry a stamped copy so a manager update cannot
-    change them underneath a running installation. The manager is the owner of
-    this source, so it consumes the source module directly instead of carrying
-    a thirty-first generated copy.
-    """
+    """The records tier every capability binds, as the library's module of its
+    own: the manager carries no capability, so it imports the tier rather than
+    binding it."""
     global _STORE_MODULE
     if _STORE_MODULE is not None:
         return _STORE_MODULE
-    path = _ASSET_ROOT / "contract" / "store.py"
-    if not path.is_file():
-        _die(5, "store_tier_missing", f"manager store tier not found: {path}",
+    try:
+        from capabilities_contract.capability import store as module
+    except ImportError as exc:
+        _die(5, "store_tier_missing",
+             f"the store tier of {CONTRACT_LIBRARY} cannot be loaded: {exc}",
              "reinstall or update the capabilities manager")
-    spec = importlib.util.spec_from_file_location("capabilities_manager_store", path)
-    if spec is None or spec.loader is None:
-        _die(5, "store_tier_load_failed", f"cannot load manager store tier: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
     _STORE_MODULE = module
     return module
 
@@ -2966,7 +2957,7 @@ def _prepare_payload(name: str, content: bytes, bundle_dir: Path | None,
     """Build and structurally validate a candidate away from the live registry.
 
     Authoring audit is an explicit command. Installation proves only the
-    invariants introduced at this boundary: generated-contract integrity,
+    invariants introduced at this boundary: a supported contract library range,
     declaration snapshots, and complete bundle layout.
     """
     _require_authoring_assets()
@@ -2974,13 +2965,13 @@ def _prepare_payload(name: str, content: bytes, bundle_dir: Path | None,
     stage = Path(tempfile.mkdtemp(prefix=f".{name}-stage-", dir=CAP_HOME))
     try:
         script = _install_payload(name, content, bundle_dir, stage)
-        drift = _contract_drift(script.read_text(), _canonical_regions())
-        if drift:
+        problems = _contract_problems(script.read_text())
+        if problems:
             _die(
                 7,
                 "install_validation_failed",
-                f"{name} from {source} has generated contract drift",
-                "; ".join(drift),
+                f"{name} from {source} does not bind a supported contract library",
+                "; ".join(problems),
             )
         manifest = _snapshot(name, script, stage)
         _validate_installed_payload(name, manifest, stage)
@@ -3018,6 +3009,27 @@ def _activate_payload(name: str, stage: Path) -> Path:
         MANAGER_MUTATION_LOCK.chmod(0o600)
         fcntl.flock(mutation, fcntl.LOCK_EX)
         return activate()
+
+
+def _refresh_contract_library(script: Path) -> None:
+    """Bring the contract library in an installed capability's environment to
+    the newest release its declared range admits. uv keeps a script's
+    environment while it still satisfies the script's requirements, so without
+    this a library release would reach only an environment made after it."""
+    uv = shutil.which("uv")
+    if uv is None:
+        return
+    try:
+        proc = subprocess.run(
+            [uv, "sync", "--quiet", "--script", str(script),
+             "--upgrade-package", CONTRACT_LIBRARY, "--refresh-package", CONTRACT_LIBRARY],
+            capture_output=True, text=True, timeout=300, env=_snapshot_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _warn(f"{script.name}: {CONTRACT_LIBRARY} was not refreshed: {exc}")
+        return
+    if proc.returncode != 0:
+        detail = (proc.stderr.strip().splitlines() or ["uv sync failed"])[-1]
+        _warn(f"{script.name}: {CONTRACT_LIBRARY} was not refreshed: {detail}")
 
 
 def _payload_sha256(reg: Path, script: str | None = None) -> str:
@@ -3179,6 +3191,7 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
         raise
     reg = _registry_dir(name)
     link = _symlink(name, script)
+    _refresh_contract_library(script)
     migrated = _migrate_tables(name, script, manifest)
     notes = _scaffold_credentials(name, manifest)
     post = manifest.get("post_install") or []
@@ -3274,6 +3287,7 @@ def cmd_update(name: str | None) -> None:
             **provenance,
         })
         script = _activate_payload(n, stage)
+        _refresh_contract_library(script)
         entry = {"name": n, "changed": before != after}
         migrated = _migrate_tables(n, script, manifest)
         if migrated is not None:
@@ -3545,7 +3559,7 @@ def _active_manager_root() -> Path | None:
     except OSError:
         return None
     root = executable.parent.parent
-    return root if (root / "contract" / "preamble.py").is_file() else executable.parent
+    return root if (root / "SHEBANG.md").is_file() else executable.parent
 
 
 def cmd_changelog(name: str | None, kind: str, show_all: bool,
@@ -9295,7 +9309,9 @@ def _migrate_outdated(names) -> list[str]:
         except OSError:
             stale.append(name)
             continue
-        if MIGRATE_CONTRACT_MARKER not in text:
+        # A payload binding the contract library at a supported range carries
+        # `migrate files` from the library; a stamped one carries it in its text.
+        if MIGRATE_CONTRACT_MARKER not in text and _contract_problems(text):
             stale.append(name)
     return stale
 
@@ -14629,147 +14645,105 @@ def cmd_doctor() -> None:
         sys.exit(7)
     _emit(report)
 
-# ---------------------------------------------------------------- contract preamble
+# ---------------------------------------------------------------- contract library
 
-def _contract_lock(contract_dir: Path) -> dict:
-    """The checksum of every file a region is canonical in. A second canonical
-    source is a second thing that can drift, so the lock names them all rather
-    than only the first one there was."""
-    lock = {"preamble_sha256": _sha256(contract_dir / "preamble.py")}
-    for rel in sorted(set(_REGION_SOURCE_REL.values())):
-        name = Path(rel).stem
-        if name != "preamble":
-            lock[f"{name}_sha256"] = _sha256(contract_dir / Path(rel).name)
-    return lock
+_SCRIPT_METADATA_RE = re.compile(
+    r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$")
+_CONTRACT_BIND_RE = re.compile(r"\b\w*bind\(\s*globals\(\)\s*,\s*(?P<tiers>[^)]*)\)")
 
 
-def _fence_markers(region: str) -> tuple[str, str]:
-    """The exact open/close marker lines bounding a vendored contract region."""
-    source = _REGION_SOURCE_REL.get(region, "contract/preamble.py")
-    return (
-        f"# >>> contract: {region} (generated — edit {source}, "
-        f"run `capabilities sync-contract`) >>>",
-        f"# <<< contract: {region} <<<",
-    )
-
-
-def _split_region(text: str, region: str) -> tuple[str, str, str] | None:
-    """Split `text` around one fenced region into (head, interior, tail): head
-    ends with the open-marker line, tail starts with the close marker, interior
-    is everything between. None when the region is absent; ValueError when a
-    marker is unbalanced or misordered."""
-    open_m, close_m = _fence_markers(region)
-    oi, ci = text.find(open_m), text.find(close_m)
-    if oi == -1 and ci == -1:
+def _script_dependencies(text: str) -> list[str] | None:
+    """The `dependencies` of a script's PEP 723 block; None when it has no
+    block or the block does not parse."""
+    import tomllib
+    blocks = [m for m in _SCRIPT_METADATA_RE.finditer(text) if m.group("type") == "script"]
+    if len(blocks) != 1:
         return None
-    if oi == -1 or ci == -1 or ci < oi:
-        raise ValueError(f"region {region!r} fence is unbalanced or misordered")
-    interior_start = text.find("\n", oi) + 1
-    return text[:interior_start], text[interior_start:ci], text[ci:]
+    content = "".join(line[2:] if line.startswith("# ") else line[1:]
+                      for line in blocks[0].group("content").splitlines(keepends=True))
+    try:
+        deps = tomllib.loads(content).get("dependencies", [])
+    except tomllib.TOMLDecodeError:
+        return None
+    return [str(d) for d in deps] if isinstance(deps, list) else None
 
 
-def _insert_contract_region(text: str, region: str, interior: str) -> str:
-    """Insert a newly required region at its canonical tier boundary."""
-    if region != "store":
-        raise ValueError(f"no insertion rule for contract region {region!r}")
-    anchor = _split_region(text, "capability core")
-    if anchor is None:
-        raise ValueError("cannot insert store without capability core")
-    _, close_m = _fence_markers("capability core")
-    close_at = text.find(close_m)
-    line_end = text.find("\n", close_at)
-    if line_end == -1:
-        line_end = len(text)
-    open_m, close_m = _fence_markers(region)
-    block = f"\n{open_m}\n{interior}{close_m}\n"
-    return text[:line_end + 1] + block + text[line_end + 1:]
+def _contract_tiers(text: str) -> list[str]:
+    """The tiers of the shared code a script binds, in the order it binds them."""
+    tiers: list[str] = []
+    for m in _CONTRACT_BIND_RE.finditer(text):
+        tiers += re.findall(r"""["']([a-z]+)["']""", m.group("tiers"))
+    return tiers
 
 
-def _canonical_regions() -> dict[str, str]:
-    """The canonical interior text of each region, read from the file that owns it."""
-    out: dict[str, str] = {}
-    for region in _CONTRACT_REGIONS:
-        rel = _REGION_SOURCE_REL[region]
-        source = _ASSET_ROOT / rel
-        if not source.is_file():
-            _die(5, "no_preamble", f"canonical source not found at {source}",
-                 "run sync-contract from a checkout of the capabilities repo")
-        split = _split_region(source.read_text(), region)
-        if split is None:
-            _die(7, "bad_fence", f"{rel} is missing region {region!r}")
-        out[region] = split[1]
-    return out
-
-
-def _contract_drift(text: str, canonical: dict[str, str]) -> list[str]:
-    """Required, malformed, or byte-different canonical regions."""
-    out: list[str] = []
-    for region, canon in canonical.items():
+def _contract_range_problem(requirement: str) -> str | None:
+    """Why a declared requirement on the contract library is not one this
+    manager supports, or None when it is: its range must admit no version older
+    than the supported floor, and at least one version inside the supported
+    range."""
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.specifiers import SpecifierSet
+    from packaging.version import InvalidVersion, Version
+    try:
+        req = Requirement(requirement)
+    except InvalidRequirement as exc:
+        return f"{requirement!r} does not parse: {exc}"
+    if req.url:
+        return f"{req.name} is declared by URL; declare it by a version range ({CONTRACT_LIBRARY_RANGE})"
+    supported = SpecifierSet(CONTRACT_LIBRARY_RANGE)
+    floor = min(Version(s.version) for s in supported if s.operator in (">=", "=="))
+    lower = None
+    candidates = {floor}
+    for spec in req.specifier:
         try:
-            split = _split_region(text, region)
-        except ValueError as e:
-            out.append(f"{region} ({e})")
-            continue
-        if split is None and region in _REQUIRED_CONTRACT_REGIONS:
-            out.append(f"{region} (missing)")
-        elif split is not None and split[1] != canon:
-            out.append(region)
-    return out
+            version = Version(spec.version.rstrip(".*"))
+        except InvalidVersion:
+            return f"{req.name}{req.specifier} names a version that does not parse"
+        candidates |= {version, Version(f"{version.major}.{version.minor}.{version.micro + 1}")}
+        if spec.operator in (">=", ">", "==", "~=", "==="):
+            lower = version if lower is None else max(lower, version)
+    if lower is None or lower < floor:
+        return (f"{req.name}{req.specifier or ''} admits versions older than {floor}, "
+                f"the first to carry the shared code; declare {CONTRACT_LIBRARY}{CONTRACT_LIBRARY_RANGE}")
+    if not any(req.specifier.contains(v, prereleases=True)
+               and supported.contains(v, prereleases=True) for v in candidates):
+        return (f"{req.name}{req.specifier} admits no version this manager supports "
+                f"({CONTRACT_LIBRARY_RANGE})")
+    return None
 
 
-def cmd_sync_contract(check_only: bool) -> None:
-    """Stamp (or, with --check, audit) the canonical preamble into every
-    capabilities/*/bin/* fenced region. The manager itself never participates."""
-    if not _PREAMBLE.is_file():
-        _die(5, "no_preamble", f"canonical preamble not found at {_PREAMBLE}",
-             "run sync-contract from a checkout of the capabilities repo")
-    src = _REPO_ROOT / "capabilities"
-    if not src.is_dir():
-        _die(5, "no_source", f"capability source tree not found at {src}")
-    canonical = _canonical_regions()
-    changed: list[dict] = []
-    for capdir in sorted(p for p in src.iterdir() if p.is_dir()):
-        script = capdir / "bin" / capdir.name
-        if not script.is_file():
-            continue
-        text = script.read_text()
-        new_text, stamped = text, []
-        for region in _CONTRACT_REGIONS:
-            try:
-                split = _split_region(new_text, region)
-            except ValueError as e:
-                _die(7, "bad_fence", f"{capdir.name}: {e}")
-            if split is None:
-                if region in _REQUIRED_CONTRACT_REGIONS:
-                    try:
-                        new_text = _insert_contract_region(
-                            new_text, region, canonical[region])
-                    except ValueError as e:
-                        _die(7, "bad_fence", f"{capdir.name}: {e}")
-                    stamped.append(region)
-                continue
-            head, interior, tail = split
-            if interior != canonical[region]:
-                new_text = head + canonical[region] + tail
-                stamped.append(region)
-        if stamped:
-            changed.append({"capability": capdir.name, "regions": stamped})
-            if not check_only:
-                script.write_text(new_text)
-    if check_only:
-        lock_path = _PREAMBLE.parent / "contract.json"
-        lock_drift = _read_json(lock_path) != _contract_lock(_PREAMBLE.parent)
-        _emit({"preamble": str(_PREAMBLE), "drift": changed,
-               "lock_drift": lock_drift, "ok": not changed and not lock_drift})
-        if lock_drift:
-            changed.append({"contract_lock": str(lock_path)})
-        if changed:
-            sys.exit(7)
+def _contract_problems(text: str) -> list[str]:
+    """Why a capability script does not stand on the shared code this manager
+    supports: it declares the contract library by a supported range, and binds
+    the tiers every capability carries."""
+    problems: list[str] = []
+    deps = _script_dependencies(text)
+    if deps is None:
+        problems.append("the script has no readable PEP 723 dependencies block")
     else:
-        lock_path = _PREAMBLE.parent / "contract.json"
-        _write_json(lock_path, _contract_lock(_PREAMBLE.parent))
-        _emit({"preamble": str(_PREAMBLE), "stamped": changed,
-               "contract_lock": str(lock_path), "ok": True})
+        from packaging.requirements import InvalidRequirement, Requirement
+        from packaging.utils import canonicalize_name
+        declared = []
+        for dep in deps:
+            try:
+                name = Requirement(dep).name
+            except InvalidRequirement:
+                continue
+            if canonicalize_name(name) == CONTRACT_LIBRARY:
+                declared.append(dep)
+        if not declared:
+            problems.append(f"the script does not declare {CONTRACT_LIBRARY}"
+                            f"{CONTRACT_LIBRARY_RANGE} in its dependencies")
+        problems += [problem for problem in map(_contract_range_problem, declared) if problem]
+    tiers = _contract_tiers(text)
+    for tier in _REQUIRED_CONTRACT_TIERS:
+        if tier not in tiers:
+            problems.append(f"the script does not bind the {tier} tier "
+                            f"(_contract_bind(globals(), {tier!r}))")
+    unknown = sorted(set(tiers) - set(_CONTRACT_TIERS))
+    if unknown:
+        problems.append(f"the script binds unknown tiers: {', '.join(unknown)}")
+    return problems
 
 # ---------------------------------------------------------------- audit
 
@@ -14845,29 +14819,22 @@ def _audit_script(
     # PATH. Capability CLIs still exercise the public manager-owned path contract.
     env["CAPABILITIES_MANAGER_BIN"] = str(Path(__file__).resolve())
     script_text = script.read_text()
-    # A capability with no `connections` fence is core-only: it carries the
-    # capability-core declaration surface and stops (DOCTRINE — core-only is an
-    # absence, not a deviation). Its `connections` verb reports no connections.
-    core_only = _split_region(script_text, "connections") is None
+    # A capability that does not bind the `connections` tier is core-only: it
+    # carries the capability-core declaration surface and stops (DOCTRINE —
+    # core-only is an absence, not a deviation). Its `connections` verb reports
+    # no connections.
+    core_only = "connections" not in _contract_tiers(script_text)
 
-    if _PREAMBLE.is_file():
-        for region in _contract_drift(script_text, _canonical_regions()):
-            source_region = region.split(" (", 1)[0]
-            source = _REGION_SOURCE_REL.get(
-                source_region, "contract/preamble.py")
-            failures.append(
-                f"contract-drift: {region} differs from {source} "
-                f"— run `capabilities sync-contract`")
+    failures += [f"contract-range: {problem}"
+                 for problem in _contract_problems(script_text)]
 
     # doctor gates on the shared resolution before any round-trip: a
     # connection-bearing capability's doctor consumes _doctor_gate — the cascade
     # verdict the `connections` report reads — so readiness is judged through one
     # resolver, never a parallel credential check. The call lives in the
-    # capability's own code, outside the vendored fence that defines the helper.
+    # capability's own code; the helper is the connections tier's.
     if not core_only:
-        _conn = _split_region(script_text, "connections")
-        _outside = script_text.replace(_conn[1], "") if _conn else script_text
-        if "_doctor_gate(" not in _outside:
+        if "_doctor_gate(" not in script_text:
             failures.append(
                 "doctor: no _doctor_gate(...) call in the capability's own code "
                 "— readiness must be judged through the cascade resolution, not "
@@ -14924,11 +14891,7 @@ def _audit_script(
     # The declaration and the builder are one fact in two places, and a
     # capability that declares an inventory it cannot build fails only when
     # someone asks for it. This is that question asked here instead.
-    _fences = [r for r in (_split_region(script_text, region)
-                           for region in _CONTRACT_REGIONS) if r]
     own_code = script_text
-    for _head, interior, _tail in _fences:
-        own_code = own_code.replace(interior, "")
     declares = re.search(r"^INVENTORY\s*=\s*(?!None\b)\S", own_code, re.M) is not None
     builds = "def _inventory(" in own_code
     if declares and not builds:
@@ -15564,8 +15527,9 @@ Create a capability only with:
 capabilities new <name> --source {source_id}
 ```
 
-The manager stamps generated contract regions from `contract/preamble.py`.
-Never edit text between `# >>> contract:` and `# <<< contract:` markers.
+Every capability binds the shared code from the `capabilities-contract`
+library, declared in its PEP 723 header by the range the manager supports
+(SHEBANG.md, "The contract verbs"). Never copy that code into a capability.
 Before every commit, stage the intended source files and derive the catalogue
 from that exact index:
 
@@ -15588,7 +15552,7 @@ def _repo_agent_markdown(source_id: str) -> str:
 # Managed capability source
 
 Read `AUTHORING.md` before editing. Create packages with `capabilities new
-<name> --source {source_id}`. Never hand-edit generated contract regions.
+<name> --source {source_id}`. Never copy the shared contract code into a package.
 Stage intended files and run `capabilities source index {source_id} --staged`
 before committing; verify the commit and publish through the manager's source
 verbs described in `AUTHORING.md`. Source code lives only under
@@ -15607,8 +15571,6 @@ def _scaffold_source_repo(source_id: str, root: Path) -> None:
         if source_asset.resolve() != target.resolve():
             shutil.copy2(source_asset, target)
     _write_json(root / "capabilities.repo.json", {"kind": "capability-source"})
-    _write_json(root / "contract" / "contract.json",
-                _contract_lock(root / "contract"))
     _write_json(root / ".capability-source" / "catalog.json", {"capabilities": {}})
     (root / "AUTHORING.md").write_text(_authoring_markdown(source_id))
     agent_text = _repo_agent_markdown(source_id)
@@ -15944,19 +15906,13 @@ def _catalog_payload_scoped(
 
 
 def _source_contract_failures(root: Path) -> list[str]:
+    """A source is a capability source by its marker. The contract it carries is
+    each capability's own declared library range, judged per capability."""
     _require_authoring_assets()
     failures = []
     marker = _read_json(root / "capabilities.repo.json")
     if not isinstance(marker, dict) or marker.get("kind") != "capability-source":
         failures.append("capabilities.repo.json: missing capability-source marker")
-    source_preamble = root / "contract" / "preamble.py"
-    if not source_preamble.is_file():
-        failures.append("contract: missing contract/preamble.py")
-    elif source_preamble.read_bytes() != _PREAMBLE.read_bytes():
-        failures.append("contract: preamble differs from the manager's canonical contract")
-    lock = _read_json(root / "contract" / "contract.json")
-    if not isinstance(lock, dict) or lock != _contract_lock(_PREAMBLE.parent):
-        failures.append("contract: contract.json checksum is stale")
     return failures
 
 
@@ -16102,16 +16058,13 @@ def _source_change_scope(changed_paths: list[str]) -> tuple[bool, set[str]]:
 def _source_validation_scope(root: Path, changed_paths: list[str]) -> tuple[bool, set[str]]:
     """Select direct validation targets without running any validator.
 
-    Package-local changes stay local. A canonical contract or manager-code
-    change gets the conservative fleet fallback because either can change the
-    meaning of every capability contract. Manager documentation/assets do not.
+    Package-local changes stay local. A manager-code change gets the
+    conservative fleet fallback because it can change the meaning of every
+    capability contract. Manager documentation/assets do not; the shared code
+    is the contract library's and changes outside this tree.
     """
     manager_changed, packages = _source_change_scope(changed_paths)
-    broad_change = any(path in {
-        "bin/capabilities",
-        "contract/preamble.py",
-        "contract/contract.json",
-    } for path in changed_paths)
+    broad_change = "bin/capabilities" in changed_paths
     if broad_change:
         cap_root = root / "capabilities"
         packages = {
@@ -16489,6 +16442,7 @@ def _activate_released_capability(
     })
     _activate_payload(name, stage)
     _symlink(name, _script_path(name))
+    _refresh_contract_library(_script_path(name))
     result = {
         "name": name,
         "action": "update",
@@ -16904,10 +16858,6 @@ def cmd_search(query: str | None, source_id: str | None) -> None:
 
 
 def _capability_skeleton(name: str, core_only: bool) -> str:
-    canonical = _canonical_regions()
-    core_open, core_close = _fence_markers("capability core")
-    store_open, store_close = _fence_markers("store")
-    conn_open, conn_close = _fence_markers("connections")
     # PEP 723 parsers scan the raw manager file rather than Python tokens. Keep
     # the generated block marker out of the source text so the manager itself
     # has exactly one `script` block while every scaffold still receives one.
@@ -16943,7 +16893,7 @@ def cmd_doctor(wanted: str | None) -> None:
            "note": "Replace this scaffold check with the cheapest real readiness round-trip."})
 """
     if not core_only:
-        connections = (f"\n{conn_open}\n{canonical['connections']}{conn_close}\n\n" +
+        connections = ('\n_contract_bind(globals(), "connections")\n\n\n' +
                        report + "\n" + doctor)
     else:
         report = """\
@@ -16958,6 +16908,9 @@ def cmd_doctor(_wanted: str | None) -> None:
     return f'''#!/usr/bin/env -S uv run --script
 {script_metadata_open}
 # requires-python = ">=3.11"
+# dependencies = [
+#     "{CONTRACT_LIBRARY}{CONTRACT_LIBRARY_RANGE}",
+# ]
 # ///
 """{name} — managed capability scaffold.
 
@@ -16972,9 +16925,9 @@ Contract:
   {name} refs
   {name} inventory [--network]
 
-Add the smallest useful domain verb surface below the generated contract
-regions. Never edit text inside those regions. Success is JSON on stdout;
-errors are JSON on stderr. Exit 4 is policy refusal.
+Add the smallest useful domain verb surface below the shared contract code it
+binds. Success is JSON on stdout; errors are JSON on stderr. Exit 4 is policy
+refusal.
 """
 
 import json
@@ -17001,11 +16954,12 @@ _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
-{core_open}
-{canonical['capability core']}{core_close}
+# The shared capability code is the capabilities-contract library's, bound here
+# into this script's namespace (SHEBANG.md, "The contract verbs").
+from capabilities_contract.capability import bind as _contract_bind
 
-{store_open}
-{canonical['store']}{store_close}
+_contract_bind(globals(), "core")
+_contract_bind(globals(), "store")
 {connections}
 
 def main() -> None:
@@ -17066,13 +17020,15 @@ def cmd_new_capability(name: str, source_id: str, core_only: bool) -> None:
     script.chmod(0o755)
     _emit({"created": name, "source": source_id, "path": str(capdir),
            "executable": str(script), "core_only": core_only,
-           "next": [f"edit only outside generated contract regions in {script}",
+           "next": [f"add the domain verbs to {script}",
                     f"git add {capdir}",
                     f"capabilities source index {source_id} --staged",
                     f"capabilities install {name} --source {source_id}"]})
 
 
 def cmd_source_sync(source_id: str) -> None:
+    """Refresh a source's copy of the authoring law from this manager. The
+    shared code is the contract library's, so there is nothing to stamp."""
     _guard_source_checkout(source_id, "source sync")
     entry = _source_entry(source_id)
     official_checkout = source_id == OFFICIAL_SOURCE_ID and \
@@ -17081,45 +17037,15 @@ def cmd_source_sync(source_id: str) -> None:
         _die(6, "not_editable", "contract sync is only available for an editable workspace")
     root = _source_author_root(source_id)
     _require_authoring_assets()
+    copied = []
     for rel in _AUTHORING_ASSETS:
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         source_asset = _ASSET_ROOT / rel
         if source_asset.resolve() != target.resolve():
             shutil.copy2(source_asset, target)
-    canonical = _canonical_regions()
-    stamped = []
-    for capdir in sorted(p for p in (root / "capabilities").iterdir() if p.is_dir()):
-        script = capdir / "bin" / capdir.name
-        if not script.is_file():
-            continue
-        source_text = script.read_text()
-        updated = source_text
-        regions = []
-        for region, body in canonical.items():
-            try:
-                split = _split_region(updated, region)
-            except ValueError as e:
-                _die(7, "bad_fence", f"{capdir.name}: {e}")
-            if split is None:
-                if region in _REQUIRED_CONTRACT_REGIONS:
-                    try:
-                        updated = _insert_contract_region(updated, region, body)
-                    except ValueError as e:
-                        _die(7, "contract_missing", f"{capdir.name}: {e}")
-                    regions.append(region)
-                continue
-            head, interior, tail = split
-            if interior != body:
-                updated = head + body + tail
-                regions.append(region)
-        if updated != source_text:
-            script.write_text(updated)
-            stamped.append({"capability": capdir.name, "regions": regions})
-    _write_json(root / "contract" / "contract.json",
-                _contract_lock(_PREAMBLE.parent))
-    _emit({"source": source_id, "contract": str(root / "contract"),
-           "stamped": stamped, "ok": True})
+            copied.append(rel)
+    _emit({"source": source_id, "authoring_assets": copied, "ok": True})
 
 # ---------------------------------------------------------------- selfcheck
 
@@ -17128,20 +17054,10 @@ def cmd_source_sync(source_id: str) -> None:
 # leading token of the failures it raises, so a deliberate break can assert its
 # check is live, not vacuous — the failure mode that let the core-only gap hide.
 _AUDIT_CHECKS = {
-    "contract-drift", "stub", "manifest", "help", "gate",
+    "contract-range", "stub", "manifest", "help", "gate",
     "refs", "ids", "connections", "connections/core-only", "guide", "doctor",
     "inventory",
 }
-
-
-def _stamp_regions(text: str, canonical: dict[str, str]) -> str:
-    """Set every present fenced region's interior to canonical — a fresh stamp."""
-    for region, canon in canonical.items():
-        split = _split_region(text, region)
-        if split is not None:
-            head, _old, tail = split
-            text = head + canon + tail
-    return text
 
 
 def _check_id(failure: str) -> str:
@@ -17168,10 +17084,10 @@ def _selfcheck_source_root() -> Path | None:
     return None
 
 
-def _selfcheck_negatives(canonical: dict[str, str], source_root: Path) -> list[str]:
-    """Prove the high-value audit checks BITE. Stamp a real capability fresh,
-    apply one targeted break, and require the expected check to fire; a check that
-    stays silent on its own break is vacuous (how the core-only gap survived)."""
+def _selfcheck_negatives(source_root: Path) -> list[str]:
+    """Prove the high-value audit checks BITE. Take a real capability, apply one
+    targeted break, and require the expected check to fire; a check that stays
+    silent on its own break is vacuous (how the core-only gap survived)."""
     findings: list[str] = []
     src = source_root / "capabilities"
     core = conn = None
@@ -17179,7 +17095,7 @@ def _selfcheck_negatives(canonical: dict[str, str], source_root: Path) -> list[s
         script = capdir / "bin" / capdir.name
         if not script.is_file():
             continue
-        if _split_region(script.read_text(), "connections") is None:
+        if "connections" not in _contract_tiers(script.read_text()):
             core = core or (capdir.name, script)
         else:
             conn = conn or (capdir.name, script)
@@ -17198,29 +17114,23 @@ def _selfcheck_negatives(canonical: dict[str, str], source_root: Path) -> list[s
         '"allow_write": True, "keys": [{"key": "SECRET", "secret": True, '
         '"required": True, "set": True, "value": "plaintext-unmasked"}]}}})')
 
-    def break_fence(text: str):
-        s = _split_region(text, "capability core")
-        if s is None:
-            return None
-        head, interior, tail = s
-        return head + interior + "# injected drift\n" + tail
+    def break_range(text: str):
+        """Declare the contract library at a version that carries no shared code."""
+        broken = re.sub(r'"capabilities-contract[^"]*"', '"capabilities-contract==0.7.2"',
+                        text, count=1)
+        return None if broken == text else broken
 
     def break_doctor_gate(text: str):
-        """Strip the doctor's _doctor_gate call from the capability's own code,
-        leaving the vendored definition intact, so only the `doctor` check fires."""
-        s = _split_region(text, "connections")
-        if s is None:
-            return None
-        head, interior, tail = s
-        broken = head.replace("_doctor_gate(", "_ungated(") + interior + \
-            tail.replace("_doctor_gate(", "_ungated(")
+        """Strip the doctor's _doctor_gate call from the capability's own code
+        (the helper is the connections tier's), so only the `doctor` check fires."""
+        broken = text.replace("_doctor_gate(", "_ungated(")
         return None if broken == text else broken
 
     cases = []
     if core:
         cases.append(("connections/core-only", core,
                       lambda t: _inject_before_main(t, report_conn)))
-        cases.append(("contract-drift", core, break_fence))
+        cases.append(("contract-range", core, break_range))
     if conn:
         cases.append(("connections", conn,
                       lambda t: _inject_before_main(t, report_unmasked)))
@@ -17228,7 +17138,7 @@ def _selfcheck_negatives(canonical: dict[str, str], source_root: Path) -> list[s
 
     with tempfile.TemporaryDirectory() as td:
         for expect, (name, script), mutate in cases:
-            base = _stamp_regions(script.read_text(), canonical)
+            base = script.read_text()
             broken = mutate(base)
             if not broken or broken == base:
                 findings.append(f"negative/{expect}: could not build the break on {name}")
@@ -17310,22 +17220,22 @@ def cmd_selfcheck() -> None:
     guide assets, and documentation links only.
     """
     import ast as _ast
+    _require_authoring_assets()
     findings: list[str] = []
 
-    for f in (Path(__file__).resolve(), _PREAMBLE):
+    for f in (Path(__file__).resolve(),):
         try:
             _ast.parse(f.read_text())
         except (OSError, SyntaxError) as e:
             findings.append(f"parse: {f.name}: {e}")
 
-    canonical = _canonical_regions()
     source_root = _selfcheck_source_root()
     if source_root is None:
         findings.append(
             "source: no complete capability source tree; run "
             "`capabilities source refresh official` and retry")
     else:
-        findings += _selfcheck_negatives(canonical, source_root)
+        findings += _selfcheck_negatives(source_root)
     findings += _selfcheck_doctrine()
     findings += _selfcheck_doclinks()
     manager_menu = _guide_menu(_ASSET_ROOT / "guides", "capabilities")
@@ -17771,8 +17681,6 @@ def main() -> None:
         if not pos:
             _die(6, "input", "audit needs a capability name")
         cmd_audit(pos[0], opt("--from"))
-    elif cmd == "sync-contract":
-        cmd_sync_contract(check_only=flag("--check"))
     elif cmd == "selfcheck":
         cmd_selfcheck()
     elif cmd == "new":

@@ -8,7 +8,7 @@
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract==0.7.2",
+#     "capabilities-contract>=0.8,<1",
 #     "callva-harness-runner==0.10.0",
 # ]
 # ///

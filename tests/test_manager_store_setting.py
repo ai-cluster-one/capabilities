@@ -897,7 +897,7 @@ def test_no_manager_verb_writes_a_record_into_the_store(tmp_path, enforced):
                         "NOT IN ('pg_catalog', 'information_schema')")
             tables = cur.fetchall()
             assert {name for _schema, name in tables} == {
-                "schema_ledger", "schema_version", "capabilities_connections",
+                "schema_ledger", "schema_version", "schema_channel", "capabilities_connections",
                 "capabilities_connection_grants", "capabilities_identifiers",
                 "capabilities_policy", "capabilities_agents", "capabilities_agent_nodes",
                 "capabilities_global", "capabilities_settings",

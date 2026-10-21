@@ -499,8 +499,8 @@ def test_dev_check_reports_the_audit_report_not_the_launcher_that_carried_it(tmp
     script = worktree / "capabilities" / "deployment" / "bin" / "deployment"
     script.write_text(
         script.read_text().replace(
-            "def _emit(",
-            "def _emit_drift_probe():\n    pass\n\n\ndef _emit(",
+            '"capabilities-contract>=0.8,<1"',
+            '"capabilities-contract>=0.8,<1", "capabilities-contract<0.8"',
             1,
         )
     )
@@ -526,7 +526,7 @@ def test_dev_check_reports_the_managers_envelope_when_selfcheck_cannot_run(tmp_p
     env = _env(tmp_path)
     started = _start(env, source, consumer, session="selfcheck-diagnosis")
     worktree = Path(started["source_worktree"])
-    (worktree / "contract" / "preamble.py").unlink()
+    (worktree / "TEMPLATE.md").unlink()
 
     checked = json.loads(
         _run(env, "dev", "check", "selfcheck-diagnosis", check=False).stdout
@@ -534,7 +534,7 @@ def test_dev_check_reports_the_managers_envelope_when_selfcheck_cannot_run(tmp_p
     assert checked["ok"] is False
     entries = checked["failures"]["manager"]
     assert len(entries) == 1
-    assert json.loads(entries[0])["error"]["code"] == "no_preamble"
+    assert json.loads(entries[0])["error"]["code"] == "authoring_assets_missing"
 
 
 def test_dev_run_executes_only_the_session_payload_against_attached_project(tmp_path):

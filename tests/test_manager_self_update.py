@@ -38,8 +38,8 @@ def _write_release(tmp_path: Path) -> tuple[Path, dict]:
     manager.parent.mkdir(parents=True)
     shutil.copy2(MANAGER, manager)
     assets = {
-        "contract/preamble.py": (REPO / "contract" / "preamble.py").read_bytes(),
-        "contract/store.py": (REPO / "contract" / "store.py").read_bytes(),
+        "SHEBANG.md": (REPO / "SHEBANG.md").read_bytes(),
+        "contract/CHANGELOG.md": (REPO / "contract" / "CHANGELOG.md").read_bytes(),
         # Deliberately absent from the outgoing manager constant. This is the
         # next new asset that used to require two self-update calls.
         "runtime/future-required.txt": b"future runtime dependency\n",

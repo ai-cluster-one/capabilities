@@ -42,7 +42,7 @@ def wa(phone: str) -> dict:
 
 def upgrade_to(world: World, count: int, major: int, minor: int) -> None:
     """The contract's tables brought to their first `count` steps."""
-    import store as S
+    from capabilities_contract.capability import store as S
     from capabilities_contract import db
     setting = db.Setting(url=world.url(), schema=SCHEMA, level="environment")
     conn = db.connect(application_name=S.STORE_OWNER, setting=setting)
@@ -59,7 +59,7 @@ def ensure_global(world: World) -> None:
     if world.sql("SELECT to_regclass('capabilities_global') IS NOT NULL")[0][0] and \
             world.sql("SELECT global_migrated_at FROM capabilities_global")[0][0]:
         return
-    import store as S
+    from capabilities_contract.capability import store as S
     upgrade_to(world, len(S.record_table_steps()), *S.STORE_TABLES_VERSION)
     world.answer(world.manager(world.roots["first"], "migrate", "--global", "--apply"))
 

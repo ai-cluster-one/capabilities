@@ -1,10 +1,10 @@
 """The records adapter, reached from the bundle's service processes.
 
 The daemon and the call recorder run without the CLI in process, and read
-their configuration through the same adapter the CLI's verbs do: the
-contract's store region, which the contract vendors into this bundle's CLI and
-which carries everything it needs. It is executed here on its own, so a
-service process takes the adapter and nothing else of the CLI with it.
+their configuration through the same adapter the CLI's verbs do: the store
+tier of the capabilities-contract library, which the CLI binds and which
+carries everything it needs. It is bound here on its own, so a service process
+takes the adapter and nothing else of the CLI with it.
 
 In a files-mode project the adapter reads the envelope's files and then the
 user's config home's; in a store-mode project it reads connections and grants
@@ -20,8 +20,6 @@ NAME = "telegram"
 # A service process writes through a connection only where its grant says so;
 # nothing declared opens it.
 WRITE_DEFAULT = False
-REGION_START = "# >>> contract: store "
-REGION_END = "# <<< contract: store <<<"
 
 _STORE = None
 
@@ -37,19 +35,13 @@ def _cli_path() -> Path:
 
 
 def store():
-    """The contract's store region, executed once from the bundle's CLI."""
+    """The contract's store tier, bound once into a module of the bundle's own."""
     global _STORE
     if _STORE is None:
-        path = _cli_path()
-        text = path.read_text()
-        try:
-            start = text.index(REGION_START)
-            end = text.index(REGION_END, start)
-        except ValueError:
-            raise RuntimeError(f"{path} carries no contract store region") from None
+        from capabilities_contract.capability import bind
         module = types.ModuleType(f"{NAME}_contract_store")
-        module.__file__ = str(path)
-        exec(compile(text[start:end], str(path), "exec"), module.__dict__)
+        module.__file__ = str(_cli_path())
+        bind(module.__dict__, "store")
         _STORE = module
     return _STORE
 

@@ -45,8 +45,7 @@ DB_KEYS = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTKIT_
            "AGENTKIT_DB_SSLMODE", "AGENTKIT_DB_SSLROOTCERT")
 EVIDENCE = os.environ.get("CAPABILITIES_MIGRATE_EVIDENCE")
 
-sys.path.insert(0, str(REPO / "contract"))
-import store as S  # noqa: E402
+from capabilities_contract.capability import store as S  # noqa: E402
 
 
 def _free_port() -> int:

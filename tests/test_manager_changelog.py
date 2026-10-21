@@ -116,7 +116,7 @@ def test_the_manager_and_the_contract_read_the_release_on_path(tmp_path: Path) -
     release = tmp_path / "release"
     (release / "bin").mkdir(parents=True)
     shutil.copy2(MANAGER, release / "bin" / "capabilities")
-    for rel in ("contract/preamble.py", "contract/CHANGELOG.md"):
+    for rel in ("SHEBANG.md", "contract/CHANGELOG.md"):
         (release / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(REPO / rel, release / rel)
     (release / "manager").mkdir()

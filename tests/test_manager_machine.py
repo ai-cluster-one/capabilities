@@ -7,7 +7,7 @@ A service that declares `service.machine` takes `--machine` on its service
 verbs, and such a call resolves no project and reads no policy row.
 
 Everything runs against a scratch HOME and a fixture capability built from
-the manager's own scaffold, so the gate under test is the stamped preamble.
+the manager's own scaffold, so the gate under test is the contract library's core tier.
 """
 
 from __future__ import annotations

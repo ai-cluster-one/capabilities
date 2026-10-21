@@ -449,9 +449,13 @@ def test_the_writer_round_trips_a_pipe_through_the_parser(tmp_path):
 
 def test_no_code_path_sources_a_credentials_file():
     """Every env file is read by `_parse_env_file`; nothing hands one to a shell."""
-    assert not re.search(r"""["'](?:source|\.)\s+[^"']*(?:\.env|credentials)""", _code)
-    assert "os.system(" not in _code
-    assert "shell=True" not in _code
-    readers = re.findall(r"_parse_env_file\(([^)]*)\)", _code)
+    from capabilities_contract.capability import TIERS, tier_path
+
+    # The code coolify runs: its own and the contract tiers it binds.
+    code = _code + "".join(tier_path(tier).read_text() for tier in TIERS)
+    assert not re.search(r"""["'](?:source|\.)\s+[^"']*(?:\.env|credentials)""", code)
+    assert "os.system(" not in code
+    assert "shell=True" not in code
+    readers = re.findall(r"_parse_env_file\(([^)]*)\)", code)
     assert any("CREDENTIALS_ENV" in r for r in readers)
     assert any('root / fname' in r for r in readers)

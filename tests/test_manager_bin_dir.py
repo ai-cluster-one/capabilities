@@ -123,7 +123,7 @@ def _release(tmp_path: Path) -> Path:
     (release / "bin").mkdir()
     shutil.copy2(MANAGER, release / "bin" / "capabilities")
     assets = {rel: hashlib.sha256((release / rel).read_bytes()).hexdigest()
-              for rel in ("contract/preamble.py", "contract/store.py")}
+              for rel in ("contract/CHANGELOG.md",)}
     manifest = release / ".capability-source" / "manager-release.json"
     manifest.parent.mkdir()
     manifest.write_text(json.dumps({

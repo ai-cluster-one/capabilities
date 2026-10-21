@@ -50,10 +50,11 @@ cd ~/.capabilities/sources/personal
 capabilities new my-service --source personal
 ```
 
-`source init` initializes git, registers the source, vendors the current
-authoring contract, and creates host-readable authoring instructions. `new`
-creates the canonical `capabilities/<name>/bin/<name>` bundle and stamps the
-generated contract regions. Never edit those fenced regions by hand.
+`source init` initializes git, registers the source, copies the current
+authoring law, and creates host-readable authoring instructions. `new`
+creates the canonical `capabilities/<name>/bin/<name>` bundle, which declares
+the `capabilities-contract` library by the range the manager supports and binds
+the shared contract code from it.
 
 The release unit is a prepared Git commit. Run `capabilities guide publishing`
 for the live staged-index, immutable verification, and release transaction.
@@ -89,17 +90,19 @@ capabilities source path personal
 
 ## Contract ownership
 
-The source repository vendors `contract/preamble.py`; `contract/contract.json`
-pins its checksum. The manager owns generated regions:
+The shared contract code is the `capabilities-contract` library's, and no
+source repository carries a copy of it: each capability declares the library by
+a version range and binds its tiers (SHEBANG.md, "The contract verbs"). A
+library release reaches every capability whose range admits it, with no change
+to the source. The manager refreshes a source's copy of the authoring law:
 
 ```sh
 capabilities source sync personal
 ```
 
-This deterministically updates the vendored authoring kit and restamps existing
-regions. There is no force or skip-conformance flag. A tool that does not
-follow this contract is still free to exist and run as an ordinary CLI, but
-the capabilities manager will not install it as a managed capability.
+There is no force or skip-conformance flag. A tool that does not follow this
+contract is still free to exist and run as an ordinary CLI, but the
+capabilities manager will not install it as a managed capability.
 
 ## Repository shape
 
@@ -108,9 +111,6 @@ capabilities.repo.json
 AUTHORING.md
 AGENTS.md
 CLAUDE.md
-contract/
-  preamble.py
-  contract.json
 capabilities/
   <name>/
     bin/<name>

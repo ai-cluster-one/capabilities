@@ -17,8 +17,8 @@ against the contract in this order:
 - Consumer-neutral code, help, and examples.
 
 Create a managed package with `capabilities new <name> --source <id>`, then move
-the domain implementation into the generated skeleton outside the contract
-fences. Keep the existing domain arguments and output stable where they are
+the domain implementation into the generated skeleton around the contract
+binds. Keep the existing domain arguments and output stable where they are
 already intentional.
 
 Verify the result with `capabilities audit <name> --from <path>`, run the
