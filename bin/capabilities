@@ -638,7 +638,8 @@ PROJECT VERBS (run inside a consuming project)
         a warning. Likewise, when the agent keeps routines in its store (the
         `routine` capability's tables), the routine index lists their active
         versions by name, each pointing to `routine show <name>`, instead of
-        the routines folder, with a warning while the folder is still there; a
+        the routines folder, and the onboarding block points at its routine
+        the same way, with a warning while the folder is still there; a
         store that does not answer leaves the folder in use with a warning.
         --print writes the text
         to stdout and writes nothing; with --json it answers {project, output,
@@ -12325,8 +12326,8 @@ def _ck_stored_routines(root: Path, routines_dir: Path, warnings: list[str],
     return sorted((name, _ck_one_line(description)) for name, description in rows)
 
 
-def _ck_routine_index(root: Path, routines_dir: Path, warnings: list[str], store: dict) -> str:
-    stored = _ck_stored_routines(root, routines_dir, warnings, store)
+def _ck_routine_index(root: Path, routines_dir: Path, warnings: list[str],
+                      stored: list | None) -> str:
     if stored is not None:
         lines = ["<!-- Routine index - generated from the store's active routine versions. -->", "",
                  "# Routines (repeatable procedures)", "",
@@ -12445,17 +12446,26 @@ def _ck_onboarding(root: Path, binding: dict, warnings: list[str], store: dict) 
     return binding["onboarding"]
 
 
-def _ck_onboarding_block(root: Path, binding: dict, onboarding: dict, warnings: list[str]) -> str:
+def _ck_onboarding_block(root: Path, binding: dict, onboarding: dict, warnings: list[str],
+                         stored_routines: list | None) -> str:
     routine = onboarding["routine"]
-    entries = _ck_routine_entries(root, binding["layers"]["routines"], []) or []
-    path = next((rel for name, _description, rel in entries if name == routine), None) \
-        if routine else None
-    if path is None:
-        warnings.append(f"onboarding routine `{routine}` is not declared in "
-                        f"`{binding['layers']['routines'].as_posix()}/`")
-        reference = f"`{routine}`"
+    if stored_routines is not None:
+        if routine and any(name == routine for name, _description in stored_routines):
+            reference = f"**{routine}** (`routine show {routine}`)"
+        else:
+            warnings.append(f"onboarding routine `{routine}` is not among the routines "
+                            "in the store")
+            reference = f"`{routine}`"
     else:
-        reference = f"[{routine}]({path.as_posix()})"
+        entries = _ck_routine_entries(root, binding["layers"]["routines"], []) or []
+        path = next((rel for name, _description, rel in entries if name == routine), None) \
+            if routine else None
+        if path is None:
+            warnings.append(f"onboarding routine `{routine}` is not declared in "
+                            f"`{binding['layers']['routines'].as_posix()}/`")
+            reference = f"`{routine}`"
+        else:
+            reference = f"[{routine}]({path.as_posix()})"
     return "\n".join([
         "# Onboarding",
         "",
@@ -12516,7 +12526,8 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
     context_dir, routines_dir = layers["context"], layers["routines"]
     warnings: list[str] = []
     store = {"failed": False}
-    routine_index = _ck_routine_index(root, routines_dir, warnings, store)
+    stored_routines = _ck_stored_routines(root, routines_dir, warnings, store)
+    routine_index = _ck_routine_index(root, routines_dir, warnings, stored_routines)
     capability_context = _ck_capability_context(root, layers["capabilities"], warnings, store)
     memory_rel = binding["body_root"] / "memory"
     if (root / memory_rel).is_dir() or (root / memory_rel).is_symlink():
@@ -12524,7 +12535,7 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
                         "not compile project memory; run `memory adopt` to carry it into the "
                         "`memory` capability")
     onboarding = _ck_onboarding(root, binding, warnings, store)
-    onboarding_block = (_ck_onboarding_block(root, binding, onboarding, warnings)
+    onboarding_block = (_ck_onboarding_block(root, binding, onboarding, warnings, stored_routines)
                         if onboarding and onboarding["status"] == "pending" else "")
     stored = _ck_stored_context(root, binding, warnings, store)
     if stored is None:

@@ -712,3 +712,31 @@ def test_build_composes_the_routine_index_from_the_routines_in_the_store(lab):
     from_store = build()
     assert from_store == beside_folder.replace(f"Generation warnings:\n\n{warning}\n\n", "", 1)
     assert "routine layer not present" not in from_store
+
+
+def test_build_points_the_onboarding_block_at_the_routine_where_the_agent_keeps_it(lab):
+    project = lab.project
+    (project / ".contextkit").mkdir()
+    (project / ".contextkit" / "config.toml").write_text(
+        f'version = 1\ntype = "agent-project"\n\n[identity]\nid = "{PROJECT_ID}"\n\n'
+        '[onboarding]\nstatus = "pending"\nroutine = "onboard"\n')
+    (project / "context" / "identity").mkdir(parents=True)
+    (project / "context" / "identity" / "MISSION.md").write_text(
+        _context_text(*_CONTEXT_FILES["identity/MISSION"]))
+    (project / "routines").mkdir()
+    (project / "routines" / "onboard.md").write_text(
+        "---\nname: onboard\ndescription: Get to know the owner.\n---\n# Onboard\n")
+
+    def build() -> str:
+        result = lab.run("build", "--print")
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    assert "run the routine [onboard](routines/onboard.md) and carry it" in build()
+
+    _seed_routines(lab, [(PROJECT_ID, "onboard", False, [("Get to know the owner.",
+                                                          "# Onboard\n", True)])])
+    shutil.rmtree(project / "routines")
+    from_store = build()
+    assert "run the routine **onboard** (`routine show onboard`) and carry it" in from_store
+    assert "is not declared in" not in from_store
