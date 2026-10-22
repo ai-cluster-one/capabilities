@@ -386,7 +386,7 @@ def test_a_store_made_before_owners_gives_each_row_its_owner_by_the_rule(lab):
         ("coolify", "nobody"): None, ("ical", "loose"): None}
     listed = lab.ok(MANAGER, "connections", "list", "agentrooms", "clickup")
     assert set(listed["capabilities"]) == {"agentrooms", "clickup"}
-    clinic, ada = listed["capabilities"]["agentrooms"]
+    ada, clinic = listed["capabilities"]["agentrooms"]
     assert clinic == {
         "connection": "clinic", "owner": OTHER, "owner_name": "Clinic Desk",
         "shared": False, "grants": [{"agent": OTHER, "agent_name": "Clinic Desk",
