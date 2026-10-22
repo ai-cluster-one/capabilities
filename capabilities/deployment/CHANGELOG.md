@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-22 — A long build is followed to its end, and a rollback builds the release it names
+
+`deployment deploy` and `deployment rollback` follow the Coolify deployment they started while Coolify reports it `queued` or `in_progress`, for at most an hour, and only then wait the usual ten minutes for the resource to be healthy, so a build longer than ten minutes is no longer reported as timed out and rolled back while Coolify is still building it; a deployment Coolify ends as failed or cancelled is reported failed and rolled back as before. The environment a deploy sends now carries the runtime's `compiler.build_args`, and a rollback, requested by hand or by a failed deploy, first sets the build args the runtime declares at the commit it returns to, so the image it builds is that release's rather than the one the environment was last set for, and `deployment node status` names the release the container runs.
+
 ## 2026-10-21 — `node status` reports what the node holds that no service accounts for
 
 `deployment node status` carries `leftovers`, read in the node's container: the processes that are neither a Supervisor program nor descended from one, with pid, parent, age and command; the development sessions open longer than a day, or damaged; and the size of /tmp and of the uv cache. Nothing is ended or removed.

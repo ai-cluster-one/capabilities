@@ -195,7 +195,9 @@ USAGE
       (target.environment, default production; none is created), named
       <project>-<target> after the project's ContextKit name or recorded
       slug, and set that name, its base directory and its Compose location
-      (the target's bundle) on every deploy, set environment through bulk stdin, deploy and wait for healthy.
+      (the target's bundle) on every deploy, set environment through bulk stdin
+      (with the runtime's compiler.build_args, which Coolify builds with), deploy,
+      follow the deployment until Coolify ends it (at most 3600 s), then wait for healthy.
       The database is never sent: the node takes AGENTKIT_DB_* from the
       server's environment, and a deploy leaves those values standing.
       On failure request the previous release. Requires agent-box-checkout, a
@@ -206,7 +208,9 @@ USAGE
       branch, points the application at that repository and branch, sets
       AGENT_REPO_URL to its HTTPS URL, and builds exactly that commit.
   deployment rollback [--target <name>] [--to <commit>]
-      Roll back through Coolify and wait. Without --to use the previous release.
+      Set the build args that release's runtime declares, roll back through
+      Coolify and wait. Without --to use the previous release; a deploy that
+      fails rolls back the same way.
   deployment logs [--target <name>] [--build] [--follow]
       Read runtime logs or the recorded deployment build log; --follow polls.
   deployment node login claude|codex [--target <name>] [--print-command]
@@ -525,6 +529,11 @@ ROOT_LAYOUT_FILES = ("Dockerfile", "docker-compose.yaml", ".dockerignore",
 # application there unless the target names another existing one, and never
 # creates an environment of its own.
 COOLIFY_ENVIRONMENT = "production"
+# A deployment Coolify reports in one of these states is still building; a
+# deploy follows it to its end, at most as long as Coolify's own deployment
+# job may run, before it judges the resource's health.
+COOLIFY_BUILDING = ("queued", "in_progress")
+COOLIFY_BUILD_LIMIT = 3600
 # A checkout target's body_source names where Coolify builds the body from and
 # where the node pulls and pushes it. Without it the body travels through the
 # server's bare repository; with kind "github" it is that GitHub repository.
@@ -6494,7 +6503,22 @@ def _node_sync_status(root, target):
             "ahead" if ahead else "behind" if behind else "level"), "conflicts": saved.get("conflicts", [])}
 
 
+def _node_build(root, target, deployment):
+    # A long build is not a failed one: its time counts against Coolify's own
+    # limit, never against the health wait that follows it.
+    deadline = time.monotonic() + COOLIFY_BUILD_LIMIT
+    while True:
+        status = _node_coolify(root, target, "deployments", deployment).get("status")
+        if status not in COOLIFY_BUILDING:
+            return status
+        if time.monotonic() >= deadline:
+            raise NodeFailure("deployment_timeout", "deployment still " + str(status) +
+                              f" after {COOLIFY_BUILD_LIMIT} s")
+        time.sleep(5)
+
+
 def _node_wait(root, target, app, deployment, timeout=600):
+    _node_build(root, target, deployment)
     # Single compatibility seam for C2: use its waiter when installed.
     help_text = _node_run(["coolify", "help"], root).stdout
     if "coolify wait " in help_text:
@@ -6616,10 +6640,33 @@ def _node_environment(root, runtime, target, host, repo_url, key, branch):
     node = _valid_node(target.get("node"))
     if node:
         env[NODE_NAME_ENV] = node
+    # Coolify builds with an environment key's value over the Compose file's
+    # build arg, so the environment carries the release's own build args.
+    env.update(_compiler_config(runtime)["build_args"])
+    return _node_env_lines(env)
+
+
+def _node_env_lines(env):
     for k, value in env.items():
         if not _safe_env_key(k) or "\n" in str(value) or "\r" in str(value):
             raise NodeFailure("environment_format", f"environment key {k} cannot be sent as one bulk line", 6)
     return "".join(f"{k}={v}\n" for k, v in sorted(env.items()))
+
+
+def _node_rollback(root, target, app, commit):
+    """Request the release at commit, first putting the build args it
+    declares back into the application's environment, so the rollback builds
+    that release rather than the one the environment was last set for."""
+    shown = _node_git(root, "show", f"{commit}:{_runtime_path(root).relative_to(root).as_posix()}",
+                      check=False)
+    try:
+        runtime = json.loads(shown) if shown else {}
+    except ValueError:
+        runtime = {}
+    build_args = _compiler_config(runtime)["build_args"] if isinstance(runtime, dict) else {}
+    if build_args:
+        _node_coolify(root, target, "env", "bulk", app, stdin=_node_env_lines(build_args))
+    return _node_coolify(root, target, "app", "rollback", app, "--to", commit)
 
 
 def _node_provider_requirements(root, *, create=False):
@@ -6767,7 +6814,7 @@ def cmd_deploy(args):
         rollback_error = None
         if previous.get("commit"):
             try:
-                result = _node_coolify(root, target, "app", "rollback", app, "--to", previous["commit"])
+                result = _node_rollback(root, target, app, previous["commit"])
                 _node_wait(root, target, app, _node_deployment_uuid(result))
                 rolled_back = True
             except NodeFailure as e:
@@ -6792,7 +6839,7 @@ def cmd_rollback(args):
     if not commit:
         raise NodeFailure("rollback_missing", "no previous release; specify --to", 3)
     app = _node_app(root, target)
-    result = _node_coolify(root, target, "app", "rollback", app, "--to", commit)
+    result = _node_rollback(root, target, app, commit)
     deployment = _node_deployment_uuid(result)
     _node_wait(root, target, app, deployment)
     old = state.get("release") or {}

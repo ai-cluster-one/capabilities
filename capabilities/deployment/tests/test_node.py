@@ -141,7 +141,7 @@ def test_deploy_fixture_sets_env_off_argv_and_waits(node, capsys):
     result = json.loads(capsys.readouterr().out)
     assert result["release"]["deployment"] == "deployment-fixture"
     requests = rows(node)
-    assert [r["argv"][0] for r in requests][-3:] == ["env", "deploy", "wait"]
+    assert [r["argv"][0] for r in requests][-4:] == ["env", "deploy", "deployments", "wait"]
     env = next(r["stdin"] for r in requests if r["argv"][:2] == ["env", "bulk"])
     assert "AGENT_REPO_URL=git@host.docker.internal:/srv/git/body.git" in env
     assert "AGENT_STORE_" not in env and "AGENTKIT_DB_" not in env
@@ -189,6 +189,29 @@ def test_failed_deploy_rolls_back_and_keeps_release(node, monkeypatch):
     with pytest.raises(node.m.NodeFailure, match="rollback=healthy"):
         node.m.cmd_deploy(node.args)
     assert ["app", "rollback", "application-fixture", "--to", old["commit"]] in [r["argv"] for r in rows(node)]
+    assert node.m._node_state(node.root, node.target)["release"] == old
+
+
+def test_rollback_builds_with_the_build_args_of_the_release_it_returns_to(node, monkeypatch):
+    (node.root / "deployment").mkdir()
+    runtime = node.root / "deployment" / "runtime.json"
+    runtime.write_text(json.dumps({"compiler": {"build_args": {"CAPABILITIES_REF": "old-ref"}}}))
+    git(node.root, "add", ".")
+    git(node.root, "commit", "-qm", "old release")
+    old = {"commit": git(node.root, "rev-parse", "HEAD"), "deployment": "previous"}
+    node.m._node_save(node.root, node.target, {"release": old})
+    commit(node.root, "deployment/runtime.json",
+           json.dumps({"compiler": {"build_args": {"CAPABILITIES_REF": "new-ref"}}}))
+    node.runtime["compiler"]["build_args"] = {"CAPABILITIES_REF": "new-ref"}
+    monkeypatch.setenv("NODE_WAIT_FAIL", "1")
+    with pytest.raises(node.m.NodeFailure, match="rollback=healthy"):
+        node.m.cmd_deploy(node.args)
+    calls = rows(node)
+    envs = [i for i, r in enumerate(calls) if r["argv"][:2] == ["env", "bulk"]]
+    assert "CAPABILITIES_REF=new-ref\n" in calls[envs[0]]["stdin"]
+    back = calls.index(next(r for r in calls if r["argv"][:2] == ["app", "rollback"]))
+    assert envs[-1] < back and calls[envs[-1]]["stdin"] == "CAPABILITIES_REF=old-ref\n"
+    assert calls[back]["argv"] == ["app", "rollback", "application-fixture", "--to", old["commit"]]
     assert node.m._node_state(node.root, node.target)["release"] == old
 
 
@@ -439,7 +462,25 @@ def test_wait_compatibility_poll_checks_release_and_resource(node, monkeypatch):
     monkeypatch.setattr(node.m, "_node_run", run)
     result = node.m._node_wait(node.root, node.target, "application-fixture", "deployment-fixture", timeout=2)
     assert result == {"deployment": "finished", "resource": "running:healthy"}
-    assert [r["argv"][0] for r in rows(node)] == ["deployments", "applications"]
+    assert [r["argv"][0] for r in rows(node)] == ["deployments", "deployments", "applications"]
+
+
+def test_a_build_longer_than_the_health_wait_is_followed_to_its_end(node, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(node.m.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(node.m.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + 300))
+    polls = []
+    original = node.m._node_coolify
+    def coolify(root, target, *args, **kw):
+        if args == ("deployments", "deployment-fixture") and len(polls) < 4:
+            polls.append(clock[0])
+            return {"status": "in_progress"}
+        return original(root, target, *args, **kw)
+    monkeypatch.setattr(node.m, "_node_coolify", coolify)
+    result = node.m._node_wait(node.root, node.target, "application-fixture", "deployment-fixture")
+    assert result["status"] == "running:healthy"
+    assert polls[-1] >= 900
+    assert [r["argv"][0] for r in rows(node)] == ["deployments", "wait"]
 
 
 def test_prepared_repo_uses_one_node_key_and_public_stdin(node, monkeypatch):

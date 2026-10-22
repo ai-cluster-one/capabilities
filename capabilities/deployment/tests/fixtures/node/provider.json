@@ -12,6 +12,7 @@
   "applications application-fixture": {"uuid": "application-fixture", "id": 42, "status": "running:healthy"},
   "deploy application-fixture": {"deployments": [{"resource_uuid": "application-fixture", "deployment_uuid": "deployment-fixture"}]},
   "deployments deployment-fixture": {"uuid": "deployment-fixture", "status": "finished", "logs": "fixture build complete"},
+  "deployments rollback-fixture": {"uuid": "rollback-fixture", "status": "finished"},
   "app rollback": {"deployment_uuid": "rollback-fixture"},
   "wait application-fixture": {"status": "running:healthy", "deployment_uuid": "deployment-fixture"},
   "logs application-fixture": {"logs": "fixture runtime ready"},
