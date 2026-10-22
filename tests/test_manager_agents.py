@@ -687,6 +687,24 @@ def test_a_document_that_does_not_read_leaves_the_build_on_the_folder(lab):
     assert result.stdout.replace(warning + "\n", "", 1) == from_folder.stdout
 
 
+
+def test_an_agent_that_lives_in_the_store_builds_with_no_context_folder(lab):
+    # A store-only agent has no context folder by design: what its store holds
+    # is its context, before any document is written there and after.
+    project = lab.project
+    (project / ".contextkit").mkdir()
+    (project / ".contextkit" / "config.toml").write_text(
+        f'version = 1\ntype = "agent-project"\n\n[identity]\nid = "{PROJECT_ID}"\n')
+    assert not (project / "context").exists()
+    for result in (lab.run("build", "--print"), lab.run("hooks", "install", "--claude")):
+        assert result.returncode == 0, result.stderr
+    _seed_context_documents(lab, [("prj_000000000000", "identity/OTHER", False,
+                                   [("Other", "Not this agent's.", "inline", 1, "\n# Other\n",
+                                     True)])])
+    empty = lab.run("build", "--print")
+    assert empty.returncode == 0, empty.stderr
+    assert "# Other" not in empty.stdout
+
 def _seed_routines(lab: Lab, routines: list[tuple]) -> None:
     """The `routine` capability's two tables, holding `routines`:
     (project_id, name, retired, [(description, body, active)])."""

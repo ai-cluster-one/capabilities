@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-22 — An agent that lives in its store builds with no context folder
+
+`capabilities build` and `capabilities hooks install` compose the context of an agent whose store answers from what that store holds, also when it holds no context document yet or has no context tables, wherever the agent has no context folder: a store-only agent raised by its id no longer stops at `context_source_missing`. An agent with a context folder and no project document in its store reads the folder as before, and an agent with no store still refuses a missing folder.
+
 ## 2026-10-22 — A project's references can live in its store: `capabilities references`
 
 Every capability's references for a project can be rows of one versioned table, `capabilities_references` (capabilities ledger 1.4, keyed by project, capability and name, one active version per reference, history kept immutable by the store). `capabilities references import [<name>...]` reads `capabilities/<name>/reference/*.md` into it byte for byte, all of it in one transaction or none; `export [<name>...]` writes the active versions back to the folder byte for byte; `save <name> <ref> --from FILE|- [--base ID] [--note TEXT]` adds a version, refused as `stale_base` when another became active after the base; `history`, `show [--version ID]`, `list` and `retire` complete it. Every capability reads a reference the store holds before any file of its key - `refs`, `refs show`, `context show|edit|put`, and the composed references menu, which names it as `<name> refs show <ref>` - and reads its files exactly as before where the store holds none, no store is configured, or none answers. The manager reads the store tier from `capabilities-contract>=0.10,<1`; capabilities, whose range admits 0.10, pick it up on `capabilities update`. Run `capabilities help` for the details.

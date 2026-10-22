@@ -12602,8 +12602,8 @@ def _ck_context_item(path: Path, rel: Path, text: str, source: str,
 
 def _ck_store_read(root: Path, query) -> list[tuple] | None:
     """The rows `query(conn, project)` reads from this project's store in a
-    read-only transaction; None where there is nothing to read: no project id,
-    no store, or no such table."""
+    read-only transaction, none where the store has no such table; None where
+    there is no store to read: no project id, or no store."""
     project = _project_id_state(root)["id"]
     if not project:
         return None
@@ -12624,7 +12624,7 @@ def _ck_store_read(root: Path, query) -> list[tuple] | None:
         conn.read_only = True
         return query(conn, project)
     except psycopg.errors.UndefinedTable:
-        return None
+        return []
     finally:
         conn.close()
 
@@ -12632,17 +12632,15 @@ def _ck_store_read(root: Path, query) -> list[tuple] | None:
 def _ck_stored_rows(root: Path, want_global: bool) -> list[tuple] | None:
     """The active versions of this project's unretired context documents in its
     store - and of the global ones when `want_global` - as (global, name, title,
-    description, load, position, body), read in a read-only transaction; None
-    where the project keeps none there: no store, no project id, no tables, or
-    no project document."""
+    description, load, position, body), read in a read-only transaction, and
+    empty where the store holds none or has no such tables; None where the agent
+    has no store to keep them in: no store, or no project id."""
     rows = _ck_store_read(root, lambda conn, project: conn.execute(
         "SELECT d.project_id IS NULL, d.name, v.title, v.description, v.load, v.position, "
         "v.body FROM context_documents d JOIN context_versions v "
         "ON v.document_id = d.id AND v.active WHERE d.retired_at IS NULL "
         "AND (d.project_id = %s OR (%s AND d.project_id IS NULL))",
         (project, want_global)).fetchall())
-    if rows is None or not any(not row[0] for row in rows):
-        return None
     return rows
 
 
@@ -12650,10 +12648,12 @@ def _ck_stored_context(root: Path, binding: dict, warnings: list[str],
                        store: dict) -> dict | None:
     """The context items this agent keeps in its store, as {"project": [...],
     "global": [...] or None where the store holds no global document}; None
-    where the build reads the folder - the agent keeps no document in the store,
-    the store already failed earlier in this build (nothing is tried, and its
-    warning stands), the store did not answer, or a document does not read,
-    either of which adds a warning."""
+    where the build reads the folder - the agent has no store, its store holds
+    no project document while the context folder is there, the store already
+    failed earlier in this build (nothing is tried, and its warning stands), the
+    store did not answer, or a document does not read, either of which adds a
+    warning. An agent whose store answers and that has no context folder lives
+    in the store, so its context is what the store holds, even nothing."""
     if store["failed"]:
         return None
     want_global = binding["global_context"] is not None
@@ -12666,6 +12666,8 @@ def _ck_stored_context(root: Path, binding: dict, warnings: list[str],
     if rows is None:
         return None
     context_dir = root / binding["layers"]["context"]
+    if not any(not row[0] for row in rows) and context_dir.exists():
+        return None
     found: dict = {"project": [], "global": []}
     errors: list[str] = []
     for is_global, name, title, description, load, position, body in rows:

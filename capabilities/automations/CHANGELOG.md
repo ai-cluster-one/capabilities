@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-22 — An agent whose settings are rows starts its scheduler before it holds any
+
+An agent whose scheduler settings are rows of the store and that holds no settings document yet - a store-only agent raised in a fresh box - runs on the shipped defaults, the same values `automations service init` writes, instead of refusing every `service run`, `start`, `reload` and `agents` with `invalid_config` (`config not found`). Its scheduler idles until an automation is defined, and `service status` still says `initialized: false` until a document is written. A project whose settings are a file still needs its `config.toml`.
+
 ## 2026-10-21 — A connection whose network flow died fails in seconds
 
 `automations` uses `capabilities-contract` 0.7.2. Its store connections give a network flow up once data sent on it has gone unacknowledged for 20 seconds (`tcp_user_timeout`), which keepalives cannot notice since none is sent while data waits, and send keepalives after 15 seconds idle, every 5 seconds, 3 probes: a connection whose flow stopped carrying packets without a FIN or a reset fails in about 20 seconds as a lost connection instead of waiting until the store ends the session, and a plain read that loses it that way runs once more on a new connection. A connection lost where `automations` catches nothing ends the command as `store_unreachable`, exit 5, as before.

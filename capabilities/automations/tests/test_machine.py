@@ -823,3 +823,23 @@ def test_the_machine_probe_fails_only_while_no_store_is_connected(monkeypatch, c
     assert answer["ok"] is ok
     if not ok:
         assert "holds no store connection" in answer["problems"][0]
+
+
+def test_an_agent_whose_settings_are_rows_and_holds_none_runs_on_the_defaults(bare,
+                                                                              monkeypatch):
+    # A store-only agent raised in a fresh box has no scheduler settings yet, and
+    # its scheduler idles on the shipped defaults instead of refusing to start.
+    root = bare.project("fresh")
+    (root / "capabilities" / "automations" / "service" / "config.toml").unlink()
+    cli = load_cli()
+    monkeypatch.setattr(cli, "_records_in_store", lambda: True)
+    monkeypatch.setattr(cli, "_settings_homes", lambda scope: ["project-home"])
+    monkeypatch.setattr(cli, "_settings_read", lambda home: ("the store", None, None))
+    monkeypatch.setattr(cli, "_stored_agents", lambda root: {})
+    for key in POINTERS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(root))
+    monkeypatch.chdir(root)
+    config = cli._load_config(cli._runtime_module(), root)
+    assert config["automations"] == []
+    assert config["engine"]["max_parallel"] == 4 and config["engine"]["recovery"] == "fail"

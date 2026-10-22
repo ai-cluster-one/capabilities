@@ -977,14 +977,14 @@ class _ConfigRefusal(Exception):
 
 def _declaration_rows(root: Path) -> dict[str, Any]:
     """The declaration of an agent whose settings are rows: its settings
-    document with its agent profiles from the store as `[agents.workers]`.
-    Raises _ConfigRefusal where there is none or it cannot be read."""
-    where, document, error = _settings_read(_settings_homes("project")[0])
+    document with its agent profiles from the store as `[agents.workers]`. An
+    agent that holds no settings document yet runs on the shipped defaults, so
+    its scheduler idles until an automation is defined. Raises _ConfigRefusal
+    where the document cannot be read."""
+    _where, document, error = _settings_read(_settings_homes("project")[0])
     if error:
         raise _ConfigRefusal(error)
-    if document is None:
-        raise _ConfigRefusal(f"config not found: {where}")
-    raw = copy.deepcopy(document)
+    raw = copy.deepcopy(document) if document is not None else {"version": 1}
     agents = raw.get("agents") if isinstance(raw.get("agents"), dict) else {}
     agents = {k: v for k, v in agents.items() if k != "workers"}
     workers = _stored_agents(root)
