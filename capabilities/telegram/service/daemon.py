@@ -480,10 +480,11 @@ def _read_document(key):
     A prompt's home is the store: its active version in `telegram_prompts` is
     what is read, and its file only while the store holds no version of the
     key, which is what a project that has not run `telegram prompts import`
-    still runs on. A store that is configured and cannot answer is never read
-    as holding nothing: the daemon goes on with what the store last answered
-    for the key, and where it never answered for it, the read raises. A
-    reference document is not a prompt and is always its file."""
+    still runs on. A store that is configured and cannot answer leaves the
+    daemon on what the store last answered for the key, and where it never
+    answered for it, on the key's file: a store that is not there is a reason
+    to keep answering, not a reason to stop. A reference document is not a
+    prompt and is always its file."""
     if prompts.is_prompt_key(key) and STORE_REFUSAL is None:
         row = _stored_prompt(key)
         if row is not None:
@@ -507,19 +508,18 @@ _PROMPT_LOCK = threading.Lock()
 def _stored_prompt(key):
     """The active version of `key` in the store, or None where it holds none.
     A connection the store or the network ended is opened again once; a store
-    that still cannot answer leaves the key on what it last answered."""
+    that still cannot answer leaves the key on what it last answered, and a key
+    it never answered for on None, so that its file is read."""
     global _PROMPT_OUTAGE_SAID
     with _PROMPT_LOCK:
         try:
             row = _query_prompt(key)
         except Exception as exc:
-            if key not in _PROMPT_LAST:
-                raise
             if not _PROMPT_OUTAGE_SAID:
                 _PROMPT_OUTAGE_SAID = True
                 log(f"prompts: the store did not answer ({exc}); serving the "
-                    "versions it last answered")
-            return _PROMPT_LAST[key]
+                    "versions it last answered, and the files for the rest")
+            return _PROMPT_LAST.get(key)
         _PROMPT_OUTAGE_SAID = False
         _PROMPT_LAST[key] = row
         return row

@@ -643,7 +643,8 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_prompt_is_read_from_the_store_and_from_its_file_until_imported(self):
         """The store's active version is the prompt; the file is read only while
         the store holds no version of the key, and a store that stops answering
-        leaves the daemon on the version it last read."""
+        leaves the daemon on the version it last read, and on the file for a
+        key it never read."""
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings(), job_worker="worker file\n",
                                    store=True)
@@ -662,9 +663,8 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                                    side_effect=RuntimeError("store gone")):
                 self.assertEqual(daemon.read_service_document(daemon.CONTEXT_FILE),
                                  "edited context")
-                daemon._PROMPT_LAST.pop("delegation", None)
-                with self.assertRaisesRegex(RuntimeError, "store gone"):
-                    daemon.read_delegation_context()
+                daemon._PROMPT_LAST.pop("job-worker", None)
+                self.assertEqual(daemon.read_job_worker_context(), "worker file")
             self.assertTrue(any("serving the versions it last answered" in line
                                 for line in daemon._test_logs))
             daemon._PROMPT_STORE.close()
