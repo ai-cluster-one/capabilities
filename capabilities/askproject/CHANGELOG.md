@@ -1,5 +1,9 @@
 # askproject — change log
 
+## 2026-10-22 — A peer resolves its target's own project
+
+A peer is started without the caller's handed-down `CAPABILITIES_PROJECT_ID` and `CAPABILITIES_PROJECT_ID_ROOT`, as it already was without the envelope pair, so a target bound to no id resolves as itself rather than as the caller's project. Declares `capabilities-contract>=0.12,<1`.
+
 ## 2026-10-21 — A connection whose network flow died fails in seconds
 
 `askproject` uses `capabilities-contract` 0.7.2. Its store connections give a network flow up once data sent on it has gone unacknowledged for 20 seconds (`tcp_user_timeout`), which keepalives cannot notice since none is sent while data waits, and send keepalives after 15 seconds idle, every 5 seconds, 3 probes: a connection whose flow stopped carrying packets without a FIN or a reset fails in about 20 seconds as a lost connection instead of waiting until the store ends the session, and a plain read that loses it that way runs once more on a new connection. A connection lost where `askproject` catches nothing ends the command as `store_unreachable`, exit 5, as before.

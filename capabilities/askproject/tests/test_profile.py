@@ -472,13 +472,16 @@ def test_a_read_peer_that_writes_is_reported_as_a_failure(lab):
 def test_the_peer_environment_belongs_to_the_target(lab, engine):
     proc, _, launch = lab.ask("--engine", engine, env={
         "TELEGRAM_CHAT_ID": "caller-chat", "TELEGRAM_REAL_TELEGRAM": "/opt/telegram",
-        "CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "caller-session"})
+        "CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "caller-session",
+        "CAPABILITIES_PROJECT_ID": "prj_aaaaaaaaaaaa",
+        "CAPABILITIES_PROJECT_ID_ROOT": str(lab.caller)})
     _ok(proc)
     env = launch["env"]
     assert launch["cwd"] in (str(lab.target), str(lab.target.resolve()))
     assert env["CLAUDE_PROJECT_DIR"] == str(lab.target)
     assert env["TELEGRAM_REAL_TELEGRAM"] == "/opt/telegram"
-    for gone in ("TELEGRAM_CHAT_ID", "CLAUDECODE", "CLAUDE_CODE_SESSION_ID"):
+    for gone in ("TELEGRAM_CHAT_ID", "CLAUDECODE", "CLAUDE_CODE_SESSION_ID",
+                 "CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT"):
         assert gone not in env, gone
 
 

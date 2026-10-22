@@ -903,12 +903,14 @@ def _peer_env(target) -> dict:
     A peer is started in another project's directory, and cwd is the weakest
     thing that says so: a capability CLI reads $CLAUDE_PROJECT_DIR first and
     falls back to cwd only in its absence, and it honours a handed-off envelope
-    whenever the handoff names the root it stands in. Inherited unchanged, both
-    make the peer answer as the CALLER's project while standing in the target —
-    its capability calls resolve the caller's envelope and the caller's
-    credentials. So the target is named and the handoff is dropped rather than
-    re-pointed: the envelope answer belongs to whoever resolved it, and a
-    descendant in another project resolves its own.
+    whenever the handoff names the root it stands in. The project id handed down
+    with its root names that root even from a folder bound to nothing, so a
+    target never initialised would resolve as the caller. Inherited unchanged,
+    these make the peer answer as the CALLER's project while standing in the
+    target — its capability calls resolve the caller's envelope and the caller's
+    credentials. So the target is named and both handoffs are dropped rather
+    than re-pointed: the envelope answer and the id belong to whoever resolved
+    them, and a descendant in another project resolves its own.
 
     A per-turn authority granted to the caller by whatever ingress launched it
     is the caller's alone. The Telegram service's worker keys are that authority
@@ -935,6 +937,8 @@ def _peer_env(target) -> dict:
         env[READ_ONLY_ENV] = "1"
     env.pop("CAPABILITIES_PROJECT_ENVELOPE", None)
     env.pop("CAPABILITIES_PROJECT_ENVELOPE_ROOT", None)
+    env.pop("CAPABILITIES_PROJECT_ID", None)
+    env.pop("CAPABILITIES_PROJECT_ID_ROOT", None)
     for key in [k for k in env
                 if k.startswith("TELEGRAM_") and k != "TELEGRAM_REAL_TELEGRAM"]:
         env.pop(key, None)
