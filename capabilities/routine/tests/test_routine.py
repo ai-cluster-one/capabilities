@@ -414,3 +414,67 @@ def test_the_read_only_switch_refuses_every_write(lab):
         assert (code, error["code"]) == (4, "read_only_switch")
     assert lab.run("list", "--store", CAPABILITIES_READ_ONLY="1").returncode == 0
     assert lab.run("show", "pitstop", CAPABILITIES_READ_ONLY="1").returncode == 0
+
+
+# --- the agent's routines and their titles ------------------------------------------
+
+def test_titles_lists_the_folder_as_contextkit_does_and_creates_no_table(lab):
+    listed = lab.ok("titles", "--json")
+    assert (listed["source"], listed["folder"], listed["count"], listed["warnings"]) == \
+        ("folder", str(lab.routines.resolve()), 3, [])
+    assert listed["routines"][1] == {
+        "name": "pitstop", "title": "Пит-стоп", "title_source": "front_matter",
+        "description": "Run for a Mac health check — disk, memory.", "source": "folder",
+        "path": str(lab.routines.resolve() / "pitstop.md")}
+    assert [(r["name"], r["title"], r["title_source"]) for r in listed["routines"]] == [
+        ("defect-intake", "defect-intake", "name"), ("pitstop", "Пит-стоп", "front_matter"),
+        ("bank-transaction", "bank-transaction", "name")]
+    assert lab.sql("SELECT to_regclass(%s)", (f"{SCHEMA}.routine_documents",)) == [(None,)]
+
+
+def test_title_sets_and_clears_a_folder_routine_as_contextkit_writes_it(lab):
+    intake = lab.routines / "defect-intake.md"
+    answer = lab.ok("title", "defect-intake", 'Разбор "дефекта"')
+    assert (answer["source"], answer["changed"], answer["routine"]["title"]) == \
+        ("folder", ["title"], 'Разбор "дефекта"')
+    assert intake.read_text() == FILES["defect-intake.md"].replace(
+        "name: defect-intake\n", 'name: defect-intake\ntitle: "Разбор \\"дефекта\\""\n')
+    assert lab.ok("title", "defect-intake", 'Разбор "дефекта"')["changed"] == []
+    cleared = lab.ok("title", "defect-intake", "--clear")
+    assert (cleared["changed"], cleared["routine"]["title_source"]) == (["title"], "name")
+    assert intake.read_text() == FILES["defect-intake.md"]
+    assert lab.refused("title", "nowhere", "x")[0] == 3
+    assert lab.refused("title", "pitstop", "two\nlines")[0] == 6
+    code, error = lab.refused("title", "pitstop", "x", CAPABILITIES_READ_ONLY="1")
+    assert (code, error["code"]) == (4, "read_only_switch")
+
+
+def test_titles_and_title_read_and_version_the_store_once_it_holds_the_routines(lab):
+    lab.ok("import")
+    listed = lab.ok("titles", "--json")
+    assert (listed["source"], listed["count"]) == ("store", 3)
+    assert [w for w in listed["warnings"] if "no longer read" in w]
+    pitstop = next(r for r in listed["routines"] if r["name"] == "pitstop")
+    assert (pitstop["title"], pitstop["source"]) == ("Пит-стоп", "store")
+    before = (lab.routines / "defect-intake.md").read_bytes()
+    answer = lab.ok("title", "defect-intake", 'Разбор "дефекта"')
+    assert (answer["source"], answer["changed"], answer["routine"]["title"]) == \
+        ("store", ["title"], 'Разбор "дефекта"')
+    assert (lab.routines / "defect-intake.md").read_bytes() == before
+    assert lab.ok("show", "defect-intake") == FILES["defect-intake.md"].replace(
+        "name: defect-intake\n", 'name: defect-intake\ntitle: "Разбор \\"дефекта\\""\n')
+    assert lab.ok("title", "defect-intake", 'Разбор "дефекта"')["changed"] == []
+    assert lab.ok("title", "pitstop", "Пит-стоп")["changed"] == []
+    assert lab.ok("title", "defect-intake", "--clear")["changed"] == ["title"]
+    assert lab.ok("show", "defect-intake") == FILES["defect-intake.md"]
+    assert lab.ok("history", "defect-intake", "--json")["count"] == 3
+    assert lab.refused("title", "nowhere", "x")[0] == 3
+
+
+def test_a_store_that_does_not_answer_is_read_past_but_refuses_a_title(lab):
+    dead = f"postgresql://{ADMIN}@127.0.0.1:{_free_port()}/none?sslmode=disable"
+    listed = lab.ok("titles", "--json", AGENTKIT_DB_URL=dead)
+    assert (listed["source"], listed["count"]) == ("folder", 3)
+    assert listed["warnings"] and "routines folder is used" in listed["warnings"][0]
+    assert lab.refused("title", "pitstop", "x", AGENTKIT_DB_URL=dead)[0] == 5
+    assert (lab.routines / "pitstop.md").read_text() == FILES["pitstop.md"]

@@ -127,6 +127,30 @@ Routines in the store:
   version per routine is active, which the store enforces; it refuses any
   change to a version other than clearing `active`, and any delete.
 
+The agent's routines and their titles:
+  These read and write the agent's routines where they live: in the store
+  when it holds an active routine of this project, else in the routines
+  layer as `capabilities path --json` names it - the rule the manager builds
+  the routine index by. A store that is set but does not answer is read past
+  to the folder with a warning; a write is refused instead.
+
+  routine titles [--json]
+      Each routine with its name, title, description and source (`folder`
+      with its path, or `store` with its active version). A routine without
+      a title is titled by its name; title_source says which (`front_matter`
+      or `name`). The answer names the source, and warns of each folder file
+      it skips. For a folder it is what `contextkit routines --json` lists.
+  routine title <name> <title>
+  routine title <name> --clear
+      Set the routine's display title, one line of at most 120 characters, or
+      remove it so the name titles it. In the folder the file's `title:` line
+      is written as ContextKit writes it, after `name:` as a JSON string; in
+      the store a new version holds that same title and the active version's
+      description and body. Answers the routine as `titles` lists it and
+      `changed` (`["title"]`, or `[]` when it already held that title). Exit 3
+      for a routine that is not there, exit 4 `read_only_switch` under
+      CAPABILITIES_READ_ONLY.
+
 Contract commands:
   routine stub
   routine manifest --json
@@ -152,6 +176,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from pathlib import Path
 from typing import NoReturn
 
@@ -165,9 +190,10 @@ SUMMARY = ("Routine CLI for project repeatable procedures — list, validate, "
            "and import and export the routines folder byte for byte.")
 SCOPE = "project"
 CRED_KEYS: list = []
-# Every verb that changes the store's routines; each is refused under the
-# read-only switch. `export` reads the store and writes only the folder named.
-WRITE_VERBS = {"save", "retire", "import"}
+# Every verb that changes the project's routines, in the store or, for `title`,
+# in the routines folder; each is refused under the read-only switch. `export`
+# reads the store and writes only the folder named.
+WRITE_VERBS = {"save", "retire", "import", "title"}
 WRITE_DEFAULT = True
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/routine/guides/")
@@ -1032,6 +1058,265 @@ def cmd_export(args) -> None:
         sys.exit(6)
 
 
+# ── the agent's routines and their titles ───────────────────────────────────
+
+# Where an agent's routines live is the manager's rule for its build: in the
+# store when the store holds an active routine of this project, else in the
+# routines folder the manager names. A folder routine's title is read and
+# written as ContextKit reads and writes it; a store routine's title is a new
+# version holding the same literal, so its export is the file ContextKit writes.
+TITLE_LIMIT = 120
+
+
+def _one_line(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _front_value(value: str) -> str:
+    """A front-matter value as ContextKit reads it: a quoted value unquoted,
+    a double-quoted one decoded as a JSON string where it is one."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        decoded = None
+        if value[0] == '"':
+            with contextlib.suppress(ValueError):
+                decoded = json.loads(value)
+        value = decoded if isinstance(decoded, str) else value[1:-1]
+    return value
+
+
+def _front_fields(text: str) -> tuple[dict, str]:
+    """The front matter and body of a routines-folder file as ContextKit reads them."""
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---", 4)
+    if end == -1:
+        return {}, text
+    body_start = end + len("\n---")
+    if body_start < len(text) and text[body_start] == "\n":
+        body_start += 1
+    fields: dict = {}
+    for raw in text[4:end].splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip()] = _front_value(value)
+    return fields, text[body_start:]
+
+
+def _folder_routines(folder: Path, warnings: list) -> list[dict]:
+    """The routines declared in the folder, each with its file, as ContextKit
+    lists them, the files it would skip named in `warnings`."""
+    if not folder.is_dir():
+        warnings.append(f"routine layer not present; add `{folder}` "
+                        "or run `routine guide authoring`")
+        return []
+    found = []
+    for path in sorted(folder.rglob("*.md")):
+        try:
+            fields, _body = _front_fields(path.read_text())
+        except OSError:
+            fields = {}
+        name = fields.get("name", "").strip()
+        description = fields.get("description", "").strip()
+        title = _one_line(fields.get("title", "").strip())
+        rel = path.relative_to(folder).as_posix()
+        if not name:
+            warnings.append(f"routine missing frontmatter name: {rel}")
+            continue
+        if not description:
+            warnings.append(f"routine missing frontmatter description: {rel}")
+            continue
+        if name != path.stem:
+            warnings.append(f"routine name `{name}` does not match filename stem "
+                            f"`{path.stem}`: {rel}")
+        found.append({"name": name, "title": title or name,
+                      "title_source": "front_matter" if title else "name",
+                      "description": _one_line(description), "source": "folder",
+                      "path": str(path)})
+    return found
+
+
+def _stored_routines(root: Path, project: str) -> list[dict]:
+    """The active versions of the project's unretired routines in its store,
+    read in a read-only transaction that creates nothing; none where the store
+    has no routine tables."""
+    import psycopg
+    db = _db()
+    setting = db.resolve_setting(root)
+    conn = db.connect(application_name=NAME, setting=setting, transaction=True)
+    try:
+        conn.read_only = True
+        try:
+            return _rows(conn, "SELECT d.name, v.id, v.title, v.description "
+                         "FROM routine_documents d JOIN routine_versions v "
+                         "ON v.document_id = d.id AND v.active "
+                         "WHERE d.project_id = %s AND d.retired_at IS NULL "
+                         "ORDER BY d.name", (project,))
+        except psycopg.errors.UndefinedTable:
+            return []
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
+def _agent_routines(write: bool) -> dict:
+    """The agent's routines where they live. A store that is set but does not
+    answer is read past to the folder with a warning, as the manager's build
+    does, and refuses a write, which must not land in the wrong place."""
+    root = _project_root()
+    if root is None:
+        _die(6, "no_project", f"{NAME} keeps a project's routines; run it inside a project",
+             "cd into the project or set CLAUDE_PROJECT_DIR")
+    folder = _folder(None)
+    warnings: list = []
+    project = _project_id(write=False)
+    rows: list = []
+    if project:
+        import psycopg
+        db = _db()
+        try:
+            rows = _stored_routines(root, str(project))
+        except db.DbError as exc:
+            if exc.slug != "store_not_configured":
+                if write:
+                    _db_refused(exc)
+                warnings.append("routines not read from the store, so the routines folder "
+                                f"is used: {exc.slug}: {exc.message}")
+        except psycopg.Error as exc:
+            if write:
+                _die(5, "store_unreachable", f"the store stopped answering: {exc}",
+                     f"`{NAME} list --store` proves the store")
+            warnings.append("routines not read from the store, so the routines folder is "
+                            f"used: {_one_line(str(exc))[:300]}")
+    if rows:
+        if folder.exists():
+            warnings.append(f"routines are read from the store; the routines folder "
+                            f"`{folder}` is no longer read and can be removed")
+        routines = []
+        for row in rows:
+            title = _one_line(_front_value(row["title"] or ""))
+            routines.append({"name": row["name"], "title": title or row["name"],
+                             "title_source": "front_matter" if title else "name",
+                             "description": _one_line(row["description"]),
+                             "source": "store", "version": str(row["id"])})
+        return {"project": str(root), "source": "store", "count": len(routines),
+                "routines": routines, "warnings": warnings}
+    routines = _folder_routines(folder, warnings)
+    return {"project": str(root), "source": "folder", "folder": str(folder),
+            "count": len(routines), "routines": routines, "warnings": warnings}
+
+
+def cmd_titles(args) -> None:
+    report = _agent_routines(write=False)
+    if args.json:
+        _emit(report)
+        return
+    lines = [f"{r['name']}\t{r['title']}\t{r['description']}" for r in report["routines"]]
+    lines += [f"warning: {w}" for w in report["warnings"]]
+    _emit("\n".join(lines) if lines else f"no routines in this project's {report['source']}")
+
+
+def _title_literal(title: str) -> str:
+    """The front-matter value a title is written as: ContextKit's literal."""
+    return json.dumps(title, ensure_ascii=False)
+
+
+def _with_title(text: str, title: str | None) -> str | None:
+    """The file with its front matter's `title:` line set, or removed for
+    None, as ContextKit writes it; None when that cannot be done safely."""
+    if not text.startswith("---\n"):
+        return None
+    end = text.find("\n---", 4)
+    if end == -1:
+        return None
+    lines = text[4:end].split("\n")
+    title_line = re.compile(r"^title\s*:")
+    kept = [line for line in lines if not title_line.match(line)]
+    if len(lines) - len(kept) > 1:
+        return None
+    if title is not None:
+        named = next((i for i, line in enumerate(kept) if re.match(r"^name\s*:", line)), None)
+        kept.insert(0 if named is None else named + 1, f"title: {_title_literal(title)}")
+    changed = "---\n" + "\n".join(kept) + text[end:]
+    fields, body = _front_fields(changed)
+    before, original_body = _front_fields(text)
+    if body != original_body or (title is not None and fields.get("title") != title):
+        return None
+    if title is None and "title" in fields:
+        return None
+    return changed
+
+
+def _title_argument(args) -> str | None:
+    if args.clear:
+        if args.title is not None:
+            _die(6, "input", "give a title or --clear, not both")
+        return None
+    if args.title is None:
+        _die(6, "input", "nothing to set: give the title, or --clear to remove it",
+             f"`{NAME} title <name> <title>` or `{NAME} title <name> --clear`")
+    for char in args.title:
+        if unicodedata.category(char) in {"Cc", "Zl", "Zp"}:
+            _die(6, "input", f"the title holds control or line-separator character "
+                 f"U+{ord(char):04X}", "a title is one line")
+    title = args.title.strip()
+    if not title:
+        _die(6, "input", "the title is empty", f"`{NAME} title <name> --clear` removes it")
+    if len(title) > TITLE_LIMIT:
+        _die(6, "input", f"the title is longer than {TITLE_LIMIT} characters")
+    return title
+
+
+def cmd_title(args) -> None:
+    title = _title_argument(args)
+    report = _agent_routines(write=True)
+    root = report["project"]
+    if report["source"] == "store":
+        name = _check_name(args.name)
+        if not any(r["name"] == name for r in report["routines"]):
+            _die(3, "not_found", f"no routine {name!r} in this project's store",
+                 f"`{NAME} titles` lists the routines")
+        project = _scope(write=True)
+        with _store() as conn:
+            with conn.transaction():
+                document = _need_document(conn, project, name, lock=True)
+                active = _active(conn, document["id"])
+                fields = {"title": None if title is None else _title_literal(title),
+                          "description": active["description"], "body": active["body"]}
+                if title is not None and _front_value(active["title"] or "") == title:
+                    fields["title"] = active["title"]
+                outcome = _save_version(conn, project, name, fields, None,
+                                        "title cleared" if title is None else "title set",
+                                        _actor())
+        item = next(r for r in _agent_routines(write=False)["routines"] if r["name"] == name)
+        _emit({"project": root, "source": "store", "routine": item,
+               "changed": [] if outcome["outcome"] == "unchanged" else ["title"]})
+        return
+    entries = [r for r in report["routines"] if r["name"] == args.name]
+    if not entries:
+        _die(3, "not_found", f"routine not found: {args.name}",
+             f"`{NAME} titles` lists the routines")
+    if len(entries) > 1:
+        _die(6, "duplicate_routine", f"routine name is declared more than once: {args.name}")
+    path = Path(entries[0]["path"])
+    current = entries[0]["title"] if entries[0]["title_source"] == "front_matter" else None
+    changed = current != title
+    if changed:
+        updated = _with_title(path.read_text(), title)
+        if updated is None:
+            _die(6, "front_matter_unwritable", f"could not write the title in {path}",
+                 "repair its front matter by hand, then run the command again")
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_bytes(updated.encode("utf-8"))
+        os.replace(temporary, path)
+    item = next(r for r in _folder_routines(Path(report["folder"]), [])
+                if r["name"] == args.name)
+    _emit({"project": root, "source": "folder", "routine": item,
+           "changed": ["title"] if changed else []})
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     _gate()
@@ -1084,6 +1369,11 @@ def main(argv: list[str] | None = None) -> None:
     store_verb("retire", cmd_retire).add_argument("name")
     store_verb("import", cmd_import).add_argument("dir", nargs="?")
     store_verb("export", cmd_export).add_argument("dir", nargs="?")
+    store_verb("titles", cmd_titles).add_argument("--json", action="store_true")
+    title = store_verb("title", cmd_title)
+    title.add_argument("name")
+    title.add_argument("title", nargs="?")
+    title.add_argument("--clear", action="store_true")
     args, extra = parser.parse_known_args(argv)
     if extra:
         _die(6, "input", f"unknown arguments: {' '.join(extra)}")

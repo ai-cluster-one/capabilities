@@ -1,5 +1,9 @@
 # routine — change log
 
+## 2026-10-22 — `titles` lists an agent's routines with their titles, and `title` sets or clears one
+
+`routine titles [--json]` answers the agent's routines where they live - in the store when it holds an active routine of the project, else in the routines layer the manager names, the rule the manager builds the routine index by - each with its name, title (its name when it has none, `title_source` saying which), description and source, the folder's path or the store's active version. For a folder it lists what `contextkit routines --json` lists. `routine title <name> <title>` and `routine title <name> --clear` set or remove a routine's display title: in the folder the `title:` line ContextKit writes, in the store a new version holding that same title. The read creates no table; a store that is set but does not answer is read past to the folder with a warning, and refuses a title. `list` and the other verbs are unchanged.
+
 ## 2026-10-21 — A connection whose network flow died fails in seconds
 
 `routine` uses `capabilities-contract` 0.7.2. Its store connections give a network flow up once data sent on it has gone unacknowledged for 20 seconds (`tcp_user_timeout`), which keepalives cannot notice since none is sent while data waits, and send keepalives after 15 seconds idle, every 5 seconds, 3 probes: a connection whose flow stopped carrying packets without a FIN or a reset fails in about 20 seconds as a lost connection instead of waiting until the store ends the session, and a plain read that loses it that way runs once more on a new connection. A connection lost where `routine` catches nothing ends the command as `store_unreachable`, exit 5, as before.
