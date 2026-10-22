@@ -3652,6 +3652,7 @@ def _wm_pair(cfg: dict, args) -> None:
     _log(f"Device name:  {_device_name(cfg)} (desktop)")
     _log(f"Sync window:  {'everything the phone holds' if full else f'{days} day(s)'}")
 
+    bound = None
     with _session_lock(cfg):
         session = Session(cfg, props=props)
         try:
@@ -3683,8 +3684,8 @@ def _wm_pair(cfg: dict, args) -> None:
                      "the device was not linked before the request expired",
                      f"re-run `{NAME} pair --connection {cfg['id']}` to get a new code")
             _LINKED[0] = True
-            if session.db is None:
-                session.bind(session.account()["id"])
+            if cfg.get("unbound"):
+                bound = _bind_link(cfg, session)
             account = session.require_account()
             _event("linked", account=account)
             _event("progress", message="capturing the one-time history burst",
@@ -3698,24 +3699,15 @@ def _wm_pair(cfg: dict, args) -> None:
             errors = list(session.errors)
         finally:
             session.close()
+            if bound:
+                # The home moves once the engine has let go of it, also when
+                # the run is cancelled during the burst, so the bound
+                # connection finds its session wherever the run ended.
+                home = _state_dir() / bound["expected_account_id"]
+                if not home.exists():
+                    Path(cfg["home"]).rename(home)
+                    cfg["home"] = str(home)
 
-    bound = None
-    if cfg.get("unbound") and account.get("id"):
-        # Nothing named the account before the pairing did, so the pairing is
-        # what binds it, and the home it paired in moves under the account.
-        ok, answer = _connection_verb("add", cfg["id"], "--replace", "--field",
-                                      f"expected_account_id={account['id']}")
-        if ok:
-            cfg["expected_account_id"] = account["id"]
-            bound = {"connection": cfg["id"], "expected_account_id": account["id"],
-                     "registry": answer.get("registry")}
-            home = _state_dir() / account["id"]
-            if not home.exists():
-                Path(cfg["home"]).rename(home)
-                cfg["home"] = str(home)
-        else:
-            _log(f"the account could not be bound to {cfg['id']!r}: "
-                 f"{answer.get('message')}")
     facts = _store_facts(cfg)
     result = {"ok": not errors, "connection": cfg["id"],
               "method": "qr" if args.qr else "pairing_code",
@@ -3739,6 +3731,26 @@ def _wm_pair(cfg: dict, args) -> None:
              f"{len(errors)} engine handler(s) failed while capturing the burst: "
              f"{errors[0]}",
              "the capture is incomplete; the tracebacks are on stderr above")
+
+
+def _bind_link(cfg: dict, session: "Session") -> dict | None:
+    """Bind the account a pairing has just linked to the connection that
+    named none, at the moment of the link: nothing named the account before
+    the pairing did, and a run stopped after the link must not leave a linked
+    device under a connection that names no account."""
+    account = session.account()["id"]
+    if not account:
+        return None
+    session.bind(account)
+    ok, answer = _connection_verb("add", cfg["id"], "--replace", "--field",
+                                  f"expected_account_id={account}")
+    if not ok:
+        _log(f"the account could not be bound to {cfg['id']!r}: "
+             f"{answer.get('message')}")
+        return None
+    cfg["expected_account_id"] = account
+    return {"connection": cfg["id"], "expected_account_id": account,
+            "registry": answer.get("registry")}
 
 
 def _wm_chats(cfg: dict, args):

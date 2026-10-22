@@ -13,6 +13,7 @@ import contextlib
 import io
 import json
 import os
+import signal
 import sqlite3
 import sys
 import tempfile
@@ -80,6 +81,13 @@ class Unlinked(FakeSession):
     linked = False
 
 
+class CancelledInBurst(FakeSession):
+    """Linked, then cancelled while the history burst is captured."""
+
+    def drain(self, **_):
+        os.kill(os.getpid(), signal.SIGTERM)
+
+
 class PairLink(unittest.TestCase):
 
     def setUp(self):
@@ -145,6 +153,17 @@ class PairLink(unittest.TestCase):
         self.assertEqual(code, "never_linked")
         self.assertNotIn("test", self.registry())
         self.assertFalse((self.home / "state" / "whatsapp" / "test").exists())
+
+    def test_link_cancelled_during_the_burst_keeps_a_bound_connection(self):
+        code, _ = self.pair(CancelledInBurst)
+        self.assertEqual(code, "cancelled")
+        self.assertEqual(self.registry()["test"]["expected_account_id"], ACCOUNT)
+        state = self.home / "state" / "whatsapp"
+        self.assertTrue((state / ACCOUNT / "session.db").is_file())
+        self.assertFalse((state / "test").exists())
+        reg, _ = self.wa._connections_registry()
+        _cfg, problem = self.wa._build_cfg(*self.wa._select_connection(reg, "test"))
+        self.assertIsNone(problem)
 
     def test_without_events_a_failed_link_keeps_the_connection(self):
         code, _ = self.pair(Unlinked, events=False)
