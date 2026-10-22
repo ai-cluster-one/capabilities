@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-22 — A connection has an owner, and `capabilities connections list` shows it with every grant
+
+`capabilities connections list [<name> ...]` answers, per capability, every connection the store holds with its owner - `owner` null and `shared` true for a connection shared by the capability, an agent's id (and its registered name as `owner_name`) for that agent's own - and every grant on it: agent (null for every agent), node, enabled, allow_write and is_default. It reads only, from the database `store show` names, inside a project or outside one, and refuses with exit 6 `tables_behind` where the store's tables predate owners. The manager requires `capabilities-contract>=0.11,<1`, whose store tier adds the owner (see the contract change log).
+
 ## 2026-10-22 — `routine` and `assets` are core capabilities
 
 `routine` and `assets` join the catalogue's core tier beside `askproject`, `automations`, `context`, `deployment`, `memory` and `tasks`: `capabilities list` shows them as `tier` "core", and the first install of each from the official catalogue on a machine arrives allowed and enabled at global scope, where that scope holds no entry for it yet. A machine that already has either installed keeps its quarantine, allowance and gates as they are; after arrival each is gated, enabled and granted as before.

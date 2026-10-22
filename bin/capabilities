@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.10,<1",
+#     "capabilities-contract>=0.11,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -787,6 +787,22 @@ PROJECT VERBS (run inside a consuming project)
         project id, so it refuses (exit 6) where the id is not verified, and
         `records.mode` answers `store` with the table as `source`. A store
         that cannot be reached is exit 5 store_unreachable.
+  connections list [<name> ...]
+        Every connection the store holds, per capability - of the capabilities
+        named, or of all - with its owner and every grant on it, read from the
+        database `store show` names here, inside a project or outside one. A
+        connection is shared by the capability (owner null, shared true),
+        which any agent may be granted, or one agent's own (owner its id),
+        its own account, granted to no other agent; a connection added with
+        `<name> connection add --project` in a project in store mode is that
+        project's own, written with its grant. Each grant names its agent
+        (null: the grant for every agent), node (null: every node), enabled,
+        allow_write (null falls to the capability's WRITE_DEFAULT) and
+        is_default; a registered agent's name rides beside its id. Reads only.
+        JSON {store {schema}, capabilities {<name> [{connection, owner,
+        owner_name, shared, grants [{agent, agent_name, node, enabled,
+        allow_write, is_default}]}]}}. Exit 6 tables_behind where the store's
+        tables predate owners, 5 when the store cannot be reached.
   connections import
         Move this project's records - connections, grants, identifiers and
         policy - from its files into its store (the database `store show`
@@ -9110,6 +9126,62 @@ def _import_records_verify(files, stored, plan: dict) -> None:
             "after the import the store would resolve the policy gate differently "
             "from the files, so nothing was written",
             "report this as a defect in `capabilities connections import`")
+
+
+def cmd_connections_list(names: list[str]) -> None:
+    """Every connection the store holds, per capability, with its owner -
+    shared, or one agent's own - and every grant on it."""
+    unknown = [n for n in names if n.startswith("-")]
+    if unknown:
+        _die(6, "input", f"unknown connections list option {unknown[0]!r}",
+             "capabilities connections list [<name> ...]")
+    names = [_references_name(n) for n in names]
+    db = _db_module()
+    import psycopg
+    root = _project_root()
+    try:
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+                          transaction=True)
+    except db.DbError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    only = " WHERE c.capability = ANY(%s)" if names else ""
+    params = (names,) if names else ()
+    try:
+        connections = conn.execute(
+            "SELECT c.capability, c.name, c.owner, a.name FROM capabilities_connections c "
+            "LEFT JOIN capabilities_agents a ON a.id = c.owner" + only
+            + " ORDER BY c.capability, c.name", params).fetchall()
+        grants = conn.execute(
+            "SELECT g.capability, g.connection, g.agent_id, a.name, g.node, g.enabled, "
+            "g.allow_write, g.is_default FROM capabilities_connection_grants g "
+            "LEFT JOIN capabilities_agents a ON a.id = g.agent_id"
+            + only.replace("c.capability", "g.capability")
+            + " ORDER BY g.capability, g.connection, g.agent_id NULLS FIRST, "
+            "g.node NULLS FIRST", params).fetchall()
+    except (psycopg.errors.UndefinedColumn, psycopg.errors.UndefinedTable):
+        major, minor = _store_module().STORE_TABLES_VERSION
+        _die(6, "tables_behind",
+             f"the store's {_store_module().STORE_OWNER} tables predate connection owners",
+             f"the first records write of this manager, or of a capability on this "
+             f"contract, brings them to {major}.{minor}")
+    except psycopg.Error as exc:
+        _die(5, "store_unreachable", f"cannot read the connections: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    finally:
+        conn.close()
+    held: dict = {}
+    for capability, connection, agent, agent_name, node, enabled, allow_write, \
+            is_default in grants:
+        held.setdefault((capability, connection), []).append({
+            "agent": agent, "agent_name": agent_name, "node": node, "enabled": enabled,
+            "allow_write": allow_write, "is_default": bool(is_default)})
+    out: dict = {}
+    for capability, connection, owner, owner_name in connections:
+        out.setdefault(capability, []).append({
+            "connection": connection, "owner": owner, "owner_name": owner_name,
+            "shared": owner is None, "grants": held.get((capability, connection), [])})
+    _emit({"store": {"schema": setting.schema}, "capabilities": out})
 
 
 def cmd_connections_import() -> None:
@@ -18147,10 +18219,13 @@ def main() -> None:
     elif cmd == "migrate":
         cmd_migrate(rest)
     elif cmd == "connections":
-        if rest != ["import"]:
-            _die(6, "input", "connections needs the subcommand import, and nothing else",
+        if rest[:1] == ["list"]:
+            cmd_connections_list(rest[1:])
+        elif rest == ["import"]:
+            cmd_connections_import()
+        else:
+            _die(6, "input", "connections needs the subcommand list or import",
                  "run `capabilities help`")
-        cmd_connections_import()
     elif cmd == "get":
         if len(pos) != 3:
             _die(6, "input", "get needs <name> <collection> <key>")

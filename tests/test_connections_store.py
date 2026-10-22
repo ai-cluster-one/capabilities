@@ -554,16 +554,23 @@ def test_a_store_connection_is_written_over_only_with_replace(lab):
     assert spec["base_url"] == lab["url"] + "/x"
 
 
-def test_a_store_connection_added_without_a_grant_says_so(lab):
+def test_a_store_connection_added_in_the_project_is_its_own_and_granted(lab):
     _import(lab)
     added = _ok(_coolify(lab, "connection", "add", "fresh", "--project",
                          "--field", f"base_url={lab['url']}",
                          "--env", "secret_env=COOLIFY_TOKEN"))
-    assert added["granted"] is False
-    assert "capabilities set coolify grant fresh" in added["hint"]
+    assert added["granted"] is True and "hint" not in added
+    assert _rows(lab, "SELECT owner FROM capabilities_connections WHERE name = 'fresh'") \
+        == [(PROJECT_ID,)]
+    assert _rows(lab, "SELECT agent_id, node, enabled FROM capabilities_connection_grants "
+                      "WHERE connection = 'fresh'") == [(PROJECT_ID, None, True)]
     replaced = _ok(_coolify(lab, "connection", "add", "box", "--replace",
                             "--field", f"base_url={lab['url']}"))
     assert replaced["granted"] is True and "hint" not in replaced
+    assert _rows(lab, "SELECT owner FROM capabilities_connections WHERE name = 'box'") \
+        == [(None,)]
+    removed = _ok(_coolify(lab, "connection", "remove", "fresh"))
+    assert removed["action"] == "remove" and "fresh" not in _stored_connections(lab)
 
 
 def test_a_read_only_grant_refuses_a_write_verb(lab):

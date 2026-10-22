@@ -242,11 +242,11 @@ def test_the_ledger_applies_the_new_steps_on_a_fresh_store_and_on_one_at_p2(lab,
 
     steps = [r[0] for r in lab.sql(
         "SELECT step FROM schema_ledger WHERE owner = 'capabilities' ORDER BY step")]
-    assert steps[-6:] == ["0014-connection-grants-global", "0015-identifiers-node",
+    assert steps[-7:] == ["0014-connection-grants-global", "0015-identifiers-node",
                           "0016-settings", "0017-settings-documents",
-                          "0018-settings-changes", "0019-references"]
+                          "0018-settings-changes", "0019-references", "0020-connection-owner"]
     assert lab.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
-        == [(1, 4)]
+        == [(1, 5)]
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
     assert "COALESCE(agent_id, ''::text)" in indexes["capabilities_connection_grants_scope_key"]
@@ -257,8 +257,10 @@ def test_the_ledger_applies_the_new_steps_on_a_fresh_store_and_on_one_at_p2(lab,
     triggers = {r[0] for r in lab.sql(
         "SELECT tgname FROM pg_trigger WHERE NOT tgisinternal")}
     assert {"capabilities_settings_guard", "capabilities_settings_changes_append_only",
-            "capabilities_settings_changes_no_truncate"} <= triggers
-    for table in ("capabilities_settings", "capabilities_settings_documents",
+            "capabilities_settings_changes_no_truncate", "capabilities_connections_owner",
+            "capabilities_connection_grants_owner"} <= triggers
+    for table in ("capabilities_connections", "capabilities_settings",
+                  "capabilities_settings_documents",
                   "capabilities_settings_changes", "capabilities_connection_grants",
                   "capabilities_identifiers"):
         [(comment,)] = lab.sql("SELECT obj_description(%s::regclass)", (f"{SCHEMA}.{table}",))
@@ -327,6 +329,134 @@ def test_grants_and_defaults_for_every_agent_cannot_duplicate(lab):
     lab.sql(grant, ("box", SERVER, True))
     with pytest.raises(psycopg.errors.CheckViolation):
         lab.sql(grant.replace("NULL", "''"), ("two", None, False))
+
+
+# --- a connection's owner ------------------------------------------------------------
+
+OTHER = "prj_" + "9f8e7d6c5b4a"
+
+
+def _ledger_before_owners(lab: Lab) -> None:
+    """A store the previous release migrated: steps 0001-0019 at version 1.4."""
+    from capabilities_contract import db
+    conn = db.connect(application_name="test", setting=db.resolve_setting(lab.project))
+    try:
+        db.migrate(conn, S.STORE_OWNER, S.record_table_steps()[:19], major=1, minor=4)
+    finally:
+        conn.close()
+
+
+def _owners(lab: Lab) -> dict:
+    return {(cap, name): owner for cap, name, owner in lab.sql(
+        "SELECT capability, name, owner FROM capabilities_connections")}
+
+
+def test_a_store_made_before_owners_gives_each_row_its_owner_by_the_rule(lab):
+    _ledger_before_owners(lab)
+    anonymous = "prj_" + "aaaaaaaaaaaa"
+    lab.sql("INSERT INTO capabilities_agents (id, name) VALUES (%s, 'Ada'), "
+            "(%s, 'Clinic Desk'), (%s, NULL)", (PROJECT_ID, OTHER, anonymous))
+    lab.sql("INSERT INTO capabilities_connections (capability, name, spec) VALUES "
+            "('agentrooms', 'ada', '{}'), ('telegram', '1000000001', '{\"name\": \"Ada\"}'), "
+            "('rclonec', 'ada_documents', '{}'), ('agentrooms', 'clinic', '{}'), "
+            "('stripe', 'default', '{}'), ('telegram', 'adams', '{}'), "
+            "('clickup', 'ada', '{}'), ('telegram', 'ada', '{}'), "
+            "('coolify', 'nobody', '{}'), ('ical', 'loose', '{}')")
+    grant = ("INSERT INTO capabilities_connection_grants "
+             "(agent_id, capability, connection, node, enabled) VALUES (%s, %s, %s, %s, true)")
+    for agent, capability, name, node in (
+            (PROJECT_ID, "agentrooms", "ada", None), (PROJECT_ID, "agentrooms", "ada", SERVER),
+            (PROJECT_ID, "telegram", "1000000001", None),
+            (PROJECT_ID, "rclonec", "ada_documents", None),
+            (OTHER, "agentrooms", "clinic", None), (PROJECT_ID, "stripe", "default", None),
+            (PROJECT_ID, "telegram", "adams", None), (PROJECT_ID, "clickup", "ada", None),
+            (OTHER, "clickup", "ada", None), (PROJECT_ID, "telegram", "ada", None),
+            (None, "telegram", "ada", None), (anonymous, "coolify", "nobody", None)):
+        lab.sql(grant, (agent, capability, name, node))
+
+    lab.ok(MANAGER, "node", "add", MASTER, "--kind", "mac", "--master")
+
+    assert _owners(lab) == {
+        # granted to exactly one agent and named for it
+        ("agentrooms", "ada"): PROJECT_ID, ("telegram", "1000000001"): PROJECT_ID,
+        ("rclonec", "ada_documents"): PROJECT_ID, ("agentrooms", "clinic"): OTHER,
+        # the rest stay shared
+        ("stripe", "default"): None, ("telegram", "adams"): None,
+        ("clickup", "ada"): None, ("telegram", "ada"): None,
+        ("coolify", "nobody"): None, ("ical", "loose"): None}
+    listed = lab.ok(MANAGER, "connections", "list", "agentrooms", "clickup")
+    assert set(listed["capabilities"]) == {"agentrooms", "clickup"}
+    clinic, ada = listed["capabilities"]["agentrooms"]
+    assert clinic == {
+        "connection": "clinic", "owner": OTHER, "owner_name": "Clinic Desk",
+        "shared": False, "grants": [{"agent": OTHER, "agent_name": "Clinic Desk",
+                                     "node": None, "enabled": True, "allow_write": None,
+                                     "is_default": False}]}
+    assert ada["owner"] == PROJECT_ID and [g["node"] for g in ada["grants"]] == [None, SERVER]
+    [shared] = listed["capabilities"]["clickup"]
+    assert shared["shared"] is True and shared["owner"] is None
+    assert [g["agent"] for g in shared["grants"]] == sorted([PROJECT_ID, OTHER])
+
+
+def test_an_agents_own_connection_is_granted_to_no_other_agent(lab):
+    import psycopg
+    lab.ok(MANAGER, "node", "add", MASTER, "--kind", "mac", "--master")
+    lab.sql("INSERT INTO capabilities_connections (capability, name, spec, owner) VALUES "
+            "('telegram', 'mine', '{}', %s), ('telegram', 'ours', '{}', NULL)", (PROJECT_ID,))
+    grant = ("INSERT INTO capabilities_connection_grants "
+             "(agent_id, capability, connection, node, allow_write) "
+             "VALUES (%s, 'telegram', %s, %s, %s)")
+    lab.sql(grant, (PROJECT_ID, "mine", None, False))
+    lab.sql(grant, (PROJECT_ID, "mine", SERVER, True))
+    for agent in (OTHER, None):
+        with pytest.raises(psycopg.errors.CheckViolation):
+            lab.sql(grant, (agent, "mine", None, None))
+    # A shared connection is read-write for one agent and read-only for another.
+    lab.sql(grant, (OTHER, "ours", None, True))
+    lab.sql(grant, (PROJECT_ID, "ours", None, False))
+    with pytest.raises(psycopg.errors.CheckViolation):
+        lab.sql("UPDATE capabilities_connections SET owner = %s WHERE name = 'ours'",
+                (PROJECT_ID,))
+    with pytest.raises(psycopg.errors.CheckViolation):
+        lab.sql("UPDATE capabilities_connection_grants SET agent_id = %s "
+                "WHERE connection = 'mine'", (OTHER,))
+    [ours] = [c for c in lab.ok(MANAGER, "connections", "list", "telegram")
+              ["capabilities"]["telegram"] if c["connection"] == "ours"]
+    assert {g["agent"]: g["allow_write"] for g in ours["grants"]} == {
+        OTHER: True, PROJECT_ID: False}
+
+
+def test_a_moved_agent_adds_its_own_connection_with_its_grant_and_a_machine_one_shared(moved):
+    lab = moved
+    fields = ("--field", "base_url=http://box.invalid", "--env", "secret_env=COOLIFY_TOKEN")
+    added = lab.ok(COOLIFY, "connection", "add", "mine", "--project", *fields)
+    assert added["granted"] is True and "hint" not in added
+    assert _owners(lab) == {("coolify", "mine"): PROJECT_ID}
+    assert lab.sql("SELECT agent_id, node, enabled, allow_write FROM "
+                   "capabilities_connection_grants") == [(PROJECT_ID, None, True, None)]
+    lab.ok(COOLIFY, "connection", "add", "box", "--machine", *fields)
+    assert _owners(lab)[("coolify", "box")] is None
+    assert lab.sql("SELECT count(*) FROM capabilities_connection_grants "
+                   "WHERE connection = 'box'") == [(0,)]
+    lab.ok(MANAGER, "set", "coolify", "grant", "mine", '{"allow_write": false}')
+    listed = {c["connection"]: c for c in
+              lab.ok(MANAGER, "connections", "list")["capabilities"]["coolify"]}
+    assert listed["box"]["shared"] is True and listed["box"]["grants"] == []
+    assert listed["mine"]["owner"] == PROJECT_ID and listed["mine"]["shared"] is False
+    assert [(g["agent"], g["enabled"], g["allow_write"]) for g in listed["mine"]["grants"]] \
+        == [(PROJECT_ID, True, False)]
+    # Another agent's own connection is neither changed nor removed from here.
+    lab.sql("INSERT INTO capabilities_connections (capability, name, spec, owner) "
+            "VALUES ('coolify', 'theirs', '{}', %s)", (OTHER,))
+    _code, error = lab.refused(COOLIFY, "connection", "add", "theirs", "--project",
+                               "--replace", *fields)
+    assert error["code"] == "connection_owned"
+    _code, error = lab.refused(COOLIFY, "connection", "remove", "theirs")
+    assert error["code"] == "connection_owned"
+    # Its own goes with its own grant, which takes it from no one else.
+    removed = lab.ok(COOLIFY, "connection", "remove", "mine")
+    assert removed["action"] == "remove"
+    assert ("coolify", "mine") not in _owners(lab)
 
 
 # --- what a migrated agent reads ----------------------------------------------------
