@@ -3700,11 +3700,21 @@ def _wm_pair(cfg: dict, args) -> None:
         finally:
             session.close()
             if bound:
-                # The home moves once the engine has let go of it, also when
-                # the run is cancelled during the burst, so the bound
-                # connection finds its session wherever the run ended.
+                # The pairing home takes the account's name once the engine
+                # has let go of it, also when the run is cancelled during the
+                # burst; until then the account's name leads to it.
                 home = _state_dir() / bound["expected_account_id"]
-                if not home.exists():
+                if home.is_symlink():
+                    try:
+                        home.unlink()
+                        Path(cfg["home"]).rename(home)
+                        cfg["home"] = str(home)
+                    except OSError as exc:
+                        if not home.exists():
+                            with contextlib.suppress(OSError):
+                                home.symlink_to(Path(cfg["home"]).name)
+                        _log(f"the pairing home stays at {cfg['home']}: {exc}")
+                elif not home.exists():
                     Path(cfg["home"]).rename(home)
                     cfg["home"] = str(home)
 
@@ -3742,9 +3752,20 @@ def _bind_link(cfg: dict, session: "Session") -> dict | None:
     if not account:
         return None
     session.bind(account)
+    # The record names the account only once the account's home leads to the
+    # session: every other verb resolves that home, and one that found it
+    # missing would make an empty one and strand the session beside it.
+    home, link = Path(cfg["home"]), _state_dir() / account
+    linked = False
+    if not link.exists() and not link.is_symlink():
+        with contextlib.suppress(OSError):
+            link.symlink_to(home.name)
+            linked = True
     ok, answer = _connection_verb("add", cfg["id"], "--replace", "--field",
                                   f"expected_account_id={account}")
     if not ok:
+        if linked:
+            link.unlink(missing_ok=True)
         _log(f"the account could not be bound to {cfg['id']!r}: "
              f"{answer.get('message')}")
         return None

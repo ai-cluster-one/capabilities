@@ -165,6 +165,25 @@ class PairLink(unittest.TestCase):
         _cfg, problem = self.wa._build_cfg(*self.wa._select_connection(reg, "test"))
         self.assertIsNone(problem)
 
+    def test_another_verb_during_the_burst_finds_the_session(self):
+        wa, seen = self.wa, {}
+
+        class OtherVerbInBurst(FakeSession):
+            def drain(inner, **_):
+                # What `doctor` does for the connection while the burst runs.
+                reg, _ = wa._connections_registry()
+                cfg, problem = wa._build_cfg(*wa._select_connection(reg, "test"))
+                seen["problem"] = problem
+                seen["session"] = (wa._connection_home(cfg) / "session.db").is_file()
+
+        code, events = self.pair(OtherVerbInBurst)
+        self.assertIsNone(code)
+        self.assertEqual(seen, {"problem": None, "session": True})
+        state = self.home / "state" / "whatsapp"
+        self.assertTrue((state / ACCOUNT / "session.db").is_file())
+        self.assertFalse((state / ACCOUNT).is_symlink())
+        self.assertFalse((state / "test").exists())
+
     def test_without_events_a_failed_link_keeps_the_connection(self):
         code, _ = self.pair(Unlinked, events=False)
         self.assertEqual(code, "never_linked")
