@@ -121,7 +121,7 @@ def holds_slot(owner_id: Any) -> bool:
 # so every comparison and every reader below sees the values it always saw.
 STORE_OWNER = "telegram"
 STORE_SCHEMA_MAJOR = 1
-STORE_SCHEMA_MINOR = 1
+STORE_SCHEMA_MINOR = 2
 STORE_STEPS = (
     ("0001-jobs", """
     CREATE TABLE telegram_jobs (
@@ -223,6 +223,60 @@ STORE_STEPS = (
     # stays the harness, because a session continues only on its own harness.
     ("0004-job-profile", """
     ALTER TABLE telegram_jobs ADD COLUMN profile TEXT;
+    """),
+    # The service's own prompts (`prompts.py`), one row per saved version. They
+    # follow the store's versioning pattern rather than the register's legacy
+    # column types: a uuid per version, timestamptz, one active version per key
+    # held by a partial unique index, and a guard that keeps every version as it
+    # was saved but for clearing `active`.
+    ("0005-prompts", """
+    CREATE TABLE telegram_prompts (
+        id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        project_id  text NOT NULL CHECK (project_id <> ''),
+        key         text NOT NULL CHECK (key ~ '^[^/[:space:]]+$' AND key !~ '^reference[.]'),
+        body        text NOT NULL,
+        active      boolean NOT NULL DEFAULT true,
+        created_at  timestamptz NOT NULL DEFAULT now(),
+        created_by  text NOT NULL CHECK (created_by <> ''),
+        note        text
+    );
+    CREATE UNIQUE INDEX telegram_prompts_active ON telegram_prompts (project_id, key)
+        WHERE active;
+    CREATE INDEX telegram_prompts_key ON telegram_prompts (project_id, key, created_at DESC);
+    COMMENT ON TABLE telegram_prompts IS
+        'Every saved version of a telegram service prompt; immutable but for active, which a save clears as it adds the next.';
+    COMMENT ON COLUMN telegram_prompts.project_id IS
+        'The project''s declared id.';
+    COMMENT ON COLUMN telegram_prompts.key IS
+        'The document key: the service file''s name without .md, lower-cased with _ as -, prefixed context. for a file in context/.';
+    COMMENT ON COLUMN telegram_prompts.body IS
+        'The prompt''s whole text, kept exactly.';
+    COMMENT ON COLUMN telegram_prompts.active IS
+        'The version the service reads; at most one per project and key.';
+    COMMENT ON COLUMN telegram_prompts.created_by IS
+        'Who saved the version: user@node, or the verb that seeded it.';
+    COMMENT ON COLUMN telegram_prompts.note IS
+        'Why the version was saved.';
+    CREATE FUNCTION telegram_prompts_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF tg_op IN ('DELETE', 'TRUNCATE') THEN
+            RAISE EXCEPTION 'telegram prompt versions are never deleted: save a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF (to_jsonb(new) - 'active') IS DISTINCT FROM (to_jsonb(old) - 'active') THEN
+            RAISE EXCEPTION 'a telegram prompt version is immutable: save a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.active AND NOT old.active THEN
+            RAISE EXCEPTION 'a telegram prompt version is not made active again: save its text as a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $$;
+    CREATE TRIGGER telegram_prompts_guard BEFORE UPDATE OR DELETE ON telegram_prompts
+        FOR EACH ROW EXECUTE FUNCTION telegram_prompts_guard();
+    CREATE TRIGGER telegram_prompts_truncate BEFORE TRUNCATE ON telegram_prompts
+        FOR EACH STATEMENT EXECUTE FUNCTION telegram_prompts_guard();
     """),
 )
 

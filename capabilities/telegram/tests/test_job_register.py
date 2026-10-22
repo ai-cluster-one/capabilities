@@ -137,15 +137,15 @@ class RegisterCase(unittest.TestCase):
             "WHERE table_schema = current_schema() AND table_name LIKE ?",
             ("telegram\\_%",)).fetchall()}
         self.assertEqual(tables, {"telegram_jobs", "telegram_job_amendments",
-                                  "telegram_job_slots"})
+                                  "telegram_job_slots", "telegram_prompts"})
 
     def test_the_profile_column_is_an_additive_fourth_step(self):
         """A job carries the profile it runs on in a nullable column of its own,
         added by a step of its own after the three the register had: a row
         registered without one keeps none, and a store at the earlier version
         takes the step without losing a row."""
-        self.assertEqual([step for step, _sql in jobs.STORE_STEPS][-1], "0004-job-profile")
-        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (1, 1))
+        self.assertEqual([step for step, _sql in jobs.STORE_STEPS][3], "0004-job-profile")
+        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (1, 2))
         with_profile = self.register(engine="claude", profile="telegram-fast")
         without = self.register(engine="codex", model="gpt-5.5")
         self.assertEqual(self.reg.get(with_profile["id"])["profile"], "telegram-fast")

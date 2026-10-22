@@ -149,6 +149,7 @@ from call_recording_helpers import (
 import gate as reply_gate
 import jobs
 import profiles
+import prompts
 import records
 import voice_agent
 from forum import GENERAL_TOPIC_ID, message_topic_id
@@ -473,9 +474,76 @@ def _document_file(key):
 
 
 def _read_document(key):
-    """A document's text, or None where neither scope keeps one by that key."""
+    """A document's text, or None where neither the store nor a scope's file
+    keeps one by that key.
+
+    A prompt's home is the store: its active version in `telegram_prompts` is
+    what is read, and its file only while the store holds no version of the
+    key, which is what a project that has not run `telegram prompts import`
+    still runs on. A store that is configured and cannot answer is never read
+    as holding nothing: the daemon goes on with what the store last answered
+    for the key, and where it never answered for it, the read raises. A
+    reference document is not a prompt and is always its file."""
+    if prompts.is_prompt_key(key) and STORE_REFUSAL is None:
+        row = _stored_prompt(key)
+        if row is not None:
+            return row["body"]
     path = _document_file(key)
     return path.read_text() if path is not None else None
+
+
+_PROMPT_STORE = None
+_PROMPT_PROJECT = None
+# What the store last answered for each key: its active version, or None for
+# none. A store that stops answering leaves a running daemon on these.
+_PROMPT_LAST = {}
+_PROMPT_OUTAGE_SAID = False
+# Prompts are read by the event loop and by the threads that build a worker's
+# turn, so their connection is their own rather than the register's, which
+# belongs to the loop, and one reader at a time uses it.
+_PROMPT_LOCK = threading.Lock()
+
+
+def _stored_prompt(key):
+    """The active version of `key` in the store, or None where it holds none.
+    A connection the store or the network ended is opened again once; a store
+    that still cannot answer leaves the key on what it last answered."""
+    global _PROMPT_OUTAGE_SAID
+    with _PROMPT_LOCK:
+        try:
+            row = _query_prompt(key)
+        except Exception as exc:
+            if key not in _PROMPT_LAST:
+                raise
+            if not _PROMPT_OUTAGE_SAID:
+                _PROMPT_OUTAGE_SAID = True
+                log(f"prompts: the store did not answer ({exc}); serving the "
+                    "versions it last answered")
+            return _PROMPT_LAST[key]
+        _PROMPT_OUTAGE_SAID = False
+        _PROMPT_LAST[key] = row
+        return row
+
+
+def _query_prompt(key):
+    global _PROMPT_STORE, _PROMPT_PROJECT
+    for attempt in (1, 2):
+        if _PROMPT_STORE is not None and _PROMPT_STORE.lost():
+            with contextlib.suppress(Exception):
+                _PROMPT_STORE.close()
+            _PROMPT_STORE = None
+        if _PROMPT_STORE is None:
+            _PROMPT_STORE, register = jobs.open_register(
+                PROJECT_CAPABILITIES_DIR, globals().get("ENVIRONMENT") or "development",
+                setting=STORE_SETTING,
+                project_id=jobs.handed_project_id(PROJECT_ROOT) or None,
+                profile_tables=False)
+            _PROMPT_PROJECT = register.project_id
+        try:
+            return prompts.active(_PROMPT_STORE.conn, _PROMPT_PROJECT, key)
+        except Exception:
+            if attempt == 2 or not _PROMPT_STORE.lost():
+                raise
 
 
 # Where the register lives, resolved once at launch for this daemon's project.

@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-22 — The service's prompts are versions in the store
+
+The service's prompts - `context`, `delegation`, `job-worker`, the voice prompts and each `context.<name>` - are kept as versions in `telegram_prompts`, a table of telegram's own that the register's ledger creates as step `0005-prompts` (version 1.2). Each save is a new version, one per key is active, and the store refuses any change to a saved version, so earlier versions stay readable. `telegram prompts import [DIR]` saves the service directory's files, `export [DIR]` writes the active versions back as files, `put <key>` saves one version (`--base` refuses a save over a version the writer did not read, exit 6 `conflict`), and `list`, `versions <key>` and `show <key> [--version ID]` read them. The daemon reads a key's active version, and its file only while the store holds no version of that key, so a project that has not imported keeps running on its files as before; while the store does not answer, a running daemon keeps the versions it last read. Reference documents stay files.
+
 ## 2026-10-21 — A connection whose network flow died fails in seconds
 
 `telegram` uses `capabilities-contract` 0.7.2. Its store connections give a network flow up once data sent on it has gone unacknowledged for 20 seconds (`tcp_user_timeout`), which keepalives cannot notice since none is sent while data waits, and send keepalives after 15 seconds idle, every 5 seconds, 3 probes: a connection whose flow stopped carrying packets without a FIN or a reset fails in about 20 seconds as a lost connection instead of waiting until the store ends the session, and a plain read that loses it that way runs once more on a new connection. A connection lost where `telegram` catches nothing ends the command as `store_unreachable`, exit 5, as before.

@@ -297,6 +297,31 @@ Commands:
                                                which). With none, `start`, `run`
                                                and `jobs` exit 6
                                                store_not_configured.
+  telegram prompts list | show <key> [--version ID] | versions <key>
+            | put <key> <file|-> [--base ID] [--note TEXT]
+            | import [DIR] [--note TEXT] | export [DIR]
+                                               The service's prompts - context,
+                                               delegation, job-worker, the voice
+                                               prompts and each context/<x> - as
+                                               versions in telegram_prompts in the
+                                               project's store. The service reads
+                                               a key's active version, and its
+                                               file under capabilities/telegram/
+                                               service only while the store holds
+                                               no version of that key. `import`
+                                               saves each file there (or in DIR)
+                                               whose text is not the active
+                                               version; `export` writes each
+                                               active version back as its file,
+                                               leaving an equal one alone. `put`
+                                               saves a new version and keeps the
+                                               earlier ones readable through
+                                               `versions` and `show --version`;
+                                               `--base` names the version
+                                               replaced, and a save that lost the
+                                               race exits 6 conflict. A worker
+                                               saves only for a requester whose
+                                               role may /set.
   telegram profiles list | show <name> | save <name> <file|-> [--base ID]
                                                The harness profiles a worker runs
                                                on, kept in the project's store.
@@ -2909,23 +2934,24 @@ def _migrate_with_profile_tables(argv: list[str]) -> None:
     sys.exit(0)
 
 
-def _profile_saver(root: Path) -> str:
+def _profile_saver(root: Path, thing: str = "profile") -> str:
     """Who a save is recorded as. A worker the daemon started saves only for a
     requester whose role the control gate admits to `/set`, as the daemon
-    states that role; the CLI trusts the daemon, not the model."""
+    states that role; the CLI trusts the daemon, not the model. `thing` is what
+    is being saved - a profile, a prompt - as the refusal names it."""
     if not os.environ.get("TELEGRAM_DAEMON_CHILD", "").strip():
         return f"{getpass.getuser()}@{os.uname().nodename}"
     requester = os.environ.get("TELEGRAM_AUTHORIZED_REQUESTER_ID", "").strip()
     role = os.environ.get(PROFILE_ROLE_ENV, "").strip()
     if not requester or not role:
-        _die(4, "profile_save_denied",
-             "a worker the Telegram daemon started tried to save a profile without "
+        _die(4, f"{thing}_save_denied",
+             f"a worker the Telegram daemon started tried to save a {thing} without "
              "the requester's role stated by the daemon",
              f"the daemon hands its worker {PROFILE_ROLE_ENV}; only a sender whose "
-             "role may /set saves a profile")
+             f"role may /set saves a {thing}")
     if not _profiles_module().role_admitted_to_set(role, _service_settings(root)):
-        _die(4, "profile_save_denied",
-             f"role {role} may not /set, so it may not save a profile",
+        _die(4, f"{thing}_save_denied",
+             f"role {role} may not /set, so it may not save a {thing}",
              "ask a sender whose role may /set (by default supervisor or "
              "channel_admin)")
     return f"telegram:{requester}"
@@ -2956,6 +2982,135 @@ def cmd_profiles(args) -> dict:
     if args.base:
         tail += ["--base", args.base]
     return _profiles_answer(tail, text)
+
+
+# --- Service prompts --------------------------------------------------------------
+#
+# The service's prompts are versioned rows of `telegram_prompts` in the project's
+# store (`service/prompts.py`); the files under the service directory are what
+# `prompts import` reads and `prompts export` writes, and what the service reads
+# for a key only while the store holds no version of it.
+
+_PROMPTS_MODULE = None
+
+
+def _prompts_module():
+    global _PROMPTS_MODULE
+    if _PROMPTS_MODULE is not None:
+        return _PROMPTS_MODULE
+    path = _service_bundle_dir() / "service" / "prompts.py"
+    _require_service_bundle_files(path)
+    spec = importlib.util.spec_from_file_location("telegram_service_prompts", path)
+    if spec is None or spec.loader is None:
+        _die(3, "service_bundle_missing", f"cannot load the bundled prompts module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _PROMPTS_MODULE = module
+    return module
+
+
+def _open_prompts(root: Path, write: bool):
+    """The store's connection and the project id prompts are kept under, with
+    telegram's tables migrated. The caller closes the connection."""
+    module = _jobs_module()
+    project_id = _project_id(write=True) if write else _project_id()
+    try:
+        store, register = module.open_register(
+            _project_capabilities_dir(root), _job_environment(root),
+            project_id=project_id, project_root=root, profile_tables=False)
+    except module.JobError as exc:
+        _die(6 if exc.slug in _STORE_SETTING_SLUGS else 5, exc.slug, exc.message, exc.hint)
+    return store, register.project_id
+
+
+def _stored_prompt_keys(root: Path) -> set:
+    """The prompt keys the store holds an active version of for this project;
+    none where the project has no store or it cannot be reached, so a report
+    that asks falls back to the files the service would read then."""
+    module = _jobs_module()
+    try:
+        store, register = module.open_register(
+            _project_capabilities_dir(root), _job_environment(root),
+            project_id=_project_id(), project_root=root, profile_tables=False)
+    except module.JobError:
+        return set()
+    try:
+        return {entry["key"] for entry in _prompts_module().keys(store.conn, register.project_id)
+                if entry["active"]}
+    finally:
+        store.close()
+
+
+def _prompt_held(root: Path, key: str, stored: set) -> bool:
+    """Whether the service has a prompt for `key`: a version in the store, or
+    the file it reads while the store holds none."""
+    return key in stored or _records().document_read(NAME, key) is not None
+
+
+def cmd_prompts(args) -> dict:
+    """`prompts list|show|versions|put|import|export`: the service's prompts as
+    the store keeps them, one version's text, a key's history, a new version,
+    and the service directory's files read in or written out."""
+    root = _service_project_root()
+    verb = args.prompts_cmd
+    writing = verb in ("put", "import")
+    if writing:
+        _read_only_gate(f"`{NAME} prompts {verb}`")
+        created_by = _profile_saver(root, "prompt")
+    module = _prompts_module()
+    key_of = _settings_schema_module().document_key
+    store, project_id = _open_prompts(root, write=writing)
+    conn = store.conn
+    try:
+        if verb == "list":
+            return {"project_id": project_id, "prompts": module.keys(conn, project_id)}
+        if verb == "show":
+            row = (module.version(conn, project_id, args.key, args.version)
+                   if args.version else module.active(conn, project_id, args.key))
+            if row is None:
+                _die(3, "not_found",
+                     f"no version {args.version} of {args.key}" if args.version
+                     else f"the store holds no version of {args.key}",
+                     f"`{NAME} prompts versions {args.key}` lists them; "
+                     f"`{NAME} prompts import` reads the service directory's files")
+            return row
+        if verb == "versions":
+            found = module.versions(conn, project_id, args.key)
+            if not found:
+                _die(3, "not_found", f"the store holds no version of {args.key}",
+                     f"`{NAME} prompts list` names the keys it holds")
+            return {"key": args.key, "versions": found}
+        if verb == "put":
+            try:
+                body = sys.stdin.read() if args.file == "-" else Path(args.file).read_text()
+            except (OSError, UnicodeDecodeError) as exc:
+                _die(6, "input", f"cannot read {args.file}: {exc}")
+            try:
+                row, saved = module.save(conn, project_id, args.key, body, created_by,
+                                         note=args.note, base=args.base)
+            except module.PromptError as exc:
+                _die(6, exc.slug, exc.message, exc.hint)
+            return {"key": args.key, "version": row["id"],
+                    "outcome": "saved" if saved else "unchanged"}
+        directory = Path(args.dir).expanduser() if args.dir else _service_dir(root)
+        if verb == "import":
+            if not directory.is_dir():
+                _die(6, "input", f"{directory} is not a directory")
+            try:
+                report = module.import_files(conn, project_id, directory, key_of,
+                                             created_by, note=args.note)
+            except module.PromptError as exc:
+                _die(6, exc.slug, exc.message, exc.hint)
+            except (OSError, UnicodeDecodeError) as exc:
+                _die(6, "input", f"cannot read a prompt file: {exc}")
+            return {"directory": str(directory), "prompts": report}
+        try:
+            report = module.export_files(conn, project_id, directory, key_of)
+        except OSError as exc:
+            _die(6, "input", f"cannot write into {directory}: {exc}")
+        return {"directory": str(directory), "prompts": report}
+    finally:
+        store.close()
 
 
 def _job_channel_key(chat: str | None, topic_id: str | None) -> str | None:
@@ -3872,9 +4027,10 @@ def _service_runtime_health(path: Path, running: bool) -> dict:
     return health
 
 
-def _service_initialized(root: Path) -> bool:
-    return bool(_service_settings(root)) and \
-        _records().document_read(NAME, "context") is not None
+def _service_initialized(root: Path, stored: set | None = None) -> bool:
+    if stored is None:
+        stored = _stored_prompt_keys(root)
+    return bool(_service_settings(root)) and _prompt_held(root, "context", stored)
 
 
 def _service_liveness(root: Path, connection_flag: str | None,
@@ -3976,7 +4132,8 @@ def cmd_service_status(connection_flag: str | None, session_flag: str | None) ->
     """Report the actual account-global owner and its recorded health paths."""
     root = _service_project_root()
     envelope = _project_capabilities_dir(root).resolve()
-    initialized = _service_initialized(root)
+    stored_prompts = _stored_prompt_keys(root)
+    initialized = _service_initialized(root, stored_prompts)
     live = _service_liveness(root, connection_flag, session_flag)
     cid, paths, pid, running = live["connection"], live["paths"], live["pid"], live["running"]
     account_id, control, owner = live["account_id"], live["control"], live["owner"]
@@ -4014,7 +4171,7 @@ def cmd_service_status(connection_flag: str | None, session_flag: str | None) ->
         # a project initialized with this build does not read as having none.
         # The unsuffixed `voice-agent` is still listed: a project that predates
         # the split owns one, and it is what the default provider falls back to.
-        "prompts": {key: _records().document_read(NAME, key) is not None
+        "prompts": {key: _prompt_held(root, key, stored_prompts)
                     for key in (
                         "context", "delegation", "job-worker", "voice-agent",
                         *(f"{provider}-{kind}"
@@ -4038,8 +4195,9 @@ def _require_service_initialized(root: Path) -> None:
     missing = []
     if not _service_settings(root):
         missing.append("telegram/settings")
+    stored = _stored_prompt_keys(root)
     for key in ("context", "job-worker"):
-        if _records().document_read(NAME, key) is None:
+        if not _prompt_held(root, key, stored):
             missing.append(f"telegram/{key}")
     if missing:
         _die(6, "service_not_initialized", "telegram service is not initialized",
@@ -4606,6 +4764,26 @@ def main() -> None:
     pf_save.add_argument("file", help="the profile file, or - for stdin")
     pf_save.add_argument("--base", help="the version being replaced, from `profiles show`")
 
+    pprompts = sub.add_parser(
+        "prompts", help="the service's prompts, as versions kept in the store")
+    pp = pprompts.add_subparsers(dest="prompts_cmd", required=True)
+    pp.add_parser("list", help="every prompt key the store holds, and its active version")
+    pp_show = pp.add_parser("show", help="one prompt's active version, or the one named")
+    pp_show.add_argument("key")
+    pp_show.add_argument("--version", help="a version id, from `prompts versions`")
+    pp_versions = pp.add_parser("versions", help="every version of one prompt, newest first")
+    pp_versions.add_argument("key")
+    pp_put = pp.add_parser("put", help="save a new version of one prompt")
+    pp_put.add_argument("key")
+    pp_put.add_argument("file", help="the prompt's text, or - for stdin")
+    pp_put.add_argument("--base", help="the version being replaced, from `prompts show`")
+    pp_put.add_argument("--note", help="why the version is saved")
+    pp_import = pp.add_parser("import", help="save the service directory's prompt files")
+    pp_import.add_argument("dir", nargs="?", help="default: capabilities/telegram/service")
+    pp_import.add_argument("--note", help="why the versions are saved")
+    pp_export = pp.add_parser("export", help="write each active version as its file")
+    pp_export.add_argument("dir", nargs="?", help="default: capabilities/telegram/service")
+
     pjobs = sub.add_parser(
         "jobs", help="the register of work that outlives a conversation")
     jb = pjobs.add_subparsers(dest="jobs_cmd", required=True)
@@ -4787,6 +4965,10 @@ def main() -> None:
     if args.cmd == "profiles":
         # The profiles are rows in the store, so this never opens Telegram.
         _emit(cmd_profiles(args))
+        return
+    if args.cmd == "prompts":
+        # The prompts are rows in the store, so this never opens Telegram.
+        _emit(cmd_prompts(args))
         return
     if args.cmd == "service":
         if args.service_cmd == "init":
