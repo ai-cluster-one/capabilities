@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-22 — Every box is told which agent it runs
+
+`deployment sync` writes the project's id, `CAPABILITIES_PROJECT_ID` as the project resolves it at sync, into the bundle's Compose file beside `AGENT_NODE_NAME`, so every container receives it, together with `CAPABILITIES_PROJECT_ID_ROOT` naming the box's project root, so only the project at that root takes it and a repository checked out beside it resolves its own; a service's own entry for either key is no longer written, since it would override the shared one. An image that runs `capabilities init` in its build (`agent-box`) sets the same two in its Dockerfile before the catalogue install and that step; a checkout image carries no project and sets neither. The id no longer travels in the project's files (`capabilities` 2026-10-22), so a box built from a fresh copy of a repository, or started on an empty volume, takes it from here. A project whose id does not resolve at sync compiles as before. `deployment` uses `capabilities-contract` 0.9.0.
+
 ## 2026-10-22 — A long build is followed to its end, and a rollback builds the release it names
 
 `deployment deploy` and `deployment rollback` follow the Coolify deployment they started while Coolify reports it `queued` or `in_progress`, for at most an hour, and only then wait the usual ten minutes for the resource to be healthy, so a build longer than ten minutes is no longer reported as timed out and rolled back while Coolify is still building it; a deployment Coolify ends as failed or cancelled is reported failed and rolled back as before. The environment a deploy sends now carries the runtime's `compiler.build_args`, and a rollback, requested by hand or by a failed deploy, first sets the build args the runtime declares at the commit it returns to, so the image it builds is that release's rather than the one the environment was last set for, and `deployment node status` names the release the container runs.

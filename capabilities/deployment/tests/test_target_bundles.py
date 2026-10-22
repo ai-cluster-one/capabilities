@@ -303,6 +303,38 @@ def test_a_target_node_is_the_name_every_container_receives(tmp_path: Path, prof
     assert _run(root, env, "sync", "--check").returncode == 0
 
 
+@pytest.mark.parametrize("profile", PROFILES)
+def test_the_project_id_is_what_every_container_and_the_image_build_receive(
+        tmp_path: Path, profile: str) -> None:
+    root, env = _project(tmp_path, contextkit=False)
+    for key in ("CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT"):
+        env.pop(key, None)
+    (root / ".env.local").write_text("CAPABILITIES_PROJECT_ID=prj_bundle00001\n")
+    assert _run(root, env, "setup", "--profile", profile, "--target", "staging",
+                "--provider", "coolify").returncode == 0
+    # A service that passes the key through would override the shared entry.
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["services"]["agent"].setdefault("optional_env", []).append("CAPABILITIES_PROJECT_ID")
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    sync = _run(root, env, "sync")
+    assert sync.returncode == 0, sync.stdout + sync.stderr
+    files = _bundle_files(root, "staging")
+    compose = files["docker-compose.yaml"].splitlines()
+    assert '  CAPABILITIES_PROJECT_ID: "prj_bundle00001"' in compose
+    assert '  CAPABILITIES_PROJECT_ID_ROOT: "/app"' in compose
+    assert files["docker-compose.yaml"].count("CAPABILITIES_PROJECT_ID:") == 1
+    dockerfile = files["Dockerfile"]
+    binding = 'ENV CAPABILITIES_PROJECT_ID="prj_bundle00001" CAPABILITIES_PROJECT_ID_ROOT="/app"'
+    if profile == "agent-box":
+        # The build runs `capabilities init`, which needs the id before it.
+        assert dockerfile.index(binding) < dockerfile.index("capabilities init")
+    else:
+        # A checkout image is no project's and runs no init in its build.
+        assert "CAPABILITIES_PROJECT_ID" not in dockerfile
+    assert _run(root, env, "sync", "--check").returncode == 0
+
+
 def test_a_node_declared_beside_a_service_default_is_refused(tmp_path: Path) -> None:
     root, env = _project(tmp_path, contextkit=False)
     assert _run(root, env, "setup", "--profile", "agent-box-checkout",

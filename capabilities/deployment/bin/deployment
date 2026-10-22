@@ -103,6 +103,10 @@ USAGE
       AGENT_NODE_NAME from the server's environment. A malformed node
       (node_invalid) or a service environment_defaults also setting
       AGENT_NODE_NAME beside it (node_declared_twice) stops the sync.
+      The project's id (CAPABILITIES_PROJECT_ID, as the project resolves it
+      at sync) is set with CAPABILITIES_PROJECT_ID_ROOT, the box's project
+      root, in every container and, for an image that runs `capabilities
+      init` in its build, in the image before that step.
       --check is read-only and exits 7 with structured drift details.
       --adopt explicitly replaces unmarked files at the runtime-declared
       managed artifact paths; external artifacts and overlays are never written.
@@ -542,6 +546,11 @@ GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?!\.)[A-Za-z0-9._-]+(
 # it as AGENT_NODE_NAME in every container, written literally into the Compose
 # file, so it takes no interpolation characters and fits one environment line.
 TARGET_NODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
+# The project's id is the agent a box runs. Its bundle sets it in every
+# container and in the image the build runs `capabilities init` in, bound to the
+# box's project root, since the id no longer travels in the project's files.
+PROJECT_ID_ENV = "CAPABILITIES_PROJECT_ID"
+PROJECT_ID_ROOT_ENV = "CAPABILITIES_PROJECT_ID_ROOT"
 
 
 # The shared capability code is the capabilities-contract library's, bound here
@@ -2067,7 +2076,8 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
                          boot_copy: list[str] | None = None,
                          persistent_manager: bool = False,
                          catalogue_exclude: set[str] | None = None,
-                         store_records: bool = False) -> str:
+                         store_records: bool = False,
+                         project_id: str | None = None) -> str:
     agent_home = compiler["container"]["agent_home"]
     project_root = compiler["container"]["project_root"]
     username = Path(agent_home).name
@@ -2112,11 +2122,20 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
             " && contextkit audit || { echo \"[build] ContextKit project setup failed\" >&2; exit 1; }\n"
         )
         capabilities_init_and_doctor = ""
+    project_binding = ""
+    if project_id:
+        project_binding = (
+            "\n# The agent this image is: the project's id, for the project at its root,\n"
+            "# read by every `capabilities` step below.\n"
+            f"ENV {PROJECT_ID_ENV}={json.dumps(project_id)} "
+            f"{PROJECT_ID_ROOT_ENV}={json.dumps(project_root)}\n")
     if checkout:
         # Both of these need a checkout to run against, and at build time there is
         # none. The entrypoint carries them instead, on every boot.
         contextkit_build = ""
         capabilities_init_and_doctor = ""
+        # The image is no project's; the Compose file gives each box its id.
+        project_binding = ""
         copies = " ".join(boot_copy or [])
         # Every generated file the boot path runs is made executable, not just
         # the entrypoint: a COPY carries the mode of whatever the build context
@@ -2214,7 +2233,7 @@ USER root
 RUN ln -sf {agent_home}/.local/bin/claude /usr/local/bin/claude \\
  && ln -sf {agent_home}/.local/bin/codex /usr/local/bin/codex{contextkit_link}
 USER ${{USERNAME}}
-
+{project_binding}
 # Capability CLIs: every capability in the catalogue at CAPABILITIES_REF (a
 # branch, tag, or SHA), installed by the manager. Whether one is usable is its
 # gate's and its connections' answer, not whether it is installed; a core one
@@ -2333,7 +2352,8 @@ def _database_keys() -> tuple[str, ...]:
 def _compose_template(project_name: str, runtime: dict,
                       descriptors: dict[str, dict], build_context: str,
                       dockerfile_rel: str, has_contextkit: bool = False,
-                      node: str | None = None) -> str:
+                      node: str | None = None,
+                      project_id: str | None = None) -> str:
     del has_contextkit
     slug = _slug(project_name)
     env_lines = [
@@ -2346,6 +2366,12 @@ def _compose_template(project_name: str, runtime: dict,
         # it from the server's environment.
         (f"  {NODE_NAME_ENV}: {json.dumps(node)}" if node else
          f"  {NODE_NAME_ENV}: ${{{NODE_NAME_ENV}:-}}"),
+        # The agent the box runs, for the project at the box's root alone: a
+        # repository checked out beside it resolves its own.
+        *([f"  {PROJECT_ID_ENV}: {json.dumps(project_id)}",
+           f"  {PROJECT_ID_ROOT_ENV}: "
+           + json.dumps(_compiler_config(runtime)["container"]["project_root"])]
+          if project_id else []),
         # The database is the server's: each key passes through from the
         # target's environment, and one left unset there is empty, which the
         # resolver reads as not set.
@@ -2406,6 +2432,8 @@ def _compose_template(project_name: str, runtime: dict,
         if node:
             # A service entry for the key would override the shared one.
             environment_keys.discard(NODE_NAME_ENV)
+        if project_id:
+            environment_keys -= {PROJECT_ID_ENV, PROJECT_ID_ROOT_ENV}
         for key in sorted(environment_keys):
             expression = f"${{{key}:-{defaults.get(key, '')}}}"
             block.append(f"      {key}: {json.dumps(expression)}")
@@ -2943,8 +2971,11 @@ def _artifact_texts(root: Path, runtime: dict,
     # An agent whose records moved into the store builds without a database
     # and bakes in none of their files.
     store_records = _records_in_store()
+    # The id the project resolves to here is the one its boxes run as.
+    project_id = _project_id_state_at(root).get("id")
     raw = {paths["compose"]: _compose_template(
-        project_name, runtime, active, build_context, dockerfile_rel, has_contextkit, node)}
+        project_name, runtime, active, build_context, dockerfile_rel, has_contextkit, node,
+        project_id)}
     candidates = {
         "dockerignore": _dockerignore_template(has_contextkit, keep=boot_copy,
                                                store_records=store_records),
@@ -2955,7 +2986,8 @@ def _artifact_texts(root: Path, runtime: dict,
                     if isinstance(v, dict) and isinstance(v.get("mount"), str)],
             checkout=checkout, boot_copy=boot_copy,
             persistent_manager=_persistent_manager(runtime),
-            catalogue_exclude=catalogue_exclude, store_records=store_records),
+            catalogue_exclude=catalogue_exclude, store_records=store_records,
+            project_id=project_id),
         "entrypoint": _entrypoint_template(
             project_name, supervisor_config, checkout=checkout,
             project_root=project_root, has_contextkit=has_contextkit,

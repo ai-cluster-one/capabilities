@@ -965,6 +965,11 @@ def test_the_image_build_steps_run_without_a_database(world, tmp_path, which):
     ignore = next(p for p in bundle.iterdir() if p.name.endswith("dockerignore")).read_text()
     assert 'capabilities install "$name" --allow' in dockerfile
     assert "&& capabilities init --codex --claude || {" in dockerfile
+    # The id is not among the agent's files: the image carries it, bound to the
+    # image's project root, which is the box here.
+    binding = f'ENV CAPABILITIES_PROJECT_ID="{IDS["moved"]}" CAPABILITIES_PROJECT_ID_ROOT="/app"'
+    assert binding in dockerfile.splitlines()
+    assert dockerfile.index(binding) < dockerfile.index("capabilities install")
     box = _build_context(root, ignore, tmp_path / "app")
     if which == "store-mode":
         # A store-mode agent that has not moved builds the same way.
@@ -976,6 +981,7 @@ def test_the_image_build_steps_run_without_a_database(world, tmp_path, which):
     with _catalogue(tmp_path / "catalogue", CORE, "slack") as source:
         env = _machine_env(tmp_path / "machine", source)
         env.pop("AGENT_NODE_NAME", None)
+        env.update(CAPABILITIES_PROJECT_ID=IDS["moved"], CAPABILITIES_PROJECT_ID_ROOT=str(box))
         steps = {}
         for name in (CORE, "slack"):
             steps[f"install {name}"] = subprocess.run(
