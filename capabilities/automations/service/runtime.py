@@ -339,10 +339,13 @@ def read_daemon_node(state_dir: Path) -> str | None:
 
 
 def _project_identity(root: Path) -> dict:
+    """What an older project.json still holds, or nothing: a project is bound
+    by its id, which no file of the envelope carries."""
     try:
-        return json.loads((root / "capabilities" / "project.json").read_text())
-    except (OSError, ValueError) as exc:
-        raise ConfigError(f"no project identity under {root}") from exc
+        identity = json.loads((root / "capabilities" / "project.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return identity if isinstance(identity, dict) else {}
 
 
 # The id a registration stamps is the one the launching CLI resolves for a
@@ -362,11 +365,12 @@ def NODE_NAME() -> str:
 
 
 def _handed_project_id(root: Path) -> str:
-    """The id handed down for this root, scoped the way the envelope is."""
+    """The id handed down for this root, scoped by CAPABILITIES_PROJECT_ID_ROOT;
+    one without that scope binds no folder."""
     handed = os.environ.get("CAPABILITIES_PROJECT_ID", "").strip()
     scope = os.environ.get("CAPABILITIES_PROJECT_ID_ROOT", "").strip()
     if not handed or not scope:
-        return handed
+        return ""
     try:
         return handed if Path(scope).resolve() == Path(root).resolve() else ""
     except OSError:
@@ -1636,10 +1640,16 @@ def _why(exc: BaseException) -> str:
 
 
 def _project_slug(root: Path) -> str:
+    """The tag of this project's log lines: the slug the CLI that launched the
+    daemon resolved for it, else an older project.json's, else the folder's name."""
+    handed = os.environ.get("AUTOMATIONS_PROJECT_SLUG", "").strip()
     try:
-        slug = json.loads((root / "capabilities" / "project.json").read_text()).get("slug")
-    except (OSError, ValueError, AttributeError):
-        slug = None
+        if handed and Path(os.environ.get("AUTOMATIONS_PROJECT_ROOT") or "").resolve() \
+                == Path(root).resolve():
+            return handed
+    except OSError:
+        pass
+    slug = _project_identity(root).get("slug")
     return slug.strip() if isinstance(slug, str) and slug.strip() else root.name
 
 

@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-22 — A project without project.json is served; its slug is its agent's row
+
+The service's state root, lock and log tag are named by the project's slug as `_project_slug` answers it (its agent's row in the store, else an older `project.json`'s, else its id, else a digest of its path). `service join` needs only the project's id, and the service no longer refuses a project whose `project.json` is gone (`project_identity_missing`); a project that changed its id is still refused. `slug_taken` names `capabilities relabel`. Declares `capabilities-contract>=0.12,<1`.
+
 ## 2026-10-22 — A process that ended is ended, collected or not
 
 On Linux the service counts a process that has exited and waits only to be collected - a zombie - as ended, wherever it asks whether its daemon, its machine process or a turn is still running. A daemon or an adopted turn that ends under an ancestor that never collects what it adopts, as a turn's own `tasks run` is, no longer reads as running: `service stop` answers once the daemon has exited instead of `service_stop_timeout`, `status` and `start` see it gone, and an adopted turn is let go when it ends. Elsewhere the judgement is as before.

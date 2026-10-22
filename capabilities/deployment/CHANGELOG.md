@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-22 — The Coolify application name falls back to the project's slug from its agent's row
+
+Where ContextKit names no project, the Coolify application is named after the project's slug as `_project_slug` answers it (its agent's row in the store, else an older `project.json`'s, else its id). The envelope check accepts a project bound to its id, and help names store mode by the agent's records rather than `project.json`. Declares `capabilities-contract>=0.12,<1`.
+
 ## 2026-10-22 — A ContextKit-bound box is built and wired by the capabilities manager alone
 
 The image of a ContextKit-bound project no longer installs ContextKit or runs any of its commands. `agent-box` builds run `capabilities init --codex --claude`, `capabilities doctor`, `capabilities hooks install --claude --codex` and `capabilities build`; `agent-box-checkout` boots run `capabilities init --codex --claude`, `capabilities hooks install --claude --codex` and `capabilities build`, and each body sync rebuilds with `capabilities build`, as `deployment node sync` does. The session hooks a box writes now run `capabilities session-start`, so a box's body sync no longer commits `contextkit session-start` hooks back to the branch. The `CONTEXTKIT_REF` build argument and the ContextKit installer are gone from the generated Dockerfile; a project that declared `CONTEXTKIT_REF` among its build args still has it compiled, and the image ignores it.

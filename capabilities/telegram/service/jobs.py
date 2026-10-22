@@ -398,11 +398,11 @@ def iso() -> str:
 
 def handed_project_id(root: Path) -> str:
     """The project id its launcher handed down for this root, scoped by
-    CAPABILITIES_PROJECT_ID_ROOT the way the envelope handoff is scoped."""
+    CAPABILITIES_PROJECT_ID_ROOT; one without that scope binds no folder."""
     handed = os.environ.get("CAPABILITIES_PROJECT_ID", "").strip()
     scope = os.environ.get("CAPABILITIES_PROJECT_ID_ROOT", "").strip()
     if not handed or not scope:
-        return handed
+        return ""
     try:
         return handed if Path(scope).resolve() == Path(root).resolve() else ""
     except OSError:

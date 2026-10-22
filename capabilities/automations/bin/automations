@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.9,<1",
+#     "capabilities-contract>=0.12,<1",
 #     "callva-harness-runner==0.9.0",
 # ]
 # ///
@@ -776,7 +776,8 @@ def _root_required() -> Path:
         _die(6, "no_project", "not inside a project", "run from a project with a capabilities envelope")
     envelope = _project_capabilities_dir(root)
     if not ((envelope / "settings.json").is_file()
-            or (envelope / "project.json").is_file()):
+            or (envelope / "project.json").is_file()
+            or (envelope.is_dir() and _project_id())):
         _die(6, "no_envelope", "no capabilities envelope in this project", "run `capabilities init` first")
     return root
 
@@ -1005,13 +1006,14 @@ def _state_override(root: Path) -> Path | None:
 
 
 def _state_project_key(root: Path) -> str:
+    """The project's slug (`_project_slug`: its agent's row in the store, else an
+    older project.json's, else its id), or a digest of its path where it has none."""
     try:
-        identity = json.loads((_project_capabilities_dir(root) / "project.json").read_text())
-    except (OSError, ValueError):
-        identity = {}
-    slug = identity.get("slug") if isinstance(identity, dict) else None
-    if isinstance(slug, str) and slug.strip():
-        return slug.strip()
+        slug = _project_slug(root)
+    except StoreError as exc:
+        _die(5 if exc.slug in STORE_ENVIRONMENT_SLUGS else 6, exc.slug, exc.message, exc.hint)
+    if slug:
+        return slug
     digest = hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:16]
     return f"path-{digest}"
 
@@ -1406,6 +1408,7 @@ def _service_env(root: Path) -> dict[str, str]:
     env.update(
         {
             "AUTOMATIONS_PROJECT_ROOT": str(root),
+            "AUTOMATIONS_PROJECT_SLUG": _state_project_key(root),
             "AUTOMATIONS_STATE_DIR": str(_state_path(root)),
             "AUTOMATIONS_NODE_NAME": node_name(),
         }
@@ -3057,12 +3060,14 @@ def _servable_here() -> tuple[str, str]:
     refusal that says why not: no durable id it may write under. Asked by
     `join`, and by the machine service before it serves a project."""
     root = _project_root()
-    envelope = _project_capabilities_dir(root)
+    # The envelope is resolved first: resolving it moves an id an older
+    # project.json still holds, which the id is then read after.
+    _project_capabilities_dir(root)
     project = _project_id(write=True, refuse=False)
-    if not (envelope / "project.json").is_file() or not project:
+    if not project:
         raise _Refusal(6, "no_project_identity",
-                       f"this project has no durable id it may write under in "
-                       f"{envelope / 'project.json'}, and the machine service's list "
+                       "this project has no durable id it may write under "
+                       "(CAPABILITIES_PROJECT_ID), and the machine service's list "
                        "names a project by it", "run `capabilities init` in the project")
     return project, _state_project_key(root)
 
@@ -3336,7 +3341,7 @@ def cmd_service_join() -> dict[str, Any]:
             _die(6, "slug_taken",
                  f"project {taken[0]} at {listed[taken[0]]['root']} is joined with slug "
                  f"{slug!r}, and two projects of one slug would share a state root",
-                 "give one of them another slug in its project.json, or leave the other "
+                 "give one of them another slug with `capabilities relabel`, or leave the other "
                  f"with `{NAME} service leave --machine --project {taken[0]}`")
         import datetime as _dt
         listed[project] = {"root": str(root), "slug": slug,

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.9,<1",
+#     "capabilities-contract>=0.12,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.9.0",
 # ]
@@ -1498,16 +1498,16 @@ def _identity_here() -> tuple[str, str]:
     """This project's id and slug, or the refusal that says why it has none."""
     root = _root()
     project = _project_id(write=True, refuse=False)
-    identity_file = _project_capabilities_dir(root) / "project.json"
-    try:
-        slug = json.loads(identity_file.read_text()).get("slug")
-    except (OSError, ValueError):
-        slug = None
-    if not project or not slug:
+    if not project:
         raise _engine().Refusal(6, "no_project_identity",
-                                f"this project has no durable id and slug in {identity_file}",
+                                f"{root} is bound to no durable id (CAPABILITIES_PROJECT_ID)",
                                 "run `capabilities init` in the project")
-    return str(project), str(slug)
+    try:
+        slug = _project_slug(root)
+    except StoreError as exc:
+        raise _engine().Refusal(5 if exc.slug in STORE_ENVIRONMENT_SLUGS else 6,
+                                exc.slug, exc.message, exc.hint) from None
+    return str(project), str(slug or project)
 
 
 def _joined_here() -> dict | None:
@@ -2149,10 +2149,9 @@ def _inventory(_network: bool) -> dict:
     if root is None:
         return {"service": service}
     try:
-        identity = json.loads((_project_capabilities_dir(root) / "project.json").read_text())
-    except (OSError, ValueError):
-        identity = {}
-    slug = identity.get("slug")
+        slug = _project_slug(root)
+    except StoreError:
+        slug = None
     if slug:
         joined = None
         with contextlib.suppress(Exception):

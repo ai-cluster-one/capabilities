@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-22 — A project without project.json runs automations; its slug is its agent's row
+
+The envelope check accepts a project bound to its id, the state root and `service join` take the slug from `_project_slug` (its agent's row in the store, else an older `project.json`'s, else its id, else a digest of its path), and the scheduler is handed it as `AUTOMATIONS_PROJECT_SLUG` for its log tag. The run ledger opens without a `project.json`, and an id in the environment without `CAPABILITIES_PROJECT_ID_ROOT` binds no folder. Declares `capabilities-contract>=0.12,<1`.
+
 ## 2026-10-22 — An agent whose settings are rows starts its scheduler before it holds any
 
 An agent whose scheduler settings are rows of the store and that holds no settings document yet - a store-only agent raised in a fresh box - runs on the shipped defaults, the same values `automations service init` writes, instead of refusing every `service run`, `start`, `reload` and `agents` with `invalid_config` (`config not found`). Its scheduler idles until an automation is defined, and `service status` still says `initialized: false` until a document is written. A project whose settings are a file still needs its `config.toml`.

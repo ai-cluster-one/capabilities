@@ -8,7 +8,7 @@
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract>=0.9,<1",
+#     "capabilities-contract>=0.12,<1",
 #     "callva-harness-runner==0.10.0",
 # ]
 # ///
@@ -303,22 +303,65 @@ class SettingsError(ValueError):
     """A settings/layout value that cannot safely become live configuration."""
 
 
+def _env_file_names_id(folder):
+    for name in (".env.local", ".env"):
+        try:
+            lines = (folder / name).read_text().splitlines()
+        except OSError:
+            continue
+        found = ""
+        for line in lines:
+            key, eq, value = line.strip().partition("=")
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            if eq and key == "CAPABILITIES_PROJECT_ID":
+                found = value.strip().strip('"').strip("'")
+        if found:
+            return True
+    return False
+
+
+def _env_bound_root():
+    ident = os.environ.get("CAPABILITIES_PROJECT_ID", "").strip()
+    scope = os.environ.get("CAPABILITIES_PROJECT_ID_ROOT", "").strip()
+    if not ident or not scope or not os.path.isabs(os.path.expanduser(scope)):
+        return None
+    try:
+        path = Path(scope).expanduser().resolve()
+    except OSError:
+        return None
+    return path if path.is_dir() else None
+
+
 def _find_project_root():
+    """The project root, as every capability CLI finds it: the nearest folder
+    walking up that is bound - the folder CAPABILITIES_PROJECT_ID_ROOT names
+    beside CAPABILITIES_PROJECT_ID, one whose .env.local or .env sets the id, or
+    one with an older binding - else the folder the environment binds, else
+    the nearest folder holding .env(.local) or .git."""
     start = (os.environ.get("TELEGRAM_SERVICE_PROJECT_ROOT")
              or os.environ.get("CLAUDE_PROJECT_DIR")
              or os.getcwd())
     here = Path(start).expanduser().resolve()
     home = Path.home().resolve()
+    bound = _env_bound_root()
+    unbound = None
     for d in (here, *here.parents):
         if d == home:
             break
-        if ((d / "capabilities" / "settings.json").is_file()
+        if (d == bound or _env_file_names_id(d)
+                or (d / "capabilities" / "settings.json").is_file()
                 or (d / "capabilities" / "project.json").is_file()
-                or (d / ".capabilities").is_dir()
-                or (d / ".env").exists()
-                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+                or (d / ".contextkit" / "config.toml").is_file()
+                or (d / ".capabilities").is_dir()):
             return d
-    return here
+        if unbound is None and ((d / ".env").exists() or (d / ".env.local").exists()
+                                or (d / ".git").is_dir()):
+            unbound = d
+    if bound is not None and bound != home:
+        return bound
+    return unbound or here
 
 
 PROJECT_ROOT = _find_project_root()

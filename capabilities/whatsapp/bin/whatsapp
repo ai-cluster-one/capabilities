@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.9,<1",
+#     "capabilities-contract>=0.12,<1",
 #     "httpx>=0.27",
 #     "puremagic>=1.28",
 #     "qrcode>=7.4",
@@ -6767,7 +6767,8 @@ def _service_project_root() -> Path:
 def _require_service_envelope(root: Path) -> None:
     envelope = _project_capabilities_dir(root)
     if not ((envelope / "settings.json").is_file()
-            or (envelope / "project.json").is_file()):
+            or (envelope / "project.json").is_file()
+            or (envelope.is_dir() and _project_id())):
         _refuse(6, "no_envelope", "no capabilities envelope in this project",
                 f"run `capabilities init` first, then `{NAME} service init`")
 

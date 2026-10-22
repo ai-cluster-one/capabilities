@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-10-22 — A project without project.json joins the service; its slug is its agent's row
+
+`service join` and the service's state take the project's slug from `_project_slug` (its agent's row in the store, else an older `project.json`'s, else its id) and need only its id. Declares `capabilities-contract>=0.12,<1`.
+
 ## 2026-10-21 — A connection whose network flow died fails in seconds
 
 `memory` uses `capabilities-contract` 0.7.2. Its store connections give a network flow up once data sent on it has gone unacknowledged for 20 seconds (`tcp_user_timeout`), which keepalives cannot notice since none is sent while data waits, and send keepalives after 15 seconds idle, every 5 seconds, 3 probes: a connection whose flow stopped carrying packets without a FIN or a reset fails in about 20 seconds as a lost connection instead of waiting until the store ends the session, and a plain read that loses it that way runs once more on a new connection. A connection lost where `memory` catches nothing ends the command as `store_unreachable`, exit 5, as before.

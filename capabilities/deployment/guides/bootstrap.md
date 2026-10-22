@@ -19,7 +19,7 @@ a capability as a separate Compose service. Global inheritance, installed
 payloads, and existing service directories do not authorize runtime services.
 Each embedded service runs under its runner.
 
-That is files mode. In a project whose records are in the store (`"records": "store"` in `project.json`), setup compiles every installed capability service, and whether one runs on a node is the gate's answer there: `capabilities enable <name> --project --node <node>` turns it on without a redeploy (`deployment guide profiles`). There the Telegram and automations flags below exit 6 with `retired_option` for any value but `auto`.
+That is files mode. In a project whose records are in the store (an agent made by `capabilities init`, or moved there by `capabilities migrate`), setup compiles every installed capability service, and whether one runs on a node is the gate's answer there: `capabilities enable <name> --project --node <node>` turns it on without a redeploy (`deployment guide profiles`). There the Telegram and automations flags below exit 6 with `retired_option` for any value but `auto`.
 
 `deployment setup --dry-run` shows which files would be written before changing
 the project.

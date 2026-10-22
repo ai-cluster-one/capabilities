@@ -141,7 +141,8 @@ def test_init_mints_an_id_offline_in_a_plain_project(tmp_path: Path) -> None:
     identity = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
 
     assert minted.startswith("prj_") and len(minted) == 16
-    assert _copy(project) == {"schema": "capabilities.project.v2", "slug": "project"}
+    # The id is the binding: init writes no project.json.
+    assert not (project / "capabilities" / "project.json").exists()
     assert identity == {"state": "declared", "id": minted,
                         "bound": False, "contextkit_id": None}
     # No database resolves here, so the agent row is reported, not written.
@@ -156,7 +157,8 @@ def test_init_carries_a_contextkit_held_id_into_a_new_identity(tmp_path: Path) -
 
     _json(_run(tmp_path, project, "init"))
 
-    assert _bound(project) == "prj_0000000000a1" and "id" not in _copy(project)
+    assert _bound(project) == "prj_0000000000a1"
+    assert not (project / "capabilities" / "project.json").exists()
     identity = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
     assert identity["state"] == "declared" and identity["id"] == "prj_0000000000a1"
     assert _identity_calls(log) == 0
@@ -330,9 +332,8 @@ def test_the_environment_wins_over_the_env_files(tmp_path: Path) -> None:
                           env=env))["project_identity"]
     assert (identity["state"], identity["id"]) == ("handed", "prj_0000000000f2")
 
-    # An id the environment sets, as a deployment does, wins over the file:
-    # it is the one a write stamps, and nothing refuses.
-    env.pop("CAPABILITIES_PROJECT_ID_ROOT")
+    # An id the environment sets with its root, as a deployment does, wins over
+    # the file: it is the one a write stamps, and nothing refuses.
     env["CAPABILITIES_PROJECT_ID"] = "prj_0000000000f9"
     identity = _json(_run(tmp_path, project, "path", "--json", "--identity",
                           env=env))["project_identity"]
@@ -342,6 +343,12 @@ def test_the_environment_wins_over_the_env_files(tmp_path: Path) -> None:
     assert relabel["id"] == "prj_0000000000f9"
     assert _probe(tmp_path, project, env)["write"] == "prj_0000000000f9"
     assert _bound(project) == "prj_0000000000f2"
+
+    # Without its root it binds no folder: the files answer.
+    env.pop("CAPABILITIES_PROJECT_ID_ROOT")
+    identity = _json(_run(tmp_path, project, "path", "--json", "--identity",
+                          env=env))["project_identity"]
+    assert (identity["state"], identity["id"]) == ("declared", "prj_0000000000f2")
 
     # A handoff scoped to another root is passed over.
     env["CAPABILITIES_PROJECT_ID_ROOT"] = str(tmp_path / "elsewhere")

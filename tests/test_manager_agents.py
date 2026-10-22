@@ -246,10 +246,13 @@ def test_a_new_agent_starts_in_the_store_with_this_node_as_master(lab):
     assert again.returncode == 0, again.stderr
     assert json.loads(again.stdout)["agent"]["created"] is False
 
-    identity = json.loads((lab.project / "capabilities" / "project.json").read_text())
-    assert identity["records"] == "store" and "id" not in identity
+    # The id is the binding and the store holds the rest: no project.json.
+    assert not (lab.project / "capabilities" / "project.json").exists()
     agent_id = _bound(lab.project)
     assert not (lab.project / "capabilities" / "settings.json").exists()
+    # The slug is the folder's name, the agent having none yet.
+    assert lab.sql(f"SELECT slug FROM {SCHEMA}.capabilities_agents WHERE id = %s",
+                   (agent_id,)) == [("project",)]
     assert lab.sql(f"SELECT migrated_at IS NOT NULL FROM {SCHEMA}.capabilities_agents "
                    "WHERE id = %s", (agent_id,)) == [(True,)]
     assert lab.sql(f"SELECT node, is_master FROM {SCHEMA}.capabilities_agent_nodes "
@@ -292,8 +295,7 @@ def test_init_id_raises_an_agent_the_store_holds_in_a_folder_of_its_own(lab, tmp
     assert answer["raised"] == {"id": agent_id, "verified": True, "migrated": True,
                                 "name": None, "store": {"level": "project", "schema": SCHEMA}}
     assert (server / ".env.local").read_text() == setting + f"CAPABILITIES_PROJECT_ID={agent_id}\n"
-    assert json.loads((server / "capabilities" / "project.json").read_text()) == {
-        "schema": "capabilities.project.v2", "slug": "server", "records": "store"}
+    assert not (server / "capabilities" / "project.json").exists()
     assert not (server / "capabilities" / "settings.json").exists()
     assert answer["agent"]["registered"] is True and answer["agent"]["created"] is False
 
@@ -487,9 +489,11 @@ def test_init_template_creates_an_agent_from_a_contextkit_template(lab, tmp_path
     sha = hashlib.sha256(icon).hexdigest()
     assert (folder / ".contextkit" / f"icon-{sha[:12]}.png").read_bytes() == icon
 
-    identity = json.loads((folder / "capabilities" / "project.json").read_text())
-    assert identity["records"] == "store" and "id" not in identity
+    assert not (folder / "capabilities" / "project.json").exists()
     agent_id = _bound(folder)
+    # A new agent's slug is its name, transliterated.
+    assert lab.sql(f"SELECT slug FROM {SCHEMA}.capabilities_agents WHERE id = %s",
+                   (agent_id,)) == [("probe",)]
     assert lab.sql(f"SELECT name, description, icon_sha, onboarding_status, onboarding_routine, "
                    f"migrated_at IS NOT NULL FROM {SCHEMA}.capabilities_agents WHERE id = %s",
                    (agent_id,)) == [("Probe", "A demo agent.", sha, "pending", "onboarding", True)]

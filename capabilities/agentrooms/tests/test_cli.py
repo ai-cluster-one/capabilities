@@ -272,6 +272,7 @@ def project(tmp_path, monkeypatch):
                            "CAPABILITIES_READ_ONLY", "CAPABILITIES_AUTH_CONTEXT")):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("CAPABILITIES_PROJECT_ID", "prj_test")
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID_ROOT", str(root))
     monkeypatch.chdir(root)
     return root
 
@@ -834,7 +835,9 @@ def nowhere(project, tmp_path, monkeypatch):
     """Outside any project, on a machine whose global policy enables agentrooms."""
     away = tmp_path / "away"
     away.mkdir()
-    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    # The environment binds no project either: from anywhere, it would name one.
+    for key in ("CLAUDE_PROJECT_DIR", "CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT"):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.chdir(away)
     caps = Path(os.environ["XDG_CONFIG_HOME"]) / "capabilities"
     caps.mkdir(parents=True, exist_ok=True)

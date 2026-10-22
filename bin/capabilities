@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.11,<1",
+#     "capabilities-contract>=0.12,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -45,13 +45,21 @@ ENVIRONMENT
                        it is honored wherever it is inherited.
   CAPABILITIES_PROJECT_ID
                        the project's id, its one binding: set in the process
-                       environment (by a deployment, or handed down beside the
-                       envelope by a process that resolved it), else in the
-                       project root's .env.local, else its .env. The
-                       environment wins over the files.
+                       environment with the root below (by a deployment, or
+                       handed down beside the envelope by a process that
+                       resolved it), else in the project root's .env.local,
+                       else its .env. The environment wins over the files.
+                       Without the root below it binds no folder.
   CAPABILITIES_PROJECT_ID_ROOT
-                       the project root that id answers for, scoping it the way
-                       CAPABILITIES_PROJECT_ENVELOPE_ROOT scopes the envelope.
+                       the project root that id answers for. The project root
+                       is the nearest folder, walking up from
+                       CLAUDE_PROJECT_DIR (else the working directory), that
+                       this names beside the id, or whose .env.local or .env
+                       sets the id, or that still carries an older binding
+                       (capabilities/project.json or settings.json, a legacy
+                       .capabilities/, .contextkit/config.toml); with none on
+                       the way, the folder this names; else the nearest folder
+                       holding .env, .env.local or .git, bound to no id.
   CAPABILITIES_READ_ONLY
                        `1` or `true` (any case) puts the process and everything
                        it starts under the read-only switch: every capability
@@ -477,31 +485,37 @@ POLICY VERBS
 
 PROJECT VERBS (run inside a consuming project)
   init [--claude] [--codex] [--with-layers | --with-template | --id <id>]
-        Wire the project: scaffold the project identity - the label in
-        capabilities/project.json (schema capabilities.project.v2, no id) and
-        the id as CAPABILITIES_PROJECT_ID in the root's .env.local - the
-        manager-owned capabilities/.gitignore, and settings.json only in files
-        mode. A new project - no identity, no settings file, no legacy
-        envelope - is a new agent and starts in the store: its identity
-        declares records "store", its row is registered migrated with this
-        node as master, and init refuses it, writing nothing, without
-        AGENT_NODE_NAME (node_unnamed), without a store
-        (store_not_configured), or on a store whose global records have not
-        moved (global_not_migrated). An existing project is initialised as
-        before. The id is written once and never rewritten: an id the project
-        already resolves (the environment, its env files, or a project.json
-        v1 it is moved out of) is kept, an id `.contextkit/config.toml` holds
-        under [identity] is carried over, otherwise one is minted offline -
-        except where project.json is v2 and nothing names the id (a fresh
-        clone): init then refuses (no_project_identity) and asks for --id.
-        --id <id> binds the folder to the agent the store holds under that id
-        instead of creating one: where a database resolves for the folder the
-        agent must be registered there (exit 6 agent_unknown) and a moved
-        agent's project.json says "records": "store"; with no database it is
-        bound unverified. It writes the id to .env.local and nothing else of
-        the agent, refuses an id other than one the folder already resolves
-        (project_id_exists), and answers raised {id, verified, migrated, name,
-        store} or {id, verified: false, reason}. Run once in each clone of a
+        Wire the project: bind it to its id - CAPABILITIES_PROJECT_ID in the
+        root's .env.local, which is the whole binding (init writes no
+        capabilities/project.json; one an older init wrote is kept, without
+        an id, until the project moves) - and scaffold the manager-owned
+        capabilities/.gitignore, and settings.json only where an older
+        project.json keeps the project in files mode. A new project - no
+        older project.json, no settings file, no legacy envelope, and no id
+        the store already holds an agent for - is a new agent and starts in
+        the store: its row is registered migrated with this node as master,
+        and init refuses it, writing nothing, without AGENT_NODE_NAME
+        (node_unnamed), without a store (store_not_configured), or on a store
+        whose global records have not moved (global_not_migrated). An
+        existing project is initialised as before. The id is written once and
+        never rewritten: an id the project already resolves (the environment,
+        its env files, or a project.json v1 it is moved out of) is kept, an
+        id `.contextkit/config.toml` holds under [identity] is carried over,
+        otherwise one is minted offline - except where nothing names the id
+        in a checkout of an existing project (a v2 project.json, or the
+        envelope's .gitignore, without an id: a fresh clone): init then
+        refuses (no_project_identity) and asks for --id. A registered row
+        without a slug is given one: the slug an older project.json names,
+        else the agent's name transliterated, else the folder's name (the
+        result's agent.slug; see relabel). --id <id> binds the folder to the
+        agent the store holds under that id instead of creating one: where a
+        database resolves for the folder the agent must be registered there
+        (exit 6 agent_unknown) and an older project.json of a moved agent
+        says "records": "store"; with no database it is bound unverified. It
+        writes the id to .env.local and nothing else of the agent, refuses
+        an id other than one the folder already resolves (project_id_exists),
+        and answers raised {id, verified, migrated, name, store} or {id,
+        verified: false, reason}. Run once in each clone of a
         repository: the id is not committed. When a database resolves for the
         project, its agent row is registered in capabilities_agents (the
         result's `agent`: registered, store_not_configured, or the store's
@@ -560,16 +574,21 @@ PROJECT VERBS (run inside a consuming project)
         targets, git, init, hooks, build}; ContextKit's doctor and audit are
         not run.
   relabel <slug>
-        Give this project a new label, keeping its id: the label lives in the
-        project identity, and that file is the one write. Records are not
-        moved and are not re-scoped — they never referred to the label; no
-        database is touched. Renaming the directory is unrelated and needs no
-        command. Idempotent.
+        Give this project a new slug, keeping its id: the slug is its agent's
+        row in the store (capabilities_agents.slug, unique there: exit 6
+        slug_taken), registered first where it is not, and an older
+        capabilities/project.json that still names one is kept saying the
+        same. Without a database the slug is written to that project.json,
+        and refused (exit 5 store_not_configured) where there is none. Records
+        are not moved and are not re-scoped — they never referred to the
+        slug. Renaming the directory is unrelated and needs no command.
+        Answers {ok, project, id, slug, previous_slug, identity (where it was
+        written), unchanged}. Idempotent.
   agent show [--icon-out PATH]
         This project's row in the agent registry (capabilities_agents in the
         project's store, keyed by the project id): {ok, project,
         agent_id, registered, agent, store {level, schema}}, where agent is
-        null until the agent is registered, else {id, name, description,
+        null until the agent is registered, else {id, slug, name, description,
         icon_sha, icon_bytes, onboarding_status, onboarding_routine,
         migrating_since, migrated_at, created_at, updated_at}. --icon-out
         writes the icon's PNG bytes to PATH (exit 6 no_icon without one).
@@ -807,7 +826,9 @@ PROJECT VERBS (run inside a consuming project)
         Move this project's records - connections, grants, identifiers and
         policy - from its files into its store (the database `store show`
         names for it) and the project into store mode, recorded as
-        "records": "store" in its project.json, which only this verb writes;
+        "records": "store" in its older project.json, which only this verb
+        writes (a project without one, bound to its id with a store, is in
+        store mode already);
         a project at "connections": "store" keeps only its connections and
         grants in the store, and its identifiers and policy in files, until
         this verb runs again. Every identity the project uses becomes a row
@@ -907,7 +928,9 @@ PROJECT VERBS (run inside a consuming project)
         resolve (exit 7 verify_failed, the agent left frozen). Finalize
         refuses while a target's node is unregistered
         (target_node_unregistered), else sets migrated_at, clears
-        migrating_since, writes "records": "store", removes the files (a git
+        migrating_since, gives the agent's row its slug where it has none
+        (the one its project.json names, see init), writes "records":
+        "store" where an older project.json remains, removes the files (a git
         change to commit) and resumes what it stopped. A journal under the
         state home makes a run interrupted anywhere resume on the next
         --apply; a run on an agent already moved changes nothing. An agent
@@ -1313,7 +1336,7 @@ def _open_project_records(root: Path, *, project_only: bool = False):
     a read takes in every state."""
     store = _store_module()
     envelope = _project_capabilities_dir(root)
-    in_store = store.connections_mode(envelope) == "store"
+    in_store = store.connections_mode(envelope, root) == "store"
     return store.open_records(
         envelope, _CONFIG_HOME, project_only=project_only, project_root=root,
         project_id=_project_id_state(root)["id"] if in_store else None)
@@ -1414,10 +1437,47 @@ def _is_machine_registry(path: Path) -> bool:
     return (path / ".manager").is_dir()
 
 
+def _env_bound_root() -> Path | None:
+    """The folder the process environment binds: $CAPABILITIES_PROJECT_ID_ROOT,
+    where $CAPABILITIES_PROJECT_ID is set beside it and it names an existing
+    absolute folder. An id without a root binds no folder."""
+    ident = os.environ.get(PROJECT_ID_ENV, "").strip()
+    scope = os.environ.get(PROJECT_ID_ROOT_ENV, "").strip()
+    if not ident or not scope:
+        return None
+    path = Path(scope).expanduser()
+    if not path.is_absolute():
+        return None
+    try:
+        path = path.resolve()
+    except OSError:
+        return None
+    return path if path.is_dir() else None
+
+
+def _bound_folder(d: Path, bound: Path | None) -> bool:
+    """Whether `d` is a project bound to its id: the folder the environment
+    binds, one whose .env.local or .env sets CAPABILITIES_PROJECT_ID, or one
+    that still carries a binding of an older kind - an envelope's
+    project.json or settings.json, a legacy .capabilities/ envelope, or a
+    ContextKit binding."""
+    if d == bound or _env_file_project_id(d)[0]:
+        return True
+    legacy = d / LEGACY_PROJECT_CAPABILITIES_REL
+    return ((d / PROJECT_CAPABILITIES_REL / "settings.json").is_file()
+            or (d / PROJECT_CAPABILITIES_REL / PROJECT_IDENTITY_REL).is_file()
+            or (d / CONTEXTKIT_CONFIG_REL).is_file()
+            or (legacy.is_dir() and not _is_machine_registry(legacy)))
+
+
 def _project_root() -> Path | None:
-    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
-    the first directory holding capabilities/, legacy .capabilities/,
-    .contextkit/config.toml, .env(.local), or .git.
+    """The project root, walking up from $CLAUDE_PROJECT_DIR (else cwd).
+
+    The nearest bound folder (`_bound_folder`) is the root. Where no folder on
+    the walk is bound, the folder the environment binds is, so a deployed agent
+    whose environment sets CAPABILITIES_PROJECT_ID with
+    CAPABILITIES_PROJECT_ID_ROOT is found from anywhere; otherwise the nearest
+    folder holding .env(.local) or .git names an unbound project.
     Markers are read from the filesystem alone: the root is what the envelope
     location is resolved against, so resolving one cannot depend on the other.
     A home directory is never a project root (the machine registry lives in
@@ -1426,27 +1486,28 @@ def _project_root() -> Path | None:
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
     homes = _home_dirs()
+    bound = _env_bound_root()
+    unbound = None
     for d in (here, *here.parents):
         if d in homes:
-            return None
-        legacy = d / LEGACY_PROJECT_CAPABILITIES_REL
-        # Either marker names a project. `settings.json` is the gate and
-        # `project.json` the label; either one alone is enough.
-        if ((d / PROJECT_CAPABILITIES_REL / "settings.json").is_file()
-                or (d / PROJECT_CAPABILITIES_REL / PROJECT_IDENTITY_REL).is_file()
-                or (d / CONTEXTKIT_CONFIG_REL).is_file()
-                or (legacy.is_dir() and not _is_machine_registry(legacy))
-                or (d / ".env").exists()
-                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+            break
+        if _bound_folder(d, bound):
             return d
-    return None
+        if unbound is None and ((d / ".env").exists() or (d / ".env.local").exists()
+                                or (d / ".git").is_dir()):
+            unbound = d
+    if bound is not None and bound not in homes:
+        return bound
+    return unbound
 
 
 def _require_project() -> Path:
     root = _project_root()
     if root is None:
         _die(6, "no_project", "not inside a project",
-             "run from a directory with capabilities/, .env, or a .git root")
+             "run from a folder whose .env.local sets CAPABILITIES_PROJECT_ID, or with "
+             "CAPABILITIES_PROJECT_ID and CAPABILITIES_PROJECT_ID_ROOT set; "
+             "`capabilities init` binds a new one")
     return root
 
 
@@ -1802,15 +1863,14 @@ def _handed_off_project_id(root: Path) -> str:
 
     CAPABILITIES_PROJECT_ID is set by a deployment for the agent it runs, or
     handed down by a process that resolved it, scoped by
-    $CAPABILITIES_PROJECT_ID_ROOT exactly as the envelope handoff is scoped by
-    its companion: a handoff for another root is passed over, and one supplied
-    without the companion is honored as given."""
+    $CAPABILITIES_PROJECT_ID_ROOT: a handoff for another root is passed over,
+    and one supplied without the companion binds no folder."""
     handed = os.environ.get(PROJECT_ID_ENV, "").strip()
     if not handed:
         return ""
     scope = os.environ.get(PROJECT_ID_ROOT_ENV, "").strip()
     if not scope:
-        return handed
+        return ""
     try:
         if Path(scope).expanduser().resolve() != root.resolve():
             return ""
@@ -2240,9 +2300,12 @@ def _installed() -> dict[str, dict]:
 
 
 def _snapshot_env() -> dict:
-    """Subprocess env for snapshotting: outside any project, so never gated."""
+    """Subprocess env for snapshotting: outside any project, so never gated.
+    An id the environment binds to its root would name a project from
+    anywhere, so it goes too."""
     env = dict(os.environ)
-    env.pop("CLAUDE_PROJECT_DIR", None)
+    for key in ("CLAUDE_PROJECT_DIR", PROJECT_ID_ENV, PROJECT_ID_ROOT_ENV):
+        env.pop(key, None)
     return env
 
 
@@ -5447,7 +5510,7 @@ def cmd_dev_run(session_id: str, capability: str, args: list[str],
     database = _dev_database(session)
     store = _store_module()
     try:
-        store_project = store.connections_mode(envelope) == "store"
+        store_project = store.connections_mode(envelope, project) == "store"
     except store.StoreError:
         store_project = False
     projected = None
@@ -6531,7 +6594,7 @@ def _policy_views_checked(root: Path) -> tuple[dict, dict]:
     is reported as a finding rather than ending the report."""
     store = _store_module()
     envelope = _project_capabilities_dir(root)
-    if store.records_mode(envelope) != "store":
+    if store.records_mode(envelope, root) != "store":
         return _policy_views(root)
     return _policy_values(*_policy_scopes(root))
 
@@ -6845,10 +6908,11 @@ def _refuse_while_moving(root: Path) -> None:
 
 def _ensure_envelope(root: Path, new_agent: bool = False, given_id: str | None = None,
                      records_in_store: bool = False) -> list[str]:
-    """Manager-owned project files: migrate, then scaffold gate + state guard.
-    A new agent's identity declares its records in the store, so it gets no
-    settings file, and so does an agent raised from the store
-    (`records_in_store`)."""
+    """Manager-owned project files: migrate, then scaffold the state guard,
+    and the file gate for a project an older project.json keeps in files mode.
+    A project bound by its id alone keeps its records in the store and gets
+    no settings file; an older project.json of a new agent, or of an agent
+    raised from the store (`records_in_store`), is told so."""
     _refuse_while_moving(root)
     migrated = _migrate_legacy_envelope(root)
     capdir = _envelope_home(root)
@@ -6859,26 +6923,28 @@ def _ensure_envelope(root: Path, new_agent: bool = False, given_id: str | None =
         gi.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n")
                       + GITIGNORE_BODY)
     identity = _ensure_project_identity(capdir, root, given_id)
-    if (new_agent or records_in_store) \
-            and identity.get(_store_module().RECORDS_MODE_KEY) != "store":
-        identity[_store_module().RECORDS_MODE_KEY] = "store"
-        identity.pop("id", None)
-        _write_json(capdir / PROJECT_IDENTITY_REL, identity)
-    gate_file = capdir / "settings.json"
-    # The file gate exists only in files mode; a project whose records are in
-    # the store keeps its policy there and is marked by project.json.
+    identity_file = capdir / PROJECT_IDENTITY_REL
     store = _store_module()
+    if (new_agent or records_in_store) and identity_file.is_file() \
+            and identity.get(store.RECORDS_MODE_KEY) != "store":
+        identity[store.RECORDS_MODE_KEY] = "store"
+        identity.pop("id", None)
+        _write_json(identity_file, identity)
+    gate_file = capdir / "settings.json"
+    # The file gate exists only in files mode, which only an older
+    # project.json declares; a project whose records are in the store keeps
+    # its policy there.
     try:
-        in_store = store.records_mode(capdir) == "store"
+        in_store = store.records_mode(capdir, root) == "store"
     except store.StoreError:
         in_store = False  # the records backend refuses it on its own read
-    if not gate_file.exists() and not in_store:
+    if not gate_file.exists() and not in_store and identity_file.is_file():
         _write_json(gate_file, {"capabilities": {}})
     return migrated
 
 
 def _ensure_project_identity(capdir: Path, root: Path, given_id: str | None = None) -> dict:
-    """Who this project is: its label in project.json, its id bound once.
+    """Who this project is: its id, bound once.
 
     The id is CAPABILITIES_PROJECT_ID, which the environment gives a deployed
     agent and the project root's .env.local gives a folder on a person's
@@ -6886,8 +6952,9 @@ def _ensure_project_identity(capdir: Path, root: Path, given_id: str | None = No
     the environment, an env file, or an older home it is moved out of - is
     kept, and `given_id` must be that id. Otherwise `given_id`, else an id a
     ContextKit binding holds, else one minted here offline, is written to
-    .env.local. A project.json that already says the id lives in the env files
-    (v2) and finds none was cloned or copied without its .env.local: its id is
+    .env.local. No project.json is written: one an older init wrote is kept,
+    without an id. One that already says the id lives in the env files (v2)
+    and finds none was cloned or copied without its .env.local: its id is
     elsewhere, so none is minted and init asks for it."""
     identity_file = capdir / PROJECT_IDENTITY_REL
     identity = _read_json(identity_file) if identity_file.is_file() else None
@@ -6921,13 +6988,12 @@ def _ensure_project_identity(capdir: Path, root: Path, given_id: str | None = No
             _write_env_local_id(root, current)
     if given_id and _env_file_project_id(root)[0] is None:
         _write_env_local_id(root, given_id)
-    if not isinstance(identity, dict):
-        identity = {"slug": _default_project_slug(root)}
-    if "id" in identity or identity.get("schema") != PROJECT_IDENTITY_SCHEMA:
+    if isinstance(identity, dict) and ("id" in identity
+                                       or identity.get("schema") != PROJECT_IDENTITY_SCHEMA):
         identity.pop("id", None)
         identity["schema"] = PROJECT_IDENTITY_SCHEMA
         _write_json(identity_file, identity)
-    return {**identity, "id": current}
+    return {**(identity or {}), "id": current}
 
 
 def _default_project_slug(root: Path) -> str:
@@ -6937,35 +7003,148 @@ def _default_project_slug(root: Path) -> str:
     return slug or "project"
 
 
-def cmd_relabel(slug: str) -> None:
-    """Give this project a new label, keeping its id.
+# An agent's slug as the store keeps it (capabilities_agents.slug).
+AGENT_SLUG_RE = re.compile(r"[a-z0-9-]+")
+# Letters NFKD leaves no ASCII for, by their usual Latin spelling.
+_SLUG_LETTERS = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh",
+    "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+    "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "shch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu",
+    "я": "ya", "є": "ye", "і": "i", "ї": "yi", "ґ": "g", "ß": "ss", "æ": "ae",
+    "ø": "o", "œ": "oe", "ð": "d", "þ": "th", "ł": "l"})
 
-    The label lives in the project's identity file and nowhere else, so the
-    rename is that one write. Records were never scoped by the label, and the
-    directory on disk was never the label either, so renaming the directory
-    remains a thing that needs no command at all.
+
+def _slug_from_name(name: str | None) -> str | None:
+    """An agent's display name as a slug: transliterated to ASCII, lowercase,
+    every other run of characters one hyphen; None where nothing is left."""
+    if not isinstance(name, str):
+        return None
+    import unicodedata
+    text = unicodedata.normalize("NFKD", name.lower().translate(_SLUG_LETTERS))
+    text = text.encode("ascii", "ignore").decode()
+    slug = re.sub(r"[^a-z0-9]+", "-", text).strip("-")[:64].strip("-")
+    return slug or None
+
+
+def _legacy_project_slug(root: Path) -> str | None:
+    """The slug an older project.json still names, where it is one the store
+    can keep."""
+    identity = _read_json(_project_capabilities_dir(root) / PROJECT_IDENTITY_REL)
+    slug = identity.get("slug") if isinstance(identity, dict) else None
+    slug = slug.strip() if isinstance(slug, str) else ""
+    return slug if AGENT_SLUG_RE.fullmatch(slug) else None
+
+
+def _settle_agent_slug(conn, agent_id: str, root: Path, carried: str | None = None,
+                       name: str | None = None) -> dict:
+    """Give the agent's row its slug where it has none, inside the caller's
+    transaction: the slug an older project.json names (`carried`, else read
+    from the project), so nothing it names moves; else its display name (the
+    row's, else `name`, the one it is about to be given) transliterated, else
+    the folder's name, each with the id's tail added
+    where another agent holds it already. A carried slug another agent holds
+    is left unset rather than changed. Answers what the row holds."""
+    import psycopg
+    row = conn.execute("SELECT slug, name FROM capabilities_agents WHERE id = %s FOR UPDATE",
+                       (agent_id,)).fetchone()
+    if row is None:
+        return {"slug": None, "set": False, "reason": "agent_unregistered"}
+    if row[0]:
+        return {"slug": row[0], "set": False}
+    carried = carried or _legacy_project_slug(root)
+    if carried:
+        wanted, source, candidates = carried, "project.json", [carried]
+    else:
+        wanted = _slug_from_name(row[1] or name)
+        source = "name" if wanted else "folder"
+        wanted = wanted or _default_project_slug(root)
+        tail = re.sub(r"[^a-z0-9]", "", agent_id.lower())[-6:]
+        candidates = [wanted, f"{wanted[:57].strip('-')}-{tail}"]
+    for candidate in candidates:
+        if not AGENT_SLUG_RE.fullmatch(candidate):
+            continue
+        try:
+            with conn.transaction():
+                done = conn.execute(
+                    "UPDATE capabilities_agents SET slug = %s, updated_at = now() "
+                    "WHERE id = %s AND slug IS NULL AND NOT EXISTS (SELECT 1 FROM "
+                    "capabilities_agents WHERE slug = %s)",
+                    (candidate, agent_id, candidate)).rowcount
+        except psycopg.errors.UniqueViolation:
+            done = 0
+        if done:
+            return {"slug": candidate, "set": True, "from": source}
+    return {"slug": None, "set": False, "reason": "slug_taken", "wanted": wanted}
+
+
+def cmd_relabel(slug: str) -> None:
+    """Give this project a new slug, keeping its id.
+
+    The slug is the agent's row's in the store (capabilities_agents.slug), and
+    an older project.json that still names one is kept saying the same. Records
+    were never scoped by the slug, and the directory on disk was never the slug
+    either, so renaming the directory remains a thing that needs no command at
+    all. Without a database the slug is written where an older project.json
+    keeps it, and refused where there is none.
     """
     root = _require_project()
     # The id is resolved first: resolving it may move an older one out of the
     # file this verb then rewrites.
     project_id = _project_id_for_write(root)
-    identity = _read_json(_envelope_home(root) / PROJECT_IDENTITY_REL)
-    if not isinstance(identity, dict) or not project_id:
+    identity_file = _envelope_home(root) / PROJECT_IDENTITY_REL
+    identity = _read_json(identity_file) if identity_file.is_file() else None
+    if not project_id:
         _die(6, "no_project_identity",
-             f"this project has no id: neither {PROJECT_ID_ENV} nor its "
-             f"{_envelope_home(root) / PROJECT_IDENTITY_REL} names one",
+             f"this project has no id: neither the environment nor its .env.local or "
+             f".env sets {PROJECT_ID_ENV}",
              "run `capabilities init` in the project to give it its identity")
     store = _store_module()
     try:
         store._store_check("slug", slug, store.CAPABILITY_RE)
     except store.StoreError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
-    was = identity.get("slug")
-    identity["slug"] = slug
-    _write_json(_envelope_home(root) / PROJECT_IDENTITY_REL, identity)
+    db = _db_module()
+    try:
+        db.resolve_setting(root)
+        stored = True
+    except db.DbError as exc:
+        if exc.slug != "store_not_configured":
+            _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+        stored = False
+    if not stored and not isinstance(identity, dict):
+        _die(5, "store_not_configured",
+             "this project's slug is kept in its agent's row in the store, and no "
+             "database is configured for it",
+             "configure the store with `capabilities store set`, then run relabel again")
+    was = identity.get("slug") if isinstance(identity, dict) else None
+    if stored:
+        conn, _setting = _kernel_open(root)
+        import psycopg
+        try:
+            with conn.transaction():
+                _ensure_agent_row(conn, project_id)
+                row = conn.execute("SELECT slug FROM capabilities_agents WHERE id = %s "
+                                   "FOR UPDATE", (project_id,)).fetchone()
+                was = row[0] or was
+                conn.execute("UPDATE capabilities_agents SET slug = %s, updated_at = now() "
+                             "WHERE id = %s AND slug IS DISTINCT FROM %s",
+                             (slug, project_id, slug))
+        except psycopg.errors.UniqueViolation:
+            _die(6, "slug_taken", f"another agent in this store is already {slug!r}",
+                 "choose another slug")
+        except psycopg.Error as exc:
+            _die(5, "store_write_failed", f"writing the slug failed: {exc}",
+                 "check the database setting with `capabilities store doctor`")
+        finally:
+            conn.close()
+    if isinstance(identity, dict) and identity.get("slug") != slug:
+        identity["slug"] = slug
+        _write_json(identity_file, identity)
     _emit({"ok": True, "project": str(root), "id": project_id,
            "slug": slug, "previous_slug": was,
-           "identity": str(_envelope_home(root) / PROJECT_IDENTITY_REL),
+           "identity": (f"store:{store.STORE_AGENTS_TABLE}" if stored
+                        else str(identity_file)),
            "unchanged": was == slug})
 
 
@@ -6974,7 +7153,7 @@ def cmd_relabel(slug: str) -> None:
 # The agent registry and the agent's nodes live in the store, in the contract's
 # own tables, keyed by the project's id (CAPABILITIES_PROJECT_ID). The manager alone writes
 # them; `agent` and `node` answer for the project the call runs in.
-AGENT_COLUMNS = ("id", "name", "description", "icon_sha", "onboarding_status",
+AGENT_COLUMNS = ("id", "slug", "name", "description", "icon_sha", "onboarding_status",
                  "onboarding_routine", "migrating_since", "migrated_at",
                  "created_at", "updated_at")
 AGENT_TEXT_FIELDS = {"--name": "name", "--description": "description",
@@ -7070,12 +7249,39 @@ def _ensure_agent_row(conn, agent_id: str) -> bool:
 
 
 def _new_agent_project(root: Path) -> bool:
-    """Whether init is creating this agent: no identity, no settings file and
-    no legacy envelope yet, so it has no records anywhere to move."""
+    """Whether init is creating this agent: no older project.json, no settings
+    file and no legacy envelope yet, so it has no records anywhere to move,
+    and no id it is bound to that the store already holds an agent for."""
     capdir = _envelope_home(root)
-    return not (capdir / PROJECT_IDENTITY_REL).exists() \
-        and not (capdir / "settings.json").exists() \
-        and not (root / LEGACY_PROJECT_CAPABILITIES_REL).exists()
+    if (capdir / PROJECT_IDENTITY_REL).exists() \
+            or (capdir / "settings.json").exists() \
+            or (root / LEGACY_PROJECT_CAPABILITIES_REL).exists():
+        return False
+    ident = _handed_off_project_id(root) or _env_file_project_id(root)[0]
+    return not ident or not _agent_registered(root, ident)
+
+
+def _agent_registered(root: Path, agent_id: str) -> bool:
+    """Whether the store holds an agent under `agent_id`: True unless a store
+    resolves for the project and answers that it holds none, so a folder
+    whose store cannot be asked is never taken for a new agent."""
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+                          transaction=True)
+    except db.DbError:
+        return True
+    import psycopg
+    try:
+        return conn.execute("SELECT 1 FROM capabilities_agents WHERE id = %s",
+                            (agent_id,)).fetchone() is not None
+    except psycopg.errors.UndefinedTable:
+        return False
+    except psycopg.Error:
+        return True
+    finally:
+        conn.close()
 
 
 def _preflight_new_agent(root: Path) -> None:
@@ -7110,10 +7316,13 @@ def _preflight_new_agent(root: Path) -> None:
              "run `capabilities migrate --global --apply`, then `capabilities init` again")
 
 
-def _register_agent_on_init(root: Path, new_agent: bool = False) -> dict:
+def _register_agent_on_init(root: Path, new_agent: bool = False,
+                            name: str | None = None) -> dict:
     """init's registration of the agent row: written where a database resolves
     for the project, and otherwise reported, never failing init. A new agent
-    is registered migrated with this node as its master."""
+    is registered migrated with this node as its master. A row without a slug
+    is given one (`_settle_agent_slug`, `name` the one it is about to be
+    given)."""
     agent_id = _project_id_state(root)["id"]
     if not agent_id:
         return {"registered": False, "reason": "no_project_identity"}
@@ -7147,8 +7356,9 @@ def _register_agent_on_init(root: Path, new_agent: bool = False) -> dict:
                              "ON CONFLICT (agent_id, node) DO NOTHING",
                              (agent_id, node, "mac" if sys.platform == "darwin" else "server",
                               agent_id))
+            slug = _settle_agent_slug(conn, agent_id, root, name=name)
         return {"registered": True, "id": agent_id, "created": created,
-                "migrated": new_agent and bool(node),
+                "migrated": new_agent and bool(node), "slug": slug["slug"],
                 "store": _kernel_store_report(setting)}
     except db.DbError as exc:
         return {"registered": False, "error": _db_error(exc)}
@@ -9196,9 +9406,9 @@ def cmd_connections_import() -> None:
     root = _require_project()
     envelope = _project_capabilities_dir(root)
     identity_file = envelope / PROJECT_IDENTITY_REL
-    identity = _read_json(identity_file)
+    identity = _read_json(identity_file) if identity_file.is_file() else {}
     if not isinstance(identity, dict):
-        _die(6, "no_project_identity", f"{identity_file} is missing or unreadable",
+        _die(6, "no_project_identity", f"{identity_file} is unreadable",
              "run `capabilities init` in the project")
     agent_id = _project_id_for_write(root)
     if not agent_id:
@@ -9207,8 +9417,8 @@ def cmd_connections_import() -> None:
              f".env sets {PROJECT_ID_ENV}",
              "run `capabilities init` in the project to give it its identity")
     try:
-        previous = ("store" if store.records_mode(envelope) == "store"
-                    else "connections" if store.connections_mode(envelope) == "store"
+        previous = ("store" if store.records_mode(envelope, root) == "store"
+                    else "connections" if store.connections_mode(envelope, root) == "store"
                     else "files")
     except store.StoreError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
@@ -9255,7 +9465,7 @@ def cmd_connections_import() -> None:
         _die(5, "store_write_failed", f"importing into the store failed: {exc}")
     finally:
         conn.close()
-    if previous != "store":
+    if previous != "store" and identity_file.is_file():
         identity = _read_json(identity_file) or identity
         identity[store.RECORDS_MODE_KEY] = "store"
         identity.pop(store.CONNECTIONS_MODE_KEY, None)
@@ -10011,8 +10221,8 @@ def _migrate_context(root: Path, opts: dict, answers: dict) -> dict:
     # The id is written to .env.local wherever it is not already there.
     ctx["id_write"] = agent_id if agent_id != in_env_file else None
     try:
-        ctx["mode"] = ("store" if store.records_mode(envelope) == "store"
-                       else "connections" if store.connections_mode(envelope) == "store"
+        ctx["mode"] = ("store" if store.records_mode(envelope, root) == "store"
+                       else "connections" if store.connections_mode(envelope, root) == "store"
                        else "files")
     except store.StoreError as exc:
         raise _MigrateRefusal(exc.slug, exc.message, exc.hint) from None
@@ -10762,8 +10972,8 @@ def _migrate_main_checkout(ctx: dict) -> dict | None:
             continue
         envelope = Path(entry["envelope"])
         try:
-            theirs = ("store" if store.records_mode(envelope) == "store"
-                      else "connections" if store.connections_mode(envelope) == "store"
+            theirs = ("store" if store.records_mode(envelope, other) == "store"
+                      else "connections" if store.connections_mode(envelope, other) == "store"
                       else "files")
         except store.StoreError:
             continue
@@ -11307,6 +11517,10 @@ def _migrate_finalize(ctx: dict, plan: dict | None, journal: dict) -> dict:
         moved = conn.execute("UPDATE capabilities_agents SET migrated_at = coalesce("
                              "migrated_at, now()), migrating_since = NULL, updated_at = now() "
                              "WHERE id = %s RETURNING migrated_at", (agent_id,)).fetchone()
+        # The slug moves into the row with the agent, so nothing it names moves.
+        _settle_agent_slug(conn, agent_id, ctx["root"],
+                           ctx["identity"].get("slug") if AGENT_SLUG_RE.fullmatch(
+                               str(ctx["identity"].get("slug") or "")) else None)
         return _store_module()._stamp(moved[0])
     migrated_at = _migrate_kernel(ctx, work)
     journal["phase"] = "finalizing"
@@ -11315,7 +11529,9 @@ def _migrate_finalize(ctx: dict, plan: dict | None, journal: dict) -> dict:
     identity = _read_json(ctx["identity_file"])
     identity = identity if isinstance(identity, dict) else {}
     store = _store_module()
-    if identity.get(store.RECORDS_MODE_KEY) != "store" or store.CONNECTIONS_MODE_KEY in identity:
+    if ctx["identity_file"].is_file() and (
+            identity.get(store.RECORDS_MODE_KEY) != "store"
+            or store.CONNECTIONS_MODE_KEY in identity):
         identity[store.RECORDS_MODE_KEY] = "store"
         identity.pop(store.CONNECTIONS_MODE_KEY, None)
         _write_json(ctx["identity_file"], identity)
@@ -11497,11 +11713,12 @@ def cmd_migrate_agent(opts: dict) -> None:
     try:
         if ctx["id_write"]:
             _write_env_local_id(root, ctx["id_write"])
-            identity = _read_json(ctx["identity_file"]) or {}
-            identity.pop("id", None)
-            identity["schema"] = PROJECT_IDENTITY_SCHEMA
-            identity.setdefault("slug", ctx["slug"])
-            _write_json(ctx["identity_file"], identity)
+            if ctx["identity_file"].is_file():
+                identity = _read_json(ctx["identity_file"]) or {}
+                identity.pop("id", None)
+                identity["schema"] = PROJECT_IDENTITY_SCHEMA
+                identity.setdefault("slug", ctx["slug"])
+                _write_json(ctx["identity_file"], identity)
             answer["identity_written"] = ctx["id_write"]
         _migrate_archive(ctx, journal, plan["files"], plan["git"])
         _migrate_journal_save(agent_id, journal)
@@ -11734,7 +11951,7 @@ def _migrate_gate_flips(conn, plan: dict, given: list[str], setting=None) -> lis
             except db.DbError:
                 continue
         try:
-            mode = store.records_mode(Path(entry["envelope"]))
+            mode = store.records_mode(Path(entry["envelope"]), Path(entry["root"]))
         except store.StoreError:
             continue
         found = agents.setdefault(entry["id"], {"agent_id": entry["id"], "reads": None})
@@ -14123,7 +14340,7 @@ def _remove_env_local_id(root: Path) -> None:
 
 
 def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False,
-          given_id: str | None = None) -> dict:
+          given_id: str | None = None, name: str | None = None) -> dict:
     """What `init` does, answered rather than printed. With `layers` or
     `starter` it first lays the body ContextKit's `init --with-layers` /
     `--with-template` lays, in the folder it runs in. With `given_id` it binds
@@ -14145,9 +14362,22 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
         raised = _agent_to_raise(root, given_id)
     else:
         new_agent = _new_agent_project(root)
+    envelope_ignore = _envelope_home(root) / ".gitignore"
+    if new_agent and envelope_ignore.is_file() \
+            and not (_handed_off_project_id(root) or _env_file_project_id(root)[0]):
+        # A project an init made holds its envelope; with no id beside it, this
+        # is a checkout of that project, cloned or copied without its
+        # .env.local, and its agent lives in a store already.
+        _die(6, "no_project_identity",
+             f"{envelope_ignore.parent} is an agent's envelope and nothing binds this "
+             f"checkout to its agent: neither the environment nor .env.local or .env sets "
+             f"{PROJECT_ID_ENV}",
+             "run `capabilities init --id <id>` with the agent's id once in this "
+             f"checkout, or set {PROJECT_ID_ENV}")
     if new_agent:
         _preflight_new_agent(root)
     had_file_id = _env_file_project_id(root)[0] is not None
+    had_ignore = envelope_ignore.exists()
     body: dict = {}
     if with_body:
         body = {"created": [], "changed": [], "skipped": []}
@@ -14160,13 +14390,18 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
                                 records_in_store=bool(raised and raised.get("migrated")))
     if with_body and not had_identity and identity_file.exists():
         body["created"].append(str(identity_file))
-    registration = _register_agent_on_init(root, new_agent=new_agent)
+    registration = _register_agent_on_init(root, new_agent=new_agent, name=name)
     if new_agent and not registration.get("migrated"):
         # Its identity was written by this init alone: removing it leaves the
         # project new, so the next init creates the agent again.
-        (_envelope_home(root) / PROJECT_IDENTITY_REL).unlink(missing_ok=True)
         if not had_file_id:
             _remove_env_local_id(root)
+        if not had_ignore:
+            envelope_ignore.unlink(missing_ok=True)
+            try:
+                envelope_ignore.parent.rmdir()
+            except OSError:
+                pass
         error = registration.get("error") or {}
         _die(5, error.get("code") or "store_write_failed",
              error.get("message") or "the new agent could not be registered in the store",
@@ -14712,7 +14947,9 @@ def cmd_init_template(template_id: str, name: str | None) -> None:
     # The agent starts in the store: refuse it before the repository is made.
     _preflight_new_agent(root)
     git = _ck_prepare_git(root, yes=True)
-    result = _init(claude=True, codex=False, layers=True)
+    if name is None:
+        name = secrets.choice(template["agent_names"])
+    result = _init(claude=True, codex=False, layers=True, name=name)
     layers = _ck_layer_paths(root)
     base = Path(template["path"])
     for rel in template["files"]:
@@ -14723,8 +14960,6 @@ def cmd_init_template(template_id: str, name: str | None) -> None:
         result["created"].append(str(destination))
     icon, data = _ck_stage_icon(root, template["icon"])
     result["created"].append(str(icon))
-    if name is None:
-        name = secrets.choice(template["agent_names"])
     values = {"name": name, "description": template["description"], "icon": data,
               "icon_sha": hashlib.sha256(data).hexdigest()}
     if template["onboarding"]:
@@ -15096,7 +15331,8 @@ def cmd_doctor() -> None:
     # Reading the id moves one still kept in project.json into .env.local.
     identity = _project_id_state(root) if root else None
     if root and envelope and ((envelope / "settings.json").is_file()
-                              or (envelope / PROJECT_IDENTITY_REL).is_file()):
+                              or (envelope / PROJECT_IDENTITY_REL).is_file()
+                              or (envelope.is_dir() and identity and identity["id"])):
         store_finding = None
         try:
             caps, _global_caps = _policy_views_checked(root)

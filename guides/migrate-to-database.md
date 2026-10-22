@@ -139,7 +139,7 @@ Answers are inputs the run records; keep the file beside the person's other note
 
 A successful apply answers `state: "migrated"`, `applied: true`, `migrated_at`, `verify.differences` (empty), `removed` (the files it deleted) and `archive` (where it kept a copy of every file git does not hold). Running `--apply` again changes nothing.
 
-Then commit **only the files the migration removed** (the `removed` list) and the `capabilities/project.json` change that records `"records": "store"`. Other uncommitted changes in the repository are not the migration's; leave them for the person.
+Then commit **only the files the migration removed** (the `removed` list) and, where the project still has one, the `capabilities/project.json` change that records `"records": "store"`. Other uncommitted changes in the repository are not the migration's; leave them for the person.
 
 ### Step 4 - restart what predates the move
 

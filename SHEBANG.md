@@ -251,7 +251,7 @@ The envelope, the flag parsing and the empty answer are the core tier's; a capab
 
 ## Project records and the envelope
 
-Every project has a visible `capabilities/` envelope. `capabilities/project.json` gives the project its slug; its durable id is `CAPABILITIES_PROJECT_ID`, in the environment or the project root's `.env.local` (resolved as described below). Live configuration is kept in files, apart from the connections, grants, identifiers and policy a project in store mode keeps in its store ([connections in the store](#connections-in-the-store)), the references a project imported into its store (below) and the definitions a service runs from - its workers, its scheduled jobs - which the store keeps as versions (DOCTRINE rule 22), and the policy gate comes through the records adapter with every other live record.
+Every project has a visible `capabilities/` envelope. A project is bound by its durable id, `CAPABILITIES_PROJECT_ID`, in the environment or the project root's `.env.local` (resolved as described below), and no file of the envelope is needed to name it. Its slug - its short technical name, which names its state directories, its service log lines and its `--project` shorthand - is its agent's row in the store, `capabilities_agents.slug`: unique within the store, lowercase letters, digits and hyphens, written by the manager alone (`capabilities relabel`, and `init` and `migrate` where the row has none: the slug an older `project.json` names, else the agent's name transliterated, else the folder's name). Where the row holds none, the slug an older `project.json` still names stands in, else the project id; a capability reads it through `_project_slug()`, which refuses rather than answer the id where the store is configured but does not answer and no older `project.json` names one. Live configuration is kept in files, apart from the connections, grants, identifiers and policy a project in store mode keeps in its store ([connections in the store](#connections-in-the-store)), the references a project imported into its store (below) and the definitions a service runs from - its workers, its scheduled jobs - which the store keeps as versions (DOCTRINE rule 22), and the policy gate comes through the records adapter with every other live record.
 
 All runtime readers open the same records adapter, which maps logical collections onto the established envelope and `$XDG_CONFIG_HOME` layout. Project records resolve before global records; merge collections compose by key, and a connection identity is always taken whole from one scope rather than assembled field by field. A call site asks for a collection, never for a path.
 
@@ -259,7 +259,7 @@ Project material has this layout:
 
 ```
 capabilities/
-  project.json        # the project's label and records mode; never its id
+  project.json        # an older project's slug and records mode, until it moves; never its id, and init writes none
   settings.json       # policy records (files mode)
   <name>/
     connections.json  # connection, grant, and default-setting records (files mode)
@@ -311,7 +311,9 @@ never written into it. The manager is the record's only writer and replaces
 entries atomically, because capability CLIs run concurrently; the record is
 reconstructible from nothing, so deleting it costs one resolution.
 
-**The project id is bound by the environment.** `CAPABILITIES_PROJECT_ID` is the id's one binding: the process environment's value wins - set by a deployment for the agent it runs, or handed down beside the envelope - and otherwise the one the project root's `.env.local`, else its `.env`, sets; ContextKit is never asked for it, and `project.json` (schema `capabilities.project.v2`) holds none. The env files are not committed, so each checkout of a repository is bound once, by `capabilities init` (which mints an id for a new project) or `capabilities init --id <id>` (which binds the checkout to an agent its store already holds); a checkout whose `project.json` is v2 and that nothing binds is refused a new id, since its id is elsewhere. The manager is the id's only writer and never rewrites it. An id kept where it was kept before - an `id` in a v1 `project.json`, or `[identity] id` in `.contextkit/config.toml` - is moved by the manager into `.env.local` the first time it reads the project, and leaves `project.json`, except under the read-only switch, where it answers the id and writes nothing; a capability that finds no id in the environment or the env files while such an older home still holds one asks the manager (`capabilities path --json --identity`) for it. The answer is in one of three states: `handed` (the environment's id for this root), `declared` (the env files') and `undeclared` (no id anywhere). A capability whose manager cannot answer refuses a write that stamps the id, such as a record a capability attributes to the project or a store registration, naming that; a project without an id is left to the write's own refusal, which names `capabilities init`. Reads never refuse over the id. An id a write may stamp is handed down beside the envelope, as `$CAPABILITIES_PROJECT_ID` scoped by `$CAPABILITIES_PROJECT_ID_ROOT` exactly as the envelope handoff is scoped, by every process that resolves the envelope, which resolves the id with it at read level, and by every process the manager launches into a project; one supplied without the scope is honored wherever it is inherited, and one scoped to another root is passed over.
+**The project root is found by its binding.** Walking up from `$CLAUDE_PROJECT_DIR`, else the working directory, the root is the nearest folder that is bound: the folder `$CAPABILITIES_PROJECT_ID_ROOT` names where the environment sets `$CAPABILITIES_PROJECT_ID` beside it, a folder whose `.env.local`, else `.env`, sets `CAPABILITIES_PROJECT_ID`, or a folder still carrying a binding of an older kind until it moves - an envelope's `project.json` or `settings.json`, a legacy `.capabilities/` envelope, a `.contextkit/config.toml`. Where no folder on the walk is bound, the folder the environment binds is the root, so a deployed agent is found from wherever its processes stand; where the environment binds none either, the nearest folder holding `.env`, `.env.local` or `.git` is the root of a project bound to no id. The nearest binding wins, so a hand-down from a process standing in one project never binds a descendant standing in a project of its own. A home directory is never a root, and the manager and every capability walk the same way.
+
+**The project id is bound by the environment.** `CAPABILITIES_PROJECT_ID` is the id's one binding: the process environment's value wins where `$CAPABILITIES_PROJECT_ID_ROOT` names this root - set so by a deployment for the agent it runs, or handed down beside the envelope - and otherwise the one the project root's `.env.local`, else its `.env`, sets; an id in the environment without a root binds no folder. ContextKit is never asked for it, and a `project.json` an older project still has holds none. The env files are not committed, so each checkout of a repository is bound once, by `capabilities init` (which mints an id for a new project) or `capabilities init --id <id>` (which binds the checkout to an agent its store already holds); a checkout whose `project.json` is v2, or whose envelope holds the `.gitignore` an init wrote, and that nothing binds is refused a new id, since its id is elsewhere. The manager is the id's only writer and never rewrites it. An id kept where it was kept before - an `id` in a v1 `project.json`, or `[identity] id` in `.contextkit/config.toml` - is moved by the manager into `.env.local` the first time it reads the project, and leaves `project.json`, except under the read-only switch, where it answers the id and writes nothing; a capability that finds no id in the environment or the env files while such an older home still holds one asks the manager (`capabilities path --json --identity`) for it. The answer is in one of three states: `handed` (the environment's id for this root), `declared` (the env files') and `undeclared` (no id anywhere). A capability whose manager cannot answer refuses a write that stamps the id, such as a record a capability attributes to the project or a store registration, naming that; a project without an id is left to the write's own refusal, which names `capabilities init`. Reads never refuse over the id. An id a write may stamp is handed down beside the envelope, as `$CAPABILITIES_PROJECT_ID` scoped by `$CAPABILITIES_PROJECT_ID_ROOT` exactly as the envelope handoff is scoped, by every process that resolves the envelope, which resolves the id with it at read level, and by every process the manager launches into a project; one supplied without the scope binds no folder, and one scoped to another root is passed over.
 
 - **Identifiers** — discoverable, non-secret, structural lookup (DOCTRINE rule 4). `identifiers.json` is a thin standard envelope — label → `{ value, note }`. Any reader renders the same menu without understanding the capability, and capability-specific structure lives inside values:
 
@@ -405,25 +407,30 @@ Above both scopes sits the machine ceiling, `$XDG_CONFIG_HOME/capabilities/machi
 
 ```python
 def _project_root() -> Path | None:
-    """Nearest project root, walking up from $CLAUDE_PROJECT_DIR (else cwd):
-    the first directory holding capabilities/project.json or settings.json, legacy
-    .capabilities/, .contextkit/config.toml, .env(.local), or .git.
-    Markers are read from the filesystem alone: the root is what the envelope
-    location is resolved against, so resolving one cannot depend on the other.
-    $HOME is never a project root (the machine registry lives there)."""
+    """The nearest bound folder walking up from $CLAUDE_PROJECT_DIR (else cwd):
+    the one $CAPABILITIES_PROJECT_ID_ROOT names beside $CAPABILITIES_PROJECT_ID,
+    one whose .env.local or .env sets the id, or one with an older binding.
+    Else the folder the environment binds, else the nearest folder holding
+    .env(.local) or .git. $HOME is never a project root (the machine registry
+    lives there)."""
     start = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     here = Path(start).resolve()
     home = Path.home().resolve()
+    bound = _env_bound_root()  # the id's root, where the environment sets both
+    unbound = None
     for d in (here, *here.parents):
         if d == home:
-            return None
-        if ((d / "capabilities" / "project.json").is_file()
+            break
+        if (d == bound or _env_file_project_id(d)
+                or (d / "capabilities" / "project.json").is_file()
                 or (d / "capabilities" / "settings.json").is_file()
                 or (d / ".contextkit" / "config.toml").is_file()
-                or (d / ".capabilities").is_dir() or (d / ".env").exists()
-                or (d / ".env.local").exists() or (d / ".git").is_dir()):
+                or (d / ".capabilities").is_dir()):
             return d
-    return None
+        if unbound is None and ((d / ".env").exists() or (d / ".env.local").exists()
+                                or (d / ".git").is_dir()):
+            unbound = d
+    return bound if bound is not None and bound != home else unbound
 
 def _project_capabilities_dir(root: Path) -> Path:
     current = root / "capabilities"
@@ -581,7 +588,7 @@ Non-secret values sit literally in the entry: chosen, committed, per-connection 
 
 ### Connections in the store
 
-A project keeps its connections, grants, identifiers and policy in one of two homes: the files above, in files mode, or the project's store, in store mode, which serves a project whose agents run on more than one node. One mode owns a project at a time and the two never compose with each other. Either is read through the same records adapter, so `_connections_registry()` below, the gate, the `ids` verbs and every verb above them behave the same in both. A project is in store mode when its `project.json` says `"records": "store"`, and in files mode otherwise; the mode is never inferred from a configured store. An agent whose row in `capabilities_agents` has `migrated_at` set is the one exception: wherever a database resolves for it, every record and every project or global settings document is read from and written to the store's rows, its own over the rows for every agent and, at each, the row for its node over the row for every node, whatever its `project.json` says and with its files unread. It is read only on a node registered among its nodes and named by `AGENT_NODE_NAME`, and refused elsewhere naming its master; the master writes the rows every node shares, another node writes rows of its own only where the master lets it (`may_write`), and while `migrating_since` is set only the migration on the master writes. A `project.json` saying `"connections": "store"` keeps only its connections and grants in the store, and its identifiers and policy in files. The manager alone writes these keys, through `capabilities connections import`, which writes the rows the project's files resolve to, proves the store resolves the same records, and only then records `"records": "store"`; it never overwrites a row that differs, and run again it changes nothing. The machine ceiling, the harness deny rule and the project's `slug` and `schema` stay in files in either mode.
+A project keeps its connections, grants, identifiers and policy in one of two homes: the files above, in files mode, or the project's store, in store mode, which serves a project whose agents run on more than one node. One mode owns a project at a time and the two never compose with each other. Either is read through the same records adapter, so `_connections_registry()` below, the gate, the `ids` verbs and every verb above them behave the same in both. A project an older `project.json` still describes is in store mode when it says `"records": "store"`, and in files mode otherwise. A project without one is in files mode where it keeps a `settings.json` gate or no database resolves for it, and otherwise - bound to its id, with a store to keep them in - in store mode: the records of a bound agent are the store's. An agent whose row in `capabilities_agents` has `migrated_at` set is the one exception: wherever a database resolves for it, every record and every project or global settings document is read from and written to the store's rows, its own over the rows for every agent and, at each, the row for its node over the row for every node, whatever its `project.json` says and with its files unread. It is read only on a node registered among its nodes and named by `AGENT_NODE_NAME`, and refused elsewhere naming its master; the master writes the rows every node shares, another node writes rows of its own only where the master lets it (`may_write`), and while `migrating_since` is set only the migration on the master writes. A `project.json` saying `"connections": "store"` keeps only its connections and grants in the store, and its identifiers and policy in files. The manager alone writes these keys, through `capabilities connections import`, which writes the rows the project's files resolve to, proves the store resolves the same records, and only then records `"records": "store"`; it never overwrites a row that differs, and run again it changes nothing. The machine ceiling and the harness deny rule stay in files in either mode, and so do the `slug` and `schema` an older `project.json` holds.
 
 Store mode keeps four tables, owned by the contract and migrated under its own ledger in the schema the project's [store setting](#the-store-setting) names:
 
@@ -769,7 +776,8 @@ def _state_dir() -> Path:
         if root is not None:
             envelope = _project_capabilities_dir(root)
             if ((envelope / "project.json").is_file()
-                    or (envelope / "settings.json").is_file()):
+                    or (envelope / "settings.json").is_file()
+                    or (envelope.is_dir() and _bound_project_id(root))):
                 return envelope / NAME / "state"
     return _STATE_HOME / NAME
 ```

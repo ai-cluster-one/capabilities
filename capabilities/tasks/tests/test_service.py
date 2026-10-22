@@ -429,11 +429,14 @@ while not release.exists():
 def serve(project: Path, entry: dict) -> None:
     """What the check before every action reads, as a project that may be served
     holds it: its id, tasks enabled for it, and the connection granted with
-    writes. Written only where the test has not written its own; no slug, so
-    the state root stays the one the test's verbs already wrote to."""
+    writes. Written only where the test has not written its own; its slug is
+    the state root the test's verbs already wrote to, which the id would
+    otherwise stand in for."""
     envelope = project / "capabilities"
+    key = mod._service_state_key(project)
     for path, value in (
-            (envelope / "project.json", {"schema": "capabilities.project.v1", "id": HERE}),
+            (envelope / "project.json",
+             {"schema": "capabilities.project.v1", "id": HERE, "slug": key}),
             (envelope / "settings.json", {"capabilities": {"tasks": {"enabled": True}}}),
             (envelope / "tasks" / "connections.json",
              {"default": "local", "connections": {"local": entry}})):

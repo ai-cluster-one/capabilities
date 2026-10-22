@@ -5,7 +5,7 @@
 #     "py-tgcalls==3.0.1b1",
 #     "ntgcalls==3.0.3",
 #     "telethon==1.45.0",
-#     "capabilities-contract>=0.9,<1",
+#     "capabilities-contract>=0.12,<1",
 # ]
 # ///
 # The 3.x line is what carries conference calls: joining one needs
@@ -118,23 +118,61 @@ def die(error: RecorderError) -> None:
     raise SystemExit(error.exit_code)
 
 
+def _env_file_names_id(folder):
+    for name in (".env.local", ".env"):
+        try:
+            lines = (folder / name).read_text().splitlines()
+        except OSError:
+            continue
+        found = ""
+        for line in lines:
+            key, eq, value = line.strip().partition("=")
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            if eq and key == "CAPABILITIES_PROJECT_ID":
+                found = value.strip().strip('"').strip("'")
+        if found:
+            return True
+    return False
+
+
+def _env_bound_root():
+    ident = os.environ.get("CAPABILITIES_PROJECT_ID", "").strip()
+    scope = os.environ.get("CAPABILITIES_PROJECT_ID_ROOT", "").strip()
+    if not ident or not scope or not os.path.isabs(os.path.expanduser(scope)):
+        return None
+    try:
+        path = Path(scope).expanduser().resolve()
+    except OSError:
+        return None
+    return path if path.is_dir() else None
+
+
 def find_project_root(explicit: str | None) -> Path:
     if explicit:
         return Path(explicit).expanduser().resolve()
     start = os.environ.get("TELEGRAM_SERVICE_PROJECT_ROOT") or os.getcwd()
     here = Path(start).expanduser().resolve()
     home = Path.home().resolve()
+    bound = _env_bound_root()
+    unbound = None
     for candidate in (here, *here.parents):
         if candidate == home:
             break
-        if ((candidate / "capabilities" / "settings.json").is_file()
+        if (candidate == bound or _env_file_names_id(candidate)
+                or (candidate / "capabilities" / "settings.json").is_file()
                 or (candidate / "capabilities" / "project.json").is_file()
-                or (candidate / ".capabilities").is_dir()
-                or (candidate / ".env.local").is_file()
-                or (candidate / ".env").is_file()
-                or (candidate / ".git").is_dir()):
+                or (candidate / ".contextkit" / "config.toml").is_file()
+                or (candidate / ".capabilities").is_dir()):
             return candidate
-    return here
+        if unbound is None and ((candidate / ".env.local").is_file()
+                                or (candidate / ".env").is_file()
+                                or (candidate / ".git").is_dir()):
+            unbound = candidate
+    if bound is not None and bound != home:
+        return bound
+    return unbound or here
 
 
 def project_capabilities_dir(root: Path) -> Path:

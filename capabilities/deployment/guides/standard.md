@@ -33,7 +33,7 @@ enablement and `runtime.json` service policy, and reconciles the runtime graph,
 Compose, env example, Dockerfile, dockerignore, and entrypoint. Each compiled
 service is supervised through its runner, `deployment runner`.
 
-That filtering is files mode, the gate kept in `capabilities/settings.json`. A project whose `project.json` says `"records": "store"` (every agent whose records moved into the store) compiles every installed descriptor instead, less `capabilities.exclude`, and the gate row naming each node decides whether a service runs there; its `service_policy` keeps only `shape` and per-capability shapes (`embedded` or `container`), and the switches and placements below are retired for it, reported and rewritten by `sync`. `deployment guide profiles` describes both, the runner and the lease.
+That filtering is files mode, the gate kept in `capabilities/settings.json`. An agent whose records are in the store (every agent `capabilities init` made, and every one moved there by `capabilities migrate`) compiles every installed descriptor instead, less `capabilities.exclude`, and the gate row naming each node decides whether a service runs there; its `service_policy` keeps only `shape` and per-capability shapes (`embedded` or `container`), and the switches and placements below are retired for it, reported and rewritten by `sync`. `deployment guide profiles` describes both, the runner and the lease.
 
 `service_policy.auto_include` controls descriptor-default auto inclusion, and
 `service_policy.default_mode` selects `embedded` or `enabled` for those auto

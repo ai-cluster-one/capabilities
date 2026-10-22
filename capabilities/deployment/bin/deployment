@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.9,<1",
+#     "capabilities-contract>=0.12,<1",
 # ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
@@ -36,7 +36,7 @@ USAGE
       capabilities the project enabled itself, with `enabled` available for
       separate Compose services, and the Telegram/automations flags are
       compatibility shorthands for per-capability service policy; in store
-      mode (project.json "records": "store") every installed capability
+      mode (an agent whose records are in the store) every installed capability
       service, and those flags with any value but `auto` exit 6
       retired_option, since whether a service runs is the gate's answer on
       each node. If --dry-run is passed, print the files that would be written.
@@ -93,7 +93,7 @@ USAGE
       capabilities.<name> auto|enabled|disabled|embedded and the descriptor's
       default_policy; service_policy.placement and services.<name>.placement
       (node|local|both) choose the substrate.
-      Store mode (project.json "records": "store"): every deployable
+      Store mode (an agent whose records are in the store): every deployable
       descriptor of the installed catalogue, less capabilities.exclude, so
       the gate row naming each node, not the compile, decides whether a
       service runs there, and turning it on or off needs no recompile or
@@ -638,7 +638,8 @@ def _root() -> Path:
 def _require_envelope(root: Path) -> Path:
     cap_root = _project_capabilities_dir(root)
     if not ((cap_root / "settings.json").is_file()
-            or (cap_root / "project.json").is_file()):
+            or (cap_root / "project.json").is_file()
+            or (cap_root.is_dir() and _project_id())):
         _die(6, "no_envelope", "no capabilities/ envelope in this project",
              "run `capabilities init --codex` or `capabilities init --claude` first")
     return cap_root / NAME
@@ -6785,7 +6786,8 @@ def _node_app_name(root, target):
     """The application is named after the project, never after the checkout
     folder, which differs between a checkout and its worktrees: the name
     ContextKit holds for the project when its config sets one, else the
-    project slug the capabilities manager recorded, then the target."""
+    project's slug (its agent's row in the store, else an older project.json's,
+    else its id), then the target."""
     project = None
     if _has_contextkit(root):
         shown = _node_run(["contextkit", "identity", "show", "--json"], root, check=False)
@@ -6797,9 +6799,10 @@ def _node_app_name(root, target):
                 and isinstance(identity.get("name"), str) and identity["name"].strip()):
             project = identity["name"]
     if not project:
-        recorded, _error = _read_json(_project_capabilities_dir(root) / "project.json")
-        if isinstance(recorded, dict) and isinstance(recorded.get("slug"), str):
-            project = recorded["slug"]
+        try:
+            project = _project_slug(root)
+        except StoreError as exc:
+            raise NodeFailure(exc.slug, exc.message, 5) from None
     if not project:
         raise NodeFailure("project_name", "the project has neither a ContextKit name nor a "
                           "recorded slug to name its Coolify application after", 6)
