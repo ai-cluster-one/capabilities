@@ -3,6 +3,11 @@ name: Store tests
 # Runs the store-backed suites against a real PostgreSQL. Informational: this
 # job is not a required status, and the release gate reads only `verify` in
 # source-integrity.yml.
+#
+# Which suites run, and what each runs on, is read from the checkout: the
+# manager's suite, and every capability whose tests reach a store, each with
+# the dependencies its own scripts declare. A new suite or a library release
+# needs no edit here.
 
 on:
   push:
@@ -14,9 +19,84 @@ on:
 permissions:
   contents: read
 
+env:
+  UV_PYTHON: "3.12"
+  # What the suites import beside their scripts' own dependencies.
+  TEST_TOOLS: pytest psycopg[binary]>=3.2 jsonschema
+
 jobs:
-  store-tests:
+  discover:
     runs-on: ubuntu-latest
+    outputs:
+      suites: ${{ steps.suites.outputs.suites }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Find the store suites and what each script declares
+        id: suites
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          # PEP 723's reference expression for an inline metadata block.
+          BLOCK = re.compile(
+              r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$")
+          # A suite that names either of these reaches a store. Its
+          # dependencies are those of the bundle's scripts, never a test's own.
+          STORE = ("psycopg", "_TEST_DSN")
+
+          def texts(root, outside=None):
+              for path in sorted(root.rglob("*")):
+                  if path.is_file() and not (outside and path.is_relative_to(outside)):
+                      try:
+                          yield path.read_text(encoding="utf-8")
+                      except (OSError, UnicodeDecodeError):
+                          pass
+
+          def declared(sources):
+              found = []
+              for text in sources:
+                  for block in BLOCK.finditer(text):
+                      if block["type"] != "script":
+                          continue
+                      content = "".join(
+                          line[2:] if line.startswith("# ") else line[1:]
+                          for line in block["content"].splitlines(keepends=True))
+                      for dependency in tomllib.loads(content).get("dependencies", []):
+                          if dependency not in found:
+                              found.append(dependency)
+              return found
+
+          tools = os.environ["TEST_TOOLS"].split()
+          manager = Path("bin/capabilities").read_text(encoding="utf-8")
+          suites = [{"name": "manager", "tests": "tests",
+                     "requirements": tools + declared([manager])}]
+          for bundle in sorted(Path("capabilities").iterdir()):
+              tests = bundle / "tests"
+              if tests.is_dir() and any(
+                      marker in text for text in texts(tests) for marker in STORE):
+                  suites.append({"name": bundle.name, "tests": str(tests),
+                                 "requirements": tools + declared(texts(bundle, outside=tests))})
+          print(json.dumps(suites, indent=2))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"suites={json.dumps(suites)}\n")
+
+  # Each suite runs on its own: collected together, the capabilities' `_cli`
+  # helper modules shadow one another.
+  suite:
+    needs: discover
+    name: ${{ matrix.suite.name }} suite
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(needs.discover.outputs.suites) }}
     services:
       postgres:
         image: postgres:16
@@ -35,18 +115,12 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      # The capability suites read a throwaway database each from these.
+      SUITE: ${{ matrix.suite.name }}
+      SUITE_TESTS: ${{ matrix.suite.tests }}
+      SUITE_REQUIREMENTS: ${{ toJSON(matrix.suite.requirements) }}
       PGHOST: 127.0.0.1
       PGPORT: "5432"
       PGUSER: ci
-      TASKS_TEST_DSN: postgresql://ci@127.0.0.1:5432/tasks_test?sslmode=disable
-      MEMORY_TEST_DSN: postgresql://ci@127.0.0.1:5432/memory_test?sslmode=disable
-      AGENTROOMS_TEST_DSN: postgresql://ci@127.0.0.1:5432/agentrooms_test?sslmode=disable
-      AUTOMATIONS_TEST_DSN: postgresql://ci@127.0.0.1:5432/automations_test?sslmode=disable
-      ASKPROJECT_TEST_DSN: postgresql://ci@127.0.0.1:5432/askproject_test?sslmode=disable
-      WHATSAPP_TEST_DSN: postgresql://ci@127.0.0.1:5432/whatsapp_test?sslmode=disable
-      TELEGRAM_TEST_DSN: postgresql://ci@127.0.0.1:5432/telegram_test?sslmode=disable
-      UV_PYTHON: "3.12"
       # The suites run each script under a home of the test's own; a shared
       # cache keeps those runs from downloading every dependency again.
       UV_CACHE_DIR: /tmp/uv-cache
@@ -81,107 +155,91 @@ jobs:
           for script in bin/capabilities capabilities/*/bin/*; do
             uv sync -q --script "$script" || echo "::warning::no environment for $script"
           done
-      - name: Create one database per capability suite
+      - name: Create the suite's database
+        # The suite reads its throwaway database from <NAME>_TEST_DSN.
         run: |
-          for db in tasks_test memory_test agentrooms_test automations_test askproject_test whatsapp_test telegram_test; do
-            psql -d ci -v ON_ERROR_STOP=1 -c "create database $db encoding 'UTF8' template template0"
-          done
-      - name: Manager suite
+          db="${SUITE//-/_}_test"
+          psql -d ci -v ON_ERROR_STOP=1 -c "create database $db encoding 'UTF8' template template0"
+          echo "${db^^}_DSN=postgresql://ci@127.0.0.1:5432/$db?sslmode=disable" >> "$GITHUB_ENV"
+      - name: Run the suite on what its scripts declare
         run: |
-          excluded=(
-            # ContextKit is not installed here; these bind a project to it and fail as contextkit_unavailable.
-            --deselect tests/test_manager_contextkit_integration.py::test_contextkit_init_skips_both_host_bindings
-            --deselect tests/test_manager_contextkit_integration.py::test_contextkit_init_and_context_preserve_owned_files
-            --deselect tests/test_manager_contextkit_integration.py::test_doctor_does_not_judge_contextkit_owned_codex_paths
-            --deselect tests/test_manager_contextkit_integration.py::test_context_fragment_is_manager_owned_and_write_free
-            --deselect tests/test_manager_contextkit_integration.py::test_contextkit_enable_updates_gate_without_generating_context
-            --deselect tests/test_manager_contextkit_integration.py::test_context_does_not_render_connection_menu
-            --deselect tests/test_manager_contextkit_integration.py::test_contextkit_init_retires_only_legacy_capabilities_wiring
-            --deselect tests/test_manager_contextkit_integration.py::test_init_migrates_legacy_hidden_envelope
-            --deselect tests/test_manager_contextkit_integration.py::test_init_merges_contextkit_empty_gate_with_legacy_gate
-            --deselect tests/test_deployment_lifecycle.py::test_dockerfile_contextkit_has_doctor_after_capabilities_init
-            --deselect tests/test_deployment_lifecycle.py::test_dockerfile_contextkit_does_not_duplicate_capabilities_init
-            --deselect tests/test_deployment_lifecycle.py::test_dockerfile_ordering_capabilities_to_contextkit
-            # Fail on main on any host: telegram service init no longer writes service/voice-agent.md.
-            --deselect tests/test_manager_bundle_install.py::test_install_from_source_script_installs_bundle
-            --deselect tests/test_manager_bundle_install.py::test_update_migrates_script_source_to_bundle
-            # Fails on main on any host: the daemon it starts has no store and exits with store_not_configured.
-            --deselect tests/test_manager_bundle_install.py::test_telegram_daemon_sigterm_stops_without_traceback
-          )
-          uv run --no-project --with pytest --with "psycopg[binary]>=3.2" --with "httpx>=0.27" \
-            --with capabilities-contract==0.5.1 \
-            pytest tests -q -rfEs "${excluded[@]}"
-
-      # Each capability suite runs on its own: collected together, their
-      # `_cli` helper modules shadow one another.
-      - name: tasks suite
-        if: ${{ !cancelled() }}
-        run: |
-          excluded=(
-            # Fail on main on any host: project profile files are refused as profiles_not_imported.
-            --deselect capabilities/tasks/tests/test_cross_project.py::test_the_grant_takes_the_task_until_a_task_of_its_own_takes_it_in
-            --deselect capabilities/tasks/tests/test_cross_project.py::test_a_worker_without_the_grant_never_reaches_the_task
-            # Fails on main on any host after Oct 9 2026: the weekly reset it reads as "Oct 9" now lands a year later.
-            --deselect "capabilities/tasks/tests/test_handlers.py::test_a_usage_limit_holds_the_lane_and_spends_no_attempt[You've hit your weekly limit \xb7 resets Oct 9, 10am (Europe/Berlin)-claude]"
-            # The suite's relay closes its listener without shutting it down; on Linux the port keeps accepting, so the store never goes away.
-            --deselect capabilities/tasks/tests/test_service.py::test_the_daemon_outlives_the_store_going_away_and_listens_again
-            --deselect capabilities/tasks/tests/test_service.py::test_a_lost_question_connection_is_asked_for_again_on_the_doubling_interval
-            --deselect capabilities/tasks/tests/test_service.py::test_a_lost_listener_is_asked_for_again_on_the_doubling_interval
-            --deselect capabilities/tasks/tests/test_store_outage.py::test_a_command_waits_out_a_store_that_is_away_and_gives_up_after_its_window
-            --deselect capabilities/tasks/tests/test_store_outage.py::test_doctor_proves_the_store_as_it_is_now
-          )
-          uv run --no-project --with pytest --with "psycopg[binary]>=3.2" --with "pyyaml>=6" \
-            --with capabilities-contract==0.5.1 --with callva-harness-runner==0.9.0 \
-            pytest capabilities/tasks/tests -q -rfEs "${excluded[@]}"
-      - name: memory suite
-        if: ${{ !cancelled() }}
-        run: |
-          uv run --no-project --with pytest --with "psycopg[binary]>=3.2" \
-            --with capabilities-contract==0.5.1 --with callva-harness-runner==0.9.0 \
-            pytest capabilities/memory/tests -q -rfEs
-      - name: agentrooms suite
-        if: ${{ !cancelled() }}
-        run: |
-          uv run --no-project --with pytest --with "psycopg[binary]>=3.2" --with "httpx>=0.27" --with "pyyaml>=6" \
-            --with capabilities-contract==0.5.1 --with callva-harness-runner==0.9.0 \
-            pytest capabilities/agentrooms/tests -q -rfEs
-      - name: automations suite
-        if: ${{ !cancelled() }}
-        run: |
-          excluded=(
-            # The claude CLI is not installed here; both refuse as engine_not_found.
-            --deselect capabilities/automations/tests/test_automations.py::AutomationsTests::test_agent_command_fences_read_and_opens_write
-            --deselect capabilities/automations/tests/test_automations.py::AutomationsTests::test_agent_command_hands_only_act_the_machine
-          )
-          uv run --no-project --with pytest --with "psycopg[binary]>=3.2" \
-            --with capabilities-contract==0.5.1 \
-            pytest capabilities/automations/tests -q -rfEs "${excluded[@]}"
-      - name: askproject suite
-        if: ${{ !cancelled() }}
-        run: |
-          uv run --no-project --with pytest --with "psycopg[binary]>=3.2" --with "httpx>=0.27" \
-            --with capabilities-contract==0.5.1 --with callva-harness-runner==0.9.0 \
-            pytest capabilities/askproject/tests -q -rfEs
-      - name: whatsapp suite
-        if: ${{ !cancelled() }}
-        run: |
-          excluded=(
-            # On Linux, `ps -o command=` run from the suite cuts the stand-in holder's command line at 80 columns, so it is never recognised as a listener.
-            --deselect capabilities/whatsapp/tests/test_liveness.py::Takeover::test_a_stale_holder_is_ended_and_the_account_taken
-            --deselect capabilities/whatsapp/tests/test_liveness.py::Takeover::test_a_stale_holder_that_listens_to_sigterm_is_not_killed
-            # On main on any host the suite closes the stream pytest captures into, and pytest then fails at exit; it runs uncaptured.
-            --capture=no
-          )
-          uv run --no-project --with pytest --with "psycopg[binary]>=3.2" --with "httpx>=0.27" \
-            --with "puremagic>=1.28" --with "qrcode>=7.4" --with capabilities-contract==0.5.1 \
-            --with callva-harness-runner==0.9.0 \
-            --with "neonize @ https://github.com/ai-cluster-one/neonize/releases/download/v0.5.2-histsync.1/neonize-0.5.2-py3-none-any.whl" \
-            pytest capabilities/whatsapp/tests -q -rfEs "${excluded[@]}"
-      - name: telegram suite
-        if: ${{ !cancelled() }}
-        run: |
-          uv run --no-project --with pytest --with "psycopg[binary]>=3.2" --with "httpx>=0.27" \
-            --with "qrcode>=7.4" --with telethon==1.45.0 --with jsonschema \
-            --with "google-genai>=1.36.0" --with "openai>=3.16.0" --with "psycopg2-binary>=2.9" \
-            --with capabilities-contract==0.5.1 --with callva-harness-runner==0.10.0 \
-            pytest capabilities/telegram/tests -q -rfEs
+          excluded=()
+          case "$SUITE" in
+            manager) excluded=(
+              # ContextKit is not installed here; these bind a project to it and fail as contextkit_unavailable.
+              --deselect tests/test_manager_contextkit_integration.py::test_contextkit_init_skips_both_host_bindings
+              --deselect tests/test_manager_contextkit_integration.py::test_contextkit_init_and_context_preserve_owned_files
+              --deselect tests/test_manager_contextkit_integration.py::test_doctor_does_not_judge_contextkit_owned_codex_paths
+              --deselect tests/test_manager_contextkit_integration.py::test_context_fragment_is_manager_owned_and_write_free
+              --deselect tests/test_manager_contextkit_integration.py::test_contextkit_enable_updates_gate_without_generating_context
+              --deselect tests/test_manager_contextkit_integration.py::test_context_does_not_render_connection_menu
+              --deselect tests/test_manager_contextkit_integration.py::test_contextkit_init_retires_only_legacy_capabilities_wiring
+              --deselect tests/test_manager_contextkit_integration.py::test_init_migrates_legacy_hidden_envelope
+              --deselect tests/test_manager_contextkit_integration.py::test_init_merges_contextkit_empty_gate_with_legacy_gate
+              --deselect tests/test_deployment_lifecycle.py::test_dockerfile_contextkit_has_doctor_after_capabilities_init
+              --deselect tests/test_deployment_lifecycle.py::test_dockerfile_contextkit_does_not_duplicate_capabilities_init
+              --deselect tests/test_deployment_lifecycle.py::test_dockerfile_ordering_capabilities_to_contextkit
+              # Fail on main on any host: telegram service init no longer writes service/voice-agent.md.
+              --deselect tests/test_manager_bundle_install.py::test_install_from_source_script_installs_bundle
+              --deselect tests/test_manager_bundle_install.py::test_update_migrates_script_source_to_bundle
+              # Fails on main on any host: the daemon it starts has no store and exits with store_not_configured.
+              --deselect tests/test_manager_bundle_install.py::test_telegram_daemon_sigterm_stops_without_traceback
+            ) ;;
+            deployment) excluded=(
+              # The service capabilities are not installed here, so a host profile cannot resolve their commands on PATH.
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_a_command_missing_from_this_machine_is_refused
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_a_declared_default_overrides_the_descriptor
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_a_declared_interval_reaches_the_agent
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_a_deliberate_stop_is_honoured_but_a_crash_is_not
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_a_host_profile_compiles_no_container_artifacts
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_a_host_runtime_declares_no_image_layout
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_a_per_session_shim_is_recorded_as_its_stable_target
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_a_service_runs_at_standard_priority_and_its_watchdog_does_not
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_agent_logs_land_in_a_directory_that_exists
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_an_edited_agent_is_reported_as_drift
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_an_unknown_host_supervisor_is_refused
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_doctor_reports_an_agent_that_was_never_installed
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_doctor_reports_the_program_launchd_holds
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_each_service_gets_a_launcher_named_for_its_project
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_every_enabled_service_becomes_one_agent
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_next_hands_over_launchctl_and_keeps_manual_control
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_next_removes_the_installed_agent_before_relinking
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_no_secret_is_written_into_an_agent
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_the_agent_carries_a_path_because_launchd_supplies_none
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_the_watchdog_can_reach_the_doctors_it_has_to_run
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_the_watchdog_is_scheduled_rather_than_supervised
+              --deselect capabilities/deployment/tests/test_host_agents.py::test_turning_the_watchdog_off_says_the_agent_is_still_there
+              # plutil exists only on macOS.
+              --deselect capabilities/deployment/tests/test_machine_scope.py::test_a_declared_allowed_service_gets_a_launcher_and_an_agent
+            ) ;;
+            tasks) excluded=(
+              # Fail on main on any host: project profile files are refused as profiles_not_imported.
+              --deselect capabilities/tasks/tests/test_cross_project.py::test_the_grant_takes_the_task_until_a_task_of_its_own_takes_it_in
+              --deselect capabilities/tasks/tests/test_cross_project.py::test_a_worker_without_the_grant_never_reaches_the_task
+              # Fails on main on any host after Oct 9 2026: the weekly reset it reads as "Oct 9" now lands a year later.
+              --deselect "capabilities/tasks/tests/test_handlers.py::test_a_usage_limit_holds_the_lane_and_spends_no_attempt[You've hit your weekly limit \xb7 resets Oct 9, 10am (Europe/Berlin)-claude]"
+              # The suite's relay closes its listener without shutting it down; on Linux the port keeps accepting, so the store never goes away.
+              --deselect capabilities/tasks/tests/test_service.py::test_the_daemon_outlives_the_store_going_away_and_listens_again
+              --deselect capabilities/tasks/tests/test_service.py::test_a_lost_question_connection_is_asked_for_again_on_the_doubling_interval
+              --deselect capabilities/tasks/tests/test_service.py::test_a_lost_listener_is_asked_for_again_on_the_doubling_interval
+              --deselect capabilities/tasks/tests/test_store_outage.py::test_a_command_waits_out_a_store_that_is_away_and_gives_up_after_its_window
+              --deselect capabilities/tasks/tests/test_store_outage.py::test_doctor_proves_the_store_as_it_is_now
+            ) ;;
+            automations) excluded=(
+              # The claude CLI is not installed here; both refuse as engine_not_found.
+              --deselect capabilities/automations/tests/test_automations.py::AutomationsTests::test_agent_command_fences_read_and_opens_write
+              --deselect capabilities/automations/tests/test_automations.py::AutomationsTests::test_agent_command_hands_only_act_the_machine
+            ) ;;
+            whatsapp) excluded=(
+              # On Linux, `ps -o command=` run from the suite cuts the stand-in holder's command line at 80 columns, so it is never recognised as a listener.
+              --deselect capabilities/whatsapp/tests/test_liveness.py::Takeover::test_a_stale_holder_is_ended_and_the_account_taken
+              --deselect capabilities/whatsapp/tests/test_liveness.py::Takeover::test_a_stale_holder_that_listens_to_sigterm_is_not_killed
+              # On main on any host the suite closes the stream pytest captures into, and pytest then fails at exit; it runs uncaptured.
+              --capture=no
+            ) ;;
+          esac
+          requirements="$RUNNER_TEMP/requirements.txt"
+          python -c 'import json, os; print(*json.loads(os.environ["SUITE_REQUIREMENTS"]), sep="\n")' > "$requirements"
+          cat "$requirements"
+          uv run --no-project --with-requirements "$requirements" \
+            pytest "$SUITE_TESTS" -q -rfEs "${excluded[@]}"
