@@ -1132,7 +1132,7 @@ SERVICE_SUPERVISION_POINTER = (
     "  Keeping it running - on this machine or on a server - is the "
     f"`{SERVICE_SUPERVISION_CAPABILITY}` capability's domain: "
 )
-CORE_CAPABILITIES = ("askproject", "automations", "context", "deployment", "memory", "tasks")
+CORE_CAPABILITIES = ("askproject", "assets", "automations", "context", "deployment", "memory", "routine", "tasks")
 # The catalogue's core tier, and its only declaration. Which capabilities are
 # foundational is a fact about the catalogue, which no single capability is
 # part of deciding, so the manager declares it rather than any manifest. Every

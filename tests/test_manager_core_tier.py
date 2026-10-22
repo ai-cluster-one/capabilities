@@ -122,8 +122,8 @@ def test_this_catalogue_carries_every_declared_core_name():
 
 def test_the_core_tier_is_the_catalogue_s_foundational_set():
     assert M.CORE_CAPABILITIES == (
-        "askproject", "automations", "context", "deployment", "memory",
-        "tasks")
+        "askproject", "assets", "automations", "context", "deployment",
+        "memory", "routine", "tasks")
 
 
 def _tree(tmp_path: Path, declaration: str | None) -> Path:

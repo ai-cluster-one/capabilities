@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-22 — `routine` and `assets` are core capabilities
+
+`routine` and `assets` join the catalogue's core tier beside `askproject`, `automations`, `context`, `deployment`, `memory` and `tasks`: `capabilities list` shows them as `tier` "core", and the first install of each from the official catalogue on a machine arrives allowed and enabled at global scope, where that scope holds no entry for it yet. A machine that already has either installed keeps its quarantine, allowance and gates as they are; after arrival each is gated, enabled and granted as before.
+
 ## 2026-10-22 — An agent that lives in its store builds with no context folder
 
 `capabilities build` and `capabilities hooks install` compose the context of an agent whose store answers from what that store holds, also when it holds no context document yet or has no context tables, wherever the agent has no context folder: a store-only agent raised by its id no longer stops at `context_source_missing`. An agent with a context folder and no project document in its store reads the folder as before, and an agent with no store still refuses a missing folder.
