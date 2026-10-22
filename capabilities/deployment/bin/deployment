@@ -22,7 +22,8 @@ compiled context, and machine-local bindings (.env.local) are target-local build
 artifacts, not deployment inputs shipped from the repo.
 
 USAGE
-  deployment setup [--profile agent-box|agent-box-checkout] [--target production]
+  deployment setup [--profile agent-box|agent-box-checkout|agent-box-shell]
+                   [--target production]
                    [--provider coolify|dockerhost|manual]
                    [--with-telegram auto|yes|no] [--project-name NAME]
                    [--with-automations auto|yes|no]
@@ -44,7 +45,8 @@ USAGE
   deployment scaffold
       Alias for `deployment setup`.
 
-  deployment init [--profile generic|agent-box|agent-box-checkout|host-agents]
+  deployment init [--profile generic|agent-box|agent-box-checkout|agent-box-shell
+                             |host-agents]
                   [--target production]
                   [--provider coolify|dockerhost|manual] [--force]
       Create the standard local deployment files:
@@ -61,7 +63,14 @@ USAGE
       a volume the entrypoint clones into. The profile then keeps that body
       level with the branch it tracks, in both directions, so what was pushed
       reaches the box and what the agent commits there both survives a redeploy
-      and reaches the remote. `host-agents` supervises the same declared
+      and reaches the remote. `agent-box-shell` builds the same container
+      with no body at all, for an agent that lives wholly in the store: no
+      project copy, no clone, no body sync, no ContextKit. Each boot binds an
+      empty project root to the agent with `capabilities init --id
+      $CAPABILITIES_PROJECT_ID`, wires the agent CLIs with `capabilities hooks
+      install`, composes its context from the store with `capabilities build`,
+      and starts the compiled services under their runners, where the gate
+      for this node places them. `host-agents` supervises the same declared
       services as processes on the machine itself, on macOS: `sync` writes one
       launchd agent per service under `compiler.host.agents_dir`, at
       ProcessType Standard so the work a service starts gets the whole machine
@@ -407,10 +416,10 @@ RUNNER_STOP_GRACE_SECONDS = 20
 # here, so restarting it would only be refused again.
 POLICY_REFUSAL_EXIT = 4
 RUNNER_STATE_DIR = "runners"
-PROFILES = ("generic", "agent-box", "agent-box-checkout", "host-agents")
+PROFILES = ("generic", "agent-box", "agent-box-checkout", "agent-box-shell", "host-agents")
 # A profile picks the substrate: a container image the target runs, or
 # supervised processes on the machine itself.
-CONTAINER_PROFILES = ("agent-box", "agent-box-checkout")
+CONTAINER_PROFILES = ("agent-box", "agent-box-checkout", "agent-box-shell")
 HOST_PROFILES = ("host-agents",)
 # launchd's ProcessType for the agents a host compiles. A supervised service
 # runs real work and its children inherit the class, so it gets Standard, the
@@ -430,6 +439,11 @@ LAUNCHD_SPAWN_TYPES = {"Standard": "daemon", "Background": "background",
 # somewhere the volume cannot mask them, and keeping the body level with the
 # branch it tracks becomes the profile's own work rather than the project's.
 CHECKOUT_PROFILES = ("agent-box-checkout",)
+# A shell profile builds the same container with no body at all. The image
+# carries tools and the boot path, nothing arrives from Git, and the agent is the
+# one the store holds under CAPABILITIES_PROJECT_ID: each boot binds an empty
+# project root to it and composes its context from the store.
+SHELL_PROFILES = ("agent-box-shell",)
 BOOT_DIR = "/opt/agent"
 BODY_VOLUME = "agent_body"
 # compiler.container.persistent_manager: the capabilities manager's whole
@@ -1338,6 +1352,10 @@ def _is_checkout(runtime: dict) -> bool:
     return str(runtime.get("profile") or "") in CHECKOUT_PROFILES
 
 
+def _is_shell(runtime: dict) -> bool:
+    return str(runtime.get("profile") or "") in SHELL_PROFILES
+
+
 # The record and settings files an agent kept before its records moved into
 # the store. An image of an agent whose records moved carries none of them: what
 # the box enables and uses is the store's, not a file baked in at build.
@@ -1958,6 +1976,49 @@ sys.exit(0 if checkout.get("valid") and checkout.get("path") == os.path.realpath
 __CALLS__
 """
 
+_SHELL_BLOCK = """
+# --- The agent, raised from the store by its id ------------------------------
+# The image carries tools and this boot path and no agent at all, and nothing
+# arrives from Git: the agent is the one the store holds under
+# CAPABILITIES_PROJECT_ID. Its root starts empty and is bound to that agent here,
+# on every boot, so the box runs what the store holds now.
+APP=__APP__
+
+if [ -z "${CAPABILITIES_PROJECT_ID:-}" ]; then
+  echo "[entrypoint] FATAL: CAPABILITIES_PROJECT_ID is unset; this box has no agent to raise" >&2
+  exit 1
+fi
+
+cd "$APP"
+
+# The manager composes context only for a folder bound to ContextKit. The binding
+# carries nothing of the agent, so an empty one is laid where none is.
+mkdir -p .contextkit
+[ -f .contextkit/config.toml ] || : > .contextkit/config.toml
+
+if ! capabilities init --id "$CAPABILITIES_PROJECT_ID" < /dev/null > /dev/null; then
+  echo "[entrypoint] FATAL: could not bind $APP to agent $CAPABILITIES_PROJECT_ID in the store this box reaches" >&2
+  exit 1
+fi
+echo "[entrypoint] $APP bound to agent $CAPABILITIES_PROJECT_ID"
+
+# --- Context, composed from the store ----------------------------------------
+# The agent CLIs' session hooks rebuild it as each session starts; the build here
+# gives the box its context before anything runs.
+if ! capabilities hooks install --claude --codex < /dev/null > /dev/null; then
+  echo "[entrypoint] WARN: could not wire the agent CLIs' session hooks; run capabilities hooks install --claude --codex inside the box" >&2
+fi
+if capabilities build < /dev/null > /dev/null; then
+  echo "[entrypoint] context composed from the store"
+else
+  echo "[entrypoint] WARN: the agent's context could not be composed; run capabilities build inside the box" >&2
+fi
+
+# Readiness is reported, never fatal: one briefly unreachable service must not
+# stop the box from coming up.
+__DOCTORS__
+"""
+
 _ENTRYPOINT_DOCTORS = {
     name: (f"{name} doctor >/dev/null 2>&1 || echo \"[entrypoint] WARN: {name} doctor"
            " reported findings; run it inside the box\" >&2")
@@ -1972,7 +2033,8 @@ def _entrypoint_template(project_name: str, supervisor_config: str | None = None
                          catalogue_exclude: set[str] | None = None,
                          checkouts: list[dict] | None = None,
                          store_records: bool = False,
-                         persistent_manager: bool = False) -> str:
+                         persistent_manager: bool = False,
+                         shell: bool = False) -> str:
     identity = _slug(project_name)
     # The image installs the catalogue at build. A persisted registry still
     # holds what an earlier image installed, so each boot brings the catalogue
@@ -2018,6 +2080,10 @@ def _entrypoint_template(project_name: str, supervisor_config: str | None = None
                           .replace("__SYNC__", sync)
                           .replace("__INIT__", "\n".join(init))
                           .replace("__DOCTORS__", "\n".join(doctors)))
+    elif shell:
+        checkout_block = (_SHELL_BLOCK
+                          .replace("__APP__", shlex.quote(project_root.rstrip("/") or "/app"))
+                          .replace("__DOCTORS__", _ENTRYPOINT_DOCTORS["capabilities"]))
     elif store_records:
         # The image was built without a database, so the manager's readiness
         # check runs here, where the box has one.
@@ -2077,13 +2143,14 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
                          persistent_manager: bool = False,
                          catalogue_exclude: set[str] | None = None,
                          store_records: bool = False,
-                         project_id: str | None = None) -> str:
+                         project_id: str | None = None,
+                         shell: bool = False) -> str:
     agent_home = compiler["container"]["agent_home"]
     project_root = compiler["container"]["project_root"]
     username = Path(agent_home).name
     entrypoint_path = project_root.rstrip("/") + "/" + entrypoint_rel
     chmod_paths = entrypoint_path
-    if checkout:
+    if checkout or shell:
         # Read from the boot directory instead: the volume mounts over the
         # project root and would hide anything the image left under it.
         entrypoint_path = BOOT_DIR + "/" + entrypoint_rel.rsplit("/", 1)[-1]
@@ -2129,7 +2196,7 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
             "# read by every `capabilities` step below.\n"
             f"ENV {PROJECT_ID_ENV}={json.dumps(project_id)} "
             f"{PROJECT_ID_ROOT_ENV}={json.dumps(project_root)}\n")
-    if checkout:
+    if checkout or shell:
         # Both of these need a checkout to run against, and at build time there is
         # none. The entrypoint carries them instead, on every boot.
         contextkit_build = ""
@@ -2145,6 +2212,15 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
             + [BOOT_DIR + "/" + Path(rel).name for rel in (boot_copy or [])
                if Path(rel).name == SYNC_PROGRAM])
         body_copy = "\n".join([
+            "# The image carries tools and the boot path, never an agent. The agent is",
+            "# raised at boot from the store into " + project_root + ", which stays empty",
+            "# here. Only the boot inputs go in, to " + BOOT_DIR + ".",
+            "USER root",
+            "RUN mkdir -p " + BOOT_DIR + " " + project_root
+            + " && chown ${USERNAME}:${USERNAME} " + BOOT_DIR + " " + project_root,
+            "USER ${USERNAME}",
+            "COPY --chown=${USERNAME}:${USERNAME} " + copies + " " + BOOT_DIR + "/",
+        ]) if shell else "\n".join([
             "# The image carries tools and the boot path, never the project. The checkout",
             "# arrives at run time on the volume mounted at " + project_root + ", so that",
             "# stays an empty mount point. Only the boot inputs go in, to " + BOOT_DIR + ",",
@@ -2159,6 +2235,9 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
     header = ("# Agent box: agent CLIs, capability CLIs, and the boot path. The project\n"
               "# itself is not here - it arrives at run time on the checkout volume."
               if checkout else
+              "# Agent box shell: agent CLIs, capability CLIs, and the boot path. No agent\n"
+              "# is here - it is raised at boot from the store by CAPABILITIES_PROJECT_ID."
+              if shell else
               "# Agent box: project brain + agent CLIs + capability CLIs.")
     supervisor_package = " supervisor" if with_supervisor else ""
     extra_packages = "".join(
@@ -2371,7 +2450,12 @@ def _compose_template(project_name: str, runtime: dict,
         *([f"  {PROJECT_ID_ENV}: {json.dumps(project_id)}",
            f"  {PROJECT_ID_ROOT_ENV}: "
            + json.dumps(_compiler_config(runtime)["container"]["project_root"])]
-          if project_id else []),
+          if project_id else
+          # A shell box is nothing without its agent: the server names it.
+          [f"  {PROJECT_ID_ENV}: ${{{PROJECT_ID_ENV}:-}}",
+           f"  {PROJECT_ID_ROOT_ENV}: "
+           + json.dumps(_compiler_config(runtime)["container"]["project_root"])]
+          if _is_shell(runtime) else []),
         # The database is the server's: each key passes through from the
         # target's environment, and one left unset there is empty, which the
         # resolver reads as not set.
@@ -2432,7 +2516,7 @@ def _compose_template(project_name: str, runtime: dict,
         if node:
             # A service entry for the key would override the shared one.
             environment_keys.discard(NODE_NAME_ENV)
-        if project_id:
+        if project_id or _is_shell(runtime):
             environment_keys -= {PROJECT_ID_ENV, PROJECT_ID_ROOT_ENV}
         for key in sorted(environment_keys):
             expression = f"${{{key}:-{defaults.get(key, '')}}}"
@@ -2504,6 +2588,10 @@ def _runtime_template(profile: str, project_name: str, store: bool = False) -> d
                 "mount": "/home/agent/.codex",
             },
         }
+    if profile in SHELL_PROFILES:
+        services["agent"]["description"] = (
+            "Container that holds the agent CLIs and capability CLIs; the agent is "
+            "raised at boot from the store by CAPABILITIES_PROJECT_ID.")
     if profile in CHECKOUT_PROFILES:
         agent = services["agent"]
         agent["description"] = (
@@ -2931,7 +3019,9 @@ def _sha(text: str | None) -> str | None:
 def _artifact_texts(root: Path, runtime: dict,
                     active: dict[str, dict], embedded: dict[str, dict],
                     target: str | None = None) -> dict[Path, str]:
-    has_contextkit = _has_contextkit(root)
+    shell = _is_shell(runtime)
+    # A shell box carries no ContextKit, whatever the deploying folder is bound to.
+    has_contextkit = _has_contextkit(root) and not shell
     project_name = str(runtime.get("name") or root.name)
     compiler = _compiler_config(runtime)
     checkout = _is_checkout(runtime)
@@ -2959,14 +3049,14 @@ def _artifact_texts(root: Path, runtime: dict,
     # capability service embedded in it at all.
     if (embedded or body_sync_config) and supervisor_path is not None:
         supervisor_rel = supervisor_path.relative_to(root).as_posix()
-        supervisor_config = ((BOOT_DIR + "/" + supervisor_path.name) if checkout
+        supervisor_config = ((BOOT_DIR + "/" + supervisor_path.name) if checkout or shell
                              else project_root.rstrip("/") + "/" + supervisor_rel)
-    # A checkout image copies these and nothing else, so they are both what the
-    # Dockerfile names and the only paths the build context has to carry.
+    # A checkout or shell image copies these and nothing else, so they are both
+    # what the Dockerfile names and the only paths the build context has to carry.
     boot_copy = ([entrypoint_rel]
                  + ([supervisor_rel] if supervisor_config else [])
                  + ([body_sync_rel] if body_sync_rel else [])
-                 if checkout else None)
+                 if checkout or shell else None)
     node = _declared_node(root, target) if _bundle_layout(runtime) else None
     # An agent whose records moved into the store builds without a database
     # and bakes in none of their files.
@@ -2987,14 +3077,14 @@ def _artifact_texts(root: Path, runtime: dict,
             checkout=checkout, boot_copy=boot_copy,
             persistent_manager=_persistent_manager(runtime),
             catalogue_exclude=catalogue_exclude, store_records=store_records,
-            project_id=project_id),
+            project_id=project_id, shell=shell),
         "entrypoint": _entrypoint_template(
             project_name, supervisor_config, checkout=checkout,
             project_root=project_root, has_contextkit=has_contextkit,
             body_sync=body_sync_config, catalogue_exclude=catalogue_exclude,
             checkouts=compiler["container"].get("checkouts"),
             store_records=store_records,
-            persistent_manager=_persistent_manager(runtime)),
+            persistent_manager=_persistent_manager(runtime), shell=shell),
     }
     if supervisor_path is not None:
         candidates["supervisor"] = _supervisor_template(
@@ -4422,7 +4512,9 @@ def _deployment_questions(store: bool = False) -> list[dict]:
             "plain_language": ("Use agent-box for a project that should run Codex/Claude plus "
                                "capability CLIs, with the project baked into the image. Use "
                                "agent-box-checkout for the same box when the project should "
-                               "instead arrive from Git at run time and survive redeploys."),
+                               "instead arrive from Git at run time and survive redeploys. Use "
+                               "agent-box-shell for an agent that lives wholly in the store: "
+                               "the box carries no project and raises the agent by its id."),
         },
         {
             "id": "provider",
