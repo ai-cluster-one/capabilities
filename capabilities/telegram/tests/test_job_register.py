@@ -68,8 +68,8 @@ class RegisterCase(unittest.TestCase):
         self.envelope.mkdir(parents=True)
         self.project_id = project_id()
         (self.envelope / "project.json").write_text(
-            json.dumps({"id": self.project_id, "slug": "testproject",
-                        "store": "db"}))
+            json.dumps({"slug": "testproject", "store": "db"}))
+        (root / ".env.local").write_text(f"CAPABILITIES_PROJECT_ID={self.project_id}\n")
         self.setting = store_setting()
         self.store, self.reg = self.open()
         self.addCleanup(self.store.close)
@@ -94,8 +94,8 @@ class RegisterCase(unittest.TestCase):
     # -- the channel a job reports into --------------------------------------
 
     def test_the_register_is_keyed_by_the_id_the_launcher_resolved(self):
-        """The id is the one the telegram CLI resolved and passed in, not
-        project.json's copy of it; project.json's stands in only without one."""
+        """The id is the one the telegram CLI resolved and passed in, not the
+        project's own binding in .env.local, which stands in only without one."""
         resolved = project_id()
         resolved_store, reg = self.open(project_id=resolved)
         self.addCleanup(resolved_store.close)
@@ -105,6 +105,7 @@ class RegisterCase(unittest.TestCase):
     def test_a_project_without_an_id_is_refused(self):
         (self.envelope / "project.json").write_text(
             json.dumps({"slug": "testproject", "store": "db"}))
+        (self.envelope.parent / ".env.local").unlink()
         with self.assertRaises(jobs.JobError) as caught:
             self.open()
         self.assertEqual(caught.exception.slug, "no_project_identity")

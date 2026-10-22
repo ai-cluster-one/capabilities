@@ -327,14 +327,23 @@ def _saved_rows(mod, root, schema: str, fresh: bool, **how) -> list[dict]:
 
 
 def save_declared_workers(mod, project: Path | str, schema: str) -> dict:
-    """`save_workers` for the project at `project`, as the id its envelope's
-    project.json declares; nothing when it declares none, or when the documents
+    """`save_workers` for the project at `project`, as the id it is bound to -
+    its .env.local's CAPABILITIES_PROJECT_ID, or the id a project.json not yet
+    moved still carries; nothing when it declares none, or when the documents
     are the ones this process last saved there."""
-    declared = Path(project) / "capabilities" / "project.json"
+    found = None
     try:
-        found = json.loads(declared.read_text()).get("id")
-    except (OSError, ValueError):
-        found = None
+        for line in (Path(project) / ".env.local").read_text().splitlines():
+            if line.startswith("CAPABILITIES_PROJECT_ID="):
+                found = line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    if not found:
+        try:
+            found = json.loads((Path(project) / "capabilities" / "project.json")
+                               .read_text()).get("id")
+        except (OSError, ValueError):
+            found = None
     if not found:
         return {}
     texts = _texts(mod, project)

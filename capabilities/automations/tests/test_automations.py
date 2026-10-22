@@ -1815,7 +1815,8 @@ def test_the_ledger_refuses_without_a_store(tmp_path, monkeypatch):
     root = tmp_path / "project"
     (root / "capabilities").mkdir(parents=True)
     (root / "capabilities" / "project.json").write_text(json.dumps(
-        {"schema": "capabilities.project.v1", "id": "prj_nostore00000", "slug": "nostore"}))
+        {"schema": "capabilities.project.v2", "slug": "nostore"}))
+    (root / ".env.local").write_text("CAPABILITIES_PROJECT_ID=prj_nostore00000\n")
     with pytest.raises(RUNTIME.StoreUnavailable) as caught:
         RUNTIME.open_ledger(root, {"engine": {"environment": "development"}})
     assert caught.value.slug == "store_not_configured"
@@ -1826,8 +1827,10 @@ def test_the_ledger_refuses_without_a_store(tmp_path, monkeypatch):
 def test_registration_stamps_the_id_its_launcher_resolved(tmp_path, monkeypatch):
     """The id a run is registered under is the one the automations CLI resolved
     for a write: installed in process, handed to the daemon it launches, and
-    project.json's own only where no launcher resolved one."""
-    identity = {"id": "prj_copy00000000", "slug": "labelled"}
+    the project root's own binding in .env.local only where no launcher
+    resolved one; project.json's is never it."""
+    identity = {"id": "prj_stale0000000", "slug": "labelled"}
+    (tmp_path / ".env.local").write_text("CAPABILITIES_PROJECT_ID=prj_copy00000000\n")
     monkeypatch.setattr(RUNTIME, "PROJECT_ID_FOR_WRITE", None)
     monkeypatch.delenv("CAPABILITIES_PROJECT_ID", raising=False)
     monkeypatch.delenv("CAPABILITIES_PROJECT_ID_ROOT", raising=False)

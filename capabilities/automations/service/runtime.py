@@ -349,8 +349,8 @@ def _project_identity(root: Path) -> dict:
 # write: in process the CLI installs its resolver here, called with `strict`
 # False on a read path so a project whose id may not be stamped reads instead of
 # refusing, and the daemon it launches is handed the answer as
-# CAPABILITIES_PROJECT_ID. project.json's own id stands in only where no
-# launcher resolved one.
+# CAPABILITIES_PROJECT_ID. The project root's own binding - the id its
+# .env.local, else its .env, sets - stands in only where no launcher resolved one.
 PROJECT_ID_FOR_WRITE = None
 
 # The node a run is recorded on is the one the contract names: in process the
@@ -373,10 +373,30 @@ def _handed_project_id(root: Path) -> str:
         return ""
 
 
+def _env_file_project_id(root: Path) -> str | None:
+    """The CAPABILITIES_PROJECT_ID the project root's .env.local, else its
+    .env, sets."""
+    for name in (".env.local", ".env"):
+        try:
+            lines = (Path(root) / name).read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            key, eq, value = line.strip().partition("=")
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            if eq and key == "CAPABILITIES_PROJECT_ID":
+                found = value.strip().strip('"').strip("'")
+                if found:
+                    return found
+    return None
+
+
 def _registration_id(root: Path, identity: dict, strict: bool = True) -> str | None:
     if callable(PROJECT_ID_FOR_WRITE):
         return PROJECT_ID_FOR_WRITE(strict)
-    return _handed_project_id(root) or identity.get("id")
+    return _handed_project_id(root) or _env_file_project_id(root)
 
 
 class DefinitionsNotImported(ConfigError):

@@ -42,16 +42,21 @@ HERE, THERE = "prj_here", "prj_there"
 @pytest.fixture
 def declares(tmp_path, monkeypatch):
     """A project on disk that declares itself, the way `capabilities init` leaves
-    one. The file is real, so what is exercised is the reader and not a stub.
+    one: its label in project.json and, with `bound`, its id in .env.local. The
+    files are real, so what is exercised is the reader and not a stub.
 
-    Where project.json declares no id and a ContextKit binding is present, the
-    manager is asked for the id it carries over from that binding; that one
-    answer is given here when a test says what the manager answers."""
-    def write(body, *, envelope="capabilities", manager=None):
+    Where nothing binds the id and project.json still holds one or a ContextKit
+    binding is present, the manager is asked for the id it moves into
+    .env.local; that one answer is given here when a test says what the
+    manager answers."""
+    def write(body, *, envelope="capabilities", manager=None, bound=None):
         root = tmp_path / envelope
         root.mkdir(parents=True, exist_ok=True)
         (root / "project.json").write_text(body if isinstance(body, str)
                                            else json.dumps(body))
+        if bound is not None:
+            (tmp_path / ".env.local").write_text(
+                f"OTHER=kept\nCAPABILITIES_PROJECT_ID={bound}\n")
         if manager is not None:
             (tmp_path / ".contextkit").mkdir(exist_ok=True)
             (tmp_path / ".contextkit" / "config.toml").write_text("version = 1\n")
@@ -69,28 +74,28 @@ def declares(tmp_path, monkeypatch):
     return write
 
 
-def test_the_project_is_the_id_its_identity_file_declares(declares):
-    declares({"id": HERE, "slug": "a-project", "schema": "capabilities.project.v1"})
+def test_the_project_is_the_id_its_env_local_binds(declares):
+    declares({"slug": "a-project", "schema": "capabilities.project.v2"}, bound=HERE)
     assert mod._declared_project() == HERE
 
 
 def test_the_slug_is_never_the_key(declares):
     # The readable name has a home in the project; the ledger carries the id and
     # nothing else, so nothing here can match a project by two criteria.
-    declares({"id": HERE, "slug": "a-project"})
+    declares({"slug": "a-project"}, bound=HERE)
     assert mod._declared_project() == HERE
     assert "slug" not in mod._LEAN
 
 
 def test_reading_the_identity_asks_the_records_backend_nothing(declares, monkeypatch):
-    """The project declares itself in project.json, which is read directly, so
+    """The project declares itself in .env.local, which is read directly, so
     the reader may not go near the records layer."""
     def never(*a, **k):
         raise AssertionError("identity was read through the records backend")
 
     monkeypatch.setattr(mod, "_records", never)
     monkeypatch.setattr(mod, "open_records", never)
-    declares({"id": HERE, "slug": "a-project"})
+    declares({"slug": "a-project"}, bound=HERE)
     assert mod._declared_project() == HERE
 
 
@@ -107,7 +112,7 @@ def test_nowhere_and_nothing_declared_are_both_no_project(tmp_path, monkeypatch,
     assert mod._declared_project() is None
 
 
-# --- project.json is the id's one home ---------------------------------------
+# --- CAPABILITIES_PROJECT_ID is the id's one binding --------------------------
 
 def test_an_id_only_a_contextkit_binding_holds_comes_through_the_manager(declares):
     declares({"slug": "a-project"}, manager={"id": HERE})
@@ -115,30 +120,29 @@ def test_an_id_only_a_contextkit_binding_holds_comes_through_the_manager(declare
     assert mod._project_id_state()["state"] == "declared"
 
 
-def test_a_project_json_id_is_read_without_asking_the_manager(declares):
+def test_an_env_local_id_is_read_without_asking_the_manager(declares):
     # The fixture fails the test if the manager is asked.
-    declares({"id": HERE, "slug": "a-project"})
+    declares({"slug": "a-project"}, bound=HERE)
     state = mod._project_id_state()
     assert (state["state"], state["id"]) == ("declared", HERE)
     assert mod._identity_refusal(state) is None
 
 
-def test_a_handed_down_id_project_json_contradicts_refuses_writes_naming_both(
-        declares, monkeypatch, capsys):
-    root = declares({"id": THERE, "slug": "a-project"})
+def test_a_project_json_id_is_never_the_id_and_goes_to_the_manager_to_move(declares):
+    declares({"id": THERE, "slug": "a-project"}, manager={"id": HERE})
+    assert mod._declared_project() == HERE
+
+
+def test_the_environment_wins_over_env_local_and_nothing_refuses(declares, monkeypatch):
+    root = declares({"slug": "a-project"}, bound=THERE)
     monkeypatch.setenv("CAPABILITIES_PROJECT_ID", HERE)
     monkeypatch.setenv("CAPABILITIES_PROJECT_ID_ROOT", str(root))
     state = mod._project_id_state()
-    assert (state["state"], mod._declared_project()) == ("mismatch", THERE)
+    assert (state["state"], mod._declared_project()) == ("handed", HERE)
     monkeypatch.setattr(mod, "PROJECT_IDENTITY", state)
     monkeypatch.setattr(mod, "PROJECT", state["id"])
-    assert mod._reading_project(None) == THERE
-    with pytest.raises(SystemExit) as exit_info:
-        mod._writing_project()
-    assert exit_info.value.code == 6
-    error = _error(capsys)
-    assert error["code"] == "project_id_mismatch"
-    assert HERE in error["message"] and THERE in error["message"]
+    assert mod._reading_project(None) == HERE
+    assert mod._writing_project() == HERE
 
 
 def test_a_project_with_no_id_anywhere_refuses_writes(declares, monkeypatch, capsys):
@@ -177,7 +181,7 @@ def test_a_handed_down_id_is_used_as_given(declares, monkeypatch):
 
 
 def test_a_resolved_id_a_write_may_stamp_is_handed_down(declares):
-    root = declares({"id": HERE, "slug": "a-project"})
+    root = declares({"slug": "a-project"}, bound=HERE)
     mod._project_id_state()
     assert os.environ["CAPABILITIES_PROJECT_ID"] == HERE
     assert os.environ["CAPABILITIES_PROJECT_ID_ROOT"] == str(root)

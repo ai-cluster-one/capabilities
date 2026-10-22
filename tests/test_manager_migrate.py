@@ -54,6 +54,17 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
+def _bound(root: Path) -> str | None:
+    """The id the agent root's .env.local binds it to, or None."""
+    try:
+        lines = (root / ".env.local").read_text().splitlines()
+    except FileNotFoundError:
+        return None
+    found = [line.split("=", 1)[1] for line in lines
+             if line.startswith("CAPABILITIES_PROJECT_ID=")]
+    return found[-1] if found else None
+
+
 def _say(name: str, value) -> None:
     """Keep what a step answered, where the run was asked to keep it."""
     if EVIDENCE:
@@ -817,7 +828,8 @@ def test_apply_moves_everything_and_reads_the_same_through_the_switch(world, nam
     else:
         assert after_switch == before_switch
     identity = json.loads((Path(applied["identity"])).read_text())
-    assert identity["records"] == "store" and identity["id"] == IDS[name]
+    assert identity["records"] == "store" and "id" not in identity
+    assert _bound(root) == IDS[name]
     for path in applied["removed"]:
         assert not Path(path).exists()
     assert applied["removed"], "nothing was removed"
@@ -897,8 +909,8 @@ def test_an_id_project_json_and_contextkit_disagree_on_is_a_question(world):
     answers = answers_file(world, "split", {"id": IDS["split-bound"]})
     applied = world.answer(world.manager(root, "migrate", "--apply", "--answers", answers))
     assert applied["agent_id"] == IDS["split-bound"] and applied["state"] == "migrated"
-    assert json.loads((root / "capabilities" / "project.json").read_text())["id"] \
-        == IDS["split-bound"]
+    assert "id" not in json.loads((root / "capabilities" / "project.json").read_text())
+    assert _bound(root) == IDS["split-bound"]
 
 
 def test_store_mode_with_no_rows_in_this_store_asks_which_is_the_truth(world):

@@ -4,7 +4,7 @@
 # dependencies = [
 #     "google-genai>=1.36.0",
 #     "sounddevice>=0.5.1",
-#     "capabilities-contract>=0.8,<1",
+#     "capabilities-contract>=0.9,<1",
 # ]
 # ///
 """geminitalk - Gemini Live voice companion for the current project.

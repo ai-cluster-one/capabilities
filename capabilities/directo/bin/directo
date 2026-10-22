@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "click>=8.1",
-#     "capabilities-contract>=0.8,<1",
+#     "capabilities-contract>=0.9,<1",
 # ]
 # ///
 """directo — agent-first CLI for a Directo ERP instance (login.directo.ee).

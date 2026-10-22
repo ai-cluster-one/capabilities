@@ -53,12 +53,21 @@ def store_project(project: Path, schema: str, extra_env: dict | None = None) -> 
     database at `schema`."""
     identity_file = project / "capabilities" / "project.json"
     identity = (json.loads(identity_file.read_text()) if identity_file.is_file()
-                else {"id": f"prj_test_{uuid.uuid4().hex}", "slug": "testproject"})
+                else {"slug": "testproject"})
     identity["records"] = "store"
+    # The id binds the project from its .env.local, never from project.json:
+    # the one it was given there, else in an older project.json, else a new one.
+    env_file = project / ".env.local"
+    bound = [line.split("=", 1)[1] for line in
+             (env_file.read_text().splitlines() if env_file.is_file() else [])
+             if line.startswith("CAPABILITIES_PROJECT_ID=")]
+    project_id = (identity.pop("id", None) or (bound[0] if bound else None)
+                  or f"prj_test_{uuid.uuid4().hex}")
     write_json(identity_file, identity)
     (project / ".env.local").write_text(
         "".join(f"{key}={value}\n"
-                for key, value in {**store_env(schema), **(extra_env or {})}.items()))
+                for key, value in {"CAPABILITIES_PROJECT_ID": project_id,
+                                   **store_env(schema), **(extra_env or {})}.items()))
 
 
 class DaemonFilesMode(unittest.TestCase):

@@ -357,7 +357,8 @@ def test_an_empty_envelope_folder_is_no_mover_failure(world):
     assert not dry["blockers"] and dry["would_write"] is True
     applied = world.answer(world.manager(root, "migrate", "--apply"))
     assert applied["state"] == "migrated"
-    assert json.loads((root / "capabilities" / "project.json").read_text())["id"] == IDS["empty"]
+    assert "id" not in json.loads((root / "capabilities" / "project.json").read_text())
+    assert f"CAPABILITIES_PROJECT_ID={IDS['empty']}\n" in (root / ".env.local").read_text()
 
 
 # --- D4: gate flips only for agents reading the same database ---------------------------

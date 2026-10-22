@@ -133,8 +133,9 @@ class World:
         envelope.mkdir(parents=True, exist_ok=True)
         (root / ".git").mkdir(exist_ok=True)
         (envelope / "project.json").write_text(json.dumps({
-            "id": pid or "prj_" + uuid.uuid4().hex[:12], "schema": "capabilities.project.v1",
-            "slug": name}))
+            "schema": "capabilities.project.v2", "slug": name}))
+        (root / ".env.local").write_text(
+            f"CAPABILITIES_PROJECT_ID={pid or 'prj_' + uuid.uuid4().hex[:12]}\n")
         gate = {"capabilities": {}}
         if enabled is not None:
             gate["capabilities"]["memory"] = {"enabled": enabled}
@@ -163,4 +164,8 @@ def error(done: subprocess.CompletedProcess) -> dict:
 
 
 def project_id(root: Path) -> str:
-    return json.loads((root / "capabilities" / "project.json").read_text())["id"]
+    """The id the project's .env.local binds it to."""
+    for line in (root / ".env.local").read_text().splitlines():
+        if line.startswith("CAPABILITIES_PROJECT_ID="):
+            return line.split("=", 1)[1]
+    raise AssertionError(f"{root} is bound to no id")

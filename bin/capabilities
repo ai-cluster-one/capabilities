@@ -44,10 +44,11 @@ ENVIRONMENT
                        Alone it carries no answer; an envelope supplied without
                        it is honored wherever it is inherited.
   CAPABILITIES_PROJECT_ID
-                       the project id a write may stamp, handed down beside the
-                       envelope by a process that read it from project.json, so
-                       a descendant uses it as given; one that differs from the
-                       project.json it finds refuses writes.
+                       the project's id, its one binding: set in the process
+                       environment (by a deployment, or handed down beside the
+                       envelope by a process that resolved it), else in the
+                       project root's .env.local, else its .env. The
+                       environment wins over the files.
   CAPABILITIES_PROJECT_ID_ROOT
                        the project root that id answers for, scoping it the way
                        CAPABILITIES_PROJECT_ENVELOPE_ROOT scopes the envelope.
@@ -74,17 +75,17 @@ PROJECT PATH VERB
         project_root, project_envelope, and provider. Plain projects use
         <root>/capabilities. ContextKit-bound projects must return a usable
         absolute in-project path; a broken binding is an error, never a fallback.
-        --identity adds project_identity: the project id, read from the
-        envelope's project.json alone, and its state - declared (project.json
-        holds it), undeclared (no id), handed (handed down by the launching
-        process as CAPABILITIES_PROJECT_ID) or mismatch (handed down differently
-        from project.json, which writes refuse; handed_id names it) - with
-        project_json_id, bound (a .contextkit/config.toml is present) and
-        contextkit_id (the id where bound, else null), the two fields
-        capabilities stamped with an earlier contract read. Where project.json
-        declares no id and
-        .contextkit/config.toml holds one under [identity], that id is copied
-        into project.json once (not under the read-only switch) and answered.
+        --identity adds project_identity: the project id
+        (CAPABILITIES_PROJECT_ID) and its state - handed (the process
+        environment's, for this root), declared (the project root's
+        .env.local, else .env, holds it) or undeclared (no id) - with bound (a
+        .contextkit/config.toml is present) and contextkit_id (the id where
+        bound, else null), the two fields capabilities stamped with an earlier
+        contract read. Where the env files declare no id and the envelope's
+        project.json still holds one (schema v1), or else
+        .contextkit/config.toml holds one under [identity], that id is moved
+        into .env.local once and leaves project.json (not under the read-only
+        switch) and answered.
 
 THE PROJECT ENVELOPE
   Every project file the system owns — identity, the gate, the state guard,
@@ -474,8 +475,10 @@ POLICY VERBS
         which stops a service placed there by it.
 
 PROJECT VERBS (run inside a consuming project)
-  init [--claude] [--codex] [--with-layers | --with-template]
-        Wire the project: scaffold the durable project identity, the
+  init [--claude] [--codex] [--with-layers | --with-template | --id <id>]
+        Wire the project: scaffold the project identity - the label in
+        capabilities/project.json (schema capabilities.project.v2, no id) and
+        the id as CAPABILITIES_PROJECT_ID in the root's .env.local - the
         manager-owned capabilities/.gitignore, and settings.json only in files
         mode. A new project - no identity, no settings file, no legacy
         envelope - is a new agent and starts in the store: its identity
@@ -484,9 +487,21 @@ PROJECT VERBS (run inside a consuming project)
         AGENT_NODE_NAME (node_unnamed), without a store
         (store_not_configured), or on a store whose global records have not
         moved (global_not_migrated). An existing project is initialised as
-        before. The identity's id is written once and never rewritten: an id
-        `.contextkit/config.toml` holds under [identity] is carried over,
-        otherwise one is minted offline. When a database resolves for the
+        before. The id is written once and never rewritten: an id the project
+        already resolves (the environment, its env files, or a project.json
+        v1 it is moved out of) is kept, an id `.contextkit/config.toml` holds
+        under [identity] is carried over, otherwise one is minted offline -
+        except where project.json is v2 and nothing names the id (a fresh
+        clone): init then refuses (no_project_identity) and asks for --id.
+        --id <id> binds the folder to the agent the store holds under that id
+        instead of creating one: where a database resolves for the folder the
+        agent must be registered there (exit 6 agent_unknown) and a moved
+        agent's project.json says "records": "store"; with no database it is
+        bound unverified. It writes the id to .env.local and nothing else of
+        the agent, refuses an id other than one the folder already resolves
+        (project_id_exists), and answers raised {id, verified, migrated, name,
+        store} or {id, verified: false, reason}. Run once in each clone of a
+        repository: the id is not committed. When a database resolves for the
         project, its agent row is registered in capabilities_agents (the
         result's `agent`: registered, store_not_configured, or the store's
         error, which never fails init); per host, wire the
@@ -551,7 +566,7 @@ PROJECT VERBS (run inside a consuming project)
         command. Idempotent.
   agent show [--icon-out PATH]
         This project's row in the agent registry (capabilities_agents in the
-        project's store, keyed by the project.json id): {ok, project,
+        project's store, keyed by the project id): {ok, project,
         agent_id, registered, agent, store {level, schema}}, where agent is
         null until the agent is registered, else {id, name, description,
         icon_sha, icon_bytes, onboarding_status, onboarding_routine,
@@ -814,8 +829,10 @@ PROJECT VERBS (run inside a consuming project)
         ("store": the agent adopts the stored spec; "files": the stored spec
         is replaced; {"rename": "<name>"}: the agent's own is written under
         that name and its grants, default and settings `connection` follow
-        it, the stored one left to the others), a node to register, an id project.json and .contextkit/config.toml
-        disagree on, a slack user or channel only one of policy.json and the
+        it, the stored one left to the others), a node to register, an id the
+        project's files (.env.local/.env, else project.json v1) and
+        .contextkit/config.toml disagree on (the one chosen is written to
+        .env.local), a slack user or channel only one of policy.json and the
         service settings holds (keep or drop), a slack mode the two disagree
         on. Each question names the path in the --answers JSON its
         answer goes to. --apply refuses (exit 6, nothing written) without a
@@ -898,8 +915,9 @@ VERIFICATION VERBS
         guard ↔ deny rules ↔ standalone host wiring, including what keeps
         Codex from loading the capability context ↔ project identity; report
         drift, and the project's project_identity state (see path
-        --identity). A handed-down id that differs from project.json's is
-        drift, as is a store-mode project whose store cannot be used. In store mode `information` lists, never
+        --identity), which moves an id still kept in project.json into
+        .env.local. A store-mode project whose store cannot be used is
+        drift. In store mode `information` lists, never
         as drift, each agent_id holding grants in the store that ContextKit's
         registry (contextkit_agents) does not know (grant_agent_unknown), or
         that the registry is not in the store (agents_registry_absent).
@@ -1019,7 +1037,11 @@ MACHINE_SCHEMA = "capabilities.machine.v1"
 MACHINE_STATES = ("allowed", "quarantined")
 GITIGNORE_BODY = "*/state/\n"
 PROJECT_IDENTITY_REL = "project.json"
-PROJECT_IDENTITY_SCHEMA = "capabilities.project.v1"
+# v2 holds no id: the id is CAPABILITIES_PROJECT_ID, in the environment or the
+# project root's env files (PROJECT_ID_FILES). v1 held it as `id`, which the
+# manager moves into .env.local the first time it reads the project.
+PROJECT_IDENTITY_SCHEMA = "capabilities.project.v2"
+PROJECT_ID_FILES = (".env.local", ".env")
 CONTEXT_BEGIN = "<!-- capabilities:begin — generated by `capabilities context`; do not edit -->"
 CONTEXT_END = "<!-- capabilities:end -->"
 CONTEXT_PROMPT_ENV = "CAPABILITIES_CONTEXT_PROMPT"
@@ -1361,7 +1383,7 @@ def _project_root() -> Path | None:
             return None
         legacy = d / LEGACY_PROJECT_CAPABILITIES_REL
         # Either marker names a project. `settings.json` is the gate and
-        # `project.json` the identity; either one alone is enough.
+        # `project.json` the label; either one alone is enough.
         if ((d / PROJECT_CAPABILITIES_REL / "settings.json").is_file()
                 or (d / PROJECT_CAPABILITIES_REL / PROJECT_IDENTITY_REL).is_file()
                 or (d / CONTEXTKIT_CONFIG_REL).is_file()
@@ -1640,8 +1662,8 @@ def _gate_file(root: Path) -> Path:
 def _contextkit_config_id(root: Path) -> str | None:
     """The id a ContextKit binding holds in `[identity] id`, or None.
 
-    Read only to carry an id that lives nowhere else into project.json; it is
-    never the project's id while project.json declares one."""
+    Read only to carry an id that lives nowhere else into the project's
+    .env.local; it is never the project's id while an env file declares one."""
     try:
         import tomllib
         with (root / CONTEXTKIT_CONFIG_REL).open("rb") as handle:
@@ -1654,39 +1676,83 @@ def _contextkit_config_id(root: Path) -> str | None:
 
 
 def _project_json_id(root: Path) -> str | None:
+    """The id an older project.json (v1) still holds, read only to move it."""
     identity = _read_json(_project_capabilities_dir(root) / PROJECT_IDENTITY_REL)
     if not isinstance(identity, dict):
         return None
     return str(identity.get("id") or "").strip() or None
 
 
-def _adopt_config_id(root: Path) -> str | None:
-    """Carry a ContextKit-held id into project.json, once, where project.json
-    declares none, and answer it. Under the read-only switch the id is
-    answered and nothing is written; the next process without the switch
-    writes it."""
-    ident = _contextkit_config_id(root)
-    if ident is None:
-        return None
-    if _store_module().read_only_switch():
-        return ident
+def _env_file_project_id(root: Path) -> tuple[str | None, Path | None]:
+    """The id the project root's .env.local, else its .env, declares, and the
+    file that declares it."""
+    for name in PROJECT_ID_FILES:
+        ident = _parse_env_file(root / name).get(PROJECT_ID_ENV, "").strip()
+        if ident:
+            return ident, root / name
+    return None, None
+
+
+def _write_env_local_id(root: Path, ident: str) -> Path:
+    """Bind the project to `ident` in its root's .env.local: the one line
+    naming CAPABILITIES_PROJECT_ID is replaced, or added, and every other line
+    is kept as it is. A new file is readable by its owner alone, since
+    .env.local is where a project keeps its secrets."""
+    path = root / ".env.local"
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        lines = []
+    pattern = re.compile(r"^\s*(export\s+)?" + PROJECT_ID_ENV + r"\s*=")
+    kept = [line for line in lines if not pattern.match(line)]
+    body = "\n".join([*kept, f"{PROJECT_ID_ENV}={ident}"]) + "\n"
+    if path.exists():
+        _atomic_write_text(path, body)
+    else:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(body)
+    return path
+
+
+def _drop_project_json_id(root: Path) -> None:
+    """Take the id out of project.json, which then says so by its schema."""
     identity_file = _project_capabilities_dir(root) / PROJECT_IDENTITY_REL
-    identity = _read_json(identity_file) if identity_file.is_file() else None
-    if not isinstance(identity, dict):
-        identity = {"schema": PROJECT_IDENTITY_SCHEMA, "slug": _default_project_slug(root)}
-    if str(identity.get("id") or "").strip():
-        return str(identity["id"]).strip()
-    identity["id"] = ident
-    _write_json(identity_file, identity)
-    return ident
+    identity = _read_json(identity_file)
+    if isinstance(identity, dict) and ("id" in identity
+                                       or identity.get("schema") != PROJECT_IDENTITY_SCHEMA):
+        identity.pop("id", None)
+        identity["schema"] = PROJECT_IDENTITY_SCHEMA
+        _write_json(identity_file, identity)
+
+
+def _move_project_id(root: Path, move: bool = True) -> str | None:
+    """The id the project's env files declare, after moving into .env.local,
+    once, an id the project still holds where it was kept before: project.json
+    (v1), else its ContextKit binding. project.json then holds no id. Under the
+    read-only switch, or without `move`, the id is answered and nothing is
+    written; the next process that may write moves it."""
+    move = move and not _store_module().read_only_switch()
+    declared, _source = _env_file_project_id(root)
+    legacy = _project_json_id(root)
+    if declared is None:
+        declared = legacy or _contextkit_config_id(root)
+        if declared is None or not move:
+            return declared
+        _write_env_local_id(root, declared)
+    if legacy is not None and legacy == declared and move:
+        _drop_project_json_id(root)
+    return declared
 
 
 def _handed_off_project_id(root: Path) -> str:
-    """The project id handed down for THIS root, or "" when there is none.
+    """The project id the environment gives THIS root, or "" when it gives none.
 
-    Scoped by $CAPABILITIES_PROJECT_ID_ROOT exactly as the envelope handoff is
-    scoped by its companion: a handoff for another root is passed over, and one
-    supplied without the companion is honored as given."""
+    CAPABILITIES_PROJECT_ID is set by a deployment for the agent it runs, or
+    handed down by a process that resolved it, scoped by
+    $CAPABILITIES_PROJECT_ID_ROOT exactly as the envelope handoff is scoped by
+    its companion: a handoff for another root is passed over, and one supplied
+    without the companion is honored as given."""
     handed = os.environ.get(PROJECT_ID_ENV, "").strip()
     if not handed:
         return ""
@@ -1701,48 +1767,37 @@ def _handed_off_project_id(root: Path) -> str:
     return handed
 
 
-def _project_id_state(root: Path) -> dict:
+def _project_id_state(root: Path, move: bool = True) -> dict:
     """The project's id and where it came from.
 
-    `capabilities/project.json` is the id's one home. A live handoff for this
-    root is that id as the launching process read it, so it is used as given
-    unless project.json now declares another, which a write refuses. A project
-    whose project.json declares none takes the id its ContextKit binding holds,
-    copied into project.json once."""
-    declared = _project_json_id(root)
+    CAPABILITIES_PROJECT_ID binds a project to its id: the environment's value
+    for this root (`handed`) wins over the one the root's .env.local, else
+    .env, declares (`declared`). An id the project still holds in project.json
+    or its ContextKit binding is moved into .env.local first, once - unless
+    `move` is off, as for a development lane, which never writes the project
+    it is attached to."""
+    declared = _move_project_id(root, move)
     handed = _handed_off_project_id(root)
-    if handed and declared and handed != declared:
-        state = {"state": "mismatch", "id": declared, "handed_id": handed}
-    elif handed:
-        state = {"state": "handed", "id": handed}
-    else:
-        if declared is None:
-            declared = _adopt_config_id(root)
-        state = {"state": "declared" if declared else "undeclared", "id": declared}
-    state["project_json_id"] = declared
-    return state
+    if handed:
+        return {"state": "handed", "id": handed}
+    return {"state": "declared" if declared else "undeclared", "id": declared}
 
 
 def _identity_refusal(state: dict) -> dict | None:
     """Why a write may not stamp this project's id, or None when it may.
 
-    A project without an id is left to the caller, whose refusal already names
-    `capabilities init`."""
-    if state["state"] == "mismatch":
-        return {"code": "project_id_mismatch",
-                "message": f"project.json holds project id {state['project_json_id']}, "
-                           f"but the process that started this one handed down "
-                           f"{state['handed_id']}",
-                "hint": "start the command again from the project itself, so the id "
-                        "is read from its project.json"}
+    The environment wins over the files, so no id the project resolves is
+    refused; a project without an id is left to the caller, whose refusal
+    already names `capabilities init`."""
     return None
 
 
 def _project_id_handoff(root: Path) -> dict[str, str]:
-    """The id hand-down for a process launched to stand in `root`: the id a
-    write may stamp there, scoped to that root, or nothing when none may be."""
+    """The id hand-down for a process a development lane launches to stand in
+    `root`: the id a write may stamp there, scoped to that root, or nothing
+    when none may be. Reading it writes nothing in the project."""
     root = Path(root)
-    state = _project_id_state(root)
+    state = _project_id_state(root, move=False)
     if not state["id"] or _identity_refusal(state) is not None:
         return {}
     return {PROJECT_ID_ENV: state["id"], PROJECT_ID_ROOT_ENV: str(root.resolve())}
@@ -1782,7 +1837,7 @@ def cmd_path(json_output: bool, identity: bool = False) -> None:
         # Capabilities stamped with an earlier contract read `bound` and take
         # `contextkit_id` as the id a bound project answers to, so both carry
         # that meaning here: whether a ContextKit binding is present, and the
-        # project's id (project.json's) where it is, else null.
+        # project's id where it is, else null.
         bound = _contextkit_managed(root)
         state["bound"] = bound
         state["contextkit_id"] = state["id"] if bound else None
@@ -5345,7 +5400,7 @@ def cmd_dev_run(session_id: str, capability: str, args: list[str],
         store_project = False
     projected = None
     if database is not None and store_project:
-        agent_id = _project_json_id(project)
+        agent_id = _project_id_state(project, move=False)["id"]
         if agent_id:
             projected = {"schema": _dev_schema(session),
                          "rows": _dev_project_rows(database[0], _dev_schema(session),
@@ -6736,10 +6791,12 @@ def _refuse_while_moving(root: Path) -> None:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
 
 
-def _ensure_envelope(root: Path, new_agent: bool = False) -> list[str]:
+def _ensure_envelope(root: Path, new_agent: bool = False, given_id: str | None = None,
+                     records_in_store: bool = False) -> list[str]:
     """Manager-owned project files: migrate, then scaffold gate + state guard.
     A new agent's identity declares its records in the store, so it gets no
-    settings file."""
+    settings file, and so does an agent raised from the store
+    (`records_in_store`)."""
     _refuse_while_moving(root)
     migrated = _migrate_legacy_envelope(root)
     capdir = _envelope_home(root)
@@ -6749,9 +6806,11 @@ def _ensure_envelope(root: Path, new_agent: bool = False) -> list[str]:
         existing = gi.read_text() if gi.exists() else ""
         gi.write_text(existing + ("" if existing.endswith("\n") or not existing else "\n")
                       + GITIGNORE_BODY)
-    identity = _ensure_project_identity(capdir, root)
-    if new_agent and identity.get(_store_module().RECORDS_MODE_KEY) != "store":
+    identity = _ensure_project_identity(capdir, root, given_id)
+    if (new_agent or records_in_store) \
+            and identity.get(_store_module().RECORDS_MODE_KEY) != "store":
         identity[_store_module().RECORDS_MODE_KEY] = "store"
+        identity.pop("id", None)
         _write_json(capdir / PROJECT_IDENTITY_REL, identity)
     gate_file = capdir / "settings.json"
     # The file gate exists only in files mode; a project whose records are in
@@ -6766,27 +6825,57 @@ def _ensure_envelope(root: Path, new_agent: bool = False) -> list[str]:
     return migrated
 
 
-def _ensure_project_identity(capdir: Path, root: Path) -> dict:
-    """Who this project is, minted once and committed.
+def _ensure_project_identity(capdir: Path, root: Path, given_id: str | None = None) -> dict:
+    """Who this project is: its label in project.json, its id bound once.
 
-    The id travels with the repository, so a laptop and a server resolve to the
-    same project without being told. project.json is its one home: an id
-    already written is never rewritten. Where it has none, an id a ContextKit
-    binding holds is carried over, and otherwise one is minted here, offline."""
+    The id is CAPABILITIES_PROJECT_ID, which the environment gives a deployed
+    agent and the project root's .env.local gives a folder on a person's
+    machine; it is never rewritten. An id the project already resolves - from
+    the environment, an env file, or an older home it is moved out of - is
+    kept, and `given_id` must be that id. Otherwise `given_id`, else an id a
+    ContextKit binding holds, else one minted here offline, is written to
+    .env.local. A project.json that already says the id lives in the env files
+    (v2) and finds none was cloned or copied without its .env.local: its id is
+    elsewhere, so none is minted and init asks for it."""
     identity_file = capdir / PROJECT_IDENTITY_REL
-    if identity_file.is_file():
-        identity = _read_json(identity_file)
-        if not isinstance(identity, dict):
-            return {}
-        if str(identity.get("id") or "").strip():
-            return identity
-    else:
-        identity = {"schema": PROJECT_IDENTITY_SCHEMA, "slug": _default_project_slug(root)}
-    # Twelve hex characters, for the reason a document version has twelve:
-    # an identifier nobody can read is an identifier nobody checks.
-    identity["id"] = _contextkit_config_id(root) or "prj_" + secrets.token_hex(6)
-    _write_json(identity_file, identity)
-    return identity
+    identity = _read_json(identity_file) if identity_file.is_file() else None
+    if identity_file.is_file() and not isinstance(identity, dict):
+        return {}
+    had_v2 = isinstance(identity, dict) and identity.get("schema") == PROJECT_IDENTITY_SCHEMA
+    state = _project_id_state(root)
+    current = state["id"]
+    if current and given_id and given_id != current:
+        _die(6, "project_id_exists",
+             f"this project is already bound to {current} "
+             f"({'by the environment' if state['state'] == 'handed' else 'by its env files'}), "
+             f"not {given_id}: an id is never rewritten",
+             f"unset {PROJECT_ID_ENV} or remove it from .env.local only if this folder "
+             "really is another agent")
+    if not current:
+        if given_id:
+            current = given_id
+        elif had_v2:
+            _die(6, "no_project_identity",
+                 f"{identity_file} says the project id is kept in .env.local or the "
+                 f"environment ({PROJECT_ID_ENV}), and neither holds one here: this "
+                 "checkout has not been bound to its agent yet",
+                 "run `capabilities init --id <id>` with the agent's id once in this "
+                 f"checkout, or set {PROJECT_ID_ENV}")
+        else:
+            # Twelve hex characters, for the reason a document version has
+            # twelve: an identifier nobody can read is an identifier nobody checks.
+            current = _contextkit_config_id(root) or "prj_" + secrets.token_hex(6)
+        if state["state"] != "handed":
+            _write_env_local_id(root, current)
+    if given_id and _env_file_project_id(root)[0] is None:
+        _write_env_local_id(root, given_id)
+    if not isinstance(identity, dict):
+        identity = {"slug": _default_project_slug(root)}
+    if "id" in identity or identity.get("schema") != PROJECT_IDENTITY_SCHEMA:
+        identity.pop("id", None)
+        identity["schema"] = PROJECT_IDENTITY_SCHEMA
+        _write_json(identity_file, identity)
+    return {**identity, "id": current}
 
 
 def _default_project_slug(root: Path) -> str:
@@ -6805,12 +6894,15 @@ def cmd_relabel(slug: str) -> None:
     remains a thing that needs no command at all.
     """
     root = _require_project()
-    identity = _read_json(_envelope_home(root) / PROJECT_IDENTITY_REL)
+    # The id is resolved first: resolving it may move an older one out of the
+    # file this verb then rewrites.
     project_id = _project_id_for_write(root)
+    identity = _read_json(_envelope_home(root) / PROJECT_IDENTITY_REL)
     if not isinstance(identity, dict) or not project_id:
         _die(6, "no_project_identity",
-             f"{_envelope_home(root) / PROJECT_IDENTITY_REL} carries no project id",
-             "run `capabilities init` in the project to mint its identity")
+             f"this project has no id: neither {PROJECT_ID_ENV} nor its "
+             f"{_envelope_home(root) / PROJECT_IDENTITY_REL} names one",
+             "run `capabilities init` in the project to give it its identity")
     store = _store_module()
     try:
         store._store_check("slug", slug, store.CAPABILITY_RE)
@@ -6828,7 +6920,7 @@ def cmd_relabel(slug: str) -> None:
 # ---------------------------------------------------------------- the kernel: agents and nodes
 
 # The agent registry and the agent's nodes live in the store, in the contract's
-# own tables, keyed by the id project.json declares. The manager alone writes
+# own tables, keyed by the project's id (CAPABILITIES_PROJECT_ID). The manager alone writes
 # them; `agent` and `node` answer for the project the call runs in.
 AGENT_COLUMNS = ("id", "name", "description", "icon_sha", "onboarding_status",
                  "onboarding_routine", "migrating_since", "migrated_at",
@@ -6872,8 +6964,10 @@ def _kernel_agent_id(root: Path) -> str:
     agent_id = _project_id_for_write(root)
     if not agent_id:
         _die(6, "no_project_identity",
-             f"{_project_capabilities_dir(root) / PROJECT_IDENTITY_REL} carries no project id",
-             "run `capabilities init` in the project to mint its identity")
+             f"this project has no id: neither the environment nor its .env.local or "
+             f".env sets {PROJECT_ID_ENV}",
+             "run `capabilities init` in the project, or `capabilities init --id <id>` "
+             "in a checkout of an agent that already has one")
     return agent_id
 
 
@@ -6968,7 +7062,7 @@ def _register_agent_on_init(root: Path, new_agent: bool = False) -> dict:
     """init's registration of the agent row: written where a database resolves
     for the project, and otherwise reported, never failing init. A new agent
     is registered migrated with this node as its master."""
-    agent_id = _project_json_id(root)
+    agent_id = _project_id_state(root)["id"]
     if not agent_id:
         return {"registered": False, "reason": "no_project_identity"}
     db = _db_module()
@@ -8757,8 +8851,10 @@ def cmd_connections_import() -> None:
              "run `capabilities init` in the project")
     agent_id = _project_id_for_write(root)
     if not agent_id:
-        _die(6, "no_project_identity", f"{identity_file} carries no project id",
-             "run `capabilities init` in the project to mint its identity")
+        _die(6, "no_project_identity",
+             f"this project has no id: neither the environment nor its .env.local or "
+             f".env sets {PROJECT_ID_ENV}",
+             "run `capabilities init` in the project to give it its identity")
     try:
         previous = ("store" if store.records_mode(envelope) == "store"
                     else "connections" if store.connections_mode(envelope) == "store"
@@ -9009,10 +9105,29 @@ def _migrate_body_envelope(root: Path) -> Path:
     return base / PROJECT_CAPABILITIES_REL
 
 
-def _migrate_root_id(envelope: Path, root: Path) -> str | None:
+def _file_project_id(envelope: Path, root: Path) -> str | None:
+    """The id the project's files hold, read and never moved: its env files',
+    else the one an older project.json still carries. A root found inside
+    another project's tree - the body folder of a ContextKit binding above it,
+    in the same repository - takes the env files of that project."""
+    declared, _source = _env_file_project_id(root)
+    if declared:
+        return declared
+    for folder in () if (root / ".git").exists() else root.parents:
+        if (folder / CONTEXTKIT_CONFIG_REL).is_file():
+            declared, _source = _env_file_project_id(folder)
+            if declared:
+                return declared
+            break
+        if (folder / ".git").exists():
+            break
     identity = _read_json(envelope / PROJECT_IDENTITY_REL)
     found = str((identity or {}).get("id") or "").strip() if isinstance(identity, dict) else ""
-    return found or _contextkit_config_id(root)
+    return found or None
+
+
+def _migrate_root_id(envelope: Path, root: Path) -> str | None:
+    return _file_project_id(envelope, root) or _contextkit_config_id(root)
 
 
 MIGRATE_SCAN_DEPTH = 3
@@ -9449,8 +9564,8 @@ def _migrate_movers(manifests: dict) -> list[str]:
 
 def _migrate_mover_env(root: Path, agent_id: str | None = None) -> dict:
     """A capability's environment in the agent's project, its envelope and its
-    id handed down so it asks the manager for neither, and so nothing writes
-    the id into project.json before the migration does."""
+    id handed down so it asks the manager for neither, and so nothing moves
+    the id into .env.local before the migration does."""
     env = dict(os.environ)
     env["CLAUDE_PROJECT_DIR"] = str(root)
     env[ENVELOPE_ENV] = str(_project_capabilities_dir(root))
@@ -9516,7 +9631,9 @@ def _migrate_context(root: Path, opts: dict, answers: dict) -> dict:
     identity_file = envelope / PROJECT_IDENTITY_REL
     identity = _read_json(identity_file)
     identity = identity if isinstance(identity, dict) else {}
-    declared = str(identity.get("id") or "").strip() or None
+    in_env_file, declaring = _env_file_project_id(root)
+    declared = _file_project_id(envelope, root)
+    declaring = declaring or identity_file
     bound = _contextkit_config_id(root)
     ctx: dict = {"root": root, "envelope": envelope, "identity_file": identity_file,
                  "given_roots": opts.get("roots") or [], "answers": answers,
@@ -9530,16 +9647,18 @@ def _migrate_context(root: Path, opts: dict, answers: dict) -> dict:
         else:
             ctx["questions"].append({
                 "id": "id", "answer": "id", "choices": [declared, bound],
-                "question": f"{identity_file} declares id {declared} and "
+                "question": f"{declaring} declares id {declared} and "
                             f"{root / CONTEXTKIT_CONFIG_REL} declares {bound}: which id is "
                             "this agent's? The other is left behind"})
     if not agent_id:
         raise _MigrateRefusal("no_project_identity",
-                              f"{identity_file} carries no project id and no "
+                              f"neither {root / '.env.local'}, {root / '.env'} nor "
+                              f"{identity_file} carries a project id and no "
                               f"{CONTEXTKIT_CONFIG_REL} holds one",
                               "give the agent an id with `capabilities init`, or archive it")
     ctx["agent_id"] = agent_id
-    ctx["id_write"] = agent_id if agent_id != declared else None
+    # The id is written to .env.local wherever it is not already there.
+    ctx["id_write"] = agent_id if agent_id != in_env_file else None
     try:
         ctx["mode"] = ("store" if store.records_mode(envelope) == "store"
                        else "connections" if store.connections_mode(envelope) == "store"
@@ -10961,7 +11080,8 @@ def cmd_migrate_agent(opts: dict) -> None:
     answer["blockers"] = [{"code": b.code, "message": b.message, "hint": b.hint}
                           for b in ctx["blockers"]]
     if ctx["id_write"]:
-        answer["identity_write"] = {"file": str(ctx["identity_file"]), "id": ctx["id_write"]}
+        answer["identity_write"] = {"file": str(ctx["root"] / ".env.local"),
+                                    "id": ctx["id_write"]}
     if apply and ctx["blockers"]:
         _migrate_refuse(ctx["blockers"][0], answer)
     if main is not None:
@@ -11025,9 +11145,10 @@ def cmd_migrate_agent(opts: dict) -> None:
     journal["target_nodes"] = sorted(row["node"] for row in plan["nodes"])
     try:
         if ctx["id_write"]:
+            _write_env_local_id(root, ctx["id_write"])
             identity = _read_json(ctx["identity_file"]) or {}
-            identity["id"] = ctx["id_write"]
-            identity.setdefault("schema", PROJECT_IDENTITY_SCHEMA)
+            identity.pop("id", None)
+            identity["schema"] = PROJECT_IDENTITY_SCHEMA
             identity.setdefault("slug", ctx["slug"])
             _write_json(ctx["identity_file"], identity)
             answer["identity_written"] = ctx["id_write"]
@@ -13593,23 +13714,87 @@ def _wire_claude_hook(root: Path) -> bool:
     return True
 
 
-def cmd_init(claude: bool, codex: bool, layers: bool = False, starter: bool = False) -> None:
-    _emit(_init(claude, codex, layers, starter))
+def cmd_init(claude: bool, codex: bool, layers: bool = False, starter: bool = False,
+             given_id: str | None = None) -> None:
+    _emit(_init(claude, codex, layers, starter, given_id))
 
 
-def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False) -> dict:
+# A project id: `prj_` and twelve hex characters, or the UUID older projects carry.
+PROJECT_ID_RE = re.compile(r"^(prj_[0-9a-f]{12}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
+                           r"-[0-9a-f]{4}-[0-9a-f]{12})$")
+
+
+def _agent_to_raise(root: Path, agent_id: str) -> dict:
+    """`init --id`: the agent the store holds under `agent_id`, which this
+    folder is being bound to. Where no database resolves for the project the
+    id is bound unverified, as a checkout in files mode is; a store that
+    resolves must hold the agent."""
+    db = _db_module()
+    try:
+        db.resolve_setting(root)
+    except db.DbError as exc:
+        if exc.slug == "store_not_configured":
+            return {"verified": False, "reason": "store_not_configured"}
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    conn, setting = _kernel_open(root)
+    import psycopg
+    try:
+        agent = _agent_row(conn, agent_id)
+    except psycopg.Error as exc:
+        _die(5, "store_unreachable", f"cannot read the agent registry: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    finally:
+        conn.close()
+    if agent is None:
+        _die(6, "agent_unknown",
+             f"the store ({setting.level}, schema {setting.schema}) holds no agent {agent_id}",
+             "check the id with `capabilities agent show` in a checkout already bound to it")
+    return {"verified": True, "migrated": bool(agent.get("migrated_at")),
+            "name": agent.get("name"), "store": _kernel_store_report(setting)}
+
+
+def _remove_env_local_id(root: Path) -> None:
+    """Undo `_write_env_local_id`: the CAPABILITIES_PROJECT_ID line leaves
+    .env.local, and a file left with nothing in it goes."""
+    path = root / ".env.local"
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return
+    pattern = re.compile(r"^\s*(export\s+)?" + PROJECT_ID_ENV + r"\s*=")
+    kept = [line for line in lines if not pattern.match(line)]
+    if any(line.strip() for line in kept):
+        _atomic_write_text(path, "\n".join(kept) + "\n")
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False,
+          given_id: str | None = None) -> dict:
     """What `init` does, answered rather than printed. With `layers` or
     `starter` it first lays the body ContextKit's `init --with-layers` /
-    `--with-template` lays, in the folder it runs in."""
+    `--with-template` lays, in the folder it runs in. With `given_id` it binds
+    the folder to the agent the store holds under that id rather than creating
+    one."""
     # init ESTABLISHES the project root: an existing root wins, else cwd. A body
     # is laid where it is asked for, as ContextKit lays it: in the folder itself.
     global _CONTEXT_WITHOUT_STORE
     _CONTEXT_WITHOUT_STORE = True
     with_body = layers or starter
     root = Path.cwd().resolve() if with_body else (_project_root() or Path.cwd().resolve())
-    new_agent = _new_agent_project(root)
+    raised = None
+    if given_id is not None:
+        if not PROJECT_ID_RE.match(given_id):
+            _die(6, "input", f"--id {given_id!r} is not a project id",
+                 "a project id is prj_ and twelve hex characters, as "
+                 "`capabilities agent show` prints it")
+        new_agent = False
+        raised = _agent_to_raise(root, given_id)
+    else:
+        new_agent = _new_agent_project(root)
     if new_agent:
         _preflight_new_agent(root)
+    had_file_id = _env_file_project_id(root)[0] is not None
     body: dict = {}
     if with_body:
         body = {"created": [], "changed": [], "skipped": []}
@@ -13618,7 +13803,8 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
         _ENVELOPE_HOME.pop(root, None)
         identity_file = _envelope_home(root) / PROJECT_IDENTITY_REL
         had_identity = identity_file.exists()
-    migrated = _ensure_envelope(root, new_agent=new_agent)
+    migrated = _ensure_envelope(root, new_agent=new_agent, given_id=given_id,
+                                records_in_store=bool(raised and raised.get("migrated")))
     if with_body and not had_identity and identity_file.exists():
         body["created"].append(str(identity_file))
     registration = _register_agent_on_init(root, new_agent=new_agent)
@@ -13626,6 +13812,8 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
         # Its identity was written by this init alone: removing it leaves the
         # project new, so the next init creates the agent again.
         (_envelope_home(root) / PROJECT_IDENTITY_REL).unlink(missing_ok=True)
+        if not had_file_id:
+            _remove_env_local_id(root)
         error = registration.get("error") or {}
         _die(5, error.get("code") or "store_write_failed",
              error.get("message") or "the new agent could not be registered in the store",
@@ -13658,6 +13846,8 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
     result: dict = {"project": str(root),
                     "gate": gate,
                     "agent": registration}
+    if raised is not None:
+        result["raised"] = {"id": given_id, **raised}
     if with_body:
         result.update(_ck_lay_body(root, starter, body))
     if migrated:
@@ -14550,12 +14740,8 @@ def cmd_doctor() -> None:
             "project: legacy .capabilities/ envelope is still present — run "
             "`capabilities init` to migrate it into visible capabilities/")
     envelope = _project_capabilities_dir(root) if root else None
+    # Reading the id moves one still kept in project.json into .env.local.
     identity = _project_id_state(root) if root else None
-    if identity and identity["state"] == "mismatch":
-        findings.append(
-            f"project: project.json holds project id {identity['project_json_id']}, "
-            f"but this process was handed down {identity['handed_id']} — writes "
-            "that stamp the project id refuse until they agree")
     if root and envelope and ((envelope / "settings.json").is_file()
                               or (envelope / PROJECT_IDENTITY_REL).is_file()):
         store_finding = None
@@ -17604,15 +17790,20 @@ def main() -> None:
         name = opt("--name")
         layers, starter = flag("--with-layers"), flag("--with-template")
         if template is not None:
-            if flag("--claude") or flag("--codex") or layers or starter:
+            if flag("--claude") or flag("--codex") or layers or starter \
+                    or opt("--id") is not None:
                 _die(6, "input", "init --template takes only --name and --json: it wires "
-                     "both hosts itself")
+                     "both hosts itself and creates the agent with an id of its own")
             cmd_init_template(template, name)
         elif name is not None:
             _die(6, "input", "--name applies only to `init --template`, which names the new agent",
                  "set an existing agent's name with `capabilities identity set --name`")
         else:
-            cmd_init(flag("--claude"), flag("--codex"), layers, starter)
+            given_id = opt("--id")
+            if given_id is not None and (layers or starter):
+                _die(6, "input", "init --id binds a folder to an agent the store already "
+                     "holds, so it lays no new body: drop --with-layers / --with-template")
+            cmd_init(flag("--claude"), flag("--codex"), layers, starter, given_id)
     elif cmd == "templates":
         if pos:
             _die(6, "input", f"unknown templates argument {pos[0]!r}")

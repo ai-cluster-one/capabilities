@@ -283,7 +283,8 @@ def test_import_moves_the_project_and_it_resolves_the_same_set(lab):
     assert result["agent_id"] == PROJECT_ID and result["node"] == socket.gethostname()
     assert result["capabilities"]["coolify"]["connections"]["imported"] == ["box", "off", "spare"]
     identity = json.loads((lab["envelope"] / "project.json").read_text())
-    assert identity["records"] == "store" and identity["id"] == PROJECT_ID
+    assert identity["records"] == "store" and "id" not in identity
+    assert f"CAPABILITIES_PROJECT_ID={PROJECT_ID}\n" in (lab["envelope"].parent / ".env.local").read_text()
     assert "connections" not in identity
     after = _ok(_coolify(lab, "connections"))
     assert _without_sources(after) == _without_sources(before)

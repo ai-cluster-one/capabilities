@@ -148,10 +148,11 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             machine_store_file(Path(td) / "config", port=1)
             envelope = Path(td) / "project" / "capabilities"
             envelope.mkdir(parents=True)
-            (envelope / "project.json").write_text(json.dumps(
-                {"id": f"prj_test_{time.time_ns()}", "slug": "testproject"}))
+            (envelope / "project.json").write_text(json.dumps({"slug": "testproject"}))
             daemon = import_daemon(Path(td), job_settings(),
-                                   project_env={"AGENTKIT_DB_URL": STORE_DSN})
+                                   project_env={"CAPABILITIES_PROJECT_ID":
+                                                f"prj_test_{time.time_ns()}",
+                                                "AGENTKIT_DB_URL": STORE_DSN})
             self.assertEqual(
                 (daemon.STORE_SETTING.level, daemon.STORE_SETTING.sources),
                 ("project", (str(daemon.PROJECT_ROOT / ".env.local"),)))

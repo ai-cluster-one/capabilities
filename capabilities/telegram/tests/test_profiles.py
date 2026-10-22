@@ -555,7 +555,8 @@ class Tables(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             envelope = Path(tmp) / "capabilities"
             envelope.mkdir()
-            (envelope / "project.json").write_text(json.dumps({"id": project_id()}))
+            (envelope / "project.json").write_text(json.dumps({}))
+            (Path(tmp) / ".env.local").write_text(f"CAPABILITIES_PROJECT_ID={project_id()}\n")
             with mock.patch.object(db, "migrate", recording), \
                     mock.patch.object(jobs, "_PROFILE_STORE_STEPS", steps):
                 store, _reg = jobs.open_register(envelope, "development",

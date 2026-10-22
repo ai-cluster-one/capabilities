@@ -17,10 +17,11 @@ def _project(tmp_path: Path, store: str | None = None) -> tuple[Path, dict[str, 
     envelope.mkdir(parents=True)
     project_id = str(uuid.uuid4())
     slug = "fixture-" + project_id[:8]
-    identity = {"schema": "capabilities.project.v1", "id": project_id, "slug": slug}
+    identity = {"schema": "capabilities.project.v2", "slug": slug}
     if store is not None:
         identity["store"] = store
     (envelope / "project.json").write_text(json.dumps(identity))
+    (root / ".env.local").write_text(f"CAPABILITIES_PROJECT_ID={project_id}\n")
     (envelope / "settings.json").write_text(json.dumps(
         {"capabilities": {"deployment": {"enabled": True}, "telegram": {"enabled": True}}}))
     env = dict(os.environ)
@@ -98,14 +99,15 @@ def test_manager_does_not_take_another_writers_collection(tmp_path):
 def test_relabel_writes_the_identity_and_nothing_else(tmp_path):
     root, env = _project(tmp_path)
     identity = json.loads((root / "capabilities" / "project.json").read_text())
+    bound = (root / ".env.local").read_text()
     payload = json.loads(_run([str(MANAGER), "relabel", "fixture-renamed"], root, env).stdout)
     assert payload["ok"] is True
     assert payload["previous_slug"] == identity["slug"]
-    assert payload["id"] == identity["id"]
+    assert bound == f"CAPABILITIES_PROJECT_ID={payload['id']}\n"
     assert "store_registry" not in payload
     written = json.loads((root / "capabilities" / "project.json").read_text())
-    assert written["slug"] == "fixture-renamed"
-    assert written["id"] == identity["id"]
+    assert written == {**identity, "slug": "fixture-renamed"}
+    assert (root / ".env.local").read_text() == bound
     _no_database_file(tmp_path)
     again = json.loads(_run([str(MANAGER), "relabel", "fixture-renamed"], root, env).stdout)
     assert again["unchanged"] is True

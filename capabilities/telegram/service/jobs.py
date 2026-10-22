@@ -396,16 +396,6 @@ def iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
-def project_identity(envelope: Path) -> dict:
-    """The project this service records its work under."""
-    try:
-        return json.loads((Path(envelope) / "project.json").read_text())
-    except (OSError, ValueError) as exc:
-        raise JobError("no_project_identity",
-                       f"no project identity under {envelope}",
-                       "run `capabilities init` in the project") from exc
-
-
 def handed_project_id(root: Path) -> str:
     """The project id its launcher handed down for this root, scoped by
     CAPABILITIES_PROJECT_ID_ROOT the way the envelope handoff is scoped."""
@@ -417,6 +407,30 @@ def handed_project_id(root: Path) -> str:
         return handed if Path(scope).resolve() == Path(root).resolve() else ""
     except OSError:
         return ""
+
+
+def bound_project_id(root: Path) -> str:
+    """The project's id, CAPABILITIES_PROJECT_ID: its launcher's, as
+    `handed_project_id` reads it, else the one the project root's .env.local,
+    else its .env, sets; "" where none does."""
+    handed = handed_project_id(root)
+    if handed:
+        return handed
+    for name in (".env.local", ".env"):
+        try:
+            lines = (Path(root) / name).read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            key, eq, value = line.strip().partition("=")
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            if eq and key == "CAPABILITIES_PROJECT_ID":
+                found = value.strip().strip('"').strip("'")
+                if found:
+                    return found
+    return ""
 
 
 def store_setting(project_root: Path | None):
@@ -475,18 +489,20 @@ def open_register(envelope: Path, environment: str, surface: str = "telegram",
     capability's own tables, migrated here under its own ledger. The caller
     closes the store.
 
-    The project id is the one the launching CLI resolved and passes in;
-    project.json's own id stands in only where no launcher resolved one.
+    The project id is the one the launching CLI resolved and passes in; the
+    project's own binding, as `bound_project_id` reads it at `project_root`
+    (else the envelope's parent), stands in only where no launcher resolved one.
     `setting` is the database already resolved by a caller that reads it once;
     otherwise it is resolved now for `project_root`. The runner's profile table
     is migrated first unless `profile_tables` is off, as it is for a CLI verb
     that only reads or writes jobs.
     """
-    identity = project_identity(envelope)
-    project_id = project_id or identity.get("id")
+    project_id = project_id or bound_project_id(
+        Path(project_root) if project_root else Path(envelope).parent)
     if not project_id:
         raise JobError("no_project_identity",
-                       f"{Path(envelope) / 'project.json'} declares no id",
+                       f"the project under {envelope} declares no id "
+                       "(CAPABILITIES_PROJECT_ID)",
                        "run `capabilities init` in the project")
     if setting is None:
         setting = store_setting(project_root)

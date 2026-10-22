@@ -285,10 +285,11 @@ def import_daemon(tmp: Path, service_settings: dict, *,
     service_dir.mkdir(parents=True)
     if store:
         (project / "capabilities" / "project.json").write_text(json.dumps({
-            "id": f"prj_test_{uuid.uuid4().hex}",
             "slug": "testproject",
             "store": "files",
         }) + "\n")
+        project_env = {"CAPABILITIES_PROJECT_ID": f"prj_test_{uuid.uuid4().hex}",
+                       **(project_env or {})}
     settings_file = service_dir / "settings.json"
     context_file = service_dir / "context.md"
     voice_context_file = service_dir / "voice-agent.md"

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.8,<1",
+#     "capabilities-contract>=0.9,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.9.0",
 #     "pyyaml>=6",
@@ -858,7 +858,7 @@ SERVICE
 
   Before it asks the store anything at a wake, and again just before it starts
   a turn, the daemon checks the project it serves: its folder and its
-  project.json with the id it was started for are there, tasks is enabled for
+  project.json are there and it still has the id it was started for, tasks is enabled for
   the project itself, and the connection is still one the project may use and
   that allows writes, outside the read-only switch - the decision `tasks run`
   makes. While a check fails, `service status` shows `state` `refused`, or
@@ -1028,7 +1028,7 @@ SERVICE
   service leave` takes it off. Only these verbs write the list, atomically and
   under a lock in the machine state root; do not edit it by hand. `join`
   refuses, in this order and each with exit 6: a project without a durable id
-  in project.json (`capabilities init` gives it one), `no_project_identity`;
+  (CAPABILITIES_PROJECT_ID; `capabilities init` gives it one), `no_project_identity`;
   and a project whose slug another joined project has, `slug_taken`,
   since the two would share a state root. It answers
   `{"joined", "project": {"id", "slug", "root"}, "list"}`, `joined` false
@@ -1302,9 +1302,10 @@ PROJECT SCOPE
   project a task is assigned to may add to its trail and set its assignee.
 
   Several projects may share one store, and every task belongs to exactly one of
-  them. Which one is the project's own declared id, read from the envelope's
-  `project.json` and from nowhere else, so a row can only ever be attributed to
-  a project that declared itself.
+  them. Which one is the project's own declared id, CAPABILITIES_PROJECT_ID:
+  the environment's, else the one its root's `.env.local` or `.env` sets, and
+  from nowhere else, so a row can only ever be attributed to a project that
+  declared itself.
 
   `--project <id>` is a filter on `list`, `ready`, `search` and `watch`, and
   unsaid it means the project the command runs in. `--all-projects` removes
@@ -1314,7 +1315,7 @@ PROJECT SCOPE
   uuid; a key names a task only in the project the command runs in.
 
   No write takes that flag. `add`, `set`, `claim`, `release`, `run`, `tag`,
-  `untag`, `meta` and `activity` take the project from `project.json`, and a
+  `untag`, `meta` and `activity` take the project from that id, and a
   write addressed to a task of another project is refused the way worker scope
   refuses one: exit 4, the policy code, and the rule named.
 
@@ -2278,8 +2279,9 @@ def _declared_project() -> str | None:
     The id is read from the project rather than taken from a flag, an
     environment variable or a stored value, which is the whole of the promise
     that a row can never be attributed to a project that did not declare itself.
-    A project declares itself through the envelope's `project.json`, which the
-    contract's one resolver reads, and reading it is independent of where the
+    A project declares itself through CAPABILITIES_PROJECT_ID - the
+    environment's, else its root's .env.local or .env - which the contract's
+    one resolver reads, and reading it is independent of where the
     project keeps its records, so this answers the same whether that project is
     on the store or on files.
 
@@ -2296,9 +2298,8 @@ def _writing_project() -> str:
     No write names its project, so there is one answer to ask for and one place
     that refuses when there is no answer. An empty project is never written:
     a task belonging to nobody is worse than a task not written, because nothing
-    afterwards can tell whose it was. Nor is an id handed down that the
-    project's own project.json contradicts: that is refused, naming what
-    settles it, rather than written."""
+    afterwards can tell whose it was. A project whose id the manager could
+    not answer is refused, naming what settles it, rather than written."""
     refusal = _identity_refusal(PROJECT_IDENTITY) if PROJECT_IDENTITY else None
     if refusal:
         _die(6, refusal["code"], refusal["message"], refusal.get("hint"))
@@ -10383,7 +10384,7 @@ class _ServiceHost:
 
         Asked inside the project's scope at every wake before the daemon asks
         the store anything for it, and again before every turn: the folder and
-        its project.json with the id this daemon serves are there, tasks is
+        its project.json are there and it still has the id this daemon serves, tasks is
         enabled for the project itself, and the connection is still one the
         project may use and write through, outside the read-only switch - the
         decision `tasks run` will make. It
@@ -11048,8 +11049,9 @@ def cmd_service_join(wanted: str | None, args: list[str]) -> None:
     project = _declared_project()
     if not (envelope / "project.json").is_file() or not project:
         _die(6, "no_project_identity",
-             f"this project has no durable id in {envelope / 'project.json'}, and the "
-             "machine service's list names a project by it",
+             f"this project has no durable id (CAPABILITIES_PROJECT_ID, or no "
+             f"{envelope / 'project.json'}), and the machine service's list names a "
+             "project by it",
              "run `capabilities init` in the project")
     # The connection the machine service will serve the project on, read as it
     # will read it, so a project whose records cannot be read does not join.

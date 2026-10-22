@@ -154,6 +154,7 @@ def test_policy_and_identity(world):
     assert done.returncode == 4 and error(done)["code"] == "disabled"
     root = world.project("p")
     (root / "capabilities" / "project.json").write_text(json.dumps({"slug": "p"}))
+    (root / ".env.local").unlink()
     done = world.run(root, "add", "x", "--title", "t")
     assert done.returncode == 6 and error(done)["code"] == "no_project_identity"
 

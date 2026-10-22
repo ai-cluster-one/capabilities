@@ -1,6 +1,7 @@
-"""A project's id: read from the envelope's project.json alone, minted there by
-`capabilities init`, and carried over once from a ContextKit binding that holds
-one where project.json declares none. ContextKit is never asked for it."""
+"""A project's id: CAPABILITIES_PROJECT_ID, the environment's or else the one
+the project root's .env.local (else .env) sets, minted there by `capabilities
+init`, and moved there once from an older project.json or a ContextKit binding
+that holds one. ContextKit is never asked for it."""
 
 import json
 import os
@@ -91,6 +92,18 @@ def _copy(project: Path) -> dict:
     return json.loads((project / "capabilities" / "project.json").read_text())
 
 
+def _bound(project: Path) -> str | None:
+    """The id the project's .env.local binds it to, or None."""
+    try:
+        lines = (project / ".env.local").read_text().splitlines()
+    except FileNotFoundError:
+        return None
+    found = [line.split("=", 1)[1] for line in lines
+             if line.startswith("CAPABILITIES_PROJECT_ID=")]
+    assert len(found) <= 1, lines
+    return found[0] if found else None
+
+
 def _identity_calls(log: Path) -> int:
     if not log.exists():
         return 0
@@ -122,11 +135,12 @@ def test_init_mints_an_id_offline_in_a_plain_project(tmp_path: Path) -> None:
     log = _contextkit(tmp_path)
 
     result = _json(_run(tmp_path, project, "init"))
-    minted = _copy(project)["id"]
+    minted = _bound(project)
     identity = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
 
     assert minted.startswith("prj_") and len(minted) == 16
-    assert identity == {"state": "declared", "id": minted, "project_json_id": minted,
+    assert _copy(project) == {"schema": "capabilities.project.v2", "slug": "project"}
+    assert identity == {"state": "declared", "id": minted,
                         "bound": False, "contextkit_id": None}
     # No database resolves here, so the agent row is reported, not written.
     assert result["agent"] == {"registered": False, "reason": "store_not_configured"}
@@ -140,7 +154,7 @@ def test_init_carries_a_contextkit_held_id_into_a_new_identity(tmp_path: Path) -
 
     _json(_run(tmp_path, project, "init"))
 
-    assert _copy(project)["id"] == "prj_0000000000a1"
+    assert _bound(project) == "prj_0000000000a1" and "id" not in _copy(project)
     identity = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
     assert identity["state"] == "declared" and identity["id"] == "prj_0000000000a1"
     assert _identity_calls(log) == 0
@@ -153,7 +167,7 @@ def test_init_mints_for_a_bound_project_whose_binding_holds_no_id(tmp_path: Path
 
     _json(_run(tmp_path, project, "init"))
 
-    assert _copy(project)["id"].startswith("prj_")
+    assert _bound(project).startswith("prj_")
     assert _identity_calls(log) == 0
 
 
@@ -163,15 +177,18 @@ def test_init_fills_a_copy_that_has_no_id_and_rewrites_none(tmp_path: Path) -> N
     _contextkit(tmp_path)
 
     _json(_run(tmp_path, project, "init"))
-    assert _copy(project)["id"] == "prj_0000000000a2"
+    assert _bound(project) == "prj_0000000000a2"
+    assert _copy(project) == {"schema": "capabilities.project.v2", "slug": "p"}
 
     (project / "capabilities" / "project.json").write_text(json.dumps(
         {"schema": "capabilities.project.v1", "slug": "p", "id": "prj_00000000ffff"}))
-    _run(tmp_path, project, "init")
-    assert _copy(project)["id"] == "prj_00000000ffff"
+    _json(_run(tmp_path, project, "init"))
+    assert _bound(project) == "prj_0000000000a2"
+    assert _copy(project) == {"schema": "capabilities.project.v2", "slug": "p"}
 
 
-def test_project_json_is_the_id_even_where_contextkit_holds_another(tmp_path: Path) -> None:
+def test_a_project_json_id_moves_to_env_local_even_where_contextkit_holds_another(
+        tmp_path: Path) -> None:
     project = _project(tmp_path, bound=True, contextkit_id="prj_0000000000c1",
                        copy={"schema": "capabilities.project.v1", "slug": "p",
                              "id": "prj_0000000000c2"})
@@ -182,24 +199,25 @@ def test_project_json_is_the_id_even_where_contextkit_holds_another(tmp_path: Pa
     relabel = _json(_run(tmp_path, project, "relabel", "other"))
 
     assert identity == {"state": "declared", "id": "prj_0000000000c2",
-                        "project_json_id": "prj_0000000000c2",
                         "bound": True, "contextkit_id": "prj_0000000000c2"}
+    assert _bound(project) == "prj_0000000000c2"
     assert not [f for f in doctor["findings"] if "project id" in f]
-    assert relabel["id"] == "prj_0000000000c2" and _copy(project)["slug"] == "other"
+    assert relabel["id"] == "prj_0000000000c2"
+    assert _copy(project) == {"schema": "capabilities.project.v2", "slug": "other"}
     assert _probe(tmp_path, project)["write"] == "prj_0000000000c2"
     assert _identity_calls(log) == 0
 
 
-def test_an_id_only_in_the_binding_is_copied_into_project_json_once(tmp_path: Path) -> None:
+def test_an_id_only_in_the_binding_is_moved_into_env_local_once(tmp_path: Path) -> None:
     project = _project(tmp_path, bound=True, contextkit_id="prj_0000000000d1")
     log = _contextkit(tmp_path)
 
     identity = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
 
     assert (identity["state"], identity["id"]) == ("declared", "prj_0000000000d1")
-    assert _copy(project) == {"schema": "capabilities.project.v1", "slug": "project",
-                              "id": "prj_0000000000d1"}
-    # Once in project.json, the binding is no longer consulted.
+    assert _bound(project) == "prj_0000000000d1"
+    assert not (project / "capabilities" / "project.json").exists()
+    # Once in .env.local, the binding is no longer consulted.
     config = project / ".contextkit" / "config.toml"
     config.write_text(config.read_text().replace("prj_0000000000d1", "prj_0000000000d9"))
     again = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
@@ -217,7 +235,7 @@ def test_a_capability_gets_the_binding_held_id_copied_through_the_manager(tmp_pa
 
     assert answer == {"read": "prj_0000000000d2", "write": "prj_0000000000d2",
                       "state": "declared"}
-    assert _copy(project)["id"] == "prj_0000000000d2"
+    assert _bound(project) == "prj_0000000000d2"
     assert _identity_calls(log) == 0
 
 
@@ -232,6 +250,7 @@ def test_the_read_only_switch_answers_the_binding_held_id_without_writing(tmp_pa
 
     assert identity["id"] == "prj_0000000000d3"
     assert not (project / "capabilities" / "project.json").exists()
+    assert not (project / ".env.local").exists()
 
 
 def test_a_project_without_any_id_is_undeclared(tmp_path: Path) -> None:
@@ -241,31 +260,47 @@ def test_a_project_without_any_id_is_undeclared(tmp_path: Path) -> None:
     identity = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
     relabel = _run(tmp_path, project, "relabel", "other")
 
-    assert identity == {"state": "undeclared", "id": None, "project_json_id": None,
+    assert identity == {"state": "undeclared", "id": None,
                         "bound": False, "contextkit_id": None}
     assert relabel.returncode == 6 and _error(relabel)["code"] == "no_project_identity"
 
 
-def test_a_capability_reads_project_json_without_the_manager(tmp_path: Path) -> None:
+def test_a_capability_reads_env_local_without_the_manager(tmp_path: Path) -> None:
     project = _project(tmp_path, bound=True, contextkit_id="prj_0000000000e1",
-                       copy={"schema": "capabilities.project.v1", "slug": "p",
-                             "id": "prj_0000000000e1"})
+                       copy={"schema": "capabilities.project.v2", "slug": "p"})
+    (project / ".env.local").write_text("OTHER=1\nCAPABILITIES_PROJECT_ID=prj_0000000000e1\n")
     _contextkit(tmp_path)
     # The envelope record is written by this manager call.
     _json(_run(tmp_path, project, "path", "--json"))
     env = _env(tmp_path, project)
-    # A manager that cannot start proves project.json, not the manager, answered.
+    # A manager that cannot start proves .env.local, not the manager, answered.
     env["CAPABILITIES_MANAGER_BIN"] = str(tmp_path / "no-manager-here")
 
     assert _probe(tmp_path, project, env) == {
         "read": "prj_0000000000e1", "write": "prj_0000000000e1", "state": "declared"}
 
 
-def test_a_handed_down_id_is_used_and_one_project_json_contradicts_refuses_writes(
-        tmp_path: Path) -> None:
+def test_env_local_wins_over_env_and_project_json_is_never_the_id(tmp_path: Path) -> None:
     project = _project(tmp_path, bound=False,
-                       copy={"schema": "capabilities.project.v1", "slug": "p",
-                             "id": "prj_0000000000f2"})
+                       copy={"schema": "capabilities.project.v2", "slug": "p"})
+    (project / ".env").write_text("CAPABILITIES_PROJECT_ID=prj_0000000000e2\n")
+    env = _env(tmp_path, project)
+    env["CAPABILITIES_MANAGER_BIN"] = str(tmp_path / "no-manager-here")
+
+    identity = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
+    assert (identity["state"], identity["id"]) == ("declared", "prj_0000000000e2")
+    assert _probe(tmp_path, project, env)["write"] == "prj_0000000000e2"
+
+    (project / ".env.local").write_text("CAPABILITIES_PROJECT_ID=prj_0000000000e3\n")
+    identity = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
+    assert identity["id"] == "prj_0000000000e3"
+    assert _probe(tmp_path, project, env)["write"] == "prj_0000000000e3"
+
+
+def test_the_environment_wins_over_the_env_files(tmp_path: Path) -> None:
+    project = _project(tmp_path, bound=False,
+                       copy={"schema": "capabilities.project.v2", "slug": "p"})
+    (project / ".env.local").write_text("CAPABILITIES_PROJECT_ID=prj_0000000000f2\n")
     env = _env(tmp_path, project)
     env.update({"CAPABILITIES_PROJECT_ID": "prj_0000000000f2",
                 "CAPABILITIES_PROJECT_ID_ROOT": str(project)})
@@ -274,25 +309,64 @@ def test_a_handed_down_id_is_used_and_one_project_json_contradicts_refuses_write
                           env=env))["project_identity"]
     assert (identity["state"], identity["id"]) == ("handed", "prj_0000000000f2")
 
+    # An id the environment sets, as a deployment does, wins over the file:
+    # it is the one a write stamps, and nothing refuses.
+    env.pop("CAPABILITIES_PROJECT_ID_ROOT")
     env["CAPABILITIES_PROJECT_ID"] = "prj_0000000000f9"
     identity = _json(_run(tmp_path, project, "path", "--json", "--identity",
                           env=env))["project_identity"]
-    assert identity == {"state": "mismatch", "id": "prj_0000000000f2",
-                        "handed_id": "prj_0000000000f9",
-                        "project_json_id": "prj_0000000000f2",
+    assert identity == {"state": "handed", "id": "prj_0000000000f9",
                         "bound": False, "contextkit_id": None}
-    relabel = _run(tmp_path, project, "relabel", "other", env=env)
-    assert relabel.returncode == 6
-    error = _error(relabel)
-    assert error["code"] == "project_id_mismatch"
-    assert "prj_0000000000f2" in error["message"] and "prj_0000000000f9" in error["message"]
-    assert _probe(tmp_path, project, env)["write"] is None
+    relabel = _json(_run(tmp_path, project, "relabel", "other", env=env))
+    assert relabel["id"] == "prj_0000000000f9"
+    assert _probe(tmp_path, project, env)["write"] == "prj_0000000000f9"
+    assert _bound(project) == "prj_0000000000f2"
 
     # A handoff scoped to another root is passed over.
     env["CAPABILITIES_PROJECT_ID_ROOT"] = str(tmp_path / "elsewhere")
     identity = _json(_run(tmp_path, project, "path", "--json", "--identity",
                           env=env))["project_identity"]
     assert (identity["state"], identity["id"]) == ("declared", "prj_0000000000f2")
+
+
+def test_a_clone_without_its_binding_is_refused_a_new_id(tmp_path: Path) -> None:
+    """A v2 project.json says the id is kept outside the repository: a clone
+    that has none is not a new project, so init mints nothing."""
+    project = _project(tmp_path, bound=False,
+                       copy={"schema": "capabilities.project.v2", "slug": "p"})
+    _in_files_mode(project)
+
+    result = _run(tmp_path, project, "init")
+
+    assert result.returncode == 6
+    error = _error(result)
+    assert error["code"] == "no_project_identity" and "init --id" in error["hint"]
+    assert _bound(project) is None
+
+
+def test_init_id_binds_a_clone_and_writes_only_the_id(tmp_path: Path) -> None:
+    project = _project(tmp_path, bound=False,
+                       copy={"schema": "capabilities.project.v2", "slug": "p"})
+    _in_files_mode(project)
+    (project / ".env.local").write_text("OTHER=kept\n")
+
+    result = _json(_run(tmp_path, project, "init", "--id", "prj_0000000000a7"))
+
+    assert (project / ".env.local").read_text() == (
+        "OTHER=kept\nCAPABILITIES_PROJECT_ID=prj_0000000000a7\n")
+    assert _copy(project) == {"schema": "capabilities.project.v2", "slug": "p"}
+    # No database resolves here, so the id is bound unverified.
+    assert result["raised"] == {"id": "prj_0000000000a7", "verified": False,
+                                "reason": "store_not_configured"}
+    identity = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
+    assert (identity["state"], identity["id"]) == ("declared", "prj_0000000000a7")
+
+    # The id is never rewritten.
+    again = _run(tmp_path, project, "init", "--id", "prj_0000000000a8")
+    assert again.returncode == 6 and _error(again)["code"] == "project_id_exists"
+    assert _bound(project) == "prj_0000000000a7"
+    _json(_run(tmp_path, project, "init", "--id", "prj_0000000000a7"))
+    assert _bound(project) == "prj_0000000000a7"
 
 
 def test_resolving_the_envelope_alone_hands_the_id_down_beside_it(tmp_path: Path) -> None:
@@ -366,7 +440,7 @@ def test_the_released_contract_still_resolves_an_id_only_the_binding_holds(
     _contextkit(tmp_path)
 
     assert _base_contract_read(tmp_path, project)["write"] == "prj_0000000000b2"
-    assert _copy(project)["id"] == "prj_0000000000b2"
+    assert _bound(project) == "prj_0000000000b2"
 
 
 def test_the_released_contract_still_resolves_and_writes_in_a_plain_project(

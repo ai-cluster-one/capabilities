@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.8,<1",
+#     "capabilities-contract>=0.9,<1",
 #     "httpx>=0.27",
 #     "puremagic>=1.28",
 #     "qrcode>=7.4",
@@ -6652,15 +6652,15 @@ def _runner_importable() -> bool:
 
 
 def _service_project_id(root: Path) -> str:
-    """The id the register keys this project's rows by, from project.json."""
+    """The id the register keys this project's rows by (CAPABILITIES_PROJECT_ID)."""
     state = _project_id_state_at(root)
     project_id = (state or {}).get("id")
     if not project_id:
         _refuse(6, "project_id_missing",
                 "the dialogue keys what it answered by the project's id, and this "
                 "project declares none",
-                "run `capabilities init` so the project's identity is recorded in "
-                "capabilities/project.json")
+                "run `capabilities init` so the project's id is recorded in its "
+                ".env.local")
     return str(project_id)
 
 

@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract>=0.8,<1",
+#     "capabilities-contract>=0.9,<1",
 # ]
 # ///
 """fathom — agent-first CLI for Fathom meeting recordings and transcripts.

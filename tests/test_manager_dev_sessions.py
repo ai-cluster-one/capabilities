@@ -499,8 +499,8 @@ def test_dev_check_reports_the_audit_report_not_the_launcher_that_carried_it(tmp
     script = worktree / "capabilities" / "deployment" / "bin" / "deployment"
     script.write_text(
         script.read_text().replace(
-            '"capabilities-contract>=0.8,<1"',
-            '"capabilities-contract>=0.8,<1", "capabilities-contract<0.8"',
+            '"capabilities-contract>=0.9,<1"',
+            '"capabilities-contract>=0.9,<1", "capabilities-contract<0.8"',
             1,
         )
     )

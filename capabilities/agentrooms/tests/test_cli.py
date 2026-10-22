@@ -260,7 +260,7 @@ def project(tmp_path, monkeypatch):
     caps = root / "capabilities"
     caps.mkdir()
     (caps / "settings.json").write_text(json.dumps({"capabilities": {"agentrooms": {"enabled": True}}}))
-    (caps / "project.json").write_text(json.dumps({"id": "prj_test", "slug": "project"}))
+    (caps / "project.json").write_text(json.dumps({"slug": "project"}))
     home = tmp_path / "home"
     for key, sub in (("XDG_CONFIG_HOME", "config"), ("XDG_STATE_HOME", "state"),
                      ("XDG_CACHE_HOME", "cache")):
@@ -271,6 +271,7 @@ def project(tmp_path, monkeypatch):
         if key.startswith(("AGENTKIT_DB_", "AGENTROOMS_", "CAPABILITIES_PROJECT_",
                            "CAPABILITIES_READ_ONLY", "CAPABILITIES_AUTH_CONTEXT")):
             monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("CAPABILITIES_PROJECT_ID", "prj_test")
     monkeypatch.chdir(root)
     return root
 
@@ -751,7 +752,7 @@ def test_a_connection_held_in_the_store_is_bound_in_this_projects_settings(cli, 
                                                                            capsys, tmp_path,
                                                                            homeserver):
     identity = project / "capabilities" / "project.json"
-    identity.write_text(json.dumps({"id": "prj_test", "slug": "project", "connections": "store"}))
+    identity.write_text(json.dumps({"slug": "project", "connections": "store"}))
     (project / ".env.local").write_text(f"AGENTROOMS_ALPHA_TOKEN={TOKEN}\n")
     records = cli._records()
     records.set("agentrooms", "connection", "alpha", {
@@ -1223,7 +1224,7 @@ def test_watch_no_held_follows_matrix_holding_no_store_connection(cli, project, 
     # connections moved there; following then holds nothing of the store.
     import psycopg
     identity = project / "capabilities" / "project.json"
-    identity.write_text(json.dumps({"id": "prj_test", "slug": "project", "connections": "store"}))
+    identity.write_text(json.dumps({"slug": "project", "connections": "store"}))
     (project / ".env.local").write_text(f"AGENTROOMS_ALPHA_TOKEN={TOKEN}\n")
     records = cli._records()
     records.set("agentrooms", "connection", "alpha", {

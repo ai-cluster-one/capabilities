@@ -8,7 +8,7 @@
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract>=0.8,<1",
+#     "capabilities-contract>=0.9,<1",
 #     "callva-harness-runner==0.10.0",
 # ]
 # ///
@@ -414,7 +414,7 @@ def _records():
     if _RECORDS is None:
         _RECORDS = records.open_records(
             PROJECT_CAPABILITIES_DIR, CONFIG_HOME, PROJECT_ROOT,
-            jobs.handed_project_id(PROJECT_ROOT))
+            jobs.bound_project_id(PROJECT_ROOT))
     return _RECORDS
 
 
@@ -589,7 +589,7 @@ def job_register():
             raise STORE_REFUSAL
         _JOB_STORE, _JOB_REGISTER = jobs.open_register(
             PROJECT_CAPABILITIES_DIR, ENVIRONMENT, setting=STORE_SETTING,
-            project_id=jobs.handed_project_id(PROJECT_ROOT) or None)
+            project_id=jobs.bound_project_id(PROJECT_ROOT) or None)
     return _JOB_REGISTER
 
 

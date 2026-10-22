@@ -247,12 +247,63 @@ def test_a_new_agent_starts_in_the_store_with_this_node_as_master(lab):
     assert json.loads(again.stdout)["agent"]["created"] is False
 
     identity = json.loads((lab.project / "capabilities" / "project.json").read_text())
-    assert identity["records"] == "store"
+    assert identity["records"] == "store" and "id" not in identity
+    agent_id = _bound(lab.project)
     assert not (lab.project / "capabilities" / "settings.json").exists()
     assert lab.sql(f"SELECT migrated_at IS NOT NULL FROM {SCHEMA}.capabilities_agents "
-                   "WHERE id = %s", (identity["id"],)) == [(True,)]
+                   "WHERE id = %s", (agent_id,)) == [(True,)]
     assert lab.sql(f"SELECT node, is_master FROM {SCHEMA}.capabilities_agent_nodes "
-                   "WHERE agent_id = %s", (identity["id"],)) == [("lab-node", True)]
+                   "WHERE agent_id = %s", (agent_id,)) == [("lab-node", True)]
+
+
+def _bound(folder: Path) -> str | None:
+    """The id the folder's .env.local binds it to, or None."""
+    found = [line.split("=", 1)[1] for line in (folder / ".env.local").read_text().splitlines()
+             if line.startswith("CAPABILITIES_PROJECT_ID=")]
+    return found[0] if found else None
+
+
+def test_init_id_raises_an_agent_the_store_holds_in_a_folder_of_its_own(lab, tmp_path):
+    node = {"AGENT_NODE_NAME": "lab-node"}
+    migrated = lab.run("migrate", "--global", "--apply", **node)
+    assert migrated.returncode == 0, migrated.stderr
+    (lab.project / "capabilities" / "project.json").unlink()
+    created = lab.run("init", **node)
+    assert created.returncode == 0, created.stderr
+    agent_id = _bound(lab.project)
+    added = lab.run("node", "add", "srv-node", "--kind", "server", **node)
+    assert added.returncode == 0, added.stderr
+    setting = (lab.project / ".env.local").read_text().replace(
+        f"CAPABILITIES_PROJECT_ID={agent_id}\n", "")
+
+    def init_in(folder: Path, *args: str) -> subprocess.CompletedProcess:
+        folder.mkdir()
+        (folder / ".env.local").write_text(setting)
+        return subprocess.run(
+            [sys.executable, str(MANAGER), "init", *args], cwd=folder,
+            env=lab.env(CLAUDE_PROJECT_DIR=str(folder), AGENT_NODE_NAME="srv-node"),
+            text=True, capture_output=True, timeout=120)
+
+    # A folder holding nothing but the store setting is raised as the agent.
+    server = tmp_path / "server"
+    raised = init_in(server, "--id", agent_id)
+    assert raised.returncode == 0, raised.stderr
+    answer = json.loads(raised.stdout)
+    assert answer["raised"] == {"id": agent_id, "verified": True, "migrated": True,
+                                "name": None, "store": {"level": "project", "schema": SCHEMA}}
+    assert (server / ".env.local").read_text() == setting + f"CAPABILITIES_PROJECT_ID={agent_id}\n"
+    assert json.loads((server / "capabilities" / "project.json").read_text()) == {
+        "schema": "capabilities.project.v2", "slug": "server", "records": "store"}
+    assert not (server / "capabilities" / "settings.json").exists()
+    assert answer["agent"]["registered"] is True and answer["agent"]["created"] is False
+
+    # An id the store does not hold is refused, and nothing is written.
+    stray = tmp_path / "stray"
+    refused = init_in(stray, "--id", "prj_00000000dead")
+    assert refused.returncode == 6, refused.stderr
+    assert json.loads(refused.stderr.strip().splitlines()[-1])["error"]["code"] == "agent_unknown"
+    assert (stray / ".env.local").read_text() == setting
+    assert not (stray / "capabilities").exists()
 
 
 def test_agent_show_and_set(lab, tmp_path):
@@ -437,12 +488,13 @@ def test_init_template_creates_an_agent_from_a_contextkit_template(lab, tmp_path
     assert (folder / ".contextkit" / f"icon-{sha[:12]}.png").read_bytes() == icon
 
     identity = json.loads((folder / "capabilities" / "project.json").read_text())
-    assert identity["records"] == "store"
+    assert identity["records"] == "store" and "id" not in identity
+    agent_id = _bound(folder)
     assert lab.sql(f"SELECT name, description, icon_sha, onboarding_status, onboarding_routine, "
                    f"migrated_at IS NOT NULL FROM {SCHEMA}.capabilities_agents WHERE id = %s",
-                   (identity["id"],)) == [("Probe", "A demo agent.", sha, "pending", "onboarding", True)]
+                   (agent_id,)) == [("Probe", "A demo agent.", sha, "pending", "onboarding", True)]
     assert lab.sql(f"SELECT node, is_master FROM {SCHEMA}.capabilities_agent_nodes "
-                   "WHERE agent_id = %s", (identity["id"],)) == [("lab-node", True)]
+                   "WHERE agent_id = %s", (agent_id,)) == [("lab-node", True)]
 
     # Both hosts are wired to the manager, and the first build is made.
     claude = json.loads((folder / ".claude" / "settings.json").read_text())
@@ -515,9 +567,8 @@ def test_the_empty_agent_is_laid_named_and_bootstrapped(lab, tmp_path):
     folder = made.folder
     assert (folder / "context" / "identity" / "MISSION.md").is_file()
     assert (folder / ".env.local").is_file() and (folder / ".contextkit" / "README.md").is_file()
-    identity = json.loads((folder / "capabilities" / "project.json").read_text())
     assert lab.sql(f"SELECT name, migrated_at IS NOT NULL FROM {SCHEMA}.capabilities_agents "
-                   "WHERE id = %s", (identity["id"],)) == [("Probe", True)]
+                   "WHERE id = %s", (_bound(folder),)) == [("Probe", True)]
     log = subprocess.run(["git", "log", "--format=%s"], cwd=folder, text=True,
                          capture_output=True)
     assert log.stdout.strip() == "ContextKit pre-bootstrap checkpoint"
