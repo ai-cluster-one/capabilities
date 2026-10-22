@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-22 — A first login that fails leaves nothing, and app-check says why in words
+
+Under `--events`, a connection's first `login` - it binds no account and has no session file - that ends in a refusal, an error, closed input or a cancellation (SIGTERM, SIGINT, SIGHUP, refused as `cancelled`, exit 6) removes the connection through `connection remove` and the session file and folder it made; a connection that was ever signed in is never touched, and without `--events` the verb is unchanged. The session file is written owner-only (0600) in an owner-only folder. `app-check` gives every verdict but `accepted` a `message`, one sentence a person can be shown, beside `error`.
+
 ## 2026-10-22 — The service's prompts are versions in the store
 
 The service's prompts - `context`, `delegation`, `job-worker`, the voice prompts and each `context.<name>` - are kept as versions in `telegram_prompts`, a table of telegram's own that the register's ledger creates as step `0005-prompts` (version 1.2). Each save is a new version, one per key is active, and the store refuses any change to a saved version, so earlier versions stay readable. `telegram prompts import [DIR]` saves the service directory's files, `export [DIR]` writes the active versions back as files, `put <key>` saves one version (`--base` refuses a save over a version the writer did not read, exit 6 `conflict`), and `list`, `versions <key>` and `show <key> [--version ID]` read them. The daemon reads a key's active version, and its file only while the store holds no version of that key, so a project that has not imported keeps running on its files as before; while the store does not answer, the daemon keeps the versions it last read and reads the file of any key it has not read yet. Reference documents stay files.

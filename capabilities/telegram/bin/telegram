@@ -97,7 +97,11 @@ Commands:
                                                time one expires, for up to five minutes;
                                                phone_needed; code_needed; password_needed
                                                with the account's hint; done; error) and
-                                               each answer as one line on stdin.
+                                               each answer as one line on stdin. A first
+                                               login under `--events` that fails or is
+                                               cancelled (SIGTERM, SIGINT, SIGHUP) removes
+                                               the connection and the session file it
+                                               made. The session file is owner-only (0600).
   telegram app-check                           Ask Telegram whether it accepts the app
                                                this machine signs in through (`--connection`
                                                names a connection's app instead), by asking
@@ -107,8 +111,9 @@ Commands:
                                                the id and hash; exit 2), or `refused`, with
                                                `reason` `blocked` (exit 2), `flood_limited`
                                                and `retry_after` seconds (exit 5), or
-                                               `other` (exit 5); `error` carries what
-                                               Telegram answered.
+                                               `other` (exit 5); `message` says why in
+                                               a sentence a person can be shown, and
+                                               `error` carries what Telegram answered.
   telegram whoami                              Identity of the signed-in account.
   telegram chats [--limit N]                   List recent dialogs. Beside `id`, `name`,
                                                `unread` and `kind` (the raw Telegram
@@ -908,12 +913,22 @@ def _cmd_connections() -> None:
     _emit(_connections_report())
 
 
+def _session_file(session: str) -> Path:
+    """The file a session name is kept in, named as Telethon names it."""
+    path = Path(session).expanduser()
+    return path if path.name.endswith(".session") else \
+        path.with_name(path.name + ".session")
+
+
 def make_client(cfg: dict) -> TelegramClient:
     """Build a client from a resolved connection config — the api id + app hash
-    identify the app, the session FILE holds the persisted login."""
+    identify the app, the session FILE holds the persisted login, and only its
+    owner may read it."""
     session_path = Path(cfg["session"]).expanduser()
-    session_path.parent.mkdir(parents=True, exist_ok=True)
+    session_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     client = TelegramClient(str(session_path), cfg["api_id"], cfg["api_hash"])
+    with contextlib.suppress(OSError):
+        _session_file(str(session_path)).chmod(0o600)
     client._cap_expected_account_id = cfg.get("expected_account_id")
     client._cap_connection_id = cfg.get("id")
     return client
@@ -1084,16 +1099,21 @@ async def _probe_app(api_id: int, api_hash: str) -> dict:
             api_id=api_id, api_hash=api_hash, except_ids=[]))
         return {"status": "accepted"}
     except RPCError as e:
-        error = {"name": _rpc_error_name(e), "code": getattr(e, "code", None),
-                 "message": str(e)}
+        name = _rpc_error_name(e)
+        error = {"name": name, "code": getattr(e, "code", None), "message": str(e)}
         if isinstance(e, ApiIdInvalidError):
-            return {"status": "invalid", "error": error}
+            return {"status": "invalid", "error": error,
+                    "message": f"Telegram does not know this api_id and api_hash ({name})"}
         if isinstance(e, ApiIdPublishedFloodError):
-            return {"status": "refused", "reason": "blocked", "error": error}
+            return {"status": "refused", "reason": "blocked", "error": error,
+                    "message": f"Telegram has blocked this api_id from signing in ({name})"}
         if isinstance(e, FloodWaitError):
             return {"status": "refused", "reason": "flood_limited",
-                    "retry_after": e.seconds, "error": error}
-        return {"status": "refused", "reason": "other", "error": error}
+                    "retry_after": e.seconds, "error": error,
+                    "message": f"Telegram asks to wait {e.seconds}s before trying "
+                               f"again ({name})"}
+        return {"status": "refused", "reason": "other", "error": error,
+                "message": f"Telegram refused the app ({name}): {e}"}
     finally:
         await client.disconnect()
 
@@ -1164,7 +1184,100 @@ def cmd_doctor(wanted: str | None) -> None:
         sys.exit(fail_exit)
 
 
+# Set once a login has signed an account in, after which nothing it made is
+# taken back, whatever happens to the rest of the run.
+_LINKED = [False]
+
+
+def _cancel_link(signum, _frame) -> NoReturn:
+    import signal
+    _die(6, "cancelled",
+         f"the login was cancelled ({signal.Signals(signum).name}) before it completed",
+         "start the login again")
+
+
+@contextlib.contextmanager
+def _first_link(wanted: str | None, session_flag: str | None):
+    """Leave nothing behind when a connection's first login does not complete.
+
+    A program driving the ceremony with `--events` adds the connection and then
+    signs it in, and a login that fails or is cancelled would leave a
+    connection with no session behind it. So when the connection has never
+    been signed in here - it binds no account and has no session file - and
+    the login ends in a refusal, an error or a cancellation, the session file
+    it made and the connection are taken out again. A connection that was ever
+    signed in is never touched, and without `--events` the verb is unchanged."""
+    import signal
+    if not _EVENTS_ON[0] or session_flag:
+        yield
+        return
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    if not isinstance(entry, dict) or entry.get("expected_account_id"):
+        yield
+        return
+    folder = _state_dir() / cid
+    session = _session_file(entry.get("session") or str(folder / "session"))
+    if session.exists():
+        yield
+        return
+    made = [path for path in (folder, session.parent) if not path.exists()]
+    cancelling = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    previous = {sig: signal.signal(sig, _cancel_link) for sig in cancelling}
+    try:
+        yield
+    except BaseException:
+        if not _LINKED[0]:
+            for sig in cancelling:
+                signal.signal(sig, signal.SIG_IGN)
+            for path in (session, session.with_name(session.name + "-journal")):
+                path.unlink(missing_ok=True)
+            for path in made:
+                shutil.rmtree(path, ignore_errors=True)
+            ok, answer = _connection_verb("remove", cid)
+            _log(f"removed connection {cid!r}, whose first login did not complete"
+                 if ok else f"connection {cid!r} was left as it is: "
+                            f"{answer.get('message')}")
+        raise
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _connection_verb(sub: str, cid: str, *options: str) -> tuple[bool, dict]:
+    """The contract's own `connection add|remove` for one connection, at the
+    scope that holds it, answered rather than printed: a linking ceremony
+    speaks one result, and this is a step inside it."""
+    if _project_root() is None:
+        scope = "--machine"
+    else:
+        try:
+            held = _records().resolve_scope(NAME, "connection", "project")
+        except StoreError as exc:
+            return False, {"code": exc.slug, "message": exc.message}
+        scope = "--project" if cid in held else "--global"
+    events, _EVENTS_ON[0] = _EVENTS_ON[0], False
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            _cmd_connection([sub, cid, scope, *options])
+        ok = True
+    except SystemExit as exc:
+        ok = not exc.code
+    finally:
+        _EVENTS_ON[0] = events
+    # The answer is the whole of stdout; a refusal is the last line of stderr.
+    text = out.getvalue().strip() if ok else \
+        (err.getvalue().strip().splitlines() or [""])[-1]
+    try:
+        answer = json.loads(text) if text else {}
+    except ValueError:
+        answer = {"message": text}
+    return ok, (answer if ok else answer.get("error", answer))
+
+
 def _login_result(cfg: dict, me, **extra) -> dict:
+    _LINKED[0] = True
     out = {"ok": True, "connection": cfg["id"],
            "logged_in_as": entity_label(me), "id": me.id, **extra}
     if cfg.get("expected_account_id") is None:
@@ -5008,6 +5121,14 @@ def main() -> None:
             _emit(cmd_service_validate(args.scope, args.key))
         return
 
+    with (_first_link(connection_flag, session_flag) if args.cmd == "login"
+          else contextlib.nullcontext()):
+        _connection_command(args, connection_flag, session_flag)
+
+
+def _connection_command(args, connection_flag: str | None,
+                        session_flag: str | None) -> None:
+    """A verb that acts through one connection's session."""
     cfg = _load_config(
         connection_flag, session_flag, allow_discovery=args.cmd == "login")
     _write_gate(cfg["id"], cfg["allow_write"], args.cmd)

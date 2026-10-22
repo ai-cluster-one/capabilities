@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-10-22 — A connection is linked by QR before it names an account, and a first link that fails leaves nothing
+
+`whatsapp pair --qr` links an in-house connection that has neither `number` nor `expected_account_id`, where it refused as `no_account_identity` before the QR was shown: it pairs in a home named for the connection, keys the store by the account once the pairing names it, writes that account to the connection as `expected_account_id` (`identity_bound` in the result) and moves the home under the account. `pair --events` on such a connection asks `phone_needed` for a pairing code. Under `--events`, a connection's first link - it binds no account and has no state home - that ends in a refusal, an error, closed input or a cancellation (SIGTERM, SIGINT, SIGHUP, refused as `cancelled`, exit 6) removes the connection through `connection remove` and the home it made; a connection that was ever linked is never touched, and without `--events` the verb is unchanged.
+
 ## 2026-10-22 — A reconnect no longer kills the assistant service later
 
 Each session the assistant service opens gives the engine a client of its own, where every session on one device used to share one; a closed session's client, once collected, then stopped the live one and the next send or account lookup ended the process with a nil-pointer panic in `main.GetMe`, losing the message it was sending. An account lookup on a session that is already closed is refused as `not_connected`, exit 5, instead of reaching the engine.

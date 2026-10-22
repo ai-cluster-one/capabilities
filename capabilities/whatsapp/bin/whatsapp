@@ -306,6 +306,14 @@ Commands
                                        arrives; pairing_code; phone_needed, when
                                        no number is known, answered by one line
                                        on stdin; linked; progress; done; error).
+                                       A connection that names no account yet is
+                                       linked all the same, and the account the
+                                       link answers for is written to it as
+                                       expected_account_id (`identity_bound` in
+                                       the result). A first link under --events
+                                       that fails or is cancelled (SIGTERM,
+                                       SIGINT, SIGHUP) removes the connection
+                                       and the state it made.
                                        --days sets the burst window (default: the
                                        connection's initial_sync_days, else 30);
                                        --full asks for everything the phone still
@@ -490,6 +498,7 @@ import base64
 import contextlib
 import datetime
 import fcntl
+import io
 import itertools
 import json
 import os
@@ -497,6 +506,7 @@ import platform
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -858,11 +868,16 @@ def _messages_dir_for(entry: dict) -> str | None:
 
 
 def _build_cfg(cid: str, entry: dict | None,
-               session_flag: str | None = None) -> tuple[dict | None, dict | None]:
+               session_flag: str | None = None, *,
+               pairing: bool = False) -> tuple[dict | None, dict | None]:
     """Materialize one connection into the config dict every command consumes.
     Returns (cfg, problem) — problem is an error dict ({"exit", "code",
     "message", "hint"?}) instead of a die, so doctor can report every connection
-    rather than stopping at the first."""
+    rather than stopping at the first.
+
+    `pairing` lets an in-house connection that names no account yet resolve
+    for `pair` alone: it pairs in a home named for the connection, with no
+    account to key the store by until the pairing says whose it is."""
     entry = entry if isinstance(entry, dict) else {}
     engine, waha_engine, _stated = _entry_engine(entry)
     allow_write = bool(entry.get("allow_write", WRITE_DEFAULT))
@@ -895,6 +910,15 @@ def _build_cfg(cid: str, entry: dict | None,
             return None, {"exit": 6, "code": "bad_sync_days",
                           "message": f"connection {cid!r}: initial_sync_days must be >= 1"}
         key = cfg["expected_account_id"] or cfg["number"]
+        if not key and pairing:
+            cfg.update({
+                "account_key": None,
+                "unbound": True,
+                "home": str(_state_dir() / cid),
+                "device_name": entry.get("device_name") or None,
+                "initial_sync_days": days,
+            })
+            return cfg, None
         if not key:
             return None, {
                 "exit": 6, "code": "no_account_identity",
@@ -902,7 +926,8 @@ def _build_cfg(cid: str, entry: dict | None,
                            f"engine keeps a capture under the account's own "
                            f"identity rather than under the connection's name",
                 "hint": "add the account's phone number as `number` (digits "
-                        "with country code), or pin it as expected_account_id"}
+                        "with country code), pin it as expected_account_id, or "
+                        f"link it with `{NAME} pair --qr`, which binds it"}
         cfg.update({
             "account_key": key,
             "home": str(_account_home(key, cid)),
@@ -2482,7 +2507,9 @@ class Session:
         self.cfg = cfg
         self.props = props
         self.home = _connection_home(cfg)
-        self.db = _open_store(cfg)
+        # A connection paired before it names an account has no rows to key
+        # yet; its store opens once the pairing says whose account it is.
+        self.db = None if cfg.get("unbound") else _open_store(cfg)
         self.errors: list[str] = []
         self.chunks: list[dict] = []
         self.live_messages = 0
@@ -2558,7 +2585,7 @@ class Session:
                 self.errors.append("qr payload could not be decoded")
 
         client.event(ev.ConnectedEv)(self._guard(lambda e: self._connected.set()))
-        client.event(ev.PairStatusEv)(self._guard(lambda e: self._paired.set()))
+        client.event(ev.PairStatusEv)(self._guard(self._on_pair))
         client.event(ev.LoggedOutEv)(self._guard(lambda e: self._logged_out.set()))
         client.event(ev.OfflineSyncCompletedEv)(self._guard(self._on_offline))
         client.event(ev.OfflineSyncPreviewEv)(self._guard(self._on_preview))
@@ -2573,6 +2600,19 @@ class Session:
             self.disconnect_reason = name
             self._disconnected.set()
         return note
+
+    def _on_pair(self, event) -> None:
+        # Bound here, before the link reconnects, so the burst that follows
+        # it lands under the account rather than nowhere.
+        if self.db is None:
+            self.bind(_digits(getattr(getattr(event, "ID", None), "User", None)))
+        self._paired.set()
+
+    def bind(self, account: str | None) -> None:
+        """Key an unbound pairing's store by the account it linked."""
+        if self.db is None and account:
+            self.cfg["account_key"] = account
+            self.db = _open_store(self.cfg)
 
     def _on_preview(self, event) -> None:
         _log(f"  queued for this device: {event.Total} item(s), "
@@ -3642,6 +3682,9 @@ def _wm_pair(cfg: dict, args) -> None:
                 _refuse(7, "never_linked",
                      "the device was not linked before the request expired",
                      f"re-run `{NAME} pair --connection {cfg['id']}` to get a new code")
+            _LINKED[0] = True
+            if session.db is None:
+                session.bind(session.account()["id"])
             account = session.require_account()
             _event("linked", account=account)
             _event("progress", message="capturing the one-time history burst",
@@ -3656,6 +3699,23 @@ def _wm_pair(cfg: dict, args) -> None:
         finally:
             session.close()
 
+    bound = None
+    if cfg.get("unbound") and account.get("id"):
+        # Nothing named the account before the pairing did, so the pairing is
+        # what binds it, and the home it paired in moves under the account.
+        ok, answer = _connection_verb("add", cfg["id"], "--replace", "--field",
+                                      f"expected_account_id={account['id']}")
+        if ok:
+            cfg["expected_account_id"] = account["id"]
+            bound = {"connection": cfg["id"], "expected_account_id": account["id"],
+                     "registry": answer.get("registry")}
+            home = _state_dir() / account["id"]
+            if not home.exists():
+                Path(cfg["home"]).rename(home)
+                cfg["home"] = str(home)
+        else:
+            _log(f"the account could not be bound to {cfg['id']!r}: "
+                 f"{answer.get('message')}")
     facts = _store_facts(cfg)
     result = {"ok": not errors, "connection": cfg["id"],
               "method": "qr" if args.qr else "pairing_code",
@@ -3664,7 +3724,9 @@ def _wm_pair(cfg: dict, args) -> None:
               "captured": {"chunks": len(session.chunks),
                            "chats": facts["chats"], "messages": facts["messages"]},
               "store": facts["location"]}
-    if not cfg.get("expected_account_id") and account.get("id"):
+    if bound:
+        result["identity_bound"] = bound
+    elif not cfg.get("expected_account_id") and account.get("id"):
         result["identity_binding"] = {
             "connection": cfg["id"], "expected_account_id": account["id"],
             "instruction": "set expected_account_id on this connection so a "
@@ -6154,9 +6216,101 @@ def cmd_health(args):
 
 
 def cmd_pair(args):
-    cfg = get_config(args)
-    _refuse_foreign_flags(cfg, args)
-    return _waha_pair(cfg, args) if cfg["engine"] == ENGINE_WAHA else _wm_pair(cfg, args)
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, getattr(args, "connection", None))
+    with _first_link(cid, entry):
+        cfg, problem = _build_cfg(cid, entry, getattr(args, "session", None),
+                                  pairing=True)
+        if problem:
+            _refuse(problem["exit"], problem["code"], problem["message"],
+                    problem.get("hint"))
+        _refuse_foreign_flags(cfg, args)
+        return _waha_pair(cfg, args) if cfg["engine"] == ENGINE_WAHA else _wm_pair(cfg, args)
+
+
+# Set once a pairing has linked a device, after which nothing it made is
+# taken back, whatever happens to the rest of the run.
+_LINKED = [False]
+
+
+def _cancel_link(signum, _frame) -> NoReturn:
+    _refuse(6, "cancelled",
+            f"the link was cancelled ({signal.Signals(signum).name}) before it completed",
+            "start the link again")
+
+
+@contextlib.contextmanager
+def _first_link(cid: str, entry: dict | None):
+    """Leave nothing behind when a connection's first link does not complete.
+
+    A program driving the ceremony with `--events` adds the connection and then
+    links it, and a link that fails or is cancelled would leave a connection
+    that names no linked device. So when the connection has never been linked
+    here - it binds no account and has no state home - and the link ends in a
+    refusal, an error or a cancellation, the home it made and the connection
+    are taken out again. A connection that was ever linked is never touched,
+    and without `--events` the verb is unchanged."""
+    entry = entry if isinstance(entry, dict) else {}
+    engine, _waha_engine, _stated = _entry_engine(entry)
+    root = _state_dir()
+    homes = {root / cid}
+    if _digits(entry.get("number")):
+        homes.add(root / _digits(entry.get("number")))
+    if (not _EVENTS_ON[0] or engine != ENGINE_INHOUSE
+            or _digits(entry.get("expected_account_id"))
+            or any(home.exists() for home in homes)):
+        yield
+        return
+    cancelling = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    previous = {sig: signal.signal(sig, _cancel_link) for sig in cancelling}
+    try:
+        yield
+    except BaseException:
+        if not _LINKED[0]:
+            for sig in cancelling:
+                signal.signal(sig, signal.SIG_IGN)
+            for home in homes:
+                shutil.rmtree(home, ignore_errors=True)
+            ok, answer = _connection_verb("remove", cid)
+            _log(f"removed connection {cid!r}, whose first link did not complete"
+                 if ok else f"connection {cid!r} was left as it is: "
+                            f"{answer.get('message')}")
+        raise
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _connection_verb(sub: str, cid: str, *options: str) -> tuple[bool, dict]:
+    """The contract's own `connection add|remove` for one connection, at the
+    scope that holds it, answered rather than printed: a linking ceremony
+    speaks one result, and this is a step inside it."""
+    if _project_root() is None:
+        scope = "--machine"
+    else:
+        try:
+            held = _records().resolve_scope(NAME, "connection", "project")
+        except StoreError as exc:
+            return False, {"code": exc.slug, "message": exc.message}
+        scope = "--project" if cid in held else "--global"
+    events, _EVENTS_ON[0] = _EVENTS_ON[0], False
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            _cmd_connection([sub, cid, scope, *options])
+        ok = True
+    except SystemExit as exc:
+        ok = not exc.code
+    finally:
+        _EVENTS_ON[0] = events
+    # The answer is the whole of stdout; a refusal is the last line of stderr.
+    text = out.getvalue().strip() if ok else \
+        (err.getvalue().strip().splitlines() or [""])[-1]
+    try:
+        answer = json.loads(text) if text else {}
+    except ValueError:
+        answer = {"message": text}
+    return ok, (answer if ok else answer.get("error", answer))
 
 
 def cmd_chats(args):
