@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.8,<1",
+#     "capabilities-contract>=0.10,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -92,7 +92,8 @@ THE PROJECT ENVELOPE
   and each capability's identifiers, references, connections, settings and
   state — sits in one envelope; records are kept in files, except the
   connections, grants, identifiers and policy of a project in store mode,
-  which its store holds (see `connections import`). In a project
+  which its store holds (see `connections import`), and the references
+  a project imported into its store (see `references`). In a project
   bound by `.contextkit/config.toml` its location is read from that binding:
   `[body] root`, the folder holding the agent's body, and `[sources]
   capabilities` inside it (`.capabilities` names the legacy project-root
@@ -739,6 +740,35 @@ PROJECT VERBS (run inside a consuming project)
         Render <name>'s project identifiers as markdown — the full labelled
         list the session context points to. (`<name> ids get|set|rm` is the
         per-value data interface on the capability itself.)
+  references list [<name>] | show <name> <ref> [--version ID]
+             | history <name> <ref>
+             | save <name> <ref> --from FILE|- [--base ID] [--note TEXT]
+             | retire <name> <ref> | import [<name>...] | export [<name>...]
+        This project's references in its store: every capability's, in one
+        versioned table, capabilities_references, keyed by project,
+        capability and name. A reference the store holds is what `<name>
+        refs` and `<name> context show|edit|put` read and write, before any
+        file of its key; one it does not hold is read from
+        capabilities/<name>/reference/ as before, and so is every reference
+        where no store answers. import reads each
+        capabilities/<name>/reference/*.md, of the capabilities named or of
+        all, byte for byte (UTF-8) as one version: a new reference, a new
+        version where the active one differs, nothing where it is equal;
+        every file is checked first and the whole import is written in one
+        transaction, or nothing is (exit 6 import_refused, naming each
+        file). export writes each active reference back to
+        capabilities/<name>/reference/<ref>.md byte for byte, leaving a file
+        already equal alone, and names under files_left the files the store
+        does not hold. save adds a version from FILE or stdin; --base names
+        the version (its id, or a prefix of six or more characters) the edit
+        was made from, and the save is refused (exit 6 stale_base) when
+        another is active now; a body equal to the active one adds nothing
+        ("changed": false). history lists every version, newest first; show
+        prints the active body, or the one --version names, exactly; retire
+        leaves a reference no active version, keeping every version, so its
+        file is read again. A write stamps the project id, verified; every
+        verb but list, show and history is exit 4 under the read-only switch,
+        and 5 where the store cannot be reached.
   get <name> <collection> <key>
         Read one resolved configuration record from wherever this project keeps
         its records. Collections are connection, grant, identifier, setting,
@@ -1235,7 +1265,9 @@ def _store_module():
 # whether the switch is on is the store tier's answer, never the manager's own.
 READ_ONLY_REFUSED_VERBS = ("agent set", "allow", "connections import", "disable",
                            "enable", "inherit", "init", "node add", "node remove",
-                           "node set", "quarantine", "relabel", "set",
+                           "node set", "quarantine", "references export",
+                           "references import", "references retire", "references save",
+                           "relabel", "set",
                            "store set", "store unset")
 
 
@@ -8373,6 +8405,249 @@ def cmd_ids(name: str) -> None:
             line += f" — {note}"
         lines.append(line)
     _emit("\n".join(lines) + "\n")
+
+
+REFERENCES_USAGE = ("capabilities references list [<name>] | show <name> <ref> [--version ID] | "
+                    "history <name> <ref> | save <name> <ref> --from FILE|- [--base ID] "
+                    "[--note TEXT] | retire <name> <ref> | import [<name>...] | "
+                    "export [<name>...]")
+
+
+def _references_project(root: Path, write: bool) -> str:
+    """The id the project's references are kept under; a write refuses where
+    it is not verified, and every verb refuses a project without one."""
+    agent_id = _project_id_for_write(root) if write else _project_id_state(root)["id"]
+    if not agent_id:
+        _die(6, "no_project_identity",
+             f"this project has no id: neither the environment nor its .env.local or "
+             f".env sets {PROJECT_ID_ENV}",
+             "run `capabilities init` in the project to give it its identity")
+    return agent_id
+
+
+def _references_name(name: str) -> str:
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+        _die(6, "bad_name", f"invalid capability name {name!r}",
+             "use lowercase letters, digits, and hyphens; start with a letter")
+    return name
+
+
+def _reference_files(envelope: Path, names: list[str]) -> tuple[dict, list, list]:
+    """Every `<name>/reference/*.md` of the envelope, of the capabilities named
+    or of all: ({(capability, name): body}, refused [{path, reason}], skipped
+    paths). Each file is read whole, as bytes, and must be UTF-8."""
+    store = _store_module()
+    if names:
+        folders = [(name, envelope / name / "reference") for name in names]
+    else:
+        folders = [(child.name, child / "reference")
+                   for child in sorted(envelope.iterdir()) if child.is_dir()
+                   and re.fullmatch(r"[a-z][a-z0-9-]*", child.name)] \
+            if envelope.is_dir() else []
+    found: dict = {}
+    refused: list = []
+    skipped: list = []
+    for capability, folder in folders:
+        if not folder.is_dir():
+            continue
+        keys: dict = {}
+        for path in sorted(folder.iterdir()):
+            if not path.is_file() or path.suffix != ".md":
+                skipped.append(str(path))
+                continue
+            name = path.stem
+            if not store.reference_name_ok(name):
+                refused.append({"path": str(path), "reason": "its name cannot name a reference"})
+                continue
+            key = store.reference_key(name)
+            if key in keys:
+                refused.append({"path": str(path),
+                                "reason": f"its key {key} is also {keys[key]}.md's"})
+                continue
+            try:
+                body = path.read_bytes().decode("utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                refused.append({"path": str(path), "reason": f"unreadable as UTF-8: {exc}"})
+                continue
+            keys[key] = name
+            found[(capability, name)] = body
+    return found, refused, skipped
+
+
+def _references_conn(root: Path, write: bool):
+    """A connection to the project's store, its tables migrated for a write. A
+    read that finds no table answers as a store that holds no reference."""
+    if write:
+        return _kernel_open(root)[0]
+    db = _db_module()
+    try:
+        return db.connect(application_name=_store_module().STORE_OWNER,
+                          setting=db.resolve_setting(root), transaction=True)
+    except db.DbError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+
+
+def _references_read(work):
+    import psycopg
+    try:
+        return work()
+    except psycopg.errors.UndefinedTable:
+        return None
+    except psycopg.Error as exc:
+        _die(5, "store_unreachable", f"cannot read the references: {exc}",
+             "check the database setting with `capabilities store doctor`")
+
+
+def cmd_references(args: list[str]) -> None:
+    """A project's references in its store, versioned: every capability's
+    `capabilities/<name>/reference/*.md`, imported from the folder and exported
+    back to it byte for byte, read by every capability before its files."""
+    if not args:
+        _die(6, "input", "references needs a subcommand", REFERENCES_USAGE)
+    sub, rest = args[0], list(args[1:])
+    store = _store_module()
+
+    def take(option: str) -> str | None:
+        if option not in rest:
+            return None
+        i = rest.index(option)
+        if i + 1 >= len(rest):
+            _die(6, "input", f"{option} needs a value", REFERENCES_USAGE)
+        value = rest[i + 1]
+        del rest[i:i + 2]
+        return value
+
+    version = take("--version") if sub == "show" else None
+    source = take("--from") if sub == "save" else None
+    base = take("--base") if sub == "save" else None
+    note = take("--note") if sub == "save" else None
+    unknown = [a for a in rest if a.startswith("--")]
+    if unknown:
+        _die(6, "input", f"unknown references option {unknown[0]!r}", REFERENCES_USAGE)
+    writes = sub in ("save", "retire", "import", "export")
+    if sub not in ("list", "show", "history") and not writes:
+        _die(6, "input", f"unknown references subcommand {sub!r}", REFERENCES_USAGE)
+    if writes:
+        _read_only_gate(f"references {sub}")
+    pair = sub in ("show", "history", "save", "retire")
+    if pair and len(rest) != 2:
+        _die(6, "input", f"references {sub} needs <name> <ref>", REFERENCES_USAGE)
+    if sub == "list" and len(rest) > 1:
+        _die(6, "input", "references list takes at most one capability name",
+             REFERENCES_USAGE)
+    if sub == "save" and source is None:
+        _die(6, "input", "references save needs --from FILE or --from -", REFERENCES_USAGE)
+    names = [_references_name(n) for n in (rest[:1] if pair else rest)]
+    root = _require_project()
+    envelope = _project_capabilities_dir(root)
+    agent_id = _references_project(root, writes)
+    if sub == "save":
+        try:
+            raw = sys.stdin.buffer.read() if source == "-" else Path(source).read_bytes()
+            body = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            _die(6, "unreadable", f"cannot read {source} as UTF-8: {exc}")
+    elif sub == "import":
+        found, refused, skipped = _reference_files(envelope, names)
+        if refused:
+            _die(6, "import_refused",
+                 "these files cannot be imported, so nothing was: " + "; ".join(
+                     f"{r['path']}: {r['reason']}" for r in refused),
+                 "rename or repair each file and run the import again")
+    conn = _references_conn(root, writes)
+    author = f"{store._user_name()}@{store.node_name()}"
+    try:
+        if sub == "list":
+            rows = _references_read(lambda: store.stored_references(
+                conn, agent_id, names[0] if names else None)) or []
+            _emit({"project": agent_id, "references": [
+                {k: row[k] for k in ("capability", "name", "key", "version", "hash",
+                                     "created_at", "created_by")} for row in rows]})
+            return
+        if sub in ("show", "history"):
+            history = _references_read(lambda: store.reference_history(
+                conn, agent_id, names[0], rest[1])) or []
+            if not history:
+                _die(3, "not_found", f"the store holds no reference {names[0]}/{rest[1]}",
+                     f"`capabilities references list {names[0]}` lists them")
+            if sub == "history":
+                _emit({"capability": names[0], "name": rest[1], "versions": [
+                    {k: row[k] for k in ("version", "name", "hash", "active", "created_at",
+                                         "created_by", "note")} for row in history]})
+                return
+            if version is None:
+                chosen = [row for row in history if row["active"]]
+                if not chosen:
+                    _die(3, "not_found", f"{names[0]}/{rest[1]} is retired",
+                         f"`capabilities references history {names[0]} {rest[1]}` "
+                         "lists its versions")
+            else:
+                wanted = version.strip().lower()
+                chosen = [row for row in history if row["version"].startswith(wanted)] \
+                    if len(wanted) >= 6 else []
+                if len(chosen) != 1:
+                    _die(3, "not_found", f"{version!r} names no single version of "
+                         f"{names[0]}/{rest[1]}",
+                         f"`capabilities references history {names[0]} {rest[1]}` lists them")
+            sys.stdout.write(chosen[0]["body"])
+            return
+        import psycopg
+        try:
+            with conn.transaction():
+                if sub == "save":
+                    done = store.reference_save(conn, agent_id, names[0], rest[1], body,
+                                                author, base_version=base, note=note)
+                    report = {"saved": f"{names[0]}/{rest[1]}", **done}
+                elif sub == "retire":
+                    retired = store.reference_retire(conn, agent_id, names[0], rest[1])
+                    if retired is None:
+                        raise store.StoreError(
+                            "not_found",
+                            f"the store holds no active reference {names[0]}/{rest[1]}",
+                            f"`capabilities references list {names[0]}` lists them")
+                    report = {"retired": f"{names[0]}/{rest[1]}", "version": retired}
+                elif sub == "import":
+                    outcomes = []
+                    for (capability, name), text in sorted(found.items()):
+                        done = store.reference_save(conn, agent_id, capability, name, text,
+                                                    author, check_base=False)
+                        outcomes.append({"capability": capability, "name": name,
+                                         "version": done["version"],
+                                         "outcome": ("unchanged" if not done["changed"]
+                                                     else "changed" if done["previous"]
+                                                     else "added")})
+                    report = {"project": agent_id, "imported": outcomes,
+                              "skipped": skipped}
+                else:
+                    rows = [row for row in store.stored_references(conn, agent_id)
+                            if not names or row["capability"] in names]
+                    outcomes, held = [], set()
+                    for row in rows:
+                        path = envelope / row["capability"] / "reference" / f"{row['name']}.md"
+                        held.add(path)
+                        data = row["body"].encode("utf-8")
+                        same = path.is_file() and path.read_bytes() == data
+                        if not same:
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_bytes(data)
+                        outcomes.append({"capability": row["capability"], "name": row["name"],
+                                         "version": row["version"], "path": str(path),
+                                         "outcome": "unchanged" if same else "written"})
+                    others, _refused, _skipped = _reference_files(
+                        envelope, names or sorted({row["capability"] for row in rows}))
+                    left = sorted(str(envelope / cap / "reference" / f"{name}.md")
+                                  for cap, name in others
+                                  if envelope / cap / "reference" / f"{name}.md" not in held)
+                    report = {"project": agent_id, "exported": outcomes,
+                              "files_left": left}
+        except store.StoreError as exc:
+            _die(3 if exc.slug == "not_found" else 6, exc.slug, exc.message, exc.hint)
+        except psycopg.Error as exc:
+            _die(5, "store_unreachable", f"cannot write the references: {exc}",
+                 "check the database setting with `capabilities store doctor`")
+        _emit(report)
+    finally:
+        conn.close()
 
 
 def cmd_get(name: str, collection: str, key: str) -> None:
@@ -17865,6 +18140,8 @@ def main() -> None:
         if not pos:
             _die(6, "input", "ids needs a capability name")
         cmd_ids(pos[0])
+    elif cmd == "references":
+        cmd_references(rest)
     elif cmd == "migrate":
         cmd_migrate(rest)
     elif cmd == "connections":

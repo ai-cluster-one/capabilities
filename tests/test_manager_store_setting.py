@@ -901,13 +901,14 @@ def test_no_manager_verb_writes_a_record_into_the_store(tmp_path, enforced):
                 "capabilities_connection_grants", "capabilities_identifiers",
                 "capabilities_policy", "capabilities_agents", "capabilities_agent_nodes",
                 "capabilities_global", "capabilities_settings",
-                "capabilities_settings_documents", "capabilities_settings_changes"}
+                "capabilities_settings_documents", "capabilities_settings_changes",
+                "capabilities_references"}
             schema = tables[0][0]
             for table in ("capabilities_connections", "capabilities_connection_grants",
                           "capabilities_identifiers", "capabilities_policy",
                           "capabilities_agent_nodes", "capabilities_settings",
                           "capabilities_settings_documents",
-                          "capabilities_settings_changes"):
+                          "capabilities_settings_changes", "capabilities_references"):
                 cur.execute(f"SELECT count(*) FROM {schema}.{table}")
                 assert cur.fetchone() == (0,), table
             cur.execute(f"SELECT id FROM {schema}.capabilities_agents")
