@@ -1730,18 +1730,22 @@ def _move_project_id(root: Path, move: bool = True) -> str | None:
     """The id the project's env files declare, after moving into .env.local,
     once, an id the project still holds where it was kept before: project.json
     (v1), else its ContextKit binding. project.json then holds no id. Under the
-    read-only switch, or without `move`, the id is answered and nothing is
-    written; the next process that may write moves it."""
+    read-only switch, without `move`, or where the project cannot be written,
+    the id is answered and nothing is written; the next process that may
+    write moves it."""
     move = move and not _store_module().read_only_switch()
     declared, _source = _env_file_project_id(root)
     legacy = _project_json_id(root)
-    if declared is None:
-        declared = legacy or _contextkit_config_id(root)
-        if declared is None or not move:
-            return declared
-        _write_env_local_id(root, declared)
-    if legacy is not None and legacy == declared and move:
-        _drop_project_json_id(root)
+    try:
+        if declared is None:
+            declared = legacy or _contextkit_config_id(root)
+            if declared is None or not move:
+                return declared
+            _write_env_local_id(root, declared)
+        if legacy is not None and legacy == declared and move:
+            _drop_project_json_id(root)
+    except OSError:
+        pass
     return declared
 
 

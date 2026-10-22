@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 MANAGER = Path(__file__).parents[1] / "bin" / "capabilities"
 TASKS = Path(__file__).parents[1] / "capabilities" / "tasks" / "bin" / "tasks"
@@ -250,6 +252,25 @@ def test_the_read_only_switch_answers_the_binding_held_id_without_writing(tmp_pa
 
     assert identity["id"] == "prj_0000000000d3"
     assert not (project / "capabilities" / "project.json").exists()
+    assert not (project / ".env.local").exists()
+
+
+def test_a_project_it_cannot_write_is_answered_its_id_unmoved(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root writes any folder")
+    project = _project(tmp_path, bound=False,
+                       copy={"schema": "capabilities.project.v1", "slug": "p",
+                             "id": "prj_0000000000e4"})
+    for path in (project, project / "capabilities", project / "capabilities" / "project.json"):
+        path.chmod(0o555 if path.is_dir() else 0o444)
+    try:
+        identity = _json(_run(tmp_path, project, "path", "--json", "--identity"))
+    finally:
+        for path in (project, project / "capabilities", project / "capabilities" / "project.json"):
+            path.chmod(0o755 if path.is_dir() else 0o644)
+
+    assert identity["project_identity"]["id"] == "prj_0000000000e4"
+    assert _copy(project)["id"] == "prj_0000000000e4"
     assert not (project / ".env.local").exists()
 
 

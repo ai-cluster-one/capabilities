@@ -2156,7 +2156,7 @@ def _inventory(_network: bool) -> dict:
     if slug:
         joined = None
         with contextlib.suppress(Exception):
-            joined = _read_projects().get(str(identity.get("id")))
+            joined = _read_projects().get(str(_project_id_state_at(root)["id"]))
         state = _machine_state_dir() if joined else _project_state_dir(slug)
         pid = _read_pid(state)
         if _pid_alive(pid):

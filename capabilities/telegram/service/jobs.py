@@ -421,6 +421,7 @@ def bound_project_id(root: Path) -> str:
             lines = (Path(root) / name).read_text().splitlines()
         except OSError:
             continue
+        found = ""  # the last line naming the key wins, as in any env file
         for line in lines:
             key, eq, value = line.strip().partition("=")
             key = key.strip()
@@ -428,8 +429,8 @@ def bound_project_id(root: Path) -> str:
                 key = key[len("export "):].strip()
             if eq and key == "CAPABILITIES_PROJECT_ID":
                 found = value.strip().strip('"').strip("'")
-                if found:
-                    return found
+        if found:
+            return found
     return ""
 
 
