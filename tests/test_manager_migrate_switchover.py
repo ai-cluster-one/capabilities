@@ -236,8 +236,9 @@ def dry_runs_change_nothing(w: World, version: str) -> dict:
     return dry
 
 
-def automations_ledger_behind(w: World) -> str:
-    """automations' own tables made by all but their last step."""
+def automations_ledger_behind(w: World) -> tuple[str, str]:
+    """automations' own tables made by all but their last step: that step, and
+    the version its runtime migrates them to."""
     import importlib.util
     import sys
     from capabilities_contract import db
@@ -253,7 +254,7 @@ def automations_ledger_behind(w: World) -> str:
         db.migrate(conn, runtime.LEDGER_OWNER, runtime.LEDGER_STEPS[:-1], major=1, minor=0)
     finally:
         conn.close()
-    return runtime.LEDGER_STEPS[-1][0]
+    return runtime.LEDGER_STEPS[-1][0], f"{runtime.LEDGER_MAJOR}.{runtime.LEDGER_MINOR}"
 
 
 def test_dry_runs_on_a_store_at_1_1_or_1_2_change_nothing_and_apply_upgrades(world):
@@ -265,11 +266,11 @@ def test_dry_runs_on_a_store_at_1_1_or_1_2_change_nothing_and_apply_upgrades(wor
     # At 1.2: the registry is there, the node on identifiers and the
     # settings tables are not; automations' tables are one step behind.
     upgrade_to(world, 13, 1, 2)
-    last = automations_ledger_behind(world)
+    last, current = automations_ledger_behind(world)
     dry = dry_runs_change_nothing(world, "1.2")
     assert dry["tables_to_upgrade"]["capabilities"]["steps"][0].startswith("0014")
     sched = world.answer(world.manager(world.roots["sched"], "migrate", "--dry-run"))
-    assert sched["tables_to_upgrade"]["automations"] == {"from": "1.0", "to": "1.1",
+    assert sched["tables_to_upgrade"]["automations"] == {"from": "1.0", "to": current,
                                                          "steps": [last]}
     applied = world.answer(world.manager(root, "migrate", "--global", "--apply"))
     assert applied["state"] == "migrated" and applied["changed"] is True

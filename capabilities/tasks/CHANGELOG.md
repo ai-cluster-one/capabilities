@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-22 — A process that ended is ended, collected or not
+
+On Linux the service counts a process that has exited and waits only to be collected - a zombie - as ended, wherever it asks whether its daemon, its machine process or a turn is still running. A daemon or an adopted turn that ends under an ancestor that never collects what it adopts, as a turn's own `tasks run` is, no longer reads as running: `service stop` answers once the daemon has exited instead of `service_stop_timeout`, `status` and `start` see it gone, and an adopted turn is let go when it ends. Elsewhere the judgement is as before.
+
 ## 2026-10-21 — A turn ends everything it started
 
 However a turn ends - answered, failed, handed back, past its profile's `timeout_seconds`, or ended by the service - every process it started ends with it, test databases, fake servers and commands sent to the background included. `tasks run --apply` makes itself the child subreaper of what it starts on Linux, so a daemon that detaches into a session of its own the way `pg_ctl start` starts a postmaster is handed to the turn rather than to init, and ends, with the rest of the turn's tree, its groups and its sessions, once the harness returns; a service that ends a running turn ends the same tree, found while the turn lives. Elsewhere only what stays in the turn's tree, its groups or its sessions is reached.

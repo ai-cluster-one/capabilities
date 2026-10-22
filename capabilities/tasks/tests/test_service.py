@@ -882,9 +882,7 @@ class Relay:
     def refuse(self) -> None:
         """Refuse new connections and leave the ones through it open, as a store
         that stops accepting does."""
-        listener, self.listener = self.listener, None
-        if listener is not None:
-            listener.close()
+        self._stop_listening()
 
     def stall(self) -> None:
         """Pass nothing more either way on the connections through it, holding
@@ -906,9 +904,7 @@ class Relay:
         threading.Thread(target=self._accept, args=(listener,), daemon=True).start()
 
     def down(self) -> None:
-        listener, self.listener = self.listener, None
-        if listener is not None:
-            listener.close()
+        self._stop_listening()
         with self.lock:
             pairs, self.pairs = self.pairs, []
         for pair in pairs:
@@ -918,6 +914,17 @@ class Relay:
                 except OSError:
                     pass
                 end.close()
+
+    def _stop_listening(self) -> None:
+        """Close the listener. On Linux one closed while a thread waits in its
+        accept() goes on accepting, so it is shut down first, which wakes it."""
+        listener, self.listener = self.listener, None
+        if listener is not None:
+            try:
+                listener.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            listener.close()
 
     def _accept(self, listener: socket.socket) -> None:
         while True:
@@ -1401,8 +1408,7 @@ def test_the_daemon_end_to_end_through_the_cli(lab):
 
     stopped = answer_of(tasks_cli(lab, "service", "stop"))
     assert stopped["stopped"] is True
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    assert not mod._service_module().pid_alive(pid)
     assert answer_of(tasks_cli(lab, "service", "status"))["running"] is False
 
 

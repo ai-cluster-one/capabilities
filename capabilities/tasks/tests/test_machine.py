@@ -555,12 +555,8 @@ def started_in(farm: Farm) -> list[str]:
             if match]
 
 
-def alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
+# The service's own judgement, under which a zombie has already ended.
+alive = mod._service_module().pid_alive
 
 
 @needs_store

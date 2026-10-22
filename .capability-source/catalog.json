@@ -172,7 +172,7 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "a8da1e7285b202f076ed9e67da1e2a197ef49a0d3f5c20de4159eacba1596f86",
+      "payload_sha256": "5f98c036eb02cfa6d1cf774dc11cfbf5f6b7a3c78e105848334e46d747413b26",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {
@@ -187,7 +187,7 @@
     },
     "whatsapp": {
       "path": "capabilities/whatsapp",
-      "payload_sha256": "4e282ecc79aab6d98df0e29e6dc494b25fe8f8ba70e9631d50067b162135251a",
+      "payload_sha256": "577540185029e5a59c71c9ac5f487ef11e4264f7136ac39145665c58af5e3b36",
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON."
     },
     "windmill": {

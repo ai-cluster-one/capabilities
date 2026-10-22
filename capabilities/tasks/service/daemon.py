@@ -180,15 +180,23 @@ def _at(seconds_ahead: float) -> str:
 
 
 def pid_alive(pid: int | None) -> bool:
+    """Whether `pid` is a process that has not ended. A zombie has ended: a
+    detached daemon or an adopted turn waits there for an ancestor to collect
+    it, and under a subreaper that never does it would wait for good."""
     if not pid or pid <= 0:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
+        pass
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as stat:
+            state = stat.read().rsplit(b")", 1)[1].split()[0]
+    except (OSError, IndexError):
         return True
+    return state != b"Z"
 
 
 def hold_awake(pid: int | None) -> subprocess.Popen | None:

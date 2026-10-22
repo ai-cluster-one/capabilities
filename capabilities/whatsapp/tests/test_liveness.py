@@ -291,17 +291,22 @@ class Process(unittest.TestCase):
     def test_a_blocked_loop_dumps_its_stacks_and_leaves_with_exit_9(self):
         self.start(stall=3.0)
         os.kill(self.proc.pid, signal.SIGUSR2)
+        blocked = time.monotonic()
         time.sleep(1.0)
         first = (wa._json_file(self.paths["health"]) or {}).get("updated_epoch")
-        time.sleep(1.2)
-        later = (wa._json_file(self.paths["health"]) or {}).get("updated_epoch")
-        # The heartbeat keeps its own time while the loop is blocked.
+        # The heartbeat keeps its own time while the loop is blocked: another
+        # beat lands before the stall limit, whenever its thread is woken.
+        later = first
+        while later == first and time.monotonic() - blocked < 2.8:
+            time.sleep(0.05)
+            later = (wa._json_file(self.paths["health"]) or {}).get("updated_epoch")
         self.assertGreater(later, first)
-        code, took = self.exit_within(15)
-        sys.stderr.write(f"\n  measured: stall limit 3s, exit {code} {took + 2.2:.1f}s "
+        code, _took = self.exit_within(15)
+        since = time.monotonic() - blocked
+        sys.stderr.write(f"\n  measured: stall limit 3s, exit {code} {since:.1f}s "
                          "after the loop blocked\n")
         self.assertEqual(code, wa.SERVICE_STALL_EXIT)
-        self.assertLess(took + 2.2, 3.0 + 2.0)
+        self.assertLess(since, 3.0 + 2.0)
         stderr = self.stderr_path.read_text()
         log = self.paths["log"].read_text()
         for text in (stderr, log):

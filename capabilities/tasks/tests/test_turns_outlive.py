@@ -48,12 +48,8 @@ cli, answer_of, poll_for = base.tasks_cli, base.answer_of, base.poll_for
 HELD = 10
 
 
-def alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
+# The service's own judgement, under which a zombie has already ended.
+alive = mod._service_module().pid_alive
 
 
 def lstart(pid: int) -> str:
