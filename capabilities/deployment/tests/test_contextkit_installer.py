@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Test suite for ContextKit public installer integration.
+"""Test suite for building ContextKit-bound projects with the capabilities manager.
 
 Validates that deployment capability:
 - Never vendors ContextKit or generated host wiring from consuming repos
-- Uses public installer for ContextKit projects
-- Generates correct build order: install ContextKit, copy project, install capabilities,
-  install hooks, build context, verify with doctor
+- Never installs or calls ContextKit in the image of a ContextKit-bound project
+- Generates correct build order: copy project, install capabilities, init,
+  verify with doctor, install hooks, build context
 - Excludes generated files from Docker build context
 - Preserves non-ContextKit behavior
 """
@@ -146,49 +146,33 @@ def test_dockerignore_excludes_contextkit(tmp_path: Path) -> None:
         "Should exclude .env.local (machine-local binding)"
 
     # Should have explanatory comment
-    assert "public installer" in dockerignore.lower(), \
-        "Should explain ContextKit is installed via public installer"
+    assert "rebuilt inside the image by the manager" in dockerignore.lower(), \
+        "Should explain the manager rebuilds generated context in the image"
 
     print("✓ .dockerignore excludes ContextKit product paths and generated files")
 
 
-def test_dockerfile_uses_public_installer(tmp_path: Path) -> None:
-    """Verify Dockerfile uses public installer instead of local copy."""
+def test_dockerfile_builds_context_with_the_manager(tmp_path: Path) -> None:
+    """Verify the Dockerfile wires and builds context with the manager, never ContextKit."""
     project = setup_test_project(tmp_path, with_contextkit=True, name="test-dockerfile")
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 
     dockerfile = (project / BUNDLE / "Dockerfile").read_text()
 
-    # Should use public installer
-    assert "https://raw.githubusercontent.com/ai-cluster-one/context-kit/" in dockerfile, \
-        "Should use public ContextKit installer URL"
-    assert "CONTEXTKIT_REF" in dockerfile, \
-        "Should use CONTEXTKIT_REF build arg"
-    assert "contextkit doctor" in dockerfile, \
-        "Should verify project with contextkit doctor"
-
-    # Should NOT copy local contextkit binary
+    # Should neither install nor call ContextKit
+    assert "context-kit" not in dockerfile, "Should not install ContextKit"
+    assert "CONTEXTKIT_REF" not in dockerfile, "Should not declare CONTEXTKIT_REF"
+    assert "contextkit " not in dockerfile, "Should not call ContextKit"
     assert ".contextkit/manager/contextkit" not in dockerfile, \
         "Should not reference local ContextKit manager binary"
 
-    # Should initialize, install hooks, and build context
-    assert "contextkit init" in dockerfile, \
-        "Should initialize ContextKit target-local bindings"
-    assert "contextkit install-hooks" in dockerfile, \
-        "Should install ContextKit hooks"
-    assert "contextkit build --target all" in dockerfile, \
-        "Should build ContextKit context"
-    assert "contextkit audit" in dockerfile, \
-        "Should audit built ContextKit context"
-
-    # Should install both target hooks
-    assert "contextkit install-hooks --target codex --target claude" in dockerfile, \
-        "Should install hooks for both codex and claude targets"
-
-    # Should initialize capabilities for both targets
+    # Should initialize capabilities, install both hosts' hooks, and build context
     assert "capabilities init --codex --claude" in dockerfile, \
         "Should initialize capabilities for both codex and claude"
+    assert "capabilities hooks install --claude --codex" in dockerfile, \
+        "Should install hooks for both claude and codex"
+    assert "capabilities build" in dockerfile, "Should build context with the manager"
 
     # Current Codex releases require the complete runtime package, including
     # the code-mode host sidecar; the legacy single-binary archive is incomplete.
@@ -197,91 +181,20 @@ def test_dockerfile_uses_public_installer(tmp_path: Path) -> None:
 
     # Verify build order
     lines = dockerfile.split('\n')
-    contextkit_install_idx = None
-    contextkit_verify_idx = None
-    copy_idx = None
-    capabilities_install_idx = None
-    contextkit_init_idx = None
-    capabilities_init_idx = None
-    capabilities_doctor_idx = None
-    hooks_idx = None
-    contextkit_doctor_idx = None
-    build_idx = None
-    audit_idx = None
-
+    order = {}
     for i, line in enumerate(lines):
-        if "context-kit" in line and "install.sh" in line:
-            contextkit_install_idx = i
-        elif "contextkit help" in line and contextkit_verify_idx is None:
-            contextkit_verify_idx = i
-        elif "COPY" in line and "/app" in line and "entrypoint" not in line:
-            copy_idx = i
-        elif "capabilities install" in line:
-            capabilities_install_idx = i
-        elif "contextkit init" in line and contextkit_init_idx is None:
-            contextkit_init_idx = i
-        elif "capabilities init" in line and capabilities_init_idx is None:
-            capabilities_init_idx = i
-        elif "capabilities doctor" in line and capabilities_doctor_idx is None:
-            capabilities_doctor_idx = i
-        elif "contextkit install-hooks" in line and hooks_idx is None:
-            hooks_idx = i
-        elif "contextkit doctor" in line and contextkit_doctor_idx is None:
-            contextkit_doctor_idx = i
-        elif "contextkit build --target all" in line and build_idx is None:
-            build_idx = i
-        elif "contextkit audit" in line and audit_idx is None:
-            audit_idx = i
+        for step, needle in (
+                ("copy", "COPY"), ("install", "capabilities install"),
+                ("init", "capabilities init"), ("doctor", "capabilities doctor"),
+                ("hooks", "capabilities hooks install"), ("build", "capabilities build")):
+            if needle in line and step not in order and (
+                    step != "copy" or ("/app" in line and "entrypoint" not in line)):
+                order[step] = i
+    steps = ["copy", "install", "init", "doctor", "hooks", "build"]
+    assert [step for step in steps if step not in order] == [], order
+    assert [order[step] for step in steps] == sorted(order[step] for step in steps), order
 
-    # Verify order: install ContextKit -> verify product -> copy project -> install capabilities -> contextkit init -> capabilities init -> capabilities doctor -> hooks -> contextkit doctor -> build -> audit
-    assert contextkit_install_idx is not None, "Should install ContextKit"
-    assert contextkit_verify_idx is not None, "Should verify ContextKit product installation"
-    assert copy_idx is not None, "Should copy project"
-    assert capabilities_install_idx is not None, "Should install capabilities"
-    assert contextkit_init_idx is not None, "Should initialize ContextKit target-local bindings"
-    assert capabilities_init_idx is not None, "Should initialize capabilities contexts"
-    assert capabilities_doctor_idx is not None, "Should verify capabilities manager readiness"
-    assert hooks_idx is not None, "Should install hooks"
-    assert contextkit_doctor_idx is not None, "Should verify project with contextkit doctor"
-    assert build_idx is not None, "Should build context"
-    assert audit_idx is not None, "Should audit built context"
-
-    assert contextkit_install_idx < contextkit_verify_idx, \
-        "Should verify ContextKit installation immediately after install"
-    assert contextkit_verify_idx < copy_idx, \
-        "Should verify product before copying project"
-    assert copy_idx < capabilities_install_idx, \
-        "Should copy project before installing capabilities"
-    assert capabilities_install_idx < contextkit_init_idx, \
-        "Should install capabilities before initializing ContextKit bindings"
-    assert contextkit_init_idx < capabilities_init_idx, \
-        "Should initialize ContextKit bindings before initializing capability contexts"
-    assert capabilities_init_idx < capabilities_doctor_idx, \
-        "Should initialize capability contexts before verifying capabilities manager"
-    assert capabilities_doctor_idx < hooks_idx, \
-        "Should verify capabilities manager before installing hooks"
-    assert hooks_idx < contextkit_doctor_idx, \
-        "Should install hooks before verifying with contextkit doctor"
-    assert contextkit_doctor_idx < build_idx, \
-        "Should verify with contextkit doctor before building context"
-    assert build_idx < audit_idx, \
-        "Should build context before auditing"
-
-    # CRITICAL: No project-dependent contextkit commands should occur before COPY
-    for i in range(copy_idx if copy_idx is not None else len(lines)):
-        line = lines[i]
-        if "contextkit init" in line:
-            assert False, f"contextkit init (project-dependent) found before COPY at line {i}"
-        if "contextkit doctor" in line:
-            assert False, f"contextkit doctor (project-dependent) found before COPY at line {i}"
-        if "contextkit build" in line:
-            assert False, f"contextkit build (project-dependent) found before COPY at line {i}"
-        if "contextkit audit" in line:
-            assert False, f"contextkit audit (project-dependent) found before COPY at line {i}"
-        if "contextkit install-hooks" in line:
-            assert False, f"contextkit install-hooks (project-dependent) found before COPY at line {i}"
-
-    print("✓ Dockerfile uses public installer with correct build order")
+    print("✓ Dockerfile builds context with the manager in the correct order")
 
 
 def test_the_image_installs_its_capabilities_allowed(tmp_path: Path) -> None:
@@ -358,20 +271,16 @@ def test_non_contextkit_behavior_preserved(tmp_path: Path) -> None:
 
 
 def test_build_fails_on_missing_steps(tmp_path: Path) -> None:
-    """Verify build includes failure checks for installer, hooks, and doctor."""
+    """Verify build includes failure checks for init, doctor, hooks, and build."""
     project = setup_test_project(tmp_path, with_contextkit=True, name="test-failure-checks")
 
     run_cmd(["deployment", "setup", "--force"], cwd=project)
 
     dockerfile = (project / BUNDLE / "Dockerfile").read_text()
 
-    # Should fail on ContextKit installation failure
-    assert "ContextKit installation failed" in dockerfile, \
-        "Should fail on ContextKit installation failure"
-
     # Should fail on project setup failure
-    assert "ContextKit project setup failed" in dockerfile, \
-        "Should fail on ContextKit project setup failure"
+    assert "[build] project setup failed" in dockerfile, \
+        "Should fail on project setup failure"
 
     # Check for exit 1
     assert "exit 1" in dockerfile, \
@@ -389,7 +298,7 @@ def main() -> None:
 
         test_dry_run_no_contextkit_copy(tmppath)
         test_dockerignore_excludes_contextkit(tmppath)
-        test_dockerfile_uses_public_installer(tmppath)
+        test_dockerfile_builds_context_with_the_manager(tmppath)
         test_compose_omits_undeclared_contextkit_ref(tmppath)
         test_declared_build_arg_is_compiled_and_documented(tmppath)
         test_non_contextkit_behavior_preserved(tmppath)

@@ -600,7 +600,7 @@ def test_a_contextkit_name_set_in_config_names_the_app(node, monkeypatch, capsys
             name = "Fixture Agent" if source == "config" else root.name
             return subprocess.CompletedProcess(argv, 0, json.dumps(
                 {"name": name, "name_source": source}), "")
-        if argv[:2] == ["contextkit", "build"]:
+        if argv[:2] == ["capabilities", "build"]:
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[:3] == ["contextkit", "path", "--json"]:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"body_root": "."}), "")

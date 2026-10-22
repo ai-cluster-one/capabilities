@@ -122,8 +122,9 @@ keeps its own volume. The option changes nothing while it is unset.
 context are build artifacts of a checkout. `agent-box` makes them at build time
 against the copy it holds. `agent-box-checkout` has nothing to make them against
 until the volume is mounted, so its entrypoint runs `capabilities init`, and
-where ContextKit is bound `contextkit init`, `install-hooks` and `build`, on
-every boot. That costs boot time and needs the network at start; in exchange the
+where ContextKit is bound `capabilities hooks install --claude --codex` and
+`capabilities build`, on every boot; ContextKit itself is neither installed nor
+run. Each body sync rebuilds the context with `capabilities build`. That costs boot time and needs the network at start; in exchange the
 bindings always describe the checkout actually running. It also writes into the
 checkout, which is now a working tree the profile itself commits and pushes: a
 project on this profile has to ignore its generated host bindings, or every boot

@@ -12,8 +12,7 @@ deployment next
 ```
 
 The default profile is `agent-box`: a long-running container image with Codex,
-Claude, ContextKit when the project uses it, and capability CLIs installed by
-the capabilities manager. Setup compiles deploy descriptors for capabilities
+Claude, and capability CLIs installed by the capabilities manager. Setup compiles deploy descriptors for capabilities
 explicitly enabled in project settings. Descriptor-default services are embedded
 in the agent container and supervised there; an explicit `enabled` override keeps
 a capability as a separate Compose service. Global inheritance, installed
@@ -48,17 +47,17 @@ Telegram when present.
 
 ## ContextKit Projects
 
-For projects with `.contextkit/config.toml`, the generated Dockerfile:
+For projects with `.contextkit/config.toml`, the generated Dockerfile neither
+installs nor calls ContextKit; the capabilities manager does the whole setup:
 
-1. Installs ContextKit globally via the public installer (pinned to `CONTEXTKIT_REF`).
-2. Copies the project body.
-3. Installs the capabilities manager and every capability in the catalogue.
-4. Runs `contextkit init` to create target-local technical bindings (`.env.local`, guards).
-5. Runs `capabilities init --codex --claude` to initialize project contexts.
-6. Runs `contextkit install-hooks --target codex --target claude` to install hooks.
-7. Runs `contextkit doctor` to verify the project is correctly configured.
-8. Runs `contextkit build --target all` to generate host bindings and compile context.
-9. Runs `contextkit audit` to validate the built context.
+1. Copies the project body.
+2. Installs the capabilities manager and every capability in the catalogue.
+3. Runs `capabilities init --codex --claude` to create target-local bindings
+   (`.env.local`) and initialize project contexts.
+4. Runs `capabilities doctor` to verify the manager and the capability set.
+5. Runs `capabilities hooks install --claude --codex` to point both hosts'
+   session hooks at `capabilities session-start`.
+6. Runs `capabilities build` to generate host bindings and compile context.
 
 Generated host bindings (`.codex/generated/`, `.claude/rules/CONTEXT.md`),
 the ContextKit manager binary (`.contextkit/manager/`), and machine-local
@@ -66,4 +65,4 @@ bindings (`.env.local`) are excluded from the Docker build context via the
 target's `Dockerfile.dockerignore`. These are target-local build artifacts, not
 deployment inputs shipped from the repo.
 
-The build fails if any step from contextkit init through contextkit audit fails.
+The build fails if any step from capabilities init through capabilities build fails.

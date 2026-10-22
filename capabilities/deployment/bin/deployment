@@ -12,14 +12,13 @@ tool. This capability is provider-neutral: it owns the local deployment shape
 inside a consuming project, while provider capabilities such as `coolify` own
 the external substrate. A project can use deployment without enabling Coolify.
 
-For ContextKit projects, generated Docker builds install ContextKit via the
-public installer (https://raw.githubusercontent.com/ai-cluster-one/context-kit/main/install.sh),
-install every capability in the catalogue, then initialize with the canonical sequence:
-`contextkit init` (target-local bindings), `capabilities init --codex --claude`,
-`capabilities doctor`, `contextkit install-hooks`, `contextkit doctor`,
-`contextkit build --target all`, `contextkit audit`. Generated host bindings,
-compiled context, and machine-local bindings (.env.local) are target-local build
-artifacts, not deployment inputs shipped from the repo.
+For ContextKit-bound projects, generated Docker builds install every capability
+in the catalogue, then initialize with the manager alone and never install or
+call ContextKit: `capabilities init --codex --claude` (target-local bindings),
+`capabilities doctor`, `capabilities hooks install --claude --codex` (session
+hooks that run `capabilities session-start`), `capabilities build`. Generated
+host bindings, compiled context, and machine-local bindings (.env.local) are
+target-local build artifacts, not deployment inputs shipped from the repo.
 
 USAGE
   deployment setup [--profile agent-box|agent-box-checkout|agent-box-shell]
@@ -1425,8 +1424,8 @@ def _dockerignore_template(has_contextkit: bool, keep: list[str] | None = None,
     if has_contextkit:
         lines += [
             "",
-            "# ContextKit is installed via public installer; generated host bindings",
-            "# and compiled context are rebuilt inside the image.",
+            "# A local ContextKit install never enters the image; generated host bindings",
+            "# and compiled context are rebuilt inside the image by the manager.",
             ".contextkit/manager/",
             ".contextkit/.manager/",
             ".contextkit/bundle/",
@@ -2022,7 +2021,7 @@ __DOCTORS__
 _ENTRYPOINT_DOCTORS = {
     name: (f"{name} doctor >/dev/null 2>&1 || echo \"[entrypoint] WARN: {name} doctor"
            " reported findings; run it inside the box\" >&2")
-    for name in ("capabilities", "contextkit")
+    for name in ("capabilities",)
 }
 
 
@@ -2055,12 +2054,10 @@ def _entrypoint_template(project_name: str, supervisor_config: str | None = None
         init = ["capabilities init --codex --claude"]
         doctors = [_ENTRYPOINT_DOCTORS["capabilities"]]
         if has_contextkit:
-            rebuild = "export AGENT_BODY_REBUILD_COMMAND='contextkit build'"
-            init = ["contextkit init",
-                    "capabilities init --codex --claude",
-                    "contextkit install-hooks --target codex --target claude",
-                    "contextkit build"]
-            doctors.append(_ENTRYPOINT_DOCTORS["contextkit"])
+            rebuild = "export AGENT_BODY_REBUILD_COMMAND='capabilities build'"
+            init = ["capabilities init --codex --claude",
+                    "capabilities hooks install --claude --codex",
+                    "capabilities build"]
         # A boot that could not reach the remote still boots: the box comes up on
         # the body it has and the supervised pass retries.
         sync = (f"{shlex.quote(body_sync)} --once || echo \"[entrypoint] WARN: the body"
@@ -2155,8 +2152,6 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
         # project root and would hide anything the image left under it.
         entrypoint_path = BOOT_DIR + "/" + entrypoint_rel.rsplit("/", 1)[-1]
     catalogue_names = _catalogue_names(catalogue_exclude)
-    contextkit_install = ""
-    contextkit_link = ""
     contextkit_build = ""
     capabilities_init_and_doctor = " && capabilities init --codex --claude \\\n && capabilities doctor"
     if store_records:
@@ -2164,29 +2159,15 @@ def _dockerfile_template(has_contextkit: bool, compiler: dict,
         # doctor runs at container start, against the store the box reaches.
         capabilities_init_and_doctor = " && capabilities init --codex --claude"
     if has_contextkit:
-        contextkit_install = (
-            "\n# ContextKit is installed globally via the public installer. Generated host\n"
-            "# bindings and compiled context are target-local build artifacts.\n"
-            "ARG CONTEXTKIT_REF=main\n"
-            "RUN curl -fsSL \"https://raw.githubusercontent.com/ai-cluster-one/context-kit/${CONTEXTKIT_REF}/install.sh\" \\\n"
-            "      | CONTEXTKIT_REF=\"${CONTEXTKIT_REF}\" sh \\\n"
-            " && contextkit help >/dev/null || { echo \"[build] ContextKit installation failed\" >&2; exit 1; }\n"
-        )
-        contextkit_link = (
-            f" && ln -sf {agent_home}/.local/bin/contextkit /usr/local/bin/contextkit"
-        )
         contextkit_build = (
-            "\n# Initialize target-local ContextKit bindings (creates .env.local and technical\n"
-            "# guards), initialize capability contexts, verify the capabilities manager,\n"
-            "# install ContextKit hooks, and validate, build, and audit context after the\n"
-            "# installed capability set is present, so generated context sees the complete runtime.\n"
-            "RUN contextkit init \\\n"
-            " && capabilities init --codex --claude \\\n"
+            "\n# Initialize target-local bindings (.env.local and the capability envelope),\n"
+            "# verify the capabilities manager, point the session hooks at\n"
+            "# `capabilities session-start`, and build context after the installed\n"
+            "# capability set is present, so generated context sees the complete runtime.\n"
+            "RUN capabilities init --codex --claude \\\n"
             + ("" if store_records else " && capabilities doctor \\\n") +
-            " && contextkit install-hooks --target codex --target claude \\\n"
-            " && contextkit doctor \\\n"
-            " && contextkit build --target all \\\n"
-            " && contextkit audit || { echo \"[build] ContextKit project setup failed\" >&2; exit 1; }\n"
+            " && capabilities hooks install --claude --codex \\\n"
+            " && capabilities build || { echo \"[build] project setup failed\" >&2; exit 1; }\n"
         )
         capabilities_init_and_doctor = ""
     project_binding = ""
@@ -2303,14 +2284,13 @@ RUN set -eux; \\
     rm -f /tmp/codex-package.tgz
 
 RUN uv python install 3.13
-{contextkit_install}
 {body_copy}
 
 RUN chmod +x {chmod_paths}
 
 USER root
 RUN ln -sf {agent_home}/.local/bin/claude /usr/local/bin/claude \\
- && ln -sf {agent_home}/.local/bin/codex /usr/local/bin/codex{contextkit_link}
+ && ln -sf {agent_home}/.local/bin/codex /usr/local/bin/codex
 USER ${{USERNAME}}
 {project_binding}
 # Capability CLIs: every capability in the catalogue at CAPABILITIES_REF (a
@@ -6601,7 +6581,7 @@ def _node_sync_locked(root, target, mirror=None):
     state["sync"] = {"remote": remote, "state": "level", "conflicts": [], "last_sync_at": _now_exact()}
     _node_save(root, target, state)
     if _has_contextkit(root):
-        _node_run(["contextkit", "build"], root)
+        _node_run(["capabilities", "build"], root)
     return state["sync"]
 
 

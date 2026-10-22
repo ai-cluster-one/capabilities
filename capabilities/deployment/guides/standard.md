@@ -212,15 +212,13 @@ Generated agent-box images install Codex from the complete pinned release
 package rather than the legacy single-binary archive, so the CLI,
 `codex-code-mode-host`, and its runtime resources stay version-aligned.
 
-For ContextKit projects, Docker builds install ContextKit via the public
-installer (https://raw.githubusercontent.com/ai-cluster-one/context-kit/${CONTEXTKIT_REF}/install.sh),
-defaulting `CONTEXTKIT_REF` to `main`. After copying the project body, installing
-capabilities, initializing project contexts, and verifying the capability set, the
-build runs `contextkit init` to create target-local technical bindings,
-`contextkit install-hooks` for all configured targets, then the canonical validation
-sequence: `contextkit doctor` to verify configuration, `contextkit build --target all`
-to generate host bindings and compile context, and `contextkit audit` to validate the
-built context. Generated host bindings (`.codex/generated/`, `.claude/rules/CONTEXT.md`),
+For ContextKit projects, Docker builds neither install nor call ContextKit. After
+copying the project body and installing capabilities, the build runs
+`capabilities init --codex --claude` to create target-local bindings and
+initialize project contexts, `capabilities doctor` to verify the capability set,
+`capabilities hooks install --claude --codex` to point both hosts' session hooks
+at `capabilities session-start`, and `capabilities build` to generate host
+bindings and compile context. Generated host bindings (`.codex/generated/`, `.claude/rules/CONTEXT.md`),
 the ContextKit manager binary (`.contextkit/manager/`), and machine-local bindings
 (`.env.local`) are excluded from the build context via the target's
 `Dockerfile.dockerignore`. These are

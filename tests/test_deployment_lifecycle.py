@@ -94,11 +94,11 @@ def test_dockerfile_contextkit_has_doctor_after_capabilities_init(tmp_path: Path
         "capabilities init should run before capabilities doctor"
     )
 
-    # Verify capabilities doctor comes before contextkit install-hooks
-    hooks_idx = dockerfile.find("contextkit install-hooks")
-    assert hooks_idx > 0, "contextkit install-hooks not found"
+    # Verify capabilities doctor comes before capabilities hooks install
+    hooks_idx = dockerfile.find("capabilities hooks install")
+    assert hooks_idx > 0, "capabilities hooks install not found"
     assert cap_doctor_idx < hooks_idx, (
-        "capabilities doctor should run before contextkit install-hooks"
+        "capabilities doctor should run before capabilities hooks install"
     )
 
 
@@ -134,14 +134,12 @@ def test_dockerfile_ordering_capabilities_to_contextkit(tmp_path: Path) -> None:
     # Extract the relevant sections and verify ordering
     steps = [
         "capabilities install",
-        "contextkit init",
         "capabilities init",
         "capabilities doctor",
-        "contextkit install-hooks",
-        "contextkit doctor",
-        "contextkit build",
-        "contextkit audit",
+        "capabilities hooks install",
+        "capabilities build",
     ]
+    assert "contextkit " not in dockerfile, "the image should never call ContextKit"
 
     indices = []
     for step in steps:
