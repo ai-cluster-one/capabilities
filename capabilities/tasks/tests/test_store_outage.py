@@ -432,6 +432,10 @@ def test_a_turn_whose_lease_runs_out_unrenewed_is_ended(lab, relay, tmp_path):
     every failed renewal counted."""
     schema = schema_of(lab)
     lab["env"]["FAKE_ENGINE_SLEEP"] = "120"
+    # Written once the engine has the prompt: the turn is at work. A descendant
+    # alone is not that, since the launcher's own child is the `run` process.
+    working = tmp_path / "engine.jsonl"
+    lab["env"]["FAKE_ENGINE_RECORD"] = str(working)
     add(lab, "t-away")
     relayed(lab, relay, 6)         # a beat every 2s, a lease of 12s
     said = tmp_path / "away.err"
@@ -442,7 +446,8 @@ def test_a_turn_whose_lease_runs_out_unrenewed_is_ended(lab, relay, tmp_path):
                                 start_new_session=True)
     try:
         poll_for(lambda: raise_of(schema, "t-away"), 60)
-        below = poll_for(lambda: descendants(turn.pid) or None, 30)
+        poll_for(working.exists, 30)
+        below = descendants(turn.pid)
         relay.down()
         away = time.monotonic()
         poll_for(lambda: '"lease_lost"' in said.read_text(), 30)
