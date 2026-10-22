@@ -897,6 +897,17 @@ def _runner(as_json: bool):
     return harness_runner
 
 
+def _inside_id_root(target, root) -> bool:
+    """Whether `target` lies in the handed-down id's root, after symlinks."""
+    if not root:
+        return False
+    real_root = _real(Path(root))
+    real_target = _real(Path(target))
+    if real_root is None or real_target is None:
+        return False
+    return real_target == real_root or real_root in real_target.parents
+
+
 def _peer_env(target) -> dict:
     """The caller's environment, made to belong to the target project.
 
@@ -910,7 +921,10 @@ def _peer_env(target) -> dict:
     target — its capability calls resolve the caller's envelope and the caller's
     credentials. So the target is named and both handoffs are dropped rather
     than re-pointed: the envelope answer and the id belong to whoever resolved
-    them, and a descendant in another project resolves its own.
+    them, and a descendant in another project resolves its own. The id is kept
+    for a target inside its root, a subfolder of the caller's project: that
+    target is the caller's project, and a node whose id lives only in its
+    environment would otherwise lose it there.
 
     A per-turn authority granted to the caller by whatever ingress launched it
     is the caller's alone. The Telegram service's worker keys are that authority
@@ -937,8 +951,9 @@ def _peer_env(target) -> dict:
         env[READ_ONLY_ENV] = "1"
     env.pop("CAPABILITIES_PROJECT_ENVELOPE", None)
     env.pop("CAPABILITIES_PROJECT_ENVELOPE_ROOT", None)
-    env.pop("CAPABILITIES_PROJECT_ID", None)
-    env.pop("CAPABILITIES_PROJECT_ID_ROOT", None)
+    if not _inside_id_root(target, env.get("CAPABILITIES_PROJECT_ID_ROOT")):
+        env.pop("CAPABILITIES_PROJECT_ID", None)
+        env.pop("CAPABILITIES_PROJECT_ID_ROOT", None)
     for key in [k for k in env
                 if k.startswith("TELEGRAM_") and k != "TELEGRAM_REAL_TELEGRAM"]:
         env.pop(key, None)

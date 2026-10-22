@@ -2,7 +2,7 @@
 
 ## 2026-10-22 — A peer resolves its target's own project
 
-A peer is started without the caller's handed-down `CAPABILITIES_PROJECT_ID` and `CAPABILITIES_PROJECT_ID_ROOT`, as it already was without the envelope pair, so a target bound to no id resolves as itself rather than as the caller's project. Declares `capabilities-contract>=0.12,<1`.
+A peer is started without the caller's handed-down `CAPABILITIES_PROJECT_ID` and `CAPABILITIES_PROJECT_ID_ROOT`, as it already was without the envelope pair, so a target bound to no id resolves as itself rather than as the caller's project. A target inside `CAPABILITIES_PROJECT_ID_ROOT`, a subfolder of the caller's project, keeps the pair, so a project whose id is only in its environment keeps it there. Declares `capabilities-contract>=0.12,<1`.
 
 ## 2026-10-21 — A connection whose network flow died fails in seconds
 

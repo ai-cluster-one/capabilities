@@ -485,6 +485,18 @@ def test_the_peer_environment_belongs_to_the_target(lab, engine):
         assert gone not in env, gone
 
 
+
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+def test_a_target_inside_the_id_root_keeps_the_handed_down_id(lab, engine):
+    root = str(lab.target.parent)
+    proc, _, launch = lab.ask("--engine", engine, env={
+        "CAPABILITIES_PROJECT_ID": "prj_aaaaaaaaaaaa",
+        "CAPABILITIES_PROJECT_ID_ROOT": root})
+    _ok(proc)
+    env = launch["env"]
+    assert env["CAPABILITIES_PROJECT_ID"] == "prj_aaaaaaaaaaaa"
+    assert env["CAPABILITIES_PROJECT_ID_ROOT"] == root
+
 def test_the_answer_carries_its_traceability(lab):
     proc, result, launch = lab.ask()
     _ok(proc)
