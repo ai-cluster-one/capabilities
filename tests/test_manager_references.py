@@ -322,6 +322,20 @@ def test_a_project_with_only_folders_reads_them_as_before(tmp_path):
     assert (code, error["code"]) == (6, "store_not_configured")
 
 
+def test_a_project_whose_store_does_not_answer_edits_its_files_as_before(tmp_path):
+    lab = Lab(tmp_path, None)
+    (lab.project / ".env.local").write_text(
+        f"CAPABILITIES_PROJECT_ID={PROJECT_ID}\n"
+        f"AGENTKIT_DB_URL=postgresql://{ADMIN}@127.0.0.1:1/none?sslmode=disable\n")
+    path = lab.reference("coolify", "account-map", TONE)
+    edit = lab.ok(COOLIFY, "context", "edit", "reference.account-map")
+    assert Path(edit["path"]) == path
+    path.write_bytes(TONE + b"Edited.\n")
+    assert lab.ok(COOLIFY, "context", "put", "reference.account-map")["put"] == \
+        "reference.account-map"
+    assert path.read_bytes() == TONE + b"Edited.\n"
+
+
 def test_a_store_without_the_table_leaves_the_files_read(lab):
     path = lab.reference("coolify", "account-map", TONE)
     assert lab.ok(COOLIFY, "refs")[0]["path"] == str(path)
