@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-10-22 — A reconnect no longer kills the assistant service later
+
+Each session the assistant service opens gives the engine a client of its own, where every session on one device used to share one; a closed session's client, once collected, then stopped the live one and the next send or account lookup ended the process with a nil-pointer panic in `main.GetMe`, losing the message it was sending. An account lookup on a session that is already closed is refused as `not_connected`, exit 5, instead of reaching the engine.
+
 ## 2026-10-21 — A connection whose network flow died fails in seconds
 
 `whatsapp` uses `capabilities-contract` 0.7.2. Its store connections give a network flow up once data sent on it has gone unacknowledged for 20 seconds (`tcp_user_timeout`), which keepalives cannot notice since none is sent while data waits, and send keepalives after 15 seconds idle, every 5 seconds, 3 probes: a connection whose flow stopped carrying packets without a FIN or a reset fails in about 20 seconds as a lost connection instead of waiting until the store ends the session, and a plain read that loses it that way runs once more on a new connection. A connection lost where `whatsapp` catches nothing ends the command as `store_unreachable`, exit 5, as before.

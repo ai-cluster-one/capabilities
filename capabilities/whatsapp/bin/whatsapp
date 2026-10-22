@@ -2505,6 +2505,10 @@ class Session:
         self._on_demand_seen = 0
         self._client = None
         self._thread = None
+        # Held across every account lookup and by `close()` while it marks the
+        # session closed, so a lookup never reaches a client already stopped.
+        self._engine_lock = threading.Lock()
+        self._closed = False
         self.stalled = False
         # The assistant service hands its capture spool in here, so what
         # arrives while the store cannot be reached is kept rather than lost.
@@ -2623,7 +2627,12 @@ class Session:
                  f"run `{NAME} pair --connection {self.cfg['id']}` and enter the "
                  "code on the phone")
         engine = _engine()
-        self._client = engine["NewClient"](str(_session_db(self.cfg)),
+        # The engine keys its client by this id and stops whatever holds the
+        # id when an earlier client is collected, which left to the database
+        # path would stop the live client of a later session on the same
+        # device. Each session's client answers to its own.
+        path = str(_session_db(self.cfg))
+        self._client = engine["NewClient"](path, uuid=f"{path}#{uuid.uuid4().hex}",
                                            props=self.props)
         self._register(self._client)
         self._thread = threading.Thread(target=self._client.connect, daemon=True)
@@ -2704,7 +2713,13 @@ class Session:
             time.sleep(0.5)
 
     def account(self) -> dict:
-        me = self._client.get_me()
+        with self._engine_lock:
+            if self._closed:
+                _refuse(5, "not_connected",
+                     f"the session for connection {self.cfg['id']!r} is closed",
+                     "the assistant service reconnects on its own; retry once "
+                     "it is connected")
+            me = self._client.get_me()
         jid = _bare_jid(_jid_str(me.JID))
         return {"jid": jid,
                 "id": _digits(str(jid).split("@", 1)[0]) if jid else None,
@@ -2881,6 +2896,8 @@ class Session:
         and a client that outlives this invocation outlives the lock this
         invocation released, which is exactly the two-clients-on-one-device
         state the lock exists to prevent."""
+        with self._engine_lock:
+            self._closed = True
         if self._client is not None:
             for step in (self._client.disconnect, self._client.stop):
                 try:

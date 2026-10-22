@@ -463,5 +463,72 @@ class Listener(unittest.TestCase):
         self.assertEqual(status["last_event_at"], "2026-01-01T00:00:00+00:00")
 
 
+
+class EngineClient(unittest.TestCase):
+    """A session reconnected on one device must not be stopped by the client of
+    the session before it: the engine stops whatever holds a client's id when
+    that client is collected, and a lookup on the stopped one kills the
+    process in `main.GetMe` rather than raising."""
+
+    class Engine:
+        def __init__(self):
+            self.ids, self.me_calls = [], 0
+            test = self
+
+            class Client:
+                def __init__(self, name, *, uuid=None, props=None):
+                    test.ids.append(uuid or name)
+
+                def event(self, _kind):
+                    return lambda handler: handler
+
+                def qr(self, handler):
+                    return handler
+
+                def connect(self):
+                    pass
+
+                def disconnect(self):
+                    pass
+
+                def stop(self):
+                    pass
+
+                def get_me(self):
+                    test.me_calls += 1
+                    raise AssertionError("looked up through a stopped client")
+
+            self.client = Client
+
+        def __getitem__(self, key):
+            if key == "NewClient":
+                return self.client
+            if key == "events":
+                return type("Events", (), {"__getattr__": lambda _self, name: type(name, (), {})})()
+            return mock.MagicMock()
+
+    def session(self, cfg):
+        with mock.patch.object(wa, "_open_store", return_value=None):
+            return wa.Session(cfg)
+
+    def test_each_session_on_one_device_holds_its_own_client_id(self):
+        engine, cfg = self.Engine(), _cfg()
+        with mock.patch.object(wa, "_engine", return_value=engine):
+            for _ in range(2):
+                session = self.session(cfg).open(expect_session=False)
+                session.close()
+        self.assertEqual(len(engine.ids), 2)
+        self.assertNotEqual(engine.ids[0], engine.ids[1])
+
+    def test_a_closed_session_refuses_a_lookup_without_reaching_its_client(self):
+        engine = self.Engine()
+        with mock.patch.object(wa, "_engine", return_value=engine):
+            session = self.session(_cfg()).open(expect_session=False)
+            session.close()
+        with self.assertRaises(wa._Refusal) as caught:
+            session.account()
+        self.assertEqual(caught.exception.code, "not_connected")
+        self.assertEqual(engine.me_calls, 0)
+
 if __name__ == "__main__":
     unittest.main()
