@@ -341,13 +341,84 @@ def test_agent_show_and_set(lab, tmp_path):
 
 # --- the nodes ------------------------------------------------------------------
 
+def test_agent_materialize_puts_a_stored_agent_in_a_folder_on_this_machine(lab, tmp_path):
+    node = {"AGENT_NODE_NAME": "lab-node"}
+    migrated = lab.run("migrate", "--global", "--apply", **node)
+    assert migrated.returncode == 0, migrated.stderr
+    (lab.project / "capabilities" / "project.json").unlink()
+    created = lab.run("init", **node)
+    assert created.returncode == 0, created.stderr
+    agent_id = _bound(lab.project)
+    # init records the folder the new agent lives in on its master node.
+    assert lab.sql(f"SELECT node, folder FROM {SCHEMA}.capabilities_agent_nodes "
+                   "WHERE agent_id = %s", (agent_id,)) == [("lab-node", str(lab.project))]
+    setting = (lab.project / ".env.local").read_text().replace(
+        f"CAPABILITIES_PROJECT_ID={agent_id}\n", "")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / ".env.local").write_text(setting)
+
+    def materialize(*args: str, **extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(MANAGER), "agent", "materialize", *args], cwd=elsewhere,
+            env=lab.env(CLAUDE_PROJECT_DIR=str(elsewhere),
+                        AGENTKIT_DB_URL=lab.cluster.url(lab.database),
+                        AGENTKIT_DB_SCHEMA=SCHEMA, **extra),
+            text=True, capture_output=True, timeout=120)
+
+    def code(result: subprocess.CompletedProcess) -> tuple[int, str]:
+        return result.returncode, json.loads(
+            result.stderr.strip().splitlines()[-1])["error"]["code"]
+
+    folder = tmp_path / "box" / "agent"
+    first = materialize(agent_id, str(folder), AGENT_NODE_NAME="box-node")
+    assert first.returncode == 0, first.stderr
+    answer = json.loads(first.stdout)
+    assert answer["changed"] is True and answer["folder"] == str(folder)
+    assert (answer["node"]["node"], answer["node"]["kind"], answer["node"]["is_master"],
+            answer["node"]["folder"]) == ("box-node", "server", False, str(folder))
+    assert (folder / ".env.local").read_text() == (
+        f"CAPABILITIES_PROJECT_ID={agent_id}\nCAPABILITIES_PROJECT_ID_ROOT={folder}\n")
+    assert "capabilities session-start" in (folder / ".claude" / "settings.json").read_text()
+    assert (folder / ".capabilities-generated" / "context.md").is_file()
+    files = {p: p.read_bytes() for p in folder.rglob("*") if p.is_file()}
+    again = materialize(agent_id, str(folder), AGENT_NODE_NAME="box-node")
+    assert again.returncode == 0, again.stderr
+    assert json.loads(again.stdout)["changed"] is False
+    assert {p: p.read_bytes() for p in folder.rglob("*") if p.is_file()} == files
+
+    # A folder bound to another agent, and a second folder for the agent on
+    # this node while its first is still bound to it, are refused unwritten.
+    taken = tmp_path / "taken"
+    taken.mkdir()
+    (taken / ".env.local").write_text("CAPABILITIES_PROJECT_ID=prj_00000000beef\n")
+    assert code(materialize(agent_id, str(taken), AGENT_NODE_NAME="box-node")) \
+        == (6, "folder_bound")
+    assert (taken / ".env.local").read_text() == "CAPABILITIES_PROJECT_ID=prj_00000000beef\n"
+    second = tmp_path / "second"
+    assert code(materialize(agent_id, str(second), AGENT_NODE_NAME="box-node")) \
+        == (6, "agent_elsewhere")
+    assert not second.exists()
+    assert code(materialize("prj_00000000dead", str(second), AGENT_NODE_NAME="box-node")) \
+        == (6, "agent_unknown")
+    assert code(materialize(agent_id, str(second))) == (6, "node_unnamed")
+
+    listed = json.loads(subprocess.run(
+        [sys.executable, str(MANAGER), "agent", "list"], cwd=tmp_path,
+        env=lab.env(CLAUDE_PROJECT_DIR=str(tmp_path),
+                    AGENTKIT_DB_URL=lab.cluster.url(lab.database), AGENTKIT_DB_SCHEMA=SCHEMA),
+        text=True, capture_output=True, timeout=120, check=True).stdout)["agents"]
+    assert [(a["id"], [(n["node"], n["folder"]) for n in a["nodes"]]) for a in listed] == [
+        (agent_id, [("box-node", str(folder)), ("lab-node", str(lab.project))])]
+
+
 def test_nodes_are_added_changed_listed_and_removed(lab):
     added = lab.ok("node", "add", "mac-one", "--kind", "mac", "--master")
     assert added["node"] == {"node": "mac-one", "kind": "mac", "address": None,
                              "is_master": True, "may_write": False, "target": None,
                              "last_seen_at": None, "coolify_connection": None,
                              "coolify_server": None, "coolify_resource": None,
-                             "public_key": None}
+                             "public_key": None, "folder": None}
     lab.ok("node", "add", "srv-one", "--kind", "server", "--address", "203.0.113.10",
            "--target", "prod", "--may-write")
 

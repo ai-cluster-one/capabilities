@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.15,<1",
+#     "capabilities-contract>=0.16,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -532,7 +532,10 @@ PROJECT VERBS (run inside a consuming project)
         repository: the id is not committed. When a database resolves for the
         project, its agent row is registered in capabilities_agents (the
         result's `agent`: registered, store_not_configured, or the store's
-        error, which never fails init); per host, wire the
+        error, which never fails init), and the row of this node
+        (AGENT_NODE_NAME) among its nodes is given the folder as its
+        `folder` where it records none and no other agent's row holds that
+        folder on this node; per host, wire the
         SessionStart hook and the generated context file and generate the
         skill. No flags defaults to Claude Code wiring; Codex projects must
         pass --codex. Host wiring is manager-owned: each init brings the hook
@@ -625,6 +628,32 @@ PROJECT VERBS (run inside a consuming project)
         a ContextKit binding (ask: the Collaboration Mode text).
         Answers {ok, project, agent_id, created, changed, agent, store};
         writing the values a row already holds changes nothing.
+  agent list
+        Every agent the store holds - the project's store inside a project,
+        else the one this machine resolves - each as `agent show` answers it
+        with its nodes as `node list` answers them, the folder it lives in on
+        each node among them: {ok, agents [{id, slug, name, ..., nodes
+        [{node, kind, ..., folder}]}], store}. Needs no project.
+  agent materialize <id|slug> <folder> [--claude] [--codex]
+        Put an agent the store holds in a folder on this machine: register
+        this machine (AGENT_NODE_NAME, exit 6 node_unnamed without it) among
+        its nodes with that folder (a new row is kind mac on a Mac, else
+        server, neither master nor writing), write CAPABILITIES_PROJECT_ID
+        and CAPABILITIES_PROJECT_ID_ROOT into the folder's .env.local
+        (creating the folder where it is missing), then bind, wire and build
+        the folder as `init --id` does - Claude when no host is named. It
+        refuses before writing anything an agent the store does not hold
+        (agent_unknown), a folder bound to another agent by its env files,
+        an older binding or the environment, or recorded as another agent's
+        folder on this node (folder_bound; the store holds one agent per
+        folder per node), and an agent that already lives in another folder
+        here which is still bound to it (agent_elsewhere; one whose folder
+        is gone or bound elsewhere is moved). Run again it changes nothing,
+        and run in a folder already bound to the agent it records the folder
+        on this node's row. Answers {ok, agent_id, folder, node, changed, env
+        {path, changed}, init, store}, init being what `init --id` answers.
+        `capabilities node remove <node>` in the folder removes the node
+        again; the folder's files stay. Exit 4 under the read-only switch.
   agent convert
         Turn a ContextKit-bound agent into one bound by its id alone, as one
         change. It first checks, writing nothing when it refuses: the id
@@ -659,7 +688,8 @@ PROJECT VERBS (run inside a consuming project)
         The nodes of this project's agent (capabilities_agent_nodes): {ok,
         project, agent_id, nodes [{node, kind, address, is_master,
         may_write, target, last_seen_at, coolify_connection, coolify_server,
-        coolify_resource, public_key}], store}.
+        coolify_resource, public_key, folder}], store}: folder is the folder
+        the agent lives in on that node, null where it is not recorded.
   node add <node> --kind mac|server [--address HOST] [--target NAME]
            [--master] [--may-write]
            [--coolify-connection ID --coolify-server UUID
@@ -7380,9 +7410,10 @@ NODE_BASE_COLUMNS = ("node", "kind", "address", "is_master", "may_write", "targe
                      "last_seen_at")
 # A node created as a Coolify resource names the coolify connection, the server
 # and the resource it was created with, all three or none; public_key is the
-# X25519 key the node made, its 32 bytes in base64.
+# X25519 key the node made, its 32 bytes in base64. folder is the folder the
+# agent lives in on that node, its project root there.
 NODE_COLUMNS = (*NODE_BASE_COLUMNS, "coolify_connection", "coolify_server",
-                "coolify_resource", "public_key")
+                "coolify_resource", "public_key", "folder")
 NODE_COOLIFY_COLUMNS = ("coolify_connection", "coolify_server", "coolify_resource")
 NODE_KINDS = ("mac", "server")
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -7568,6 +7599,7 @@ def _register_agent_on_init(root: Path, new_agent: bool = False,
         db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
                    major=major, minor=minor)
         node = os.environ.get(store.NODE_NAME_ENV, "").strip()
+        folder = str(root.resolve())
         with conn.transaction():
             created = _ensure_agent_row(conn, agent_id)
             if new_agent and node:
@@ -7579,6 +7611,14 @@ def _register_agent_on_init(root: Path, new_agent: bool = False,
                              "ON CONFLICT (agent_id, node) DO NOTHING",
                              (agent_id, node, "mac" if sys.platform == "darwin" else "server",
                               agent_id))
+            if node:
+                # This node's row records the folder the agent lives in here,
+                # where it records none yet and no other agent holds the folder.
+                conn.execute("UPDATE capabilities_agent_nodes SET folder = %s "
+                             "WHERE agent_id = %s AND node = %s AND folder IS NULL "
+                             "AND NOT EXISTS (SELECT 1 FROM capabilities_agent_nodes "
+                             "WHERE node = %s AND folder = %s)",
+                             (folder, agent_id, node, node, folder))
             slug = _settle_agent_slug(conn, agent_id, root, name=name)
         return {"registered": True, "id": agent_id, "created": created,
                 "migrated": new_agent and bool(node), "slug": slug["slug"],
@@ -7622,6 +7662,22 @@ def _kernel_options(args: list[str], valued: set[str], flags: set[str],
 
 def cmd_agent(args: list[str]) -> None:
     sub = args[0] if args else None
+    if sub == "list":
+        pos, _opts = _kernel_options(args[1:], set(), {"--json"}, "agent list")
+        if pos:
+            _die(6, "input", "agent list takes no positional argument")
+        _emit(_agent_list())
+        return
+    if sub == "materialize":
+        _read_only_gate("agent materialize")
+        pos, opts = _kernel_options(args[1:], set(), {"--claude", "--codex", "--json"},
+                                    "agent materialize")
+        if len(pos) != 2 or not all(part.strip() for part in pos):
+            _die(6, "input", "agent materialize needs an agent (its id or slug) and a folder",
+                 "capabilities agent materialize <id|slug> <folder> [--claude] [--codex]")
+        _emit(_agent_materialize(pos[0].strip(), pos[1], "--claude" in opts,
+                                 "--codex" in opts))
+        return
     root = _require_project()
     if sub == "show":
         pos, opts = _kernel_options(args[1:], {"--icon-out"}, {"--json"}, "agent show")
@@ -7701,8 +7757,158 @@ def cmd_agent(args: list[str]) -> None:
             _die(6, "input", "agent convert takes no positional argument")
         _emit(_agent_convert(root.resolve()))
     else:
-        _die(6, "input", "agent needs a subcommand: show, set or convert",
+        _die(6, "input", "agent needs a subcommand: show, set, convert, list or materialize",
              "run `capabilities help`")
+
+
+def _agent_list() -> dict:
+    """Every agent the store holds - the project's store inside one, else the
+    machine's - with its nodes and the folder it lives in on each."""
+    conn, setting = _kernel_open(_project_root())
+    import psycopg
+    try:
+        ids = [row[0] for row in conn.execute(
+            "SELECT id FROM capabilities_agents ORDER BY slug NULLS LAST, name NULLS LAST, id")]
+        agents = []
+        for agent_id in ids:
+            agent = _agent_row(conn, agent_id)
+            agent["nodes"] = _node_rows(conn, agent_id)
+            agents.append(agent)
+    except psycopg.Error as exc:
+        _die(5, "store_unreachable", f"cannot read the agent registry: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    finally:
+        conn.close()
+    return {"ok": True, "agents": agents, "store": _kernel_store_report(setting)}
+
+
+def _folder_agent_id(folder: Path) -> str | None:
+    """The id `folder` is bound to as a project root of its own, reading only:
+    the environment's for that root, its .env.local or .env, an older
+    project.json or ContextKit binding."""
+    if not folder.is_dir():
+        return None
+    return _project_id_state(folder, move=False)["id"]
+
+
+def _write_env_local_keys(root: Path, values: dict[str, str]) -> bool:
+    """Set each key in `values` in the root's .env.local, replacing the line
+    that names it or adding one, every other line kept; True when the file
+    changed. A new file is readable by its owner alone."""
+    path = root / ".env.local"
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        lines = None
+    current = _parse_env_file(path) if lines is not None else {}
+    if all(current.get(key) == value for key, value in values.items()):
+        return False
+    kept = [line for line in lines or [] if not any(
+        re.match(r"^\s*(export\s+)?" + re.escape(key) + r"\s*=", line) for key in values)]
+    body = "\n".join([*kept, *(f"{key}={value}" for key, value in values.items())]) + "\n"
+    if lines is not None:
+        _atomic_write_text(path, body)
+    else:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(body)
+    return True
+
+
+def _agent_materialize(ref: str, folder_arg: str, claude: bool, codex: bool) -> dict:
+    """`agent materialize`: bind `folder` on this machine to the agent the store
+    holds under `ref` (its id or slug) - this node registered among its nodes
+    with that folder, the id and its root in the folder's .env.local - then
+    wire and build it as `init --id` does. Refuses before writing anything a
+    folder bound to another agent, and the agent where it already lives in
+    another folder here."""
+    store = _store_module()
+    node = os.environ.get(store.NODE_NAME_ENV, "").strip()
+    if not node:
+        _die(6, "node_unnamed",
+             f"{store.NODE_NAME_ENV} is not set: the agent is registered on this machine "
+             "as one of its nodes, and this machine names no node",
+             f"set {store.NODE_NAME_ENV} to this machine's node name, then run "
+             "`capabilities agent materialize` again")
+    folder = Path(folder_arg).expanduser()
+    folder = (folder if folder.is_absolute() else Path.cwd() / folder).resolve()
+    if folder.exists() and not folder.is_dir():
+        _die(6, "input", f"{folder} is not a folder")
+    if folder in _home_dirs():
+        _die(6, "input", f"{folder} is a home folder, which is never an agent's folder",
+             "choose a folder inside it")
+    conn, setting = _kernel_open(folder)
+    import psycopg
+    try:
+        found = conn.execute(
+            "SELECT id FROM capabilities_agents WHERE id = %s OR slug = %s",
+            (ref, ref)).fetchall()
+        if not found:
+            _die(6, "agent_unknown",
+                 f"the store ({setting.level}, schema {setting.schema}) holds no agent {ref!r}",
+                 "run `capabilities agent list` to see the agents it holds")
+        agent_id = found[0][0]
+        bound = _folder_agent_id(folder)
+        if bound and bound != agent_id:
+            _die(6, "folder_bound", f"{folder} is bound to agent {bound}",
+                 "choose another folder")
+        with conn.transaction():
+            held = conn.execute(
+                "SELECT agent_id FROM capabilities_agent_nodes WHERE node = %s AND folder = %s "
+                "AND agent_id <> %s", (node, str(folder), agent_id)).fetchone()
+            if held:
+                _die(6, "folder_bound",
+                     f"{folder} is the folder of agent {held[0]} on node {node}",
+                     "choose another folder")
+            row = conn.execute(
+                "SELECT folder FROM capabilities_agent_nodes WHERE agent_id = %s AND node = %s "
+                "FOR UPDATE", (agent_id, node)).fetchone()
+            elsewhere = row[0] if row and row[0] and row[0] != str(folder) else None
+            if elsewhere and _folder_agent_id(Path(elsewhere)) == agent_id:
+                _die(6, "agent_elsewhere",
+                     f"agent {agent_id} already lives in {elsewhere} on node {node}",
+                     f"an agent has one folder on a node: work in {elsewhere}, or unbind it "
+                     f"(its .env.local's {PROJECT_ID_ENV}) and run this again")
+            cur = conn.execute(
+                "INSERT INTO capabilities_agent_nodes (agent_id, node, kind, folder) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT (agent_id, node) DO UPDATE "
+                "SET folder = EXCLUDED.folder "
+                "WHERE capabilities_agent_nodes.folder IS DISTINCT FROM EXCLUDED.folder",
+                (agent_id, node, "mac" if sys.platform == "darwin" else "server",
+                 str(folder)))
+            node_changed = cur.rowcount == 1
+            node_row = _node_rows(conn, agent_id, node)[0]
+    except psycopg.errors.UniqueViolation:
+        _die(6, "folder_bound", f"{folder} is the folder of another agent on node {node}",
+             "choose another folder")
+    except psycopg.OperationalError as exc:
+        _die(5, "store_unreachable", f"cannot reach the store: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    except psycopg.Error as exc:
+        _die(5, "store_write_failed", f"the store refused the change: {exc}")
+    finally:
+        conn.close()
+    folder.mkdir(parents=True, exist_ok=True)
+    env_changed = _write_env_local_keys(
+        folder, {PROJECT_ID_ENV: agent_id, PROJECT_ID_ROOT_ENV: str(folder)})
+    # From here this process stands in the folder, bound to the agent.
+    os.environ[PROJECT_ID_ENV] = agent_id
+    os.environ[PROJECT_ID_ROOT_ENV] = str(folder)
+    os.environ["CLAUDE_PROJECT_DIR"] = str(folder)
+    os.chdir(folder)
+    init = _init(claude, codex, given_id=agent_id)
+    hooks = init.get("hooks") or {}
+    build = hooks.get("build") or {}
+    wired = any((hooks.get(host) or {}).get(flag)
+                for host in ("claude", "codex")
+                for flag in ("hook_added", "hook_changed", "adapter_changed", "config_changed"))
+    changed = (node_changed or env_changed or wired
+               or bool((hooks.get("gitignore") or {}).get("changed"))
+               or bool(build.get("created") or build.get("changed")))
+    return {"ok": True, "agent_id": agent_id, "folder": str(folder), "node": node_row,
+            "changed": changed, "env": {"path": str(folder / ".env.local"),
+                                        "changed": env_changed},
+            "init": init, "store": _kernel_store_report(setting)}
 
 
 CK_ICON_FILE = re.compile(r"icon-[^/]+\.png")
