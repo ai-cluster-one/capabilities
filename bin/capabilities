@@ -514,8 +514,9 @@ PROJECT VERBS (run inside a consuming project)
         never rewritten: an id the project already resolves (the environment,
         its env files, or a project.json v1 it is moved out of) is kept, an
         id `.contextkit/config.toml` holds under [identity] is carried over,
-        otherwise one is minted offline - except where nothing names the id
-        in a checkout of an existing project (a v2 project.json, or the
+        otherwise one is minted offline, twelve lowercase hex characters
+        (`agent rekey` moves an agent off an older form) - except where
+        nothing names the id in a checkout of an existing project (a v2 project.json, or the
         envelope's .gitignore, without an id: a fresh clone): init then
         refuses (no_project_identity) and asks for --id. A registered row
         without a slug is given one: the slug an older project.json names,
@@ -687,6 +688,38 @@ PROJECT VERBS (run inside a consuming project)
         hosts, build, agent}. Run where no ContextKit binding is left, it
         changes nothing and answers changed false with a message. Exit 4
         under the read-only switch.
+  agent rekey [<new id>] [--dry-run]
+        Move this project's agent from the id it is bound to to a new one:
+        the id given (twelve lowercase hex characters, the form every new
+        agent is given; exit 6 input otherwise) or one minted, which must be
+        held nowhere in the store (exit 6 id_in_use). In one transaction it
+        rewrites every row of the store's schema whose text column holds the
+        old id whole - any table, any column; text that only contains it is
+        history and stays - with the tables' triggers that would refuse the
+        move held off inside that transaction, and rolls back where a row
+        still holds the old id (exit 5 rekey_incomplete). It refuses,
+        changing nothing, while the agent's services run (exit 6
+        agent_services_running: an unexpired lease row in the store naming
+        the id, or a machine service's project list on this machine keying
+        it, each named with how to stop it), and an agent holding asset
+        files, whose bucket objects are stored under the id (exit 6
+        rekey_assets_files). Then it rebinds each node it can reach: the
+        env file line of the folder it runs in (only that folder: another
+        one this node's row records is named), and a server node created through a coolify connection by setting
+        CAPABILITIES_PROJECT_ID in its resource's environment with `coolify
+        env set` (it starts under the new id at its next deploy). Every
+        other node is named in `unreached` with what to run there: on a Mac,
+        `capabilities agent rekey <new id>` in the agent's folder, which
+        finds the store already moved and rebinds that folder alone. An id
+        the environment hands this folder is named, not written.
+        --dry-run changes nothing and answers the same, with every row
+        (each table, column, count, and the rows' keys: the primary key,
+        else the first unique index), the
+        triggers, the files and resources it would write, the services
+        running and what would refuse. Answers {ok, project, dry_run,
+        old_id, new_id, minted, store {level, schema, moved,
+        already_moved}, rows, total_rows, triggers, bindings, unreached}.
+        Exit 4 under the read-only switch, but for --dry-run.
   node list
         The nodes of this project's agent (capabilities_agent_nodes): {ok,
         project, agent_id, nodes [{node, kind, address, is_master,
@@ -7229,9 +7262,7 @@ def _ensure_project_identity(capdir: Path, root: Path, given_id: str | None = No
                  "run `capabilities init --id <id>` with the agent's id once in this "
                  f"checkout, or set {PROJECT_ID_ENV}")
         else:
-            # Twelve hex characters, for the reason a document version has
-            # twelve: an identifier nobody can read is an identifier nobody checks.
-            current = _contextkit_config_id(root) or "prj_" + secrets.token_hex(6)
+            current = _contextkit_config_id(root) or _mint_agent_id()
         if state["state"] != "handed":
             _write_env_local_id(root, current)
     if given_id and _env_file_project_id(root)[0] is None:
@@ -7759,8 +7790,17 @@ def cmd_agent(args: list[str]) -> None:
         if pos:
             _die(6, "input", "agent convert takes no positional argument")
         _emit(_agent_convert(root.resolve()))
+    elif sub == "rekey":
+        pos, opts = _kernel_options(args[1:], set(), {"--dry-run", "--json"}, "agent rekey")
+        if len(pos) > 1:
+            _die(6, "input", "agent rekey takes at most one new id",
+                 "capabilities agent rekey [<new id>] [--dry-run]")
+        if "--dry-run" not in opts:
+            _read_only_gate("agent rekey")
+        _emit(_agent_rekey(root, pos[0].strip() if pos else None, "--dry-run" in opts))
     else:
-        _die(6, "input", "agent needs a subcommand: show, set, convert, list or materialize",
+        _die(6, "input", "agent needs a subcommand: show, set, convert, list, materialize "
+             "or rekey",
              "run `capabilities help`")
 
 
@@ -8244,6 +8284,350 @@ def _agent_set(root: Path, values: dict) -> dict:
     return {"ok": True, "project": str(root), "agent_id": agent_id,
             "created": created, "changed": created or changed, "agent": agent,
             "store": _kernel_store_report(setting)}
+
+
+# The id an agent is given from now on: twelve lowercase hex characters, no
+# prefix. The older forms PROJECT_ID_RE still accepts are read everywhere, and
+# a rekey moves an agent off one of them.
+NEW_AGENT_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+# The column types a project id is held in. A uuid column holds the id of a
+# row, never an agent's, so the UUID an older agent carries is looked for in
+# text alone.
+REKEY_TEXT_TYPES = ("text", "varchar", "bpchar")
+
+
+def _mint_agent_id() -> str:
+    # Twelve hex characters, for the reason a document version has twelve: an
+    # identifier nobody can read is an identifier nobody checks.
+    return secrets.token_hex(6)
+
+
+def _rekey_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _rekey_scan(conn, schema: str, ident: str, keys: bool = False) -> list[dict]:
+    """Every column of every table of the store's schema whose text value is
+    `ident` in whole, with how many rows hold it there and, with `keys`, each
+    row's primary key. A value that only contains the id - a description, a
+    log line - is history and is not counted."""
+    columns: dict[str, list[str]] = {}
+    for table, column in conn.execute(
+            "SELECT c.relname, a.attname FROM pg_attribute a "
+            "JOIN pg_class c ON c.oid = a.attrelid "
+            "WHERE c.relnamespace = to_regnamespace(%s) AND c.relkind IN ('r', 'p') "
+            "AND NOT c.relispartition AND a.attnum > 0 AND NOT a.attisdropped "
+            "AND format_type(a.atttypid, NULL) IN ('text', 'character varying', 'character') "
+            "ORDER BY c.relname, a.attnum", (schema,)).fetchall():
+        columns.setdefault(table, []).append(column)
+    found = []
+    for table, names in columns.items():
+        counts = conn.execute(
+            "SELECT " + ", ".join(f"count(*) FILTER (WHERE {_rekey_ident(n)} = %s)"
+                                  for n in names)
+            + f" FROM {_rekey_ident(schema)}.{_rekey_ident(table)}",
+            (ident,) * len(names)).fetchone()
+        for name, count in zip(names, counts):
+            if not count:
+                continue
+            hit = {"table": table, "column": name, "rows": count}
+            if keys:
+                # The primary key, else the first unique index - its columns or
+                # the expressions it is built on - names a row.
+                index = conn.execute(
+                    "SELECT indexrelid, indnkeyatts FROM pg_index "
+                    "WHERE indrelid = to_regclass(%s) AND indisunique AND indpred IS NULL "
+                    "ORDER BY indisprimary DESC, indexrelid LIMIT 1",
+                    (f"{_rekey_ident(schema)}.{_rekey_ident(table)}",)).fetchone()
+                primary = [conn.execute("SELECT pg_get_indexdef(%s, %s, true)",
+                                        (index[0], k)).fetchone()[0]
+                           for k in range(1, index[1] + 1)] if index else []
+                if primary:
+                    hit["key"] = primary
+                    hit["keys"] = [
+                        [None if v is None else str(v) for v in row] for row in conn.execute(
+                            "SELECT " + ", ".join(primary)
+                            + f" FROM {_rekey_ident(schema)}.{_rekey_ident(table)} "
+                            f"WHERE {_rekey_ident(name)} = %s ORDER BY 1", (ident,)).fetchall()]
+            found.append(hit)
+    return found
+
+
+def _rekey_order(conn, schema: str, plan: list[dict]) -> list[dict]:
+    """The plan with every table another table's foreign key refers to first,
+    so the parent's id moves before a child's row names it."""
+    parents = {row[0] for row in conn.execute(
+        "SELECT DISTINCT p.relname FROM pg_constraint k JOIN pg_class p ON p.oid = k.confrelid "
+        "WHERE k.contype = 'f' AND k.connamespace = to_regnamespace(%s)", (schema,)).fetchall()}
+    return sorted(plan, key=lambda hit: (hit["table"] not in parents, hit["table"],
+                                         hit["column"]))
+
+
+def _rekey_triggers(conn, schema: str, tables: list[str]) -> list[dict]:
+    """The triggers of `tables` that fire, each with the mode it fires in, so
+    the rekey can set it back exactly: its guards would refuse an id moving."""
+    return [{"table": table, "trigger": name, "mode": mode} for table, name, mode in conn.execute(
+        "SELECT c.relname, t.tgname, t.tgenabled FROM pg_trigger t "
+        "JOIN pg_class c ON c.oid = t.tgrelid "
+        "WHERE c.relnamespace = to_regnamespace(%s) AND c.relname = ANY (%s) "
+        "AND NOT t.tgisinternal AND t.tgenabled <> 'D' ORDER BY 1, 2",
+        (schema, sorted(set(tables)))).fetchall()]
+
+
+def _rekey_leases(conn, schema: str, plan: list[dict], ident: str) -> list[dict]:
+    """The services the store says run for `ident`: a row of a table that
+    keeps a lease - a node and an expiry - naming the id and not yet expired."""
+    running = []
+    for hit in plan:
+        table = hit["table"]
+        shape = {row[0] for row in conn.execute(
+            "SELECT attname FROM pg_attribute WHERE attrelid = to_regclass(%s) "
+            "AND attnum > 0 AND NOT attisdropped",
+            (f"{_rekey_ident(schema)}.{_rekey_ident(table)}",)).fetchall()}
+        if not {"node", "expires_at"} <= shape:
+            continue
+        name = ("capability" if "capability" in shape
+                else f"'{table.split('_', 1)[0]}'::text")
+        for capability, node, until in conn.execute(
+                f"SELECT {name}, node, expires_at "
+                f"FROM {_rekey_ident(schema)}.{_rekey_ident(table)} "
+                f"WHERE {_rekey_ident(hit['column'])} = %s AND expires_at > now() "
+                "ORDER BY 1, 2", (ident,)).fetchall():
+            running.append({"capability": capability, "node": node,
+                            "until": _store_module()._stamp(until), "lease": table})
+    return running
+
+
+def _rekey_machine_services(ident: str) -> list[dict]:
+    """The machine services on this machine whose list of projects keys `ident`:
+    each serves the agent by that id until it leaves."""
+    joined = []
+    for listing in sorted(_CONFIG_HOME.glob("*/service/projects.*")):
+        name = listing.parent.parent.name
+        try:
+            if listing.suffix == ".toml":
+                import tomllib
+                body = tomllib.loads(listing.read_text())
+            elif listing.suffix == ".json":
+                body = json.loads(listing.read_text())
+            else:
+                continue
+        except (OSError, ValueError):
+            continue
+        if ident in ((body or {}).get("projects") or {}):
+            joined.append({"capability": name, "list": str(listing)})
+    return joined
+
+
+def _rebind_env_file(path: Path, old: str, new: str, write: bool) -> bool:
+    """Turn the line binding `old` in an env file into one binding `new`,
+    every other line kept; True when there is such a line."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return False
+    pattern = re.compile(r"^(\s*(?:export\s+)?" + PROJECT_ID_ENV + r"\s*=\s*)(['\"]?)"
+                         + re.escape(old) + r"\2\s*$")
+    changed = [pattern.sub(lambda m: m.group(1) + new, line) for line in lines]
+    if changed == lines:
+        return False
+    if write:
+        _atomic_write_text(path, "\n".join(changed) + "\n")
+    return True
+
+
+def _rekey_folder(folder: Path, old: str, new: str, write: bool) -> dict:
+    """Move one folder on this machine from `old` to `new`: the env file that
+    binds it. An id the environment hands the folder is not a file's to move."""
+    entry: dict = {"folder": str(folder)}
+    if _handed_off_project_id(folder) == old:
+        entry.update(changed=False, reason="handed",
+                     do=f"set {PROJECT_ID_ENV}={new} where this process's environment "
+                        "comes from")
+        return entry
+    for name in PROJECT_ID_FILES:
+        path = folder / name
+        if _rebind_env_file(path, old, new, write):
+            entry.update(changed=True, path=str(path))
+            break
+    else:
+        entry.update(changed=False, reason="not_bound",
+                     do=f"{folder} does not bind {old} in its env files")
+    if _contextkit_config_id(folder) == old:
+        entry["left"] = (f"{CONTEXTKIT_CONFIG_REL} still names {old} under [identity]; "
+                         "ContextKit owns that file")
+    return entry
+
+
+def _rekey_server(root: Path, node: dict, new: str, write: bool) -> dict:
+    """Move a server node's binding: CAPABILITIES_PROJECT_ID in its Coolify
+    resource's environment, set through the coolify capability with the
+    connection the node was created through."""
+    entry = {"node": node["node"], "kind": node["kind"], "how": "coolify",
+             "connection": node["coolify_connection"], "resource": node["coolify_resource"]}
+    redeploy = (f"redeploy the node (`coolify deploy {node['coolify_resource']}`) "
+                "to start it under the new id")
+    if not write:
+        return {**entry, "next": redeploy}
+    coolify = shutil.which("coolify")
+    if not coolify:
+        return {**entry, "changed": False, "reason": "coolify_unavailable"}
+    env = {**os.environ, PROJECT_ID_ENV: new, PROJECT_ID_ROOT_ENV: str(root.resolve())}
+    try:
+        result = subprocess.run(
+            [coolify, "--connection", node["coolify_connection"], "env", "set",
+             node["coolify_resource"], PROJECT_ID_ENV, "--value-stdin"],
+            cwd=root, env=env, input=new, text=True, capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {**entry, "changed": False, "reason": f"coolify could not complete: {exc}"}
+    if result.returncode:
+        try:
+            reason = json.loads(result.stderr.strip().splitlines()[-1])["error"]["code"]
+        except (ValueError, KeyError, TypeError, IndexError):
+            reason = f"coolify exited {result.returncode}"
+        return {**entry, "changed": False, "reason": reason}
+    return {**entry, "changed": True, "next": redeploy}
+
+
+def _agent_rekey(root: Path, given: str | None, dry_run: bool) -> dict:
+    """`agent rekey`: move this project's agent from the id it is bound to to
+    a new one - every row of the store's schema holding it in one transaction,
+    then the binding on each node it can reach, naming the ones it cannot."""
+    store = _store_module()
+    old = _project_id_state(root, move=not dry_run)["id"]
+    if not old:
+        _kernel_agent_id(root)
+    if given is not None and not NEW_AGENT_ID_RE.match(given):
+        _die(6, "input", f"{given!r} is not an agent id of the current form",
+             "a new agent id is twelve lowercase hex characters; leave it out to have "
+             "one minted")
+    if given == old:
+        _die(6, "input", f"this project is already bound to {old}")
+    node_name = os.environ.get(store.NODE_NAME_ENV, "").strip()
+    conn, setting = _kernel_open(root)
+    schema = setting.schema
+    import psycopg
+    try:
+        held = conn.execute("SELECT 1 FROM capabilities_agents WHERE id = %s",
+                            (old,)).fetchone() is not None
+        if not held:
+            # The store moved already, from another node: what is left here
+            # is this folder's binding, for an agent that lists this node.
+            if given is None or not conn.execute(
+                    "SELECT 1 FROM capabilities_agent_nodes WHERE agent_id = %s AND node = %s",
+                    (given, node_name)).fetchone():
+                _die(6, "agent_unknown",
+                     f"the store ({setting.level}, schema {schema}) holds no agent {old!r}",
+                     "a folder whose agent was rekeyed on another node is moved by "
+                     "`capabilities agent rekey <new id>` here, on a node that agent lists")
+        new = given or _mint_agent_id()
+        if held:
+            taken = _rekey_scan(conn, schema, new)
+            if taken:
+                _die(6, "id_in_use",
+                     f"{new} is already held in the store: "
+                     + ", ".join(f"{t['table']}.{t['column']}" for t in taken),
+                     "give another id, or leave it out to have one minted")
+        plan = _rekey_order(conn, schema, _rekey_scan(conn, schema, old, keys=dry_run)) \
+            if held else []
+        refusals = []
+        if any(hit["table"] == "assets_files" for hit in plan):
+            refusals.append(("rekey_assets_files",
+                             "the agent holds asset files, whose objects are stored under "
+                             f"{old}/ in their bucket, which this manager does not reach",
+                             "move the objects to the new id's prefix with the assets "
+                             "capability's storage first; nothing was changed"))
+        running = _rekey_leases(conn, schema, plan, old)
+        joined = _rekey_machine_services(old)
+        if (running or joined) and not dry_run:
+            names = ([f"{r['capability']} on {r['node']} (lease until {r['until']})"
+                      for r in running]
+                     + [f"the {j['capability']} machine service here" for j in joined])
+            _die(6, "agent_services_running",
+                 f"the agent's services run under {old}: " + "; ".join(names),
+                 "stop each before the rekey and start it after: on a server node stop "
+                 "the node (`coolify stop <resource>`), a project service with "
+                 "`<capability> service stop` in its folder, a machine service's project "
+                 "with `<capability> service leave` here (`service join` after); a lease "
+                 "a stopped service held runs out at its time")
+        if refusals and not dry_run:
+            _die(6, *refusals[0])
+        triggers = _rekey_triggers(conn, schema, [hit["table"] for hit in plan])
+        nodes = _node_rows(conn, old if held else new)
+    except psycopg.Error as exc:
+        conn.close()
+        _die(5, "store_unreachable", f"cannot read the store: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    moved = False
+    if held and not dry_run:
+        modes = {"O": "", "A": "ALWAYS ", "R": "REPLICA "}
+        qualified = lambda table: f"{_rekey_ident(schema)}.{_rekey_ident(table)}"
+        try:
+            with conn.transaction():
+                conn.execute("SET LOCAL lock_timeout = '10s'")
+                for t in triggers:
+                    conn.execute(f"ALTER TABLE {qualified(t['table'])} "
+                                 f"DISABLE TRIGGER {_rekey_ident(t['trigger'])}")
+                for hit in plan:
+                    conn.execute(f"UPDATE {qualified(hit['table'])} SET "
+                                 f"{_rekey_ident(hit['column'])} = %s "
+                                 f"WHERE {_rekey_ident(hit['column'])} = %s", (new, old))
+                for t in triggers:
+                    conn.execute(f"ALTER TABLE {qualified(t['table'])} ENABLE "
+                                 f"{modes.get(t['mode'], '')}TRIGGER "
+                                 f"{_rekey_ident(t['trigger'])}")
+                left = _rekey_scan(conn, schema, old)
+                if left:
+                    raise RuntimeError("rows still hold the old id: " + ", ".join(
+                        f"{t['table']}.{t['column']}" for t in left))
+            moved = True
+        except RuntimeError as exc:
+            conn.close()
+            _die(5, "rekey_incomplete", f"the rekey was rolled back: {exc}")
+        except psycopg.Error as exc:
+            conn.close()
+            _die(5, "store_write_failed",
+                 f"the store refused the rekey and nothing was changed: {exc}")
+    conn.close()
+    bindings, unreached = [], []
+    here = root.resolve()
+    for node in nodes:
+        if node["node"] == node_name:
+            bindings.append({"node": node["node"], "kind": node["kind"], "how": "env_file",
+                             **_rekey_folder(here, old, new, not dry_run)})
+            # Only the folder it runs in is rebound: another folder this
+            # node's row records is named, for the same command run there.
+            if node.get("folder") and Path(node["folder"]).resolve() != here:
+                unreached.append({"node": node["node"], "kind": node["kind"],
+                                  "folder": node["folder"],
+                                  "do": f"run `capabilities agent rekey {new}` in {node['folder']}"})
+        elif node["kind"] == "server" and node.get("coolify_resource"):
+            done = _rekey_server(root, node, new, not dry_run)
+            (bindings if dry_run or done.get("changed") else unreached).append(done)
+        else:
+            unreached.append({
+                "node": node["node"], "kind": node["kind"], "folder": node.get("folder"),
+                "do": (f"run `capabilities agent rekey {new}` in the agent's folder there"
+                       if node["kind"] == "mac" else
+                       f"set {PROJECT_ID_ENV}={new} in the node's environment and redeploy it")})
+    if not any(b.get("folder") == str(here) for b in bindings):
+        bindings.insert(0, {"node": node_name or None, "how": "env_file",
+                            **_rekey_folder(here, old, new, not dry_run)})
+    answer = {"ok": True, "project": str(root), "dry_run": dry_run, "old_id": old,
+              "new_id": new, "minted": given is None,
+              "store": {**_kernel_store_report(setting),
+                        "moved": moved, "already_moved": not held},
+              "rows": plan, "total_rows": sum(hit["rows"] for hit in plan),
+              "triggers": [{"table": t["table"], "trigger": t["trigger"]} for t in triggers],
+              "bindings": bindings, "unreached": unreached}
+    if dry_run:
+        answer["services_running"] = running + [
+            {"capability": j["capability"], "node": node_name or None,
+             "machine_service": j["list"]} for j in joined]
+        answer["refusals"] = [{"code": c, "message": m} for c, m, _h in refusals]
+        if given is None:
+            answer["note"] = "a run without an id mints another one"
+    return answer
 
 
 def _node_rows(conn, agent_id: str, node: str | None = None) -> list[dict]:

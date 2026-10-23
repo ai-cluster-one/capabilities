@@ -140,7 +140,7 @@ def test_init_mints_an_id_offline_in_a_plain_project(tmp_path: Path) -> None:
     minted = _bound(project)
     identity = _json(_run(tmp_path, project, "path", "--json", "--identity"))["project_identity"]
 
-    assert minted.startswith("prj_") and len(minted) == 16
+    assert len(minted) == 12 and all(c in "0123456789abcdef" for c in minted)
     # The id is the binding: init writes no project.json.
     assert not (project / "capabilities" / "project.json").exists()
     assert identity == {"state": "declared", "id": minted,
@@ -171,7 +171,8 @@ def test_init_mints_for_a_bound_project_whose_binding_holds_no_id(tmp_path: Path
 
     _json(_run(tmp_path, project, "init"))
 
-    assert _bound(project).startswith("prj_")
+    bound = _bound(project)
+    assert len(bound) == 12 and all(c in "0123456789abcdef" for c in bound)
     assert _identity_calls(log) == 0
 
 

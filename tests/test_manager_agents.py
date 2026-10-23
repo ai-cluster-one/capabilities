@@ -1216,3 +1216,129 @@ def test_agent_convert_refuses_before_writing_anything(lab, tmp_path):
     code, error = unknown.refused("agent", "convert")
     assert (code, error["code"]) == (6, "agent_unknown")
     assert (unknown.path / ".contextkit" / "config.toml").read_text() == BOUND_CONFIG
+
+
+def test_agent_rekey_moves_an_agent_to_a_new_id_in_the_store_and_on_its_nodes(lab, tmp_path):
+    old, new = PROJECT_ID, "0123456789ab"
+    here = {"AGENT_NODE_NAME": "lab-node"}
+    # A coolify that records what it was asked, standing in for the capability.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "coolify-calls"
+    (bin_dir / "coolify").write_text(
+        "#!/bin/sh\n"
+        f'printf "%s|%s|" "$*" "$CAPABILITIES_PROJECT_ID" >> {calls}\n'
+        f"cat >> {calls}\necho >> {calls}\necho '{{\"ok\": true}}'\n")
+    (bin_dir / "coolify").chmod(0o755)
+    path = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+
+    def execute(query: str, params: tuple = ()) -> None:
+        with lab.cluster.connect(lab.database) as conn:
+            conn.execute(query, params)
+
+    lab.ok("agent", "set", "--name", "Lab")
+    for name, kind, extra in (("lab-node", "mac", ()), ("far-mac", "mac", ()),
+                              ("old-box", "server", ()),
+                              ("box", "server", ("--coolify-connection", "infra",
+                                                 "--coolify-server", "srv-uuid",
+                                                 "--coolify-resource", "res-uuid"))):
+        added = lab.run("node", "add", name, "--kind", kind, *extra, **here)
+        assert added.returncode == 0, added.stderr
+    # A capability's table whose guard refuses any change, a lease table, and
+    # a free-text line that only mentions the id.
+    execute(f"CREATE TABLE {SCHEMA}.lab_notes (id serial PRIMARY KEY, project_id text, "
+            "note text)")
+    execute(f"CREATE FUNCTION {SCHEMA}.lab_notes_guard() RETURNS trigger LANGUAGE plpgsql "
+            "AS $$ BEGIN RAISE EXCEPTION 'lab_notes is append-only'; END $$")
+    execute(f"CREATE TRIGGER lab_notes_guard BEFORE UPDATE OR DELETE ON {SCHEMA}.lab_notes "
+            f"FOR EACH ROW EXECUTE FUNCTION {SCHEMA}.lab_notes_guard()")
+    execute(f"INSERT INTO {SCHEMA}.lab_notes (project_id, note) VALUES (%s, 'a'), "
+            "(%s, %s), ('prj_00000000beef', 'other')", (old, old, f"made by {old}"))
+    execute(f"CREATE TABLE {SCHEMA}.lab_leases (project_id text, node text, "
+            "expires_at timestamptz)")
+    execute(f"INSERT INTO {SCHEMA}.lab_leases VALUES (%s, 'old-box', now() + interval '1 hour')",
+            (old,))
+
+    def rekey(*args: str, cwd: Path = lab.project, **extra: str):
+        return subprocess.run(
+            [sys.executable, str(MANAGER), "agent", "rekey", *args], cwd=cwd,
+            env=lab.env(CLAUDE_PROJECT_DIR=str(cwd), **path, **extra),
+            text=True, capture_output=True, timeout=120)
+
+    def code(result) -> tuple[int, str]:
+        return result.returncode, json.loads(
+            result.stderr.strip().splitlines()[-1])["error"]["code"]
+
+    def text_columns() -> list[tuple]:
+        return sorted(lab.sql(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema = %s AND data_type = 'text'", (SCHEMA,)))
+
+    # The dry run lists every row, trigger, file and node, and changes nothing.
+    env_before = (lab.project / ".env.local").read_text()
+    dry = rekey(new, "--dry-run", **here)
+    assert dry.returncode == 0, dry.stderr
+    plan = json.loads(dry.stdout)
+    rows = {(r["table"], r["column"]): r for r in plan["rows"]}
+    assert plan["rows"][0]["table"] == "capabilities_agents"
+    assert rows[("lab_notes", "project_id")]["rows"] == 2
+    assert rows[("lab_notes", "project_id")]["keys"] == [["1"], ["2"]]
+    assert rows[("capabilities_agent_nodes", "agent_id")]["rows"] == 4
+    assert ("lab_notes", "note") not in rows
+    assert {"table": "lab_notes", "trigger": "lab_notes_guard"} in plan["triggers"]
+    assert plan["services_running"] == [
+        {"capability": "lab", "node": "old-box", "until": plan["services_running"][0]["until"],
+         "lease": "lab_leases"}]
+    assert [b["node"] for b in plan["bindings"]] == ["box", "lab-node"]
+    assert [u["node"] for u in plan["unreached"]] == ["far-mac", "old-box"]
+    assert (lab.project / ".env.local").read_text() == env_before
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.lab_notes WHERE project_id = %s",
+                   (old,)) == [(2,)]
+    assert not calls.exists()
+
+    # Refused, changing nothing: an older form as the new id, an id the store
+    # holds, and a service still running.
+    assert code(rekey("prj_0123456789ab", **here)) == (6, "input")
+    execute(f"INSERT INTO {SCHEMA}.capabilities_agents (id) VALUES ('fedcba987654')")
+    assert code(rekey("fedcba987654", **here)) == (6, "id_in_use")
+    assert code(rekey(new, **here)) == (6, "agent_services_running")
+    execute(f"UPDATE {SCHEMA}.lab_leases SET expires_at = now() - interval '1 minute'")
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.capabilities_agents WHERE id = %s",
+                   (old,)) == [(1,)]
+
+    done = rekey(new, **here)
+    assert done.returncode == 0, done.stderr
+    answer = json.loads(done.stdout)
+    assert (answer["old_id"], answer["new_id"], answer["store"]["moved"]) == (old, new, True)
+    for table, column in text_columns():
+        assert lab.sql(f'SELECT count(*) FROM {SCHEMA}."{table}" WHERE "{column}" = %s',
+                       (old,)) == [(0,)], (table, column)
+    assert lab.sql(f"SELECT id, project_id, note FROM {SCHEMA}.lab_notes ORDER BY id") == [
+        (1, new, "a"), (2, new, f"made by {old}"), (3, "prj_00000000beef", "other")]
+    assert lab.sql("SELECT tgenabled FROM pg_trigger WHERE tgname = 'lab_notes_guard'") \
+        == [("O",)]
+    assert lab.sql(f"SELECT node FROM {SCHEMA}.capabilities_agent_nodes WHERE agent_id = %s "
+                   "ORDER BY node", (new,)) == [("box",), ("far-mac",), ("lab-node",),
+                                                 ("old-box",)]
+    assert (lab.project / ".env.local").read_text() == env_before.replace(
+        f"CAPABILITIES_PROJECT_ID={old}", f"CAPABILITIES_PROJECT_ID={new}")
+    assert calls.read_text() == (
+        f"--connection infra env set res-uuid CAPABILITIES_PROJECT_ID --value-stdin|{new}|{new}\n")
+    assert [u["node"] for u in answer["unreached"]] == ["far-mac", "old-box"]
+    assert lab.ok("agent", "show")["agent"]["name"] == "Lab"
+
+    # On another Mac of the agent the store has moved already: the same
+    # command rebinds that folder alone.
+    far = tmp_path / "far"
+    far.mkdir()
+    (far / ".env.local").write_text(env_before)
+    assert code(rekey(cwd=far, AGENT_NODE_NAME="far-mac")) == (6, "agent_unknown")
+    moved = rekey(new, cwd=far, AGENT_NODE_NAME="far-mac")
+    assert moved.returncode == 0, moved.stderr
+    assert json.loads(moved.stdout)["store"]["already_moved"] is True
+    assert f"CAPABILITIES_PROJECT_ID={new}\n" in (far / ".env.local").read_text()
+    stranger = tmp_path / "stranger"
+    stranger.mkdir()
+    (stranger / ".env.local").write_text(env_before)
+    assert code(rekey(new, cwd=stranger, AGENT_NODE_NAME="no-such-node")) \
+        == (6, "agent_unknown")
