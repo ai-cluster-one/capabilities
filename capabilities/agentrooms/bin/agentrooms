@@ -453,6 +453,22 @@ COMMANDS
         null (exit 0) when no turn of this agent is recorded as posting it -
         a message the agent posted itself, or one answered before this
         version recorded it.
+    catch-up [--limit N]
+        Inside a turn the service started (AGENTROOMS_TURN), what arrived
+        in the turn's room since the turn began, or since its last
+        catch-up - of the room's N newest messages (default 50, 1-100),
+        oldest first: {room_id, turn, count, more, messages: [the rows
+        `read` prints], wakes: [{event_id, sender, kind}]}. `more` is true
+        when all N were new, so some may lie beyond them. What it returns
+        is seen: once the turn ends, if its harness ran, the next turn in
+        the room does not carry it as new. A mention, a direct message or a
+        marked-room message among it from a sender the turn's worker admits
+        is taken by this turn (`wakes`): it starts no turn of its own, even
+        when the service records it after catch-up ran, and counts toward
+        the worker's limits as this turn's. One from a sender the worker
+        does not admit is refused or held as before. Outside a turn exits 6
+        not_in_turn; a turn that has ended, 6 turn_ended; another agent's
+        turn, 6 not_your_turn.
 
   Workers (WORKERS states the document)
     workers list
@@ -588,10 +604,11 @@ SERVICE
   fit a turn: free text out, claude's permission_mode bypassPermissions or
   codex's approval_policy never. A session not recorded on this node starts
   fresh, primed from the room's recent messages. One turn per agent per room
-  at a time: what arrives during a turn is carried into the next one. The turn
-  runs in the project's root as the project would run it, with AGENTROOMS_TURN
-  set. On every turn the bundled room frame, with the worker's body after it
-  as the agent's role, is appended to the harness's system prompt, after any
+  at a time: what arrives during a turn is carried into the next one,
+  unless the turn takes it with `catch-up`. The turn runs in the project's
+  root as the project would run it, with AGENTROOMS_TURN set. On every turn
+  the bundled room frame, with the worker's body after it as the agent's
+  role, is appended to the harness's system prompt, after any
   append_system_prompt the profile carries; the turn's message holds only what
   woke the agent and the room's messages since its last turn. Its final answer
   is posted to the room as the agent, in the thread that woke it; an answer of
@@ -3178,6 +3195,48 @@ def cmd_turn(wanted: str | None, event_id: str):
     return None if found is None else {"event_id": event_id, "connection": cid, **found}
 
 
+def cmd_catch_up(wanted: str | None, limit: int) -> dict:
+    engine = _engine()
+    turn_id = os.environ.get(engine.TURN_ENV)
+    if not turn_id:
+        _die(6, "not_in_turn", f"`catch-up` takes what arrived in the room during a turn the "
+             f"{NAME} service started, and this is not one",
+             f"`{NAME} read ROOM` reads a room")
+    cid, _entry, project, store = _agent_store(wanted, "catch-up")
+    try:
+        turn = store.running_turn(turn_id)
+        if turn is None or turn["project_id"] != project:
+            _die(6, "turn_not_found", f"no turn {turn_id} of the {NAME} service is recorded "
+                 "in this project")
+        if turn["agent"] != cid:
+            _die(6, "not_your_turn", f"turn {turn_id} is agent {turn['agent']!r}'s, not "
+                 f"{cid!r}'s", f"run it as `{NAME} --connection {turn['agent']} catch-up`")
+        if turn["outcome"] is not None:
+            _die(6, "turn_ended", f"turn {turn_id} has ended ({turn['outcome']})")
+        cfg = _cfg(wanted, "catch-up")
+        room_id = turn["room_id"]
+        with _matrix(cfg) as m:
+            try:
+                found = m.call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/messages",
+                               params={"dir": "b", "limit": str(limit),
+                                       "filter": json.dumps({"types": ["m.room.message"]})})
+            except MatrixError as exc:
+                _fail(exc)
+        chunk = [e for e in (found or {}).get("chunk") or [] if e.get("type") == "m.room.message"]
+        mark = turn["seen_ts"] or 0
+        new = [e for e in reversed(chunk) if (e.get("origin_server_ts") or 0) > mark]
+        took = store.catch_up(turn_id, new, engine.turn_admits(store, project, turn))
+        if took is None:
+            _die(6, "turn_ended", f"turn {turn_id} has ended")
+    finally:
+        store.close()
+    return {"room_id": room_id, "turn": turn_id, "count": len(new),
+            "more": len(chunk) >= limit and len(new) == len(chunk),
+            "messages": [_message_row(e) for e in new],
+            "wakes": [{"event_id": w["event_id"], "sender": w["sender"], "kind": w["kind"]}
+                      for w in took]}
+
+
 # ── the service: files, settings, the opt-in list ────────────────────────────
 
 MACHINE_KEYS = ("version", "max_turns")
@@ -4852,6 +4911,7 @@ def _parser() -> _Parser:
     watch.add_argument("--no-held", dest="held", action="store_false")
     sub.add_parser("sessions").add_argument("--room")
     sub.add_parser("turn").add_argument("event")
+    sub.add_parser("catch-up").add_argument("--limit", type=_limit, default=50)
     read = sub.add_parser("read")
     read.add_argument("room")
     read.add_argument("--limit", type=_limit, default=20)
@@ -5039,6 +5099,9 @@ def main() -> None:
     if cmd == "turn":
         found = cmd_turn(wanted, args.event)
         _emit("null" if found is None else found)
+        return
+    if cmd == "catch-up":
+        _emit(cmd_catch_up(wanted, args.limit))
         return
     if cmd == "service":
         _service(args)

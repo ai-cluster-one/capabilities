@@ -213,6 +213,53 @@ def test_held_wakes_wait_for_the_operator_and_a_grant_releases_them(store):
                               "room": "!r"} for n in said)
 
 
+def test_catch_up_takes_the_admitted_wakes_and_a_later_one_is_known_taken(store):
+    store.acquire("p", "alpha", "h1", "n1", 1)
+    wake = {"room_id": "!r", "kind": "mention", "sender": "@b:x"}
+    store.save_sync("p", "alpha", "@alpha:x", "h1", "b1", [{**wake, "key": "$1", "event_id": "$1"}])
+    store.claim("p", "alpha", "!r", "t1")
+    store.start_turn("t1", "p", "alpha", "!r", "w", None, ["@b:x"], ["mention"])
+    store.mark_turn("t1", 100)
+    assert store.running_turn("t1")["seen_ts"] == 100
+    store.save_sync("p", "alpha", "@alpha:x", "h1", "b2", [
+        {**wake, "key": "$2", "event_id": "$2"},
+        {**wake, "key": "$3", "event_id": "$3", "sender": "@s:x"}])
+    events = [{"event_id": f"${n}", "origin_server_ts": 100 + n} for n in (2, 3, 4)]
+    took = store.catch_up("t1", events, lambda w: w["sender"] == "@b:x")
+    assert [w["event_id"] for w in took] == ["$2"]
+    turn = store.execute("SELECT seen_ts, taken, senders FROM agentrooms_turns WHERE id = 't1'",
+                         fetch="one")
+    assert turn[0] == 104 and sorted(turn[1]) == ["$2", "$3", "$4"] and turn[2] == ["@b:x"]
+    assert store.turn_seen("t1") == 104
+    # A wake for a message the turn took, recorded after catch-up ran.
+    store.save_sync("p", "alpha", "@alpha:x", "h1", "b3", [
+        {**wake, "key": "$4", "event_id": "$4", "sender": "@c:x"}])
+    store.end_turn("t1", "answered")
+    store.finish("p", "alpha", "!r", "t1")
+    assert store.catch_up("t1", [], lambda w: True) is None
+    pending = store.claim("p", "alpha", "!r", "t2")
+    assert sorted(w["event_id"] for w in pending) == ["$3", "$4"]
+    known = store.taken_before("p", "alpha", "!r", pending)
+    assert [(w["event_id"], w["taken_by"]) for w in known] == [("$3", "t1"), ("$4", "t1")]
+    assert sorted(store.execute("SELECT senders FROM agentrooms_turns WHERE id = 't1'",
+                                fetch="one")[0]) == ["@b:x", "@c:x", "@s:x"]
+
+
+def test_a_turn_that_took_nothing_hands_its_taken_wakes_back(store):
+    store.acquire("p", "alpha", "h1", "n1", 1)
+    wake = {"room_id": "!r", "kind": "mention", "sender": "@b:x"}
+    store.save_sync("p", "alpha", "@alpha:x", "h1", "b1", [{**wake, "key": "$1", "event_id": "$1"}])
+    store.claim("p", "alpha", "!r", "t1")
+    store.start_turn("t1", "p", "alpha", "!r", "w", None, ["@b:x"], ["mention"])
+    store.save_sync("p", "alpha", "@alpha:x", "h1", "b2", [{**wake, "key": "$2", "event_id": "$2"}])
+    store.catch_up("t1", [{"event_id": "$2", "origin_server_ts": 5}], lambda w: True)
+    store.untake("p", "alpha", "!r", "t1")
+    store.finish("p", "alpha", "!r", "t1")
+    assert [w["event_id"] for w in store.claim("p", "alpha", "!r", "t2")] == ["$2"]
+    assert store.taken_before("p", "alpha", "!r", [{"key": "$2", "kind": "mention",
+                                                     "event_id": "$2", "sender": "@b:x"}]) == []
+
+
 def test_the_store_keeps_one_working_connection_between_operations(store):
     """Each statement and each transaction borrows the process's working
     connection and gives it back after, so the store holds no connection of

@@ -54,7 +54,7 @@ from typing import Any, Callable
 
 LEDGER_OWNER = "agentrooms"
 LEDGER_MAJOR = 1
-LEDGER_MINOR = 3
+LEDGER_MINOR = 4
 LEDGER_STEPS = [
     ("0001-sync", """
     CREATE TABLE agentrooms_sync (
@@ -192,6 +192,15 @@ LEDGER_STEPS = [
     END $$;
     CREATE TRIGGER agentrooms_wakes_held_notify AFTER INSERT OR UPDATE OR DELETE
         ON agentrooms_wakes FOR EACH ROW EXECUTE FUNCTION agentrooms_wakes_held_notify();
+    """),
+    ("0010-turn-catch-up", """
+    ALTER TABLE agentrooms_turns
+        ADD COLUMN seen_ts  bigint,
+        ADD COLUMN taken    text[] NOT NULL DEFAULT '{}';
+    COMMENT ON COLUMN agentrooms_turns.seen_ts IS
+        'origin_server_ts of the newest room message the turn has been shown: its prompt''s, advanced by each `catch-up` it ran; the session''s seen_ts takes it when the turn ends, if the harness ran';
+    COMMENT ON COLUMN agentrooms_turns.taken IS
+        'event ids of the room messages `catch-up` returned inside the turn; a wake recorded later for one of them, from a sender the worker admits, starts no turn of its own';
     """),
 ]
 # The channel a change to an agent's held wakes is announced on, with the
@@ -465,6 +474,18 @@ def read_served(content) -> dict:
 
 def admits(patterns: list[str], sender: str | None) -> bool:
     return bool(sender) and any(fnmatch.fnmatchcase(sender, p) for p in patterns)
+
+
+def turn_admits(store, project: str, turn: dict) -> Callable[[dict], bool]:
+    """Whether the worker a turn ran under would have answered a wake: its kind
+    is one the worker wakes on and its sender one it admits. The version the
+    turn recorded, else the shipped default, which records none."""
+    row = store.worker(project, turn["worker"], turn["worker_id"]) if turn["worker_id"] else None
+    worker = (read_worker(row["name"], row["spec"], row["body"],
+                          f"worker {row['name']!r} version {row['id']}")
+              if row else load_default())
+    return lambda wake: (wake["kind"] in worker["wakes_on"]
+                         and admits(worker["accepts_from"], wake.get("sender")))
 
 
 def is_default_answer(content: dict) -> bool:
@@ -991,6 +1012,91 @@ class Store:
                      "worker_id, senders, kinds) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
                      "ON CONFLICT (id) DO NOTHING",
                      (turn, project, agent, room_id, worker, worker_id, senders, kinds))
+
+    def mark_turn(self, turn: str, seen_ts: int | None) -> None:
+        """The newest message the turn's prompt carries: where `catch-up` starts."""
+        self.execute("UPDATE agentrooms_turns SET seen_ts = GREATEST(COALESCE(seen_ts, 0), %s) "
+                     "WHERE id = %s", (seen_ts or 0, turn))
+
+    def running_turn(self, turn: str) -> dict | None:
+        row = self.execute("SELECT project_id, agent, room_id, worker, worker_id, outcome, "
+                           "seen_ts FROM agentrooms_turns WHERE id = %s", (turn,), fetch="one")
+        if row is None:
+            return None
+        return {"turn": turn, "project_id": row[0], "agent": row[1], "room_id": row[2],
+                "worker": row[3], "worker_id": str(row[4]) if row[4] else None,
+                "outcome": row[5], "seen_ts": row[6]}
+
+    def catch_up(self, turn: str, events: list[dict],
+                 admitted: Callable[[dict], bool]) -> list[dict] | None:
+        """What a running turn took of the room: `events`, the messages after its
+        mark. Its mark moves to the newest, their ids are recorded taken, and the
+        pending wakes among them that `admitted` passes are claimed by the turn,
+        their senders and kinds counted on it. None when the turn has ended."""
+        ids = [e["event_id"] for e in events if e.get("event_id")]
+        newest = max([e.get("origin_server_ts") or 0 for e in events] or [0])
+        with self.transaction() as cur:
+            cur.execute("SELECT project_id, agent, room_id FROM agentrooms_turns "
+                        "WHERE id = %s AND outcome IS NULL FOR UPDATE", (turn,))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            project, agent, room_id = row
+            cur.execute("SELECT wake_key, kind, event_id, sender FROM agentrooms_wakes "
+                        "WHERE project_id = %s AND agent = %s AND room_id = %s "
+                        "AND claimed_by IS NULL AND held_at IS NULL AND event_id = ANY(%s) "
+                        "FOR UPDATE", (project, agent, room_id, ids))
+            wakes = [{"key": r[0], "kind": r[1], "event_id": r[2], "sender": r[3]}
+                     for r in cur.fetchall()]
+            took = [w for w in wakes if admitted(w)]
+            if took:
+                cur.execute("UPDATE agentrooms_wakes SET claimed_by = %s WHERE project_id = %s "
+                            "AND agent = %s AND room_id = %s AND wake_key = ANY(%s)",
+                            (turn, project, agent, room_id, [w["key"] for w in took]))
+            cur.execute(
+                "UPDATE agentrooms_turns SET seen_ts = GREATEST(COALESCE(seen_ts, 0), %s), "
+                "taken = ARRAY(SELECT DISTINCT unnest(taken || %s::text[])), "
+                "senders = ARRAY(SELECT DISTINCT unnest(senders || %s::text[])), "
+                "kinds = ARRAY(SELECT DISTINCT unnest(kinds || %s::text[])) WHERE id = %s",
+                (newest, ids, sorted({w["sender"] for w in took if w["sender"]}),
+                 sorted({w["kind"] for w in took}), turn))
+        return took
+
+    def turn_seen(self, turn: str) -> int | None:
+        row = self.execute("SELECT seen_ts FROM agentrooms_turns WHERE id = %s", (turn,),
+                           fetch="one")
+        return row[0] if row else None
+
+    def untake(self, project: str, agent: str, room_id: str, turn: str) -> None:
+        """A turn whose harness did not run took nothing: the wakes `catch-up`
+        claimed for it are handed back and what it took is forgotten."""
+        with self.transaction() as cur:
+            cur.execute("UPDATE agentrooms_wakes SET claimed_by = NULL WHERE project_id = %s "
+                        "AND agent = %s AND room_id = %s AND claimed_by = %s AND wake_key IN "
+                        "(SELECT unnest(taken) FROM agentrooms_turns WHERE id = %s)",
+                        (project, agent, room_id, turn, turn))
+            cur.execute("UPDATE agentrooms_turns SET taken = '{}' WHERE id = %s", (turn,))
+
+    def taken_before(self, project: str, agent: str, room_id: str,
+                     wakes: list[dict]) -> list[dict]:
+        """The wakes whose message an earlier turn in the room already took with
+        `catch-up`; each one's sender and kind are counted on that turn."""
+        out = []
+        for wake in wakes:
+            if not wake.get("event_id"):
+                continue
+            row = self.execute(
+                "UPDATE agentrooms_turns SET "
+                "senders = ARRAY(SELECT DISTINCT unnest(senders || %s::text[])), "
+                "kinds = ARRAY(SELECT DISTINCT unnest(kinds || %s::text[])) "
+                "WHERE id = (SELECT id FROM agentrooms_turns WHERE project_id = %s "
+                "AND agent = %s AND room_id = %s AND %s = ANY(taken) "
+                "ORDER BY started_at DESC LIMIT 1) RETURNING id",
+                ([wake["sender"]] if wake.get("sender") else [], [wake["kind"]],
+                 project, agent, room_id, wake["event_id"]), fetch="one")
+            if row is not None:
+                out.append({**wake, "taken_by": row[0]})
+        return out
 
     def end_turn(self, turn: str, outcome: str, *, event_id: str | None = None,
                  harness: str | None = None, session_id: str | None = None,
@@ -2164,6 +2270,12 @@ class Engine:
             self.answer_refusal(turn, agent, binding, wake, default)
         if not admitted or worker is None:
             return
+        for wake in slot.store.taken_before(slot.project_id, cid, room_id, admitted):
+            slot.log(f"{cid}: {wake['kind']} in {room_id} from {wake.get('sender')} starts no "
+                     f"turn: turn {wake['taken_by']} took {wake['event_id']} with catch-up")
+            admitted = [w for w in admitted if w["key"] != wake["key"]]
+        if not admitted:
+            return
         self.admit_and_run(turn, agent, worker, admitted)
 
     def answer_refusal(self, turn: Turn, agent: dict, binding: dict, wake: dict,
@@ -2330,6 +2442,8 @@ class Engine:
                 return {"outcome": "refused"}
             room_name = self.room_name(matrix, room_id)
             events = self.history(matrix, room_id, worker["history"])
+            seen = max([e.get("origin_server_ts") or 0 for e in events] or [0]) or None
+            store.mark_turn(turn.id, seen)
             row = store.session(slot.project_id, cid, room_id)
             resumable = bool(row and row.get("session_id") and row.get("node") == self.node
                              and row.get("harness") == harness)
@@ -2359,7 +2473,10 @@ class Engine:
                 result = self.call_runner(turn, timeout, profile, prompt, runner.Session.fresh(),
                                           runner)
             session_id = getattr(result, "session_id", None)
-            seen = max([e.get("origin_server_ts") or 0 for e in events] or [0]) or None
+            if harness_ran(result):
+                seen = max(seen or 0, store.turn_seen(turn.id) or 0) or None
+            else:
+                store.untake(slot.project_id, cid, room_id, turn.id)
             if session_id and harness_ran(result):
                 store.save_session(slot.project_id, cid, room_id, harness=harness,
                                    session_id=session_id, node=self.node, seen_ts=seen)

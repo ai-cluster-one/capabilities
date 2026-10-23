@@ -1017,6 +1017,51 @@ def test_sessions_and_the_turn_behind_an_answer(cli, project, stored, capsys):
     assert code == 6 and err["error"]["code"] == "bad_event"
 
 
+@needs_store
+def test_catch_up_takes_what_arrived_during_the_turn_and_only_inside_it(
+        cli, project, stored, homeserver, capsys, monkeypatch):
+    connect(project, allow_write=False)
+    monkeypatch.delenv("AGENTROOMS_TURN", raising=False)
+    code, _out, err = run(cli, capsys, "catch-up")
+    assert code == 6 and err["error"]["code"] == "not_in_turn"
+    monkeypatch.setenv("AGENTROOMS_TURN", "t1")
+    code, _out, err = run(cli, capsys, "catch-up")
+    assert code == 6 and err["error"]["code"] == "turn_not_found"
+    engine = cli._engine()
+    store = engine.Store(engine.resolve_store(project)).open()
+    base = 1_700_000_000_000
+    try:
+        store.start_turn("t1", "prj_test", "alpha", "!r", "default", None, [], ["mention"])
+        store.mark_turn("t1", base + 1)
+        store.start_turn("t2", "prj_test", "beta", "!r", "default", None, [], ["mention"])
+        store.acquire("prj_test", "alpha", "h1", "n1", 1)
+        store.save_sync("prj_test", "alpha", f"@alpha:{SERVER}", "h1", "b1", [
+            {"room_id": "!r", "key": "$m2", "kind": "mention", "event_id": "$m2",
+             "sender": f"@b:{SERVER}"}])
+    finally:
+        store.close()
+    # The fake room holds $m1..$m3; the turn's prompt carried $m1.
+    code, out, err = run(cli, capsys, "catch-up")
+    assert code == 0, err
+    assert [m["event_id"] for m in out["messages"]] == ["$m2", "$m3"]
+    assert out["wakes"] == [{"event_id": "$m2", "sender": f"@b:{SERVER}", "kind": "mention"}]
+    assert {k: out[k] for k in ("room_id", "turn", "count", "more")} == {
+        "room_id": "!r", "turn": "t1", "count": 2, "more": False}
+    code, out, _err = run(cli, capsys, "catch-up")
+    assert code == 0 and out["count"] == 0 and out["wakes"] == []
+    monkeypatch.setenv("AGENTROOMS_TURN", "t2")
+    code, _out, err = run(cli, capsys, "catch-up")
+    assert code == 6 and err["error"]["code"] == "not_your_turn"
+    store = engine.Store(engine.resolve_store(project)).open()
+    try:
+        store.end_turn("t1", "answered")
+    finally:
+        store.close()
+    monkeypatch.setenv("AGENTROOMS_TURN", "t1")
+    code, _out, err = run(cli, capsys, "catch-up")
+    assert code == 6 and err["error"]["code"] == "turn_ended"
+
+
 # ── the operator's consent: invites wait, a grant per room, held wakes ───────
 
 

@@ -231,7 +231,46 @@ class FakeStore:
 
     def start_turn(self, turn, project, agent, room, worker, worker_id, senders, kinds):
         self.turn_log.append({"id": turn, "room": room, "worker": worker, "senders": senders,
-                              "kinds": kinds, "at": time.time(), "outcome": None})
+                              "kinds": kinds, "at": time.time(), "outcome": None,
+                              "seen_ts": None, "taken": []})
+
+    def row(self, turn):
+        return next(r for r in self.turn_log if r["id"] == turn)
+
+    def mark_turn(self, turn, seen_ts):
+        row = self.row(turn)
+        row["seen_ts"] = max(row["seen_ts"] or 0, seen_ts or 0)
+
+    def turn_seen(self, turn):
+        return self.row(turn)["seen_ts"]
+
+    def catch_up(self, turn, events, admitted):
+        """What `Store.catch_up` does, for the engine's side of it."""
+        row = self.row(turn)
+        ids = [e["event_id"] for e in events]
+        with self.lock:
+            took = [w for w in self.wakes if w["claimed_by"] is None and w["event_id"] in ids
+                    and admitted(w)]
+            for w in took:
+                w["claimed_by"] = turn
+        row["seen_ts"] = max([row["seen_ts"] or 0] + [e["origin_server_ts"] for e in events])
+        row["taken"] += ids
+        row["senders"] = sorted(set(row["senders"]) | {w["sender"] for w in took})
+        return took
+
+    def untake(self, project, agent, room, turn):
+        row = self.row(turn)
+        self.restore(project, agent, room, turn, row["taken"])
+        row["taken"] = []
+
+    def taken_before(self, project, agent, room, wakes):
+        out = []
+        for wake in wakes:
+            rows = [r for r in self.turn_log if r["room"] == room and wake["event_id"] in r["taken"]]
+            if rows:
+                rows[-1]["senders"] = sorted(set(rows[-1]["senders"]) | {wake["sender"]})
+                out.append({**wake, "taken_by": rows[-1]["id"]})
+        return out
 
     def end_turn(self, turn, outcome, *, event_id=None, harness=None, session_id=None, node=None):
         for row in self.turn_log:
@@ -601,6 +640,93 @@ def test_one_turn_per_room_and_what_arrives_waits_for_the_next(tmp_path):
     assert len(runner.calls) == 2
     assert "two" in runner.calls[1]["prompt"] and runner.calls[1]["session"].kind == "resume"
     assert [b["body"] for _r, b in matrix.posted] == ["a1", "a2"]
+
+
+class CatchingUpRunner(FakeRunner):
+    """A harness whose first turn runs `catch-up` midway: `during(turn_id)`
+    posts and takes what it wants, then the turn ends as `ended` says."""
+
+    def __init__(self, answers, during):
+        super().__init__(answers)
+        self.during = during
+
+    def run(self, prompt, profile, cwd, *, session, environ, extra_env, cancel):
+        if not self.calls:
+            self.during(extra_env["AGENTROOMS_TURN"])
+        return super().run(prompt, profile, cwd, session=session, environ=environ,
+                           extra_env=extra_env, cancel=cancel)
+
+
+def later(event_id, sender, body, n):
+    return {**message(event_id, sender, body), "origin_server_ts": 1_700_000_000_000 + n}
+
+
+def test_what_a_turn_took_with_catch_up_is_neither_new_nor_a_wake_next_turn(tmp_path):
+    events = [message("$1", "@b:example.org", f"{ME} one")]
+    matrix = FakeMatrix(events)
+
+    def during(turn_id):
+        # Mid-turn: b mentions the agent twice and a stranger once; the agent
+        # catches up after the first wake and the stranger's are recorded, and
+        # before the second's.
+        arrived = [later("$2", "@b:example.org", f"{ME} two", 2),
+                   later("$3", STRANGER, f"{ME} me too", 3),
+                   later("$4", "@b:example.org", f"{ME} four", 4)]
+        events.extend(arrived)
+        slot.store.add("!r", "$2")
+        slot.store.add("!r", "$3", sender=STRANGER)
+        mark = slot.store.turn_seen(turn_id)
+        new = [e for e in events if e["origin_server_ts"] > mark]
+        took = slot.store.catch_up(turn_id, new, engine.turn_admits(
+            slot.store, "prj", {"worker": "w", "worker_id": "v-w"}))
+        assert [w["event_id"] for w in took] == ["$2"]
+        slot.store.add("!r", "$4")
+
+    runner = CatchingUpRunner(["a1", "a5"], during)
+    eng, slot = make_engine(tmp_path, matrix, runner)
+    slot.store.add("!r", "$1")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    first = slot.store.turn_log[0]
+    assert first["senders"] == ["@b:example.org"]
+    # The next pass starts no turn for the wakes b's messages left, the one
+    # recorded after catch-up ran included; the stranger gets the refusal.
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert len(runner.calls) == 1 and slot.store.wakes == []
+    assert [b["body"] for _r, b in matrix.posted][0] == "a1"
+    assert "the person who runs it" in matrix.posted[1][1]["body"]
+    assert "starts no turn" in (tmp_path / engine.LOG_FILE).read_text()
+    # The limits count b on the turn that took its wakes.
+    assert first["senders"] == ["@b:example.org"]
+    # What arrives next is all the next turn carries as new.
+    events.append(later("$5", "@b:example.org", f"{ME} five", 5))
+    slot.store.add("!r", "$5")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    prompt = runner.calls[1]["prompt"]
+    assert "five" in prompt and "two" not in prompt and "four" not in prompt
+    assert "me too" not in prompt
+
+
+def test_a_turn_whose_harness_did_not_run_took_nothing(tmp_path):
+    events = [message("$1", "@b:example.org", f"{ME} one")]
+    matrix = FakeMatrix(events)
+
+    def during(turn_id):
+        events.append(later("$2", "@b:example.org", f"{ME} two", 2))
+        slot.store.add("!r", "$2")
+        slot.store.catch_up(turn_id, [events[-1]], lambda wake: True)
+
+    never = SimpleNamespace(ok=False, answer="", session_id="pinned", stderr_tail="",
+                            failure=SimpleNamespace(kind="not_authenticated", message="login"))
+    runner = CatchingUpRunner([never, "a2"], during)
+    eng, slot = make_engine(tmp_path, matrix, runner)
+    slot.store.add("!r", "$1")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert slot.store.sessions == {}
+    assert [(w["event_id"], w["claimed_by"]) for w in slot.store.wakes] == [("$2", None)]
+    assert slot.store.turn_log[0]["taken"] == []
+    # Its wake starts the next turn, which carries it.
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert len(runner.calls) == 2 and "two" in runner.calls[1]["prompt"]
 
 
 def test_the_cap_bounds_turns_across_rooms(tmp_path):
