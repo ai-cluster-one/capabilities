@@ -261,7 +261,9 @@ USAGE
   deployment node remove <node> --yes
       Delete the node's Coolify resource with its volumes and configuration,
       then its node row. Only the resource the row names is touched; one
-      already gone leaves only the row to remove.
+      already gone leaves only the row to remove. A resource whose agent
+      container does not run the standard image as this node is refused
+      (exit 6 node_resource_not_own) and nothing is deleted.
   deployment node login claude|codex [--target <name>] [--print-command]
       SSH with a terminal into the application's agent container for subscription
       login. --print-command prepares the command without attempting login.
@@ -7560,6 +7562,30 @@ def cmd_node_enrol(args):
     _emit(answer)
 
 
+def _agent_node_is_own(root, host, resource, node):
+    """Whether the Compose project `resource` on `host` is this node: its agent
+    containers, stopped ones too, run the standard image with AGENT_NODE_NAME
+    set to `node`."""
+    owner = "com.docker.compose.project=" + resource
+    ids = _node_ssh(root, host, "docker ps -a --filter " + shlex.quote("label=" + owner)
+                    + " --filter " + shlex.quote(
+                        "label=com.docker.compose.service=" + AGENT_NODE_SERVICE)
+                    + " --format '{{.ID}}'").split()
+    if not ids or not all(re.fullmatch(r"[a-f0-9]+", i) for i in ids):
+        return False
+    configs = []
+    for line in _node_ssh(root, host, shlex.join(
+            ["docker", "inspect", "--format", "{{json .Config}}", *ids])).splitlines():
+        try:
+            configs.append(json.loads(line))
+        except ValueError:
+            return False
+    named = f"{NODE_NAME_ENV}={node}"
+    return len(configs) == len(ids) and all(
+        isinstance(c, dict) and str(c.get("Image") or "").startswith(AGENT_NODE_IMAGE + ":")
+        and named in (c.get("Env") or []) for c in configs)
+
+
 def cmd_node_remove(args):
     root = _root()
     node = _agent_node_name(args.node)
@@ -7574,17 +7600,29 @@ def cmd_node_remove(args):
         raise NodeFailure("node_not_coolify", f"node {node} is not a Coolify resource made by "
                           "`deployment node create`", 6)
     target = {"connection": row["coolify_connection"]}
-    _node_connection(target, write=True)
+    entry = _node_connection(target, write=True)
     resource = row["coolify_resource"]
     try:
-        _node_coolify(root, target, "service", "delete", resource, "--yes",
-                      "--delete-volumes", "--delete-configurations")
-        deleted = True
+        _node_coolify(root, target, "services", resource)
+        present = True
     except NodeFailure as failure:
         # A resource already gone leaves only its row to remove.
         if failure.exit_code != 3:
             raise
-        deleted = False
+        present = False
+    deleted = False
+    if present:
+        host = _node_server_host(root, target, entry, row["coolify_server"])
+        if not _agent_node_is_own(root, host, resource, node):
+            raise NodeFailure("node_resource_not_own", f"resource {resource} does not run "
+                              f"{AGENT_NODE_IMAGE} as node {node}; nothing was deleted", 6)
+        try:
+            _node_coolify(root, target, "service", "delete", resource, "--yes",
+                          "--delete-volumes", "--delete-configurations")
+            deleted = True
+        except NodeFailure as failure:
+            if failure.exit_code != 3:
+                raise
     _manager(root, "node", "remove", node)
     _emit({"ok": True, "node": node, "resource": resource, "resource_deleted": deleted,
            "volumes_deleted": deleted, "row_removed": True})

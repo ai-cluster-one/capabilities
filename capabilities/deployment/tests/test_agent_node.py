@@ -28,6 +28,9 @@ class Fake:
         self.secret_file.write_text("TELEGRAM_BOT_TOKEN=bot-secret\n"
                                     "COOLIFY_INFRA_TOKEN=coolify-secret\n")
         self.state = "running agent prj_00000000a1a1 as node box1"
+        self.gone: set[str] = set()
+        self.config = {"Image": "ghcr.io/agenium-dev/agent-node:0.0.1",
+                       "Env": ["AGENT_NODE_NAME=box1", "PATH=/usr/bin"]}
 
     def __call__(self, argv, root, *, stdin=None, timeout=120, check=True, env=None):
         self.calls.append({"argv": list(argv), "stdin": stdin})
@@ -46,6 +49,10 @@ class Fake:
                 return json.dumps({"environments": [{"name": "test"}, {"name": "production"}]})
             if args[:2] == ["service", "create"]:
                 return json.dumps({"uuid": "svc-new", "domains": []})
+            if args[:1] == ["services"]:
+                if args[1] in self.gone:
+                    return self.module.NodeFailure("not_found", "fixture", 3)
+                return json.dumps({"uuid": args[1]})
             if args[:2] == ["service", "delete"]:
                 return json.dumps({"message": "deleted"})
             if args[:1] == ["servers"]:
@@ -84,6 +91,8 @@ class Fake:
             remote = shlex.split(args[-1])
             if remote[:2] == ["docker", "ps"]:
                 return "abc123\n"
+            if remote[:2] == ["docker", "inspect"]:
+                return json.dumps(self.config) + "\n"
             assert remote[:2] == ["docker", "exec"], remote
             inner = [w for w in remote[2:] if w != "-i"][1:]
             if inner[:2] == ["sh", "-c"]:
@@ -267,6 +276,31 @@ def test_remove_deletes_its_own_resource_with_its_volumes_and_its_row(lab, capsy
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_remove(SimpleNamespace(node="mac", yes=True))
     assert refused.value.code == "node_not_coolify"
+
+
+@pytest.mark.parametrize("config", [
+    {"Image": "registry.invalid/other-service:1.0", "Env": ["AGENT_NODE_NAME=box1"]},
+    {"Image": "ghcr.io/agenium-dev/agent-node:0.0.1", "Env": ["AGENT_NODE_NAME=box2"]},
+])
+def test_remove_refuses_a_resource_that_is_not_the_nodes_own(lab, capsys, config):
+    lab.m.cmd_node_create(create_args())
+    lab.fake.rows["box1"]["coolify_resource"] = "svc-other"
+    lab.fake.config = config
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_remove(SimpleNamespace(node="box1", yes=True))
+    assert refused.value.code == "node_resource_not_own"
+    assert not [c for c in lab.fake.of("coolify") if "delete" in c["argv"]]
+    assert "box1" in lab.fake.rows
+
+
+def test_remove_of_a_resource_already_gone_removes_only_the_row(lab, capsys):
+    lab.m.cmd_node_create(create_args())
+    lab.fake.gone.add("svc-new")
+    capsys.readouterr()
+    lab.m.cmd_node_remove(SimpleNamespace(node="box1", yes=True))
+    assert json.loads(capsys.readouterr().out)["resource_deleted"] is False
+    assert not [c for c in lab.fake.of("coolify") if "delete" in c["argv"]]
+    assert "box1" not in lab.fake.rows
 
 
 def test_a_node_is_made_only_for_an_agent_that_lives_in_the_store(lab, monkeypatch):
