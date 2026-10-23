@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.12,<1",
+#     "capabilities-contract>=0.13,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -603,19 +603,29 @@ PROJECT VERBS (run inside a consuming project)
   node list
         The nodes of this project's agent (capabilities_agent_nodes): {ok,
         project, agent_id, nodes [{node, kind, address, is_master,
-        may_write, target, last_seen_at}], store}.
+        may_write, target, last_seen_at, coolify_connection, coolify_server,
+        coolify_resource, public_key}], store}.
   node add <node> --kind mac|server [--address HOST] [--target NAME]
            [--master] [--may-write]
+           [--coolify-connection ID --coolify-server UUID
+            --coolify-resource UUID] [--public-key KEY]
         Register a node of this project's agent, registering the agent first
         where needed. <node> is the name the node gives itself in
         AGENT_NODE_NAME; --address is its fixed host name or IP, --target the
-        deployment target that deploys it. An agent has at most one master:
+        deployment target that deploys it. A node that is a Coolify resource
+        names the coolify connection it was created through, its server and
+        the resource, all three or none (exit 6 coolify_incomplete); the
+        token stays in that connection. --public-key is the node's X25519
+        public key, its 32 bytes in base64 (`deployment node enrol` records
+        it). An agent has at most one master:
         --master while another node is master exits 6 master_exists naming
         it. A node already registered exits 6 node_exists. Answers {ok,
         project, agent_id, node, changed, store}.
   node set <node> [--kind mac|server] [--address HOST] [--target NAME]
            [--master | --no-master] [--may-write | --no-may-write]
-        Change a registered node's fields; an empty HOST or NAME clears it.
+           [--coolify-connection ID] [--coolify-server UUID]
+           [--coolify-resource UUID] [--public-key KEY]
+        Change a registered node's fields; an empty value clears one.
         Exit 6 node_unknown for a node not registered, master_exists as for
         add. Answers as add, changed false when nothing moved.
   node remove <node>
@@ -7159,8 +7169,16 @@ AGENT_COLUMNS = ("id", "slug", "name", "description", "icon_sha", "onboarding_st
 AGENT_TEXT_FIELDS = {"--name": "name", "--description": "description",
                      "--onboarding-routine": "onboarding_routine"}
 ONBOARDING_STATUSES = ("pending", "complete")
-NODE_COLUMNS = ("node", "kind", "address", "is_master", "may_write", "target",
-                "last_seen_at")
+# What a migration reads of a node: the columns every store version carries,
+# since it reads them before the store is brought to this code's version.
+NODE_BASE_COLUMNS = ("node", "kind", "address", "is_master", "may_write", "target",
+                     "last_seen_at")
+# A node created as a Coolify resource names the coolify connection, the server
+# and the resource it was created with, all three or none; public_key is the
+# X25519 key the node made, its 32 bytes in base64.
+NODE_COLUMNS = (*NODE_BASE_COLUMNS, "coolify_connection", "coolify_server",
+                "coolify_resource", "public_key")
+NODE_COOLIFY_COLUMNS = ("coolify_connection", "coolify_server", "coolify_resource")
 NODE_KINDS = ("mac", "server")
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
@@ -7518,9 +7536,17 @@ def _node_values(opts: dict) -> dict:
         if kind not in NODE_KINDS:
             _die(6, "input", f"--kind {kind!r} is not one of {', '.join(NODE_KINDS)}")
         values["kind"] = kind
-    for flag_name, column in (("--address", "address"), ("--target", "target")):
+    for flag_name, column in (("--address", "address"), ("--target", "target"),
+                              ("--coolify-connection", "coolify_connection"),
+                              ("--coolify-server", "coolify_server"),
+                              ("--coolify-resource", "coolify_resource"),
+                              ("--public-key", "public_key")):
         if flag_name in opts:
             values[column] = opts[flag_name].strip() or None
+    key = values.get("public_key")
+    if key is not None and not re.fullmatch(r"[A-Za-z0-9+/]{43}=", key):
+        _die(6, "input", "--public-key takes the node's X25519 public key: its 32 bytes "
+             "in base64")
     for on, off, column in (("--master", "--no-master", "is_master"),
                             ("--may-write", "--no-may-write", "may_write")):
         if on in opts and off in opts:
@@ -7543,6 +7569,16 @@ def _refuse_second_master(conn, agent_id: str, node: str) -> None:
             "--no-master` first, then make this node the master")
 
 
+def _refuse_partial_coolify(row: dict) -> None:
+    """A node names its coolify connection, server and resource together or not
+    at all; the store's constraint holds the same."""
+    if len({row.get(column) is None for column in NODE_COOLIFY_COLUMNS}) > 1:
+        raise _KernelRefusal(
+            "coolify_incomplete", "a node names its coolify connection, server and "
+            "resource together or none of them",
+            "give --coolify-connection, --coolify-server and --coolify-resource together")
+
+
 class _KernelRefusal(Exception):
     def __init__(self, code: str, message: str, hint: str | None = None):
         super().__init__(message)
@@ -7552,7 +7588,8 @@ class _KernelRefusal(Exception):
 def cmd_node(args: list[str]) -> None:
     sub = args[0] if args else None
     root = _require_project()
-    valued = {"--kind", "--address", "--target"}
+    valued = {"--kind", "--address", "--target", "--coolify-connection", "--coolify-server",
+              "--coolify-resource", "--public-key"}
     toggles = {"--master", "--no-master", "--may-write", "--no-may-write"}
     import psycopg
     if sub == "list":
@@ -7579,7 +7616,8 @@ def cmd_node(args: list[str]) -> None:
         _die(6, "input", "node add needs --kind mac|server")
     if sub == "set" and not values:
         _die(6, "input", "node set needs at least one of --kind, --address, --target, "
-             "--master, --no-master, --may-write, --no-may-write")
+             "--master, --no-master, --may-write, --no-may-write, --coolify-connection, "
+             "--coolify-server, --coolify-resource, --public-key")
 
     def work(conn, agent_id):
         if sub == "add":
@@ -7590,6 +7628,7 @@ def cmd_node(args: list[str]) -> None:
                                      f"change it with `capabilities node set {node}`")
             if values.get("is_master"):
                 _refuse_second_master(conn, agent_id, node)
+            _refuse_partial_coolify(values)
             columns = ["agent_id", "node", *values]
             conn.execute(
                 f"INSERT INTO capabilities_agent_nodes ({', '.join(columns)}) "
@@ -7606,6 +7645,7 @@ def cmd_node(args: list[str]) -> None:
             return agent_id, before[0], True
         if values.get("is_master"):
             _refuse_second_master(conn, agent_id, node)
+        _refuse_partial_coolify({**before[0], **values})
         assignments = ", ".join(f"{c} = %s" for c in values)
         conn.execute(f"UPDATE capabilities_agent_nodes SET {assignments} "
                      "WHERE agent_id = %s AND node = %s",
@@ -9917,8 +9957,8 @@ def _migrate_agent_state(conn, agent_id: str) -> dict | None:
 
 
 def _migrate_node_rows(conn, agent_id: str) -> dict:
-    return {row[0]: dict(zip(NODE_COLUMNS, row)) for row in _migrate_rows(
-        conn, f"SELECT {', '.join(NODE_COLUMNS)} FROM capabilities_agent_nodes "
+    return {row[0]: dict(zip(NODE_BASE_COLUMNS, row)) for row in _migrate_rows(
+        conn, f"SELECT {', '.join(NODE_BASE_COLUMNS)} FROM capabilities_agent_nodes "
               "WHERE agent_id = %s", (agent_id,))}
 
 

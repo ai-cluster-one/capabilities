@@ -345,7 +345,9 @@ def test_nodes_are_added_changed_listed_and_removed(lab):
     added = lab.ok("node", "add", "mac-one", "--kind", "mac", "--master")
     assert added["node"] == {"node": "mac-one", "kind": "mac", "address": None,
                              "is_master": True, "may_write": False, "target": None,
-                             "last_seen_at": None}
+                             "last_seen_at": None, "coolify_connection": None,
+                             "coolify_server": None, "coolify_resource": None,
+                             "public_key": None}
     lab.ok("node", "add", "srv-one", "--kind", "server", "--address", "203.0.113.10",
            "--target", "prod", "--may-write")
 
@@ -361,6 +363,27 @@ def test_nodes_are_added_changed_listed_and_removed(lab):
     assert [n["node"] for n in lab.ok("node", "list")["nodes"]] == ["mac-one"]
     code, error = lab.refused("node", "remove", "srv-one")
     assert (code, error["code"]) == (6, "node_unknown")
+
+
+def test_a_coolify_node_names_its_connection_server_and_resource_and_its_key(lab):
+    added = lab.ok("node", "add", "box-one", "--kind", "server",
+                   "--coolify-connection", "infra", "--coolify-server", "srv-uuid",
+                   "--coolify-resource", "res-uuid")["node"]
+    assert (added["coolify_connection"], added["coolify_server"],
+            added["coolify_resource"], added["public_key"]) == (
+        "infra", "srv-uuid", "res-uuid", None)
+
+    key = "A" * 42 + "Q="
+    assert lab.ok("node", "set", "box-one", "--public-key", key)["node"]["public_key"] == key
+    assert lab.refused("node", "set", "box-one", "--public-key", "not-a-key")[0] == 6
+
+    code, error = lab.refused("node", "add", "box-two", "--kind", "server",
+                              "--coolify-resource", "res-two")
+    assert (code, error["code"]) == (6, "coolify_incomplete")
+    code, error = lab.refused("node", "set", "box-one", "--coolify-server", "")
+    assert (code, error["code"]) == (6, "coolify_incomplete")
+    assert lab.sql(f"SELECT coolify_server FROM {SCHEMA}.capabilities_agent_nodes "
+                   "WHERE node = 'box-one'") == [("srv-uuid",)]
 
 
 def test_an_agent_has_one_master(lab):

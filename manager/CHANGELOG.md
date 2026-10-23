@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-23 — A node row names the Coolify resource it is and the node's public key
+
+`capabilities node add` and `node set` take `--coolify-connection`, `--coolify-server` and `--coolify-resource`, which a node created as a Coolify resource carries together (a partial set exits 6 `coolify_incomplete`), and `--public-key`, the node's X25519 public key as 32 bytes in base64; an empty value clears one. `node list` and every node answer carry the four. The manager requires `capabilities-contract` 0.13, whose ledger adds the columns; `capabilities migrate` still reads only the columns every store version has.
+
 ## 2026-10-23 — The generated context names a document the store holds by the command that reads it
 
 Where `capabilities build` composes context from documents the store holds, each Context Stubs line and each Inline Context `Source:` label names `context show <name>` (`context show <name> --global` for a global document) in place of a `context/<name>.md` path no folder holds, and the stubs' lead sentence says to run the command. A context folder still read is named by its paths, as before.
