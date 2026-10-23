@@ -291,18 +291,17 @@ supplies the same answer in advance, so a context owner composing through
 `capabilities context --fragment` is never called back mid-compose. Resolution is
 filesystem-cheap and leaves the project untouched: at most one lookup per
 invocation, cached per project root, and never during project-root discovery.
-Every other case — no `.contextkit/config.toml`, no `contextkit` on `PATH`, a
-failing command, or output that is not an absolute path inside the project —
-keeps the envelope at `<root>/capabilities`, so a project without a context owner
-depends on nothing but itself.
+
+A project without `.contextkit/config.toml` that is bound to its id keeps the envelope at `<root>/<body_root>/capabilities`: the body root is the folder its agent's row in the store names (`capabilities_agents.body_root`), and the project root itself where the row names none or no store is configured for the project. The manager reads the row when its record (below) holds no standing answer for the root; while the store does not answer, the last answer recorded for that root and id stands whatever its age; with none recorded, an existing `<root>/capabilities` folder is the envelope; and only where that folder does not exist either does the manager refuse (`store_unreachable`, exit 5) rather than guess. Capabilities ask the manager and never read the row. Every other case — no `.contextkit/config.toml` and no id, no `contextkit` on `PATH`, a failing command, or output that is not an absolute path inside the project — keeps the envelope at `<root>/capabilities`, so a project without a context owner depends on nothing but itself.
 
 **A resolved answer is recorded, and stands only while its inputs do.** The
 manager writes one entry per absolute project root at
 `$XDG_CACHE_HOME/capabilities/envelope/`, holding the resolved envelope, the size
 and modification time of every input that answer consulted — the project's
-`.contextkit/config.toml` and the context owner's own program — and a coarse
-expiry bounding what a stat cannot see. A capability CLI and the manager both
-read it, re-observing each named input and comparing it whole, so an ordinary
+`.contextkit/config.toml` (where it has none, also its `.env.local` and `.env`,
+beside the id and the body root it was answered for) and the context owner's own
+program — and a coarse expiry bounding what a stat cannot see. A capability CLI
+and the manager both read it, re-observing each named input and comparing it whole, so an ordinary
 call resolves the envelope in one small read rather than two interpreter starts.
 Anything in doubt — an unreadable file, an unexpected shape, a moved input, a
 passed expiry — resolves again from the context owner, so the failure mode is

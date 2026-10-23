@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-23 — A box that carries no body binds its agent by the id alone
+
+The `agent-box-shell` entrypoint no longer lays an empty `.contextkit/config.toml` in the project root before binding it: the manager composes the context of a folder bound to its agent's id, so each boot still binds the root with `capabilities init --id`, wires the agent CLIs with `capabilities hooks install --claude --codex` and composes the context with `capabilities build`, now written to `.capabilities-generated/context.md`. Requires a manager that builds for a folder bound by its id.
+
 ## 2026-10-23 — A node of a store-only agent is created, enrolled and removed from the standard image
 
 `deployment node create <node>` creates a Coolify resource through the coolify capability's connection: a Compose service of one container running `ghcr.io/agenium-dev/agent-node:<version>` with a memory limit (`--memory`, default `2g`), a volume of its own for each state path of the image (`~/.config`, `~/.local/state`, `~/.claude`, `~/.codex`), and only `CAPABILITIES_PROJECT_ID`, `CAPABILITIES_PROJECT_ID_ROOT` and `AGENT_NODE_NAME`, with no repository and no build; it then registers the node row with the connection, server and resource. `deployment node enrol <node> [--services ...]` reaches the container over SSH and docker exec, makes the node's X25519 key pair there and records the public key on the row, writes the agent's connection secrets into each capability's credentials file, except the coolify connection the node was created through, whose token stays on the deploying machine, and the store setting with the node's own `capabilities store set`, places the named services with `capabilities enable <name> --project --node <node>`, and waits for the node to raise its agent; secrets travel on standard input only. `deployment node remove <node> --yes` deletes that resource with its volumes and the node row, and touches nothing else on the server.

@@ -1,5 +1,9 @@
 # contract — change log
 
+## 2026-10-23 — An agent's row names its body root and collaboration mode; capabilities-contract 0.14.0
+
+`capabilities-contract` 0.14.0's store tier adds step `0023-agent-binding` to the contract's ledger (version 1.8): `capabilities_agents` gains `body_root`, the folder inside the project that holds the body of an agent without a ContextKit binding (null for the project root; a relative, visible path - not empty, not absolute, no `..` part, not starting with `.`), and `collaboration_mode`, `ask` or `direct` (null for `ask`). Readers at 1.7 keep working against a 1.8 store.
+
 ## 2026-10-23 — A node row names the Coolify resource it is and the node's public key; capabilities-contract 0.13.0
 
 `capabilities-contract` 0.13.0's store tier adds step `0022-agent-node-coolify` to the contract's ledger (version 1.7): `capabilities_agent_nodes` gains `coolify_connection`, `coolify_server` and `coolify_resource`, set together or not at all (constraint `capabilities_agent_nodes_coolify`), and `public_key`, the node's X25519 public key as base64 of its 32 bytes. Readers at 1.6 keep working against a 1.7 store.

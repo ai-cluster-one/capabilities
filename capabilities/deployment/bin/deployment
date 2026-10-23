@@ -2030,11 +2030,8 @@ fi
 
 cd "$APP"
 
-# The manager composes context only for a folder bound to ContextKit. The binding
-# carries nothing of the agent, so an empty one is laid where none is.
-mkdir -p .contextkit
-[ -f .contextkit/config.toml ] || : > .contextkit/config.toml
-
+# The id binds the folder: the manager composes the context of a folder bound
+# to its agent's id, and places its envelope where the agent's row says.
 if ! capabilities init --id "$CAPABILITIES_PROJECT_ID" < /dev/null > /dev/null; then
   echo "[entrypoint] FATAL: could not bind $APP to agent $CAPABILITIES_PROJECT_ID in the store this box reaches" >&2
   exit 1

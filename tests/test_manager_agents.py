@@ -847,3 +847,201 @@ def test_build_points_the_onboarding_block_at_the_routine_where_the_agent_keeps_
     from_store = build()
     assert "run the routine **onboard** (`routine show onboard`) and carry it" in from_store
     assert "is not declared in" not in from_store
+
+
+# --- an agent bound by its id alone ---------------------------------------------
+
+BARE_ID = "prj_00000000cc01"
+
+
+class Folder:
+    """A folder of its own beside the lab's store setting, run by the manager."""
+
+    def __init__(self, lab: Lab, path: Path, agent_id: str | None = BARE_ID):
+        self.lab, self.path = lab, path
+        path.mkdir(parents=True)
+        setting = f"AGENTKIT_DB_URL={lab.cluster.url(lab.database)}\nAGENTKIT_DB_SCHEMA={SCHEMA}\n"
+        (path / ".env.local").write_text(
+            setting + (f"CAPABILITIES_PROJECT_ID={agent_id}\n" if agent_id else ""))
+
+    def run(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(MANAGER), *args], cwd=self.path,
+                              env=self.lab.env(CLAUDE_PROJECT_DIR=str(self.path)),
+                              text=True, capture_output=True, timeout=120)
+
+    def ok(self, *args: str) -> dict:
+        result = self.run(*args)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    def refused(self, *args: str) -> tuple[int, dict]:
+        result = self.run(*args)
+        line = next(line for line in reversed(result.stderr.splitlines())
+                    if line.lstrip().startswith("{"))
+        return result.returncode, json.loads(line)["error"]
+
+    def git(self, *args: str) -> str:
+        result = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                                 *args], cwd=self.path, text=True, capture_output=True,
+                                timeout=60)
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+
+def test_an_agent_without_a_contextkit_binding_keeps_its_settings_in_its_row(lab, tmp_path):
+    import psycopg
+    folder = Folder(lab, tmp_path / "bare")
+    written = folder.ok("agent", "set", "--collaboration-mode", "direct")["agent"]
+    assert (written["collaboration_mode"], written["body_root"]) == ("direct", None)
+    assert folder.refused("agent", "set", "--collaboration-mode", "sometimes")[0] == 6
+    for bad in ("", "/abs", "../up", "a/../b", ".hidden", " agent"):
+        with pytest.raises(psycopg.errors.CheckViolation):
+            lab.sql(f"UPDATE {SCHEMA}.capabilities_agents SET body_root = %s WHERE id = %s "
+                    "RETURNING id", (bad, BARE_ID))
+
+    built = folder.ok("build")
+    output = folder.path / ".capabilities-generated" / "context.md"
+    assert built["output"] == str(output)
+    text = output.read_text()
+    assert "Source config: the agent's row (`capabilities agent show`)" in text
+    assert "## Collaboration Mode" not in text
+
+    # The envelope sits in the body root the row names, read on a record miss.
+    lab.sql(f"UPDATE {SCHEMA}.capabilities_agents SET body_root = 'agent' WHERE id = %s "
+            "RETURNING id", (BARE_ID,))
+    records = lab.tmp / "cache" / "capabilities" / "envelope"
+    shutil.rmtree(records, ignore_errors=True)
+    path = folder.ok("path", "--json")
+    assert path["project_envelope"] == str(folder.path / "agent" / "capabilities")
+    assert (path["body_root"], path["layers"]["context"]) == (
+        "agent", str(folder.path / "agent" / "context"))
+    assert "This project keeps its visible body under `agent/`." in folder.ok(
+        "build", "--print", "--json")["text"]
+
+    # While the store does not answer, the answer recorded for the folder
+    # stands, past its expiry too; with none recorded, an existing
+    # <root>/capabilities folder is the envelope; without that either, it is
+    # refused rather than guessed.
+    env_local = folder.path / ".env.local"
+    env_local.write_text(env_local.read_text().replace(
+        f":{lab.cluster.port}/", f":{_free_port()}/"))
+    [(record, entry)] = [(path, json.loads(path.read_text())) for path in records.iterdir()
+                         if json.loads(path.read_text())["root"] == str(folder.path.resolve())]
+    entry["expires_at"] = entry["written_at"] + 1
+    record.write_text(json.dumps(entry))
+    assert folder.ok("path", "--json")["project_envelope"] == str(
+        folder.path / "agent" / "capabilities")
+    shutil.rmtree(records)
+    code, error = folder.refused("path", "--json")
+    assert (code, error["code"]) == (5, "store_unreachable")
+    (folder.path / "capabilities").mkdir()
+    assert folder.ok("path", "--json")["project_envelope"] == str(folder.path / "capabilities")
+    assert not records.exists() or not any(records.iterdir())
+
+
+def _bound_agent(lab: Lab, path: Path, config: str) -> Folder:
+    """A ContextKit-bound agent in a Git repository with its body under agent/,
+    its row registered and Claude wired, everything committed."""
+    folder = Folder(lab, path)
+    folder.git("init", "-q")
+    (path / ".gitignore").write_text(".env.local\n")
+    for rel, body in {
+        "agent/context/MISSION.md": "---\ntitle: Mission\ndescription: Why.\nload: inline\norder: 1\n---\n# Mission\n",
+        "agent/routines/welcome.md": "---\nname: welcome\ndescription: Run to onboard.\n---\n# Welcome\n",
+        ".contextkit/config.toml": config,
+        ".contextkit/README.md": "# ContextKit Binding\n",
+        ".claude/settings.json": json.dumps({"permissions": {"allow": ["Bash(ls)"]}}),
+    }.items():
+        (path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (path / rel).write_text(body)
+    import hashlib
+    (path / ".contextkit" / f"icon-{hashlib.sha256(_png()).hexdigest()}.png").write_bytes(_png())
+    folder.ok("agent", "set", "--name", "Bound")
+    folder.ok("hooks", "install", "--claude")
+    folder.git("add", "-A")
+    folder.git("commit", "-qm", "bound")
+    return folder
+
+
+BOUND_CONFIG = ('version = 1\ntype = "agent-project"\n\n[body]\nroot = "agent"\n\n'
+                '[collaboration]\nmode = "direct"\n\n[onboarding]\nstatus = "pending"\n'
+                'routine = "welcome"\n')
+
+
+def test_agent_convert_carries_a_bound_agent_into_its_row_as_one_change(lab, tmp_path):
+    import hashlib
+    folder = _bound_agent(lab, tmp_path / "bound", BOUND_CONFIG)
+    root = folder.path
+    before = (root / ".contextkit" / "generated" / "context.md").read_text()
+
+    converted = folder.ok("agent", "convert")
+
+    assert converted["changed"] is True
+    assert converted["carried"] == {
+        "body_root": "agent", "collaboration_mode": "direct",
+        "onboarding": {"status": "pending", "routine": "welcome"},
+        "icon_sha": hashlib.sha256(_png()).hexdigest()}
+    agent = converted["agent"]
+    assert (agent["body_root"], agent["collaboration_mode"], agent["onboarding_status"],
+            agent["onboarding_routine"], agent["icon_bytes"]) == (
+        "agent", "direct", "pending", "welcome", len(_png()))
+    assert not (root / ".contextkit").exists()
+    output = root / ".capabilities-generated" / "context.md"
+    link = root / ".claude" / "rules" / "CONTEXT.md"
+    assert link.is_symlink() and link.resolve() == output.resolve()
+    text = output.read_text()
+    assert text != before and "# Onboarding" in text and "## Collaboration Mode" not in text
+    assert "This project keeps its visible body under `agent/`." in text
+    assert "# Foreign Instruction Files" not in text
+    settings = json.loads((root / ".claude" / "settings.json").read_text())
+    assert settings["permissions"] == {"allow": ["Bash(ls)"]}
+    assert ".capabilities-generated/" in (root / ".gitignore").read_text().splitlines()
+    assert set(converted["untracked"]) == {
+        ".claude/rules/CONTEXT.md", ".claude/settings.json", ".contextkit/README.md",
+        ".contextkit/config.toml", ".contextkit/generated/context.md",
+        f".contextkit/icon-{hashlib.sha256(_png()).hexdigest()}.png"}
+    status = folder.git("status", "--porcelain").splitlines()
+    assert sorted(status) == sorted([f"D  {path}" for path in converted["untracked"]]
+                                    + ["M  .gitignore"])
+    assert (root / ".claude" / "settings.json").is_file() and link.is_symlink()
+    assert folder.ok("path", "--json")["project_envelope"] == str(root / "agent" / "capabilities")
+
+    again = folder.ok("agent", "convert")
+    assert (again["changed"], again["removed"], again["untracked"], again["wrote"]) == (
+        False, [], [], [])
+    assert folder.git("status", "--porcelain").splitlines() == status
+
+
+def test_agent_convert_refuses_before_writing_anything(lab, tmp_path):
+    def unchanged(folder: Folder, config: str) -> None:
+        assert (folder.path / ".contextkit" / "config.toml").read_text() == config
+        assert not (folder.path / ".capabilities-generated").exists()
+        assert folder.git("status", "--porcelain") == ""
+        assert lab.sql(f"SELECT body_root FROM {SCHEMA}.capabilities_agents WHERE id = %s",
+                       (BARE_ID,)) == [(None,)]
+
+    (tmp_path / "global").mkdir()
+    retired = BOUND_CONFIG + f'\n[sources]\nglobal_context = "{tmp_path / "global"}"\n'
+    folder = _bound_agent(lab, tmp_path / "sources", retired)
+    code, error = folder.refused("agent", "convert")
+    assert (code, error["code"]) == (6, "setting_retired")
+    assert "sources.global_context" in error["message"]
+    unchanged(folder, retired)
+    assert folder.ok("build")["output"] == str(folder.path / ".contextkit" / "generated" / "context.md")
+
+    folder = _bound_agent(lab, tmp_path / "foreign", BOUND_CONFIG)
+    (folder.path / ".contextkit" / "manager").mkdir()
+    (folder.path / ".contextkit" / "manager" / "contextkit").write_text("#!/bin/sh\n")
+    code, error = folder.refused("agent", "convert")
+    assert (code, error["code"]) == (6, "contextkit_folder_not_empty")
+    assert ".contextkit/manager" in error["message"]
+    (folder.path / ".contextkit" / "manager" / "contextkit").unlink()
+    (folder.path / ".contextkit" / "manager").rmdir()
+    unchanged(folder, BOUND_CONFIG)
+
+    unknown = Folder(lab, tmp_path / "unknown", agent_id="prj_00000000dd01")
+    (unknown.path / ".contextkit").mkdir()
+    (unknown.path / ".contextkit" / "config.toml").write_text(BOUND_CONFIG)
+    code, error = unknown.refused("agent", "convert")
+    assert (code, error["code"]) == (6, "agent_unknown")
+    assert (unknown.path / ".contextkit" / "config.toml").read_text() == BOUND_CONFIG

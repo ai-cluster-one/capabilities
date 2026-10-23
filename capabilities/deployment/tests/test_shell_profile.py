@@ -68,6 +68,8 @@ def test_boot_binds_the_agent_by_id_and_builds_from_the_store(tmp_path: Path) ->
     hooks = entrypoint.index("capabilities hooks install --claude --codex")
     build = entrypoint.index("capabilities build")
     assert init < hooks < build
+    # The id alone binds the folder: no ContextKit binding is laid for the manager.
+    assert ".contextkit" not in entrypoint
     assert "contextkit build" not in entrypoint
     assert "contextkit init" not in entrypoint
     assert "git clone" not in entrypoint

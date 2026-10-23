@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.13,<1",
+#     "capabilities-contract>=0.14,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -65,9 +65,10 @@ ENVIRONMENT
                        it starts under the read-only switch: every capability
                        reads but changes nothing (write verbs, project-record
                        writes and service activation exit 4), and this manager
-                       refuses agent set, allow, connections import, disable,
-                       enable, inherit, init, node add, node remove, node set,
-                       quarantine, relabel, set, store set and store unset.
+                       refuses agent convert, agent set, allow, connections
+                       import, disable, enable, inherit, init, node add, node
+                       remove, node set, quarantine, relabel, set, store set
+                       and store unset.
                        doctor reports it. Unset, `0` or `false` leaves it off.
   AGENTKIT_DB_URL, AGENTKIT_DB_HOST, AGENTKIT_DB_PORT, AGENTKIT_DB_NAME,
   AGENTKIT_DB_USER, AGENTKIT_DB_PASSWORD, AGENTKIT_DB_SCHEMA,
@@ -81,8 +82,10 @@ PROJECT PATH VERB
   path --json [--identity]
         Resolve the current project root and capability envelope once, returning
         project_root, project_envelope, and provider. Plain projects use
-        <root>/capabilities. ContextKit-bound projects must return a usable
-        absolute in-project path; a broken binding is an error, never a fallback.
+        <root>/<body root>/capabilities, the body root their agent's row
+        names (see THE PROJECT ENVELOPE). ContextKit-bound projects must
+        return a usable absolute in-project path; a broken binding is an
+        error, never a fallback.
         --identity adds project_identity: the project id
         (CAPABILITIES_PROJECT_ID) and its state - handed (the process
         environment's, for this root), declared (the project root's
@@ -105,10 +108,17 @@ THE PROJECT ENVELOPE
   bound by `.contextkit/config.toml` its location is read from that binding:
   `[body] root`, the folder holding the agent's body, and `[sources]
   capabilities` inside it (`.capabilities` names the legacy project-root
-  envelope). Without that binding the envelope is <root>/capabilities. A
-  binding that names an absolute, hidden or out-of-project path is an error
-  (body_path_invalid); it never silently selects another tree. `path --json`
-  reports the body root and each layer.
+  envelope). Without that binding the envelope is
+  <root>/<body_root>/capabilities, the body root the agent's row names
+  (capabilities_agents.body_root), and <root>/capabilities where it names
+  none, the project has no id or no store is configured for it. The row is
+  read when the manager's envelope record holds no standing answer for the
+  root; while the store does not answer, the last answer recorded for the
+  root and its id stands whatever its age, else an existing
+  <root>/capabilities folder is the envelope, else the call exits 5
+  store_unreachable. A binding that names an absolute, hidden or
+  out-of-project path is an error (body_path_invalid); it never silently
+  selects another tree. `path --json` reports the body root and each layer.
 
 MACHINE VERBS
   install <name> [--from <path|url> | --source ID] [--yes] [--allow]
@@ -527,6 +537,13 @@ PROJECT VERBS (run inside a consuming project)
         refuses a host settings file it cannot parse rather than replace it.
         Idempotent. When `.contextkit/config.toml` is present, init keeps the
         envelope and skill setup but skips host wiring: ContextKit owns it.
+        Without one, init --id wires the agent's hosts as `hooks install`
+        does - the hosts its flags name, Claude when none - instead of the
+        standalone wiring, and answers the result as `hooks`, a build that
+        fails as hooks.build.error; plain init does the same for a host
+        whose SessionStart hook already runs `capabilities session-start`
+        (with no flag, for every such host), and wires the standalone
+        context only on the other hosts it names.
         A legacy project `.capabilities/` envelope is preflighted and migrated
         into visible `capabilities/`; content conflicts refuse before writes.
         --with-layers first lays, in the folder init runs in, the body
@@ -590,16 +607,48 @@ PROJECT VERBS (run inside a consuming project)
         agent_id, registered, agent, store {level, schema}}, where agent is
         null until the agent is registered, else {id, slug, name, description,
         icon_sha, icon_bytes, onboarding_status, onboarding_routine,
-        migrating_since, migrated_at, created_at, updated_at}. --icon-out
+        body_root, collaboration_mode, migrating_since, migrated_at,
+        created_at, updated_at}: body_root is the folder holding the body of
+        an agent without a ContextKit binding (null: the project root),
+        collaboration_mode ask or direct (null: ask). --icon-out
         writes the icon's PNG bytes to PATH (exit 6 no_icon without one).
   agent set [--name TEXT] [--description TEXT] [--icon PNG | --no-icon]
             [--onboarding-status pending|complete|none]
-            [--onboarding-routine NAME]
+            [--onboarding-routine NAME] [--collaboration-mode ask|direct]
         Register the agent where it is not yet registered and write the
         fields given; an empty TEXT or NAME, `none` and --no-icon clear a
         field. --icon takes a PNG file and stores it with its SHA-256.
+        --collaboration-mode is what `build` composes for an agent without
+        a ContextKit binding (ask: the Collaboration Mode text).
         Answers {ok, project, agent_id, created, changed, agent, store};
         writing the values a row already holds changes nothing.
+  agent convert
+        Turn a ContextKit-bound agent into one bound by its id alone, as one
+        change. It first checks, writing nothing when it refuses: the id
+        resolves (an [identity] id is moved into .env.local), a store
+        answers and holds the agent's row (store_not_configured,
+        store_unreachable, agent_unknown), the config is valid
+        (contextkit_config_invalid) and sets no [sources] entry (exit 6
+        setting_retired, naming it: global context lives in the store
+        through `context`), and .contextkit/ holds only config.toml,
+        README.md, generated/ with generated context alone, and
+        icon-*.png (exit 6 contextkit_folder_not_empty, naming the rest;
+        icon_ambiguous for more than one icon the row would take). It then
+        carries [body] root into the row's body_root (null for .),
+        [collaboration] mode into collaboration_mode where set, [onboarding]
+        into the onboarding columns and the icon into the row where the row
+        has none; builds the context at .capabilities-generated/context.md,
+        points every wired host's link at it and brings the wired hosts'
+        hooks to `capabilities session-start` as `hooks install` does;
+        removes the old generated output; writes the manager's block of
+        host files into the root .gitignore; in a Git repository removes
+        those host files and every tracked file under .contextkit/ from the
+        index, keeping the host files on disk, and stages the .gitignore,
+        committing nothing; and removes .contextkit/. Answers {ok, project,
+        agent_id, changed, carried, removed, untracked, staged, wrote,
+        hosts, build, agent}. Run where no ContextKit binding is left, it
+        changes nothing and answers changed false with a message. Exit 4
+        under the read-only switch.
   node list
         The nodes of this project's agent (capabilities_agent_nodes): {ok,
         project, agent_id, nodes [{node, kind, address, is_master,
@@ -673,7 +722,8 @@ PROJECT VERBS (run inside a consuming project)
         point to `contextkit build`, while --fragment remains the read-only
         provider surface ContextKit calls.
   build [--print] [--json]
-        Compose a ContextKit-bound agent's generated host context in the
+        Compose an agent's generated host context - a ContextKit-bound
+        agent's, or one bound by its project id alone - in the
         shape `contextkit build` gives it: runtime and collaboration texts
         that route the agent to this manager and to the `context`, `assets`
         and `routine` capabilities, a guide menu of only the guides those
@@ -693,18 +743,24 @@ PROJECT VERBS (run inside a consuming project)
         the routines folder, and the onboarding block points at its routine
         the same way, with a warning while the folder is still there; a
         store that does not answer leaves the folder in use with a warning.
-        --print writes the text
+        An agent without a ContextKit binding reads its body root,
+        collaboration mode and onboarding from its row (`agent show`), keeps
+        its layers at their own names in that body root, and has no global
+        context folder. --print writes the text
         to stdout and writes nothing; with --json it answers {project, output,
-        text, warnings}. Without --print it replaces the configured output
-        (`[output] context`, default .contextkit/generated/context.md) whole
-        and points each host ContextKit has a hook for at it (.contextkit.md,
+        text, warnings}. Without --print it replaces the output - for a
+        ContextKit-bound agent the configured one (`[output] context`,
+        default .contextkit/generated/context.md), otherwise
+        .capabilities-generated/context.md - whole
+        and points each host that has a hook for it at it (.contextkit.md,
         .claude/rules/CONTEXT.md), leaving a path that holds something else
         blocked; it answers {project, output, created, changed, links,
         foreign_instructions, warnings}. An output that is not generated
         context exits 6 output_not_generated. No update notice is composed.
-        A project without a ContextKit binding exits 6 not_contextkit_bound.
+        A project with neither a ContextKit binding nor a project id exits 6
+        not_contextkit_bound.
   session-start --host claude|codex
-        What a ContextKit-bound agent's SessionStart hook runs: rebuilds the
+        What an agent's SessionStart hook runs: rebuilds the
         generated context as `build` does and prints a notice to the host only
         when the session must be told - the context was just created or its
         host link just made, it changed since the session loaded it, it could
@@ -712,10 +768,11 @@ PROJECT VERBS (run inside a consuming project)
         AGENTS.override.md, or .contextkit.md not linked; Claude:
         .claude/rules/CONTEXT.md not linked). It always exits 0 and the
         context reaches the agent through the host's own file loading. In a
-        project without a binding it gives the notice `context` gives as a
-        hook.
+        project with neither a ContextKit binding nor a project id it gives
+        the notice `context` gives as a hook.
   hooks install [--claude] [--codex]
-        In a ContextKit-bound project, point the SessionStart hooks at
+        In an agent's project - ContextKit-bound, or bound by its project id
+        alone - point the SessionStart hooks at
         `capabilities session-start`: the Claude hook in .claude/settings.json
         becomes `/bin/bash -lc 'capabilities session-start --host claude'`
         (a new settings file also gets autoMemoryEnabled false), and the Codex
@@ -726,22 +783,33 @@ PROJECT VERBS (run inside a consuming project)
         project_doc_max_bytes to at least 524288 in .codex/config.toml, and
         records the folder and hook trust in $CODEX_HOME/config.toml (default
         ~/.codex). Every other key and hook is left as it is; a duplicate
-        session-start hook is dropped. It then builds the context and links
+        session-start hook is dropped. Without a ContextKit binding it also
+        retires the standalone capabilities wiring of the hosts it wires
+        (the `capabilities context` hooks, .claude/rules/CAPABILITIES.md, the
+        .capabilities.md link and its generated file) and writes the
+        manager's block naming the host files it writes
+        (.capabilities-generated/, .contextkit.md, .claude/settings.json,
+        .claude/rules/CONTEXT.md, .codex/config.toml, .codex/hooks.json,
+        .codex/hooks/) into the root .gitignore where it is missing. It then
+        builds the context and links
         the hosts. Without a flag it takes over the hosts already wired (exit
         6 no_host_wired when none is). Rerunning changes nothing. Answers
-        {project, hosts, codex, claude, build}. Exit 6 not_contextkit_bound
-        without a binding, host_settings_unreadable for a host file it cannot
+        {project, hosts, codex, claude, build}, with retired_capabilities_wiring
+        and gitignore {path, changed} without a binding. Exit 6
+        not_contextkit_bound with neither a binding nor a project id,
+        host_settings_unreadable for a host file it cannot
         read, codex_config_blocked where the Codex settings cannot be edited
         safely.
   hooks check
-        Report, as JSON, whether each wired host of a ContextKit-bound project
+        Report, as JSON, whether each wired host of an agent's project
         delivers its context, wired by ContextKit or by `hooks install`:
         {ok, project, output, hosts, foreign_instructions, problems}. Per
         host: the hook present once and running a program found on PATH
         (`runs`, `program`), the host link resolving to the generated context,
         and for Codex the adapter script, the project-doc settings and byte
         budget, root AGENTS files and the trust records. Exit 7 when any
-        problem is found; 6 not_contextkit_bound without a binding.
+        problem is found; 6 not_contextkit_bound with neither a binding nor
+        a project id.
   inventory [NAME ...] [--detail] [--network]
         What this project's capabilities are and what they hold. One row per
         effective-enabled capability: its tier (as in `list`), gate and the
@@ -1134,6 +1202,9 @@ CODEX_RETIRED_FALLBACKS = (CODEX_CAPABILITIES_REL.as_posix(),
 CODEX_CONFIG_REL = Path(".codex") / "config.toml"
 CODEX_HOOKS_REL = Path(".codex") / "hooks.json"
 CONTEXTKIT_CONFIG_REL = Path(".contextkit") / "config.toml"
+# An agent without a ContextKit binding has its generated context here, at a
+# path no setting moves, and every host link points at it.
+AGENT_OUTPUT_REL = Path(".capabilities-generated") / "context.md"
 ENVELOPE_ENV = "CAPABILITIES_PROJECT_ENVELOPE"
 ENVELOPE_ROOT_ENV = "CAPABILITIES_PROJECT_ENVELOPE_ROOT"
 PROJECT_ID_ENV = "CAPABILITIES_PROJECT_ID"
@@ -1312,8 +1383,8 @@ def _store_module():
 # The verbs that write a project record — policy, configuration, the project's
 # identity and its wiring — and the machine ceiling. Under the read-only switch the manager refuses them;
 # whether the switch is on is the store tier's answer, never the manager's own.
-READ_ONLY_REFUSED_VERBS = ("agent set", "allow", "connections import", "disable",
-                           "enable", "inherit", "init", "node add", "node remove",
+READ_ONLY_REFUSED_VERBS = ("agent convert", "agent set", "allow", "connections import",
+                           "disable", "enable", "inherit", "init", "node add", "node remove",
                            "node set", "quarantine", "references export",
                            "references import", "references retire", "references save",
                            "relabel", "set",
@@ -1522,6 +1593,8 @@ def _require_project() -> Path:
 
 
 _ENVELOPE_HOME: dict[Path, Path] = {}
+# The body root of a project without a ContextKit binding, per resolved root.
+_BODY_ROOT: dict[Path, Path] = {}
 
 
 def _validated_envelope(root: Path, raw: str, provider: str) -> Path:
@@ -1591,14 +1664,17 @@ def _envelope_witness(path) -> dict:
             "size": seen.st_size, "mtime_ns": seen.st_mtime_ns}
 
 
-def _cached_record(cache_root: Path, version: int, root: Path) -> dict | None:
+def _cached_record(cache_root: Path, version: int, root: Path,
+                   stale: bool = False) -> dict | None:
     """The recorded entry for this root while every input it rests on holds.
 
     Every reader re-observes the inputs the record names and compares each of
     them whole. Anything at all in doubt — an unreadable file, an unexpected
     shape, an input that moved, an expiry already behind the clock or a write
     ahead of it — returns None and costs a full resolution, so the failure mode
-    is slow and never wrong.
+    is slow and never wrong. With `stale` the last entry written for this root
+    is answered whatever its expiry and inputs say: the answer that stands
+    while what it was resolved from cannot be asked.
     """
     key = str(root.resolve())
     try:
@@ -1612,6 +1688,8 @@ def _cached_record(cache_root: Path, version: int, root: Path) -> dict | None:
     written, expires = entry.get("written_at"), entry.get("expires_at")
     if not isinstance(written, (int, float)) or not isinstance(expires, (int, float)):
         return None
+    if stale:
+        return entry
     now = time.time()
     if now < written or now >= expires:
         return None
@@ -1626,9 +1704,13 @@ def _cached_record(cache_root: Path, version: int, root: Path) -> dict | None:
 
 
 def _cached_envelope(root: Path) -> Path | None:
-    """The recorded envelope for this root, while its record stands."""
+    """The recorded envelope for this root, while its record stands. A root
+    without a ContextKit binding was answered for the id it was bound to, so a
+    record of another id, or of none, is not its answer."""
     entry = _cached_record(ENVELOPE_CACHE_ROOT, ENVELOPE_CACHE_VERSION, root)
     if entry is None:
+        return None
+    if not _contextkit_managed(root) and entry.get("agent_id") != _env_bound_id(root):
         return None
     envelope = Path(str(entry.get("envelope") or ""))
     if not envelope.is_absolute():
@@ -1665,9 +1747,98 @@ def _write_record(cache_root: Path, version: int, key: str, fields: dict,
             pass
 
 
-def _record_envelope(key: str, envelope: Path, witness: list[dict]) -> None:
+def _record_envelope(key: str, envelope: Path, witness: list[dict],
+                     fields: dict | None = None) -> None:
     _write_record(ENVELOPE_CACHE_ROOT, ENVELOPE_CACHE_VERSION, key,
-                  {"envelope": str(envelope)}, witness)
+                  {**(fields or {}), "envelope": str(envelope)}, witness)
+
+
+def _env_bound_id(root: Path) -> str | None:
+    """The id the environment, else the root's env files, bind this root to,
+    read without moving or writing anything."""
+    return _handed_off_project_id(root) or _env_file_project_id(root)[0] or None
+
+
+def _row_body_root(root: Path, agent_id: str) -> str | None:
+    """The body root the agent's row in the project's store names, as a
+    relative path ("." for the project root: a null column, no row, no such
+    column yet, or no store configured for the project), or None where a store
+    is configured and does not answer."""
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(root)
+    except db.DbError as exc:
+        if exc.slug == "store_not_configured":
+            return "."
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    try:
+        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+                          transaction=True)
+    except db.DbError:
+        return None
+    import psycopg
+    try:
+        conn.read_only = True
+        row = conn.execute("SELECT to_jsonb(a) -> 'body_root' FROM capabilities_agents a "
+                           "WHERE id = %s", (agent_id,)).fetchone()
+    except psycopg.errors.UndefinedTable:
+        return "."
+    except psycopg.Error:
+        return None
+    finally:
+        conn.close()
+    value = row[0] if row else None
+    return value if isinstance(value, str) and value else "."
+
+
+def _unbound_body_root(root: Path) -> Path:
+    """Where a project without a ContextKit binding keeps its agent's body: the
+    project root, or the folder its agent's row names (`body_root`).
+
+    The answer is read from the store on a miss of the envelope record and
+    recorded there with the id it was read for. While the store does not
+    answer, the last answer recorded for this root and id stands whatever its
+    age; with none, a <root>/capabilities folder that exists is the envelope,
+    and without one either the read is refused rather than guessed."""
+    key = root.resolve()
+    if key in _BODY_ROOT:
+        return _BODY_ROOT[key]
+    agent_id = _env_bound_id(root)
+    witness = [_envelope_witness(root / CONTEXTKIT_CONFIG_REL),
+               *(_envelope_witness(root / name) for name in PROJECT_ID_FILES)]
+    entry = _cached_record(ENVELOPE_CACHE_ROOT, ENVELOPE_CACHE_VERSION, root)
+    body = None
+    if entry is not None and entry.get("agent_id") == agent_id \
+            and isinstance(entry.get("body_root"), str):
+        body = entry["body_root"]
+    elif agent_id is None:
+        body = "."
+        _record_envelope(str(key), root / PROJECT_CAPABILITIES_REL, witness,
+                         {"agent_id": None, "body_root": body})
+    else:
+        body = _row_body_root(root, agent_id)
+        if body is None:
+            last = _cached_record(ENVELOPE_CACHE_ROOT, ENVELOPE_CACHE_VERSION, root, stale=True)
+            if last is not None and last.get("agent_id") == agent_id \
+                    and isinstance(last.get("body_root"), str):
+                body = last["body_root"]
+            elif (root / PROJECT_CAPABILITIES_REL).is_dir():
+                # Not recorded: the folder's own envelope is the answer it
+                # already had, so it is used and not recorded.
+                body = "."
+            else:
+                _die(5, "store_unreachable",
+                     f"the store does not answer, so where agent {agent_id} keeps its body "
+                     f"inside {root} is not known: its row names it, no earlier answer is "
+                     f"recorded for this folder and it has no {PROJECT_CAPABILITIES_REL}/ folder",
+                     "check the database setting with `capabilities store doctor`, then retry")
+        else:
+            _record_envelope(str(key), root / body / PROJECT_CAPABILITIES_REL, witness,
+                             {"agent_id": agent_id, "body_root": body})
+    found = _body_path(body, "body_root", Path(f"the row of agent {agent_id}"),
+                       root_allowed=True)
+    _BODY_ROOT[key] = found
+    return found
 
 
 BODY_LAYERS = ("context", "assets", "routines", "capabilities")
@@ -1697,8 +1868,9 @@ def _project_body(root: Path) -> dict:
 
     A ContextKit binding names them - `[body] root`, and `[sources] <layer>`
     inside it, the legacy `.capabilities` envelope fixed at the project root -
-    and is read here directly; every other project keeps its layers at the
-    project root."""
+    and is read here directly; every other project keeps its layers at their
+    own names in its body root, which its agent's row names
+    (`_unbound_body_root`)."""
     body_root, declared = Path("."), {}
     config_file = root / CONTEXTKIT_CONFIG_REL
     if _contextkit_managed(root):
@@ -1712,6 +1884,8 @@ def _project_body(root: Path) -> dict:
         body_root = _body_path(body.get("root", "."), "body.root", config_file,
                                root_allowed=True)
         declared = raw.get("sources") if isinstance(raw.get("sources"), dict) else {}
+    else:
+        body_root = _unbound_body_root(root)
     layers = {}
     for name in BODY_LAYERS:
         value = declared.get(name, name)
@@ -1737,7 +1911,8 @@ def _envelope_home(root: Path) -> Path:
 
     A ContextKit binding names where the projects it binds keep it, and is read
     for it. Broken configured bindings fail closed. Every other project keeps
-    the envelope at <root>/capabilities.
+    the envelope at <root>/<body root>/capabilities, the body root its agent's
+    row names, else the root itself.
 
     An answer this manager resolved itself is recorded against the inputs it
     rests on — the project's context binding — so the next process on this
@@ -1753,12 +1928,13 @@ def _envelope_home(root: Path) -> Path:
     else:
         home = _cached_envelope(root)
         if home is None:
-            witness = [_envelope_witness(root / CONTEXTKIT_CONFIG_REL)]
             if _contextkit_managed(root):
+                witness = [_envelope_witness(root / CONTEXTKIT_CONFIG_REL)]
                 home = _contextkit_envelope(root)
+                _record_envelope(str(root.resolve()), home, witness)
             else:
-                home = root / PROJECT_CAPABILITIES_REL
-            _record_envelope(str(root.resolve()), home, witness)
+                # Resolving the body root records the answer.
+                home = root / _unbound_body_root(root) / PROJECT_CAPABILITIES_REL
     _ENVELOPE_HOME[root] = home
     return home
 
@@ -2206,13 +2382,25 @@ def _migrate_codex_legacy(root: Path) -> dict:
     return {"removed": removed, "findings": findings}
 
 
-def _retire_capabilities_host_wiring(root: Path) -> list[str]:
-    """Remove legacy capabilities-owned injection after ContextKit takes over.
+def _retire_capabilities_host_wiring(root: Path,
+                                     hosts: tuple[str, ...] | list[str] = ("claude", "codex")
+                                     ) -> list[str]:
+    """Remove legacy capabilities-owned injection from `hosts` after the
+    agent's own wiring takes over - ContextKit's, or `hooks install`'s.
 
     Ownership markers are mandatory: ContextKit and human-authored host files
     are never deleted. The Codex hook shares a command path with ContextKit, so
     it is retired only when the compiler at that path is capabilities-owned.
     """
+    removed: list[str] = []
+    if "claude" in hosts:
+        removed += _retire_claude_capabilities_wiring(root)
+    if "codex" in hosts:
+        removed += _retire_codex_capabilities_wiring(root)
+    return removed
+
+
+def _retire_claude_capabilities_wiring(root: Path) -> list[str]:
     removed: list[str] = []
     claude_settings = root / ".claude" / "settings.json"
     if _prune_session_hooks(
@@ -2222,7 +2410,11 @@ def _retire_capabilities_host_wiring(root: Path) -> list[str]:
     claude_context = root / ".claude" / "rules" / "CAPABILITIES.md"
     if _remove_generated_file(claude_context, CONTEXT_BEGIN):
         removed.append(str(claude_context))
+    return removed
 
+
+def _retire_codex_capabilities_wiring(root: Path) -> list[str]:
+    removed: list[str] = []
     # Remove legacy Codex compiler script (pre-direct-invocation)
     legacy_compiler = root / ".codex" / "hooks" / "build-context.sh"
     try:
@@ -7164,8 +7356,8 @@ def cmd_relabel(slug: str) -> None:
 # own tables, keyed by the project's id (CAPABILITIES_PROJECT_ID). The manager alone writes
 # them; `agent` and `node` answer for the project the call runs in.
 AGENT_COLUMNS = ("id", "slug", "name", "description", "icon_sha", "onboarding_status",
-                 "onboarding_routine", "migrating_since", "migrated_at",
-                 "created_at", "updated_at")
+                 "onboarding_routine", "body_root", "collaboration_mode",
+                 "migrating_since", "migrated_at", "created_at", "updated_at")
 AGENT_TEXT_FIELDS = {"--name": "name", "--description": "description",
                      "--onboarding-routine": "onboarding_routine"}
 ONBOARDING_STATUSES = ("pending", "complete")
@@ -7447,7 +7639,8 @@ def cmd_agent(args: list[str]) -> None:
     elif sub == "set":
         _read_only_gate("agent set")
         pos, opts = _kernel_options(
-            args[1:], {*AGENT_TEXT_FIELDS, "--icon", "--onboarding-status"},
+            args[1:], {*AGENT_TEXT_FIELDS, "--icon", "--onboarding-status",
+                       "--collaboration-mode"},
             {"--no-icon", "--json"}, "agent set")
         if pos:
             _die(6, "input", "agent set takes no positional argument")
@@ -7461,6 +7654,12 @@ def cmd_agent(args: list[str]) -> None:
                 _die(6, "input", f"--onboarding-status {status!r} is not one of "
                      f"{', '.join(ONBOARDING_STATUSES)} or none")
             values["onboarding_status"] = None if status == "none" else status
+        if "--collaboration-mode" in opts:
+            mode = opts["--collaboration-mode"].strip()
+            if mode not in CK_COLLABORATION_MODES:
+                _die(6, "input", f"--collaboration-mode {mode!r} is not one of "
+                     f"{', '.join(CK_COLLABORATION_MODES)}")
+            values["collaboration_mode"] = mode
         if "--icon" in opts and "--no-icon" in opts:
             _die(6, "input", "agent set takes --icon or --no-icon, not both")
         if "--icon" in opts:
@@ -7478,12 +7677,234 @@ def cmd_agent(args: list[str]) -> None:
             values["icon_sha"] = None
         if not values:
             _die(6, "input", "agent set needs at least one of --name, --description, "
-                 "--icon, --no-icon, --onboarding-status, --onboarding-routine")
+                 "--icon, --no-icon, --onboarding-status, --onboarding-routine, "
+                 "--collaboration-mode")
 
         _emit(_agent_set(root, values))
+    elif sub == "convert":
+        _read_only_gate("agent convert")
+        pos, _opts = _kernel_options(args[1:], set(), {"--json"}, "agent convert")
+        if pos:
+            _die(6, "input", "agent convert takes no positional argument")
+        _emit(_agent_convert(root.resolve()))
     else:
-        _die(6, "input", "agent needs a subcommand: show or set",
+        _die(6, "input", "agent needs a subcommand: show, set or convert",
              "run `capabilities help`")
+
+
+CK_ICON_FILE = re.compile(r"icon-[^/]+\.png")
+
+
+def _convert_preflight_store(root: Path, agent_id: str) -> dict:
+    """The agent's row as `agent convert` finds it before writing anything:
+    {row (its columns, icon left out), has_icon}, read without migrating; a
+    store that is not configured, does not answer or holds no row refuses."""
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(root)
+    except db.DbError as exc:
+        hint = ("an agent without a ContextKit binding keeps its settings in its row in "
+                "the store: configure one with `capabilities store set`, then convert"
+                if exc.slug == "store_not_configured" else exc.hint)
+        _die(6 if exc.slug == "store_not_configured" else _store_error_exit(exc),
+             exc.slug, exc.message, hint)
+    try:
+        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+                          transaction=True)
+    except db.DbError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    import psycopg
+    try:
+        conn.read_only = True
+        row = conn.execute("SELECT to_jsonb(a) - 'icon', icon IS NOT NULL "
+                           "FROM capabilities_agents a WHERE id = %s", (agent_id,)).fetchone()
+    except psycopg.errors.UndefinedTable:
+        row = None
+    except psycopg.Error as exc:
+        _die(5, "store_unreachable", f"cannot read the agent registry: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    finally:
+        conn.close()
+    if row is None:
+        _die(6, "agent_unknown",
+             f"the store ({setting.level}, schema {setting.schema}) holds no agent {agent_id}, "
+             "so it has no row to carry this agent's settings into",
+             "register it with `capabilities agent set`, then convert")
+    return {"row": row[0], "has_icon": bool(row[1])}
+
+
+def _agent_convert(root: Path) -> dict:
+    """`agent convert`: turn a ContextKit-bound agent into one bound by its id
+    alone, as one change, refusing before anything is written."""
+    import tomllib
+    if not _contextkit_managed(root):
+        if _project_id_state(root)["id"]:
+            return {"ok": True, "project": str(root), "changed": False,
+                    "message": "this agent has no ContextKit binding to convert; nothing changed",
+                    "carried": {}, "removed": [], "untracked": [], "wrote": []}
+        _die(6, "not_contextkit_bound",
+             f"{root} has neither a ContextKit binding ({CONTEXTKIT_CONFIG_REL.as_posix()}) "
+             f"nor a project id ({PROJECT_ID_ENV}), so there is no agent to convert",
+             "run `capabilities init` to make one")
+    config_file = root / CONTEXTKIT_CONFIG_REL
+    ck_dir = config_file.parent
+    try:
+        raw = tomllib.loads(config_file.read_text())
+    except (OSError, ValueError) as exc:
+        _die(6, "contextkit_config_invalid", f"{config_file} cannot be read: {exc}",
+             "repair the project context binding, then convert")
+    sources = raw.get("sources")
+    if sources is not None and sources != {}:
+        named = ", ".join(f"sources.{key}" for key in sorted(sources)) \
+            if isinstance(sources, dict) else "sources"
+        _die(6, "setting_retired",
+             f"{config_file} sets {named}, which an agent without a ContextKit binding "
+             "has no home for: its layers keep their own names in its body root, and "
+             "global context lives in the store through the `context` capability",
+             "remove the [sources] entries (move global context into the store with "
+             "`context` first), then run `capabilities agent convert` again; the agent "
+             "stays bound and working until then")
+    binding = _ck_binding(root)
+    had_env_id = _env_file_project_id(root)[0] is not None
+    agent_id = _project_id_state(root)["id"]
+    if not agent_id:
+        _die(6, "no_project_identity",
+             f"{root} has no id: neither the environment, its .env.local or .env nor "
+             f"{config_file} ([identity] id) sets one",
+             "run `capabilities init --id <id>` with the agent's id, then convert")
+    # .contextkit/ holds the binding and what ContextKit and this manager made
+    # for it, and nothing else that removing the folder would lose.
+    foreign, icons = [], []
+    for entry in sorted(ck_dir.iterdir()):
+        rel = _ck_rel(root, entry)
+        if entry.is_symlink():
+            foreign.append(rel)
+        elif entry.name in ("config.toml", "README.md") and entry.is_file():
+            continue
+        elif entry.name == "generated" and entry.is_dir():
+            for item in sorted(entry.rglob("*")):
+                if item.is_dir() and not item.is_symlink():
+                    continue
+                if not _ck_generated(item):
+                    foreign.append(_ck_rel(root, item))
+        elif CK_ICON_FILE.fullmatch(entry.name) and entry.is_file():
+            icons.append(entry)
+        else:
+            foreign.append(rel)
+    if foreign:
+        _die(6, "contextkit_folder_not_empty",
+             f"{ck_dir} holds what converting would remove and nothing carries: "
+             f"{', '.join(foreign)}",
+             "move or remove those, then run `capabilities agent convert` again; the "
+             "agent stays bound and working until then")
+    hosts = _ck_installed_hosts(root)
+    if "codex" in hosts:
+        try:
+            plan = _ck_planned_codex_config(root / CODEX_CONFIG_REL)
+        except ValueError as exc:
+            _die(6, "codex_config_invalid", str(exc),
+                 "repair .codex/config.toml, then convert")
+        if plan["blocked"]:
+            _die(6, "codex_config_blocked", plan["blocked"])
+        _hooks_host_file(root / CODEX_HOOKS_REL, "Codex hooks")
+    if "claude" in hosts:
+        _hooks_host_file(root / ".claude" / "settings.json", "Claude settings")
+    found = _convert_preflight_store(root, agent_id)
+    row = found["row"]
+    values: dict = {"body_root": (None if binding["body_root"] == Path(".")
+                                  else binding["body_root"].as_posix())}
+    collaboration = raw.get("collaboration")
+    if isinstance(collaboration, dict) and "mode" in collaboration:
+        values["collaboration_mode"] = binding["collaboration_mode"]
+    if binding["onboarding"] and not row.get("onboarding_status"):
+        values["onboarding_status"] = binding["onboarding"]["status"]
+        values["onboarding_routine"] = binding["onboarding"]["routine"]
+    icon_sha = None
+    if icons and not found["has_icon"]:
+        if len(icons) > 1:
+            _die(6, "icon_ambiguous",
+                 f"{ck_dir} holds {len(icons)} icons and the agent's row none: "
+                 f"{', '.join(_ck_rel(root, icon) for icon in icons)}",
+                 "keep the agent's icon alone there (or set it with `capabilities agent set "
+                 "--icon`), then convert")
+        data = icons[0].read_bytes()
+        if not data.startswith(PNG_SIGNATURE):
+            _die(6, "icon_invalid", f"{icons[0]} is not a PNG file",
+                 "replace or remove it, then convert")
+        icon_sha = hashlib.sha256(data).hexdigest()
+        values.update(icon=data, icon_sha=icon_sha)
+    git = (root / ".git").exists() and _ck_git(root, "rev-parse", "--git-dir").returncode == 0
+
+    # Everything is checked: the change is made.
+    answer = _agent_set(root, values)
+    carried = {key: values[key] for key in ("body_root", "collaboration_mode") if key in values}
+    if "onboarding_status" in values:
+        carried["onboarding"] = {"status": values["onboarding_status"],
+                                 "routine": values["onboarding_routine"]}
+    if icon_sha:
+        carried["icon_sha"] = icon_sha
+    old_output = root / binding["output"]
+    old_target = old_output.resolve()
+    aside = root / f".contextkit.converting-{os.getpid()}"
+    ck_dir.rename(aside)
+    _ENVELOPE_HOME.pop(root, None)
+    _BODY_ROOT.pop(root, None)
+    try:
+        # A host link to the old output is pointed at the new one before the
+        # context is composed, which would otherwise list it as foreign.
+        relinked = [str(root / link) for host, link in CK_HOST_LINKS.items()
+                    if (root / link).is_symlink() and (root / link).resolve() == old_target
+                    and _ck_link_host(root, host, AGENT_OUTPUT_REL) == "linked"]
+        hooks = _hooks_install(root, hosts) if hosts else None
+        build = hooks["build"] if hooks else _ck_write(root, *_ck_compose(root))
+        gitignore = hooks["gitignore"] if hooks else _write_agent_gitignore(root)
+    except BaseException:
+        # The binding goes back: the agent stays bound and working.
+        if not ck_dir.exists():
+            aside.rename(ck_dir)
+        raise
+    removed = [f"{CONTEXTKIT_CONFIG_REL.parent.as_posix()}/"]
+    if not old_output.is_relative_to(ck_dir) and _ck_generated(old_output):
+        old_output.unlink()
+        removed.append(_ck_rel(root, old_output))
+    if hooks and hooks.get("retired_capabilities_wiring"):
+        removed += hooks["retired_capabilities_wiring"]
+    untracked: list[str] = []
+    if git:
+        listed = _ck_git(root, "ls-files", "-z", "--", *AGENT_HOST_FILES,
+                         f"{CONTEXTKIT_CONFIG_REL.parent.as_posix()}/")
+        untracked = [path for path in listed.stdout.split("\0") if path] \
+            if listed.returncode == 0 else []
+        if untracked:
+            dropped = _ck_git(root, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--",
+                              *AGENT_HOST_FILES, f"{CONTEXTKIT_CONFIG_REL.parent.as_posix()}/")
+            if dropped.returncode != 0:
+                _die(1, "git_untrack_failed", _ck_manager_message(dropped),
+                     "the agent is converted; untrack its host files with `git rm --cached`")
+        if gitignore["changed"]:
+            _ck_git(root, "add", "--", ".gitignore")
+    shutil.rmtree(aside)
+    wrote = [build["output"]]
+    wrote += relinked + [str(root / CK_HOST_LINKS[host]) for host, status in build["links"].items()
+                         if status == "linked" and str(root / CK_HOST_LINKS[host]) not in relinked]
+    if hooks and "codex" in hooks:
+        codex = hooks["codex"]
+        wrote += [path for path, changed in ((codex["adapter"], codex["adapter_changed"]),
+                                              (codex["config"], codex["config_changed"]),
+                                              (codex["hooks"], codex["hook_added"] or codex["hook_changed"]))
+                  if changed]
+    if hooks and "claude" in hooks:
+        claude = hooks["claude"]
+        if claude["hook_added"] or claude["hook_changed"]:
+            wrote.append(claude["settings"])
+    if gitignore["changed"]:
+        wrote.append(gitignore["path"])
+    if not had_env_id and _env_file_project_id(root)[0]:
+        wrote.append(str(root / ".env.local"))
+    return {"ok": True, "project": str(root), "agent_id": agent_id, "changed": True,
+            "carried": carried, "removed": removed, "untracked": untracked,
+            "staged": git and bool(untracked or gitignore["changed"]), "wrote": wrote,
+            "hosts": hosts, "build": build, "agent": answer["agent"]}
 
 
 def _agent_set(root: Path, values: dict) -> dict:
@@ -12757,6 +13178,12 @@ Before editing, search for the existing owner.
 When changing project body, routines, hooks, or capability envelopes, rerun `capabilities build` and read its warnings, and prove the host wiring with `capabilities hooks check`.
 
 Repair the owning source or tool surface, then rerun the command that exposed the problem."""
+# The Source Body line that names the binding: an agent without a ContextKit
+# binding has only generated output in a folder of the manager's.
+CK_BINDING_LINE = ("`.contextkit/` is technical binding, config, and generated output. "
+                   "It is not project doctrine.")
+AGENT_BINDING_LINE = (f"`{AGENT_OUTPUT_REL.parent.as_posix()}/` is generated output. "
+                      "It is not project doctrine.")
 CK_COLLABORATION_TEXT = """\
 ## Collaboration Mode
 
@@ -12809,9 +13236,26 @@ def _ck_frontmatter(text: str) -> tuple[dict, str]:
     return fm, text[body_start:]
 
 
+def _agent_project(root: Path) -> bool:
+    """Whether `build`, `session-start` and `hooks` treat this folder as an
+    agent: it carries a ContextKit binding, or it is bound to a project id."""
+    return _contextkit_managed(root) or bool(_project_id_state(root)["id"])
+
+
 def _ck_binding(root: Path) -> dict:
     """What the binding config says beyond the body: global context, output,
-    collaboration mode and onboarding, refused as ContextKit refuses them."""
+    collaboration mode and onboarding, refused as ContextKit refuses them.
+
+    An agent without a ContextKit binding has no config: its layers keep their
+    names in the body root its row names, its context is written to
+    AGENT_OUTPUT_REL, it has no global context folder, and its collaboration
+    mode and onboarding are its row's, read as the context is composed."""
+    if not _contextkit_managed(root):
+        body = _project_body(root)
+        return {"body_root": body["body_root"],
+                "layers": {name: path.relative_to(root) for name, path in body["layers"].items()},
+                "global_context": None, "output": AGENT_OUTPUT_REL,
+                "collaboration_mode": "ask", "onboarding": None, "bound": False}
     import tomllib
     config_file = root / CONTEXTKIT_CONFIG_REL
     try:
@@ -12877,7 +13321,7 @@ def _ck_binding(root: Path) -> dict:
             _die(6, "contextkit_config_invalid", f"invalid onboarding.routine: {routine}")
         onboarding = {"status": status, "routine": routine}
     return {"body_root": body["body_root"], "layers": layers, "global_context": global_context,
-            "output": output, "collaboration_mode": mode, "onboarding": onboarding}
+            "output": output, "collaboration_mode": mode, "onboarding": onboarding, "bound": True}
 
 
 def _ck_collect_context(root: Path, base: Path, source: str) -> list[dict]:
@@ -13160,9 +13604,16 @@ def _ck_capability_context(root: Path, capabilities_dir: Path, warnings: list[st
     return text
 
 
-def _ck_registry_onboarding(root: Path) -> dict | None:
+def _ck_registry_onboarding(root: Path, with_mode: bool = False):
     """This agent's registry row's onboarding columns, read without writing;
-    None where the project keeps no registry row ContextKit would read."""
+    None where the project keeps no registry row ContextKit would read. With
+    `with_mode`, (onboarding, collaboration_mode) - the row's mode, None where
+    it names none or the store has no such column yet."""
+    if with_mode:
+        row = _agent_row_json(root)
+        onboarding = ({"status": row["onboarding_status"], "routine": row.get("onboarding_routine")}
+                      if row and row.get("onboarding_status") else None)
+        return onboarding, (row or {}).get("collaboration_mode")
     agent_id = _kernel_agent_id(root)
     db = _db_module()
     store = _store_module()
@@ -13188,7 +13639,49 @@ def _ck_registry_onboarding(root: Path) -> dict | None:
     return None
 
 
+def _agent_row_json(root: Path) -> dict | None:
+    """This agent's registry row as its columns' values (its icon left out),
+    read without writing and without migrating the store, so a column a later
+    ledger step adds is simply absent; None where the store holds no row."""
+    agent_id = _kernel_agent_id(root)
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+                          transaction=True)
+    except db.DbError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    import psycopg
+    try:
+        conn.read_only = True
+        row = conn.execute("SELECT to_jsonb(a) - 'icon' FROM capabilities_agents a "
+                           "WHERE id = %s", (agent_id,)).fetchone()
+    except psycopg.errors.UndefinedTable:
+        row = None
+    except psycopg.Error as exc:
+        _die(5, "store_unreachable", f"cannot reach the store: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    finally:
+        conn.close()
+    return row[0] if row and isinstance(row[0], dict) else None
+
+
 def _ck_onboarding(root: Path, binding: dict, warnings: list[str], store: dict) -> dict | None:
+    if not binding["bound"]:
+        # No config to fall back on: the row answers the onboarding and the
+        # collaboration mode, and a row that names no mode asks.
+        code, answer, err = _ck_in_process(lambda: _ck_registry_onboarding(root, with_mode=True))
+        if code == 0:
+            onboarding, mode = answer
+            binding["collaboration_mode"] = mode if mode in CK_COLLABORATION_MODES else "ask"
+            return onboarding
+        store["failed"] = store["failed"] or code == 5
+        error = _ck_error_line(err)
+        if error[0] not in ("store_not_configured", "no_project_identity"):
+            warnings.append("the agent registry did not answer, so the context carries no "
+                            "onboarding and the collaboration mode is ask: "
+                            f"`capabilities agent show` exited {code}: {error[1]}")
+        return None
     code, answer, err = _ck_in_process(lambda: _ck_registry_onboarding(root))
     if code == 0:
         return answer or binding["onboarding"]
@@ -13207,6 +13700,18 @@ def _ck_onboarding(root: Path, binding: dict, warnings: list[str], store: dict) 
     warnings.append("the agent registry did not answer, so the onboarding is the config's: "
                     f"`capabilities agent show` exited {code}: {message}")
     return binding["onboarding"]
+
+
+def _ck_error_line(err: str) -> tuple[str, str]:
+    """(code, one-line message) of the manager's last error line in `err`."""
+    for line in reversed(err.splitlines()):
+        try:
+            error = json.loads(line)["error"]
+            return (str(error.get("code") or "manager_failed"),
+                    _ck_one_line(str(error.get("message") or "")))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return "manager_failed", ""
 
 
 def _ck_onboarding_block(root: Path, binding: dict, onboarding: dict, warnings: list[str],
@@ -13319,13 +13824,17 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
     inline = [item for item in files if item["load"] == "inline"]
     stubs = [item for item in files if item["load"] == "stub"]
 
+    source = (f"Source config: `{CONTEXTKIT_CONFIG_REL.as_posix()}`" if binding["bound"]
+              else f"Source config: the agent's row (`capabilities agent show`)")
     out = ["# Project Context", "", CK_GENERATED_MARKER,
-           f"Source config: `{CONTEXTKIT_CONFIG_REL.as_posix()}`", "Rebuild: `capabilities build`", ""]
+           source, "Rebuild: `capabilities build`", ""]
     if warnings:
         out += ["Generation warnings:", ""]
         out += [f"- {warning}" for warning in warnings]
         out.append("")
-    out += ["---", "", CK_RUNTIME_TEXT, ""]
+    runtime = (CK_RUNTIME_TEXT if binding["bound"]
+               else CK_RUNTIME_TEXT.replace(CK_BINDING_LINE, AGENT_BINDING_LINE))
+    out += ["---", "", runtime, ""]
     if binding["collaboration_mode"] == "ask":
         out += [CK_COLLABORATION_TEXT, ""]
     if binding["body_root"] != Path("."):
@@ -13426,10 +13935,10 @@ def _ck_link_host(root: Path, host: str, output: Path) -> str:
 
 def cmd_build(print_only: bool, json_output: bool) -> None:
     root = _require_project().resolve()
-    if not _contextkit_managed(root):
+    if not _agent_project(root):
         _die(6, "not_contextkit_bound",
-             f"{root} has no ContextKit binding ({CONTEXTKIT_CONFIG_REL.as_posix()}), "
-             "so it has no generated agent context to build",
+             f"{root} has neither a ContextKit binding ({CONTEXTKIT_CONFIG_REL.as_posix()}) "
+             f"nor a project id ({PROJECT_ID_ENV}), so it has no generated agent context to build",
              "run `capabilities context --claude` or `--codex` for a project without one")
     text, warnings, binding = _ck_compose(root)
     output = root / binding["output"]
@@ -13449,7 +13958,8 @@ def _ck_write(root: Path, text: str, warnings: list[str], binding: dict) -> dict
     if output.is_symlink() or (output.exists() and not _ck_generated(output)):
         _die(6, "output_not_generated",
              f"{output} exists and is not ContextKit-generated context; it is left as it is",
-             "move it, or point `[output] context` at a free path")
+             "move it, or point `[output] context` at a free path" if binding["bound"]
+             else "move it, then build again")
     try:
         previous = output.read_text(encoding="utf-8", errors="replace") if output.is_file() else None
     except OSError:
@@ -13572,9 +14082,9 @@ def _ck_session_notice(root: Path, host: str) -> str:
 
 
 def cmd_session_start(host: str) -> None:
-    # A project without a binding keeps the manager's own session notice.
+    # A project that is no agent keeps the manager's own session notice.
     root = _project_root()
-    if root is None or not _contextkit_managed(root):
+    if root is None or not _agent_project(root.resolve()):
         notice = _session_notice(host)
     else:
         notice = _ck_session_notice(root.resolve(), host)
@@ -14102,10 +14612,10 @@ def _hooks_install_claude(root: Path, settings: dict, existed: bool) -> dict:
 
 def _require_bound(verb: str) -> Path:
     root = _require_project().resolve()
-    if not _contextkit_managed(root):
+    if not _agent_project(root):
         _die(6, "not_contextkit_bound",
-             f"{root} has no ContextKit binding ({CONTEXTKIT_CONFIG_REL.as_posix()}), "
-             f"so it has no agent hooks to {verb}",
+             f"{root} has neither a ContextKit binding ({CONTEXTKIT_CONFIG_REL.as_posix()}) "
+             f"nor a project id ({PROJECT_ID_ENV}), so it has no agent hooks to {verb}",
              "run `capabilities init --claude` or `--codex` for a project without one")
     return root
 
@@ -14123,8 +14633,13 @@ def cmd_hooks_install(claude: bool, codex: bool) -> None:
     _emit(_hooks_install(root, hosts))
 
 
-def _hooks_install(root: Path, hosts: list[str]) -> dict:
-    """Wire `hosts` ("codex", "claude") to `capabilities session-start` and build."""
+def _hooks_install(root: Path, hosts: list[str], tolerate_build: bool = False) -> dict:
+    """Wire `hosts` ("codex", "claude") to `capabilities session-start` and build.
+
+    For an agent without a ContextKit binding the standalone capabilities
+    wiring of those hosts is retired and the root .gitignore is given the
+    manager's block for the host files. With `tolerate_build` a build that
+    fails is answered as `build: {error}` rather than ending the call."""
     # Every host file is read and planned before any of them is written.
     if "codex" in hosts:
         try:
@@ -14143,11 +14658,60 @@ def _hooks_install(root: Path, hosts: list[str]) -> dict:
         result["codex"] = _hooks_install_codex(root, plan, codex_hooks)
     if "claude" in hosts:
         result["claude"] = _hooks_install_claude(root, settings, existed)
+    if not _contextkit_managed(root):
+        retired = _retire_capabilities_host_wiring(root, hosts)
+        if retired:
+            result["retired_capabilities_wiring"] = retired
+        result["gitignore"] = _write_agent_gitignore(root)
     # Hosts read the generated context before their hook runs, so the binding
     # is complete only once the context and its host links exist.
+    if tolerate_build:
+        code, built, err = _ck_in_process(lambda: _ck_write(root, *_ck_compose(root)))
+        if code != 0:
+            error = _ck_error_line(err)
+            result["build"] = {"error": {"code": error[0], "message": error[1]}}
+        else:
+            result["build"] = built
+        return result
     text, warnings, binding = _ck_compose(root)
     result["build"] = _ck_write(root, text, warnings, binding)
     return result
+
+
+# The host files the manager writes for an agent, which are generated and so
+# ignored rather than committed: the root .gitignore carries them in a block
+# of the manager's own.
+AGENT_HOST_FILES = (f"{AGENT_OUTPUT_REL.parent.as_posix()}/", ".contextkit.md",
+                    ".claude/settings.json", ".claude/rules/CONTEXT.md",
+                    ".codex/config.toml", ".codex/hooks.json", ".codex/hooks/")
+AGENT_GITIGNORE_BEGIN = "# >>> capabilities: generated host files (managed; do not edit)"
+AGENT_GITIGNORE_END = "# <<< capabilities"
+
+
+def _write_agent_gitignore(root: Path) -> dict:
+    """Give the root .gitignore the manager's block naming the agent's host
+    files where it does not carry it as the manager writes it; every other
+    line is kept as it is."""
+    path = root / ".gitignore"
+    block = "\n".join([AGENT_GITIGNORE_BEGIN, *AGENT_HOST_FILES, AGENT_GITIGNORE_END]) + "\n"
+    try:
+        text = path.read_text() if path.exists() else ""
+    except OSError as exc:
+        _die(6, "gitignore_unreadable", f"{path} cannot be read: {exc}",
+             "repair it, then retry; the file is left as it is")
+    lines = text.splitlines(keepends=True)
+    begin = next((i for i, line in enumerate(lines) if line.rstrip("\n") == AGENT_GITIGNORE_BEGIN), None)
+    end = (next((i for i in range(begin, len(lines)) if lines[i].rstrip("\n") == AGENT_GITIGNORE_END),
+                None) if begin is not None else None)
+    if begin is not None and end is not None:
+        if "".join(lines[begin:end + 1]) == block:
+            return {"path": str(path), "changed": False}
+        updated = "".join(lines[:begin]) + block + "".join(lines[end + 1:])
+    else:
+        updated = text + ("\n" if text and not text.endswith("\n") else "") \
+            + ("\n" if text.strip() else "") + block
+    _atomic_write_text(path, updated)
+    return {"path": str(path), "changed": True}
 
 
 def _hooks_program(root: Path, runs: str | None) -> dict:
@@ -14334,6 +14898,21 @@ def _wire_claude_hook(root: Path) -> bool:
     return True
 
 
+def _agent_wired_hosts(root: Path) -> list[str]:
+    """The hosts whose SessionStart hook already runs `capabilities
+    session-start`, as `hooks install` wires them."""
+    hosts = []
+    try:
+        if (root / CK_CODEX_ADAPTER_REL).read_text() == SESSION_START_ADAPTER:
+            hosts.append("codex")
+    except OSError:
+        pass
+    if any(SESSION_START_NEEDLE.format(host="claude") in str(hook.get("command", ""))
+           for _entry, hook in _ck_claude_session_hooks(_read_json(root / ".claude" / "settings.json"))):
+        hosts.append("claude")
+    return hosts
+
+
 def cmd_init(claude: bool, codex: bool, layers: bool = False, starter: bool = False,
              given_id: str | None = None) -> None:
     _emit(_init(claude, codex, layers, starter, given_id))
@@ -14410,6 +14989,12 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
                  "`capabilities agent show` prints it")
         new_agent = False
         raised = _agent_to_raise(root, given_id)
+        if not _contextkit_managed(root) and not _project_id_state(root)["id"]:
+            # The envelope of a folder without a ContextKit binding sits where
+            # its agent's row says, so the id is bound before it is placed.
+            _write_env_local_id(root, given_id)
+            _ENVELOPE_HOME.pop(root, None)
+            _BODY_ROOT.pop(root.resolve(), None)
     else:
         new_agent = _new_agent_project(root)
     envelope_ignore = _envelope_home(root) / ".gitignore"
@@ -14491,6 +15076,7 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
     if migrated:
         result["migrated_from"] = str(root / LEGACY_PROJECT_CAPABILITIES_REL)
         result["migrated_entries"] = migrated
+    named = claude or codex
     if not claude and not codex:
         claude = True
     if _contextkit_managed(root):
@@ -14501,6 +15087,31 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
             result["retired_capabilities_wiring"] = retired
         _sync_skill(force_claude=claude, force_codex=codex)
         return result
+    # An agent without a ContextKit binding is wired as `hooks install` wires
+    # it: always when init binds it to its id, and otherwise on a host whose
+    # hook already runs `capabilities session-start`, which plain init then
+    # brings current instead of adding the standalone wiring beside it.
+    requested = [host for host, asked in (("codex", codex), ("claude", claude)) if asked]
+    wired = _agent_wired_hosts(root)
+    if given_id is not None:
+        agent_hosts = requested
+    elif named:
+        agent_hosts = [host for host in requested if host in wired]
+    else:
+        agent_hosts = wired
+    if agent_hosts:
+        result["hooks"] = _hooks_install(root, agent_hosts, tolerate_build=True)
+        # Only a host named here and not wired as the agent's gets the
+        # standalone wiring.
+        standalone = [host for host in requested if host not in agent_hosts] \
+            if named and given_id is None else []
+        skill = (claude, codex)
+        claude, codex = "claude" in standalone, "codex" in standalone
+        if not standalone:
+            _sync_skill(force_claude=skill[0], force_codex=skill[1])
+            return result
+    else:
+        skill = (claude, codex)
     # Refuse an unreadable host settings file before either host is touched.
     if claude:
         _read_host_settings(root / ".claude" / "settings.json")
@@ -14516,7 +15127,7 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
         if migration["findings"]:
             result["codex_migration_findings"] = migration["findings"]
         result["codex"] = _wire_codex(root)
-    _sync_skill(force_claude=claude, force_codex=codex)
+    _sync_skill(force_claude=skill[0], force_codex=skill[1])
     return result
 
 
@@ -15429,8 +16040,10 @@ def cmd_doctor() -> None:
                                 f"— remove {_deny_rule(n)} or disable the capability")
         # ContextKit owns every host binding in a bound project. Its compiler
         # may intentionally use the same legacy-looking paths that standalone
-        # capabilities wiring used, so only the owner may judge them there.
-        if not _contextkit_managed(root):
+        # capabilities wiring used, so only the owner may judge them there; so
+        # do the Codex wiring `hooks install` gives an agent, judged by `hooks
+        # check`.
+        if not _contextkit_managed(root) and "codex" not in _agent_wired_hosts(root):
             legacy_script = root / ".codex" / "hooks" / "build-context.sh"
             if legacy_script.exists():
                 findings.append("project: legacy .codex/hooks/build-context.sh present "
