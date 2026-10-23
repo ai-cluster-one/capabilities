@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-23 — The routine index carries the global routines an agent has enabled
+
+`build` composes an agent's routine index from its own routines in the store and from the global routines it has enabled with `routine enable`, each at its active version; a global routine is left out where the agent keeps a routine of its own with the same name. Enabled global routines count toward reading the routines from the store rather than the folder. A store whose routine tables predate enabling is read as before.
+
 ## 2026-10-23 — The global layer is the store's once it holds the global rows, and `migrate --retire-connections` retires the config home's connections files
 
 Outside any project, `enable`, `disable` and `inherit` with `--global` write the store's global policy row (`gate` names `store:<schema>.capabilities_policy`) once the store this machine reads holds the global rows, and `list` reads the global gate and counts `machine_connections` through the same global layer - the store's rows, with a config-home file answering only for what the store holds no row of - instead of switching to the store only once no connections file is left. A configured store that does not answer refuses such a write with exit 5. Before the global rows exist, or with no database, the config home's files answer and are written as before.

@@ -13686,14 +13686,25 @@ def _ck_routine_entries(root: Path, routines_dir: Path, warnings: list[str]) -> 
 
 
 def _ck_stored_routine_rows(root: Path) -> list[tuple] | None:
-    """The active versions of this project's unretired routines in its store, as
-    (name, description), read in a read-only transaction; None where the
-    project keeps none there: no store, no project id, no tables, or no
-    routine."""
-    rows = _ck_store_read(root, lambda conn, project: conn.execute(
-        "SELECT d.name, v.description FROM routine_documents d JOIN routine_versions v "
-        "ON v.document_id = d.id AND v.active WHERE d.retired_at IS NULL "
-        "AND d.project_id = %s", (project,)).fetchall())
+    """The active versions of this project's unretired routines in its store,
+    and of the global routines it has enabled and holds no routine of the same
+    name for, as (name, description), read in a read-only transaction; None
+    where the project keeps none there: no store, no project id, no tables,
+    or no routine. A store whose routine tables predate enabling reads the
+    project's own alone."""
+    def query(conn, project):
+        enabling = conn.execute("SELECT to_regclass('routine_enablements') IS NOT NULL"
+                                ).fetchone()[0]
+        enabled = (" OR (d.project_id IS NULL AND EXISTS (SELECT 1 FROM routine_enablements e "
+                   "WHERE e.document_id = d.id AND e.project_id = %(project)s) "
+                   "AND NOT EXISTS (SELECT 1 FROM routine_documents o "
+                   "WHERE o.project_id = %(project)s AND o.name = d.name "
+                   "AND o.retired_at IS NULL))") if enabling else ""
+        return conn.execute(
+            "SELECT d.name, v.description FROM routine_documents d JOIN routine_versions v "
+            "ON v.document_id = d.id AND v.active WHERE d.retired_at IS NULL "
+            f"AND (d.project_id = %(project)s{enabled})", {"project": project}).fetchall()
+    rows = _ck_store_read(root, query)
     return rows or None
 
 

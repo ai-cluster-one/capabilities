@@ -821,6 +821,61 @@ def test_build_composes_the_routine_index_from_the_routines_in_the_store(lab):
     assert "routine layer not present" not in from_store
 
 
+def test_build_indexes_a_global_routine_once_the_agent_enables_it(lab):
+    project = lab.project
+    (project / ".contextkit").mkdir()
+    (project / ".contextkit" / "config.toml").write_text(
+        f'version = 1\ntype = "agent-project"\n\n[identity]\nid = "{PROJECT_ID}"\n')
+    (project / "context" / "identity").mkdir(parents=True)
+    (project / "context" / "identity" / "MISSION.md").write_text(
+        _context_text(*_CONTEXT_FILES["identity/MISSION"]))
+    _seed_routines(lab, [(PROJECT_ID, "alpha", False, [("Run first by name.", "# Alpha\n", True)])])
+    with lab.cluster.connect(lab.database) as conn:
+        # The tables as the routine ledger's global step leaves them.
+        conn.execute(f"ALTER TABLE {SCHEMA}.routine_documents ALTER COLUMN project_id "
+                     "DROP NOT NULL")
+        conn.execute(f"CREATE TABLE {SCHEMA}.routine_enablements (project_id text NOT NULL, "
+                     f"document_id uuid NOT NULL REFERENCES {SCHEMA}.routine_documents (id), "
+                     "enabled_at timestamptz NOT NULL DEFAULT now(), enabled_by text NOT NULL)")
+        globals_ = {}
+        for name, description in (("shared", "Run in every agent."), ("alpha", "Shadowed."),
+                                  ("unused", "Not enabled.")):
+            (document,) = conn.execute(
+                f"INSERT INTO {SCHEMA}.routine_documents (project_id, name, created_by) "
+                "VALUES (NULL, %s, 'tester@lab') RETURNING id", (name,)).fetchone()
+            conn.execute(f"INSERT INTO {SCHEMA}.routine_versions (document_id, description, "
+                         "body, created_by) VALUES (%s, %s, '# x\n', 'tester@lab')",
+                         (document, description))
+            globals_[name] = document
+
+    def build() -> str:
+        result = lab.run("build", "--print")
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    def enable(name: str, on: bool = True) -> None:
+        with lab.cluster.connect(lab.database) as conn:
+            if on:
+                conn.execute(f"INSERT INTO {SCHEMA}.routine_enablements (project_id, document_id, "
+                             "enabled_by) VALUES (%s, %s, 'tester@lab')",
+                             (PROJECT_ID, globals_[name]))
+            else:
+                conn.execute(f"DELETE FROM {SCHEMA}.routine_enablements WHERE document_id = %s",
+                             (globals_[name],))
+
+    before = build()
+    assert "- **alpha** (`routine show alpha`) - Run first by name.\n" in before
+    assert "routine show shared" not in before and "routine show unused" not in before
+    enable("shared")
+    enable("alpha")
+    enabled = build()
+    assert ("- **alpha** (`routine show alpha`) - Run first by name.\n"
+            "- **shared** (`routine show shared`) - Run in every agent.\n") in enabled
+    assert "Shadowed." not in enabled and "routine show unused" not in enabled
+    enable("shared", on=False)
+    assert build() == before
+
+
 def test_build_points_the_onboarding_block_at_the_routine_where_the_agent_keeps_it(lab):
     project = lab.project
     (project / ".contextkit").mkdir()

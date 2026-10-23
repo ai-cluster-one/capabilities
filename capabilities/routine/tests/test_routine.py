@@ -229,12 +229,14 @@ def test_the_ledger_creates_the_tables_with_their_indexes_comments_and_guard(lab
     lab.ok("list", "--store", "--json")
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'routine' ORDER BY step")]
-    assert steps == ["0001-documents", "0002-versions", "0003-versions-guard"]
+    assert steps == ["0001-documents", "0002-versions", "0003-versions-guard", "0004-global",
+                     "0005-enablements"]
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
     assert "WHERE active" in indexes["routine_versions_active"]
-    assert "(project_id, name) WHERE (retired_at IS NULL)" in indexes["routine_documents_name"]
-    for table in ("routine_documents", "routine_versions"):
+    assert ("(COALESCE(project_id, ''::text), name) WHERE (retired_at IS NULL)"
+            in indexes["routine_documents_name"])
+    for table in ("routine_documents", "routine_versions", "routine_enablements"):
         [(comment,)] = lab.sql("SELECT obj_description(%s::regclass)", (f"{SCHEMA}.{table}",))
         assert comment
     commented = {r[0] for r in lab.sql(
@@ -478,3 +480,82 @@ def test_a_store_that_does_not_answer_is_read_past_but_refuses_a_title(lab):
     assert listed["warnings"] and "routines folder is used" in listed["warnings"][0]
     assert lab.refused("title", "pitstop", "x", AGENTKIT_DB_URL=dead)[0] == 5
     assert (lab.routines / "pitstop.md").read_text() == FILES["pitstop.md"]
+
+
+# --- global routines ----------------------------------------------------------------
+
+OTHER_ID = "prj_" + "9a8b7c6d5e4f"
+SHARED = "---\nname: shared\ndescription: Run in every agent.\n---\n\n# Shared\n"
+
+
+def _other_project(lab: Lab) -> dict:
+    """A second project in the lab's store, as the env its runs take."""
+    other = lab.tmp / "other"
+    (other / ".git").mkdir(parents=True)
+    (other / "capabilities").mkdir()
+    (other / "capabilities" / "project.json").write_text(json.dumps(
+        {"schema": "capabilities.project.v1", "slug": "other", "id": OTHER_ID}))
+    (other / "capabilities" / "settings.json").write_text(json.dumps(
+        {"capabilities": {"routine": {"enabled": True}}}))
+    return {"CLAUDE_PROJECT_DIR": str(other)}
+
+
+def test_a_global_routine_reaches_a_project_only_once_it_is_enabled(lab):
+    other = _other_project(lab)
+    saved = lab.ok("save", "shared", "--from", "-", "--global", stdin=SHARED, **other)
+    assert (saved["outcome"], saved["global"]) == ("created", True)
+    assert [(r["name"], r["author"]) for r in
+            lab.ok("list", "--store", "--global", "--json")["routines"]] == [("shared", OTHER_ID)]
+    assert lab.ok("show", "shared", "--global") == SHARED
+    assert lab.ok("list", "--store", "--json")["count"] == 0
+    assert lab.refused("show", "shared")[0] == 3
+    assert lab.ok("titles", "--json")["source"] == "folder"
+
+    enabled = lab.ok("enable", "shared")
+    assert (enabled["changed"], enabled["author"]) == (True, OTHER_ID)
+    assert lab.ok("enable", "shared")["changed"] is False
+    [(by,)] = lab.sql(f"SELECT enabled_by FROM {SCHEMA}.routine_enablements "
+                      "WHERE project_id = %s", (PROJECT_ID,))
+    assert by == "tester@test-node"
+    [listed] = lab.ok("list", "--store", "--json")["routines"]
+    assert (listed["name"], listed["global"], listed["author"]) == ("shared", True, OTHER_ID)
+    assert lab.ok("show", "shared") == SHARED
+    assert lab.ok("show", "shared", "--json")["global"] is True
+    titles = lab.ok("titles", "--json")
+    assert (titles["source"], [r["name"] for r in titles["routines"]]) == ("store", ["shared"])
+    assert lab.refused("title", "shared", "Mine")[1]["code"] == "global_routine"
+
+    # A routine of the project's own of the same name shadows it.
+    own = SHARED.replace("Run in every agent.", "Run here.")
+    lab.ok("save", "shared", "--from", "-", stdin=own)
+    [listed] = lab.ok("list", "--store", "--json")["routines"]
+    assert (listed["global"], listed.get("shadows_global")) == (False, True)
+    assert lab.ok("show", "shared") == own
+    lab.ok("retire", "shared")
+    assert lab.ok("show", "shared") == SHARED
+
+    assert lab.ok("disable", "shared")["changed"] is True
+    assert lab.ok("disable", "shared")["changed"] is False
+    assert lab.ok("list", "--store", "--json")["count"] == 0
+    assert lab.refused("show", "shared")[0] == 3
+
+
+def test_only_the_author_project_changes_a_global_routine_and_hands_it_on(lab):
+    other = _other_project(lab)
+    lab.ok("save", "shared", "--from", "-", "--global", stdin=SHARED, **other)
+    newer = SHARED.replace("# Shared", "# Shared, again")
+    for args in (("save", "shared", "--from", "-", "--global"), ("retire", "shared", "--global"),
+                 ("transfer", "shared", "--to", PROJECT_ID)):
+        code, error = lab.refused(*args, stdin=newer)
+        assert (code, error["code"]) == (4, "not_author"), args
+    assert lab.ok("show", "shared", "--global") == SHARED
+
+    handed = lab.ok("transfer", "shared", "--to", PROJECT_ID, **other)
+    assert (handed["author"], handed["changed"]) == (PROJECT_ID, True)
+    assert lab.refused("transfer", "shared", "--to", OTHER_ID, **other)[1]["code"] == "not_author"
+    assert lab.refused("save", "shared", "--from", "-", "--global", stdin=newer,
+                       **other)[1]["code"] == "not_author"
+    assert lab.ok("save", "shared", "--from", "-", "--global", stdin=newer)["outcome"] == "versioned"
+    assert lab.ok("show", "shared", "--global") == newer
+    assert lab.ok("retire", "shared", "--global")["retired"] is True
+    assert lab.ok("list", "--store", "--global", "--json")["count"] == 0
