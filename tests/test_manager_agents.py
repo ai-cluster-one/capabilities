@@ -1039,6 +1039,31 @@ def test_agent_convert_refuses_before_writing_anything(lab, tmp_path):
     (folder.path / ".contextkit" / "manager").rmdir()
     unchanged(folder, BOUND_CONFIG)
 
+    # A refusal while it builds puts back what it had changed: the agent stays
+    # bound, its host link on its own output.
+    folder = _bound_agent(lab, tmp_path / "invalid", BOUND_CONFIG)
+    link = folder.path / ".claude" / "rules" / "CONTEXT.md"
+    (folder.path / "agent" / "context" / "BROKEN.md").write_text(
+        "---\ntitle: Broken\ndescription: No order.\nload: inline\n---\n# Broken\n")
+    folder.git("add", "-A")
+    folder.git("commit", "-qm", "broken")
+    code, error = folder.refused("agent", "convert")
+    assert (code, error["code"]) == (6, "context_file_invalid")
+    unchanged(folder, BOUND_CONFIG)
+    assert link.resolve() == (folder.path / ".contextkit" / "generated" / "context.md").resolve()
+
+    folder = _bound_agent(lab, tmp_path / "occupied", BOUND_CONFIG)
+    link = folder.path / ".claude" / "rules" / "CONTEXT.md"
+    occupied = folder.path / ".capabilities-generated" / "context.md"
+    occupied.parent.mkdir()
+    occupied.write_text("# Not generated\n")
+    code, error = folder.refused("agent", "convert")
+    assert (code, error["code"]) == (6, "output_not_generated")
+    assert occupied.read_text() == "# Not generated\n"
+    assert link.resolve() == (folder.path / ".contextkit" / "generated" / "context.md").resolve()
+    assert folder.git("status", "--porcelain").splitlines() == ["?? .capabilities-generated/"]
+    assert not folder.ok("build")["links"]["claude"].startswith("blocked")
+
     unknown = Folder(lab, tmp_path / "unknown", agent_id="prj_00000000dd01")
     (unknown.path / ".contextkit").mkdir()
     (unknown.path / ".contextkit" / "config.toml").write_text(BOUND_CONFIG)

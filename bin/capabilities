@@ -644,7 +644,10 @@ PROJECT VERBS (run inside a consuming project)
         host files into the root .gitignore; in a Git repository removes
         those host files and every tracked file under .contextkit/ from the
         index, keeping the host files on disk, and stages the .gitignore,
-        committing nothing; and removes .contextkit/. Answers {ok, project,
+        committing nothing; and removes .contextkit/. A refusal while it
+        builds (a context file the build refuses, a file it did not
+        generate at the new output) puts the binding, the host files, the
+        .gitignore and the row's values back as it found them. Answers {ok, project,
         agent_id, changed, carried, removed, untracked, staged, wrote,
         hosts, build, agent}. Run where no ContextKit binding is left, it
         changes nothing and answers changed false with a message. Exit 4
@@ -7733,6 +7736,51 @@ def _convert_preflight_store(root: Path, agent_id: str) -> dict:
     return {"row": row[0], "has_icon": bool(row[1])}
 
 
+def _convert_touched() -> tuple[Path, ...]:
+    """What `agent convert` can change on disk once its checks pass, kept so a
+    refusal while it builds puts every one of them back as it found it."""
+    return (*CK_HOST_LINKS.values(), CODEX_CONFIG_REL, CODEX_HOOKS_REL,
+            CK_CODEX_ADAPTER_REL, Path(".claude") / "settings.json",
+            Path(".claude") / "rules" / "CAPABILITIES.md", CODEX_CAPABILITIES_REL,
+            CODEX_ROOT_LINK_REL, Path(".codex") / "generated" / "context.md",
+            Path(".gitignore"), AGENT_OUTPUT_REL)
+
+
+def _path_states(root: Path, rels) -> dict:
+    """Each path as it is: ("link", target), ("file", bytes, mode) or None."""
+    states: dict = {}
+    for rel in rels:
+        path = root / rel
+        if path.is_symlink():
+            states[rel] = ("link", os.readlink(path))
+        elif path.is_file():
+            states[rel] = ("file", path.read_bytes(), path.stat().st_mode & 0o7777)
+        else:
+            states[rel] = None
+    return states
+
+
+def _restore_path_states(root: Path, states: dict) -> None:
+    for rel, state in states.items():
+        path = root / rel
+        if state is None:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            continue
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if state[0] == "link":
+            path.symlink_to(state[1])
+        else:
+            path.write_bytes(state[1])
+            path.chmod(state[2])
+    output_dir = root / AGENT_OUTPUT_REL.parent
+    if states.get(AGENT_OUTPUT_REL) is None and output_dir.is_dir() \
+            and not any(output_dir.iterdir()):
+        output_dir.rmdir()
+
+
 def _agent_convert(root: Path) -> dict:
     """`agent convert`: turn a ContextKit-bound agent into one bound by its id
     alone, as one change, refusing before anything is written."""
@@ -7835,7 +7883,10 @@ def _agent_convert(root: Path) -> dict:
         values.update(icon=data, icon_sha=icon_sha)
     git = (root / ".git").exists() and _ck_git(root, "rev-parse", "--git-dir").returncode == 0
 
-    # Everything is checked: the change is made.
+    # Everything is checked: the change is made. What it changes is kept, so a
+    # refusal while it builds leaves the agent bound and as it was.
+    states = _path_states(root, _convert_touched())
+    previous = {key: (None if key == "icon" else row.get(key)) for key in values}
     answer = _agent_set(root, values)
     carried = {key: values[key] for key in ("body_root", "collaboration_mode") if key in values}
     if "onboarding_status" in values:
@@ -7859,9 +7910,14 @@ def _agent_convert(root: Path) -> dict:
         build = hooks["build"] if hooks else _ck_write(root, *_ck_compose(root))
         gitignore = hooks["gitignore"] if hooks else _write_agent_gitignore(root)
     except BaseException:
-        # The binding goes back: the agent stays bound and working.
+        # The binding, the host files and the row go back: the agent stays
+        # bound and working.
         if not ck_dir.exists():
             aside.rename(ck_dir)
+        _ENVELOPE_HOME.pop(root, None)
+        _BODY_ROOT.pop(root, None)
+        _restore_path_states(root, states)
+        _ck_in_process(lambda: _agent_set(root, previous))
         raise
     removed = [f"{CONTEXTKIT_CONFIG_REL.parent.as_posix()}/"]
     if not old_output.is_relative_to(ck_dir) and _ck_generated(old_output):
