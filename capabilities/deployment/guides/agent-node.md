@@ -1,0 +1,89 @@
+# Agent Nodes From The Standard Image
+
+Use this guide to run an agent that lives in the store on a server of its own: create a node from the public standard image, enrol it, log in on it, move services onto it, watch it, update it and remove it. It is the whole procedure, in order; every command's exact options are `deployment help`'s, `capabilities help`'s and `coolify help`'s, and are not repeated here.
+
+## What a node is
+
+`agent-node` is one agent in one container. The container runs the public standard image `ghcr.io/agenium-dev/agent-node:<version>`, which carries the tools and the boot path - Python and uv, Claude Code and Codex, the capabilities manager with the whole catalogue, the supervisor - and no agent and no secret. Nothing is built per agent and no repository is cloned: the container is told only which agent it runs (`CAPABILITIES_PROJECT_ID`), the folder it raises it in (`CAPABILITIES_PROJECT_ID_ROOT`, `/app`) and its own name as a node (`AGENT_NODE_NAME`), and it waits idle until enrolment hands it a store to reach. It then raises the agent from the store, compiles every catalogue service under its runner, and runs a service only where the agent's gate places it on this node.
+
+A node is also a row among the agent's nodes (`capabilities node list`): its name, and for a node made here the coolify connection, the Coolify server and the Coolify resource it was created through, and the public half of the key pair it made for itself.
+
+`agent-node-multi` - several agents of one owner in one container, as on a Mac, with a folder per agent and machine services serving all of them - is planned and not shipped. Everything below is `agent-node`.
+
+## Before you start
+
+Work from the folder of the agent on the machine you deploy from: a folder bound to the agent's id (`capabilities init --id <id>`, or `capabilities agent materialize`), whose records are in the store. A project whose gate is in its files gets `not_store_mode`.
+
+You need:
+
+- a coolify connection granted to this agent that allows writes (`coolify help` for connections and their write permission); with more than one granted, name it with `--connection`;
+- in Coolify, an existing project and environment and the server the node runs on: their uuids and the environment's name. `deployment` creates no project and no environment;
+- SSH as root from this machine to that server's address as Coolify reports it, with the key the connection names or the one your SSH configuration offers for that host. Enrolment, and everything you do inside the node, runs over it with `docker exec`;
+- a store the server can reach. The node is given the store setting this folder resolves, so a setting that points at `localhost`, or names a root certificate file (`store_setting_not_portable`), does not travel.
+
+## Create
+
+`deployment node create <node>`, with the Coolify project, server and environment, the image tag (`--version`) and optionally a memory limit, makes one Coolify service of one container from the standard image. It has a volume of its own for each state path of the image - `~/.config` (store setting, secrets, node key), `~/.local/state` (capability state), `~/.claude` and `~/.codex` (the logins) - and only the three keys above in its environment. Then it registers the node row. The container comes up healthy and its log says it is waiting for a store setting; it runs nothing yet.
+
+## Enrol
+
+`deployment node enrol <node> --services <name,...>` reaches the container over SSH and `docker exec` and, in this order:
+
+- makes the node's X25519 key pair in the container, keeps the private key on its config volume and records the public key on the node row;
+- writes the agent's secrets - every secret key of a connection the agent's enabled capabilities resolve here - into each capability's credentials file on the node. The token of the coolify connection the node was created through is not among them: it stays on the deploying machine, and the node does not hold it;
+- places each named service on the node with a policy row naming it (`capabilities enable <name> --project --node <node>`). A fresh node runs no service until such a row exists, and you can add or remove rows later without enrolling again;
+- writes the store setting, last, with the node's own manager. That is what the waiting node raises the agent on, and enrol waits until the node reports `running agent ... as node <node>` (`--wait`, else `node_not_raised`).
+
+Secrets and the store password travel on standard input and are never printed or put on a command line.
+
+## Log in on the node
+
+No login is handed to a node: a person makes each one on it, once, and it stays on the node's volumes. No `deployment` verb does it for a node made by `node create` yet (`deployment node login` serves a `deployment/targets/` application); open a terminal into the container yourself:
+
+```sh
+ssh -t root@<server-address> docker exec -it <container> claude auth login
+ssh -t root@<server-address> docker exec -it <container> codex login --device-auth
+```
+
+The container is the one Docker labels `com.docker.compose.project=<resource>` and `com.docker.compose.service=agent`, where `<resource>` is the node row's `coolify_resource`: `docker ps --filter label=com.docker.compose.project=<resource> --filter label=com.docker.compose.service=agent` on the server names it.
+
+`gh auth login` works the same way once the image carries the GitHub CLI; `agent-node` 0.0.1 does not, so check with `gh --version` in the container. Its login is kept under `~/.config`, on the config volume.
+
+## Move a service onto the node
+
+A service runs on a node only where the agent's policy row names that node, and its lease keeps it on one node at a time (`deployment guide profiles`, **Where a service runs**). To move one from the machine it runs on now to the node:
+
+1. Place it on the node: `capabilities enable <name> --project --node <node>`. While the other machine still holds the lease, the node's runner waits and says so.
+2. Take it off the other machine: `capabilities disable <name> --project --node <machine>`, or `capabilities inherit <name> --project --node <machine>` to remove that row. At its next reconcile the machine's runner stops the service and releases the lease, and the node's runner takes it over at its own next reconcile, by default within a minute.
+
+No recompile and no redeploy is needed on either side. `deployment services` on each side shows what the gate answers there, whether the runner runs the service and who holds the lease.
+
+## Status and logs
+
+`deployment node status` and `deployment logs` read a `deployment/targets/` application and do not reach a node made by `node create` yet. What there is today:
+
+- `capabilities node list` here: the node's row, its resource and its public key;
+- `coolify services <resource>`: what Coolify reports for the node's service;
+- in the container, `docker exec <container> deployment services`: each service's gate answer, runner state, refusal and lease; `docker exec <container> cat /tmp/agent-node.state`: what the node is doing (`idle: ...`, `running agent ...`);
+- on the server, `docker logs <container>`: the boot log, which says what an idle node is waiting for and what the agent's raise did.
+
+## Update to a new image version
+
+No verb moves a node to a new tag yet. The tools are the image's, and everything the node learned is on its four volumes, so an update is the same resource running a newer tag: in Coolify, change the image of the node's service from `ghcr.io/agenium-dev/agent-node:<old>` to `:<new>` and redeploy it. The store setting, the secrets, the node key and the logins stay on the volumes, and each boot brings the capabilities to the catalogue the new image names. Do not update with `node remove` and `node create`: remove deletes the volumes, and the new node has to be enrolled and logged in again.
+
+## Remove
+
+`deployment node remove <node> --yes` deletes the node's Coolify resource with its volumes and configuration, then its node row. It first checks that the resource is this node's own - its agent container runs the standard image as this node - and deletes nothing when it is not (`node_resource_not_own`); a resource already gone leaves only the row to remove.
+
+The policy rows that placed services on the node are not removed with it, and a node created again under the same name would run those services at once. Remove them first, one per service: `capabilities inherit <name> --project --node <node>`.
+
+## Architectures and derived images
+
+These are planned and not shipped:
+
+- `agent-node` 0.0.1 is published for `linux/amd64` only; an arm64 server cannot run it until the image is published for `linux/arm64` as well.
+- `node create` takes only the standard image by tag. A node whose image Coolify builds on the server from a Dockerfile in a repository, `FROM` the standard image, with the host's Docker socket and host directories mounted at the same path, is not available yet; until it is, a node needs nothing the standard image lacks.
+
+## Another provider
+
+The image is plain Docker; Coolify is only how `deployment` creates and removes it. Any host that runs a container can run a node: start `ghcr.io/agenium-dev/agent-node:<version>` with `CAPABILITIES_PROJECT_ID`, `CAPABILITIES_PROJECT_ID_ROOT=/app` and `AGENT_NODE_NAME`, a named volume on each of the four state paths, a memory limit and a restart policy. Register its row from the agent's folder with `capabilities node add <node> --kind server`; the node raises no agent without it. `deployment node enrol` and `remove` reach only a node whose row names a Coolify resource, so on another provider you do by hand what **Enrol** lists - the secrets into each capability's credentials file in the container, the placement rows from the agent's folder, and the store setting last with the node's own `capabilities store set` - and removing it is deleting the container and its volumes, then `capabilities node remove <node>`.

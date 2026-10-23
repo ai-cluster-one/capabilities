@@ -317,7 +317,7 @@ Contract commands:
   deployment help
   deployment stub
   deployment manifest --json
-  deployment guide [bootstrap|profiles|standard|targets]
+  deployment guide [agent-node|bootstrap|profiles|standard|targets]
   deployment migrate [status]
   deployment connections
   deployment ids list|get <label>|set <label> <value>|rm <label> [--note <text>]
