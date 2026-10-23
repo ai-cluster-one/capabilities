@@ -1035,6 +1035,18 @@ def test_a_config_home_file_answers_only_for_a_connection_the_store_holds_no_row
                                                         / "connections.json")
 
 
+def test_outside_a_project_an_agents_own_connection_is_not_the_machines(lab):
+    _global_rows_in_force(lab)
+    _add_machine(lab, "mach")
+    other = "prj_" + "9f8e7d6c5b4a"
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("INSERT INTO lab.capabilities_connections (capability, name, spec, owner) "
+                     "VALUES ('coolify', 'theirs', %s::jsonb, %s)",
+                     ('{"base_url": "http://theirs.invalid"}', other))
+    listed = _ok(_outside(lab, COOLIFY, "connections"))
+    assert set(listed["connections"]) == {"mach"}
+
+
 def test_a_machine_connection_an_agent_is_granted_is_not_removed(lab):
     _global_rows_in_force(lab)
     _add_machine(lab, "mach")

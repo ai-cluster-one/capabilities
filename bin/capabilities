@@ -237,9 +237,9 @@ MACHINE VERBS
         row carries `machine` ("allowed" or
         "quarantined") and `machine_connections`, the connections this
         machine's global scope declares for it less those whose grant there
-        is disabled - once the store's global rows exist, the connections the
-        store holds for it, with a config-home file counted only for one the
-        store holds no row of; a quarantined row is
+        is disabled - once the store's global rows exist, the shared
+        connections the store holds for it, with a config-home file counted
+        only for one the store holds no row of; a quarantined row is
         effective "disabled" with source "machine".
   search [QUERY] [--source ID]
         Search cached catalogues from the official and registered sources.
