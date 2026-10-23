@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-23 — Help says how a person logs in on a node of the standard image
+
+`deployment help`, under `node enrol`, says the logins are not handed to a node: a person makes them over SSH and `docker exec -it` into the node's container (labelled with the resource as Compose project and `agent` as service) with `claude auth login`, `codex login --device-auth` and `gh auth login`, which agent-node 0.0.2 and later carries and through which git reaches github.com over https. Each login is kept on the node's volumes.
+
 ## 2026-10-23 — A box that carries no body binds its agent by the id alone
 
 The `agent-box-shell` entrypoint no longer lays an empty `.contextkit/config.toml` in the project root before binding it: the manager composes the context of a folder bound to its agent's id, so each boot still binds the root with `capabilities init --id`, wires the agent CLIs with `capabilities hooks install --claude --codex` and composes the context with `capabilities build`, now written to `.capabilities-generated/context.md`. Requires a manager that builds for a folder bound by its id.

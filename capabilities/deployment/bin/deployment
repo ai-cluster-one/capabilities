@@ -258,6 +258,14 @@ USAGE
       printed. Waits up to --wait seconds for the node to report its agent
       running (exit 5 node_not_raised otherwise). A store setting naming a
       root certificate file exits 6 store_setting_not_portable.
+      The logins are not handed over: a person makes them on the node, over
+      SSH to its server and `docker exec -it <container>` into the container
+      labelled com.docker.compose.project=<resource> and
+      com.docker.compose.service=agent - `claude auth login`, `codex login
+      --device-auth`, and `gh auth login` for the GitHub CLI (agent-node
+      0.0.2 and later), through which git also reaches github.com over
+      https. Each is kept on the node's volumes and outlives a new image
+      tag.
   deployment node remove <node> --yes
       Delete the node's Coolify resource with its volumes and configuration,
       then its node row. Only the resource the row names is touched; one
