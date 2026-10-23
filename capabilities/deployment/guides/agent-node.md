@@ -33,7 +33,7 @@ The node is then a Coolify application rather than a service. It is told the sam
 
 Only such a node takes host paths, each bound at the same path inside the container, so a container it starts on the host sees the same paths it does:
 
-- `--docker-socket` binds the host's `/var/run/docker.sock`. The node runs as user `agent`, which reaches the socket only through its group: the Dockerfile creates a group with the socket's group id on that server (`stat -c %g /var/run/docker.sock` there) and adds `agent` to it, then returns to `USER agent`. The socket is root on that server, so give it only to a node on a server that serves nothing else.
+- `--docker-socket` binds the host's `/var/run/docker.sock`. The node runs as user `agent`, which reaches the socket only through its group. From agent-node 0.0.4 the image puts `agent` in a group with the socket's group id at boot, read from the socket itself, so the Dockerfile names no id. On an older image the Dockerfile creates that group with the id the socket has on that server (`stat -c %g /var/run/docker.sock` there) and adds `agent` to it, then returns to `USER agent`. The socket is root on that server, so give it only to a node on a server that serves nothing else.
 - `--host-dir <path>`, repeatable, binds a directory of the server, which must already exist and belong to the node's user (`agent`, uid 1000 in the standard image) for the node to write in it. A secret file the work needs there is placed once by a person; `deployment` puts nothing in it.
 
 Coolify never creates, writes or deletes a host path, and `node remove` deletes the application and its volumes but never the socket, a host directory or what is in it.

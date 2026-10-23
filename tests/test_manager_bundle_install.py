@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import errno
 import io
 import json
 import importlib.machinery
@@ -465,6 +466,46 @@ def test_update_migrates_script_source_to_bundle() -> None:
         assert meta["source_type"] == "directory"
         assert meta["source"] == str(TELEGRAM_BUNDLE)
         _run_service_init(bin_dir, env, tmp / "project-update")
+
+
+def test_update_replaces_a_payload_the_filesystem_will_not_rename() -> None:
+    """A capability a container image installed sits in the image's overlayfs
+    layer, which refuses to rename its directory with EXDEV; the update still
+    replaces it and leaves no backup behind."""
+    loader = importlib.machinery.SourceFileLoader(
+        f"capabilities_manager_exdev_{time.time_ns()}", str(MANAGER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    manager = importlib.util.module_from_spec(spec)
+    loader.exec_module(manager)
+    with tempfile.TemporaryDirectory() as td:
+        cap_home = Path(td)
+        manager.CAP_HOME = cap_home
+        manager._MANAGER_MUTATION_DEPTH = 1
+        manager._assert_payload_mutable = lambda *args: None
+        reg = cap_home / "fixture"
+        (reg / "guides").mkdir(parents=True)
+        (reg / "fixture").write_text("old\n")
+        (reg / "guides" / "use.md").write_text("old guide\n")
+        stage = cap_home / ".fixture-stage-1"
+        stage.mkdir()
+        (stage / "fixture").write_text("new\n")
+        rename = Path.rename
+
+        def refuse_image_layer(self: Path, target):
+            if self == reg:
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), str(self))
+            return rename(self, target)
+
+        Path.rename = refuse_image_layer
+        try:
+            script = manager._activate_payload("fixture", stage)
+        finally:
+            Path.rename = rename
+        assert script == reg / "fixture"
+        assert script.read_text() == "new\n"
+        assert not (reg / "guides").exists()
+        assert not stage.exists()
+        assert not (cap_home / ".fixture-previous").exists()
 
 
 def test_install_keeps_nonempty_source_bin_directory() -> None:
@@ -1112,6 +1153,7 @@ if __name__ == "__main__":
         ("geminitalk legacy prompt_file migrates after project base", test_geminitalk_legacy_prompt_file_migrates_after_project_base),
         ("geminitalk init does not overwrite edited prompt", test_geminitalk_init_does_not_overwrite_edited_prompt),
         ("geminitalk generation_complete marks turn done", test_geminitalk_generation_complete_marks_turn_done),
+        ("update replaces a payload the filesystem will not rename", test_update_replaces_a_payload_the_filesystem_will_not_rename),
     ]
     failed = 0
     for name, test in tests:

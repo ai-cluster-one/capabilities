@@ -1195,6 +1195,7 @@ I/O CONTRACT
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import hashlib
 import fcntl
 import io
@@ -3461,6 +3462,25 @@ def _prepare_payload(name: str, content: bytes, bundle_dir: Path | None,
             shutil.rmtree(temp_root, ignore_errors=True)
 
 
+def _set_payload_aside(reg: Path, backup: Path) -> None:
+    """Move the live registry entry to its backup name.
+
+    A directory a container image built cannot be renamed in a running
+    container: overlayfs refuses it with EXDEV. That entry is copied aside
+    and removed instead, which leaves the same two paths."""
+    try:
+        reg.rename(backup)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        try:
+            shutil.copytree(reg, backup, symlinks=True)
+        except BaseException:
+            shutil.rmtree(backup, ignore_errors=True)
+            raise
+        shutil.rmtree(reg)
+
+
 def _activate_payload(name: str, stage: Path) -> Path:
     """Atomically replace one registry entry, restoring the old copy on error."""
     def activate() -> Path:
@@ -3470,7 +3490,7 @@ def _activate_payload(name: str, stage: Path) -> Path:
         if backup.exists():
             shutil.rmtree(backup)
         if reg.exists():
-            reg.rename(backup)
+            _set_payload_aside(reg, backup)
         try:
             stage.rename(reg)
         except BaseException:
