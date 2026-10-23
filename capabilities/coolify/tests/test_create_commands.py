@@ -232,6 +232,76 @@ def test_env_bulk():
         assert result == response
 
 
+def test_app_create_sets_memory_limit_and_no_generated_domain():
+    """app create sends limits_memory and autogenerate_domain when given."""
+    calls = []
+
+    def mock_request(c, method, path, params=None, json_body=None):
+        calls.append({"method": method, "path": path, "body": json_body})
+        return {"uuid": "app-uuid-123"}
+
+    class Args:
+        project = "proj-uuid"
+        server = "srv-uuid"
+        environment = "production"
+        git_repository = "git@github.com:org/repo.git"
+        git_branch = "main"
+        private_deploy_key = "key-uuid"
+        build_pack = "dockerfile"
+        base_directory = "/"
+        dockerfile_location = "/dev/node/Dockerfile"
+        docker_compose_location = None
+        limits_memory = "4g"
+        autogenerate_domain = False
+        health_check_enabled = False
+
+    with patch.object(coolify_module, '_request', side_effect=mock_request):
+        coolify_module.cmd_app_create(None, Args())
+
+    [call] = calls
+    assert call["path"] == "/applications/private-deploy-key"
+    body = call["body"]
+    assert body["limits_memory"] == "4g"
+    assert body["autogenerate_domain"] is False
+    assert body["health_check_enabled"] is False
+    assert body["dockerfile_location"] == "/dev/node/Dockerfile"
+    assert body["private_key_uuid"] == "key-uuid"
+
+
+def test_storage_add_sends_a_volume_or_a_host_path():
+    """storage add posts a named volume, or a host path Coolify never writes."""
+    calls = []
+
+    def mock_request(c, method, path, params=None, json_body=None):
+        calls.append({"method": method, "path": path, "body": json_body})
+        return {"uuid": "storage-uuid"}
+
+    class Volume:
+        uuid = "app-uuid"
+        volume = "config"
+        host_path = None
+        mount_path = "/home/agent/.config"
+
+    class HostPath:
+        uuid = "app-uuid"
+        volume = None
+        host_path = "/var/run/docker.sock"
+        mount_path = "/var/run/docker.sock"
+
+    with patch.object(coolify_module, '_request', side_effect=mock_request):
+        coolify_module.cmd_storage_add(None, Volume())
+        coolify_module.cmd_storage_add(None, HostPath())
+
+    assert [(c["method"], c["path"]) for c in calls] == [
+        ("POST", "/applications/app-uuid/storages")] * 2
+    assert calls[0]["body"] == {"type": "persistent", "name": "config",
+                                "mount_path": "/home/agent/.config"}
+    assert calls[1]["body"] == {"type": "file", "is_host_file": True,
+                                "fs_path": "/var/run/docker.sock",
+                                "mount_path": "/var/run/docker.sock"}
+    assert "storage" in coolify_module.WRITE_VERBS
+
+
 if __name__ == "__main__":
     import traceback
 
@@ -243,6 +313,9 @@ if __name__ == "__main__":
         ("env list typed application", test_env_list_typed_application),
         ("env list typed service", test_env_list_typed_service),
         ("env bulk", test_env_bulk),
+        ("app create memory limit and no generated domain",
+         test_app_create_sets_memory_limit_and_no_generated_domain),
+        ("storage add volume or host path", test_storage_add_sends_a_volume_or_a_host_path),
     ]
 
     passed = 0

@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-23 — A node built on its server from a Dockerfile in a repository, with the host's Docker socket and same-path host directories
+
+`deployment node create <node> ... --repository <url> --branch <branch> --dockerfile <path> [--context <dir>]`, in place of `--version`, makes a Coolify application that builds the node's image on the target server from that Dockerfile, `FROM` the standard image, with no CI and no registry; a private repository is cloned through `--deploy-key <uuid>` or `--github-app <uuid>`. The node keeps the three keys, the four state volumes and the memory limit, gets no domain and no automatic deploy on push, and only it takes `--docker-socket` (the host's `/var/run/docker.sock`) and `--host-dir <path>` (repeatable), each bound at the same path in the container as a Coolify host path, which Coolify never creates, writes or deletes. The answer names the application and its build deployment. `node enrol` reaches its container by the Compose project alone, and `node remove` deletes the application with its volumes and never a host path or what is in it. `node create --version` is unchanged. Requires the coolify capability's `storage add`, `--limits-memory` and `--no-autogenerate-domain`.
+
 ## 2026-10-23 — Help says how a person logs in on a node of the standard image
 
 `deployment help`, under `node enrol`, says the logins are not handed to a node: a person makes them over SSH and `docker exec -it` into the node's container (labelled with the resource as Compose project and `agent` as service) with `claude auth login`, `codex login --device-auth` and `gh auth login`, which agent-node 0.0.2 and later carries and through which git reaches github.com over https. Each login is kept on the node's volumes.

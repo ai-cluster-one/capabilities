@@ -135,8 +135,11 @@ COMMANDS
       --image <registry/name:tag>  (registry image)
       --dockerfile <file|->  (inline dockerfile, raw content)
       Common optional: --name, --domains, --ports-exposes, --instant-deploy,
-      --destination <uuid>, --base-directory, --watch-paths, and the
-      health-check flags accepted by `app update`. Returns the application uuid.
+      --destination <uuid>, --base-directory, --watch-paths, --limits-memory,
+      and the health-check flags accepted by `app update`.
+      --no-autogenerate-domain keeps an application with no --domains without
+      one; Coolify otherwise generates a domain from the server's wildcard
+      domain or sslip.io. Returns the application uuid.
       Write verb - requires allow_write.
 
       --instant-deploy creates without queuing, then deploys once, returning
@@ -148,6 +151,7 @@ COMMANDS
       --name --domains --ports-exposes --base-directory
       --dockerfile-location --docker-compose-location --build-pack
       --git-repository --git-branch --watch-paths
+      --limits-memory <size>  (the container's memory limit, e.g. 2g or 1536m)
       --auto-deploy-enabled / --no-auto-deploy-enabled
       --health-check-enabled / --no-health-check-enabled
       --health-check-path --health-check-port --health-check-host
@@ -174,6 +178,17 @@ COMMANDS
       the current tag. Coolify lists only images named after the application's
       uuid (or its registry image name), so a Compose application that names
       its own images lists none and rolls back by commit. Reads only.
+
+  storage add <uuid> (--volume <name> | --host-path <path>) --mount-path <path>
+      Add one storage to an application; it takes effect at the next deploy.
+      --volume adds a named volume (Coolify prefixes the name with the
+      application uuid) and `app delete --delete-volumes` removes it.
+      --host-path binds an absolute path on the server - a directory or a
+      file such as /var/run/docker.sock - at --mount-path as it is: Coolify
+      never creates, writes or deletes that path, also when the application
+      is deleted, and a path missing on the server is created by Docker,
+      empty and owned by root. Not idempotent: each call adds a storage.
+      Write verb - requires allow_write.
 
   service create --compose <file|-> --project <uuid> --server <uuid>
                  --environment <name> [--name <name>] [--instant-deploy]
@@ -337,7 +352,7 @@ CONN_FIELDS = [{'key': 'base_url',
   'required': False}]
 WRITE_VERBS = {
     "deploy", "start", "stop", "restart", "env",
-    "projects", "app", "service", "database",
+    "projects", "app", "service", "database", "storage",
 }   # verbs that mutate the instance
 WRITE_DEFAULT = True    # writes stay inside an instance the consumer owns
 MACHINE_READS = ("connections", "doctor", "servers")   # outside any project, read-only on the machine's connections
@@ -1036,6 +1051,7 @@ APP_PATCH_FIELDS = (
     ("git_repository", "git_repository"),
     ("git_branch", "git_branch"),
     ("watch_paths", "watch_paths"),
+    ("limits_memory", "limits_memory"),
     ("is_auto_deploy_enabled", "is_auto_deploy_enabled"),
     ("health_check_enabled", "health_check_enabled"),
     ("health_check_path", "health_check_path"),
@@ -1081,6 +1097,8 @@ def cmd_app_create(c, args):
         payload["instant_deploy"] = False
     if hasattr(args, 'destination') and args.destination:
         payload["destination_uuid"] = args.destination
+    if getattr(args, "autogenerate_domain", None) is not None:
+        payload["autogenerate_domain"] = args.autogenerate_domain
 
     # Determine source type and endpoint
     if hasattr(args, 'image') and args.image:
@@ -1154,6 +1172,21 @@ def cmd_app_rollback(c, uuid: str, ref: str):
 
 def cmd_app_rollback_images(c, uuid: str):
     return _request(c, "GET", f"/applications/{uuid}/rollback-images")
+
+
+def cmd_storage_add(c, args):
+    """Add one storage to an application: a named volume, or a host path
+    bound as it is."""
+    if args.volume is not None:
+        payload = {"type": "persistent", "name": args.volume,
+                   "mount_path": args.mount_path}
+    else:
+        # A host file mount: Coolify binds the path and never creates,
+        # writes or deletes it on the server.
+        payload = {"type": "file", "is_host_file": True,
+                   "fs_path": args.host_path, "mount_path": args.mount_path}
+    return _request(c, "POST", f"/applications/{args.uuid}/storages",
+                    json_body=payload)
 
 
 def cmd_service_create(c, args):
@@ -1323,6 +1356,10 @@ def _add_app_patch_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--watch-paths", dest="watch_paths",
         help="newline-separated glob patterns filtering which changes trigger deploys; empty string clears",
+    )
+    parser.add_argument(
+        "--limits-memory", dest="limits_memory",
+        help="memory limit of the container, a size such as 2g or 1536m",
     )
     parser.add_argument(
         "--health-check-enabled", dest="health_check_enabled",
@@ -1758,6 +1795,11 @@ def main() -> None:
     _add_app_patch_arguments(sp_create)
     sp_create.add_argument("--instant-deploy", dest="instant_deploy", action="store_true")
     sp_create.add_argument("--destination", help="destination UUID")
+    sp_create.add_argument(
+        "--autogenerate-domain", dest="autogenerate_domain",
+        action=argparse.BooleanOptionalAction, default=None,
+        help="let Coolify generate a domain when --domains is empty (its default)",
+    )
     # Source type flags
     sp_create.add_argument("--private-deploy-key", dest="private_deploy_key", help="deploy key UUID")
     sp_create.add_argument("--github-app", dest="github_app", help="GitHub app UUID")
@@ -1788,6 +1830,18 @@ def main() -> None:
         action="store_false",
         help="disable automatic deployments from source webhooks",
     )
+
+    # storage add
+    sp = sub.add_parser("storage", help="add an application storage")
+    storage_sub = sp.add_subparsers(dest="storage_cmd", required=True)
+    sp_add = storage_sub.add_parser("add", help="add a volume or a host path")
+    sp_add.add_argument("uuid", help="application UUID")
+    storage_source = sp_add.add_mutually_exclusive_group(required=True)
+    storage_source.add_argument("--volume", help="named volume")
+    storage_source.add_argument("--host-path", dest="host_path",
+                                help="absolute path on the server")
+    sp_add.add_argument("--mount-path", dest="mount_path", required=True,
+                        help="absolute path in the container")
 
     # service create
     sp = sub.add_parser("service", help="create service")
@@ -1908,7 +1962,8 @@ def main() -> None:
     # command family (notably `env list`) must remain usable on read-only
     # connections.
     is_write = (
-        args.cmd in {"deploy", "start", "stop", "restart", "service", "database"}
+        args.cmd in {"deploy", "start", "stop", "restart", "service", "database",
+                     "storage"}
         or (args.cmd == "app" and args.app_cmd != "rollback-images")
         or (projects_call is not None and projects_call[0] in {"create", "delete"})
         or (args.cmd == "env" and args.env_cmd != "list")
@@ -1957,6 +2012,8 @@ def main() -> None:
                 out(cmd_app_rollback_images(c, args.uuid))
             else:
                 _die(6, "unknown_command", f"no handler for app {args.app_cmd!r}")
+        elif args.cmd == "storage":
+            out(cmd_storage_add(c, args))
         elif args.cmd == "service":
             if args.service_cmd == "delete":
                 out(cmd_delete(c, "services", args.uuid, args))

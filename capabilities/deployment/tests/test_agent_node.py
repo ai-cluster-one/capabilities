@@ -29,6 +29,8 @@ class Fake:
                                     "COOLIFY_INFRA_TOKEN=coolify-secret\n")
         self.state = "running agent prj_00000000a1a1 as node box1"
         self.gone: set[str] = set()
+        self.apps: set[str] = set()
+        self.fail_storage = False
         self.config = {"Image": "ghcr.io/agenium-dev/agent-node:0.0.1",
                        "Env": ["AGENT_NODE_NAME=box1", "PATH=/usr/bin"]}
 
@@ -50,11 +52,27 @@ class Fake:
             if args[:2] == ["service", "create"]:
                 return json.dumps({"uuid": "svc-new", "domains": []})
             if args[:1] == ["services"]:
-                if args[1] in self.gone:
+                if args[1] in self.gone or args[1] in self.apps:
                     return self.module.NodeFailure("not_found", "fixture", 3)
                 return json.dumps({"uuid": args[1]})
-            if args[:2] == ["service", "delete"]:
+            if args[:2] in (["service", "delete"], ["app", "delete"]):
                 return json.dumps({"message": "deleted"})
+            if args[:2] == ["app", "create"]:
+                self.apps.add("app-new")
+                return json.dumps({"uuid": "app-new", "domains": None})
+            if args[:1] == ["applications"]:
+                if args[1] in self.gone or args[1] not in self.apps:
+                    return self.module.NodeFailure("not_found", "fixture", 3)
+                return json.dumps({"uuid": args[1]})
+            if args[:2] in (["app", "update"], ["env", "bulk"]):
+                return json.dumps({"ok": True})
+            if args[:2] == ["storage", "add"]:
+                if self.fail_storage:
+                    return self.module.NodeFailure("validation_failed", "fixture", 6)
+                return json.dumps({"uuid": "storage-" + str(len(self.calls))})
+            if args[:1] == ["deploy"]:
+                return json.dumps({"deployments": [{"resource_uuid": args[1],
+                                                    "deployment_uuid": "dep-1"}]})
             if args[:1] == ["servers"]:
                 return json.dumps({"uuid": args[1], "ip": "203.0.113.7", "name": "srv"})
             if args == ["connections"]:
@@ -90,6 +108,10 @@ class Fake:
                 return ""
             remote = shlex.split(args[-1])
             if remote[:2] == ["docker", "ps"]:
+                # An application's container is no Compose service named `agent`.
+                if any(w.endswith("project=" + app) for app in self.apps for w in remote) \
+                        and "label=com.docker.compose.service=agent" in remote:
+                    return ""
                 return "abc123\n"
             if remote[:2] == ["docker", "inspect"]:
                 return json.dumps(self.config) + "\n"
@@ -147,7 +169,17 @@ def lab(tmp_path, monkeypatch):
 def create_args(**extra):
     return SimpleNamespace(**{"node": "box1", "project": "prj-uuid", "server": "srv-uuid",
                               "environment": "test", "version": "0.0.1", "memory": "2g",
-                              "connection": None, **extra})
+                              "connection": None, "repository": None, "branch": None,
+                              "dockerfile": None, "context": None, "deploy_key": None,
+                              "github_app": None, "docker_socket": False, "host_dir": None,
+                              **extra})
+
+
+def build_args(**extra):
+    return create_args(**{"version": None, "repository": "git@github.com:org/product.git",
+                          "branch": "main", "dockerfile": "dev/agent-node/Dockerfile",
+                          "deploy_key": "key-uuid", "docker_socket": True,
+                          "host_dir": ["/srv/product"], **extra})
 
 
 def test_create_makes_a_resource_of_the_standard_image_and_registers_its_row(lab, capsys):
@@ -309,3 +341,109 @@ def test_a_node_is_made_only_for_an_agent_that_lives_in_the_store(lab, monkeypat
         lab.m.cmd_node_create(create_args())
     assert refused.value.code == "not_store_mode"
     assert not lab.fake.of("coolify")
+
+
+def test_create_builds_a_node_from_a_repository_with_the_socket_and_same_path_dirs(lab, capsys):
+    lab.m.cmd_node_create(build_args(memory="4g"))
+
+    coolify = [c for c in lab.fake.of("coolify")]
+    verbs = [c["argv"][3:5] for c in coolify]
+    assert verbs == [["projects", "prj-uuid"], ["app", "create"], ["app", "update"],
+                     ["env", "bulk"]] + [["storage", "add"]] * 6 + [["deploy", "app-new"]]
+    create = coolify[1]["argv"]
+    for flag, value in (("--project", "prj-uuid"), ("--server", "srv-uuid"),
+                        ("--environment", "test"), ("--private-deploy-key", "key-uuid"),
+                        ("--git-repository", "git@github.com:org/product.git"),
+                        ("--git-branch", "main"), ("--build-pack", "dockerfile"),
+                        ("--base-directory", "/"),
+                        ("--dockerfile-location", "/dev/agent-node/Dockerfile"),
+                        ("--name", "lab-agent-box1"), ("--limits-memory", "4g")):
+        assert create[create.index(flag) + 1] == value
+    assert "--no-autogenerate-domain" in create and "--no-health-check-enabled" in create
+    assert "--instant-deploy" not in create and "--github-app" not in create
+    assert coolify[2]["argv"][5:] == ["app-new", "--no-auto-deploy-enabled"]
+    # Only the three keys, as for a node of the standard image.
+    assert coolify[3]["stdin"] == ("AGENT_NODE_NAME=box1\n"
+                                   "CAPABILITIES_PROJECT_ID=prj_00000000a1a1\n"
+                                   "CAPABILITIES_PROJECT_ID_ROOT=/app\n")
+    storages = [c["argv"][5:] for c in coolify[4:10]]
+    assert storages == [
+        ["app-new", "--volume", "config", "--mount-path", "/home/agent/.config"],
+        ["app-new", "--volume", "state", "--mount-path", "/home/agent/.local/state"],
+        ["app-new", "--volume", "claude", "--mount-path", "/home/agent/.claude"],
+        ["app-new", "--volume", "codex", "--mount-path", "/home/agent/.codex"],
+        ["app-new", "--host-path", "/var/run/docker.sock", "--mount-path", "/var/run/docker.sock"],
+        ["app-new", "--host-path", "/srv/product", "--mount-path", "/srv/product"]]
+
+    assert lab.fake.rows["box1"]["coolify_resource"] == "app-new"
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["resource"] == {"kind": "application", "uuid": "app-new"}
+    assert answer["deployment"] == "dep-1"
+    assert answer["host_paths"] == ["/var/run/docker.sock", "/srv/product"]
+    assert answer["image"] == {"repository": "git@github.com:org/product.git",
+                               "branch": "main", "context": "/",
+                               "dockerfile": "/dev/agent-node/Dockerfile"}
+
+
+def test_create_takes_back_an_application_it_could_not_finish(lab):
+    lab.fake.fail_storage = True
+    with pytest.raises(lab.m.NodeFailure):
+        lab.m.cmd_node_create(build_args())
+    [delete] = [c["argv"] for c in lab.fake.of("coolify") if "delete" in c["argv"]]
+    assert delete[3:] == ["app", "delete", "app-new", "--yes", "--delete-volumes",
+                          "--delete-configurations"]
+    assert "box1" not in lab.fake.rows
+
+
+@pytest.mark.parametrize("extra, wrong", [
+    ({"repository": "git@github.com:org/product.git"}, "either --version"),
+    ({"docker_socket": True}, "--docker-socket"),
+    ({"host_dir": ["/srv/product"]}, "--host-dir"),
+])
+def test_a_standard_image_node_takes_no_build_and_no_host_path(lab, extra, wrong):
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_create(create_args(**extra))
+    assert refused.value.code == "input" and wrong in refused.value.message
+    assert not lab.fake.of("coolify")
+
+
+@pytest.mark.parametrize("extra", [
+    {"context": "/dev/other"},
+    {"host_dir": ["/home/agent/work"]},
+    {"host_dir": ["/srv/../etc"]},
+    {"deploy_key": "key-uuid", "github_app": "app-uuid"},
+])
+def test_a_repository_node_refuses_what_it_cannot_build_or_bind(lab, extra):
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_create(build_args(**extra))
+    assert refused.value.code == "input"
+    assert not lab.fake.of("coolify")
+
+
+def test_enrol_and_remove_reach_a_node_built_from_a_repository(lab, capsys):
+    lab.m.cmd_node_create(build_args())
+    capsys.readouterr()
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+    lab.fake.config = {"Image": "app-new:0123abc", "Env": ["AGENT_NODE_NAME=box1"]}
+    before = len(lab.fake.calls)
+    lab.m.cmd_node_remove(SimpleNamespace(node="box1", yes=True))
+    [delete] = [c["argv"] for c in lab.fake.of("coolify") if "delete" in c["argv"]]
+    assert delete[3:] == ["app", "delete", "app-new", "--yes", "--delete-volumes",
+                          "--delete-configurations"]
+    # On the server remove only reads: the host paths stay as they are.
+    remote = [shlex.split(c["argv"][-1])[:2] for c in lab.fake.calls[before:]
+              if c["argv"][0] == "ssh" and "-G" not in c["argv"]]
+    assert remote and all(r in (["docker", "ps"], ["docker", "inspect"]) for r in remote)
+    assert "box1" not in lab.fake.rows
+
+
+def test_remove_refuses_an_application_that_does_not_run_its_own_build_as_the_node(lab):
+    lab.m.cmd_node_create(build_args())
+    lab.fake.config = {"Image": "ghcr.io/agenium-dev/agent-node:0.0.3",
+                       "Env": ["AGENT_NODE_NAME=box1"]}
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_remove(SimpleNamespace(node="box1", yes=True))
+    assert refused.value.code == "node_resource_not_own"
+    assert not [c for c in lab.fake.of("coolify") if "delete" in c["argv"]]

@@ -62,12 +62,12 @@
     },
     "coolify": {
       "path": "capabilities/coolify",
-      "payload_sha256": "b3fa51d8299e72059fd51bfe0a0de9155e44a8ab5bc308f3a285db25f7c4fb33",
+      "payload_sha256": "a2643a64ed7491841da5a8274137a21f71939ecccf8b52dfd9d4d9ab5b62ed18",
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance."
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "defcc1483f94d05e75ec759eca244024226652ccf5eb7fe41a9a60c391363d34",
+      "payload_sha256": "c3a3f0429c91630c06603eaa995dc2e493d85ef8a4158751c0c8798c4498767e",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into launchd-supervised processes on a Mac, and describe the targets they deploy to."
     },
     "directo": {

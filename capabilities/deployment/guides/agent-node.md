@@ -25,6 +25,21 @@ You need:
 
 `deployment node create <node>`, with the Coolify project, server and environment, the image tag (`--version`) and optionally a memory limit, makes one Coolify service of one container from the standard image. It has a volume of its own for each state path of the image - `~/.config` (store setting, secrets, node key), `~/.local/state` (capability state), `~/.claude` and `~/.codex` (the logins) - and only the three keys above in its environment. Then it registers the node row. The container comes up healthy and its log says it is waiting for a store setting; it runs nothing yet.
 
+## Create from a repository
+
+A node that needs more than the standard image carries - other tools, the host's Docker, the host's directories - gets an image of its own, built `FROM` the standard one. `deployment node create <node>` with `--repository <url> --branch <branch> --dockerfile <path>` in place of `--version` has Coolify clone that branch on the node's server and build the Dockerfile there, natively for the server's architecture, with no CI and no registry. `--context <dir>` names the build context when it is not the repository root; the Dockerfile lies inside it. A private repository is cloned through a Coolify deploy key (`--deploy-key <uuid>`) or GitHub App (`--github-app <uuid>`); `coolify sources` lists both.
+
+The node is then a Coolify application rather than a service. It is told the same three keys, keeps the same four state volumes and memory limit, and gets no domain and no automatic deploy on a push, so a commit to the branch never restarts it. Fixed, non-secret settings its tools need go in the Dockerfile as `ENV`; `deployment` hands it nothing more.
+
+Only such a node takes host paths, each bound at the same path inside the container, so a container it starts on the host sees the same paths it does:
+
+- `--docker-socket` binds the host's `/var/run/docker.sock`. The node runs as user `agent`, which reaches the socket only through its group: the Dockerfile creates a group with the socket's group id on that server (`stat -c %g /var/run/docker.sock` there) and adds `agent` to it, then returns to `USER agent`. The socket is root on that server, so give it only to a node on a server that serves nothing else.
+- `--host-dir <path>`, repeatable, binds a directory of the server, which must already exist and belong to the node's user (`agent`, uid 1000 in the standard image) for the node to write in it. A secret file the work needs there is placed once by a person; `deployment` puts nothing in it.
+
+Coolify never creates, writes or deletes a host path, and `node remove` deletes the application and its volumes but never the socket, a host directory or what is in it.
+
+The answer names the application, the build's deployment and the `coolify wait` command that waits for the build; enrol once it is done. To rebuild - a change to the Dockerfile, or a new standard-image tag in its `FROM` - run `coolify deploy <uuid>` for the application; the state volumes stay. Its container is the one labelled `com.docker.compose.project=<resource>` alone, without the `agent` service label, and `coolify applications <resource>` shows what Coolify reports for it.
+
 ## Enrol
 
 `deployment node enrol <node> --services <name,...>` reaches the container over SSH and `docker exec` and, in this order:
@@ -77,12 +92,11 @@ No verb moves a node to a new tag yet. The tools are the image's, and everything
 
 The policy rows that placed services on the node are not removed with it, and a node created again under the same name would run those services at once. Remove them first, one per service: `capabilities inherit <name> --project --node <node>`.
 
-## Architectures and derived images
+## Architectures
 
 These are planned and not shipped:
 
 - `agent-node` 0.0.1 is published for `linux/amd64` only; an arm64 server cannot run it until the image is published for `linux/arm64` as well.
-- `node create` takes only the standard image by tag. A node whose image Coolify builds on the server from a Dockerfile in a repository, `FROM` the standard image, with the host's Docker socket and host directories mounted at the same path, is not available yet; until it is, a node needs nothing the standard image lacks.
 
 ## Another provider
 

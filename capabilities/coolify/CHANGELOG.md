@@ -1,5 +1,9 @@
 # coolify — change log
 
+## 2026-10-23 — `storage add`, and an application's memory limit and generated domain
+
+`storage add <uuid> (--volume <name> | --host-path <path>) --mount-path <path>` adds one storage to an application: a named volume, which `app delete --delete-volumes` removes, or a path on the server bound as it is, such as a directory or `/var/run/docker.sock`, which Coolify never creates, writes or deletes, also when the application is deleted. `app create` and `app update` take `--limits-memory <size>`, and `app create --no-autogenerate-domain` keeps an application created without `--domains` from getting a generated one.
+
 ## 2026-10-13 — `coolify` declares what a person is asked for, and writes it through the contract
 
 `coolify manifest` now declares a connection's fields under `connections.fields` (`base_url`, `secret_env`, `ssh`), each with its label, help, type, whether it is required and whether it is a secret, and `coolify connection add <id>` writes one connection from them: non-secret fields on argv with `--field KEY=VALUE` or in a JSON object on stdin with `--stdin`, a secret only on stdin, written to the scope's `.env.local` or `credentials.env` under its own env key. `coolify connection remove <id>` takes it out again with the secrets it wrote. Bare `coolify help` ends with a section rendered from these declarations. Nothing else changes.

@@ -228,6 +228,12 @@ USAGE
   deployment node create <node> --project <uuid> --server <uuid>
                          --environment <name> --version <tag>
                          [--memory 2g] [--connection <id>]
+  deployment node create <node> --project <uuid> --server <uuid>
+                         --environment <name> --repository <url>
+                         --branch <branch> --dockerfile <path> [--context <dir>]
+                         [--deploy-key <uuid> | --github-app <uuid>]
+                         [--docker-socket] [--host-dir <path>]...
+                         [--memory 2g] [--connection <id>]
       For an agent that lives in the store: create a Coolify resource
       running the standard image ghcr.io/agenium-dev/agent-node:<tag>
       through the coolify connection (the only one granted, or --connection),
@@ -241,6 +247,22 @@ USAGE
       cannot be written takes the resource away again. The node starts idle,
       knowing no store. Exit 6 node_exists, not_store_mode,
       environment_missing (3).
+      With --repository instead of --version, Coolify builds the node's
+      image on that server from the Dockerfile at --dockerfile in the
+      repository's --branch, with --context as the build context (the
+      repository root by default; the Dockerfile lies inside it) - a
+      Dockerfile FROM the standard image, with no CI and no registry. The
+      repository is cloned with a Coolify deploy key or GitHub App
+      (`coolify sources` lists their uuids), else as public. The node is
+      then a Coolify application with no domain, no automatic deploy on
+      push and the same memory limit, keys and state volumes, and only it
+      takes host paths, each bound at the same path in the container:
+      --docker-socket the host's /var/run/docker.sock, and each --host-dir
+      an existing directory on the server (not /home/agent, /app or above
+      them). Coolify never creates, writes or deletes a host path. The
+      answer names the application and the build's deployment; `coolify
+      wait <uuid> --deployment <uuid>` waits for the build before enrol.
+      A step that fails once the application exists takes it away again.
   deployment node enrol <node> [--services <name,...>] [--wait 300]
       Over SSH to the node's server and docker exec into its container:
       make the node's X25519 key pair there (the private key stays in
@@ -261,7 +283,8 @@ USAGE
       The logins are not handed over: a person makes them on the node, over
       SSH to its server and `docker exec -it <container>` into the container
       labelled com.docker.compose.project=<resource> and
-      com.docker.compose.service=agent - `claude auth login`, `codex login
+      com.docker.compose.service=agent (a node built from a repository: the
+      one container labelled with the project alone) - `claude auth login`, `codex login
       --device-auth`, and `gh auth login` for the GitHub CLI (agent-node
       0.0.2 and later), through which git also reaches github.com over
       https. Each is kept on the node's volumes and outlives a new image
@@ -270,8 +293,11 @@ USAGE
       Delete the node's Coolify resource with its volumes and configuration,
       then its node row. Only the resource the row names is touched; one
       already gone leaves only the row to remove. A resource whose agent
-      container does not run the standard image as this node is refused
-      (exit 6 node_resource_not_own) and nothing is deleted.
+      container does not run the standard image - for a node built from a
+      repository, the image Coolify built for that application - as this
+      node is refused (exit 6 node_resource_not_own) and nothing is deleted.
+      The host paths a node built from a repository binds are not its
+      volumes: the socket and the directories and what is in them stay.
   deployment node login claude|codex [--target <name>] [--print-command]
       SSH with a terminal into the application's agent container for subscription
       login. --print-command prepares the command without attempting login.
@@ -7280,6 +7306,15 @@ AGENT_NODE_VERSION = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
 AGENT_NODE_MEMORY_LIMIT = re.compile(r"[1-9][0-9]*[bkmgBKMG]?")
 AGENT_NODE_PUBLIC_KEY = re.compile(r"[A-Za-z0-9+/]{43}=")
 COOLIFY_UUID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+# A node built on its server from a Dockerfile in a repository, FROM the
+# standard image, is a Coolify application instead of a Compose service. Only
+# it takes the host's Docker socket and host directories, each bound at the
+# same path as a Coolify host path, which Coolify never creates, writes or
+# deletes on the server.
+AGENT_NODE_DOCKER_SOCKET = "/var/run/docker.sock"
+# An absolute path of named segments: no '.' or '..' segment, no ':' or ','.
+AGENT_NODE_PATH = re.compile(r"(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)+")
+AGENT_NODE_BRANCH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}")
 
 # Run in the node: make its X25519 key pair once, keep the private key on its
 # config volume, and print the public key's 32 bytes in base64.
@@ -7359,12 +7394,17 @@ def _agent_node_name(value):
     return node
 
 
+def _agent_node_environment(project_id, node):
+    """The three keys a node is told, and nothing else."""
+    return {"CAPABILITIES_PROJECT_ID": project_id,
+            "CAPABILITIES_PROJECT_ID_ROOT": AGENT_NODE_ROOT,
+            NODE_NAME_ENV: node}
+
+
 def _agent_node_compose(project_id, node, image, memory):
     """The node's Compose document: the standard image, its memory limit, its
     state volumes and the three keys it is told - nothing else."""
-    environment = {"CAPABILITIES_PROJECT_ID": project_id,
-                   "CAPABILITIES_PROJECT_ID_ROOT": AGENT_NODE_ROOT,
-                   NODE_NAME_ENV: node}
+    environment = _agent_node_environment(project_id, node)
     lines = ["services:", f"  {AGENT_NODE_SERVICE}:", f"    image: {json.dumps(image)}",
              "    restart: unless-stopped", f"    mem_limit: {json.dumps(memory)}",
              "    environment:"]
@@ -7389,6 +7429,11 @@ def _agent_node_reach(root, row, write):
                            + " --filter " + shlex.quote(
                                "label=com.docker.compose.service=" + AGENT_NODE_SERVICE)
                            + " --format '{{.ID}}'").splitlines()
+    if not containers:
+        # A node built from a repository is a Coolify application, whose one
+        # container is a Compose service named after it rather than `agent`.
+        containers = _node_ssh(root, host, "docker ps --filter " + shlex.quote("label=" + owner)
+                               + " --format '{{.ID}}'").splitlines()
     if len(containers) != 1 or not re.fullmatch(r"[a-f0-9]+", containers[0]):
         raise NodeFailure("node_container", "expected one running container for node "
                           f"{row.get('node')}", 3)
@@ -7473,13 +7518,120 @@ def _agent_node_store_args(root):
     return args + ["--password-stdin"], str(values["password"]) + "\n"
 
 
+def _agent_node_build(args):
+    """The repository a node's image is built from and the host paths it is
+    given, checked; None for a node of the standard image by tag."""
+    built = {"--branch": args.branch, "--dockerfile": args.dockerfile,
+             "--context": args.context, "--deploy-key": args.deploy_key,
+             "--github-app": args.github_app,
+             "--docker-socket": args.docker_socket or None, "--host-dir": args.host_dir or None}
+    if (args.version is None) == (args.repository is None):
+        raise NodeFailure("input", "a node takes either --version, the standard image's tag, "
+                          "or --repository, to build its image on the server", 6)
+    if args.repository is None:
+        given = [flag for flag, value in built.items() if value is not None]
+        if given:
+            raise NodeFailure("input", f"{', '.join(given)}: taken only with --repository; "
+                              "a node of the standard image by --version takes none", 6)
+        return None
+    repository = args.repository
+    if not repository or repository.startswith("-") or any(c.isspace() for c in repository):
+        raise NodeFailure("input", "--repository takes the repository's URL as Coolify "
+                          "clones it", 6)
+    if not AGENT_NODE_BRANCH.fullmatch(args.branch or "") or ".." in args.branch:
+        raise NodeFailure("input", "--repository needs --branch, a branch name", 6)
+    paths = {}
+    for flag, value in (("--dockerfile", args.dockerfile), ("--context", args.context or "/")):
+        value = "/" + (value or "").strip("/")
+        if value != "/" and not AGENT_NODE_PATH.fullmatch(value):
+            raise NodeFailure("input", f"{flag} takes a path in the repository such as "
+                              "dev/agent-node/Dockerfile", 6)
+        paths[flag] = value
+    dockerfile, context = paths["--dockerfile"], paths["--context"]
+    if dockerfile == "/":
+        raise NodeFailure("input", "--repository needs --dockerfile, the Dockerfile's path "
+                          "in the repository", 6)
+    # Coolify builds with the Dockerfile named from inside the context.
+    prefix = context.rstrip("/") + "/"
+    if not dockerfile.startswith(prefix):
+        raise NodeFailure("input", f"--dockerfile {dockerfile} is not inside --context "
+                          f"{context}", 6)
+    if args.deploy_key and args.github_app:
+        raise NodeFailure("input", "--deploy-key and --github-app each give Coolify the "
+                          "repository; take one", 6)
+    for flag, value in (("--deploy-key", args.deploy_key), ("--github-app", args.github_app)):
+        if value is not None and not COOLIFY_UUID.fullmatch(value):
+            raise NodeFailure("input", f"{flag} takes a Coolify uuid (`coolify sources`)", 6)
+    mounts = [AGENT_NODE_DOCKER_SOCKET] if args.docker_socket else []
+    for path in args.host_dir or []:
+        if not AGENT_NODE_PATH.fullmatch(path):
+            raise NodeFailure("input", f"--host-dir {path!r} is not an absolute path of "
+                              "letters, digits, '.', '_' and '-'", 6)
+        # A host path over the node's own state or its agent root would hide them.
+        if any(path == own or path.startswith(own + "/") or own.startswith(path + "/")
+               for own in ("/home/agent", AGENT_NODE_ROOT, AGENT_NODE_DOCKER_SOCKET)):
+            raise NodeFailure("input", f"--host-dir {path} would cover the node's own "
+                              "/home/agent, /app or the Docker socket", 6)
+        if path in mounts:
+            raise NodeFailure("input", f"--host-dir {path} is given twice", 6)
+        mounts.append(path)
+    return {"repository": repository, "branch": args.branch, "context": context,
+            "dockerfile": dockerfile, "dockerfile_location": dockerfile[len(prefix) - 1:],
+            "deploy_key": args.deploy_key, "github_app": args.github_app, "mounts": mounts}
+
+
+def _agent_node_delete(root, target, kind, resource):
+    """Delete a node's Coolify resource with its volumes and configuration.
+    The host paths an application binds are not its volumes: Coolify leaves
+    them as they are."""
+    _node_coolify(root, target, "app" if kind == "application" else "service", "delete",
+                  resource, "--yes", "--delete-volumes", "--delete-configurations")
+
+
+def _agent_node_application(root, target, args, project_id, node, name, build):
+    """A Coolify application building the node's image on its server from the
+    Dockerfile in the repository: no domain, no health check of Coolify's own
+    (the image has one), no automatic deploy, the memory limit, the three keys,
+    a volume for each state path, the declared host paths, then one deploy.
+    Anything that fails after it exists takes it away again."""
+    source = (["--private-deploy-key", build["deploy_key"]] if build["deploy_key"]
+              else ["--github-app", build["github_app"]] if build["github_app"] else [])
+    created = _node_coolify(root, target, "app", "create", "--project", args.project,
+                            "--server", args.server, "--environment", args.environment,
+                            *source, "--git-repository", build["repository"],
+                            "--git-branch", build["branch"], "--build-pack", "dockerfile",
+                            "--base-directory", build["context"],
+                            "--dockerfile-location", build["dockerfile_location"],
+                            "--name", name, "--limits-memory", args.memory,
+                            "--no-autogenerate-domain", "--no-health-check-enabled")
+    resource = created.get("uuid") or created.get("application_uuid")
+    if not isinstance(resource, str) or not COOLIFY_UUID.fullmatch(resource):
+        raise NodeFailure("provider_output", "application creation returned no uuid")
+    try:
+        _node_coolify(root, target, "app", "update", resource, "--no-auto-deploy-enabled")
+        _node_coolify(root, target, "env", "bulk", resource,
+                      stdin=_node_env_lines(_agent_node_environment(project_id, node)))
+        for volume, path in AGENT_NODE_VOLUMES:
+            _node_coolify(root, target, "storage", "add", resource, "--volume", volume,
+                          "--mount-path", path)
+        for path in build["mounts"]:
+            _node_coolify(root, target, "storage", "add", resource, "--host-path", path,
+                          "--mount-path", path)
+        deployment = _node_deployment_uuid(_node_coolify(root, target, "deploy", resource))
+    except NodeFailure:
+        _agent_node_delete(root, target, "application", resource)
+        raise
+    return resource, deployment
+
+
 def cmd_node_create(args):
     root = _root()
     node = _agent_node_name(args.node)
     for flag, value in (("--project", args.project), ("--server", args.server)):
         if not COOLIFY_UUID.fullmatch(value or ""):
             raise NodeFailure("input", f"{flag} takes a Coolify uuid", 6)
-    if not AGENT_NODE_VERSION.fullmatch(args.version or ""):
+    build = _agent_node_build(args)
+    if build is None and not AGENT_NODE_VERSION.fullmatch(args.version or ""):
         raise NodeFailure("input", "--version takes the standard image's tag", 6)
     if not AGENT_NODE_MEMORY_LIMIT.fullmatch(args.memory or ""):
         raise NodeFailure("input", "--memory takes a size such as 2g or 1536m", 6)
@@ -7493,30 +7645,42 @@ def cmd_node_create(args):
     if args.environment not in [row.get("name") for row in environments]:
         raise NodeFailure("environment_missing", f"the Coolify project has no "
                           f"{args.environment!r} environment; deployment creates none", 3)
-    image = f"{AGENT_NODE_IMAGE}:{args.version}"
-    compose = _agent_node_compose(project_id, node, image, args.memory)
-    created = _node_coolify(root, target, "service", "create", "--compose", "-",
-                            "--project", args.project, "--server", args.server,
-                            "--environment", args.environment,
-                            "--name", _slug(slug) + "-" + _slug(node), "--instant-deploy",
-                            stdin=compose)
-    resource = created.get("uuid") or created.get("service_uuid")
-    if not isinstance(resource, str) or not COOLIFY_UUID.fullmatch(resource):
-        raise NodeFailure("provider_output", "service creation returned no uuid")
+    name = _slug(slug) + "-" + _slug(node)
+    if build is None:
+        kind, image, deployment = "service", f"{AGENT_NODE_IMAGE}:{args.version}", None
+        compose = _agent_node_compose(project_id, node, image, args.memory)
+        created = _node_coolify(root, target, "service", "create", "--compose", "-",
+                                "--project", args.project, "--server", args.server,
+                                "--environment", args.environment,
+                                "--name", name, "--instant-deploy",
+                                stdin=compose)
+        resource = created.get("uuid") or created.get("service_uuid")
+        if not isinstance(resource, str) or not COOLIFY_UUID.fullmatch(resource):
+            raise NodeFailure("provider_output", "service creation returned no uuid")
+    else:
+        kind = "application"
+        image = {key: build[key] for key in ("repository", "branch", "context", "dockerfile")}
+        resource, deployment = _agent_node_application(root, target, args, project_id, node,
+                                                       name, build)
     try:
         row = _manager(root, "node", "add", node, "--kind", "server",
                        "--coolify-connection", target["connection"],
                        "--coolify-server", args.server, "--coolify-resource", resource)["node"]
     except NodeFailure:
         # A resource no row names would be reached by nothing: take it away again.
-        _node_coolify(root, target, "service", "delete", resource, "--yes",
-                      "--delete-volumes", "--delete-configurations")
+        _agent_node_delete(root, target, kind, resource)
         raise
-    _emit({"ok": True, "node": row, "image": image, "memory": args.memory,
-           "environment": {"project": args.project, "name": args.environment},
-           "volumes": [{"name": name, "path": path} for name, path in AGENT_NODE_VOLUMES],
-           "handed": ["CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT", NODE_NAME_ENV],
-           "next": f"deployment node enrol {node}"})
+    answer = {"ok": True, "node": row, "image": image, "memory": args.memory,
+              "environment": {"project": args.project, "name": args.environment},
+              "volumes": [{"name": name, "path": path} for name, path in AGENT_NODE_VOLUMES],
+              "handed": ["CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT", NODE_NAME_ENV],
+              "next": f"deployment node enrol {node}"}
+    if build is not None:
+        answer.update({"resource": {"kind": kind, "uuid": resource}, "deployment": deployment,
+                       "host_paths": build["mounts"],
+                       "wait": f"coolify wait {resource} --deployment {deployment} "
+                               "--timeout 1800"})
+    _emit(answer)
 
 
 def cmd_node_enrol(args):
@@ -7567,15 +7731,16 @@ def cmd_node_enrol(args):
     _emit(answer)
 
 
-def _agent_node_is_own(root, host, resource, node):
+def _agent_node_is_own(root, host, resource, node, kind="service"):
     """Whether the Compose project `resource` on `host` is this node: its agent
-    containers, stopped ones too, run the standard image with AGENT_NODE_NAME
-    set to `node`."""
+    containers, stopped ones too, run the standard image - for an application,
+    the image Coolify built for it, named after it - with AGENT_NODE_NAME set
+    to `node`."""
     owner = "com.docker.compose.project=" + resource
+    service = ("" if kind == "application" else " --filter " + shlex.quote(
+        "label=com.docker.compose.service=" + AGENT_NODE_SERVICE))
     ids = _node_ssh(root, host, "docker ps -a --filter " + shlex.quote("label=" + owner)
-                    + " --filter " + shlex.quote(
-                        "label=com.docker.compose.service=" + AGENT_NODE_SERVICE)
-                    + " --format '{{.ID}}'").split()
+                    + service + " --format '{{.ID}}'").split()
     if not ids or not all(re.fullmatch(r"[a-f0-9]+", i) for i in ids):
         return False
     configs = []
@@ -7586,8 +7751,9 @@ def _agent_node_is_own(root, host, resource, node):
         except ValueError:
             return False
     named = f"{NODE_NAME_ENV}={node}"
+    image = (resource if kind == "application" else AGENT_NODE_IMAGE) + ":"
     return len(configs) == len(ids) and all(
-        isinstance(c, dict) and str(c.get("Image") or "").startswith(AGENT_NODE_IMAGE + ":")
+        isinstance(c, dict) and str(c.get("Image") or "").startswith(image)
         and named in (c.get("Env") or []) for c in configs)
 
 
@@ -7607,23 +7773,25 @@ def cmd_node_remove(args):
     target = {"connection": row["coolify_connection"]}
     entry = _node_connection(target, write=True)
     resource = row["coolify_resource"]
-    try:
-        _node_coolify(root, target, "services", resource)
-        present = True
-    except NodeFailure as failure:
-        # A resource already gone leaves only its row to remove.
-        if failure.exit_code != 3:
-            raise
-        present = False
+    kind = None
+    # A node of the standard image is a service, one built from a repository
+    # an application; a resource that is neither any more leaves only its row.
+    for found, collection in (("service", "services"), ("application", "applications")):
+        try:
+            _node_coolify(root, target, collection, resource)
+            kind = found
+            break
+        except NodeFailure as failure:
+            if failure.exit_code != 3:
+                raise
     deleted = False
-    if present:
+    if kind is not None:
         host = _node_server_host(root, target, entry, row["coolify_server"])
-        if not _agent_node_is_own(root, host, resource, node):
+        if not _agent_node_is_own(root, host, resource, node, kind):
             raise NodeFailure("node_resource_not_own", f"resource {resource} does not run "
                               f"{AGENT_NODE_IMAGE} as node {node}; nothing was deleted", 6)
         try:
-            _node_coolify(root, target, "service", "delete", resource, "--yes",
-                          "--delete-volumes", "--delete-configurations")
+            _agent_node_delete(root, target, kind, resource)
             deleted = True
         except NodeFailure as failure:
             if failure.exit_code != 3:
@@ -7770,7 +7938,15 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--project", required=True)
     p.add_argument("--server", required=True)
     p.add_argument("--environment", required=True)
-    p.add_argument("--version", required=True)
+    p.add_argument("--version")
+    p.add_argument("--repository")
+    p.add_argument("--branch")
+    p.add_argument("--dockerfile")
+    p.add_argument("--context")
+    p.add_argument("--deploy-key")
+    p.add_argument("--github-app")
+    p.add_argument("--docker-socket", action="store_true")
+    p.add_argument("--host-dir", action="append")
     p.add_argument("--memory", default=AGENT_NODE_MEMORY)
     p.add_argument("--connection")
     p.set_defaults(fn=cmd_node_create)
