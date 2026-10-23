@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.14,<1",
+#     "capabilities-contract>=0.15,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -237,9 +237,9 @@ MACHINE VERBS
         row carries `machine` ("allowed" or
         "quarantined") and `machine_connections`, the connections this
         machine's global scope declares for it less those whose grant there
-        is disabled - once the config home holds no connections file and the
-        store's global rows exist, the connections the store holds for it
-        less those whose global grant is disabled; a quarantined row is
+        is disabled - once the store's global rows exist, the connections the
+        store holds for it, with a config-home file counted only for one the
+        store holds no row of; a quarantined row is
         effective "disabled" with source "machine".
   search [QUERY] [--source ID]
         Search cached catalogues from the official and registered sources.
@@ -473,7 +473,10 @@ POLICY VERBS
         global row of capabilities_policy, which applies to every project
         reading that store, each for every node, or with --node for that one
         node (the name a node gives itself: AGENT_NODE_NAME, else its host
-        name). A row naming this node is read before the row for every node,
+        name). Outside any project --global writes that global row, not the
+        config home's file, once the store this machine reads holds the global
+        rows (global_migrated_at), and a store that does not answer then
+        refuses it (exit 5). A row naming this node is read before the row for every node,
         at either scope. Only the project's row naming a node places a
         capability's bundled service on that node; a row for every node, or a
         global row, makes the CLI usable there without placing the service
@@ -1047,6 +1050,22 @@ PROJECT VERBS (run inside a consuming project)
         (global_not_migrated), or while one of those roots has not moved or
         has no id (agents_unmigrated, each root named with where it was
         found).
+  migrate --retire-connections
+        On any node, the global master's included, once the store this
+        project (outside one, this machine) reads holds the global rows:
+        check that every connection of each config-home connections file
+        ($XDG_CONFIG_HOME/<name>/connections.json) is a row of the store
+        with the same fields (its grant fields aside), then move those files
+        to $XDG_CONFIG_HOME/capabilities/retired/connections-<UTC stamp>/
+        <name>/connections.json. Credentials and env files, *.session files
+        and every other file stay where they are. Refused before
+        global_migrated_at (global_not_migrated), and, moving nothing, while
+        a file's connection is missing from the store or differs there
+        (connections_not_in_store, each named), or a file cannot be read
+        (files_unreadable). Run it after `capabilities update`: a capability
+        on a contract library older than 0.15 still reads these files. JSON
+        {ok, global_migrated_at, config_home, backup, retired [{file,
+        backup, connections}]}.
   migrate --report [--root PATH]...
         What remains on this machine and why: each agent root found in the
         machine services' join lists, AgentKit's agent list, the roots
@@ -1424,6 +1443,23 @@ def _open_project_records(root: Path, *, project_only: bool = False):
     return store.open_records(
         envelope, _CONFIG_HOME, project_only=project_only, project_root=root,
         project_id=_project_id_state(root)["id"] if in_store else None)
+
+
+def _global_records(root: Path | None = None):
+    """The machine's global layer alone: the store's rows for every agent once
+    they are in force for the database `root` resolves (None: this machine's),
+    else the config home's files."""
+    store = _store_module()
+    return store.global_records(_CONFIG_HOME, root, application_name=store.STORE_OWNER)
+
+
+def _global_kept(adapter) -> str:
+    """Where the global layer is read: `store` or `files`. A store that does
+    not answer leaves the read on the files."""
+    try:
+        return adapter.global_kept()
+    except _store_module().StoreError:
+        return "files"
 
 
 def _store_error_exit(exc) -> int:
@@ -4428,7 +4464,7 @@ def cmd_list() -> None:
     entries = []
     root = _project_root()
     project_caps, global_caps = _policy_views(root)
-    held = _machine_connections_store(root)
+    machine = _global_records(root)
     for name, meta in _installed().items():
         stub, manifest = _load_snapshots(name)
         entry: dict = {"name": name,
@@ -4444,8 +4480,7 @@ def cmd_list() -> None:
         entry["effective"] = effective
         entry["source"] = source
         entry["machine"] = _machine_state(name)
-        entry["machine_connections"] = (_machine_connections(name) if held is None
-                                        else held.get(name, 0))
+        entry["machine_connections"] = _machine_connections(name, machine)
         entries.append(entry)
     known = set(global_caps) | (set(project_caps) if root else set())
     enabled_not_installed = []
@@ -6807,6 +6842,13 @@ def _policy_views_checked(root: Path) -> tuple[dict, dict]:
 def _policy_views(root: Path | None) -> tuple[dict, dict]:
     """Policy values at each exact scope through the active records backend."""
     if root is None:
+        adapter = _global_records()
+        if _global_kept(adapter) == "store":
+            try:
+                return _policy_values({}, adapter.resolve_scope("capabilities", "policy",
+                                                                "global"))
+            except _store_module().StoreError as exc:
+                _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
         return {}, _load_gate_file(GLOBAL_GATE_FILE)["capabilities"]
     try:
         project_rows, global_rows = _policy_scopes(root)
@@ -6909,45 +6951,13 @@ def _write_machine(name: str, state: str | None, record: bool = False) -> bool:
         return _write_machine_locked(name, state, record)
 
 
-def _machine_connections_store(root: Path | None) -> dict | None:
-    """{capability: count} of the connections the store holds as the global
-    layer - every connection row, less those whose global grant is switched
-    off - where the config home holds no connections file any more (it was
-    discarded, or never held one) and the store's global rows exist; None
-    where the files still answer or no store does."""
-    if any(_CONFIG_HOME.glob("*/connections.json")):
-        return None
-    db = _db_module()
-    try:
-        setting = db.resolve_setting(root)
-        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
-                          transaction=True)
-    except Exception:
-        return None
-    try:
-        if not _migrate_global_at(conn):
-            return None
-        out: dict = {}
-        for name, count in _migrate_rows(
-                conn, "SELECT c.capability, count(*) FROM capabilities_connections c "
-                      "WHERE NOT EXISTS (SELECT 1 FROM capabilities_connection_grants g "
-                      "WHERE g.agent_id IS NULL AND g.node IS NULL AND "
-                      "g.capability = c.capability AND g.connection = c.name AND "
-                      "g.enabled IS FALSE) GROUP BY c.capability"):
-            out[name] = int(count)
-        return out
-    except Exception:
-        return None
-    finally:
-        conn.close()
-
-
-def _machine_connections(name: str) -> int:
+def _machine_connections(name: str, records) -> int:
     """How many connections this machine's global scope declares for `name`,
-    leaving out those whose grant there resolves to disabled. Reads the
-    non-secret connections file only: no secret, no network."""
+    leaving out those whose grant there resolves to disabled: the store's rows
+    for every agent once they are in force, with a config-home file answering
+    only for a connection the store holds no row of, else the non-secret
+    connections file alone. No secret is read."""
     store = _store_module()
-    records = store.FileRecords(_CONFIG_HOME / "no-project", _CONFIG_HOME)
     try:
         declared = records.resolve_scope(name, "connection", "global")
         grants = records.resolve_scope(name, "grant", "global")
@@ -8784,11 +8794,7 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False,
             adapter.close()
     else:
         _gate_node(node, None)
-        gate_file = GLOBAL_GATE_FILE
-        gate = _load_gate_file(gate_file)
-        gate["capabilities"].setdefault(name, {})["enabled"] = enabled
-        _write_json(gate_file, gate)
-        gate_source = str(gate_file)
+        gate_source = _global_gate_write(name, {"enabled": enabled})
     result: dict = {("enabled" if enabled else "disabled"): name,
                     "scope": scope, "gate": gate_source}
     if node is not None:
@@ -8811,6 +8817,54 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False,
         _warn(result["warning"])
     _refresh_after_gate(root, result, enabled)
     _emit(result)
+
+
+def _global_gate_store():
+    """The global layer's adapter where its policy is the store's rows, else
+    None and the config home's file is written. A configured store that does
+    not answer refuses the write rather than leaving it in a file the store's
+    rows shadow."""
+    adapter = _global_records()
+    store = _store_module()
+    try:
+        return adapter if adapter.global_kept() == "store" else None
+    except store.StoreError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+
+
+def _global_gate_write(name: str, value: dict) -> str:
+    """Write the global policy entry outside any project; where it went."""
+    adapter = _global_gate_store()
+    if adapter is not None:
+        try:
+            adapter.set("capabilities", "policy", name, value, actor="capabilities",
+                        scope="global")
+            return adapter.scope_source("capabilities", "policy", "global")
+        except _store_module().StoreError as exc:
+            _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+        finally:
+            adapter.close()
+    gate = _load_gate_file(GLOBAL_GATE_FILE)
+    gate["capabilities"].setdefault(name, {}).update(value)
+    _write_json(GLOBAL_GATE_FILE, gate)
+    return str(GLOBAL_GATE_FILE)
+
+
+def _global_gate_delete(name: str) -> tuple[bool, str]:
+    """Remove the global policy entry outside any project: (removed, where)."""
+    adapter = _global_gate_store()
+    if adapter is not None:
+        try:
+            removed = adapter.delete("capabilities", "policy", name, scope="global")
+            return removed, adapter.scope_source("capabilities", "policy", "global")
+        except _store_module().StoreError as exc:
+            _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+        finally:
+            adapter.close()
+    gate = _load_gate_file(GLOBAL_GATE_FILE)
+    removed = gate["capabilities"].pop(name, None) is not None
+    _write_json(GLOBAL_GATE_FILE, gate)
+    return removed, str(GLOBAL_GATE_FILE)
 
 
 def _arrival_global_enable(name: str, undo: bool = False) -> dict | None:
@@ -8880,11 +8934,7 @@ def _inherit_gate(name: str, scope: str, node: str | None = None) -> None:
             adapter.close()
     else:
         _gate_node(node, None)
-        gate_file = GLOBAL_GATE_FILE
-        gate = _load_gate_file(gate_file)
-        removed = gate["capabilities"].pop(name, None) is not None
-        _write_json(gate_file, gate)
-        gate_source = str(gate_file)
+        removed, gate_source = _global_gate_delete(name)
     result = {"inherited": name, "scope": scope, "removed": removed,
               "gate": gate_source}
     if node is not None:
@@ -10104,7 +10154,8 @@ def _utc_now() -> str:
 def _migrate_options(args: list[str]) -> dict:
     opts: dict = {"roots": []}
     flags = {"--dry-run": "dry_run", "--apply": "apply", "--global": "global",
-             "--discard": "discard", "--report": "report", "--json": "json"}
+             "--discard": "discard", "--report": "report", "--json": "json",
+             "--retire-connections": "retire"}
     i = 0
     while i < len(args):
         arg = args[i]
@@ -10125,15 +10176,19 @@ def _migrate_options(args: list[str]) -> dict:
         else:
             _die(6, "input", f"`capabilities migrate` does not take {arg}",
                  "capabilities migrate [--dry-run|--apply] [--answers FILE] | --global "
-                 "[--dry-run|--apply] [--answers FILE] | --discard | --report [--root PATH]")
+                 "[--dry-run|--apply] [--answers FILE] | --discard | --retire-connections "
+                 "| --report [--root PATH]")
         i += 1
-    modes = [m for m in ("global", "discard", "report") if opts.get(m)]
+    modes = [m for m in ("global", "discard", "retire", "report") if opts.get(m)]
     if len(modes) > 1:
         _die(6, "input", f"--{modes[0]} and --{modes[1]} are separate runs")
     if opts.get("dry_run") and opts.get("apply"):
         _die(6, "input", "--dry-run and --apply are opposites; give one")
     if (opts.get("discard") or opts.get("report")) and (opts.get("apply") or opts.get("answers")):
         _die(6, "input", "--discard and --report take no --apply or --answers")
+    if opts.get("retire") and (opts.get("apply") or opts.get("answers") or opts.get("dry_run")
+                               or opts["roots"]):
+        _die(6, "input", "--retire-connections takes no other option")
     return opts
 
 
@@ -12792,6 +12847,80 @@ def cmd_migrate_discard(opts: dict) -> None:
            "config_home": str(_CONFIG_HOME), "removed": removed})
 
 
+def cmd_migrate_retire_connections() -> None:
+    """`migrate --retire-connections`: once the store's global rows are the
+    global layer, the config home's connections files are only a legacy read
+    path. Each connection they declare is checked against the store's rows,
+    and only when every one is there with the same fields are the files moved
+    to one dated backup, so a connection the store lacks is never lost. Only
+    connections files move: credentials, env and session files stay."""
+    _read_only_gate("migrate --retire-connections")
+    store = _store_module()
+    try:
+        conn, _setting = _migrate_connect(_project_root())
+    except _MigrateRefusal as exc:
+        _migrate_refuse(exc)
+    try:
+        at = _migrate_global_at(conn)
+        held = {(name, cid): dict(spec) if isinstance(spec, dict) else {}
+                for name, cid, spec in _migrate_rows(
+                    conn, "SELECT capability, name, spec FROM capabilities_connections")}
+    finally:
+        conn.close()
+    if not at:
+        _migrate_refuse(_MigrateRefusal(
+            "global_not_migrated", "the global records are not in the store, so these "
+            "files are still their only copy", "run `capabilities migrate --global --apply` "
+            "on the global master first"))
+    files = sorted(path for path in _CONFIG_HOME.glob("*/connections.json") if path.is_file())
+    absent, unreadable, counts = [], [], {}
+    for path in files:
+        name = path.parent.name
+        try:
+            body = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            unreadable.append(f"{path}: {exc}")
+            continue
+        declared = body.get("connections") if isinstance(body, dict) else None
+        if not isinstance(declared, dict):
+            declared = {}
+        counts[str(path)] = len(declared)
+        for cid, entry in sorted(declared.items()):
+            spec = {k: v for k, v in (entry if isinstance(entry, dict) else {}).items()
+                    if k not in store.GRANT_FIELDS}
+            row = held.get((name, cid))
+            if row is None:
+                absent.append({"capability": name, "connection": cid, "file": str(path),
+                               "reason": "missing"})
+            elif row != spec:
+                absent.append({"capability": name, "connection": cid, "file": str(path),
+                               "reason": "differs"})
+    if unreadable:
+        _migrate_refuse(_MigrateRefusal(
+            "files_unreadable", f"{len(unreadable)} connections file(s) cannot be read: "
+            + "; ".join(unreadable), "repair or remove them, then run it again"))
+    if absent:
+        _migrate_refuse(_MigrateRefusal(
+            "connections_not_in_store", f"{len(absent)} connection(s) of the config home's "
+            "files are not in the store as the files declare them: "
+            + ", ".join(f"{a['capability']}/{a['connection']} ({a['reason']})" for a in absent),
+            "write each one to the store with `<name> connection add <id> --machine "
+            "--replace`, or remove it from its file if it is no longer wanted, then run "
+            "it again; nothing was moved", detail={"connections": absent}))
+    import datetime as _dt
+    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = _CONFIG_HOME / "capabilities" / "retired" / f"connections-{stamp}"
+    retired = []
+    for path in files:
+        target = backup / path.parent.name / path.name
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.replace(path, target)
+        retired.append({"file": str(path), "backup": str(target),
+                        "connections": counts.get(str(path), 0)})
+    _emit({"ok": True, "global_migrated_at": at, "config_home": str(_CONFIG_HOME),
+           "backup": str(backup) if retired else None, "retired": retired})
+
+
 def _migrate_historical(relative: Path, body: tuple) -> bool:
     """Whether a file of the project is a historical note rather than a live
     reader: under its evidence, memory or snapshot folders (at the root or at
@@ -12893,6 +13022,8 @@ def cmd_migrate(args: list[str]) -> None:
         cmd_migrate_global(opts)
     elif opts.get("discard"):
         cmd_migrate_discard(opts)
+    elif opts.get("retire"):
+        cmd_migrate_retire_connections()
     elif opts.get("report"):
         cmd_migrate_report(opts)
     else:

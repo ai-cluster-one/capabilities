@@ -967,3 +967,155 @@ def test_the_records_reader_reaches_the_store_at_its_transaction_address(lab):
     refused = _coolify(lab, "connections")
     assert refused.returncode != 0
     assert "store_unreachable" in refused.stdout + refused.stderr
+
+
+# --- the store's global rows: no connection is written to a file ----------------
+
+def _outside(lab, exe: Path, *args: str, extra: dict | None = None) -> subprocess.CompletedProcess:
+    """Run outside any project, the store named by the environment as a machine's
+    setting would name it."""
+    elsewhere = lab["project"].parent / "elsewhere"
+    elsewhere.mkdir(exist_ok=True)
+    env = {k: v for k, v in lab["env"].items() if k != "CLAUDE_PROJECT_DIR"}
+    env.update({"AGENTKIT_DB_URL": lab["cluster"].url(lab["database"]),
+                "AGENTKIT_DB_SCHEMA": "lab", "COOLIFY_TOKEN": "test-token-1234",
+                **(extra or {})})
+    return subprocess.run([str(exe), *args], cwd=elsewhere, env=env, text=True,
+                          capture_output=True, timeout=240)
+
+
+def _global_rows_in_force(lab) -> None:
+    """The store holds the rows every agent inherits, as `migrate --global` leaves it."""
+    applied = _ok(_outside(lab, MANAGER, "migrate", "--global", "--apply"))
+    assert applied["global_migrated_at"]
+
+
+def _add_machine(lab, cid: str, *more: str) -> dict:
+    return _ok(_outside(lab, COOLIFY, "connection", "add", cid, "--machine",
+                        "--field", f"base_url={lab['url']}", "--env",
+                        "secret_env=COOLIFY_TOKEN", *more))
+
+
+def test_outside_a_project_a_machine_connection_is_a_store_row_once_the_global_rows_are_in_force(lab):
+    registry = lab["config"] / "coolify" / "connections.json"
+    before = _add_machine(lab, "early")
+    assert before["registry"] == str(registry) and registry.is_file()
+    registry.unlink()
+    _global_rows_in_force(lab)
+    added = _add_machine(lab, "mach")
+    assert added["registry"] == "store:lab.capabilities_connections"
+    assert not registry.exists()
+    assert _rows(lab, "SELECT name, owner, spec FROM capabilities_connections "
+                      "WHERE name = 'mach'") == [
+        ("mach", None, {"base_url": lab["url"], "secret_env": "COOLIFY_TOKEN"})]
+    listed = _ok(_outside(lab, COOLIFY, "connections"))
+    assert listed["connections"]["mach"]["keys"][0]["source"] == \
+        "store:lab.capabilities_connections"
+    refused = _outside(lab, COOLIFY, "connection", "add", "mach", "--machine",
+                       "--field", f"base_url={lab['url']}/x")
+    assert _error(refused)["code"] == "connection_exists"
+    _ok(_outside(lab, COOLIFY, "connection", "add", "mach", "--machine", "--replace",
+                 "--field", f"base_url={lab['url']}/x"))
+    assert _rows(lab, "SELECT spec FROM capabilities_connections WHERE name = 'mach'")[0][0][
+        "base_url"] == lab["url"] + "/x"
+    _ok(_outside(lab, COOLIFY, "connection", "remove", "mach", "--machine"))
+    assert _stored_connections(lab) == []
+    assert not registry.exists()
+
+
+def test_a_config_home_file_answers_only_for_a_connection_the_store_holds_no_row_of(lab):
+    _global_rows_in_force(lab)
+    _add_machine(lab, "mach")
+    _offer_global(lab, {"legacy": {}, "mach": {"base_url": "http://stale.invalid"}})
+    listed = _ok(_outside(lab, COOLIFY, "connections"))["connections"]
+    assert set(listed) == {"legacy", "mach"}
+    assert listed["mach"]["keys"][0]["source"] == "store:lab.capabilities_connections"
+    assert listed["mach"]["keys"][0]["value"] == lab["url"]
+    assert listed["legacy"]["keys"][0]["source"] == str(lab["config"] / "coolify"
+                                                        / "connections.json")
+
+
+def test_a_machine_connection_an_agent_is_granted_is_not_removed(lab):
+    _global_rows_in_force(lab)
+    _add_machine(lab, "mach")
+    other = "prj_" + "9f8e7d6c5b4a"
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("INSERT INTO lab.capabilities_connection_grants "
+                     "(agent_id, capability, connection, enabled) "
+                     "VALUES (%s, 'coolify', 'mach', true)", (other,))
+    refused = _outside(lab, COOLIFY, "connection", "remove", "mach", "--machine")
+    assert refused.returncode == 6, refused.stdout + refused.stderr
+    error = _error(refused)
+    assert error["code"] == "connection_granted" and other in error["message"]
+    assert _stored_connections(lab) == ["mach"]
+
+
+def test_a_project_in_files_mode_writes_no_connection_to_a_file_once_the_global_rows_are_in_force(lab):
+    _global_rows_in_force(lab)
+    registry = lab["envelope"] / "coolify" / "connections.json"
+    held = registry.read_text()
+    refused = _coolify(lab, "connection", "add", "fresh", "--project",
+                       "--field", f"base_url={lab['url']}", "--env",
+                       "secret_env=COOLIFY_TOKEN")
+    assert refused.returncode == 6, refused.stdout + refused.stderr
+    assert _error(refused)["code"] == "connections_in_store"
+    refused = _manager(lab, "set", "coolify", "grant", "spare", '{"enabled": false}')
+    assert _error(refused)["code"] == "connections_in_store"
+    assert registry.read_text() == held
+    added = _ok(_coolify(lab, "connection", "add", "shared", "--global",
+                         "--field", f"base_url={lab['url']}", "--env",
+                         "secret_env=COOLIFY_TOKEN"))
+    assert added["registry"] == "store:lab.capabilities_connections"
+    assert _stored_connections(lab) == ["shared"]
+    assert not (lab["config"] / "coolify" / "connections.json").exists()
+    assert set(_ok(_coolify(lab, "connections"))["connections"]) == {"box", "spare"}
+
+
+def test_a_global_gate_set_outside_a_project_is_a_store_row_once_the_global_rows_are_in_force(lab):
+    gate = lab["config"] / "capabilities" / "settings.json"
+    _global_rows_in_force(lab)
+    held = gate.read_text() if gate.exists() else None
+    enabled = _ok(_outside(lab, MANAGER, "enable", "coolify", "--global"))
+    assert enabled["gate"] == "store:lab.capabilities_policy"
+    assert _rows(lab, "SELECT agent_id, capability, node, enabled FROM capabilities_policy"
+                      " WHERE capability = 'coolify'") == [(None, "coolify", None, True)]
+    assert (gate.read_text() if gate.exists() else None) == held
+    inherited = _ok(_outside(lab, MANAGER, "inherit", "coolify", "--global"))
+    assert inherited["removed"] is True and inherited["gate"] == "store:lab.capabilities_policy"
+    assert _rows(lab, "SELECT 1 FROM capabilities_policy WHERE capability = 'coolify'") == []
+
+
+def test_retire_connections_moves_the_config_home_files_once_the_store_holds_them(lab):
+    refused = _outside(lab, MANAGER, "migrate", "--retire-connections")
+    assert _error(refused)["code"] == "global_not_migrated"
+    _global_rows_in_force(lab)
+    _add_machine(lab, "mach")
+    home = lab["config"] / "coolify"
+    home.mkdir(parents=True, exist_ok=True)
+    spec = {"base_url": lab["url"], "secret_env": "COOLIFY_TOKEN"}
+    (home / "connections.json").write_text(json.dumps(
+        {"default": "mach", "connections": {"mach": {**spec, "allow_write": True},
+                                            "lost": {"base_url": "http://lost.invalid"}}}))
+    (home / "credentials.env").write_text("COOLIFY_MACH_TOKEN=x\n")
+    (home / "account.session").write_text("kept")
+    refused = _outside(lab, MANAGER, "migrate", "--retire-connections")
+    assert refused.returncode == 6, refused.stdout + refused.stderr
+    error = _error(refused)
+    assert error["code"] == "connections_not_in_store"
+    assert error["detail"]["connections"] == [
+        {"capability": "coolify", "connection": "lost", "file": str(home / "connections.json"),
+         "reason": "missing"}]
+    assert (home / "connections.json").is_file()
+    body = json.loads((home / "connections.json").read_text())
+    del body["connections"]["lost"]
+    (home / "connections.json").write_text(json.dumps(body))
+    retired = _ok(_outside(lab, MANAGER, "migrate", "--retire-connections"))
+    backup = Path(retired["backup"])
+    assert backup.parent == lab["config"] / "capabilities" / "retired"
+    assert retired["retired"] == [{"file": str(home / "connections.json"),
+                                   "backup": str(backup / "coolify" / "connections.json"),
+                                   "connections": 1}]
+    assert not (home / "connections.json").exists()
+    assert json.loads((backup / "coolify" / "connections.json").read_text()) == body
+    assert sorted(p.name for p in home.iterdir()) == ["account.session", "credentials.env"]
+    assert "mach" in _ok(_outside(lab, COOLIFY, "connections"))["connections"]
