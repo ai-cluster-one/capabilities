@@ -851,6 +851,27 @@ def test_a_service_moves_between_nodes_and_its_capability_stays_usable_on_both(l
     assert _error(_manager(lab, "place", "coolify", "--node", NODE))["code"] == "no_service"
 
 
+def test_a_writer_that_predates_the_service_column_places_where_it_enables(lab):
+    # A manager on an older library writes enabled alone, meaning what
+    # enable --node and disable --node always meant: the service follows.
+    _import(lab)
+
+    def write(node: str, enabled: bool) -> tuple:
+        return _rows(lab, (
+            "INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
+            f"VALUES ('{PROJECT_ID}', 'coolify', '{node}', {enabled}) ON CONFLICT "
+            "((coalesce(agent_id, '')), capability, (coalesce(node, ''))) "
+            "DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now() "
+            "RETURNING node, enabled, service"))[0]
+
+    assert write(NODE, True) == (NODE, True, True)
+    assert write(NODE, False) == (NODE, False, False)
+    assert write(NODE, True) == (NODE, True, True)
+    assert _rows(lab, "INSERT INTO capabilities_policy (agent_id, capability, enabled) "
+                      f"VALUES ('{PROJECT_ID}', 'slack', true) RETURNING service") == [
+        (False,)]
+
+
 def test_a_store_mode_project_marked_only_by_project_json_gets_no_file_gate(lab):
     # A project whose records are in the store keeps its gate in the store, so
     # project.json alone marks it and no write brings back a file gate.
