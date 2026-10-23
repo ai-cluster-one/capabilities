@@ -521,7 +521,8 @@ PROJECT VERBS (run inside a consuming project)
         without a slug is given one: the slug an older project.json names,
         else the agent's name transliterated, else the folder's name (the
         result's agent.slug; see relabel). --id <id> binds the folder to the
-        agent the store holds under that id instead of creating one: where a
+        agent the store holds under that id (twelve hex characters, prj_ and
+        twelve, or a UUID; exit 6 input otherwise) instead of creating one: where a
         database resolves for the folder the agent must be registered there
         (exit 6 agent_unknown) and an older project.json of a moved agent
         says "records": "store"; with no database it is bound unverified. It
@@ -648,7 +649,9 @@ PROJECT VERBS (run inside a consuming project)
         folder on this node (folder_bound; the store holds one agent per
         folder per node), and an agent that already lives in another folder
         here which is still bound to it (agent_elsewhere; one whose folder
-        is gone or bound elsewhere is moved). Run again it changes nothing,
+        is gone or bound elsewhere is moved). Where the wiring after those
+        writes is refused, the .env.local, this node's row and the folders it
+        made are put back as they were. Run again it changes nothing,
         and run in a folder already bound to the agent it records the folder
         on this node's row. Answers {ok, agent_id, folder, node, changed, env
         {path, changed}, init, store}, init being what `init --id` answers.
@@ -7848,6 +7851,9 @@ def _agent_materialize(ref: str, folder_arg: str, claude: bool, codex: bool) -> 
                  f"the store ({setting.level}, schema {setting.schema}) holds no agent {ref!r}",
                  "run `capabilities agent list` to see the agents it holds")
         agent_id = found[0][0]
+        if not PROJECT_ID_RE.match(agent_id):
+            _die(6, "input", f"the store's agent id {agent_id!r} is not a project id",
+                 PROJECT_ID_HINT)
         bound = _folder_agent_id(folder)
         if bound and bound != agent_id:
             _die(6, "folder_bound", f"{folder} is bound to agent {bound}",
@@ -7863,6 +7869,7 @@ def _agent_materialize(ref: str, folder_arg: str, claude: bool, codex: bool) -> 
             row = conn.execute(
                 "SELECT folder FROM capabilities_agent_nodes WHERE agent_id = %s AND node = %s "
                 "FOR UPDATE", (agent_id, node)).fetchone()
+            node_before = row
             elsewhere = row[0] if row and row[0] and row[0] != str(folder) else None
             if elsewhere and _folder_agent_id(Path(elsewhere)) == agent_id:
                 _die(6, "agent_elsewhere",
@@ -7888,7 +7895,9 @@ def _agent_materialize(ref: str, folder_arg: str, claude: bool, codex: bool) -> 
         _die(5, "store_write_failed", f"the store refused the change: {exc}")
     finally:
         conn.close()
+    made = [path for path in (folder, *folder.parents) if not path.exists()]
     folder.mkdir(parents=True, exist_ok=True)
+    env_before = _path_states(folder, [Path(".env.local")])
     env_changed = _write_env_local_keys(
         folder, {PROJECT_ID_ENV: agent_id, PROJECT_ID_ROOT_ENV: str(folder)})
     # From here this process stands in the folder, bound to the agent.
@@ -7896,7 +7905,14 @@ def _agent_materialize(ref: str, folder_arg: str, claude: bool, codex: bool) -> 
     os.environ[PROJECT_ID_ROOT_ENV] = str(folder)
     os.environ["CLAUDE_PROJECT_DIR"] = str(folder)
     os.chdir(folder)
-    init = _init(claude, codex, given_id=agent_id)
+    try:
+        init = _init(claude, codex, given_id=agent_id)
+    except SystemExit as refused:
+        # A refusal while it wires leaves the folder's binding, this node's
+        # row and the folders it made as they were.
+        if refused.code:
+            _unmaterialize(folder, agent_id, node, node_before, env_before, made)
+        raise
     hooks = init.get("hooks") or {}
     build = hooks.get("build") or {}
     wired = any((hooks.get(host) or {}).get(flag)
@@ -7909,6 +7925,37 @@ def _agent_materialize(ref: str, folder_arg: str, claude: bool, codex: bool) -> 
             "changed": changed, "env": {"path": str(folder / ".env.local"),
                                         "changed": env_changed},
             "init": init, "store": _kernel_store_report(setting)}
+
+
+def _unmaterialize(folder: Path, agent_id: str, node: str, node_before,
+                   env_before: dict, made: list[Path]) -> None:
+    """Undo what `agent materialize` wrote before the init it runs refused: the
+    .env.local as it was, this node's row as it was (gone where it made it),
+    and every folder it made that is left empty."""
+    _restore_path_states(folder, env_before)
+    try:
+        conn, _setting = _kernel_open(folder)
+    except SystemExit:
+        return
+    import psycopg
+    try:
+        with conn.transaction():
+            if node_before is None:
+                conn.execute("DELETE FROM capabilities_agent_nodes "
+                             "WHERE agent_id = %s AND node = %s", (agent_id, node))
+            else:
+                conn.execute("UPDATE capabilities_agent_nodes SET folder = %s "
+                             "WHERE agent_id = %s AND node = %s",
+                             (node_before[0], agent_id, node))
+    except psycopg.Error:
+        pass
+    finally:
+        conn.close()
+    for path in made:
+        try:
+            path.rmdir()
+        except OSError:
+            break
 
 
 CK_ICON_FILE = re.compile(r"icon-[^/]+\.png")
@@ -15322,9 +15369,12 @@ def cmd_init(claude: bool, codex: bool, layers: bool = False, starter: bool = Fa
     _emit(_init(claude, codex, layers, starter, given_id))
 
 
-# A project id: `prj_` and twelve hex characters, or the UUID older projects carry.
-PROJECT_ID_RE = re.compile(r"^(prj_[0-9a-f]{12}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
+# A project id: twelve hex characters, or the `prj_` and twelve hex characters
+# or the UUID agents not yet moved to it carry.
+PROJECT_ID_RE = re.compile(r"^((prj_)?[0-9a-f]{12}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
                            r"-[0-9a-f]{4}-[0-9a-f]{12})$")
+PROJECT_ID_HINT = ("a project id is twelve hex characters, or prj_ and twelve hex "
+                   "characters, as `capabilities agent show` prints it")
 
 
 def _agent_to_raise(root: Path, agent_id: str) -> dict:
@@ -15388,9 +15438,7 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
     raised = None
     if given_id is not None:
         if not PROJECT_ID_RE.match(given_id):
-            _die(6, "input", f"--id {given_id!r} is not a project id",
-                 "a project id is prj_ and twelve hex characters, as "
-                 "`capabilities agent show` prints it")
+            _die(6, "input", f"--id {given_id!r} is not a project id", PROJECT_ID_HINT)
         new_agent = False
         raised = _agent_to_raise(root, given_id)
         if not _contextkit_managed(root) and not _project_id_state(root)["id"]:

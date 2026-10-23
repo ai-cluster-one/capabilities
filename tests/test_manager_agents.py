@@ -411,6 +411,26 @@ def test_agent_materialize_puts_a_stored_agent_in_a_folder_on_this_machine(lab, 
     assert [(a["id"], [(n["node"], n["folder"]) for n in a["nodes"]]) for a in listed] == [
         (agent_id, [("box-node", str(folder)), ("lab-node", str(lab.project))])]
 
+    # An agent the store holds under the bare twelve-hex id is materialized
+    # too.
+    bare = "4a5b6c7d8e9f"
+    lab.sql(f"INSERT INTO {SCHEMA}.capabilities_agents (id) VALUES (%s) RETURNING id", (bare,))
+    plain = tmp_path / "plain"
+    placed = materialize(bare, str(plain), AGENT_NODE_NAME="box-node")
+    assert placed.returncode == 0, placed.stderr
+    assert json.loads(placed.stdout)["node"]["folder"] == str(plain)
+    assert f"CAPABILITIES_PROJECT_ID={bare}\n" in (plain / ".env.local").read_text()
+
+    # A refusal while it wires the folder leaves no binding and no node row.
+    broken = tmp_path / "broken"
+    (broken / ".claude").mkdir(parents=True)
+    (broken / ".claude" / "settings.json").write_text("{not json")
+    refused = materialize(bare, str(broken), AGENT_NODE_NAME="other-node")
+    assert refused.returncode != 0
+    assert not (broken / ".env.local").exists()
+    assert lab.sql(f"SELECT node FROM {SCHEMA}.capabilities_agent_nodes "
+                   "WHERE agent_id = %s", (bare,)) == [("box-node",)]
+
 
 def test_nodes_are_added_changed_listed_and_removed(lab):
     added = lab.ok("node", "add", "mac-one", "--kind", "mac", "--master")
