@@ -12964,9 +12964,11 @@ def _ck_stored_context(root: Path, binding: dict, warnings: list[str],
         path = base / f"{name}.md"
         text = (f"---\ntitle: {title}\ndescription: {description}\n"
                 f"load: {load}\norder: {position}\n---\n{body}")
+        items = found["global" if is_global else "project"]
         _ck_context_item(path, Path(_ck_rel(root, path)), text,
-                         "global" if is_global else "project",
-                         found["global" if is_global else "project"], errors)
+                         "global" if is_global else "project", items, errors)
+        if items and items[-1]["path"] == path:
+            items[-1]["stored"] = name
     if errors:
         warnings.append("context documents not read from the store, so the context folder "
                         f"is used: {'; '.join(errors)}")
@@ -12979,6 +12981,10 @@ def _ck_stored_context(root: Path, binding: dict, warnings: list[str],
 
 
 def _ck_reference(item: dict) -> str:
+    """Where a session reads the item: the `context` verb that shows a document
+    the store holds, else the file."""
+    if item.get("stored"):
+        return f"context show {item['stored']}" + (" --global" if item["source"] == "global" else "")
     return str(item["path"].resolve()) if item["source"] == "global" else item["rel"].as_posix()
 
 
@@ -13311,9 +13317,13 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
             out += ["---", "", f"## {label}: `{_ck_reference(item)}`", "", item["body"].strip(), ""]
     else:
         out += ["No inline context files.", ""]
-    out += ["---", "", "# Context Stubs", "",
-            "These context files are visible by metadata only. Load the path when the task needs that doctrine.",
-            ""]
+    stored_stubs = sum(1 for item in stubs if item.get("stored"))
+    lead = ("These context files are visible by metadata only. Load the path when the task needs that doctrine."
+            if not stored_stubs else
+            "These context documents are visible by metadata only. Run the command beside one when the task needs that doctrine."
+            if stored_stubs == len(stubs) else
+            "These context documents are visible by metadata only. Run the command, or load the path, beside one when the task needs that doctrine.")
+    out += ["---", "", "# Context Stubs", "", lead, ""]
     if stubs:
         for item in stubs:
             origin = ", global" if item["source"] == "global" else ""

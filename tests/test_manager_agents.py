@@ -658,16 +658,27 @@ def test_build_composes_the_context_from_the_documents_in_the_store(lab, tmp_pat
          [("Other", "Not this agent's.", "inline", 1, "\n# Other\n", True)]),
         (None, "SHARED", False, [(*shared, True)]),
     ])
+    # A document the store holds is named by the command that reads it, not
+    # by a file path.
+    from_store = from_folder.replace(
+        f"`{(tmp_path / 'global' / 'SHARED.md').resolve()}`", "`context show SHARED --global`")
+    for name in _CONTEXT_FILES:
+        from_store = from_store.replace(f"`context/{name}.md`", f"`context show {name}`")
+    from_store = from_store.replace(
+        "These context files are visible by metadata only. Load the path when the task needs "
+        "that doctrine.", "These context documents are visible by metadata only. Run the "
+        "command beside one when the task needs that doctrine.")
+    assert "**Style** (`context show guidelines/STYLE`)" in from_store
     warning = ("- context documents are read from the store; the context folder `context/` "
                "is no longer read and can be removed")
     beside_folder = build()
     assert warning in beside_folder.splitlines()
-    assert beside_folder.replace(warning + "\n", "", 1) == from_folder
+    assert beside_folder.replace(warning + "\n", "", 1) == from_store
 
     # Without the folders the store alone composes the same context.
     shutil.rmtree(project / "context")
     shutil.rmtree(tmp_path / "global")
-    assert build() == from_folder
+    assert build() == from_store
 
 
 def test_a_document_that_does_not_read_leaves_the_build_on_the_folder(lab):
