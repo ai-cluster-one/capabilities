@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-23 — The service declares how many nodes run it at once
+
+The service descriptor declares `service.placement` `exclusive`: one node runs the service at a time, the deployment runner's lease holds it there, and `capabilities place telegram --node <node>` moves it, leaving `telegram` usable on the node it left.
+
 ## 2026-10-22 — A first login that fails leaves nothing, and app-check says why in words
 
 Under `--events`, a connection's first `login` - it binds no account and has no session file - that ends in a refusal, an error, closed input or a cancellation (SIGTERM, SIGINT, SIGHUP, refused as `cancelled`, exit 6) removes the connection through `connection remove` and the session file and folder it made; a connection that was ever signed in is never touched, and without `--events` the verb is unchanged. The session file is written owner-only (0600) in an owner-only folder. `app-check` gives every verdict but `accepted` a `message`, one sentence a person can be shown, beside `error`.

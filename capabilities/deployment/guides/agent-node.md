@@ -46,7 +46,7 @@ The answer names the application, the build's deployment and the `coolify wait` 
 
 - makes the node's X25519 key pair in the container, keeps the private key on its config volume and records the public key on the node row;
 - writes the agent's secrets - every secret key of a connection the agent's enabled capabilities resolve here - into each capability's credentials file on the node. The token of the coolify connection the node was created through is not among them: it stays on the deploying machine, and the node does not hold it;
-- places each named service on the node with a policy row naming it (`capabilities enable <name> --project --node <node>`). A fresh node runs no service until such a row exists, and you can add or remove rows later without enrolling again;
+- places each named service on the node (`capabilities place <name> --node <node>`), which takes an exclusive service off the machine it ran on before and leaves the capability usable everywhere it was; the answer's `unplaced` names those machines. A fresh node runs no service until one is placed there, and you can place or unplace services later without enrolling again;
 - writes the store setting, last, with the node's own manager. That is what the waiting node raises the agent on, and enrol waits until the node reports `running agent ... as node <node>` (`--wait`, else `node_not_raised`).
 
 Secrets and the store password travel on standard input and are never printed or put on a command line.
@@ -66,10 +66,19 @@ The container is the one Docker labels `com.docker.compose.project=<resource>` a
 
 ## Move a service onto the node
 
-A service runs on a node only where the agent's policy row names that node, and its lease keeps it on one node at a time (`deployment guide profiles`, **Where a service runs**). To move one from the machine it runs on now to the node:
+Where a service runs and where its capability is usable are two separate answers of the agent's gate: a service runs on a node only where it is placed there, and placing or unplacing it never changes where the capability's CLI works (`deployment guide profiles`, **Where a service runs**). Each service's descriptor says how many nodes run it at once, and `<name> manifest` shows it as `service.placement`: `exclusive`, for a service that holds one account or one connection, runs on one node at a time and its lease enforces that; `shared` runs on every node it is placed on.
 
-1. Place it on the node: `capabilities enable <name> --project --node <node>`. While the other machine still holds the lease, the node's runner waits and says so.
-2. Take it off the other machine: `capabilities disable <name> --project --node <machine>`, or `capabilities inherit <name> --project --node <machine>` to remove that row. At its next reconcile the machine's runner stops the service and releases the lease, and the node's runner takes it over at its own next reconcile, by default within a minute.
+To move an exclusive service from the machine it runs on now to the node, place it on the node:
+
+```sh
+capabilities place <name> --node <node>
+```
+
+That one write places it on the node and takes it off every other node; the answer names them under `unplaced_from`. The capability stays usable on the machine it left - reading its messages there on demand keeps working - and only its service stops there. At its next reconcile the machine's runner stops the service and releases the lease, and the node's runner takes it over at its own next reconcile, by default within a minute.
+
+A shared service is placed on the node beside the machines it already runs on; to take it off one of them, `capabilities unplace <name> --node <machine>`.
+
+Do not move a service with `capabilities disable <name> --project --node <machine>`: that turns the capability off on that machine, CLI and all. `capabilities inherit <name> --project --node <machine>` removes the machine's row, and with it the service, and leaves the CLI to whatever the project's row for every node says. Both warn when they take a service off a node.
 
 No recompile and no redeploy is needed on either side. `deployment services` on each side shows what the gate answers there, whether the runner runs the service and who holds the lease.
 
@@ -90,7 +99,7 @@ No verb moves a node to a new tag yet. The tools are the image's, and everything
 
 `deployment node remove <node> --yes` deletes the node's Coolify resource with its volumes and configuration, then its node row. It first checks that the resource is this node's own - its agent container runs the standard image as this node - and deletes nothing when it is not (`node_resource_not_own`); a resource already gone leaves only the row to remove.
 
-The policy rows that placed services on the node are not removed with it, and a node created again under the same name would run those services at once. Remove them first, one per service: `capabilities inherit <name> --project --node <node>`.
+The policy rows that placed services on the node are not removed with it, and a node created again under the same name would run those services at once. Take them off first, one per service: `capabilities unplace <name> --node <node>`, or `capabilities inherit <name> --project --node <node>` to remove the row altogether.
 
 ## Architectures
 
@@ -100,4 +109,4 @@ These are planned and not shipped:
 
 ## Another provider
 
-The image is plain Docker; Coolify is only how `deployment` creates and removes it. Any host that runs a container can run a node: start `ghcr.io/agenium-dev/agent-node:<version>` with `CAPABILITIES_PROJECT_ID`, `CAPABILITIES_PROJECT_ID_ROOT=/app` and `AGENT_NODE_NAME`, a named volume on each of the four state paths, a memory limit and a restart policy. Register its row from the agent's folder with `capabilities node add <node> --kind server`; the node raises no agent without it. `deployment node enrol` and `remove` reach only a node whose row names a Coolify resource, so on another provider you do by hand what **Enrol** lists - the secrets into each capability's credentials file in the container, the placement rows from the agent's folder, and the store setting last with the node's own `capabilities store set` - and removing it is deleting the container and its volumes, then `capabilities node remove <node>`.
+The image is plain Docker; Coolify is only how `deployment` creates and removes it. Any host that runs a container can run a node: start `ghcr.io/agenium-dev/agent-node:<version>` with `CAPABILITIES_PROJECT_ID`, `CAPABILITIES_PROJECT_ID_ROOT=/app` and `AGENT_NODE_NAME`, a named volume on each of the four state paths, a memory limit and a restart policy. Register its row from the agent's folder with `capabilities node add <node> --kind server`; the node raises no agent without it. `deployment node enrol` and `remove` reach only a node whose row names a Coolify resource, so on another provider you do by hand what **Enrol** lists - the secrets into each capability's credentials file in the container, `capabilities place <name> --node <node>` from the agent's folder, and the store setting last with the node's own `capabilities store set` - and removing it is deleting the container and its volumes, then `capabilities node remove <node>`.

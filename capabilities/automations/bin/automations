@@ -525,6 +525,9 @@ TABLES = True       # automations_* tables in the project's store, built by _tab
 INVENTORY = {"network": "none"}   # config and daemon state are both local
 POST_INSTALL: list = []
 SERVICE = {
+    # How many nodes run it at once (service.placement). A run is claimed in the
+    # store, one active run per automation, so any node it is placed on may run it.
+    "placement": "shared",
     "name": "scheduler",
     "summary": ("Project-local scheduler, store-backed queue, and subprocess workers, "
                 "also run once per machine for the projects that join it."),

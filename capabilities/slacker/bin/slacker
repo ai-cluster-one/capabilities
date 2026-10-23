@@ -220,6 +220,9 @@ TABLES = True       # slacker_* tables in the project's database, built by _tabl
 INVENTORY = {"network": "none"}   # the service's state is files on this machine
 POST_INSTALL: list[dict] = []
 SERVICE = {
+    # How many nodes run it at once (service.placement). One web-session event stream
+    # per account: one node at a time.
+    "placement": "exclusive",
     "name": "capture",
     "summary": ("Long-running listener that holds the linked account's Slack "
                 "web-session event stream and writes every new message, edit, "

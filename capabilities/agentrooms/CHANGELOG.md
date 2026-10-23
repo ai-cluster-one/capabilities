@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-23 — The service declares how many nodes run it at once
+
+The service descriptor declares `service.placement` `exclusive`: one node runs the service at a time, the deployment runner's lease holds it there, and `capabilities place agentrooms --node <node>` moves it, leaving `agentrooms` usable on the node it left.
+
 ## 2026-10-23 — A running turn takes the room's new messages with `catch-up`
 
 `agentrooms catch-up [--limit N]`, inside a turn the service started (`AGENTROOMS_TURN`), returns what arrived in the turn's room since the turn began or since its last catch-up - `{room_id, turn, count, more, messages, wakes}`, the messages as `read` prints them. What it returns is seen: once the turn ends, if its harness ran, the next turn in the room does not carry it as new. A mention, a direct message or a marked-room message among it from a sender the turn's worker admits is taken by the turn (`wakes`): it starts no turn of its own, also when the service records it after `catch-up` ran, and its sender counts toward the worker's limits on the turn that took it. One from a sender the worker does not admit is refused or held as before. Outside a turn it exits 6 `not_in_turn`, for a turn that has ended 6 `turn_ended`, for another agent's turn 6 `not_your_turn`. The room frame tells the agent to run it before answering on a long turn. The store gains ledger step `0010-turn-catch-up`: `agentrooms_turns.seen_ts` and `agentrooms_turns.taken`, both additive. A turn that never runs it behaves as before.

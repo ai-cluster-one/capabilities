@@ -855,6 +855,9 @@ TABLES = True       # the service's runtime state lives in the project's store
 INVENTORY = {"network": "none"}
 POST_INSTALL: list[dict] = []
 SERVICE = {
+    # How many nodes run it at once (service.placement). One /sync long-poll per
+    # agent: one node at a time.
+    "placement": "exclusive",
     "name": "rooms",
     "summary": ("Wakes opted-in agents on a mention, a direct message or a marked room "
                 "from a sender the room's grant admits, holding the rest for the "

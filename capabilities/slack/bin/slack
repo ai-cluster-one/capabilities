@@ -208,6 +208,9 @@ EXITS   0 ok · 2 auth · 3 not found · 4 policy/write refusal · 5 network · 
 """
 
 SERVICE = {
+    # How many nodes run it at once (service.placement). One Socket Mode connection
+    # per app: one node at a time.
+    "placement": "exclusive",
     "name": "assistant",
     "summary": "Project-local Slack real-time daemon (Socket Mode) using the bundled service engine.",
     "verbs": ["init", "doctor", "run", "start", "stop", "status", "logs"],

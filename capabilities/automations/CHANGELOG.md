@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-23 — The service declares how many nodes run it at once
+
+The service descriptor declares `service.placement` `shared`: the service runs on every node it is placed on (`capabilities place automations --node <node>`), and the deployment runner takes no lease for it. A project that had it placed on more than one node, where the lease ran it on one, runs it on each of them.
+
 ## 2026-10-22 — A project without project.json runs automations; its slug is its agent's row
 
 The envelope check accepts a project bound to its id, the state root and `service join` take the slug from `_project_slug` (its agent's row in the store, else an older `project.json`'s, else its id, else a digest of its path), and the scheduler is handed it as `AUTOMATIONS_PROJECT_SLUG` for its log tag. The run ledger opens without a `project.json`, and an id in the environment without `CAPABILITIES_PROJECT_ID_ROOT` binds no folder. Declares `capabilities-contract>=0.12,<1`.

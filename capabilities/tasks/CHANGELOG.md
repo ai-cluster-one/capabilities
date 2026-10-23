@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-23 — The service declares how many nodes run it at once
+
+The service descriptor declares `service.placement` `shared`: the service runs on every node it is placed on (`capabilities place tasks --node <node>`), and the deployment runner takes no lease for it. A project that had it placed on more than one node, where the lease ran it on one, runs it on each of them.
+
 ## 2026-10-22 — A project without project.json is served; its slug is its agent's row
 
 The service's state root, lock and log tag are named by the project's slug as `_project_slug` answers it (its agent's row in the store, else an older `project.json`'s, else its id, else a digest of its path). `service join` needs only the project's id, and the service no longer refuses a project whose `project.json` is gone (`project_identity_missing`); a project that changed its id is still refused. `slug_taken` names `capabilities relabel`. Declares `capabilities-contract>=0.12,<1`.

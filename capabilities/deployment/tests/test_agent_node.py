@@ -100,8 +100,9 @@ class Fake:
                 return json.dumps({"node": self.rows[args[2]]})
             if args[:2] == ["node", "remove"]:
                 return json.dumps({"removed": self.rows.pop(args[2])})
-            if args[:1] == ["enable"]:
-                return json.dumps({"ok": True})
+            if args[:1] == ["place"]:
+                return json.dumps({"placed": args[1], "node": args[3],
+                                   "unplaced_from": ["mac"] if args[1] == "tasks" else []})
             raise AssertionError(args)
         if tool == "ssh":
             if "-G" in args:
@@ -256,16 +257,17 @@ def test_enrol_gives_the_node_its_key_secrets_placements_and_store(lab, capsys):
     assert json.loads(secrets["stdin"]) == {"telegram": {"TELEGRAM_BOT_TOKEN": "bot-secret"}}
     [store] = [c for c in docker if "capabilities store set" in c["argv"][-1]]
     assert store["stdin"] == "store-secret\n"
-    enables = [c["argv"][1:] for c in lab.fake.of("capabilities") if c["argv"][1] == "enable"]
-    assert enables == [["enable", "tasks", "--project", "--node", "box1"],
-                       ["enable", "automations", "--project", "--node", "box1"]]
+    places = [c["argv"][1:] for c in lab.fake.of("capabilities") if c["argv"][1] == "place"]
+    assert places == [["place", "tasks", "--node", "box1"],
+                      ["place", "automations", "--node", "box1"]]
     # The store setting is what the node raises on, so it is written last.
     order = [i for i, c in enumerate(lab.fake.calls)
-             if c in (secrets, store) or c["argv"][1:2] == ["enable"]]
+             if c in (secrets, store) or c["argv"][1:2] == ["place"]]
     assert lab.fake.calls.index(store) == max(order)
 
     answer = json.loads(capsys.readouterr().out)
     assert answer["ok"] is True and answer["placed"] == ["tasks", "automations"]
+    assert answer["unplaced"] == {"tasks": ["mac"]}
     assert answer["secrets"] == {"telegram": ["TELEGRAM_BOT_TOKEN"]}
     assert "bot-secret" not in json.dumps(answer)
 

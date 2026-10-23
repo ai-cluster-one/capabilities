@@ -310,7 +310,8 @@ def test_the_gate_on_each_node_starts_and_stops_the_service_and_one_node_holds_i
         [seen] = report["services"]
         assert seen["name"] == "fixture" and seen["running"] is False
         assert seen["gate"]["placed"] is True
-        assert seen["gate"]["row"] == {"scope": "project", "node": "node-b", "enabled": True}
+        assert seen["gate"]["row"] == {"scope": "project", "node": "node-b", "enabled": True,
+                                       "service": True}
         assert seen["lease"]["state"] == "held_elsewhere" and seen["lease"]["holder"] == "node-a"
 
         _manager(a, env, "disable", "fixture", "--project", "--node", "node-a")

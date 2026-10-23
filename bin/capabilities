@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.16,<1",
+#     "capabilities-contract>=0.17,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -67,8 +67,8 @@ ENVIRONMENT
                        writes and service activation exit 4), and this manager
                        refuses agent convert, agent set, allow, connections
                        import, disable, enable, inherit, init, node add, node
-                       remove, node set, quarantine, relabel, set, store set
-                       and store unset.
+                       remove, node set, place, quarantine, relabel, set,
+                       store set, store unset and unplace.
                        doctor reports it. Unset, `0` or `false` leaves it off.
   AGENTKIT_DB_URL, AGENTKIT_DB_HOST, AGENTKIT_DB_PORT, AGENTKIT_DB_NAME,
   AGENTKIT_DB_USER, AGENTKIT_DB_PASSWORD, AGENTKIT_DB_SCHEMA,
@@ -477,13 +477,17 @@ POLICY VERBS
         config home's file, once the store this machine reads holds the global
         rows (global_migrated_at), and a store that does not answer then
         refuses it (exit 5). A row naming this node is read before the row for every node,
-        at either scope. Only the project's row naming a node places a
-        capability's bundled service on that node; a row for every node, or a
-        global row, makes the CLI usable there without placing the service
-        (`deployment guide profiles`). Files carry no node, so --node in files
-        mode is refused with node_requires_store; `capabilities connections
-        import` moves the project's records into its store first. --deny takes
-        no --node.
+        at either scope. A row says two things apart: whether the CLI is usable
+        there (enabled) and, for the project's row naming a node only, whether
+        the capability's bundled service is placed on that node (service).
+        enable --node writes both true, so it places the service there, and
+        disable --node both false, so it also takes the service off that node
+        and says so (unplaced, warning); `place` and `unplace` below change the
+        service alone. A row for every node, or a global row, makes the CLI
+        usable without placing the service (`deployment guide profiles`).
+        Files carry no node, so --node in files mode is refused with
+        node_requires_store; `capabilities connections import` moves the
+        project's records into its store first. --deny takes no --node.
         Scope is mandatory: ask whether the decision is for this project or
         every project before invoking the manager. Project enable removes any
         harness deny rule; project disable --deny additionally writes
@@ -493,8 +497,25 @@ POLICY VERBS
   inherit <name> --project|--global [--node <node>]
         Remove the selected scope's explicit entry. A project then inherits the
         machine default; removing the global entry restores default deny. With
-        --node (store mode only) remove that scope's row for that one node,
-        which stops a service placed there by it.
+        --node (store mode only) remove that scope's row for that one node;
+        where that row placed the service, it stops there and the answer says
+        so (unplaced, warning).
+  place <name> --node <node>
+  unplace <name> --node <node>
+        Store mode only: put this project's bundled service of <name> on that
+        node, or take it off, changing nothing about where <name> is usable.
+        A service's descriptor declares how many nodes run it at once
+        (service.placement): exclusive, the default, runs on one node at a
+        time, so place takes it off every other node in the same write - this
+        is how a service moves, its CLI left usable on the node it left;
+        shared runs on every node it is placed on. Placing where the project
+        has no row naming the node writes one that also enables <name> there
+        (enabled_on_node), since a service runs only where its project
+        enables it; placing where that row disables it is refused (exit 6
+        disabled_on_node). Unplacing a node it is not on changes nothing.
+        JSON {placed|unplaced, node, placement, changed, placed_on [nodes],
+        unplaced_from?, enabled_on_node?, gate}. Exit 3 when <name> is not
+        installed, 6 no_service when it bundles none.
 
 PROJECT VERBS (run inside a consuming project)
   init [--claude] [--codex] [--with-layers | --with-template | --id <id>]
@@ -1013,7 +1034,11 @@ PROJECT VERBS (run inside a consuming project)
         sources, schema, tables}, capabilities {<name> {connections
         {imported, unchanged}, grants {imported, unchanged}, default}},
         skipped {<name> [<id>]}, identifiers {<name> {project|global {imported, unchanged}}}, policy
-        {project|global {imported, unchanged}}, files_kept}. Exit 4 under the
+        {project|global {imported, unchanged}}, service {placed, unchanged},
+        files_kept}. A capability the project enables itself whose service
+        the files ran here stays placed: the import writes the project's row
+        naming this node with its service placed (service.placed), as
+        `place` would. Exit 4 under the
         read-only switch, 5 when the store cannot be reached.
 
   migrate [--dry-run|--apply] [--answers FILE]
@@ -1474,10 +1499,10 @@ def _store_module():
 # whether the switch is on is the store tier's answer, never the manager's own.
 READ_ONLY_REFUSED_VERBS = ("agent convert", "agent set", "allow", "connections import",
                            "disable", "enable", "inherit", "init", "node add", "node remove",
-                           "node set", "quarantine", "references export",
+                           "node set", "place", "quarantine", "references export",
                            "references import", "references retire", "references save",
                            "relabel", "set",
-                           "store set", "store unset")
+                           "store set", "store unset", "unplace")
 
 
 def _read_only_gate(verb: str) -> None:
@@ -3051,6 +3076,9 @@ def _validate_manifest(name: str, manifest) -> list[str]:
             verbs = service.get("verbs")
             if not isinstance(verbs, list) or not all(isinstance(v, str) for v in verbs):
                 problems.append("service.verbs is not a list of strings")
+            if "placement" in service and service["placement"] not in SERVICE_PLACEMENTS:
+                problems.append(f"service.placement must be one of "
+                                f"{'|'.join(SERVICE_PLACEMENTS)}")
             if "deploy" in service:
                 problems.extend(_validate_service_deploy(service["deploy"]))
             if "machine" in service:
@@ -9429,6 +9457,7 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False,
               node: str | None = None) -> None:
     root = _project_root()
     migrated: list[str] = []
+    was_placed = False
     if scope == "project":
         root = _require_project()
         migrated = _ensure_envelope(root)
@@ -9442,6 +9471,8 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False,
         try:
             node = _gate_node(node, root, adapter)
             _stamp_policy(adapter, root, scope)
+            was_placed = (not enabled and scope == "project" and node is not None
+                          and node in adapter.placed_nodes(name))
             adapter.set("capabilities", "policy", name, {"enabled": enabled},
                         actor="capabilities", scope=scope, node=node)
             gate_source = _gate_source(adapter, root, scope)
@@ -9456,6 +9487,10 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False,
                     "scope": scope, "gate": gate_source}
     if node is not None:
         result["node"] = node
+    if was_placed:
+        result["unplaced"] = node
+        result["warning"] = _unplaced_warning(name, node, "the row disabled")
+        _warn(result["warning"])
     if migrated:
         result["migrated_from"] = str(root / LEGACY_PROJECT_CAPABILITIES_REL)
     if scope == "project" and enabled:
@@ -9572,8 +9607,70 @@ def _arrival_global_enable(name: str, undo: bool = False) -> dict | None:
         conn.close()
 
 
+SERVICE_PLACEMENTS = ("exclusive", "shared")
+
+
+def _installed_service(name: str) -> dict | None:
+    """The bundled service an installed capability declares, or None."""
+    manifest = _read_json(CAP_HOME / name / "manifest.json")
+    service = manifest.get("service") if isinstance(manifest, dict) else None
+    return service if isinstance(service, dict) else None
+
+
+def _service_placement(service: dict) -> str:
+    """How many nodes a service runs on at once: `exclusive`, one at a time,
+    unless its descriptor declares it `shared`."""
+    return "shared" if service.get("placement") == "shared" else "exclusive"
+
+
+def _place_service(name: str, placed: bool, node: str | None) -> None:
+    """Place this project's bundled service of `name` on a node, or take it off,
+    leaving where the capability is usable as it is. An exclusive service
+    placed on one node is taken off every other in the same write."""
+    root = _require_project()
+    _ensure_envelope(root)
+    verb = "place" if placed else "unplace"
+    if node is None:
+        _die(6, "input", f"{verb} needs --node <node>")
+    if name not in _installed():
+        _die(3, "not_installed", f"{name} is not installed",
+             f"run `capabilities install {name}`")
+    service = _installed_service(name)
+    if service is None:
+        _die(6, "no_service", f"{name} bundles no service, so there is nothing to {verb}")
+    mode = _service_placement(service)
+    adapter = _records_for(root)
+    try:
+        node = _gate_node(node, root, adapter)
+        _stamp_policy(adapter, root, "project")
+        answer = adapter.place(name, node, placed, exclusive=mode == "exclusive",
+                               actor="capabilities")
+        on = adapter.placed_nodes(name)
+        gate_source = _gate_source(adapter, root, "project")
+    except _store_module().StoreError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    finally:
+        adapter.close()
+    result: dict = {("placed" if placed else "unplaced"): name, "node": node,
+                    "placement": mode, "changed": answer["changed"],
+                    "placed_on": on, "gate": gate_source}
+    if answer["unplaced"]:
+        result["unplaced_from"] = answer["unplaced"]
+    if answer.get("enabled_on_node"):
+        result["enabled_on_node"] = True
+    _emit(result)
+
+
+def _unplaced_warning(name: str, node: str, by: str) -> str:
+    return (f"{by} placed {name}'s service on {node}, so it no longer runs there; "
+            f"to move a service and leave where {name} is usable as it is, use "
+            f"`capabilities place {name} --node <node>` and `capabilities unplace "
+            f"{name} --node {node}`")
+
+
 def _inherit_gate(name: str, scope: str, node: str | None = None) -> None:
     root = _project_root()
+    was_placed = False
     if scope == "project":
         root = _require_project()
         _ensure_envelope(root)
@@ -9582,6 +9679,8 @@ def _inherit_gate(name: str, scope: str, node: str | None = None) -> None:
         try:
             node = _gate_node(node, root, adapter)
             _stamp_policy(adapter, root, scope)
+            was_placed = (scope == "project" and node is not None
+                          and node in adapter.placed_nodes(name))
             removed = adapter.delete("capabilities", "policy", name, scope=scope,
                                      node=node)
             gate_source = _gate_source(adapter, root, scope)
@@ -9596,6 +9695,10 @@ def _inherit_gate(name: str, scope: str, node: str | None = None) -> None:
               "gate": gate_source}
     if node is not None:
         result["node"] = node
+    if root is not None and was_placed:
+        result["unplaced"] = node
+        result["warning"] = _unplaced_warning(name, node, "the row removed")
+        _warn(result["warning"])
     _refresh_after_gate(root, result)
     _emit(result)
 
@@ -10488,6 +10591,12 @@ def _import_record_rows(conn, agent_id: str, node: str, plan: dict) -> dict:
                              "it for every project and this project's files do not "
                              "resolve it")
 
+    # A service the files ran here - the project enables its capability itself,
+    # which in files mode places it on every machine reading them - stays
+    # placed on this node: the import writes the project's row naming it, or
+    # the service would stop here once the gate is read from the store.
+    placing = {cap for cap, enabled in plan["policy"].get("project", {}).items()
+               if enabled and cap in plan.get("services", ())}
     held_policy = {(scope_of(agent), cap, row_node): enabled
                    for agent, cap, row_node, enabled in conn.execute(
                        "SELECT agent_id, capability, node, enabled "
@@ -10508,11 +10617,27 @@ def _import_record_rows(conn, agent_id: str, node: str, plan: dict) -> dict:
             else:
                 conflicts.append(f"{cap} {scope} policy for every node: the store holds "
                                  f"enabled={found}, the files enabled={enabled}")
+    placed: dict = {"placed": [], "unchanged": []}
+    for cap in sorted(placing):
+        found = held_policy.get(("project", cap, node))
+        if found is None:
+            writes.append((
+                "INSERT INTO capabilities_policy "
+                "(agent_id, capability, node, enabled, service) "
+                "VALUES (%s, %s, %s, true, true)", (agent_id, cap, node)))
+            placed["placed"].append(cap)
+        elif found:
+            placed["unchanged"].append(cap)
+        else:
+            conflicts.append(f"{cap} project policy for node {node!r}: the store holds "
+                             "enabled=false, the files enable it and run its service")
     for (scope, cap, row_node) in sorted(held_policy,
                                          key=lambda k: (k[0], k[1], k[2] or "")):
         where = f"node {row_node!r}" if row_node else "every node"
         if scope == "project":
             if row_node is None and cap in plan["policy"].get("project", {}):
+                continue
+            if row_node == node and cap in placing:
                 continue
             conflicts.append(f"{cap} project policy for {where}: the store holds it "
                              "and the files do not")
@@ -10532,7 +10657,7 @@ def _import_record_rows(conn, agent_id: str, node: str, plan: dict) -> dict:
             "enable|disable|inherit`), or the files - and import again")
     for query, params in writes:
         conn.execute(query, params)
-    return {"identifiers": identifiers, "policy": policy}
+    return {"identifiers": identifiers, "policy": policy, "service": placed}
 
 
 def _import_records_verify(files, stored, plan: dict) -> None:
@@ -10660,6 +10785,8 @@ def cmd_connections_import() -> None:
     try:
         plan, skipped = _import_plan(files, names)
         records_plan = _import_records_plan(files, _import_identifier_names(envelope))
+        records_plan["services"] = {name for name in records_plan["policy"].get("project", {})
+                                    if "deploy" in (_installed_service(name) or {})}
         major, minor = store.STORE_TABLES_VERSION
         db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
                    major=major, minor=minor)
@@ -10708,6 +10835,7 @@ def cmd_connections_import() -> None:
            "skipped": skipped,
            "identifiers": records_imported["identifiers"],
            "policy": records_imported["policy"],
+           "service": records_imported["service"],
            "files_kept": sorted(str(p) for p in kept)})
 
 
@@ -12557,12 +12685,14 @@ def _migrate_write_records(ctx: dict, plan: dict) -> dict:
         for row in records["policy"] + [r for r in plan["placement"] if r["outcome"] == "write"]:
             if row.get("outcome") == "held":
                 continue
+            # A placement row places the service where it enables the capability.
             conn.execute(
-                "INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
-                "VALUES (%s, %s, %s, %s) ON CONFLICT ((coalesce(agent_id, '')), capability, "
-                "(coalesce(node, ''))) DO UPDATE SET enabled = EXCLUDED.enabled, "
+                "INSERT INTO capabilities_policy (agent_id, capability, node, enabled, "
+                "service) VALUES (%s, %s, %s, %s, %s) ON CONFLICT "
+                "((coalesce(agent_id, '')), capability, (coalesce(node, ''))) "
+                "DO UPDATE SET enabled = EXCLUDED.enabled, service = EXCLUDED.service, "
                 "updated_at = now()", (agent_id, row["capability"], row["node"],
-                                       row["enabled"]))
+                                       row["enabled"], bool(row["enabled"] and row["node"])))
             written["placement" if row["node"] else "policy"] += 1
         return written
     return _migrate_kernel(ctx, work)
@@ -19888,6 +20018,10 @@ def main() -> None:
             _die(6, "input", "disable needs a capability name")
         scope = _gate_scope(flag("--project"), flag("--global"))
         _set_gate(pos[0], False, scope, deny=flag("--deny"), node=opt("--node"))
+    elif cmd in ("place", "unplace"):
+        if not pos:
+            _die(6, "input", f"{cmd} needs a capability name")
+        _place_service(pos[0], cmd == "place", opt("--node"))
     elif cmd == "inherit":
         if not pos:
             _die(6, "input", "inherit needs a capability name")

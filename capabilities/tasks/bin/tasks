@@ -1864,6 +1864,9 @@ TABLES = True       # tasks_* tables in the project's store, built by _tables()
 INVENTORY = {"network": "none"}   # the service's state on this machine; the queue is the store's
 POST_INSTALL: list[dict] = []
 SERVICE = {
+    # How many nodes run it at once (service.placement). Turns are claimed row by row
+    # under a lease, so any node it is placed on may run it.
+    "placement": "shared",
     "name": "conveyor",
     "summary": ("Project-local daemon that runs one turn of the conveyor for each "
                 "worker lane with work, woken by the store."),

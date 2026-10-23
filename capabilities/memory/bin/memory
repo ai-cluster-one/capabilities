@@ -389,6 +389,9 @@ POST_INSTALL: list[dict] = []
 # block carries no entry and stays far below it.
 CONTRIBUTION = {"path": "state/context.md", "max_bytes": 32768}
 SERVICE = {
+    # How many nodes run it at once (service.placement). Writes and consolidation take
+    # advisory locks in the store, so any node it is placed on may run it.
+    "placement": "shared",
     "name": "memory",
     "summary": ("Keeps each served project's memory block rendered as the store announces "
                 "changes, and consolidates a project's memory when its window no longer "

@@ -614,6 +614,9 @@ INVENTORY = {"network": "none"}   # the daemon's state is pid and health files o
 SERVICE_STATE_VERSION = 1
 POST_INSTALL: list = []
 SERVICE = {
+    # How many nodes run it at once (service.placement). One Telegram account is one
+    # MTProto session: one node runs it at a time.
+    "placement": "exclusive",
     "name": "assistant",
     "summary": "Project-local Telegram assistant daemon using the bundled service engine.",
     "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs",

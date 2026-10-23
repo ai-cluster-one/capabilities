@@ -1,5 +1,9 @@
 # slack — change log
 
+## 2026-10-23 — The service declares how many nodes run it at once
+
+The service descriptor declares `service.placement` `exclusive`: one node runs the service at a time, the deployment runner's lease holds it there, and `capabilities place slack --node <node>` moves it, leaving `slack` usable on the node it left.
+
 ## 2026-10-16 — A moved agent keeps one allow-list in its slack settings
 
 For an agent whose records moved into the store, `slack read` and `post` judge conversations by the `direct_messages`, `allowed_users`, `allowed_channels` and `default_channel_policy` of its slack settings - the allow-list the service admits by - edited with `slack settings set`, and a refusal names the settings verb; `service init` writes the template beside an allow-list set before the service was, and `service status` counts such settings as not yet initialized. The daemon is started without `SLACK_SERVICE_SETTINGS`, which is ignored with a notice. Every other project reads policy.json as before.

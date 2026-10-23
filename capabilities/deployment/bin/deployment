@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.12,<1",
+#     "capabilities-contract>=0.17,<1",
 # ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
@@ -126,11 +126,16 @@ USAGE
       (service_policy.reconcile_seconds, default 60, 5-3600) it reads the gate
       for <name> in this project on this node (AGENT_NODE_NAME, else the host
       name): in store mode only the project's row naming this node places the
-      service, in files mode the project's own enable does (the runtime
-      declaration having already chosen which services are compiled), and
-      nothing inherited or global places it. Placed, it takes or renews the service's
+      service, by its service flag (`capabilities place|unplace`), apart from
+      whether that row makes the CLI usable here; in files mode the
+      project's own enable does (the runtime declaration having already
+      chosen which services are compiled), and nothing inherited or global
+      places it. Placed, an exclusive service - the default, as its
+      descriptor's service.placement declares - takes or renews the service's
       lease, a row in the project's store naming the holding node and
-      expiring after three reconciles, starts <command> in a process group of
+      expiring after three reconciles, so it runs on one node at a time; a
+      shared service takes no lease and runs on every node it is placed on.
+      Either way it starts <command> in a process group of
       its own and restarts it per POLICY (no|on-failure|always|unless-stopped);
       a service that exits 4, the contract's policy refusal, is not restarted:
       the runner releases the lease and holds it idle, reporting the refusal
@@ -145,7 +150,8 @@ USAGE
 
   deployment services
       This node's view of each compiled service: what the gate answers for
-      it here (placed, the row that answered: scope, node, enabled, and why),
+      it here (placed, the row that answered: scope, node, enabled, service,
+      and why),
       whether its runner is running it, a refusal it is held idle for, and
       who holds its lease (state, holder, expiry). Writes nothing.
 
@@ -273,7 +279,9 @@ USAGE
       connection the node was created through, whose token the node does
       not hold - into each capability's credentials.env on the node's
       config volume; place each named service
-      on the node (`capabilities enable <name> --project --node <node>`);
+      on the node (`capabilities place <name> --node <node>`), which takes an
+      exclusive service off the node it ran on before (unplaced) and leaves
+      where the capability is usable as it is;
       and write the store setting this project resolves with the node's own
       `capabilities store set`, last, since it is what the waiting node
       raises the agent on. Secrets travel on standard input and are never
@@ -5162,7 +5170,8 @@ def _iso(moment) -> str | None:
 def _gate_answer(name: str) -> dict:
     """What the gate answers for `name` on this node, and whether that places
     its service here. In store mode only the project's row naming this node
-    places it; in files mode, which carries no node, the project's own enable
+    places it, by its `service`, apart from whether it makes the CLI usable
+    here; in files mode, which carries no node, the project's own enable
     does. Nothing inherited or global places a service."""
     node = node_name()
     answer: dict = {"node": node, "records": None, "placed": False, "row": None}
@@ -5178,11 +5187,14 @@ def _gate_answer(name: str) -> dict:
     enabled = isinstance(value, dict) and value.get("enabled") is True
     scope = (row or {}).get("scope")
     named = (row or {}).get("node")
+    service = (row or {}).get("service") is True
     if row is not None:
         answer["row"] = {"scope": scope, "node": named,
                          "enabled": value.get("enabled") if isinstance(value, dict) else None}
+        if answer["records"] == "store":
+            answer["row"]["service"] = service
     if answer["records"] == "store":
-        answer["placed"] = enabled and scope == "project" and named == node
+        answer["placed"] = enabled and scope == "project" and named == node and service
         if row is None:
             answer["reason"] = f"no policy row answers for {name} on {node}"
         elif scope != "project":
@@ -5193,8 +5205,11 @@ def _gate_answer(name: str) -> dict:
                                 f"naming {node} places the service here")
         elif not enabled:
             answer["reason"] = f"the project's row for {node} disables {name}"
+        elif not service:
+            answer["reason"] = (f"the project's row for {node} enables {name} without "
+                                "placing its service here")
         else:
-            answer["reason"] = f"the project's row for {node} enables {name}"
+            answer["reason"] = f"the project's row for {node} places {name}'s service"
     else:
         answer["placed"] = enabled and scope == "project"
         if answer["placed"]:
@@ -5206,6 +5221,16 @@ def _gate_answer(name: str) -> dict:
             answer["reason"] = (f"the project does not enable {name} itself, and nothing "
                                 "inherited or global places a service")
     return answer
+
+
+def _service_placement(name: str) -> str:
+    """How many nodes `name`'s service runs on at once, as its installed
+    descriptor declares: `shared`, or `exclusive`, the default, which the
+    lease holds to one node."""
+    manifest, _err = _installed_manifest(name)
+    service = (manifest or {}).get("service")
+    return ("shared" if isinstance(service, dict) and service.get("placement") == "shared"
+            else "exclusive")
 
 
 def _runner_project_key(root: Path) -> str:
@@ -5652,7 +5677,16 @@ class _Runner:
             self.converge()
             self.save()
             return
-        if placed:
+        shared = placed and _service_placement(self.name) == "shared"
+        if shared:
+            # A shared service runs on every node it is placed on, so it takes
+            # no lease, and gives up one it held while it was exclusive.
+            lease = self.lease.release_if_held(self.name, self.lease_state)
+            want = True
+            reason = (f"{gate.get('reason') or 'placed'}; a shared service, so it runs on "
+                      "every node it is placed on")
+            key = ("shared",)
+        elif placed:
             lease = self.lease.acquire(self.name)
             state = lease.get("state")
             if state == "held":
@@ -7710,9 +7744,12 @@ def cmd_node_enrol(args):
     written = json.loads(_agent_node_exec(root, host, container, ["python3", "-c", _AGENT_NODE_SECRETS],
                                           stdin=json.dumps(secrets)) or "{}") if secrets else {}
     placed = []
+    unplaced: dict[str, list[str]] = {}
     for name in services:
-        _manager(root, "enable", name, "--project", "--node", node)
+        moved = _manager(root, "place", name, "--node", node)
         placed.append(name)
+        if moved.get("unplaced_from"):
+            unplaced[name] = moved["unplaced_from"]
     _agent_node_exec(root, host, container, ["capabilities", *store_args], stdin=password)
     deadline = time.monotonic() + args.wait
     state = ""
@@ -7723,7 +7760,8 @@ def cmd_node_enrol(args):
         time.sleep(10)
     answer = {"ok": state.startswith("running agent"), "node": node, "public_key": public_key,
               "secrets": {name: sorted(keys) for name, keys in secrets.items()},
-              "secrets_written": written, "store": "written", "placed": placed, "state": state}
+              "secrets_written": written, "store": "written", "placed": placed,
+              "unplaced": unplaced, "state": state}
     if not answer["ok"]:
         _emit(answer)
         raise NodeFailure("node_not_raised", f"node {node} did not raise its agent within "

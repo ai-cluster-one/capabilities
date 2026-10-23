@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-10-23 — The service declares how many nodes run it at once
+
+The service descriptor declares `service.placement` `shared`: the service runs on every node it is placed on (`capabilities place memory --node <node>`), and the deployment runner takes no lease for it. A project that had it placed on more than one node, where the lease ran it on one, runs it on each of them.
+
 ## 2026-10-22 — A project without project.json joins the service; its slug is its agent's row
 
 `service join` and the service's state take the project's slug from `_project_slug` (its agent's row in the store, else an older `project.json`'s, else its id) and need only its id. Declares `capabilities-contract>=0.12,<1`.

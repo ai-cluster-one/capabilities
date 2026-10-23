@@ -711,6 +711,9 @@ TABLES = True       # whatsapp_* tables in the project's database, built by _tab
 INVENTORY = {"network": "none"}   # the assistant service's state is files on this machine
 POST_INSTALL: list = []
 SERVICE = {
+    # How many nodes run it at once (service.placement). One linked device: two
+    # clients on it desync the account, so one node at a time.
+    "placement": "exclusive",
     "name": "assistant",
     "summary": ("Long-running listener that holds one account's WhatsApp "
                 "connection, captures every message live into the store, "

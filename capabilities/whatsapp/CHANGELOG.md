@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-10-23 — The service declares how many nodes run it at once
+
+The service descriptor declares `service.placement` `exclusive`: one node runs the service at a time, the deployment runner's lease holds it there, and `capabilities place whatsapp --node <node>` moves it, leaving `whatsapp` usable on the node it left.
+
 ## 2026-10-22 — A connection is linked by QR before it names an account, and a first link that fails leaves nothing
 
 `whatsapp pair --qr` links an in-house connection that has neither `number` nor `expected_account_id`, where it refused as `no_account_identity` before the QR was shown: it pairs in a home named for the connection, keys the store by the account once the pairing names it, writes that account to the connection as `expected_account_id` (`identity_bound` in the result) at the moment the phone links, with the account's name already leading to the pairing home so every other verb finds the session during the history burst, and moves the home under the account once the engine lets go of it. `pair --events` on such a connection asks `phone_needed` for a pairing code. Under `--events`, a connection's first link - it binds no account and has no state home - that ends in a refusal, an error, closed input or a cancellation (SIGTERM, SIGINT, SIGHUP, refused as `cancelled`, exit 6) removes the connection through `connection remove` and the home it made; a connection that was ever linked is never touched, and without `--events` the verb is unchanged.

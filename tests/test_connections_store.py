@@ -800,6 +800,57 @@ def test_a_policy_row_is_written_and_removed_for_one_node(lab):
     assert deny.returncode == 6 and "--deny takes no --node" in _error(deny)["message"]
 
 
+def test_a_service_moves_between_nodes_and_its_capability_stays_usable_on_both(lab):
+    # The defect: moving a service off a node turned its capability off there.
+    # Placing the service and making the capability usable are answers apart.
+    _import(lab)
+    registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"
+    registry.mkdir(parents=True)
+    (registry / "coolify").write_text("#!/bin/sh\n")
+
+    def declare(placement: str) -> None:
+        (registry / "manifest.json").write_text(json.dumps({"name": "coolify", "service": {
+            "name": "svc", "summary": "s", "verbs": [], "placement": placement}}))
+
+    def rows():
+        return _rows(lab, "SELECT node, enabled, service FROM capabilities_policy "
+                          "WHERE capability = 'coolify' ORDER BY node NULLS FIRST")
+
+    here, there = {"AGENT_NODE_NAME": NODE}, {"AGENT_NODE_NAME": "box-node"}
+    declare("exclusive")
+    _ok(_manager(lab, "enable", "coolify", "--project", "--node", NODE))
+    assert rows() == [(None, True, False), (NODE, True, True)]
+    moved = _ok(_manager(lab, "place", "coolify", "--node", "box-node"))
+    assert {k: moved[k] for k in ("placed", "node", "placement", "changed", "placed_on",
+                                  "unplaced_from", "enabled_on_node")} == {
+        "placed": "coolify", "node": "box-node", "placement": "exclusive", "changed": True,
+        "placed_on": ["box-node"], "unplaced_from": [NODE], "enabled_on_node": True}
+    assert rows() == [(None, True, False), ("box-node", True, True), (NODE, True, False)]
+    _ok(_coolify(lab, "deploy", "x", extra=here))
+    _ok(_coolify(lab, "deploy", "x", extra=there))
+    assert _ok(_manager(lab, "place", "coolify", "--node", "box-node"))["changed"] is False
+    # A shared service is placed beside the nodes it runs on.
+    declare("shared")
+    shared = _ok(_manager(lab, "place", "coolify", "--node", NODE))
+    assert shared["placed_on"] == ["box-node", NODE] and "unplaced_from" not in shared
+    unplaced = _ok(_manager(lab, "unplace", "coolify", "--node", NODE))
+    assert unplaced["placed_on"] == ["box-node"]
+    assert rows() == [(None, True, False), ("box-node", True, True), (NODE, True, False)]
+    _ok(_coolify(lab, "deploy", "x", extra=here))
+    # disable --node and inherit --node say when they take the service off.
+    disabled = _ok(_manager(lab, "disable", "coolify", "--project", "--node", "box-node"))
+    assert disabled["unplaced"] == "box-node" and "place" in disabled["warning"]
+    refused = _manager(lab, "place", "coolify", "--node", "box-node")
+    assert refused.returncode == 6 and _error(refused)["code"] == "disabled_on_node"
+    _ok(_manager(lab, "enable", "coolify", "--project", "--node", "box-node"))
+    inherited = _ok(_manager(lab, "inherit", "coolify", "--project", "--node", "box-node"))
+    assert inherited["unplaced"] == "box-node" and "warning" in inherited
+    assert "unplaced" not in _ok(_manager(lab, "inherit", "coolify", "--project",
+                                          "--node", NODE))
+    (registry / "manifest.json").write_text(json.dumps({"name": "coolify"}))
+    assert _error(_manager(lab, "place", "coolify", "--node", NODE))["code"] == "no_service"
+
+
 def test_a_store_mode_project_marked_only_by_project_json_gets_no_file_gate(lab):
     # A project whose records are in the store keeps its gate in the store, so
     # project.json alone marks it and no write brings back a file gate.
