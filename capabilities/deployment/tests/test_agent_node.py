@@ -25,7 +25,8 @@ class Fake:
         self.rows: dict[str, dict] = {}
         self.fail_add = False
         self.secret_file = tmp_path / ".env.local"
-        self.secret_file.write_text("TELEGRAM_BOT_TOKEN=bot-secret\n")
+        self.secret_file.write_text("TELEGRAM_BOT_TOKEN=bot-secret\n"
+                                    "COOLIFY_INFRA_TOKEN=coolify-secret\n")
         self.state = "running agent prj_00000000a1a1 as node box1"
 
     def __call__(self, argv, root, *, stdin=None, timeout=120, check=True, env=None):
@@ -49,6 +50,12 @@ class Fake:
                 return json.dumps({"message": "deleted"})
             if args[:1] == ["servers"]:
                 return json.dumps({"uuid": args[1], "ip": "203.0.113.7", "name": "srv"})
+            if args == ["connections"]:
+                return json.dumps({"connections": {"infra": {"keys": [
+                    {"key": "base_url", "secret": False, "set": True,
+                     "tier": "connection", "source": "store"},
+                    {"key": "COOLIFY_INFRA_TOKEN", "secret": True, "set": True,
+                     "tier": "project", "source": str(self.secret_file)}]}}})
             raise AssertionError(args)
         if tool == "capabilities":
             if args[:2] == ["node", "list"]:
@@ -220,6 +227,20 @@ def test_enrol_gives_the_node_its_key_secrets_placements_and_store(lab, capsys):
     assert answer["ok"] is True and answer["placed"] == ["tasks", "automations"]
     assert answer["secrets"] == {"telegram": ["TELEGRAM_BOT_TOKEN"]}
     assert "bot-secret" not in json.dumps(answer)
+
+
+def test_enrol_leaves_the_coolify_token_the_node_was_created_through_here(lab, monkeypatch,
+                                                                         capsys):
+    monkeypatch.setattr(lab.m, "_enabled_capabilities", lambda root: ["coolify", "telegram"])
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+
+    [secrets] = [c for c in lab.fake.of("ssh")
+                 if "docker exec" in c["argv"][-1] and "python3" in c["argv"][-1]]
+    assert json.loads(secrets["stdin"]) == {"telegram": {"TELEGRAM_BOT_TOKEN": "bot-secret"}}
+    assert "coolify-secret" not in secrets["stdin"]
+    assert json.loads(capsys.readouterr().out)["secrets"] == {"telegram": ["TELEGRAM_BOT_TOKEN"]}
 
 
 def test_enrol_reports_a_node_that_did_not_raise_its_agent(lab, capsys):

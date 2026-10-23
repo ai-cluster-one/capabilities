@@ -247,8 +247,10 @@ USAGE
       ~/.config/agent-node/node-key.pem, mode 0600) and record its public
       key on the node row; write the agent's secrets - every secret key of a
       connection the agent's enabled capabilities resolve here, read where
-      each capability's `connections` says it is - into each capability's
-      credentials.env on the node's config volume; place each named service
+      each capability's `connections` says it is, except the coolify
+      connection the node was created through, whose token the node does
+      not hold - into each capability's credentials.env on the node's
+      config volume; place each named service
       on the node (`capabilities enable <name> --project --node <node>`);
       and write the store setting this project resolves with the node's own
       `capabilities store set`, last, since it is what the waiting node
@@ -7392,10 +7394,12 @@ def _agent_node_exec(root, host, container, argv, *, stdin=None, timeout=120):
                      stdin=stdin, timeout=timeout)
 
 
-def _agent_node_secrets(root, capabilities):
+def _agent_node_secrets(root, capabilities, withheld=None):
     """{capability: {KEY: value}}: every secret key of a connection each of
     these capabilities resolves for this agent, read where its own
-    `connections` answer says the value is."""
+    `connections` answer says the value is, except the connections
+    `withheld` names per capability."""
+    withheld = withheld or {}
     out = {}
     for name in capabilities:
         p = _node_run([name, "connections"], root, check=False, timeout=120)
@@ -7404,7 +7408,9 @@ def _agent_node_secrets(root, capabilities):
         except ValueError:
             listed = {}
         keys = {}
-        for connection in (listed.get("connections") or {}).values():
+        for cid, connection in (listed.get("connections") or {}).items():
+            if cid in withheld.get(name, ()):
+                continue
             for key in (connection or {}).get("keys") or []:
                 if not (isinstance(key, dict) and key.get("secret") and key.get("set")
                         and _safe_env_key(str(key.get("key") or ""))):
@@ -7526,7 +7532,10 @@ def cmd_node_enrol(args):
     _manager(root, "node", "set", node, "--public-key", public_key)
     # The agent's secrets go first and the store setting last: the setting is
     # what the waiting node raises the agent on, so it finds them all there.
-    secrets = _agent_node_secrets(root, sorted({*_enabled_capabilities(root), *services}))
+    # The coolify connection the node was created through stays here: the
+    # row names it, and the node does not hold its token.
+    secrets = _agent_node_secrets(root, sorted({*_enabled_capabilities(root), *services}),
+                                  {"coolify": {row["coolify_connection"]}})
     written = json.loads(_agent_node_exec(root, host, container, ["python3", "-c", _AGENT_NODE_SECRETS],
                                           stdin=json.dumps(secrets)) or "{}") if secrets else {}
     placed = []
