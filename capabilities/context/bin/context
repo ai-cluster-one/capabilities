@@ -686,6 +686,9 @@ def _folder(given: str | None, is_global: bool) -> Path:
     if error:
         _die(error["exit"], error["code"], error["message"], error.get("hint"))
     layer = (answer.get("layers") or {}).get("context")
+    if isinstance(layer, dict):
+        # A layer the store holds: the folder its import and export default to.
+        layer = layer.get("folder")
     if not layer:
         _die(6, "no_context_layer", "the capabilities manager names no context layer here",
              "name the folder: DIR")

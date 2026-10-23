@@ -912,6 +912,47 @@ def test_build_composes_the_routine_index_from_the_routines_in_the_store(lab):
     assert "routine layer not present" not in from_store
 
 
+def test_path_names_the_store_as_the_home_of_a_layer_the_store_holds(lab):
+    project = lab.project
+    (project / ".contextkit").mkdir()
+    (project / ".contextkit" / "config.toml").write_text(
+        f'version = 1\ntype = "agent-project"\n\n[identity]\nid = "{PROJECT_ID}"\n')
+    stored = ("context", "assets", "routines")
+    for name in stored:
+        (project / name).mkdir()
+
+    def layers() -> dict:
+        result = lab.run("path", "--json")
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)["layers"]
+
+    in_folders = layers()
+    assert {name: in_folders[name] for name in stored} == {
+        name: str((project / name).resolve()) for name in stored}
+
+    # The store holds the agent's documents, routines and an asset: each of
+    # those layers names the store and the command that lists it, and keeps
+    # the folder its import and export default to.
+    _seed_context_documents(lab, [(PROJECT_ID, "identity/MISSION", False,
+                                   [(*_CONTEXT_FILES["identity/MISSION"], True)])])
+    _seed_routines(lab, [(PROJECT_ID, "alpha", False, [("Run first.", "# Alpha\n", True)])])
+    with lab.cluster.connect(lab.database) as conn:
+        conn.execute(f"CREATE TABLE {SCHEMA}.assets_documents (project_id text NOT NULL, "
+                     "name text NOT NULL, retired_at timestamptz)")
+        conn.execute(f"INSERT INTO {SCHEMA}.assets_documents (project_id, name) "
+                     "VALUES (%s, 'plans/x')", (PROJECT_ID,))
+    reads = {"context": "context list", "assets": "assets list",
+             "routines": "routine list --store"}
+    in_store = {name: {"where": "store", "read": reads[name], "folder": in_folders[name]}
+                for name in stored}
+    assert layers() == {**in_folders, **in_store}
+
+    # Without the folders the answer stays the store's.
+    for name in stored:
+        shutil.rmtree(project / name)
+    assert layers() == {**in_folders, **in_store}
+
+
 def test_build_indexes_a_global_routine_once_the_agent_enables_it(lab):
     project = lab.project
     (project / ".contextkit").mkdir()
@@ -1059,8 +1100,10 @@ def test_an_agent_without_a_contextkit_binding_keeps_its_settings_in_its_row(lab
     shutil.rmtree(records, ignore_errors=True)
     path = folder.ok("path", "--json")
     assert path["project_envelope"] == str(folder.path / "agent" / "capabilities")
+    # It has no context folder, so its context is the store's (as `build` reads it).
     assert (path["body_root"], path["layers"]["context"]) == (
-        "agent", str(folder.path / "agent" / "context"))
+        "agent", {"where": "store", "read": "context list",
+                  "folder": str(folder.path / "agent" / "context")})
     assert "This project keeps its visible body under `agent/`." in folder.ok(
         "build", "--print", "--json")["text"]
 

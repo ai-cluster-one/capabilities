@@ -1169,6 +1169,9 @@ def _folder(given: str | None) -> Path:
     if error:
         _die(error["exit"], error["code"], error["message"], error.get("hint"))
     layer = (answer.get("layers") or {}).get("routines")
+    if isinstance(layer, dict):
+        # A layer the store holds: the folder its import and export default to.
+        layer = layer.get("folder")
     if not layer:
         _die(6, "no_routines_layer", "the capabilities manager names no routines layer here",
              "name the folder: DIR")

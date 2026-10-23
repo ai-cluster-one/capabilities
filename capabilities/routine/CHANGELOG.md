@@ -1,5 +1,9 @@
 # routine — change log
 
+## 2026-10-23 — import and export find the routines folder of an agent whose routines the store holds
+
+`routine import` and `routine export` without DIR take the folder from the manager's `path --json` answer also where it names the routines layer as held in the store (`{"where": "store", ..., "folder": <path>}`), so they default to the same folder as before.
+
 ## 2026-10-23 — A global routine is written once and taken up by each project that enables it, and only its author project changes it
 
 `routine save <name> --global` keeps a routine of no project in the store, authored by the project that first saves it; `list --store --global` lists them with their authors, and `show`, `history` and `diff` read one with `--global`, from a project or outside one. A global routine reaches a project only once it runs `routine enable <name>`, recorded with who and when, and leaves it on `routine disable <name>`: enabled, it is in that project's `list --store` (marked global, with its author), `show`, `history`, `diff` and `titles`, and in the routine index the manager builds, at its active version. A routine of the project's own with the same name shadows it, and `list --store` marks the project's routine as shadowing one. Only the current author project saves a new version of a global routine, retires it, or hands it on with `routine transfer <name> --to <project id>`; any other project is refused with exit 4 `not_author`. The ledger goes to 1.1: `routine_documents.project_id` is NULL for a global routine and `author_project_id` names its author, and `routine_enablements` holds what each project has enabled. A routine CLI of ledger 1.0 reads a 1.1 store as before. Project routines and every other verb are unchanged.

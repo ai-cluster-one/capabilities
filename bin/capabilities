@@ -86,6 +86,13 @@ PROJECT PATH VERB
         names (see THE PROJECT ENVELOPE). ContextKit-bound projects must
         return a usable absolute in-project path; a broken binding is an
         error, never a fallback.
+        body_root and layers name the agent's body: each of context, assets,
+        routines and capabilities as the absolute path of its folder, except
+        a layer the agent keeps in its store, decided as `build` decides it,
+        which is {where: "store", read, folder}: read the command that lists
+        it (context list, assets list, routine list --store), folder where its
+        import and export default to. While the store does not answer, each
+        layer is its folder.
         --identity adds project_identity: the project id
         (CAPABILITIES_PROJECT_ID) and its state - handed (the process
         environment's, for this root), declared (the project root's
@@ -2242,6 +2249,29 @@ def _project_id_for_write(root: Path) -> str | None:
     return state["id"]
 
 
+# The command that lists a body layer the store holds, by layer.
+STORE_LAYER_READS = {"context": "context list", "assets": "assets list",
+                     "routines": "routine list --store"}
+
+
+def _layers_in_store(root: Path, layers: dict) -> set[str]:
+    """The body layers this agent keeps in its store, decided as the context
+    build decides them: its context where `_ck_context_held` says so, its
+    routines where the store holds one, its assets where the store holds an
+    asset document or file. A layer whose store does not answer is not among
+    them, so its folder stands as the answer."""
+    reads = {"context": lambda: _ck_context_held(_ck_stored_rows(root, False),
+                                                 layers["context"]),
+             "routines": lambda: _ck_stored_routine_rows(root) is not None,
+             "assets": lambda: bool(_ck_stored_assets(root))}
+    held = set()
+    for name, read in reads.items():
+        code, found, _err = _ck_in_process(read)
+        if code == 0 and found:
+            held.add(name)
+    return held
+
+
 def cmd_path(json_output: bool, identity: bool = False) -> None:
     if not json_output:
         _die(6, "input", "path requires --json")
@@ -2254,12 +2284,15 @@ def cmd_path(json_output: bool, identity: bool = False) -> None:
     else:
         provider = "default"
     body = _project_body(root)
+    held = _layers_in_store(root, body["layers"])
     answer = {
         "project_root": str(root),
         "project_envelope": str(envelope),
         "provider": provider,
         "body_root": body["body_root"].as_posix(),
-        "layers": {name: str(path.resolve()) for name, path in body["layers"].items()},
+        "layers": {name: {"where": "store", "read": STORE_LAYER_READS[name],
+                          "folder": str(path.resolve())} if name in held
+                   else str(path.resolve()) for name, path in body["layers"].items()},
     }
     if identity:
         state = _project_id_state(root)
@@ -14391,6 +14424,28 @@ def _ck_stored_rows(root: Path, want_global: bool) -> list[tuple] | None:
     return rows
 
 
+def _ck_context_held(rows: list[tuple] | None, context_dir: Path) -> bool:
+    """Whether the agent's context lives in its store, given the rows
+    `_ck_stored_rows` read: the store answers and holds a project document, or
+    holds none while no context folder is there."""
+    return rows is not None and (any(not row[0] for row in rows) or not context_dir.exists())
+
+
+def _ck_stored_assets(root: Path) -> bool | None:
+    """Whether this project's store holds an unretired asset document or file,
+    read in a read-only transaction; None where there is no store to read: no
+    project id, or no store."""
+    def query(conn, project):
+        found = []
+        for table in ("assets_documents", "assets_files"):
+            if conn.execute("SELECT to_regclass(%s) IS NOT NULL", (table,)).fetchone()[0]:
+                found += conn.execute(f"SELECT 1 FROM {table} WHERE project_id = %s "
+                                      "AND retired_at IS NULL LIMIT 1", (project,)).fetchall()
+        return found
+    rows = _ck_store_read(root, query)
+    return None if rows is None else bool(rows)
+
+
 def _ck_stored_context(root: Path, binding: dict, warnings: list[str],
                        store: dict) -> dict | None:
     """The context items this agent keeps in its store, as {"project": [...],
@@ -14410,10 +14465,8 @@ def _ck_stored_context(root: Path, binding: dict, warnings: list[str],
         warnings.append("context documents not read from the store, so the context folder "
                         f"is used: exited {code}" + (f": {detail}" if detail else ""))
         return None
-    if rows is None:
-        return None
     context_dir = root / binding["layers"]["context"]
-    if not any(not row[0] for row in rows) and context_dir.exists():
+    if not _ck_context_held(rows, context_dir):
         return None
     found: dict = {"project": [], "global": []}
     errors: list[str] = []
