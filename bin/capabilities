@@ -9735,7 +9735,9 @@ def _place_service(name: str, placed: bool, node: str | None,
     places a shared service on every node of the agent; `place` with neither
     reports where the service is placed beside the node holding its lease."""
     root = _require_project()
-    _ensure_envelope(root)
+    # The report writes nothing, so it scaffolds no envelope either.
+    if node is not None or every or not placed:
+        _ensure_envelope(root)
     verb = "place" if placed else "unplace"
     if every and node is not None:
         _die(6, "input", "place takes --node <node> or --all, not both")
@@ -19969,10 +19971,6 @@ def main() -> None:
         sys.stdout.write((__doc__ or "").lstrip("\n"))
         return
     cmd, rest = argv[0], argv[1:]
-    # `place` with neither --node nor --all only reports, so it reads here too.
-    if cmd in READ_ONLY_REFUSED_VERBS and not (
-            cmd == "place" and "--node" not in rest and "--all" not in rest):
-        _read_only_gate(cmd)
 
     def flag(name: str) -> bool:
         return name in rest
@@ -19988,6 +19986,12 @@ def main() -> None:
             if value.startswith(prefix):
                 return value.split("=", 1)[1]
         return None
+
+    # `place` with neither --node nor --all only reports, so it reads here too.
+    if cmd in READ_ONLY_REFUSED_VERBS and not (
+            cmd == "place" and "--node" not in rest and opt("--node") is None
+            and not flag("--all")):
+        _read_only_gate(cmd)
 
     def positional() -> list[str]:
         out, skip = [], False
