@@ -73,9 +73,11 @@ keeps only its policy/config under capabilities/telegram/service/:
 
 Runtime state follows the selected Telegram connection:
   <connection-state>/session.session          auth session
-  <connection-state>/service/register.json    daemon register
   <connection-state>/service/progress/        progress outbox
   <connection-state>/service/worker-sessions/ hot session copies
+The register is in the project's store, in `telegram_channels`, so whichever
+node runs the service reads it; a `register.json` left in the service state dir
+by an earlier version is carried into the store once and no longer written.
 
 Four gates, not to be conflated:
   1. door         — direct_messages mode in private chats; allowed_groups in groups,
@@ -96,6 +98,7 @@ per-channel /set overrides.
 """
 import asyncio
 import contextlib
+import copy
 import fcntl
 import hashlib
 import html
@@ -147,6 +150,7 @@ from call_recording_helpers import (
     write_metadata,
 )
 import gate as reply_gate
+import channels
 import jobs
 import profiles
 import prompts
@@ -1014,6 +1018,7 @@ def _service_state_dir():
 
 SERVICE_STATE_DIR = _service_state_dir()
 REGISTER = SERVICE_STATE_DIR / "register.json"
+REGISTER_IMPORTED = SERVICE_STATE_DIR / "register.imported.json"
 EXPECTED_CONTROL_DIR = STATE_HOME / "telegram" / str(EXPECTED_ACCOUNT_ID) / "control"
 CONTROL_DIR = Path(os.environ.get("TELEGRAM_ACCOUNT_CONTROL_DIR") or EXPECTED_CONTROL_DIR).expanduser()
 if CONTROL_DIR.resolve() != EXPECTED_CONTROL_DIR.resolve():
@@ -3199,13 +3204,102 @@ def _delivery_description(reply_to, is_direct):
 
 
 # --- register (dynamic state: watermark + per-channel /set overrides) ---------
-def load_register():
+# The register is one row per channel in `telegram_channels` (`channels.py`),
+# for this project, environment and connection, written through the job
+# register's connection, which belongs to the event loop as every caller here
+# does. `register.json` under the service state dir held it before; a node
+# carries that file into the store once and never writes it again.
+# What the store holds of each row, as this daemon last read or wrote it, so a
+# save writes only the rows that changed since.
+_REGISTER_STORED = {}
+# The register a save could not write, which a later load serves instead of
+# the store's older copy; None while the store holds all of it.
+_REGISTER_UNSAVED = None
+_REGISTER_OUTAGE_SAID = False
+
+
+def _register_text(row):
+    return json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _register_scope():
+    register = job_register()
+    return (register.project_id, register.environment, CONNECTION)
+
+
+def read_register_file():
+    """`register.json` as a daemon from before the store left it, else {}."""
     return json.loads(REGISTER.read_text()) if REGISTER.exists() else {}
 
 
+def _import_register_file(conn, scope):
+    """Carry `register.json` into the store, once for each content it holds: a
+    file an older payload wrote again after the import is read again, and the
+    newer watermark still wins per channel. A file still carrying the old
+    worker fields is refused before anything of it is written."""
+    if not REGISTER.exists():
+        return
+    raw = REGISTER.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        marker = json.loads(REGISTER_IMPORTED.read_text())
+    except (OSError, ValueError):
+        marker = {}
+    if isinstance(marker, dict) and marker.get("sha256") == digest:
+        return
+    reg = json.loads(raw)
+    reg = reg if isinstance(reg, dict) else {}
+    refuse_old_register(reg)
+    taken = channels.import_file(conn, scope, reg)
+    _atomic_json(REGISTER_IMPORTED, {"sha256": digest, "imported_at": now(),
+                                     "channels": taken})
+    log(f"register: carried {REGISTER} into the store ({len(taken)} of {len(reg)} "
+        "channels newer than the store's); the file is no longer written")
+
+
+def load_register():
+    """The register the store holds for this project, environment and
+    connection, after carrying in a `register.json` not yet imported. Where a
+    save could not reach the store, the register it could not write is served
+    instead: this daemon holds the service, so its copy is the newer one."""
+    global _REGISTER_STORED
+    if _REGISTER_UNSAVED is not None:
+        return copy.deepcopy(_REGISTER_UNSAVED)
+    job_register()
+    conn, scope = _JOB_STORE.conn, _register_scope()
+    _import_register_file(conn, scope)
+    reg = channels.rows(conn, scope)
+    _REGISTER_STORED = {key: _register_text(row) for key, row in reg.items()}
+    return reg
+
+
 def save_register(reg):
-    """Commit the watermark register atomically so crashes retain the prior file."""
-    _atomic_json(REGISTER, reg)
+    """Write the rows of `reg` that changed since the store last held them, in
+    one transaction, so a job leaving its row and the watermark passing it are
+    one commit. A store that does not answer keeps them for the next save,
+    which writes them with whatever changed meanwhile."""
+    global _REGISTER_STORED, _REGISTER_UNSAVED, _REGISTER_OUTAGE_SAID
+    texts = {key: _register_text(row) for key, row in reg.items() if isinstance(row, dict)}
+    changed = {key: reg[key] for key, text in texts.items()
+               if text != _REGISTER_STORED.get(key)}
+    removed = [key for key in _REGISTER_STORED if key not in texts]
+    if changed or removed:
+        try:
+            job_register()
+            channels.write(_JOB_STORE.conn, _register_scope(), changed, removed)
+        except Exception as exc:
+            _REGISTER_UNSAVED = copy.deepcopy(reg)
+            if not _REGISTER_OUTAGE_SAID:
+                _REGISTER_OUTAGE_SAID = True
+                log(f"register: the store did not take the register "
+                    f"({_short_error(exc)}); this daemon keeps it and writes it "
+                    "with the next save")
+            return
+    _REGISTER_STORED = texts
+    _REGISTER_UNSAVED = None
+    if _REGISTER_OUTAGE_SAID:
+        _REGISTER_OUTAGE_SAID = False
+        log("register: the store took the register again")
 
 
 def _channel_row(reg, key):
@@ -10488,7 +10582,7 @@ async def main():
         SERVICE_STATE_DIR.mkdir(parents=True, exist_ok=True)
         _require_hardened_state()
         try:
-            refuse_old_register(load_register())
+            refuse_old_register(read_register_file())
         except SettingsError as exc:
             sys.exit(str(exc))
         lock_handle = acquire_daemon_lock()

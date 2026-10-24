@@ -170,7 +170,6 @@ For account ID `8200881535`, runtime state is:
 
 ```text
 $XDG_STATE_HOME/telegram/8200881535/session.session
-$XDG_STATE_HOME/telegram/8200881535/service/register.json
 $XDG_STATE_HOME/telegram/8200881535/service/health.json
 $XDG_STATE_HOME/telegram/8200881535/service/progress/
 $XDG_STATE_HOME/telegram/8200881535/service/worker-sessions/
@@ -218,26 +217,29 @@ Two hosts running a daemon on one account each derive their own `control/` direc
 |---|---|---|
 | `control/` and its contents | derived from the account id; not overrideable | Yes, by construction — every primitive above is machine-local. |
 | `daemon.pid`, `daemon.log`, `health.json`, `progress/`, `worker-sessions/`, `lanes.json`, `authority/`, `project-layout.json`, `state-schema.json` | the service state dir | Yes — each describes one running daemon: its process, its logs, its in-flight work and the version of the tree it sits in. |
-| `register.json` | the service state dir | Not by construction; it is the file that decides what a daemon answers, below. |
+| the register | `telegram_channels` in the project's store, one row per project, environment, connection and channel | No — it decides what a daemon answers, below, and whichever node runs the service reads the same rows. |
 | the auth session | `$XDG_STATE_HOME/telegram/<connection>/session.session`, or the `session` path the connection declares; the un-keyed path the connection named `default` keeps instead is recorded in this bundle's `deviations.md` | No — its location is derived from the connection id, not from the account id and not from the machine. What re-authenticating elsewhere does to it is recorded there too. |
 | `settings.json` | the project envelope, handed to the daemon at launch | No — it is a project file, versioned with the project. |
 | the prompts (`context`, `delegation`, `job-worker`, the voice prompts, `context.<name>`) | versions in `telegram_prompts` in the project's store; a key the store holds no version of is read from its file in the project envelope | No — see *Worker and Channel Context*. |
 | registered jobs | the project's Postgres database, scoped by project and environment | No — see *Registered Jobs*. The database is the first that answers for the project: its `.env.local` / `.env`, then the process environment, then the machine's store setting (`capabilities store show` shows which); the daemon keeps the one it resolved at launch, and does not run without one. |
 
-`register.json` is what decides whether a message is answered. It holds, per channel, the jobs already reserved and the last processed message id. A message is skipped only because that file already knows it: `reserve_job` is the single idempotency boundary for live delivery and startup catch-up alike, and it asks `_message_is_known`, which reads this register and nothing else.
+The register is what decides whether a message is answered. It holds, per channel, the jobs already reserved, the last processed message id (the watermark), the channel's `/set` overrides and which outgoing voice echoes quote whom. A message is skipped only because the register already knows it: `reserve_job` is the single idempotency boundary for live delivery and startup catch-up alike, and it asks `_message_is_known`, which reads this register and nothing else.
 
-Startup and each periodic sync reconcile recent history — the last `tail_size` messages of each channel the register already holds — against that register's own watermarks. A channel the local register does not hold is not reconciled at all; a channel it holds is reconciled against the watermark this host recorded for it.
+Startup and each periodic sync reconcile recent history — the last `tail_size` messages of each channel the register holds — against its watermarks. A channel the register does not hold is not reconciled at all.
 
-So what a daemon treats as already answered is decided entirely by the register under its own state directory. A message one host has answered is invisible to the other's decision: where the other's register holds that channel with an earlier watermark, the message is not known to it and is reconciled as unanswered.
+The register is a row per channel in `telegram_channels` in the project's store, keyed by project, environment, connection and channel, so it is not bound to the machine. The daemon reads it when a session starts and writes the rows that changed in one transaction, so a job leaving its row and the watermark passing it are one commit, and the watermark is never moved back. When the deployment lease moves the service to another node, that node starts from the watermarks and the reserved jobs the last one left: messages that arrived during the switch are caught up, and what was already answered is not answered again. A write the store does not take is kept by the daemon and written with the next one, so it keeps answering through a store outage; a session does not start while the store cannot be read.
+
+A `register.json` an earlier version left in the service state dir is carried into the store once, the first time a session starts: per channel, the copy whose watermark is newer wins whole, and the store's copy wins a tie. The file is left as it is and never written again; `register.imported.json` beside it records which content was carried in, so a file an older version writes again is carried in again on the same terms. A file that still carries the worker fields `/set worker` and `/set model` wrote is refused before anything of it is carried in, as `service start` already refuses it.
+
+The `/set` overrides stay on the channel's row rather than in the project's telegram settings: they are a person's choice for one channel, made in that channel, while the settings are the project's own configuration.
 
 For a managed development session, use `capabilities dev live start <session>
 telegram`. The manager stops only a matching canonical owner, launches the
-session payload against the same auth session and watermark register, and keeps
+session payload against the same auth session and the canonical owner's register, and keeps
 a durable `takeover.json` transition lease. `dev live stop` restores the
 recorded canonical state. After interruption, `dev live status` is read-only and
 `capabilities dev live recover <session> telegram --restore-canonical` performs
-the explicit fail-closed restoration. Auth and register files are never copied
-or merged.
+the explicit fail-closed restoration. Auth files are never copied or merged. Where the project names no database of its own, the payload keeps its records in the session's schema, so the manager copies the canonical owner's `telegram_channels` rows for the connection into that schema before the payload starts, and back once before the canonical owner restarts; the payload's jobs and prompts stay in the session's schema.
 
 ## Behavior
 

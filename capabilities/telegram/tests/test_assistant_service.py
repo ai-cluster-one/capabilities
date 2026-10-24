@@ -378,6 +378,14 @@ def import_daemon(tmp: Path, service_settings: dict, *,
         if store:
             module.STORE_SETTING = dataclasses.replace(
                 module.STORE_SETTING, schema=f"tgtest_{uuid.uuid4().hex}")
+        else:
+            # The register is a table in the store. A case without one keeps
+            # it in memory instead, apart from the daemon's own copy as the
+            # store keeps it.
+            held = {}
+            module.save_register = lambda reg: held.update(
+                reg=json.loads(json.dumps(reg)))
+            module.load_register = lambda: json.loads(json.dumps(held.get("reg", {})))
         return module
     finally:
         os.environ.clear()
@@ -670,15 +678,20 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                                 for line in daemon._test_logs))
             daemon._PROMPT_STORE.close()
 
-    async def test_register_replace_failure_keeps_previous_complete_json(self):
+    async def test_a_register_write_the_store_refuses_keeps_its_rows_and_is_retried(self):
         with tempfile.TemporaryDirectory() as td:
-            daemon = import_daemon(Path(td), settings())
-            original = {"test": {"last_processed_message_id": 7}}
-            daemon.save_register(original)
-            with mock.patch.object(daemon.os, "replace", side_effect=OSError("power loss")):
-                with self.assertRaisesRegex(OSError, "power loss"):
-                    daemon.save_register({"test": {"last_processed_message_id": 8}})
-            self.assertEqual(daemon.load_register(), original)
+            daemon = import_daemon(Path(td), settings(), store=True)
+            self.addCleanup(daemon.close_job_register)
+            daemon.save_register({"test": {"last_processed_message_id": 7}})
+            with mock.patch.object(daemon.channels, "write",
+                                   side_effect=RuntimeError("store gone")):
+                daemon.save_register({"test": {"last_processed_message_id": 8}})
+            stored = daemon.channels.rows(daemon._JOB_STORE.conn, daemon._register_scope())
+            self.assertEqual(stored["test"]["last_processed_message_id"], 7)
+            self.assertEqual(daemon.load_register()["test"]["last_processed_message_id"], 8)
+            daemon.save_register(daemon.load_register())
+            stored = daemon.channels.rows(daemon._JOB_STORE.conn, daemon._register_scope())
+            self.assertEqual(stored["test"]["last_processed_message_id"], 8)
 
     async def test_hardened_state_adopts_only_version_one_and_requires_cutover(self):
         with tempfile.TemporaryDirectory() as td:
@@ -9002,7 +9015,7 @@ class RoomProfileTests(unittest.IsolatedAsyncioTestCase):
             daemon.refuse_old_register({"123": {"settings": {"profile": "telegram-x"}}})
         source = DAEMON_PATH.read_text()
         main = source[source.index("async def main():"):]
-        self.assertLess(main.index("refuse_old_register(load_register())"),
+        self.assertLess(main.index("refuse_old_register(read_register_file())"),
                         main.index("lock_handle = acquire_daemon_lock()"))
 
     def test_a_turn_saves_a_profile_only_for_a_role_that_may_set(self):
@@ -9293,6 +9306,118 @@ class VoiceTaskHarnessTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(("resume", "thread-7"), sessions)
             client.disconnected.set()
             await asyncio.wait_for(session_task, timeout=10)
+
+
+class StoreRegisterTests(unittest.IsolatedAsyncioTestCase):
+    """The register is a row per channel in the store, so the node that runs
+    the service next starts from where the last one stopped."""
+
+    def group_settings(self):
+        service_settings = settings(sync_interval=60)
+        service_settings["allowed_groups"] = {"-200": {"aliases": ["Assistant"]}}
+        return service_settings
+
+    def node(self, td, project_id, store_setting=None):
+        daemon = import_daemon(Path(td), self.group_settings(), store=True,
+                               project_env={"CAPABILITIES_PROJECT_ID": project_id})
+        if store_setting is not None:
+            daemon.STORE_SETTING = store_setting
+        self.addCleanup(daemon.close_job_register)
+        answered = []
+
+        def answer(_chat, _tail, state=None, _procs=None):
+            answered.append(state["current_request"]["message_id"])
+            return successful_result("ok")
+
+        daemon.WORKERS["stub"] = answer
+        return daemon, answered
+
+    @staticmethod
+    def addressed(message_id):
+        message = Message(message_id, text="Assistant, answer this")
+        message.mentioned = True
+        return message
+
+    async def test_a_service_moved_to_another_node_answers_each_message_once(self):
+        project_id = f"prj_test_{uuid.uuid4().hex}"
+        with tempfile.TemporaryDirectory() as first_td, \
+                tempfile.TemporaryDirectory() as second_td:
+            first, first_answered = self.node(first_td, project_id)
+            second, second_answered = self.node(second_td, project_id, first.STORE_SETTING)
+            first.save_register({"-200": {"last_processed_message_id": 300}})
+
+            # The first node answers a message live, mid-conversation, and stops.
+            answered_live = self.addressed(301)
+            client = FakeClient([])
+            task = asyncio.create_task(first.run_session(client))
+            await client.started.wait()
+            event = Event(answered_live, chat_id=-200)
+            event.is_private = False
+            await client.handler(event)
+            await wait_until(
+                lambda: first.load_register()["-200"]["last_processed_message_id"] == 301)
+            client.disconnected.set()
+            await asyncio.wait_for(task, timeout=5)
+
+            # Two more arrive while nothing runs; the second starts on the history.
+            client = FakeClient([answered_live, self.addressed(302), self.addressed(303)])
+            task = asyncio.create_task(second.run_session(client))
+            await client.started.wait()
+            await wait_until(
+                lambda: second.load_register()["-200"]["last_processed_message_id"] == 303)
+            client.disconnected.set()
+            await asyncio.wait_for(task, timeout=5)
+
+            self.assertEqual(first_answered, [301])
+            self.assertEqual(sorted(second_answered), [302, 303])
+            self.assertEqual(len(client.sent), 2)
+            self.assertFalse(first.REGISTER.exists())
+            self.assertFalse(second.REGISTER.exists())
+
+    async def test_a_register_file_is_carried_into_the_store_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon, _ = self.node(td, f"prj_test_{uuid.uuid4().hex}")
+            daemon.job_register()
+            scope = daemon._register_scope()
+            # Another node already answered further in -300 than this file knows.
+            daemon.channels.write(daemon._JOB_STORE.conn, scope, {
+                "-300": {"last_processed_message_id": 20, "settings": {"tail_size": 9}}})
+            daemon.REGISTER.parent.mkdir(parents=True, exist_ok=True)
+            daemon.REGISTER.write_text(json.dumps({
+                "-200": {"last_processed_message_id": 50, "settings": {"tail_size": 5},
+                         "voice_echo_senders": {"51": "Alice"}},
+                "-300": {"last_processed_message_id": 10, "settings": {"tail_size": 3}},
+            }))
+            before = daemon.REGISTER.read_bytes()
+
+            reg = daemon.load_register()
+            self.assertEqual(reg["-200"]["last_processed_message_id"], 50)
+            self.assertEqual(reg["-200"]["settings"], {"tail_size": 5})
+            self.assertEqual(reg["-200"]["voice_echo_senders"], {"51": "Alice"})
+            self.assertEqual(reg["-300"]["last_processed_message_id"], 20)
+            self.assertEqual(reg["-300"]["settings"], {"tail_size": 9})
+
+            reg["-200"]["last_processed_message_id"] = 52
+            reg["-200"]["settings"] = {"tail_size": 7}
+            daemon.save_register(reg)
+            again = daemon.load_register()
+            self.assertEqual(again["-200"]["last_processed_message_id"], 52)
+            self.assertEqual(again["-200"]["settings"], {"tail_size": 7})
+            self.assertEqual(daemon.REGISTER.read_bytes(), before)
+            self.assertEqual(sum("carried" in line for line in daemon._test_logs), 1)
+
+    async def test_a_register_file_with_the_old_worker_fields_is_not_carried_in(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon, _ = self.node(td, f"prj_test_{uuid.uuid4().hex}")
+            daemon.REGISTER.parent.mkdir(parents=True, exist_ok=True)
+            daemon.REGISTER.write_text(json.dumps({
+                "-200": {"last_processed_message_id": 50,
+                         "settings": {"worker": "codex"}}}))
+            with self.assertRaises(daemon.SettingsError):
+                daemon.load_register()
+            self.assertEqual(daemon.channels.rows(daemon._JOB_STORE.conn,
+                                                  daemon._register_scope()), {})
+            self.assertFalse(daemon.REGISTER_IMPORTED.exists())
 
 
 if __name__ == "__main__":

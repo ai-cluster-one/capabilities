@@ -2,7 +2,7 @@
 
 Two classes of work run in this service and they are not the same thing. A
 conversation is answered while the person is still there, so its unit is the
-message and its record is the watermark register in `register.json`. A task
+message and its record is the watermark register in `telegram_channels`. A task
 outlives its sentence: the person who asked has gone back to talking, the work
 has minutes or hours left, and a correction arriving meanwhile is an amendment
 to work already in flight rather than a second request. That second class is
@@ -121,7 +121,7 @@ def holds_slot(owner_id: Any) -> bool:
 # so every comparison and every reader below sees the values it always saw.
 STORE_OWNER = "telegram"
 STORE_SCHEMA_MAJOR = 1
-STORE_SCHEMA_MINOR = 2
+STORE_SCHEMA_MINOR = 3
 STORE_STEPS = (
     ("0001-jobs", """
     CREATE TABLE telegram_jobs (
@@ -277,6 +277,50 @@ STORE_STEPS = (
         FOR EACH ROW EXECUTE FUNCTION telegram_prompts_guard();
     CREATE TRIGGER telegram_prompts_truncate BEFORE TRUNCATE ON telegram_prompts
         FOR EACH STATEMENT EXECUTE FUNCTION telegram_prompts_guard();
+    """),
+    # The service's register (`channels.py`), one row per channel, which
+    # `register.json` on the machine running the service used to hold, so the
+    # node that runs it next reads where the last one stopped. Keyed by
+    # connection as the file was, under the connection's state directory, and
+    # by environment as the job queue is. The watermark is a column because
+    # the store keeps it from moving back; the `/set` overrides, the voice
+    # echoes and the reserved dialogue jobs are the daemon's to read, and the
+    # store filters on none of them. The `/set` overrides stay here rather
+    # than with the project's telegram settings: they are a person's choice
+    # for one channel, made in that channel, not the project's configuration.
+    ("0006-channels", """
+    CREATE TABLE telegram_channels (
+        project_id                text NOT NULL CHECK (project_id <> ''),
+        environment               text NOT NULL CHECK (environment <> ''),
+        connection                text NOT NULL CHECK (connection <> ''),
+        channel_key               text NOT NULL CHECK (channel_key <> ''),
+        last_processed_message_id bigint NOT NULL DEFAULT 0
+                                  CHECK (last_processed_message_id >= 0),
+        settings                  jsonb NOT NULL DEFAULT '{}'::jsonb,
+        voice_echo_senders        jsonb NOT NULL DEFAULT '{}'::jsonb,
+        state                     jsonb NOT NULL DEFAULT '{}'::jsonb,
+        updated_at                timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT telegram_channels_pkey
+            PRIMARY KEY (project_id, environment, connection, channel_key)
+    );
+    COMMENT ON TABLE telegram_channels IS
+        'The telegram service''s register: per channel, what decides whether a message is answered, read by whichever node runs the service.';
+    COMMENT ON COLUMN telegram_channels.project_id IS
+        'The project''s declared id.';
+    COMMENT ON COLUMN telegram_channels.environment IS
+        'The service''s environment, as the job queue is scoped.';
+    COMMENT ON COLUMN telegram_channels.connection IS
+        'The Telegram connection the service runs on; message ids are numbered by its account.';
+    COMMENT ON COLUMN telegram_channels.channel_key IS
+        'A chat id, or a chat id and #topic:<id> for one forum topic.';
+    COMMENT ON COLUMN telegram_channels.last_processed_message_id IS
+        'The watermark: the newest message handled in the channel; never moves back.';
+    COMMENT ON COLUMN telegram_channels.settings IS
+        'The channel''s /set overrides, over the project''s settings.';
+    COMMENT ON COLUMN telegram_channels.voice_echo_senders IS
+        'Outgoing voice-transcription echoes by message id, mapped to the speaker they quote.';
+    COMMENT ON COLUMN telegram_channels.state IS
+        'The rest of the row as the daemon keeps it: reserved dialogue jobs, last seen message, last usage, agent dialogue turns.';
     """),
 )
 
