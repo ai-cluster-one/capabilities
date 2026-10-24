@@ -457,6 +457,45 @@ def test_a_runner_holds_a_connection_only_while_its_service_runs(tmp_path: Path,
     assert rows("SELECT * FROM deployment_service_leases") == []
 
 
+FAILING = [sys.executable, "-c",
+           "import sys; sys.stderr.write('project: must be a path inside the agent home\\n'); "
+           "sys.exit(6)"]
+
+
+def test_a_service_that_fails_leaves_its_error_on_the_lease_for_another_machine(
+        tmp_path: Path, cluster) -> None:
+    database, rows = _database(cluster)
+    env = _env(tmp_path / "home")
+    dotenv = (f"AGENTKIT_DB_URL=postgresql://{ADMIN}@127.0.0.1:{cluster}/{database}"
+              "?sslmode=disable\nAGENTKIT_DB_SCHEMA=lab\n")
+    identity = {"id": PROJECT_ID, "slug": "lab", "records": "store"}
+    a = _project(tmp_path / "a", identity, dotenv=dotenv)
+    b = _project(tmp_path / "b", identity, dotenv=dotenv)
+    _manager(a, env, "enable", "deployment", "--project")
+    _manager(a, env, "enable", "fixture", "--project", "--node", "node-a")
+    runner = Runner(a, env, "node-a", tmp_path / "a.log", child=FAILING)
+    try:
+        failed = runner.until(lambda s: (s.get("last_exit") or {}).get("code") == 6)
+        assert "must be a path inside" in failed["last_exit"]["error"]
+        [(node, code, error)] = rows(
+            "SELECT node, last_exit, last_error FROM deployment_service_leases")
+        assert (node, code) == ("node-a", 6) and "must be a path inside" in error
+        # Another machine, reading the store, sees why it stopped.
+        (b / "deployment").mkdir()
+        (b / "deployment" / "runtime.json").write_text(json.dumps(
+            {"profile": "agent-box", "services": {"agent": {"embedded_services": ["fixture"]}}}))
+        proc = subprocess.run([str(DEPLOYMENT), "services"], cwd=b,
+                              env={**env, "AGENT_NODE_NAME": "node-b"},
+                              capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr
+        [seen] = json.loads(proc.stdout)["services"]
+        assert seen["lease"]["holder"] == "node-a"
+        assert seen["lease"]["last_error"]["exit"] == 6
+        assert "must be a path inside" in seen["lease"]["last_error"]["error"]
+    finally:
+        runner.stop()
+
+
 def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_live(
         tmp_path: Path, cluster) -> None:
     database, rows = _database(cluster)

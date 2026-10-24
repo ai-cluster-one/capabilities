@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-24 — A service that fails hands back its error on its lease
+
+When a service its runner holds the lease for exits with a non-zero code other than 4, or cannot be started, the runner writes the exit code, the service's last stderr lines (at most 2000 characters) and the time onto the lease row, in the new `deployment_service_leases` columns `last_exit`, `last_error` and `last_error_at` (deployment tables 1.1, an added step that every runner applies when it connects). Any machine reading the store can therefore see why the service stopped, and `deployment services` answers it as the lease's `last_error`, `null` until a failure is recorded; the runner's own `last_exit` carries the same `error` text. Another node taking the lease clears them, and a lease released, as on an exit-4 refusal, goes with its row as before. A shared service takes no lease and records nothing there.
+
 ## 2026-10-24 — A command deployment runs that fails is named, with its own error
 
 Where a command deployment runs fails, the `node_command_failed` message names the program and its verb and carries the command's own error: its standard error, or the message of the error envelope a capability prints. `sync`, `sync --check` and `doctor` on a ContextKit-bound checkout body now answer, for example, ``"`contextkit path` failed (exit 6): invalid collaboration.mode: bogus ..."`` rather than `contextkit failed (exit 6)` alone. Arguments are never named. A command fed standard input, and `ssh`, whose standard error carries the remote process's diagnostics, still answer with the command and its exit code only. A Coolify error envelope still passes through with its own code. The code and exit code are unchanged.

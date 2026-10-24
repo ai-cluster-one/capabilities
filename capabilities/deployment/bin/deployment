@@ -140,7 +140,11 @@ USAGE
       a service that exits 4, the contract's policy refusal, is not restarted:
       the runner releases the lease and holds it idle, reporting the refusal
       (the service's error code and message when it printed one), until the
-      gate answer for this node changes or the runner restarts.
+      gate answer for this node changes or the runner restarts. A service
+      that exits with any other non-zero code, or cannot be started, has its
+      exit code, its last stderr lines (at most 2000 characters) and the time
+      written onto the lease it holds, so any machine reading the store can
+      see why it stopped; another node taking the lease clears them.
       Not placed, or the lease held live by another node, it stops the group
       (TERM, KILL after 20 seconds) and releases its lease; a refusal names
       the holder and expiry on stderr, and it keeps checking, so it takes over
@@ -157,7 +161,9 @@ USAGE
       it here (placed, the row that answered: scope, node, enabled, service,
       and why),
       whether its runner is running it, a refusal it is held idle for, and
-      who holds its lease (state, holder, expiry). Writes nothing.
+      who holds its lease (state, holder, expiry, and last_error: the exit
+      code, stderr tail and time the service last failed with on the holder,
+      else null). Writes nothing.
 
   deployment watchdog [--dry-run]
       One pass over the launchd agents this project supervises: ask each
@@ -5177,8 +5183,22 @@ LEASE_STEPS = [
      " renewed_at timestamptz NOT NULL DEFAULT now(),"
      " expires_at timestamptz NOT NULL,"
      " PRIMARY KEY (project, capability))"),
+    ("0002-service-lease-errors",
+     "ALTER TABLE deployment_service_leases"
+     " ADD COLUMN last_exit integer,"
+     " ADD COLUMN last_error text,"
+     " ADD COLUMN last_error_at timestamptz;"
+     " COMMENT ON COLUMN deployment_service_leases.last_exit IS"
+     " 'the exit code the service last failed with on the holding node; null when it"
+     " could not be started at all';"
+     " COMMENT ON COLUMN deployment_service_leases.last_error IS"
+     " 'the last lines the service printed to stderr when it last failed, or why it"
+     " could not be started; cleared when another node takes the lease';"
+     " COMMENT ON COLUMN deployment_service_leases.last_error_at IS"
+     " 'when the service last failed on the holding node'"),
 ]
-LEASE_MAJOR, LEASE_MINOR = 1, 0
+LEASE_MAJOR, LEASE_MINOR = 1, 1
+LEASE_ERROR_CHARS = 2000
 RUNNER_SCHEMA = "capabilities.deployment.runner.v1"
 
 
@@ -5339,12 +5359,14 @@ class _Lease:
     def _holding(row, node: str) -> dict:
         if row is None:
             return {"state": "free", "holder": None}
-        holder, acquired, renewed, expires, live = row
+        holder, acquired, renewed, expires, live, code, error, failed = row
         return {"state": ("held" if holder == node else
                           "held_elsewhere" if live else "free"),
                 "holder": holder, "acquired_at": _iso(acquired),
                 "renewed_at": _iso(renewed), "expires_at": _iso(expires),
-                "live": bool(live)}
+                "live": bool(live),
+                "last_error": ({"exit": code, "error": error, "at": _iso(failed)}
+                               if failed is not None else None)}
 
     def acquire(self, capability: str) -> dict:
         """Take or renew this node's hold, unless another node's is live."""
@@ -5356,13 +5378,19 @@ class _Lease:
                 "ON CONFLICT (project, capability) DO UPDATE "
                 "SET node = EXCLUDED.node, expires_at = EXCLUDED.expires_at, "
                 "renewed_at = now(), acquired_at = CASE WHEN l.node = EXCLUDED.node "
-                "THEN l.acquired_at ELSE now() END "
+                "THEN l.acquired_at ELSE now() END, "
+                "last_exit = CASE WHEN l.node = EXCLUDED.node THEN l.last_exit END, "
+                "last_error = CASE WHEN l.node = EXCLUDED.node THEN l.last_error END, "
+                "last_error_at = CASE WHEN l.node = EXCLUDED.node "
+                "THEN l.last_error_at END "
                 "WHERE l.node = EXCLUDED.node OR l.expires_at <= now() "
-                "RETURNING node, acquired_at, renewed_at, expires_at, true",
+                "RETURNING node, acquired_at, renewed_at, expires_at, true, "
+                "last_exit, last_error, last_error_at",
                 (self.project, capability, self.node, self.ttl)).fetchone()
             if row is None:
                 row = conn.execute(
-                    "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now() "
+                    "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
+                    "last_exit, last_error, last_error_at "
                     "FROM deployment_service_leases WHERE project = %s AND capability = %s",
                     (self.project, capability)).fetchone()
             return self._holding(row, self.node)
@@ -5385,7 +5413,8 @@ class _Lease:
                 "WHERE project = %s AND capability = %s AND node = %s",
                 (self.project, capability, self.node)).rowcount
             row = conn.execute(
-                "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now() "
+                "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
+                "last_exit, last_error, last_error_at "
                 "FROM deployment_service_leases WHERE project = %s AND capability = %s",
                 (self.project, capability)).fetchone()
             found = self._holding(row, self.node)
@@ -5404,10 +5433,24 @@ class _Lease:
             return known
         return self.release(capability)
 
+    def record_error(self, capability: str, code, error: str) -> dict:
+        """Write why the service last failed onto this node's hold, so it can
+        be read from any machine that reads the store."""
+        def work(conn):
+            done = conn.execute(
+                "UPDATE deployment_service_leases SET last_exit = %s, last_error = %s, "
+                "last_error_at = now() "
+                "WHERE project = %s AND capability = %s AND node = %s",
+                (code, error[-LEASE_ERROR_CHARS:], self.project, capability,
+                 self.node)).rowcount
+            return {"recorded": bool(done)}
+        return self._run(work)
+
     def read(self, capability: str) -> dict:
         def work(conn):
             row = conn.execute(
-                "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now() "
+                "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
+                "last_exit, last_error, last_error_at "
                 "FROM deployment_service_leases WHERE project = %s AND capability = %s",
                 (self.project, capability)).fetchone()
             return self._holding(row, self.node)
@@ -5549,6 +5592,8 @@ class _Runner:
         self.said: object = None
         self.tick_at: str | None = None
         self.stderr_tail: list = []
+        self.relay = None
+        self.error_unrecorded: str | None = None
         # A service that refused with the policy exit is held idle until the
         # gate answer it was refused under changes, or the runner restarts.
         self.refusal: dict | None = None
@@ -5602,11 +5647,14 @@ class _Runner:
                               "error": f"{type(exc).__name__}: {exc}"[:300]}
             self.say(f"cannot start {shlex.join(self.command)}: {exc}")
             self.restart_at = time.monotonic() + self.every
+            self.record_error()
             return
         import threading
         self.stderr_tail = []
-        threading.Thread(target=_relay_stderr, args=(self.child.stderr, self.stderr_tail),
-                         daemon=True).start()
+        self.relay = threading.Thread(target=_relay_stderr,
+                                      args=(self.child.stderr, self.stderr_tail),
+                                      daemon=True)
+        self.relay.start()
         self.child_started = time.monotonic()
         self.child_started_at = _now_iso()
         self.restart_at = None
@@ -5639,6 +5687,11 @@ class _Runner:
             time.sleep(0.2)  # let the relay take the service's last words
             self.hold_refused()
             return
+        if code != 0:
+            if self.relay is not None:
+                self.relay.join(timeout=0.5)  # the service's last words
+            self.last_exit["error"] = "\n".join(self.stderr_tail)[-LEASE_ERROR_CHARS:]
+            self.record_error()
         again = (self.restart in ("always", "unless-stopped")
                  or (self.restart == "on-failure" and code != 0))
         if not self.want:
@@ -5655,6 +5708,19 @@ class _Runner:
             self.restart_at = time.monotonic() + delay
             self.say(f"exited with {code}; restarting in {delay}s")
         self.save()
+
+    def record_error(self) -> None:
+        """Put the failure in `last_exit` on the lease this node holds, where
+        another machine can read it."""
+        if self.lease.mine_until is None:
+            return
+        found = self.lease.record_error(self.name, self.last_exit.get("code"),
+                                        self.last_exit.get("error") or "")
+        failing = (found.get("error") or {}).get("code")
+        if failing and failing != self.error_unrecorded:
+            self.say("cannot record the failure on the lease: "
+                     f"{found['error'].get('message')}")
+        self.error_unrecorded = failing
 
     def hold_refused(self) -> None:
         """The service refused to run here with the policy exit: hold it
