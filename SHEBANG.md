@@ -28,7 +28,7 @@ Every script implements the same contract verbs alongside its domain verbs. This
 |---|---|
 | `help` | The full usage contract (the module docstring), verbatim. |
 | `doctor` | The cheapest authenticated round-trip, per connection; proves credentials, reachability, identity. |
-| `connections` | The resolution report: every connection, every value, its winning tier and source, secrets masked. Local only — no call to any system a connection names; in store mode reading the store is the resolution. |
+| `connections` | The resolution report: every connection, every value, its winning tier and source, secrets masked. Local only — no call to any system a connection names; in store mode reading the store is the resolution. `connections show <id> --reveal <KEY>` prints one of those values in the clear ([revealing one value](#revealing-one-value)). |
 | `stub` | The one-line awareness text. |
 | `manifest --json` | The machine-readable declaration (schema below). |
 | `guide` / `guide <topic>` | The shipped guide menu with previews / one guide's body, fetched live from the docs base. |
@@ -394,7 +394,7 @@ A capability resolves the setting, and reaches its runtime state, through the sh
 
 ## The capability policy gate
 
-Operational verbs and `doctor` pass an effective two-scope policy gate before dispatch. Safe discovery verbs — `help`, `stub`, `manifest`, and the local-only `connections` report — remain available so a disabled capability can be understood and configured. The manager owns the policy collection, kept in files mode at:
+Operational verbs and `doctor` pass an effective two-scope policy gate before dispatch. Safe discovery verbs — `help`, `stub`, `manifest`, and the local-only `connections` report — remain available so a disabled capability can be understood and configured. `connections show`, which prints a value in the clear, is not one of them: it passes the gate as an operational verb, and a request's verb list passes it only where it names `connections`. The manager owns the policy collection, kept in files mode at:
 
 1. Project: `capabilities/settings.json`.
 2. Global machine default: `$XDG_CONFIG_HOME/capabilities/settings.json`.
@@ -704,6 +704,10 @@ def _mask(value: str) -> str:
 
 Beside the connections the report carries `policy`, the capability's effective policy state in the words `capabilities list` uses: `effective` (`enabled` or `disabled`), the `source` that decided it (`machine` for the ceiling, `project`, `global`, or `default` when neither scope says anything) and the `machine` ceiling itself. A policy record that cannot be read is reported there as the refusal the gate would give, and the report still answers.
 
+#### Revealing one value
+
+`<name> connections show <id> --reveal <KEY>` prints one value in the clear, so a person's own control panel can show or copy a secret it otherwise displays masked: the value the declared [connection field](#what-a-person-is-asked-for) `KEY` of connection `<id>` resolves to - for a secret field, the value of the env key the entry names, resolved through the cascade - raw on stdout with a trailing newline and nothing else. The connection is selected as every verb selects one, so an unknown connection exits 6 `unknown_connection` and one the project may not use exits 4 `connection_not_granted`. A key the capability does not declare exits 6 `unknown_field` and one that holds no value exits 3 `not_set`, each with nothing on stdout. It is not safe discovery: it passes [the capability policy gate](#the-capability-policy-gate) as an operational verb, and outside any project it is a machine read where the capability declares `connections` in `MACHINE_READS`. Every other output keeps the masking rule above.
+
 A **core-only** capability — one binding the core tier and not the connections tier, because it has nothing to resolve (it drives a local tool or the host, with no credentials or endpoint) — still answers `connections`, reporting an empty map: `{ "connections": {}, "default": null }`. That absence is the contract, not a gap: `audit` accepts the empty report in place of the explicit-registry checks, and never writes a registry against such a capability.
 
 ## What a person is asked for
@@ -736,7 +740,7 @@ The manager validates the declarations wherever it validates a manifest.
 
 ### `setup`
 
-`<name> setup` reports each declared prerequisite: whether it resolves, from which tier and file, secrets masked, and `ready` when every required one does. `setup set [--machine] [--field KEY=VALUE ...] [--stdin]` writes them to the capability's `credentials.env`, a secret only from the JSON object on stdin, and `setup unset [--machine] <KEY> ...` removes them. Outside any project `setup` reporting is [machine administration](#machine-administration), and so is a write that carries `--machine`. Every connection of the capability resolves them through the cascade, so a control panel asks for them once, above the connections.
+`<name> setup` reports each declared prerequisite: whether it resolves, from which tier and file, secrets masked, and `ready` when every required one does. `setup set [--machine] [--field KEY=VALUE ...] [--stdin]` writes them to the capability's `credentials.env`, a secret only from the JSON object on stdin, and `setup unset [--machine] <KEY> ...` removes them. `setup show --reveal <KEY>` prints the one value that report masks for the declared setup field `KEY`, as the cascade resolves it, raw on stdout with a trailing newline and nothing else; a key the capability does not declare exits 6 `unknown_field` and one that resolves nowhere exits 3 `not_set`, each with nothing on stdout. Outside any project `setup` reporting is [machine administration](#machine-administration), and so is a write that carries `--machine`. Every connection of the capability resolves them through the cascade, so a control panel asks for them once, above the connections.
 
 ### Linking a connection
 

@@ -525,6 +525,77 @@ def test_setup_reports_and_writes_the_machine_prerequisites(lab):
     assert answer["ready"] is False
 
 
+
+def test_setup_show_reveals_one_value_in_the_clear_and_nothing_else(lab):
+    result = _run(lab, "setup", "set", "--machine", "--field", "DECLFIX_APP_ID=7", "--stdin",
+                  stdin=json.dumps({"DECLFIX_APP_HASH": "hash-0123456789"}))
+    assert result.returncode == 0, result.stderr
+    # Outside any project it reads the machine's value, with no policy read.
+    _not_enabled(lab)
+    result = _run(lab, "setup", "show", "--reveal", "DECLFIX_APP_HASH", where="nowhere")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "hash-0123456789\n"
+    # In a project its own value wins, as the masked report resolves it.
+    (lab["project"] / ".env.local").write_text("DECLFIX_APP_HASH='proj-hash-000111'\n")
+    _write(lab["config"] / "capabilities" / "settings.json",
+           {"capabilities": {NAME: {"enabled": True}}})
+    result = _run(lab, "setup", "--reveal", "DECLFIX_APP_HASH")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "proj-hash-000111\n"
+    assert {f["key"]: f["value"] for f in json.loads(_run(lab, "setup").stdout)["fields"]} == {
+        "DECLFIX_APP_ID": "7", "DECLFIX_APP_HASH": "…0111"}
+    result = _run(lab, "setup", "show", "--reveal", "DECLFIX_OTHER")
+    assert (result.returncode, _error(result)["code"]) == (6, "unknown_field")
+    assert result.stdout == ""
+    _run(lab, "setup", "unset", "DECLFIX_APP_ID")
+    result = _run(lab, "setup", "show", "--reveal", "DECLFIX_APP_ID")
+    assert (result.returncode, _error(result)["code"]) == (3, "not_set")
+    assert result.stdout == ""
+    result = _run(lab, "setup", "set", "--reveal", "DECLFIX_APP_ID")
+    assert result.returncode == 6 and _error(result)["code"] == "input"
+
+
+def test_connections_show_reveals_one_value_of_a_usable_connection(lab):
+    result = _run(lab, "connection", "add", "work", "--field", "url=https://a.example",
+                  "--stdin", stdin=json.dumps({"secret_env": "tok-123456789"}))
+    assert result.returncode == 0, result.stderr
+    result = _run(lab, "connections", "show", "work", "--reveal", "secret_env")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "tok-123456789\n"
+    result = _run(lab, "connections", "show", "work", "--reveal", "url")
+    assert result.returncode == 0 and result.stdout == "https://a.example\n"
+    # Every other output stays masked.
+    assert "tok-123456789" not in _run(lab, "connections").stdout
+    for args, exit_code, code in (
+            (("work", "--reveal", "colour"), 6, "unknown_field"),
+            (("work", "--reveal", "port"), 3, "not_set"),
+            (("other", "--reveal", "secret_env"), 6, "unknown_connection"),
+            (("work",), 6, "input")):
+        result = _run(lab, "connections", "show", *args)
+        assert (result.returncode, _error(result)["code"]) == (exit_code, code), args
+        assert result.stdout == ""
+
+
+def test_a_reveal_is_not_safe_discovery(lab):
+    result = _run(lab, "connection", "add", "work", "--field", "url=https://a.example",
+                  "--stdin", stdin=json.dumps({"secret_env": "tok-123456789"}))
+    assert result.returncode == 0, result.stderr
+    # A request whose verb list names other verbs reads the report, not the value.
+    auth = {"CAPABILITIES_AUTH_CONTEXT": json.dumps(
+        {"allowed_capabilities": {NAME: {"verbs": ["doctor"]}}})}
+    assert _run(lab, "connections", extra=auth).returncode == 0
+    result = _run(lab, "connections", "show", "work", "--reveal", "secret_env", extra=auth)
+    assert result.returncode == 4 and _error(result)["code"] == "verb_not_authorized"
+    assert result.stdout == ""
+    # A capability this project disabled reports its connections and reveals nothing.
+    _write(lab["project"] / "capabilities" / "settings.json",
+           {"capabilities": {NAME: {"enabled": False}}})
+    assert _run(lab, "connections").returncode == 0
+    result = _run(lab, "connections", "show", "work", "--reveal", "secret_env")
+    assert result.returncode == 4 and _error(result)["code"] == "disabled"
+    assert result.stdout == ""
+
+
 # --- settings --------------------------------------------------------------------
 
 def test_settings_write_toml_from_its_seed_and_read_it_back_whole(lab):
@@ -598,6 +669,7 @@ def test_stdin_closing_while_an_answer_is_awaited_is_input_closed(lab):
 def test_help_ends_with_the_declared_verbs(lab):
     text = _run(lab, "help").stdout
     for needle in ("connection add <id>", "--replace", "--machine", "setup set",
+                   "setup [show] [--reveal <KEY>]", "connections show <id> --reveal <KEY>",
                    "settings put", "declfix link --events", "poll_seconds @project"):
         assert needle in text, needle
 

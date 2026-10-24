@@ -2,10 +2,10 @@
   "assets": {
     "DOCTRINE.md": "c08bd4a5b2176e0f2654beb4c72aafcef23655239cc0c79b32a84b9da45154e5",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "a6194713a32757116f2d4ea7577a31a44e60f9faf44f29a17448aa3bd57ef927",
+    "SHEBANG.md": "d55aade1ed7878bb97434d3615f9c4c36f29169ad67a526f6aa312934397f59e",
     "SOURCES.md": "f130558217bd581ccff5ed8020d35c7e2e155b59894e6e2fc01dc63e5f1a4aaa",
     "TEMPLATE.md": "29f72a0c4dfeb08a8434fc89440e799bba6a42a933b5819bd6e897af6d15c73b",
-    "contract/CHANGELOG.md": "21f04a1b4df826f53b804c2796e7e0f269c43ead5213b228b900ccfd3657f35a",
+    "contract/CHANGELOG.md": "8f7bc9c49d73789bc2953cde3f20fee6e10aed0b696eac8d40f98515ab8d599f",
     "guides/authoring.md": "67fef4797186e0da177c9f860f67897187f079d8aa8a0af4c4ca63649023a310",
     "guides/conforming.md": "d2724037c42aea0d0528b429be0eb14a16b558426ee3982b4a6f541a342e7361",
     "guides/contract.md": "8dfbe840b2c17fe73e718971a65913d271f72b5767b1f18b1fca13e2f65cee08",
