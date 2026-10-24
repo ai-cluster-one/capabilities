@@ -1298,3 +1298,45 @@ def test_retire_connections_moves_the_config_home_files_once_the_store_holds_the
     assert json.loads((backup / "coolify" / "connections.json").read_text()) == body
     assert sorted(p.name for p in home.iterdir()) == ["account.session", "credentials.env"]
     assert "mach" in _ok(_outside(lab, COOLIFY, "connections"))["connections"]
+
+
+def test_retire_records_moves_the_config_home_gate_and_identifiers_once_the_store_holds_them(lab):
+    refused = _outside(lab, MANAGER, "migrate", "--retire-records")
+    assert _error(refused)["code"] == "global_not_migrated"
+    gate = lab["config"] / "capabilities" / "settings.json"
+    gate.parent.mkdir(parents=True, exist_ok=True)
+    gate.write_text(json.dumps({"capabilities": {"coolify": {"enabled": True}}}))
+    home = lab["config"] / "coolify"
+    home.mkdir(parents=True, exist_ok=True)
+    ids = {"identifiers": {"team": {"value": "t-1", "note": "the team"}}}
+    (home / "identifiers.json").write_text(json.dumps(ids))
+    (home / "credentials.env").write_text("COOLIFY_MACH_TOKEN=x\n")
+    _global_rows_in_force(lab)
+    ids["identifiers"]["lost"] = {"value": "x"}
+    (home / "identifiers.json").write_text(json.dumps(ids))
+    refused = _outside(lab, MANAGER, "migrate", "--retire-records")
+    assert refused.returncode == 6, refused.stdout + refused.stderr
+    error = _error(refused)
+    assert error["code"] == "records_not_in_store"
+    assert error["detail"]["values"] == [
+        {"file": str(home / "identifiers.json"), "capability": "coolify", "key": "lost",
+         "reason": "missing"}]
+    assert gate.is_file() and (home / "identifiers.json").is_file()
+    del ids["identifiers"]["lost"]
+    (home / "identifiers.json").write_text(json.dumps(ids))
+    refused = _outside(lab, MANAGER, "migrate", "--retire-records",
+                       "--root", str(lab["project"]))
+    assert _error(refused)["code"] == "agents_unmigrated"
+    assert gate.is_file() and (home / "identifiers.json").is_file()
+    retired = _ok(_outside(lab, MANAGER, "migrate", "--retire-records"))
+    backup = Path(retired["backup"])
+    assert backup.parent == lab["config"] / "capabilities" / "retired"
+    assert retired["retired"] == [
+        {"file": str(gate), "backup": str(backup / "capabilities" / "settings.json")},
+        {"file": str(home / "identifiers.json"),
+         "backup": str(backup / "coolify" / "identifiers.json")}]
+    assert not gate.exists() and not (home / "identifiers.json").exists()
+    assert json.loads((backup / "coolify" / "identifiers.json").read_text()) == ids
+    assert sorted(p.name for p in home.iterdir()) == ["credentials.env"]
+    report = _ok(_outside(lab, MANAGER, "migrate", "--report"))
+    assert report["config_home"]["files"] == []

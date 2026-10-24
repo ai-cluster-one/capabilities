@@ -1221,6 +1221,26 @@ PROJECT VERBS (run inside a consuming project)
         on a contract library older than 0.15 still reads these files. JSON
         {ok, global_migrated_at, config_home, backup, retired [{file,
         backup, connections}]}.
+  migrate --retire-records [--root PATH]...
+        On any node, the global master's included, once the store this
+        project (outside one, this machine) reads holds the global rows:
+        check that every value of the config home's gate
+        ($XDG_CONFIG_HOME/capabilities/settings.json), identifiers files
+        (<name>/identifiers.json) and global settings files (each global
+        settings home a capability declares) is a global row of the store
+        with the same value, then move those files to
+        $XDG_CONFIG_HOME/capabilities/retired/records-<UTC stamp>/, each at
+        its path below the config home. Connections files are
+        --retire-connections'; credentials and env files, *.session files
+        and every other file stay where they are. Refused, moving nothing,
+        before global_migrated_at (global_not_migrated), while a value is
+        missing from the store or differs there (records_not_in_store, each
+        file, capability and key named), while a file cannot be read
+        (files_unreadable), or while a root on this machine that may read
+        them has not moved or has no id (agents_unmigrated; the roots are
+        found as --discard finds them). Run it after `capabilities update`.
+        JSON {ok, global_migrated_at, config_home, backup, retired [{file,
+        backup}]}.
   migrate --report [--root PATH]...
         What remains on this machine and why: each agent root found in the
         machine services' join lists, AgentKit's agent list, the roots
@@ -11392,7 +11412,7 @@ def _migrate_options(args: list[str]) -> dict:
     opts: dict = {"roots": []}
     flags = {"--dry-run": "dry_run", "--apply": "apply", "--global": "global",
              "--discard": "discard", "--report": "report", "--json": "json",
-             "--retire-connections": "retire"}
+             "--retire-connections": "retire", "--retire-records": "retire_records"}
     i = 0
     while i < len(args):
         arg = args[i]
@@ -11414,11 +11434,14 @@ def _migrate_options(args: list[str]) -> dict:
             _die(6, "input", f"`capabilities migrate` does not take {arg}",
                  "capabilities migrate [--dry-run|--apply] [--answers FILE] | --global "
                  "[--dry-run|--apply] [--answers FILE] | --discard | --retire-connections "
-                 "| --report [--root PATH]")
+                 "| --retire-records [--root PATH] | --report [--root PATH]")
         i += 1
-    modes = [m for m in ("global", "discard", "retire", "report") if opts.get(m)]
+    modes = [m for m in ("global", "discard", "retire", "retire_records", "report")
+             if opts.get(m)]
+    flag = {"retire_records": "retire-records"}
     if len(modes) > 1:
-        _die(6, "input", f"--{modes[0]} and --{modes[1]} are separate runs")
+        _die(6, "input", f"--{flag.get(modes[0], modes[0])} and "
+             f"--{flag.get(modes[1], modes[1])} are separate runs")
     if opts.get("dry_run") and opts.get("apply"):
         _die(6, "input", "--dry-run and --apply are opposites; give one")
     if (opts.get("discard") or opts.get("report")) and (opts.get("apply") or opts.get("answers")):
@@ -11426,6 +11449,9 @@ def _migrate_options(args: list[str]) -> dict:
     if opts.get("retire") and (opts.get("apply") or opts.get("answers") or opts.get("dry_run")
                                or opts["roots"]):
         _die(6, "input", "--retire-connections takes no other option")
+    if opts.get("retire_records") and (opts.get("apply") or opts.get("answers")
+                                       or opts.get("dry_run")):
+        _die(6, "input", "--retire-records takes no option but --root")
     return opts
 
 
@@ -14159,6 +14185,122 @@ def cmd_migrate_retire_connections() -> None:
     _emit({"ok": True, "global_migrated_at": at, "config_home": str(_CONFIG_HOME),
            "backup": str(backup) if retired else None, "retired": retired})
 
+def cmd_migrate_retire_records(opts: dict) -> None:
+    """`migrate --retire-records`: once the store's global rows are the
+    global layer, the config home's gate, identifiers files and global
+    settings files are only a copy of them. Each value they hold is checked
+    against the store's global rows, and only when every one is there with
+    the same value, and no agent on this machine still reads the files, are
+    they moved to one dated backup, so a value the store lacks is never lost.
+    Connections files are `--retire-connections`'; credentials, env and
+    session files stay."""
+    _read_only_gate("migrate --retire-records")
+    store = _store_module()
+    manifests = _migrate_manifests()
+    homes = {str(_CONFIG_HOME / name / home["path"]): (name, home)
+             for name, home in _migrate_settings_homes(manifests, "global")}
+    try:
+        conn, _setting = _migrate_connect(_project_root())
+    except _MigrateRefusal as exc:
+        _migrate_refuse(exc)
+    try:
+        at = _migrate_global_at(conn)
+        policy = _migrate_policy_rows(conn, None)
+        identifiers = _migrate_identifier_rows(conn, None)
+        settings = {name: _migrate_setting_rows(conn, None, name)
+                    for name, _home in homes.values()}
+    finally:
+        conn.close()
+    if not at:
+        _migrate_refuse(_MigrateRefusal(
+            "global_not_migrated", "the global records are not in the store, so these "
+            "files are still their only copy", "run `capabilities migrate --global --apply` "
+            "on the global master first"))
+    connections = {str(p) for p in _CONFIG_HOME.glob("*/connections.json")}
+    files = [p for p in _migrate_config_files(manifests) if str(p) not in connections]
+    gate_file = _CONFIG_HOME / "capabilities" / "settings.json"
+    reader = store.FileRecords(_CONFIG_HOME / "no-project", _CONFIG_HOME)
+    absent, unreadable = [], []
+
+    def compare(path: Path, name: str, key: str, held, wanted) -> None:
+        if held is None:
+            absent.append({"file": str(path), "capability": name, "key": key,
+                           "reason": "missing"})
+        elif held != wanted:
+            absent.append({"file": str(path), "capability": name, "key": key,
+                           "reason": "differs"})
+
+    for path in files:
+        if path == gate_file:
+            body = _read_json(path)
+            entries = body.get("capabilities") if isinstance(body, dict) else None
+            if not isinstance(entries, dict):
+                unreadable.append(f"{path}: not a capability policy")
+                continue
+            for key in sorted(k for k in body if k != "capabilities"):
+                compare(path, "capabilities", key, None, body[key])
+            for name, entry in sorted(entries.items()):
+                if not isinstance(entry, dict) or set(entry) != {"enabled"} \
+                        or not isinstance(entry["enabled"], bool):
+                    unreadable.append(f'{path}: {name!r} is not {{"enabled": true|false}}')
+                    continue
+                compare(path, name, "enabled", policy.get((name, None)), entry["enabled"])
+        elif str(path) in homes:
+            name, home = homes[str(path)]
+            document, problem = _migrate_read_document(path, home.get("format") or "json")
+            if problem:
+                unreadable.append(problem)
+                continue
+            held = settings.get(name)
+            for key, value in sorted((document or {}).items()):
+                compare(path, name, key, None if held is None else held.get(key), value)
+        else:
+            name = path.parent.name
+            try:
+                rows = reader.resolve_scope(name, "identifier", "global")
+            except store.StoreError as exc:
+                unreadable.append(f"{path}: {exc.message}")
+                continue
+            for label, row in sorted(rows.items()):
+                compare(path, name, label, identifiers.get((name, label)),
+                        (row["value"], row["note"] or ""))
+    if unreadable:
+        _migrate_refuse(_MigrateRefusal(
+            "files_unreadable", f"{len(unreadable)} config home file(s) cannot be read: "
+            + "; ".join(unreadable), "repair or remove them, then run it again"))
+    if absent:
+        _migrate_refuse(_MigrateRefusal(
+            "records_not_in_store", f"{len(absent)} value(s) of the config home's files "
+            "are not in the store's global rows as the files hold them: "
+            + ", ".join(f"{Path(a['file']).relative_to(_CONFIG_HOME)} {a['capability']}/"
+                        f"{a['key']} ({a['reason']})" for a in absent),
+            "write each one at global scope with its own verb - `capabilities enable|disable "
+            "<name> --global`, `<name> ids set <label> <value> --global`, the "
+            "capability's settings verb - or remove "
+            "it from its file if it is no longer wanted, then run it again; nothing was "
+            "moved", detail={"values": absent}))
+    agents = _migrate_agent_states(_migrate_discover(opts.get("roots") or [], scan=True))
+    waiting = [a for a in agents if a["state"] not in ("migrated",)]
+    if waiting:
+        _migrate_refuse(_MigrateRefusal(
+            "agents_unmigrated", f"{len(waiting)} root(s) on this machine have not moved "
+            "and still read the config home's identifiers and settings files: "
+            + ", ".join(f"{a['root']} ({a['state']}; {', '.join(a['sources'])})"
+                        for a in waiting),
+            "migrate each on its master first, give one without an id an id with "
+            "`capabilities init` or archive it; nothing was moved", detail={"agents": waiting}))
+    import datetime as _dt
+    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = _CONFIG_HOME / "capabilities" / "retired" / f"records-{stamp}"
+    retired = []
+    for path in files:
+        target = backup / path.relative_to(_CONFIG_HOME)
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.replace(path, target)
+        retired.append({"file": str(path), "backup": str(target)})
+    _emit({"ok": True, "global_migrated_at": at, "config_home": str(_CONFIG_HOME),
+           "backup": str(backup) if retired else None, "retired": retired})
+
 
 def _migrate_historical(relative: Path, body: tuple) -> bool:
     """Whether a file of the project is a historical note rather than a live
@@ -14250,7 +14392,11 @@ def cmd_migrate_report(opts: dict) -> None:
                                       "the global rows are in the store; agents not yet "
                                       "moved still read these, and a node that is not the "
                                       "global master discards them with `capabilities "
-                                      "migrate --discard`" if at else
+                                      "migrate --discard`, while any node, the global "
+                                      "master included, retires them once the store holds "
+                                      "what they say with `capabilities migrate "
+                                      "--retire-connections` and `capabilities migrate "
+                                      "--retire-records`" if at else
                                       "the global records are not in the store yet: run "
                                       "`capabilities migrate --global` on the global master")}})
 
@@ -14263,6 +14409,8 @@ def cmd_migrate(args: list[str]) -> None:
         cmd_migrate_discard(opts)
     elif opts.get("retire"):
         cmd_migrate_retire_connections()
+    elif opts.get("retire_records"):
+        cmd_migrate_retire_records(opts)
     elif opts.get("report"):
         cmd_migrate_report(opts)
     else:

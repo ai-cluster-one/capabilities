@@ -159,6 +159,15 @@ capabilities migrate --discard
 
 It refuses on the master node of any agent (`master_node`), before the global layer exists (`global_not_migrated`) and while any agent root it finds has not moved (`agents_unmigrated`, each root named).
 
+On the global master, which keeps these files, and on any other machine that would rather keep a copy, retire them once the store holds what they say:
+
+```sh
+capabilities migrate --retire-connections   # the connections files
+capabilities migrate --retire-records       # the gate, identifiers and global settings files
+```
+
+Each compares every value of its files with the store's global rows and, only when every one is there with the same value, moves the files to one dated backup under `$XDG_CONFIG_HOME/capabilities/retired/`. Otherwise it moves nothing and names each value that is missing or differs (`connections_not_in_store`, `records_not_in_store`); write it at global scope with its own verb, or remove it from its file, and run it again. `--retire-records` also refuses while any agent root it finds has not moved (`agents_unmigrated`), as `--discard` does. Credentials, env and session files stay where they are.
+
 ### Step 6 - done
 
 ```sh
@@ -168,7 +177,7 @@ capabilities migrate --report --root <path>   # for agent roots it does not find
 
 The report lists every agent root the machine finds - from the machine services' join lists, the desktop app's agent list, the project you run it in, the roots you give and their git worktrees - with its `state`, the record and settings `files` left, an open migration's `journal`, `consumers` (lines of the agent's own text that read those files directly) and a `reason`, and the machine's `config_home` files. On the master, roots that none of those sources know about need `--root`.
 
-The move is done on a machine when every agent in its report is `migrated` with no `files`, no `consumers` and no `reason`, and `config_home.files` is empty. It is done for the person when that holds on every machine.
+The move is done on a machine when every agent in its report is `migrated` with no `files`, no `consumers` and no `reason`, and `config_home.files` is empty - on the global master once step 5's retire runs have moved them, elsewhere once `--discard` or those runs have. It is done for the person when that holds on every machine.
 
 Fix `consumers` with the person: each names a script or document of theirs that still reads the old files.
 
