@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-24 — A running raise shows its model and turns, and every raise names its node
+
+While a turn runs, its raise's metrics carry the `model` the harness resolved, written as soon as the harness names it (a profile's alias such as `opus` shows as the model it ran, such as `claude-opus-5-5`), and `num_turns`, the turns taken so far, refreshed on the beat - every 30 s by default. The close writes the measured metrics over them as before, so a finished raise reads as it always has; a cost is known only once the turn has ended, since the harness reports none before. Every raise records the node it was claimed on in the new column `tasks_executions.node`: `AGENT_NODE_NAME`, else the host name. Store step `0006-execution-node` adds it (tables 1.4); a raise opened before it names none.
+
 ## 2026-10-23 — The service declares how many nodes run it at once
 
 The service descriptor declares `service.placement` `shared`: the service runs on every node it is placed on (`capabilities place tasks --node <node>`), and the deployment runner takes no lease for it. A project that had it placed on more than one node, where the lease ran it on one, runs it on each of them.

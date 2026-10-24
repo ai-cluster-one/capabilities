@@ -15,6 +15,9 @@ init event and a result document. It does no work.
                        link it with `origin` tasks and `origin_ref`, and say so
                        on the named task's trail
   FAKE_ENGINE_SLEEP    seconds to hold the turn open before answering
+  FAKE_ENGINE_TURNS    a count: before holding the turn open, send the init
+                       event and that many assistant messages, one per turn,
+                       as a turn at work does
   FAKE_ENGINE_DETACH   a file: before holding the turn open, start a daemon the
                        way `pg_ctl start` starts a postmaster - forked twice, in
                        a session of its own, its parent gone - and write its pid
@@ -82,6 +85,20 @@ for line in sys.stdin:
                 os.execvp("sleep", ["sleep", "300"])
             os._exit(0)
         os.wait()
+
+    def init():
+        emit({"type": "system", "subtype": "init", "session_id": session,
+              "apiKeySource": "none", "model": model, "claude_code_version": "2.1.280",
+              "tools": [], "cwd": os.getcwd(),
+              "permissionMode": arg("--permission-mode") or "default"})
+
+    turns = int(os.environ.get("FAKE_ENGINE_TURNS") or 0)
+    if turns:
+        init()
+        for number in range(1, turns + 1):
+            emit({"type": "assistant", "session_id": session, "parent_tool_use_id": None,
+                  "message": {"id": f"msg-{number}", "model": model,
+                              "content": [{"type": "text", "text": f"turn {number}"}]}})
     if os.environ.get("FAKE_ENGINE_SLEEP"):
         time.sleep(float(os.environ["FAKE_ENGINE_SLEEP"]))
     tasks = os.environ.get("FAKE_ENGINE_TASKS")
@@ -103,10 +120,8 @@ for line in sys.stdin:
                        capture_output=True, timeout=120)
         subprocess.run([tasks, "set", named.group(1), "--status", "complete"],
                        capture_output=True, timeout=120)
-    emit({"type": "system", "subtype": "init", "session_id": session,
-          "apiKeySource": "none", "model": model, "claude_code_version": "2.1.280",
-          "tools": [], "cwd": os.getcwd(),
-          "permissionMode": arg("--permission-mode") or "default"})
+    if not turns:
+        init()
     emit({"type": "result", "subtype": "error_during_execution" if failing else "success",
           "is_error": bool(failing),
           "duration_ms": 5, "duration_api_ms": 4, "num_turns": 1,

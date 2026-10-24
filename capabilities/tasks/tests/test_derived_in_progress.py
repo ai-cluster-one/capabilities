@@ -351,6 +351,44 @@ def test_a_run_the_service_started_renews_nothing_and_ends_when_unrenewed(lab, t
     assert task["status"] == "todo"
 
 
+@needs_store
+def test_a_running_raise_shows_its_model_and_turns_and_names_its_node(lab):
+    """While its turn runs, a raise carries the model the harness named and the
+    turns taken so far, and the raise names the node it was claimed on. The
+    close writes the measured metrics over the running reading."""
+    import psycopg
+    schema = lab["schema"]
+    lab["env"].update({"FAKE_ENGINE_SLEEP": "6", "FAKE_ENGINE_TURNS": "3",
+                       "TASKS_STORE_RETRY_SECONDS": "3",    # a beat every 2s
+                       "AGENT_NODE_NAME": "node-under-test"})
+    service.answer_of(service.tasks_cli(lab, "add", "--type", "alpha", "--title", "t",
+                                        "--key", "t-live", "--status", "todo"))
+    turn = subprocess.Popen([str(_cli.CLI_PATH), "run", "alpha", "--apply"],
+                            cwd=lab["project"], env=lab["env"], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    query = f"""select e.status, e.metrics, e.node from {schema}.tasks_executions e
+                  join {schema}.tasks_tasks t on t.id = e.task_id
+                 where t.unique_key = 't-live'"""
+    try:
+        with psycopg.connect(service.DSN, autocommit=True) as conn:
+            def reading():
+                row = conn.execute(query).fetchone()
+                return row if row and row[0] == "running" and row[1].get("num_turns") else None
+            status, metrics, node = service.poll_for(reading, 30)
+            assert metrics["model"] == "claude-opus-5" and metrics["num_turns"] == 3, metrics
+            assert node == "node-under-test"
+            out, err = turn.communicate(timeout=60)
+            assert turn.returncode == 0, out + err
+            status, metrics, node = conn.execute(query).fetchone()
+    finally:
+        if turn.poll() is None:
+            os.killpg(turn.pid, signal.SIGKILL)
+    assert status == "ok" and node == "node-under-test"
+    # The result's own count and cost, as the close has always written them.
+    assert (metrics["num_turns"], metrics["cost_usd"]) == (1, 0.01), metrics
+
+
 # --- The contract --------------------------------------------------------------
 
 def test_help_states_the_derivation_and_the_one_lease_writer():

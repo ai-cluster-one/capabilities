@@ -226,6 +226,13 @@ ONE TURN OF THE CONVEYOR
   codex turn learns its id from the harness, and its raise names it when it is
   closed.
 
+  Every raise records the node it was claimed on as `node`: the name the
+  machine declares in AGENT_NODE_NAME, and its host name where it declares none.
+  While its turn runs, the raise's metrics carry the `model` the harness
+  resolved, from the moment the harness names it, and `num_turns`, the turns
+  taken so far, refreshed on the beat. The close writes the measured metrics
+  over them; a cost is known only once the turn has ended.
+
   A raise is cut off when it ended without an ending of its own: closed as
   abandoned, because its lease lapsed or `service stop --end-turns` ended its
   turn, or marked `cut_off`. When a worker on a claude profile claims a task whose last
@@ -4419,23 +4426,23 @@ def _claim(entry, opts: dict) -> dict:
         if fixed:
             cur.execute(f"""insert into {SCHEMA}.tasks_executions
                               (task_id, attempt, worker, worker_id, profile_id, handler,
-                               lease_until, metrics, run_system, run_ref)
+                               lease_until, metrics, run_system, run_ref, node)
                             values (%s, %s, %s, %s, %s, %s,
-                                    now() + make_interval(secs => %s), %s::jsonb, %s, %s)
+                                    now() + make_interval(secs => %s), %s::jsonb, %s, %s, %s)
                             returning *""",
                         (tid, attempt, opts.get("worker"), opts.get("worker_id"),
                          opts.get("profile_id"), opts.get("handler"), lease,
-                         json.dumps(fixed), run_system, run_ref))
+                         json.dumps(fixed), run_system, run_ref, node_name()))
         else:
             cur.execute(f"""insert into {SCHEMA}.tasks_executions
                               (task_id, attempt, worker, worker_id, profile_id, handler,
-                               lease_until, run_system, run_ref)
+                               lease_until, run_system, run_ref, node)
                             values (%s, %s, %s, %s, %s, %s,
-                                    now() + make_interval(secs => %s), %s, %s)
+                                    now() + make_interval(secs => %s), %s, %s, %s)
                             returning *""",
                         (tid, attempt, opts.get("worker"), opts.get("worker_id"),
                          opts.get("profile_id"), opts.get("handler"), lease, run_system,
-                         run_ref))
+                         run_ref, node_name()))
         execution = _rows(cur)[0]
         # The raise is the whole of the claim. The task stays where it rests -
         # its status, assignee and pickup untouched, no move recorded - and is
@@ -8773,7 +8780,8 @@ def _record_run(entry, execution: str, system: str, ref: str) -> None:
         conn.commit()
 
 
-def _boot(worker: dict, prompt: str, execution: str, cwd: Path, session, cancel=None):
+def _boot(worker: dict, prompt: str, execution: str, cwd: Path, session, cancel=None,
+          on_event=None):
     """One harness turn, and the wall time it took. The only thing here that
     knows how a turn is started.
 
@@ -8789,7 +8797,8 @@ def _boot(worker: dict, prompt: str, execution: str, cwd: Path, session, cancel=
     needs in order to decide whether an attempt was spent.
 
     `cancel`, once set, ends the turn and kills what it started: the beat sets
-    it when the raise is lost.
+    it when the raise is lost. `on_event` is handed every event the harness
+    reports while the turn runs.
 
     However the turn ends - answered, failed, timed out or cancelled - every
     process it started ends with it, `_end_what_it_left` says how."""
@@ -8800,7 +8809,7 @@ def _boot(worker: dict, prompt: str, execution: str, cwd: Path, session, cancel=
     try:
         result = runner.run(prompt, worker["profile"], str(cwd), session=session,
                             environ=os.environ, extra_env={"TASKS_EXECUTION": execution},
-                            cancel=cancel)
+                            cancel=cancel, on_event=on_event)
     finally:
         _end_what_it_left()
     return result, int((time.monotonic() - started) * 1000)
@@ -8994,6 +9003,88 @@ class _Beat:
         self._thread.join(timeout=15)
 
 
+class _Progress:
+    """What a running turn has shown of itself, kept on its raise while it runs:
+    the model the harness resolved, and the turns it has taken so far.
+
+    It is the turn's `on_event`. The model is written as soon as the harness
+    names it, and after that what changed is written at most every `every`
+    seconds, by a thread of its own, so a store that is slow or away never holds
+    up the turn. Each write merges into the raise's metrics while it is still
+    running and is lost, said on stderr, when the store cannot take it. The
+    close writes the measured metrics over all of it, as it always has: these
+    are a running reading, and what a turn cost is known only when it ends -
+    the harness reports a cost with its result and not before."""
+
+    def __init__(self, entry, execution: str, every: int):
+        import threading
+        self.entry, self.execution, self.every = entry, execution, every
+        self.model: str | None = None
+        self._turns: set[str] = set()
+        self._written: dict = {}
+        self._lock = threading.Lock()
+        self._wake, self._stop = threading.Event(), threading.Event()
+        self._thread = threading.Thread(target=self._run, name="tasks-progress", daemon=True)
+        self._thread.start()
+
+    def __call__(self, event: dict) -> None:
+        """One harness event. Claude names the model in its `init` event and on
+        every assistant message, one message per turn of the main loop; codex
+        names it where its event carries one."""
+        params = event.get("params") if isinstance(event.get("params"), dict) else {}
+        model = event.get("model") or params.get("model")
+        top = event.get("parent_tool_use_id") is None
+        with self._lock:
+            if isinstance(model, str) and model and top:
+                first, self.model = self.model is None, model
+                if first:
+                    self._wake.set()
+            if event.get("type") == "AssistantMessage" and top and event.get("message_id"):
+                self._turns.add(str(event["message_id"]))
+
+    def reading(self) -> dict:
+        with self._lock:
+            return {k: v for k, v in (("model", self.model),
+                                      ("num_turns", len(self._turns) or None))
+                    if v is not None}
+
+    def _write(self) -> None:
+        import contextlib
+        seen = self.reading()
+        if not seen or seen == self._written:
+            return
+        try:
+            with _connect(self.entry, raising=True) as conn, \
+                    _sever_after(conn, min(self.every, 10)), conn.cursor() as cur:
+                cur.execute(f"""update {SCHEMA}.tasks_executions
+                                   set metrics = metrics || %s::jsonb
+                                 where id::text = %s and status = 'running'""",
+                            (json.dumps(seen), self.execution))
+                conn.commit()
+            self._written = seen
+        except (Exception, SystemExit) as exc:
+            with contextlib.suppress(Exception):
+                sys.stderr.write(json.dumps({"progress_unwritten": {
+                    "execution": self.execution,
+                    "error": (str(exc).strip() or type(exc).__name__)[:300]}}) + "\n")
+                sys.stderr.flush()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._wake.wait(self.every)
+            self._wake.clear()
+            if self._stop.is_set():
+                return
+            self._write()
+
+    def stop(self) -> None:
+        """No write after this returns: the turn is over and its raise is about
+        to be closed."""
+        self._stop.set()
+        self._wake.set()
+        self._thread.join(timeout=15)
+
+
 def _close(entry, execution: str, outcome: str, detail: str | None,
            system: str, pointer: str, metrics: dict, tid: str, report: dict) -> None:
     """Close the raise, moving nothing, and say on the trail when it could not be
@@ -9124,6 +9215,7 @@ def cmd_run(entry, args: list[str]) -> None:
     # it is lost, whoever was keeping it.
     beat = _Beat(entry, execution, worker["limits"]["lease_seconds"], short, every,
                  renews=not receipt)
+    progress = None
     try:
         report.update(claimed=_address(task), attempt=attempt, execution=execution)
         if receipt:
@@ -9185,12 +9277,15 @@ def cmd_run(entry, args: list[str]) -> None:
         # Where the task rests as the turn begins, which is where the claim found
         # it: what the turn is scored against when it is over.
         rested, grew_from = _state(entry, tid)
+        # What the turn shows of itself while it runs is kept on its raise at
+        # the beat's pace, and the model as soon as the harness names it.
+        progress = _Progress(entry, execution, every)
         if resumed:
             _record_run(entry, execution, "claude", resumed["run_ref"])
             result, elapsed_ms = _boot(worker, _continuation(worker, task, resumed),
                                        execution, _project_here(),
                                        runner.Session.resume(resumed["run_ref"]),
-                                       beat.ended)
+                                       beat.ended, progress)
             _after, grown = _state(entry, tid)
             # A resume refused at launch fails in seconds having written nothing, and
             # not for the account's limit: the turn is started again, fresh.
@@ -9205,7 +9300,8 @@ def cmd_run(entry, args: list[str]) -> None:
                 _record_run(entry, execution, "claude", pinned)
         if not resumed:
             result, elapsed_ms = _boot(worker, prompt, execution, _project_here(), session,
-                                       beat.ended)
+                                       beat.ended, progress)
+        progress.stop()
         landing, grew_to = _state(entry, tid)
 
         detail = result.failure.message[:300] if result.failure else ""
@@ -9296,6 +9392,8 @@ def cmd_run(entry, args: list[str]) -> None:
         _emit(report)
     finally:
         # Closed or not, the raise is no longer this process's to renew.
+        if progress is not None:
+            progress.stop()
         beat.stop()
 
 
@@ -12275,7 +12373,7 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 # callva-harness-runner owns and ships as steps of its own, applied under its own
 # ledger before these, everywhere these are: `_profile_tables` names them.
 STORE_MAJOR = 1
-STORE_MINOR = 3
+STORE_MINOR = 4
 
 _MOVE_FROM_SCHEMA_TASKS = r"""
 DO $move$
@@ -12749,12 +12847,23 @@ create trigger tasks_workers_keep_history_truncate before truncate on tasks_work
     for each statement execute function tasks_workers_keep_history();
 """
 
+_EXECUTION_NODE = r"""
+alter table tasks_executions add column node text
+  constraint tasks_executions_node_check check (node <> '');
+comment on column tasks_executions.node is
+  'The node the raise was claimed on, which is where its run and the run''s session '
+  'live: the name the machine declares in AGENT_NODE_NAME, and its host name where it '
+  'declares none. Null on a raise opened before nodes were kept, and on a hold, which '
+  'is no raise.';
+"""
+
 STORE_STEPS = [
     ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
     ("0002-tables", _TABLES_SHAPE),
     ("0003-workers", _WORKERS_TABLE),
     ("0004-profiles", _PROFILE_COLUMN),
     ("0005-workers-history", _WORKERS_HISTORY_GUARD),
+    ("0006-execution-node", _EXECUTION_NODE),
 ]
 
 
