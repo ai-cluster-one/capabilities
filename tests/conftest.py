@@ -5,7 +5,12 @@ capabilities into a fresh temporary registry for nearly every test, so a run
 against the machine's uv cache leaves one environment there per test and per
 run, and nothing removes them. The run is given a uv cache of its own instead,
 holding every bucket of the cache it was handed apart from the environments: the
-wheels and interpreters stay shared, and the environments go with the run."""
+wheels and interpreters stay shared, and the environments go with the run.
+
+A script's first run in a cache reports its install on stderr, which a test
+reading that stderr as JSON would take for its answer, so the checkout's own
+scripts have their environments made quietly in the run's cache before any test
+runs them."""
 
 import os
 import shutil
@@ -34,6 +39,10 @@ def pytest_configure(config):
             (run_cache / entry.name).symlink_to(entry)
     os.environ["UV_CACHE_DIR"] = str(run_cache)
     _RUN_CACHE = run_cache
+    checkout = Path(__file__).resolve().parent.parent
+    scripts = [checkout / "bin" / "capabilities", *sorted(checkout.glob("capabilities/*/bin/*"))]
+    for script in scripts:
+        subprocess.run([uv, "sync", "-q", "--script", str(script)], capture_output=True)
 
 
 def pytest_unconfigure(config):
