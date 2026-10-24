@@ -217,21 +217,25 @@ def _safe_service_path(value, path, project_root, service_dir):
         _fail(path, "must resolve inside the Telegram service directory")
 
 
-def _route_project(value, path):
+def _route_project(value, path, project_root):
     """A worker route target, judged by its shape alone.
 
     Existence is deliberately not asserted here. A settings failure exits the
     daemon, so a neighbouring project that was renamed or unmounted would stop
     the service for every other channel. The dispatch check owns that failure
     and spends it on the one request that names the route.
+
+    A target lies inside the home or is the agent's own folder, or inside it:
+    on a node the agent lives at /app, outside the home.
     """
     _string(value, path, nonempty=True)
     candidate = Path(value).expanduser()
     if not candidate.is_absolute():
         _fail(path, "must be an absolute path, or start with ~")
     home = Path.home()
-    if home not in candidate.parents:
-        _fail(path, f"must be a path inside {home}")
+    own = Path(project_root)
+    if home not in candidate.parents and candidate != own and own not in candidate.parents:
+        _fail(path, f"must be a path inside {home}, or this agent's folder {own}")
 
 
 def _topics(value, path, project_root, service_dir):
@@ -252,7 +256,7 @@ def _topics(value, path, project_root, service_dir):
         entry = _object(entry, entry_path)
         _unknown(entry, TOPIC_KEYS, entry_path)
         if "project" in entry:
-            _route_project(entry["project"], f"{entry_path}.project")
+            _route_project(entry["project"], f"{entry_path}.project", project_root)
         if "profile" in entry:
             _profile(entry["profile"], f"{entry_path}.profile")
         _overlay(entry, entry_path, project_root, service_dir)
@@ -469,7 +473,7 @@ def _participant(value, path, project_root, service_dir, *, member=False):
     if "voice_agent" in value:
         _voice_agent(value["voice_agent"], f"{path}.voice_agent")
     if "project" in value:
-        _route_project(value["project"], f"{path}.project")
+        _route_project(value["project"], f"{path}.project", project_root)
     _overlay(value, path, project_root, service_dir)
 
 
@@ -529,7 +533,7 @@ def _group(value, path, project_root, service_dir):
         if key in value:
             _capabilities(value[key], f"{path}.{key}")
     if "project" in value:
-        _route_project(value["project"], f"{path}.project")
+        _route_project(value["project"], f"{path}.project", project_root)
     if "topics" in value:
         _topics(value["topics"], f"{path}.topics", project_root, service_dir)
     if "triggers" in value:

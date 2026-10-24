@@ -5216,6 +5216,28 @@ class ChatProjectRoutingTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(Exception, "must be a path inside"):
                 validated("/opt/elsewhere")
 
+    async def test_a_route_may_name_the_agents_own_folder_outside_the_home(self):
+        # On a node the agent lives at /app while the home is /home/agent.
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            base = {"connection": "test", "assistant_name": "Assistant",
+                    "direct_messages": {"mode": "anyone",
+                                        "default_role": "direct_user"},
+                    "allowed_users": {}, "allowed_groups": {}}
+            home, app = Path(td) / "home", Path(td) / "app"
+
+            def validated(project):
+                with mock.patch.dict(os.environ, {"HOME": str(home)}):
+                    return daemon.validate_settings(
+                        {**base, "allowed_groups": {"-200": {"project": project}}},
+                        app, app / "capabilities" / "telegram" / "service")
+
+            validated(str(app))
+            validated(str(app / "sub"))
+            validated(str(home / "other"))
+            with self.assertRaisesRegex(Exception, "must be a path inside"):
+                validated(str(Path(td) / "elsewhere"))
+
     async def test_a_topic_entry_carries_a_route_and_prose_and_nothing_else(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())

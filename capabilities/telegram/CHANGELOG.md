@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-24 — A route may name the agent's own folder outside the home
+
+A `project` route on a group, a topic, a member or a direct user is accepted when it is the agent's own folder or a path inside it, as well as a path inside the home. On a node the agent lives at `/app`, outside `/home/agent`, and a route to it was refused as `must be a path inside /home/agent`, which stopped the service at load. Any other path outside the home is still refused, now naming both places a route may lie.
+
 ## 2026-10-23 — The service declares how many nodes run it at once
 
 The service descriptor declares `service.placement` `exclusive`: one node runs the service at a time, the deployment runner's lease holds it there, and `capabilities place telegram --node <node>` moves it, leaving `telegram` usable on the node it left.

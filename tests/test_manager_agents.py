@@ -308,6 +308,36 @@ def test_init_id_raises_an_agent_the_store_holds_in_a_folder_of_its_own(lab, tmp
     assert not (stray / "capabilities").exists()
 
 
+def test_a_folder_an_agent_is_raised_in_does_not_name_it(lab, tmp_path):
+    # A node raises an agent the store already holds in /app: an agent with no
+    # slug and no name is not named "app" after it.
+    node = {"AGENT_NODE_NAME": "lab-node"}
+    migrated = lab.run("migrate", "--global", "--apply", **node)
+    assert migrated.returncode == 0, migrated.stderr
+    (lab.project / "capabilities" / "project.json").unlink()
+    created = lab.run("init", **node)
+    assert created.returncode == 0, created.stderr
+    agent_id = _bound(lab.project)
+    added = lab.run("node", "add", "srv-node", "--kind", "server", **node)
+    assert added.returncode == 0, added.stderr
+    with lab.cluster.connect(lab.database) as conn:
+        conn.execute(f"UPDATE {SCHEMA}.capabilities_agents SET slug = NULL, name = NULL "
+                     "WHERE id = %s", (agent_id,))
+    setting = (lab.project / ".env.local").read_text().replace(
+        f"CAPABILITIES_PROJECT_ID={agent_id}\n", "")
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / ".env.local").write_text(setting)
+    raised = subprocess.run(
+        [sys.executable, str(MANAGER), "init", "--id", agent_id], cwd=app,
+        env=lab.env(CLAUDE_PROJECT_DIR=str(app), AGENT_NODE_NAME="srv-node"),
+        text=True, capture_output=True, timeout=120)
+    assert raised.returncode == 0, raised.stderr
+    assert json.loads(raised.stdout)["agent"]["slug"] is None
+    assert lab.sql(f"SELECT slug FROM {SCHEMA}.capabilities_agents WHERE id = %s",
+                   (agent_id,)) == [(None,)]
+
+
 def test_agent_show_and_set(lab, tmp_path):
     shown = lab.ok("agent", "show")
     assert (shown["agent_id"], shown["registered"], shown["agent"]) == (PROJECT_ID, False, None)

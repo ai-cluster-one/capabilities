@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-24 — An agent whose settings were left behind as files is told to move them
+
+Where the scheduler's `config.toml` is missing or broken for an agent whose records are already in the store while its settings are still files - its connections imported, `capabilities migrate` never run - `invalid_config` names `capabilities migrate` as what moves the settings into the store, and `automations service init` as what writes the file here instead. Every other project is told to run `automations service init` or repair config.toml, as before.
+
 ## 2026-10-23 — The service declares how many nodes run it at once
 
 The service descriptor declares `service.placement` `shared`: the service runs on every node it is placed on (`capabilities place automations --node <node>`), and the deployment runner takes no lease for it. A project that had it placed on more than one node, where the lease ran it on one, runs it on each of them.

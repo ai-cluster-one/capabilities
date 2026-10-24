@@ -7397,14 +7397,16 @@ def _legacy_project_slug(root: Path) -> str | None:
 
 
 def _settle_agent_slug(conn, agent_id: str, root: Path, carried: str | None = None,
-                       name: str | None = None) -> dict:
+                       name: str | None = None, folder: bool = True) -> dict:
     """Give the agent's row its slug where it has none, inside the caller's
     transaction: the slug an older project.json names (`carried`, else read
     from the project), so nothing it names moves; else its display name (the
     row's, else `name`, the one it is about to be given) transliterated, else
-    the folder's name, each with the id's tail added
-    where another agent holds it already. A carried slug another agent holds
-    is left unset rather than changed. Answers what the row holds."""
+    the folder's name where `folder` says the folder names the agent, each
+    with the id's tail added where another agent holds it already. A carried
+    slug another agent holds is left unset rather than changed, and so is the
+    slug of an agent with no name whose folder does not name it. Answers what
+    the row holds."""
     import psycopg
     row = conn.execute("SELECT slug, name FROM capabilities_agents WHERE id = %s FOR UPDATE",
                        (agent_id,)).fetchone()
@@ -7418,6 +7420,8 @@ def _settle_agent_slug(conn, agent_id: str, root: Path, carried: str | None = No
     else:
         wanted = _slug_from_name(row[1] or name)
         source = "name" if wanted else "folder"
+        if not wanted and not folder:
+            return {"slug": None, "set": False, "reason": "no_name"}
         wanted = wanted or _default_project_slug(root)
         tail = re.sub(r"[^a-z0-9]", "", agent_id.lower())[-6:]
         candidates = [wanted, f"{wanted[:57].strip('-')}-{tail}"]
@@ -7617,14 +7621,20 @@ def _ensure_agent_row(conn, agent_id: str) -> bool:
     return cur.rowcount == 1
 
 
+def _folder_holds_older_records(root: Path) -> bool:
+    """Whether the folder still holds an older project.json, settings file or
+    legacy envelope: records of the agent kept in the folder itself."""
+    capdir = _envelope_home(root)
+    return ((capdir / PROJECT_IDENTITY_REL).exists()
+            or (capdir / "settings.json").exists()
+            or (root / LEGACY_PROJECT_CAPABILITIES_REL).exists())
+
+
 def _new_agent_project(root: Path) -> bool:
     """Whether init is creating this agent: no older project.json, no settings
     file and no legacy envelope yet, so it has no records anywhere to move,
     and no id it is bound to that the store already holds an agent for."""
-    capdir = _envelope_home(root)
-    if (capdir / PROJECT_IDENTITY_REL).exists() \
-            or (capdir / "settings.json").exists() \
-            or (root / LEGACY_PROJECT_CAPABILITIES_REL).exists():
+    if _folder_holds_older_records(root):
         return False
     ident = _handed_off_project_id(root) or _env_file_project_id(root)[0]
     return not ident or not _agent_registered(root, ident)
@@ -7734,7 +7744,11 @@ def _register_agent_on_init(root: Path, new_agent: bool = False,
                              "AND NOT EXISTS (SELECT 1 FROM capabilities_agent_nodes "
                              "WHERE node = %s AND folder = %s)",
                              (folder, agent_id, node, node, folder))
-            slug = _settle_agent_slug(conn, agent_id, root, name=name)
+            # A folder bound to an agent the store already held - a node's
+            # /app, a checkout on another machine - does not name it.
+            slug = _settle_agent_slug(
+                conn, agent_id, root, name=name,
+                folder=new_agent or created or _folder_holds_older_records(root))
         return {"registered": True, "id": agent_id, "created": created,
                 "migrated": new_agent and bool(node), "slug": slug["slug"],
                 "store": _kernel_store_report(setting)}

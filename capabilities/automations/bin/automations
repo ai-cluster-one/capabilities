@@ -872,6 +872,23 @@ def _config_in_rows(root: Path) -> bool:
     return _records_in_store()
 
 
+def _config_file_hint() -> str:
+    """What to run where the settings file is missing or broken. An agent whose
+    records moved into the store while its settings stayed files is told to move
+    them as well: a file written here does not travel to a node raised from the
+    store."""
+    try:
+        records_moved = (_records().mode_of("policy") == "store"
+                         and _records().settings_kept() != "store")
+    except (StoreError, AttributeError):
+        records_moved = False
+    if records_moved:
+        return ("this agent's records are in the store and its settings are still files: "
+                "`capabilities migrate` moves them into the store; `automations service "
+                "init` writes config.toml here instead")
+    return "run `automations service init` or repair config.toml"
+
+
 def _config_where(root: Path) -> str:
     """Where this project's scheduler settings are kept, as a person reads it."""
     if _config_in_rows(root):
@@ -1372,7 +1389,7 @@ def _load(root: Path, definitions: bool = True):
         _die(6, "definitions_not_imported", str(exc),
              f"run `{NAME} import` to see what moves, then `{NAME} import --apply`")
     except runtime.ConfigError as exc:
-        _die(6, "invalid_config", str(exc), "run `automations service init` or repair config.toml")
+        _die(6, "invalid_config", str(exc), _config_file_hint())
     if definitions:
         try:
             with runtime.open_ledger(root, config, strict=False) as ledger:
@@ -1438,7 +1455,7 @@ def cmd_service_declaration() -> dict[str, Any]:
             return tomllib.loads(_config_path(root).read_text())
         except (OSError, tomllib.TOMLDecodeError) as exc:
             _die(6, "invalid_config", f"cannot read config {_config_path(root)}: {exc}",
-                 "run `automations service init` or repair config.toml")
+                 _config_file_hint())
     try:
         return _declaration_rows(root)
     except _ConfigRefusal as exc:
@@ -3957,7 +3974,7 @@ def _agents_config(root: Path) -> dict[str, Any]:
             return _load_config(runtime, root)
         return runtime.load_config(root, _config_path(root), unimported=True)
     except runtime.ConfigError as exc:
-        _die(6, "invalid_config", str(exc), "run `automations service init` or repair config.toml")
+        _die(6, "invalid_config", str(exc), _config_file_hint())
 
 
 def cmd_agents() -> dict[str, Any]:

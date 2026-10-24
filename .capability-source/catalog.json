@@ -27,7 +27,7 @@
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "43886fe4b1e08875238e57816aa5b86965b6c6cca9d812e0700408828872faa9",
+      "payload_sha256": "c8e8261211bfb885a68c990f48d174a005c7bee78246863349dabe3e549eba93",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {
@@ -177,7 +177,7 @@
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "19664febdd3317658dd13a1e78e022380f6c0244761b130029543cbea1ec9393",
+      "payload_sha256": "319d3468d6d9c488134c7a170694c664de96d118bc77b499b015af6a6a622c4b",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {

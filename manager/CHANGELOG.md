@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-24 — A folder an agent is raised in does not name it
+
+`capabilities init` gives an agent's row a slug from its folder's name only where the folder makes the agent - init registered the row, or is creating the agent - or still holds the agent's older project.json, settings file or legacy envelope. A folder bound with `--id` to an agent the store already holds, such as a node's `/app`, no longer names an agent that has no slug and no name: the row keeps no slug (`agent.slug` null in init's answer) instead of becoming `app`. A slug carried from a project.json or taken from the agent's name is given as before.
+
 ## 2026-10-23 — `path --json` names the store as the home of a layer the store holds
 
 In `capabilities path --json`, a layer of `context`, `assets` or `routines` the agent keeps in its store is answered in `layers` as `{"where": "store", "read": <command>, "folder": <path>}` - `read` the command that lists it (`context list`, `assets list`, `routine list --store`), `folder` where its import and export default to - in place of the path of a folder that may be gone. A layer is held in the store as `build` decides it: context where the store holds a project document or no context folder is there, routines where the store holds one, assets where the store holds an asset document or file. A layer in a folder, and every layer while the store does not answer, is its folder's path as before. A reader that took every `layers` value as a path reads a store-held layer as an object: the shipped `context` and `routine` take `folder` from it. An older copy of either beside this manager fails against a store-held layer until `capabilities update <name>` brings it current: an older `context` in `import` and `export` without DIR, an older `routine` in `import` and `export` without DIR and in `titles` and `title`, each ending with a `TypeError` naming a `dict`.
