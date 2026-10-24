@@ -652,6 +652,13 @@ def test_a_proven_identity_is_recorded_where_it_changes_and_never_fails(lab):
     assert result.returncode == 0 and json.loads(result.stdout) == {"recorded": False}
     result = _run(lab, "prove", "ghost", "9", "Eve")
     assert result.returncode == 0 and json.loads(result.stdout) == {"recorded": False}
+    # Nor where the record cannot be written, and the verb still answers.
+    path.chmod(0o444)
+    try:
+        result = _run(lab, "prove", "work", "9", "Eve")
+    finally:
+        path.chmod(0o644)
+    assert result.returncode == 0 and json.loads(result.stdout) == {"recorded": False}, result.stderr
     assert _identities(lab) == {"work": {"id": "4242", "display_name": "Example User @example"}}
 
 
