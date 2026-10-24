@@ -192,18 +192,21 @@ def test_prompt_marks_what_woke_the_agent():
 def test_a_supervisors_post_reaches_the_turn_as_theirs_and_wakes_nothing():
     boss = "@boss:example.org"
     marked = message("$1", ME, f"[supervisor] check {ME} status",
-                     **{"agentrooms.supervisor": boss})
+                     **{"agentrooms.supervisor": {"user_id": boss}})
     own = message("$2", ME, "my own answer")
-    other = message("$3", "@b:example.org", "[supervisor] hi", **{"agentrooms.supervisor": boss})
+    other = message("$3", "@b:example.org", "[supervisor] hi",
+                    **{"agentrooms.supervisor": {"user_id": boss, "name": "The Lead"}})
+    unnamed = message("$4", ME, "[supervisor] go", **{"agentrooms.supervisor": {}})
     wakes, _notes = engine.read_sync(sync(join={"!direct": {
         "summary": {"m.joined_member_count": 2}, "timeline": {"events": [marked]}}}),
         ME, {}, initial=False, member_count=lambda r: None)
     assert wakes == []
-    prompt = engine.build_prompt(room_id="!r", room_name="lab", wakes=[], events=[marked, own, other],
-                                 primed=True, user_id=ME)
-    assert f"{boss}, your supervisor, writing from your account - their words, not yours" in prompt
+    prompt = engine.build_prompt(room_id="!r", room_name="lab", wakes=[],
+                                 events=[marked, own, other, unnamed], primed=True, user_id=ME)
+    assert f"] your supervisor ({boss}), writing from your account - their words, not yours" in prompt
     assert f"] {ME} (event $2" in prompt
-    assert f"{boss}, supervisor of @b:example.org, writing from its account" in prompt
+    assert f"] supervisor of @b:example.org (The Lead, {boss}), writing from its account" in prompt
+    assert "] your supervisor, writing from your account - their words, not yours (event $4" in prompt
 
 
 def test_answers_cut_and_endings_judged():
@@ -514,14 +517,14 @@ def test_first_turn_is_primed_and_the_next_resumes(tmp_path):
 
 
 def test_a_woken_turn_reads_its_supervisors_post_as_the_supervisors(tmp_path):
-    events = [message("$1", ME, "[supervisor] be brief", **{"agentrooms.supervisor": "@boss:example.org"}),
+    events = [message("$1", ME, "[supervisor] be brief", **{"agentrooms.supervisor": {}}),
               message("$2", "@b:example.org", f"{ME} question")]
     matrix = FakeMatrix(events)
     runner = FakeRunner(["answer"])
     eng, slot = make_engine(tmp_path, matrix, runner)
     slot.store.add("!r", "$2")
     eng.turn(engine.Turn(slot, "alpha", "!r"))
-    assert "@boss:example.org, your supervisor, writing from your account" in runner.calls[0]["prompt"]
+    assert "your supervisor, writing from your account" in runner.calls[0]["prompt"]
 
 
 def test_the_room_rules_ride_in_the_system_prompt_of_every_turn(tmp_path):

@@ -243,7 +243,8 @@ DIRECTORY_TYPE = "agentrooms.directory"
 # Where custom data rides in a message's content.
 DATA_KEY = "agentrooms.data"
 # Where a message written by an agent's supervisor from the agent's account
-# names that supervisor (`post --as-supervisor`).
+# carries that mark (`post --as-supervisor`): an object, its user_id and name
+# each present only where known.
 SUPERVISOR_KEY = "agentrooms.supervisor"
 # Set in the environment of every turn the service starts, so what the agent
 # runs knows it runs under a worker, and a worker's fence cannot be rewritten
@@ -491,10 +492,21 @@ def turn_admits(store, project: str, turn: dict) -> Callable[[dict], bool]:
                          and admits(worker["accepts_from"], wake.get("sender")))
 
 
-def supervisor_of(content: dict) -> str | None:
-    """The supervisor a message says wrote it from its sender's account, if any."""
+def supervisor_of(content: dict) -> dict | None:
+    """{user_id, name} of the supervisor a message says wrote it from its
+    sender's account, each None where the mark does not carry it; None for a
+    message without the mark."""
     value = content.get(SUPERVISOR_KEY)
-    return value if isinstance(value, str) and value else None
+    if not isinstance(value, dict):
+        return None
+    return {k: (value[k] if isinstance(value.get(k), str) and value[k] else None)
+            for k in ("user_id", "name")}
+
+
+def supervisor_named(supervisor: dict) -> str:
+    """The supervisor as a turn names it: ' (name, user_id)' of what is known."""
+    known = [" ".join(supervisor[k].split()) for k in ("name", "user_id") if supervisor[k]]
+    return f" ({', '.join(known)})" if known else ""
 
 
 def is_default_answer(content: dict) -> bool:
@@ -1443,12 +1455,12 @@ def message_line(event: dict, wake_ids: set[str], user_id: str | None = None) ->
     when = ts_iso(event.get("origin_server_ts")) or "?"
     parts = [f"[{when}] {event.get('sender')}"]
     supervisor = supervisor_of(content)
-    if supervisor and event.get("sender") == user_id:
-        parts = [f"[{when}] {supervisor}, your supervisor, writing from your account - "
-                 "their words, not yours"]
-    elif supervisor:
-        parts = [f"[{when}] {supervisor}, supervisor of {event.get('sender')}, writing from "
-                 "its account"]
+    if supervisor is not None and event.get("sender") == user_id:
+        parts = [f"[{when}] your supervisor{supervisor_named(supervisor)}, writing from your "
+                 "account - their words, not yours"]
+    elif supervisor is not None:
+        parts = [f"[{when}] supervisor of {event.get('sender')}{supervisor_named(supervisor)}, "
+                 "writing from its account"]
     meta = [f"event {event.get('event_id')}"]
     root = thread_root(content)
     if root:

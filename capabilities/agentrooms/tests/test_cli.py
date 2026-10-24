@@ -449,8 +449,16 @@ def test_post_content_thread_reply_data_mentions(cli, project, homeserver, capsy
 def test_a_supervisor_posts_as_the_agent_marked_and_read_answers_the_mark(
         cli, project, homeserver, capsys, monkeypatch):
     connect(project, allow_write=True)
+    # A supervisor with no account of their own: the mark says only that, or the name given.
     code, _out, err = run(cli, capsys, "post", "!room", "hi", "--as-supervisor")
-    assert code == 6 and err["error"]["code"] == "supervisor_unset"
+    assert code == 0, err
+    content = homeserver.messages["!room"][-1]["content"]
+    assert content["agentrooms.supervisor"] == {} and content["body"] == "[supervisor] hi"
+    assert cli._message_row({"content": content})["supervisor"] == {"user_id": None, "name": None}
+    code, _out, err = run(cli, capsys, "post", "!room", "hi", "--as-supervisor", "The Owner")
+    assert code == 0, err
+    content = homeserver.messages["!room"][-1]["content"]
+    assert content["agentrooms.supervisor"] == {"name": "The Owner"}
     path = project / "capabilities" / "agentrooms" / "connections.json"
     conns = json.loads(path.read_text())
     conns["connections"]["alpha"]["supervisor"] = f"@boss:{SERVER}"
@@ -459,13 +467,13 @@ def test_a_supervisor_posts_as_the_agent_marked_and_read_answers_the_mark(
                          "--thread", "$root")
     assert code == 0, err
     content = homeserver.messages["!room"][-1]["content"]
-    assert content["agentrooms.supervisor"] == f"@boss:{SERVER}"
+    assert content["agentrooms.supervisor"] == {"user_id": f"@boss:{SERVER}"}
     assert content["body"] == f"[supervisor] ask @b:{SERVER}"
     assert content["m.mentions"] == {"user_ids": [f"@b:{SERVER}"]}
     assert content["m.relates_to"]["event_id"] == "$root"
     row = cli._message_row({"type": "m.room.message", "event_id": out["event_id"],
                             "sender": f"@alpha:{SERVER}", "content": content})
-    assert row["supervisor"] == f"@boss:{SERVER}"
+    assert row["supervisor"] == {"user_id": f"@boss:{SERVER}", "name": None}
     code, out, _err = run(cli, capsys, "read", "!room")
     assert [m["supervisor"] for m in out["messages"]] == [None] * out["count"]
     # The agent cannot write its supervisor's words from inside a turn.

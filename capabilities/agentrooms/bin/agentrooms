@@ -222,10 +222,11 @@ COMMANDS
         The last N messages (default 20, 1-100), oldest first: {room_id,
         limit, count, more, messages: [{event_id, sender, ts, msgtype, body,
         thread, reply_to, data, file, supervisor}]}. `more` is true when older
-        messages exist beyond N. supervisor is the user id a message posted
-        with `post --as-supervisor` names, null on any other. Refuses an
-        encrypted room. An archived room - or any room the agent left -
-        reads up to the agent's leave.
+        messages exist beyond N. supervisor is {user_id, name} on a message
+        posted with `post --as-supervisor` - each null where the mark does
+        not carry it - and null on any other. Refuses an encrypted room. An
+        archived room - or any room the agent left - reads up to the agent's
+        leave.
     open NAME --invite WHO [--invite WHO ...] [--topic TEXT]
         WRITE. Create a room: room version 12, unfederated, unencrypted,
         invite-only, its rights fixed at creation through the power-level
@@ -268,7 +269,7 @@ COMMANDS
   homeserver did not answer exits switch_not_written; the room is then
   served until `serve` writes it.
     post ROOM TEXT [--thread EVENT] [--reply-to EVENT] [--data JSON]
-                   [--file PATH] [--txn-id KEY] [--as-supervisor]
+                   [--file PATH] [--txn-id KEY] [--as-supervisor [NAME]]
         WRITE. Send one message. TEXT `-` reads standard input. --thread
         posts into the thread rooted at EVENT; --reply-to quotes EVENT;
         --data attaches a JSON object under the content key "agentrooms.data";
@@ -278,13 +279,14 @@ COMMANDS
         makes a repeat safe: the homeserver delivers one message per KEY per
         token, so a retry after a timeout reuses it. -> {room_id, event_id,
         txn_id}. Refuses an encrypted room. --as-supervisor posts the
-        connection's supervisor's words from the agent's account: the
-        content carries "agentrooms.supervisor" (the supervisor's user id)
-        and the body starts "[supervisor] " for other clients; the agent
-        reads it in its turns as its supervisor's, and it wakes nothing in
-        the agent, as none of the agent's own posts do. A connection with no
-        supervisor exits 6 supervisor_unset (`workers supervisor` sets it);
-        inside a turn the service started it is refused (exit 4 policy).
+        agent's supervisor's words from the agent's account; the supervisor
+        needs no account of their own. The content carries
+        "agentrooms.supervisor", an object holding user_id (the connection's
+        supervisor, where it names one) and name (NAME, where given), and
+        the body starts "[supervisor] " for other clients; the agent reads it
+        in its turns as its supervisor's, and it wakes nothing in the agent,
+        as none of the agent's own posts do. Inside a turn the service
+        started it is refused (exit 4 policy).
     mark ROOM / unmark ROOM
         WRITE. Mark a room so the service wakes this agent on every message
         in it, or take the mark off. The mark is this agent's own room
@@ -894,9 +896,10 @@ HOMESERVER_KEY = "AGENTROOMS_HOMESERVER"
 REGISTRATION_KEY = "AGENTROOMS_REGISTRATION_TOKEN"
 ROOM_VERSION = "12"
 DATA_KEY = "agentrooms.data"
-# A message the agent's supervisor wrote from the agent's account carries the
-# supervisor's user id under this content key, and its body this prefix for
-# clients that show no more than the body.
+# A message the agent's supervisor wrote from the agent's account carries an
+# object under this content key - the supervisor's user_id where the connection
+# names one, the name the supervisor gave, either, both or neither - and its
+# body this prefix for clients that show no more than the body.
 SUPERVISOR_KEY = "agentrooms.supervisor"
 SUPERVISOR_PREFIX = "[supervisor] "
 MARK_TYPE = "agentrooms.marked"
@@ -2076,8 +2079,8 @@ def _upload(m: Matrix, path: Path) -> dict:
 
 def _message_content(cfg: dict, text: str, thread: str | None, reply: str | None,
                      data: dict | None, upload: dict | None,
-                     supervisor: str | None = None) -> dict:
-    prefix = SUPERVISOR_PREFIX if supervisor else ""
+                     supervisor: dict | None = None) -> dict:
+    prefix = SUPERVISOR_PREFIX if supervisor is not None else ""
     if upload:
         family = upload["mimetype"].split("/", 1)[0]
         msgtype = {"image": "m.image", "video": "m.video", "audio": "m.audio"}.get(family, "m.file")
@@ -2096,24 +2099,25 @@ def _message_content(cfg: dict, text: str, thread: str | None, reply: str | None
         content["m.relates_to"] = {"m.in_reply_to": {"event_id": reply}}
     if data is not None:
         content[DATA_KEY] = data
-    if supervisor:
+    if supervisor is not None:
         content[SUPERVISOR_KEY] = supervisor
     return content
 
 
 def cmd_post(cfg: dict, room: str, text: str, thread: str | None, reply: str | None,
              data_raw: str | None, file: str | None, txn: str | None,
-             as_supervisor: bool = False) -> dict:
+             as_supervisor: str | None = None) -> dict:
     supervisor = None
-    if as_supervisor:
+    if as_supervisor is not None:
         if os.environ.get(_engine().TURN_ENV):
             _die(4, "policy", f"post --as-supervisor is refused inside a turn the {NAME} service "
                  "started: the supervisor's words are the supervisor's to write",
                  "the supervisor posts it, outside any turn")
-        supervisor = cfg.get("supervisor")
-        if not supervisor:
-            _die(6, "supervisor_unset", f"connection {cfg['id']!r} names no supervisor",
-                 f"`{NAME} --connection {cfg['id']} workers supervisor USER_ID` sets it")
+        supervisor = {}
+        if cfg.get("supervisor"):
+            supervisor["user_id"] = cfg["supervisor"]
+        if as_supervisor.strip():
+            supervisor["name"] = " ".join(as_supervisor.split())
     if text == "-":
         text = sys.stdin.read()
     text = text.rstrip("\n")
@@ -5011,7 +5015,7 @@ def _parser() -> _Parser:
     post.add_argument("--data")
     post.add_argument("--file")
     post.add_argument("--txn-id", dest="txn_id")
-    post.add_argument("--as-supervisor", dest="as_supervisor", action="store_true")
+    post.add_argument("--as-supervisor", dest="as_supervisor", nargs="?", const="", metavar="NAME")
     workers = sub.add_parser("workers")
     wsub = workers.add_subparsers(dest="action", required=True, parser_class=_Parser)
     wsub.add_parser("list")
