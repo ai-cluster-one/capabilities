@@ -298,7 +298,8 @@ def test_a_target_node_is_the_id_every_container_receives(tmp_path: Path, profil
     # A target that declares no node compiles exactly as before.
     assert _bundle_files(root, "edge") == before
     edge = before["docker-compose.yaml"]
-    assert "  AGENT_NODE_ID: ${AGENT_NODE_ID:-}" in edge.splitlines()
+    # One that names its node only by AGENT_NODE_NAME, as before ids, keeps it.
+    assert "  AGENT_NODE_ID: ${AGENT_NODE_ID:-${AGENT_NODE_NAME:-}}" in edge.splitlines()
     assert '      AGENT_NODE_ID: "${AGENT_NODE_ID:-}"' in edge.splitlines()
     assert _run(root, env, "sync", "--check").returncode == 0
 

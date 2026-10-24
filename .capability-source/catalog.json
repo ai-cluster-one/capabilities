@@ -17,7 +17,7 @@
     },
     "askproject": {
       "path": "capabilities/askproject",
-      "payload_sha256": "be51cf33be3d1791e9e21d68d5538736b0b6e327fc072961df7a34e83dc00432",
+      "payload_sha256": "db3996f2aa6f664842849dc529ae4f0a33e4a30daee0e681bd5deba8d38f15dd",
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project under a read or act profile, and return its answer with cost, token, and files-changed traceability."
     },
     "assets": {
@@ -27,7 +27,7 @@
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "9b1091bd0f6f13397397c64cf9c85e1e063f46b72908af7d0ef8829d67efefa9",
+      "payload_sha256": "21756f0a1a2c6c75ca07fd8bc187a990b079e160d74cb0f2ab0c7454f1237902",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {
@@ -57,7 +57,7 @@
     },
     "context": {
       "path": "capabilities/context",
-      "payload_sha256": "0fbf27ec7efe0ecf348a406b1152727e9571474dcf2dae5920fcfec334243050",
+      "payload_sha256": "d040e1f1b9a03979246216bde6fb00e14d684b70128b08db9907a95dc5e9c13e",
       "summary": "An agent's doctrine as versioned documents in the project's PostgreSQL store - list, show, save with a base, history, diff and retire, and import and export the context folder byte for byte."
     },
     "coolify": {
@@ -67,7 +67,7 @@
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "13c0d4e83289744b01858eef3a8a0e21da99d2051d1cd310a77be2cbb240e327",
+      "payload_sha256": "e9b45a15fdc846d068053f874e961cff211a5fa6e4fa13f81274e460306de501",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into launchd-supervised processes on a Mac, and describe the targets they deploy to."
     },
     "directo": {
@@ -142,7 +142,7 @@
     },
     "routine": {
       "path": "capabilities/routine",
-      "payload_sha256": "0983a5d54b583677c7bdeccb407a9e48f719a8c5399cb1007c6c8a8c6acba475",
+      "payload_sha256": "1a7aff9a7083be47f0897b7858bbd7f43e5b6b59b1e317f29dd7f552eccdc903",
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes, and keep routines as versioned documents in the project's store: show, save with a base, history, diff, retire, and import and export the routines folder byte for byte."
     },
     "signoz": {
@@ -172,7 +172,7 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "cf7f57e5150fe8e1cb1d8c4fd32785f2741038b80c0823311ff13188eee15691",
+      "payload_sha256": "04e08245631e9a3fef7d74eb49051c91e825963edf19602064f10f2e1538789c",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {

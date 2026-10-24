@@ -110,7 +110,8 @@ USAGE
       by: its bundle's Compose file sets AGENT_NODE_ID to it in every
       container, so every container of the box and every redeploy is that
       one node, and `deploy` sends it to the application. A target without
-      one takes AGENT_NODE_ID from the server's environment. The node's
+      one takes AGENT_NODE_ID from the server's environment, else its
+      AGENT_NODE_NAME, which named the node before ids. The node's
       label is its row's (`capabilities node set <id> --label`). A malformed
       node (node_invalid) or a service environment_defaults also setting
       AGENT_NODE_ID beside it (node_declared_twice) stops the sync.
@@ -1598,7 +1599,8 @@ def _env_example_template(runtime: dict, descriptors: dict[str, dict],
         "# This node's id in the gate. A capability service runs here only where",
         "# the project's policy row names it; keep it the same across redeploys.",
         *([f"# The target declares it as {node!r}, and the Compose file sets it."]
-          if node else [f"{NODE_ID_ENV}="]),
+          if node else [f"# Left empty, {NODE_NAME_ENV} is the id, as it was before ids.",
+                        f"{NODE_ID_ENV}="]),
         "",
         "# Runtime secrets injected by Coolify / docker compose env.",
     ]
@@ -2552,9 +2554,10 @@ def _compose_template(project_name: str, runtime: dict,
         # the project's policy row names this node. A target that declares
         # its node sets it here and nowhere else, so every container and every
         # redeploy is that node; one that declares none takes it from the
-        # server's environment.
+        # server's environment, and where the server names it only by
+        # AGENT_NODE_NAME, as before ids, that name is its id.
         (f"  {NODE_ID_ENV}: {json.dumps(node)}" if node else
-         f"  {NODE_ID_ENV}: ${{{NODE_ID_ENV}:-}}"),
+         f"  {NODE_ID_ENV}: ${{{NODE_ID_ENV}:-${{{NODE_NAME_ENV}:-}}}}"),
         # The agent the box runs, for the project at the box's root alone: a
         # repository checked out beside it resolves its own.
         *([f"  {PROJECT_ID_ENV}: {json.dumps(project_id)}",
