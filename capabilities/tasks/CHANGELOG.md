@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-24 — Turns run on callva-harness-runner 0.10.1
+
+The runner is pinned at 0.10.1 in place of 0.9.0. Claude turns run through claude-agent-sdk 0.2.174, and a claude CLI up to 2.1.310 runs without the runner's out-of-range warning; codex is unchanged. The runner's 0.10.0 additions are new profile knobs only, so a turn runs as before.
+
 ## 2026-10-24 — A running raise shows its model and turns, and every raise names its node
 
 While a turn runs, its raise's metrics carry the `model` the harness resolved, written as soon as the harness names it (a profile's alias such as `opus` shows as the model it ran, such as `claude-opus-5-5`), and `num_turns`, the turns taken so far, refreshed on the beat - every 30 s by default. The close writes the measured metrics over them as before, so a finished raise reads as it always has; a cost is known only once the turn has ended, since the harness reports none before. Every raise records the node it was claimed on in the new column `tasks_executions.node`: `AGENT_NODE_NAME`, else the host name. Store step `0006-execution-node` adds it (tables 1.4); a raise opened before it names none.

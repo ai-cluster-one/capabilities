@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-24 — A generated image installs Codex 0.162.1
+
+Generated agent-box images install Codex `rust-v0.162.1` in place of `rust-v0.147.0`. That is inside the range callva-harness-runner was tested with, so on a rebuilt box codex turns through the runner are no longer refused as `incompatible_harness`. An image that is already built keeps its codex until it is rebuilt.
+
 ## 2026-10-24 — Every runner reports its node seen, and a node seen within three reconciles is live
 
 On each reconcile, whatever the gate answers, `deployment runner` reports its node up with `capabilities node seen`, which sets the node's `last_seen_at`; a node is therefore seen while any runner runs on it, on a Mac and on a node of the standard image alike, whether or not it holds a lease. A report that fails is said once on stderr and changes nothing else. `deployment node list` lists the agent's nodes with `seen_seconds_ago` and `live`, and `deployment help` defines a node as live when its `last_seen_at` is within three reconciles (3 x `service_policy.reconcile_seconds`, default 60) of now; a never-seen node is not live. Whether a given service runs is still proven by its live lease, not by its node being live. Requires a manager with `node seen`; beside an older one the runner says once that it cannot report and runs its service as before.

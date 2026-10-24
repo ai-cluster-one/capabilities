@@ -1,5 +1,9 @@
 # askproject — change log
 
+## 2026-10-24 — Turns run on callva-harness-runner 0.10.1
+
+The runner is pinned at 0.10.1 in place of 0.9.0. Claude turns run through claude-agent-sdk 0.2.174, and a claude CLI up to 2.1.310 runs without the runner's out-of-range warning; codex is unchanged. The runner's 0.10.0 additions are new profile knobs only, so a turn runs as before.
+
 ## 2026-10-22 — A peer resolves its target's own project
 
 A peer is started without the caller's handed-down `CAPABILITIES_PROJECT_ID` and `CAPABILITIES_PROJECT_ID_ROOT`, as it already was without the envelope pair, so a target bound to no id resolves as itself rather than as the caller's project. A target inside `CAPABILITIES_PROJECT_ID_ROOT`, a subfolder of the caller's project, keeps the pair, so a project whose id is only in its environment keeps it there. Declares `capabilities-contract>=0.12,<1`.

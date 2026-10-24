@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-10-24 — Turns run on callva-harness-runner 0.10.1
+
+The runner is pinned at 0.10.1 in place of 0.9.0. Claude turns run through claude-agent-sdk 0.2.174, and a claude CLI up to 2.1.310 runs without the runner's out-of-range warning; codex is unchanged. The runner's 0.10.0 additions are new profile knobs only, so a turn runs as before.
+
 ## 2026-10-23 — The service declares how many nodes run it at once
 
 The service descriptor declares `service.placement` `shared`: the service runs on every node it is placed on (`capabilities place memory --node <node>`), and the deployment runner takes no lease for it. A project that had it placed on more than one node, where the lease ran it on one, runs it on each of them.

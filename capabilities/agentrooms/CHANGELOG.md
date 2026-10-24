@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-24 — Turns run on callva-harness-runner 0.10.1
+
+The runner is pinned at 0.10.1 in place of 0.9.0. Claude turns run through claude-agent-sdk 0.2.174, and a claude CLI up to 2.1.310 runs without the runner's out-of-range warning; codex is unchanged. The runner's 0.10.0 additions are new profile knobs only, so a turn runs as before.
+
 ## 2026-10-23 — The service declares how many nodes run it at once
 
 The service descriptor declares `service.placement` `exclusive`: one node runs the service at a time, the deployment runner's lease holds it there, and `capabilities place agentrooms --node <node>` moves it, leaving `agentrooms` usable on the node it left.

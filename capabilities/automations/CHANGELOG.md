@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-24 — Turns run on callva-harness-runner 0.10.1
+
+The runner is pinned at 0.10.1 in place of 0.9.0. Claude turns run through claude-agent-sdk 0.2.174, and a claude CLI up to 2.1.310 runs without the runner's out-of-range warning; codex is unchanged. The runner's 0.10.0 additions are new profile knobs only, so a turn runs as before.
+
 ## 2026-10-24 — An agent whose settings were left behind as files is told to move them
 
 Where the scheduler's `config.toml` is missing or broken for an agent whose records are already in the store while its settings are still files - its connections imported, `capabilities migrate` never run - `invalid_config` names `capabilities migrate` as what moves the settings into the store, and `automations service init` as what writes the file here instead. Every other project is told to run `automations service init` or repair config.toml, as before.

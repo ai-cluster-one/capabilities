@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract>=0.8,<1",
-#                 "callva-harness-runner==0.9.0",
+#                 "callva-harness-runner==0.10.1",
 #                 "pyyaml>=6"]
 # ///
 """The service: its declaration, its lanes, how it wakes, reloads and stops.
@@ -20,7 +20,7 @@ stops a server it did not start.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
         --with 'capabilities-contract>=0.8,<1' \\
-        --with 'callva-harness-runner==0.9.0' python -m pytest capabilities/tasks/tests -q
+        --with 'callva-harness-runner==0.10.1' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations

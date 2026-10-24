@@ -2365,7 +2365,7 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 
 # OpenAI Codex CLI. The complete package includes the code-mode host and runtime
 # resources required by current releases. Auth/session state is volume-backed.
-ARG CODEX_REF=rust-v0.147.0
+ARG CODEX_REF=rust-v0.162.1
 RUN set -eux; \\
     case "$(dpkg --print-architecture)" in \\
       amd64) triple=x86_64-unknown-linux-musl ;; \\

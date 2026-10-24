@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-24 — Turns run on callva-harness-runner 0.10.1
+
+The runner is pinned at 0.10.1 in place of 0.10.0. Claude turns run through claude-agent-sdk 0.2.174, and a claude CLI up to 2.1.310 runs without the runner's out-of-range warning in the log; codex is unchanged.
+
 ## 2026-10-24 — A route may name the agent's own folder outside the home
 
 A `project` route on a group, a topic, a member or a direct user is accepted when it is the agent's own folder or a path inside it, as well as a path inside the home. On a node the agent lives at `/app`, outside `/home/agent`, and a route to it was refused as `must be a path inside /home/agent`, which stopped the service at load. Any other path outside the home is still refused, now naming both places a route may lie.
