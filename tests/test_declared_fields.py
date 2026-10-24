@@ -45,7 +45,7 @@ M = _manager_module()
 
 DECLARATIONS = '''CONN_FIELDS = [
     {"key": "url", "label": "URL", "help": "The service root.", "type": "url",
-     "required": True},
+     "required": True, "identity": True},
     {"key": "port", "label": "Port", "help": "The port.", "type": "integer",
      "required": False, "default": 443},
     {"key": "secret_env", "label": "Token", "help": "The API token.", "type": "string",
@@ -92,6 +92,9 @@ DOMAIN = '''    if cleaned[:1] == ["link"]:
         if code == "bad":
             _die(2, "code_invalid", "the code was refused")
         _emit({"ok": True, "code": code})
+        return
+    if cleaned[:1] == ["prove"]:
+        _emit({"recorded": _record_identity(*cleaned[1:])})
         return
     if cleaned == ["doctor"]:'''
 
@@ -191,6 +194,21 @@ def test_a_capability_without_declarations_answers_null_and_keeps_its_verbs(lab)
     # Undeclared, the verbs fall through to the CLI's own parser.
     assert _run(lab, "settings").returncode != 0
     assert "settings_undeclared" not in _run(lab, "settings").stderr
+
+
+@pytest.mark.parametrize("fields, problem", [
+    ([{"key": "a", "label": "A", "help": "h", "identity": "yes"}], "not a boolean"),
+    ([{"key": "s_env", "label": "S", "help": "h", "secret": True, "identity": True}],
+     "is a secret"),
+    ([{"key": "a", "label": "A", "help": "h", "identity": True},
+      {"key": "b", "label": "B", "help": "h", "identity": True}], "has one"),
+])
+def test_a_main_identifier_marks_one_field_that_is_no_secret(lab, fields, problem):
+    manifest = json.loads(_run(lab, "manifest").stdout)
+    assert [f["key"] for f in manifest["connections"]["fields"] if f.get("identity")] == ["url"]
+    manifest["connections"]["fields"] = fields
+    problems = M._validate_manifest(NAME, manifest)
+    assert any(problem in p for p in problems), problems
 
 
 @pytest.mark.parametrize("broken, problem", [
@@ -576,6 +594,67 @@ def test_connections_show_reveals_one_value_of_a_usable_connection(lab):
         assert result.stdout == ""
 
 
+def _identities(lab) -> dict:
+    result = _run(lab, "connections")
+    assert result.returncode == 0, result.stderr
+    return {cid: entry["identity"]
+            for cid, entry in json.loads(result.stdout)["connections"].items()}
+
+
+def test_an_identity_is_set_by_hand_and_listed_from_the_record(lab):
+    result = _run(lab, "connection", "add", "work", "--field", "url=https://a.example",
+                  "--identity", "4242", "--display-name", "Example User @example",
+                  "--stdin", stdin=json.dumps({"secret_env": "tok-123456789"}))
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["identity"] == {"id": "4242", "display_name": "Example User @example"}
+    assert _registry(lab)["connections"]["work"]["identity"] == {
+        "id": "4242", "display_name": "Example User @example"}
+    assert _identities(lab) == {"work": {"id": "4242", "display_name": "Example User @example"}}
+    # --display-name alone renames the identity recorded; other fields stay.
+    result = _run(lab, "connection", "add", "work", "--replace", "--display-name=Example Renamed")
+    assert result.returncode == 0, result.stderr
+    assert _identities(lab) == {"work": {"id": "4242", "display_name": "Example Renamed"}}
+    assert _registry(lab)["connections"]["work"]["url"] == "https://a.example"
+    # Cleared, the main identifier field's value is the id.
+    result = _run(lab, "connection", "add", "work", "--replace", "--identity", "")
+    assert result.returncode == 0, result.stderr
+    assert "identity" not in _registry(lab)["connections"]["work"]
+    assert _identities(lab) == {"work": {"id": "https://a.example", "display_name": None}}
+    result = _run(lab, "connection", "add", "work", "--replace", "--display-name", "X")
+    assert result.returncode == 6 and _error(result)["code"] == "input"
+    result = _run(lab, "connection", "remove", "work", "--identity", "1")
+    assert result.returncode == 6 and _error(result)["code"] == "input"
+
+
+def test_a_connection_with_no_identity_lists_null_and_keeps_working(lab):
+    _project_registry(lab, {"default": "old", "connections": {
+        "old": {"port": 1, "secret_env": "DECLFIX_OLD_TOKEN"}}})
+    assert _identities(lab) == {"old": None}
+    result = _run(lab, "connections", "show", "old", "--reveal", "port")
+    assert result.returncode == 0 and result.stdout == "1\n"
+
+
+def test_a_proven_identity_is_recorded_where_it_changes_and_never_fails(lab):
+    result = _run(lab, "connection", "add", "work", "--field", "url=https://a.example",
+                  "--stdin", stdin=json.dumps({"secret_env": "tok-123456789"}))
+    assert result.returncode == 0, result.stderr
+    result = _run(lab, "prove", "work", "4242", "Example User @example")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"recorded": True}
+    assert _identities(lab) == {"work": {"id": "4242", "display_name": "Example User @example"}}
+    path = lab["project"] / "capabilities" / NAME / "connections.json"
+    before = path.stat().st_mtime_ns
+    assert json.loads(_run(lab, "prove", "work", "4242", "Example User @example").stdout) == {"recorded": True}
+    assert path.stat().st_mtime_ns == before
+    # Nothing is written under the read-only switch, nor for a connection no record holds.
+    switch = {"CAPABILITIES_READ_ONLY": "1"}
+    result = _run(lab, "prove", "work", "9", "Eve", extra=switch)
+    assert result.returncode == 0 and json.loads(result.stdout) == {"recorded": False}
+    result = _run(lab, "prove", "ghost", "9", "Eve")
+    assert result.returncode == 0 and json.loads(result.stdout) == {"recorded": False}
+    assert _identities(lab) == {"work": {"id": "4242", "display_name": "Example User @example"}}
+
+
 def test_a_reveal_is_not_safe_discovery(lab):
     result = _run(lab, "connection", "add", "work", "--field", "url=https://a.example",
                   "--stdin", stdin=json.dumps({"secret_env": "tok-123456789"}))
@@ -701,7 +780,8 @@ def test_help_ends_with_the_declared_verbs(lab):
     text = _run(lab, "help").stdout
     for needle in ("connection add <id>", "--replace", "--machine", "setup set",
                    "setup [show] [--reveal <KEY>]", "connections show <id> --reveal <KEY>",
-                   "settings put", "declfix link --events", "poll_seconds @project"):
+                   "settings put", "declfix link --events", "poll_seconds @project",
+                   "--identity ID [--display-name TEXT]", "main identifier"):
         assert needle in text, needle
 
 

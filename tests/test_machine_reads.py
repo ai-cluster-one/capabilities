@@ -576,7 +576,9 @@ def test_the_policy_field_is_the_only_field_added(lab):
     report = _report(lab, "project")
     assert set(report) == {"default", "connections", "policy"}
     assert report["default"] == "home"
-    assert report["connections"] == {"home": {"allow_write": True, "keys": []}}
+    # Each connection carries who it is, from its record; this one records nobody.
+    assert report["connections"] == {"home": {"allow_write": True, "keys": [],
+                                              "identity": None}}
 
 
 def test_an_unreadable_policy_is_reported_and_connections_still_answers(lab):

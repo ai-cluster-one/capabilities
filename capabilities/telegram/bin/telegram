@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.12,<1",
+#     "capabilities-contract>=0.19,<1",
 #     "httpx>=0.27",
 #     "qrcode>=7.4",
 #     "telethon==1.45.0",
@@ -494,7 +494,8 @@ CONN_FIELDS = [{'key': 'api_id',
           'it to bind.',
   'type': 'integer',
   'required': False,
-  'minimum': 1},
+  'minimum': 1,
+  'identity': True},
  {'key': 'gemini_secret_env',
   'label': 'Gemini key',
   'help': 'The Google key voice calls use; GOOGLE_API_KEY when empty.',
@@ -1178,6 +1179,8 @@ def cmd_doctor(wanted: str | None) -> None:
                 }
             else:
                 res = asyncio.run(_check_connection(cfg))
+                if res.get("ok"):
+                    _record_identity(cid, res["actual_account_id"], res["account"])
         if not res.get("ok") and not fail_exit:
             fail_exit = res.get("category") or 5
         res.pop("category", None)
@@ -1294,6 +1297,7 @@ def _login_result(cfg: dict, me, **extra) -> dict:
         _die(2, "account_identity_mismatch",
              f"Telegram session account mismatch: expected {cfg['expected_account_id']}, got {me.id}",
              "use the session owned by the configured account or correct expected_account_id")
+    _record_identity(cfg["id"], int(me.id), entity_label(me))
     return out
 
 

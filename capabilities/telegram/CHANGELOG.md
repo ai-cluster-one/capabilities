@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-24 — A connection records the account it is signed in as
+
+`telegram login` and `telegram doctor` record, on success, the account the session belongs to as the connection's `identity` - its id and its name with `@username` - in the connection's own record, and `telegram connections` lists it for every connection with no call to Telegram. `expected_account_id` is marked as the main identifier, so a connection bound to an account and not yet signed in here lists that id. Nothing is recorded under the read-only switch, and a record that cannot be written leaves the verb's answer as it was. The binding is unchanged: `expected_account_id` is still set by hand. The script declares `capabilities-contract>=0.19,<1`.
+
 ## 2026-10-24 — Turns run on callva-harness-runner 0.10.1
 
 The runner is pinned at 0.10.1 in place of 0.10.0. Claude turns run through claude-agent-sdk 0.2.174, and a claude CLI up to 2.1.310 runs without the runner's out-of-range warning in the log; codex is unchanged.

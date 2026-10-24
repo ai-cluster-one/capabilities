@@ -3000,6 +3000,21 @@ def _validate_connections_declaration(declared) -> list[str]:
     problems: list[str] = []
     if declared["fields"] is not None:
         problems += _validate_fields("connections.fields", declared["fields"])
+        if isinstance(declared["fields"], list):
+            marked = []
+            for index, field in enumerate(declared["fields"]):
+                if not isinstance(field, dict) or "identity" not in field:
+                    continue
+                at = f"connections.fields[{index}]"
+                if not isinstance(field["identity"], bool):
+                    problems.append(f"{at}.identity is not a boolean")
+                elif field["identity"]:
+                    marked.append(at)
+                    if field.get("secret"):
+                        problems.append(f"{at} is a secret, and a main identifier is not")
+            if len(marked) > 1:
+                problems.append(f"{', '.join(marked)} each mark the main identifier; "
+                                "a connection has one")
     problems += _validate_fields("connections.setup", declared["setup"])
     link = declared["link"]
     if not isinstance(link, list):
