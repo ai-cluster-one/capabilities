@@ -1,8 +1,8 @@
 # routine — change log
 
-## 2026-10-23 — import and export find the routines folder of an agent whose routines the store holds
+## 2026-10-23 — import, export, titles and title find the routines folder of an agent whose routines the store holds
 
-`routine import` and `routine export` without DIR take the folder from the manager's `path --json` answer also where it names the routines layer as held in the store (`{"where": "store", ..., "folder": <path>}`), so they default to the same folder as before.
+`routine import` and `routine export` without DIR, `routine titles` and `routine title` take the folder from the manager's `path --json` answer also where it names the routines layer as held in the store (`{"where": "store", ..., "folder": <path>}`), so they use the same folder as before.
 
 ## 2026-10-23 — A global routine is written once and taken up by each project that enables it, and only its author project changes it
 
