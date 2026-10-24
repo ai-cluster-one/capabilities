@@ -502,7 +502,7 @@ def test_discard_refuses_on_a_master_node(world):
     assert error["code"] == "master_node", error
     assert nid(MASTER) in error["message"] and config_files(world) == before
     bad = world.error(world.manager(world.roots["first"], "migrate", "--discard",
-                                    AGENT_NODE_ID=MASTER))
+                                    AGENT_NODE_ID="not an id"))
     assert bad["code"] == "bad_node_id" and config_files(world) == before
     discarded = world.answer(world.manager(world.roots["first"], "migrate", "--discard",
                                            **node_env(OTHER_NODE)))

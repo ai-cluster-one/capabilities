@@ -443,7 +443,7 @@ def test_agent_materialize_puts_a_stored_agent_in_a_folder_on_this_machine(lab, 
     assert not second.exists()
     assert code(materialize("prj_00000000dead", str(second), **node_env("box-node"))) \
         == (6, "agent_unknown")
-    assert code(materialize(agent_id, str(second), AGENT_NODE_ID="box-node")) \
+    assert code(materialize(agent_id, str(second), AGENT_NODE_ID="box node")) \
         == (6, "bad_node_id")
 
     listed = json.loads(subprocess.run(
@@ -669,6 +669,32 @@ def test_a_node_known_by_its_name_moves_to_its_id_and_a_label_renames_it(lab):
     assert (code, error["code"]) == (6, "node_services_running")
     assert "box-one" in {n["node"] for n in lab.ok("node", "list", **mac)["nodes"]}
 
+
+
+def test_a_node_registered_under_its_id_beside_its_name_merges_into_one_link(lab):
+    # A box registered before ids, then registered again under its id, as
+    # `node_unregistered`'s hint says: the agent is linked on both.
+    lab.ok("agent", "show")
+    lab.sql(f"INSERT INTO {SCHEMA}.capabilities_agents (id) VALUES (%s) ON CONFLICT DO NOTHING "
+            "RETURNING id", (PROJECT_ID,))
+    for statement in (
+            "INSERT INTO {s}.capabilities_nodes (id, label, kind) VALUES "
+            "('work-mac', 'work-mac', 'mac'), ('box-two', 'box-two', 'server') RETURNING id",
+            "INSERT INTO {s}.capabilities_agent_nodes (agent_id, node, is_master, may_write, "
+            "folder) VALUES (%s, 'work-mac', true, true, NULL), "
+            "(%s, 'box-two', false, true, '/app') RETURNING node"):
+        lab.sql(statement.format(s=SCHEMA), (PROJECT_ID, PROJECT_ID) if "%s" in statement else ())
+    # The master is still keyed by its name, which the override takes.
+    master = {"AGENT_NODE_ID": "work-mac", "AGENT_NODE_NAME": "work-mac"}
+    lab.ok("node", "add", nid("box-two"), "--label", "box", "--kind", "server", **master)
+    moved = lab.ok("node", "rekey", "box-two", nid("box-two"), **master)
+    assert moved["merged"] is True and moved["store"]["moved"] is True
+    links = lab.sql(f"SELECT node, is_master, may_write, folder FROM {SCHEMA}.capabilities_agent_nodes "
+                    "WHERE agent_id = %s ORDER BY node", (PROJECT_ID,))
+    assert sorted(links) == sorted([(nid("box-two"), False, True, "/app"),
+                                    ("work-mac", True, True, None)])
+    assert {n["node"] for n in lab.ok("node", "list", **master)["nodes"]} == {
+        nid("box-two"), "work-mac"}
 
 def _fake_tool(bin_dir: Path, name: str, body: str) -> None:
     bin_dir.mkdir(parents=True, exist_ok=True)

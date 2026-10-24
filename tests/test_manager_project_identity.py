@@ -488,7 +488,7 @@ def test_a_new_agent_without_a_node_name_is_refused_before_anything_is_written(
     project = _project(tmp_path, bound=False)
     _contextkit(tmp_path)
     env = _env(tmp_path, project)
-    env["AGENT_NODE_ID"] = "test-node"
+    env["AGENT_NODE_ID"] = "test node"
 
     result = _run(tmp_path, project, "init", env=env)
 

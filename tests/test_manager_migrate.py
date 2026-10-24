@@ -668,7 +668,7 @@ def test_refusals_write_nothing(world):
     before = world.everything()
     refused = {}
     refused["bad_node_id"] = world.error(world.manager(root, "migrate", "--apply",
-                                                       AGENT_NODE_ID=MASTER))
+                                                       AGENT_NODE_ID="not an id"))
     refused["node_mismatch"] = world.error(world.manager(
         root, "migrate", "--apply", "--answers", answers_file(world, "mismatch",
                                                               {"node": "mac9"})))

@@ -900,19 +900,19 @@ def test_in_store_mode_placement_no_longer_filters_and_the_shape_composes(node, 
 
 
 def test_a_target_node_reaches_the_application_and_status(node, monkeypatch, capsys):
-    # This machine declares its own name; a target that declares its node
-    # sends that one instead.
-    monkeypatch.setenv("AGENT_NODE_NAME", "the-mac")
+    # This machine has its own id; a target that declares its node sends that
+    # one instead.
+    monkeypatch.setenv("AGENT_NODE_ID", "0a0a0a0a0a0a")
     service = next(svc for svc in node.runtime["services"].values() if svc.get("placement") != "local")
-    service.setdefault("optional_env", []).append("AGENT_NODE_NAME")
-    node.target["node"] = "node-a"
+    service.setdefault("optional_env", []).append("AGENT_NODE_ID")
+    node.target["node"] = "6e6f64652d61"
     node.m.cmd_deploy(node.args)
     capsys.readouterr()
     env = next(r["stdin"] for r in rows(node) if r["argv"][:2] == ["env", "bulk"])
-    assert "AGENT_NODE_NAME=node-a" in env.splitlines() and "the-mac" not in env
+    assert "AGENT_NODE_ID=6e6f64652d61" in env.splitlines() and "0a0a0a0a0a0a" not in env
     node.m.cmd_node_status(node.args)
     data = json.loads(capsys.readouterr().out)
-    assert data["declared_node_name"] == "node-a" and data["node_name"] == "node-a"
+    assert data["declared_node_name"] == "6e6f64652d61" and data["node_id"] == "6e6f64652d61"
     assert data["errors"] == []
     node.target["node"] = "node-b"
     node.m.cmd_node_status(node.args)

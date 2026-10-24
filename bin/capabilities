@@ -817,8 +817,10 @@ PROJECT VERBS (run inside a consuming project)
         derived from its hardware UUID through a hash (the UUID never leaves
         it, nothing is stored), elsewhere read from
         $XDG_CONFIG_HOME/capabilities/node-id, minted there once where it is
-        missing; AGENT_NODE_ID (twelve lowercase hex characters, exit 6
-        bad_node_id otherwise) overrides both. Answers {ok, id, source
+        missing; AGENT_NODE_ID (twelve lowercase hex characters, or the name
+        a node registered before ids is still keyed by, as a box compiled for
+        a deployment target is handed; exit 6 bad_node_id otherwise)
+        overrides both. Answers {ok, id, source
         (env | hardware | file | minted), label}, label being the one this
         machine gives itself when it is first registered (AGENT_NODE_NAME,
         else its host name), and overridden_by where AGENT_NODE_ID is set.
@@ -9609,6 +9611,18 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
                     "last_seen_at = greatest(n.last_seen_at, o.last_seen_at), "
                     "updated_at = now() FROM capabilities_nodes o "
                     "WHERE n.id = %s AND o.id = %s", (new, old))
+                # An agent linked on both ids keeps one link, on the new id,
+                # holding what either knew of the pair.
+                for agent, master, may_write, folder in conn.execute(
+                        "DELETE FROM capabilities_agent_nodes o USING capabilities_agent_nodes n "
+                        "WHERE o.node = %s AND n.node = %s AND n.agent_id = o.agent_id "
+                        "RETURNING o.agent_id, o.is_master, o.may_write, o.folder",
+                        (old, new)).fetchall():
+                    conn.execute(
+                        "UPDATE capabilities_agent_nodes SET is_master = is_master OR %s, "
+                        "may_write = may_write OR %s, folder = coalesce(folder, %s) "
+                        "WHERE agent_id = %s AND node = %s",
+                        (master, may_write, folder, agent, new))
                 conn.execute("UPDATE capabilities_agent_nodes SET node = %s WHERE node = %s",
                              (new, old))
                 conn.execute("DELETE FROM capabilities_nodes WHERE id = %s", (old,))

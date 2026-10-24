@@ -82,7 +82,11 @@ def test_agent_node_id_overrides_and_must_be_an_id(monkeypatch, tmp_path):
     monkeypatch.setenv(S.NODE_ID_ENV, " 0123456789ab ")
     assert S.node_identity() == {"id": "0123456789ab", "source": "env"}
     assert not (tmp_path / "config").exists()
-    for bad in ("lab-node", "0123456789AB", "0123456789a"):
+    # A node registered before ids is still keyed by its name, which a box
+    # compiled for its deployment target is handed.
+    monkeypatch.setenv(S.NODE_ID_ENV, "lab-node")
+    assert S.node_identity() == {"id": "lab-node", "source": "env"}
+    for bad in ("lab node", "-lab", "lab/node"):
         monkeypatch.setenv(S.NODE_ID_ENV, bad)
         with pytest.raises(S.StoreError) as refused:
             S.node_id()

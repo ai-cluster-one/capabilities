@@ -105,14 +105,15 @@ USAGE
       auto|enabled|disabled) or placement is reported as a warning naming each
       one, and sync rewrites it, keeping the shape it implied; `retired` in
       the result lists what it rewrote.
-      A target's `node` is the label its server gives itself as a node: its
-      bundle's Compose file sets AGENT_NODE_NAME to it in every container,
-      and `deploy` sends it to the application. A target without one takes
-      AGENT_NODE_NAME from the server's environment. The server's node id
-      is its own, kept on its config volume (`capabilities node id`), and
-      is what the gate names it by. A malformed node
-      (node_invalid) or a service environment_defaults also setting
-      AGENT_NODE_NAME beside it (node_declared_twice) stops the sync.
+      A target's `node` is the id of the node its server runs as in the
+      gate - for a node registered before ids, the name it is still keyed
+      by: its bundle's Compose file sets AGENT_NODE_ID to it in every
+      container, so every container of the box and every redeploy is that
+      one node, and `deploy` sends it to the application. A target without
+      one takes AGENT_NODE_ID from the server's environment. The node's
+      label is its row's (`capabilities node set <id> --label`). A malformed
+      node (node_invalid) or a service environment_defaults also setting
+      AGENT_NODE_ID beside it (node_declared_twice) stops the sync.
       The project's id (CAPABILITIES_PROJECT_ID, as the project resolves it
       at sync) is set with CAPABILITIES_PROJECT_ID_ROOT, the box's project
       root, in every container and, for an image that runs `capabilities
@@ -370,7 +371,7 @@ USAGE
       the gate and node_name the label it gives itself (its
       AGENT_NODE_NAME). A target that declares `node` adds
       declared_node_name, and an error node_name_mismatch while the node
-      gives itself another label.
+      answers to another id.
       leftovers is what no service accounts for, read in the container:
       processes that are neither a Supervisor program nor descended from one
       (pid, ppid, age_seconds, command), development sessions open longer than
@@ -684,10 +685,10 @@ COOLIFY_BUILD_LIMIT = 3600
 # where the node pulls and pushes it. Without it the body travels through the
 # server's bare repository; with kind "github" it is that GitHub repository.
 GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?!\.)[A-Za-z0-9._-]+(?<!\.git)")
-# A target's `node` is the label its server gives itself as a node. Its bundle
-# sets it as AGENT_NODE_NAME in every container, written literally into the
-# Compose file, so it takes no interpolation characters and fits one
-# environment line. The server's id is its own, on its config volume.
+# A target's `node` is the id of the node its server runs as - for a node
+# registered before ids, the name it is still keyed by. Its bundle sets it as
+# AGENT_NODE_ID in every container, written literally into the Compose file, so
+# it takes no interpolation characters and fits one environment line.
 TARGET_NODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
 # The project's id is the agent a box runs. Its bundle sets it in every
 # container and in the image the build runs `capabilities init` in, bound to the
@@ -1594,10 +1595,10 @@ def _env_example_template(runtime: dict, descriptors: dict[str, dict],
         ]
     lines += [
         "",
-        "# This node's name in the gate. A capability service runs here only where",
+        "# This node's id in the gate. A capability service runs here only where",
         "# the project's policy row names it; keep it the same across redeploys.",
         *([f"# The target declares it as {node!r}, and the Compose file sets it."]
-          if node else [f"{NODE_NAME_ENV}="]),
+          if node else [f"{NODE_ID_ENV}="]),
         "",
         "# Runtime secrets injected by Coolify / docker compose env.",
     ]
@@ -1627,7 +1628,7 @@ def _env_example_template(runtime: dict, descriptors: dict[str, dict],
     # Keys the file already states under a heading that explains what they are
     # for. Restating them lower down would leave the reader two assignments to
     # the same name, and the later one wins.
-    stated = [runtime.get("image_env"), NODE_NAME_ENV]
+    stated = [runtime.get("image_env"), NODE_ID_ENV]
     if checkout:
         stated += [REPO_URL_ENV, REPO_BRANCH_ENV, *SYNC_DEFAULTS]
     for key in stated:
@@ -2547,12 +2548,13 @@ def _compose_template(project_name: str, runtime: dict,
         "x-agent-env: &agent-env",
         "  GIT_DEPLOY_KEY_B64: ${GIT_DEPLOY_KEY_B64:-}",
         "  AGENT_GIT_KNOWN_HOSTS_B64: ${AGENT_GIT_KNOWN_HOSTS_B64:-}",
-        # The node's name in the gate: a runner starts a service only where
+        # The node's id in the gate: a runner starts a service only where
         # the project's policy row names this node. A target that declares
-        # its node sets it here and nowhere else; one that declares none takes
-        # it from the server's environment.
-        (f"  {NODE_NAME_ENV}: {json.dumps(node)}" if node else
-         f"  {NODE_NAME_ENV}: ${{{NODE_NAME_ENV}:-}}"),
+        # its node sets it here and nowhere else, so every container and every
+        # redeploy is that node; one that declares none takes it from the
+        # server's environment.
+        (f"  {NODE_ID_ENV}: {json.dumps(node)}" if node else
+         f"  {NODE_ID_ENV}: ${{{NODE_ID_ENV}:-}}"),
         # The agent the box runs, for the project at the box's root alone: a
         # repository checked out beside it resolves its own.
         *([f"  {PROJECT_ID_ENV}: {json.dumps(project_id)}",
@@ -2623,7 +2625,7 @@ def _compose_template(project_name: str, runtime: dict,
         environment_keys = set(required) | set(optional) | set(defaults)
         if node:
             # A service entry for the key would override the shared one.
-            environment_keys.discard(NODE_NAME_ENV)
+            environment_keys.discard(NODE_ID_ENV)
         if project_id or _is_shell(runtime):
             environment_keys -= {PROJECT_ID_ENV, PROJECT_ID_ROOT_ENV}
         for key in sorted(environment_keys):
@@ -4511,12 +4513,12 @@ def _target_node_findings(root: Path, runtime: dict, name: str) -> list[dict]:
     doubled = sorted(service_name for service_name, service in services.items()
                      if isinstance(service, dict)
                      and isinstance(service.get("environment_defaults"), dict)
-                     and NODE_NAME_ENV in service["environment_defaults"])
+                     and NODE_ID_ENV in service["environment_defaults"])
     return [{"severity": "error", "code": "node_declared_twice", "path": path,
              "message": f"the target declares node {value!r}, and "
                         f"services.{service_name}.environment_defaults in "
-                        f"deployment/runtime.json also sets {NODE_NAME_ENV}",
-             "hint": f"remove {NODE_NAME_ENV} from that environment_defaults; "
+                        f"deployment/runtime.json also sets {NODE_ID_ENV}",
+             "hint": f"remove {NODE_ID_ENV} from that environment_defaults; "
                      "the target's node is the one the containers receive"}
             for service_name in doubled]
 
@@ -7011,11 +7013,11 @@ def _node_environment(root, runtime, target, host, repo_url, key, branch):
                     REPO_BRANCH_ENV: branch, "GIT_DEPLOY_KEY_B64": base64.b64encode(key.read_bytes()).decode(),
                     "AGENT_GIT_KNOWN_HOSTS_B64": base64.b64encode(_node_ssh(root, host,
                         "cat /etc/ssh/ssh_host_ed25519_key.pub").encode()).decode()})
-    # A target that declares its node is the one home of its name, so the
-    # application's environment carries that name rather than this machine's.
+    # A target that declares its node is the one home of its id, so the
+    # application's environment carries that id rather than this machine's.
     node = _valid_node(target.get("node"))
     if node:
-        env[NODE_NAME_ENV] = node
+        env[NODE_ID_ENV] = node
     # Coolify builds with an environment key's value over the Compose file's
     # build arg, so the environment carries the release's own build args.
     env.update(_compiler_config(runtime)["build_args"])
@@ -7462,16 +7464,16 @@ def cmd_node_status(args):
                                      "message": "deployment services on the node returned malformed JSON"})
     report["node_id"] = remote.get("node")
     report["node_name"] = remote.get("label")
-    # The label the target declares for its server, beside the one the node
-    # gives itself; a node not yet redeployed since the declaration differs.
+    # The node the target declares for its server, beside the id the node
+    # answers to; a node not yet redeployed since the declaration differs.
     declared = _valid_node(target.get("node"))
     if declared:
         report["declared_node_name"] = declared
-        if report["node_name"] and report["node_name"] != declared:
+        if report["node_id"] and report["node_id"] != declared:
             report["errors"].append({
                 "code": "node_name_mismatch",
                 "message": f"the target declares node {declared!r} and the node "
-                           f"answers as {report['node_name']!r}; run `deployment "
+                           f"answers as {report['node_id']!r}; run `deployment "
                            "sync` and redeploy"})
     on_node = {item.get("name"): item for item in remote.get("services") or []
                if isinstance(item, dict)}

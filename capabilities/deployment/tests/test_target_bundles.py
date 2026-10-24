@@ -274,7 +274,7 @@ def _bundle_files(root: Path, target: str) -> dict[str, str]:
 
 
 @pytest.mark.parametrize("profile", PROFILES)
-def test_a_target_node_is_the_name_every_container_receives(tmp_path: Path, profile: str) -> None:
+def test_a_target_node_is_the_id_every_container_receives(tmp_path: Path, profile: str) -> None:
     root, env = _project(tmp_path, contextkit=False)
     assert _run(root, env, "setup", "--profile", profile, "--target", "staging",
                 "--provider", "coolify").returncode == 0
@@ -283,7 +283,7 @@ def test_a_target_node_is_the_name_every_container_receives(tmp_path: Path, prof
     # A service that passes the key through would override the shared entry.
     runtime_path = root / "deployment" / "runtime.json"
     runtime = json.loads(runtime_path.read_text())
-    runtime["services"]["agent"].setdefault("optional_env", []).append("AGENT_NODE_NAME")
+    runtime["services"]["agent"].setdefault("optional_env", []).append("AGENT_NODE_ID")
     runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
     assert _run(root, env, "sync").returncode == 0
     before = _bundle_files(root, "edge")
@@ -291,15 +291,15 @@ def test_a_target_node_is_the_name_every_container_receives(tmp_path: Path, prof
     sync = _run(root, env, "sync")
     assert sync.returncode == 0, sync.stdout + sync.stderr
     compose = (root / "deployment" / "targets" / "staging" / "docker-compose.yaml").read_text()
-    assert compose.count("AGENT_NODE_NAME") == 1
-    assert '  AGENT_NODE_NAME: "staging-node.1"' in compose.splitlines()
+    assert compose.count("AGENT_NODE_ID") == 1
+    assert '  AGENT_NODE_ID: "staging-node.1"' in compose.splitlines()
     example = (root / "deployment" / "targets" / "staging" / ".env.example").read_text()
-    assert "AGENT_NODE_NAME=" not in example and "'staging-node.1'" in example
+    assert "AGENT_NODE_ID=" not in example and "'staging-node.1'" in example
     # A target that declares no node compiles exactly as before.
     assert _bundle_files(root, "edge") == before
     edge = before["docker-compose.yaml"]
-    assert "  AGENT_NODE_NAME: ${AGENT_NODE_NAME:-}" in edge.splitlines()
-    assert '      AGENT_NODE_NAME: "${AGENT_NODE_NAME:-}"' in edge.splitlines()
+    assert "  AGENT_NODE_ID: ${AGENT_NODE_ID:-}" in edge.splitlines()
+    assert '      AGENT_NODE_ID: "${AGENT_NODE_ID:-}"' in edge.splitlines()
     assert _run(root, env, "sync", "--check").returncode == 0
 
 
@@ -341,7 +341,7 @@ def test_a_node_declared_beside_a_service_default_is_refused(tmp_path: Path) -> 
                 "--provider", "coolify").returncode == 0
     runtime_path = root / "deployment" / "runtime.json"
     runtime = json.loads(runtime_path.read_text())
-    runtime["services"]["agent"].setdefault("environment_defaults", {})["AGENT_NODE_NAME"] = "old"
+    runtime["services"]["agent"].setdefault("environment_defaults", {})["AGENT_NODE_ID"] = "old"
     runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
     assert _run(root, env, "sync").returncode == 0
     _declare_node(root, "production", "prod-node")

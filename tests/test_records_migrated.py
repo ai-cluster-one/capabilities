@@ -606,7 +606,7 @@ def test_a_migrated_agent_refuses_without_a_node_name_or_on_an_unregistered_node
     minted = (lab.config / "capabilities" / "node-id").read_text().strip()
     assert error["code"] == "node_unregistered" and minted in error["message"]
     assert MASTER in error["hint"]
-    code, error = lab.refused(COOLIFY, "ids", "list", AGENT_NODE_ID="stranger")
+    code, error = lab.refused(COOLIFY, "ids", "list", AGENT_NODE_ID="a stranger")
     assert error["code"] == "bad_node_id" and code == 6
     stranger = node_env("stranger")
     code, error = lab.refused(COOLIFY, "ids", "list", **stranger)
