@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-24 — One command runs on a node with its output streamed back
+
+`deployment node exec <node> -- <command> [<arg>...]` runs one command in the container of a node made by `node create`, over SSH to its server and `docker exec -i`, the path `node enrol` reaches it by, with no terminal: standard input is forwarded, standard output and standard error come back unchanged as the command writes them, so `telegram login --events` or `whatsapp pair --events` streams its JSON events to this machine, and the exit code is the command's own (255 when SSH cannot reach the server). It is refused under the read-only switch, like `node login`.
+
 ## 2026-10-24 — A generated image installs Codex 0.162.1
 
 Generated agent-box images install Codex `rust-v0.162.1` in place of `rust-v0.147.0`. That is inside the range callva-harness-runner was tested with, so on a rebuilt box codex turns through the runner are no longer refused as `incompatible_harness`. An image that is already built keeps its codex until it is rebuilt.

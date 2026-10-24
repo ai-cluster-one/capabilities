@@ -64,6 +64,8 @@ The container is the one Docker labels `com.docker.compose.project=<resource>` a
 
 `gh auth login` works the same way once the image carries the GitHub CLI; `agent-node` 0.0.1 does not, so check with `gh --version` in the container. Its login is kept under `~/.config`, on the config volume.
 
+A login that speaks JSON events instead of a terminal runs from this machine with `deployment node exec <node> -- <command>`, which reaches the same container over SSH and `docker exec -i` with no terminal: `deployment node exec box1 -- telegram login --events` or `deployment node exec box1 -- whatsapp pair --events` streams each event line back unchanged, forwards what you type on standard input, and exits with the command's own code.
+
 ## Move a service onto the node
 
 Where a service runs and where its capability is usable are two separate answers of the agent's gate: a service runs on a node only where it is placed there, and placing or unplacing it never changes where the capability's CLI works (`deployment guide profiles`, **Where a service runs**). Each service's descriptor says how many nodes run it at once, and `<name> manifest` shows it as `service.placement`: `exclusive`, for a service that holds one account or one connection, runs on one node at a time and its lease enforces that; `shared` runs on every node it is placed on.

@@ -449,3 +449,30 @@ def test_remove_refuses_an_application_that_does_not_run_its_own_build_as_the_no
         lab.m.cmd_node_remove(SimpleNamespace(node="box1", yes=True))
     assert refused.value.code == "node_resource_not_own"
     assert not [c for c in lab.fake.of("coolify") if "delete" in c["argv"]]
+
+
+def test_exec_runs_one_command_in_the_node_container_with_its_stdio_and_exit_code(lab, monkeypatch):
+    lab.m.cmd_node_create(create_args())
+    ran = []
+    monkeypatch.setattr(lab.m.subprocess, "call", lambda argv, **kw: ran.append(argv) or 3)
+    with pytest.raises(SystemExit) as exited:
+        lab.m.cmd_node_exec(SimpleNamespace(node="box1",
+                                            argv=["telegram", "login", "--events"]))
+    assert exited.value.code == 3
+    # No terminal, so each event line comes back as written; -i forwards stdin.
+    [argv] = ran
+    assert argv[:3] == ["ssh", "-o", "BatchMode=yes"] and "-t" not in argv
+    assert argv[-2] == "root@203.0.113.7"
+    assert shlex.split(argv[-1]) == ["docker", "exec", "-i", "abc123",
+                                     "telegram", "login", "--events"]
+
+
+def test_exec_refuses_an_unknown_node_and_a_missing_command(lab, monkeypatch):
+    monkeypatch.setattr(lab.m.subprocess, "call", lambda argv, **kw: pytest.fail("ran"))
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_exec(SimpleNamespace(node="box1", argv=["true"]))
+    assert refused.value.code == "node_unknown"
+    lab.m.cmd_node_create(create_args())
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_exec(SimpleNamespace(node="box1", argv=[]))
+    assert refused.value.code == "input"

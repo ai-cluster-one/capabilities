@@ -310,6 +310,14 @@ USAGE
       node is refused (exit 6 node_resource_not_own) and nothing is deleted.
       The host paths a node built from a repository binds are not its
       volumes: the socket and the directories and what is in them stay.
+  deployment node exec <node> -- <command> [<arg>...]
+      Run one command in the node's container, over SSH to its server and
+      `docker exec -i` into the container enrol reaches, with no terminal:
+      standard input is forwarded, standard output and standard error come
+      back byte for byte as the command writes them (a JSON event stream
+      such as `telegram login --events` or `whatsapp pair --events` reaches
+      this machine line by line), and the exit code is the command's own -
+      255 is SSH's own, when the server cannot be reached.
   deployment node login claude|codex [--target <name>] [--print-command]
       SSH with a terminal into the application's agent container for subscription
       login. --print-command prepares the command without attempting login.
@@ -7860,6 +7868,20 @@ def _agent_node_is_own(root, host, resource, node, kind="service"):
         and named in (c.get("Env") or []) for c in configs)
 
 
+def cmd_node_exec(args):
+    root = _root()
+    node = _agent_node_name(args.node)
+    _agent_node_project(root)
+    if not args.argv:
+        raise NodeFailure("input", "node exec needs a command after --", 6)
+    row = _agent_node_row(root, node)
+    if row is None:
+        raise NodeFailure("node_unknown", f"this agent has no node {node}", 6)
+    _target, host, container = _agent_node_reach(root, row, write=True)
+    command = _node_ssh_argv(host) + [shlex.join(["docker", "exec", "-i", container, *args.argv])]
+    raise SystemExit(subprocess.call(command, cwd=root))
+
+
 def cmd_node_remove(args):
     root = _root()
     node = _agent_node_name(args.node)
@@ -7944,6 +7966,11 @@ def main(argv: list[str] | None = None) -> None:
     if argv and argv[0] == "runner" and "--" in argv:
         split = argv.index("--")
         argv, service_command = argv[:split], argv[split + 1:]
+    # So is the command `node exec` runs on the node.
+    node_command: list[str] = []
+    if argv[:2] == ["node", "exec"] and "--" in argv:
+        split = argv.index("--")
+        argv, node_command = argv[:split], argv[split + 1:]
 
     parser = argparse.ArgumentParser(prog=NAME, add_help=False)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -8062,6 +8089,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("node")
     p.add_argument("--yes", action="store_true")
     p.set_defaults(fn=cmd_node_remove)
+    p = node.add_parser("exec", add_help=False)
+    p.add_argument("node")
+    p.set_defaults(fn=cmd_node_exec)
     node.add_parser("list", add_help=False).set_defaults(fn=cmd_node_list)
     for verb, fn in (("status", cmd_node_status), ("sync", cmd_node_sync), ("login", cmd_node_login)):
         p = node.add_parser(verb, add_help=False)
@@ -8077,6 +8107,7 @@ def main(argv: list[str] | None = None) -> None:
     if extra:
         _die(6, "input", f"unknown arguments: {' '.join(extra)}")
     args.service_command = service_command
+    args.argv = node_command
     # A write verb, a watchdog pass that may restart a service, and a runner
     # that starts and stops one change the project or its machine; a preview
     # (--check, --dry-run) only reads.
@@ -8086,7 +8117,7 @@ def main(argv: list[str] | None = None) -> None:
     if (args.cmd == "machine" and args.machine_cmd in ("sync", "watchdog")
             and not previews):
         _read_only_gate(f"`{NAME} machine {args.machine_cmd}`")
-    if args.cmd == "node" and args.node_cmd in ("sync", "login", "create", "enrol", "remove"):
+    if args.cmd == "node" and args.node_cmd in ("sync", "login", "create", "enrol", "remove", "exec"):
         _read_only_gate(f"`deployment node {args.node_cmd}`")
     try:
         args.fn(args)
