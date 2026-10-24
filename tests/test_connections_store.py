@@ -851,6 +851,101 @@ def test_a_service_moves_between_nodes_and_its_capability_stays_usable_on_both(l
     assert _error(_manager(lab, "place", "coolify", "--node", NODE))["code"] == "no_service"
 
 
+def test_a_shared_service_is_placed_on_every_node_and_a_move_shows_until_the_lease_follows(
+        lab):
+    _import(lab)
+    registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"
+    registry.mkdir(parents=True)
+    (registry / "coolify").write_text("#!/bin/sh\n")
+
+    def declare(placement: str) -> None:
+        (registry / "manifest.json").write_text(json.dumps({"name": "coolify", "service": {
+            "name": "svc", "summary": "s", "verbs": [], "placement": placement}}))
+
+    def placed() -> list[tuple]:
+        return _rows(lab, "SELECT node FROM capabilities_policy WHERE capability = 'coolify' "
+                          "AND service ORDER BY node")
+
+    def sql(query: str) -> None:
+        with lab["cluster"].admin(lab["database"]) as conn:
+            conn.execute("SET search_path TO lab")
+            conn.execute(query)
+
+    here = {"AGENT_NODE_NAME": NODE}
+    declare("shared")
+    assert _error(_manager(lab, "place", "coolify", "--all", extra=here))["code"] == "no_nodes"
+    _ok(_manager(lab, "node", "add", NODE, "--kind", "mac", "--master", extra=here))
+    _ok(_manager(lab, "node", "add", "box-node", "--kind", "server", extra=here))
+    # An agent on several nodes keeps its records in the store, under its
+    # nodes' write authority.
+    sql("UPDATE capabilities_agents SET migrated_at = now()")
+    both = _manager(lab, "place", "coolify", "--all", "--node", NODE, extra=here)
+    assert both.returncode == 6 and _error(both)["code"] == "input"
+
+    # A node that would refuse refuses the whole command, and nothing is written.
+    _ok(_manager(lab, "disable", "coolify", "--project", "--node", "box-node", extra=here))
+    refused = _manager(lab, "place", "coolify", "--all", extra=here)
+    assert refused.returncode == 6 and _error(refused)["code"] == "disabled_on_node"
+    assert [r["node"] for r in _error(refused)["detail"]["refused"]] == ["box-node"]
+    assert placed() == []
+    off_master = _manager(lab, "place", "coolify", "--all", extra={"AGENT_NODE_NAME": "box-node"})
+    assert off_master.returncode != 0 and placed() == []
+    assert {r["node"] for r in _error(off_master)["detail"]["refused"]} == {"box-node", NODE}
+    _ok(_manager(lab, "inherit", "coolify", "--project", "--node", "box-node", extra=here))
+
+    # A write that fails part-way names the nodes it placed; running it again finishes.
+    sql("CREATE FUNCTION lab.refuse_lab_node() RETURNS trigger LANGUAGE plpgsql AS "
+        f"$$ BEGIN IF NEW.node = '{NODE}' THEN RAISE EXCEPTION 'refused'; END IF; "
+        "RETURN NEW; END $$; CREATE TRIGGER refuse_lab_node BEFORE INSERT OR UPDATE "
+        "ON lab.capabilities_policy FOR EACH ROW EXECUTE FUNCTION lab.refuse_lab_node()")
+    partial = _manager(lab, "place", "coolify", "--all", extra=here)
+    assert partial.returncode != 0
+    assert _error(partial)["detail"] == {"placed": ["box-node"], "failed": NODE}
+    assert placed() == [("box-node",)]
+    sql("DROP TRIGGER refuse_lab_node ON lab.capabilities_policy")
+    every = _ok(_manager(lab, "place", "coolify", "--all", extra=here))
+    assert {k: every[k] for k in ("placed", "nodes", "placement", "changed", "placed_on",
+                                  "enabled_on_nodes")} == {
+        "placed": "coolify", "nodes": ["box-node", NODE], "placement": "shared",
+        "changed": True, "placed_on": ["box-node", NODE], "enabled_on_nodes": [NODE]}
+    again = _ok(_manager(lab, "place", "coolify", "--all", extra=here))
+    assert again["changed"] is False and "enabled_on_nodes" not in again
+    report = _ok(_manager(lab, "place", "coolify", extra=here))
+    assert {k: report[k] for k in ("placement", "placed_on", "holder", "lease", "agrees")} == {
+        "placement": "shared", "placed_on": ["box-node", NODE], "holder": None,
+        "lease": None, "agrees": None}
+
+    # An exclusive service moves with --node; the report agrees once the lease follows.
+    declare("exclusive")
+    exclusive = _manager(lab, "place", "coolify", "--all", extra=here)
+    assert exclusive.returncode == 6 and _error(exclusive)["code"] == "placement_exclusive"
+    _ok(_manager(lab, "place", "coolify", "--node", "box-node", extra=here))
+    report = _ok(_manager(lab, "place", "coolify", extra=here))
+    assert (report["placed_on"], report["holder"], report["lease"], report["agrees"]) == (
+        ["box-node"], None, None, False)
+    sql("CREATE TABLE lab.deployment_service_leases (project text NOT NULL, "
+        "capability text NOT NULL, node text NOT NULL, acquired_at timestamptz NOT "
+        "NULL DEFAULT now(), renewed_at timestamptz NOT NULL DEFAULT now(), expires_at "
+        "timestamptz NOT NULL, PRIMARY KEY (project, capability)); "
+        "INSERT INTO lab.deployment_service_leases (project, capability, node, "
+        f"expires_at) VALUES ('{PROJECT_ID}', 'coolify', '{NODE}', "
+        "now() + interval '3 minutes')")
+    moving = _ok(_manager(lab, "place", "coolify", extra=here))
+    assert (moving["holder"], moving["lease"]["live"], moving["agrees"]) == (NODE, True, False)
+    sql("UPDATE lab.deployment_service_leases SET node = 'box-node'")
+    assert _ok(_manager(lab, "place", "coolify", extra=here))["agrees"] is True
+    sql("UPDATE lab.deployment_service_leases SET expires_at = now() - interval '1 minute'")
+    expired = _ok(_manager(lab, "place", "coolify", extra=here))
+    assert (expired["holder"], expired["lease"]["live"], expired["agrees"]) == (
+        None, False, False)
+
+    # The report writes nothing, so the read-only switch lets it through.
+    read_only = {**here, "CAPABILITIES_READ_ONLY": "1"}
+    assert _ok(_manager(lab, "place", "coolify", extra=read_only))["placed_on"] == ["box-node"]
+    assert _manager(lab, "place", "coolify", "--all", extra=read_only).returncode == 4
+    assert _manager(lab, "place", "coolify", "--node", NODE, extra=read_only).returncode == 4
+
+
 def test_a_writer_that_predates_the_service_column_places_where_it_enables(lab):
     # A manager on an older library writes enabled alone, meaning what
     # enable --node and disable --node always meant: the service follows.

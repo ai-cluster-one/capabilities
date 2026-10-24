@@ -67,8 +67,9 @@ ENVIRONMENT
                        writes and service activation exit 4), and this manager
                        refuses agent convert, agent set, allow, connections
                        import, disable, enable, inherit, init, node add, node
-                       remove, node seen, node set, place, quarantine, relabel, set,
-                       store set, store unset and unplace.
+                       remove, node seen, node set, place (but its report),
+                       quarantine, relabel, set, store set, store unset and
+                       unplace.
                        doctor reports it. Unset, `0` or `false` leaves it off.
   AGENTKIT_DB_URL, AGENTKIT_DB_HOST, AGENTKIT_DB_PORT, AGENTKIT_DB_NAME,
   AGENTKIT_DB_USER, AGENTKIT_DB_PASSWORD, AGENTKIT_DB_SCHEMA,
@@ -523,6 +524,29 @@ POLICY VERBS
         JSON {placed|unplaced, node, placement, changed, placed_on [nodes],
         unplaced_from?, enabled_on_node?, gate}. Exit 3 when <name> is not
         installed, 6 no_service when it bundles none.
+  place <name> --all
+        Put a shared service on every node of this project's agent (`node
+        list`); an exclusive one is refused (exit 6 placement_exclusive).
+        Every node is checked before anything is written: where any would
+        refuse - disabled there, or a row this node may not write - nothing
+        is written and the error's detail.refused names each node, code and
+        message. Then it is placed node by node, each its own write; a write
+        that fails part-way exits non-zero with detail {placed [nodes],
+        failed}, and running the command again finishes it. Exit 6 no_nodes
+        when the agent has no registered node. JSON {placed, nodes [nodes],
+        placement, changed, placed_on [nodes], enabled_on_nodes?, gate}.
+  place <name>
+        Store mode only, and allowed under the read-only switch: where the
+        service is placed beside the node running it, writing nothing. JSON
+        {capability, placement, placed_on [nodes], holder, lease {node,
+        acquired_at, renewed_at, expires_at, live} | null, agrees, gate}.
+        holder is the node whose lease is live (deployment's runner takes it
+        on the node the service is placed on), else null; agrees is whether
+        holder is one of placed_on, or with nothing placed whether no node
+        holds it, so false while a move is under way until the lease names
+        the new node. A
+        shared service takes no lease: holder and lease are null and agrees
+        is null.
 
 PROJECT VERBS (run inside a consuming project)
   init [--claude] [--codex] [--with-layers | --with-template | --id <id>]
@@ -9499,6 +9523,11 @@ def _gate_node(node: str | None, root: Path | None, adapter=None) -> str | None:
         return None
     if not node.strip():
         _die(6, "input", "--node needs a node name")
+    _require_node_store(root, adapter)
+    return node.strip()
+
+
+def _require_node_store(root: Path | None, adapter=None) -> None:
     if root is None or adapter is None or adapter.mode_of("policy") != "store":
         _die(6, "node_requires_store",
              "a policy row naming a node is kept only in the store: this "
@@ -9506,7 +9535,6 @@ def _gate_node(node: str | None, root: Path | None, adapter=None) -> str | None:
              "record written there is for every node",
              "import this project's records into its store with `capabilities "
              "connections import`, then write the row for the node")
-    return node.strip()
 
 
 def _stamp_policy(adapter, root: Path, scope: str) -> None:
@@ -9699,14 +9727,19 @@ def _service_placement(service: dict) -> str:
     return "shared" if service.get("placement") == "shared" else "exclusive"
 
 
-def _place_service(name: str, placed: bool, node: str | None) -> None:
+def _place_service(name: str, placed: bool, node: str | None,
+                   every: bool = False) -> None:
     """Place this project's bundled service of `name` on a node, or take it off,
     leaving where the capability is usable as it is. An exclusive service
-    placed on one node is taken off every other in the same write."""
+    placed on one node is taken off every other in the same write. `every`
+    places a shared service on every node of the agent; `place` with neither
+    reports where the service is placed beside the node holding its lease."""
     root = _require_project()
     _ensure_envelope(root)
     verb = "place" if placed else "unplace"
-    if node is None:
+    if every and node is not None:
+        _die(6, "input", "place takes --node <node> or --all, not both")
+    if node is None and not (placed or every):
         _die(6, "input", f"{verb} needs --node <node>")
     if name not in _installed():
         _die(3, "not_installed", f"{name} is not installed",
@@ -9715,7 +9748,22 @@ def _place_service(name: str, placed: bool, node: str | None) -> None:
     if service is None:
         _die(6, "no_service", f"{name} bundles no service, so there is nothing to {verb}")
     mode = _service_placement(service)
+    if every and mode == "exclusive":
+        _die(6, "placement_exclusive",
+             f"{name}'s service is exclusive: it runs on one node at a time, so it "
+             "is placed on one node, not on every node",
+             f"move it with `capabilities place {name} --node <node>`")
     adapter = _records_for(root)
+    if node is None:
+        try:
+            _require_node_store(root, adapter)
+            _emit(_place_everywhere(name, root, adapter) if every
+                  else _placement_report(name, root, adapter, mode))
+        except _store_module().StoreError as exc:
+            _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+        finally:
+            adapter.close()
+        return
     try:
         node = _gate_node(node, root, adapter)
         _stamp_policy(adapter, root, "project")
@@ -9735,6 +9783,103 @@ def _place_service(name: str, placed: bool, node: str | None) -> None:
     if answer.get("enabled_on_node"):
         result["enabled_on_node"] = True
     _emit(result)
+
+
+def _place_everywhere(name: str, root: Path, adapter) -> dict:
+    """Place a shared service on every node of the agent. Every node is checked
+    before anything is written, and one that would refuse refuses the whole
+    command; the writes are then one per node, so a write that fails part-way
+    names the nodes it placed, and running it again finishes the job."""
+    store = _store_module()
+    actor = "capabilities"
+    _stamp_policy(adapter, root, "project")
+
+    def survey(conn, agent_id):
+        nodes = [row["node"] for row in _node_rows(conn, agent_id)]
+        disabled = {node for (node,) in conn.execute(
+            "SELECT node FROM capabilities_policy WHERE agent_id = %s AND capability = %s "
+            "AND node IS NOT NULL AND NOT enabled", (agent_id, name)).fetchall()}
+        refused = []
+        for node in nodes:
+            if node in disabled:
+                refused.append({"node": node, "code": "disabled_on_node", "exit": 6,
+                                "message": f"{name} is disabled for this project on node "
+                                           f"{node}, so its service cannot run there"})
+                continue
+            try:
+                # The library's own write authority, read without writing.
+                adapter._place_node(conn, node, actor)
+            except store.StoreError as exc:
+                refused.append({"node": node, "code": exc.slug, "message": exc.message,
+                                "exit": _store_error_exit(exc)})
+        return agent_id, nodes, refused
+
+    (agent_id, nodes, refused), _setting = _kernel_run(root, survey)
+    if not nodes:
+        _die(6, "no_nodes", f"agent {agent_id} has no registered node to place {name} on",
+             "register its nodes with `capabilities node add <node> --kind mac|server`")
+    if refused:
+        sys.stderr.write(json.dumps({"error": {
+            "code": refused[0]["code"],
+            "message": f"{name} was placed on no node: " + "; ".join(
+                f"{r['node']}: {r['message']}" for r in refused),
+            "hint": "settle each node named, then run the same command again",
+            "detail": {"refused": [{k: r[k] for k in ("node", "code", "message")}
+                                   for r in refused]}}}, ensure_ascii=False) + "\n")
+        sys.exit(refused[0]["exit"])
+    done: list[str] = []
+    enabled_on: list[str] = []
+    changed = False
+    for node in nodes:
+        try:
+            answer = adapter.place(name, node, True, exclusive=False, actor=actor)
+        except store.StoreError as exc:
+            sys.stderr.write(json.dumps({"error": {
+                "code": exc.slug,
+                "message": f"{name} was placed on {', '.join(done) or 'no node'} and "
+                           f"then failed on {node}: {exc.message}",
+                "hint": "run the same command again to place it on the rest",
+                "detail": {"placed": done, "failed": node}}}, ensure_ascii=False) + "\n")
+            sys.exit(_store_error_exit(exc))
+        done.append(node)
+        changed = changed or answer["changed"]
+        if answer.get("enabled_on_node"):
+            enabled_on.append(node)
+    result: dict = {"placed": name, "nodes": nodes, "placement": "shared",
+                    "changed": changed, "placed_on": adapter.placed_nodes(name),
+                    "gate": _gate_source(adapter, root, "project")}
+    if enabled_on:
+        result["enabled_on_nodes"] = enabled_on
+    return result
+
+
+def _placement_report(name: str, root: Path, adapter, mode: str) -> dict:
+    """Where this project's service of `name` is placed, beside the node that
+    holds its lease, so a move shows as under way until the lease names the
+    node it moved to. Only an exclusive service takes a lease."""
+    stamp = _store_module()._stamp
+    on = adapter.placed_nodes(name)
+    gate_source = _gate_source(adapter, root, "project")
+    lease = None
+    if mode == "exclusive":
+        def read(conn, agent_id):
+            # deployment's table, written by its runner, keyed by the project id.
+            if conn.execute("SELECT to_regclass('deployment_service_leases')"
+                            ).fetchone()[0] is None:
+                return None
+            return conn.execute(
+                "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now() "
+                "FROM deployment_service_leases WHERE project = %s AND capability = %s",
+                (agent_id, name)).fetchone()
+        row, _setting = _kernel_run(root, read)
+        if row is not None:
+            lease = {"node": row[0], "acquired_at": stamp(row[1]),
+                     "renewed_at": stamp(row[2]), "expires_at": stamp(row[3]),
+                     "live": bool(row[4])}
+    holder = lease["node"] if lease and lease["live"] else None
+    agrees = None if mode == "shared" else (holder in on if on else holder is None)
+    return {"capability": name, "placement": mode, "placed_on": on, "holder": holder,
+            "lease": lease, "agrees": agrees, "gate": gate_source}
 
 
 def _unplaced_warning(name: str, node: str, by: str) -> str:
@@ -19824,7 +19969,9 @@ def main() -> None:
         sys.stdout.write((__doc__ or "").lstrip("\n"))
         return
     cmd, rest = argv[0], argv[1:]
-    if cmd in READ_ONLY_REFUSED_VERBS:
+    # `place` with neither --node nor --all only reports, so it reads here too.
+    if cmd in READ_ONLY_REFUSED_VERBS and not (
+            cmd == "place" and "--node" not in rest and "--all" not in rest):
         _read_only_gate(cmd)
 
     def flag(name: str) -> bool:
@@ -20117,7 +20264,8 @@ def main() -> None:
     elif cmd in ("place", "unplace"):
         if not pos:
             _die(6, "input", f"{cmd} needs a capability name")
-        _place_service(pos[0], cmd == "place", opt("--node"))
+        _place_service(pos[0], cmd == "place", opt("--node"),
+                       every=cmd == "place" and flag("--all"))
     elif cmd == "inherit":
         if not pos:
             _die(6, "input", "inherit needs a capability name")
