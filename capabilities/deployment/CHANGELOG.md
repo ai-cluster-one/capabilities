@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-24 — A command deployment runs that fails is named, with its own error
+
+Where a command deployment runs fails, the `node_command_failed` message names the program and its verb and carries the command's own error: its standard error, or the message of the error envelope a capability prints. `sync`, `sync --check` and `doctor` on a ContextKit-bound checkout body now answer, for example, ``"`contextkit path` failed (exit 6): invalid collaboration.mode: bogus ..."`` rather than `contextkit failed (exit 6)` alone. Arguments are never named. A command fed standard input, and `ssh`, whose standard error carries the remote process's diagnostics, still answer with the command and its exit code only. A Coolify error envelope still passes through with its own code. The code and exit code are unchanged.
+
 ## 2026-10-24 — One command runs on a node with its output streamed back
 
 `deployment node exec <node> -- <command> [<arg>...]` runs one command in the container of a node made by `node create`, over SSH to its server and `docker exec -i`, the path `node enrol` reaches it by, with no terminal: standard input is forwarded, standard output and standard error come back unchanged as the command writes them, so `telegram login --events` or `whatsapp pair --events` streams its JSON events to this machine, and the exit code is the command's own (255 when SSH cannot reach the server). It is refused under the read-only switch, like `node login`.

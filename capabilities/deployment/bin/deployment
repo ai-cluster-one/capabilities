@@ -6470,22 +6470,48 @@ class NodeFailure(Exception):
         super().__init__(message)
 
 
+def _node_command(argv):
+    # Names the program and its verb only: never the arguments or stdin.
+    program = Path(argv[0]).name
+    verb = argv[1] if len(argv) > 1 and program != "ssh" else ""
+    return f"{program} {verb}" if verb and not verb.startswith("-") else program
+
+
+def _node_failure(argv, p, *, echo=True):
+    """The failure of a command that ran: the command and its own error, which a
+    contract error envelope carries as its message. A command fed stdin may echo
+    it, and a remote process's diagnostics arrive on ssh's stderr: neither is
+    ever echoed."""
+    command = _node_command(argv)
+    if not echo or command == "ssh":
+        return NodeFailure("node_command_failed", f"`{command}` failed (exit {p.returncode})",
+                           p.returncode)
+    detail = (p.stderr or "").strip()
+    try:
+        e = json.loads(detail or p.stdout or "")["error"]
+        if isinstance(e["message"], str):
+            detail = e["message"]
+    except (ValueError, KeyError, TypeError):
+        pass
+    message = f"`{command}` failed (exit {p.returncode})"
+    return NodeFailure("node_command_failed",
+                       message + (f": {detail[-2000:]}" if detail else ""), p.returncode)
+
+
 def _node_run(argv, root, *, stdin=None, timeout=120, check=True, env=None):
     try:
         p = subprocess.run(argv, cwd=root, input=stdin, text=True,
                            capture_output=True, timeout=timeout, env=env)
     except (OSError, subprocess.TimeoutExpired):
-        raise NodeFailure("node_command_failed", f"{Path(argv[0]).name} could not complete")
+        raise NodeFailure("node_command_failed", f"`{_node_command(argv)}` could not complete")
     if check and p.returncode:
-        # Never echo command arguments, stdin or a remote process's diagnostics.
-        code, message = "node_command_failed", f"{Path(argv[0]).name} failed (exit {p.returncode})"
         if Path(argv[0]).name == "coolify" and stdin is None:
             try:
                 e = json.loads(p.stderr)["error"]
-                code, message = e["code"], e["message"]
+                raise NodeFailure(e["code"], e["message"], p.returncode)
             except (ValueError, KeyError, TypeError):
                 pass
-        raise NodeFailure(code, message, p.returncode)
+        raise _node_failure(argv, p, echo=stdin is None)
     return p
 
 
@@ -7929,10 +7955,10 @@ def cmd_node_remove(args):
 def _memory_attributes(root):
     if not _has_contextkit(root):
         return None
-    p = _node_run(["contextkit", "path", "--json"], root, check=False)
+    argv = ["contextkit", "path", "--json"]
+    p = _node_run(argv, root, check=False)
     if getattr(p, "returncode", 0):
-        raise NodeFailure("node_command_failed", f"contextkit failed (exit {p.returncode})",
-                          p.returncode)
+        raise _node_failure(argv, p)
     try:
         body = json.loads(p.stdout or "").get("body_root")
     except (ValueError, AttributeError):

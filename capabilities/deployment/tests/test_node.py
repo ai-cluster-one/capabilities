@@ -370,13 +370,23 @@ def test_a_project_without_contextkit_asks_nothing_and_writes_no_attributes(node
     assert node.m._memory_attributes(node.root) is None
 
 
-def test_other_contextkit_failure_still_refused(node, monkeypatch):
+def test_other_contextkit_failure_still_refused_with_its_own_error(node, monkeypatch):
     (node.root / ".contextkit").mkdir()
     (node.root / ".contextkit/config.toml").write_text("")
     monkeypatch.setattr(node.m, "_node_run", lambda *a, **kw: SimpleNamespace(
-        returncode=1, stdout="", stderr="config broken"))
-    with pytest.raises(node.m.NodeFailure, match="contextkit failed"):
+        returncode=6, stdout="", stderr="invalid identity.id: x\n"))
+    with pytest.raises(node.m.NodeFailure) as failure:
         node.m._memory_attributes(node.root)
+    assert failure.value.message == "`contextkit path` failed (exit 6): invalid identity.id: x"
+    assert failure.value.exit_code == 6
+
+
+def test_a_failed_command_names_itself_and_keeps_remote_diagnostics_out(node):
+    with pytest.raises(node.m.NodeFailure) as failure:
+        node.m._node_run(["git", "rev-parse", "--verify", "no-such-ref"], node.root)
+    assert failure.value.message.startswith("`git rev-parse` failed (exit 128): fatal:")
+    assert node.m._node_failure(["ssh", "root@host", "secret"], SimpleNamespace(
+        returncode=1, stdout="", stderr="secret")).message == "`ssh` failed (exit 1)"
 
 
 @pytest.mark.parametrize("body_root", ["../elsewhere", "/elsewhere"])
