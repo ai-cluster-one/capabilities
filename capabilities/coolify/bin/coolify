@@ -121,6 +121,10 @@ COMMANDS
   services [<uuid>]               List services, or get one.
   databases [<uuid>]              List databases, or get one.
   servers [<uuid>]                List servers, or get one.
+      Resource and server records from these reads and `resources` carry
+      "dashboard_url", the record's page in the Coolify dashboard, built
+      from the connection's base_url (resources read the projects for their
+      environment path); it is absent when the page cannot be resolved.
   deployments [<uuid>]            List active/queued deployments, or get one
                                   deployment by its uuid.
   logs <uuid> [--lines N]         An application's runtime logs (default 100).
@@ -755,11 +759,77 @@ def cmd_doctor(args) -> None:
         sys.exit(fail_exit)
 
 
-def cmd_collection(c, base_path: str, uuid: str | None):
-    """List a resource collection (slimmed), or get one by uuid (full detail)."""
+DASHBOARD_KINDS = {"applications": "application", "services": "service",
+                   "databases": "database"}
+
+
+def _dashboard_kind(item: dict, base_path: str) -> str | None:
+    """The dashboard's path word for a resource; every standalone database
+    type (`standalone-postgresql`, ...) lives under /database/."""
+    if base_path in DASHBOARD_KINDS:
+        return DASHBOARD_KINDS[base_path]
+    rtype = str(item.get("type") or "")
+    if rtype in ("application", "service"):
+        return rtype
+    return "database" if rtype.startswith("standalone-") else None
+
+
+def _environment_paths(c) -> dict:
+    """Environment id -> `/project/<uuid>/environment/<uuid>`. A resource
+    record carries only its environment_id; the uuids come from the projects."""
+    paths: dict = {}
+    for project in _list_data(_request(c, "GET", "/projects")):
+        puuid = project.get("uuid") if isinstance(project, dict) else None
+        if not puuid:
+            continue
+        detail = _request(c, "GET", f"/projects/{puuid}")
+        envs = detail.get("environments") if isinstance(detail, dict) else None
+        for env in envs if isinstance(envs, list) else []:
+            if isinstance(env, dict) and env.get("id") is not None and env.get("uuid"):
+                paths[env["id"]] = f"/project/{puuid}/environment/{env['uuid']}"
+    return paths
+
+
+def _with_dashboard_urls(c, base_url: str | None, value, base_path: str, slim: bool):
+    """Add `dashboard_url` to each record whose dashboard page resolves (the
+    projects are read only when a record needs them), slimming lists after."""
+    records = _list_data(value) if slim else [value]
+    if not records:
+        return _slim_list(value)
+    urls: list = [None] * len(records)
+    if base_url:
+        environments = None
+        for i, item in enumerate(records):
+            if not isinstance(item, dict) or not item.get("uuid"):
+                continue
+            if base_path == "servers":
+                urls[i] = f"{base_url}/server/{item['uuid']}"
+                continue
+            kind = _dashboard_kind(item, base_path)
+            if not kind or item.get("environment_id") is None:
+                continue
+            if environments is None:
+                environments = _environment_paths(c)
+            env = environments.get(item["environment_id"])
+            if env:
+                urls[i] = f"{base_url}{env}/{kind}/{item['uuid']}"
+    out = [_slim(i) for i in records] if slim else records
+    for item, url in zip(out, urls):
+        if url and isinstance(item, dict):
+            item["dashboard_url"] = url
+    return out if slim else out[0]
+
+
+def cmd_collection(c, base_path: str, uuid: str | None, base_url: str | None = None):
+    """List a resource collection (slimmed), or get one by uuid (full detail).
+    Resource and server reads carry the record's `dashboard_url`."""
     if uuid:
-        return _request(c, "GET", f"/{base_path}/{uuid}")
-    return _slim_list(_request(c, "GET", f"/{base_path}"))
+        value = _request(c, "GET", f"/{base_path}/{uuid}")
+    else:
+        value = _request(c, "GET", f"/{base_path}")
+    if base_path not in (*DASHBOARD_KINDS, "servers"):
+        return value if uuid else _slim_list(value)
+    return _with_dashboard_urls(c, base_url, value, base_path, slim=not uuid)
 
 
 def cmd_sources(c):
@@ -1977,7 +2047,9 @@ def main() -> None:
 
     with _client(conn) as c:
         if args.cmd == "resources":
-            out(_slim_list(_request(c, "GET", "/resources")))
+            out(_with_dashboard_urls(c, conn["base_url"],
+                                     _request(c, "GET", "/resources"),
+                                     "resources", slim=True))
         elif args.cmd == "sources":
             out(cmd_sources(c))
         elif args.cmd == "projects":
@@ -1990,7 +2062,7 @@ def main() -> None:
                 out(cmd_collection(c, args.cmd, uuid))
         elif args.cmd in ("applications", "services", "databases",
                           "servers", "deployments"):
-            out(cmd_collection(c, args.cmd, args.uuid))
+            out(cmd_collection(c, args.cmd, args.uuid, conn["base_url"]))
         elif args.cmd == "logs":
             out(cmd_logs(c, args.uuid, args.lines))
         elif args.cmd == "deploy":

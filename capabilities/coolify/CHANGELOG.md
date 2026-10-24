@@ -1,5 +1,9 @@
 # coolify — change log
 
+## 2026-10-24 — Resource and server reads carry their dashboard URL
+
+Every record from `resources`, `applications`, `services`, `databases` and `servers`, listed or read by uuid, carries `dashboard_url`: its page in the Coolify dashboard, the connection's `base_url` followed by `/project/<project-uuid>/environment/<environment-uuid>/application|service|database/<uuid>`, or `/server/<uuid>` for a server. A resource record names only its environment's id, so a read with resources in it also reads `GET /projects` and each project once to find the uuids; a server read makes no extra request. The field is absent when the page does not resolve. Every other field is unchanged.
+
 ## 2026-10-23 — `storage add`, and an application's memory limit and generated domain
 
 `storage add <uuid> (--volume <name> | --host-path <path>) --mount-path <path>` adds one storage to an application: a named volume, which `app delete --delete-volumes` removes, or a path on the server bound as it is, such as a directory or `/var/run/docker.sock`, which Coolify never creates, writes or deletes, also when the application is deleted. `app create` and `app update` take `--limits-memory <size>`, and `app create --no-autogenerate-domain` keeps an application created without `--domains` from getting a generated one.
