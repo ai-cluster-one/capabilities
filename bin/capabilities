@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.17,<1",
+#     "capabilities-contract>=0.21,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -428,8 +428,9 @@ DEVELOPMENT VERBS
         machine resolves a database outside any project (its environment, then
         its store setting file), the session reaches that database bound to a
         schema of its own, dev_<session>, through the AGENTKIT_DB_* keys with
-        AGENTKIT_DB_SCHEMA (which then cannot be inherited), and AGENT_NODE_NAME
-        goes with it; without one the lane has no database, as before. The
+        AGENTKIT_DB_SCHEMA (which then cannot be inherited), and this
+        machine's node id goes with it as AGENT_NODE_ID (with AGENT_NODE_NAME
+        where set); without one the lane has no database, as before. The
         session creates that schema, marked as its own, before anything in
         the lane reaches it, and drops it when it ends - by finish, stop or
         gc - unless the schema was already there or no longer carries its
@@ -480,8 +481,8 @@ POLICY VERBS
         store mode to this project's row, stamped with its verified id, and the
         global row of capabilities_policy, which applies to every project
         reading that store, each for every node, or with --node for that one
-        node (the name a node gives itself: AGENT_NODE_NAME, else its host
-        name). Outside any project --global writes that global row, not the
+        node (its id, as `node id` answers it on that machine). Outside any
+        project --global writes that global row, not the
         config home's file, once the store this machine reads holds the global
         rows (global_migrated_at), and a store that does not answer then
         refuses it (exit 5). A row naming this node is read before the row for every node,
@@ -559,8 +560,9 @@ PROJECT VERBS (run inside a consuming project)
         older project.json, no settings file, no legacy envelope, and no id
         the store already holds an agent for - is a new agent and starts in
         the store: its row is registered migrated with this node as master,
-        and init refuses it, writing nothing, without AGENT_NODE_NAME
-        (node_unnamed), without a store (store_not_configured), or on a store
+        and init refuses it, writing nothing, where this machine resolves no
+        node id (node_unidentified, bad_node_id; see `node id`), without a
+        store (store_not_configured), or on a store
         whose global records have not moved (global_not_migrated). An
         existing project is initialised as before. The id is written once and
         never rewritten: an id the project already resolves (the environment,
@@ -586,8 +588,8 @@ PROJECT VERBS (run inside a consuming project)
         repository: the id is not committed. When a database resolves for the
         project, its agent row is registered in capabilities_agents (the
         result's `agent`: registered, store_not_configured, or the store's
-        error, which never fails init), and the row of this node
-        (AGENT_NODE_NAME) among its nodes is given the folder as its
+        error, which never fails init), and the row of this node (its id,
+        `node id`) among its nodes is given the folder as its
         `folder` where it records none and no other agent's row holds that
         folder on this node; per host, wire the
         SessionStart hook and the generated context file and generate the
@@ -716,9 +718,11 @@ PROJECT VERBS (run inside a consuming project)
         agent the store does not hold.
   agent materialize <id|slug> <folder> [--claude] [--codex]
         Put an agent the store holds in a folder on this machine: register
-        this machine (AGENT_NODE_NAME, exit 6 node_unnamed without it) among
-        its nodes with that folder (a new row is kind mac on a Mac, else
-        server, neither master nor writing), write CAPABILITIES_PROJECT_ID
+        this machine by its node id (`node id`; exit 6 node_unidentified
+        where it resolves none) among its nodes with that folder (a node new
+        to the registry is labelled as this machine labels itself and is
+        kind mac on a Mac, else server; the link is neither master nor
+        writing), write CAPABILITIES_PROJECT_ID
         and CAPABILITIES_PROJECT_ID_ROOT into the folder's .env.local
         (creating the folder where it is missing), then bind, wire and build
         the folder as `init --id` does - Claude when no host is named. It
@@ -799,48 +803,102 @@ PROJECT VERBS (run inside a consuming project)
         already_moved}, rows, total_rows, triggers, bindings, unreached}.
         Exit 4 under the read-only switch, but for --dry-run.
   node list
-        The nodes of this project's agent (capabilities_agent_nodes): {ok,
-        project, agent_id, nodes [{node, kind, address, is_master,
-        may_write, target, last_seen_at, coolify_connection, coolify_server,
-        coolify_resource, public_key, folder}], store}: folder is the folder
-        the agent lives in on that node, null where it is not recorded.
-  node add <node> --kind mac|server [--address HOST] [--target NAME]
-           [--master] [--may-write]
+        The nodes of this project's agent: {ok, project, agent_id, nodes
+        [{node, label, kind, address, is_master, may_write, target,
+        last_seen_at, coolify_connection, coolify_server, coolify_resource,
+        public_key, folder}], store}. A node is a row of the node registry
+        (capabilities_nodes): node is its id, the key every store row naming
+        the node holds, and label the name it is shown by. is_master,
+        may_write and folder belong to the agent's link to it
+        (capabilities_agent_nodes): folder is the folder the agent lives in
+        on that node, null where it is not recorded.
+  node id [--set <id>]
+        This machine's node id, resolved with nothing configured: on a Mac
+        derived from its hardware UUID through a hash (the UUID never leaves
+        it, nothing is stored), elsewhere read from
+        $XDG_CONFIG_HOME/capabilities/node-id, minted there once where it is
+        missing; AGENT_NODE_ID (twelve lowercase hex characters, exit 6
+        bad_node_id otherwise) overrides both. Answers {ok, id, source
+        (env | hardware | file | minted), label}, label being the one this
+        machine gives itself when it is first registered (AGENT_NODE_NAME,
+        else its host name), and overridden_by where AGENT_NODE_ID is set.
+        --set <id> writes that file (`deployment node enrol` sets the id a
+        server was created with); refused on a Mac (node_id_derived) and
+        under the read-only switch. No project is needed.
+  node add <id> --label TEXT --kind mac|server [--address HOST]
+           [--target NAME] [--master] [--may-write]
            [--coolify-connection ID --coolify-server UUID
             --coolify-resource UUID] [--public-key KEY]
         Register a node of this project's agent, registering the agent first
-        where needed. <node> is the name the node gives itself in
-        AGENT_NODE_NAME; --address is its fixed host name or IP, --target the
-        deployment target that deploys it. A node that is a Coolify resource
-        names the coolify connection it was created through, its server and
-        the resource, all three or none (exit 6 coolify_incomplete); the
-        token stays in that connection. --public-key is the node's X25519
-        public key, its 32 bytes in base64 (`deployment node enrol` records
-        it). An agent has at most one master:
-        --master while another node is master exits 6 master_exists naming
-        it. A node already registered exits 6 node_exists. Answers {ok,
-        project, agent_id, node, changed, store}.
-  node set <node> [--kind mac|server] [--address HOST] [--target NAME]
-           [--master | --no-master] [--may-write | --no-may-write]
-           [--coolify-connection ID] [--coolify-server UUID]
-           [--coolify-resource UUID] [--public-key KEY]
-        Change a registered node's fields; an empty value clears one.
+        where needed. <id> is the id `node id` answers on that machine, or,
+        for a machine that predates node ids such as a deployment target's
+        server, the name it is known by - letters, digits, '.', '_' and '-'
+        (exit 6 input for anything else) - which stands as its id until
+        `node rekey` on that machine moves it, and is its label unless
+        --label names another; a node the registry already holds - another
+        agent's - is linked as it is, and --label and --kind are needed only
+        for a new one (--label defaults to this machine's own where <id> is
+        this machine). --address is its fixed host name or IP,
+        --target the deployment target that deploys it. A node that is a
+        Coolify resource names the coolify connection it was created
+        through, its server and the resource, all three or none (exit 6
+        coolify_incomplete); the token stays in that connection.
+        --public-key is the node's X25519 public key, its 32 bytes in base64
+        (`deployment node enrol` records it). An agent has at most one
+        master: --master while another node is master exits 6 master_exists
+        naming it. A node already registered exits 6 node_exists. Answers
+        {ok, project, agent_id, node, changed, store}.
+  node set <node> [--label TEXT] [--kind mac|server] [--address HOST]
+           [--target NAME] [--master | --no-master]
+           [--may-write | --no-may-write] [--coolify-connection ID]
+           [--coolify-server UUID] [--coolify-resource UUID]
+           [--public-key KEY]
+        Change a registered node's fields; an empty value clears one, but a
+        label is never empty. <node> is its id, or a label exactly one of
+        the agent's nodes carries (node_ambiguous otherwise). The label,
+        kind, address, target, Coolify resource and key are the node's own,
+        in its registry row, so renaming a node changes that one row and no
+        row that names it; master and may-write are the agent's link's.
         Exit 6 node_unknown for a node not registered, master_exists as for
         add. Answers as add, changed false when nothing moved.
   node remove <node>
-        Remove a registered node; answers {ok, project, agent_id, removed,
-        store}. Exit 6 node_unknown for a node not registered.
+        Remove a registered node from this agent - its link, and its
+        registry row once no agent lives on it; answers {ok, project,
+        agent_id, removed, store}. Exit 6 node_unknown for a node not
+        registered.
   node seen
         Report this node up: set its last_seen_at to the store's now. The
-        node is the one this process runs on (AGENT_NODE_NAME, else the host
-        name); a node reports itself and no other. Every `deployment runner`
-        runs it on each reconcile, and `deployment help` says when a node
-        counts as live. Answers {ok, project, agent_id, node, last_seen_at,
-        store}. Exit 6 node_unknown for a node not registered.
-        The agent and node verbs need the project's id (exit 6
+        node is the one this process runs on (`node id`); a node reports
+        itself and no other. Every `deployment runner` runs it on each
+        reconcile, and `deployment help` says when a node counts as live.
+        Answers {ok, project, agent_id, node, last_seen_at, store}. Exit 6
+        node_unknown for a node not registered.
+  node rekey <old id> [<new id>] [--dry-run]
+        Move a node from the id it is known by - a node registered before
+        ids keeps the name it had as its id - to its own: this machine's id
+        (`node id`), or the one given. In one transaction the registry row
+        takes the new id, every agent's link to it follows, and every column
+        of the store that names a node moves with it: the policy, grant,
+        identifier and settings rows for that node, the service leases,
+        sessions, runs, definitions, executions and memory entries recorded
+        under it (only the node part of agentrooms' lease holder); the
+        tables' triggers that would refuse it are held off inside that
+        transaction, and it rolls back where a row still names the old id
+        (exit 5 rekey_incomplete). Where the new id is registered already -
+        this machine registered itself before the rekey - that row takes the
+        links and the old row's label and fields. It refuses, changing
+        nothing, while a live lease names the old id (exit 6
+        node_services_running): stop those services first. Run again it
+        changes nothing (store.already_moved). Exit 6 node_unknown where the
+        store holds neither id. --dry-run changes nothing and answers the
+        same with every row it would move. Answers {ok, project, dry_run,
+        old_id, new_id, label, merged, rows [{table, column, rows, how}],
+        total_rows, triggers, store {level, schema, moved, already_moved}}.
+        The agent and node verbs but `node id` need the project's id (exit 6
         no_project_identity: run init) and a database that resolves for the
         project (exit 6 store_not_configured, 5 when it cannot be reached);
-        set, add, remove and seen exit 4 under the read-only switch.
+        set, add, remove, seen and rekey exit 4 under the read-only switch,
+        but for rekey --dry-run.
   context --claude|--codex|--fragment
         Compose the session injection from the gate + snapshots + project
         envelopes. --fragment prints the manager-owned Markdown block without
@@ -1035,7 +1093,7 @@ PROJECT VERBS (run inside a consuming project)
         the policy verbs, identifiers with the capability's ids verbs, and long
         text with the capability's context verbs. In store mode a connection
         is a row every project may be granted, a grant is this project's row
-        and may carry node (a node name, or null for every node, the default)
+        and may carry node (a node id, or null for every node, the default)
         and is_default (the default pointer, one per capability and node), and
         setting connection.default moves is_default; such a write stamps the
         project id, so it refuses (exit 6) where the id is not verified, and
@@ -1142,8 +1200,9 @@ PROJECT VERBS (run inside a consuming project)
         service settings holds (keep or drop), a slack mode the two disagree
         on. Each question names the path in the --answers JSON its
         answer goes to. --apply refuses (exit 6, nothing written) without a
-        database (its own code), without AGENT_NODE_NAME (node_unnamed), on a
-        node other than the answers' or the open migration's (node_mismatch)
+        database (its own code), where this machine resolves no node id
+        (node_unidentified), on a node other than the answers' (named by its
+        id or its label) or the open migration's (node_mismatch)
         or other than the agent's master (not_master), before `migrate
         --global` (global_not_migrated), with a payload older than this
         contract (payload_outdated) or with a question open (question_open).
@@ -1200,7 +1259,8 @@ PROJECT VERBS (run inside a consuming project)
         record and settings files without reading them. The roots it weighs
         are the ones --report finds plus every root holding an envelope or a
         ContextKit binding below the folders those sit in and below each
-        --root. Refused without AGENT_NODE_NAME (node_unnamed), on the master
+        --root. Refused where this machine resolves no node id
+        (node_unidentified), on the master
         node of any of those agents (master_node), before global_migrated_at
         (global_not_migrated), or while one of those roots has not moved or
         has no id (agents_unmigrated, each root named with where it was
@@ -5556,6 +5616,21 @@ def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> d
         with conn.transaction():
             counts["capabilities_agents"] = copy(
                 "capabilities_agents", sql.SQL("id = %s"), (agent_id,))
+            # The agent's nodes before its links to them. A machine's store
+            # from before the node registry keeps a node's fields on its links.
+            nodes_of = sql.SQL("id IN (SELECT node FROM {}.capabilities_agent_nodes "
+                               "WHERE agent_id = %s)").format(sql.Identifier(real))
+            if columns("capabilities_nodes", real):
+                counts["capabilities_nodes"] = copy("capabilities_nodes", nodes_of,
+                                                    (agent_id,))
+            else:
+                conn.execute(sql.SQL("DELETE FROM {}.capabilities_nodes WHERE ").format(
+                    sql.Identifier(schema)) + nodes_of, (agent_id,))
+                counts["capabilities_nodes"] = conn.execute(sql.SQL(
+                    "INSERT INTO {}.capabilities_nodes (id, label, kind) SELECT DISTINCT ON "
+                    "(node) node, node, kind FROM {}.capabilities_agent_nodes WHERE agent_id "
+                    "= %s ORDER BY node").format(sql.Identifier(schema), sql.Identifier(real)),
+                    (agent_id,)).rowcount
             counts["capabilities_agent_nodes"] = copy(
                 "capabilities_agent_nodes", sql.SQL("agent_id = %s"), (agent_id,))
             conn.execute(sql.SQL("UPDATE {}.capabilities_global SET global_migrated_at = "
@@ -5615,8 +5690,13 @@ def _dev_env(session: dict, inherit: list[str] | None = None) -> dict[str, str]:
     database = _dev_database(session)
     if database is not None:
         env.update(database[1])
-        if os.environ.get("AGENT_NODE_NAME", "").strip():
-            env["AGENT_NODE_NAME"] = os.environ["AGENT_NODE_NAME"]
+        store = _store_module()
+        try:
+            env[store.NODE_ID_ENV] = store.node_id()
+        except store.StoreError:
+            pass
+        if os.environ.get(store.NODE_NAME_ENV, "").strip():
+            env[store.NODE_NAME_ENV] = os.environ[store.NODE_NAME_ENV]
     for key in inherit or []:
         if not _dev_safe_env_key(key):
             _die(6, "bad_env_key", f"invalid inherited env key: {key!r}")
@@ -7652,16 +7732,31 @@ AGENT_COLUMNS = ("id", "slug", "name", "description", "icon_sha", "onboarding_st
 AGENT_TEXT_FIELDS = {"--name": "name", "--description": "description",
                      "--onboarding-routine": "onboarding_routine"}
 ONBOARDING_STATUSES = ("pending", "complete")
-# What a migration reads of a node: the columns every store version carries,
-# since it reads them before the store is brought to this code's version.
-NODE_BASE_COLUMNS = ("node", "kind", "address", "is_master", "may_write", "target",
-                     "last_seen_at")
-# A node created as a Coolify resource names the coolify connection, the server
-# and the resource it was created with, all three or none; public_key is the
-# X25519 key the node made, its 32 bytes in base64. folder is the folder the
-# agent lives in on that node, its project root there.
-NODE_COLUMNS = (*NODE_BASE_COLUMNS, "coolify_connection", "coolify_server",
+# A node is a row of the node registry (capabilities_nodes), keyed by its id
+# and shown by its label; which agent lives on it is a link
+# (capabilities_agent_nodes) holding what belongs to the pair - the folder the
+# agent lives in there, whether the node is the agent's master and whether it
+# may write rows of its own. A node created as a Coolify resource names the
+# coolify connection, the server and the resource it was created with, all
+# three or none; public_key is the X25519 key the node made, its 32 bytes in
+# base64.
+NODE_FIELDS = ("label", "kind", "address", "target", "coolify_connection",
+               "coolify_server", "coolify_resource", "public_key")
+NODE_LINK_FIELDS = ("is_master", "may_write")
+# What a node reads as: its id as `node`, its own fields, the link's.
+NODE_COLUMNS = ("node", "label", "kind", "address", "is_master", "may_write", "target",
+                "last_seen_at", "coolify_connection", "coolify_server",
                 "coolify_resource", "public_key", "folder")
+NODE_SELECT = ("SELECT l.node, n.label, n.kind, n.address, l.is_master, l.may_write, "
+               "n.target, n.last_seen_at, n.coolify_connection, n.coolify_server, "
+               "n.coolify_resource, n.public_key, l.folder "
+               "FROM capabilities_agent_nodes l JOIN capabilities_nodes n ON n.id = l.node ")
+# What a migration reads of a node, on a store at any version: it reads them
+# before the store is brought to this code's version, and a store from before
+# the node registry keeps a node's fields on its link, its name standing as id
+# and label.
+NODE_BASE_COLUMNS = ("node", "label", "kind", "address", "is_master", "may_write", "target",
+                     "last_seen_at")
 NODE_COOLIFY_COLUMNS = ("coolify_connection", "coolify_server", "coolify_resource")
 NODE_KINDS = ("mac", "server")
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -7794,15 +7889,10 @@ def _agent_registered(root: Path, agent_id: str) -> bool:
 
 def _preflight_new_agent(root: Path) -> None:
     """A new agent starts in the store, so init refuses one before writing
-    anything where it could not work there: no node name, no store, or a store
+    anything where it could not work there: no node id, no store, or a store
     whose global records have not moved from this machine's files."""
     store = _store_module()
-    if not os.environ.get(store.NODE_NAME_ENV, "").strip():
-        _die(6, "node_unnamed",
-             f"{store.NODE_NAME_ENV} is not set: a new agent keeps its records in the "
-             "store, read per node, and this machine names no node",
-             f"set {store.NODE_NAME_ENV} to this machine's node name, then run "
-             "`capabilities init` again")
+    _this_node()
     db = _db_module()
     try:
         setting = db.resolve_setting(root)
@@ -7852,19 +7942,23 @@ def _register_agent_on_init(root: Path, new_agent: bool = False,
         major, minor = store.STORE_TABLES_VERSION
         db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
                    major=major, minor=minor)
-        node = os.environ.get(store.NODE_NAME_ENV, "").strip()
+        try:
+            here = store.this_node()
+        except store.StoreError:
+            here = None
+        node = here["id"] if here else None
         folder = str(root.resolve())
         with conn.transaction():
             created = _ensure_agent_row(conn, agent_id)
             if new_agent and node:
                 conn.execute("UPDATE capabilities_agents SET migrated_at = now(), updated_at = now() "
                              "WHERE id = %s AND migrated_at IS NULL AND migrating_since IS NULL", (agent_id,))
-                conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node, kind, "
-                             "is_master) SELECT %s, %s, %s, true WHERE NOT EXISTS (SELECT 1 "
-                             "FROM capabilities_agent_nodes WHERE agent_id = %s AND is_master) "
-                             "ON CONFLICT (agent_id, node) DO NOTHING",
-                             (agent_id, node, "mac" if sys.platform == "darwin" else "server",
-                              agent_id))
+                if not conn.execute("SELECT 1 FROM capabilities_agent_nodes "
+                                    "WHERE agent_id = %s AND is_master", (agent_id,)).fetchone():
+                    _ensure_node_row(conn, here)
+                    conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node, "
+                                 "is_master) VALUES (%s, %s, true) "
+                                 "ON CONFLICT (agent_id, node) DO NOTHING", (agent_id, node))
             if node:
                 # This node's row records the folder the agent lives in here,
                 # where it records none yet and no other agent holds the folder.
@@ -8079,8 +8173,9 @@ def _agent_state(ref: str) -> dict:
         agent = _agent_row(conn, agent_id)
         nodes = _node_rows(conn, agent_id)
         ago = dict(conn.execute(
-            "SELECT node, round(extract(epoch FROM now() - last_seen_at))::int "
-            "FROM capabilities_agent_nodes WHERE agent_id = %s", (agent_id,)).fetchall())
+            "SELECT l.node, round(extract(epoch FROM now() - n.last_seen_at))::int "
+            "FROM capabilities_agent_nodes l JOIN capabilities_nodes n ON n.id = l.node "
+            "WHERE l.agent_id = %s", (agent_id,)).fetchall())
         policy = conn.execute(
             "SELECT agent_id IS NOT NULL, capability, node, enabled, service "
             "FROM capabilities_policy WHERE agent_id = %s OR agent_id IS NULL",
@@ -8278,13 +8373,8 @@ def _agent_materialize(ref: str, folder_arg: str, claude: bool, codex: bool) -> 
     folder bound to another agent, and the agent where it already lives in
     another folder here."""
     store = _store_module()
-    node = os.environ.get(store.NODE_NAME_ENV, "").strip()
-    if not node:
-        _die(6, "node_unnamed",
-             f"{store.NODE_NAME_ENV} is not set: the agent is registered on this machine "
-             "as one of its nodes, and this machine names no node",
-             f"set {store.NODE_NAME_ENV} to this machine's node name, then run "
-             "`capabilities agent materialize` again")
+    here = _this_node()
+    node = here["id"]
     folder = Path(folder_arg).expanduser()
     folder = (folder if folder.is_absolute() else Path.cwd() / folder).resolve()
     if folder.exists() and not folder.is_dir():
@@ -8328,14 +8418,14 @@ def _agent_materialize(ref: str, folder_arg: str, claude: bool, codex: bool) -> 
                      f"agent {agent_id} already lives in {elsewhere} on node {node}",
                      f"an agent has one folder on a node: work in {elsewhere}, or unbind it "
                      f"(its .env.local's {PROJECT_ID_ENV}) and run this again")
+            made = _ensure_node_row(conn, here)
             cur = conn.execute(
-                "INSERT INTO capabilities_agent_nodes (agent_id, node, kind, folder) "
-                "VALUES (%s, %s, %s, %s) ON CONFLICT (agent_id, node) DO UPDATE "
+                "INSERT INTO capabilities_agent_nodes (agent_id, node, folder) "
+                "VALUES (%s, %s, %s) ON CONFLICT (agent_id, node) DO UPDATE "
                 "SET folder = EXCLUDED.folder "
                 "WHERE capabilities_agent_nodes.folder IS DISTINCT FROM EXCLUDED.folder",
-                (agent_id, node, "mac" if sys.platform == "darwin" else "server",
-                 str(folder)))
-            node_changed = cur.rowcount == 1
+                (agent_id, node, str(folder)))
+            node_changed = cur.rowcount == 1 or made
             node_row = _node_rows(conn, agent_id, node)[0]
     except psycopg.errors.UniqueViolation:
         _die(6, "folder_bound", f"{folder} is the folder of another agent on node {node}",
@@ -8395,6 +8485,7 @@ def _unmaterialize(folder: Path, agent_id: str, node: str, node_before,
             if node_before is None:
                 conn.execute("DELETE FROM capabilities_agent_nodes "
                              "WHERE agent_id = %s AND node = %s", (agent_id, node))
+                _drop_unlinked_node(conn, node)
             else:
                 conn.execute("UPDATE capabilities_agent_nodes SET folder = %s "
                              "WHERE agent_id = %s AND node = %s",
@@ -8915,7 +9006,10 @@ def _agent_rekey(root: Path, given: str | None, dry_run: bool) -> dict:
              "one minted")
     if given == old:
         _die(6, "input", f"this project is already bound to {old}")
-    node_name = os.environ.get(store.NODE_NAME_ENV, "").strip()
+    try:
+        node_name = store.node_id()
+    except store.StoreError:
+        node_name = ""
     conn, setting = _kernel_open(root)
     schema = setting.schema
     import psycopg
@@ -9044,12 +9138,11 @@ def _agent_rekey(root: Path, given: str | None, dry_run: bool) -> dict:
 
 def _node_rows(conn, agent_id: str, node: str | None = None) -> list[dict]:
     stamp = _store_module()._stamp
-    sql = (f"SELECT {', '.join(NODE_COLUMNS)} FROM capabilities_agent_nodes "
-           "WHERE agent_id = %s")
+    sql = NODE_SELECT + "WHERE l.agent_id = %s"
     params: tuple = (agent_id,)
     if node is not None:
-        sql, params = sql + " AND node = %s", (agent_id, node)
-    rows = conn.execute(sql + " ORDER BY node", params).fetchall()
+        sql, params = sql + " AND l.node = %s", (agent_id, node)
+    rows = conn.execute(sql + " ORDER BY n.label, l.node", params).fetchall()
     out = []
     for row in rows:
         entry = dict(zip(NODE_COLUMNS, row))
@@ -9060,13 +9153,15 @@ def _node_rows(conn, agent_id: str, node: str | None = None) -> list[dict]:
 
 def _node_name_arg(pos: list[str], verb: str) -> str:
     if len(pos) != 1 or not pos[0].strip():
-        _die(6, "input", f"node {verb} needs exactly one node name")
+        _die(6, "input", f"node {verb} needs exactly one node: its id, or its label")
     return pos[0].strip()
 
 
 def _node_values(opts: dict) -> dict:
     """The columns a node add or set writes, from its options."""
     values: dict = {}
+    if "--label" in opts:
+        values["label"] = opts["--label"].strip()
     if "--kind" in opts:
         kind = opts["--kind"].strip()
         if kind not in NODE_KINDS:
@@ -9115,17 +9210,90 @@ def _refuse_partial_coolify(row: dict) -> None:
             "give --coolify-connection, --coolify-server and --coolify-resource together")
 
 
+def _this_node() -> dict:
+    """This machine as a node, {id, label, source}, or exit 6 where it cannot
+    resolve its id (`node_unidentified`, `bad_node_id`)."""
+    store = _store_module()
+    try:
+        return store.this_node()
+    except store.StoreError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+
+
+def _ensure_node_row(conn, node: dict, kind: str | None = None) -> bool:
+    """The registry row of a node {id, label}, made where the store holds none:
+    a Mac's kind on a Mac, else server, unless `kind` names one. A row already
+    there keeps its label and fields. Answers whether it made one."""
+    kind = kind or ("mac" if sys.platform == "darwin" else "server")
+    return conn.execute(
+        "INSERT INTO capabilities_nodes (id, label, kind) VALUES (%s, %s, %s) "
+        "ON CONFLICT (id) DO NOTHING", (node["id"], node.get("label") or node["id"],
+                                        kind)).rowcount > 0
+
+
+def _drop_unlinked_node(conn, node: str) -> None:
+    """Remove a node's registry row once no agent lives on it."""
+    conn.execute("DELETE FROM capabilities_nodes WHERE id = %s AND NOT EXISTS "
+                 "(SELECT 1 FROM capabilities_agent_nodes WHERE node = %s)", (node, node))
+
+
+def _node_id_or(default: str | None) -> str | None:
+    """This machine's node id, or `default` where it resolves none."""
+    store = _store_module()
+    try:
+        return store.node_id()
+    except store.StoreError:
+        return default
+
+
 class _KernelRefusal(Exception):
     def __init__(self, code: str, message: str, hint: str | None = None):
         super().__init__(message)
         self.code, self.message, self.hint = code, message, hint
 
 
+# Every column of the store that names a node by its id, apart from the
+# links (capabilities_agent_nodes), which follow the registry's id through
+# their foreign key: `node rekey` moves each in one transaction. `prefix` is a
+# column holding `<node>:<more>`, of which only the node part moves. A
+# capability that adds a column naming a node adds it here.
+NODE_REFERENCES = (
+    ("agentrooms_leases", "node", "whole"),
+    ("agentrooms_leases", "holder", "prefix"),
+    ("agentrooms_sessions", "node", "whole"),
+    ("agentrooms_turns", "node", "whole"),
+    ("askproject_sessions", "host", "whole"),
+    ("automations_definitions", "node", "whole"),
+    ("automations_runs", "node", "whole"),
+    ("automations_runs", "environment", "whole"),
+    ("capabilities_connection_grants", "node", "whole"),
+    ("capabilities_identifiers", "node", "whole"),
+    ("capabilities_policy", "node", "whole"),
+    ("capabilities_settings", "node", "whole"),
+    ("capabilities_settings_changes", "node", "whole"),
+    ("capabilities_settings_documents", "node", "whole"),
+    ("deployment_service_leases", "node", "whole"),
+    ("memory_entries", "node", "whole"),
+    ("memory_events", "node", "whole"),
+    ("tasks_executions", "node", "whole"),
+)
+# The tables that keep a lease - a node and an expiry - and the column naming
+# what holds it: a live one names a service that runs on the node.
+# The name a node registered before ids is known by: a deployment target's
+# node, as deployment validates it.
+NODE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
+NODE_LEASES = (("deployment_service_leases", "capability"),
+               ("agentrooms_leases", "agent"))
+
+
 def cmd_node(args: list[str]) -> None:
     sub = args[0] if args else None
+    if sub == "id":
+        _node_id_verb(args[1:])
+        return
     root = _require_project()
-    valued = {"--kind", "--address", "--target", "--coolify-connection", "--coolify-server",
-              "--coolify-resource", "--public-key"}
+    valued = {"--label", "--kind", "--address", "--target", "--coolify-connection",
+              "--coolify-server", "--coolify-resource", "--public-key"}
     toggles = {"--master", "--no-master", "--may-write", "--no-may-write"}
     import psycopg
     if sub == "list":
@@ -9137,8 +9305,18 @@ def cmd_node(args: list[str]) -> None:
         _emit({"ok": True, "project": str(root), "agent_id": agent_id,
                "nodes": nodes, "store": _kernel_store_report(setting)})
         return
+    if sub == "rekey":
+        pos, opts = _kernel_options(args[1:], set(), {"--dry-run", "--json"}, "node rekey")
+        if not 1 <= len(pos) <= 2 or not all(p.strip() for p in pos):
+            _die(6, "input", "node rekey takes the node's old id and, optionally, its new id",
+                 "capabilities node rekey <old id> [<new id>] [--dry-run]")
+        if "--dry-run" not in opts:
+            _read_only_gate("node rekey")
+        _emit(_node_rekey(root, pos[0].strip(), pos[1].strip() if len(pos) > 1 else None,
+                          "--dry-run" in opts))
+        return
     if sub not in ("add", "set", "remove", "seen"):
-        _die(6, "input", "node needs a subcommand: add, set, list, remove or seen",
+        _die(6, "input", "node needs a subcommand: add, set, list, remove, seen, id or rekey",
              "run `capabilities help`")
     _read_only_gate(f"node {sub}")
     if sub == "seen":
@@ -9146,15 +9324,16 @@ def cmd_node(args: list[str]) -> None:
         if pos:
             _die(6, "input", "node seen takes no positional argument: a node reports "
                  "itself")
-        here = _store_module().node_name()
+        here = _this_node()["id"]
 
         def seen(conn, agent_id):
-            if conn.execute("UPDATE capabilities_agent_nodes SET last_seen_at = now() "
-                            "WHERE agent_id = %s AND node = %s",
-                            (agent_id, here)).rowcount == 0:
+            if conn.execute("UPDATE capabilities_nodes SET last_seen_at = now() "
+                            "WHERE id = %s AND EXISTS (SELECT 1 FROM capabilities_agent_nodes "
+                            "WHERE agent_id = %s AND node = %s)",
+                            (here, agent_id, here)).rowcount == 0:
                 raise _KernelRefusal("node_unknown", f"agent {agent_id} has no node {here}",
                                      f"register it with `capabilities node add {here} "
-                                     "--kind mac|server`")
+                                     "--label <label> --kind mac|server`")
             return agent_id, _node_rows(conn, agent_id, here)[0]["last_seen_at"]
         try:
             (agent_id, stamp), setting = _kernel_run(root, seen)
@@ -9169,45 +9348,80 @@ def cmd_node(args: list[str]) -> None:
     else:
         pos, opts = _kernel_options(args[1:], valued, {*toggles, "--json"}, f"node {sub}")
         values = _node_values(opts)
-    node = _node_name_arg(pos, sub)
-    if sub == "add" and "kind" not in values:
-        _die(6, "input", "node add needs --kind mac|server")
+    ref = _node_name_arg(pos, sub)
+    node_values = {k: v for k, v in values.items() if k in NODE_FIELDS}
+    link_values = {k: v for k, v in values.items() if k in NODE_LINK_FIELDS}
     if sub == "set" and not values:
-        _die(6, "input", "node set needs at least one of --kind, --address, --target, "
-             "--master, --no-master, --may-write, --no-may-write, --coolify-connection, "
-             "--coolify-server, --coolify-resource, --public-key")
+        _die(6, "input", "node set needs at least one of --label, --kind, --address, "
+             "--target, --master, --no-master, --may-write, --no-may-write, "
+             "--coolify-connection, --coolify-server, --coolify-resource, --public-key")
 
     def work(conn, agent_id):
         if sub == "add":
+            node = ref
             _ensure_agent_row(conn, agent_id)
             if _node_rows(conn, agent_id, node):
                 raise _KernelRefusal("node_exists",
                                      f"agent {agent_id} already has node {node}",
                                      f"change it with `capabilities node set {node}`")
-            if values.get("is_master"):
+            known = conn.execute("SELECT 1 FROM capabilities_nodes WHERE id = %s FOR UPDATE",
+                                 (node,)).fetchone() is not None
+            if not known:
+                # A machine's id, or the name a machine that predates ids - a
+                # deployment target's server - is known by until it moves to
+                # its own id there (`node rekey`).
+                if not (_store_module().NODE_ID_RE.fullmatch(node)
+                        or NODE_NAME_RE.fullmatch(node)):
+                    raise _KernelRefusal(
+                        "input", f"{node!r} is not a node id: twelve lowercase hex characters",
+                        "a machine's id is what `capabilities node id` answers on it")
+                if "kind" not in node_values:
+                    raise _KernelRefusal("input", f"node {node} is new: node add needs "
+                                         "--kind mac|server")
+                if not node_values.get("label") and not _store_module().NODE_ID_RE.fullmatch(node):
+                    # A name stands as its own label.
+                    node_values["label"] = node
+                if not node_values.get("label"):
+                    try:
+                        here = _store_module().this_node()
+                    except _store_module().StoreError:
+                        here = {}
+                    if here.get("id") != node:
+                        raise _KernelRefusal("input", f"node {node} is new: node add needs "
+                                             "--label, the name it is shown by")
+                    node_values["label"] = here["label"]
+                _refuse_partial_coolify(node_values)
+                columns = ["id", *node_values]
+                conn.execute(
+                    f"INSERT INTO capabilities_nodes ({', '.join(columns)}) "
+                    f"VALUES ({', '.join(['%s'] * len(columns))})",
+                    (node, *node_values.values()))
+            elif node_values:
+                _node_update(conn, node, node_values)
+            if link_values.get("is_master"):
                 _refuse_second_master(conn, agent_id, node)
-            _refuse_partial_coolify(values)
-            columns = ["agent_id", "node", *values]
+            columns = ["agent_id", "node", *link_values]
             conn.execute(
                 f"INSERT INTO capabilities_agent_nodes ({', '.join(columns)}) "
                 f"VALUES ({', '.join(['%s'] * len(columns))})",
-                (agent_id, node, *values.values()))
+                (agent_id, node, *link_values.values()))
             return agent_id, _node_rows(conn, agent_id, node)[0], True
+        node = _node_ref(conn, agent_id, ref)
         before = _node_rows(conn, agent_id, node)
-        if not before:
-            raise _KernelRefusal("node_unknown", f"agent {agent_id} has no node {node}",
-                                 "run `capabilities node list` to see its nodes")
         if sub == "remove":
             conn.execute("DELETE FROM capabilities_agent_nodes "
                          "WHERE agent_id = %s AND node = %s", (agent_id, node))
+            _drop_unlinked_node(conn, node)
             return agent_id, before[0], True
-        if values.get("is_master"):
+        if link_values.get("is_master"):
             _refuse_second_master(conn, agent_id, node)
-        _refuse_partial_coolify({**before[0], **values})
-        assignments = ", ".join(f"{c} = %s" for c in values)
-        conn.execute(f"UPDATE capabilities_agent_nodes SET {assignments} "
-                     "WHERE agent_id = %s AND node = %s",
-                     (*values.values(), agent_id, node))
+        if node_values:
+            _node_update(conn, node, node_values)
+        if link_values:
+            assignments = ", ".join(f"{c} = %s" for c in link_values)
+            conn.execute(f"UPDATE capabilities_agent_nodes SET {assignments} "
+                         "WHERE agent_id = %s AND node = %s",
+                         (*link_values.values(), agent_id, node))
         after = _node_rows(conn, agent_id, node)[0]
         return agent_id, after, after != before[0]
 
@@ -9226,6 +9440,215 @@ def cmd_node(args: list[str]) -> None:
     else:
         answer.update(node=row, changed=changed)
     _emit(answer)
+
+
+def _node_ref(conn, agent_id: str, ref: str) -> str:
+    """The id of this agent's node `ref` names: its id, else a label exactly one
+    of the agent's nodes carries."""
+    rows = _node_rows(conn, agent_id)
+    if any(row["node"] == ref for row in rows):
+        return ref
+    labelled = [row["node"] for row in rows if row["label"] == ref]
+    if len(labelled) == 1:
+        return labelled[0]
+    if labelled:
+        raise _KernelRefusal("node_ambiguous", f"agent {agent_id} has {len(labelled)} nodes "
+                             f"labelled {ref!r}: " + ", ".join(labelled),
+                             "name the node by its id")
+    raise _KernelRefusal("node_unknown", f"agent {agent_id} has no node {ref}",
+                         "run `capabilities node list` to see its nodes")
+
+
+def _node_update(conn, node: str, values: dict) -> None:
+    """Change a node's own fields, in its registry row: a new label is that one
+    column, and nothing that names the node by its id moves."""
+    current = dict(zip(NODE_FIELDS, conn.execute(
+        f"SELECT {', '.join(NODE_FIELDS)} FROM capabilities_nodes WHERE id = %s FOR UPDATE",
+        (node,)).fetchone()))
+    if "label" in values and not values["label"]:
+        raise _KernelRefusal("input", "a node's label is the name it is shown by; it is "
+                             "never empty")
+    _refuse_partial_coolify({**current, **values})
+    if all(current.get(k) == v for k, v in values.items()):
+        return
+    assignments = ", ".join(f"{c} = %s" for c in values)
+    conn.execute(f"UPDATE capabilities_nodes SET {assignments}, updated_at = now() "
+                 "WHERE id = %s", (*values.values(), node))
+
+
+def _node_id_verb(args: list[str]) -> None:
+    """`node id [--set <id>]`: this machine's node id, where it came from and
+    the label it gives itself; --set keeps a server's id in its config home."""
+    pos, opts = _kernel_options(args, {"--set"}, {"--json"}, "node id")
+    if pos:
+        _die(6, "input", "node id takes no positional argument",
+             "capabilities node id [--set <id>]")
+    store = _store_module()
+    written = None
+    if "--set" in opts:
+        _read_only_gate("node id --set")
+        given = str(opts["--set"]).strip()
+        if not store.NODE_ID_RE.fullmatch(given):
+            _die(6, "input", f"{given!r} is not a node id: twelve lowercase hex characters")
+        if sys.platform == "darwin":
+            _die(6, "node_id_derived", "a Mac's node id is derived from its hardware and "
+                 "is never set", "run `capabilities node id` to read it")
+        try:
+            written = str(store._node_id_path())
+            store.write_node_id(given)
+        except store.StoreError as exc:
+            _die(6, exc.slug, exc.message, exc.hint)
+    here = _this_node()
+    answer = {"ok": True, **here}
+    if written is not None:
+        answer["written"] = written
+    if os.environ.get(store.NODE_ID_ENV, "").strip():
+        answer["overridden_by"] = store.NODE_ID_ENV
+    _emit(answer)
+
+
+def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
+    """`node rekey`: move a node from the id it is known by - the name it had
+    before ids - to its own: this machine's id, or the one given. In one
+    transaction the registry row takes the new id, which every link follows,
+    and every column NODE_REFERENCES names moves with it, the triggers that
+    would refuse the move held off inside that transaction."""
+    store = _store_module()
+    new = given if given is not None else _this_node()["id"]
+    if not store.NODE_ID_RE.fullmatch(new):
+        _die(6, "input", f"{new!r} is not a node id: twelve lowercase hex characters")
+    if new == old:
+        _die(6, "input", f"node {old} already has the id {new}")
+    conn, setting = _kernel_open(root)
+    schema = setting.schema
+    qualified = lambda table: f"{_rekey_ident(schema)}.{_rekey_ident(table)}"
+    import psycopg
+    try:
+        rows = dict(conn.execute(
+            "SELECT id, to_jsonb(n) FROM capabilities_nodes n WHERE id = ANY (%s)",
+            ([old, new],)).fetchall())
+        if old not in rows:
+            conn.close()
+            if new in rows:
+                return {"ok": True, "project": str(root), "dry_run": dry_run, "old_id": old,
+                        "new_id": new, "label": rows[new].get("label"),
+                        "store": {**_kernel_store_report(setting), "moved": False,
+                                  "already_moved": True},
+                        "rows": [], "total_rows": 0, "triggers": []}
+            _die(6, "node_unknown", f"the store ({setting.level}, schema {schema}) holds no "
+                 f"node {old!r}", "run `capabilities node list` to see this agent's nodes")
+        present = {(t, c) for t, c in conn.execute(
+            "SELECT c.relname, a.attname FROM pg_attribute a "
+            "JOIN pg_class c ON c.oid = a.attrelid "
+            "WHERE c.relnamespace = to_regnamespace(%s) AND c.relkind IN ('r', 'p') "
+            "AND a.attnum > 0 AND NOT a.attisdropped", (schema,)).fetchall()}
+        prefix = old.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + ":%"
+        plan = []
+        for table, column, how in NODE_REFERENCES:
+            if (table, column) not in present:
+                continue
+            where = (f"{_rekey_ident(column)} LIKE %s" if how == "prefix"
+                     else f"{_rekey_ident(column)} = %s")
+            count = conn.execute(f"SELECT count(*) FROM {qualified(table)} WHERE {where}",
+                                 (prefix if how == "prefix" else old,)).fetchone()[0]
+            if count:
+                plan.append({"table": table, "column": column, "rows": count, "how": how})
+        links = conn.execute("SELECT count(*) FROM capabilities_agent_nodes WHERE node = %s",
+                             (old,)).fetchone()[0]
+        running = []
+        for table, what in NODE_LEASES:
+            if (table, "expires_at") not in present or (table, what) not in present:
+                continue
+            for name, until in conn.execute(
+                    f"SELECT {_rekey_ident(what)}, expires_at FROM {qualified(table)} "
+                    "WHERE node = %s AND expires_at > now() ORDER BY 1", (old,)).fetchall():
+                running.append({"service": name, "until": store._stamp(until), "lease": table})
+        if running and not dry_run:
+            conn.close()
+            _die(6, "node_services_running",
+                 f"services run on node {old}: " + "; ".join(
+                     f"{r['service']} ({r['lease']}, until {r['until']})" for r in running),
+                 "stop them on that node and rekey it after: a lease a stopped service "
+                 "held runs out at its time")
+        triggers = _rekey_triggers(conn, schema, [hit["table"] for hit in plan]
+                                   + ["capabilities_nodes", "capabilities_agent_nodes"])
+    except psycopg.Error as exc:
+        conn.close()
+        _die(5, "store_unreachable", f"cannot read the store: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    answer = {"ok": True, "project": str(root), "dry_run": dry_run, "old_id": old,
+              "new_id": new, "label": rows[old].get("label"), "merged": new in rows,
+              "rows": [{"table": "capabilities_agent_nodes", "column": "node",
+                        "rows": links, "how": "foreign key"}] + plan,
+              "total_rows": links + sum(hit["rows"] for hit in plan),
+              "triggers": [{"table": t["table"], "trigger": t["trigger"]} for t in triggers]}
+    if dry_run:
+        conn.close()
+        answer["services_running"] = running
+        answer["store"] = {**_kernel_store_report(setting), "moved": False,
+                           "already_moved": False}
+        return answer
+    modes = {"O": "", "A": "ALWAYS ", "R": "REPLICA "}
+    try:
+        with conn.transaction():
+            conn.execute("SET LOCAL lock_timeout = '10s'")
+            for t in triggers:
+                conn.execute(f"ALTER TABLE {qualified(t['table'])} "
+                             f"DISABLE TRIGGER {_rekey_ident(t['trigger'])}")
+            if new in rows:
+                # The machine registered itself under its id already: that row
+                # takes the links and what the old row knew of the node.
+                conn.execute(
+                    "UPDATE capabilities_nodes n SET label = o.label, kind = o.kind, "
+                    "address = coalesce(n.address, o.address), "
+                    "target = coalesce(n.target, o.target), "
+                    "coolify_connection = coalesce(n.coolify_connection, o.coolify_connection), "
+                    "coolify_server = coalesce(n.coolify_server, o.coolify_server), "
+                    "coolify_resource = coalesce(n.coolify_resource, o.coolify_resource), "
+                    "public_key = coalesce(n.public_key, o.public_key), "
+                    "last_seen_at = greatest(n.last_seen_at, o.last_seen_at), "
+                    "updated_at = now() FROM capabilities_nodes o "
+                    "WHERE n.id = %s AND o.id = %s", (new, old))
+                conn.execute("UPDATE capabilities_agent_nodes SET node = %s WHERE node = %s",
+                             (new, old))
+                conn.execute("DELETE FROM capabilities_nodes WHERE id = %s", (old,))
+            else:
+                conn.execute("UPDATE capabilities_nodes SET id = %s, updated_at = now() "
+                             "WHERE id = %s", (new, old))
+            for hit in plan:
+                column = _rekey_ident(hit["column"])
+                if hit["how"] == "prefix":
+                    conn.execute(f"UPDATE {qualified(hit['table'])} SET {column} = "
+                                 f"%s || substr({column}, %s) WHERE {column} LIKE %s",
+                                 (new, len(old) + 1, prefix))
+                else:
+                    conn.execute(f"UPDATE {qualified(hit['table'])} SET {column} = %s "
+                                 f"WHERE {column} = %s", (new, old))
+            for t in triggers:
+                conn.execute(f"ALTER TABLE {qualified(t['table'])} ENABLE "
+                             f"{modes.get(t['mode'], '')}TRIGGER "
+                             f"{_rekey_ident(t['trigger'])}")
+            left = [f"{hit['table']}.{hit['column']}" for hit in plan
+                    if conn.execute(
+                        f"SELECT count(*) FROM {qualified(hit['table'])} WHERE "
+                        + (f"{_rekey_ident(hit['column'])} LIKE %s" if hit["how"] == "prefix"
+                           else f"{_rekey_ident(hit['column'])} = %s"),
+                        (prefix if hit["how"] == "prefix" else old,)).fetchone()[0]]
+            if conn.execute("SELECT 1 FROM capabilities_agent_nodes WHERE node = %s",
+                            (old,)).fetchone():
+                left.append("capabilities_agent_nodes.node")
+            if left:
+                raise RuntimeError("rows still name the old id: " + ", ".join(left))
+    except RuntimeError as exc:
+        conn.close()
+        _die(5, "rekey_incomplete", f"the rekey was rolled back: {exc}")
+    except psycopg.Error as exc:
+        conn.close()
+        _die(5, "store_write_failed",
+             f"the store refused the rekey and nothing was changed: {exc}")
+    conn.close()
+    answer["store"] = {**_kernel_store_report(setting), "moved": True, "already_moved": False}
+    return answer
 
 
 # ---------------------------------------------------------------- the store setting
@@ -9808,7 +10231,7 @@ def _gate_node(node: str | None, root: Path | None, adapter=None) -> str | None:
     if node is None:
         return None
     if not node.strip():
-        _die(6, "input", "--node needs a node name")
+        _die(6, "input", "--node needs a node id")
     _require_node_store(root, adapter)
     return node.strip()
 
@@ -11789,9 +12212,15 @@ def _migrate_agent_state(conn, agent_id: str) -> dict | None:
 
 
 def _migrate_node_rows(conn, agent_id: str) -> dict:
-    return {row[0]: dict(zip(NODE_BASE_COLUMNS, row)) for row in _migrate_rows(
-        conn, f"SELECT {', '.join(NODE_BASE_COLUMNS)} FROM capabilities_agent_nodes "
-              "WHERE agent_id = %s", (agent_id,))}
+    if _migrate_rows(conn, "SELECT 1 WHERE to_regclass('capabilities_nodes') IS NOT NULL"):
+        query = ("SELECT l.node, n.label, n.kind, n.address, l.is_master, l.may_write, "
+                 "n.target, n.last_seen_at FROM capabilities_agent_nodes l "
+                 "JOIN capabilities_nodes n ON n.id = l.node WHERE l.agent_id = %s")
+    else:
+        query = ("SELECT node, node, kind, address, is_master, may_write, target, "
+                 "last_seen_at FROM capabilities_agent_nodes WHERE agent_id = %s")
+    return {row[0]: dict(zip(NODE_BASE_COLUMNS, row))
+            for row in _migrate_rows(conn, query, (agent_id,))}
 
 
 def _migrate_policy_rows(conn, agent_id: str | None) -> dict:
@@ -12098,18 +12527,21 @@ def _migrate_context(root: Path, opts: dict, answers: dict) -> dict:
                        else "files")
     except store.StoreError as exc:
         raise _MigrateRefusal(exc.slug, exc.message, exc.hint) from None
-    node = os.environ.get(store.NODE_NAME_ENV, "").strip()
-    ctx["node"] = node or None
-    if not node:
+    try:
+        here = store.this_node()
+    except store.StoreError as exc:
+        here = None
         ctx["blockers"].append(_MigrateRefusal(
-            "node_unnamed", f"{store.NODE_NAME_ENV} is not set: a migration names the node "
-            "it runs on, the agent's master", f"set {store.NODE_NAME_ENV} for this machine "
-            "(its shells and its launchd services), then run it again"))
+            exc.slug, f"a migration names the node it runs on, the agent's master, and "
+            f"{exc.message}", exc.hint))
+    node = here["id"] if here else ""
+    ctx["node"] = node or None
+    ctx["node_label"] = here["label"] if here else None
     named = answers.get("node")
-    if node and named is not None and named != node:
+    if node and named is not None and named not in (node, here["label"]):
         ctx["blockers"].append(_MigrateRefusal(
             "node_mismatch", f"the answers name node {named!r} and this process runs as "
-            f"{node!r} ({store.NODE_NAME_ENV})", "run it on the node the answers name, or "
+            f"node {node} ({here['label']})", "run it on the node the answers name, or "
             "correct the answers"))
     journal = _migrate_journal(agent_id)
     ctx["journal"] = journal
@@ -13106,9 +13538,10 @@ def _migrate_register(ctx: dict, plan: dict) -> dict:
                               "WHERE agent_id = %s AND is_master", (agent_id,)).fetchone()
         registered = []
         if master is None:
-            conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node, kind, "
-                         "is_master) VALUES (%s, %s, %s, true) ON CONFLICT (agent_id, node) "
-                         "DO UPDATE SET is_master = true", (agent_id, node, kind))
+            _ensure_node_row(conn, {"id": node, "label": ctx.get("node_label")}, kind)
+            conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node, "
+                         "is_master) VALUES (%s, %s, true) ON CONFLICT (agent_id, node) "
+                         "DO UPDATE SET is_master = true", (agent_id, node))
             registered.append({"node": node, "kind": kind, "master": True})
         elif master[0] != node:
             raise _MigrateRefusal("not_master", f"node {node} is not the master of agent "
@@ -13117,10 +13550,15 @@ def _migrate_register(ctx: dict, plan: dict) -> dict:
         for row in plan["nodes"]:
             if row["outcome"] != "register":
                 continue
-            conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node, kind, address, "
-                         "target) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (agent_id, node) "
-                         "DO NOTHING", (agent_id, row["node"], row.get("kind") or "server",
-                                        row.get("address"), row.get("target")))
+            # A node another machine runs is registered by the name the answers
+            # give it, its id until it moves to its own there (`node rekey`).
+            conn.execute("INSERT INTO capabilities_nodes (id, label, kind, address, target) "
+                         "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+                         (row["node"], row["node"], row.get("kind") or "server",
+                          row.get("address"), row.get("target")))
+            conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node) "
+                         "VALUES (%s, %s) ON CONFLICT (agent_id, node) DO NOTHING",
+                         (agent_id, row["node"]))
             registered.append({"node": row["node"], "kind": row.get("kind") or "server",
                                "target": row.get("target")})
         conn.execute("UPDATE capabilities_agents SET migrating_since = now(), "
@@ -13470,7 +13908,8 @@ def cmd_migrate_agent(opts: dict) -> None:
         if unfinished and apply:
             # Interrupted after the switch: finish what finalize had left.
             for blocker in ctx["blockers"]:
-                if blocker.code in ("node_unnamed", "node_mismatch", "not_master"):
+                if blocker.code in ("node_unidentified", "bad_node_id", "node_mismatch",
+                                    "not_master"):
                     _migrate_refuse(blocker, answer)
             try:
                 answer.update(state="migrated", resumed=True,
@@ -13832,7 +14271,10 @@ def _migrate_gate_flips(conn, plan: dict, given: list[str], setting=None) -> lis
         found["root"] = entry["root"]
         if mode == "store":
             found["reads"] = "store"
-    node = os.environ.get(store.NODE_NAME_ENV, "").strip() or None
+    try:
+        node = store.node_id()
+    except store.StoreError:
+        node = None
     names = sorted({key[0] for key in before} | {key[0] for key in after})
     flips = []
     for agent_id, entry in sorted(agents.items()):
@@ -14007,8 +14449,8 @@ def cmd_migrate_global(opts: dict) -> None:
     if plan["settings"]:
         writer = store.AgentRecords(_CONFIG_HOME / "no-project", _CONFIG_HOME,
                                     "global-migration", None, agent={},
-                                    node=os.environ.get(store.NODE_NAME_ENV, "").strip()
-                                    or "global", project_root=root, actor=MIGRATE_ACTOR)
+                                    node=_node_id_or("global"), project_root=root,
+                                    actor=MIGRATE_ACTOR)
         writer._authority = lambda _conn, _scope, wanted, _actor: wanted
         try:
             for entry in plan["settings"]:
@@ -14103,12 +14545,12 @@ def cmd_migrate_discard(opts: dict) -> None:
     any of them is a master the files were read on, and keeps them."""
     _read_only_gate("migrate --discard")
     store = _store_module()
-    node = os.environ.get(store.NODE_NAME_ENV, "").strip()
-    if not node:
+    try:
+        node = store.node_id()
+    except store.StoreError as exc:
         _migrate_refuse(_MigrateRefusal(
-            "node_unnamed", f"{store.NODE_NAME_ENV} is not set: a discard names the node it "
-            "runs on, so it can tell this node is no agent's master",
-            f"set {store.NODE_NAME_ENV} for this machine, then run it again"))
+            exc.slug, f"a discard names the node it runs on, so it can tell this node is "
+            f"no agent's master, and {exc.message}", exc.hint))
     root = _project_root() or Path.cwd()
     try:
         conn, _setting = _migrate_connect(root)

@@ -41,6 +41,10 @@ OUT_OF_ORDER = ("---\ntitle: Telegram History\ndescription: Run for old messages
                 "order: 300\nname: telegram-history\n---\n\n# Telegram History\n")
 
 
+# The node id the tests run as; an actor is recorded as user@<node id>.
+TEST_NODE = "746573742d6e"
+
+
 def load_module():
     spec = importlib.util.spec_from_loader("routine_cli", loader=None)
     module = importlib.util.module_from_spec(spec)
@@ -147,7 +151,7 @@ class Lab:
             "CAPABILITIES_MANAGER_BIN": str(MANAGER),
             "AGENTKIT_DB_URL": self.cluster.url(self.database),
             "AGENTKIT_DB_SCHEMA": SCHEMA,
-            "AGENT_NODE_NAME": "test-node",
+            "AGENT_NODE_ID": TEST_NODE,
             "USER": "tester",
             **extra,
         })
@@ -353,7 +357,7 @@ def test_save_adds_a_version_against_its_base_and_refuses_a_stale_one(lab):
     assert [v["version"] for v in history] == [saved["version"], base]
     assert [v["active"] for v in history] == [True, False]
     assert history[0]["note"] == "title in English"
-    assert history[0]["created_by"] == "tester@test-node"
+    assert history[0]["created_by"] == f"tester@{TEST_NODE}"
 
     diff = lab.run("diff", "pitstop").stdout
     assert f"--- pitstop.md@{base[:8]}" in diff
@@ -544,7 +548,7 @@ def test_a_global_routine_reaches_a_project_only_once_it_is_enabled(lab):
     assert lab.ok("enable", "shared")["changed"] is False
     [(by,)] = lab.sql(f"SELECT enabled_by FROM {SCHEMA}.routine_enablements "
                       "WHERE project_id = %s", (PROJECT_ID,))
-    assert by == "tester@test-node"
+    assert by == f"tester@{TEST_NODE}"
     [listed] = lab.ok("list", "--store", "--json")["routines"]
     assert (listed["name"], listed["global"], listed["author"]) == ("shared", True, OTHER_ID)
     assert lab.ok("show", "shared") == SHARED
@@ -584,7 +588,7 @@ def test_a_routine_is_switched_off_for_the_agent_whether_its_own_or_global(lab):
     assert lab.ok("disable", "defect-intake")["changed"] is False
     [(by,)] = lab.sql(f"SELECT disabled_by FROM {SCHEMA}.routine_documents "
                       "WHERE name = 'defect-intake'")
-    assert by == "tester@test-node"
+    assert by == f"tester@{TEST_NODE}"
     assert listed() == {"defect-intake": ("own", False), "shared": ("global", True)}
     assert lab.ok("show", "defect-intake") == FILES["defect-intake.md"]
 

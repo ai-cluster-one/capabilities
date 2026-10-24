@@ -8,7 +8,6 @@ what the engine said. See _peer.py for how to run the suite.
 import importlib.util
 import json
 import os
-import socket
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -61,12 +60,18 @@ def _stored(lab) -> list[tuple]:
             (f"path:{lab.caller.resolve()}",)).fetchall()
 
 
-def test_a_session_is_kept_under_the_node_s_declared_name(lab):
-    declared = {"AGENT_NODE_NAME": "lab-node"}
+def _here(lab) -> str:
+    """The node id the caller's machine resolves for itself, minted in its
+    config home."""
+    return (Path(lab.env["XDG_CONFIG_HOME"]) / "capabilities" / "node-id").read_text().strip()
+
+
+def test_a_session_is_kept_under_the_node_s_id(lab):
+    declared = {"AGENT_NODE_ID": "6c61622d6e6f"}
     first, result, _ = lab.ask("--engine", "codex", env=declared)
     assert first.returncode == 0, first.stderr
     [row] = _stored(lab)
-    assert row[1] == "lab-node"
+    assert row[1] == "6c61622d6e6f"
     second, again, _ = lab.ask("-c", env=declared)
     assert second.returncode == 0, second.stderr
     assert (again["resumed"], again["session_id"]) == (True, result["session_id"])
@@ -78,7 +83,7 @@ def test_a_second_question_resumes_the_session_the_first_recorded_in_the_store(l
     session = result["session_id"]
 
     [row] = _stored(lab)
-    assert row[:7] == (f"path:{lab.caller.resolve()}", socket.gethostname(),
+    assert row[:7] == (f"path:{lab.caller.resolve()}", _here(lab),
                        str(lab.target), "codex", session, "read", "codex-read")
     assert row[7] == 1 and row[8] is not None
     assert row[9]["status"] == "completed" and row[9]["session_id"] == session

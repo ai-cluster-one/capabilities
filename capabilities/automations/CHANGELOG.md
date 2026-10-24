@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-24 — A definition's node is a node id
+
+A node schedules the definitions that name its node id, the one the machine resolves for itself (`capabilities node id`), as the contract now answers it; `AGENT_NODE_ID` overrides it in place of `AGENT_NODE_NAME`. The service runtime, loaded where no CLI handed it the node, asks the contract for that id rather than falling back to the host name. Help and guides say so. A definition saved under a node's name moves with that node's `capabilities node rekey`.
+
 ## 2026-10-24 — Turns run on callva-harness-runner 0.10.1
 
 The runner is pinned at 0.10.1 in place of 0.9.0. Claude turns run through claude-agent-sdk 0.2.174, and a claude CLI up to 2.1.310 runs without the runner's out-of-range warning; codex is unchanged. The runner's 0.10.0 additions are new profile knobs only, so a turn runs as before.

@@ -35,8 +35,9 @@ Definitions:
   One run of an automation is active at a time across every node, and a
   firing that finds one is recorded skipped.
 
-  A node schedules the enabled definitions that name it, by the node name its
-  service runs under (AGENT_NODE_NAME, else the host name). Every definition
+  A node schedules the enabled definitions that name it, by the node id its
+  service runs under (the id the machine resolves for itself, `capabilities
+  node id`; AGENT_NODE_ID overrides it). Every definition
   saved is announced on the store, so a running daemon on any machine takes
   the change up within a second without a reload, and moving an automation to
   another node touches no file of either. A row the store holds that does
@@ -340,8 +341,9 @@ Machine mode:
   and `reload`.
 
 Environment:
-  AGENT_NODE_NAME          The node this machine schedules for (default: the host
-                           name), matched against each definition's node.
+  AGENT_NODE_ID            The node this machine schedules for, overriding the id
+                           it resolves for itself (`capabilities node id`),
+                           matched against each definition's node.
   AUTOMATIONS_ENVIRONMENT  Handed to every job as AUTOMATION_ENVIRONMENT, and the
                            environment `import` maps to this node (default:
                            development).

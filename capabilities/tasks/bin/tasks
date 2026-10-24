@@ -226,8 +226,8 @@ ONE TURN OF THE CONVEYOR
   codex turn learns its id from the harness, and its raise names it when it is
   closed.
 
-  Every raise records the node it was claimed on as `node`: the name the
-  machine declares in AGENT_NODE_NAME, and its host name where it declares none.
+  Every raise records the node it was claimed on as `node`: the node id the
+  machine resolves for itself (`capabilities node id`).
   While its turn runs, the raise's metrics carry the `model` the harness
   resolved, from the moment the harness names it, and `num_turns`, the turns
   taken so far, refreshed on the beat. The close writes the measured metrics

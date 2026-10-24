@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.17,<1",
+#     "capabilities-contract>=0.21,<1",
 # ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
@@ -105,10 +105,12 @@ USAGE
       auto|enabled|disabled) or placement is reported as a warning naming each
       one, and sync rewrites it, keeping the shape it implied; `retired` in
       the result lists what it rewrote.
-      A target's `node` is the name its server runs as in the gate: its
+      A target's `node` is the label its server gives itself as a node: its
       bundle's Compose file sets AGENT_NODE_NAME to it in every container,
       and `deploy` sends it to the application. A target without one takes
-      AGENT_NODE_NAME from the server's environment. A malformed node
+      AGENT_NODE_NAME from the server's environment. The server's node id
+      is its own, kept on its config volume (`capabilities node id`), and
+      is what the gate names it by. A malformed node
       (node_invalid) or a service environment_defaults also setting
       AGENT_NODE_NAME beside it (node_declared_twice) stops the sync.
       The project's id (CAPABILITIES_PROJECT_ID, as the project resolves it
@@ -124,8 +126,8 @@ USAGE
       stopped; this is what every compiled supervisor entry runs (Supervisor
       program, own Compose service, host launchd agent). Every SECONDS
       (service_policy.reconcile_seconds, default 60, 5-3600) it reads the gate
-      for <name> in this project on this node (AGENT_NODE_NAME, else the host
-      name): in store mode only the project's row naming this node places the
+      for <name> in this project on this node (its id, `capabilities node
+      id`): in store mode only the project's row naming this node places the
       service, by its service flag (`capabilities place|unplace`), apart from
       whether that row makes the CLI usable here; in files mode the
       project's own enable does (the runtime declaration having already
@@ -157,7 +159,8 @@ USAGE
       report that fails is said once on stderr and changes nothing else.
 
   deployment services
-      This node's view of each compiled service: what the gate answers for
+      This node - its id (node) and the label it gives itself (label) - and
+      its view of each compiled service: what the gate answers for
       it here (placed, the row that answered: scope, node, enabled, service,
       and why),
       whether its runner is running it, a refusal it is held idle for, and
@@ -257,12 +260,15 @@ USAGE
       service of one container with the memory limit, a volume of its own
       for each state path of the image (~/.config, ~/.local/state,
       ~/.claude, ~/.codex) and only CAPABILITIES_PROJECT_ID,
-      CAPABILITIES_PROJECT_ID_ROOT (/app) and AGENT_NODE_NAME; no
-      repository, no build. Then register the node row with the
-      connection, server and resource (`capabilities node add`); a row that
-      cannot be written takes the resource away again. The node starts idle,
-      knowing no store. Exit 6 node_exists, not_store_mode,
-      environment_missing (3).
+      CAPABILITIES_PROJECT_ID_ROOT (/app) and AGENT_NODE_NAME, which is
+      <node>, the label it is shown by; no repository, no build. Then mint
+      the node's id, twelve lowercase hex characters, and register the
+      node row under it with that label and the connection, server and
+      resource (`capabilities node add`); a row that cannot be written takes
+      the resource away again. The node starts idle, knowing no store; the
+      answer's node.node is its id, which enrol puts on its config volume.
+      Exit 6 node_exists (a node of this agent already labelled so),
+      not_store_mode, environment_missing (3).
       With --repository instead of --version, Coolify builds the node's
       image on that server from the Dockerfile at --dockerfile in the
       repository's --branch, with --context as the build context (the
@@ -280,8 +286,12 @@ USAGE
       wait <uuid> --deployment <uuid>` waits for the build before enrol.
       A step that fails once the application exists takes it away again.
   deployment node enrol <node> [--services <name,...>] [--wait 300]
+      <node> is the node's id, or the label exactly one of the agent's
+      nodes carries (node_ambiguous otherwise); so for exec and remove.
       Over SSH to the node's server and docker exec into its container:
-      make the node's X25519 key pair there (the private key stays in
+      write the node's id onto its config volume with the node's own
+      `capabilities node id --set <id>`, which the node resolves its id
+      from from then on; make the node's X25519 key pair there (the private key stays in
       ~/.config/agent-node/node-key.pem, mode 0600) and record its public
       key on the node row; write the agent's secrets - every secret key of a
       connection the agent's enabled capabilities resolve here, read where
@@ -312,8 +322,9 @@ USAGE
       then its node row. Only the resource the row names is touched; one
       already gone leaves only the row to remove. A resource whose agent
       container does not run the standard image - for a node built from a
-      repository, the image Coolify built for that application - as this
-      node is refused (exit 6 node_resource_not_own) and nothing is deleted.
+      repository, the image Coolify built for that application - for this
+      agent (its CAPABILITIES_PROJECT_ID) is refused (exit 6
+      node_resource_not_own) and nothing is deleted.
       The host paths a node built from a repository binds are not its
       volumes: the socket and the directories and what is in them stay.
   deployment node exec <node> -- <command> [<arg>...]
@@ -355,9 +366,11 @@ USAGE
       Each service carries `node` (its Supervisor or container state there),
       `local` (its launchd agent here), `placement` in files mode, and, from
       `deployment services` run in the node's container, `gate`, `running`,
-      `lease` and any `refusal`; node_name is the name the node answers to in
-      the gate. A target that declares `node` adds declared_node_name, and an
-      error node_name_mismatch while the node answers to another name.
+      `lease` and any `refusal`; node_id is the id the node answers to in
+      the gate and node_name the label it gives itself (its
+      AGENT_NODE_NAME). A target that declares `node` adds
+      declared_node_name, and an error node_name_mismatch while the node
+      gives itself another label.
       leftovers is what no service accounts for, read in the container:
       processes that are neither a Supervisor program nor descended from one
       (pid, ppid, age_seconds, command), development sessions open longer than
@@ -476,6 +489,7 @@ import json
 import os
 import plistlib
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -670,9 +684,10 @@ COOLIFY_BUILD_LIMIT = 3600
 # where the node pulls and pushes it. Without it the body travels through the
 # server's bare repository; with kind "github" it is that GitHub repository.
 GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?!\.)[A-Za-z0-9._-]+(?<!\.git)")
-# A target's `node` is the name its server runs as in the gate. Its bundle sets
-# it as AGENT_NODE_NAME in every container, written literally into the Compose
-# file, so it takes no interpolation characters and fits one environment line.
+# A target's `node` is the label its server gives itself as a node. Its bundle
+# sets it as AGENT_NODE_NAME in every container, written literally into the
+# Compose file, so it takes no interpolation characters and fits one
+# environment line. The server's id is its own, on its config volume.
 TARGET_NODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
 # The project's id is the agent a box runs. Its bundle sets it in every
 # container and in the image the build runs `capabilities init` in, bound to the
@@ -5956,7 +5971,8 @@ def _services_report(root: Path) -> dict:
     node = node_name()
     lease = _Lease(root, _runner_project_key(root), node)
     every_default = _reconcile_seconds(runtime)
-    out: dict = {"project": str(root), "node": node, "records": None, "services": []}
+    out: dict = {"project": str(root), "node": node, "label": node_label(), "records": None,
+                 "services": []}
     try:
         for name in _compiled_service_names(runtime):
             gate = _gate_answer(name)
@@ -7444,9 +7460,10 @@ def cmd_node_status(args):
         except ValueError:
             report["errors"].append({"code": "node_services_unreadable",
                                      "message": "deployment services on the node returned malformed JSON"})
-    report["node_name"] = remote.get("node")
-    # The name the target declares for its server, beside the one the node
-    # answers to; a node not yet redeployed since the declaration differs.
+    report["node_id"] = remote.get("node")
+    report["node_name"] = remote.get("label")
+    # The label the target declares for its server, beside the one the node
+    # gives itself; a node not yet redeployed since the declaration differs.
     declared = _valid_node(target.get("node"))
     if declared:
         report["declared_node_name"] = declared
@@ -7566,8 +7583,17 @@ def _manager(root, *args, stdin=None):
 
 
 def _agent_node_row(root, node):
+    """This agent's node `node` names: its id, else the one node it labels."""
     rows = _manager(root, "node", "list").get("nodes") or []
-    return next((row for row in rows if row.get("node") == node), None)
+    found = next((row for row in rows if row.get("node") == node), None)
+    if found is not None:
+        return found
+    labelled = [row for row in rows if row.get("label") == node]
+    if len(labelled) > 1:
+        raise NodeFailure("node_ambiguous", f"this agent has {len(labelled)} nodes labelled "
+                          f"{node}: " + ", ".join(row["node"] for row in labelled)
+                          + "; name it by its id", 6)
+    return labelled[0] if labelled else None
 
 
 def _agent_node_project(root):
@@ -7586,15 +7612,18 @@ def _agent_node_project(root):
 
 
 def _agent_node_name(value):
+    """A node's id or label as a node verb takes it: letters, digits, '.', '_'
+    and '-', starting with a letter or digit."""
     node = _valid_node(value)
     if not node:
-        raise NodeFailure("node_invalid", "a node name takes letters, digits, '.', '_' and "
-                          "'-', and starts with a letter or digit", 6)
+        raise NodeFailure("node_invalid", "a node's label takes letters, digits, '.', '_' "
+                          "and '-', and starts with a letter or digit", 6)
     return node
 
 
 def _agent_node_environment(project_id, node):
-    """The three keys a node is told, and nothing else."""
+    """The three keys a node is told, and nothing else: `node` is its label,
+    the name it gives itself; its id is put on its config volume at enrolment."""
     return {"CAPABILITIES_PROJECT_ID": project_id,
             "CAPABILITIES_PROJECT_ID_ROOT": AGENT_NODE_ROOT,
             NODE_NAME_ENV: node}
@@ -7840,6 +7869,9 @@ def cmd_node_create(args):
     _node_connection(target, write=True)
     if _agent_node_row(root, node) is not None:
         raise NodeFailure("node_exists", f"this agent already has node {node}", 6)
+    # The node's id is minted here and registered with the row; enrolment
+    # puts it on the node's config volume, where the node resolves it from.
+    node_id = secrets.token_hex(6)
     environments = _node_coolify(root, target, "projects", args.project).get("environments") or []
     if args.environment not in [row.get("name") for row in environments]:
         raise NodeFailure("environment_missing", f"the Coolify project has no "
@@ -7862,7 +7894,7 @@ def cmd_node_create(args):
         resource, deployment = _agent_node_application(root, target, args, project_id, node,
                                                        name, build)
     try:
-        row = _manager(root, "node", "add", node, "--kind", "server",
+        row = _manager(root, "node", "add", node_id, "--label", node, "--kind", "server",
                        "--coolify-connection", target["connection"],
                        "--coolify-server", args.server, "--coolify-resource", resource)["node"]
     except NodeFailure:
@@ -7873,7 +7905,7 @@ def cmd_node_create(args):
               "environment": {"project": args.project, "name": args.environment},
               "volumes": [{"name": name, "path": path} for name, path in AGENT_NODE_VOLUMES],
               "handed": ["CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT", NODE_NAME_ENV],
-              "next": f"deployment node enrol {node}"}
+              "next": f"deployment node enrol {node_id}"}
     if build is not None:
         answer.update({"resource": {"kind": kind, "uuid": resource}, "deployment": deployment,
                        "host_paths": build["mounts"],
@@ -7893,8 +7925,12 @@ def cmd_node_enrol(args):
     row = _agent_node_row(root, node)
     if row is None:
         raise NodeFailure("node_unknown", f"this agent has no node {node}", 6)
+    node = row["node"]
     store_args, password = _agent_node_store_args(root)
     _target, host, container = _agent_node_reach(root, row, write=True)
+    # The node's id goes onto its config volume first, with the node's own
+    # manager: everything after it, the raised agent too, runs as that node.
+    _agent_node_exec(root, host, container, ["capabilities", "node", "id", "--set", node])
     public_key = _agent_node_exec(root, host, container,
                                   ["sh", "-c", _AGENT_NODE_KEYGEN, "keygen", AGENT_NODE_KEY])
     if not AGENT_NODE_PUBLIC_KEY.fullmatch(public_key):
@@ -7923,7 +7959,8 @@ def cmd_node_enrol(args):
         if state.startswith("running agent") or time.monotonic() >= deadline:
             break
         time.sleep(10)
-    answer = {"ok": state.startswith("running agent"), "node": node, "public_key": public_key,
+    answer = {"ok": state.startswith("running agent"), "node": node, "label": row.get("label"),
+              "public_key": public_key,
               "secrets": {name: sorted(keys) for name, keys in secrets.items()},
               "secrets_written": written, "store": "written", "placed": placed,
               "unplaced": unplaced, "state": state}
@@ -7934,11 +7971,12 @@ def cmd_node_enrol(args):
     _emit(answer)
 
 
-def _agent_node_is_own(root, host, resource, node, kind="service"):
-    """Whether the Compose project `resource` on `host` is this node: its agent
-    containers, stopped ones too, run the standard image - for an application,
-    the image Coolify built for it, named after it - with AGENT_NODE_NAME set
-    to `node`."""
+def _agent_node_is_own(root, host, resource, project_id, kind="service"):
+    """Whether the Compose project `resource` on `host` - the resource this
+    node's row names - is this agent's node: its agent containers, stopped ones
+    too, run the standard image - for an application, the image Coolify built
+    for it, named after it - for this agent, CAPABILITIES_PROJECT_ID set to its
+    id. The node's label, its AGENT_NODE_NAME there, may have changed since."""
     owner = "com.docker.compose.project=" + resource
     service = ("" if kind == "application" else " --filter " + shlex.quote(
         "label=com.docker.compose.service=" + AGENT_NODE_SERVICE))
@@ -7953,7 +7991,7 @@ def _agent_node_is_own(root, host, resource, node, kind="service"):
             configs.append(json.loads(line))
         except ValueError:
             return False
-    named = f"{NODE_NAME_ENV}={node}"
+    named = f"CAPABILITIES_PROJECT_ID={project_id}"
     image = (resource if kind == "application" else AGENT_NODE_IMAGE) + ":"
     return len(configs) == len(ids) and all(
         isinstance(c, dict) and str(c.get("Image") or "").startswith(image)
@@ -7980,10 +8018,11 @@ def cmd_node_remove(args):
     if not args.yes:
         raise NodeFailure("confirmation_required", "node remove deletes the node's resource "
                           "and its volumes; pass --yes", 6)
-    _agent_node_project(root)
+    project_id, _slug = _agent_node_project(root)
     row = _agent_node_row(root, node)
     if row is None:
         raise NodeFailure("node_unknown", f"this agent has no node {node}", 6)
+    node = row["node"]
     if not row.get("coolify_resource"):
         raise NodeFailure("node_not_coolify", f"node {node} is not a Coolify resource made by "
                           "`deployment node create`", 6)
@@ -8004,9 +8043,9 @@ def cmd_node_remove(args):
     deleted = False
     if kind is not None:
         host = _node_server_host(root, target, entry, row["coolify_server"])
-        if not _agent_node_is_own(root, host, resource, node, kind):
+        if not _agent_node_is_own(root, host, resource, project_id, kind):
             raise NodeFailure("node_resource_not_own", f"resource {resource} does not run "
-                              f"{AGENT_NODE_IMAGE} as node {node}; nothing was deleted", 6)
+                              f"{AGENT_NODE_IMAGE} for this agent; nothing was deleted", 6)
         try:
             _agent_node_delete(root, target, kind, resource)
             deleted = True

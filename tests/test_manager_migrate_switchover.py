@@ -25,7 +25,8 @@ from pathlib import Path
 
 import pytest
 
-from test_manager_migrate import MASTER, REPO, SCHEMA, WORKER, World, answers_file, gate
+from test_manager_migrate import (MASTER, REPO, SCHEMA, WORKER, World, answers_file, gate,
+                                  nid, node_env)
 
 
 NAMES = ("automations", "coolify", "memory", "tasks", "whatsapp")
@@ -220,7 +221,7 @@ def dry_runs_change_nothing(w: World, version: str) -> dict:
     dry = w.answer(result)
     assert dry["applied"] is False and dry["would_write"] is True
     assert dry["tables_to_upgrade"]["capabilities"]["from"] == version
-    assert dry["tables_to_upgrade"]["capabilities"]["to"] == "1.10"
+    assert dry["tables_to_upgrade"]["capabilities"]["to"] == "1.11"
     assert "tables_upgraded" not in dry
     assert {r["capability"] for r in dry["plan"]["policy"]} == {"coolify", "memory"}
     assert store_snapshot(w) == before
@@ -274,10 +275,10 @@ def test_dry_runs_on_a_store_at_1_1_or_1_2_change_nothing_and_apply_upgrades(wor
                                                          "steps": [last]}
     applied = world.answer(world.manager(root, "migrate", "--global", "--apply"))
     assert applied["state"] == "migrated" and applied["changed"] is True
-    assert applied["tables_upgraded"]["version"] == "1.10"
+    assert applied["tables_upgraded"]["version"] == "1.11"
     assert applied["tables_upgraded"]["steps"][0].startswith("0014")
     assert world.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
-        == [(1, 10)]
+        == [(1, 11)]
     # Each capability's own tables, as its install migrated them.
     for name in ("automations", "tasks", "whatsapp", "memory"):
         result = world.cap(root, name, "migrate")
@@ -468,7 +469,7 @@ def test_discard_weighs_every_root_found_near_the_listed_ones(world):
     listing_only(world, [])
     try:
         result = world.manager(world.roots["first"], "migrate", "--discard",
-                               AGENT_NODE_NAME=OTHER_NODE)
+                               **node_env(OTHER_NODE))
         assert config_files(world) == before, result.stdout
     finally:
         listing_only(world, world.listed)
@@ -499,12 +500,12 @@ def test_discard_refuses_on_a_master_node(world):
         listing_only(world, world.listed)
     error = world.error(result)
     assert error["code"] == "master_node", error
-    assert MASTER in error["message"] and config_files(world) == before
-    unnamed = world.error(world.manager(world.roots["first"], "migrate", "--discard",
-                                        AGENT_NODE_NAME=None))
-    assert unnamed["code"] == "node_unnamed" and config_files(world) == before
+    assert nid(MASTER) in error["message"] and config_files(world) == before
+    bad = world.error(world.manager(world.roots["first"], "migrate", "--discard",
+                                    AGENT_NODE_ID=MASTER))
+    assert bad["code"] == "bad_node_id" and config_files(world) == before
     discarded = world.answer(world.manager(world.roots["first"], "migrate", "--discard",
-                                           AGENT_NODE_NAME=OTHER_NODE))
+                                           **node_env(OTHER_NODE)))
     assert "coolify/connections.json" in {str(Path(p).relative_to(world.config))
                                           for p in discarded["removed"]}
 

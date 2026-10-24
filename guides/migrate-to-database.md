@@ -68,17 +68,11 @@ Behind a session pooler, the store can also be given its transaction address, so
 
 Back up the database before the first `--apply` of anything. Use a `pg_dump` whose major version is at least the server's: `store doctor` reports the server's version under `checks.tls.server_version`, and `pg_dump --version` reports the tool's. Connect `pg_dump` to the direct or session address, not to a transaction pooler, and keep the dump where the person keeps backups. **Ask the person** where that is.
 
-### A name for each machine
+### Each machine's node id
 
-Every machine names itself with `AGENT_NODE_NAME`. A moved agent refuses to work in a process that has no node name (`node_unnamed`), so the name must reach every process that runs agents or their tools - interactive shells **and** the machine's service manager, so that services and apps it starts get it too:
+Every machine resolves its own node id, twelve lowercase hex characters, with nothing set: a Mac derives it from its hardware, and any other machine keeps the one minted for it in `~/.config/capabilities/node-id` (a server node's is written there at enrolment). `capabilities node id` prints it, with where it came from. A moved agent's records are read per node by that id, so nothing has to reach a shell, a login session or a service manager for it, and a process started without the shell profile resolves the same node. `AGENT_NODE_ID` overrides it where a container is handed its id or a test runs as a given node. `AGENT_NODE_NAME`, where set, is only the label a machine gives itself when it is first registered; a node's label is its row's (`capabilities node set <id> --label <label>`).
 
-- shells: export it in the shell profile;
-- macOS: `launchctl setenv AGENT_NODE_NAME <node>` for the running login session, and the same command at every login (for example from a login item) so it survives a restart; check with `launchctl getenv AGENT_NODE_NAME`;
-- Linux with systemd: an `Environment=AGENT_NODE_NAME=<node>` line in the units that run agents, or the user manager's environment; check with `systemctl show-environment` or the unit's own environment.
-
-**Ask the person** for the name; it takes letters, digits, `.`, `_` and `-`. Set it before migrating. A new terminal should print it with `echo $AGENT_NODE_NAME`.
-
-Servers get their name from their deployment target, below; nothing is set by hand on a server.
+A machine registered before node ids is known by its name. Move it to its id once, on that machine, with its agents' services stopped: `capabilities node rekey <name>` (`--dry-run` first lists every row it moves).
 
 ## 2. The order
 
@@ -110,12 +104,12 @@ The dry run reads targets only where the agent has a `deployment/runtime.json`. 
 
 For each agent that deploys to a server, and for each of its deployment targets **that has a live deployment**:
 
-1. Add `"node": "<server-node>"` to `deployment/targets/<target>/target.json` (or `deployment/targets/<target>.json` where the declaration has not moved yet). **Ask the person** for the name, or propose one and confirm it.
+1. Add `"node": "<server-node>"` to `deployment/targets/<target>/target.json` (or `deployment/targets/<target>.json` where the declaration has not moved yet). **Ask the person** for the name, or propose one and confirm it. It is the server's label; the migration registers the server under it, and the server moves to its own id with `capabilities node rekey <server-node>` run there.
 2. Remove any `AGENT_NODE_NAME` from `services.<name>.environment_defaults` in `deployment/runtime.json`; the target is its one home, and `deployment sync` refuses the duplicate with `node_declared_twice`.
 3. Run `deployment sync` and commit the result.
 4. Redeploy the server (`deployment deploy --target <target>` where that is how it deploys) so it runs the updated code before its agent moves.
 
-A target with no live deployment gets no node: **ask the person** whether it is dead, and remove it rather than registering a node for it. `deployment node status --target <target>` reports `declared_node_name` beside the `node_name` the server answers to, with `node_name_mismatch` while they differ. `deployment guide targets` ("The node a target's server runs as") is the reference.
+A target with no live deployment gets no node: **ask the person** whether it is dead, and remove it rather than registering a node for it. `deployment node status --target <target>` reports `declared_node_name` beside the `node_name` the server gives itself, with `node_name_mismatch` while they differ. `deployment guide targets` ("The node a target's server runs as") is the reference.
 
 ### Step 3 - each agent
 
@@ -143,13 +137,13 @@ Then commit **only the files the migration removed** (the `removed` list) and, w
 
 ### Step 4 - restart what predates the move
 
-A process started before `AGENT_NODE_NAME` was set does not have it, and a moved agent refuses to work there with `node_unnamed`. After the agents on a machine have moved, restart every long-running process that predates the variable: machine services, the desktop app that launches agent sessions, open terminals and agent harness sessions.
+A process started before the move still reads the agent's records as it found them. After the agents on a machine have moved, restart every long-running process that predates it: machine services, the desktop app that launches agent sessions, open terminals and agent harness sessions.
 
 On a cold start with many agents, a machine service may need one restart cycle before every agent it serves answers; check each with `<cap> service doctor --machine` for the capabilities that run a machine service.
 
 ### Step 5 - other machines
 
-A second machine that runs the same agent is a node of it: on the master, `capabilities node add <node> --kind mac` (or `--kind server --address <host> --target <target>`), then set `AGENT_NODE_NAME` to that name on the machine. `capabilities node list` shows the agent's nodes and its master.
+A second machine that runs the same agent is a node of it: read its id there with `capabilities node id`, then on the master `capabilities node add <id> --label <label> --kind mac` (or `--kind server --address <host> --target <target>`); `capabilities agent materialize` run on that machine registers it the same way. `capabilities node list` shows the agent's nodes and its master.
 
 On a machine that is no agent's master, once every agent there has moved, delete the machine's own leftover record and settings files:
 
@@ -199,5 +193,5 @@ Each question names what code cannot decide. Read it to the person in plain word
 - **Interrupted** (a crash, a closed terminal, `store_unreachable` mid-apply): run the same `--apply` again on the same machine. A journal in the machine's state home resumes the run where it stopped.
 - **Frozen**: from the start of an apply until it finishes, only that migration writes the agent's configuration, on any node; the agent's launchd agents on the master are stopped and its services that pause are paused until it finishes. `capabilities agent show` reports `migrating_since` while this lasts. Finish it by running `--apply` again on the machine that started it; another machine is refused (`node_mismatch`).
 - **Verify failed** (exit 7 `verify_failed`): the agent stays frozen. Read the differences, settle them (often a connection question answered `"store"`), and run `--apply` again.
-- **Other refusals** carry a `code` and a `hint`: `node_unnamed` (set `AGENT_NODE_NAME`), `not_master` (run on the master), `question_open` (answer the named questions), `second_checkout` (this root is a second checkout of an agent; move it from the main checkout the refusal names), `payload_outdated` (run `capabilities update`).
-- **A moved agent refuses with `node_unnamed`** in a terminal, service or app: that process predates `AGENT_NODE_NAME`; restart it (step 4). Refused naming its master: this machine is not registered among the agent's nodes; register it there with `capabilities node add`.
+- **Other refusals** carry a `code` and a `hint`: `node_unidentified` (this machine resolves no node id: see `capabilities node id`), `not_master` (run on the master), `question_open` (answer the named questions), `second_checkout` (this root is a second checkout of an agent; move it from the main checkout the refusal names), `payload_outdated` (run `capabilities update`).
+- **A moved agent refuses with `node_unregistered`** naming its master: this machine's node id is not among the agent's nodes; register it there with `capabilities node add <id>`, or, for a machine registered before node ids under its name, move it to its id with `capabilities node rekey <name>` here.

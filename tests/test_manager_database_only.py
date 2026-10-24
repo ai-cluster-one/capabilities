@@ -31,7 +31,7 @@ from pathlib import Path
 import pytest
 
 from test_manager_migrate import (MASTER, MANAGER, REPO, SCHEMA, World, _say,  # noqa: F401
-                                  answers_file, gate)
+                                  answers_file, gate, nid, node_env)
 
 
 NAMES = ("agentrooms", "askproject", "automations", "coolify", "deployment", "memory",
@@ -663,7 +663,7 @@ def test_an_agent_made_after_discard_migrates_without_the_config_home(blank):
     assert first["state"] == "migrated" and not first["verify"]["differences"]
     # Discarded on a node that is no agent's master, as a server's config home is.
     discarded = w.answer(w.manager(w.roots["first"], "migrate", "--discard",
-                                   AGENT_NODE_NAME="srv-discard"))
+                                   **node_env("srv-discard")))
     assert discarded["removed"] and not (w.config / "capabilities" / "settings.json").exists()
     # A new agent, using the global connection by its own grant and inheriting
     # the global gate, identifiers and default.
@@ -685,7 +685,7 @@ def test_a_refused_write_while_an_agent_moves_creates_no_file(blank):
     w = blank
     root = w.agent("moving", "prj_blank0000003", {"{env}/settings.json": gate("memory")})
     w.answer(w.manager(root, "agent", "show"))
-    w.answer(w.manager(root, "node", "add", MASTER, "--kind", "mac", "--master"))
+    w.answer(w.manager(root, "node", "add", nid(MASTER), "--kind", "mac", "--master"))
     w.sql("UPDATE capabilities_agents SET migrating_since = now() WHERE id = 'prj_blank0000003'")
     before = w.files(root)
     refused = w.error(w.manager(root, "enable", "coolify", "--project"))
@@ -764,7 +764,7 @@ def test_a_dev_session_keeps_its_records_in_a_schema_of_its_own(world, tmp_path)
                   "XDG_STATE_HOME": str(tmp_path / "outer-state"),
                   "XDG_DATA_HOME": str(tmp_path / "outer-data"),
                   "XDG_CACHE_HOME": str(tmp_path / "outer-cache"),
-                  "AGENT_NODE_NAME": MASTER, "USER": "tester"})
+                  **node_env(MASTER), "USER": "tester"})
     # The machine's database, as `capabilities store set` leaves it.
     w.write(tmp_path / "outer-config" / "agentkit" / "store.json", {
         "schema": "agentkit.store.v1", "host": "127.0.0.1", "port": w.port,

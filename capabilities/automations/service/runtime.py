@@ -333,7 +333,8 @@ def read_daemon_environment(state_dir: Path) -> str | None:
 
 def read_daemon_node(state_dir: Path) -> str | None:
     """The node the running daemon schedules for, or None if it published none:
-    a supervisor's AGENT_NODE_NAME is not visible from a terminal opened later."""
+    the node a supervisor's daemon was handed is not visible from a terminal
+    opened later."""
     value = read_daemon_record(state_dir).get("node")
     return value if isinstance(value, str) and value else None
 
@@ -358,10 +359,14 @@ PROJECT_ID_FOR_WRITE = None
 
 # The node a run is recorded on is the one the contract names: in process the
 # CLI installs its resolver here, and the daemon it launches is handed the
-# answer as AUTOMATIONS_NODE_NAME. The host name stands in only where neither
-# reached it.
+# answer as AUTOMATIONS_NODE_NAME. Where neither reached it, the contract is
+# asked directly: the node id the machine resolves for itself.
 def NODE_NAME() -> str:
-    return os.environ.get("AUTOMATIONS_NODE_NAME", "").strip() or socket.gethostname()
+    given = os.environ.get("AUTOMATIONS_NODE_NAME", "").strip()
+    if given:
+        return given
+    from capabilities_contract.capability import store
+    return store.node_id()
 
 
 def _handed_project_id(root: Path) -> str:

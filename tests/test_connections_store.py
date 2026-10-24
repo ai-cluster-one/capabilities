@@ -45,16 +45,59 @@ DB_KEYS = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTKIT_
 from capabilities_contract.capability import store as S  # noqa: E402
 
 
-def test_the_node_is_the_host_name(monkeypatch):
-    monkeypatch.delenv(S.NODE_NAME_ENV, raising=False)
-    assert S.node_name() == socket.gethostname()
+def _resolve_fresh(monkeypatch, tmp_path, platform="linux"):
+    monkeypatch.delenv(S.NODE_ID_ENV, raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(S, "_mac_node_id", None)
 
 
-def test_a_declared_node_name_is_the_node(monkeypatch):
-    monkeypatch.setenv(S.NODE_NAME_ENV, " lab-node ")
-    assert S.node_name() == "lab-node"
-    monkeypatch.setenv(S.NODE_NAME_ENV, "  ")
-    assert S.node_name() == socket.gethostname()
+def test_a_machine_mints_its_node_id_once_and_resolves_it_after(monkeypatch, tmp_path):
+    _resolve_fresh(monkeypatch, tmp_path)
+    monkeypatch.setenv(S.NODE_NAME_ENV, "lab-node")
+    first = S.node_identity()
+    assert first["source"] == "minted" and S.NODE_ID_RE.fullmatch(first["id"])
+    assert first["id"] not in (socket.gethostname(), "lab-node")
+    assert (tmp_path / "config" / "capabilities" / "node-id").read_text().strip() == first["id"]
+    assert S.node_identity() == {"id": first["id"], "source": "file"}
+    assert S.node_name() == S.node_id() == first["id"]
+    assert S.this_node() == {"id": first["id"], "source": "file", "label": "lab-node"}
+
+
+def test_a_mac_derives_its_node_id_from_its_hardware(monkeypatch, tmp_path):
+    _resolve_fresh(monkeypatch, tmp_path, "darwin")
+    monkeypatch.setattr(S, "_mac_hardware_uuid", lambda: "00000000-1111-2222-3333-444444444444")
+    found = S.node_identity()
+    assert found["source"] == "hardware" and S.NODE_ID_RE.fullmatch(found["id"])
+    assert "00000000" not in found["id"] and not (tmp_path / "config").exists()
+    monkeypatch.setattr(S, "_mac_node_id", None)
+    assert S.node_identity() == found
+    monkeypatch.setattr(S, "_mac_node_id", None)
+    monkeypatch.setattr(S, "_mac_hardware_uuid", lambda: "00000000-1111-2222-3333-555555555555")
+    assert S.node_id() != found["id"]
+
+
+def test_agent_node_id_overrides_and_must_be_an_id(monkeypatch, tmp_path):
+    _resolve_fresh(monkeypatch, tmp_path)
+    monkeypatch.setenv(S.NODE_ID_ENV, " 0123456789ab ")
+    assert S.node_identity() == {"id": "0123456789ab", "source": "env"}
+    assert not (tmp_path / "config").exists()
+    for bad in ("lab-node", "0123456789AB", "0123456789a"):
+        monkeypatch.setenv(S.NODE_ID_ENV, bad)
+        with pytest.raises(S.StoreError) as refused:
+            S.node_id()
+        assert refused.value.slug == "bad_node_id"
+
+
+def test_a_node_id_file_that_holds_no_id_is_refused(monkeypatch, tmp_path):
+    _resolve_fresh(monkeypatch, tmp_path)
+    (tmp_path / "config" / "capabilities").mkdir(parents=True)
+    (tmp_path / "config" / "capabilities" / "node-id").write_text("work-mac\n")
+    with pytest.raises(S.StoreError) as refused:
+        S.node_id()
+    assert refused.value.slug == "node_unidentified"
+    assert S.write_node_id("abcdefabcdef") == "abcdefabcdef"
+    assert S.node_identity() == {"id": "abcdefabcdef", "source": "file"}
 
 
 # --- a throwaway PostgreSQL ------------------------------------------------------
@@ -198,7 +241,8 @@ def lab(tmp_path, instance, cluster):
     for leaked in ("CAPABILITIES_READ_ONLY", "COOLIFY_BASE_URL", "COOLIFY_TOKEN",
                    "VIRTUAL_ENV", "CAPABILITIES_PROJECT_ENVELOPE",
                    "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "CAPABILITIES_PROJECT_ID",
-                   "CAPABILITIES_PROJECT_ID_ROOT", "AGENT_NODE_NAME", *DB_KEYS):
+                   "CAPABILITIES_PROJECT_ID_ROOT", "AGENT_NODE_NAME", "AGENT_NODE_ID",
+                   *DB_KEYS):
         env.pop(leaked, None)
     return {"project": project, "envelope": envelope, "env": env, "seen": seen,
             "database": database, "cluster": cluster, "url": url,
@@ -273,6 +317,11 @@ def test_a_project_never_moved_keeps_its_files_with_a_store_configured(lab):
     assert _tables(lab) == []
 
 
+def _here(lab) -> str:
+    """The node id this lab's machine resolves for itself."""
+    return _ok(_manager(lab, "node", "id"))["id"]
+
+
 # --- the import ----------------------------------------------------------------------
 
 def test_import_moves_the_project_and_it_resolves_the_same_set(lab):
@@ -280,7 +329,7 @@ def test_import_moves_the_project_and_it_resolves_the_same_set(lab):
     connection_before = _ok(_manager(lab, "get", "coolify", "connection", "box"))
     result = _import(lab)
     assert result["mode"] == "store" and result["previous_mode"] == "files"
-    assert result["agent_id"] == PROJECT_ID and result["node"] == socket.gethostname()
+    assert result["agent_id"] == PROJECT_ID and result["node"] == _here(lab)
     assert result["capabilities"]["coolify"]["connections"]["imported"] == ["box", "off", "spare"]
     identity = json.loads((lab["envelope"] / "project.json").read_text())
     assert identity["records"] == "store" and "id" not in identity
@@ -594,7 +643,7 @@ def test_a_read_only_grant_refuses_a_write_verb(lab):
 
 def test_a_grant_naming_this_node_is_used_before_the_grant_for_every_node(lab):
     _import(lab)
-    node = socket.gethostname()
+    node = _here(lab)
     _ok(_manager(lab, "set", "coolify", "grant", "box", '{"allow_write": false}'))
     _ok(_manager(lab, "set", "coolify", "grant", "box",
                  json.dumps({"node": "another-node", "allow_write": True})))
@@ -613,15 +662,15 @@ def test_a_grant_naming_this_node_is_used_before_the_grant_for_every_node(lab):
     assert _ok(_coolify(lab, "connections"))["default"] == "spare"
 
 
-def test_a_node_that_declares_its_name_is_matched_by_it_and_not_its_host_name(lab):
-    declared = {"AGENT_NODE_NAME": "lab-node"}
+def test_a_node_handed_its_id_is_matched_by_it_and_not_the_one_it_resolves(lab):
+    declared = {"AGENT_NODE_ID": NODE}
     result = _ok(_manager(lab, "connections", "import", extra=declared))
-    assert result["node"] == "lab-node"
+    assert result["node"] == NODE != _here(lab)
     _ok(_manager(lab, "set", "coolify", "grant", "box", '{"allow_write": false}'))
     _ok(_manager(lab, "set", "coolify", "grant", "box",
-                 json.dumps({"node": "lab-node", "allow_write": True})))
+                 json.dumps({"node": NODE, "allow_write": True})))
     assert _ok(_manager(lab, "get", "coolify", "grant", "box", extra=declared)) == {
-        "allow_write": True, "node": "lab-node", "is_default": False}
+        "allow_write": True, "node": NODE, "is_default": False}
     _ok(_coolify(lab, "deploy", "x", extra=declared))
     # The host name names another node now, so the grant for every node applies.
     assert _error(_coolify(lab, "deploy", "x"))["code"] == "read_only"
@@ -687,7 +736,8 @@ def test_doctor_in_files_mode_does_not_reach_the_store(lab):
 
 # --- identifiers and the gate --------------------------------------------------
 
-NODE = "lab-node"
+NODE = "6c61622d6e6f"  # its label lab-node, as hex
+BOX = "626f782d6e6f"  # box-node
 
 
 def _global_files(lab) -> None:
@@ -762,7 +812,7 @@ def test_the_gate_is_written_to_and_read_from_the_store(lab):
         conn.execute("INSERT INTO lab.capabilities_policy (agent_id, capability, node, "
                      "enabled) VALUES (%s, 'coolify', 'another-node', false)",
                      (PROJECT_ID,))
-    declared = {"AGENT_NODE_NAME": NODE}
+    declared = {"AGENT_NODE_ID": NODE}
     assert _error(_coolify(lab, "deploy", "x", extra=declared))["code"] == "not_enabled"
     _ok(_coolify(lab, "deploy", "x"))
     with lab["cluster"].admin(lab["database"]) as conn:
@@ -776,7 +826,7 @@ def test_a_policy_row_is_written_and_removed_for_one_node(lab):
     refused = _manager(lab, "enable", "coolify", "--project", "--node", NODE)
     assert refused.returncode == 6 and _error(refused)["code"] == "node_requires_store"
     _import(lab)
-    declared = {"AGENT_NODE_NAME": NODE}
+    declared = {"AGENT_NODE_ID": NODE}
     disabled = _ok(_manager(lab, "disable", "coolify", "--project", "--node", NODE))
     assert {k: disabled[k] for k in ("disabled", "scope", "node", "gate")} == {
         "disabled": "coolify", "scope": "project", "node": NODE,
@@ -816,35 +866,35 @@ def test_a_service_moves_between_nodes_and_its_capability_stays_usable_on_both(l
         return _rows(lab, "SELECT node, enabled, service FROM capabilities_policy "
                           "WHERE capability = 'coolify' ORDER BY node NULLS FIRST")
 
-    here, there = {"AGENT_NODE_NAME": NODE}, {"AGENT_NODE_NAME": "box-node"}
+    here, there = {"AGENT_NODE_ID": NODE}, {"AGENT_NODE_ID": BOX}
     declare("exclusive")
     _ok(_manager(lab, "enable", "coolify", "--project", "--node", NODE))
     assert rows() == [(None, True, False), (NODE, True, True)]
-    moved = _ok(_manager(lab, "place", "coolify", "--node", "box-node"))
+    moved = _ok(_manager(lab, "place", "coolify", "--node", BOX))
     assert {k: moved[k] for k in ("placed", "node", "placement", "changed", "placed_on",
                                   "unplaced_from", "enabled_on_node")} == {
-        "placed": "coolify", "node": "box-node", "placement": "exclusive", "changed": True,
-        "placed_on": ["box-node"], "unplaced_from": [NODE], "enabled_on_node": True}
-    assert rows() == [(None, True, False), ("box-node", True, True), (NODE, True, False)]
+        "placed": "coolify", "node": BOX, "placement": "exclusive", "changed": True,
+        "placed_on": [BOX], "unplaced_from": [NODE], "enabled_on_node": True}
+    assert rows() == [(None, True, False), (BOX, True, True), (NODE, True, False)]
     _ok(_coolify(lab, "deploy", "x", extra=here))
     _ok(_coolify(lab, "deploy", "x", extra=there))
-    assert _ok(_manager(lab, "place", "coolify", "--node", "box-node"))["changed"] is False
+    assert _ok(_manager(lab, "place", "coolify", "--node", BOX))["changed"] is False
     # A shared service is placed beside the nodes it runs on.
     declare("shared")
     shared = _ok(_manager(lab, "place", "coolify", "--node", NODE))
-    assert shared["placed_on"] == ["box-node", NODE] and "unplaced_from" not in shared
+    assert shared["placed_on"] == [BOX, NODE] and "unplaced_from" not in shared
     unplaced = _ok(_manager(lab, "unplace", "coolify", "--node", NODE))
-    assert unplaced["placed_on"] == ["box-node"]
-    assert rows() == [(None, True, False), ("box-node", True, True), (NODE, True, False)]
+    assert unplaced["placed_on"] == [BOX]
+    assert rows() == [(None, True, False), (BOX, True, True), (NODE, True, False)]
     _ok(_coolify(lab, "deploy", "x", extra=here))
     # disable --node and inherit --node say when they take the service off.
-    disabled = _ok(_manager(lab, "disable", "coolify", "--project", "--node", "box-node"))
-    assert disabled["unplaced"] == "box-node" and "place" in disabled["warning"]
-    refused = _manager(lab, "place", "coolify", "--node", "box-node")
+    disabled = _ok(_manager(lab, "disable", "coolify", "--project", "--node", BOX))
+    assert disabled["unplaced"] == BOX and "place" in disabled["warning"]
+    refused = _manager(lab, "place", "coolify", "--node", BOX)
     assert refused.returncode == 6 and _error(refused)["code"] == "disabled_on_node"
-    _ok(_manager(lab, "enable", "coolify", "--project", "--node", "box-node"))
-    inherited = _ok(_manager(lab, "inherit", "coolify", "--project", "--node", "box-node"))
-    assert inherited["unplaced"] == "box-node" and "warning" in inherited
+    _ok(_manager(lab, "enable", "coolify", "--project", "--node", BOX))
+    inherited = _ok(_manager(lab, "inherit", "coolify", "--project", "--node", BOX))
+    assert inherited["unplaced"] == BOX and "warning" in inherited
     assert "unplaced" not in _ok(_manager(lab, "inherit", "coolify", "--project",
                                           "--node", NODE))
     (registry / "manifest.json").write_text(json.dumps({"name": "coolify"}))
@@ -871,11 +921,13 @@ def test_a_shared_service_is_placed_on_every_node_and_a_move_shows_until_the_lea
             conn.execute("SET search_path TO lab")
             conn.execute(query)
 
-    here = {"AGENT_NODE_NAME": NODE}
+    here = {"AGENT_NODE_ID": NODE}
     declare("shared")
     assert _error(_manager(lab, "place", "coolify", "--all", extra=here))["code"] == "no_nodes"
-    _ok(_manager(lab, "node", "add", NODE, "--kind", "mac", "--master", extra=here))
-    _ok(_manager(lab, "node", "add", "box-node", "--kind", "server", extra=here))
+    _ok(_manager(lab, "node", "add", NODE, "--label", "lab-node", "--kind", "mac", "--master",
+                 extra=here))
+    _ok(_manager(lab, "node", "add", BOX, "--label", "box-node", "--kind", "server",
+                 extra=here))
     # An agent on several nodes keeps its records in the store, under its
     # nodes' write authority.
     sql("UPDATE capabilities_agents SET migrated_at = now()")
@@ -883,15 +935,15 @@ def test_a_shared_service_is_placed_on_every_node_and_a_move_shows_until_the_lea
     assert both.returncode == 6 and _error(both)["code"] == "input"
 
     # A node that would refuse refuses the whole command, and nothing is written.
-    _ok(_manager(lab, "disable", "coolify", "--project", "--node", "box-node", extra=here))
+    _ok(_manager(lab, "disable", "coolify", "--project", "--node", BOX, extra=here))
     refused = _manager(lab, "place", "coolify", "--all", extra=here)
     assert refused.returncode == 6 and _error(refused)["code"] == "disabled_on_node"
-    assert [r["node"] for r in _error(refused)["detail"]["refused"]] == ["box-node"]
+    assert [r["node"] for r in _error(refused)["detail"]["refused"]] == [BOX]
     assert placed() == []
-    off_master = _manager(lab, "place", "coolify", "--all", extra={"AGENT_NODE_NAME": "box-node"})
+    off_master = _manager(lab, "place", "coolify", "--all", extra={"AGENT_NODE_ID": BOX})
     assert off_master.returncode != 0 and placed() == []
-    assert {r["node"] for r in _error(off_master)["detail"]["refused"]} == {"box-node", NODE}
-    _ok(_manager(lab, "inherit", "coolify", "--project", "--node", "box-node", extra=here))
+    assert {r["node"] for r in _error(off_master)["detail"]["refused"]} == {BOX, NODE}
+    _ok(_manager(lab, "inherit", "coolify", "--project", "--node", BOX, extra=here))
 
     # A write that fails part-way names the nodes it placed; running it again finishes.
     sql("CREATE FUNCTION lab.refuse_lab_node() RETURNS trigger LANGUAGE plpgsql AS "
@@ -900,29 +952,29 @@ def test_a_shared_service_is_placed_on_every_node_and_a_move_shows_until_the_lea
         "ON lab.capabilities_policy FOR EACH ROW EXECUTE FUNCTION lab.refuse_lab_node()")
     partial = _manager(lab, "place", "coolify", "--all", extra=here)
     assert partial.returncode != 0
-    assert _error(partial)["detail"] == {"placed": ["box-node"], "failed": NODE}
-    assert placed() == [("box-node",)]
+    assert _error(partial)["detail"] == {"placed": [BOX], "failed": NODE}
+    assert placed() == [(BOX,)]
     sql("DROP TRIGGER refuse_lab_node ON lab.capabilities_policy")
     every = _ok(_manager(lab, "place", "coolify", "--all", extra=here))
     assert {k: every[k] for k in ("placed", "nodes", "placement", "changed", "placed_on",
                                   "enabled_on_nodes")} == {
-        "placed": "coolify", "nodes": ["box-node", NODE], "placement": "shared",
-        "changed": True, "placed_on": ["box-node", NODE], "enabled_on_nodes": [NODE]}
+        "placed": "coolify", "nodes": [BOX, NODE], "placement": "shared",
+        "changed": True, "placed_on": [BOX, NODE], "enabled_on_nodes": [NODE]}
     again = _ok(_manager(lab, "place", "coolify", "--all", extra=here))
     assert again["changed"] is False and "enabled_on_nodes" not in again
     report = _ok(_manager(lab, "place", "coolify", extra=here))
     assert {k: report[k] for k in ("placement", "placed_on", "holder", "lease", "agrees")} == {
-        "placement": "shared", "placed_on": ["box-node", NODE], "holder": None,
+        "placement": "shared", "placed_on": [BOX, NODE], "holder": None,
         "lease": None, "agrees": None}
 
     # An exclusive service moves with --node; the report agrees once the lease follows.
     declare("exclusive")
     exclusive = _manager(lab, "place", "coolify", "--all", extra=here)
     assert exclusive.returncode == 6 and _error(exclusive)["code"] == "placement_exclusive"
-    _ok(_manager(lab, "place", "coolify", "--node", "box-node", extra=here))
+    _ok(_manager(lab, "place", "coolify", "--node", BOX, extra=here))
     report = _ok(_manager(lab, "place", "coolify", extra=here))
     assert (report["placed_on"], report["holder"], report["lease"], report["agrees"]) == (
-        ["box-node"], None, None, False)
+        [BOX], None, None, False)
     sql("CREATE TABLE lab.deployment_service_leases (project text NOT NULL, "
         "capability text NOT NULL, node text NOT NULL, acquired_at timestamptz NOT "
         "NULL DEFAULT now(), renewed_at timestamptz NOT NULL DEFAULT now(), expires_at "
@@ -932,7 +984,7 @@ def test_a_shared_service_is_placed_on_every_node_and_a_move_shows_until_the_lea
         "now() + interval '3 minutes')")
     moving = _ok(_manager(lab, "place", "coolify", extra=here))
     assert (moving["holder"], moving["lease"]["live"], moving["agrees"]) == (NODE, True, False)
-    sql("UPDATE lab.deployment_service_leases SET node = 'box-node'")
+    sql(f"UPDATE lab.deployment_service_leases SET node = '{BOX}'")
     assert _ok(_manager(lab, "place", "coolify", extra=here))["agrees"] is True
     sql("UPDATE lab.deployment_service_leases SET expires_at = now() - interval '1 minute'")
     expired = _ok(_manager(lab, "place", "coolify", extra=here))
@@ -941,7 +993,7 @@ def test_a_shared_service_is_placed_on_every_node_and_a_move_shows_until_the_lea
 
     # The report writes nothing, so the read-only switch lets it through.
     read_only = {**here, "CAPABILITIES_READ_ONLY": "1"}
-    assert _ok(_manager(lab, "place", "coolify", extra=read_only))["placed_on"] == ["box-node"]
+    assert _ok(_manager(lab, "place", "coolify", extra=read_only))["placed_on"] == [BOX]
     assert _manager(lab, "place", "coolify", "--all", extra=read_only).returncode == 4
     assert _manager(lab, "place", "coolify", "--node", NODE, extra=read_only).returncode == 4
 

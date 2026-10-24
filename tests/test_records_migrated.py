@@ -6,8 +6,8 @@ and keeps settings as rows: `capabilities_settings` (one row per leaf path),
 generation) and `capabilities_settings_changes` (the append-only trail). An
 agent whose `capabilities_agents.migrated_at` is set reads every record and its
 settings from those rows - its own over every agent's, and this node's over
-every node's - on a node it registered, named by AGENT_NODE_NAME; its files are
-not read. Its master writes the shared rows, a node the master lets write
+every node's - on a node it registered, the one whose id `node_id()` resolves
+(AGENT_NODE_ID in these tests); its files are not read. Its master writes the shared rows, a node the master lets write
 writes rows of its own, and while `migrating_since` is set only the migration
 on the master writes. An agent that never moved reads its files and its store
 exactly as before.
@@ -45,8 +45,24 @@ DB_KEYS = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTKIT_
            "AGENTKIT_DB_USER", "AGENTKIT_DB_PASSWORD", "AGENTKIT_DB_SCHEMA",
            "AGENTKIT_DB_SSLMODE", "AGENTKIT_DB_SSLROOTCERT")
 PROJECT_ID = "prj_" + "0a1b2c3d4e5f"
-MASTER = "mac1"
-SERVER = "srv1"
+
+
+def nid(label: str) -> str:
+    """The twelve-hex node id a test gives the node it labels `label`; ids
+    sort as their labels do."""
+    return label.encode()[:6].ljust(6, b"\0").hex()
+
+
+def node_env(label: str) -> dict:
+    """The environment of a process running on the node labelled `label`."""
+    return {"AGENT_NODE_ID": nid(label), "AGENT_NODE_NAME": label}
+
+
+MASTER_LABEL = "mac1"
+SERVER_LABEL = "srv1"
+MASTER = nid(MASTER_LABEL)
+SERVER = nid(SERVER_LABEL)
+LABELS = {MASTER: MASTER_LABEL, SERVER: SERVER_LABEL}
 
 from capabilities_contract.capability import store as S  # noqa: E402
 
@@ -141,7 +157,7 @@ class Lab:
     def env(self, **extra: str) -> dict:
         env = {k: v for k, v in os.environ.items()
                if k not in DB_KEYS and not k.startswith("CAPABILITIES_")
-               and k not in ("AGENT_NODE_NAME", "VIRTUAL_ENV", "COOLIFY_TOKEN",
+               and k not in ("AGENT_NODE_ID", "AGENT_NODE_NAME", "VIRTUAL_ENV", "COOLIFY_TOKEN",
                              "COOLIFY_BASE_URL", "EDITOR", "VISUAL")}
         env.update({
             "HOME": str(self.tmp / "home"),
@@ -151,7 +167,7 @@ class Lab:
             "CAPABILITIES_HOME": str(self.tmp / "registry"),
             "CLAUDE_PROJECT_DIR": str(self.project),
             "USER": "tester",
-            "AGENT_NODE_NAME": MASTER,
+            **node_env(MASTER_LABEL),
         })
         env.update(extra)
         return {k: v for k, v in env.items() if v is not None}
@@ -191,8 +207,8 @@ class Lab:
     def migrate(self, *, master: str = MASTER) -> None:
         """Register the agent with `master` as its master node and mark it
         moved into the store."""
-        self.ok(MANAGER, "node", "add", master, "--kind", "mac", "--master",
-                AGENT_NODE_NAME=master)
+        self.ok(MANAGER, "node", "add", master, "--label", LABELS[master], "--kind", "mac",
+                "--master", AGENT_NODE_ID=master, AGENT_NODE_NAME=LABELS[master])
         self.sql("UPDATE capabilities_agents SET migrated_at = now() WHERE id = %s",
                  (PROJECT_ID,))
 
@@ -238,17 +254,18 @@ def test_the_ledger_applies_the_new_steps_on_a_fresh_store_and_on_one_at_p2(lab,
             == "0013-global"
         lab.sql("INSERT INTO capabilities_identifiers (agent_id, capability, label, value) "
                 "VALUES (%s, 'coolify', 'team', '\"kept\"')", (PROJECT_ID,))
-    lab.ok(MANAGER, "node", "add", MASTER, "--kind", "mac", "--master")
+    lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
+           "--master")
 
     steps = [r[0] for r in lab.sql(
         "SELECT step FROM schema_ledger WHERE owner = 'capabilities' ORDER BY step")]
-    assert steps[-12:] == ["0014-connection-grants-global", "0015-identifiers-node",
+    assert steps[-13:] == ["0014-connection-grants-global", "0015-identifiers-node",
                            "0016-settings", "0017-settings-documents",
                            "0018-settings-changes", "0019-references", "0020-connection-owner",
                            "0021-agent-slug", "0022-agent-node-coolify", "0023-agent-binding",
-                           "0024-agent-node-folder", "0025-policy-service"]
+                           "0024-agent-node-folder", "0025-policy-service", "0026-nodes"]
     assert lab.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
-        == [(1, 10)]
+        == [(1, 11)]
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
     assert "COALESCE(agent_id, ''::text)" in indexes["capabilities_connection_grants_scope_key"]
@@ -280,7 +297,8 @@ def test_the_ledger_applies_the_new_steps_on_a_fresh_store_and_on_one_at_p2(lab,
 
 def test_the_settings_triggers_refuse_an_object_and_an_overlapping_path(lab):
     import psycopg
-    lab.ok(MANAGER, "node", "add", MASTER, "--kind", "mac", "--master")
+    lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
+           "--master")
     insert = ("INSERT INTO capabilities_settings (agent_id, capability, node, path, value, "
               "updated_by) VALUES (%s, 'memory', %s, %s, %s::jsonb, 'tester@mac1')")
     lab.sql(insert, (PROJECT_ID, None, ["a", "b"], "1"))
@@ -304,7 +322,8 @@ def test_the_settings_triggers_refuse_an_object_and_an_overlapping_path(lab):
 
 def test_the_trail_is_append_only(lab):
     import psycopg
-    lab.ok(MANAGER, "node", "add", MASTER, "--kind", "mac", "--master")
+    lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
+           "--master")
     lab.sql("INSERT INTO capabilities_settings_changes (agent_id, capability, action, path, "
             "new_value, changed_by) VALUES (%s, 'memory', 'set', '{a}', '1', 'x@y')",
             (PROJECT_ID,))
@@ -318,7 +337,8 @@ def test_the_trail_is_append_only(lab):
 
 def test_grants_and_defaults_for_every_agent_cannot_duplicate(lab):
     import psycopg
-    lab.ok(MANAGER, "node", "add", MASTER, "--kind", "mac", "--master")
+    lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
+           "--master")
     lab.sql("INSERT INTO capabilities_connections (capability, name, spec) "
             "VALUES ('coolify', 'box', '{}'), ('coolify', 'two', '{}')")
     grant = ("INSERT INTO capabilities_connection_grants (agent_id, capability, connection, "
@@ -376,7 +396,8 @@ def test_a_store_made_before_owners_gives_each_row_its_owner_by_the_rule(lab):
             (None, "telegram", "ada", None), (anonymous, "coolify", "nobody", None)):
         lab.sql(grant, (agent, capability, name, node))
 
-    lab.ok(MANAGER, "node", "add", MASTER, "--kind", "mac", "--master")
+    lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
+           "--master")
 
     assert _owners(lab) == {
         # granted to exactly one agent and named for it
@@ -402,7 +423,8 @@ def test_a_store_made_before_owners_gives_each_row_its_owner_by_the_rule(lab):
 
 def test_an_agents_own_connection_is_granted_to_no_other_agent(lab):
     import psycopg
-    lab.ok(MANAGER, "node", "add", MASTER, "--kind", "mac", "--master")
+    lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
+           "--master")
     lab.sql("INSERT INTO capabilities_connections (capability, name, spec, owner) VALUES "
             "('telegram', 'mine', '{}', %s), ('telegram', 'ours', '{}', NULL)", (PROJECT_ID,))
     grant = ("INSERT INTO capabilities_connection_grants "
@@ -502,7 +524,8 @@ def _rows_for_reads(lab: Lab) -> None:
 
 
 def _register(lab: Lab, node: str, *flags: str) -> None:
-    lab.ok(MANAGER, "node", "add", node, "--kind", "server", *flags)
+    lab.ok(MANAGER, "node", "add", node, "--label", LABELS[node], "--kind", "server",
+           *flags)
 
 
 def test_a_migrated_agent_reads_rows_and_never_its_stale_files(lab):
@@ -536,7 +559,7 @@ def test_rows_for_this_node_are_read_over_the_shared_rows(lab):
     lab.migrate()
     _register(lab, SERVER)
     _rows_for_reads(lab)
-    on_server = {"AGENT_NODE_NAME": SERVER}
+    on_server = node_env(SERVER_LABEL)
 
     ids = lab.ok(COOLIFY, "ids", "list", **on_server)
     assert ids["team"]["value"] == "server-team"
@@ -577,14 +600,19 @@ def test_a_migrated_agent_refuses_without_a_node_name_or_on_an_unregistered_node
     lab.migrate()
     lab.sql("INSERT INTO capabilities_policy (agent_id, capability, enabled) "
             "VALUES (%s, 'coolify', true)", (PROJECT_ID,))
-    code, error = lab.refused(COOLIFY, "ids", "list", AGENT_NODE_NAME=None)
-    assert error["code"] == "node_unnamed" and code == 6
+    # Without AGENT_NODE_ID the process mints this machine's id, which is not
+    # one of the agent's nodes; an AGENT_NODE_ID that is no id is refused.
+    code, error = lab.refused(COOLIFY, "ids", "list", AGENT_NODE_ID=None, AGENT_NODE_NAME=None)
+    minted = (lab.config / "capabilities" / "node-id").read_text().strip()
+    assert error["code"] == "node_unregistered" and minted in error["message"]
     assert MASTER in error["hint"]
-    code, error = lab.refused(COOLIFY, "ids", "list", AGENT_NODE_NAME="stranger")
+    code, error = lab.refused(COOLIFY, "ids", "list", AGENT_NODE_ID="stranger")
+    assert error["code"] == "bad_node_id" and code == 6
+    stranger = node_env("stranger")
+    code, error = lab.refused(COOLIFY, "ids", "list", **stranger)
     assert error["code"] == "node_unregistered"
-    assert "stranger" in error["message"] and MASTER in error["hint"]
-    code, error = lab.refused(MANAGER, "get", "coolify", "grant", "box",
-                              AGENT_NODE_NAME="stranger")
+    assert stranger["AGENT_NODE_ID"] in error["message"] and MASTER in error["hint"]
+    code, error = lab.refused(MANAGER, "get", "coolify", "grant", "box", **stranger)
     assert error["code"] == "node_unregistered"
 
 
@@ -773,7 +801,7 @@ def test_identifiers_policy_and_grants_are_written_as_rows(moved):
 def test_off_the_master_shared_writes_are_refused(moved):
     lab = moved
     _register(lab, SERVER)
-    on_server = {"AGENT_NODE_NAME": SERVER}
+    on_server = node_env(SERVER_LABEL)
     for exe, args in ((MEMORY, ("settings", "set", "window_days", "9")),
                       (COOLIFY, ("ids", "set", "team", "x")),
                       (MANAGER, ("enable", "coolify", "--project")),
@@ -789,7 +817,7 @@ def test_a_node_allowed_to_write_writes_rows_marked_with_its_node(moved):
     lab = moved
     _register(lab, SERVER, "--may-write")
     lab.ok(MEMORY, "settings", "set", "window_days", "9")
-    on_server = {"AGENT_NODE_NAME": SERVER}
+    on_server = node_env(SERVER_LABEL)
     out = lab.ok(MEMORY, "settings", "set", "window_days", "3", **on_server)
     assert out["node"] == SERVER
     assert _document(lab) == {"window_days": 9}
@@ -826,7 +854,7 @@ def test_an_open_migration_freezes_every_write_but_the_migration_on_the_master(m
     try:
         for actor, node, allowed in (("migrate", MASTER, True), (None, MASTER, False),
                                      ("migrate", SERVER, False)):
-            os.environ["AGENT_NODE_NAME"] = node
+            os.environ.update(AGENT_NODE_ID=node, AGENT_NODE_NAME=LABELS[node])
             if node == SERVER and not lab.sql(
                     "SELECT 1 FROM capabilities_agent_nodes WHERE node = %s", (SERVER,)):
                 _register(lab, SERVER)
@@ -854,7 +882,8 @@ def test_an_open_migration_freezes_every_write_but_the_migration_on_the_master(m
 def test_an_open_migration_freezes_a_files_mode_agents_file_writes(lab):
     lab.identity({})
     lab.file("capabilities/settings.json", {"capabilities": {"memory": {"enabled": True}}})
-    lab.ok(MANAGER, "node", "add", MASTER, "--kind", "mac", "--master")
+    lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
+           "--master")
     before = lab.ok(MEMORY, "settings", "set", "window_days", "9")
     assert before["path"].endswith("memory/service/settings.json")
     lab.sql("UPDATE capabilities_agents SET migrating_since = now()")
@@ -872,7 +901,8 @@ def test_an_agent_without_migrated_at_keeps_its_files_and_store_mode(lab):
     lab.identity({})
     lab.file("capabilities/settings.json", {"capabilities": {"memory": {"enabled": True}}})
     lab.file("capabilities/memory/service/settings.json", {"window_days": 8})
-    lab.ok(MANAGER, "node", "add", MASTER, "--kind", "mac", "--master")
+    lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
+           "--master")
     assert lab.ok(MEMORY, "settings", "get", "window_days") == 8
     shown = lab.ok(MEMORY, "settings")
     assert "generations" not in shown

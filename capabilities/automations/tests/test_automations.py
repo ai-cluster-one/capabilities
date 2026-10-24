@@ -45,6 +45,14 @@ sys.modules[SPEC.name] = RUNTIME
 SPEC.loader.exec_module(RUNTIME)
 
 
+# The nodes the tests run as, by id: a label's first six characters as hex.
+HERE = "686572650000"
+LAB_NODE = "6c61622d6e6f"
+NODE_B = "6e6f64652d62"
+ELSEWHERE = "656c73657768"
+PRODUCTION = "70726f647563"
+
+
 class AutomationsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -72,8 +80,11 @@ class AutomationsTests(unittest.TestCase):
         # out of reach either way.
         self.store_path = Path(self.tmp.name) / "store.db"
         self._env_before = {key: os.environ.get(key)
-                            for key in ("AGENTKIT_DB_URL", "XDG_CONFIG_HOME")}
+                            for key in ("AGENTKIT_DB_URL", "XDG_CONFIG_HOME", "AGENT_NODE_ID")}
         os.environ["XDG_CONFIG_HOME"] = str(Path(self.tmp.name) / "xdg-config")
+        # The node this machine runs as, for the runtime loaded here as for
+        # every process the tests start.
+        os.environ["AGENT_NODE_ID"] = HERE
         if DSN:
             os.environ["AGENTKIT_DB_URL"] = DSN
         else:
@@ -118,8 +129,8 @@ environment = "test"
 """
         )
         # The automations are definitions in the store, scheduled on the node
-        # the CLI runs as here: the host name, since the fixture declares none.
-        self.node = socket.gethostname()
+        # the CLI runs as here: the id the fixture hands it.
+        self.node = HERE
         if DSN:
             for slug, script, timeout, retries in (
                     ("job", "job.py", 5, 0), ("agentbin", "agentbin.py", 5, 0),
@@ -678,13 +689,13 @@ environments = ["production"]
         self.assertIn("'nightly'", error["message"])
         self.assertIn("--node", error["message"])
 
-        planned = json.loads(self.cli("import", "--node", "production=node-b").stdout)
+        planned = json.loads(self.cli("import", "--node", f"production={NODE_B}").stdout)
         self.assertFalse(planned["applied"])
         self.assertEqual({a["automation"]: a["outcome"] for a in planned["automations"]},
                          {"full": "would_be_created", "nightly": "would_be_created"})
         self.assertIn("[[automations]]", config_path.read_text())
 
-        applied = json.loads(self.cli("import", "--apply", "--node", "production=node-b").stdout)
+        applied = json.loads(self.cli("import", "--apply", "--node", f"production={NODE_B}").stdout)
         self.assertTrue(applied["applied"] and applied["config_rewritten"])
         text = config_path.read_text()
         self.assertNotIn("[[automations]]", text)
@@ -702,7 +713,7 @@ environments = ["production"]
                           full["arguments"], full["script"], full["body"]),
                          (False, 13, 1, ["--apply"],
                           "capabilities/automations/scripts/job.py", False))
-        self.assertEqual((nightly["schedule"], nightly["node"]), ("0 3 * * *", "node-b"))
+        self.assertEqual((nightly["schedule"], nightly["node"]), ("0 3 * * *", NODE_B))
 
         # Importing again finds nothing in the file, and the store unchanged.
         again = json.loads(self.cli("import", "--apply").stdout)
@@ -985,7 +996,7 @@ environments = ["production"]
         state = Path(json.loads(self.cli("service", "status").stdout)["state_dir"])
         daemon = subprocess.Popen(
             [str(CLI), "service", "run"], cwd=self.root,
-            env={**self.env, "AGENT_NODE_NAME": node},
+            env={**self.env, "AGENT_NODE_ID": node},
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         deadline = time.time() + 15
         while time.time() < deadline and not (state / "daemon.pid").is_file():
@@ -1007,9 +1018,9 @@ environments = ["production"]
             self.assertNotIn("node_idle", report)
             elsewhere = json.loads(subprocess.run(
                 [str(CLI), "doctor"], cwd=self.root,
-                env={**self.env, "AGENT_NODE_NAME": "elsewhere"},
+                env={**self.env, "AGENT_NODE_ID": ELSEWHERE},
                 capture_output=True, text=True, timeout=30).stdout)
-            self.assertEqual(elsewhere["node"], "elsewhere")
+            self.assertEqual(elsewhere["node"], ELSEWHERE)
             self.assertEqual(elsewhere["daemon_node"], self.node)
         finally:
             daemon.terminate()
@@ -1021,13 +1032,13 @@ environments = ["production"]
         # names is alive, answering, and scheduling nothing, and a count of the
         # definitions reports it as healthy. What a supervisor acts on is `ok`,
         # so this is where it has to show.
-        daemon = self._supervised_daemon("production-node")
+        daemon = self._supervised_daemon(PRODUCTION)
         try:
             probe = self.cli("service", "doctor", check=False)
             self.assertEqual(probe.returncode, 6)
             report = json.loads(probe.stdout)
             self.assertFalse(report["ok"])
-            self.assertEqual(report["daemon_node"], "production-node")
+            self.assertEqual(report["daemon_node"], PRODUCTION)
             self.assertEqual(report["node_idle"]["nodes"], [self.node])
             self.assertIn("scheduling nothing", report["node_idle"]["message"])
         finally:
@@ -1067,7 +1078,7 @@ environments = ["production"]
         # another. Judged from the asker, every automation a supervised daemon
         # runs would read as another node's.
         self.define("nightly", script_path="capabilities/automations/scripts/job.py",
-                    schedule="0 3 * * *", node="production-node")
+                    schedule="0 3 * * *", node=PRODUCTION)
 
         def states(report: dict) -> dict:
             return {item["name"]: item["state"] for item in report["items"]}
@@ -1082,11 +1093,11 @@ environments = ["production"]
         self.assertEqual(states(idle)["nightly"], "other node")
         self.assertIn(self.node, active(idle)["note"])
 
-        daemon = self._supervised_daemon("production-node")
+        daemon = self._supervised_daemon(PRODUCTION)
         try:
             report = json.loads(self.cli("inventory").stdout)
             self.assertEqual(report["service"]["state"], "running")
-            self.assertIn("production-node", report["service"]["detail"])
+            self.assertIn(PRODUCTION, report["service"]["detail"])
             self.assertIs(report["service"]["ok"], True)
             self.assertEqual(states(report)["nightly"], "active")
             self.assertEqual(states(report)["job"], "other node")
@@ -1148,7 +1159,7 @@ environments = ["production"]
         same = json.loads(self.cli("set", "job", "--description", "Does the job").stdout)
         self.assertFalse(same["created"])
         self.assertEqual(same["version"], first["version"])
-        moved = json.loads(self.cli("set", "job", "--node", "node-b", "--schedule",
+        moved = json.loads(self.cli("set", "job", "--node", NODE_B, "--schedule",
                                     "*/10 * * * *", "--timezone", "Etc/GMT-3",
                                     "--timeout", "30", "--retries", "2",
                                     "--arguments", '["--all"]').stdout)
@@ -1161,7 +1172,7 @@ environments = ["production"]
         history = json.loads(self.cli("history", "job").stdout)["versions"]
         self.assertEqual([v["active"] for v in history], [False, False, False, True])
         self.assertEqual(history[0]["created_by"], "fixture")
-        self.assertEqual(history[2]["node"], "node-b")
+        self.assertEqual(history[2]["node"], NODE_B)
         # A writer that read an older version is told rather than overwriting.
         stale = self.cli("set", "job", "--enabled", "false", "--base", first["version"],
                          check=False)
@@ -1273,7 +1284,7 @@ environments = ["production"]
     def test_a_run_is_recorded_under_the_node_s_declared_name(self) -> None:
         # A manual run goes to the automation's node, and to the machine that
         # asked when it names none; the host is the machine, whatever its node.
-        self.env["AGENT_NODE_NAME"] = "lab-node"
+        self.env["AGENT_NODE_ID"] = LAB_NODE
         self.define("job", node=None)
         run = json.loads(self.cli("run", "job").stdout)["run"]
         placed = json.loads(self.cli("run", "slow").stdout)["run"]
@@ -1286,13 +1297,13 @@ environments = ["production"]
                 "SELECT node FROM automations_runs WHERE id = %s", [placed["id"]]).fetchone()
         finally:
             conn.close()
-        self.assertEqual(row, ("lab-node", socket.gethostname(), "lab-node"))
+        self.assertEqual(row, (LAB_NODE, socket.gethostname(), LAB_NODE))
         self.assertEqual(other, (self.node,))
 
     @needs_store
     def test_a_run_the_daemon_queues_is_recorded_under_the_node_s_declared_name(self) -> None:
-        self.env["AGENT_NODE_NAME"] = "lab-node"
-        self.define("flaky", node="lab-node")
+        self.env["AGENT_NODE_ID"] = LAB_NODE
+        self.define("flaky", node=LAB_NODE)
         self.cli("service", "start")
         first = json.loads(self.cli("run", "flaky").stdout)["run"]
         self.wait_status(first["id"], {"failed"})
@@ -1307,7 +1318,7 @@ environments = ["production"]
                 time.sleep(0.1)
         finally:
             conn.close()
-        self.assertEqual(row, ("retry", "lab-node"))
+        self.assertEqual(row, ("retry", LAB_NODE))
 
     @needs_store
     def test_manual_run_history_and_logs(self) -> None:
@@ -1458,7 +1469,7 @@ environments = ["production"]
         self.define("scheduled", script_path="capabilities/automations/scripts/job.py",
                     schedule="*/5 * * * *", timezone="Etc/GMT-3", node=self.node)
         self.define("elsewhere", script_path="capabilities/automations/scripts/job.py",
-                    schedule="*/5 * * * *", node="node-b")
+                    schedule="*/5 * * * *", node=NODE_B)
         config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
         state_dir = self.root / "schedule-state"
         daemon = RUNTIME.Daemon(self.root, config_path, state_dir)
@@ -1546,7 +1557,7 @@ environments = ["production"]
         # touching the other machine's files.
         root_b = Path(self.tmp.name) / "machine-b" / "project"
         shutil.copytree(self.root, root_b)
-        env_b = {**self.env, "CLAUDE_PROJECT_DIR": str(root_b), "AGENT_NODE_NAME": "node-b",
+        env_b = {**self.env, "CLAUDE_PROJECT_DIR": str(root_b), "AGENT_NODE_ID": NODE_B,
                  "XDG_STATE_HOME": str(Path(self.tmp.name) / "machine-b" / "xdg-state")}
 
         def cli_b(*args: str) -> dict:
@@ -1557,7 +1568,7 @@ environments = ["production"]
 
         started_b = cli_b("service", "start")
         try:
-            self.assertEqual(started_b["daemon_node"], "node-b")
+            self.assertEqual(started_b["daemon_node"], NODE_B)
             self.cli("service", "start")
             here = self.wait_status(json.loads(self.cli("run", "job").stdout)["run"]["id"],
                                     {"succeeded"})
@@ -1566,15 +1577,15 @@ environments = ["production"]
                 json.loads(self.cli("service", "status").stdout)["state_dir"]))
             # Moved to node-b from this machine: its runs are node-b's, and run
             # there, from node-b's own checkout and state root.
-            self.cli("set", "job", "--node", "node-b")
+            self.cli("set", "job", "--node", NODE_B)
             there = json.loads(self.cli("run", "job").stdout)["run"]
-            self.assertEqual(there["node"], "node-b")
+            self.assertEqual(there["node"], NODE_B)
             finished = self.wait_status(there["id"], {"succeeded"})
             self.assertTrue(finished["log_path"].startswith(started_b["state_dir"]), finished)
             # A restart of this node closes what it ran and nothing of node-b's.
             mine = json.loads(self.cli("run", "slow").stdout)["run"]
             self.wait_status(mine["id"], {"running"})
-            self.cli("set", "slow", "--node", "node-b")
+            self.cli("set", "slow", "--node", NODE_B)
             theirs = json.loads(self.cli("run", "slow").stdout)["run"]
             self.cli("service", "stop", "--timeout", "10")
             self.assertEqual(json.loads(self.cli("show", mine["id"]).stdout)["status"],
@@ -1647,7 +1658,7 @@ def test_two_machines_cannot_both_claim_one_scheduled_firing(tmp_path, ledger_en
     """The whole reason the ledger lives in a shared store: two daemons of one
     project, on two machines, race one firing and exactly one owns it."""
     a = ledger_env()
-    b = ledger_env(a.project_id, node="node-b")
+    b = ledger_env(a.project_id, node=NODE_B)
     first = a.claim("nightly", tmp_path, trigger="schedule", dedupe_key=DEDUPE)
     second = b.claim("nightly", tmp_path, trigger="schedule", dedupe_key=DEDUPE)
     assert first is not None and second is None
@@ -1700,7 +1711,7 @@ def test_two_machines_on_one_store_read_only_their_own_runs(tmp_path, ledger_env
     """Recovery, the queue and the running count read only the node's own runs,
     while one run of an automation at a time still holds across both."""
     a = ledger_env(node="node-a")
-    b = ledger_env(a.project_id, node="node-b")
+    b = ledger_env(a.project_id, node=NODE_B)
     queued = a.claim("nightly", tmp_path, trigger="manual")
     started = a.claim("other", tmp_path, trigger="manual")
     a.update(started["id"], status="running", pid=os.getpid())
@@ -1718,7 +1729,7 @@ def test_another_nodes_run_past_its_timeout_is_closed_for_the_automation(tmp_pat
     """A node that went away cannot hold its automation forever: past the
     timeout and grace another node marks its run interrupted, and never its own."""
     a = ledger_env(node="node-a")
-    b = ledger_env(a.project_id, node="node-b")
+    b = ledger_env(a.project_id, node=NODE_B)
     gone = a.claim("nightly", tmp_path, trigger="manual")
     a.update(gone["id"], status="running", started_at="2026-01-01T00:00:00+00:00")
     mine = b.claim("nightly", tmp_path, trigger="manual")

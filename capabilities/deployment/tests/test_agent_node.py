@@ -14,6 +14,8 @@ import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "deployment"
 KEY = "A" * 42 + "Q="
+# The id the node is minted with; it is shown by its label, box1.
+BOX1 = "b0b100000001"
 
 
 class Fake:
@@ -32,7 +34,8 @@ class Fake:
         self.apps: set[str] = set()
         self.fail_storage = False
         self.config = {"Image": "ghcr.io/agenium-dev/agent-node:0.0.1",
-                       "Env": ["AGENT_NODE_NAME=box1", "PATH=/usr/bin"]}
+                       "Env": ["CAPABILITIES_PROJECT_ID=prj_00000000a1a1",
+                               "AGENT_NODE_NAME=box1", "PATH=/usr/bin"]}
 
     def __call__(self, argv, root, *, stdin=None, timeout=120, check=True, env=None):
         self.calls.append({"argv": list(argv), "stdin": stdin})
@@ -89,7 +92,8 @@ class Fake:
                 if self.fail_add:
                     return self.module.NodeFailure("store_unreachable", "fixture", 5)
                 flags = dict(zip(args[3::2], args[4::2]))
-                self.rows[args[2]] = {"node": args[2], "kind": flags["--kind"],
+                self.rows[args[2]] = {"node": args[2], "label": flags["--label"],
+                                      "kind": flags["--kind"],
                                       "coolify_connection": flags["--coolify-connection"],
                                       "coolify_server": flags["--coolify-server"],
                                       "coolify_resource": flags["--coolify-resource"],
@@ -164,6 +168,8 @@ def lab(tmp_path, monkeypatch):
         ["store", "set", "--host", "db.invalid", "--database", "agents", "--user", "agent",
          "--schema", "agentkit", "--password-stdin"], "store-secret\n"))
     monkeypatch.setattr(m.time, "sleep", lambda seconds: None)
+    # The id `node create` mints for the node it makes.
+    monkeypatch.setattr(m.secrets, "token_hex", lambda n: BOX1)
     return SimpleNamespace(m=m, fake=fake, root=root)
 
 
@@ -217,15 +223,17 @@ def test_create_makes_a_resource_of_the_standard_image_and_registers_its_row(lab
         '  claude: {}\n'
         '  codex: {}\n')
 
-    assert lab.fake.rows["box1"] == {"node": "box1", "kind": "server",
+    assert lab.fake.rows[BOX1] == {"node": BOX1, "label": "box1", "kind": "server",
                                      "coolify_connection": "infra",
                                      "coolify_server": "srv-uuid",
                                      "coolify_resource": "svc-new", "public_key": None}
-    assert json.loads(capsys.readouterr().out)["node"]["coolify_resource"] == "svc-new"
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["node"]["coolify_resource"] == "svc-new"
+    assert answer["next"] == f"deployment node enrol {BOX1}"
 
 
 def test_create_refuses_a_node_the_agent_has_and_takes_back_a_resource_it_cannot_register(lab):
-    lab.fake.rows["box1"] = {"node": "box1"}
+    lab.fake.rows[BOX1] = {"node": BOX1, "label": "box1"}
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_create(create_args())
     assert refused.value.code == "node_exists"
@@ -245,8 +253,10 @@ def test_enrol_gives_the_node_its_key_secrets_placements_and_store(lab, capsys):
     capsys.readouterr()
     lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="tasks,automations", wait=30))
 
-    assert lab.fake.rows["box1"]["public_key"] == KEY
+    assert lab.fake.rows[BOX1]["public_key"] == KEY
     docker = [c for c in lab.fake.of("ssh") if "docker exec" in c["argv"][-1]]
+    # The node's id goes onto its volume first, through the node's own manager.
+    assert f"capabilities node id --set {BOX1}" in docker[0]["argv"][-1]
     assert all("label=com.docker.compose.project=svc-new" in c["argv"][-1]
                for c in lab.fake.of("ssh") if "docker ps" in c["argv"][-1])
     # No secret is ever on a command line; each goes on standard input.
@@ -258,8 +268,8 @@ def test_enrol_gives_the_node_its_key_secrets_placements_and_store(lab, capsys):
     [store] = [c for c in docker if "capabilities store set" in c["argv"][-1]]
     assert store["stdin"] == "store-secret\n"
     places = [c["argv"][1:] for c in lab.fake.of("capabilities") if c["argv"][1] == "place"]
-    assert places == [["place", "tasks", "--node", "box1"],
-                      ["place", "automations", "--node", "box1"]]
+    assert places == [["place", "tasks", "--node", BOX1],
+                      ["place", "automations", "--node", BOX1]]
     # The store setting is what the node raises on, so it is written last.
     order = [i for i, c in enumerate(lab.fake.calls)
              if c in (secrets, store) or c["argv"][1:2] == ["place"]]
@@ -267,6 +277,7 @@ def test_enrol_gives_the_node_its_key_secrets_placements_and_store(lab, capsys):
 
     answer = json.loads(capsys.readouterr().out)
     assert answer["ok"] is True and answer["placed"] == ["tasks", "automations"]
+    assert (answer["node"], answer["label"]) == (BOX1, "box1")
     assert answer["unplaced"] == {"tasks": ["mac"]}
     assert answer["secrets"] == {"telegram": ["TELEGRAM_BOT_TOKEN"]}
     assert "bot-secret" not in json.dumps(answer)
@@ -300,31 +311,37 @@ def test_remove_deletes_its_own_resource_with_its_volumes_and_its_row(lab, capsy
         lab.m.cmd_node_remove(SimpleNamespace(node="box1", yes=False))
     assert refused.value.code == "confirmation_required"
 
-    lab.m.cmd_node_remove(SimpleNamespace(node="box1", yes=True))
+    # Renamed since it was made, its container still told the old label: it
+    # is the node's own all the same, and its new label names it.
+    lab.fake.rows[BOX1]["label"] = "renamed"
+    lab.m.cmd_node_remove(SimpleNamespace(node="renamed", yes=True))
     [delete] = [c["argv"] for c in lab.fake.of("coolify") if "delete" in c["argv"]]
     assert delete == ["coolify", "--connection", "infra", "service", "delete", "svc-new",
                       "--yes", "--delete-volumes", "--delete-configurations"]
-    assert "box1" not in lab.fake.rows
+    assert BOX1 not in lab.fake.rows
 
-    lab.fake.rows["mac"] = {"node": "mac", "kind": "mac", "coolify_resource": None}
+    lab.fake.rows["mac"] = {"node": "mac", "label": "mac", "kind": "mac",
+                            "coolify_resource": None}
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_remove(SimpleNamespace(node="mac", yes=True))
     assert refused.value.code == "node_not_coolify"
 
 
 @pytest.mark.parametrize("config", [
-    {"Image": "registry.invalid/other-service:1.0", "Env": ["AGENT_NODE_NAME=box1"]},
-    {"Image": "ghcr.io/agenium-dev/agent-node:0.0.1", "Env": ["AGENT_NODE_NAME=box2"]},
+    {"Image": "registry.invalid/other-service:1.0",
+     "Env": ["CAPABILITIES_PROJECT_ID=prj_00000000a1a1"]},
+    {"Image": "ghcr.io/agenium-dev/agent-node:0.0.1",
+     "Env": ["CAPABILITIES_PROJECT_ID=prj_00000000b2b2", "AGENT_NODE_NAME=box1"]},
 ])
 def test_remove_refuses_a_resource_that_is_not_the_nodes_own(lab, capsys, config):
     lab.m.cmd_node_create(create_args())
-    lab.fake.rows["box1"]["coolify_resource"] = "svc-other"
+    lab.fake.rows[BOX1]["coolify_resource"] = "svc-other"
     lab.fake.config = config
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_remove(SimpleNamespace(node="box1", yes=True))
     assert refused.value.code == "node_resource_not_own"
     assert not [c for c in lab.fake.of("coolify") if "delete" in c["argv"]]
-    assert "box1" in lab.fake.rows
+    assert BOX1 in lab.fake.rows
 
 
 def test_remove_of_a_resource_already_gone_removes_only_the_row(lab, capsys):
@@ -334,7 +351,7 @@ def test_remove_of_a_resource_already_gone_removes_only_the_row(lab, capsys):
     lab.m.cmd_node_remove(SimpleNamespace(node="box1", yes=True))
     assert json.loads(capsys.readouterr().out)["resource_deleted"] is False
     assert not [c for c in lab.fake.of("coolify") if "delete" in c["argv"]]
-    assert "box1" not in lab.fake.rows
+    assert BOX1 not in lab.fake.rows
 
 
 def test_a_node_is_made_only_for_an_agent_that_lives_in_the_store(lab, monkeypatch):
@@ -377,7 +394,7 @@ def test_create_builds_a_node_from_a_repository_with_the_socket_and_same_path_di
         ["app-new", "--host-path", "/var/run/docker.sock", "--mount-path", "/var/run/docker.sock"],
         ["app-new", "--host-path", "/srv/product", "--mount-path", "/srv/product"]]
 
-    assert lab.fake.rows["box1"]["coolify_resource"] == "app-new"
+    assert lab.fake.rows[BOX1]["coolify_resource"] == "app-new"
     answer = json.loads(capsys.readouterr().out)
     assert answer["resource"] == {"kind": "application", "uuid": "app-new"}
     assert answer["deployment"] == "dep-1"
@@ -394,7 +411,7 @@ def test_create_takes_back_an_application_it_could_not_finish(lab):
     [delete] = [c["argv"] for c in lab.fake.of("coolify") if "delete" in c["argv"]]
     assert delete[3:] == ["app", "delete", "app-new", "--yes", "--delete-volumes",
                           "--delete-configurations"]
-    assert "box1" not in lab.fake.rows
+    assert BOX1 not in lab.fake.rows
 
 
 @pytest.mark.parametrize("extra, wrong", [
@@ -428,7 +445,8 @@ def test_enrol_and_remove_reach_a_node_built_from_a_repository(lab, capsys):
     lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
     assert json.loads(capsys.readouterr().out)["ok"] is True
 
-    lab.fake.config = {"Image": "app-new:0123abc", "Env": ["AGENT_NODE_NAME=box1"]}
+    lab.fake.config = {"Image": "app-new:0123abc",
+                       "Env": ["CAPABILITIES_PROJECT_ID=prj_00000000a1a1"]}
     before = len(lab.fake.calls)
     lab.m.cmd_node_remove(SimpleNamespace(node="box1", yes=True))
     [delete] = [c["argv"] for c in lab.fake.of("coolify") if "delete" in c["argv"]]
@@ -438,7 +456,7 @@ def test_enrol_and_remove_reach_a_node_built_from_a_repository(lab, capsys):
     remote = [shlex.split(c["argv"][-1])[:2] for c in lab.fake.calls[before:]
               if c["argv"][0] == "ssh" and "-G" not in c["argv"]]
     assert remote and all(r in (["docker", "ps"], ["docker", "inspect"]) for r in remote)
-    assert "box1" not in lab.fake.rows
+    assert BOX1 not in lab.fake.rows
 
 
 def test_remove_refuses_an_application_that_does_not_run_its_own_build_as_the_node(lab):

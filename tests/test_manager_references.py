@@ -37,6 +37,18 @@ DB_KEYS = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTKIT_
            "AGENTKIT_DB_SSLMODE", "AGENTKIT_DB_SSLROOTCERT")
 PROJECT_ID = "prj_" + "5e1f0a2b3c4d"
 
+
+def nid(label: str) -> str:
+    """The twelve-hex node id a test gives the node it labels `label`; ids
+    sort as their labels do."""
+    return label.encode()[:6].ljust(6, b"\0").hex()
+
+
+def node_env(label: str) -> dict:
+    """The environment of a process running on the node labelled `label`."""
+    return {"AGENT_NODE_ID": nid(label), "AGENT_NODE_NAME": label}
+
+
 # Bytes a text read would not keep: CRLF line ends, a non-ASCII character and
 # no final newline; and a file that opens with a byte-order mark.
 ACCOUNTS = ("---\r\nname: account-map\r\ndescription: How entries map to accounts\r\n"
@@ -131,7 +143,8 @@ class Lab:
     def env(self, **extra: str) -> dict:
         env = {k: v for k, v in os.environ.items()
                if k not in DB_KEYS and not k.startswith("CAPABILITIES_")
-               and k not in ("AGENT_NODE_NAME", "VIRTUAL_ENV", "EDITOR", "VISUAL")}
+               and k not in ("AGENT_NODE_ID", "AGENT_NODE_NAME", "VIRTUAL_ENV", "EDITOR",
+                             "VISUAL")}
         env.update({
             "HOME": str(self.tmp / "home"),
             "XDG_CONFIG_HOME": str(self.tmp / "config"),
@@ -140,7 +153,7 @@ class Lab:
             "CAPABILITIES_HOME": str(self.tmp / "registry"),
             "CLAUDE_PROJECT_DIR": str(self.project),
             "USER": "tester",
-            "AGENT_NODE_NAME": "mac1",
+            **node_env("mac1"),
         })
         env.update(extra)
         return {k: v for k, v in env.items() if v is not None}

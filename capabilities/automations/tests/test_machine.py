@@ -42,7 +42,10 @@ STORE_KEYS = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTK
 POINTERS = ("CLAUDE_PROJECT_DIR", "CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT",
             "CAPABILITIES_PROJECT_ENVELOPE", "CAPABILITIES_PROJECT_ENVELOPE_ROOT",
             "AUTOMATIONS_ENVIRONMENT", "AUTOMATIONS_NAMESPACE", "AUTOMATIONS_CONFIG",
-            "AUTOMATIONS_STATE_DIR", "CAPABILITIES_READ_ONLY", "AGENT_NODE_NAME", *STORE_KEYS)
+            "AUTOMATIONS_STATE_DIR", "CAPABILITIES_READ_ONLY", "AGENT_NODE_NAME", "AGENT_NODE_ID",
+            *STORE_KEYS)
+# The node id the machine runs as here, handed to every process the fixture starts.
+HERE = "686572650000"
 
 PROBE = """import json, os, time
 print(json.dumps({"secret": os.environ.get("PROJECT_SECRET"), "cwd": os.getcwd(),
@@ -109,7 +112,8 @@ class Farm:
     def __init__(self, tmp: Path, *, store: bool = True):
         self.tmp = tmp
         self.env = {key: value for key, value in os.environ.items() if key not in POINTERS}
-        self.env.update(XDG_CONFIG_HOME=str(tmp / "config"), XDG_STATE_HOME=str(tmp / "state"))
+        self.env.update(XDG_CONFIG_HOME=str(tmp / "config"), XDG_STATE_HOME=str(tmp / "state"),
+                        AGENT_NODE_ID=HERE)
         self.store = bool(store and DSN)
         if self.store:
             self.env["AGENTKIT_DB_URL"] = DSN
@@ -148,7 +152,7 @@ class Farm:
             with ledger:
                 for automation, fields in {**DEFINITIONS, **(BEAT if beat else {})}.items():
                     checked = runtime.check_definition(
-                        root, automation, {**fields, "node": socket.gethostname()})
+                        root, automation, {**fields, "node": HERE})
                     ledger.save_definition(automation, checked, by="fixture")
         return root
 

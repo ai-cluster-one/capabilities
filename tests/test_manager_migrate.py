@@ -48,6 +48,17 @@ EVIDENCE = os.environ.get("CAPABILITIES_MIGRATE_EVIDENCE")
 from capabilities_contract.capability import store as S  # noqa: E402
 
 
+def nid(label: str) -> str:
+    """The twelve-hex node id a test gives the node it labels `label`; ids
+    sort as their labels do."""
+    return label.encode()[:6].ljust(6, b"\0").hex()
+
+
+def node_env(label: str) -> dict:
+    """The environment of a process running on the node labelled `label`."""
+    return {"AGENT_NODE_ID": nid(label), "AGENT_NODE_NAME": label}
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -200,12 +211,13 @@ class World:
     def env(self, root: Path | None = None, **extra) -> dict:
         env = {k: v for k, v in os.environ.items()
                if k not in DB_KEYS and not k.startswith("CAPABILITIES_")
-               and k not in ("AGENT_NODE_NAME", "VIRTUAL_ENV", "CLAUDE_PROJECT_DIR")}
+               and k not in ("AGENT_NODE_ID", "AGENT_NODE_NAME", "VIRTUAL_ENV",
+                             "CLAUDE_PROJECT_DIR")}
         env.update({
             "HOME": str(self.home), "XDG_CONFIG_HOME": str(self.config),
             "XDG_STATE_HOME": str(self.state), "XDG_CACHE_HOME": str(self.cache),
             "CAPABILITIES_HOME": str(self.registry), "USER": "tester",
-            "AGENT_NODE_NAME": MASTER, "AGENTKIT_DB_URL": self.url(),
+            **node_env(MASTER), "AGENTKIT_DB_URL": self.url(),
             "AGENTKIT_DB_SCHEMA": SCHEMA,
             "PATH": f"{self.shims}{os.pathsep}{os.environ.get('PATH', '')}",
             "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR")
@@ -300,7 +312,7 @@ class World:
                     else root / "capabilities")
         saved = dict(os.environ)
         os.environ.update({"AGENTKIT_DB_URL": self.url(), "AGENTKIT_DB_SCHEMA": SCHEMA,
-                           "AGENT_NODE_NAME": MASTER, "HOME": str(self.home)})
+                           **node_env(MASTER), "HOME": str(self.home)})
         try:
             records = S.open_records(envelope, self.config, project_root=root)
             out = {"adapter": type(records).__name__, "gate": {}, "connections": {},
@@ -655,8 +667,8 @@ def test_refusals_write_nothing(world):
     root = world.roots["other"]
     before = world.everything()
     refused = {}
-    refused["node_unnamed"] = world.error(world.manager(root, "migrate", "--apply",
-                                                        AGENT_NODE_NAME=None))
+    refused["bad_node_id"] = world.error(world.manager(root, "migrate", "--apply",
+                                                       AGENT_NODE_ID=MASTER))
     refused["node_mismatch"] = world.error(world.manager(
         root, "migrate", "--apply", "--answers", answers_file(world, "mismatch",
                                                               {"node": "mac9"})))
@@ -667,8 +679,8 @@ def test_refusals_write_nothing(world):
         assert error["code"] == code, error
     assert world.everything() == before
     # Another node is the master of `other`: this one is not.
-    world.answer(world.manager(root, "node", "add", "mac-other", "--kind", "mac", "--master",
-                               AGENT_NODE_NAME="mac-other"))
+    world.answer(world.manager(root, "node", "add", nid("mac-other"), "--label", "mac-other",
+                               "--kind", "mac", "--master", **node_env("mac-other")))
     before = world.everything()
     error = world.error(world.manager(root, "migrate", "--apply"))
     _say("refusal-not-master", error)
@@ -839,9 +851,10 @@ def test_apply_moves_everything_and_reads_the_same_through_the_switch(world, nam
                       "WHERE id = %s", (IDS[name],))
     assert state[0][0] is None and state[0][1] is not None
     if name == "relay":
-        nodes = dict(world.sql("SELECT node, address FROM capabilities_agent_nodes "
-                               "WHERE agent_id = %s", (IDS[name],)))
-        assert nodes == {MASTER: None, "srv-relay": "203.0.113.10"}
+        nodes = dict(world.sql("SELECT l.node, n.address FROM capabilities_agent_nodes l "
+                               "JOIN capabilities_nodes n ON n.id = l.node "
+                               "WHERE l.agent_id = %s", (IDS[name],)))
+        assert nodes == {nid(MASTER): None, "srv-relay": "203.0.113.10"}
         placed = world.sql("SELECT capability FROM capabilities_policy WHERE agent_id = %s "
                            "AND node = 'srv-relay'", (IDS[name],))
         assert ("telegram",) in placed
@@ -854,15 +867,15 @@ def test_apply_moves_everything_and_reads_the_same_through_the_switch(world, nam
         assert profiles == [("automations-books", {
             "harness": "claude", "model": "sonnet", "timeout_seconds": 600.0, "permission_mode": "plan",
             "tools": ["Read", "Glob", "Grep"], "allowed_tools": ["Read", "Glob", "Grep"]},
-            f"migrate@{MASTER}")]
+            f"migrate@{nid(MASTER)}")]
         rows = world.sql("SELECT slug, node, schedule, timezone, created_by FROM "
                          "automations_definitions WHERE project_id = %s AND active "
                          "ORDER BY slug", (IDS[name],))
-        assert rows == [("by-hand", MASTER, None, "Europe/Tallinn", f"migrate@{MASTER}"),
+        assert rows == [("by-hand", nid(MASTER), None, "Europe/Tallinn", f"migrate@{nid(MASTER)}"),
                         ("daily-books", "srv-books", "0 6 * * *", "Europe/Tallinn",
-                         f"migrate@{MASTER}"),
+                         f"migrate@{nid(MASTER)}"),
                         ("watch", "srv-books", "*/5 * * * *", "Europe/Tallinn",
-                         f"migrate@{MASTER}")]
+                         f"migrate@{nid(MASTER)}")]
     if name == "clinic":
         rows = world.sql("SELECT name FROM harness_profiles WHERE scope_id = %s AND active "
                          "ORDER BY name", (IDS[name],))
@@ -884,7 +897,7 @@ def test_apply_moves_everything_and_reads_the_same_through_the_switch(world, nam
                             (["escalation", "stall_after"], "6h")]
         trail = world.sql("SELECT DISTINCT changed_by FROM capabilities_settings_changes "
                           "WHERE agent_id = %s", (IDS[name],))
-        assert trail == [(f"migrate@{MASTER}",)]
+        assert trail == [(f"migrate@{nid(MASTER)}",)]
     if name == "body":
         assert not (root / "agent" / "capabilities" / "slack" / "policy.json").exists()
         assert world.sql("SELECT value FROM capabilities_settings WHERE agent_id = %s AND "
@@ -1040,7 +1053,7 @@ def test_report_and_discard(world):
     # A node that is no agent's master discards them, once no agent here
     # still reads them.
     error = world.error(world.manager(root, "migrate", "--discard",
-                                      AGENT_NODE_NAME="srv-discard"))
+                                      **node_env("srv-discard")))
     _say("discard-refused", error)
     assert error["code"] == "agents_unmigrated" and world.everything() == before
     # Once `other` is gone from this machine, the files go without being read.
@@ -1048,7 +1061,7 @@ def test_report_and_discard(world):
     del world.roots["other"]
     world.agentkit_list()
     discarded = world.answer(world.manager(world.roots["relay"], "migrate", "--discard",
-                                           AGENT_NODE_NAME="srv-discard"))
+                                           **node_env("srv-discard")))
     _say("discard", discarded)
     assert sorted(Path(p).relative_to(world.config).as_posix() for p in discarded["removed"]) \
         == ["capabilities/settings.json", "coolify/connections.json",

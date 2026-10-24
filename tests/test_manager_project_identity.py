@@ -488,12 +488,12 @@ def test_a_new_agent_without_a_node_name_is_refused_before_anything_is_written(
     project = _project(tmp_path, bound=False)
     _contextkit(tmp_path)
     env = _env(tmp_path, project)
-    env.pop("AGENT_NODE_NAME", None)
+    env["AGENT_NODE_ID"] = "test-node"
 
     result = _run(tmp_path, project, "init", env=env)
 
     assert result.returncode == 6
-    assert _error(result)["code"] == "node_unnamed"
+    assert _error(result)["code"] == "bad_node_id"
     assert not (project / "capabilities").exists()
 
 

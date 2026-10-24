@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-24 — A raise records its node's id
+
+The `node` a raise is claimed on is the node id the machine resolves for itself (`capabilities node id`), as the contract now answers it, in place of `AGENT_NODE_NAME` or the host name. Help says so.
+
 ## 2026-10-24 — Turns run on callva-harness-runner 0.10.1
 
 The runner is pinned at 0.10.1 in place of 0.9.0. Claude turns run through claude-agent-sdk 0.2.174, and a claude CLI up to 2.1.310 runs without the runner's out-of-range warning; codex is unchanged. The runner's 0.10.0 additions are new profile knobs only, so a turn runs as before.

@@ -27,6 +27,11 @@ from pathlib import Path
 import pytest
 
 
+# The nodes these tests play, by id: each is its label's first six characters
+# as hex, so the ids sort as the labels do.
+LABELS = {"6e6f64652d61": "node-a", "6e6f64652d62": "node-b", "6e6f64652d66": "node-f",
+          "6d61632d6100": "mac-a", "626f782d6200": "box-b", "626f782d6300": "box-c"}
+
 CAP_ROOT = Path(__file__).resolve().parents[2]
 REPO = CAP_ROOT.parent
 DEPLOYMENT = CAP_ROOT / "deployment" / "bin" / "deployment"
@@ -39,6 +44,7 @@ SCRUBBED = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTKIT
             "AGENTKIT_DB_USER", "AGENTKIT_DB_PASSWORD", "AGENTKIT_DB_SCHEMA",
             "AGENTKIT_DB_SSLMODE", "AGENTKIT_DB_SSLROOTCERT", "AGENTKIT_STORE_URL",
             "CAPABILITIES_STORE_URL", "CAPABILITIES_READ_ONLY", "AGENT_NODE_NAME",
+            "AGENT_NODE_ID",
             "CAPABILITIES_PROJECT_ENVELOPE", "CAPABILITIES_PROJECT_ENVELOPE_ROOT",
             "CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT",
             "CLAUDE_PROJECT_DIR", "VIRTUAL_ENV")
@@ -79,7 +85,7 @@ class Runner:
                           "time.sleep(600)"]
         self.proc = subprocess.Popen(
             [str(DEPLOYMENT), "runner", "fixture", "--every", EVERY, "--", *child],
-            cwd=root, env={**env, "AGENT_NODE_NAME": node}, stdout=self.log,
+            cwd=root, env={**env, "AGENT_NODE_ID": node}, stdout=self.log,
             stderr=subprocess.STDOUT, start_new_session=True)
 
     def state(self) -> dict:
@@ -131,7 +137,7 @@ def test_files_mode_places_the_service_by_the_projects_own_enable(tmp_path: Path
     (home / "config" / "capabilities").mkdir(parents=True)
     (home / "config" / "capabilities" / "settings.json").write_text(
         json.dumps({"capabilities": {"fixture": {"enabled": True}}}))
-    runner = Runner(root, env, "node-f", tmp_path / "runner.log")
+    runner = Runner(root, env, "6e6f64652d66", tmp_path / "runner.log")
     try:
         idle = runner.until(lambda s: s.get("tick_at") is not None)
         assert idle["want"] is False and idle["running"] is False
@@ -170,7 +176,7 @@ def test_a_policy_refusal_holds_the_service_idle_until_the_gate_changes(tmp_path
     (root / "deployment").mkdir()
     (root / "deployment" / "runtime.json").write_text(json.dumps(
         {"profile": "agent-box", "services": {"agent": {"embedded_services": ["fixture"]}}}))
-    runner = Runner(root, env, "node-f", tmp_path / "runner.log", child=REFUSING)
+    runner = Runner(root, env, "6e6f64652d66", tmp_path / "runner.log", child=REFUSING)
     try:
         held = runner.until(lambda s: s.get("refusal"))
         assert held["want"] is False and held["running"] is False
@@ -185,7 +191,7 @@ def test_a_policy_refusal_holds_the_service_idle_until_the_gate_changes(tmp_path
         assert runner.text().count("child start") == 1
         assert runner.text().count("joined_to_machine_service") >= 1
         report = json.loads(subprocess.run(
-            [str(DEPLOYMENT), "services"], cwd=root, env={**env, "AGENT_NODE_NAME": "node-f"},
+            [str(DEPLOYMENT), "services"], cwd=root, env={**env, "AGENT_NODE_ID": "6e6f64652d66"},
             capture_output=True, text=True, timeout=120).stdout)
         [seen] = report["services"]
         assert seen["running"] is False
@@ -198,7 +204,7 @@ def test_a_policy_refusal_holds_the_service_idle_until_the_gate_changes(tmp_path
         (root / "capabilities" / "settings.json").write_text(json.dumps({"capabilities": settings}))
         runner.until(lambda s: s.get("refusal") and s["tick_at"] and
                      runner.text().count("child start") == 2)
-        assert "the gate answer for node-f changed" in runner.text()
+        assert "the gate answer for 6e6f64652d66 changed" in runner.text()
     finally:
         runner.stop()
 
@@ -273,58 +279,58 @@ def test_the_gate_on_each_node_starts_and_stops_the_service_and_one_node_holds_i
     _manager(a, env, "enable", "deployment", "--project")
     runners = {}
     try:
-        runners["node-a"] = Runner(a, env, "node-a", tmp_path / "a.log")
-        idle = runners["node-a"].until(lambda s: s.get("tick_at") is not None)
+        runners["6e6f64652d61"] = Runner(a, env, "6e6f64652d61", tmp_path / "a.log")
+        idle = runners["6e6f64652d61"].until(lambda s: s.get("tick_at") is not None)
         assert idle["running"] is False
-        assert idle["gate"]["reason"] == "no policy row answers for fixture on node-a"
+        assert idle["gate"]["reason"] == "no policy row answers for fixture on 6e6f64652d61"
 
         # A row for every node makes the CLI usable and places nothing.
         _manager(a, env, "enable", "fixture", "--project")
-        runners["node-a"].until(lambda s: "row for every node answers" in s["reason"])
-        assert runners["node-a"].state()["running"] is False
+        runners["6e6f64652d61"].until(lambda s: "row for every node answers" in s["reason"])
+        assert runners["6e6f64652d61"].state()["running"] is False
 
-        written = _manager(a, env, "enable", "fixture", "--project", "--node", "node-a")
-        assert written["node"] == "node-a"
-        running = runners["node-a"].until(lambda s: s.get("running"))
-        assert running["lease"]["state"] == "held" and running["lease"]["holder"] == "node-a"
+        written = _manager(a, env, "enable", "fixture", "--project", "--node", "6e6f64652d61")
+        assert written["node"] == "6e6f64652d61"
+        running = runners["6e6f64652d61"].until(lambda s: s.get("running"))
+        assert running["lease"]["state"] == "held" and running["lease"]["holder"] == "6e6f64652d61"
         first = running["child"]["pid"]
         assert rows("SELECT capability, node FROM deployment_service_leases") == [
-            ("fixture", "node-a")]
+            ("fixture", "6e6f64652d61")]
 
-        _manager(b, env, "enable", "fixture", "--project", "--node", "node-b")
-        runners["node-b"] = Runner(b, env, "node-b", tmp_path / "b.log")
-        refused = runners["node-b"].until(lambda s: s["lease"].get("state") == "held_elsewhere")
-        assert refused["running"] is False and refused["lease"]["holder"] == "node-a"
-        assert "held by node-a until" in runners["node-b"].text()
+        _manager(b, env, "enable", "fixture", "--project", "--node", "6e6f64652d62")
+        runners["6e6f64652d62"] = Runner(b, env, "6e6f64652d62", tmp_path / "b.log")
+        refused = runners["6e6f64652d62"].until(lambda s: s["lease"].get("state") == "held_elsewhere")
+        assert refused["running"] is False and refused["lease"]["holder"] == "6e6f64652d61"
+        assert "held by 6e6f64652d61 until" in runners["6e6f64652d62"].text()
         # A person on node-b sees what its gate answers, that nothing runs
         # here, and who holds the lease.
         (b / "deployment").mkdir()
         (b / "deployment" / "runtime.json").write_text(json.dumps(
             {"profile": "agent-box", "services": {"agent": {"embedded_services": ["fixture"]}}}))
         proc = subprocess.run([str(DEPLOYMENT), "services"], cwd=b,
-                              env={**env, "AGENT_NODE_NAME": "node-b"},
+                              env={**env, "AGENT_NODE_ID": "6e6f64652d62"},
                               capture_output=True, text=True, timeout=120)
         assert proc.returncode == 0, proc.stderr
         report = json.loads(proc.stdout)
-        assert report["node"] == "node-b" and report["records"] == "store"
+        assert report["node"] == "6e6f64652d62" and report["records"] == "store"
         [seen] = report["services"]
         assert seen["name"] == "fixture" and seen["running"] is False
         assert seen["gate"]["placed"] is True
-        assert seen["gate"]["row"] == {"scope": "project", "node": "node-b", "enabled": True,
+        assert seen["gate"]["row"] == {"scope": "project", "node": "6e6f64652d62", "enabled": True,
                                        "service": True}
-        assert seen["lease"]["state"] == "held_elsewhere" and seen["lease"]["holder"] == "node-a"
+        assert seen["lease"]["state"] == "held_elsewhere" and seen["lease"]["holder"] == "6e6f64652d61"
 
-        _manager(a, env, "disable", "fixture", "--project", "--node", "node-a")
-        stopped = runners["node-a"].until(lambda s: not s.get("running")
+        _manager(a, env, "disable", "fixture", "--project", "--node", "6e6f64652d61")
+        stopped = runners["6e6f64652d61"].until(lambda s: not s.get("running")
                                           and s["lease"].get("state") != "held")
         assert "disables fixture" in stopped["reason"]
         assert not _alive(first)
-        taken = runners["node-b"].until(lambda s: s.get("running"))
-        assert taken["lease"]["holder"] == "node-b"
-        assert "released the lease for fixture" in runners["node-a"].text()
+        taken = runners["6e6f64652d62"].until(lambda s: s.get("running"))
+        assert taken["lease"]["holder"] == "6e6f64652d62"
+        assert "released the lease for fixture" in runners["6e6f64652d61"].text()
 
-        _manager(b, env, "inherit", "fixture", "--project", "--node", "node-b")
-        runners["node-b"].until(lambda s: not s.get("running"))
+        _manager(b, env, "inherit", "fixture", "--project", "--node", "6e6f64652d62")
+        runners["6e6f64652d62"].until(lambda s: not s.get("running"))
     finally:
         for runner in runners.values():
             runner.stop()
@@ -438,14 +444,14 @@ def test_a_runner_holds_a_connection_only_while_its_service_runs(tmp_path: Path,
                     dotenv=dotenv)
     _manager(root, env, "enable", "deployment", "--project")
     _manager(root, env, "enable", "fixture", "--project")
-    runner = Runner(root, env, "node-a", tmp_path / "a.log")
+    runner = Runner(root, env, "6e6f64652d61", tmp_path / "a.log")
     try:
         idle = runner.until(lambda s: "row for every node answers" in (s.get("reason") or ""))
         assert idle["running"] is False
         # Its service not placed here, the runner reads the gate every reconcile
         # and holds nothing between the reads.
         assert _held_across(cluster, database, 3 * int(EVERY)) == set()
-        _manager(root, env, "enable", "fixture", "--project", "--node", "node-a")
+        _manager(root, env, "enable", "fixture", "--project", "--node", "6e6f64652d61")
         running = runner.until(lambda s: s.get("running"))
         assert running["lease"]["state"] == "held"
         # Placed, it renews the lease every reconcile on its one working
@@ -508,20 +514,20 @@ def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_li
               "?sslmode=disable\nAGENTKIT_DB_SCHEMA=lab\n")
     identity = {"id": PROJECT_ID, "slug": "lab", "records": "store"}
     # Two checkouts of one project, a Mac and a node of the standard image.
-    roots = {"mac-a": _project(tmp_path / "a", identity, dotenv=dotenv),
-             "box-b": _project(tmp_path / "b", identity, dotenv=dotenv)}
-    a = roots["mac-a"]
+    roots = {"6d61632d6100": _project(tmp_path / "a", identity, dotenv=dotenv),
+             "626f782d6200": _project(tmp_path / "b", identity, dotenv=dotenv)}
+    a = roots["6d61632d6100"]
     (a / "deployment").mkdir()
     (a / "deployment" / "runtime.json").write_text(json.dumps(
         {"profile": "agent-box", "service_policy": {"reconcile_seconds": int(EVERY)},
          "services": {"agent": {"embedded_services": ["fixture"]}}}))
     _manager(a, env, "enable", "deployment", "--project")
-    for node, kind in (("mac-a", "mac"), ("box-b", "server"), ("box-c", "server")):
-        _manager(a, env, "node", "add", node, "--kind", kind)
+    for node, kind in (("6d61632d6100", "mac"), ("626f782d6200", "server"), ("626f782d6300", "server")):
+        _manager(a, env, "node", "add", node, "--label", LABELS[node], "--kind", kind)
 
     def seen() -> dict:
-        return dict(rows("SELECT node, last_seen_at > now() - interval '1 minute' "
-                         "FROM capabilities_agent_nodes WHERE last_seen_at IS NOT NULL"))
+        return dict(rows("SELECT id, last_seen_at > now() - interval '1 minute' "
+                         "FROM capabilities_nodes WHERE last_seen_at IS NOT NULL"))
 
     def until_seen(want: dict) -> None:
         deadline = time.monotonic() + 40
@@ -542,10 +548,10 @@ def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_li
         # No service is placed on either node, so neither holds a lease.
         for node, root in roots.items():
             runners[node] = Runner(root, env, node, tmp_path / f"{node}.log")
-        until_seen({"mac-a": True, "box-b": True})
-        rows("UPDATE capabilities_agent_nodes SET last_seen_at = now() - interval '1 hour' "
-             "WHERE last_seen_at IS NOT NULL RETURNING node")
-        until_seen({"mac-a": True, "box-b": True})
+        until_seen({"6d61632d6100": True, "626f782d6200": True})
+        rows("UPDATE capabilities_nodes SET last_seen_at = now() - interval '1 hour' "
+             "WHERE last_seen_at IS NOT NULL RETURNING id")
+        until_seen({"6d61632d6100": True, "626f782d6200": True})
         for runner in runners.values():
             state = runner.state()
             assert state["want"] is False and state["lease"].get("state") != "held"
@@ -554,15 +560,15 @@ def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_li
         report = listed()
         assert (report["reconcile_seconds"], report["live_within_seconds"]) == (5, 15)
         assert {n["node"]: n["live"] for n in report["nodes"]} == {
-            "box-b": True, "box-c": False, "mac-a": True}
+            "626f782d6200": True, "626f782d6300": False, "6d61632d6100": True}
 
         # box-b falls silent: past three reconciles it no longer reads live.
-        runners.pop("box-b").stop()
-        rows("UPDATE capabilities_agent_nodes SET last_seen_at = now() - interval '16 seconds' "
-             "WHERE node = 'box-b' RETURNING node")
+        runners.pop("626f782d6200").stop()
+        rows("UPDATE capabilities_nodes SET last_seen_at = now() - interval '16 seconds' "
+             "WHERE id = '626f782d6200' RETURNING id")
         nodes = {n["node"]: n for n in listed()["nodes"]}
-        assert (nodes["box-b"]["live"], nodes["mac-a"]["live"]) == (False, True)
-        assert nodes["box-b"]["seen_seconds_ago"] >= 16
+        assert (nodes["626f782d6200"]["live"], nodes["6d61632d6100"]["live"]) == (False, True)
+        assert nodes["626f782d6200"]["seen_seconds_ago"] >= 16
     finally:
         for runner in runners.values():
             runner.stop()

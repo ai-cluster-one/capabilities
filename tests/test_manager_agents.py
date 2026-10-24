@@ -24,6 +24,18 @@ from pathlib import Path
 import pytest
 
 
+
+def nid(label: str) -> str:
+    """The node id a test gives the machine it plays as `label`: the label's
+    first six characters as hex, so the ids sort as their labels do."""
+    return label.encode()[:6].ljust(6, b"\0").hex()
+
+
+def node_env(label: str) -> dict:
+    """The environment of a process on that machine: its id, and its label."""
+    return {"AGENT_NODE_ID": nid(label), "AGENT_NODE_NAME": label}
+
+
 REPO = Path(__file__).resolve().parents[1]
 MANAGER = REPO / "bin" / "capabilities"
 ADMIN = "pgadmin"
@@ -143,8 +155,8 @@ class Lab:
                               env=self.env(**extra), text=True, capture_output=True,
                               timeout=120)
 
-    def ok(self, *args: str) -> dict:
-        result = self.run(*args)
+    def ok(self, *args: str, **extra: str) -> dict:
+        result = self.run(*args, **extra)
         assert result.returncode == 0, result.stderr
         return json.loads(result.stdout)
 
@@ -231,7 +243,7 @@ def test_init_registers_the_agent_row(lab):
 
 def test_a_new_agent_starts_in_the_store_with_this_node_as_master(lab):
     (lab.project / "capabilities" / "project.json").unlink()
-    node = {"AGENT_NODE_NAME": "lab-node"}
+    node = {**node_env("lab-node")}
 
     code, error = lab.refused("init", **node)
     assert (code, error["code"]) == (6, "global_not_migrated")
@@ -256,7 +268,7 @@ def test_a_new_agent_starts_in_the_store_with_this_node_as_master(lab):
     assert lab.sql(f"SELECT migrated_at IS NOT NULL FROM {SCHEMA}.capabilities_agents "
                    "WHERE id = %s", (agent_id,)) == [(True,)]
     assert lab.sql(f"SELECT node, is_master FROM {SCHEMA}.capabilities_agent_nodes "
-                   "WHERE agent_id = %s", (agent_id,)) == [("lab-node", True)]
+                   "WHERE agent_id = %s", (agent_id,)) == [(nid("lab-node"), True)]
 
 
 def _bound(folder: Path) -> str | None:
@@ -267,14 +279,14 @@ def _bound(folder: Path) -> str | None:
 
 
 def test_init_id_raises_an_agent_the_store_holds_in_a_folder_of_its_own(lab, tmp_path):
-    node = {"AGENT_NODE_NAME": "lab-node"}
+    node = {**node_env("lab-node")}
     migrated = lab.run("migrate", "--global", "--apply", **node)
     assert migrated.returncode == 0, migrated.stderr
     (lab.project / "capabilities" / "project.json").unlink()
     created = lab.run("init", **node)
     assert created.returncode == 0, created.stderr
     agent_id = _bound(lab.project)
-    added = lab.run("node", "add", "srv-node", "--kind", "server", **node)
+    added = lab.run("node", "add", nid("srv-node"), "--label", "srv-node", "--kind", "server", **node)
     assert added.returncode == 0, added.stderr
     setting = (lab.project / ".env.local").read_text().replace(
         f"CAPABILITIES_PROJECT_ID={agent_id}\n", "")
@@ -284,7 +296,7 @@ def test_init_id_raises_an_agent_the_store_holds_in_a_folder_of_its_own(lab, tmp
         (folder / ".env.local").write_text(setting)
         return subprocess.run(
             [sys.executable, str(MANAGER), "init", *args], cwd=folder,
-            env=lab.env(CLAUDE_PROJECT_DIR=str(folder), AGENT_NODE_NAME="srv-node"),
+            env=lab.env(CLAUDE_PROJECT_DIR=str(folder), **node_env("srv-node")),
             text=True, capture_output=True, timeout=120)
 
     # A folder holding nothing but the store setting is raised as the agent.
@@ -311,14 +323,14 @@ def test_init_id_raises_an_agent_the_store_holds_in_a_folder_of_its_own(lab, tmp
 def test_a_folder_an_agent_is_raised_in_does_not_name_it(lab, tmp_path):
     # A node raises an agent the store already holds in /app: an agent with no
     # slug and no name is not named "app" after it.
-    node = {"AGENT_NODE_NAME": "lab-node"}
+    node = {**node_env("lab-node")}
     migrated = lab.run("migrate", "--global", "--apply", **node)
     assert migrated.returncode == 0, migrated.stderr
     (lab.project / "capabilities" / "project.json").unlink()
     created = lab.run("init", **node)
     assert created.returncode == 0, created.stderr
     agent_id = _bound(lab.project)
-    added = lab.run("node", "add", "srv-node", "--kind", "server", **node)
+    added = lab.run("node", "add", nid("srv-node"), "--label", "srv-node", "--kind", "server", **node)
     assert added.returncode == 0, added.stderr
     with lab.cluster.connect(lab.database) as conn:
         conn.execute(f"UPDATE {SCHEMA}.capabilities_agents SET slug = NULL, name = NULL "
@@ -330,7 +342,7 @@ def test_a_folder_an_agent_is_raised_in_does_not_name_it(lab, tmp_path):
     (app / ".env.local").write_text(setting)
     raised = subprocess.run(
         [sys.executable, str(MANAGER), "init", "--id", agent_id], cwd=app,
-        env=lab.env(CLAUDE_PROJECT_DIR=str(app), AGENT_NODE_NAME="srv-node"),
+        env=lab.env(CLAUDE_PROJECT_DIR=str(app), **node_env("srv-node")),
         text=True, capture_output=True, timeout=120)
     assert raised.returncode == 0, raised.stderr
     assert json.loads(raised.stdout)["agent"]["slug"] is None
@@ -372,7 +384,7 @@ def test_agent_show_and_set(lab, tmp_path):
 # --- the nodes ------------------------------------------------------------------
 
 def test_agent_materialize_puts_a_stored_agent_in_a_folder_on_this_machine(lab, tmp_path):
-    node = {"AGENT_NODE_NAME": "lab-node"}
+    node = {**node_env("lab-node")}
     migrated = lab.run("migrate", "--global", "--apply", **node)
     assert migrated.returncode == 0, migrated.stderr
     (lab.project / "capabilities" / "project.json").unlink()
@@ -381,7 +393,7 @@ def test_agent_materialize_puts_a_stored_agent_in_a_folder_on_this_machine(lab, 
     agent_id = _bound(lab.project)
     # init records the folder the new agent lives in on its master node.
     assert lab.sql(f"SELECT node, folder FROM {SCHEMA}.capabilities_agent_nodes "
-                   "WHERE agent_id = %s", (agent_id,)) == [("lab-node", str(lab.project))]
+                   "WHERE agent_id = %s", (agent_id,)) == [(nid("lab-node"), str(lab.project))]
     setting = (lab.project / ".env.local").read_text().replace(
         f"CAPABILITIES_PROJECT_ID={agent_id}\n", "")
     elsewhere = tmp_path / "elsewhere"
@@ -401,18 +413,18 @@ def test_agent_materialize_puts_a_stored_agent_in_a_folder_on_this_machine(lab, 
             result.stderr.strip().splitlines()[-1])["error"]["code"]
 
     folder = tmp_path / "box" / "agent"
-    first = materialize(agent_id, str(folder), AGENT_NODE_NAME="box-node")
+    first = materialize(agent_id, str(folder), **node_env("box-node"))
     assert first.returncode == 0, first.stderr
     answer = json.loads(first.stdout)
     assert answer["changed"] is True and answer["folder"] == str(folder)
     assert (answer["node"]["node"], answer["node"]["kind"], answer["node"]["is_master"],
-            answer["node"]["folder"]) == ("box-node", "server", False, str(folder))
+            answer["node"]["folder"]) == (nid("box-node"), "server", False, str(folder))
     assert (folder / ".env.local").read_text() == (
         f"CAPABILITIES_PROJECT_ID={agent_id}\nCAPABILITIES_PROJECT_ID_ROOT={folder}\n")
     assert "capabilities session-start" in (folder / ".claude" / "settings.json").read_text()
     assert (folder / ".capabilities-generated" / "context.md").is_file()
     files = {p: p.read_bytes() for p in folder.rglob("*") if p.is_file()}
-    again = materialize(agent_id, str(folder), AGENT_NODE_NAME="box-node")
+    again = materialize(agent_id, str(folder), **node_env("box-node"))
     assert again.returncode == 0, again.stderr
     assert json.loads(again.stdout)["changed"] is False
     assert {p: p.read_bytes() for p in folder.rglob("*") if p.is_file()} == files
@@ -422,16 +434,17 @@ def test_agent_materialize_puts_a_stored_agent_in_a_folder_on_this_machine(lab, 
     taken = tmp_path / "taken"
     taken.mkdir()
     (taken / ".env.local").write_text("CAPABILITIES_PROJECT_ID=prj_00000000beef\n")
-    assert code(materialize(agent_id, str(taken), AGENT_NODE_NAME="box-node")) \
+    assert code(materialize(agent_id, str(taken), **node_env("box-node"))) \
         == (6, "folder_bound")
     assert (taken / ".env.local").read_text() == "CAPABILITIES_PROJECT_ID=prj_00000000beef\n"
     second = tmp_path / "second"
-    assert code(materialize(agent_id, str(second), AGENT_NODE_NAME="box-node")) \
+    assert code(materialize(agent_id, str(second), **node_env("box-node"))) \
         == (6, "agent_elsewhere")
     assert not second.exists()
-    assert code(materialize("prj_00000000dead", str(second), AGENT_NODE_NAME="box-node")) \
+    assert code(materialize("prj_00000000dead", str(second), **node_env("box-node"))) \
         == (6, "agent_unknown")
-    assert code(materialize(agent_id, str(second))) == (6, "node_unnamed")
+    assert code(materialize(agent_id, str(second), AGENT_NODE_ID="box-node")) \
+        == (6, "bad_node_id")
 
     listed = json.loads(subprocess.run(
         [sys.executable, str(MANAGER), "agent", "list"], cwd=tmp_path,
@@ -439,14 +452,14 @@ def test_agent_materialize_puts_a_stored_agent_in_a_folder_on_this_machine(lab, 
                     AGENTKIT_DB_URL=lab.cluster.url(lab.database), AGENTKIT_DB_SCHEMA=SCHEMA),
         text=True, capture_output=True, timeout=120, check=True).stdout)["agents"]
     assert [(a["id"], [(n["node"], n["folder"]) for n in a["nodes"]]) for a in listed] == [
-        (agent_id, [("box-node", str(folder)), ("lab-node", str(lab.project))])]
+        (agent_id, [(nid("box-node"), str(folder)), (nid("lab-node"), str(lab.project))])]
 
     # An agent the store holds under the bare twelve-hex id is materialized
     # too.
     bare = "4a5b6c7d8e9f"
     lab.sql(f"INSERT INTO {SCHEMA}.capabilities_agents (id) VALUES (%s) RETURNING id", (bare,))
     plain = tmp_path / "plain"
-    placed = materialize(bare, str(plain), AGENT_NODE_NAME="box-node")
+    placed = materialize(bare, str(plain), **node_env("box-node"))
     assert placed.returncode == 0, placed.stderr
     assert json.loads(placed.stdout)["node"]["folder"] == str(plain)
     assert f"CAPABILITIES_PROJECT_ID={bare}\n" in (plain / ".env.local").read_text()
@@ -455,39 +468,40 @@ def test_agent_materialize_puts_a_stored_agent_in_a_folder_on_this_machine(lab, 
     broken = tmp_path / "broken"
     (broken / ".claude").mkdir(parents=True)
     (broken / ".claude" / "settings.json").write_text("{not json")
-    refused = materialize(bare, str(broken), AGENT_NODE_NAME="other-node")
+    refused = materialize(bare, str(broken), **node_env("other-node"))
     assert refused.returncode != 0
     assert not (broken / ".env.local").exists()
     assert lab.sql(f"SELECT node FROM {SCHEMA}.capabilities_agent_nodes "
-                   "WHERE agent_id = %s", (bare,)) == [("box-node",)]
+                   "WHERE agent_id = %s", (bare,)) == [(nid("box-node"),)]
 
 
 def test_nodes_are_added_changed_listed_and_removed(lab):
-    added = lab.ok("node", "add", "mac-one", "--kind", "mac", "--master")
-    assert added["node"] == {"node": "mac-one", "kind": "mac", "address": None,
+    added = lab.ok("node", "add", nid("mac-one"), "--label", "mac-one", "--kind", "mac", "--master")
+    assert added["node"] == {"node": nid("mac-one"), "label": "mac-one", "kind": "mac",
+                             "address": None,
                              "is_master": True, "may_write": False, "target": None,
                              "last_seen_at": None, "coolify_connection": None,
                              "coolify_server": None, "coolify_resource": None,
                              "public_key": None, "folder": None}
-    lab.ok("node", "add", "srv-one", "--kind", "server", "--address", "203.0.113.10",
+    lab.ok("node", "add", nid("srv-one"), "--label", "srv-one", "--kind", "server", "--address", "203.0.113.10",
            "--target", "prod", "--may-write")
 
-    assert lab.ok("node", "set", "srv-one", "--may-write")["changed"] is False
-    assert lab.ok("node", "set", "srv-one", "--address", "")["node"]["address"] is None
+    assert lab.ok("node", "set", nid("srv-one"), "--may-write")["changed"] is False
+    assert lab.ok("node", "set", nid("srv-one"), "--address", "")["node"]["address"] is None
 
     listed = lab.ok("node", "list")["nodes"]
     assert [(n["node"], n["is_master"], n["may_write"], n["target"]) for n in listed] == [
-        ("mac-one", True, False, None), ("srv-one", False, True, "prod")]
+        (nid("mac-one"), True, False, None), (nid("srv-one"), False, True, "prod")]
 
-    removed = lab.ok("node", "remove", "srv-one")["removed"]
-    assert removed["node"] == "srv-one"
-    assert [n["node"] for n in lab.ok("node", "list")["nodes"]] == ["mac-one"]
-    code, error = lab.refused("node", "remove", "srv-one")
+    removed = lab.ok("node", "remove", nid("srv-one"))["removed"]
+    assert removed["node"] == nid("srv-one")
+    assert [n["node"] for n in lab.ok("node", "list")["nodes"]] == [nid("mac-one")]
+    code, error = lab.refused("node", "remove", nid("srv-one"))
     assert (code, error["code"]) == (6, "node_unknown")
 
 
 def test_a_coolify_node_names_its_connection_server_and_resource_and_its_key(lab):
-    added = lab.ok("node", "add", "box-one", "--kind", "server",
+    added = lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "server",
                    "--coolify-connection", "infra", "--coolify-server", "srv-uuid",
                    "--coolify-resource", "res-uuid")["node"]
     assert (added["coolify_connection"], added["coolify_server"],
@@ -495,85 +509,165 @@ def test_a_coolify_node_names_its_connection_server_and_resource_and_its_key(lab
         "infra", "srv-uuid", "res-uuid", None)
 
     key = "A" * 42 + "Q="
-    assert lab.ok("node", "set", "box-one", "--public-key", key)["node"]["public_key"] == key
-    assert lab.refused("node", "set", "box-one", "--public-key", "not-a-key")[0] == 6
+    assert lab.ok("node", "set", nid("box-one"), "--public-key", key)["node"]["public_key"] == key
+    assert lab.refused("node", "set", nid("box-one"), "--public-key", "not-a-key")[0] == 6
 
-    code, error = lab.refused("node", "add", "box-two", "--kind", "server",
+    code, error = lab.refused("node", "add", nid("box-two"), "--label", "box-two", "--kind", "server",
                               "--coolify-resource", "res-two")
     assert (code, error["code"]) == (6, "coolify_incomplete")
-    code, error = lab.refused("node", "set", "box-one", "--coolify-server", "")
+    code, error = lab.refused("node", "set", nid("box-one"), "--coolify-server", "")
     assert (code, error["code"]) == (6, "coolify_incomplete")
-    assert lab.sql(f"SELECT coolify_server FROM {SCHEMA}.capabilities_agent_nodes "
-                   "WHERE node = 'box-one'") == [("srv-uuid",)]
+    assert lab.sql(f"SELECT coolify_server FROM {SCHEMA}.capabilities_nodes "
+                   "WHERE id = %s", (nid("box-one"),)) == [("srv-uuid",)]
 
 
 def test_an_agent_has_one_master(lab):
-    lab.ok("node", "add", "mac-one", "--kind", "mac", "--master")
-    lab.ok("node", "add", "srv-one", "--kind", "server")
+    lab.ok("node", "add", nid("mac-one"), "--label", "mac-one", "--kind", "mac", "--master")
+    lab.ok("node", "add", nid("srv-one"), "--label", "srv-one", "--kind", "server")
 
-    for args in (("node", "add", "srv-two", "--kind", "server", "--master"),
-                 ("node", "set", "srv-one", "--master")):
+    for args in (("node", "add", nid("srv-two"), "--label", "srv-two", "--kind", "server", "--master"),
+                 ("node", "set", nid("srv-one"), "--master")):
         code, error = lab.refused(*args)
         assert (code, error["code"]) == (6, "master_exists")
-        assert "mac-one" in error["message"]
+        assert nid("mac-one") in error["message"]
 
-    lab.ok("node", "set", "mac-one", "--no-master")
-    assert lab.ok("node", "set", "srv-one", "--master")["node"]["is_master"] is True
+    lab.ok("node", "set", nid("mac-one"), "--no-master")
+    assert lab.ok("node", "set", nid("srv-one"), "--master")["node"]["is_master"] is True
 
     import psycopg
     with pytest.raises(psycopg.errors.UniqueViolation):
-        lab.sql(f"INSERT INTO {SCHEMA}.capabilities_agent_nodes (agent_id, node, kind, "
-                "is_master) VALUES (%s, 'raw', 'mac', true)", (PROJECT_ID,))
+        lab.sql(f"INSERT INTO {SCHEMA}.capabilities_nodes (id, label, kind) "
+                "VALUES ('raw', 'raw', 'mac') RETURNING id")
+        lab.sql(f"INSERT INTO {SCHEMA}.capabilities_agent_nodes (agent_id, node, "
+                "is_master) VALUES (%s, 'raw', true)", (PROJECT_ID,))
 
 
 def test_node_refuses_what_it_does_not_take(lab):
-    assert lab.refused("node", "add", "x")[1]["message"] == "node add needs --kind mac|server"
-    assert lab.refused("node", "add", "x", "--kind", "vm")[0] == 6
-    assert lab.refused("node", "add", "x", "--kind", "mac", "--bogus")[0] == 6
-    assert lab.refused("node", "add", "x", "--kind", "mac", "--master", "--no-master")[0] == 6
-    lab.ok("node", "add", "x", "--kind", "mac")
-    assert lab.refused("node", "add", "x", "--kind", "mac")[1]["code"] == "node_exists"
-    assert lab.refused("node", "set", "x")[0] == 6
-    assert lab.refused("node", "set", "nope", "--kind", "mac")[1]["code"] == "node_unknown"
+    x = nid("x")
+    assert lab.refused("node", "add", x, "--label", "x")[1]["message"] == (
+        f"node {x} is new: node add needs --kind mac|server")
+    assert lab.refused("node", "add", x, "--kind", "mac")[1]["message"] == (
+        f"node {x} is new: node add needs --label, the name it is shown by")
+    assert lab.refused("node", "add", "-x", "--label", "x", "--kind", "mac")[0] == 6
+    assert lab.refused("node", "add", "x y", "--label", "x", "--kind", "mac")[1]["code"] == "input"
+    assert lab.refused("node", "add", x, "--label", "x", "--kind", "vm")[0] == 6
+    assert lab.refused("node", "add", x, "--label", "x", "--kind", "mac", "--bogus")[0] == 6
+    assert lab.refused("node", "add", x, "--label", "x", "--kind", "mac", "--master",
+                       "--no-master")[0] == 6
+    lab.ok("node", "add", x, "--label", "x", "--kind", "mac")
+    assert lab.refused("node", "add", x, "--kind", "mac")[1]["code"] == "node_exists"
+    assert lab.refused("node", "set", x)[0] == 6
+    assert lab.refused("node", "set", x, "--label", "")[1]["code"] == "input"
+    assert lab.refused("node", "set", nid("nope"), "--kind", "mac")[1]["code"] == "node_unknown"
 
 
 def test_a_node_reports_itself_seen_and_no_other(lab):
-    lab.ok("node", "add", "box-one", "--kind", "server")
-    lab.ok("node", "add", "box-two", "--kind", "server")
+    lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "server")
+    lab.ok("node", "add", nid("box-two"), "--label", "box-two", "--kind", "server")
 
-    def seen(node: str) -> dict:
-        result = lab.run("node", "seen", AGENT_NODE_NAME=node)
+    def seen(label: str) -> dict:
+        result = lab.run("node", "seen", **node_env(label))
         assert result.returncode == 0, result.stderr
         return json.loads(result.stdout)
 
     first = seen("box-one")
-    assert (first["node"], first["agent_id"]) == ("box-one", PROJECT_ID)
+    assert (first["node"], first["agent_id"]) == (nid("box-one"), PROJECT_ID)
     assert first["last_seen_at"] is not None
-    lab.sql(f"UPDATE {SCHEMA}.capabilities_agent_nodes "
-            "SET last_seen_at = now() - interval '1 hour' WHERE node = 'box-one' RETURNING node")
+    lab.sql(f"UPDATE {SCHEMA}.capabilities_nodes "
+            "SET last_seen_at = now() - interval '1 hour' WHERE id = %s RETURNING id",
+            (nid("box-one"),))
     again = seen("box-one")
     assert again["last_seen_at"] >= first["last_seen_at"]
     assert lab.sql(f"SELECT last_seen_at > now() - interval '1 minute' FROM "
-                   f"{SCHEMA}.capabilities_agent_nodes WHERE node = 'box-one'") == [(True,)]
+                   f"{SCHEMA}.capabilities_nodes WHERE id = %s", (nid("box-one"),)) == [(True,)]
     listed = {n["node"]: n["last_seen_at"] for n in lab.ok("node", "list")["nodes"]}
-    assert listed == {"box-one": again["last_seen_at"], "box-two": None}
+    assert listed == {nid("box-one"): again["last_seen_at"], nid("box-two"): None}
 
-    code, error = lab.refused("node", "seen", AGENT_NODE_NAME="box-three")
+    code, error = lab.refused("node", "seen", **node_env("box-three"))
     assert (code, error["code"]) == (6, "node_unknown")
-    assert lab.refused("node", "seen", "box-two", AGENT_NODE_NAME="box-one")[0] == 6
+    assert lab.refused("node", "seen", nid("box-two"), **node_env("box-one"))[0] == 6
 
 
 def test_writes_are_refused_under_the_read_only_switch(lab):
-    lab.ok("node", "add", "x", "--kind", "mac")
-    for args in (("agent", "set", "--name", "X"), ("node", "add", "y", "--kind", "mac"),
+    lab.ok("node", "add", nid("x"), "--label", "x", "--kind", "mac")
+    for args in (("agent", "set", "--name", "X"),
+                 ("node", "add", nid("y"), "--label", "y", "--kind", "mac"),
                  ("node", "set", "x", "--may-write"), ("node", "remove", "x"),
                  ("node", "seen")):
         code, error = lab.refused(*args, CAPABILITIES_READ_ONLY="1")
         assert (code, error["code"]) == (4, "read_only_switch")
     result = lab.run("node", "list", CAPABILITIES_READ_ONLY="1")
     assert result.returncode == 0, result.stderr
-    assert [n["node"] for n in json.loads(result.stdout)["nodes"]] == ["x"]
+    assert [n["node"] for n in json.loads(result.stdout)["nodes"]] == [nid("x")]
 
+
+
+def test_a_node_known_by_its_name_moves_to_its_id_and_a_label_renames_it(lab):
+    # A node registered before ids: its name is its id, and rows name it.
+    lab.ok("agent", "show")
+    lab.sql(f"INSERT INTO {SCHEMA}.capabilities_agents (id) VALUES (%s) ON CONFLICT DO NOTHING "
+            "RETURNING id", (PROJECT_ID,))
+    for statement, params in (
+            ("INSERT INTO {s}.capabilities_nodes (id, label, kind) VALUES "
+             "('work-mac', 'work-mac', 'mac'), ('box-one', 'box-one', 'server') RETURNING id", ()),
+            ("UPDATE {s}.capabilities_nodes SET target = 'work-mac' WHERE id = 'box-one' "
+             "RETURNING id", ()),
+            ("INSERT INTO {s}.capabilities_agent_nodes (agent_id, node, is_master) VALUES "
+             "(%s, 'work-mac', true), (%s, 'box-one', false) RETURNING node",
+             (PROJECT_ID, PROJECT_ID)),
+            ("INSERT INTO {s}.capabilities_policy (agent_id, capability, node, enabled, service) "
+             "VALUES (%s, 'tasks', 'work-mac', true, true) RETURNING node", (PROJECT_ID,)),
+            ("INSERT INTO {s}.capabilities_settings_changes (agent_id, capability, node, action, "
+             "path, new_value, changed_by) VALUES (%s, 'tasks', 'work-mac', 'set', '{{a}}', '1', "
+             "'user@work-mac') RETURNING node", (PROJECT_ID,))):
+        lab.sql(statement.format(s=SCHEMA), params)
+    mac = node_env("work-mac")
+
+    def everything() -> dict:
+        tables = [t for (t,) in lab.sql("SELECT tablename FROM pg_tables WHERE schemaname = %s "
+                                        "ORDER BY 1", (SCHEMA,))]
+        return {t: sorted(r for (r,) in lab.sql(f"SELECT to_jsonb(x)::text FROM {SCHEMA}.{t} x"))
+                for t in tables}
+
+    planned = lab.ok("node", "rekey", "work-mac", "--dry-run", **mac)
+    assert (planned["new_id"], planned["store"]["moved"]) == (nid("work-mac"), False)
+    assert {(r["table"], r["rows"]) for r in planned["rows"]} >= {
+        ("capabilities_agent_nodes", 1), ("capabilities_policy", 1),
+        ("capabilities_settings_changes", 1)}
+    moved = lab.ok("node", "rekey", "work-mac", **mac)
+    assert moved["store"]["moved"] is True and moved["label"] == "work-mac"
+    nodes = {n["node"]: n for n in lab.ok("node", "list", **mac)["nodes"]}
+    assert set(nodes) == {nid("work-mac"), "box-one"}
+    assert (nodes[nid("work-mac")]["label"], nodes[nid("work-mac")]["is_master"]) == ("work-mac", True)
+    # The id moved where it named the node, and nowhere else: not the other
+    # node's target, which only reads the same, nor the history text.
+    assert nodes["box-one"]["target"] == "work-mac"
+    assert lab.sql(f"SELECT node FROM {SCHEMA}.capabilities_policy") == [(nid("work-mac"),)]
+    assert lab.sql(f"SELECT node, changed_by FROM {SCHEMA}.capabilities_settings_changes") == [
+        (nid("work-mac"), "user@work-mac")]
+    again = lab.ok("node", "rekey", "work-mac", **mac)
+    assert (again["store"]["already_moved"], again["total_rows"]) == (True, 0)
+    assert lab.ok("node", "seen", **mac)["node"] == nid("work-mac")
+
+    # A rename is the label alone: no other row changes.
+    before = everything()
+    renamed = lab.ok("node", "set", "work-mac", "--label", "Office Mac", **mac)["node"]
+    assert (renamed["node"], renamed["label"]) == (nid("work-mac"), "Office Mac")
+    after = everything()
+    changed = {t for t in before if before[t] != after[t]}
+    assert changed == {"capabilities_nodes"}
+    assert [r for r in after["capabilities_nodes"] if r not in before["capabilities_nodes"]] \
+        == [r for r in after["capabilities_nodes"] if nid("work-mac") in r]
+
+    # A live lease on a node keeps it where it is.
+    with lab.cluster.connect(lab.database) as conn:
+        conn.execute(f"CREATE TABLE {SCHEMA}.deployment_service_leases (project text, capability "
+                     "text, node text NOT NULL, expires_at timestamptz NOT NULL)")
+        conn.execute(f"INSERT INTO {SCHEMA}.deployment_service_leases VALUES (%s, 'tasks', "
+                     "'box-one', now() + interval '3 minutes')", (PROJECT_ID,))
+    code, error = lab.refused("node", "rekey", "box-one", nid("box-one"), **mac)
+    assert (code, error["code"]) == (6, "node_services_running")
+    assert "box-one" in {n["node"] for n in lab.ok("node", "list", **mac)["nodes"]}
 
 
 def _fake_tool(bin_dir: Path, name: str, body: str) -> None:
@@ -584,23 +678,24 @@ def _fake_tool(bin_dir: Path, name: str, body: str) -> None:
 
 
 def test_agent_state_reads_an_agent_across_its_nodes(lab):
-    lab.ok("node", "add", "box-one", "--kind", "server", "--master", "--may-write",
+    lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "server", "--master", "--may-write",
            "--address", "203.0.113.10")
-    lab.ok("node", "add", "box-two", "--kind", "server", "--coolify-connection", "infra",
+    lab.ok("node", "add", nid("box-two"), "--label", "box-two", "--kind", "server", "--coolify-connection", "infra",
            "--coolify-server", "srv-uuid", "--coolify-resource", "res-uuid")
-    lab.ok("node", "add", "mac-one", "--kind", "mac")
-    lab.sql(f"UPDATE {SCHEMA}.capabilities_agent_nodes SET folder = %s, "
-            "last_seen_at = now() WHERE node = 'box-one' RETURNING node",
-            (str(lab.project.resolve()),))
+    lab.ok("node", "add", nid("mac-one"), "--label", "mac-one", "--kind", "mac")
+    lab.sql(f"UPDATE {SCHEMA}.capabilities_agent_nodes SET folder = %s "
+            "WHERE node = %s RETURNING node", (str(lab.project.resolve()), nid("box-one")))
+    lab.sql(f"UPDATE {SCHEMA}.capabilities_nodes SET last_seen_at = now() "
+            "WHERE id = %s RETURNING id", (nid("box-one"),))
     lab.sql(f"UPDATE {SCHEMA}.capabilities_agents SET slug = 'lab' WHERE id = %s "
             "RETURNING id", (PROJECT_ID,))
     for agent, name, node, enabled, service in (
-            (PROJECT_ID, "tasks", "box-one", True, True),
-            (PROJECT_ID, "tasks", "box-two", True, True),
-            (PROJECT_ID, "telegram", "box-two", True, True),
+            (PROJECT_ID, "tasks", nid("box-one"), True, True),
+            (PROJECT_ID, "tasks", nid("box-two"), True, True),
+            (PROJECT_ID, "telegram", nid("box-two"), True, True),
             (PROJECT_ID, "telegram", None, False, False),
             (None, "memory", None, True, False),
-            (None, "telegram", "mac-one", True, False)):
+            (None, "telegram", nid("mac-one"), True, False)):
         lab.sql(f"INSERT INTO {SCHEMA}.capabilities_policy (agent_id, capability, node, "
                 "enabled, service) VALUES (%s, %s, %s, %s, %s) RETURNING capability",
                 (agent, name, node, enabled, service))
@@ -612,9 +707,10 @@ def test_agent_state_reads_an_agent_across_its_nodes(lab):
                      "DEFAULT now(), expires_at timestamptz NOT NULL, "
                      "PRIMARY KEY (project, capability))")
         conn.execute(f"INSERT INTO {SCHEMA}.deployment_service_leases (project, capability, "
-                     "node, expires_at) VALUES (%s, 'telegram', 'box-two', now() + "
-                     "interval '3 minutes'), (%s, 'tasks', 'box-one', now() - "
-                     "interval '1 minute')", (PROJECT_ID, PROJECT_ID))
+                     "node, expires_at) VALUES (%s, 'telegram', %s, now() + "
+                     "interval '3 minutes'), (%s, 'tasks', %s, now() - "
+                     "interval '1 minute')",
+                     (PROJECT_ID, nid("box-two"), PROJECT_ID, nid("box-one")))
     for name, service in (("tasks", {"name": "tasks", "placement": "shared"}),
                           ("telegram", {"name": "telegram"})):
         bundle = lab.tmp / "registry" / name
@@ -624,8 +720,9 @@ def test_agent_state_reads_an_agent_across_its_nodes(lab):
     tools = lab.tmp / "tools"
     _fake_tool(tools, "deployment", "import json, os\nprint(json.dumps({'ok': True, "
                f"'agent_id': {PROJECT_ID!r}, 'live_within_seconds': 180, 'nodes': ["
-               "{'node': 'box-one', 'live': True}, {'node': 'box-two', 'live': False}, "
-               "{'node': 'mac-one', 'live': False}]}))\n"
+               f"{{'node': {nid('box-one')!r}, 'live': True}}, "
+               f"{{'node': {nid('box-two')!r}, 'live': False}}, "
+               f"{{'node': {nid('mac-one')!r}, 'live': False}}]}}))\n"
                "open(os.environ['STATE_CALLS'], 'a').write(os.getcwd() + '\\n')\n")
     _fake_tool(tools, "coolify", "import json, sys\nassert sys.argv[1:] == ['--connection', "
                "'infra', 'servers', 'srv-uuid'], sys.argv\n"
@@ -634,22 +731,23 @@ def test_agent_state_reads_an_agent_across_its_nodes(lab):
     path = f"{tools}{os.pathsep}{os.environ.get('PATH', '')}"
 
     def state(ref: str, **extra: str) -> dict:
-        result = lab.run("agent", "state", ref, "--json", AGENT_NODE_NAME="box-one",
+        result = lab.run("agent", "state", ref, "--json", **node_env("box-one"),
                          PATH=path, STATE_CALLS=str(calls), **extra)
         assert result.returncode == 0, result.stderr
         return json.loads(result.stdout)
 
-    before = lab.sql(f"SELECT node, last_seen_at, folder FROM {SCHEMA}.capabilities_agent_nodes "
-                     "ORDER BY node")
+    nodes_now = (f"SELECT l.node, n.last_seen_at, l.folder FROM {SCHEMA}.capabilities_agent_nodes "
+                 f"l JOIN {SCHEMA}.capabilities_nodes n ON n.id = l.node ORDER BY l.node")
+    before = lab.sql(nodes_now)
     answer = state(PROJECT_ID)
-    assert (answer["agent_id"], answer["this_node"]) == (PROJECT_ID, "box-one")
+    assert (answer["agent_id"], answer["this_node"]) == (PROJECT_ID, nid("box-one"))
     assert answer["liveness"] == {"by": "deployment node list",
                                   "folder": str(lab.project.resolve()),
                                   "live_within_seconds": 180, "reason": None}
     assert calls.read_text().splitlines() == [str(lab.project.resolve())]
     nodes = {n["node"]: n for n in answer["nodes"]}
-    assert list(nodes) == ["box-one", "box-two", "mac-one"]
-    one, two, mac = nodes["box-one"], nodes["box-two"], nodes["mac-one"]
+    assert list(nodes) == [nid("box-one"), nid("box-two"), nid("mac-one")]
+    one, two, mac = nodes[nid("box-one")], nodes[nid("box-two")], nodes[nid("mac-one")]
     assert (one["is_master"], one["may_write"], one["folder"]) == (
         True, True, str(lab.project.resolve()))
     assert (one["address"], one["address_source"]) == ("203.0.113.10", "node")
@@ -660,10 +758,10 @@ def test_agent_state_reads_an_agent_across_its_nodes(lab):
     assert (one["live"], two["live"], mac["live"]) == (True, False, False)
     assert one["gate"] == {
         "memory": {"effective": "enabled", "source": "global", "node": None},
-        "tasks": {"effective": "enabled", "source": "project", "node": "box-one"},
+        "tasks": {"effective": "enabled", "source": "project", "node": nid("box-one")},
         "telegram": {"effective": "disabled", "source": "project", "node": None}}
     assert two["gate"]["telegram"] == {"effective": "enabled", "source": "project",
-                                       "node": "box-two"}
+                                       "node": nid("box-two")}
     assert mac["gate"]["tasks"] == {"effective": "disabled", "source": "default",
                                     "node": None}
     assert mac["gate"]["telegram"] == {"effective": "disabled", "source": "project",
@@ -675,9 +773,9 @@ def test_agent_state_reads_an_agent_across_its_nodes(lab):
     assert set(two["leases"][0]) == {"capability", "acquired_at", "renewed_at", "expires_at"}
     assert answer["services"] == [
         {"capability": "tasks", "placement": "shared", "nodes": None,
-         "placed_on": ["box-one", "box-two"], "holders": []},
+         "placed_on": [nid("box-one"), nid("box-two")], "holders": []},
         {"capability": "telegram", "placement": "exclusive", "nodes": None,
-         "placed_on": ["box-two"], "holders": ["box-two"]}]
+         "placed_on": [nid("box-two")], "holders": [nid("box-two")]}]
 
     # By slug, from outside any project, under the read-only switch: the same
     # read, with no folder of the agent on this node to ask deployment in.
@@ -685,7 +783,7 @@ def test_agent_state_reads_an_agent_across_its_nodes(lab):
     elsewhere.mkdir()
     result = subprocess.run(
         [sys.executable, str(MANAGER), "agent", "state", "lab"], cwd=elsewhere,
-        env={**lab.env(AGENT_NODE_NAME="mac-one", PATH=path, STATE_CALLS=str(calls),
+        env={**lab.env(**node_env("mac-one"), PATH=path, STATE_CALLS=str(calls),
                        CAPABILITIES_READ_ONLY="1",
                        AGENTKIT_DB_URL=lab.cluster.url(lab.database),
                        AGENTKIT_DB_SCHEMA=SCHEMA),
@@ -698,8 +796,7 @@ def test_agent_state_reads_an_agent_across_its_nodes(lab):
     assert all(n["live"] is None for n in remote["nodes"])
     assert [n["placed"] for n in remote["nodes"]] == [["tasks"], ["tasks", "telegram"], []]
     assert calls.read_text().splitlines() == [str(lab.project.resolve())]
-    assert lab.sql(f"SELECT node, last_seen_at, folder FROM "
-                   f"{SCHEMA}.capabilities_agent_nodes ORDER BY node") == before
+    assert lab.sql(nodes_now) == before
 
     code, error = lab.refused("agent", "state", "nobody", PATH=path)
     assert (code, error["code"]) == (6, "agent_unknown")
@@ -750,7 +847,7 @@ class Creation:
         self.lab = lab
         self.folder = tmp_path / "agent"
         self.folder.mkdir()
-        self.extra = {"AGENT_NODE_NAME": "lab-node", "CLAUDE_PROJECT_DIR": str(self.folder),
+        self.extra = {**node_env("lab-node"), "CLAUDE_PROJECT_DIR": str(self.folder),
                       "CONTEXTKIT_TEMPLATES_DIR": str(_templates(tmp_path)),
                       "AGENTKIT_DB_URL": lab.cluster.url(lab.database),
                       "AGENTKIT_DB_SCHEMA": SCHEMA}
@@ -800,7 +897,7 @@ def test_init_template_creates_an_agent_from_a_contextkit_template(lab, tmp_path
                    f"migrated_at IS NOT NULL FROM {SCHEMA}.capabilities_agents WHERE id = %s",
                    (agent_id,)) == [("Probe", "A demo agent.", sha, "pending", "onboarding", True)]
     assert lab.sql(f"SELECT node, is_master FROM {SCHEMA}.capabilities_agent_nodes "
-                   "WHERE agent_id = %s", (agent_id,)) == [("lab-node", True)]
+                   "WHERE agent_id = %s", (agent_id,)) == [(nid("lab-node"), True)]
 
     # Both hosts are wired to the manager, and the first build is made.
     claude = json.loads((folder / ".claude" / "settings.json").read_text())
@@ -1284,8 +1381,8 @@ class Folder:
                               env=self.lab.env(CLAUDE_PROJECT_DIR=str(self.path)),
                               text=True, capture_output=True, timeout=120)
 
-    def ok(self, *args: str) -> dict:
-        result = self.run(*args)
+    def ok(self, *args: str, **extra: str) -> dict:
+        result = self.run(*args, **extra)
         assert result.returncode == 0, result.stderr
         return json.loads(result.stdout)
 
@@ -1491,7 +1588,7 @@ def test_agent_convert_refuses_before_writing_anything(lab, tmp_path):
 
 def test_agent_rekey_moves_an_agent_to_a_new_id_in_the_store_and_on_its_nodes(lab, tmp_path):
     old, new = PROJECT_ID, "0123456789ab"
-    here = {"AGENT_NODE_NAME": "lab-node"}
+    here = {**node_env("lab-node")}
     # A coolify that records what it was asked, standing in for the capability.
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -1513,7 +1610,8 @@ def test_agent_rekey_moves_an_agent_to_a_new_id_in_the_store_and_on_its_nodes(la
                               ("box", "server", ("--coolify-connection", "infra",
                                                  "--coolify-server", "srv-uuid",
                                                  "--coolify-resource", "res-uuid"))):
-        added = lab.run("node", "add", name, "--kind", kind, *extra, **here)
+        added = lab.run("node", "add", nid(name), "--label", name, "--kind", kind, *extra,
+                        **here)
         assert added.returncode == 0, added.stderr
     # A capability's table whose guard refuses any change, a lease table, and
     # a free-text line that only mentions the id.
@@ -1527,7 +1625,7 @@ def test_agent_rekey_moves_an_agent_to_a_new_id_in_the_store_and_on_its_nodes(la
             "(%s, %s), ('prj_00000000beef', 'other')", (old, old, f"made by {old}"))
     execute(f"CREATE TABLE {SCHEMA}.lab_leases (project_id text, node text, "
             "expires_at timestamptz)")
-    execute(f"INSERT INTO {SCHEMA}.lab_leases VALUES (%s, 'old-box', now() + interval '1 hour')",
+    execute(f"INSERT INTO {SCHEMA}.lab_leases VALUES (%s, '{nid('old-box')}', now() + interval '1 hour')",
             (old,))
 
     def rekey(*args: str, cwd: Path = lab.project, **extra: str):
@@ -1558,10 +1656,10 @@ def test_agent_rekey_moves_an_agent_to_a_new_id_in_the_store_and_on_its_nodes(la
     assert ("lab_notes", "note") not in rows
     assert {"table": "lab_notes", "trigger": "lab_notes_guard"} in plan["triggers"]
     assert plan["services_running"] == [
-        {"capability": "lab", "node": "old-box", "until": plan["services_running"][0]["until"],
+        {"capability": "lab", "node": nid("old-box"), "until": plan["services_running"][0]["until"],
          "lease": "lab_leases"}]
-    assert [b["node"] for b in plan["bindings"]] == ["box", "lab-node"]
-    assert [u["node"] for u in plan["unreached"]] == ["far-mac", "old-box"]
+    assert [b["node"] for b in plan["bindings"]] == [nid("box"), nid("lab-node")]
+    assert [u["node"] for u in plan["unreached"]] == [nid("far-mac"), nid("old-box")]
     assert (lab.project / ".env.local").read_text() == env_before
     assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.lab_notes WHERE project_id = %s",
                    (old,)) == [(2,)]
@@ -1589,13 +1687,13 @@ def test_agent_rekey_moves_an_agent_to_a_new_id_in_the_store_and_on_its_nodes(la
     assert lab.sql("SELECT tgenabled FROM pg_trigger WHERE tgname = 'lab_notes_guard'") \
         == [("O",)]
     assert lab.sql(f"SELECT node FROM {SCHEMA}.capabilities_agent_nodes WHERE agent_id = %s "
-                   "ORDER BY node", (new,)) == [("box",), ("far-mac",), ("lab-node",),
-                                                 ("old-box",)]
+                   "ORDER BY node", (new,)) == [(nid("box"),), (nid("far-mac"),), (nid("lab-node"),),
+                                                 (nid("old-box"),)]
     assert (lab.project / ".env.local").read_text() == env_before.replace(
         f"CAPABILITIES_PROJECT_ID={old}", f"CAPABILITIES_PROJECT_ID={new}")
     assert calls.read_text() == (
         f"--connection infra env set res-uuid CAPABILITIES_PROJECT_ID --value-stdin|{new}|{new}\n")
-    assert [u["node"] for u in answer["unreached"]] == ["far-mac", "old-box"]
+    assert [u["node"] for u in answer["unreached"]] == [nid("far-mac"), nid("old-box")]
     assert lab.ok("agent", "show")["agent"]["name"] == "Lab"
 
     # On another Mac of the agent the store has moved already: the same
@@ -1603,13 +1701,13 @@ def test_agent_rekey_moves_an_agent_to_a_new_id_in_the_store_and_on_its_nodes(la
     far = tmp_path / "far"
     far.mkdir()
     (far / ".env.local").write_text(env_before)
-    assert code(rekey(cwd=far, AGENT_NODE_NAME="far-mac")) == (6, "agent_unknown")
-    moved = rekey(new, cwd=far, AGENT_NODE_NAME="far-mac")
+    assert code(rekey(cwd=far, **node_env("far-mac"))) == (6, "agent_unknown")
+    moved = rekey(new, cwd=far, **node_env("far-mac"))
     assert moved.returncode == 0, moved.stderr
     assert json.loads(moved.stdout)["store"]["already_moved"] is True
     assert f"CAPABILITIES_PROJECT_ID={new}\n" in (far / ".env.local").read_text()
     stranger = tmp_path / "stranger"
     stranger.mkdir()
     (stranger / ".env.local").write_text(env_before)
-    assert code(rekey(new, cwd=stranger, AGENT_NODE_NAME="no-such-node")) \
+    assert code(rekey(new, cwd=stranger, **node_env("no-such-node"))) \
         == (6, "agent_unknown")
