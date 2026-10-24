@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.21,<1",
+#     "capabilities-contract>=0.21.1,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -9642,6 +9642,11 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
                 conn.execute(f"ALTER TABLE {qualified(t['table'])} ENABLE "
                              f"{modes.get(t['mode'], '')}TRIGGER "
                              f"{_rekey_ident(t['trigger'])}")
+            # The node fields a store keeps on the links for older readers
+            # copy the moved row again, which the merge changed with the
+            # triggers off.
+            conn.execute("UPDATE capabilities_agent_nodes SET node = node WHERE node = %s",
+                         (new,))
             left = [f"{hit['table']}.{hit['column']}" for hit in plan
                     if conn.execute(
                         f"SELECT count(*) FROM {qualified(hit['table'])} WHERE "

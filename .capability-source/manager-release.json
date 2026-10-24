@@ -5,7 +5,7 @@
     "SHEBANG.md": "5aeb98f47536abb826b880e6419faf71789b90fb66e787d57eb6e4c960f2daf8",
     "SOURCES.md": "f130558217bd581ccff5ed8020d35c7e2e155b59894e6e2fc01dc63e5f1a4aaa",
     "TEMPLATE.md": "29f72a0c4dfeb08a8434fc89440e799bba6a42a933b5819bd6e897af6d15c73b",
-    "contract/CHANGELOG.md": "50a3b7eea5bfa84a014907cfdfc2b6ae5c663eef079e836c610bf6a1006daaa9",
+    "contract/CHANGELOG.md": "dec34f9d45300f4fd3edab604c3df9712b3f0696a3df64293a105643fe267b5a",
     "guides/authoring.md": "67fef4797186e0da177c9f860f67897187f079d8aa8a0af4c4ca63649023a310",
     "guides/conforming.md": "d2724037c42aea0d0528b429be0eb14a16b558426ee3982b4a6f541a342e7361",
     "guides/contract.md": "8dfbe840b2c17fe73e718971a65913d271f72b5767b1f18b1fca13e2f65cee08",
@@ -17,12 +17,12 @@
     "guides/repositories.md": "61c593b97dc699a8932892ceacbb86f8231222faa06a6915d0d97f25756d76b2",
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "44b853b3747dd5ebf9464d92886d75f73e0471a9d3b4f4c3250e5a07943b5066",
+    "manager/CHANGELOG.md": "b4628f15440bdf9b661a02585fbec8fa0eb53e233a91415988205ebae12a9202",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "b03db0eb257d900fa226f3c5396e74f3c0f49f13fcc8c73f97896baf1a9530ae"
+    "sha256": "c6e612808a0bf3bdc6c79c1b18db56754e3b72ddac8e36734a51e5ce21ca453f"
   },
   "schema": "capabilities.manager-release.v1"
 }
