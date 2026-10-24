@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-24 — A routine the agent switched off leaves its routine index
+
+`build` leaves out of the routine index it composes from the store each routine of the agent's own that `routine disable` switched off. A routine switched off still counts toward reading the routines from the store rather than the folder, so an agent whose routines are all off gets an index with no routine in it, not the folder's. A store whose routine tables predate switching a routine off is read as before.
+
 ## 2026-10-24 — `agent state` reads an agent across its nodes in one call
 
 `capabilities agent state <id|slug>` answers, for an agent the store holds, every node with its row as `node list` gives it, its `address` (the row's, else the `ip` of the Coolify server it was created on, asked through `coolify servers` and the node's connection; `address_source` says which, `address_error` why none was found), `seen_seconds_ago`, `live`, the gate of each capability a policy row names with the layer that decided it (`source` project, global, machine or default, `node` the node the row was for), the services placed there and the live leases it holds in `deployment_service_leases`; and, per capability with a service installed here or placed on a node, its descriptor's `placement`, its declared `nodes` (null until a descriptor declares `single` or `several`), the nodes it is placed on and the nodes holding its lease. `live` is deployment's answer, read with `deployment node list` in the agent's folder on this machine; where deployment is not installed or the agent has no folder here it is null and `liveness.reason` names why. It writes nothing, needs no project, is allowed under the read-only switch, and exits 6 `agent_unknown` for an agent the store does not hold.

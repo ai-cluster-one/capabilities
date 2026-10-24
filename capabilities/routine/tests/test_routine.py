@@ -230,7 +230,7 @@ def test_the_ledger_creates_the_tables_with_their_indexes_comments_and_guard(lab
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'routine' ORDER BY step")]
     assert steps == ["0001-documents", "0002-versions", "0003-versions-guard", "0004-global",
-                     "0005-enablements"]
+                     "0005-enablements", "0006-disabled"]
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
     assert "WHERE active" in indexes["routine_versions_active"]
@@ -566,6 +566,47 @@ def test_a_global_routine_reaches_a_project_only_once_it_is_enabled(lab):
     assert lab.ok("disable", "shared")["changed"] is False
     assert lab.ok("list", "--store", "--json")["count"] == 0
     assert lab.refused("show", "shared")[0] == 3
+
+
+def test_a_routine_is_switched_off_for_the_agent_whether_its_own_or_global(lab):
+    lab.ok("save", "defect-intake", "--from", "-", stdin=FILES["defect-intake.md"])
+    other = _other_project(lab)
+    lab.ok("save", "shared", "--from", "-", "--global", stdin=SHARED, **other)
+    lab.ok("enable", "shared")
+
+    def listed() -> dict:
+        return {r["name"]: (r["origin"], r["enabled"])
+                for r in lab.ok("list", "--json")["routines"]}
+
+    assert listed() == {"defect-intake": ("own", True), "shared": ("global", True)}
+    off = lab.ok("disable", "defect-intake")
+    assert (off["origin"], off["enabled"], off["changed"]) == ("own", False, True)
+    assert lab.ok("disable", "defect-intake")["changed"] is False
+    [(by,)] = lab.sql(f"SELECT disabled_by FROM {SCHEMA}.routine_documents "
+                      "WHERE name = 'defect-intake'")
+    assert by == "tester@test-node"
+    assert listed() == {"defect-intake": ("own", False), "shared": ("global", True)}
+    assert lab.ok("show", "defect-intake") == FILES["defect-intake.md"]
+
+    gone = lab.ok("disable", "shared")
+    assert (gone["origin"], gone["enabled"], gone["changed"]) == ("global", False, True)
+    assert listed() == {"defect-intake": ("own", False)}
+    assert [(r["name"], r["origin"], r["enabled"]) for r in
+            lab.ok("list", "--store", "--global", "--json")["routines"]] == [
+                ("shared", "global", False)]
+
+    on = lab.ok("enable", "defect-intake")
+    assert (on["origin"], on["enabled"], on["changed"]) == ("own", True, True)
+    assert lab.ok("enable", "defect-intake")["changed"] is False
+    assert lab.ok("enable", "shared")["origin"] == "global"
+    assert listed() == {"defect-intake": ("own", True), "shared": ("global", True)}
+
+    # A routine of the agent's own of a global one's name is the one switched;
+    # --global names the global one.
+    lab.ok("save", "shared", "--from", "-", stdin=SHARED.replace("every agent", "here"))
+    assert lab.ok("disable", "shared")["origin"] == "own"
+    assert lab.ok("disable", "shared", "--global")["origin"] == "global"
+    assert listed() == {"defect-intake": ("own", True), "shared": ("own", False)}
 
 
 def test_only_the_author_project_changes_a_global_routine_and_hands_it_on(lab):

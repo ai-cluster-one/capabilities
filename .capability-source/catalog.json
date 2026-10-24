@@ -142,7 +142,7 @@
     },
     "routine": {
       "path": "capabilities/routine",
-      "payload_sha256": "a0b20c540024661d1def102dcfc2601f958bc136033aaeb0576665519b30d113",
+      "payload_sha256": "0983a5d54b583677c7bdeccb407a9e48f719a8c5399cb1007c6c8a8c6acba475",
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes, and keep routines as versioned documents in the project's store: show, save with a base, history, diff, retire, and import and export the routines folder byte for byte."
     },
     "signoz": {

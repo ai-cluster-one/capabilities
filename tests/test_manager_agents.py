@@ -1196,6 +1196,46 @@ def test_build_indexes_a_global_routine_once_the_agent_enables_it(lab):
     assert build() == before
 
 
+def test_build_leaves_out_a_routine_the_agent_switched_off(lab):
+    project = lab.project
+    (project / ".contextkit").mkdir()
+    (project / ".contextkit" / "config.toml").write_text(
+        f'version = 1\ntype = "agent-project"\n\n[identity]\nid = "{PROJECT_ID}"\n')
+    (project / "context" / "identity").mkdir(parents=True)
+    (project / "context" / "identity" / "MISSION.md").write_text(
+        _context_text(*_CONTEXT_FILES["identity/MISSION"]))
+    _seed_routines(lab, [(PROJECT_ID, "alpha", False, [("Run first by name.", "# Alpha\n", True)]),
+                         (PROJECT_ID, "beta", False, [("Run second.", "# Beta\n", True)])])
+
+    def build() -> str:
+        result = lab.run("build", "--print")
+        assert result.returncode == 0, result.stderr
+        return result.stdout
+
+    before = build()
+    # The column as the routine ledger's switching step leaves it.
+    with lab.cluster.connect(lab.database) as conn:
+        conn.execute(f"ALTER TABLE {SCHEMA}.routine_documents ADD COLUMN disabled_at timestamptz")
+    assert build() == before
+
+    def switch(name: str, off: bool) -> None:
+        with lab.cluster.connect(lab.database) as conn:
+            conn.execute(f"UPDATE {SCHEMA}.routine_documents SET disabled_at = "
+                         + ("now()" if off else "NULL") + " WHERE name = %s", (name,))
+
+    switch("alpha", True)
+    one_off = build()
+    assert "routine show alpha" not in one_off
+    assert "- **beta** (`routine show beta`) - Run second.\n" in one_off
+    switch("beta", True)
+    all_off = build()
+    assert "generated from the store's active routine versions" in all_off
+    assert "routine show alpha" not in all_off and "routine show beta" not in all_off
+    switch("alpha", False)
+    switch("beta", False)
+    assert build() == before
+
+
 def test_build_points_the_onboarding_block_at_the_routine_where_the_agent_keeps_it(lab):
     project = lab.project
     (project / ".contextkit").mkdir()

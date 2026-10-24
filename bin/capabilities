@@ -14947,20 +14947,27 @@ def _ck_routine_entries(root: Path, routines_dir: Path, warnings: list[str]) -> 
 def _ck_stored_routine_rows(root: Path) -> list[tuple] | None:
     """The active versions of this project's unretired routines in its store,
     and of the global routines it has enabled and holds no routine of the same
-    name for, as (name, description), read in a read-only transaction; None
-    where the project keeps none there: no store, no project id, no tables,
-    or no routine. A store whose routine tables predate enabling reads the
-    project's own alone."""
+    name for, as (name, description, off), `off` where the project switched a
+    routine of its own off, read in a read-only transaction; None where the
+    project keeps none there: no store, no project id, no tables, or no
+    routine. A store whose routine tables predate enabling reads the project's
+    own alone, and one that predates switching a routine off reads each on."""
     def query(conn, project):
         enabling = conn.execute("SELECT to_regclass('routine_enablements') IS NOT NULL"
                                 ).fetchone()[0]
+        switching = conn.execute(
+            "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = "
+            "to_regclass('routine_documents') AND attname = 'disabled_at' "
+            "AND NOT attisdropped)").fetchone()[0]
         enabled = (" OR (d.project_id IS NULL AND EXISTS (SELECT 1 FROM routine_enablements e "
                    "WHERE e.document_id = d.id AND e.project_id = %(project)s) "
                    "AND NOT EXISTS (SELECT 1 FROM routine_documents o "
                    "WHERE o.project_id = %(project)s AND o.name = d.name "
                    "AND o.retired_at IS NULL))") if enabling else ""
         return conn.execute(
-            "SELECT d.name, v.description FROM routine_documents d JOIN routine_versions v "
+            "SELECT d.name, v.description, "
+            + ("d.disabled_at IS NOT NULL" if switching else "false")
+            + " FROM routine_documents d JOIN routine_versions v "
             "ON v.document_id = d.id AND v.active WHERE d.retired_at IS NULL "
             f"AND (d.project_id = %(project)s{enabled})", {"project": project}).fetchall()
     rows = _ck_store_read(root, query)
@@ -14969,10 +14976,11 @@ def _ck_stored_routine_rows(root: Path) -> list[tuple] | None:
 
 def _ck_stored_routines(root: Path, routines_dir: Path, warnings: list[str],
                         store: dict) -> list | None:
-    """The routines this agent keeps in its store, as (name, one-line
-    description) ordered by name; None where the build reads the folder - the
-    agent keeps no routine in the store, the store already failed earlier in
-    this build, or the store did not answer, which adds a warning."""
+    """The routines this agent keeps in its store and has not switched off, as
+    (name, one-line description) ordered by name; None where the build reads
+    the folder - the agent keeps no routine in the store, the store already
+    failed earlier in this build, or the store did not answer, which adds a
+    warning. A routine switched off still keeps the build on the store."""
     if store["failed"]:
         return None
     code, rows, err = _ck_in_process(lambda: _ck_stored_routine_rows(root))
@@ -14987,7 +14995,8 @@ def _ck_stored_routines(root: Path, routines_dir: Path, warnings: list[str],
     if (root / routines_dir).exists():
         warnings.append(f"routines are read from the store; the routines folder "
                         f"`{routines_dir.as_posix()}/` is no longer read and can be removed")
-    return sorted((name, _ck_one_line(description)) for name, description in rows)
+    return sorted((name, _ck_one_line(description)) for name, description, off in rows
+                  if not off)
 
 
 def _ck_routine_index(root: Path, routines_dir: Path, warnings: list[str],

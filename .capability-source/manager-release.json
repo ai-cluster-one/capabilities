@@ -17,12 +17,12 @@
     "guides/repositories.md": "61c593b97dc699a8932892ceacbb86f8231222faa06a6915d0d97f25756d76b2",
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "4468b7e5d48284055ade81ba2c191a5092c00db8ed1c1acdf8c588a38111ed41",
+    "manager/CHANGELOG.md": "ccf70e8f8f1fdde9347c6983ae451e4689c4095e8267071d07d002f292134c56",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "b70a0c2dd67565b50118332b2f5092bcea94811644d0fdbae6026d927c8dd8d9"
+    "sha256": "a328f2ab5e956f8894822c4ac878e3d0f697ab4a62ca4519a8aa809ba05260c3"
   },
   "schema": "capabilities.manager-release.v1"
 }

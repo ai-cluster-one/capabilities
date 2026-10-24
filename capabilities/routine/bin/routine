@@ -29,7 +29,9 @@ Commands:
       List the project's routines where they live, by the rule `titles`
       states: where the store holds an active routine of this project, what
       `list --store` lists; otherwise the routine files under `.routines/`
-      and their parsed front matter.
+      and their parsed front matter. Every routine --json lists carries
+      `origin` (`own`, or `global` for a global routine) and `enabled`,
+      whether it is on for this agent; a routine file is its own and on.
 
   routine validate [--json]
       Check that every routine markdown file has exactly the expected front
@@ -80,6 +82,8 @@ Routines in the store:
       name, version, title, description - and every global routine it has
       enabled, marked global with its author, unless a routine of its own
       has the same name: that one is listed instead, marked as shadowing it.
+      A routine of its own that is switched off is listed too, `enabled`
+      false, and still shadows a global one of its name.
   routine show <name> [--version ID] [--global] [--json]
       The active version, or the version ID names, in the file form. --json
       adds the version id, who saved it, when, and its note; the version id is
@@ -143,7 +147,8 @@ Global routines:
   shadows it.
 
   routine list --store --global [--json]
-      Every global routine with its active version and its author project.
+      Every global routine with its active version and its author project;
+      run in a project, --json marks each `enabled` or not for it.
   routine save <name> --from FILE|- --global [--base ID] [--note TEXT]
   routine retire <name> --global
   routine show|history|diff <name> ... --global
@@ -152,18 +157,24 @@ Global routines:
   routine transfer <name> --to PROJECT_ID
       Make the project PROJECT_ID the global routine's author. Run by its
       current author alone; the receiver cannot take it.
-  routine enable <name>
-  routine disable <name>
-      Take the global routine up in this project, or let it go: enabled, it
-      is in `list --store`, `show`, `titles`, and the routine index the
-      manager builds. Recorded with who enabled it and when; disabling
-      removes the record. Safe to repeat: answers `"changed": false`.
+  routine enable <name> [--global]
+  routine disable <name> [--global]
+      Switch the routine of that name on or off for this agent: its own
+      routine, else the global one; --global names the global one. A global
+      routine enabled is in `list --store`, `show`, `titles`, and the
+      routine index the manager builds; recorded with who enabled it and
+      when, and disabling removes the record. A routine of the agent's own
+      switched off leaves the routine index the manager builds, and stays
+      in the store, `list` and every other verb, recorded with who switched
+      it off and when; enabling it clears that. Answers `origin` (`own` or
+      `global`) and `enabled`. Safe to repeat: answers `"changed": false`.
 
   enable, disable and transfer are writes (exit 4 `read_only_switch` under
   CAPABILITIES_READ_ONLY).
 
   The tables are routine_documents (one row per routine: project, or none
-  and its author project for a global one, name, created, retired),
+  and its author project for a global one, name, created, retired, and
+  for a project's own when it is switched off),
   routine_versions (one row per version) and routine_enablements (one row
   per global routine a project has enabled), in the schema
   the project's store setting names, migrated under the `routine` ledger. One
@@ -442,7 +453,8 @@ def cmd_doctor(args) -> None:
 def cmd_list(args) -> None:
     _rroot, entries = _entries()
     if args.json:
-        _emit(entries)
+        # A routine file is the agent's own, and has no off state.
+        _emit([{**e, "origin": "own", "enabled": True} for e in entries])
     else:
         for e in entries:
             status = "ERROR" if e.get("error") else "OK"
@@ -498,7 +510,7 @@ def cmd_groom(args) -> None:
 # versions reference their routine by a foreign key: both tables are this
 # capability's own and a routine is retired rather than deleted, so the key
 # never blocks a write and refuses only a version of no routine.
-LEDGER_MAJOR, LEDGER_MINOR = 1, 1
+LEDGER_MAJOR, LEDGER_MINOR = 1, 2
 _STORE_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"
 LEDGER_STEPS = [
     ("0001-documents", f"""
@@ -611,6 +623,21 @@ LEDGER_STEPS = [
         'The global routine enabled: a routine_documents row with no project.';
     COMMENT ON COLUMN routine_enablements.enabled_by IS
         'Who enabled it: user@node.';
+    """),
+    # A project's own routine is switched off for its agent on its own row: it
+    # belongs to that one project, so its off state is a property of the
+    # routine rather than a row of its own. A global routine is off for a
+    # project by having no enablement.
+    ("0006-disabled", """
+    ALTER TABLE routine_documents ADD COLUMN disabled_at timestamptz;
+    ALTER TABLE routine_documents ADD COLUMN disabled_by text CHECK (disabled_by <> '');
+    ALTER TABLE routine_documents ADD CONSTRAINT routine_documents_disabled
+        CHECK ((disabled_at IS NULL) = (disabled_by IS NULL)
+               AND (disabled_at IS NULL OR project_id IS NOT NULL));
+    COMMENT ON COLUMN routine_documents.disabled_at IS
+        'When the project switched its own routine off: it leaves the routine index the manager builds and stays in the store. NULL while it is on, and always for a global routine.';
+    COMMENT ON COLUMN routine_documents.disabled_by IS
+        'Who switched it off: user@node.';
     """),
 ]
 
@@ -921,13 +948,17 @@ def _version_view(version: dict, with_body: bool = True) -> dict:
 def cmd_store_list(args) -> None:
     if args.is_global:
         project = _reader(True)
-        where, params = "d.project_id IS NULL", {}
+        where, params = "d.project_id IS NULL", {"project": project}
     else:
         project = _scope(write=False)
         where, params = _SEEN, {"project": project}
     with _store() as conn:
         rows = _rows(conn, "SELECT d.name, d.project_id IS NULL AS global, d.author_project_id, "
                      "v.id, v.title, v.description, v.created_at, "
+                     + ("EXISTS (SELECT 1 FROM routine_enablements e WHERE e.document_id = d.id "
+                        "AND e.project_id = %(project)s)" if args.is_global and project
+                        else "(d.project_id IS NULL OR d.disabled_at IS NULL)")
+                     + " AS enabled, "
                      "(d.project_id IS NOT NULL AND EXISTS (SELECT 1 FROM routine_documents g "
                      "JOIN routine_enablements e ON e.document_id = g.id "
                      "AND e.project_id = d.project_id WHERE g.project_id IS NULL "
@@ -940,7 +971,9 @@ def cmd_store_list(args) -> None:
         for r in rows:
             item = {"name": r["name"], "version": str(r["id"]), "title": r["title"],
                     "description": r["description"], "saved_at": _moment(r["created_at"]),
-                    "global": r["global"]}
+                    "global": r["global"], "origin": "global" if r["global"] else "own"}
+            if project is not None:
+                item["enabled"] = r["enabled"]
             if r["global"]:
                 item["author"] = r["author_project_id"]
             elif r["shadows_global"]:
@@ -957,6 +990,7 @@ def cmd_store_list(args) -> None:
     _emit("\n".join(f"{r['name']:<{width}}  {str(r['id'])[:8]}  {r['description']}"
                     + (f"  (global, by {r['author_project_id']})" if r["global"] else "")
                     + ("  (shadows a global routine)" if r["shadows_global"] else "")
+                    + ("  (off)" if project is not None and not r["enabled"] else "")
                     for r in rows))
 
 
@@ -1188,18 +1222,40 @@ def cmd_transfer(args) -> None:
            "changed": to != project})
 
 
+def _switch_own(conn, project: str, name: str, on: bool, is_global: bool) -> dict | None:
+    """Switch the project's own routine of `name` on or off and answer it, or
+    None where the switch is for the global routine of that name: --global,
+    or no routine of the project's own of that name."""
+    if is_global:
+        return None
+    document = _document(conn, project, name, lock=True)
+    if document is None:
+        return None
+    changed = _rows(conn, "UPDATE routine_documents SET disabled_at = "
+                    + ("NULL, disabled_by = NULL WHERE id = %s AND disabled_at IS NOT NULL"
+                       if on else "now(), disabled_by = %s WHERE id = %s AND disabled_at IS NULL")
+                    + " RETURNING id", (document["id"],) if on else (_actor(), document["id"]))
+    return {"name": name, "project": project, "origin": "own", "enabled": on,
+            "changed": bool(changed)}
+
+
 def cmd_enable(args) -> None:
     name = _check_name(args.name)
     project = _scope(write=True)
     with _store() as conn:
         with conn.transaction():
-            document = _need_document(conn, None, name)
-            added = _one(conn, "INSERT INTO routine_enablements (project_id, document_id, "
-                         "enabled_by) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING "
-                         "RETURNING enabled_at", (project, document["id"], _actor()))
-            shadowed = _document(conn, project, name) is not None
-    found = {"name": name, "project": project, "enabled": True, "changed": added is not None,
-             "author": document["author_project_id"]}
+            own = _switch_own(conn, project, name, True, args.is_global)
+            if own is None:
+                document = _need_document(conn, None, name)
+                added = _one(conn, "INSERT INTO routine_enablements (project_id, document_id, "
+                             "enabled_by) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING "
+                             "RETURNING enabled_at", (project, document["id"], _actor()))
+                shadowed = _document(conn, project, name) is not None
+    if own is not None:
+        _emit(own)
+        return
+    found = {"name": name, "project": project, "origin": "global", "enabled": True,
+             "changed": added is not None, "author": document["author_project_id"]}
     if shadowed:
         found["shadowed_by_project_routine"] = True
     _emit(found)
@@ -1210,11 +1266,17 @@ def cmd_disable(args) -> None:
     project = _scope(write=True)
     with _store() as conn:
         with conn.transaction():
-            document = _need_document(conn, None, name)
-            gone = _rows(conn, "DELETE FROM routine_enablements WHERE project_id = %s "
-                         "AND document_id = %s RETURNING document_id",
-                         (project, document["id"]))
-    _emit({"name": name, "project": project, "enabled": False, "changed": bool(gone)})
+            own = _switch_own(conn, project, name, False, args.is_global)
+            if own is None:
+                document = _need_document(conn, None, name)
+                gone = _rows(conn, "DELETE FROM routine_enablements WHERE project_id = %s "
+                             "AND document_id = %s RETURNING document_id",
+                             (project, document["id"]))
+    if own is not None:
+        _emit(own)
+        return
+    _emit({"name": name, "project": project, "origin": "global", "enabled": False,
+           "changed": bool(gone)})
 
 
 def _folder(given: str | None) -> Path:
@@ -1658,8 +1720,8 @@ def main(argv: list[str] | None = None) -> None:
     save.add_argument("--base")
     save.add_argument("--note")
     global_flag(store_verb("retire", cmd_retire)).add_argument("name")
-    store_verb("enable", cmd_enable).add_argument("name")
-    store_verb("disable", cmd_disable).add_argument("name")
+    global_flag(store_verb("enable", cmd_enable)).add_argument("name")
+    global_flag(store_verb("disable", cmd_disable)).add_argument("name")
     transfer = store_verb("transfer", cmd_transfer)
     transfer.add_argument("name")
     transfer.add_argument("--to", required=True)
