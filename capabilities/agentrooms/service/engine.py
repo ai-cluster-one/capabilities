@@ -242,6 +242,9 @@ SERVED_TYPE = "agentrooms.served"
 DIRECTORY_TYPE = "agentrooms.directory"
 # Where custom data rides in a message's content.
 DATA_KEY = "agentrooms.data"
+# Where a message written by an agent's supervisor from the agent's account
+# names that supervisor (`post --as-supervisor`).
+SUPERVISOR_KEY = "agentrooms.supervisor"
 # Set in the environment of every turn the service starts, so what the agent
 # runs knows it runs under a worker, and a worker's fence cannot be rewritten
 # from inside the turn it fences.
@@ -486,6 +489,12 @@ def turn_admits(store, project: str, turn: dict) -> Callable[[dict], bool]:
               if row else load_default())
     return lambda wake: (wake["kind"] in worker["wakes_on"]
                          and admits(worker["accepts_from"], wake.get("sender")))
+
+
+def supervisor_of(content: dict) -> str | None:
+    """The supervisor a message says wrote it from its sender's account, if any."""
+    value = content.get(SUPERVISOR_KEY)
+    return value if isinstance(value, str) and value else None
 
 
 def is_default_answer(content: dict) -> bool:
@@ -1429,10 +1438,17 @@ def read_sync(response: dict, user_id: str, rooms: dict[str, RoomView], *,
 # ── building a turn ──────────────────────────────────────────────────────────
 
 
-def message_line(event: dict, wake_ids: set[str]) -> str:
+def message_line(event: dict, wake_ids: set[str], user_id: str | None = None) -> str:
     content = event.get("content") or {}
     when = ts_iso(event.get("origin_server_ts")) or "?"
     parts = [f"[{when}] {event.get('sender')}"]
+    supervisor = supervisor_of(content)
+    if supervisor and event.get("sender") == user_id:
+        parts = [f"[{when}] {supervisor}, your supervisor, writing from your account - "
+                 "their words, not yours"]
+    elif supervisor:
+        parts = [f"[{when}] {supervisor}, supervisor of {event.get('sender')}, writing from "
+                 "its account"]
     meta = [f"event {event.get('event_id')}"]
     root = thread_root(content)
     if root:
@@ -1474,7 +1490,7 @@ def with_rules(profile, rules: str):
 
 
 def build_prompt(*, room_id: str, room_name: str | None, wakes: list[dict],
-                 events: list[dict], primed: bool) -> str:
+                 events: list[dict], primed: bool, user_id: str | None = None) -> str:
     """The turn's user prompt: what woke the agent and the room's messages. The
     room's rules travel in the system prompt (`room_rules`), not here."""
     kinds = sorted({w["kind"] for w in wakes})
@@ -1486,7 +1502,7 @@ def build_prompt(*, room_id: str, room_name: str | None, wakes: list[dict],
         lines += ["", "=== Room history ===" if primed
                   else "=== New in the room since your last turn ==="]
         for event in events:
-            lines += [message_line(event, wake_ids), ""]
+            lines += [message_line(event, wake_ids, user_id), ""]
     elif primed:
         lines += ["", "(No readable messages in the room.)"]
     return "\n".join(lines).rstrip() + "\n"
@@ -2454,7 +2470,8 @@ class Engine:
                 self.host.template(slot.entry), agent=agent, room_id=room_id,
                 room_name=room_name, role=worker["body"]))
             prompt = build_prompt(room_id=room_id, room_name=room_name, wakes=wakes,
-                                  events=shown, primed=not resumable)
+                                  events=shown, primed=not resumable,
+                                  user_id=agent["user_id"])
             runner = self.host.runner()
             session = (runner.Session.resume(row["session_id"]) if resumable
                        else runner.Session.fresh())
@@ -2469,7 +2486,7 @@ class Engine:
                 slot.log(f"{cid}: session {row['session_id']} is not on this node; "
                          "starting a fresh one primed from the room")
                 prompt = build_prompt(room_id=room_id, room_name=room_name, wakes=wakes,
-                                      events=events, primed=True)
+                                      events=events, primed=True, user_id=agent["user_id"])
                 result = self.call_runner(turn, timeout, profile, prompt, runner.Session.fresh(),
                                           runner)
             session_id = getattr(result, "session_id", None)

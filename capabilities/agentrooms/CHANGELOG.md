@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-24 — A supervisor posts as its agent, marked as the supervisor's words
+
+`agentrooms post ROOM TEXT --as-supervisor` posts from the agent's account in the name of the connection's supervisor: the content carries `agentrooms.supervisor`, the supervisor's user id, and the body starts `[supervisor] ` for clients that show only the body. Mentions are taken from TEXT as before. A connection with no supervisor exits 6 `supervisor_unset`, and inside a turn the service started it is refused (exit 4 `policy`), so the agent cannot write its supervisor's words itself. Message rows of `read`, `watch` and `catch-up` gain `supervisor`, the user id the mark names, null on every other message. In the agent's turns such a message is headed as its supervisor's, written from its account, not as its own; like every post from the agent's account it wakes nothing in the agent. A post without the flag is unchanged.
+
 ## 2026-10-24 — Turns run on callva-harness-runner 0.10.1
 
 The runner is pinned at 0.10.1 in place of 0.9.0. Claude turns run through claude-agent-sdk 0.2.174, and a claude CLI up to 2.1.310 runs without the runner's out-of-range warning; codex is unchanged. The runner's 0.10.0 additions are new profile knobs only, so a turn runs as before.

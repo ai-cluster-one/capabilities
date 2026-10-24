@@ -221,9 +221,11 @@ COMMANDS
     read ROOM [--limit N]
         The last N messages (default 20, 1-100), oldest first: {room_id,
         limit, count, more, messages: [{event_id, sender, ts, msgtype, body,
-        thread, reply_to, data, file}]}. `more` is true when older messages
-        exist beyond N. Refuses an encrypted room. An archived room - or any
-        room the agent left - reads up to the agent's leave.
+        thread, reply_to, data, file, supervisor}]}. `more` is true when older
+        messages exist beyond N. supervisor is the user id a message posted
+        with `post --as-supervisor` names, null on any other. Refuses an
+        encrypted room. An archived room - or any room the agent left -
+        reads up to the agent's leave.
     open NAME --invite WHO [--invite WHO ...] [--topic TEXT]
         WRITE. Create a room: room version 12, unfederated, unencrypted,
         invite-only, its rights fixed at creation through the power-level
@@ -266,7 +268,7 @@ COMMANDS
   homeserver did not answer exits switch_not_written; the room is then
   served until `serve` writes it.
     post ROOM TEXT [--thread EVENT] [--reply-to EVENT] [--data JSON]
-                   [--file PATH] [--txn-id KEY]
+                   [--file PATH] [--txn-id KEY] [--as-supervisor]
         WRITE. Send one message. TEXT `-` reads standard input. --thread
         posts into the thread rooted at EVENT; --reply-to quotes EVENT;
         --data attaches a JSON object under the content key "agentrooms.data";
@@ -275,7 +277,14 @@ COMMANDS
         (@agent:example.org) is mentioned, which wakes that agent. --txn-id
         makes a repeat safe: the homeserver delivers one message per KEY per
         token, so a retry after a timeout reuses it. -> {room_id, event_id,
-        txn_id}. Refuses an encrypted room.
+        txn_id}. Refuses an encrypted room. --as-supervisor posts the
+        connection's supervisor's words from the agent's account: the
+        content carries "agentrooms.supervisor" (the supervisor's user id)
+        and the body starts "[supervisor] " for other clients; the agent
+        reads it in its turns as its supervisor's, and it wakes nothing in
+        the agent, as none of the agent's own posts do. A connection with no
+        supervisor exits 6 supervisor_unset (`workers supervisor` sets it);
+        inside a turn the service started it is refused (exit 4 policy).
     mark ROOM / unmark ROOM
         WRITE. Mark a room so the service wakes this agent on every message
         in it, or take the mark off. The mark is this agent's own room
@@ -885,6 +894,11 @@ HOMESERVER_KEY = "AGENTROOMS_HOMESERVER"
 REGISTRATION_KEY = "AGENTROOMS_REGISTRATION_TOKEN"
 ROOM_VERSION = "12"
 DATA_KEY = "agentrooms.data"
+# A message the agent's supervisor wrote from the agent's account carries the
+# supervisor's user id under this content key, and its body this prefix for
+# clients that show no more than the body.
+SUPERVISOR_KEY = "agentrooms.supervisor"
+SUPERVISOR_PREFIX = "[supervisor] "
 MARK_TYPE = "agentrooms.marked"
 GRANT_TYPE = "agentrooms.grant"
 SERVED_TYPE = "agentrooms.served"
@@ -1549,7 +1563,8 @@ def _message_row(event: dict) -> dict:
             if isinstance(ts, (int, float)) else None)
     return {"event_id": event.get("event_id"), "sender": event.get("sender"), "ts": when,
             "msgtype": content.get("msgtype"), "body": content.get("body"),
-            "thread": thread, "reply_to": reply, "data": content.get(DATA_KEY), "file": file}
+            "thread": thread, "reply_to": reply, "data": content.get(DATA_KEY), "file": file,
+            "supervisor": _engine().supervisor_of(content)}
 
 
 def cmd_read(cfg: dict, room: str, limit: int) -> dict:
@@ -2060,15 +2075,17 @@ def _upload(m: Matrix, path: Path) -> dict:
 
 
 def _message_content(cfg: dict, text: str, thread: str | None, reply: str | None,
-                     data: dict | None, upload: dict | None) -> dict:
+                     data: dict | None, upload: dict | None,
+                     supervisor: str | None = None) -> dict:
+    prefix = SUPERVISOR_PREFIX if supervisor else ""
     if upload:
         family = upload["mimetype"].split("/", 1)[0]
         msgtype = {"image": "m.image", "video": "m.video", "audio": "m.audio"}.get(family, "m.file")
-        content: dict = {"msgtype": msgtype, "body": text or upload["name"],
+        content: dict = {"msgtype": msgtype, "body": prefix + (text or upload["name"]),
                          "filename": upload["name"], "url": upload["url"],
                          "info": {"mimetype": upload["mimetype"], "size": upload["size"]}}
     else:
-        content = {"msgtype": "m.text", "body": text}
+        content = {"msgtype": "m.text", "body": prefix + text}
     mentioned = sorted({u for u in USER_RE.findall(text) if u != cfg["user_id"]})
     content["m.mentions"] = {"user_ids": mentioned} if mentioned else {}
     if thread:
@@ -2079,11 +2096,24 @@ def _message_content(cfg: dict, text: str, thread: str | None, reply: str | None
         content["m.relates_to"] = {"m.in_reply_to": {"event_id": reply}}
     if data is not None:
         content[DATA_KEY] = data
+    if supervisor:
+        content[SUPERVISOR_KEY] = supervisor
     return content
 
 
 def cmd_post(cfg: dict, room: str, text: str, thread: str | None, reply: str | None,
-             data_raw: str | None, file: str | None, txn: str | None) -> dict:
+             data_raw: str | None, file: str | None, txn: str | None,
+             as_supervisor: bool = False) -> dict:
+    supervisor = None
+    if as_supervisor:
+        if os.environ.get(_engine().TURN_ENV):
+            _die(4, "policy", f"post --as-supervisor is refused inside a turn the {NAME} service "
+                 "started: the supervisor's words are the supervisor's to write",
+                 "the supervisor posts it, outside any turn")
+        supervisor = cfg.get("supervisor")
+        if not supervisor:
+            _die(6, "supervisor_unset", f"connection {cfg['id']!r} names no supervisor",
+                 f"`{NAME} --connection {cfg['id']} workers supervisor USER_ID` sets it")
     if text == "-":
         text = sys.stdin.read()
     text = text.rstrip("\n")
@@ -2107,7 +2137,7 @@ def cmd_post(cfg: dict, room: str, text: str, thread: str | None, reply: str | N
         room_id = _resolve_room(m, cfg, room)
         _refuse_encrypted(m, room_id)
         upload = _upload(m, Path(file).expanduser()) if file else None
-        content = _message_content(cfg, text, thread, reply, data, upload)
+        content = _message_content(cfg, text, thread, reply, data, upload, supervisor)
         try:
             found = m.call("PUT", f"/_matrix/client/v3/rooms/{_q(room_id)}/send/m.room.message/"
                            f"{_q(txn)}", body=content, idempotent=True)
@@ -4981,6 +5011,7 @@ def _parser() -> _Parser:
     post.add_argument("--data")
     post.add_argument("--file")
     post.add_argument("--txn-id", dest="txn_id")
+    post.add_argument("--as-supervisor", dest="as_supervisor", action="store_true")
     workers = sub.add_parser("workers")
     wsub = workers.add_subparsers(dest="action", required=True, parser_class=_Parser)
     wsub.add_parser("list")
@@ -5167,7 +5198,7 @@ def main() -> None:
         _emit(cmd_leave(cfg, args.room))
     elif cmd == "post":
         _emit(cmd_post(cfg, args.room, args.text, args.thread, args.reply_to, args.data,
-                       args.file, args.txn_id))
+                       args.file, args.txn_id, args.as_supervisor))
     elif cmd in ("mark", "unmark"):
         _emit(cmd_mark(cfg, args.room, cmd == "mark"))
 

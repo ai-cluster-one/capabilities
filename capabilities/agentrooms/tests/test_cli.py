@@ -440,9 +440,38 @@ def test_post_content_thread_reply_data_mentions(cli, project, homeserver, capsy
                                        "is_falling_back": False,
                                        "m.in_reply_to": {"event_id": "$parent"}}
     assert content["agentrooms.data"] == {"kind": "status"}
+    assert "agentrooms.supervisor" not in content  # the agent's own post carries no mark
     first = out["event_id"]
     code, out, _err = run(cli, capsys, "post", "!room", f"hello @b:{SERVER}", "--txn-id", "fixed-1")
     assert out["event_id"] == first and out["txn_id"] == "fixed-1"
+
+
+def test_a_supervisor_posts_as_the_agent_marked_and_read_answers_the_mark(
+        cli, project, homeserver, capsys, monkeypatch):
+    connect(project, allow_write=True)
+    code, _out, err = run(cli, capsys, "post", "!room", "hi", "--as-supervisor")
+    assert code == 6 and err["error"]["code"] == "supervisor_unset"
+    path = project / "capabilities" / "agentrooms" / "connections.json"
+    conns = json.loads(path.read_text())
+    conns["connections"]["alpha"]["supervisor"] = f"@boss:{SERVER}"
+    path.write_text(json.dumps(conns))
+    code, out, err = run(cli, capsys, "post", "!room", f"ask @b:{SERVER}", "--as-supervisor",
+                         "--thread", "$root")
+    assert code == 0, err
+    content = homeserver.messages["!room"][-1]["content"]
+    assert content["agentrooms.supervisor"] == f"@boss:{SERVER}"
+    assert content["body"] == f"[supervisor] ask @b:{SERVER}"
+    assert content["m.mentions"] == {"user_ids": [f"@b:{SERVER}"]}
+    assert content["m.relates_to"]["event_id"] == "$root"
+    row = cli._message_row({"type": "m.room.message", "event_id": out["event_id"],
+                            "sender": f"@alpha:{SERVER}", "content": content})
+    assert row["supervisor"] == f"@boss:{SERVER}"
+    code, out, _err = run(cli, capsys, "read", "!room")
+    assert [m["supervisor"] for m in out["messages"]] == [None] * out["count"]
+    # The agent cannot write its supervisor's words from inside a turn.
+    monkeypatch.setenv("AGENTROOMS_TURN", "turn-1")
+    code, _out, err = run(cli, capsys, "post", "!room", "hi", "--as-supervisor")
+    assert code == 4 and err["error"]["code"] == "policy"
 
 
 def test_post_file_and_refusals(cli, project, homeserver, capsys, tmp_path):
