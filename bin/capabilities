@@ -688,6 +688,32 @@ PROJECT VERBS (run inside a consuming project)
         with its nodes as `node list` answers them, the folder it lives in on
         each node among them: {ok, agents [{id, slug, name, ..., nodes
         [{node, kind, ..., folder}]}], store}. Needs no project.
+  agent state <id|slug>
+        One read of an agent the store holds across its nodes, writing
+        nothing (allowed under the read-only switch; needs no project):
+        {ok, agent_id, agent, this_node, liveness {by, folder,
+        live_within_seconds, reason}, nodes [{...node list's fields...,
+        address, address_source (node | coolify | null), address_error?,
+        seen_seconds_ago, live, gate {<capability>: {effective, source
+        (project | global | machine | default), node}}, placed [capability],
+        leases [{capability, acquired_at, renewed_at, expires_at}]}],
+        services [{capability, placement, nodes, placed_on, holders}],
+        store}. address is the node's row's, else the ip of the Coolify
+        server it was created on (`coolify servers`, through its
+        connection). live is deployment's answer (`deployment node list`
+        in the agent's folder on this machine); where deployment is not
+        installed or the agent has no folder here it is null and
+        liveness.reason says why. A gate is read from the store's policy
+        rows highest first - the agent's row for the node, its row for every
+        node, the global rows likewise (node names the node a row was for),
+        this machine's ceiling on this node alone - and is disabled by
+        default; it names every capability a row names. placed is the
+        services placed on the node (`place`), leases the live leases it
+        holds in deployment_service_leases. services lists each capability
+        with a service installed here or placed on a node: placement from its
+        descriptor (null where not installed here), nodes its declared
+        single | several (null until declared). Exit 6 agent_unknown for an
+        agent the store does not hold.
   agent materialize <id|slug> <folder> [--claude] [--codex]
         Put an agent the store holds in a folder on this machine: register
         this machine (AGENT_NODE_NAME, exit 6 node_unnamed without it) among
@@ -7843,6 +7869,13 @@ def cmd_agent(args: list[str]) -> None:
             _die(6, "input", "agent list takes no positional argument")
         _emit(_agent_list())
         return
+    if sub == "state":
+        pos, _opts = _kernel_options(args[1:], set(), {"--json"}, "agent state")
+        if len(pos) != 1 or not pos[0].strip():
+            _die(6, "input", "agent state needs one agent (its id or slug)",
+                 "capabilities agent state <id|slug>")
+        _emit(_agent_state(pos[0].strip()))
+        return
     if sub == "materialize":
         _read_only_gate("agent materialize")
         pos, opts = _kernel_options(args[1:], set(), {"--claude", "--codex", "--json"},
@@ -7940,8 +7973,8 @@ def cmd_agent(args: list[str]) -> None:
             _read_only_gate("agent rekey")
         _emit(_agent_rekey(root, pos[0].strip() if pos else None, "--dry-run" in opts))
     else:
-        _die(6, "input", "agent needs a subcommand: show, set, convert, list, materialize "
-             "or rekey",
+        _die(6, "input", "agent needs a subcommand: show, set, convert, list, state, "
+             "materialize or rekey",
              "run `capabilities help`")
 
 
@@ -7964,6 +7997,187 @@ def _agent_list() -> dict:
     finally:
         conn.close()
     return {"ok": True, "agents": agents, "store": _kernel_store_report(setting)}
+
+
+def _agent_state(ref: str) -> dict:
+    """`agent state`: one read of the agent the store holds under `ref` (its id
+    or slug) across its nodes - each node's row with its address, when it was
+    last seen and whether it is live, the gate of every capability there with
+    the layer that decided it, the services placed there and the leases it
+    holds - and how each service capability is placed. It writes nothing."""
+    store = _store_module()
+    stamp = store._stamp
+    here = store.node_name()
+    conn, setting = _kernel_open(_project_root())
+    import psycopg
+    try:
+        found = conn.execute(
+            "SELECT id FROM capabilities_agents WHERE id = %s OR slug = %s "
+            "ORDER BY id = %s DESC", (ref, ref, ref)).fetchall()
+        if not found:
+            _die(6, "agent_unknown",
+                 f"the store ({setting.level}, schema {setting.schema}) holds no agent {ref!r}",
+                 "run `capabilities agent list` to see the agents it holds")
+        agent_id = found[0][0]
+        agent = _agent_row(conn, agent_id)
+        nodes = _node_rows(conn, agent_id)
+        ago = dict(conn.execute(
+            "SELECT node, round(extract(epoch FROM now() - last_seen_at))::int "
+            "FROM capabilities_agent_nodes WHERE agent_id = %s", (agent_id,)).fetchall())
+        policy = conn.execute(
+            "SELECT agent_id IS NOT NULL, capability, node, enabled, service "
+            "FROM capabilities_policy WHERE agent_id = %s OR agent_id IS NULL",
+            (agent_id,)).fetchall()
+        leases = []
+        # deployment's table, written by its runner, keyed by the project id.
+        if conn.execute("SELECT to_regclass('deployment_service_leases')"
+                        ).fetchone()[0] is not None:
+            leases = conn.execute(
+                "SELECT node, capability, acquired_at, renewed_at, expires_at "
+                "FROM deployment_service_leases WHERE project = %s AND expires_at > now() "
+                "ORDER BY capability", (agent_id,)).fetchall()
+    except psycopg.Error as exc:
+        _die(5, "store_unreachable", f"cannot read the agent registry: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    finally:
+        conn.close()
+
+    # The store tier's layers, highest first: the project's row for the node,
+    # its row for every node, then the global rows the same way.
+    layers: dict[tuple[str, str | None], dict[str, tuple[bool, bool]]] = {}
+    for own, name, node, enabled, service in policy:
+        layers.setdefault(("project" if own else "global", node), {})[name] = (
+            bool(enabled), bool(service))
+    names = sorted({name for _own, name, *_rest in policy})
+    folder = _agent_folder_here(agent_id, nodes, here)
+    liveness = _deployment_liveness(agent_id, folder)
+    lease_rows = [{"node": node, "capability": name, "acquired_at": stamp(acquired),
+                   "renewed_at": stamp(renewed), "expires_at": stamp(expires)}
+                  for node, name, acquired, renewed, expires in leases]
+    out_nodes = []
+    for row in nodes:
+        node = row["node"]
+        gate: dict[str, dict] = {}
+        for name in names:
+            if node == here and _machine_state(name) == "quarantined":
+                gate[name] = {"effective": "disabled", "source": "machine", "node": None}
+                continue
+            for scope, at in (("project", node), ("project", None),
+                              ("global", node), ("global", None)):
+                held = layers.get((scope, at), {}).get(name)
+                if held is not None:
+                    gate[name] = {"effective": "enabled" if held[0] else "disabled",
+                                  "source": scope, "node": at}
+                    break
+            else:
+                gate[name] = {"effective": "disabled", "source": "default", "node": None}
+        out_nodes.append({
+            **row, **_node_address(row, folder),
+            "seen_seconds_ago": ago.get(node),
+            "live": (liveness["nodes"].get(node) if liveness["reason"] is None else None),
+            "gate": gate,
+            "placed": sorted(name for name, (_en, service)
+                             in layers.get(("project", node), {}).items() if service),
+            "leases": [{k: v for k, v in lease.items() if k != "node"}
+                       for lease in lease_rows if lease["node"] == node]})
+    services = []
+    placed_names = {name for (scope, node), rows in layers.items()
+                    if scope == "project" and node is not None
+                    for name, (_en, service) in rows.items() if service}
+    for name in sorted(placed_names | {n for n in _installed() if _installed_service(n)}):
+        service = _installed_service(name)
+        declared = service.get("nodes") if service else None
+        services.append({
+            "capability": name,
+            "placement": _service_placement(service) if service else None,
+            "nodes": declared if declared in ("single", "several") else None,
+            "placed_on": sorted(node for (scope, node), rows in layers.items()
+                                if scope == "project" and node is not None
+                                and rows.get(name, (False, False))[1]),
+            "holders": sorted(lease["node"] for lease in lease_rows
+                              if lease["capability"] == name)})
+    return {"ok": True, "agent_id": agent_id, "agent": agent, "this_node": here,
+            "liveness": {k: v for k, v in liveness.items() if k != "nodes"},
+            "nodes": out_nodes, "services": services,
+            "store": _kernel_store_report(setting)}
+
+
+def _agent_folder_here(agent_id: str, nodes: list[dict], here: str) -> Path | None:
+    """The folder the agent lives in on this machine and is still bound to: the
+    one this node's row records, else the project the call runs in."""
+    row = next((n for n in nodes if n["node"] == here), None)
+    for candidate in ((Path(row["folder"]) if row and row.get("folder") else None),
+                      _project_root()):
+        if candidate is not None and _folder_agent_id(candidate) == agent_id:
+            return candidate
+    return None
+
+
+def _deployment_liveness(agent_id: str, folder: Path | None) -> dict:
+    """Whether each node is live, as deployment defines it (`deployment node
+    list`, read in the agent's folder, whose runtime sets the window). Where it
+    cannot be asked here the answer is null with the reason, never a guess."""
+    out: dict = {"by": "deployment node list", "folder": str(folder) if folder else None,
+                 "live_within_seconds": None, "reason": None, "nodes": {}}
+    deployment = shutil.which("deployment")
+    if folder is None:
+        return {**out, "reason": "no_folder_here"}
+    if not deployment:
+        return {**out, "reason": "deployment_unavailable"}
+    try:
+        result = subprocess.run([deployment, "node", "list"], cwd=folder, text=True,
+                                capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {**out, "reason": f"deployment could not complete: {exc}"}
+    try:
+        answer = json.loads(result.stdout) if not result.returncode else None
+    except ValueError:
+        answer = None
+    if not isinstance(answer, dict) or answer.get("agent_id") != agent_id:
+        try:
+            reason = json.loads(result.stderr.strip().splitlines()[-1])["error"]["code"]
+        except (ValueError, KeyError, TypeError, IndexError):
+            reason = f"deployment node list exited {result.returncode}"
+        return {**out, "reason": reason}
+    return {**out, "live_within_seconds": answer.get("live_within_seconds"),
+            "nodes": {n.get("node"): n.get("live") for n in answer.get("nodes") or []
+                      if isinstance(n, dict)}}
+
+
+def _node_address(row: dict, folder: Path | None) -> dict:
+    """The node's address: its row's, else the IP of the Coolify server it was
+    created on, asked through the coolify capability and the node's connection."""
+    if row.get("address"):
+        return {"address": row["address"], "address_source": "node"}
+    if not (row.get("coolify_connection") and row.get("coolify_server")):
+        return {"address": None, "address_source": None}
+    out = {"address": None, "address_source": None}
+    coolify = shutil.which("coolify")
+    if not coolify:
+        return {**out, "address_error": "coolify_unavailable"}
+    try:
+        result = subprocess.run(
+            [coolify, "--connection", row["coolify_connection"], "servers",
+             row["coolify_server"]], cwd=folder or _project_root() or Path.cwd(),
+            text=True, capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {**out, "address_error": f"coolify could not complete: {exc}"}
+    if result.returncode:
+        try:
+            reason = json.loads(result.stderr.strip().splitlines()[-1])["error"]["code"]
+        except (ValueError, KeyError, TypeError, IndexError):
+            reason = f"coolify exited {result.returncode}"
+        return {**out, "address_error": reason}
+    try:
+        server = json.loads(result.stdout)
+    except ValueError:
+        return {**out, "address_error": "coolify returned malformed JSON"}
+    if isinstance(server, list):
+        server = server[0] if server else {}
+    ip = server.get("ip") if isinstance(server, dict) else None
+    if not isinstance(ip, str) or not ip:
+        return {**out, "address_error": "the Coolify server names no ip"}
+    return {"address": ip, "address_source": "coolify"}
 
 
 def _folder_agent_id(folder: Path) -> str | None:

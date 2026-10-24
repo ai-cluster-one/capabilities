@@ -575,6 +575,137 @@ def test_writes_are_refused_under_the_read_only_switch(lab):
     assert [n["node"] for n in json.loads(result.stdout)["nodes"]] == ["x"]
 
 
+
+def _fake_tool(bin_dir: Path, name: str, body: str) -> None:
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    path = bin_dir / name
+    path.write_text(f"#!{sys.executable}\n{body}")
+    path.chmod(0o755)
+
+
+def test_agent_state_reads_an_agent_across_its_nodes(lab):
+    lab.ok("node", "add", "box-one", "--kind", "server", "--master", "--may-write",
+           "--address", "203.0.113.10")
+    lab.ok("node", "add", "box-two", "--kind", "server", "--coolify-connection", "infra",
+           "--coolify-server", "srv-uuid", "--coolify-resource", "res-uuid")
+    lab.ok("node", "add", "mac-one", "--kind", "mac")
+    lab.sql(f"UPDATE {SCHEMA}.capabilities_agent_nodes SET folder = %s, "
+            "last_seen_at = now() WHERE node = 'box-one' RETURNING node",
+            (str(lab.project.resolve()),))
+    lab.sql(f"UPDATE {SCHEMA}.capabilities_agents SET slug = 'lab' WHERE id = %s "
+            "RETURNING id", (PROJECT_ID,))
+    for agent, name, node, enabled, service in (
+            (PROJECT_ID, "tasks", "box-one", True, True),
+            (PROJECT_ID, "tasks", "box-two", True, True),
+            (PROJECT_ID, "telegram", "box-two", True, True),
+            (PROJECT_ID, "telegram", None, False, False),
+            (None, "memory", None, True, False),
+            (None, "telegram", "mac-one", True, False)):
+        lab.sql(f"INSERT INTO {SCHEMA}.capabilities_policy (agent_id, capability, node, "
+                "enabled, service) VALUES (%s, %s, %s, %s, %s) RETURNING capability",
+                (agent, name, node, enabled, service))
+    with lab.cluster.connect(lab.database) as conn:
+        # deployment's lease table, as its runner makes it.
+        conn.execute(f"CREATE TABLE {SCHEMA}.deployment_service_leases (project text "
+                     "NOT NULL, capability text NOT NULL, node text NOT NULL, acquired_at "
+                     "timestamptz NOT NULL DEFAULT now(), renewed_at timestamptz NOT NULL "
+                     "DEFAULT now(), expires_at timestamptz NOT NULL, "
+                     "PRIMARY KEY (project, capability))")
+        conn.execute(f"INSERT INTO {SCHEMA}.deployment_service_leases (project, capability, "
+                     "node, expires_at) VALUES (%s, 'telegram', 'box-two', now() + "
+                     "interval '3 minutes'), (%s, 'tasks', 'box-one', now() - "
+                     "interval '1 minute')", (PROJECT_ID, PROJECT_ID))
+    for name, service in (("tasks", {"name": "tasks", "placement": "shared"}),
+                          ("telegram", {"name": "telegram"})):
+        bundle = lab.tmp / "registry" / name
+        bundle.mkdir(parents=True)
+        (bundle / name).write_text("#!/bin/sh\n")
+        (bundle / "manifest.json").write_text(json.dumps({"name": name, "service": service}))
+    tools = lab.tmp / "tools"
+    _fake_tool(tools, "deployment", "import json, os\nprint(json.dumps({'ok': True, "
+               f"'agent_id': {PROJECT_ID!r}, 'live_within_seconds': 180, 'nodes': ["
+               "{'node': 'box-one', 'live': True}, {'node': 'box-two', 'live': False}, "
+               "{'node': 'mac-one', 'live': False}]}))\n"
+               "open(os.environ['STATE_CALLS'], 'a').write(os.getcwd() + '\\n')\n")
+    _fake_tool(tools, "coolify", "import json, sys\nassert sys.argv[1:] == ['--connection', "
+               "'infra', 'servers', 'srv-uuid'], sys.argv\n"
+               "print(json.dumps({'uuid': 'srv-uuid', 'ip': '198.51.100.7'}))\n")
+    calls = lab.tmp / "calls"
+    path = f"{tools}{os.pathsep}{os.environ.get('PATH', '')}"
+
+    def state(ref: str, **extra: str) -> dict:
+        result = lab.run("agent", "state", ref, "--json", AGENT_NODE_NAME="box-one",
+                         PATH=path, STATE_CALLS=str(calls), **extra)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    before = lab.sql(f"SELECT node, last_seen_at, folder FROM {SCHEMA}.capabilities_agent_nodes "
+                     "ORDER BY node")
+    answer = state(PROJECT_ID)
+    assert (answer["agent_id"], answer["this_node"]) == (PROJECT_ID, "box-one")
+    assert answer["liveness"] == {"by": "deployment node list",
+                                  "folder": str(lab.project.resolve()),
+                                  "live_within_seconds": 180, "reason": None}
+    assert calls.read_text().splitlines() == [str(lab.project.resolve())]
+    nodes = {n["node"]: n for n in answer["nodes"]}
+    assert list(nodes) == ["box-one", "box-two", "mac-one"]
+    one, two, mac = nodes["box-one"], nodes["box-two"], nodes["mac-one"]
+    assert (one["is_master"], one["may_write"], one["folder"]) == (
+        True, True, str(lab.project.resolve()))
+    assert (one["address"], one["address_source"]) == ("203.0.113.10", "node")
+    assert (two["address"], two["address_source"]) == ("198.51.100.7", "coolify")
+    assert (mac["address"], mac["address_source"]) == (None, None)
+    assert one["last_seen_at"] is not None and 0 <= one["seen_seconds_ago"] < 60
+    assert (two["last_seen_at"], two["seen_seconds_ago"]) == (None, None)
+    assert (one["live"], two["live"], mac["live"]) == (True, False, False)
+    assert one["gate"] == {
+        "memory": {"effective": "enabled", "source": "global", "node": None},
+        "tasks": {"effective": "enabled", "source": "project", "node": "box-one"},
+        "telegram": {"effective": "disabled", "source": "project", "node": None}}
+    assert two["gate"]["telegram"] == {"effective": "enabled", "source": "project",
+                                       "node": "box-two"}
+    assert mac["gate"]["tasks"] == {"effective": "disabled", "source": "default",
+                                    "node": None}
+    assert mac["gate"]["telegram"] == {"effective": "disabled", "source": "project",
+                                       "node": None}
+    assert (one["placed"], two["placed"], mac["placed"]) == (
+        ["tasks"], ["tasks", "telegram"], [])
+    assert one["leases"] == [] and mac["leases"] == []
+    assert [lease["capability"] for lease in two["leases"]] == ["telegram"]
+    assert set(two["leases"][0]) == {"capability", "acquired_at", "renewed_at", "expires_at"}
+    assert answer["services"] == [
+        {"capability": "tasks", "placement": "shared", "nodes": None,
+         "placed_on": ["box-one", "box-two"], "holders": []},
+        {"capability": "telegram", "placement": "exclusive", "nodes": None,
+         "placed_on": ["box-two"], "holders": ["box-two"]}]
+
+    # By slug, from outside any project, under the read-only switch: the same
+    # read, with no folder of the agent on this node to ask deployment in.
+    elsewhere = lab.tmp / "elsewhere"
+    elsewhere.mkdir()
+    result = subprocess.run(
+        [sys.executable, str(MANAGER), "agent", "state", "lab"], cwd=elsewhere,
+        env={**lab.env(AGENT_NODE_NAME="mac-one", PATH=path, STATE_CALLS=str(calls),
+                       CAPABILITIES_READ_ONLY="1",
+                       AGENTKIT_DB_URL=lab.cluster.url(lab.database),
+                       AGENTKIT_DB_SCHEMA=SCHEMA),
+             "CLAUDE_PROJECT_DIR": str(elsewhere)},
+        text=True, capture_output=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    remote = json.loads(result.stdout)
+    assert remote["agent_id"] == PROJECT_ID
+    assert remote["liveness"]["reason"] == "no_folder_here"
+    assert all(n["live"] is None for n in remote["nodes"])
+    assert [n["placed"] for n in remote["nodes"]] == [["tasks"], ["tasks", "telegram"], []]
+    assert calls.read_text().splitlines() == [str(lab.project.resolve())]
+    assert lab.sql(f"SELECT node, last_seen_at, folder FROM "
+                   f"{SCHEMA}.capabilities_agent_nodes ORDER BY node") == before
+
+    code, error = lab.refused("agent", "state", "nobody", PATH=path)
+    assert (code, error["code"]) == (6, "agent_unknown")
+    assert lab.refused("agent", "state")[0] == 6
+
+
 # --- agent creation from ContextKit's templates --------------------------------
 
 def _square_png(side: int = 64) -> bytes:
