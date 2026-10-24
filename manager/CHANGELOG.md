@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-24 — A node reports itself seen
+
+`capabilities node seen` sets `last_seen_at` on this project's agent's row for the node the process runs on (`AGENT_NODE_NAME`, else the host name) to the store's now, and answers `{ok, project, agent_id, node, last_seen_at, store}`. It takes no node name, since a node reports itself and no other; a node not registered exits 6 `node_unknown`, and the read-only switch refuses it like the other node writes. `deployment runner` runs it on every reconcile, and `deployment help` says when a node counts as live.
+
 ## 2026-10-24 — A folder an agent is raised in does not name it
 
 `capabilities init` gives an agent's row a slug from its folder's name only where the folder makes the agent - init registered the row, or is creating the agent - or still holds the agent's older project.json, settings file or legacy envelope. A folder bound with `--id` to an agent the store already holds, such as a node's `/app`, no longer names an agent that has no slug and no name: the row keeps no slug (`agent.slug` null in init's answer) instead of becoming `app`. A slug carried from a project.json or taken from the agent's name is given as before.

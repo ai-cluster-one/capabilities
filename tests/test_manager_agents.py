@@ -537,10 +537,37 @@ def test_node_refuses_what_it_does_not_take(lab):
     assert lab.refused("node", "set", "nope", "--kind", "mac")[1]["code"] == "node_unknown"
 
 
+def test_a_node_reports_itself_seen_and_no_other(lab):
+    lab.ok("node", "add", "box-one", "--kind", "server")
+    lab.ok("node", "add", "box-two", "--kind", "server")
+
+    def seen(node: str) -> dict:
+        result = lab.run("node", "seen", AGENT_NODE_NAME=node)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)
+
+    first = seen("box-one")
+    assert (first["node"], first["agent_id"]) == ("box-one", PROJECT_ID)
+    assert first["last_seen_at"] is not None
+    lab.sql(f"UPDATE {SCHEMA}.capabilities_agent_nodes "
+            "SET last_seen_at = now() - interval '1 hour' WHERE node = 'box-one' RETURNING node")
+    again = seen("box-one")
+    assert again["last_seen_at"] >= first["last_seen_at"]
+    assert lab.sql(f"SELECT last_seen_at > now() - interval '1 minute' FROM "
+                   f"{SCHEMA}.capabilities_agent_nodes WHERE node = 'box-one'") == [(True,)]
+    listed = {n["node"]: n["last_seen_at"] for n in lab.ok("node", "list")["nodes"]}
+    assert listed == {"box-one": again["last_seen_at"], "box-two": None}
+
+    code, error = lab.refused("node", "seen", AGENT_NODE_NAME="box-three")
+    assert (code, error["code"]) == (6, "node_unknown")
+    assert lab.refused("node", "seen", "box-two", AGENT_NODE_NAME="box-one")[0] == 6
+
+
 def test_writes_are_refused_under_the_read_only_switch(lab):
     lab.ok("node", "add", "x", "--kind", "mac")
     for args in (("agent", "set", "--name", "X"), ("node", "add", "y", "--kind", "mac"),
-                 ("node", "set", "x", "--may-write"), ("node", "remove", "x")):
+                 ("node", "set", "x", "--may-write"), ("node", "remove", "x"),
+                 ("node", "seen")):
         code, error = lab.refused(*args, CAPABILITIES_READ_ONLY="1")
         assert (code, error["code"]) == (4, "read_only_switch")
     result = lab.run("node", "list", CAPABILITIES_READ_ONLY="1")

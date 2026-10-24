@@ -455,3 +455,75 @@ def test_a_runner_holds_a_connection_only_while_its_service_runs(tmp_path: Path,
     finally:
         runner.stop()
     assert rows("SELECT * FROM deployment_service_leases") == []
+
+
+def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_live(
+        tmp_path: Path, cluster) -> None:
+    database, rows = _database(cluster)
+    env = _env(tmp_path / "home")
+    # The runner reports through the manager on PATH: this tree's.
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "capabilities").symlink_to(MANAGER)
+    env["PATH"] = f"{tmp_path / 'bin'}{os.pathsep}{env.get('PATH', '')}"
+    dotenv = (f"AGENTKIT_DB_URL=postgresql://{ADMIN}@127.0.0.1:{cluster}/{database}"
+              "?sslmode=disable\nAGENTKIT_DB_SCHEMA=lab\n")
+    identity = {"id": PROJECT_ID, "slug": "lab", "records": "store"}
+    # Two checkouts of one project, a Mac and a node of the standard image.
+    roots = {"mac-a": _project(tmp_path / "a", identity, dotenv=dotenv),
+             "box-b": _project(tmp_path / "b", identity, dotenv=dotenv)}
+    a = roots["mac-a"]
+    (a / "deployment").mkdir()
+    (a / "deployment" / "runtime.json").write_text(json.dumps(
+        {"profile": "agent-box", "service_policy": {"reconcile_seconds": int(EVERY)},
+         "services": {"agent": {"embedded_services": ["fixture"]}}}))
+    _manager(a, env, "enable", "deployment", "--project")
+    for node, kind in (("mac-a", "mac"), ("box-b", "server"), ("box-c", "server")):
+        _manager(a, env, "node", "add", node, "--kind", kind)
+
+    def seen() -> dict:
+        return dict(rows("SELECT node, last_seen_at > now() - interval '1 minute' "
+                         "FROM capabilities_agent_nodes WHERE last_seen_at IS NOT NULL"))
+
+    def until_seen(want: dict) -> None:
+        deadline = time.monotonic() + 40
+        while seen() != want:
+            assert time.monotonic() < deadline, (seen(), *(r.text() for r in runners.values()))
+            for runner in runners.values():
+                assert runner.proc.poll() is None, runner.text()
+            time.sleep(0.3)
+
+    def listed() -> dict:
+        proc = subprocess.run([str(DEPLOYMENT), "node", "list"], cwd=a, env=env,
+                              capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr
+        return json.loads(proc.stdout)
+
+    runners = {}
+    try:
+        # No service is placed on either node, so neither holds a lease.
+        for node, root in roots.items():
+            runners[node] = Runner(root, env, node, tmp_path / f"{node}.log")
+        until_seen({"mac-a": True, "box-b": True})
+        rows("UPDATE capabilities_agent_nodes SET last_seen_at = now() - interval '1 hour' "
+             "WHERE last_seen_at IS NOT NULL RETURNING node")
+        until_seen({"mac-a": True, "box-b": True})
+        for runner in runners.values():
+            state = runner.state()
+            assert state["want"] is False and state["lease"].get("state") != "held"
+            assert "cannot report" not in runner.text()
+
+        report = listed()
+        assert (report["reconcile_seconds"], report["live_within_seconds"]) == (5, 15)
+        assert {n["node"]: n["live"] for n in report["nodes"]} == {
+            "box-b": True, "box-c": False, "mac-a": True}
+
+        # box-b falls silent: past three reconciles it no longer reads live.
+        runners.pop("box-b").stop()
+        rows("UPDATE capabilities_agent_nodes SET last_seen_at = now() - interval '16 seconds' "
+             "WHERE node = 'box-b' RETURNING node")
+        nodes = {n["node"]: n for n in listed()["nodes"]}
+        assert (nodes["box-b"]["live"], nodes["mac-a"]["live"]) == (False, True)
+        assert nodes["box-b"]["seen_seconds_ago"] >= 16
+    finally:
+        for runner in runners.values():
+            runner.stop()

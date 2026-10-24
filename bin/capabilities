@@ -67,7 +67,7 @@ ENVIRONMENT
                        writes and service activation exit 4), and this manager
                        refuses agent convert, agent set, allow, connections
                        import, disable, enable, inherit, init, node add, node
-                       remove, node set, place, quarantine, relabel, set,
+                       remove, node seen, node set, place, quarantine, relabel, set,
                        store set, store unset and unplace.
                        doctor reports it. Unset, `0` or `false` leaves it off.
   AGENTKIT_DB_URL, AGENTKIT_DB_HOST, AGENTKIT_DB_PORT, AGENTKIT_DB_NAME,
@@ -780,10 +780,17 @@ PROJECT VERBS (run inside a consuming project)
   node remove <node>
         Remove a registered node; answers {ok, project, agent_id, removed,
         store}. Exit 6 node_unknown for a node not registered.
+  node seen
+        Report this node up: set its last_seen_at to the store's now. The
+        node is the one this process runs on (AGENT_NODE_NAME, else the host
+        name); a node reports itself and no other. Every `deployment runner`
+        runs it on each reconcile, and `deployment help` says when a node
+        counts as live. Answers {ok, project, agent_id, node, last_seen_at,
+        store}. Exit 6 node_unknown for a node not registered.
         The agent and node verbs need the project's id (exit 6
         no_project_identity: run init) and a database that resolves for the
         project (exit 6 store_not_configured, 5 when it cannot be reached);
-        set, add and remove exit 4 under the read-only switch.
+        set, add, remove and seen exit 4 under the read-only switch.
   context --claude|--codex|--fragment
         Compose the session injection from the gate + snapshots + project
         envelopes. --fragment prints the manager-owned Markdown block without
@@ -8820,10 +8827,32 @@ def cmd_node(args: list[str]) -> None:
         _emit({"ok": True, "project": str(root), "agent_id": agent_id,
                "nodes": nodes, "store": _kernel_store_report(setting)})
         return
-    if sub not in ("add", "set", "remove"):
-        _die(6, "input", "node needs a subcommand: add, set, list or remove",
+    if sub not in ("add", "set", "remove", "seen"):
+        _die(6, "input", "node needs a subcommand: add, set, list, remove or seen",
              "run `capabilities help`")
     _read_only_gate(f"node {sub}")
+    if sub == "seen":
+        pos, _opts = _kernel_options(args[1:], set(), {"--json"}, "node seen")
+        if pos:
+            _die(6, "input", "node seen takes no positional argument: a node reports "
+                 "itself")
+        here = _store_module().node_name()
+
+        def seen(conn, agent_id):
+            if conn.execute("UPDATE capabilities_agent_nodes SET last_seen_at = now() "
+                            "WHERE agent_id = %s AND node = %s",
+                            (agent_id, here)).rowcount == 0:
+                raise _KernelRefusal("node_unknown", f"agent {agent_id} has no node {here}",
+                                     f"register it with `capabilities node add {here} "
+                                     "--kind mac|server`")
+            return agent_id, _node_rows(conn, agent_id, here)[0]["last_seen_at"]
+        try:
+            (agent_id, stamp), setting = _kernel_run(root, seen)
+        except _KernelRefusal as exc:
+            _die(6, exc.code, exc.message, exc.hint)
+        _emit({"ok": True, "project": str(root), "agent_id": agent_id, "node": here,
+               "last_seen_at": stamp, "store": _kernel_store_report(setting)})
+        return
     if sub == "remove":
         pos, _opts = _kernel_options(args[1:], set(), {"--json"}, "node remove")
         values: dict = {}

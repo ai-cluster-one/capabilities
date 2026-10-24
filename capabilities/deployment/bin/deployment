@@ -147,6 +147,10 @@ USAGE
       once the lease expires or is released. With no database resolvable no
       lease can be taken, and it runs as the gate says. It records its state
       under capabilities/deployment/state/runners/.
+      Each reconcile, whatever the gate answers, it also reports this node up
+      (`capabilities node seen`, which sets the node's last_seen_at), so a
+      node is seen while any runner runs on it, holding a lease or not; a
+      report that fails is said once on stderr and changes nothing else.
 
   deployment services
       This node's view of each compiled service: what the gate answers for
@@ -315,6 +319,18 @@ USAGE
       an interval job (target.sync_interval, default 60 seconds). A target
       whose body_source is GitHub answers state nothing_to_carry, touches no
       remote and gets no interval job: its node syncs with GitHub itself.
+  deployment node list
+      The nodes of this project's agent (`capabilities node list`), each
+      with seen_seconds_ago and live. A node is live when its last_seen_at
+      is within three reconciles (3 x service_policy.reconcile_seconds of
+      deployment/runtime.json, default 60) of now: this is the definition of
+      a node being live, and it holds for a Mac and for a node of the
+      standard image alike, since the runner on either reports it each
+      reconcile. A node never seen is not live. Whether a given service runs
+      is not this: an exclusive service's live lease is the proof it runs,
+      and on which node (`deployment services`). Answers {ok, project,
+      agent_id, reconcile_seconds, live_within_seconds, nodes [{...,
+      seen_seconds_ago, live}]}; the manager's refusals pass through.
   deployment node status [--target <name>] [--json]
       JSON host, release, Git sync, harness, store and per-service state.
       Git sync is against the node remote, or the GitHub branch for a target
@@ -491,6 +507,10 @@ RESTART_POLICIES = ("no", "on-failure", "always", "unless-stopped")
 RECONCILE_DEFAULT_SECONDS = 60
 RECONCILE_BOUNDS = (5, 3600)
 LEASE_TTL_RECONCILES = 3
+# Each reconcile a runner reports its node seen; a node is live while it was
+# seen within this many reconciles, so one missed report never reads as down.
+LIVE_RECONCILES = 3
+SEEN_TIMEOUT_SECONDS = 20
 RUNNER_STOP_GRACE_SECONDS = 20
 # The contract's policy refusal. A service that exits with it is refusing to run
 # here, so restarting it would only be refused again.
@@ -5525,6 +5545,7 @@ class _Runner:
         # gate answer it was refused under changes, or the runner restarts.
         self.refusal: dict | None = None
         self.gate_seen: tuple | None = None
+        self.seen_failing: str | None = None
 
     def say(self, message: str) -> None:
         sys.stderr.write(f"[deployment runner {self.name}] {message}\n")
@@ -5652,8 +5673,32 @@ class _Runner:
         elif not self.want and self.child is not None:
             self.stop(self.reason)
 
+    def report_seen(self) -> None:
+        """Report this node up in the store through the manager, which alone
+        writes the agent's nodes. A failure is said once, and once more when
+        the reports work again."""
+        failing = detail = None
+        try:
+            done = subprocess.run(["capabilities", "node", "seen"], cwd=str(self.root),
+                                  stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  timeout=min(self.every, SEEN_TIMEOUT_SECONDS))
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            failing = type(exc).__name__
+            detail = f"the manager could not be run ({failing})"
+        else:
+            if done.returncode:
+                said = _refusal_of(done.stderr.splitlines())
+                failing = said.get("slug") or f"exit {done.returncode}"
+                detail = (f"{said['slug']}: {said['message']}" if said else
+                          f"capabilities node seen exited {done.returncode}")
+        if failing != self.seen_failing:
+            self.say(f"cannot report {self.node} seen: {detail}" if failing
+                     else f"reports {self.node} seen again")
+        self.seen_failing = failing
+
     def tick(self) -> None:
         self.tick_at = _now_iso()
+        self.report_seen()
         gate = _gate_answer(self.name)
         self.gate = gate
         if "error" in gate:
@@ -7219,6 +7264,26 @@ def _node_database(root, host, container):
         "python", "-c", _NODE_DATABASE_PROBE]))
 
 
+def cmd_node_list(args):
+    root = _root()
+    every = _reconcile_seconds(_load_runtime(root) if _runtime_path(root).exists() else {})
+    within = every * LIVE_RECONCILES
+    listed = _manager(root, "node", "list")
+    now = datetime.now(timezone.utc)
+    nodes = []
+    for node in listed.get("nodes") or []:
+        ago = None
+        try:
+            ago = max(0, round((now - datetime.fromisoformat(node["last_seen_at"]))
+                               .total_seconds()))
+        except (KeyError, TypeError, ValueError):
+            pass
+        nodes.append({**node, "seen_seconds_ago": ago,
+                      "live": ago is not None and ago <= within})
+    _emit({"ok": True, "project": str(root), "agent_id": listed.get("agent_id"),
+           "reconcile_seconds": every, "live_within_seconds": within, "nodes": nodes})
+
+
 def cmd_node_status(args):
     root = _root()
     target = _node_target(root, args.target)
@@ -7997,6 +8062,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("node")
     p.add_argument("--yes", action="store_true")
     p.set_defaults(fn=cmd_node_remove)
+    node.add_parser("list", add_help=False).set_defaults(fn=cmd_node_list)
     for verb, fn in (("status", cmd_node_status), ("sync", cmd_node_sync), ("login", cmd_node_login)):
         p = node.add_parser(verb, add_help=False)
         p.add_argument("--target")
