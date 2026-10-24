@@ -62,7 +62,7 @@ ssh -t root@<server-address> docker exec -it <container> codex login --device-au
 
 The container is the one Docker labels `com.docker.compose.project=<resource>` and `com.docker.compose.service=agent`, where `<resource>` is the node row's `coolify_resource`: `docker ps --filter label=com.docker.compose.project=<resource> --filter label=com.docker.compose.service=agent` on the server names it.
 
-`gh auth login` works the same way once the image carries the GitHub CLI; `agent-node` 0.0.1 does not, so check with `gh --version` in the container. Its login is kept under `~/.config`, on the config volume.
+`gh auth login` works the same way: the image carries the GitHub CLI from `agent-node` 0.0.2, and 0.0.1 does not, so on an older node check with `gh --version` in the container. Its login is kept under `~/.config`, on the config volume.
 
 A login that speaks JSON events instead of a terminal runs from this machine with `deployment node exec <node> -- <command>`, which reaches the same container over SSH and `docker exec -i` with no terminal: `deployment node exec box1 -- telegram login --events` or `deployment node exec box1 -- whatsapp pair --events` streams each event line back unchanged, forwards what you type on standard input, and exits with the command's own code.
 
@@ -105,9 +105,7 @@ The policy rows that placed services on the node are not removed with it, and a 
 
 ## Architectures
 
-These are planned and not shipped:
-
-- `agent-node` 0.0.1 is published for `linux/amd64` only; an arm64 server cannot run it until the image is published for `linux/arm64` as well.
+`agent-node` is published for `linux/amd64` and `linux/arm64` from 0.0.3, so an amd64 or an arm64 server pulls the image for its own architecture under the same tag. 0.0.1 and 0.0.2 are published for `linux/amd64` only, and an arm64 server cannot run them.
 
 ## Another provider
 
