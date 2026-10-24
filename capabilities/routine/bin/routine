@@ -26,7 +26,10 @@ Commands:
       the routine folder exists. No network, no mutation.
 
   routine list [--json]
-      List routine files and their parsed front matter.
+      List the project's routines where they live, by the rule `titles`
+      states: where the store holds an active routine of this project, what
+      `list --store` lists; otherwise the routine files under `.routines/`
+      and their parsed front matter.
 
   routine validate [--json]
       Check that every routine markdown file has exactly the expected front
@@ -80,7 +83,11 @@ Routines in the store:
   routine show <name> [--version ID] [--global] [--json]
       The active version, or the version ID names, in the file form. --json
       adds the version id, who saved it, when, and its note; the version id is
-      what `save --base` names and what a follower records.
+      what `save --base` names and what a follower records. Without --version
+      and --global, a project whose store holds no routine of its own, nor a
+      global one it has enabled, is answered from its routines folder, by the
+      rule `titles` states: the file under it whose stem is the name, as
+      written; --json gives `source: folder`, its path and its text.
   routine history <name> [--global] [--json]
       Every version, newest first: id, when, by whom, the note, and which one
       is active.
@@ -961,8 +968,59 @@ def _where(project: str | None, document: dict) -> dict:
     return found
 
 
+def _store_holds_routines() -> bool:
+    """Whether the agent's routines live in its store, by the rule `titles`
+    reads them by. A store that is set but does not answer is read past to
+    the folder, saying so on stderr."""
+    root = _project_root()
+    project = _project_id(write=False) if root is not None else None
+    if not project:
+        return False
+    import psycopg
+    db = _db()
+    try:
+        return bool(_stored_routines(root, str(project)))
+    except db.DbError as exc:
+        if exc.slug != "store_not_configured":
+            sys.stderr.write(json.dumps({"warning": "routines not read from the store, so "
+                                         f"the routines folder is used: {exc.slug}: "
+                                         f"{exc.message}"}, ensure_ascii=False) + "\n")
+    except psycopg.Error as exc:
+        sys.stderr.write(json.dumps({"warning": "routines not read from the store, so the "
+                                     "routines folder is used: "
+                                     f"{_one_line(str(exc))[:300]}"}, ensure_ascii=False)
+                         + "\n")
+    return False
+
+
+def _show_from_folder(args, name: str) -> None:
+    """The routine's file in the agent's routines folder, as written."""
+    folder = _folder(None)
+    found = ([path for stem, path, _rel in _files(folder)[0] if stem == name]
+             if folder.is_dir() else [])
+    if not found:
+        _die(3, "not_found", f"no routine {name!r} in the routines folder {folder}, and "
+             "this project keeps no routine in its store", f"`{NAME} titles` shows the routines")
+    if len(found) > 1:
+        _die(6, "ambiguous_routine", f"{len(found)} files under {folder} are named {name!r}: "
+             + ", ".join(str(path) for path in found), "keep one file per routine name")
+    try:
+        text = _read_text(found[0])
+    except (OSError, Unreadable) as exc:
+        _die(6, "input", f"{found[0]} cannot be read: {exc}")
+    if args.json:
+        project = _project_id(write=False)
+        _emit({"name": name, "project": str(project) if project else None, "global": False,
+               "source": "folder", "path": str(found[0]), "rendered": text})
+        return
+    sys.stdout.write(text)
+
+
 def cmd_show(args) -> None:
     name = _check_name(args.name)
+    if not args.is_global and not args.version and not _store_holds_routines():
+        _show_from_folder(args, name)
+        return
     project = _reader(args.is_global)
     with _store() as conn:
         document = _seen_document(conn, project, name, args.is_global)
@@ -1623,6 +1681,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.cmd == "list" and args.is_global:
         _die(6, "input", "--global lists the store's global routines: give --store with it",
              f"`{NAME} list --store --global`")
+    if args.cmd == "list" and _store_holds_routines():
+        cmd_store_list(args)
+        return
     args.fn(args)
 
 

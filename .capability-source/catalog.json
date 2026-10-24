@@ -142,7 +142,7 @@
     },
     "routine": {
       "path": "capabilities/routine",
-      "payload_sha256": "568ba0c4d10d2aee5c8efd7d267fe54cb57b96a34f5998d5281f0377747311a0",
+      "payload_sha256": "a0b20c540024661d1def102dcfc2601f958bc136033aaeb0576665519b30d113",
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes, and keep routines as versioned documents in the project's store: show, save with a base, history, diff, retire, and import and export the routines folder byte for byte."
     },
     "signoz": {
@@ -172,7 +172,7 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "c2b00549a8e018873a3b5f469c5b6239247cca4f08a2e4bdc5eac8b21eae23cf",
+      "payload_sha256": "974be6a0b63e772b7c2bc23e9d6bdeece188751cbc20a4765f568edbadb7265c",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {

@@ -522,6 +522,35 @@ def test_a_missing_routine_is_named_and_the_worker_still_read(project):
     assert "'development'" in reported
 
 
+def keep_routines_in_the_store(project, monkeypatch, *names):
+    """The project keeps its routines in its store, which holds these; its
+    routines folder is gone."""
+    for path in (project / "routines").glob("*.md"):
+        path.unlink()
+    (project / "routines").rmdir()
+    monkeypatch.setattr(mod, "_stored_routines", lambda: set(names))
+
+
+def test_a_routine_kept_only_in_the_store_is_not_missing(project, monkeypatch):
+    keep_routines_in_the_store(project, monkeypatch, "development", "reachability")
+    assert mod._worker("implementation")["missing"] == []
+    assert problems_of("implementation") == []
+
+
+def test_a_routine_the_store_does_not_hold_is_named_as_missing_there(project, monkeypatch):
+    keep_routines_in_the_store(project, monkeypatch, "development")
+    [said] = mod._worker("implementation")["missing"]
+    assert "'reachability' is not in this project's store" in said
+
+
+def test_a_store_with_routines_leaves_the_folder_unread(project, monkeypatch):
+    """The store holding the project's routines is where they are, as the
+    agent's build reads them: a file in the folder does not stand in for one."""
+    monkeypatch.setattr(mod, "_stored_routines", lambda: {"development"})
+    [said] = mod._worker("implementation")["missing"]
+    assert "'reachability' is not in this project's store" in said
+
+
 def test_a_missing_profile_is_named_in_the_librarys_words(project):
     names(project, "implementation", "no-such-profile")
     worker = mod._worker("implementation")
@@ -875,6 +904,30 @@ def test_a_worker_naming_no_routine_is_told_to_choose_and_say_so(project):
     assert "The first entry you write on the trail names what you chose and why" in prompt
 
 
+def test_a_turn_loads_routines_kept_in_the_store_with_routine_show(project, monkeypatch):
+    keep_routines_in_the_store(project, monkeypatch, "development", "reachability")
+    prompt = mod._prompt(mod._worker("implementation"), a_task(), [], 1, None)
+    assert "LOAD THESE ROUTINES" in prompt
+    assert "Load each of these with `routine show <name>` and follow it." in prompt
+    assert "from this project's `routines/`" not in prompt
+    assert "- `development`\n- `reachability`" in prompt
+
+
+def test_a_turn_choosing_a_routine_is_pointed_at_the_store(project, monkeypatch):
+    keep_routines_in_the_store(project, monkeypatch, "development", "reachability")
+    write_worker(project, "probe", "takes: [chore]\nprofile: implementation",
+                 body="probe body.")
+    prompt = mod._prompt(mod._worker("probe"), a_task("chore"), [], 1, None)
+    assert "No procedure is named for this work." in prompt
+    assert "`routine list` lists them" in prompt and "`routines/`" not in prompt
+
+
+def test_a_project_on_files_is_still_told_to_load_from_its_folder(project):
+    prompt = mod._prompt(mod._worker("implementation"), a_task(), [], 1, None)
+    assert "Load each of these from this project's `routines/` and follow it." in prompt
+    assert "routine show" not in prompt
+
+
 def test_the_shipped_default_prompt_is_whole(project):
     prompt = mod._prompt(mod._worker("default"), a_task("chore"), [], 1, None)
     assert "You are the worker `default`" in prompt
@@ -1125,6 +1178,17 @@ def test_a_task_at_the_ceiling_is_parked_and_no_turn_is_started(
     assert "Raised 3 times without finishing" in store.notes[0]
     # The project's own sentence goes back with it, on the trail and on the raise.
     assert "Check the lane" in store.notes[0] and "Check the lane" in released["detail"]
+
+
+def test_a_worker_whose_routines_are_in_the_store_is_not_parked(
+        project, monkeypatch, capsys):
+    keep_routines_in_the_store(project, monkeypatch, "development", "reachability")
+    store = Store()
+    harness = Harness(Result(ok=True, harness="claude", session_id=None),
+                      lands="complete", writes=True)
+    report, _released = one_turn(monkeypatch, capsys, store, harness)
+    assert "parked" not in report and harness.seen != {}
+    assert "`routine show <name>`" in harness.seen["prompt"]
 
 
 def test_a_worker_missing_a_routine_parks_the_task_without_spending_an_attempt(

@@ -438,7 +438,10 @@ WORKERS
   `pg_ctl start` does, since the turn's `run` receives its orphans; elsewhere
   only what stays in the turn's tree, its groups or its sessions is reached.
 
-  A routine name resolves to `routines/<name>.md` at the project root. The first
+  A routine name resolves where the project keeps its routines, by the rule
+  the manager builds the agent's context by: in the project's store when it
+  holds an active routine of the project, and the turn loads it with `routine
+  show <name>`; otherwise to `routines/<name>.md` at the project root. The first
   routine is the procedure; a worker naming none leaves the turn to choose one
   by the routines' descriptions, or to work from the project's doctrine, and to
   say on the trail what it chose.
@@ -5886,6 +5889,58 @@ def _routine_dir() -> Path:
     return _project_here() / "routines"
 
 
+# The routine names this process read from the store, per schema and project,
+# with when: read again after a minute, so the service sees a routine saved
+# while it runs as soon as it would see a file written.
+_ROUTINE_ROWS: dict = {}
+_ROUTINE_ROWS_SECONDS = 60
+
+
+def _stored_routines() -> set[str] | None:
+    """The routines this project keeps in its store, by name, or None where it
+    keeps them in its routines folder. The manager's rule for the agent's
+    build: the store when it holds an active routine of this project, or a
+    global one it has enabled, else the folder. A store that does not answer,
+    or holds no routine tables, leaves the folder standing, as the build does."""
+    import psycopg
+    import time
+    project = PROJECT
+    if not project:
+        return None
+    key = (SCHEMA, project)
+    held = _ROUTINE_ROWS.get(key)
+    if held is not None and time.monotonic() - held[0] < _ROUTINE_ROWS_SECONDS:
+        return held[1]
+    names: set[str] | None = None
+    try:
+        with _connect(None, raising=True, waiting=False,
+                      migrating=False) as conn, conn.cursor() as cur:
+            try:
+                cur.execute("select to_regclass(%s) is not null as held",
+                            (f"{SCHEMA}.routine_enablements",))
+                enabling = cur.fetchone()["held"]
+                enabled = (f" or (d.project_id is null and exists (select 1 from "
+                           f"{SCHEMA}.routine_enablements e where e.document_id = d.id "
+                           f"and e.project_id = %(project)s) and not exists (select 1 from "
+                           f"{SCHEMA}.routine_documents o where o.project_id = %(project)s "
+                           "and o.name = d.name and o.retired_at is null))"
+                           if enabling else "")
+                cur.execute(f"""select d.name from {SCHEMA}.routine_documents d
+                                  join {SCHEMA}.routine_versions v
+                                    on v.document_id = d.id and v.active
+                                 where d.retired_at is null
+                                   and (d.project_id = %(project)s{enabled})""",
+                            {"project": project})
+                names = {row["name"] for row in cur.fetchall()} or None
+            except psycopg.errors.UndefinedTable:
+                names = None
+            conn.rollback()
+    except (Refusal, psycopg.Error):
+        names = None
+    _ROUTINE_ROWS[key] = (time.monotonic(), names)
+    return names
+
+
 _VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -6470,7 +6525,13 @@ def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
             wrong(f"its profile is refused by callva-harness-runner: {exc}")
 
     routines = _names(settings.get("routines"), "routines", wrong)
+    stored = _stored_routines() if routines else None
     for one in routines:
+        if stored is not None:
+            if one not in stored:
+                missing.append(f"the routine {one!r} is not in this project's store, "
+                               "where its routines are kept (`routine list`)")
+            continue
         where = _routine_dir() / f"{one}.md"
         if not where.is_file():
             missing.append(f"the routine {one!r} is not at {where}")
@@ -7605,6 +7666,14 @@ _NO_ROUTINES = """NO PROCEDURE IS NAMED
 
 No procedure is named for this work. Choose one from this project's `routines/` by the description each one carries, or work from the project's doctrine where none fits. The first entry you write on the trail names what you chose and why, so what this turn loaded is answerable from outside it."""
 
+_LOAD_STORED_ROUTINES = """LOAD THESE ROUTINES
+
+This project keeps its routines in its store. Load each of these with `routine show <name>` and follow it. Do not work from memory of them and do not ask for them. Each says when it applies; the first is the procedure for this work, and the rest apply at the moments they name."""
+
+_NO_STORED_ROUTINES = """NO PROCEDURE IS NAMED
+
+No procedure is named for this work. This project keeps its routines in its store: `routine list` lists them with the description each one carries, and `routine show <name>` gives one. Choose one by its description, or work from the project's doctrine where none fits. The first entry you write on the trail names what you chose and why, so what this turn loaded is answerable from outside it."""
+
 _WRITE_BACK = """THE TRAIL IS HOW YOU REPORT
 
 Write to the task's trail with `{cli} activity {key} "..."` as work happens, not once at the end. If this turn dies, the trail is all that survives, and the next turn reads it to continue.
@@ -7736,8 +7805,11 @@ def _prompt(worker: dict, task: dict, trail: list, attempt: int,
     if stage:
         opening += "\n\n" + (_AT_STAGE.format(stage=stage)
                              if _PLAIN_STAGE.fullmatch(stage) else _AT_UNNAMED_STAGE)
-    procedure = ([_LOAD_ROUTINES, "\n".join(f"- `{one}`" for one in worker["routines"])]
-                 if worker["routines"] else [_NO_ROUTINES])
+    stored = _stored_routines() is not None
+    procedure = ([_LOAD_STORED_ROUTINES if stored else _LOAD_ROUTINES,
+                  "\n".join(f"- `{one}`" for one in worker["routines"])]
+                 if worker["routines"] else
+                 [_NO_STORED_ROUTINES if stored else _NO_ROUTINES])
     guest = ([_GUEST.format(owner=task["project_id"], cli=NAME, key=key,
                             origin=_ORIGIN_TASKS)]
              if _foreign(task) else [])

@@ -408,6 +408,34 @@ def test_list_without_store_reads_the_files_as_before_and_needs_no_store(lab):
     assert (code, error["code"]) == (6, "store_not_configured")
 
 
+def test_list_without_store_reads_the_store_once_it_holds_the_routines(lab):
+    lab.ok("import")
+    assert lab.ok("list", "--json") == lab.ok("list", "--store", "--json")
+    assert lab.ok("list").splitlines()[0].startswith("bank-transaction  ")
+
+
+def test_show_reads_the_folder_while_the_store_holds_no_routine(lab):
+    assert lab.ok("show", "pitstop") == FILES["pitstop.md"]
+    assert lab.ok("show", "bank-transaction") == FILES["processor/bank-transaction.md"]
+    shown = lab.ok("show", "defect-intake", "--json")
+    assert (shown["source"], shown["path"], shown["rendered"]) == (
+        "folder", str(lab.routines.resolve() / "defect-intake.md"), FILES["defect-intake.md"])
+    assert lab.ok("show", "pitstop", AGENTKIT_DB_URL=None,
+                  AGENTKIT_DB_SCHEMA=None) == FILES["pitstop.md"]
+    code, error = lab.refused("show", "nowhere")
+    assert (code, error["code"]) == (3, "not_found")
+    assert lab.sql("SELECT to_regclass(%s)", (f"{SCHEMA}.routine_documents",)) == [(None,)]
+
+
+def test_show_reads_the_store_once_it_holds_the_routines(lab):
+    lab.ok("import")
+    (lab.routines / "pitstop.md").write_text("---\nname: pitstop\ndescription: x\n---\n")
+    assert lab.ok("show", "pitstop") == FILES["pitstop.md"]
+    (lab.routines / "only-a-file.md").write_text(
+        "---\nname: only-a-file\ndescription: x\n---\n")
+    assert lab.refused("show", "only-a-file")[0] == 3
+
+
 def test_the_read_only_switch_refuses_every_write(lab):
     lab.ok("import")
     for args in (("save", "pitstop", "--from", "-"), ("retire", "pitstop"), ("import",)):
