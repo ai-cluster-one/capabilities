@@ -596,6 +596,37 @@ def test_a_reveal_is_not_safe_discovery(lab):
     assert result.stdout == ""
 
 
+def test_a_reveal_is_gated_where_connection_is_lifted_before_dispatch(lab):
+    # A capability that lifts `--connection <id>` out of argv before `_contract`
+    # dispatches `connections show` from words the raw argv puts apart.
+    text = lab["script"].read_text()
+    lifted = ('    _contract([a for i, a in enumerate(argv) if a != "--connection"'
+              ' and not (i and argv[i - 1] == "--connection")'
+              ' and not a.startswith("--connection=")])\n')
+    assert text.count("    _contract(argv)\n") == 1
+    lab["script"].write_text(text.replace("    _contract(argv)\n", lifted, 1))
+    result = _run(lab, "connection", "add", "work", "--field", "url=https://a.example",
+                  "--stdin", stdin=json.dumps({"secret_env": "tok-123456789"}))
+    assert result.returncode == 0, result.stderr
+    forms = (["connections", "--connection", "work", "show", "work"],
+             ["connections", "--connection=work", "show", "work"])
+    for form in forms:
+        result = _run(lab, *form, "--reveal", "secret_env")
+        assert result.returncode == 0 and result.stdout == "tok-123456789\n", result.stderr
+    auth = {"CAPABILITIES_AUTH_CONTEXT": json.dumps(
+        {"allowed_capabilities": {NAME: {"verbs": ["doctor"]}}})}
+    for form in forms:
+        result = _run(lab, *form, "--reveal", "secret_env", extra=auth)
+        assert result.returncode == 4 and _error(result)["code"] == "verb_not_authorized"
+        assert result.stdout == ""
+    _write(lab["project"] / "capabilities" / "settings.json",
+           {"capabilities": {NAME: {"enabled": False}}})
+    for form in forms:
+        result = _run(lab, *form, "--reveal", "secret_env")
+        assert result.returncode == 4 and _error(result)["code"] == "disabled"
+        assert result.stdout == ""
+
+
 # --- settings --------------------------------------------------------------------
 
 def test_settings_write_toml_from_its_seed_and_read_it_back_whole(lab):
