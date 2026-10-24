@@ -57,6 +57,10 @@ SETUP_FIELDS = [
     {"key": "DECLFIX_APP_HASH", "label": "App hash", "help": "The app hash.",
      "type": "string", "secret": True, "required": True},
 ]
+SETUP = {"title": "Declfix App",
+         "guide": {"url": "https://apps.example/declfix",
+                   "steps": ["Sign in.", "Copy App id and App hash here."]},
+         "verify": "doctor"}
 LINK_METHODS = [
     {"id": "code", "label": "Code", "help": "Enter a code.",
      "argv": ["declfix", "link", "--events"]},
@@ -181,6 +185,10 @@ def test_manifest_carries_the_declarations_and_validates(lab):
     assert [f["key"] for f in manifest["connections"]["setup"]] == ["DECLFIX_APP_ID", "DECLFIX_APP_HASH"]
     assert manifest["connections"]["link"][0]["argv"][-1] == "--events"
     assert manifest["settings"]["homes"][0]["format"] == "toml"
+    assert manifest["setup"] == {"title": "Declfix App",
+                                 "guide": {"url": "https://apps.example/declfix",
+                                           "steps": ["Sign in.", "Copy App id and App hash here."]},
+                                 "verify": "doctor"}
     assert M._validate_manifest(NAME, manifest) == []
 
 
@@ -190,6 +198,7 @@ def test_a_capability_without_declarations_answers_null_and_keeps_its_verbs(lab)
     manifest = json.loads(_run(lab, "manifest").stdout)
     assert manifest["connections"] == {"fields": None, "setup": [], "link": []}
     assert manifest["settings"] is None
+    assert "setup" not in manifest
     assert M._validate_manifest(NAME, manifest) == []
     # Undeclared, the verbs fall through to the CLI's own parser.
     assert _run(lab, "settings").returncode != 0
@@ -222,6 +231,13 @@ def test_a_main_identifier_marks_one_field_that_is_no_secret(lab, fields, proble
                       "link": [{"id": "qr", "label": "QR", "argv": ["x", "pair"]}]}}, "--events"),
     ({"settings": {"homes": [{"scope": "galaxy", "path": "a.json", "format": "json"}],
                    "keys": []}}, "scope"),
+    ({"setup": {"title": " "}}, "setup.title"),
+    ({"setup": {"guide": {"url": "my.example/apps", "steps": ["Sign in."]}}}, "setup.guide.url"),
+    ({"setup": {"guide": {"url": "https://my.example/apps", "steps": []}}}, "setup.guide.steps"),
+    ({"setup": {"guide": {"url": "https://my.example/apps"}}}, "setup.guide is not"),
+    ({"setup": {"verify": "--check"}}, "setup.verify"),
+    ({"setup": {"verify": "doctor", "colour": "red"}}, "unknown key"),
+    ({"setup": None}, "setup is not"),
     ({"settings": {"homes": [{"scope": "project", "path": "../a.json", "format": "json"}],
                    "keys": []}}, "path"),
     ({"settings": {"homes": [{"scope": "project", "path": "a.json", "format": "json"}],
@@ -541,6 +557,32 @@ def test_setup_reports_and_writes_the_machine_prerequisites(lab):
         "DECLFIX_APP_ID": "7", "DECLFIX_APP_HASH": "hash-0123456789"}
     answer = json.loads(_run(lab, "setup", "unset", "DECLFIX_APP_HASH").stdout)
     assert answer["ready"] is False
+
+
+def test_setup_names_itself_the_guide_to_its_fields_and_its_check(lab):
+    presentation = {"title": "Declfix App",
+                    "guide": {"url": "https://apps.example/declfix",
+                              "steps": ["Sign in.", "Copy App id and App hash here."]},
+                    "verify": "doctor"}
+    for args, stdin in ((("setup",), None),
+                        (("setup", "set", "--field", "DECLFIX_APP_ID=7"), None),
+                        (("setup", "unset", "DECLFIX_APP_ID"), None)):
+        result = _run(lab, *args, stdin=stdin)
+        assert result.returncode == 0, (args, result.stderr)
+        answer = json.loads(result.stdout)
+        assert {k: answer[k] for k in presentation} == presentation, args
+    # Each key is carried only where it is declared.
+    lab["script"].write_text(_fixture_text().replace(
+        '         "verify": "doctor"}\n', '         }\n', 1).replace(
+        'SETUP = {"title": "Declfix App",', 'SETUP = {', 1))
+    answer = json.loads(_run(lab, "setup").stdout)
+    assert "title" not in answer and "verify" not in answer
+    assert answer["guide"] == presentation["guide"]
+    assert json.loads(_run(lab, "manifest").stdout)["setup"] == {"guide": presentation["guide"]}
+    lab["script"].write_text(_fixture_text().replace("SETUP = {", "_UNUSED = {", 1))
+    answer = json.loads(_run(lab, "setup").stdout)
+    assert not set(presentation) & set(answer)
+    assert "setup" not in json.loads(_run(lab, "manifest").stdout)
 
 
 

@@ -3082,6 +3082,41 @@ def _validate_connections_declaration(declared) -> list[str]:
     return problems
 
 
+SETUP_PRESENTATION_KEYS = ("title", "guide", "verify")
+
+
+def _validate_setup_declaration(declared) -> list[str]:
+    """`setup`: what the machine's setup is called, the guide a person follows
+    to obtain its fields, and the verb that asks the remote system whether it
+    accepts them."""
+    if not isinstance(declared, dict) or not declared:
+        return ["setup is not an object of title, guide and verify"]
+    problems: list[str] = []
+    unknown = sorted(set(declared) - set(SETUP_PRESENTATION_KEYS))
+    if unknown:
+        problems.append(f"setup has unknown key(s): {', '.join(unknown)}")
+    if "title" in declared and (
+            not isinstance(declared["title"], str) or not declared["title"].strip()):
+        problems.append("setup.title is not non-empty text")
+    if "guide" in declared:
+        guide = declared["guide"]
+        if not isinstance(guide, dict) or set(guide) != {"url", "steps"}:
+            problems.append("setup.guide is not an object of url and steps")
+        else:
+            if (not isinstance(guide["url"], str)
+                    or not re.match(r"https?://[^/\s]+", guide["url"])):
+                problems.append("setup.guide.url is not an http(s) URL")
+            steps = guide["steps"]
+            if (not isinstance(steps, list) or not steps
+                    or not all(isinstance(step, str) and step.strip() for step in steps)):
+                problems.append("setup.guide.steps is not a non-empty list of non-empty text")
+    if "verify" in declared and (
+            not isinstance(declared["verify"], str)
+            or not re.fullmatch(r"[a-z][a-z0-9-]*", declared["verify"])):
+        problems.append("setup.verify is not the name of one verb")
+    return problems
+
+
 def _validate_settings_declaration(declared) -> list[str]:
     if declared is None:
         return []
@@ -3215,6 +3250,8 @@ def _validate_manifest(name: str, manifest) -> list[str]:
         problems.extend(_validate_connections_declaration(manifest["connections"]))
     if "settings" in manifest:
         problems.extend(_validate_settings_declaration(manifest["settings"]))
+    if "setup" in manifest:
+        problems.extend(_validate_setup_declaration(manifest["setup"]))
     return problems
 
 def _machine_reads_declared(text: str) -> tuple[tuple | None, str | None]:

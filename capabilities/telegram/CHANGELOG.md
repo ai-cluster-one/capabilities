@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-24 — `telegram setup` names the app, links where to get it and the check for it
+
+`telegram setup` and the manifest carry the title `Telegram App`, a guide to `https://my.telegram.org/apps` with the steps to obtain the app's id and hash, and `verify` `app-check`, the verb that asks Telegram whether it accepts the machine's app. The two setup fields are labelled `App api_id` and `App api_hash`, as that page names them. The fields, their keys and the connection fields are unchanged. The script declares `capabilities-contract>=0.20,<1`.
+
 ## 2026-10-24 — A connection records the account it is signed in as
 
 `telegram login` and `telegram doctor` record, on success, the account the session belongs to as the connection's `identity` - its id and its name with `@username` - in the connection's own record, and `telegram connections` lists it for every connection with no call to Telegram. `expected_account_id` is marked as the main identifier, so a connection bound to an account and not yet signed in here lists that id. Nothing is recorded under the read-only switch, and a record that cannot be written leaves the verb's answer as it was. The binding is unchanged: `expected_account_id` is still set by hand. The script declares `capabilities-contract>=0.19,<1`.

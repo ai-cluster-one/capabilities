@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.19,<1",
+#     "capabilities-contract>=0.20,<1",
 #     "httpx>=0.27",
 #     "qrcode>=7.4",
 #     "telethon==1.45.0",
@@ -512,13 +512,13 @@ CONN_FIELDS = [{'key': 'api_id',
   'env': 'TELEGRAM_{ID}_OPENAI_KEY'}]
 # What the machine is given once, before any connection; `setup` writes it.
 SETUP_FIELDS = [{'key': 'TELEGRAM_API_ID',
-  'label': 'App id',
+  'label': 'App api_id',
   'help': 'The numeric app id of the app registered at my.telegram.org/apps; every '
           'connection that names none signs in through it.',
   'type': 'integer',
   'required': True},
  {'key': 'TELEGRAM_API_HASH',
-  'label': 'App hash',
+  'label': 'App api_hash',
   'help': 'The app hash paired with the id, from my.telegram.org/apps.',
   'type': 'string',
   'secret': True,
@@ -529,6 +529,18 @@ SETUP_FIELDS = [{'key': 'TELEGRAM_API_ID',
   'type': 'string',
   'secret': True,
   'required': False}]
+# That setup as a whole: what it is called, how a person obtains its fields, and
+# the verb that asks Telegram whether it accepts them.
+SETUP = {'title': 'Telegram App',
+ 'guide': {'url': 'https://my.telegram.org/apps',
+           'steps': ['Sign in at my.telegram.org with the phone number of your Telegram '
+                     'account and the code Telegram sends to the app.',
+                     'Open API development tools.',
+                     'Create an application if none exists yet: any app title and short '
+                     'name will do.',
+                     'Copy App api_id and App api_hash from the App configuration into '
+                     'the fields here.']},
+ 'verify': 'app-check'}
 # The interactive ceremonies that link a connection, each speaking JSON lines.
 LINK_METHODS = [{'id': 'qr',
   'label': 'Scan a QR code',
