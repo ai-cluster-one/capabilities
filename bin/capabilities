@@ -877,7 +877,8 @@ PROJECT VERBS (run inside a consuming project)
         Report this node up: set its last_seen_at to the store's now. The
         node is the one this process runs on (`node id`); a node reports
         itself and no other. Every `deployment runner` runs it on each
-        reconcile, and `deployment help` says when a node counts as live.
+        reconcile, `node run` does the same, and `deployment help` says
+        when a node counts as live.
         Answers {ok, project, agent_id, node, last_seen_at, store}. Exit 6
         node_unknown for a node not registered.
   node rekey <old id> [<new id>] [--dry-run]
@@ -906,6 +907,68 @@ PROJECT VERBS (run inside a consuming project)
         project (exit 6 store_not_configured, 5 when it cannot be reached);
         set, add, remove, seen and rekey exit 4 under the read-only switch,
         but for rekey --dry-run.
+  node run --supervisor <dir> [--every N] [--services <name,...>]
+        The node's service manager: one per node and OS user, run as a
+        program of the Supervisor whose configuration includes <dir>/*.conf
+        (it reaches that Supervisor through SUPERVISOR_SERVER_URL, which
+        Supervisor sets). For every agent the store links to this node
+        whose folder here is bound to it, and every service the agent places
+        on this node (`place`), it keeps one Supervisor program in <dir>,
+        named <capability>.<agent id>, running `node supervise` in the
+        agent's folder; a service no longer placed here loses its program.
+        --services limits it to those capabilities, the ones this
+        Supervisor's box carries; a service placed here outside them is left
+        to whatever runs it, such as a container of its own.
+        It applies the difference with `supervisorctl update`, which leaves
+        every unchanged program running, so node run can stop and start
+        again while the services keep running. It reconciles every N
+        seconds (default 60, 5 to 3600) and within seconds of a placement
+        change, announced by the manager's placement writes, and answers a
+        `service restart` for one of its programs. It reports the node seen
+        on each reconcile. While the store cannot be read it changes no job,
+        and at its first start it writes none until it has read the store. A
+        placed service that cannot run here - not installed, no deploy
+        command, quarantined, or its agent's folder not bound to it - is
+        named once on stderr. Exit 6 supervisor_required,
+        supervisor_unreachable or node_run_running.
+  node supervise <name> [--agent <id>]
+        What a node-run program runs: read <name>'s deploy command and
+        restart policy from its installed descriptor, then run it under
+        `deployment runner` (exec), which asks the gate and the lease on
+        each reconcile and writes this node's row of the service. Exit 6
+        agent_mismatch where the folder is bound to another agent than
+        --agent, 3 no_service or deployment_unavailable.
+  service start <name> [--node <node>] [--wait S]
+  service move <name> --node <node> [--wait S]
+  service stop <name> [--node <node> | --all] [--wait S]
+  service restart <name> [--node <node>] [--wait S]
+  service status [<name>] [--agent <id|slug>]
+        One set of handles for every capability's service, in a store-mode
+        project; the node defaults to this one. start places the service on
+        the node (as `place --node`: an exclusive one leaves every other
+        node in the same write) and waits up to S seconds (default 120, 0 to
+        3600) for that node's row in capabilities_service_instances: it
+        answers {started, node, placement, changed, placed_on, ready, state,
+        instance, waited_seconds, unplaced_from?} once the row is ready or
+        degraded, and exits 6 service_<state> (unusable, held, failing,
+        waiting, starting, or absent for no row) with that answer as the
+        error's detail when it is not. move does the same for an exclusive
+        service (exit 6 placement_shared otherwise) and also waits for every
+        other node's row to go. stop unplaces it from the node, or with
+        --all from every node it is placed or running on, and waits until
+        those nodes hold no row: {stopped, nodes, changed, placed_on,
+        waited_seconds}, else exit 6 service_still_running. restart asks the
+        node's manager through the store to restart its program and waits
+        for the row's started_at to move: {restarted, node, state, ready,
+        instance, waited_seconds}; exit 6 service_not_running where the node
+        has no row, restart_unanswered where nothing restarted it (only
+        `node run` answers). status writes nothing: {ok, project, agent_id,
+        this_node, services [{capability, placed_on, ready_on, instances
+        [row]}], store}, each row with its node, state, ready, problem,
+        problem_code, payload_sha256, pid, host, started_at, checked_at,
+        checked_seconds_ago, last_exit_code, last_error, last_error_at and
+        skipped_settings; --agent reads another agent in the same store.
+        start, move and stop exit 4 under the read-only switch.
   context --claude|--codex|--fragment
         Compose the session injection from the gate + snapshots + project
         envelopes. --fragment prints the manager-owned Markdown block without
@@ -1652,8 +1715,8 @@ READ_ONLY_REFUSED_VERBS = ("agent convert", "agent set", "allow", "connections i
                            "disable", "enable", "inherit", "init", "node add", "node remove",
                            "node set", "place", "quarantine", "references export",
                            "references import", "references retire", "references save",
-                           "relabel", "set",
-                           "store set", "store unset", "unplace")
+                           "relabel", "service move", "service start", "service stop",
+                           "set", "store set", "store unset", "unplace")
 
 
 def _read_only_gate(verb: str) -> None:
@@ -9414,10 +9477,709 @@ NODE_LEASES = (("deployment_service_leases", "capability"),
                ("agentrooms_leases", "agent"))
 
 
+# ---------------------------------------------------------------- node services
+#
+# One process per node and OS user, `node run`, keeps one supervised job per
+# service placed on this node, for every agent that lives here, and no job for
+# any other. It reads the placement rows of the store, writes each job's
+# definition where the node's supervisor reads it, and asks the supervisor to
+# apply only the difference. A job runs `node supervise`, which reads the
+# service's command from the installed descriptor each time it starts, so no
+# job carries a command that can go stale. The jobs are the supervisor's, not
+# this process's children: it can stop, be updated and start again while every
+# service keeps running, and what it knows is only what the store and the job
+# files hold.
+
+NODE_RUN_EVERY_DEFAULT = 60
+NODE_RUN_BOUNDS = (5, 3600)
+NODE_RUN_FOLLOW_SECONDS = 2.0
+NODE_PLACEMENT_CHANNEL = "capabilities_placement"
+NODE_RESTART_CHANNEL = "capabilities_service_restart"
+NODE_JOB_MARK = "; written by `capabilities node run`, which rewrites or removes it\n"
+NODE_JOB_STOP_SECONDS = 30
+SERVICE_WAIT_DEFAULT = 120
+SERVICE_WAIT_BOUNDS = (0, 3600)
+SERVICE_READY_STATES = ("ready", "degraded")
+INSTANCE_COLUMNS = ("node", "state", "ready", "problem", "problem_code", "payload_sha256",
+                    "pid", "host", "started_at", "checked_at", "last_exit_code",
+                    "last_error", "last_error_at", "skipped_settings")
+
+
+def _announce(root: Path, channel: str, scope: str) -> bool:
+    """Raise the version of `channel` for `scope` in the project's store, so a
+    node manager that follows it acts now rather than at its next reconcile.
+    Best effort: where the store cannot take it, the change waits for that
+    reconcile; what it announces has already been written."""
+    db = _db_module()
+    try:
+        conn = db.connect(application_name=_store_module().STORE_OWNER,
+                          setting=db.resolve_setting(root), transaction=True)
+    except db.DbError:
+        return False
+    try:
+        with conn.transaction():
+            db.announce(conn, channel, scope)
+        return True
+    except Exception:  # a store without the channel table, or one that went away
+        return False
+    finally:
+        conn.close()
+
+
+def _announce_placement(root: Path) -> None:
+    """Tell the node managers of this project's agent that where its services
+    are placed may have changed."""
+    agent_id = _folder_agent_id(root)
+    if agent_id:
+        _announce(root, NODE_PLACEMENT_CHANNEL, agent_id)
+
+
+def _node_job_name(agent_id: str, capability: str) -> str:
+    """A job's name in the node's supervisor: the capability, then the agent."""
+    return f"{capability}.{re.sub(r'[^A-Za-z0-9_-]', '_', agent_id)}"
+
+
+def _node_service_command(name: str) -> tuple[list[str], str | None]:
+    """The argv the installed service of `name` declares (`service.deploy.
+    command`) and its restart policy, or ([], why not)."""
+    service = _installed_service(name) if name in _installed() else None
+    if service is None:
+        return [], f"{name} is not installed here or bundles no service"
+    deploy = service.get("deploy")
+    command = deploy.get("command") if isinstance(deploy, dict) else None
+    if not (isinstance(command, list) and command
+            and all(isinstance(v, str) and v for v in command)):
+        return [], f"{name}'s service declares no deploy command"
+    return list(command), None
+
+
+def _node_job_text(job: dict, manager: str) -> str:
+    """A job's definition for the node's supervisor (Supervisor's program
+    section). It names the agent, the capability and the manager, never the
+    service's command line."""
+    command = [manager, "node", "supervise", job["capability"], "--agent", job["agent_id"]]
+    return (NODE_JOB_MARK
+            + f"[program:{job['name']}]\n"
+            + f"command={shlex.join(command)}\n"
+            + f"directory={job['folder']}\n"
+            + "autostart=true\nautorestart=true\nstartsecs=3\nstartretries=100\n"
+            + f"stopsignal=TERM\nstopwaitsecs={NODE_JOB_STOP_SECONDS}\n"
+            + "stopasgroup=true\nkillasgroup=true\n"
+            + "stdout_logfile=/dev/fd/1\nstdout_logfile_maxbytes=0\n"
+            + "stderr_logfile=/dev/fd/2\nstderr_logfile_maxbytes=0\n")
+
+
+class _NodeManager:
+    """`node run` on a node whose supervisor is Supervisor: each job is a
+    program file in the include directory its configuration names, applied
+    with `supervisorctl update`, which starts what is new, stops what went and
+    leaves every other program running."""
+
+    def __init__(self, root: Path, include: Path, server_url: str, every: int,
+                 only: set[str] | None = None):
+        self.root, self.include, self.url, self.every = root, include, server_url, every
+        self.only = only
+        self.here = _this_node()["id"]
+        self.manager = shutil.which("capabilities") or str(Path(sys.argv[0]).resolve())
+        self.db = _db_module()
+        self.store = _store_module()
+        self.setting = None
+        self.migrated = False
+        self.read_once = False
+        self.pending_apply = True
+        self.jobs: dict[str, dict] = {}
+        self.agents: list[str] = []
+        self.follower = None
+        self.follow_keys: tuple = ()
+        self.said: dict[str, object] = {}
+
+    def say(self, message: str) -> None:
+        sys.stderr.write(f"[capabilities node {self.here}] {message}\n")
+        sys.stderr.flush()
+
+    def say_once(self, key: str, value: object, message: str) -> None:
+        if self.said.get(key) != value:
+            self.said[key] = value
+            if message:
+                self.say(message)
+
+    def _connect(self):
+        db = self.db
+        if self.setting is None:
+            self.setting = db.resolve_setting(self.root)
+        conn = db.connect(application_name=self.store.STORE_OWNER, setting=self.setting,
+                          transaction=True)
+        if not self.migrated:
+            major, minor = self.store.STORE_TABLES_VERSION
+            try:
+                db.migrate(conn, self.store.STORE_OWNER, self.store.record_table_steps(),
+                           major=major, minor=minor)
+            except Exception:
+                conn.close()
+                raise
+            self.migrated = True
+        return conn
+
+    def read_store(self) -> tuple[list[tuple], list[tuple]] | None:
+        """(agents [(agent_id, folder)], placed [(agent_id, capability)]) as the
+        store holds them for this node, reporting the node seen; None where the
+        store cannot be read, said once."""
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            self.say_once("store", getattr(exc, "slug", type(exc).__name__),
+                          f"cannot read the store, so every job stays as it is: "
+                          f"{getattr(exc, 'message', exc)}")
+            return None
+        try:
+            with conn.transaction():
+                agents = conn.execute(
+                    "SELECT agent_id, folder FROM capabilities_agent_nodes WHERE node = %s "
+                    "ORDER BY agent_id", (self.here,)).fetchall()
+                placed = conn.execute(
+                    "SELECT p.agent_id, p.capability FROM capabilities_policy p "
+                    "JOIN capabilities_agent_nodes l ON l.agent_id = p.agent_id "
+                    "AND l.node = p.node WHERE p.node = %s AND p.enabled AND p.service "
+                    "ORDER BY p.agent_id, p.capability", (self.here,)).fetchall()
+                conn.execute("UPDATE capabilities_nodes SET last_seen_at = now() "
+                             "WHERE id = %s", (self.here,))
+        except Exception as exc:
+            self.say_once("store", type(exc).__name__,
+                          "cannot read the store, so every job stays as it is: "
+                          + " ".join(f"{type(exc).__name__}: {exc}".split())[:300])
+            return None
+        finally:
+            conn.close()
+        if self.said.get("store") is not None:
+            self.say("reads the store again")
+        self.said["store"] = None
+        return agents, placed
+
+    def desired(self, agents: list[tuple], placed: list[tuple]) -> dict[str, dict]:
+        """The jobs this node should run, by job name; what is placed here and
+        cannot run is said once, with why."""
+        folders: dict[str, Path] = {}
+        for agent_id, folder in agents:
+            path = Path(folder) if folder else None
+            if path is None or _folder_agent_id(path) != agent_id:
+                self.say_once(f"agent:{agent_id}", folder,
+                              f"agent {agent_id} records no folder on this node that is "
+                              f"bound to it ({folder or 'none'}), so none of its services "
+                              "runs here")
+                continue
+            self.said.pop(f"agent:{agent_id}", None)
+            folders[agent_id] = path
+        jobs: dict[str, dict] = {}
+        for agent_id, capability in placed:
+            if agent_id not in folders:
+                continue
+            if self.only is not None and capability not in self.only:
+                # Placed here and run by something else on this node, such as
+                # a container of its own.
+                continue
+            key = f"service:{agent_id}/{capability}"
+            _command, why = _node_service_command(capability)
+            if why is None and _machine_state(capability) == "quarantined":
+                why = f"{capability} is quarantined on this machine"
+            if why is not None:
+                self.say_once(key, why, f"{capability} is placed here for {agent_id} and "
+                                        f"does not run: {why}")
+                continue
+            self.said.pop(key, None)
+            name = _node_job_name(agent_id, capability)
+            jobs[name] = {"name": name, "agent_id": agent_id, "capability": capability,
+                          "folder": str(folders[agent_id])}
+        return jobs
+
+    def written(self) -> dict[str, Path]:
+        """The job files this process wrote, by job name."""
+        found = {}
+        for path in sorted(self.include.glob("*.conf")):
+            try:
+                if path.read_text().startswith(NODE_JOB_MARK):
+                    found[path.stem] = path
+            except OSError:
+                continue
+        return found
+
+    def reconcile(self) -> None:
+        answer = self.read_store()
+        if answer is None:
+            return
+        agents, placed = answer
+        self.agents = [agent_id for agent_id, _folder in agents]
+        desired = self.desired(agents, placed)
+        present = self.written()
+        for name, job in desired.items():
+            path = self.include / f"{name}.conf"
+            text = _node_job_text(job, self.manager)
+            try:
+                current = path.read_text()
+            except OSError:
+                current = None
+            if current == text:
+                continue
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(text)
+            os.replace(tmp, path)
+            self.pending_apply = True
+            self.say(f"runs {job['capability']} for {job['agent_id']} here as job {name}")
+        for name, path in present.items():
+            if name in desired:
+                continue
+            path.unlink(missing_ok=True)
+            self.pending_apply = True
+            self.say(f"stops job {name}: its service is no longer placed here")
+        self.jobs = desired
+        self.read_once = True
+        if self.pending_apply:
+            self.apply()
+
+    def supervisorctl(self, *args: str) -> tuple[bool, str]:
+        try:
+            done = subprocess.run(["supervisorctl", "-s", self.url, *args],
+                                  stdin=subprocess.DEVNULL, capture_output=True,
+                                  text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"supervisorctl could not be run: {exc}"
+        said = (done.stdout + done.stderr).strip()
+        failed = done.returncode != 0 or "ERROR" in said
+        return not failed, said
+
+    def apply(self) -> None:
+        ok, said = self.supervisorctl("update")
+        self.pending_apply = not ok
+        self.say_once("apply", None if ok else said,
+                      f"the supervisor did not apply the jobs, tried again next "
+                      f"reconcile: {said[:300]}" if not ok else "")
+
+    def refollow(self) -> None:
+        """Follow the placement of every agent here and a restart request for
+        every job, starting from the versions the store holds now, so nothing
+        that was asked before this process looked is acted on."""
+        keys = tuple(sorted(
+            {(NODE_PLACEMENT_CHANNEL, agent_id) for agent_id in self.agents}
+            | {(NODE_RESTART_CHANNEL, f"{job['agent_id']}/{job['capability']}/{self.here}")
+               for job in self.jobs.values()}))
+        if keys == self.follow_keys or not keys:
+            return
+        db = self.db
+        seen = dict(self.follower.seen) if self.follower is not None else {}
+        fresh = [key for key in keys if key not in seen]
+        try:
+            if fresh:
+                base = db.Follower(fresh, application_name=self.store.STORE_OWNER,
+                                   setting=self.setting).read()
+                seen.update(base)
+            self.follower = db.Follower(keys, application_name=self.store.STORE_OWNER,
+                                        setting=self.setting, seen=seen)
+            self.follow_keys = keys
+        except Exception as exc:
+            self.say_once("follow", type(exc).__name__,
+                          f"cannot follow placement changes, so it acts on its "
+                          f"reconcile alone: {getattr(exc, 'message', exc)}")
+
+    def poll(self) -> tuple[bool, list[str]]:
+        """(placement moved, jobs asked to restart) since the last poll."""
+        if self.follower is None:
+            return False, []
+        try:
+            moved = self.follower.poll()
+        except Exception:
+            return False, []
+        placement = any(channel == NODE_PLACEMENT_CHANNEL for channel, _scope in moved)
+        restarts = []
+        for channel, scope in moved:
+            if channel != NODE_RESTART_CHANNEL:
+                continue
+            agent_id, capability, _node = scope.rsplit("/", 2)
+            restarts.append(_node_job_name(agent_id, capability))
+        return placement, restarts
+
+    def restart(self, name: str) -> None:
+        if name not in self.jobs:
+            return
+        ok, said = self.supervisorctl("restart", name)
+        self.say(f"restarted job {name}, as asked" if ok
+                 else f"could not restart job {name}: {said[:300]}")
+
+    def run(self, stopping: dict) -> None:
+        next_reconcile = 0.0
+        while not stopping["now"]:
+            placement, restarts = self.poll()
+            if placement or time.monotonic() >= next_reconcile:
+                self.reconcile()
+                self.refollow()
+                next_reconcile = time.monotonic() + self.every
+            elif self.pending_apply and self.read_once:
+                self.apply()
+            for name in restarts:
+                self.restart(name)
+            deadline = time.monotonic() + NODE_RUN_FOLLOW_SECONDS
+            while not stopping["now"] and time.monotonic() < deadline:
+                time.sleep(0.2)
+
+
+def _node_run(args: list[str]) -> None:
+    import fcntl
+    import signal
+    pos, opts = _kernel_options(args, {"--supervisor", "--every", "--services"}, set(),
+                                "node run")
+    if pos:
+        _die(6, "input", "node run takes no positional argument: it runs this node's "
+             "services")
+    include = opts.get("--supervisor")
+    if not include:
+        _die(6, "supervisor_required",
+             "node run needs the include directory of the Supervisor it runs under",
+             "capabilities node run --supervisor <dir>, as a program of a Supervisor "
+             "whose configuration includes <dir>/*.conf")
+    url = os.environ.get("SUPERVISOR_SERVER_URL")
+    if not url:
+        _die(6, "supervisor_unreachable",
+             "node run reaches its Supervisor through SUPERVISOR_SERVER_URL, which "
+             "Supervisor sets for each program it starts, and it is unset",
+             "run node run as a program of that Supervisor")
+    every = opts.get("--every", str(NODE_RUN_EVERY_DEFAULT))
+    low, high = NODE_RUN_BOUNDS
+    if not every.isdigit() or not low <= int(every) <= high:
+        _die(6, "input", f"--every takes whole seconds from {low} to {high}")
+    root = _require_project()
+    include_dir = Path(include)
+    try:
+        include_dir.mkdir(parents=True, exist_ok=True)
+        lock = open(include_dir / ".node-run.lock", "w")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        _die(6, "node_run_running",
+             f"another node run already keeps the jobs in {include_dir}")
+    except OSError as exc:
+        _die(6, "supervisor_include_unwritable", f"cannot write {include_dir}: {exc}")
+    stopping = {"now": False}
+
+    def stop(_signum, _frame):
+        stopping["now"] = True
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, stop)
+    only = ({name for name in opts["--services"].split(",") if name}
+            if "--services" in opts else None)
+    manager = _NodeManager(root, include_dir, url, int(every), only)
+    manager.say(f"keeps a job per service placed on this node in {include_dir}, "
+                f"reconciling every {every}s and on each placement change")
+    manager.run(stopping)
+    manager.say("stops; every job keeps running under the supervisor")
+    lock.close()
+
+
+def _node_supervise(args: list[str]) -> None:
+    pos, opts = _kernel_options(args, {"--agent"}, set(), "node supervise")
+    if len(pos) != 1:
+        _die(6, "input", "node supervise takes the capability whose service it runs",
+             "capabilities node supervise <name> [--agent <id>]")
+    name = pos[0]
+    root = _require_project()
+    agent = opts.get("--agent")
+    bound = _folder_agent_id(root)
+    if agent and bound != agent:
+        _die(6, "agent_mismatch",
+             f"{root} is bound to agent {bound or 'none'}, not {agent}; the job is stale "
+             "and its node manager removes it")
+    command, why = _node_service_command(name)
+    if why is not None:
+        _die(3, "no_service", why)
+    service = _installed_service(name) or {}
+    restart = (service.get("deploy") or {}).get("restart")
+    deployment = shutil.which("deployment")
+    if not deployment:
+        _die(3, "deployment_unavailable",
+             "a service is supervised through `deployment runner`, and deployment is not "
+             "installed on this node", "run `capabilities install deployment`")
+    argv = [deployment, "runner", name]
+    if isinstance(restart, str) and restart:
+        argv += ["--restart", restart]
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(deployment, [*argv, "--", *command])
+
+
+# ---------------------------------------------------------------- service handles
+
+
+def _instance_rows(conn, agent_id: str, capability: str | None = None) -> list[dict]:
+    """The rows of what each node runs of this agent's services
+    (capabilities_service_instances), with how long ago each was checked; none
+    on a store that predates the table."""
+    stamp = _store_module()._stamp
+    if conn.execute("SELECT to_regclass('capabilities_service_instances')"
+                    ).fetchone()[0] is None:
+        return []
+    rows = conn.execute(
+        f"SELECT capability, {', '.join(INSTANCE_COLUMNS)}, "
+        "round(extract(epoch FROM now() - checked_at))::int "
+        "FROM capabilities_service_instances WHERE project_id = %s "
+        "AND (%s::text IS NULL OR capability = %s) ORDER BY capability, node",
+        (agent_id, capability, capability)).fetchall()
+    out = []
+    for row in rows:
+        item = {"capability": row[0], **dict(zip(INSTANCE_COLUMNS, row[1:-1])),
+                "checked_seconds_ago": row[-1]}
+        for key in ("started_at", "checked_at", "last_error_at"):
+            item[key] = stamp(item[key])
+        out.append(item)
+    return out
+
+
+def _service_options(args: list[str], verb: str, valued: set[str],
+                     flags: set[str] = frozenset()) -> tuple[str | None, dict]:
+    pos, opts = _kernel_options(args, valued, {"--json", *flags}, f"service {verb}")
+    if len(pos) > 1 or (verb != "status" and len(pos) != 1):
+        _die(6, "input", f"service {verb} takes one capability name")
+    wait = opts.get("--wait", str(SERVICE_WAIT_DEFAULT))
+    low, high = SERVICE_WAIT_BOUNDS
+    if not wait.isdigit() or not low <= int(wait) <= high:
+        _die(6, "input", f"--wait takes whole seconds from {low} to {high}")
+    opts["--wait"] = int(wait)
+    return (pos[0] if pos else None), opts
+
+
+def _service_watch(root: Path, agent_id: str, name: str, done, wait: int
+                   ) -> tuple[list[dict], bool, float]:
+    """Read the service's instance rows each second until `done(rows)` or
+    `wait` seconds pass: (the last rows, whether done, seconds waited)."""
+    conn, _setting = _kernel_open(root)
+    started = time.monotonic()
+    try:
+        while True:
+            try:
+                with conn.transaction():
+                    rows = _instance_rows(conn, agent_id, name)
+            except Exception as exc:
+                _die(5, "store_unreachable", f"cannot read what the nodes run: {exc}",
+                     "check the database setting with `capabilities store doctor`")
+            if done(rows):
+                return rows, True, round(time.monotonic() - started, 1)
+            if time.monotonic() - started >= wait:
+                return rows, False, round(time.monotonic() - started, 1)
+            time.sleep(1.0)
+    finally:
+        conn.close()
+
+
+def _service_fail(code: str, message: str, hint: str, detail: dict) -> NoReturn:
+    sys.stderr.write(json.dumps({"error": {"code": code, "message": message, "hint": hint,
+                                           "detail": detail}},
+                                ensure_ascii=False, default=str) + "\n")
+    sys.exit(6)
+
+
+def _service_settled(row: dict | None) -> str:
+    """Why a started service is not ready, in words, from its node's row."""
+    if row is None:
+        return "no node manager or runner reports it there yet"
+    state = row["state"]
+    if state == "waiting":
+        return f"waiting: {row.get('problem') or 'another node holds its lease'}"
+    if state == "failing":
+        return f"failing: {(row.get('last_error') or '').strip()[-300:]}"
+    return f"{state}: {row.get('problem') or ''}".rstrip(": ")
+
+
+def _service_start(args: list[str], move: bool = False) -> None:
+    verb = "move" if move else "start"
+    name, opts = _service_options(args, verb, {"--node", "--wait"})
+    if move and not opts.get("--node"):
+        _die(6, "input", "service move needs --node <node>, the node it moves to")
+    root = _require_project()
+    node = opts.get("--node") or _this_node()["id"]
+    service = _installed_service(name) if name in _installed() else None
+    if move and service is not None and _service_placement(service) == "shared":
+        _die(6, "placement_shared",
+             f"{name}'s service is shared: it runs on every node it is placed on, so it "
+             "moves by starting it on one node and stopping it on another",
+             f"capabilities service start {name} --node {node}")
+    placed = _service_place(name, True, node)
+    agent_id = _kernel_agent_id(root)
+    _announce_placement(root)
+    exclusive = placed["placement"] == "exclusive"
+
+    def done(rows):
+        here = next((r for r in rows if r["node"] == node), None)
+        if move and any(r["node"] != node for r in rows):
+            return False
+        return here is not None and (here["state"] in SERVICE_READY_STATES
+                                     or here["state"] in ("unusable", "held"))
+
+    rows, _done, waited = _service_watch(root, agent_id, name, done, opts["--wait"])
+    row = next((r for r in rows if r["node"] == node), None)
+    others = [r for r in rows if r["node"] != node] if exclusive else []
+    result = {("moved" if move else "started"): name, "node": node,
+              "placement": placed["placement"], "changed": placed["changed"],
+              "placed_on": placed["placed_on"], "ready": bool(row and row["ready"]),
+              "state": row["state"] if row else None, "instance": row,
+              "waited_seconds": waited}
+    if placed.get("unplaced_from"):
+        result["unplaced_from"] = placed["unplaced_from"]
+    if others:
+        result["still_on"] = others
+    if row and row["ready"] and not (move and others):
+        _emit(result)
+        return
+    state = row["state"] if row else "absent"
+    _service_fail(f"service_{state}",
+                  f"{name} is placed on {node} and is not ready there after {waited}s: "
+                  + _service_settled(row)
+                  + (f"; still running on {', '.join(r['node'] for r in others)}"
+                     if move and others else ""),
+                  f"`capabilities service status {name}` shows every node's row; "
+                  "a longer --wait waits for a slow start", result)
+
+
+def _service_stop(args: list[str]) -> None:
+    name, opts = _service_options(args, "stop", {"--node", "--wait"}, {"--all"})
+    if "--all" in opts and opts.get("--node"):
+        _die(6, "input", "service stop takes --node <node> or --all, not both")
+    root = _require_project()
+    agent_id = _kernel_agent_id(root)
+    if "--all" in opts:
+        conn, _setting = _kernel_open(root)
+        try:
+            with conn.transaction():
+                running = {r["node"] for r in _instance_rows(conn, agent_id, name)}
+        finally:
+            conn.close()
+        adapter = _records_for(root)
+        try:
+            nodes = sorted(set(adapter.placed_nodes(name)) | running)
+        finally:
+            adapter.close()
+    else:
+        nodes = [opts.get("--node") or _this_node()["id"]]
+    unplaced = [_service_place(name, False, node) for node in nodes]
+    _announce_placement(root)
+    rows, _done, waited = _service_watch(
+        root, agent_id, name, lambda rows: not any(r["node"] in nodes for r in rows),
+        opts["--wait"])
+    left = [r for r in rows if r["node"] in nodes]
+    result = {"stopped": name, "nodes": nodes,
+              "changed": any(u["changed"] for u in unplaced),
+              "placed_on": unplaced[-1]["placed_on"] if unplaced else [],
+              "waited_seconds": waited}
+    if not left:
+        _emit(result)
+        return
+    result["still_running"] = left
+    _service_fail("service_still_running",
+                  f"{name} is unplaced from {', '.join(nodes)} and still runs on "
+                  f"{', '.join(r['node'] for r in left)} after {waited}s",
+                  "the node's manager stops it at its next reconcile; a node that does "
+                  "not answer keeps its row until it is back", result)
+
+
+def _service_status(args: list[str]) -> None:
+    name, opts = _service_options(args, "status", {"--agent"})
+    root = _require_project()
+    ref = opts.get("--agent")
+
+    def read(conn, own_id):
+        agent_id = own_id
+        if ref:
+            found = conn.execute(
+                "SELECT id FROM capabilities_agents WHERE id = %s OR slug = %s "
+                "ORDER BY id = %s DESC", (ref, ref, ref)).fetchone()
+            if found is None:
+                raise _KernelRefusal("agent_unknown", f"the store holds no agent {ref!r}",
+                                     "run `capabilities agent list` to see the agents it "
+                                     "holds")
+            agent_id = found[0]
+        placed = conn.execute(
+            "SELECT capability, node FROM capabilities_policy WHERE agent_id = %s "
+            "AND node IS NOT NULL AND enabled AND service "
+            "AND (%s::text IS NULL OR capability = %s) ORDER BY capability, node",
+            (agent_id, name, name)).fetchall()
+        return agent_id, placed, _instance_rows(conn, agent_id, name)
+
+    try:
+        (agent_id, placed, rows), setting = _kernel_run(root, read)
+    except _KernelRefusal as exc:
+        _die(6, exc.code, exc.message, exc.hint)
+    names = sorted({c for c, _n in placed} | {r["capability"] for r in rows}
+                   | ({name} if name else set()))
+    services = []
+    for capability in names:
+        instances = [{k: v for k, v in r.items() if k != "capability"}
+                     for r in rows if r["capability"] == capability]
+        services.append({"capability": capability,
+                         "placed_on": [n for c, n in placed if c == capability],
+                         "ready_on": [r["node"] for r in instances if r["ready"]],
+                         "instances": instances})
+    _emit({"ok": True, "project": str(root), "agent_id": agent_id,
+           "this_node": _node_id_or(None), "services": services,
+           "store": _kernel_store_report(setting)})
+
+
+def _service_restart(args: list[str]) -> None:
+    name, opts = _service_options(args, "restart", {"--node", "--wait"})
+    root = _require_project()
+    agent_id = _kernel_agent_id(root)
+    node = opts.get("--node") or _this_node()["id"]
+    conn, _setting = _kernel_open(root)
+    try:
+        with conn.transaction():
+            before = next((r for r in _instance_rows(conn, agent_id, name)
+                           if r["node"] == node), None)
+    finally:
+        conn.close()
+    if before is None:
+        _die(6, "service_not_running",
+             f"no node manager or runner reports {name} on {node}, so there is nothing "
+             "to restart", f"capabilities service start {name} --node {node}")
+    if not _announce(root, NODE_RESTART_CHANNEL, f"{agent_id}/{name}/{node}"):
+        _die(5, "store_unreachable", "the restart could not be asked through the store",
+             "check the database setting with `capabilities store doctor`")
+
+    def done(rows):
+        row = next((r for r in rows if r["node"] == node), None)
+        return (row is not None and row["started_at"] is not None
+                and row["started_at"] != before["started_at"] and row["state"] != "stopping")
+
+    rows, finished, waited = _service_watch(root, agent_id, name, done, opts["--wait"])
+    row = next((r for r in rows if r["node"] == node), None)
+    result = {"restarted": name, "node": node, "state": row["state"] if row else None,
+              "ready": bool(row and row["ready"]), "instance": row,
+              "waited_seconds": waited}
+    if finished:
+        _emit(result)
+        return
+    _service_fail("restart_unanswered",
+                  f"{name} on {node} did not start again within {waited}s",
+                  f"only a node manager (`capabilities node run`) answers a restart; a "
+                  f"node without one restarts {name} by its own means", result)
+
+
+def cmd_service(args: list[str]) -> None:
+    sub = args[0] if args else None
+    verbs = {"start": _service_start, "stop": _service_stop,
+             "move": lambda rest: _service_start(rest, move=True),
+             "status": _service_status, "restart": _service_restart}
+    if sub not in verbs:
+        _die(6, "input", "service needs a subcommand: start, stop, move, status or restart",
+             "run `capabilities help`")
+    if sub in ("start", "stop", "move"):
+        _read_only_gate(f"service {sub}")
+    verbs[sub](args[1:])
+
+
 def cmd_node(args: list[str]) -> None:
     sub = args[0] if args else None
     if sub == "id":
         _node_id_verb(args[1:])
+        return
+    if sub == "run":
+        _node_run(args[1:])
+        return
+    if sub == "supervise":
+        _node_supervise(args[1:])
         return
     root = _require_project()
     valued = {"--label", "--kind", "--address", "--target", "--coolify-connection",
@@ -9444,7 +10206,8 @@ def cmd_node(args: list[str]) -> None:
                           "--dry-run" in opts))
         return
     if sub not in ("add", "set", "remove", "seen"):
-        _die(6, "input", "node needs a subcommand: add, set, list, remove, seen, id or rekey",
+        _die(6, "input", "node needs a subcommand: add, set, list, remove, seen, id, rekey, run "
+             "or supervise",
              "run `capabilities help`")
     _read_only_gate(f"node {sub}")
     if sub == "seen":
@@ -10449,6 +11212,8 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False,
         result["unplaced"] = node
         result["warning"] = _unplaced_warning(name, node, "the row disabled")
         _warn(result["warning"])
+    if scope == "project" and node is not None:
+        _announce_placement(root)
     if migrated:
         result["migrated_from"] = str(root / LEGACY_PROJECT_CAPABILITIES_REL)
     if scope == "project" and enabled:
@@ -10609,17 +11374,39 @@ def _place_service(name: str, placed: bool, node: str | None,
              f"{name}'s service is exclusive: it runs on one node at a time, so it "
              "is placed on one node, not on every node",
              f"move it with `capabilities place {name} --node <node>`")
-    adapter = _records_for(root)
     if node is None:
+        adapter = _records_for(root)
         try:
             _require_node_store(root, adapter)
             _emit(_place_everywhere(name, root, adapter) if every
                   else _placement_report(name, root, adapter, mode))
+            if every:
+                _announce_placement(root)
         except _store_module().StoreError as exc:
             _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
         finally:
             adapter.close()
         return
+    result = _service_place(name, placed, node)
+    _announce_placement(root)
+    _emit(result)
+
+
+def _service_place(name: str, placed: bool, node: str) -> dict:
+    """Place this project's service of `name` on `node`, or take it off, and
+    answer what `place --node` answers. An exclusive service placed on one node
+    is taken off every other in the same write."""
+    root = _require_project()
+    _ensure_envelope(root)
+    verb = "place" if placed else "unplace"
+    if name not in _installed():
+        _die(3, "not_installed", f"{name} is not installed",
+             f"run `capabilities install {name}`")
+    service = _installed_service(name)
+    if service is None:
+        _die(6, "no_service", f"{name} bundles no service, so there is nothing to {verb}")
+    mode = _service_placement(service)
+    adapter = _records_for(root)
     try:
         node = _gate_node(node, root, adapter)
         _stamp_policy(adapter, root, "project")
@@ -10638,7 +11425,7 @@ def _place_service(name: str, placed: bool, node: str | None,
         result["unplaced_from"] = answer["unplaced"]
     if answer.get("enabled_on_node"):
         result["enabled_on_node"] = True
-    _emit(result)
+    return result
 
 
 def _place_everywhere(name: str, root: Path, adapter) -> dict:
@@ -10776,6 +11563,8 @@ def _inherit_gate(name: str, scope: str, node: str | None = None) -> None:
         result["unplaced"] = node
         result["warning"] = _unplaced_warning(name, node, "the row removed")
         _warn(result["warning"])
+    if scope == "project" and node is not None:
+        _announce_placement(root)
     _refresh_after_gate(root, result)
     _emit(result)
 
@@ -21320,6 +22109,8 @@ def main() -> None:
         cmd_agent(rest)
     elif cmd == "node":
         cmd_node(rest)
+    elif cmd == "service":
+        cmd_service(rest)
     elif cmd == "relabel":
         if len(pos) != 1:
             _die(6, "input", "relabel needs exactly one new slug")

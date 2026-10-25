@@ -1396,3 +1396,172 @@ def test_retire_records_moves_the_config_home_gate_and_identifiers_once_the_stor
     assert sorted(p.name for p in home.iterdir()) == ["credentials.env"]
     report = _ok(_outside(lab, MANAGER, "migrate", "--report"))
     assert report["config_home"]["files"] == []
+
+
+# --- the node's service manager and the service handles ----------------------------
+
+def _service_lab(lab, placement: str = "exclusive") -> dict:
+    """The lab's agent in the store on this node, NODE, its folder recorded,
+    with coolify standing in for a capability that bundles a service."""
+    _import(lab)
+    registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"
+    registry.mkdir(parents=True)
+    (registry / "coolify").write_text("#!/bin/sh\n")
+    (registry / "manifest.json").write_text(json.dumps({"name": "coolify", "service": {
+        "name": "svc", "summary": "s", "verbs": [], "placement": placement,
+        "deploy": {"command": ["coolify", "service", "run"], "restart": "on-failure"}}}))
+    here = {"AGENT_NODE_ID": NODE}
+    _ok(_manager(lab, "node", "add", NODE, "--label", "lab-node", "--kind", "server",
+                 extra=here))
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("UPDATE lab.capabilities_agent_nodes SET folder = %s",
+                     (str(lab["project"]),))
+    return here
+
+
+def _instance(lab, node: str, state: str, **columns) -> None:
+    """Write the row a runner on `node` writes of coolify's service."""
+    row = {"project_id": PROJECT_ID, "capability": "coolify", "node": node,
+           "state": state, "started_at": "2026-10-25T10:00:00+00:00", **columns}
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("SET search_path TO lab")
+        conn.execute("DELETE FROM capabilities_service_instances WHERE node = %s", (node,))
+        conn.execute(f"INSERT INTO capabilities_service_instances ({', '.join(row)}) "
+                     f"VALUES ({', '.join(['%s'] * len(row))})", list(row.values()))
+
+
+def _wait_for(check, seconds: float = 20.0):
+    import time
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        found = check()
+        if found:
+            return found
+        time.sleep(0.2)
+    return check()
+
+
+def test_node_run_keeps_a_job_per_service_placed_here_and_answers_a_restart(lab, tmp_path):
+    here = _service_lab(lab)
+    jobs = tmp_path / "jobs"
+    calls = tmp_path / "supervisorctl.log"
+    # Supervisor stands in as its control client: each call is logged, and a
+    # restart starts the service again as the runner would, by moving its row.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "supervisorctl").write_text(f"""#!{sys.executable}
+import json, sys
+import psycopg
+args = sys.argv[1:]
+with open({str(calls)!r}, "a") as log:
+    log.write(json.dumps(args) + "\\n")
+if args[2:3] == ["restart"]:
+    with psycopg.connect(host="127.0.0.1", port={lab["cluster"].port}, user="{ADMIN}",
+                         dbname="{lab["database"]}", autocommit=True) as conn:
+        conn.execute("UPDATE lab.capabilities_service_instances SET started_at = now()")
+""")
+    (bin_dir / "supervisorctl").chmod(0o755)
+    env = {**lab["env"], **here, "SUPERVISOR_SERVER_URL": "unix:///tmp/test.sock",
+           "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+
+    def logged() -> list[list[str]]:
+        return ([json.loads(line) for line in calls.read_text().splitlines()]
+                if calls.exists() else [])
+
+    job = jobs / f"coolify.{PROJECT_ID}.conf"
+    node_run = subprocess.Popen([str(MANAGER), "node", "run", "--supervisor", str(jobs),
+                                 "--every", "30"], cwd=lab["project"], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        # Nothing placed: no job, and the supervisor is still asked once.
+        assert _wait_for(lambda: ["-s", "unix:///tmp/test.sock", "update"] in logged())
+        assert not job.exists()
+        second = subprocess.run([str(MANAGER), "node", "run", "--supervisor", str(jobs)],
+                                cwd=lab["project"], env=env, capture_output=True,
+                                text=True, timeout=120)
+        assert second.returncode == 6 and _error(second)["code"] == "node_run_running"
+
+        # Placed here: a job within seconds, long before the 30s reconcile.
+        _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+        assert _wait_for(job.exists, 15)
+        text = job.read_text()
+        assert f"[program:coolify.{PROJECT_ID}]" in text
+        assert (f"node supervise coolify --agent {PROJECT_ID}\n" in text
+                and "coolify service run" not in text)
+        assert f"directory={lab['project']}\n" in text
+        assert _wait_for(lambda: sum(call[2:] == ["update"] for call in logged()) == 2)
+
+        # A restart asked through the store restarts that one program.
+        _instance(lab, NODE, "ready")
+        restarted = _ok(_manager(lab, "service", "restart", "coolify", "--wait", "20",
+                                 extra=here))
+        assert restarted["restarted"] == "coolify" and restarted["state"] == "ready"
+        assert ["-s", "unix:///tmp/test.sock", "restart", f"coolify.{PROJECT_ID}"] in logged()
+
+        # Placed elsewhere: the job goes.
+        _ok(_manager(lab, "node", "add", BOX, "--label", "box-node", "--kind", "server",
+                     extra=here))
+        _ok(_manager(lab, "place", "coolify", "--node", BOX, extra=here))
+        assert _wait_for(lambda: not job.exists(), 15)
+        assert _wait_for(lambda: sum(call[2:] == ["update"] for call in logged()) == 3)
+    finally:
+        node_run.terminate()
+        _out, err = node_run.communicate(timeout=60)
+    assert node_run.returncode == 0, err
+    assert "every job keeps running" in err
+
+
+def test_the_service_handles_place_and_answer_what_the_node_reports(lab):
+    here = _service_lab(lab)
+    assert _ok(_manager(lab, "service", "status", extra=here))["services"] == []
+
+    # start places it on this node and answers once the node's row is ready.
+    _instance(lab, NODE, "ready", payload_sha256="a" * 64)
+    started = _ok(_manager(lab, "service", "start", "coolify", "--wait", "5", extra=here))
+    assert {k: started[k] for k in ("started", "node", "placement", "placed_on", "ready",
+                                    "state")} == {
+        "started": "coolify", "node": NODE, "placement": "exclusive",
+        "placed_on": [NODE], "ready": True, "state": "ready"}
+    assert started["instance"]["payload_sha256"] == "a" * 64
+
+    # A row that says it cannot do its work is the answer, as the error's detail.
+    _instance(lab, NODE, "unusable", problem="the session is not signed in",
+              problem_code="service_unhealthy")
+    unusable = _manager(lab, "service", "start", "coolify", "--wait", "5", extra=here)
+    assert unusable.returncode == 6
+    error = _error(unusable)
+    assert error["code"] == "service_unusable"
+    assert "not signed in" in error["message"]
+    assert error["detail"]["instance"]["problem_code"] == "service_unhealthy"
+
+    status = _ok(_manager(lab, "service", "status", "coolify", extra=here))
+    assert status["services"][0]["capability"] == "coolify"
+    assert status["services"][0]["placed_on"] == [NODE]
+    assert status["services"][0]["ready_on"] == []
+    assert status["services"][0]["instances"][0]["state"] == "unusable"
+
+    # stop unplaces it and waits for the node to give its row up.
+    still = _manager(lab, "service", "stop", "coolify", "--wait", "1", extra=here)
+    assert still.returncode == 6 and _error(still)["code"] == "service_still_running"
+    assert _rows(lab, "SELECT node FROM capabilities_policy WHERE capability = 'coolify' "
+                      "AND service") == []
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("DELETE FROM lab.capabilities_service_instances")
+    stopped = _ok(_manager(lab, "service", "stop", "coolify", "--wait", "5", extra=here))
+    assert stopped["stopped"] == "coolify" and stopped["nodes"] == [NODE]
+
+    # A restart needs a row to restart, and move is for an exclusive service.
+    missing = _manager(lab, "service", "restart", "coolify", "--wait", "1", extra=here)
+    assert _error(missing)["code"] == "service_not_running"
+    registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify" / "manifest.json"
+    manifest = json.loads(registry.read_text())
+    manifest["service"]["placement"] = "shared"
+    registry.write_text(json.dumps(manifest))
+    shared = _manager(lab, "service", "move", "coolify", "--node", NODE, extra=here)
+    assert shared.returncode == 6 and _error(shared)["code"] == "placement_shared"
+
+    read_only = _manager(lab, "service", "start", "coolify",
+                         extra={**here, "CAPABILITIES_READ_ONLY": "1"})
+    assert read_only.returncode == 4
+    assert _ok(_manager(lab, "service", "status", extra={**here,
+                                                         "CAPABILITIES_READ_ONLY": "1"}))

@@ -99,12 +99,14 @@ USAGE
       service runs there, and turning it on or off needs no recompile or
       redeploy. service_policy keeps only the shape: `shape`
       (embedded|container) for every service and `capabilities.<name>` for
-      one; embedded runs under the agent container's Supervisor, container is
-      a Compose service of its own. A store-mode runtime still carrying the
-      retired switches (auto_include, default_mode, capabilities.<name>
-      auto|enabled|disabled) or placement is reported as a warning naming each
-      one, and sync rewrites it, keeping the shape it implied; `retired` in
-      the result lists what it rewrote.
+      one; embedded runs under the agent container's Supervisor, whose one
+      program for them is the node's service manager (`capabilities node
+      run`), which keeps a program per service placed on the node and none
+      for any other; container is a Compose service of its own. A store-mode
+      runtime still carrying the retired switches (auto_include, default_mode,
+      capabilities.<name> auto|enabled|disabled) or placement is reported as a
+      warning naming each one, and sync rewrites it, keeping the shape it
+      implied; `retired` in the result lists what it rewrote.
       A target's `node` is the id of the node its server runs as in the
       gate - for a node registered before ids, the name it is still keyed
       by: its bundle's Compose file sets AGENT_NODE_ID to it in every
@@ -135,12 +137,14 @@ USAGE
   deployment runner <name> [--every SECONDS] [--restart POLICY] -- <command...>
       Run one capability service as the gate on this node says, until
       stopped; this is what every compiled supervisor entry runs (Supervisor
-      program, own Compose service, host launchd agent). Every SECONDS
-      (service_policy.reconcile_seconds, default 60, 5-3600) it reads the gate
-      for <name> in this project on this node (its id, `capabilities node
-      id`): in store mode only the project's row naming this node places the
-      service, by its service flag (`capabilities place|unplace`), apart from
-      whether that row makes the CLI usable here; in files mode the
+      program, own Compose service, host launchd agent), and what a program
+      of the node's service manager runs (`capabilities node supervise`).
+      Every SECONDS (service_policy.reconcile_seconds when omitted, default
+      60, 5-3600) it reads the gate for <name> in this project on this node
+      (its id, `capabilities node id`): in store mode only the project's row
+      naming this node places the service, by its service flag (`capabilities
+      place|unplace`), apart from whether that row makes the CLI usable here;
+      in files mode the
       project's own enable does (the runtime declaration having already
       chosen which services are compiled), and nothing inherited or global
       places it. Placed, an exclusive service - the default, as its
@@ -574,6 +578,10 @@ RUNNER_STOP_GRACE_SECONDS = 20
 # here, so restarting it would only be refused again.
 POLICY_REFUSAL_EXIT = 4
 RUNNER_STATE_DIR = "runners"
+# Where a store-mode box's node service manager keeps a Supervisor program per
+# service placed on its node, and that manager's own program.
+NODE_JOBS_DIR = "/tmp/agent-box-services"
+NODE_MANAGER_PROGRAM = "node"
 # A running service is asked whether it can do its work by its declared doctor
 # once it has run this long, and again every reconcile, each time for at most
 # PROBE_TIMEOUT_SECONDS. A doctor's exit code stands for its category where
@@ -2497,9 +2505,18 @@ def _runner_argv(name: str, command: list[str], restart: str, every: int) -> lis
             "--", *command]
 
 
+def _node_manager_argv(embedded: dict[str, dict], every: int) -> list[str]:
+    """The one program a store-mode box runs for its embedded services: the
+    node's service manager, which keeps a program per service the gate places
+    on this node, among those this box carries, in the include directory."""
+    return ["capabilities", "node", "run", "--supervisor", NODE_JOBS_DIR,
+            "--every", str(every), "--services", ",".join(sorted(embedded))]
+
+
 def _supervisor_template(embedded: dict[str, dict], project_root: str,
                          body_sync: str | None = None,
-                         every: int = RECONCILE_DEFAULT_SECONDS) -> str:
+                         every: int = RECONCILE_DEFAULT_SECONDS,
+                         node_manager: bool = False) -> str:
     sections = ["""[unix_http_server]
 file=/tmp/agent-box-supervisor.sock
 chmod=0700
@@ -2541,6 +2558,32 @@ stdout_logfile_maxbytes=0
 stderr_logfile=/dev/fd/2
 stderr_logfile_maxbytes=0
 priority=5""")
+    if node_manager and embedded:
+        # In store mode the node's service manager is the one program for the
+        # services: it adds a program per service placed on this node to the
+        # included directory and removes it when the service leaves, and each
+        # runs that service's runner. The directory is in /tmp, so a restarted
+        # box starts no service before the manager has read the store.
+        sections.append(f"""[include]
+files={NODE_JOBS_DIR}/*.conf
+
+[program:{NODE_MANAGER_PROGRAM}]
+command={shlex.join(_node_manager_argv(embedded, every))}
+directory={project_root}
+autostart=true
+autorestart=true
+startsecs=3
+startretries=100
+stopsignal=TERM
+stopwaitsecs=10
+stopasgroup=true
+killasgroup=true
+stdout_logfile=/dev/fd/1
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/fd/2
+stderr_logfile_maxbytes=0
+priority=10""")
+        return "\n\n".join(sections) + "\n"
     # Each program is the service's runner, kept running whatever the gate
     # says: the runner is what starts the service when the gate places it on
     # this node and stops it when it does not, and it applies the descriptor's
@@ -3237,7 +3280,8 @@ def _artifact_texts(root: Path, runtime: dict,
     if supervisor_path is not None:
         candidates["supervisor"] = _supervisor_template(
             embedded, compiler["container"]["project_root"],
-            body_sync=body_sync_config, every=_reconcile_seconds(runtime))
+            body_sync=body_sync_config, every=_reconcile_seconds(runtime),
+            node_manager=_store_placed(root))
     # The profile owns this one outright rather than offering it as a declarable
     # artifact: which program keeps the body current is not a project's choice.
     if body_sync_path is not None:
@@ -6307,6 +6351,10 @@ def cmd_runner(args) -> None:
     if not command:
         _die(6, "input", "runner needs the service command after `--`",
              f"deployment runner {name} [--every N] [--restart POLICY] -- <command...>")
+    if args.every is None:
+        # A node manager's program names no cadence: the project's own applies.
+        args.every = _reconcile_seconds(_load_runtime(root) if _runtime_path(root).exists()
+                                        else {})
     low, high = RECONCILE_BOUNDS
     if not low <= args.every <= high:
         _die(6, "input", f"--every must be from {low} to {high} seconds")
@@ -7833,6 +7881,13 @@ def cmd_node_status(args):
                 ["bash", "-c", f'test -s "$HOME/{file}" && echo logged_in || echo logged_out'])
         services = _node_exec(root, host, container, ["supervisorctl", "-s", "unix:///tmp/agent-box-supervisor.sock", "status"])
         node_services = {line.split()[0]: line.split()[1].lower() for line in services.splitlines() if len(line.split()) >= 2}
+        # A store-mode box's node service manager names each program it keeps
+        # <capability>.<agent id> (`capabilities help`, node run).
+        own = re.sub(r"[^A-Za-z0-9_-]", "_", _project_id(refuse=False) or "")
+        for program, state in list(node_services.items()):
+            capability, dot, agent = program.partition(".")
+            if dot and own and agent == own:
+                node_services.setdefault(capability, state)
         detail = _node_coolify(root, target, "applications", app)
         app_id = str(detail.get("id") or "")
         owner = ("coolify.applicationId=" + app_id if app_id.isdigit()
@@ -8555,7 +8610,7 @@ def main(argv: list[str] | None = None) -> None:
 
     p_runner = sub.add_parser("runner", add_help=False)
     p_runner.add_argument("name")
-    p_runner.add_argument("--every", type=int, default=RECONCILE_DEFAULT_SECONDS)
+    p_runner.add_argument("--every", type=int, default=None)
     p_runner.add_argument("--restart", choices=RESTART_POLICIES, default="unless-stopped")
     p_runner.set_defaults(fn=cmd_runner)
 

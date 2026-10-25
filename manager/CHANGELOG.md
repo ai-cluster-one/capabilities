@@ -1,5 +1,11 @@
 # capabilities — change log
 
+## 2026-10-25 — A node's service manager, and one set of handles for every service
+
+`capabilities node run --supervisor <dir>` is the service manager of a node whose supervisor is Supervisor: run as one of its programs, it keeps one program in `<dir>` per service placed on this node, for every agent the store links to the node whose folder here is bound to it, and none for any other, applied with `supervisorctl update`. Each program runs `capabilities node supervise <name> --agent <id>` in the agent's folder, which reads the deploy command and restart policy from the installed descriptor at each start and runs it under `deployment runner`. It reconciles on a timer (`--every`, default 60) and within seconds of a placement change, which `place`, `unplace`, `place --all` and `enable|disable|inherit --project --node` now announce through the store's change channel, and it answers a restart asked through the store. `--services` limits it to the services its box carries. Its programs are the supervisor's, so it stops and starts again while the services keep running; while the store cannot be read it changes nothing, and it reports the node seen on each reconcile.
+
+`capabilities service start|stop|move|status|restart` place or unplace a service (start and move as `place --node`, stop as `unplace`, from this node by default or `--all`) and wait up to `--wait` seconds for each node's row in `capabilities_service_instances`: start answers once the row is `ready` or `degraded`, and exits 6 `service_<state>` with the row as the error's detail otherwise; stop answers once the nodes hold no row; restart asks the node's manager and answers once the row's `started_at` moves. `service status` reads every node's row and writes nothing. start, move and stop are refused under the read-only switch.
+
 ## 2026-10-25 — `node rekey` moves a node's service instance rows
 
 `capabilities_service_instances.node` (capabilities-contract 0.23) is one of the columns `capabilities node rekey` moves from a node's old id to its new one, with every other column that names a node.

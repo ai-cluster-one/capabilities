@@ -372,8 +372,12 @@ def test_a_store_mode_project_compiles_every_service_and_retires_the_switches(
     runtime = json.loads(runtime_path.read_text())
     assert runtime["service_policy"] == {"shape": "embedded", "capabilities": {}}
     supervisor = (root / "deployment/targets/production/supervisord.conf").read_text()
-    assert ("command=deployment runner telegram --every 60 --restart unless-stopped "
-            "-- telegram service run") in supervisor
+    # One program for the services, the node's service manager, which keeps a
+    # program per service the gate places on this node in the included folder.
+    assert "[include]\nfiles=/tmp/agent-box-services/*.conf\n" in supervisor
+    assert ("command=capabilities node run --supervisor /tmp/agent-box-services "
+            "--every 60 --services automations,slack,telegram") in supervisor
+    assert "deployment runner" not in supervisor
     refused = deployment("setup", "--provider", "manual", "--force", "--with-telegram", "no")
     assert refused.returncode == 6
     assert json.loads(refused.stderr.splitlines()[-1])["error"]["code"] == "retired_option"
