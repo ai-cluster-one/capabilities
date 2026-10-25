@@ -536,3 +536,64 @@ def test_doctor_names_an_agent_running_its_service_outside_the_runner(loaded, ca
     finding = next(f for f in report["findings"] if f["path"] == "project.telegram")
     assert finding["severity"] == "error"
     assert "project.telegram" in finding["message"] and OLD_WRAPPER in finding["message"]
+
+
+# --- Handing the host agents over to the node's service manager --------------
+
+def test_handover_takes_down_the_service_agents_and_the_watchdog_only(
+        tmp_path, monkeypatch, capsys) -> None:
+    root, env = _host_project(tmp_path, ())
+    for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "CAPABILITIES_HOME"):
+        monkeypatch.setenv(key, env[key])
+    monkeypatch.chdir(root)
+    module = _module()
+    agents = root / "deployment" / "launchd"
+    agents.mkdir(parents=True, exist_ok=True)
+    library = Path(env["HOME"]) / "Library" / "LaunchAgents"
+    library.mkdir(parents=True)
+    xml = '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict/></plist>\n'
+    for label in ("project.telegram", "project.watchdog", "project.node-sync-production"):
+        path = agents / f"{label}.plist"
+        path.write_text(module._mark_generated(path, xml))
+    (agents / "project.mine.plist").write_text(xml)
+    (library / "project.telegram.plist").symlink_to(agents / "project.telegram.plist")
+    (library / "project.watchdog.plist").write_text("copied in by hand\n")
+    (library / "project.node-sync-production.plist").symlink_to(
+        agents / "project.node-sync-production.plist")
+    loaded = {"project.telegram", "project.watchdog", "project.node-sync-production"}
+    calls = []
+
+    def launchctl(*argv):
+        calls.append(argv)
+        label = argv[1].rsplit("/", 1)[-1]
+        if argv[0] == "print":
+            return (0, "") if label in loaded else (113, "not found")
+        if argv[0] == "bootout":
+            loaded.discard(label)
+        return 0, ""
+
+    monkeypatch.setattr(module, "_launchctl", launchctl)
+
+    def handover(dry_run):
+        module.cmd_handover(type("Args", (), {"dry_run": dry_run})())
+        return json.loads(capsys.readouterr().out)
+
+    preview = handover(True)
+    assert [(a["label"], a["kind"], a["action"]) for a in preview["agents"]] == [
+        ("project.telegram", "service", "would_hand_over"),
+        ("project.watchdog", "watchdog", "would_hand_over")]
+    assert all(argv[0] == "print" for argv in calls) and len(loaded) == 3
+
+    done = handover(False)
+    assert done["ok"] and [a["action"] for a in done["agents"]] == ["handed_over"] * 2
+    assert [argv[1].rsplit("/", 1)[-1] for argv in calls if argv[0] == "bootout"] == [
+        "project.telegram", "project.watchdog"]
+    assert loaded == {"project.node-sync-production"}
+    assert not (library / "project.telegram.plist").exists()
+    assert (library / "project.node-sync-production.plist").is_symlink()
+    kept = agents / "project.watchdog.plist.handed-over"
+    assert done["agents"][1]["kept_at"] == str(kept) and kept.read_text() == "copied in by hand\n"
+    # The compiled files stay; a second run finds nothing to hand over.
+    assert (agents / "project.telegram.plist").is_file()
+    again = handover(False)
+    assert [a["action"] for a in again["agents"]] == ["absent", "absent"]

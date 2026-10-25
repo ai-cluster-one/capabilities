@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-25 — `handover` gives a Mac's host agents to the node's service manager, and a service runs once per machine
+
+`deployment handover [--dry-run]` boots out a host-agents project's loaded service agents and its project watchdog and takes their entries out of `~/Library/LaunchAgents`, leaving the compiled files and the node-sync agents; `capabilities node install` runs it in every folder whose services the Mac's node manager will run. `deployment runner` now takes a lock per service in the project's state, so a second runner of the same service in the same project on one machine - a host agent loaded again beside the node manager's job - starts nothing and waits for the first to stop. The runner gives its service each environment default the compiled service carries (the descriptor's optional defaults, then the runtime's `environment_defaults`) where its own environment sets none, as a host agent's file and a box's Compose file already did, so a service the node manager starts runs with the same values.
+
 ## 2026-10-25 — A store-mode box runs its services through the node's service manager
 
 In a store-mode project, a box's `supervisord.conf` runs one program for its embedded services, `capabilities node run --supervisor /tmp/agent-box-services --every <reconcile_seconds> --services <embedded>`, and includes `/tmp/agent-box-services/*.conf`, where that manager keeps a program per service the gate places on the node; it no longer compiles a runner program per embedded service. A files-mode box, and a service in a Compose service of its own, compile as before. `deployment runner` given no `--every` reads `service_policy.reconcile_seconds` from the project's runtime. `deployment node status` reports a node manager's program `<capability>.<agent id>` of its own agent as that capability.

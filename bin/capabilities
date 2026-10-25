@@ -931,6 +931,34 @@ PROJECT VERBS (run inside a consuming project)
         command, quarantined, or its agent's folder not bound to it - is
         named once on stderr. Exit 6 supervisor_required,
         supervisor_unreachable or node_run_running.
+  node run --launchd [--every N] [--services <name,...>]
+        The same on a Mac, where each job is a launchd agent of this OS user
+        instead: ~/Library/LaunchAgents/capabilities.<agent slug>.<capability>
+        .plist, whose program is a launcher of the same name running `node
+        supervise` in the agent's folder, with its logs beside the launcher in
+        $XDG_STATE_HOME/capabilities/node/launchd/ and the node manager's
+        PATH, node id and home variables. Each job is loaded, replaced and
+        taken down on its own (`launchctl bootstrap`, `bootout`), a job that
+        is not loaded is loaded again on the next reconcile, and a restart is
+        `launchctl kickstart -k`. The jobs are launchd's, so node run can stop
+        and start again while every service keeps running. `node install`
+        loads it. Exit 6 launchd_unavailable where launchctl is not on PATH.
+  node install [--apply]
+        Install this Mac's node manager, once per OS user: the launchd agent
+        capabilities.node, running `node run --launchd` in this folder with
+        the PATH this shell has, at every login. Before it loads, every
+        folder whose services it will run - this agent's and each agent the
+        store links to this node whose folder here is bound to it - hands its
+        old host agents over (`deployment handover` there), so no service
+        runs twice. Without --apply it changes nothing and answers what it
+        would do, which is how a machine's migration is announced before it
+        runs. Answers {applied, project, agent_id, node, served [{agent_id,
+        folder}], left [{agent_id, folder, reason}], handover [{agent_id,
+        folder, agents, error?}], node_agent {label, plist, program, folder,
+        changed, loaded}, store, next?}. Run again it changes nothing. Exit 6
+        launchd_unavailable, agent_not_on_node (run `capabilities init`
+        here), node_agent_not_loaded, or handover_incomplete, with the answer
+        as the error's detail; --apply exits 4 under the read-only switch.
   node supervise <name> [--agent <id>]
         What a node-run program runs: read <name>'s deploy command and
         restart policy from its installed descriptor, then run it under
@@ -9498,6 +9526,15 @@ NODE_PLACEMENT_CHANNEL = "capabilities_placement"
 NODE_RESTART_CHANNEL = "capabilities_service_restart"
 NODE_JOB_MARK = "; written by `capabilities node run`, which rewrites or removes it\n"
 NODE_JOB_STOP_SECONDS = 30
+# On a Mac each job is a launchd agent of this OS user, and the node manager
+# is one more, which `node install` writes and loads.
+NODE_LAUNCHD_MARK = "<!-- written by `capabilities node run`, which rewrites or removes it -->"
+NODE_AGENT_LABEL = "capabilities.node"
+NODE_AGENT_MARK = "<!-- written by `capabilities node install`, which rewrites it -->"
+# What a job carries over from the node manager's own environment: launchd
+# hands a job none, and these decide which node, home and tools it runs as.
+NODE_JOB_ENV = ("PATH", "AGENT_NODE_ID", "AGENT_NODE_NAME", "CAPABILITIES_HOME",
+                "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME")
 SERVICE_WAIT_DEFAULT = 120
 SERVICE_WAIT_BOUNDS = (0, 3600)
 SERVICE_READY_STATES = ("ready", "degraded")
@@ -9570,6 +9607,97 @@ def _node_job_text(job: dict, manager: str) -> str:
             + "stderr_logfile=/dev/fd/2\nstderr_logfile_maxbytes=0\n")
 
 
+def _launch_agents_dir() -> Path:
+    return Path.home() / "Library" / "LaunchAgents"
+
+
+def _node_launchd_dir() -> Path:
+    """Where the Mac's node manager keeps each job's launcher and logs."""
+    state = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+    return state / "capabilities" / "node" / "launchd"
+
+
+def _launchd_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def _launchctl(*argv: str, timeout: int = 60) -> tuple[int, str]:
+    try:
+        done = subprocess.run(["launchctl", *argv], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, f"launchctl could not be run: {exc}"
+    return done.returncode, (done.stderr or done.stdout).strip()
+
+
+def _launchd_loaded(label: str) -> bool:
+    return _launchctl("print", f"{_launchd_domain()}/{label}", timeout=15)[0] == 0
+
+
+def _launchd_load(label: str, plist: Path) -> tuple[bool, str]:
+    """Bootstrap a launchd agent from its file, taking down the job that holds
+    its label first."""
+    if _launchd_loaded(label):
+        code, said = _launchctl("bootout", f"{_launchd_domain()}/{label}")
+        if code != 0 and _launchd_loaded(label):
+            return False, f"bootout: {said}"
+    said = ""
+    for attempt in range(5):
+        if attempt:
+            # bootout answers before launchd has let go of the label.
+            time.sleep(1)
+        code, said = _launchctl("bootstrap", _launchd_domain(), str(plist))
+        if code == 0:
+            return True, ""
+    return False, f"bootstrap: {said}"
+
+
+def _launchd_unload(label: str) -> tuple[bool, str]:
+    if not _launchd_loaded(label):
+        return True, ""
+    code, said = _launchctl("bootout", f"{_launchd_domain()}/{label}")
+    return code == 0 or not _launchd_loaded(label), said
+
+
+def _launchd_document(body: dict, mark: str) -> str:
+    """A launchd property list with `mark` right after its XML declaration."""
+    import plistlib
+    first, rest = plistlib.dumps(body, sort_keys=False).decode().split("\n", 1)
+    return f"{first}\n{mark}\n{rest}"
+
+
+def _node_job_environment() -> dict:
+    return {key: os.environ[key] for key in NODE_JOB_ENV if os.environ.get(key)}
+
+
+def _node_launchd_job_text(job: dict, launcher: Path, logs: Path) -> str:
+    """A job's launchd agent. It names the agent, the capability and the
+    manager through its launcher, never the service's command line."""
+    return _launchd_document({
+        "Label": job["name"],
+        "ProgramArguments": [str(launcher)],
+        "WorkingDirectory": job["folder"],
+        "EnvironmentVariables": _node_job_environment(),
+        "RunAtLoad": True,
+        # A clean exit is a stop someone asked for; anything else is restarted.
+        "KeepAlive": {"SuccessfulExit": False},
+        "ThrottleInterval": 10,
+        # The work a service starts gets the whole machine.
+        "ProcessType": "Standard",
+        "ExitTimeOut": NODE_JOB_STOP_SECONDS,
+        "StandardOutPath": str(logs / f"{job['name']}.out.log"),
+        "StandardErrorPath": str(logs / f"{job['name']}.err.log"),
+    }, NODE_LAUNCHD_MARK)
+
+
+def _node_launcher_text(job: dict, manager: str) -> str:
+    """A launcher whose file name is the job's label: macOS lists a background
+    item by the name of the program its job runs, never by its label, so each
+    service shows under a name a person can tell apart."""
+    command = [manager, "node", "supervise", job["capability"], "--agent", job["agent_id"]]
+    return f"#!/bin/sh\n# {NODE_LAUNCHD_MARK}\nexec {shlex.join(command)}\n"
+
+
 class _NodeManager:
     """`node run` on a node whose supervisor is Supervisor: each job is a
     program file in the include directory its configuration names, applied
@@ -9593,6 +9721,7 @@ class _NodeManager:
         self.follower = None
         self.follow_keys: tuple = ()
         self.said: dict[str, object] = {}
+        self.changed: set[str] = set()
 
     def say(self, message: str) -> None:
         sys.stderr.write(f"[capabilities node {self.here}] {message}\n")
@@ -9622,7 +9751,7 @@ class _NodeManager:
         return conn
 
     def read_store(self) -> tuple[list[tuple], list[tuple]] | None:
-        """(agents [(agent_id, folder)], placed [(agent_id, capability)]) as the
+        """(agents [(agent_id, folder, slug)], placed [(agent_id, capability)]) as the
         store holds them for this node, reporting the node seen; None where the
         store cannot be read, said once."""
         try:
@@ -9635,8 +9764,9 @@ class _NodeManager:
         try:
             with conn.transaction():
                 agents = conn.execute(
-                    "SELECT agent_id, folder FROM capabilities_agent_nodes WHERE node = %s "
-                    "ORDER BY agent_id", (self.here,)).fetchall()
+                    "SELECT l.agent_id, l.folder, a.slug FROM capabilities_agent_nodes l "
+                    "LEFT JOIN capabilities_agents a ON a.id = l.agent_id "
+                    "WHERE l.node = %s ORDER BY l.agent_id", (self.here,)).fetchall()
                 placed = conn.execute(
                     "SELECT p.agent_id, p.capability FROM capabilities_policy p "
                     "JOIN capabilities_agent_nodes l ON l.agent_id = p.agent_id "
@@ -9660,8 +9790,10 @@ class _NodeManager:
         """The jobs this node should run, by job name; what is placed here and
         cannot run is said once, with why."""
         folders: dict[str, Path] = {}
+        slugs: dict[str, str | None] = {}
         own = _folder_agent_id(self.root)
-        for agent_id, folder in agents:
+        for agent_id, folder, slug in agents:
+            slugs[agent_id] = slug
             path = Path(folder) if folder else None
             if (path is None or _folder_agent_id(path) != agent_id) and agent_id == own:
                 # The folder this process runs in is its own agent's folder on
@@ -9693,10 +9825,31 @@ class _NodeManager:
                                         f"does not run: {why}")
                 continue
             self.said.pop(key, None)
-            name = _node_job_name(agent_id, capability)
+            name = self.job_name(agent_id, capability, slugs.get(agent_id))
             jobs[name] = {"name": name, "agent_id": agent_id, "capability": capability,
                           "folder": str(folders[agent_id])}
         return jobs
+
+    def job_name(self, agent_id: str, capability: str, slug: str | None) -> str:
+        del slug
+        return _node_job_name(agent_id, capability)
+
+    def job_path(self, name: str) -> Path:
+        return self.include / f"{name}.conf"
+
+    def job_text(self, job: dict) -> str:
+        return _node_job_text(job, self.manager)
+
+    def write_job(self, job: dict, path: Path, text: str) -> None:
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(text)
+        os.replace(tmp, path)
+
+    def remove_job(self, name: str, path: Path) -> bool:
+        """Take a job away; False where it is still there, to try again."""
+        del name
+        path.unlink(missing_ok=True)
+        return True
 
     def written(self) -> dict[str, Path]:
         """The job files this process wrote, by job name."""
@@ -9709,38 +9862,40 @@ class _NodeManager:
                 continue
         return found
 
-    def reconcile(self) -> None:
+    def reconcile(self) -> bool:
+        """Bring the jobs to what the store places here; False where the store
+        could not be read, and nothing changed."""
         answer = self.read_store()
         if answer is None:
-            return
+            return False
         agents, placed = answer
-        self.agents = [agent_id for agent_id, _folder in agents]
+        self.agents = [row[0] for row in agents]
         desired = self.desired(agents, placed)
         present = self.written()
         for name, job in desired.items():
-            path = self.include / f"{name}.conf"
-            text = _node_job_text(job, self.manager)
+            path = self.job_path(name)
+            text = self.job_text(job)
             try:
                 current = path.read_text()
             except OSError:
                 current = None
             if current == text:
                 continue
-            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-            tmp.write_text(text)
-            os.replace(tmp, path)
+            self.write_job(job, path, text)
+            self.changed.add(name)
             self.pending_apply = True
             self.say(f"runs {job['capability']} for {job['agent_id']} here as job {name}")
         for name, path in present.items():
             if name in desired:
                 continue
-            path.unlink(missing_ok=True)
-            self.pending_apply = True
-            self.say(f"stops job {name}: its service is no longer placed here")
+            if self.remove_job(name, path):
+                self.pending_apply = True
+                self.say(f"stops job {name}: its service is no longer placed here")
         self.jobs = desired
         self.read_once = True
         if self.pending_apply:
             self.apply()
+        return True
 
     def supervisorctl(self, *args: str) -> tuple[bool, str]:
         try:
@@ -9756,6 +9911,8 @@ class _NodeManager:
     def apply(self) -> None:
         ok, said = self.supervisorctl("update")
         self.pending_apply = not ok
+        if ok:
+            self.changed.clear()
         self.say_once("apply", None if ok else said,
                       f"the supervisor did not apply the jobs, tried again next "
                       f"reconcile: {said[:300]}" if not ok else "")
@@ -9800,7 +9957,8 @@ class _NodeManager:
             if channel != NODE_RESTART_CHANNEL:
                 continue
             agent_id, capability, _node = scope.rsplit("/", 2)
-            restarts.append(_node_job_name(agent_id, capability))
+            restarts += [name for name, job in self.jobs.items()
+                         if (job["agent_id"], job["capability"]) == (agent_id, capability)]
         return placement, restarts
 
     def restart(self, name: str) -> None:
@@ -9827,32 +9985,138 @@ class _NodeManager:
                 time.sleep(0.2)
 
 
+class _LaunchdNodeManager(_NodeManager):
+    """`node run` on a Mac: each job is a launchd agent of this OS user,
+    labelled capabilities.<agent slug>.<capability>, whose file sits in
+    ~/Library/LaunchAgents and whose launcher and logs sit in the node's own
+    folder. Each job is loaded, replaced and taken down on its own, so every
+    other job keeps running; a job that is not loaded - taken down by hand,
+    or not yet back after a login - is loaded again on the next reconcile."""
+
+    def __init__(self, root: Path, home: Path, every: int, only: set[str] | None = None):
+        super().__init__(root, _launch_agents_dir(), "", every, only)
+        self.home = home
+
+    def job_name(self, agent_id: str, capability: str, slug: str | None) -> str:
+        who = re.sub(r"[^A-Za-z0-9_-]", "_", slug or agent_id)
+        return f"capabilities.{who}.{capability}"
+
+    def job_path(self, name: str) -> Path:
+        return self.include / f"{name}.plist"
+
+    def job_text(self, job: dict) -> str:
+        return _node_launchd_job_text(job, self.home / job["name"], self.home)
+
+    def write_job(self, job: dict, path: Path, text: str) -> None:
+        launcher = self.home / job["name"]
+        launcher_text = _node_launcher_text(job, self.manager)
+        try:
+            current = launcher.read_text()
+        except OSError:
+            current = None
+        if current != launcher_text:
+            tmp = launcher.with_name(f".{launcher.name}.{os.getpid()}.tmp")
+            tmp.write_text(launcher_text)
+            tmp.chmod(0o755)
+            os.replace(tmp, launcher)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        super().write_job(job, path, text)
+
+    def remove_job(self, name: str, path: Path) -> bool:
+        ok, said = _launchd_unload(name)
+        if not ok:
+            self.say_once(f"remove:{name}", said,
+                          f"could not take job {name} down, tried again next reconcile: "
+                          f"{said[:300]}")
+            return False
+        self.said.pop(f"remove:{name}", None)
+        path.unlink(missing_ok=True)
+        (self.home / name).unlink(missing_ok=True)
+        self.changed.discard(name)
+        return True
+
+    def written(self) -> dict[str, Path]:
+        found = {}
+        for path in sorted(self.include.glob("capabilities.*.plist")):
+            try:
+                head = "\n".join(path.read_text().splitlines()[:3])
+            except OSError:
+                continue
+            if NODE_LAUNCHD_MARK in head:
+                found[path.stem] = path
+        return found
+
+    def reconcile(self) -> bool:
+        self.applied = False
+        if not super().reconcile():
+            return False
+        if not self.applied:
+            # A job loaded once can be gone since: taken down by hand, or not
+            # loaded again after a login. The store places it, so it runs.
+            self.apply()
+        return True
+
+    def apply(self) -> None:
+        self.applied = True
+        failed = []
+        for name in sorted(self.jobs):
+            if name not in self.changed and _launchd_loaded(name):
+                continue
+            ok, said = _launchd_load(name, self.job_path(name))
+            if ok:
+                self.changed.discard(name)
+                self.said.pop(f"load:{name}", None)
+            else:
+                failed.append(name)
+                self.say_once(f"load:{name}", said,
+                              f"launchd did not load job {name}, tried again next "
+                              f"reconcile: {said[:300]}")
+        self.pending_apply = bool(failed)
+
+    def restart(self, name: str) -> None:
+        if name not in self.jobs:
+            return
+        code, said = _launchctl("kickstart", "-k", f"{_launchd_domain()}/{name}")
+        self.say(f"restarted job {name}, as asked" if code == 0
+                 else f"could not restart job {name}: {said[:300]}")
+
+
 def _node_run(args: list[str]) -> None:
     import fcntl
     import signal
-    pos, opts = _kernel_options(args, {"--supervisor", "--every", "--services"}, set(),
-                                "node run")
+    pos, opts = _kernel_options(args, {"--supervisor", "--every", "--services"},
+                                {"--launchd"}, "node run")
     if pos:
         _die(6, "input", "node run takes no positional argument: it runs this node's "
              "services")
     include = opts.get("--supervisor")
-    if not include:
+    launchd = "--launchd" in opts
+    if include and launchd:
+        _die(6, "input", "node run keeps its jobs in one supervisor: --supervisor <dir> "
+             "or --launchd, not both")
+    if not include and not launchd:
         _die(6, "supervisor_required",
-             "node run needs the include directory of the Supervisor it runs under",
+             "node run needs the supervisor it keeps its jobs in",
              "capabilities node run --supervisor <dir>, as a program of a Supervisor "
-             "whose configuration includes <dir>/*.conf")
+             "whose configuration includes <dir>/*.conf; on a Mac, capabilities node "
+             "run --launchd, as `capabilities node install` loads it")
     url = os.environ.get("SUPERVISOR_SERVER_URL")
-    if not url:
+    if include and not url:
         _die(6, "supervisor_unreachable",
              "node run reaches its Supervisor through SUPERVISOR_SERVER_URL, which "
              "Supervisor sets for each program it starts, and it is unset",
              "run node run as a program of that Supervisor")
+    if launchd and not shutil.which("launchctl"):
+        _die(6, "launchd_unavailable",
+             "node run --launchd keeps its jobs as launchd agents, and launchctl is not "
+             "on PATH: this is not a Mac",
+             "on a server, run node run as a program of its Supervisor (--supervisor)")
     every = opts.get("--every", str(NODE_RUN_EVERY_DEFAULT))
     low, high = NODE_RUN_BOUNDS
     if not every.isdigit() or not low <= int(every) <= high:
         _die(6, "input", f"--every takes whole seconds from {low} to {high}")
     root = _require_project()
-    include_dir = Path(include)
+    include_dir = Path(include) if include else _node_launchd_dir()
     try:
         include_dir.mkdir(parents=True, exist_ok=True)
         lock = open(include_dir / ".node-run.lock", "w")
@@ -9871,12 +10135,160 @@ def _node_run(args: list[str]) -> None:
         signal.signal(signum, stop)
     only = ({name for name in opts["--services"].split(",") if name}
             if "--services" in opts else None)
-    manager = _NodeManager(root, include_dir, url, int(every), only)
-    manager.say(f"keeps a job per service placed on this node in {include_dir}, "
+    if launchd:
+        manager = _LaunchdNodeManager(root, include_dir, int(every), only)
+        where = f"launchd ({_launch_agents_dir()})"
+    else:
+        manager = _NodeManager(root, include_dir, url, int(every), only)
+        where = str(include_dir)
+    manager.say(f"keeps a job per service placed on this node in {where}, "
                 f"reconciling every {every}s and on each placement change")
     manager.run(stopping)
     manager.say("stops; every job keeps running under the supervisor")
     lock.close()
+
+
+def _node_search_path() -> str:
+    """PATH for the node manager's agent, which its jobs carry on. launchd
+    hands a job a bare environment, so the PATH that works here, the
+    installing shell's, is captured whole behind the directories the manager
+    and deployment resolve from, each entry resolved through symlinks so a
+    per-session shim's directory gives way to the one it points at."""
+    entries = [str(Path(found).parent) for found in
+               (shutil.which("capabilities"), shutil.which("deployment")) if found]
+    entries += os.environ.get("PATH", "").split(os.pathsep)
+    entries += ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin",
+                "/sbin"]
+    seen, ordered = set(), []
+    for entry in entries:
+        try:
+            candidate = Path(entry) if entry else None
+            if candidate is None or not candidate.is_dir():
+                continue
+            resolved = str(candidate.resolve())
+        except OSError:
+            continue
+        if resolved not in seen:
+            seen.add(resolved)
+            ordered.append(resolved)
+    return os.pathsep.join(ordered)
+
+
+def _node_agent_text(root: Path, manager: str, logs: Path) -> str:
+    """The Mac's node manager as a launchd agent of this OS user."""
+    return _launchd_document({
+        "Label": NODE_AGENT_LABEL,
+        "ProgramArguments": [manager, "node", "run", "--launchd"],
+        "WorkingDirectory": str(root),
+        "EnvironmentVariables": {**_node_job_environment(), "PATH": _node_search_path()},
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 30,
+        "ProcessType": "Standard",
+        "StandardOutPath": str(logs / f"{NODE_AGENT_LABEL}.out.log"),
+        "StandardErrorPath": str(logs / f"{NODE_AGENT_LABEL}.err.log"),
+    }, NODE_AGENT_MARK)
+
+
+def _node_install(args: list[str]) -> None:
+    pos, opts = _kernel_options(args, set(), {"--apply", "--json"}, "node install")
+    if pos:
+        _die(6, "input", "node install takes no positional argument: it installs this "
+             "Mac's node manager", "capabilities node install [--apply]")
+    apply = "--apply" in opts
+    if apply:
+        _read_only_gate("node install")
+    if not shutil.which("launchctl"):
+        _die(6, "launchd_unavailable",
+             "node install loads the node manager as a launchd agent, and launchctl is "
+             "not on PATH: this is not a Mac",
+             "on a server the box's Supervisor runs `capabilities node run`, as "
+             "`deployment sync` compiles it")
+    root = _require_project()
+    here = _this_node()["id"]
+
+    def read(conn, agent_id):
+        return agent_id, conn.execute(
+            "SELECT agent_id, folder FROM capabilities_agent_nodes WHERE node = %s "
+            "ORDER BY agent_id", (here,)).fetchall()
+
+    (agent_id, links), setting = _kernel_run(root, read)
+    if agent_id not in {linked for linked, _folder in links}:
+        _die(6, "agent_not_on_node",
+             f"agent {agent_id} does not live on node {here}, so a node manager here "
+             "would run none of its services",
+             "run `capabilities init` in this folder, which records it on this node")
+    # Every folder whose services the node manager will run; only these hand
+    # their old agents over, so a project it will not run keeps its own.
+    folders, left = [], []
+    for linked, folder in links:
+        path = root if linked == agent_id else (Path(folder) if folder else None)
+        if path is None or _folder_agent_id(path) != linked:
+            left.append({"agent_id": linked, "folder": folder,
+                         "reason": "no folder on this node is bound to it"})
+            continue
+        folders.append((linked, path))
+    deployment = shutil.which("deployment")
+    handovers, failed = [], []
+    for linked, path in folders:
+        entry: dict = {"agent_id": linked, "folder": str(path)}
+        if not deployment:
+            entry["agents"] = []
+            entry["note"] = "deployment is not installed, so no agent of its compiling runs here"
+        else:
+            rc, out, err = _run_script(Path(deployment),
+                                       ["handover", *([] if apply else ["--dry-run"])],
+                                       cwd=path, env=_snapshot_env(), timeout=300)
+            try:
+                answer = json.loads(out) if out.strip() else None
+            except ValueError:
+                answer = None
+            if isinstance(answer, dict):
+                entry["agents"] = answer.get("agents") or []
+            if rc != 0 or not isinstance(answer, dict):
+                entry["error"] = (err or out).strip()[-1000:] or f"exit {rc}"
+                failed.append(entry)
+        handovers.append(entry)
+    manager = shutil.which("capabilities") or str(Path(sys.argv[0]).resolve())
+    logs = _node_launchd_dir()
+    plist = _launch_agents_dir() / f"{NODE_AGENT_LABEL}.plist"
+    text = _node_agent_text(root, manager, logs)
+    try:
+        current = plist.read_text()
+    except OSError:
+        current = None
+    loaded = _launchd_loaded(NODE_AGENT_LABEL)
+    agent = {"label": NODE_AGENT_LABEL, "plist": str(plist), "program": manager,
+             "folder": str(root), "changed": current != text, "loaded": loaded}
+    result = {"applied": apply, "project": str(root), "agent_id": agent_id, "node": here,
+              "served": [{"agent_id": linked, "folder": str(path)} for linked, path in folders],
+              "left": left, "handover": handovers, "node_agent": agent,
+              "store": _kernel_store_report(setting)}
+    if not apply:
+        result["next"] = "capabilities node install --apply"
+        _emit(result)
+        return
+    if current != text:
+        logs.mkdir(parents=True, exist_ok=True)
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        tmp = plist.with_name(f".{plist.name}.{os.getpid()}.tmp")
+        tmp.write_text(text)
+        os.replace(tmp, plist)
+    if current != text or not loaded:
+        ok, said = _launchd_load(NODE_AGENT_LABEL, plist)
+        agent["loaded"] = ok
+        if not ok:
+            _service_fail("node_agent_not_loaded",
+                          f"launchd did not load {NODE_AGENT_LABEL}: {said}",
+                          f"`launchctl bootstrap {_launchd_domain()} {plist}` loads it by hand",
+                          result)
+    if failed:
+        _service_fail("handover_incomplete",
+                      "the node manager is loaded, and the old agents of "
+                      + ", ".join(e["folder"] for e in failed) + " were not all handed over",
+                      "run `deployment handover` in that folder; until it hands an agent "
+                      "over, the node manager's job for that service waits for it", result)
+    _emit(result)
 
 
 def _node_supervise(args: list[str]) -> None:
@@ -10187,6 +10599,9 @@ def cmd_node(args: list[str]) -> None:
         return
     if sub == "supervise":
         _node_supervise(args[1:])
+        return
+    if sub == "install":
+        _node_install(args[1:])
         return
     root = _require_project()
     valued = {"--label", "--kind", "--address", "--target", "--coolify-connection",

@@ -188,6 +188,13 @@ USAGE
       category. The row goes when the service is no longer placed here or
       the runner stops; a project that declares no id keeps none, and a
       write that fails is said once on stderr and changes nothing else.
+      A second runner of the same service in the same project on this
+      machine starts nothing and waits for the first to stop, saying so
+      once, since a lease names a node and cannot tell two runners on it
+      apart. The service gets each environment default the compiled service
+      carries - its descriptor's optional defaults, then the runtime's
+      environment_defaults for it - where the runner's environment sets
+      none.
 
   deployment services
       This node - its id (node) and the label it gives itself (label) - and
@@ -215,6 +222,22 @@ USAGE
       `deployment sync` installs this as its own launchd agent on the
       host-agents profile; run it by hand with --dry-run to see what it would
       do. Settings live under `compiler.host.watchdog` in runtime.json.
+
+  deployment handover [--dry-run]
+      Hand this project's host agents over to the node's service manager on
+      a Mac (`capabilities node install`, which runs this in every folder
+      whose services it will run): boot out each loaded launchd agent the
+      host-agents compilation left in compiler.host.agents_dir - every
+      service agent and the project watchdog, not the node-sync agents - and
+      take its entry out of ~/Library/LaunchAgents, so a login does not load
+      it again (a link is removed; a file put there by hand is kept beside
+      the agents as <label>.plist.handed-over). The compiled files stay. Run
+      again it changes nothing. --dry-run changes nothing and answers the
+      same. Answers {project, profile, dry_run, ok, agents [{label, kind
+      (service|watchdog), loaded, installed, action (handed_over,
+      would_hand_over, absent or failed, with step and detail), kept_at?}]},
+      or skipped where the project compiles no host agents; exit 6 when an
+      agent could not be handed over.
 
   deployment machine sync|next [--text|--json]|status|watchdog [--dry-run]
       The machine scope, on macOS: supervision for the services that run once
@@ -5385,6 +5408,81 @@ def cmd_doctor(args) -> None:
         sys.exit(6)
 
 
+def _handover_labels(root: Path, runtime: dict) -> list[tuple[str, str]]:
+    """(label, kind) of each launchd agent this project's compiling left in its
+    agents folder that runs a service or watches one: every service agent and
+    the project watchdog, not the agents that carry the body to a node."""
+    prefix = _host_label_prefix(runtime, root)
+    agents_dir = _host_agents_dir(root, runtime)
+    found = []
+    for path in sorted(agents_dir.glob(f"{prefix}.*.plist")) if agents_dir.is_dir() else []:
+        label = path.stem
+        rest = label[len(prefix) + 1:]
+        if rest.startswith("node-sync-") or not _is_generated(_read_text(path) or ""):
+            continue
+        found.append((label, "watchdog" if rest == "watchdog" else "service"))
+    return found
+
+
+def cmd_handover(args) -> None:
+    """Hand this project's host agents to the node's service manager."""
+    root = _root()
+    dry_run = bool(getattr(args, "dry_run", False))
+    report: dict = {"project": str(root), "profile": None, "dry_run": dry_run,
+                    "agents": []}
+    runtime, err = _read_json(_runtime_path(root))
+    if err or not isinstance(runtime, dict):
+        report["skipped"] = "no deployment/runtime.json here, so nothing of it was compiled"
+        _emit(report)
+        return
+    report["profile"] = runtime.get("profile")
+    if str(runtime.get("profile") or "") not in HOST_PROFILES:
+        report["skipped"] = "only the host-agents profile compiles launchd agents"
+        _emit(report)
+        return
+    library = Path.home() / "Library" / "LaunchAgents"
+    domain = f"gui/{os.getuid()}"
+    failed = False
+    for label, kind in _handover_labels(root, runtime):
+        installed = library / f"{label}.plist"
+        loaded = _launchctl("print", f"{domain}/{label}")[0] == 0
+        present = installed.is_symlink() or installed.exists()
+        entry = {"label": label, "kind": kind, "loaded": loaded, "installed": present}
+        if not loaded and not present:
+            entry["action"] = "absent"
+        elif dry_run:
+            entry["action"] = "would_hand_over"
+        else:
+            if loaded:
+                code, detail = _launchctl("bootout", f"{domain}/{label}")
+                if code != 0 and _launchctl("print", f"{domain}/{label}")[0] == 0:
+                    entry.update(action="failed", step="bootout", detail=detail[:400])
+                    failed = True
+                    report["agents"].append(entry)
+                    continue
+            if present:
+                try:
+                    if installed.is_symlink():
+                        installed.unlink()
+                    else:
+                        # A file someone put there by hand stays, beside the
+                        # agents, rather than being lost.
+                        aside = _host_agents_dir(root, runtime) / f"{label}.plist.handed-over"
+                        shutil.move(str(installed), str(aside))
+                        entry["kept_at"] = str(aside)
+                except OSError as exc:
+                    entry.update(action="failed", step="unlink", detail=str(exc)[:400])
+                    failed = True
+                    report["agents"].append(entry)
+                    continue
+            entry["action"] = "handed_over"
+        report["agents"].append(entry)
+    report["ok"] = not failed
+    _emit(report)
+    if failed:
+        sys.exit(6)
+
+
 def cmd_watchdog_command(args) -> None:
     report = cmd_watchdog(bool(getattr(args, "dry_run", False)))
     _emit(report)
@@ -5768,6 +5866,67 @@ def _read_runner_state(name: str) -> dict:
     return data if isinstance(data, dict) and data.get("schema") == RUNNER_SCHEMA else {}
 
 
+def _runner_environment(root: Path, name: str) -> dict:
+    """The service's environment: the runner's own, with each default the
+    compiled service carries set where the runner's sets none - the
+    descriptor's optional environment defaults, then the runtime's
+    environment_defaults for it - as a host agent's file and a box's Compose
+    file set them. A runner started from neither, as the node's service
+    manager starts it on a Mac, gives the service the same values."""
+    defaults: dict[str, str] = {}
+    manifest, _err = _installed_manifest(name)
+    service = (manifest or {}).get("service")
+    deploy = service.get("deploy") if isinstance(service, dict) else None
+    environment = deploy.get("environment") if isinstance(deploy, dict) else None
+    optional = environment.get("optional") if isinstance(environment, dict) else None
+    for item in optional if isinstance(optional, list) else []:
+        if (isinstance(item, dict) and isinstance(item.get("key"), str)
+                and isinstance(item.get("default"), str)):
+            defaults[item["key"]] = item["default"]
+    runtime, err = _read_json(_runtime_path(root))
+    services = runtime.get("services") if not err and isinstance(runtime, dict) else None
+    entry = services.get(name) if isinstance(services, dict) else None
+    declared = entry.get("environment_defaults") if isinstance(entry, dict) else None
+    if isinstance(declared, dict):
+        defaults.update({key: value for key, value in declared.items()
+                         if isinstance(value, str)})
+    env = dict(os.environ)
+    for key, value in defaults.items():
+        if _safe_env_key(key):
+            env.setdefault(key, value)
+    return env
+
+
+def _runner_lock(name: str, stopping: dict):
+    """The one runner of `name` in this project on this machine. A lease is
+    held by a node, so it cannot tell two runners on one node apart - a host
+    agent loaded again beside the node manager's job - and a second runner
+    waits here, starting nothing, until the first stops. None once stopped
+    while waiting."""
+    import fcntl
+    path = _runner_state_path(name).with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a")
+    said = False
+    while not stopping["now"]:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if not said:
+                holder = _read_runner_state(name).get("runner_pid")
+                sys.stderr.write(
+                    f"[deployment runner {name}] another runner of {name}"
+                    + (f", pid {holder}," if isinstance(holder, int) else "")
+                    + " runs in this project on this machine; this one starts nothing "
+                    "and waits for it to stop, so the service never runs twice here\n")
+                sys.stderr.flush()
+                said = True
+            time.sleep(2)
+    handle.close()
+    return None
+
+
 def _child_preexec() -> None:
     """The service leads a process group of its own, so stopping it reaches
     every worker it started; on Linux it is also told when its runner dies."""
@@ -5986,6 +6145,7 @@ class _Runner:
     def start(self) -> None:
         try:
             self.child = subprocess.Popen(self.command, cwd=str(self.root),
+                                          env=_runner_environment(self.root, self.name),
                                           preexec_fn=_child_preexec,
                                           stderr=subprocess.PIPE)
         except OSError as exc:
@@ -6358,7 +6518,6 @@ def cmd_runner(args) -> None:
     low, high = RECONCILE_BOUNDS
     if not low <= args.every <= high:
         _die(6, "input", f"--every must be from {low} to {high} seconds")
-    runner = _Runner(root, name, command, args.restart, args.every)
     stopping = {"now": False}
 
     def stop(_signum, _frame):
@@ -6366,6 +6525,10 @@ def cmd_runner(args) -> None:
 
     for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(signum, stop)
+    lock = _runner_lock(name, stopping)
+    if lock is None:
+        return
+    runner = _Runner(root, name, command, args.restart, args.every)
     runner.adopt_orphan()
     runner.say(f"runs {shlex.join(command)} on {runner.node} as the gate says, "
                f"reconciling every {args.every}s")
@@ -8608,6 +8771,10 @@ def main(argv: list[str] | None = None) -> None:
     p_watchdog.add_argument("--dry-run", action="store_true")
     p_watchdog.set_defaults(fn=cmd_watchdog_command)
 
+    p_handover = sub.add_parser("handover", add_help=False)
+    p_handover.add_argument("--dry-run", action="store_true")
+    p_handover.set_defaults(fn=cmd_handover)
+
     p_runner = sub.add_parser("runner", add_help=False)
     p_runner.add_argument("name")
     p_runner.add_argument("--every", type=int, default=None)
@@ -8703,7 +8870,8 @@ def main(argv: list[str] | None = None) -> None:
     # that starts and stops one change the project or its machine; a preview
     # (--check, --dry-run) only reads.
     previews = getattr(args, "check", False) or getattr(args, "dry_run", False)
-    if (args.cmd in WRITE_VERBS or args.cmd in ("watchdog", "runner")) and not previews:
+    if ((args.cmd in WRITE_VERBS or args.cmd in ("watchdog", "runner", "handover"))
+            and not previews):
         _read_only_gate(f"`{NAME} {args.cmd}`")
     if (args.cmd == "machine" and args.machine_cmd in ("sync", "watchdog")
             and not previews):

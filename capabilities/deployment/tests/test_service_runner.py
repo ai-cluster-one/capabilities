@@ -699,3 +699,47 @@ def test_a_shared_service_has_a_row_on_each_node_and_a_failing_one_says_why(
         for runner in runners:
             runner.stop()
     assert rows(INSTANCES) == []
+
+
+def test_a_second_runner_of_a_service_waits_and_the_service_gets_its_defaults(
+        tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    env = {**_env(home), "FIXTURE_SET": "mine"}
+    root = _project(tmp_path / "project", {"id": PROJECT_ID, "slug": "files"},
+                    settings={"deployment": {"enabled": True}, "fixture": {"enabled": True}})
+    manifest = home / "registry" / "fixture" / "manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"name": "fixture", "service": {"deploy": {
+        "environment": {"optional": [
+            {"key": "FIXTURE_DEFAULT", "default": "from-descriptor"},
+            {"key": "FIXTURE_MODE", "default": "from-descriptor"},
+            {"key": "FIXTURE_SET", "default": "from-descriptor"}]}}}}))
+    (root / "deployment").mkdir()
+    (root / "deployment" / "runtime.json").write_text(json.dumps({"services": {"fixture": {
+        "environment_defaults": {"FIXTURE_MODE": "from-runtime"}}}}))
+    child = [sys.executable, "-c",
+             "import os, time; print('child up', os.getpid(), *(os.environ.get(k) for k in "
+             "('FIXTURE_DEFAULT', 'FIXTURE_MODE', 'FIXTURE_SET')), flush=True); "
+             "time.sleep(600)"]
+    first = Runner(root, env, "6e6f64652d66", tmp_path / "first.log", child)
+    second = None
+    try:
+        running = first.until(lambda s: s.get("running"))
+        assert "from-descriptor from-runtime mine" in first.text()
+        second = Runner(root, env, "6e6f64652d66", tmp_path / "second.log", child)
+        deadline = time.monotonic() + 20
+        while "waits for it to stop" not in second.text() and time.monotonic() < deadline:
+            time.sleep(0.3)
+        assert "waits for it to stop" in second.text()
+        time.sleep(2 * int(EVERY))
+        assert "child up" not in second.text()
+        assert first.state()["child"]["pid"] == running["child"]["pid"]
+        first.stop()
+        deadline = time.monotonic() + 30
+        while "child up" not in second.text() and time.monotonic() < deadline:
+            time.sleep(0.3)
+        assert "child up" in second.text(), second.text()
+    finally:
+        first.stop()
+        if second is not None:
+            second.stop()

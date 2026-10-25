@@ -1538,6 +1538,138 @@ def test_node_run_runs_its_own_agents_services_where_the_store_records_no_folder
     assert node_run.returncode == 0, err
 
 
+def _stand_in_launchctl(lab, tmp_path) -> tuple[Path, Path, Path]:
+    """(bin dir, call log, loaded dir): launchctl as a stand-in that logs each
+    call and keeps which labels are loaded as files, whose kickstart starts the
+    service again as its runner would, by moving its row."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    calls, loaded = tmp_path / "launchctl.log", tmp_path / "loaded"
+    loaded.mkdir()
+    (bin_dir / "launchctl").write_text(f"""#!{sys.executable}
+import json, plistlib, sys
+from pathlib import Path
+import psycopg
+args = sys.argv[1:]
+with open({str(calls)!r}, "a") as log:
+    log.write(json.dumps(args) + "\\n")
+loaded = Path({str(loaded)!r})
+label = args[-1].rsplit("/", 1)[-1]
+if args[0] == "bootstrap":
+    body = plistlib.loads(Path(args[2]).read_bytes())
+    (loaded / body["Label"]).write_text(args[2])
+elif args[0] == "bootout":
+    (loaded / label).unlink(missing_ok=True)
+elif args[0] == "print":
+    sys.exit(0 if (loaded / label).exists() else 113)
+elif args[0] == "kickstart":
+    with psycopg.connect(host="127.0.0.1", port={lab["cluster"].port}, user="{ADMIN}",
+                         dbname="{lab["database"]}", autocommit=True) as conn:
+        conn.execute("UPDATE lab.capabilities_service_instances SET started_at = now()")
+""")
+    (bin_dir / "launchctl").chmod(0o755)
+    return bin_dir, calls, loaded
+
+
+def _logged(calls: Path) -> list[list[str]]:
+    return [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+
+
+def test_node_run_on_a_mac_keeps_a_launchd_agent_per_service_placed_here(lab, tmp_path):
+    import plistlib
+    here = _service_lab(lab)
+    # The agent's slug names its jobs, so a person can tell them apart.
+    _ok(_manager(lab, "relabel", "lab", extra=here))
+    bin_dir, calls, loaded = _stand_in_launchctl(lab, tmp_path)
+    env = {**lab["env"], **here, "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+    label = "capabilities.lab.coolify"
+    plist = Path(env["HOME"]) / "Library" / "LaunchAgents" / f"{label}.plist"
+    launcher = Path(env["XDG_STATE_HOME"]) / "capabilities" / "node" / "launchd" / label
+    domain = f"gui/{os.getuid()}"
+    node_run = subprocess.Popen([str(MANAGER), "node", "run", "--launchd", "--every", "5"],
+                                cwd=lab["project"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    try:
+        # Placed here: its own launchd agent within seconds, loaded.
+        _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+        assert _wait_for(lambda: (loaded / label).exists(), 15)
+        body = plistlib.loads(plist.read_bytes())
+        assert body["Label"] == label and body["ProgramArguments"] == [str(launcher)]
+        assert body["WorkingDirectory"] == str(lab["project"])
+        assert body["EnvironmentVariables"]["AGENT_NODE_ID"] == NODE
+        text = launcher.read_text()
+        assert f"node supervise coolify --agent {PROJECT_ID}\n" in text
+        assert "coolify service run" not in text
+        assert ["bootstrap", domain, str(plist)] in _logged(calls)
+
+        # Taken down by hand: the next reconcile loads it again.
+        (loaded / label).unlink()
+        assert _wait_for(lambda: (loaded / label).exists(), 15)
+
+        # A restart asked through the store kickstarts that one agent.
+        _instance(lab, NODE, "ready")
+        restarted = _ok(_manager(lab, "service", "restart", "coolify", "--wait", "20",
+                                 extra=here))
+        assert restarted["restarted"] == "coolify"
+        assert ["kickstart", "-k", f"{domain}/{label}"] in _logged(calls)
+
+        # Placed elsewhere: the agent is taken down and its files go.
+        _ok(_manager(lab, "node", "add", BOX, "--label", "box-node", "--kind", "server",
+                     extra=here))
+        _ok(_manager(lab, "place", "coolify", "--node", BOX, extra=here))
+        assert _wait_for(lambda: not plist.exists(), 15)
+        assert not (loaded / label).exists() and not launcher.exists()
+        assert ["bootout", f"{domain}/{label}"] in _logged(calls)
+    finally:
+        node_run.terminate()
+        _out, err = node_run.communicate(timeout=60)
+    assert node_run.returncode == 0, err
+
+
+def test_node_install_announces_then_hands_the_old_agents_over_and_loads_the_manager(
+        lab, tmp_path):
+    import plistlib
+    here = _service_lab(lab)
+    bin_dir, calls, loaded = _stand_in_launchctl(lab, tmp_path)
+    handovers = tmp_path / "handover.log"
+    (bin_dir / "deployment").write_text(f"""#!{sys.executable}
+import json, os, sys
+with open({str(handovers)!r}, "a") as log:
+    log.write(json.dumps([os.getcwd(), *sys.argv[1:]]) + "\\n")
+action = "would_hand_over" if "--dry-run" in sys.argv else "handed_over"
+print(json.dumps({{"ok": True, "agents": [{{"label": "lab.coolify", "action": action}}]}}))
+""")
+    (bin_dir / "deployment").chmod(0o755)
+    env = {**here, "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+    plist = Path(lab["env"]["HOME"]) / "Library" / "LaunchAgents" / "capabilities.node.plist"
+
+    preview = _ok(_manager(lab, "node", "install", extra=env))
+    assert preview["applied"] is False and preview["next"] == "capabilities node install --apply"
+    assert preview["served"] == [{"agent_id": PROJECT_ID, "folder": str(lab["project"])}]
+    assert preview["handover"][0]["agents"][0]["action"] == "would_hand_over"
+    assert not plist.exists() and not any(loaded.iterdir())
+    assert [json.loads(line) for line in handovers.read_text().splitlines()] == [
+        [str(lab["project"]), "handover", "--dry-run"]]
+
+    refused = _manager(lab, "node", "install", "--apply",
+                       extra={**env, "CAPABILITIES_READ_ONLY": "1"})
+    assert refused.returncode == 4 and _error(refused)["code"] == "read_only_switch"
+
+    done = _ok(_manager(lab, "node", "install", "--apply", extra=env))
+    assert done["applied"] is True and done["node_agent"]["loaded"] is True
+    assert done["handover"][0]["agents"][0]["action"] == "handed_over"
+    body = plistlib.loads(plist.read_bytes())
+    assert body["Label"] == "capabilities.node"
+    assert body["ProgramArguments"][1:] == ["node", "run", "--launchd"]
+    assert body["WorkingDirectory"] == str(lab["project"])
+    assert (loaded / "capabilities.node").exists()
+    # The old agents go before the node manager starts.
+    assert _logged(calls)[-1][0] == "bootstrap"
+
+    again = _ok(_manager(lab, "node", "install", "--apply", extra=env))
+    assert again["node_agent"]["changed"] is False
+    assert sum(call[0] == "bootstrap" for call in _logged(calls)) == 1
+
 def test_the_service_handles_place_and_answer_what_the_node_reports(lab):
     here = _service_lab(lab)
     assert _ok(_manager(lab, "service", "status", extra=here))["services"] == []
