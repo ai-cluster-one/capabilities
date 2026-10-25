@@ -484,6 +484,34 @@ def test_a_moved_agent_adds_its_own_connection_with_its_grant_and_a_machine_one_
     assert ("coolify", "mine") not in _owners(lab)
 
 
+def test_a_moved_agent_removes_a_shared_connection_the_store_holds(moved):
+    lab = moved
+    fields = ("--field", "base_url=http://box.invalid", "--env", "secret_env=COOLIFY_TOKEN")
+    lab.ok(COOLIFY, "connection", "add", "mine", "--project", *fields)
+    lab.sql("INSERT INTO capabilities_connections (capability, name, spec) VALUES "
+            "('coolify', 'stray', '{\"base_url\": \"http://stray.invalid\", "
+            "\"secret_env\": \"COOLIFY_TOKEN\"}')")
+    lab.sql("INSERT INTO capabilities_connection_grants "
+            "(agent_id, capability, connection, enabled) VALUES (%s, 'coolify', 'stray', true)",
+            (OTHER,))
+    # Granted to another agent, it is not taken from it, at either name of the scope.
+    for scope in ("--global", "--machine"):
+        _code, error = lab.refused(COOLIFY, "connection", "remove", "stray", scope)
+        assert error["code"] == "connection_granted" and OTHER in error["message"]
+    assert ("coolify", "stray") in _owners(lab)
+    lab.sql("UPDATE capabilities_connection_grants SET enabled = false "
+            "WHERE connection = 'stray'")
+    removed = lab.ok(COOLIFY, "connection", "remove", "stray", "--machine")
+    assert removed["action"] == "remove" and removed["scope"] == "global"
+    assert _owners(lab) == {("coolify", "mine"): PROJECT_ID}
+    _code, error = lab.refused(COOLIFY, "connection", "remove", "stray", "--global")
+    assert error["code"] == "unknown_connection"
+    # The agent's own connection is no connection of the machine's.
+    _code, error = lab.refused(COOLIFY, "connection", "remove", "mine", "--global")
+    assert error["code"] == "unknown_connection"
+    assert ("coolify", "mine") in _owners(lab)
+
+
 # --- what a migrated agent reads ----------------------------------------------------
 
 def _rows_for_reads(lab: Lab) -> None:
