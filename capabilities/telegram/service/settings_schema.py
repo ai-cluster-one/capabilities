@@ -238,6 +238,100 @@ def _route_project(value, path, project_root):
         _fail(path, f"must be a path inside {home}, or this agent's folder {own}")
 
 
+def _routes(settings):
+    """Every route the settings carry, as (path keys, value)."""
+    found = []
+    for user_id, policy in _mapping(_mapping(settings).get("allowed_users")).items():
+        found.append((("allowed_users", user_id, "project"), _mapping(policy).get("project")))
+    for chat_id, policy in _mapping(_mapping(settings).get("allowed_groups")).items():
+        policy = _mapping(policy)
+        found.append((("allowed_groups", chat_id, "project"), policy.get("project")))
+        for topic_id, entry in _mapping(policy.get("topics")).items():
+            found.append((("allowed_groups", chat_id, "topics", topic_id, "project"),
+                          _mapping(entry).get("project")))
+        for user_id, member in _mapping(policy.get("members")).items():
+            found.append((("allowed_groups", chat_id, "members", user_id, "project"),
+                          _mapping(member).get("project")))
+    return [(keys, value) for keys, value in found if value is not None]
+
+
+def node_assigned(adapter, capability):
+    """The settings paths this node's own rows supply, as tuples of keys.
+
+    An agent whose settings are store rows keeps them for every node (node
+    null) or for one node; the service reads each top-level key from the
+    project's document, else the global one, with this node's rows laid over
+    the shared ones. Files carry no node, so everything there holds for every
+    node. None where the adapter keeps rows but does not say whose they are:
+    nothing can then be told to hold for every node."""
+    if not getattr(adapter, "settings_in_rows", False):
+        return frozenset()
+    read = getattr(adapter, "_settings_rows", None)
+    node = getattr(adapter, "node", None)
+    if read is None or node is None:
+        return None
+    _docs, rows = read(capability)
+    project_keys = {str(path[0]) for scope_node in (("project", None), ("project", node))
+                    for path, _value in rows.get(scope_node, []) if path}
+    found = set()
+    for scope in ("project", "global"):
+        for path, _value in rows.get((scope, node), []):
+            path = tuple(str(key) for key in path)
+            if scope == "global" and path[:1] and path[0] in project_keys:
+                continue
+            found.add(path)
+    return frozenset(found)
+
+
+def routes_skipped_here(settings, project_root, assigned):
+    """The routes that hold for every node and cannot apply on this one.
+
+    A route outside this node's home and the agent's folder is a folder of
+    another machine: on the node it names it is valid, and here it is skipped
+    rather than stopping the service. A route this node's own rows supply is
+    not skipped, nor one of any malformed shape; validation judges those.
+    `assigned` is `node_assigned`'s answer, None skipping nothing. Each is
+    {path, project, reason}, path the settings path validation names."""
+    if assigned is None:
+        return []
+    home = Path.home()
+    own = Path(project_root)
+    skipped = []
+    for keys, value in _routes(settings):
+        if not isinstance(value, str) or not value.strip():
+            continue
+        if any(keys[:len(path)] == path for path in assigned):
+            continue
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            continue
+        if home in candidate.parents or candidate == own or own in candidate.parents:
+            continue
+        skipped.append({
+            "path": "settings." + ".".join(keys),
+            "project": value,
+            "reason": (f"a route for every node, outside this node's home {home} "
+                       f"and this agent's folder {own}"),
+        })
+    return skipped
+
+
+def without_routes(settings, skipped):
+    """`settings` with each skipped route left out, the rest untouched."""
+    if not skipped:
+        return settings
+    import copy
+    settings = copy.deepcopy(settings)
+    drop = {entry["path"] for entry in skipped}
+    for keys, _value in _routes(settings):
+        if "settings." + ".".join(keys) in drop:
+            owner = settings
+            for key in keys[:-1]:
+                owner = owner[key]
+            owner.pop(keys[-1], None)
+    return settings
+
+
 def _topics(value, path, project_root, service_dir):
     """Per-topic overrides inside one group policy.
 

@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-25 — A route of another machine is skipped on this node instead of stopping the service
+
+A `project` route on a group, a topic, a member or a direct user that holds for every node - a settings row naming no node, or any route kept in files - and lies outside this node's home and the agent's folder is left out of the settings this node runs on, instead of stopping the service as `service_settings_invalid`. The daemon logs `warning: <path> -> <folder> is skipped on this node: ...` at start and on each reload, `service doctor` lists it under `warnings`, and `service validate` under `skipped_routes`. A request that route would carry is refused in its chat, naming the route, rather than run in the agent's own folder. A route this node's own settings rows supply is judged as before and still stops the service, and a malformed route is refused on every node.
+
 ## 2026-10-25 — The Deepgram key is kept once for the machine
 
 The setup field `DEEPGRAM_API_KEY` is declared `shared`, so `telegram setup` lists it under `shared`, apart from the Telegram app's fields, and `telegram setup set` writes it to `~/.config/capabilities/shared.env`, where whatsapp reads the same value. `transcribe`, the connections report and the service's voice transcription ask that file before `~/.config/telegram/credentials.env`, so a key already kept there still works; a project's `.env.local`/`.env` still wins. `telegram setup unset DEEPGRAM_API_KEY` removes it from both files. The script declares `capabilities-contract>=0.22,<1`.

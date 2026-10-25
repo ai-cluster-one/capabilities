@@ -2674,13 +2674,27 @@ def _workers_module():
     return module
 
 
+# The routes the last settings validated left out on this node, for the doctor.
+_SKIPPED_ROUTES: list = []
+
+
 def _validate_service_settings(root: Path, data: dict | None = None) -> dict:
+    """The settings the service runs on: refused as a reload refuses them, and
+    without the routes that hold for every node and cannot apply on this one,
+    which `_SKIPPED_ROUTES` names."""
+    global _SKIPPED_ROUTES
     if data is None:
         data = _service_settings(root)
         if not data:
             _die(6, "service_settings_missing",
                  f"no Telegram service settings in {_records().source}")
     schema = _settings_schema_module()
+    try:
+        assigned = schema.node_assigned(_records(), NAME)
+    except StoreError:
+        assigned = None
+    _SKIPPED_ROUTES = schema.routes_skipped_here(data, root.resolve(), assigned)
+    data = schema.without_routes(data, _SKIPPED_ROUTES)
     try:
         schema.validate_settings(data, root.resolve(), _service_dir(root).resolve())
     except schema.OldWorkerSettings as exc:
@@ -2744,7 +2758,7 @@ def cmd_service_validate(scope: str, key: str | None) -> dict:
             "exists": _records().document_path(NAME, doc_key) is not None})
     return {"ok": True, "scope": scope, "key": key, "changed": changed,
             "apply": "restart" if restart else "reload", "restart": restart,
-            "documents": documents}
+            "documents": documents, "skipped_routes": _SKIPPED_ROUTES}
 
 
 def _declared_profiles(settings: dict) -> list[dict]:
@@ -4737,15 +4751,19 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None,
     status["session_file_exists"] = session_file.exists()
     workers = _service_worker_preflight(root, settings or {}, live)
     store = _service_store_check(root)
-    return {"ok": local_ok and workers["ok"] and store["ok"],
-            "service": status,
-            "workers": workers,
-            "store": store,
-            "connection": cfg["id"],
-            "note": ("`telegram doctor` performs the authenticated Telegram round-trip; "
-                     "a running service is healthy only while its update sync stays fresh; "
-                     "`workers` is each profile the settings name resolved and fitted; "
-                     "with `--live`, each answering one live turn on its harness")}
+    report = {"ok": local_ok and workers["ok"] and store["ok"],
+              "service": status,
+              "workers": workers,
+              "store": store,
+              "connection": cfg["id"],
+              "note": ("`telegram doctor` performs the authenticated Telegram round-trip; "
+                       "a running service is healthy only while its update sync stays fresh; "
+                       "`workers` is each profile the settings name resolved and fitted; "
+                       "with `--live`, each answering one live turn on its harness")}
+    if _SKIPPED_ROUTES:
+        report["warnings"] = [f"{entry['path']} -> {entry['project']} is skipped on this "
+                              f"node: {entry['reason']}" for entry in _SKIPPED_ROUTES]
+    return report
 
 
 def cmd_service_run(connection_flag: str | None, session_flag: str | None) -> None:

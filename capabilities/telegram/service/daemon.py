@@ -160,10 +160,13 @@ from forum import GENERAL_TOPIC_ID, message_topic_id
 from settings_schema import (
     VOICE_PROVIDER_INCUMBENT,
     document_key,
+    node_assigned,
     old_environment,
     old_names_sentence,
     old_register_fields,
+    routes_skipped_here,
     validate_settings,
+    without_routes,
 )
 from workers import (
     DEFAULT_WORKER_TIMEOUT,
@@ -713,13 +716,27 @@ CHANNEL_ENABLED = os.environ.get(
     in ("1", "true", "yes", "on")
 
 
-def _read_settings():
+def _skipped_routes(settings):
+    """The routes in `settings` that hold for every node and cannot apply on
+    this one, as `settings_schema.routes_skipped_here` names them."""
+    try:
+        assigned = node_assigned(_records(), records.NAME)
+    except records.store().StoreError:
+        assigned = None
+    return routes_skipped_here(settings, PROJECT_ROOT, assigned)
+
+
+def _read_settings(skipped=None):
+    """The settings this node runs on; the routes left out of them are added
+    to `skipped` where one is given."""
     settings = _read_record_settings()
     if not settings:
         raise SettingsError(
             f"Telegram service settings not found in {PROJECT_CAPABILITIES_DIR}")
     if not isinstance(settings, dict):
         raise SettingsError(f"{SETTINGS_FILE} must contain a JSON object")
+    left_out = _skipped_routes(settings)
+    settings = without_routes(settings, left_out)
     try:
         validate_settings(settings, PROJECT_ROOT, SERVICE_DIR)
     except ValueError as exc:
@@ -729,17 +746,25 @@ def _read_settings():
     old_names = old_environment(os.environ)
     if old_names:
         raise SettingsError(old_names_sentence(old_names))
+    if skipped is not None:
+        skipped.extend(left_out)
     return settings
 
 
-def _load_settings():
+def _log_skipped_routes(skipped):
+    for entry in skipped:
+        log(f"warning: {entry['path']} -> {entry['project']} is skipped on this node: "
+            f"{entry['reason']}; a request it routes is refused")
+
+
+def _load_settings(skipped=None):
     try:
-        return _read_settings()
+        return _read_settings(skipped)
     except SettingsError as exc:
         sys.exit(str(exc))
 
 
-def _runtime_settings(settings, project_layout=None):
+def _runtime_settings(settings, project_layout=None, skipped=()):
     """Validate and derive every setting that may be replaced while live.
 
     Nothing in this function mutates module state. Reload first builds this
@@ -812,6 +837,9 @@ def _runtime_settings(settings, project_layout=None):
 
     return {
         "SETTINGS": settings,
+        # A route skipped on this node, by the label `_route_for` names it with.
+        "SKIPPED_ROUTES": {entry["path"].removeprefix("settings."): entry
+                           for entry in skipped},
         "ALLOWED": allowed,
         "ALLOWED_GROUPS": allowed_groups,
         "DIRECT_MESSAGES": direct_messages,
@@ -848,9 +876,10 @@ def _publish_runtime_settings(runtime):
 
 
 # --- static policy (project) --------------------------------------------------
-SETTINGS = _load_settings()
+_SKIPPED_AT_LOAD = []
+SETTINGS = _load_settings(_SKIPPED_AT_LOAD)
 PROJECT_LAYOUT = _read_project_layout()
-_publish_runtime_settings(_runtime_settings(SETTINGS, PROJECT_LAYOUT))
+_publish_runtime_settings(_runtime_settings(SETTINGS, PROJECT_LAYOUT, _SKIPPED_AT_LOAD))
 SETTINGS_GENERATION = 1
 SETTINGS_RELOAD_ATTEMPTS = 0
 CONTROL_DEFAULTS = {
@@ -2146,11 +2175,12 @@ def reload_runtime_settings():
     SETTINGS_RELOAD_ATTEMPTS += 1
     attempted_at = now()
     try:
-        candidate = _read_settings()
+        skipped = []
+        candidate = _read_settings(skipped)
         if candidate.get("connection") != SETTINGS.get("connection"):
             raise SettingsError("settings.connection changed; a daemon restart is required")
         project_layout = _read_project_layout(reload_file=True)
-        runtime = _runtime_settings(candidate, project_layout)
+        runtime = _runtime_settings(candidate, project_layout, skipped)
         # Every profile the new settings name has to resolve and fit, or the
         # settings are refused here rather than at a message.
         problems = reached_profile_problems(candidate)
@@ -2175,6 +2205,7 @@ def reload_runtime_settings():
     _publish_runtime_settings(runtime)
     apply_media_log_level()
     SETTINGS_GENERATION += 1
+    _log_skipped_routes(skipped)
     routes = _route_map()
     write_health(
         settings_reload_attempts=SETTINGS_RELOAD_ATTEMPTS,
@@ -2841,6 +2872,10 @@ def _route_target(raw, label):
     otherwise stop the daemon that serves every other channel. Here it costs
     the one request that names it.
     """
+    if label in SKIPPED_ROUTES:
+        raise RouteUnavailable(
+            f"{label} points at {raw}, which is skipped on this node: "
+            f"{SKIPPED_ROUTES[label]['reason']}")
     candidate = Path(str(raw)).expanduser()
     try:
         resolved = candidate.resolve(strict=True)
@@ -2875,15 +2910,19 @@ def _route_for(job, group_policy, is_direct):
     policy = _as_mapping(group_policy)
     chat_id = job.get("chat_id")
     topic = _topic_policy(group_policy, job.get("topic_id"))
-    if topic.get("project"):
-        return topic["project"], f"allowed_groups.{chat_id}.topics.{job.get('topic_id')}.project"
-    if policy.get("project"):
-        return policy["project"], f"allowed_groups.{chat_id}.project"
-    if is_direct:
+
+    def configured(owner, label):
+        # A route skipped on this node is still the route this request names.
+        skipped = SKIPPED_ROUTES.get(label)
+        value = owner.get("project") or (skipped and skipped["project"])
+        return (value, label) if value else None
+
+    found = (configured(topic, f"allowed_groups.{chat_id}.topics.{job.get('topic_id')}.project")
+             or configured(policy, f"allowed_groups.{chat_id}.project"))
+    if not found and is_direct:
         sender = _as_mapping(ALLOWED.get(str(job.get("sender_id"))))
-        if sender.get("project"):
-            return sender["project"], f"allowed_users.{job.get('sender_id')}.project"
-    return None, None
+        found = configured(sender, f"allowed_users.{job.get('sender_id')}.project")
+    return found or (None, None)
 
 
 def _route_map():
@@ -6370,6 +6409,7 @@ async def run_session(client):
             f"{route['scope']} -> {route['project']}" for route in routes))
     else:
         log(f"worker routes: none; every channel runs in {PROJECT_ROOT}")
+    _log_skipped_routes(SKIPPED_ROUTES.values())
     write_health(routes=routes)
 
     reg = load_register()

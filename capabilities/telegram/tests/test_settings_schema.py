@@ -176,6 +176,63 @@ class SchemaTest(unittest.TestCase):
         })
 
 
+class NodeRoutesTest(unittest.TestCase):
+    """A route that holds for every node and names a folder of another machine
+    is skipped on this one; a route this node's own rows supply is not."""
+
+    ELSEWHERE = "/Users/someone/Projects/elsewhere"
+    PATH = ["allowed_groups", "-200", "project"]
+
+    class Rows:
+        settings_in_rows = True
+        node = "0123456789ab"
+
+        def __init__(self, rows):
+            self.rows = rows
+
+        def _settings_rows(self, capability):
+            return {}, self.rows
+
+    def settings(self):
+        return {"connection": "main", "allowed_groups": {"-200": {"project": self.ELSEWHERE}}}
+
+    def test_a_route_for_every_node_is_skipped_and_the_rest_validates(self):
+        root = Path(tempfile.gettempdir()) / "agent"
+        adapter = self.Rows({("project", None): [(self.PATH, self.ELSEWHERE)]})
+        assigned = schema.node_assigned(adapter, "telegram")
+        skipped = schema.routes_skipped_here(self.settings(), root, assigned)
+        self.assertEqual([entry["path"] for entry in skipped],
+                         ["settings.allowed_groups.-200.project"])
+        self.assertEqual(skipped[0]["project"], self.ELSEWHERE)
+        left = schema.without_routes(self.settings(), skipped)
+        self.assertEqual(left["allowed_groups"], {"-200": {}})
+        schema.validate_settings(left, root, root / "service")
+
+    def test_a_route_this_node_was_assigned_still_fails(self):
+        root = Path(tempfile.gettempdir()) / "agent"
+        node = self.Rows.node
+        adapter = self.Rows({("project", node): [(self.PATH, self.ELSEWHERE)]})
+        assigned = schema.node_assigned(adapter, "telegram")
+        self.assertEqual(schema.routes_skipped_here(self.settings(), root, assigned), [])
+        with self.assertRaisesRegex(ValueError, "must be a path inside"):
+            schema.validate_settings(self.settings(), root, root / "service")
+
+    def test_a_global_node_row_the_project_shadows_assigns_nothing(self):
+        node = self.Rows.node
+        adapter = self.Rows({("project", None): [(self.PATH, self.ELSEWHERE)],
+                             ("global", node): [(self.PATH, "/elsewhere")]})
+        self.assertEqual(schema.node_assigned(adapter, "telegram"), frozenset())
+
+    def test_files_hold_for_every_node_and_unknown_rows_skip_nothing(self):
+        root = Path(tempfile.gettempdir()) / "agent"
+        self.assertEqual(schema.node_assigned(object(), "telegram"), frozenset())
+
+        class Opaque:
+            settings_in_rows = True
+        self.assertIsNone(schema.node_assigned(Opaque(), "telegram"))
+        self.assertEqual(schema.routes_skipped_here(self.settings(), root, None), [])
+
+
 class ValidateTest(unittest.TestCase):
     """`service validate` against a real file-backed project envelope."""
 

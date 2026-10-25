@@ -5314,6 +5314,36 @@ class ChatProjectRoutingTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(daemon.RouteUnavailable, "no project marker"):
                 daemon._route_target(str(bare), "label")
 
+    async def test_a_route_of_another_machine_is_skipped_here_and_refused_at_dispatch(self):
+        # A route for every node naming a folder of another machine: the
+        # service starts without it, says so, and refuses what it routes.
+        with tempfile.TemporaryDirectory() as td:
+            room = self.target(td, "room")
+            elsewhere = "/Users/someone/Projects/elsewhere"
+            service_settings = settings()
+            service_settings["allowed_groups"] = {
+                "-200": {"project": str(room),
+                         "topics": {"7": {"project": elsewhere}}}}
+            daemon = import_daemon(Path(td), service_settings)
+            label = "allowed_groups.-200.topics.7.project"
+
+            self.assertEqual(list(daemon.SKIPPED_ROUTES), [label])
+            self.assertNotIn("project", daemon.ALLOWED_GROUPS["-200"]["topics"]["7"])
+            _, group_policy = daemon._group_policy(-200)
+            topic_job = {"chat_id": -200, "topic_id": 7, "sender_id": 42}
+            self.assertEqual(daemon._route_for(topic_job, group_policy, False),
+                             (elsewhere, label))
+            with self.assertRaisesRegex(daemon.RouteUnavailable, "skipped on this node"):
+                daemon._route_target(elsewhere, label)
+
+            lines = []
+            with mock.patch.object(daemon, "log", lines.append):
+                result = daemon.reload_runtime_settings()
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(any(line.startswith(f"warning: settings.{label} -> {elsewhere} "
+                                                "is skipped on this node")
+                                for line in lines), lines)
+
     async def test_project_json_alone_marks_a_route_target_and_the_root(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
