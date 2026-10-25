@@ -285,6 +285,8 @@ other generated artifact, so a hand-tweak surfaces instead of quietly diverging.
 link the compiled agent into `~/Library/LaunchAgents`, then
 `launchctl bootstrap gui/$UID <plist>`.
 
+Once an agent is loaded, sync keeps it running the runner. A job keeps the process it started when its launcher is rewritten, so an agent loaded from an older compilation - one whose launcher ran the capability's `service run` directly - goes on running its service outside the gate and the lease, and keeps it running on this Mac after the service is placed on another node. `deployment doctor` reports such an agent as an error naming its label, judged by the process launchd holds for it (or, with none, by the program it would start), and `deployment sync` replaces it: it boots the job out, links the compiled agent in place of the installed file and bootstraps it, and the runner then stops or starts the service as the gate places it. `sync --check` reports it instead.
+
 Afterwards the controls are plain launchctl, and they are the ones to reach
 for. `launchctl kickstart -k gui/$UID/<label>` restarts a job, `launchctl kill
 TERM gui/$UID/<label>` stops it and leaves it stopped, `launchctl kickstart

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import plistlib
 import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 
 CAP_ROOT = Path(__file__).resolve().parents[2]
@@ -414,3 +418,121 @@ def test_a_declared_interval_reaches_the_agent(tmp_path: Path) -> None:
 
     _run(root, env, "sync", "--adopt")
     assert _agents(root)["project.watchdog.plist"]["StartInterval"] == 180
+
+
+# --- An agent loaded from an older compilation --------------------------------
+# A job keeps the process it started when sync rewrites its launcher, so an
+# agent whose launcher once ran `<capability> service run` directly goes on
+# running the service outside the gate and the lease. These fake launchd and
+# the process table; the decision and the launchctl sequence are what is real.
+
+OLD_WRAPPER = "/Users/someone/bin/telegram service run"
+
+
+def _module():
+    loader = importlib.machinery.SourceFileLoader("deployment_under_test", str(DEPLOYMENT))
+    spec = importlib.util.spec_from_loader("deployment_under_test", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def loaded(tmp_path, monkeypatch):
+    """A host project whose telegram agent launchd holds, running `process`."""
+    root, env = _host_project(tmp_path, ("telegram",))
+    for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "CAPABILITIES_HOME"):
+        monkeypatch.setenv(key, env[key])
+    monkeypatch.chdir(root)
+    module = _module()
+    launcher = root / "deployment" / "launchd" / "project-telegram"
+    state = {"process": OLD_WRAPPER, "pid": "4242", "program": str(launcher),
+             "calls": [], "answers": {}}
+
+    def status(label):
+        if label != "project.telegram":
+            return {"label": label, "installed": False, "loaded": False,
+                    "pid": None, "program": None}
+        return {"label": label, "installed": True, "loaded": True,
+                "pid": state["pid"], "program": state["program"]}
+
+    def launchctl(*argv):
+        state["calls"].append(argv)
+        return state["answers"].get(argv[0], (0, ""))
+
+    monkeypatch.setattr(module, "_launchd_status", status)
+    monkeypatch.setattr(module, "_process_args", lambda pid: state["process"])
+    monkeypatch.setattr(module, "_launchctl", launchctl)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    module._test = (root, state)
+    return module
+
+
+def _sync_here(module, check=False):
+    root, _state = module._test
+    return module._sync(root, module._load_runtime(root), check=check)
+
+
+def test_sync_replaces_an_agent_that_runs_its_service_outside_the_runner(loaded) -> None:
+    root, state = loaded._test
+    installed = Path(os.environ["HOME"]) / "Library" / "LaunchAgents" / "project.telegram.plist"
+    installed.parent.mkdir(parents=True)
+    installed.write_text("an older compilation, copied in\n")
+    result = _sync_here(loaded)
+    assert result["ok"], result["findings"]
+    assert result["agents"] == [{"label": "project.telegram", "action": "replaced",
+                                 "ran": OLD_WRAPPER}]
+    assert [argv[0] for argv in state["calls"]] == ["bootout", "bootstrap"]
+    assert state["calls"][0][1].endswith("/project.telegram")
+    assert state["calls"][1][2] == str(installed)
+    # The installed copy goes, so launchd records the compiled program afresh.
+    assert installed.is_symlink()
+    assert installed.resolve() == (root / "deployment" / "launchd"
+                                   / "project.telegram.plist").resolve()
+
+
+def test_an_agent_running_its_runner_is_left_alone(loaded) -> None:
+    _root, state = loaded._test
+    state["process"] = ("uv run --script /opt/caps/bin/deployment runner telegram "
+                        "--every 60 --restart on-failure -- /opt/caps/bin/telegram service run")
+    result = _sync_here(loaded)
+    assert result["ok"] and result["agents"] == [] and state["calls"] == []
+
+
+def test_an_agent_with_no_process_is_judged_by_the_program_it_would_start(loaded) -> None:
+    _root, state = loaded._test
+    state["pid"] = None
+    assert _sync_here(loaded)["agents"] == [] and state["calls"] == []
+    state["program"] = "/Users/someone/bin/telegram"
+    assert _sync_here(loaded)["agents"][0]["action"] == "replaced"
+
+
+def test_check_reports_the_agent_and_touches_nothing(loaded) -> None:
+    _root, state = loaded._test
+    result = _sync_here(loaded, check=True)
+    assert not result["ok"] and state["calls"] == []
+    finding = next(f for f in result["findings"] if f["path"] == "project.telegram")
+    assert finding["severity"] == "error" and OLD_WRAPPER in finding["message"]
+
+
+def test_an_agent_taken_down_but_not_loaded_again_is_an_error(loaded) -> None:
+    _root, state = loaded._test
+    state["answers"]["bootstrap"] = (5, "Bootstrap failed: 5: Input/output error")
+    result = _sync_here(loaded)
+    assert result["agents"][0]["action"] == "unloaded"
+    assert result["agents"][0]["step"] == "bootstrap"
+    assert not result["ok"]
+    assert any(f["path"] == "project.telegram" and f["severity"] == "error"
+               for f in result["findings"])
+
+
+def test_doctor_names_an_agent_running_its_service_outside_the_runner(loaded, capsys) -> None:
+    class Args:
+        target = None
+    with pytest.raises(SystemExit) as exit_:
+        loaded.cmd_doctor(Args())
+    assert exit_.value.code == 6
+    report = json.loads(capsys.readouterr().out)
+    finding = next(f for f in report["findings"] if f["path"] == "project.telegram")
+    assert finding["severity"] == "error"
+    assert "project.telegram" in finding["message"] and OLD_WRAPPER in finding["message"]

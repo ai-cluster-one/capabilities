@@ -119,7 +119,16 @@ USAGE
       at sync) is set with CAPABILITIES_PROJECT_ID_ROOT, the box's project
       root, in every container and, for an image that runs `capabilities
       init` in its build, in the image before that step.
-      --check is read-only and exits 7 with structured drift details.
+      For host-agents, a loaded agent of a compiled service whose process
+      is not `deployment runner <service>` (or, with no process, whose program
+      is not the compiled launcher) runs its service outside the gate and the
+      lease, as an agent loaded from an older compilation does: once the
+      artifacts are written, sync boots it out, links the compiled agent in
+      place of its installed file and bootstraps it, and lists each in
+      `agents` (`replaced`, or `unloaded` or `failed` with the step, which is
+      also an error). An agent never loaded stays a person's act (`next`).
+      --check is read-only and exits 7 with structured drift details, and
+      reports such an agent as an error instead of replacing it.
       --adopt explicitly replaces unmarked files at the runtime-declared
       managed artifact paths; external artifacts and overlays are never written.
 
@@ -383,7 +392,9 @@ USAGE
       Validate deployment/runtime.json, deployment/targets/*.json, and the deployment
       references. Reports provider readiness as local facts only: whether the
       provider capability is installed/enabled here. It does not call Coolify,
-      SSH, Docker, or any remote provider.
+      SSH, Docker, or any remote provider. For host-agents it reports each
+      compiled agent as launchd holds it, and a loaded one running its
+      service outside `deployment runner` as an error naming its label.
 
   deployment runtime
       Print deployment/runtime.json.
@@ -3529,6 +3540,98 @@ def _launchd_status(label: str) -> dict:
     return state
 
 
+def _process_args(pid) -> str | None:
+    """The command line of a running process, as `ps` reports it."""
+    try:
+        result = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
+                                capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = result.stdout.strip()
+    return text if result.returncode == 0 and text else None
+
+
+def _runs_runner(args: str, name: str) -> bool:
+    """Whether a command line is `deployment runner <name>`, however the
+    executable was reached."""
+    return re.search(rf"(^|[/\s]){re.escape(NAME)}\s+runner\s+{re.escape(name)}(\s|$)",
+                     args) is not None
+
+
+def _agent_outside_runner(status: dict, name: str, launcher: Path) -> str | None:
+    """What a loaded agent of service `name` runs when that is not its runner;
+    None when it runs the runner, or will when it next starts.
+
+    The live process is the evidence. A job keeps the process it started after
+    sync rewrites its launcher, so a launcher that now runs the runner says
+    nothing about what is running: an agent loaded from an older compilation
+    goes on running its service outside the gate and the lease until it is
+    replaced. With no process, the program launchd would start is."""
+    if not status.get("loaded"):
+        return None
+    args = _process_args(status["pid"]) if status.get("pid") else None
+    if args is not None:
+        return None if _runs_runner(args, name) else args
+    program = status.get("program")
+    return program if program and program != str(launcher) else None
+
+
+def _agents_outside_runner(root: Path, runtime: dict, services) -> list[dict]:
+    prefix = _host_label_prefix(runtime, root)
+    agents_dir = _host_agents_dir(root, runtime)
+    found = []
+    for name in sorted(services):
+        label = f"{prefix}.{name}"
+        runs = _agent_outside_runner(_launchd_status(label), name,
+                                     agents_dir / f"{prefix}-{name}")
+        if runs is not None:
+            found.append({"label": label, "service": name, "runs": runs,
+                          "compiled": agents_dir / f"{label}.plist"})
+    return found
+
+
+def _launchctl(*argv: str) -> tuple[int, str]:
+    try:
+        result = subprocess.run(["launchctl", *argv], capture_output=True,
+                                text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+    return result.returncode, (result.stderr or result.stdout).strip()
+
+
+def _replace_agent(label: str, compiled: Path) -> dict:
+    """Put the compiled agent in place of the one launchd holds: take the job
+    down, which stops the process it runs, put the compiled file where the old
+    one was installed, and load it. The installed file goes as well as the job,
+    because macOS keeps the program it recorded for an agent until its file
+    leaves ~/Library/LaunchAgents. A job that is down but did not load again is
+    reported as `unloaded`: its service no longer runs outside the runner, and
+    `deployment next` names the steps that load it."""
+    domain = f"gui/{os.getuid()}"
+    installed = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    code, detail = _launchctl("bootout", f"{domain}/{label}")
+    if code != 0 and _launchd_status(label)["loaded"]:
+        return {"label": label, "action": "failed", "step": "bootout",
+                "detail": detail[:400]}
+    try:
+        if installed.is_symlink() or installed.exists():
+            installed.unlink()
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.symlink_to(compiled)
+    except OSError as exc:
+        return {"label": label, "action": "unloaded", "step": "link",
+                "detail": str(exc)[:400]}
+    for attempt in range(5):
+        if attempt:
+            # bootout answers before launchd has let go of the label.
+            time.sleep(1)
+        code, detail = _launchctl("bootstrap", domain, str(installed))
+        if code == 0:
+            return {"label": label, "action": "replaced"}
+    return {"label": label, "action": "unloaded", "step": "bootstrap",
+            "detail": detail[:400]}
+
+
 def _watchdog_state_path(root: Path, runtime: dict) -> Path:
     return _host_agents_dir(root, runtime) / ".watchdog-state.json"
 
@@ -3896,6 +3999,29 @@ def _sync(root: Path, runtime: dict, *, check: bool,
             written.append({"path": _rel(root, path),
                             "action": "created" if actual is None else "updated"})
         drift = []
+        wrote = True
+    else:
+        wrote = False
+    agents: list[dict] = []
+    if str(compiled.get("profile") or "") in HOST_PROFILES:
+        for found in _agents_outside_runner(root, compiled, {**active, **embedded}):
+            if wrote:
+                outcome = {**_replace_agent(found["label"], found["compiled"]),
+                           "ran": found["runs"]}
+                agents.append(outcome)
+                if outcome["action"] == "replaced":
+                    continue
+                message = (f"agent {found['label']!r} ran {found['runs']!r} outside the "
+                           f"deployment runner and could not be replaced at "
+                           f"{outcome['step']}: {outcome['detail']}")
+            else:
+                message = (f"agent {found['label']!r} runs {found['runs']!r} outside the "
+                           "deployment runner, so its service never asks the gate or "
+                           "holds the lease; `deployment sync` replaces it")
+            findings.append({"severity": "error", "path": found["label"],
+                             "message": message,
+                             "hint": "`deployment next` names the launchctl steps"})
+    errors = [f for f in findings if f.get("severity") == "error"]
     ok = not errors and not drift
     return {
         "ok": ok,
@@ -3910,6 +4036,7 @@ def _sync(root: Path, runtime: dict, *, check: bool,
         "drift": drift,
         "findings": findings,
         "written": written,
+        "agents": agents,
     }
 
 
@@ -5135,7 +5262,17 @@ def cmd_doctor(args) -> None:
                         "message": "agent is installed but not loaded into launchd"})
                 else:
                     expected = str(_host_agents_dir(root, compiled) / f"{prefix}-{name}")
-                    if status["program"] and status["program"] != expected:
+                    runs = _agent_outside_runner(status, name, Path(expected))
+                    if runs is not None:
+                        findings.append({
+                            "severity": "error", "path": status["label"],
+                            "message": f"agent {status['label']!r} runs {runs!r} outside "
+                                       "the deployment runner, so its service never asks "
+                                       "the gate or holds the lease, and keeps running "
+                                       "here wherever it is placed",
+                            "hint": "run `deployment sync`, which replaces it with the "
+                                    "compiled agent"})
+                    elif status["program"] and status["program"] != expected:
                         findings.append({
                             "severity": "warning", "path": status["label"],
                             "message": f"agent runs {status['program']!r} but the "
