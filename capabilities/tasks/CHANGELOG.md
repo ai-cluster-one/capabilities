@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-25 — A task waiting its turn in a moving lane is not escalated past the ceiling
+
+A task its `before` hook has held back for longer than `escalation.stall_after` is escalated only once its worker's lane has started or ended no raise in the project for `stall_after`. While the lane keeps working other tasks, the task is held again and waits its turn; a lane that stands still for the ceiling - a session nobody advances, a blocker that never ends - still sends it along the chain at the next hold, and the escalation's reason says the lane moved nothing. Help (ESCALATION) says so.
+
 ## 2026-10-24 — A raise records its node's id
 
 The `node` a raise is claimed on is the node id the machine resolves for itself (`capabilities node id`), as the contract now answers it, in place of `AGENT_NODE_NAME` or the host name. Help says so.

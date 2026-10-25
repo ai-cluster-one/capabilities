@@ -705,15 +705,19 @@ ESCALATION
 
     its raises in place have reached the worker's `limits.attempts`; this is
     counted before its `before` hook is asked
-    its `before` hook holds it back, and has held it back in this place for
-    longer than `stall_after`
+    its `before` hook holds it back, has held it back in this place for
+    longer than `stall_after`, and the worker's lane has started or ended no
+    raise in this project for `stall_after`
     its `before` hook answers escalate; its last line is the reason
 
   and a worker's `after` hook escalates a task it answers escalate for, as
   HOOKS states. Only the claim of the task's own taker escalates it: a task
   waiting its turn behind other work in its lane is never escalated, and a
   lane held by a usage limit runs no claim, so its tasks are not escalated for
-  that time. A paused lane claims nothing, so it escalates nothing either;
+  that time. A task held back past `stall_after` while its lane keeps
+  starting or ending turns on other tasks waits its turn and is held again;
+  once the lane has started and ended nothing for `stall_after`, the next hold
+  escalates it. A paused lane claims nothing, so it escalates nothing either;
   `service status` shows how long its oldest due task has waited. A task
   assigned to a person is never escalated by these rules. With a chain,
   `limits.attempts` counts raises in place and the whole-life count that
@@ -5208,6 +5212,20 @@ def _escalate_asked(entry, escalation: dict, task: dict, why: str, *,
     return moved
 
 
+def _lane_moving(cur, task: dict, escalation: dict) -> bool:
+    """Whether the task's lane - its worker's raises in its project, hold rows
+    left out - started or ended one within the last `stall_after`."""
+    cur.execute(f"""select exists (
+                      select 1 from {SCHEMA}.tasks_executions e
+                        join {SCHEMA}.tasks_tasks et on et.id = e.task_id
+                       where et.project_id = %s and e.worker is not distinct from %s
+                         and {_a_raise()}
+                         and greatest(e.started_at, e.ended_at)
+                               > now() - make_interval(secs => %s)) as moving""",
+                (task["project_id"], escalation["worker"], escalation["stall_after"]))
+    return bool(_rows(cur)[0]["moving"])
+
+
 def _held_back(entry, escalation: dict, task: dict, said: str | None, how: str, *,
                write: bool) -> dict | None:
     """Count a hold of a task by its own taker's `before` hook against
@@ -5218,8 +5236,11 @@ def _held_back(entry, escalation: dict, task: dict, said: str | None, how: str, 
     last moved, so a task that waited its turn in a busy lane is not escalated
     at its first hold. That moment is the one thing here no record already
     holds: the first hold of an episode writes one hold row among the task's
-    raises, the claim's alone, and every later hold reads it. A task not where
-    the hook saw it is left as it is, and without `write` nothing is written."""
+    raises, the claim's alone, and every later hold reads it. Past the ceiling
+    it is still held, not escalated, while its lane is moving - a raise of its
+    worker in its project started or ended within the last `stall_after` - since
+    then it waits its turn behind other work. A task not where the hook saw it
+    is left as it is, and without `write` nothing is written."""
     if _foreign(task) or _is_person(task.get("assignee"), escalation):
         return None
     target = _escalation_target(escalation, task.get("assignee"))
@@ -5246,10 +5267,14 @@ def _held_back(entry, escalation: dict, task: dict, said: str | None, how: str, 
         if int(facts["held_seconds"] or 0) <= escalation["stall_after"]:
             conn.commit()
             return None
+        if _lane_moving(cur, row, escalation):
+            conn.commit()
+            return None
         why = (f"worker {escalation['worker']!r}'s before hook held it back ({how}) "
                f"for {_span(facts['held_seconds'])}, past the "
-               f"{_span(escalation['stall_after'])} ceiling; the hook said: "
-               + (said or "nothing"))
+               f"{_span(escalation['stall_after'])} ceiling, and its lane started or "
+               f"ended no turn in the last {_span(escalation['stall_after'])}; the hook "
+               "said: " + (said or "nothing"))
         if not write:
             conn.commit()
             return _escalation_answer(task, target, why, facts)

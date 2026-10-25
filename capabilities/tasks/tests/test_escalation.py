@@ -113,6 +113,15 @@ def held_for(conn, schema: str, key: str, hours: float) -> None:
     assert moved == 1, moved
 
 
+def lane_idle_for(conn, schema: str, hours: float) -> None:
+    """Move every raise of the project back `hours`, hold rows left where they
+    are: the lane started and ended its turns that long ago."""
+    conn.execute(f"""update {schema}.tasks_executions
+                        set started_at = started_at - make_interval(secs => %s),
+                            ended_at = ended_at - make_interval(secs => %s)
+                      where not (metrics ? 'hold')""", (hours * 3600, hours * 3600))
+
+
 # --- What is declared --------------------------------------------------------
 
 def test_the_settings_load_with_their_default_ceiling(project):
@@ -313,12 +322,44 @@ def test_a_skip_past_the_ceiling_escalates_with_the_hooks_last_line(project, sto
     assert report["claimed"] == "t-free" and turns == ["t-free"]
     assert "escalated" not in report
     held_for(conn, schema, "t-shut", 2.5)
+    lane_idle_for(conn, schema, 2.5)
     mod.cmd_run(entry, ["alpha", "--apply"])
     report = answer(capsys)
     [moved] = report["escalated"]
     assert moved["task"] == "t-shut" and "SHUT lane: open work" in moved["why"]
     assert "held: exited 3" in moved["why"]
     assert shown(entry, capsys, "t-shut")["task"]["status"] == "waiting"
+
+
+@needs_store
+def test_a_hold_past_the_ceiling_in_a_moving_lane_waits_its_turn(project, store, turns,
+                                                                 capsys):
+    """Held past the ceiling while its lane ended a turn on other work an hour
+    ago, the task waits its turn; once the lane has moved nothing for the
+    ceiling, the next hold escalates it."""
+    entry, schema, conn = store
+    hooks.hooked(project)
+    supervised(project)
+    conveyor(project)
+    add(entry, capsys, "t-behind")
+    add(entry, capsys, "t-other")
+    conn.execute(f"update {schema}.tasks_tasks set status = 'complete' where unique_key = 't-other'")
+    raised(conn, schema, "t-other", 1, hours_ago=1)
+    aged(conn, schema, "t-behind", 8)
+    tell(project, "before", "t-behind", exit=75, print=moment_ahead())
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    assert answer(capsys)["passed_over"][0]["verdict"] == "hold"
+    held_for(conn, schema, "t-behind", 7)
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    report = answer(capsys)
+    assert report["claimed"] is None and "escalated" not in report and turns == []
+    assert report["passed_over"][0]["verdict"] == "hold"
+    assert shown(entry, capsys, "t-behind")["task"]["status"] == "todo"
+    lane_idle_for(conn, schema, 6)
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    [moved] = answer(capsys)["escalated"]
+    assert (moved["task"], moved["to"]) == ("t-behind", "supervisor")
+    assert "its lane started or ended no turn in the last 6h" in moved["why"]
 
 
 @needs_store
