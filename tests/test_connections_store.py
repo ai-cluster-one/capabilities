@@ -1808,6 +1808,41 @@ print(json.dumps({{"ok": True, "agents": [{{"label": "lab.coolify", "action": ac
     assert again["node_agent"]["changed"] is False
     assert sum(call[0] == "bootstrap" for call in _logged(calls)) == 1
 
+def test_node_install_places_here_a_service_an_old_agent_ran_and_nothing_placed(
+        lab, tmp_path):
+    here = _service_lab(lab)
+    bin_dir, _calls, _loaded = _stand_in_launchctl(lab, tmp_path)
+    handovers = tmp_path / "handover.log"
+    (bin_dir / "deployment").write_text(f"""#!{sys.executable}
+import json, os, sys
+with open({str(handovers)!r}, "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\\n")
+action = "would_hand_over" if "--dry-run" in sys.argv else "handed_over"
+print(json.dumps({{"ok": True, "agents": [{{"label": "lab.coolify", "kind": "service",
+    "service": "coolify", "loaded": True, "action": action}}]}}))
+""")
+    (bin_dir / "deployment").chmod(0o755)
+    env = {**here, "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+    assert _ok(_manager(lab, "place", "coolify", extra=here))["placed_on"] == []
+
+    preview = _ok(_manager(lab, "node", "install", extra=env))
+    assert preview["handover"][0]["would_place"] == [
+        {"service": "coolify", "node": NODE, "placement": "exclusive"}]
+    assert _ok(_manager(lab, "place", "coolify", extra=here))["placed_on"] == []
+
+    done = _ok(_manager(lab, "node", "install", "--apply", extra=env))
+    assert done["handover"][0]["placed"] == [
+        {"service": "coolify", "node": NODE, "placement": "exclusive"}]
+    assert done["handover"][0]["agents"][0]["action"] == "handed_over"
+    assert _ok(_manager(lab, "place", "coolify", extra=here))["placed_on"] == [NODE]
+    # Placed before the agent that ran it is handed over.
+    assert [json.loads(line) for line in handovers.read_text().splitlines()][-2:] == [
+        ["handover", "--dry-run"], ["handover"]]
+
+    # Placed now, so a second run places nothing.
+    again = _ok(_manager(lab, "node", "install", "--apply", extra=env))
+    assert "placed" not in again["handover"][0]
+
 def test_the_service_handles_place_and_answer_what_the_node_reports(lab):
     here = _service_lab(lab)
     assert _ok(_manager(lab, "service", "status", extra=here))["services"] == []

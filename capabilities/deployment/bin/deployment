@@ -188,15 +188,22 @@ USAGE
       whose services it will run): boot out each loaded launchd agent the
       host-agents compilation left in compiler.host.agents_dir - every
       service agent and the project watchdog, not the node-sync agents - and
-      take its entry out of ~/Library/LaunchAgents, so a login does not load
-      it again (a link is removed; a file put there by hand is kept beside
-      the agents as <label>.plist.handed-over). The compiled files stay. Run
-      again it changes nothing. --dry-run changes nothing and answers the
-      same. Answers {project, profile, dry_run, ok, agents [{label, kind
-      (service|watchdog), loaded, installed, action (handed_over,
-      would_hand_over, absent or failed, with step and detail), kept_at?}]},
-      or skipped where the project compiles no host agents; exit 6 when an
-      agent could not be handed over.
+      every other agent in ~/Library/LaunchAgents or that folder whose
+      program or working directory lies inside the project, whatever
+      compiled it, where its label ends in `watchdog` or in the name of an
+      installed capability that bundles a service; and take its entry out
+      of ~/Library/LaunchAgents, so a login does not load it again (a link
+      is removed; a file put there by hand is kept beside the agents as
+      <label>.plist.handed-over). Such an agent that runs neither is
+      reported as kind other and left running, and the node manager's own
+      agents (capabilities.*) are never touched. The compiled files stay.
+      Run again it changes nothing. --dry-run changes nothing and answers
+      the same. Answers {project, profile, dry_run, ok, agents [{label, kind
+      (service|watchdog|other), service?, loaded, installed, action
+      (handed_over, would_hand_over, kept, absent or failed, with step and
+      detail), kept_at?}]}, or skipped where the project compiles no host
+      agents and no agent of it is found; exit 6 when an agent could not be
+      handed over.
 
   deployment machine sync|next [--text|--json]|status|watchdog [--dry-run]
       The machine scope, on macOS: supervision for the services that run once
@@ -5474,20 +5481,73 @@ def cmd_doctor(args) -> None:
         sys.exit(6)
 
 
-def _handover_labels(root: Path, runtime: dict) -> list[tuple[str, str]]:
-    """(label, kind) of each launchd agent this project's compiling left in its
-    agents folder that runs a service or watches one: every service agent and
-    the project watchdog, not the agents that carry the body to a node."""
-    prefix = _host_label_prefix(runtime, root)
-    agents_dir = _host_agents_dir(root, runtime)
-    found = []
-    for path in sorted(agents_dir.glob(f"{prefix}.*.plist")) if agents_dir.is_dir() else []:
-        label = path.stem
-        rest = label[len(prefix) + 1:]
-        if rest.startswith("node-sync-") or not _is_generated(_read_text(path) or ""):
-            continue
-        found.append((label, "watchdog" if rest == "watchdog" else "service"))
-    return found
+def _inside(path: object, root: Path) -> bool:
+    """Whether an absolute path an agent names lies inside a folder."""
+    if not isinstance(path, str) or not path.startswith("/"):
+        return False
+    try:
+        Path(path).resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _bundles_service(name: str) -> bool:
+    """Whether an installed capability declares a bundled service."""
+    if not re.fullmatch(r"[a-z][a-z0-9_-]*", name):
+        return False
+    manifest, _err = _installed_manifest(name)
+    return isinstance(manifest, dict) and isinstance(manifest.get("service"), dict)
+
+
+def _handover_labels(root: Path, runtime: dict | None) -> list[dict]:
+    """Each launchd agent of this folder that runs a service or watches one:
+    every service agent and the project watchdog this project's compiling left
+    in its agents folder, not the agents that carry the body to a node; and
+    every other agent in ~/Library/LaunchAgents or that folder whose program
+    or working directory lies inside the project, whatever compiled it, such
+    as one an older compilation left under another label. Such an agent is a
+    service where its label ends in the name of an installed capability that
+    bundles one, the watchdog where it ends in `watchdog`, and otherwise
+    `other`, which is reported and left running. The node manager's own jobs
+    (`capabilities.*`) are never one."""
+    found: dict[str, dict] = {}
+    agents_dir = _host_agents_dir(root, runtime or {})
+    if runtime is not None and str(runtime.get("profile") or "") in HOST_PROFILES:
+        prefix = _host_label_prefix(runtime, root)
+        for path in sorted(agents_dir.glob(f"{prefix}.*.plist")) if agents_dir.is_dir() else []:
+            label = path.stem
+            rest = label[len(prefix) + 1:]
+            if rest.startswith("node-sync-") or not _is_generated(_read_text(path) or ""):
+                continue
+            found[label] = ({"label": label, "kind": "watchdog"} if rest == "watchdog"
+                            else {"label": label, "kind": "service", "service": rest})
+    library = Path.home() / "Library" / "LaunchAgents"
+    for directory in (library, agents_dir):
+        for path in sorted(directory.glob("*.plist")) if directory.is_dir() else []:
+            try:
+                body = plistlib.loads(path.read_bytes())
+            except Exception:  # noqa: BLE001 - a file launchd could not read either
+                continue
+            label = body.get("Label") if isinstance(body, dict) else None
+            if (not isinstance(label, str) or not label or label in found
+                    or label.startswith("capabilities.")):
+                continue
+            name = label.rsplit(".", 1)[-1]
+            if name.startswith("node-sync"):
+                continue
+            argv = body.get("ProgramArguments")
+            program = body.get("Program") or (argv[0] if isinstance(argv, list) and argv
+                                              else None)
+            if not (_inside(program, root) or _inside(body.get("WorkingDirectory"), root)):
+                continue
+            if name == "watchdog":
+                found[label] = {"label": label, "kind": "watchdog"}
+            elif _bundles_service(name):
+                found[label] = {"label": label, "kind": "service", "service": name}
+            else:
+                found[label] = {"label": label, "kind": "other"}
+    return list(found.values())
 
 
 def cmd_handover(args) -> None:
@@ -5498,23 +5558,31 @@ def cmd_handover(args) -> None:
                     "agents": []}
     runtime, err = _read_json(_runtime_path(root))
     if err or not isinstance(runtime, dict):
+        runtime = None
+    else:
+        report["profile"] = runtime.get("profile")
+    found = _handover_labels(root, runtime)
+    if not found and runtime is None:
         report["skipped"] = "no deployment/runtime.json here, so nothing of it was compiled"
         _emit(report)
         return
-    report["profile"] = runtime.get("profile")
-    if str(runtime.get("profile") or "") not in HOST_PROFILES:
+    if not found and str(runtime.get("profile") or "") not in HOST_PROFILES:
         report["skipped"] = "only the host-agents profile compiles launchd agents"
         _emit(report)
         return
     library = Path.home() / "Library" / "LaunchAgents"
     domain = f"gui/{os.getuid()}"
     failed = False
-    for label, kind in _handover_labels(root, runtime):
+    for agent in found:
+        label = agent["label"]
         installed = library / f"{label}.plist"
         loaded = _launchctl("print", f"{domain}/{label}")[0] == 0
         present = installed.is_symlink() or installed.exists()
-        entry = {"label": label, "kind": kind, "loaded": loaded, "installed": present}
-        if not loaded and not present:
+        entry = {**agent, "loaded": loaded, "installed": present}
+        if agent["kind"] == "other":
+            # Nothing the node manager runs takes its place, so it keeps running.
+            entry["action"] = "absent" if not loaded and not present else "kept"
+        elif not loaded and not present:
             entry["action"] = "absent"
         elif dry_run:
             entry["action"] = "would_hand_over"
@@ -5533,7 +5601,9 @@ def cmd_handover(args) -> None:
                     else:
                         # A file someone put there by hand stays, beside the
                         # agents, rather than being lost.
-                        aside = _host_agents_dir(root, runtime) / f"{label}.plist.handed-over"
+                        aside_dir = _host_agents_dir(root, runtime or {})
+                        aside_dir.mkdir(parents=True, exist_ok=True)
+                        aside = aside_dir / f"{label}.plist.handed-over"
                         shutil.move(str(installed), str(aside))
                         entry["kept_at"] = str(aside)
                 except OSError as exc:

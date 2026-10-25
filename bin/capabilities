@@ -956,12 +956,18 @@ PROJECT VERBS (run inside a consuming project)
         folder whose services it will run - this agent's and each agent the
         store links to this node whose folder here is bound to it - hands its
         old host agents over (`deployment handover` there), so no service
-        runs twice. Without --apply it changes nothing and answers what it
-        would do, which is how a machine's migration is announced before it
-        runs. Answers {applied, project, agent_id, node, served [{agent_id,
-        folder}], left [{agent_id, folder, reason}], handover [{agent_id,
-        folder, agents, error?}], node_agent {label, plist, program, folder,
-        changed, loaded}, store, next?}. Run again it changes nothing. Exit 6
+        runs twice. A service a loaded old agent runs that nothing places -
+        an exclusive one placed on no node, a shared one not on this one - is
+        first placed on this node (`capabilities place <name> --node <this
+        node>` there), so the migration stops no service that was running;
+        where that fails the folder's agents are not handed over. Without
+        --apply it changes nothing and answers what it would do, which is how
+        a machine's migration is announced before it runs. Answers {applied,
+        project, agent_id, node, served [{agent_id, folder}], left [{agent_id,
+        folder, reason}], handover [{agent_id, folder, agents, placed? |
+        would_place? [{service, node, placement}], error?}], node_agent
+        {label, plist, program, folder, changed, loaded}, store, next?}. Run
+        again it changes nothing. Exit 6
         launchd_unavailable, agent_not_on_node (run `capabilities init`
         here), node_agent_not_loaded, or handover_incomplete, with the answer
         as the error's detail; --apply exits 4 under the read-only switch.
@@ -10326,6 +10332,51 @@ def _node_agent_text(root: Path, manager: str, logs: Path) -> str:
     }, NODE_AGENT_MARK)
 
 
+def _node_install_placements(path: Path, agents: list, here: str,
+                             apply: bool) -> tuple[list[dict], str | None]:
+    """The services the loaded old agents of one folder run that nothing places
+    where the node manager would run them - an exclusive one placed nowhere, a
+    shared one not on this node - each placed on this node where `apply`.
+    Answers ([{service, node, placement}], error or None); placing stops at
+    the first that fails."""
+    me = [sys.executable, str(Path(__file__).resolve())]
+
+    def run(*argv: str) -> tuple[dict | None, str]:
+        try:
+            proc = subprocess.run([*me, *argv], cwd=path, env=_snapshot_env(), text=True,
+                                  capture_output=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return None, str(exc)
+        try:
+            answer = json.loads(proc.stdout) if proc.returncode == 0 else None
+        except ValueError:
+            answer = None
+        return (answer if isinstance(answer, dict) else None,
+                (proc.stderr or proc.stdout).strip()[-1000:] or f"exit {proc.returncode}")
+
+    placing: list[dict] = []
+    seen: set[str] = set()
+    for agent in agents:
+        name = agent.get("service") if isinstance(agent, dict) else None
+        if (not isinstance(name, str) or name in seen or not agent.get("loaded")
+                or _installed_service(name) is None):
+            continue
+        seen.add(name)
+        report, said = run("place", name)
+        if report is None:
+            return placing, f"could not read where {name}'s service is placed: {said}"
+        on = report.get("placed_on") or []
+        mode = report.get("placement") or "exclusive"
+        if (bool(on) if mode == "exclusive" else here in on):
+            continue
+        if apply:
+            placed, said = run("place", name, "--node", here)
+            if placed is None:
+                return placing, f"could not place {name}'s service on {here}: {said}"
+        placing.append({"service": name, "node": here, "placement": mode})
+    return placing, None
+
+
 def _node_install(args: list[str]) -> None:
     pos, opts = _kernel_options(args, set(), {"--apply", "--json"}, "node install")
     if pos:
@@ -10371,9 +10422,12 @@ def _node_install(args: list[str]) -> None:
         if not deployment:
             entry["agents"] = []
             entry["note"] = "deployment is not installed, so no agent of its compiling runs here"
-        else:
+            handovers.append(entry)
+            continue
+
+        def handover(dry_run: bool) -> dict | None:
             rc, out, err = _run_script(Path(deployment),
-                                       ["handover", *([] if apply else ["--dry-run"])],
+                                       ["handover", *(["--dry-run"] if dry_run else [])],
                                        cwd=path, env=_snapshot_env(), timeout=300)
             try:
                 answer = json.loads(out) if out.strip() else None
@@ -10383,7 +10437,22 @@ def _node_install(args: list[str]) -> None:
                 entry["agents"] = answer.get("agents") or []
             if rc != 0 or not isinstance(answer, dict):
                 entry["error"] = (err or out).strip()[-1000:] or f"exit {rc}"
-                failed.append(entry)
+                return None
+            return answer
+
+        answer = handover(True)
+        if answer is not None:
+            # A service an old agent runs here, and nothing places, is placed
+            # here first, so the node manager runs it once the agent is gone.
+            placing, error = _node_install_placements(path, entry["agents"], here, apply)
+            if placing:
+                entry["placed" if apply else "would_place"] = placing
+            if error:
+                entry["error"] = error
+            elif apply:
+                handover(False)
+        if "error" in entry:
+            failed.append(entry)
         handovers.append(entry)
     manager = shutil.which("capabilities") or str(Path(sys.argv[0]).resolve())
     logs = _node_launchd_dir()

@@ -599,6 +599,61 @@ def test_handover_takes_down_the_service_agents_and_the_watchdog_only(
     assert [a["action"] for a in again["agents"]] == ["absent", "absent"]
 
 
+def test_handover_finds_every_loaded_agent_of_the_folder_whatever_compiled_it(
+        tmp_path, monkeypatch, capsys) -> None:
+    """An older compilation's agents under another label, loaded from a file
+    put in ~/Library/LaunchAgents, are this folder's too."""
+    root, env = _host_project(tmp_path, ("telegram",))
+    for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "CAPABILITIES_HOME"):
+        monkeypatch.setenv(key, env[key])
+    monkeypatch.chdir(root)
+    module = _module()
+    library = Path(env["HOME"]) / "Library" / "LaunchAgents"
+    library.mkdir(parents=True)
+    launchers = root / "deployment" / "launchd"
+
+    def agent(label, program, **extra):
+        (library / f"{label}.plist").write_bytes(plistlib.dumps(
+            {"Label": label, "ProgramArguments": [str(program)], **extra}))
+
+    agent("legacy.telegram", launchers / "legacy-telegram")
+    agent("legacy.watchdog", launchers / "legacy-watchdog")
+    agent("legacy.backup", root / "scripts" / "backup")
+    agent("elsewhere.telegram", tmp_path / "elsewhere" / "telegram")
+    agent("capabilities.node", "/usr/local/bin/capabilities", WorkingDirectory=str(root))
+    loaded = {"legacy.telegram", "legacy.watchdog", "legacy.backup", "elsewhere.telegram",
+              "capabilities.node"}
+
+    def launchctl(*argv):
+        label = argv[1].rsplit("/", 1)[-1]
+        if argv[0] == "print":
+            return (0, "") if label in loaded else (113, "not found")
+        if argv[0] == "bootout":
+            loaded.discard(label)
+        return 0, ""
+
+    monkeypatch.setattr(module, "_launchctl", launchctl)
+
+    def handover(dry_run):
+        module.cmd_handover(type("Args", (), {"dry_run": dry_run})())
+        return json.loads(capsys.readouterr().out)
+
+    preview = handover(True)
+    assert [(a["label"], a["kind"], a.get("service"), a["action"])
+            for a in preview["agents"]] == [
+        ("legacy.backup", "other", None, "kept"),
+        ("legacy.telegram", "service", "telegram", "would_hand_over"),
+        ("legacy.watchdog", "watchdog", None, "would_hand_over")]
+    done = handover(False)
+    assert done["ok"] and [a["action"] for a in done["agents"]] == [
+        "kept", "handed_over", "handed_over"]
+    # What runs nothing the node manager takes over keeps running, and so
+    # does what is not this folder's.
+    assert loaded == {"legacy.backup", "elsewhere.telegram", "capabilities.node"}
+    assert not (library / "legacy.telegram.plist").exists()
+    assert (launchers / "legacy.telegram.plist.handed-over").is_file()
+
+
 def test_a_mac_handed_over_to_its_node_manager_is_not_told_to_load_its_agents(
         tmp_path, monkeypatch, capsys) -> None:
     root, env = _host_project(tmp_path, ("telegram",))
