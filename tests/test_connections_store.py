@@ -1400,9 +1400,10 @@ def test_retire_records_moves_the_config_home_gate_and_identifiers_once_the_stor
 
 # --- the node's service manager and the service handles ----------------------------
 
-def _service_lab(lab, placement: str = "exclusive") -> dict:
-    """The lab's agent in the store on this node, NODE, its folder recorded,
-    with coolify standing in for a capability that bundles a service."""
+def _service_lab(lab, placement: str = "exclusive", folder: bool = True) -> dict:
+    """The lab's agent in the store on this node, NODE, its folder recorded
+    unless `folder` is false, as on a box, where no `capabilities init` reaches
+    the store, with coolify standing in for a capability that bundles a service."""
     _import(lab)
     registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"
     registry.mkdir(parents=True)
@@ -1413,9 +1414,10 @@ def _service_lab(lab, placement: str = "exclusive") -> dict:
     here = {"AGENT_NODE_ID": NODE}
     _ok(_manager(lab, "node", "add", NODE, "--label", "lab-node", "--kind", "server",
                  extra=here))
-    with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("UPDATE lab.capabilities_agent_nodes SET folder = %s",
-                     (str(lab["project"]),))
+    if folder:
+        with lab["cluster"].admin(lab["database"]) as conn:
+            conn.execute("UPDATE lab.capabilities_agent_nodes SET folder = %s",
+                         (str(lab["project"]),))
     return here
 
 
@@ -1511,6 +1513,31 @@ if args[2:3] == ["restart"]:
     assert "every job keeps running" in err
 
 
+def test_node_run_runs_its_own_agents_services_where_the_store_records_no_folder(
+        lab, tmp_path):
+    here = _service_lab(lab, folder=False)
+    assert _rows(lab, "SELECT folder FROM capabilities_agent_nodes") == [(None,)]
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "supervisorctl").write_text("#!/bin/sh\n")
+    (bin_dir / "supervisorctl").chmod(0o755)
+    env = {**lab["env"], **here, "SUPERVISOR_SERVER_URL": "unix:///tmp/test.sock",
+           "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+    job = tmp_path / "jobs" / f"coolify.{PROJECT_ID}.conf"
+    node_run = subprocess.Popen([str(MANAGER), "node", "run", "--supervisor",
+                                 str(tmp_path / "jobs"), "--services", "coolify"],
+                                cwd=lab["project"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    try:
+        assert _wait_for(job.exists, 15)
+        assert f"directory={lab['project']}\n" in job.read_text()
+    finally:
+        node_run.terminate()
+        _out, err = node_run.communicate(timeout=60)
+    assert node_run.returncode == 0, err
+
+
 def test_the_service_handles_place_and_answer_what_the_node_reports(lab):
     here = _service_lab(lab)
     assert _ok(_manager(lab, "service", "status", extra=here))["services"] == []
@@ -1560,8 +1587,9 @@ def test_the_service_handles_place_and_answer_what_the_node_reports(lab):
     shared = _manager(lab, "service", "move", "coolify", "--node", NODE, extra=here)
     assert shared.returncode == 6 and _error(shared)["code"] == "placement_shared"
 
-    read_only = _manager(lab, "service", "start", "coolify",
-                         extra={**here, "CAPABILITIES_READ_ONLY": "1"})
-    assert read_only.returncode == 4
+    for verb in ("start", "restart"):
+        read_only = _manager(lab, "service", verb, "coolify",
+                             extra={**here, "CAPABILITIES_READ_ONLY": "1"})
+        assert read_only.returncode == 4 and _error(read_only)["code"] == "read_only_switch"
     assert _ok(_manager(lab, "service", "status", extra={**here,
                                                          "CAPABILITIES_READ_ONLY": "1"}))

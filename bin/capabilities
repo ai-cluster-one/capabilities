@@ -1715,7 +1715,8 @@ READ_ONLY_REFUSED_VERBS = ("agent convert", "agent set", "allow", "connections i
                            "disable", "enable", "inherit", "init", "node add", "node remove",
                            "node set", "place", "quarantine", "references export",
                            "references import", "references retire", "references save",
-                           "relabel", "service move", "service start", "service stop",
+                           "relabel", "service move", "service restart", "service start",
+                           "service stop",
                            "set", "store set", "store unset", "unplace")
 
 
@@ -9598,7 +9599,7 @@ class _NodeManager:
         sys.stderr.flush()
 
     def say_once(self, key: str, value: object, message: str) -> None:
-        if self.said.get(key) != value:
+        if key not in self.said or self.said[key] != value:
             self.said[key] = value
             if message:
                 self.say(message)
@@ -9659,8 +9660,14 @@ class _NodeManager:
         """The jobs this node should run, by job name; what is placed here and
         cannot run is said once, with why."""
         folders: dict[str, Path] = {}
+        own = _folder_agent_id(self.root)
         for agent_id, folder in agents:
             path = Path(folder) if folder else None
+            if (path is None or _folder_agent_id(path) != agent_id) and agent_id == own:
+                # The folder this process runs in is its own agent's folder on
+                # this node, recorded or not: a box records none, since no
+                # `capabilities init` reaches the store there.
+                path = self.root
             if path is None or _folder_agent_id(path) != agent_id:
                 self.say_once(f"agent:{agent_id}", folder,
                               f"agent {agent_id} records no folder on this node that is "
@@ -10165,7 +10172,7 @@ def cmd_service(args: list[str]) -> None:
     if sub not in verbs:
         _die(6, "input", "service needs a subcommand: start, stop, move, status or restart",
              "run `capabilities help`")
-    if sub in ("start", "stop", "move"):
+    if sub in ("start", "stop", "move", "restart"):
         _read_only_gate(f"service {sub}")
     verbs[sub](args[1:])
 
