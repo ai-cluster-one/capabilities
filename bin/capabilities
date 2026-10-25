@@ -1025,6 +1025,10 @@ PROJECT VERBS (run inside a consuming project)
         environment_defaults for it - where the supervisor's environment sets
         none. Exit 6 agent_mismatch where the folder is bound to another agent
         than --agent, 3 no_service; 4 under the read-only switch.
+  node supervise --probe
+        Answer {supervises: true} and start nothing: how `deployment runner`
+        learns that this manager supervises the service it is handed, where an
+        older one refuses the option and the runner supervises it itself.
   node supervise <name> --machine [--every N] [--restart POLICY]
         What a node-run job runs for a service with no project command that
         declares one per machine (service.machine.command): one process on
@@ -11975,8 +11979,14 @@ def _node_supervise(args: list[str]) -> None:
             _die(6, "input", "node supervise needs the service command after `--`",
                  "capabilities node supervise <name> [--every N] [--restart POLICY] "
                  "[-- <command...>]")
-    pos, opts = _kernel_options(args, {"--agent", "--every", "--restart"}, {"--machine"},
-                                "node supervise")
+    pos, opts = _kernel_options(args, {"--agent", "--every", "--restart"},
+                                {"--machine", "--probe"}, "node supervise")
+    if "--probe" in opts:
+        if pos or command or len(opts) > 1:
+            _die(6, "input", "node supervise --probe takes nothing else",
+                 "capabilities node supervise --probe")
+        _emit({"supervises": True})
+        return
     if len(pos) != 1:
         _die(6, "input", "node supervise takes the capability whose service it runs",
              "capabilities node supervise <name> [--agent <id>] [--every N] "
