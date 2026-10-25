@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-25 — `service doctor` names why the service cannot work
+
+A failing `telegram service doctor` still prints its report and exits 5, and now also prints the contract's error envelope naming the first thing it found: `service_unhealthy` with the running daemon's health and last error (for a session that is not signed in, `session not authorized — exec in and run: telegram login ...`), `worker_unavailable` with the profile that cannot run a turn, or the job register's own store code. A supervisor that runs the doctor, such as `deployment runner`, records that as why the service is unusable. A route skipped on this node is listed under `skipped_settings`, as `{setting, project, reason}`, beside the `warnings` that already named it, and the doctor stays ok.
+
 ## 2026-10-25 — A route of another machine is skipped on this node instead of stopping the service
 
 A `project` route on a group, a topic, a member or a direct user that holds for every node - a settings row naming no node, or any route kept in files - and lies outside this node's home and the agent's folder is left out of the settings this node runs on, instead of stopping the service as `service_settings_invalid`. The daemon logs `warning: <path> -> <folder> is skipped on this node: ...` at start and on each reload, `service doctor` lists it under `warnings`, and `service validate` under `skipped_routes`. A request that route would carry is refused in its chat, naming the route, rather than run in the agent's own folder. A route this node's own settings rows supply is judged as before and still stops the service, and a malformed route is refused on every node.

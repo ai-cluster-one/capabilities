@@ -9396,6 +9396,7 @@ NODE_REFERENCES = (
     ("capabilities_connection_grants", "node", "whole"),
     ("capabilities_identifiers", "node", "whole"),
     ("capabilities_policy", "node", "whole"),
+    ("capabilities_service_instances", "node", "whole"),
     ("capabilities_settings", "node", "whole"),
     ("capabilities_settings_changes", "node", "whole"),
     ("capabilities_settings_documents", "node", "whole"),

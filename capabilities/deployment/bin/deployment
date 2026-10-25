@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.21.1,<1",
+#     "capabilities-contract>=0.23,<1",
 # ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
@@ -168,6 +168,22 @@ USAGE
       (`capabilities node seen`, which sets the node's last_seen_at), so a
       node is seen while any runner runs on it, holding a lease or not; a
       report that fails is said once on stderr and changes nothing else.
+      While the service is placed here, exclusive or shared, the runner keeps
+      this node's row of it in the store's capabilities_service_instances
+      (keyed by project id, capability and node), written on each start,
+      exit and reconcile: its state - starting, ready, unusable, degraded,
+      failing, held, waiting or stopping - with the problem and its code,
+      the payload, pid, host and start time of the running process, the
+      last failure's exit code, stderr tail and time, and the settings
+      skipped on this node. Whether a running service can do its work is
+      its declared doctor's answer (service.deploy.doctor), asked 10 seconds
+      after it starts and then every reconcile, for at most 30 seconds: exit
+      0 is ready, or degraded when its body names skipped_settings; any
+      other answer is unusable, with the message and code of the error
+      envelope it printed, else the body's problem, else its exit code's
+      category. The row goes when the service is no longer placed here or
+      the runner stops; a project that declares no id keeps none, and a
+      write that fails is said once on stderr and changes nothing else.
 
   deployment services
       This node - its id (node) and the label it gives itself (label) - and
@@ -505,6 +521,7 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -557,6 +574,13 @@ RUNNER_STOP_GRACE_SECONDS = 20
 # here, so restarting it would only be refused again.
 POLICY_REFUSAL_EXIT = 4
 RUNNER_STATE_DIR = "runners"
+# A running service is asked whether it can do its work by its declared doctor
+# once it has run this long, and again every reconcile, each time for at most
+# PROBE_TIMEOUT_SECONDS. A doctor's exit code stands for its category where
+# it names no error code of its own.
+PROBE_GRACE_SECONDS = 10
+PROBE_TIMEOUT_SECONDS = 30
+PROBE_EXIT_CODES = {2: "auth", 3: "not_found", 4: "policy", 5: "unreachable", 6: "input"}
 PROFILES = ("generic", "agent-box", "agent-box-checkout", "agent-box-shell", "host-agents")
 # A profile picks the substrate: a container image the target runs, or
 # supervised processes on the machine itself.
@@ -5444,27 +5468,20 @@ def _runner_project_key(root: Path) -> str:
     return project or f"path:{root}"
 
 
-class _Lease:
-    """One project's service leases in its store: a row per (project,
-    capability) naming the node that holds it and when that hold expires. The
-    holder renews it every reconcile; another node takes it only once it has
-    expired or been released. With no database resolvable for the project,
-    no lease can be taken and the lease is `unavailable`.
-
-    Each take, renewal, release or read is one transaction on a transaction
+class _StoreTurns:
+    """The project's store, one transaction at a time: each on a transaction
     connection opened for it and closed after it, so a runner holds no
-    connection between reconciles. `maybe_held` is whether this node may hold
-    the lease as far as this runner knows: unknown at first, so the first
-    release asks the store; a release is skipped while it is known not to be
-    held, so a runner whose service is not placed here does not reach the
-    store for its lease at all."""
+    connection between reconciles, with the tables it writes migrated on the
+    first. With no database resolvable for the project nothing is written and
+    the answer is `unavailable`."""
 
-    def __init__(self, root: Path, project: str, node: str, ttl: int = 0):
-        self.root, self.project, self.node, self.ttl = root, project, node, ttl
+    def __init__(self, root: Path):
+        self.root = root
         self.conn = None
-        self.mine_until: float | None = None
-        self.maybe_held = True
         self._migrated = False
+
+    def _migrate(self, conn, db) -> None:
+        raise NotImplementedError
 
     def _connect(self):
         if self.conn is not None:
@@ -5486,8 +5503,7 @@ class _Lease:
             raise _LeaseProblem("unreachable", exc.slug, exc.message) from None
         if not self._migrated:
             try:
-                steps, major, minor = _tables()
-                db.migrate(conn, NAME, steps, major=major, minor=minor)
+                self._migrate(conn, db)
             except db.DbError as exc:
                 conn.close()
                 raise _LeaseProblem("unreachable", exc.slug, exc.message) from None
@@ -5511,6 +5527,38 @@ class _Lease:
                 "message": " ".join(f"{type(exc).__name__}: {exc}".split())[:300]}}
         finally:
             self.close()
+
+    def close(self) -> None:
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+
+class _Lease(_StoreTurns):
+    """One project's service leases in its store: a row per (project,
+    capability) naming the node that holds it and when that hold expires. The
+    holder renews it every reconcile; another node takes it only once it has
+    expired or been released. With no database resolvable for the project,
+    no lease can be taken and the lease is `unavailable`.
+
+    Each take, renewal, release or read is one store turn. `maybe_held` is
+    whether this node may hold the lease as far as this runner knows: unknown
+    at first, so the first release asks the store; a release is skipped while
+    it is known not to be held, so a runner whose service is not placed here
+    does not reach the store for its lease at all."""
+
+    def __init__(self, root: Path, project: str, node: str, ttl: int = 0):
+        super().__init__(root)
+        self.project, self.node, self.ttl = project, node, ttl
+        self.mine_until: float | None = None
+        self.maybe_held = True
+
+    def _migrate(self, conn, db) -> None:
+        steps, major, minor = _tables()
+        db.migrate(conn, NAME, steps, major=major, minor=minor)
 
     @staticmethod
     def _holding(row, node: str) -> dict:
@@ -5617,13 +5665,45 @@ class _Lease:
         """Whether the hold this node last renewed has not yet run out."""
         return self.mine_until is not None and time.monotonic() < self.mine_until
 
-    def close(self) -> None:
-        if self.conn is not None:
-            try:
-                self.conn.close()
-            except Exception:
-                pass
-            self.conn = None
+
+class _Instance(_StoreTurns):
+    """This node's row of what it runs of one service, in the store's
+    `capabilities_service_instances`, which the contract's ledger owns:
+    written on every start, reconcile and exit, and deleted once the runner
+    no longer supervises the service here. `maybe_written` is whether a row
+    may stand: unknown at first, since a runner killed before it could delete
+    its row left one, so the first delete asks the store, and later ones only
+    after a write."""
+
+    def __init__(self, root: Path, project: str, node: str):
+        super().__init__(root)
+        self.project, self.node = project, node
+        self.maybe_written = True
+
+    def _migrate(self, conn, db) -> None:
+        major, minor = STORE_TABLES_VERSION
+        db.migrate(conn, STORE_OWNER, record_table_steps(), major=major, minor=minor)
+
+    def put(self, capability: str, row: dict) -> dict:
+        def work(conn):
+            service_instance_put(conn, self.project, capability, self.node, **row)
+            return {"written": True}
+        found = self._run(work)
+        if found.get("written"):
+            self.maybe_written = True
+        return found
+
+    def drop(self, capability: str) -> dict:
+        if not self.maybe_written:
+            return {"dropped": False}
+
+        def work(conn):
+            return {"dropped": service_instance_drop(conn, self.project, capability,
+                                                     self.node)}
+        found = self._run(work)
+        if "dropped" in found:
+            self.maybe_written = False
+        return found
 
 
 class _LeaseProblem(Exception):
@@ -5683,6 +5763,63 @@ def _refusal_of(lines: list) -> dict:
             return {"slug": str(error["code"]),
                     "message": str(error.get("message") or "")[:500]}
     return {}
+
+
+def _service_doctor(name: str) -> list[str]:
+    """The argv the installed service declares as its doctor, or none."""
+    manifest, _err = _installed_manifest(name)
+    service = (manifest or {}).get("service")
+    deploy = service.get("deploy") if isinstance(service, dict) else None
+    doctor = deploy.get("doctor") if isinstance(deploy, dict) else None
+    if isinstance(doctor, list) and doctor and all(isinstance(v, str) and v for v in doctor):
+        return list(doctor)
+    return []
+
+
+def _payload_sha256(name: str) -> str | None:
+    """The installed payload of `name`, as the manager recorded it."""
+    meta, _err = _read_json(_cap_home() / name / "meta.json")
+    value = meta.get("payload_sha256") if isinstance(meta, dict) else None
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) else None
+
+
+def _readiness(command: list[str], root: Path, timeout: int) -> dict:
+    """Whether a running service can do its work here, in its declared
+    doctor's words: `ready`, `degraded` (ready, with settings it skipped on
+    this node) or `unusable`, with the problem and its code. The words are the
+    contract's: the exit code, the error envelope on stderr, and the body's
+    `ok`, `problem` and `skipped_settings`."""
+    if not command:
+        return {"state": "unusable", "code": "doctor_undeclared",
+                "problem": "the service declares no doctor, so whether it can do its "
+                           "work here is not known"}
+    shown = shlex.join(command)
+    try:
+        done = subprocess.run(command, cwd=str(root), stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"state": "unusable", "code": "doctor_timeout",
+                "problem": f"{shown} did not answer in {timeout}s"}
+    except OSError as exc:
+        return {"state": "unusable", "code": "doctor_unavailable",
+                "problem": f"{shown} cannot be run: {exc}"[:300]}
+    try:
+        body = json.loads(done.stdout)
+    except ValueError:
+        body = None
+    body = body if isinstance(body, dict) else {}
+    skipped = body.get("skipped_settings")
+    skipped = skipped if isinstance(skipped, list) else []
+    if done.returncode == 0 and body.get("ok") is not False:
+        return {"state": "degraded" if skipped else "ready", "skipped_settings": skipped}
+    said = _refusal_of(done.stderr.splitlines())
+    problem = (said.get("message")
+               or (body.get("problem") if isinstance(body.get("problem"), str) else None)
+               or (f"{shown} exited {done.returncode}" if done.returncode
+                   else f"{shown} answered ok: false"))
+    return {"state": "unusable", "problem": problem,
+            "code": said.get("slug") or PROBE_EXIT_CODES.get(done.returncode)
+            or "doctor_failed", "skipped_settings": skipped}
 
 
 def _gate_key(gate: dict) -> tuple:
@@ -5756,6 +5893,15 @@ class _Runner:
         self.refusal: dict | None = None
         self.gate_seen: tuple | None = None
         self.seen_failing: str | None = None
+        # What runs here, as the store's instance row tells every machine: the
+        # running child's payload and readiness, and the last failure.
+        project_id = _project_id(refuse=False)
+        self.instance = _Instance(root, project_id, self.node) if project_id else None
+        self.instance_failing: str | None = None
+        self.payload_sha256: str | None = None
+        self.probe: dict | None = None
+        self.probe_at: float | None = None
+        self.failure: dict | None = None
 
     def say(self, message: str) -> None:
         sys.stderr.write(f"[deployment runner {self.name}] {message}\n")
@@ -5802,9 +5948,11 @@ class _Runner:
             self.child = None
             self.last_exit = {"code": None, "at": _now_iso(),
                               "error": f"{type(exc).__name__}: {exc}"[:300]}
+            self.failure = dict(self.last_exit)
             self.say(f"cannot start {shlex.join(self.command)}: {exc}")
             self.restart_at = time.monotonic() + self.every
             self.record_error()
+            self.write_instance()
             return
         import threading
         self.stderr_tail = []
@@ -5815,13 +5963,18 @@ class _Runner:
         self.child_started = time.monotonic()
         self.child_started_at = _now_iso()
         self.restart_at = None
+        self.payload_sha256 = _payload_sha256(self.name)
+        self.probe = None
+        self.probe_at = self.child_started + PROBE_GRACE_SECONDS
         self.say(f"started {shlex.join(self.command)} as pid {self.child.pid} on {self.node}")
+        self.write_instance()
         self.save()
 
     def stop(self, why: str) -> None:
         if self.child is None:
             return
         pid = self.child.pid
+        self.write_instance()
         _stop_group(pid, reap=self.child.poll)
         try:
             self.child.wait(timeout=5)
@@ -5842,16 +5995,22 @@ class _Runner:
         self.child = None
         if code == POLICY_REFUSAL_EXIT and self.want:
             time.sleep(0.2)  # let the relay take the service's last words
+            self.failure = {"code": code, "at": self.last_exit["at"],
+                            "error": "\n".join(self.stderr_tail)[-LEASE_ERROR_CHARS:]
+                            or f"exited with {code}"}
             self.hold_refused()
             return
         if code != 0:
             if self.relay is not None:
                 self.relay.join(timeout=0.5)  # the service's last words
             self.last_exit["error"] = "\n".join(self.stderr_tail)[-LEASE_ERROR_CHARS:]
+            self.failure = {"code": code, "at": self.last_exit["at"],
+                            "error": self.last_exit["error"] or f"exited with {code}"}
             self.record_error()
         again = (self.restart in ("always", "unless-stopped")
                  or (self.restart == "on-failure" and code != 0))
         if not self.want:
+            self.write_instance()
             self.save()
             return
         if not again:
@@ -5864,6 +6023,7 @@ class _Runner:
             delay = min(2 ** self.quick_failures, self.every)
             self.restart_at = time.monotonic() + delay
             self.say(f"exited with {code}; restarting in {delay}s")
+        self.write_instance()
         self.save()
 
     def record_error(self) -> None:
@@ -5895,7 +6055,83 @@ class _Runner:
         self.lease_state = self.lease.release_if_held(self.name, self.lease_state)
         if self.lease_state.get("released"):
             self.say(f"released the lease for {self.name}")
+        self.write_instance()
         self.save()
+
+    def instance_row(self) -> dict | None:
+        """The row of what this node runs of the service as the runner sees it
+        now, or None while it does not supervise the service here: neither
+        placed here nor still running."""
+        running = self.running()
+        if not self.placed and not running:
+            return None
+        failure = self.failure or {}
+        row = {"payload_sha256": self.payload_sha256 if running else None,
+               "pid": self.child.pid if running else None,
+               "host": socket.gethostname() if running else None,
+               "started_at": self.child_started_at if running else None,
+               "last_exit_code": failure.get("code"), "last_error": failure.get("error"),
+               "last_error_at": failure.get("at")}
+        holder = self.lease_state.get("holder")
+        # Whether the service's last exit was a failure: a start that failed or
+        # an exit other than 0, and not a stop the runner made.
+        last = self.last_exit or {}
+        failed = bool(last) and "stopped" not in last and last.get("code") != 0
+        if running and not self.want:
+            return {**row, "state": "stopping", "problem": self.reason}
+        if running:
+            if self.probe is None:
+                # Restarted after a quick failure and not yet asked: it is
+                # crashing, not starting.
+                state = "failing" if self.quick_failures and failed else "starting"
+                return {**row, "state": state}
+            return {**row, "state": self.probe["state"], "problem": self.probe.get("problem"),
+                    "problem_code": self.probe.get("code"),
+                    "skipped_settings": self.probe.get("skipped_settings") or []}
+        if self.refusal is not None:
+            return {**row, "state": "held", "problem": self.reason,
+                    "problem_code": self.refusal.get("slug") or "policy"}
+        if self.held_down:
+            return {**row, "state": "held", "problem_code": "restart_policy",
+                    "problem": (f"exited with {failure.get('code', 0)}; restart policy "
+                                f"{self.restart!r} keeps it stopped until the gate turns "
+                                "it off and on again or the runner restarts")}
+        if self.want:
+            return {**row, "state": "failing" if failed else "starting"}
+        return {**row, "state": "waiting", "problem": self.reason,
+                "problem_code": ("lease_held_elsewhere" if holder and holder != self.node
+                                 else "lease_unconfirmed")}
+
+    def write_instance(self) -> None:
+        """Put the row of what runs here in the store, or take it away once the
+        runner no longer supervises the service here. A failure to reach the
+        store is said once, and once more when the writes work again."""
+        if self.instance is None:
+            if self.instance_failing != "project_undeclared":
+                self.say("the project declares no id, so what runs here is not recorded "
+                         "in the store")
+            self.instance_failing = "project_undeclared"
+            return
+        row = self.instance_row()
+        found = (self.instance.drop(self.name) if row is None
+                 else self.instance.put(self.name, row))
+        failing = (found.get("error") or {}).get("code")
+        if failing != self.instance_failing:
+            self.say(f"cannot record what runs here in the store: "
+                     f"{found['error'].get('message')}" if failing
+                     else "records what runs here in the store again")
+        self.instance_failing = failing
+
+    def probe_if_due(self) -> bool:
+        """Ask the running service's declared doctor whether it can do its work,
+        once it has run PROBE_GRACE_SECONDS and then every reconcile; whether
+        it was asked."""
+        if not self.running() or self.probe_at is None or time.monotonic() < self.probe_at:
+            return False
+        self.probe = _readiness(_service_doctor(self.name), self.root,
+                                min(PROBE_TIMEOUT_SECONDS, 2 * self.every))
+        self.probe_at = time.monotonic() + self.every
+        return True
 
     def converge(self) -> None:
         if self.want and not self.running() and not self.held_down:
@@ -5951,6 +6187,7 @@ class _Runner:
             lease = self.lease.release_if_held(self.name, self.lease_state)
             self.placed, self.want, self.reason, self.lease_state = placed, want, reason, lease
             self.converge()
+            self.write_instance()
             self.save()
             return
         shared = placed and _service_placement(self.name) == "shared"
@@ -6010,6 +6247,8 @@ class _Runner:
             self.lease_state = self.lease.release_if_held(self.name, self.lease_state)
             if self.lease_state.get("released"):
                 self.say(f"released the lease for {self.name}")
+        self.probe_if_due()
+        self.write_instance()
         self.save()
 
     def save(self) -> None:
@@ -6041,6 +6280,9 @@ class _Runner:
         if self.lease.mine_until is not None:
             self.lease_state = self.lease.release(self.name)
         self.lease.close()
+        if self.instance is not None:
+            self.instance.drop(self.name)
+            self.instance.close()
         self.save()
 
 
@@ -6093,6 +6335,8 @@ def cmd_runner(args) -> None:
             else:
                 runner.reap()
                 runner.converge()
+                if runner.probe_if_due():
+                    runner.write_instance()
             time.sleep(max(0.05, min(1.0, next_tick - time.monotonic())))
     finally:
         runner.shutdown()

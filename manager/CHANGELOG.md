@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-25 — `node rekey` moves a node's service instance rows
+
+`capabilities_service_instances.node` (capabilities-contract 0.23) is one of the columns `capabilities node rekey` moves from a node's old id to its new one, with every other column that names a node.
+
 ## 2026-10-25 — `dev run` and `dev live` hand down a value kept once for the machine
 
 Where a session payload's manifest declares a setup field `shared` (capabilities-contract 0.22), the user-config tier `dev run` hands down, and the Telegram credentials `dev live start` passes to the payload, ask `~/.config/capabilities/shared.env` under the field's shared name before the capability's own `credentials.env`, as the capability itself does. A project's env files still win, `--project-only` still hands down no user-config value, and a key no field declares shared resolves as before.

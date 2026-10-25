@@ -572,3 +572,126 @@ def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_li
     finally:
         for runner in runners.values():
             runner.stop()
+
+
+# --- what each node runs, and whether it can do its work -------------------------
+
+# The fixture's declared doctor answers as the file `doctor-says` in the
+# project tells it: ready by default, unusable in the contract's own words -
+# exit 5 and an error envelope - or ready with a setting skipped here.
+DOCTOR = [sys.executable, "-c", (
+    "import json, pathlib, sys\n"
+    "says = pathlib.Path('doctor-says')\n"
+    "says = says.read_text().strip() if says.exists() else ''\n"
+    "if says == 'unusable':\n"
+    "    print(json.dumps({'ok': False}))\n"
+    "    sys.stderr.write(json.dumps({'error': {'code': 'service_unhealthy', "
+    "'message': 'session not authorized'}}) + '\\n')\n"
+    "    sys.exit(5)\n"
+    "print(json.dumps({'ok': True, 'skipped_settings': "
+    "[{'setting': 'groups.g.project'}] if says == 'skipped' else []}))\n")]
+PAYLOAD = "ab" * 32
+
+
+def _installed_fixture(env: dict[str, str], placement: str) -> None:
+    home = Path(env["CAPABILITIES_HOME"]) / "fixture"
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "manifest.json").write_text(json.dumps(
+        {"name": "fixture", "service": {"placement": placement,
+                                        "deploy": {"doctor": DOCTOR}}}))
+    (home / "meta.json").write_text(json.dumps({"name": "fixture",
+                                                "payload_sha256": PAYLOAD}))
+
+
+INSTANCES = ("SELECT node, state, ready, problem, problem_code, pid, host, payload_sha256, "
+             "last_exit_code, last_error, skipped_settings "
+             "FROM capabilities_service_instances WHERE project_id = '" + PROJECT_ID
+             + "' AND capability = 'fixture' ORDER BY node")
+
+
+def _instances(rows, check, runners, timeout: float = 45.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while True:
+        found = {row[0]: dict(zip(("node", "state", "ready", "problem", "problem_code",
+                                   "pid", "host", "payload_sha256", "last_exit_code",
+                                   "last_error", "skipped_settings"), row))
+                 for row in rows(INSTANCES)}
+        if check(found):
+            return found
+        assert time.monotonic() < deadline, (found, *(r.text() for r in runners))
+        for runner in runners:
+            assert runner.proc.poll() is None, runner.text()
+        time.sleep(0.3)
+
+
+def _store_project(tmp_path: Path, cluster: int, env: dict[str, str], *names: str):
+    database, rows = _database(cluster)
+    dotenv = (f"AGENTKIT_DB_URL=postgresql://{ADMIN}@127.0.0.1:{cluster}/{database}"
+              "?sslmode=disable\nAGENTKIT_DB_SCHEMA=lab\n")
+    identity = {"id": PROJECT_ID, "slug": "lab", "records": "store"}
+    roots = [_project(tmp_path / name, identity, dotenv=dotenv) for name in names]
+    _manager(roots[0], env, "enable", "deployment", "--project")
+    return rows, roots
+
+
+def test_an_exclusive_service_records_on_its_node_whether_it_can_do_its_work(
+        tmp_path: Path, cluster) -> None:
+    env = _env(tmp_path / "home")
+    _installed_fixture(env, "exclusive")
+    rows, (a,) = _store_project(tmp_path, cluster, env, "a")
+    node = "6e6f64652d61"
+    _manager(a, env, "enable", "fixture", "--project", "--node", node)
+    runner = Runner(a, env, node, tmp_path / "a.log")
+    try:
+        ready = _instances(rows, lambda f: (f.get(node) or {}).get("state") == "ready",
+                           [runner])[node]
+        assert ready["ready"] is True and ready["problem"] is None
+        assert ready["pid"] == runner.state()["child"]["pid"]
+        assert ready["host"] == socket.gethostname() and ready["payload_sha256"] == PAYLOAD
+
+        # Running, and its doctor says it cannot work: unusable, with why.
+        (a / "doctor-says").write_text("unusable")
+        unusable = _instances(rows, lambda f: f[node]["state"] == "unusable", [runner])[node]
+        assert unusable["ready"] is False and unusable["pid"] == ready["pid"]
+        assert (unusable["problem"], unusable["problem_code"]) == (
+            "session not authorized", "service_unhealthy")
+
+        (a / "doctor-says").write_text("skipped")
+        degraded = _instances(rows, lambda f: f[node]["state"] == "degraded", [runner])[node]
+        assert degraded["ready"] is True
+        assert degraded["skipped_settings"] == [{"setting": "groups.g.project"}]
+
+        # Unplaced, the node no longer runs it, and its row goes.
+        _manager(a, env, "disable", "fixture", "--project", "--node", node)
+        _instances(rows, lambda f: f == {}, [runner])
+        assert "cannot record" not in runner.text()
+    finally:
+        runner.stop()
+
+
+def test_a_shared_service_has_a_row_on_each_node_and_a_failing_one_says_why(
+        tmp_path: Path, cluster) -> None:
+    env = _env(tmp_path / "home")
+    _installed_fixture(env, "shared")
+    rows, (a, b) = _store_project(tmp_path, cluster, env, "a", "b")
+    node_a, node_b = "6e6f64652d61", "6e6f64652d62"
+    for node in (node_a, node_b):
+        _manager(a, env, "enable", "fixture", "--project", "--node", node)
+    runners = [Runner(a, env, node_a, tmp_path / "a.log", child=FAILING),
+               Runner(b, env, node_b, tmp_path / "b.log")]
+    try:
+        found = _instances(rows, lambda f: (f.get(node_a) or {}).get("state") == "failing"
+                           and (f.get(node_b) or {}).get("state") == "ready", runners)
+        failing = found[node_a]
+        assert failing["ready"] is False and failing["last_exit_code"] == 6
+        assert "must be a path inside" in failing["last_error"]
+        assert rows("SELECT * FROM deployment_service_leases") == []
+
+        # A runner that stops takes its node's row with it.
+        runners.pop().stop()
+        found = _instances(rows, lambda f: set(f) == {node_a}, runners)
+        assert found[node_a]["state"] in ("failing", "starting")
+    finally:
+        for runner in runners:
+            runner.stop()
+    assert rows(INSTANCES) == []

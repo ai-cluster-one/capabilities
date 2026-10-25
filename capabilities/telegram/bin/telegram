@@ -402,7 +402,12 @@ Exit codes:
      `service doctor` reporting `ok: false` — a running daemon whose update
      sync is not fresh, a profile the settings name that does not resolve
      or fit or, under `--live`, that its harness did not accept, or a job
-     register the store did not open
+     register the store did not open; after its report it prints the error
+     envelope naming the first of these (`service_unhealthy` with the
+     daemon's last error, `worker_unavailable`, or the store's own code),
+     which a supervisor records as why the service cannot work. A route
+     skipped on this node is named under `skipped_settings` beside
+     `warnings`, and the doctor stays ok
   6  input / validation — a malformed argument, a bad date, a machine with
      no store configured for the service or its jobs, a profile the
      service settings name that does not resolve or fit, or a worker still
@@ -4763,7 +4768,36 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None,
     if _SKIPPED_ROUTES:
         report["warnings"] = [f"{entry['path']} -> {entry['project']} is skipped on this "
                               f"node: {entry['reason']}" for entry in _SKIPPED_ROUTES]
+        report["skipped_settings"] = [{"setting": entry["path"], "project": entry["project"],
+                                       "reason": entry["reason"]}
+                                      for entry in _SKIPPED_ROUTES]
     return report
+
+
+def _service_doctor_problem(report: dict) -> tuple[str, str, str | None]:
+    """The first thing a failing `service doctor` found, as its error envelope
+    names it: the code, the message and the remedy."""
+    status = report["service"]
+    if status["running"] and not status["healthy"]:
+        health = status.get("health") or {}
+        said = health.get("last_error")
+        return ("service_unhealthy",
+                f"the running service is not healthy: health {health.get('state')}"
+                + (f": {said}" if said else ""),
+                f"`telegram service logs --connection {report['connection']}` shows what "
+                "it is doing")
+    failed = [row for row in report["workers"]["checked"] if not row.get("ok")]
+    if failed:
+        row = failed[0]
+        return ("worker_unavailable",
+                f"profile {row.get('profile')} declared at {row.get('declared_at')} "
+                f"cannot run a turn: {row.get('reason')}", None)
+    store = report["store"]
+    if not store["ok"]:
+        return (store.get("code") or "store_unavailable",
+                store.get("error") or "the job register does not open in the store",
+                store.get("hint"))
+    return "service_unhealthy", "the service doctor found it not ok", None
 
 
 def cmd_service_run(connection_flag: str | None, session_flag: str | None) -> None:
@@ -5148,8 +5182,8 @@ def main() -> None:
                 # running daemon whose update sync is not fresh, a profile the
                 # settings name that its harness did not accept, or a job
                 # register the store did not open: a server/network outcome,
-                # category 5.
-                sys.exit(5)
+                # category 5, named in the error envelope a supervisor records.
+                _die(5, *_service_doctor_problem(report))
         elif args.service_cmd == "run":
             cmd_service_run(connection_flag, session_flag)
         elif args.service_cmd == "migrate-ownership":

@@ -67,7 +67,7 @@
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "0d5c7af783f5c8e5108fd13e2a9f13a413e234a04e17102aa4ccd61e44ff5034",
+      "payload_sha256": "e932b10cf1e3e80b07bee482924e82c0b668b2a3b5d771eb9f19b03df4a7bc92",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into launchd-supervised processes on a Mac, and describe the targets they deploy to."
     },
     "directo": {
@@ -177,7 +177,7 @@
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "4de4b15daafcd67d943b3362019c37df92c497060a1f129d45e056736e7ab95d",
+      "payload_sha256": "5b6e3b28feebbe60b9e8e912085fec3e1525eb504ecf3465c5da18893ac5a0cd",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {
