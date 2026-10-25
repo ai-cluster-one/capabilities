@@ -934,7 +934,8 @@ PROJECT VERBS (run inside a consuming project)
   node run --launchd [--every N] [--services <name,...>]
         The same on a Mac, where each job is a launchd agent of this OS user
         instead: ~/Library/LaunchAgents/capabilities.<agent slug>.<capability>
-        .plist, whose program is a launcher of the same name running `node
+        .plist (the agent's id for a slug of `machine`, deployment's machine
+        scope), whose program is a launcher of the same name running `node
         supervise` in the agent's folder, with its logs beside the launcher in
         $XDG_STATE_HOME/capabilities/node/launchd/ and the node manager's
         PATH, node id and home variables. Each job is loaded, replaced and
@@ -9530,6 +9531,7 @@ NODE_JOB_STOP_SECONDS = 30
 # is one more, which `node install` writes and loads.
 NODE_LAUNCHD_MARK = "<!-- written by `capabilities node run`, which rewrites or removes it -->"
 NODE_AGENT_LABEL = "capabilities.node"
+NODE_LAUNCHD_FOREIGN_SLUG = "machine"
 NODE_AGENT_MARK = "<!-- written by `capabilities node install`, which rewrites it -->"
 # What a job carries over from the node manager's own environment: launchd
 # hands a job none, and these decide which node, home and tools it runs as.
@@ -9998,6 +10000,10 @@ class _LaunchdNodeManager(_NodeManager):
         self.home = home
 
     def job_name(self, agent_id: str, capability: str, slug: str | None) -> str:
+        # capabilities.machine.* is deployment's machine scope, so an agent
+        # whose slug is `machine` is labelled by its id instead.
+        if slug == NODE_LAUNCHD_FOREIGN_SLUG:
+            slug = None
         who = re.sub(r"[^A-Za-z0-9_-]", "_", slug or agent_id)
         return f"capabilities.{who}.{capability}"
 

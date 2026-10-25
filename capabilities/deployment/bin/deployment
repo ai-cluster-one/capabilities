@@ -5523,6 +5523,7 @@ LEASE_STEPS = [
 LEASE_MAJOR, LEASE_MINOR = 1, 1
 LEASE_ERROR_CHARS = 2000
 RUNNER_SCHEMA = "capabilities.deployment.runner.v1"
+RUNNER_UNLOCKED = object()
 
 
 def _tables():
@@ -5905,8 +5906,16 @@ def _runner_lock(name: str, stopping: dict):
     while waiting."""
     import fcntl
     path = _runner_state_path(name).with_suffix(".lock")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = path.open("a")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a")
+    except OSError as exc:
+        # As with its state, a runner that cannot write here still runs its
+        # service; only the guard against a second copy is lost.
+        sys.stderr.write(f"[deployment runner {name}] cannot take its lock {path}: {exc}; "
+                         "it runs without the guard against a second runner here\n")
+        sys.stderr.flush()
+        return RUNNER_UNLOCKED
     said = False
     while not stopping["now"]:
         try:

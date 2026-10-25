@@ -725,7 +725,10 @@ def test_a_second_runner_of_a_service_waits_and_the_service_gets_its_defaults(
     second = None
     try:
         running = first.until(lambda s: s.get("running"))
-        assert "from-descriptor from-runtime mine" in first.text()
+        deadline = time.monotonic() + 20
+        while "child up" not in first.text() and time.monotonic() < deadline:
+            time.sleep(0.3)
+        assert "from-descriptor from-runtime mine" in first.text(), first.text()
         second = Runner(root, env, "6e6f64652d66", tmp_path / "second.log", child)
         deadline = time.monotonic() + 20
         while "waits for it to stop" not in second.text() and time.monotonic() < deadline:
@@ -743,3 +746,23 @@ def test_a_second_runner_of_a_service_waits_and_the_service_gets_its_defaults(
         first.stop()
         if second is not None:
             second.stop()
+
+
+def test_a_runner_that_cannot_write_its_lock_still_runs_its_service(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    root = _project(tmp_path / "project", {"id": PROJECT_ID, "slug": "files"},
+                    settings={"deployment": {"enabled": True}, "fixture": {"enabled": True}})
+    runners = root / "capabilities" / "deployment" / "state" / "runners"
+    runners.mkdir(parents=True)
+    runners.chmod(0o555)
+    runner = Runner(root, _env(home), "6e6f64652d66", tmp_path / "runner.log")
+    try:
+        deadline = time.monotonic() + 25
+        while "child up" not in runner.text() and time.monotonic() < deadline:
+            assert runner.proc.poll() is None, runner.text()
+            time.sleep(0.3)
+        assert "child up" in runner.text(), runner.text()
+        assert "cannot take its lock" in runner.text()
+    finally:
+        runner.stop()
+        runners.chmod(0o755)
