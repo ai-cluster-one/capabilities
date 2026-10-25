@@ -87,15 +87,20 @@ COMMANDS
 
   Identity
     register NAME [--homeserver URL] [--as ID] [--default] [--supervisor WHO]
+                  [--registration-token -]
         Register @NAME on the shared homeserver (from --homeserver, else
         AGENTROOMS_HOMESERVER). A homeserver whose registration is open
         registers it at once or through m.login.dummy, with no token; only one
         that asks for m.login.registration_token needs the registration token,
         read from AGENTROOMS_REGISTRATION_TOKEN through the cascade, and exits
-        2 registration_token_missing without it. Writes connection ID (default
-        NAME) into this project's registry and the minted access token into
-        the project's .env.local under AGENTROOMS_<ID>_TOKEN, mode 0600; the
-        token is never printed. The account gets a random password, sent
+        2 registration_token_missing without it. --registration-token - reads
+        the token from standard input instead (no echo on a terminal; - is
+        the only value it takes, so the token never sits on the command
+        line): that token is the one sent, whatever the cascade holds, and
+        an empty one exits 6 registration_token_missing. Writes connection
+        ID (default NAME) into this project's registry and the minted access
+        token into the project's .env.local under AGENTROOMS_<ID>_TOKEN, mode
+        0600; the token is never printed. The account gets a random password, sent
         once and never stored or printed, so its access token is its only
         credential: a tuwunel homeserver treats an account without a
         password as a guest and keeps it out of public rooms such as the
@@ -2970,7 +2975,8 @@ def _published_identity(cfg: dict) -> dict:
 
 
 def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
-                 make_default: bool, supervisor: str | None = None) -> dict:
+                 make_default: bool, supervisor: str | None = None,
+                 token_flag: str | None = None) -> dict:
     _read_only_gate(f"`{NAME} register`")
     if not LOCALPART_RE.fullmatch(name):
         _die(6, "bad_name", f"NAME {name!r} is not a Matrix localpart",
@@ -2999,6 +3005,17 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
     homeserver = homeserver.rstrip("/")
     if not re.match(r"https?://[^/\s]+$", homeserver):
         _die(6, "bad_homeserver", f"{homeserver!r} is not http(s)://host[:port]")
+    given_token = None
+    if token_flag is not None:
+        if token_flag != "-":
+            _die(6, "invalid_arguments",
+                 "--registration-token takes only -, the token on standard input",
+                 "pipe the token to standard input; it is never taken on the command line")
+        given_token = _read_password()
+        if not given_token:
+            _die(6, "registration_token_missing", "no registration token on standard input",
+                 "pipe the token to standard input, or drop --registration-token to read "
+                 f"{REGISTRATION_KEY} through the cascade")
     # A password nobody keeps: the token stays the only credential, and the
     # account is not a guest, which a homeserver makes of one without a password.
     password = secrets.token_urlsafe(32)
@@ -3028,7 +3045,7 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
             if ["m.login.dummy"] in flows:
                 auth = {"type": "m.login.dummy", "session": info.get("session")}
             elif ["m.login.registration_token"] in flows:
-                token = _resolve_env_key(REGISTRATION_KEY)[0]
+                token = given_token or _resolve_env_key(REGISTRATION_KEY)[0]
                 if not token:
                     _die(2, "registration_token_missing",
                          f"{homeserver} asks for a registration token and {REGISTRATION_KEY} is unset",
@@ -3047,6 +3064,8 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
                 if exc.status == 401 and auth["type"] == "m.login.registration_token":
                     _die(2, "registration_token_rejected",
                          "the homeserver rejected the registration token",
+                         "check the token you gave with the person who configured it"
+                         if given_token else
                          f"check {REGISTRATION_KEY} with the person who configured it")
                 _fail(exc)
     user_id, access, device = done.get("user_id"), done.get("access_token"), done.get("device_id")
@@ -4933,6 +4952,7 @@ def _parser() -> _Parser:
     register.add_argument("--as", dest="as_id")
     register.add_argument("--default", action="store_true")
     register.add_argument("--supervisor")
+    register.add_argument("--registration-token", dest="registration_token")
     login = sub.add_parser("login")
     login.add_argument("user_id")
     login.add_argument("--homeserver")
@@ -5125,7 +5145,7 @@ def main() -> None:
         return
     if cmd == "register":
         _emit(cmd_register(args.name, args.homeserver, args.as_id, args.default,
-                           args.supervisor))
+                           args.supervisor, args.registration_token))
         return
     if cmd == "login":
         _emit(cmd_login(args.user_id, args.homeserver, args.as_id, args.scope or "project",

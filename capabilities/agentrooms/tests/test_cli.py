@@ -375,6 +375,31 @@ def test_register_needs_the_registration_token(cli, project, homeserver, capsys)
     assert not homeserver.users and not (project / ".env.local").exists()
 
 
+def test_register_takes_the_registration_token_on_standard_input(cli, project, homeserver,
+                                                                capsys, monkeypatch):
+    import io
+    # The token given on standard input is the one sent, whatever the cascade holds.
+    monkeypatch.setenv("AGENTROOMS_REGISTRATION_TOKEN", "wrong")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("reg-token\n"))
+    code, out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS,
+                         "--registration-token", "-")
+    assert code == 0, err
+    auth = [b for m, p, b in homeserver.requests if b and "auth" in b][0]["auth"]
+    assert auth == {"type": "m.login.registration_token", "token": "reg-token", "session": "s1"}
+    assert "reg-token" not in json.dumps(out)
+    # Nothing on standard input is refused before the network, not read from the cascade.
+    homeserver.requests.clear()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    code, _out, err = run(cli, capsys, "register", "beta", "--homeserver", HS,
+                          "--registration-token", "-")
+    assert code == 6 and err["error"]["code"] == "registration_token_missing"
+    # The token itself is never taken on the command line.
+    code, _out, err = run(cli, capsys, "register", "beta", "--homeserver", HS,
+                          "--registration-token", "reg-token")
+    assert code == 6 and err["error"]["code"] == "invalid_arguments"
+    assert not homeserver.requests
+
+
 def test_register_on_an_open_homeserver_needs_no_token(cli, project, homeserver, capsys):
     homeserver.registration_flows = [["m.login.registration_token"], ["m.login.dummy"]]
     code, out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS)
