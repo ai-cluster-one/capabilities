@@ -452,6 +452,11 @@ DEVELOPMENT VERBS
   dev live recover <session> telegram --restore-canonical
         Borrow one account's real Telegram state under a durable exclusive
         lease; recovery is explicit and always targets the recorded canonical state.
+        Where the project names no database of its own, so the payload keeps
+        its records in the session's schema, the service's register in the
+        store (telegram_channels) is borrowed too: the canonical rows of the
+        project's connection are copied into the session schema before the
+        payload starts, and back before the canonical service restarts.
   dev doctor <session> | dev list
         Inspect provenance, worktrees, isolation paths, installed payloads, and
         cleanup readiness. Source dirtiness is visible development state, not
@@ -6277,6 +6282,93 @@ def _dev_live_env(session: dict, inputs: dict,
     return env, projection
 
 
+# The Telegram service's register: per channel, what decides whether a message
+# is answered. A service that keeps it in the store keeps it in this table.
+DEV_LIVE_REGISTER_TABLE = "telegram_channels"
+
+
+def _dev_live_copy_register(source: str, target: str, project_id: str,
+                            connection: str) -> int | None:
+    """Replace the register rows one project's connection holds in the
+    `target` schema with the `source` schema's, in one transaction, by the
+    columns both tables have. The number of rows copied, or None where either
+    schema holds no register table, so there is nothing of it to carry."""
+    import dataclasses
+    import psycopg
+    from psycopg import sql
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(None)
+        conn = db.connect(application_name="capabilities-dev",
+                          setting=dataclasses.replace(setting, schema=target),
+                          transaction=True)
+    except db.DbError as exc:
+        _die(5, "dev_live_register_failed",
+             f"cannot reach the store to carry the Telegram register: {exc.message}",
+             "check the store with `capabilities store doctor`")
+    try:
+        def columns(schema: str) -> list[str]:
+            return [row[0] for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = %s "
+                "AND table_name = %s AND is_generated = 'NEVER' AND identity_generation "
+                "IS NULL ORDER BY ordinal_position",
+                (schema, DEV_LIVE_REGISTER_TABLE)).fetchall()]
+        held = set(columns(source))
+        shared = [c for c in columns(target) if c in held]
+        if not shared:
+            return None
+        table = sql.Identifier(DEV_LIVE_REGISTER_TABLE)
+        names = sql.SQL(", ").join(sql.Identifier(c) for c in shared)
+        scope = sql.SQL(" WHERE project_id = %s AND connection = %s")
+        with conn.transaction():
+            conn.execute(sql.SQL("DELETE FROM {}.{}").format(sql.Identifier(target), table)
+                         + scope, (project_id, connection))
+            return conn.execute(sql.SQL("INSERT INTO {}.{} ({}) SELECT {} FROM {}.{}").format(
+                sql.Identifier(target), table, names, names, sql.Identifier(source), table)
+                + scope, (project_id, connection)).rowcount
+    except psycopg.Error as exc:
+        _die(5, "dev_live_register_failed",
+             f"cannot carry the Telegram register from schema {source} to {target}: {exc}",
+             "check the store with `capabilities store doctor`")
+    finally:
+        conn.close()
+
+
+def _dev_live_borrow_register(session: dict, inputs: dict, executable: Path,
+                              env: dict[str, str]) -> dict | None:
+    """Carry the canonical service's register into the lane before the
+    session payload starts, where the two read it from different schemas: the
+    project names no database of its own, so the canonical service reads the
+    one this machine resolves and the payload that database's session schema.
+    The payload first opens its own register there, so the table is its own
+    code's. What was borrowed, which restoring carries back; None where no
+    database resolves or both read one schema."""
+    project = inputs["project"]
+    if _dev_database(session) is None:
+        return None
+    db = _db_module()
+    try:
+        canonical = db.resolve_setting(project)
+    except db.DbError:
+        return None
+    lane = _dev_schema(session)
+    if canonical.level == "project" or canonical.schema == lane:
+        return None
+    project_id = _project_id_handoff(project).get(PROJECT_ID_ENV)
+    if not project_id:
+        return None
+    _dev_live_command(executable, ["jobs", "list", "--limit", "1"], project, env,
+                      inputs["secrets"])
+    out = {"canonical_schema": canonical.schema, "lane_schema": lane,
+           "project_id": project_id, "connection": inputs["connection"]}
+    rows = _dev_live_copy_register(canonical.schema, lane, project_id, inputs["connection"])
+    if rows is None:
+        return {**out, "borrowed": False,
+                "reason": f"schema {canonical.schema} or {lane} holds no "
+                          f"{DEV_LIVE_REGISTER_TABLE}"}
+    return {**out, "borrowed": True, "rows": rows}
+
+
 def _dev_live_command(executable: Path, args: list[str], project: Path,
                       env: dict[str, str], secrets_list: list[str]) -> dict:
     """Run a Telegram control command and parse its redacted JSON result."""
@@ -6487,6 +6579,10 @@ def cmd_dev_live_start(session_id: str, adapter: str) -> None:
             inputs["project"], canonical_env, inputs["secrets"])
     _dev_live_transition(lease_path, lease, "dev_starting")
     dev_env, projection = _dev_live_env(session, inputs, projection_path)
+    register = _dev_live_borrow_register(session, inputs, Path(payload["executable"]),
+                                         dev_env)
+    if register is not None:
+        _dev_live_transition(lease_path, lease, "dev_starting", register=register)
     dev_status = _dev_live_command(
         Path(payload["executable"]),
         ["service", "start", "--connection", inputs["connection"]],
@@ -6584,6 +6680,22 @@ def _dev_live_recover_locked(session_id: str, adapter: str, lease: dict) -> None
     _dev_live_transition(lease_path, lease, "dev_stopping")
     _dev_live_command(canonical, ["service", "stop", "--connection", connection],
                       project, env, secrets_list)
+    # Once returned, the canonical schema is the register's home again: a
+    # recovery repeated after the canonical restarted must not carry the
+    # lane's older copy over what it has answered since.
+    register = lease.get("register")
+    if isinstance(register, dict) and register.get("borrowed") and not register.get("returned"):
+        _dev_live_transition(lease_path, lease, "register_returning")
+        returned = _dev_live_copy_register(
+            str(register["lane_schema"]), str(register["canonical_schema"]),
+            str(register["project_id"]), str(register["connection"]))
+        if returned is None:
+            _die(6, "dev_live_register_failed",
+                 f"the borrowed Telegram register cannot return to schema "
+                 f"{register['canonical_schema']}: a schema holds no {DEV_LIVE_REGISTER_TABLE}",
+                 str(lease_path))
+        _dev_live_transition(lease_path, lease, "register_returned",
+                             register={**register, "returned": True, "rows_returned": returned})
     if lease.get("restart_canonical"):
         _dev_live_transition(lease_path, lease, "canonical_restarting")
         status = _dev_live_command(
