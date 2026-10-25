@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-10-25 — The Deepgram key is kept once for the machine
+
+The setup field `DEEPGRAM_API_KEY` is declared `shared`, so `whatsapp setup` lists it under `shared`, apart from `fields`, and `whatsapp setup set` writes it to `~/.config/capabilities/shared.env`, where telegram reads the same value. `transcribe`, the assistant service's voice notes and the connections report ask that file before `~/.config/whatsapp/credentials.env`, so a key already kept there still works; a project's `.env.local`/`.env` still wins. `whatsapp setup unset DEEPGRAM_API_KEY` removes it from both files. The script declares `capabilities-contract>=0.22,<1`.
+
 ## 2026-10-24 — Turns run on callva-harness-runner 0.10.1
 
 The runner is pinned at 0.10.1 in place of 0.9.0. Claude turns run through claude-agent-sdk 0.2.174, and a claude CLI up to 2.1.310 runs without the runner's out-of-range warning; codex is unchanged. The runner's 0.10.0 additions are new profile knobs only, so a turn runs as before.

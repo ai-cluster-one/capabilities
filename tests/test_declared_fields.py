@@ -586,6 +586,46 @@ def test_setup_names_itself_the_guide_to_its_fields_and_its_check(lab):
 
 
 
+def test_a_shared_setup_field_is_kept_once_for_the_machine(lab):
+    # A capability that declares no shared field answers as before.
+    plain = json.loads(_run(lab, "setup").stdout)
+    assert "shared" not in plain and "shared_credentials" not in plain
+    lab["script"].write_text(_fixture_text().replace(
+        '"type": "string", "secret": True, "required": True},\n]\nSETUP = ',
+        '"type": "string", "secret": True, "required": True,\n'
+        '     "shared": "DECLFIX_SHARED_HASH"},\n]\nSETUP = ', 1))
+    shared_env = lab["config"] / "capabilities" / "shared.env"
+    own_env = lab["config"] / NAME / "credentials.env"
+    # A value kept the older way, in the capability's own file, still resolves.
+    own_env.parent.mkdir(parents=True, exist_ok=True)
+    own_env.write_text("DECLFIX_APP_HASH='own-hash-0000aaaa'\n")
+    shown = json.loads(_run(lab, "setup").stdout)
+    assert [f["key"] for f in shown["fields"]] == ["DECLFIX_APP_ID"]
+    assert [f["key"] for f in shown["shared"]] == ["DECLFIX_APP_HASH"]
+    assert shown["shared"][0]["shared"] == "DECLFIX_SHARED_HASH"
+    assert shown["shared_credentials"] == str(shared_env)
+    assert (shown["shared"][0]["value"], shown["shared"][0]["source"]) == ("…aaaa", str(own_env))
+    # A write lands once, in the machine's shared file, under the shared name.
+    result = _run(lab, "setup", "set", "--machine", "--stdin",
+                  stdin=json.dumps({"DECLFIX_APP_HASH": "shared-hash-1111bbbb"}))
+    assert result.returncode == 0, result.stderr
+    assert _env_file(shared_env) == {"DECLFIX_SHARED_HASH": "shared-hash-1111bbbb"}
+    assert _env_file(own_env) == {"DECLFIX_APP_HASH": "own-hash-0000aaaa"}
+    answer = json.loads(result.stdout)
+    assert answer["changed"] == ["DECLFIX_APP_HASH"]
+    assert (answer["shared"][0]["tier"], answer["shared"][0]["source"]) == ("user", str(shared_env))
+    result = _run(lab, "setup", "show", "--reveal", "DECLFIX_APP_HASH")
+    assert result.stdout == "shared-hash-1111bbbb\n"
+    # The project's own value still wins over the machine's.
+    (lab["project"] / ".env.local").write_text("DECLFIX_APP_HASH='proj-hash-2222cccc'\n")
+    assert json.loads(_run(lab, "setup").stdout)["shared"][0]["tier"] == "project"
+    (lab["project"] / ".env.local").unlink()
+    # Unset takes it out of both files, so the older value does not come back.
+    answer = json.loads(_run(lab, "setup", "unset", "DECLFIX_APP_HASH").stdout)
+    assert answer["shared"][0]["set"] is False
+    assert _env_file(shared_env) == {} and _env_file(own_env) == {}
+
+
 def test_setup_show_reveals_one_value_in_the_clear_and_nothing_else(lab):
     result = _run(lab, "setup", "set", "--machine", "--field", "DECLFIX_APP_ID=7", "--stdin",
                   stdin=json.dumps({"DECLFIX_APP_HASH": "hash-0123456789"}))

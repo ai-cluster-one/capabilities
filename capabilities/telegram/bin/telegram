@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.20,<1",
+#     "capabilities-contract>=0.22,<1",
 #     "httpx>=0.27",
 #     "qrcode>=7.4",
 #     "telethon==1.45.0",
@@ -80,7 +80,10 @@ machine; every other verb that needs a connection is refused there.
                            default connection's session defaults to
                            $XDG_STATE_HOME/telegram/session, a named connection's
                            to <state-dir>/<id>/session.
-  DEEPGRAM_API_KEY         Required only by `transcribe` (secret).
+  DEEPGRAM_API_KEY         Required only by `transcribe` (secret). Shared: kept once
+                           for the machine in ~/.config/capabilities/shared.env,
+                           which `telegram setup set` writes, asked before
+                           telegram's own credentials.env.
 
   --session <PATH>         One-shot override of the session-file path, accepted
                            anywhere on the line. Names a path, not a secret.
@@ -528,7 +531,8 @@ SETUP_FIELDS = [{'key': 'TELEGRAM_API_ID',
   'help': 'The Deepgram key voice and audio transcription use.',
   'type': 'string',
   'secret': True,
-  'required': False}]
+  'required': False,
+  'shared': 'DEEPGRAM_API_KEY'}]
 # That setup as a whole: what it is called, how a person obtains its fields, and
 # the verb that asks Telegram whether it accepts them.
 SETUP = {'title': 'Telegram App',
