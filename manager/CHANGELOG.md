@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-26 — `node id` and `doctor` warn while AGENT_NODE_ID is set
+
+A node resolves its id itself, so `AGENT_NODE_ID` in the environment is needed only by a node still keyed by the name it had before ids. While it is set, `capabilities node id` answers `warnings` beside `overridden_by`, and `capabilities doctor` answers `warnings`, each `[{code: node_id_in_environment, variable, value, message, hint}]`, the hint naming `capabilities node id --set <id>` or `capabilities node rekey <name>`. It is a warning, not drift: doctor's exit code does not change, and the variable still overrides the id as before.
+
 ## 2026-10-25 — `node install` places a service an old agent ran before handing it over
 
 Before `capabilities node install` hands a folder's old host agents over, it places on this node each service a loaded old agent runs that nothing places - an exclusive one placed on no node, a shared one not on this node - so the migration stops no service that was running. Without `--apply` the answer names them under `would_place`, with `--apply` under `placed`, each `{service, node, placement}`; a placement that fails is the folder's `error`, and its agents are not handed over (`handover_incomplete`).

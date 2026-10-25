@@ -94,6 +94,26 @@ def test_agent_node_id_overrides_and_must_be_an_id(monkeypatch, tmp_path):
         assert refused.value.slug == "bad_node_id"
 
 
+def test_node_id_warns_while_agent_node_id_is_set(tmp_path):
+    env = {"HOME": str(tmp_path), "XDG_CONFIG_HOME": str(tmp_path / "config"),
+           "PATH": os.environ.get("PATH", "")}
+    for key in ("UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    plain = subprocess.run([str(MANAGER), "node", "id"], cwd=tmp_path, env=env, text=True,
+                           capture_output=True, timeout=240)
+    assert plain.returncode == 0, plain.stdout + plain.stderr
+    assert "warnings" not in json.loads(plain.stdout)
+    pinned = subprocess.run([str(MANAGER), "node", "id"], cwd=tmp_path, text=True,
+                            env={**env, S.NODE_ID_ENV: "lab-node"},
+                            capture_output=True, timeout=240)
+    assert pinned.returncode == 0, pinned.stdout + pinned.stderr
+    answer = json.loads(pinned.stdout)
+    assert answer["id"] == "lab-node" and answer["overridden_by"] == S.NODE_ID_ENV
+    [warning] = answer["warnings"]
+    assert warning["code"] == "node_id_in_environment" and warning["value"] == "lab-node"
+
+
 def test_a_node_id_file_that_holds_no_id_is_refused(monkeypatch, tmp_path):
     _resolve_fresh(monkeypatch, tmp_path)
     (tmp_path / "config" / "capabilities").mkdir(parents=True)

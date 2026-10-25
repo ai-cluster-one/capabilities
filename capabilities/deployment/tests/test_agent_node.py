@@ -200,8 +200,8 @@ def test_create_makes_a_resource_of_the_standard_image_and_registers_its_row(lab
                         ("--environment", "test"), ("--name", "lab-agent-box1")):
         assert argv[argv.index(flag) + 1] == value
     assert "--instant-deploy" in argv
-    # The whole document: the image, its memory limit, its state volumes and
-    # the three keys it is told, and nothing to build or clone.
+    # The whole document: the image, its memory limit, its volumes and the two
+    # keys it is told - no node identity - and nothing to build or clone.
     assert create["stdin"] == (
         'services:\n'
         '  agent:\n'
@@ -211,17 +211,18 @@ def test_create_makes_a_resource_of_the_standard_image_and_registers_its_row(lab
         '    environment:\n'
         '      CAPABILITIES_PROJECT_ID: "prj_00000000a1a1"\n'
         '      CAPABILITIES_PROJECT_ID_ROOT: "/app"\n'
-        '      AGENT_NODE_NAME: "box1"\n'
         '    volumes:\n'
         '      - "config:/home/agent/.config"\n'
         '      - "state:/home/agent/.local/state"\n'
         '      - "claude:/home/agent/.claude"\n'
         '      - "codex:/home/agent/.codex"\n'
+        '      - "work:/home/agent/work"\n'
         'volumes:\n'
         '  config: {}\n'
         '  state: {}\n'
         '  claude: {}\n'
-        '  codex: {}\n')
+        '  codex: {}\n'
+        '  work: {}\n')
 
     assert lab.fake.rows[BOX1] == {"node": BOX1, "label": "box1", "kind": "server",
                                      "coolify_connection": "infra",
@@ -368,7 +369,7 @@ def test_create_builds_a_node_from_a_repository_with_the_socket_and_same_path_di
     coolify = [c for c in lab.fake.of("coolify")]
     verbs = [c["argv"][3:5] for c in coolify]
     assert verbs == [["projects", "prj-uuid"], ["app", "create"], ["app", "update"],
-                     ["env", "bulk"]] + [["storage", "add"]] * 6 + [["deploy", "app-new"]]
+                     ["env", "bulk"]] + [["storage", "add"]] * 7 + [["deploy", "app-new"]]
     create = coolify[1]["argv"]
     for flag, value in (("--project", "prj-uuid"), ("--server", "srv-uuid"),
                         ("--environment", "test"), ("--private-deploy-key", "key-uuid"),
@@ -381,16 +382,16 @@ def test_create_builds_a_node_from_a_repository_with_the_socket_and_same_path_di
     assert "--no-autogenerate-domain" in create and "--no-health-check-enabled" in create
     assert "--instant-deploy" not in create and "--github-app" not in create
     assert coolify[2]["argv"][5:] == ["app-new", "--no-auto-deploy-enabled"]
-    # Only the three keys, as for a node of the standard image.
-    assert coolify[3]["stdin"] == ("AGENT_NODE_NAME=box1\n"
-                                   "CAPABILITIES_PROJECT_ID=prj_00000000a1a1\n"
+    # Only the two keys, as for a node of the standard image.
+    assert coolify[3]["stdin"] == ("CAPABILITIES_PROJECT_ID=prj_00000000a1a1\n"
                                    "CAPABILITIES_PROJECT_ID_ROOT=/app\n")
-    storages = [c["argv"][5:] for c in coolify[4:10]]
+    storages = [c["argv"][5:] for c in coolify[4:11]]
     assert storages == [
         ["app-new", "--volume", "config", "--mount-path", "/home/agent/.config"],
         ["app-new", "--volume", "state", "--mount-path", "/home/agent/.local/state"],
         ["app-new", "--volume", "claude", "--mount-path", "/home/agent/.claude"],
         ["app-new", "--volume", "codex", "--mount-path", "/home/agent/.codex"],
+        ["app-new", "--volume", "work", "--mount-path", "/home/agent/work"],
         ["app-new", "--host-path", "/var/run/docker.sock", "--mount-path", "/var/run/docker.sock"],
         ["app-new", "--host-path", "/srv/product", "--mount-path", "/srv/product"]]
 

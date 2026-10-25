@@ -295,6 +295,15 @@ def test_a_target_node_is_the_id_every_container_receives(tmp_path: Path, profil
     assert '  AGENT_NODE_ID: "staging-node.1"' in compose.splitlines()
     example = (root / "deployment" / "targets" / "staging" / ".env.example").read_text()
     assert "AGENT_NODE_ID=" not in example and "'staging-node.1'" in example
+    # A node's id it resolves itself, from the file enrol writes: nothing
+    # hands it one, so nothing overrides that file.
+    _declare_node(root, "staging", "0a1b2c3d4e5f")
+    assert _run(root, env, "sync").returncode == 0
+    compose = (root / "deployment" / "targets" / "staging" / "docker-compose.yaml").read_text()
+    assert "AGENT_NODE_ID" not in compose
+    example = (root / "deployment" / "targets" / "staging" / ".env.example").read_text()
+    assert "AGENT_NODE_ID=" not in example and "'0a1b2c3d4e5f'" in example
+    assert _run(root, env, "sync", "--check").returncode == 0
     # A target that declares no node compiles exactly as before.
     assert _bundle_files(root, "edge") == before
     edge = before["docker-compose.yaml"]

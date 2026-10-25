@@ -921,8 +921,8 @@ def test_in_store_mode_placement_no_longer_filters_and_the_shape_composes(node, 
 
 
 def test_a_target_node_reaches_the_application_and_status(node, monkeypatch, capsys):
-    # This machine has its own id; a target that declares its node sends that
-    # one instead.
+    # This machine has its own id. A target that declares a node's id sends
+    # none, emptying an earlier deploy's, since the node resolves it itself.
     monkeypatch.setenv("AGENT_NODE_ID", "0a0a0a0a0a0a")
     service = next(svc for svc in node.runtime["services"].values() if svc.get("placement") != "local")
     service.setdefault("optional_env", []).append("AGENT_NODE_ID")
@@ -930,7 +930,7 @@ def test_a_target_node_reaches_the_application_and_status(node, monkeypatch, cap
     node.m.cmd_deploy(node.args)
     capsys.readouterr()
     env = next(r["stdin"] for r in rows(node) if r["argv"][:2] == ["env", "bulk"])
-    assert "AGENT_NODE_ID=6e6f64652d61" in env.splitlines() and "0a0a0a0a0a0a" not in env
+    assert "AGENT_NODE_ID=" in env.splitlines() and "0a0a0a0a0a0a" not in env
     node.m.cmd_node_status(node.args)
     data = json.loads(capsys.readouterr().out)
     assert data["declared_node_name"] == "6e6f64652d61" and data["node_id"] == "6e6f64652d61"
@@ -940,6 +940,16 @@ def test_a_target_node_reaches_the_application_and_status(node, monkeypatch, cap
     data = json.loads(capsys.readouterr().out)
     assert data["declared_node_name"] == "node-b"
     assert [e["code"] for e in data["errors"]] == ["node_name_mismatch"]
+
+
+def test_a_target_node_from_before_ids_reaches_the_application_by_its_name(
+        node, monkeypatch, capsys):
+    monkeypatch.setenv("AGENT_NODE_ID", "0a0a0a0a0a0a")
+    node.target["node"] = "legacy-node"
+    node.m.cmd_deploy(node.args)
+    capsys.readouterr()
+    env = next(r["stdin"] for r in rows(node) if r["argv"][:2] == ["env", "bulk"])
+    assert "AGENT_NODE_ID=legacy-node" in env.splitlines() and "0a0a0a0a0a0a" not in env
 
 
 def test_status_of_a_target_without_a_node_reports_no_declaration(node, capsys):

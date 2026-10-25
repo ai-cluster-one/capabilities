@@ -828,7 +828,9 @@ PROJECT VERBS (run inside a consuming project)
         overrides both. Answers {ok, id, source
         (env | hardware | file | minted), label}, label being the one this
         machine gives itself when it is first registered (AGENT_NODE_NAME,
-        else its host name), and overridden_by where AGENT_NODE_ID is set.
+        else its host name), and, where AGENT_NODE_ID is set, overridden_by
+        and warnings [{code node_id_in_environment, variable, value, message,
+        hint}]: only a node still keyed by its name from before ids needs it.
         --set <id> writes that file (`deployment node enrol` sets the id a
         server was created with); refused on a Mac (node_id_derived) and
         under the read-only switch. No project is needed.
@@ -1505,8 +1507,9 @@ VERIFICATION VERBS
         Codex from loading the capability context ↔ project identity; report
         drift, and the project's project_identity state (see path
         --identity), which moves an id still kept in project.json into
-        .env.local. A store-mode project whose store cannot be used is
-        drift. In store mode `information` lists, never
+        .env.local. warnings names AGENT_NODE_ID set in the environment
+        (node_id_in_environment), as `node id` does; it is not drift. A
+        store-mode project whose store cannot be used is drift. In store mode `information` lists, never
         as drift, each agent_id holding grants in the store that ContextKit's
         registry (contextkit_agents) does not know (grant_agent_unknown), or
         that the registry is not in the store (agents_registry_absent).
@@ -1844,6 +1847,23 @@ def _read_only_gate(verb: str) -> None:
              "so this process changes no project record",
              "Do not lift the switch yourself — ask the user; the change has to "
              f"run in a process without {store.READ_ONLY_ENV}.")
+
+
+def _node_id_env_warning() -> dict | None:
+    """What `node id` and doctor say while AGENT_NODE_ID is set: a node
+    resolves its id itself, so the variable is needed only by a node still
+    keyed by the name it had before ids, until `node rekey` moves it."""
+    store = _store_module()
+    value = os.environ.get(store.NODE_ID_ENV, "").strip()
+    if not value:
+        return None
+    return {"code": "node_id_in_environment", "variable": store.NODE_ID_ENV, "value": value,
+            "message": f"{store.NODE_ID_ENV}={value} overrides the id this machine resolves "
+                       "for itself; only a node still keyed by the name it had before ids "
+                       "needs it",
+            "hint": "keep the id in the node's own file (`capabilities node id --set <id>`, "
+                    "or `capabilities node rekey <name>` for a node keyed by a name) and "
+                    f"remove {store.NODE_ID_ENV} from the environment"}
 
 
 def _read_only_report() -> dict | None:
@@ -12594,6 +12614,7 @@ def _node_id_verb(args: list[str]) -> None:
         answer["written"] = written
     if os.environ.get(store.NODE_ID_ENV, "").strip():
         answer["overridden_by"] = store.NODE_ID_ENV
+        answer["warnings"] = [_node_id_env_warning()]
     _emit(answer)
 
 
@@ -21315,6 +21336,9 @@ def cmd_doctor() -> None:
     read_only = _read_only_report()
     if read_only is not None:
         report["read_only_switch"] = read_only
+    node_env = _node_id_env_warning()
+    if node_env is not None:
+        report["warnings"] = [node_env]
     if findings:
         _emit(report)
         sys.exit(7)

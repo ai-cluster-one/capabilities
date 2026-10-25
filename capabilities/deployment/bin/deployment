@@ -110,12 +110,16 @@ USAGE
       warning naming each one, and sync rewrites it, keeping the shape it
       implied; `retired` in the result lists what it rewrote.
       A target's `node` is the id of the node its server runs as in the
-      gate - for a node registered before ids, the name it is still keyed
-      by: its bundle's Compose file sets AGENT_NODE_ID to it in every
-      container, so every container of the box and every redeploy is that
-      one node, and `deploy` sends it to the application. A target without
-      one takes AGENT_NODE_ID from the server's environment, else its
-      AGENT_NODE_NAME, which named the node before ids. The node's
+      gate. The node resolves an id itself, from the
+      ~/.config/capabilities/node-id that enrol writes (`capabilities node
+      id --set`), so its bundle hands it none and `deploy` empties
+      AGENT_NODE_ID on the application. For a node registered before ids,
+      `node` is the name it is still keyed by: its bundle's Compose file
+      sets AGENT_NODE_ID to it in every container, so every container of
+      the box and every redeploy is that one node, and `deploy` sends it to
+      the application. A target without one takes AGENT_NODE_ID from the
+      server's environment, else its AGENT_NODE_NAME, which named the node
+      before ids. The node's
       label is its row's (`capabilities node set <id> --label`). A malformed
       node (node_invalid) or a service environment_defaults also setting
       AGENT_NODE_ID beside it (node_declared_twice) stops the sync.
@@ -279,11 +283,13 @@ USAGE
       in that project's existing environment on that server. It is a Compose
       service of one container with the memory limit, a volume of its own
       for each state path of the image (~/.config, ~/.local/state,
-      ~/.claude, ~/.codex) and only CAPABILITIES_PROJECT_ID,
-      CAPABILITIES_PROJECT_ID_ROOT (/app) and AGENT_NODE_NAME, which is
-      <node>, the label it is shown by; no repository, no build. Then mint
-      the node's id, twelve lowercase hex characters, and register the
-      node row under it with that label and the connection, server and
+      ~/.claude, ~/.codex) and for ~/work, where the agent keeps its
+      checkouts and git worktrees, and only CAPABILITIES_PROJECT_ID and
+      CAPABILITIES_PROJECT_ID_ROOT (/app); no repository, no build, and no
+      node identity in its environment. Then mint the node's id, twelve
+      lowercase hex characters, and register the node row under it with
+      <node> as its label, the name it is shown by, and the connection,
+      server and
       resource (`capabilities node add`); a row that cannot be written takes
       the resource away again. The node starts idle, knowing no store; the
       answer's node.node is its id, which enrol puts on its config volume.
@@ -297,7 +303,7 @@ USAGE
       repository is cloned with a Coolify deploy key or GitHub App
       (`coolify sources` lists their uuids), else as public. The node is
       then a Coolify application with no domain, no automatic deploy on
-      push and the same memory limit, keys and state volumes, and only it
+      push and the same memory limit, keys and volumes, and only it
       takes host paths, each bound at the same path in the container:
       --docker-socket the host's /var/run/docker.sock, and each --host-dir
       an existing directory on the server (not /home/agent, /app or above
@@ -726,9 +732,11 @@ COOLIFY_BUILD_LIMIT = 3600
 # server's bare repository; with kind "github" it is that GitHub repository.
 GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?!\.)[A-Za-z0-9._-]+(?<!\.git)")
 # A target's `node` is the id of the node its server runs as - for a node
-# registered before ids, the name it is still keyed by. Its bundle sets it as
-# AGENT_NODE_ID in every container, written literally into the Compose file, so
-# it takes no interpolation characters and fits one environment line.
+# registered before ids, the name it is still keyed by. A node resolves its id
+# itself, from the file enrolment writes, so its bundle hands it none; only a
+# name, which nothing on the node resolves, is set as AGENT_NODE_ID in every
+# container, written literally into the Compose file, so it takes no
+# interpolation characters and fits one environment line.
 TARGET_NODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
 # The project's id is the agent a box runs. Its bundle sets it in every
 # container and in the image the build runs `capabilities init` in, bound to the
@@ -1638,6 +1646,9 @@ def _env_example_template(runtime: dict, descriptors: dict[str, dict],
         "# This node's id in the gate. A capability service runs here only where",
         "# the project's policy row names it; keep it the same across redeploys.",
         *([f"# The target declares it as {node!r}, and the Compose file sets it."]
+          if _handed_node(node) else
+          [f"# The target declares it as {node!r}; the node keeps it in",
+           "# ~/.config/capabilities/node-id, which `capabilities node id --set` writes."]
           if node else [f"# Left empty, {NODE_NAME_ENV} is the id, as it was before ids.",
                         f"{NODE_ID_ENV}="]),
         "",
@@ -2634,12 +2645,15 @@ def _compose_template(project_name: str, runtime: dict,
         "  AGENT_GIT_KNOWN_HOSTS_B64: ${AGENT_GIT_KNOWN_HOSTS_B64:-}",
         # The node's id in the gate: a runner starts a service only where
         # the project's policy row names this node. A target that declares
-        # its node sets it here and nowhere else, so every container and every
-        # redeploy is that node; one that declares none takes it from the
-        # server's environment, and where the server names it only by
-        # AGENT_NODE_NAME, as before ids, that name is its id.
-        (f"  {NODE_ID_ENV}: {json.dumps(node)}" if node else
-         f"  {NODE_ID_ENV}: ${{{NODE_ID_ENV}:-${{{NODE_NAME_ENV}:-}}}}"),
+        # an id sets nothing: the node resolves it from the file enrolment
+        # writes. One that declares the name a node registered before ids is
+        # still keyed by sets it here and nowhere else, so every container
+        # and every redeploy is that node; one that declares none takes it
+        # from the server's environment, and where the server names it only
+        # by AGENT_NODE_NAME, as before ids, that name is its id.
+        *([] if node and not _handed_node(node) else
+          [f"  {NODE_ID_ENV}: {json.dumps(node)}" if node else
+           f"  {NODE_ID_ENV}: ${{{NODE_ID_ENV}:-${{{NODE_NAME_ENV}:-}}}}"]),
         # The agent the box runs, for the project at the box's root alone: a
         # repository checked out beside it resolves its own.
         *([f"  {PROJECT_ID_ENV}: {json.dumps(project_id)}",
@@ -4650,6 +4664,13 @@ def _declared_node(root: Path, name: str | None) -> str | None:
     """The node name a target declares for its server, when it declares a
     valid one."""
     return _valid_node(_target_node(root, name))
+
+
+def _handed_node(node: str | None) -> str | None:
+    """The value a declared node is handed to its containers as AGENT_NODE_ID:
+    the name a node registered before ids is still keyed by, and nothing for
+    an id, which the node resolves itself."""
+    return None if node is None or NODE_ID_RE.fullmatch(node) else node
 
 
 def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict:
@@ -7807,11 +7828,13 @@ def _node_environment(root, runtime, target, host, repo_url, key, branch):
                     REPO_BRANCH_ENV: branch, "GIT_DEPLOY_KEY_B64": base64.b64encode(key.read_bytes()).decode(),
                     "AGENT_GIT_KNOWN_HOSTS_B64": base64.b64encode(_node_ssh(root, host,
                         "cat /etc/ssh/ssh_host_ed25519_key.pub").encode()).decode()})
-    # A target that declares its node is the one home of its id, so the
-    # application's environment carries that id rather than this machine's.
+    # A target that declares its node is the one home of its id. An id the
+    # node resolves itself, so the application's environment carries none, an
+    # earlier deploy's emptied; a name from before ids it carries rather than
+    # this machine's.
     node = _valid_node(target.get("node"))
     if node:
-        env[NODE_ID_ENV] = node
+        env[NODE_ID_ENV] = _handed_node(node) or ""
     # Coolify builds with an environment key's value over the Compose file's
     # build arg, so the environment carries the release's own build args.
     env.update(_compiler_config(runtime)["build_args"])
@@ -8302,7 +8325,7 @@ def cmd_node_status(args):
 # --- An agent node from the standard image -----------------------------------
 # A node of a store-only agent is a Coolify resource running the one standard
 # image, which carries no agent and no secret. It is created knowing only the
-# agent's id, its root and its node name; enrolment then gives it a key pair of
+# agent's id and its root; enrolment then gives it its node id, a key pair of
 # its own, the store setting and the agent's secrets on its volumes, and the
 # placements that say which services run there. The node's row in the store
 # names the coolify connection, server and resource, so the node is reached and
@@ -8312,12 +8335,15 @@ AGENT_NODE_ROOT = "/app"
 AGENT_NODE_SERVICE = "agent"
 AGENT_NODE_MEMORY = "2g"
 # The state the image keeps, each on a volume of the node's own: the store
-# setting, the secrets and the node key (.config), capability state, and the
-# harness logins. The tools stay the image's, so a new tag brings new tools.
+# setting, the secrets, the node key and the node id (.config), capability
+# state, the harness logins, and the agent's work - the checkouts and git
+# worktrees it develops in. The tools stay the image's, so a new tag brings
+# new tools.
 AGENT_NODE_VOLUMES = (("config", "/home/agent/.config"),
                       ("state", "/home/agent/.local/state"),
                       ("claude", "/home/agent/.claude"),
-                      ("codex", "/home/agent/.codex"))
+                      ("codex", "/home/agent/.codex"),
+                      ("work", "/home/agent/work"))
 # Under the node user's home, on its config volume.
 AGENT_NODE_KEY = ".config/agent-node/node-key.pem"
 AGENT_NODE_STATE = "/tmp/agent-node.state"
@@ -8424,18 +8450,18 @@ def _agent_node_name(value):
     return node
 
 
-def _agent_node_environment(project_id, node):
-    """The three keys a node is told, and nothing else: `node` is its label,
-    the name it gives itself; its id is put on its config volume at enrolment."""
+def _agent_node_environment(project_id):
+    """The two keys a node is told, and nothing else. Its identity is not in
+    its environment: its id is put on its config volume at enrolment, and its
+    label is its row's."""
     return {"CAPABILITIES_PROJECT_ID": project_id,
-            "CAPABILITIES_PROJECT_ID_ROOT": AGENT_NODE_ROOT,
-            NODE_NAME_ENV: node}
+            "CAPABILITIES_PROJECT_ID_ROOT": AGENT_NODE_ROOT}
 
 
-def _agent_node_compose(project_id, node, image, memory):
+def _agent_node_compose(project_id, image, memory):
     """The node's Compose document: the standard image, its memory limit, its
-    state volumes and the three keys it is told - nothing else."""
-    environment = _agent_node_environment(project_id, node)
+    volumes and the two keys it is told - nothing else."""
+    environment = _agent_node_environment(project_id)
     lines = ["services:", f"  {AGENT_NODE_SERVICE}:", f"    image: {json.dumps(image)}",
              "    restart: unless-stopped", f"    mem_limit: {json.dumps(memory)}",
              "    environment:"]
@@ -8619,10 +8645,10 @@ def _agent_node_delete(root, target, kind, resource):
                   resource, "--yes", "--delete-volumes", "--delete-configurations")
 
 
-def _agent_node_application(root, target, args, project_id, node, name, build):
+def _agent_node_application(root, target, args, project_id, name, build):
     """A Coolify application building the node's image on its server from the
     Dockerfile in the repository: no domain, no health check of Coolify's own
-    (the image has one), no automatic deploy, the memory limit, the three keys,
+    (the image has one), no automatic deploy, the memory limit, the two keys,
     a volume for each state path, the declared host paths, then one deploy.
     Anything that fails after it exists takes it away again."""
     source = (["--private-deploy-key", build["deploy_key"]] if build["deploy_key"]
@@ -8641,7 +8667,7 @@ def _agent_node_application(root, target, args, project_id, node, name, build):
     try:
         _node_coolify(root, target, "app", "update", resource, "--no-auto-deploy-enabled")
         _node_coolify(root, target, "env", "bulk", resource,
-                      stdin=_node_env_lines(_agent_node_environment(project_id, node)))
+                      stdin=_node_env_lines(_agent_node_environment(project_id)))
         for volume, path in AGENT_NODE_VOLUMES:
             _node_coolify(root, target, "storage", "add", resource, "--volume", volume,
                           "--mount-path", path)
@@ -8682,7 +8708,7 @@ def cmd_node_create(args):
     name = _slug(slug) + "-" + _slug(node)
     if build is None:
         kind, image, deployment = "service", f"{AGENT_NODE_IMAGE}:{args.version}", None
-        compose = _agent_node_compose(project_id, node, image, args.memory)
+        compose = _agent_node_compose(project_id, image, args.memory)
         created = _node_coolify(root, target, "service", "create", "--compose", "-",
                                 "--project", args.project, "--server", args.server,
                                 "--environment", args.environment,
@@ -8694,7 +8720,7 @@ def cmd_node_create(args):
     else:
         kind = "application"
         image = {key: build[key] for key in ("repository", "branch", "context", "dockerfile")}
-        resource, deployment = _agent_node_application(root, target, args, project_id, node,
+        resource, deployment = _agent_node_application(root, target, args, project_id,
                                                        name, build)
     try:
         row = _manager(root, "node", "add", node_id, "--label", node, "--kind", "server",
@@ -8707,7 +8733,7 @@ def cmd_node_create(args):
     answer = {"ok": True, "node": row, "image": image, "memory": args.memory,
               "environment": {"project": args.project, "name": args.environment},
               "volumes": [{"name": name, "path": path} for name, path in AGENT_NODE_VOLUMES],
-              "handed": ["CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT", NODE_NAME_ENV],
+              "handed": ["CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT"],
               "next": f"deployment node enrol {node_id}"}
     if build is not None:
         answer.update({"resource": {"kind": kind, "uuid": resource}, "deployment": deployment,
@@ -8779,7 +8805,7 @@ def _agent_node_is_own(root, host, resource, project_id, kind="service"):
     node's row names - is this agent's node: its agent containers, stopped ones
     too, run the standard image - for an application, the image Coolify built
     for it, named after it - for this agent, CAPABILITIES_PROJECT_ID set to its
-    id. The node's label, its AGENT_NODE_NAME there, may have changed since."""
+    id. Its label is its row's, so it is not read here."""
     owner = "com.docker.compose.project=" + resource
     service = ("" if kind == "application" else " --filter " + shlex.quote(
         "label=com.docker.compose.service=" + AGENT_NODE_SERVICE))
