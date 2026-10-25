@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-25 — A node deploy carries the value a capability keeps once for the machine
+
+A setup field an installed capability declares `shared` (capabilities-contract 0.22) is kept in `~/.config/capabilities/shared.env` under its shared name. When `deploy` fills a node-placed service's required and optional environment, it now asks that file for such a field before the owning capability's own `~/.config/<capability>/credentials.env`, reading which fields are shared from the capability's installed manifest, so a value written once for the machine reaches the node, and an older per-capability value no longer outranks it. The project's env files still win, and a key no installed capability declares shared resolves as before.
+
 ## 2026-10-25 — sync replaces a launchd agent that runs its service outside the runner
 
 On `host-agents`, a loaded agent of a compiled service whose process launchd holds is not `deployment runner <service>` - or, with no process, whose program is not the compiled launcher - runs its service outside the gate and the lease, as an agent loaded from an older compilation that ran `<capability> service run` directly does, and keeps it running on the Mac after the service is placed on another node. `deployment sync`, once it has written the artifacts, boots such an agent out, links the compiled agent in place of its installed file in `~/Library/LaunchAgents` and bootstraps it, so the runner then starts or stops the service as the gate places it; the result lists each under `agents` as `replaced`, or as `unloaded` or `failed` with the step and launchctl's answer, which is also an error finding. `sync --check` reports such an agent as an error instead of acting, and `deployment doctor` reports it as an error naming its label. An agent never loaded is still handed over by `deployment next`.

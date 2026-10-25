@@ -7105,6 +7105,20 @@ done
     return url, key
 
 
+def _shared_setup_values(name):
+    """The values this machine's shared.env holds for the setup fields the
+    installed capability `name` declares shared, keyed by each field's own key."""
+    manifest, _err = _installed_manifest(name)
+    setup = ((manifest or {}).get("connections") or {}).get("setup") or []
+    shared = _parse_env_file(_CONFIG_HOME / "capabilities" / "shared.env")
+    values = {}
+    for field in setup:
+        if isinstance(field, dict) and isinstance(field.get("key"), str) \
+                and isinstance(field.get("shared"), str) and shared.get(field["shared"]):
+            values[field["key"]] = shared[field["shared"]]
+    return values
+
+
 def _node_environment(root, runtime, target, host, repo_url, key, branch):
     # A node takes its database only from its server's environment, so no
     # database key is filled from this machine, and the bulk update leaves the
@@ -7129,6 +7143,11 @@ def _node_environment(root, runtime, target, host, repo_url, key, branch):
         owners = [service.get("capability"), *service.get("embedded_services", [])]
         for owner in owners:
             if isinstance(owner, str) and re.fullmatch(r"[a-z][a-z0-9_-]*", owner):
+                # A setup field the owner declares shared is kept once for the
+                # machine, and that copy is asked before the owner's own file
+                # (SHEBANG.md, "The credential cascade").
+                for k, value in _shared_setup_values(owner).items():
+                    machine_values.setdefault(k, value)
                 for k, value in _parse_env_file(_CONFIG_HOME / owner / "credentials.env").items():
                     if value:
                         machine_values.setdefault(k, value)

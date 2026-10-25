@@ -6026,6 +6026,17 @@ def _dev_redact(text: str, secrets: list[str]) -> str:
     return text
 
 
+def _dev_shared_values(manifest: dict) -> dict[str, str]:
+    """The machine's shared.env values for the setup fields a payload declares
+    shared, keyed by each field's own key; the user-config tier asks them before
+    the capability's own credentials.env (SHEBANG.md, "The credential cascade")."""
+    setup = (manifest.get("connections") or {}).get("setup") or []
+    shared = _parse_env_file(_CONFIG_HOME / "capabilities" / "shared.env")
+    return {field["key"]: shared[field["shared"]] for field in setup
+            if isinstance(field, dict) and isinstance(field.get("key"), str)
+            and isinstance(field.get("shared"), str) and shared.get(field["shared"])}
+
+
 def cmd_dev_run(session_id: str, capability: str, args: list[str],
                 project_only: bool) -> None:
     """Run one verified session payload with a short-lived selected-cap projection."""
@@ -6073,8 +6084,9 @@ def cmd_dev_run(session_id: str, capability: str, args: list[str],
             registry_data, _dev_connection_selector(args))
 
     project_values = _project_env(project)
-    user_values = {} if project_only else _parse_env_file(
-        _CONFIG_HOME / capability / "credentials.env")
+    user_values = {} if project_only else {
+        **_parse_env_file(_CONFIG_HOME / capability / "credentials.env"),
+        **_dev_shared_values(manifest)}
     child_values: dict[str, str] = {}
     value_tiers: dict[str, str] = {}
     secrets: list[str] = []
@@ -6223,10 +6235,11 @@ def _dev_live_inputs(session: dict) -> dict:
     state_path = Path(state_value).expanduser() if state_value else session_path.parent / "service"
     if not state_path.is_absolute():
         state_path = project / state_path
-    user_values = _parse_env_file(_CONFIG_HOME / "telegram" / "credentials.env")
     manifest = _read_json(Path(session["paths"]["registry"]) / "telegram" / "manifest.json")
     if not isinstance(manifest, dict):
         _die(6, "dev_manifest_missing", "session Telegram payload has no manifest")
+    user_values = {**_parse_env_file(_CONFIG_HOME / "telegram" / "credentials.env"),
+                   **_dev_shared_values(manifest)}
     values: dict[str, str] = {}
     secrets_list: list[str] = []
     for spec in (manifest.get("credentials") or {}).get("keys") or []:

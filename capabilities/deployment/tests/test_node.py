@@ -663,6 +663,27 @@ def test_descriptor_env_resolves_machine_tier_before_process(node, monkeypatch, 
     assert "FIXTURE_SECRET=project-secret\n" in env
 
 
+def test_descriptor_env_asks_the_shared_value_before_the_owners_own(node, monkeypatch):
+    config = node.tmp / "config"
+    (config / "fixture").mkdir(parents=True)
+    (config / "fixture" / "credentials.env").write_text("FIXTURE_TOKEN=own-old\n")
+    (config / "capabilities").mkdir()
+    (config / "capabilities" / "shared.env").write_text("SHARED_TOKEN=shared-new\n")
+    monkeypatch.setattr(node.m, "_CONFIG_HOME", config)
+    monkeypatch.setattr(node.m, "_project_env", lambda: {})
+    monkeypatch.setattr(node.m, "_installed_manifest", lambda name: ({"connections": {"setup": [
+        {"key": "FIXTURE_TOKEN", "secret": True, "shared": "SHARED_TOKEN"}]}}, None)
+        if name == "fixture" else (None, "absent"))
+    node.runtime["services"].setdefault("fixture", {}).update(
+        {"capability": "fixture", "optional_env": ["FIXTURE_TOKEN"]})
+    host = {"address": "192.0.2.10"}
+    env = node.m._node_environment(node.root, node.runtime, node.target, host, "git@192.0.2.10:/srv/git/body.git", node.key, "main")
+    assert "FIXTURE_TOKEN=shared-new\n" in env
+    (config / "capabilities" / "shared.env").write_text("")
+    env = node.m._node_environment(node.root, node.runtime, node.target, host, "git@192.0.2.10:/srv/git/body.git", node.key, "main")
+    assert "FIXTURE_TOKEN=own-old\n" in env
+
+
 def test_local_coolify_host_uses_pairing_address_and_openssh_identity(node, monkeypatch):
     monkeypatch.setattr("socket.gethostbyname", lambda host: "192.0.2.10")
     key = node.root / "identity"
