@@ -120,6 +120,15 @@ COMMANDS
         connection's supervisor, a user id on the agent's homeserver (one on
         another is not written, and supervisor_unset says why), and publishes
         it in the agent's profile.
+        An ID already declared without its account (no user id, or this
+        NAME's, and a token that does not resolve) is completed: registered
+        on its homeserver, its token written under its own secret_env, its
+        user id and device written onto it. One that has its account, or
+        names another, exits 6 connection_exists, as does a new ID whose
+        token variable another connection already uses (ids that differ
+        only in case). --default points the default at the connection only
+        where this project grants it; otherwise default is false and
+        default_unset says why.
         The new connection has no write grant; ask the user to grant it.
     login USER_ID [--homeserver URL] [--as ID] [--global | --project]
                   [--default] [--supervisor WHO]
@@ -2994,10 +3003,30 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
     if root is None or envelope is None or not Path(envelope).is_dir():
         _die(6, "no_envelope", "register writes the agent's connection into this project's "
              "capabilities/ envelope, and there is none here", "run `capabilities init` first")
-    if cid in (_inventory_connections()["connections"] or {}):
-        _die(6, "connection_exists", f"connection {cid!r} is already declared",
-             "pass --as <another-id>, or register another NAME")
-    homeserver = homeserver_flag or _resolve_env_key(HOMESERVER_KEY)[0]
+    declared_all = _inventory_connections()["connections"] or {}
+    declared = declared_all.get(cid)
+    secret_env = (declared or {}).get("secret_env") or _connection_env_key(cid)
+    if declared is not None:
+        # A connection declared before its account exists is completed rather
+        # than refused: one that already names another account, or whose token
+        # already resolves, is a working connection and is left alone.
+        named = declared.get("user_id")
+        if (named and named[1:].split(":", 1)[0] != name) or _resolve_env_key(secret_env)[0]:
+            _die(6, "connection_exists",
+                 f"connection {cid!r} is already declared"
+                 + (f" for {named!r}" if named else "") + " and has its account",
+                 "pass --as <another-id>, or register another NAME")
+    else:
+        # Two ids that differ only in case share one token variable; a second
+        # connection on it would overwrite the first one's token.
+        sharing = sorted(other for other, entry in declared_all.items()
+                         if (entry.get("secret_env") or _connection_env_key(other)) == secret_env)
+        if sharing:
+            _die(6, "connection_exists",
+                 f"connection {sharing[0]!r} already keeps its token in {secret_env}",
+                 f"pass --as {sharing[0]} to register its account, or --as <another-id>")
+    homeserver = homeserver_flag or (declared or {}).get("homeserver") \
+        or _resolve_env_key(HOMESERVER_KEY)[0]
     if not homeserver:
         _die(6, "homeserver_missing", "no homeserver to register on",
              f"a person sets {HOMESERVER_KEY} once per machine in {CREDENTIALS_ENV}, or pass "
@@ -3071,25 +3100,34 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
     user_id, access, device = done.get("user_id"), done.get("access_token"), done.get("device_id")
     if not user_id or not access:
         _die(5, "registration_incomplete", "the homeserver registered without returning a token")
-    secret_env = _connection_env_key(cid)
     credentials = root / ".env.local"
     _write_env_key(credentials, secret_env, access)
-    entry = {"homeserver": homeserver, "user_id": user_id, "secret_env": secret_env,
-             "device_id": device}
+    entry = {k: v for k, v in (declared or {}).items() if k not in ("allow_write", "granted")}
+    entry.update({"homeserver": homeserver, "user_id": user_id, "secret_env": secret_env,
+                  "device_id": device})
     unset = _supervisor_problem(supervisor, user_id) if supervisor is not None else None
     if supervisor is not None and unset is None:
         entry["supervisor"] = supervisor
+    default_unset = None
     try:
         adapter.set(NAME, "connection", cid, entry, scope="project")
         if make_default:
-            adapter.set(NAME, "setting", "connection.default", cid, scope="project")
+            # The default pointer names only a connection this project may use;
+            # an ungranted default would leave every verb refused.
+            if (_inventory_connections()["connections"] or {}).get(cid, {}).get("granted"):
+                adapter.set(NAME, "setting", "connection.default", cid, scope="project")
+            else:
+                default_unset = (f"connection {cid!r} is not granted in this project, so it "
+                                 "is not made the default; grant it, then set the default")
         registry = adapter.scope_source(NAME, "connection", "project")
     except StoreError as e:
         _die(6, e.slug, e.message, e.hint)
     out = {"registered": True, "connection": cid, "user_id": user_id, "homeserver": homeserver,
            "device_id": device, "secret_env": secret_env, "credentials": str(credentials),
-           "registry": str(registry), "default": make_default, "allow_write": WRITE_DEFAULT,
-           "supervisor": entry.get("supervisor")}
+           "registry": str(registry), "default": make_default and default_unset is None,
+           "allow_write": WRITE_DEFAULT, "supervisor": entry.get("supervisor")}
+    if default_unset:
+        out["default_unset"] = default_unset
     if unset:
         out["supervisor_unset"] = unset
     out.update(_published_identity({"id": cid, "homeserver": homeserver, "user_id": user_id,

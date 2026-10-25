@@ -855,6 +855,45 @@ def test_a_connection_held_in_the_store_is_bound_in_this_projects_settings(cli, 
     assert out["bindings"]["alpha"]["supervisor"] == "@boss:example.org"
 
 
+@needs_store
+def test_register_completes_a_declared_connection_and_defaults_only_to_a_granted_one(
+        cli, project, stored, capsys, homeserver, monkeypatch):
+    monkeypatch.setenv("AGENTROOMS_REGISTRATION_TOKEN", "reg-token")
+    identity = project / "capabilities" / "project.json"
+    identity.write_text(json.dumps({"slug": "project", "connections": "store"}))
+    records = cli._records()
+    # Beta is declared and granted, and has no account on the homeserver yet.
+    records.set("agentrooms", "connection", "Beta", {
+        "homeserver": HS, "user_id": f"@beta:{SERVER}", "secret_env": "AGENTROOMS_BETA_TOKEN",
+        "supervisor": f"@boss:{SERVER}"})
+    records.set("agentrooms", "grant", "Beta", {"enabled": True})
+    # A second id on Beta's token variable is refused before the network.
+    code, _out, err = run(cli, capsys, "register", "beta", "--default")
+    assert code == 6 and err["error"]["code"] == "connection_exists", err
+    assert "--as Beta" in err["error"]["hint"] and not homeserver.requests
+    code, out, err = run(cli, capsys, "register", "beta", "--as", "Beta", "--default")
+    assert code == 0, err
+    assert out["connection"] == "Beta" and out["default"] is True and "default_unset" not in out
+    assert out["secret_env"] == "AGENTROOMS_BETA_TOKEN" and out["supervisor"] == f"@boss:{SERVER}"
+    assert f"AGENTROOMS_BETA_TOKEN='{TOKEN}'" in (project / ".env.local").read_text()
+    cli._RECORDS = None
+    held = cli._records().resolve("agentrooms", "connection")
+    assert set(held) == {"Beta"}
+    assert held["Beta"]["value"] == {"homeserver": HS, "user_id": f"@beta:{SERVER}",
+                                     "secret_env": "AGENTROOMS_BETA_TOKEN", "device_id": "DEV1",
+                                     "supervisor": f"@boss:{SERVER}"}
+    code, out, err = run(cli, capsys, "connections")
+    assert code == 0 and out["default"] == "Beta", err
+    # Now that it has its account it is not registered again.
+    code, _out, err = run(cli, capsys, "register", "beta", "--as", "Beta")
+    assert code == 6 and err["error"]["code"] == "connection_exists"
+    # A connection this project has not granted is registered, and is not made the default.
+    code, out, err = run(cli, capsys, "register", "gamma", "--homeserver", HS, "--default")
+    assert code == 0 and out["default"] is False and "not granted" in out["default_unset"], err
+    code, out, err = run(cli, capsys, "connections")
+    assert code == 0 and out["default"] == "Beta", err
+
+
 # ── a person's connection, the stream, owners, sessions ──────────────────────
 
 OWNER = f"@owner:{SERVER}"

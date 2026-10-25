@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-25 — `register` completes a declared connection and points the default only at a granted one
+
+`agentrooms register NAME --as ID` where connection ID is already declared without its account - no user id or NAME's own, and a token that does not resolve - registers NAME on the connection's homeserver (`--homeserver`, else the connection's, else `AGENTROOMS_HOMESERVER`) and writes the token under the connection's own `secret_env` and the user id and device onto it, keeping its other fields; it exited 6 `connection_exists` before. A declared ID that has its account or names another still exits 6 `connection_exists`, and so does a new ID whose token variable another declared connection already uses (ids that differ only in case, such as `beta` beside `Beta`), before anything reaches the homeserver, where it used to write a second connection over the first one's token. `--default` writes the default pointer only when this project grants the connection; otherwise the result carries `default: false` and `default_unset`, where it used to make an ungranted connection the default and leave every verb refused `connection_not_granted`.
+
 ## 2026-10-25 — `register` takes the registration token on standard input
 
 `agentrooms register NAME --registration-token -` reads the registration token from standard input (no echo on a terminal) and sends that token in the `m.login.registration_token` flow, whatever `AGENTROOMS_REGISTRATION_TOKEN` resolves to through the cascade, a machine value included. `-` is the only value the flag takes (any other exits 6 `invalid_arguments`), so the token never sits on the command line; an empty standard input exits 6 `registration_token_missing` before anything reaches the homeserver. Without the flag `register` reads the cascade as before.
