@@ -31,7 +31,8 @@ compiler for capability services: it discovers installed
 `manifest.service.deploy` descriptors, filters them through explicit project
 enablement and `runtime.json` service policy, and reconciles the runtime graph,
 Compose, env example, Dockerfile, dockerignore, and entrypoint. Each compiled
-service is supervised through its runner, `deployment runner`.
+service is supervised through its runner, the manager's `capabilities node
+supervise` - a host agent through `deployment runner`, which hands it over.
 
 That filtering is files mode, the gate kept in `capabilities/settings.json`. An agent whose records are in the store (every agent `capabilities init` made, and every one moved there by `capabilities migrate`) compiles every installed descriptor instead, less `capabilities.exclude`, and the gate row naming each node decides whether a service runs there; its `service_policy` keeps only `shape` and per-capability shapes (`embedded` or `container`), and the switches and placements below are retired for it, reported and rewritten by `sync`. `deployment guide profiles` describes both, the runner and the lease.
 

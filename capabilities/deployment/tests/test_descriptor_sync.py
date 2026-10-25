@@ -90,8 +90,8 @@ def test_auto_discovers_only_explicit_project_services(tmp_path: Path) -> None:
     assert runtime["services"]["agent"]["embedded_services"] == ["automations", "telegram"]
     supervisor = (root / BUNDLE / "supervisord.conf").read_text()
     # Each service runs under its runner, which the gate on the node starts.
-    assert "command=deployment runner automations --every 60 --restart unless-stopped -- automations service run" in supervisor
-    assert "command=deployment runner telegram --every 60 --restart unless-stopped -- telegram service run" in supervisor
+    assert "command=capabilities node supervise automations --every 60 --restart unless-stopped -- automations service run" in supervisor
+    assert "command=capabilities node supervise telegram --every 60 --restart unless-stopped -- telegram service run" in supervisor
 
 
 def test_explicit_disable_and_enable_overrides(tmp_path: Path) -> None:
@@ -142,7 +142,7 @@ def test_embedded_service_merges_contract_into_agent(tmp_path: Path) -> None:
     assert "project-telegram" not in compose
     assert 'TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:-}"' in compose
     assert "telegram_state:/home/agent/.local/state/telegram" in compose
-    assert "command=deployment runner telegram --every 60 --restart unless-stopped -- telegram service run" in (root / BUNDLE / "supervisord.conf").read_text()
+    assert "command=capabilities node supervise telegram --every 60 --restart unless-stopped -- telegram service run" in (root / BUNDLE / "supervisord.conf").read_text()
     assert (f"exec /usr/bin/supervisord -c /app/{BUNDLE}/supervisord.conf"
             in (root / BUNDLE / "entrypoint.sh").read_text())
     dockerfile = (root / BUNDLE / "Dockerfile").read_text()

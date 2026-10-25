@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1536,6 +1537,143 @@ def test_node_run_runs_its_own_agents_services_where_the_store_records_no_folder
         node_run.terminate()
         _out, err = node_run.communicate(timeout=60)
     assert node_run.returncode == 0, err
+
+
+def test_a_machine_service_runs_once_per_node_for_the_agents_placing_it(lab, tmp_path):
+    """A service with no project command of its own that declares a machine one
+    is run once on the node, for each placing agent whose lease it holds, which
+    it puts on the service's own list; and never beside a machine process it did
+    not start."""
+    import time
+    _import(lab)
+    registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"
+    registry.mkdir(parents=True)
+    (registry / "coolify").write_text("#!/bin/sh\n")
+    state = tmp_path / "machine"
+    state.mkdir()
+    # The service as the capability's own verbs show it: join and leave keep a
+    # list, `status --machine` reads what its machine process published.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "coolify").write_text(f"""#!{sys.executable}
+import json, os, sys, time
+from pathlib import Path
+state = Path({str(state)!r})
+listed = state / "list.json"
+names = json.loads(listed.read_text()) if listed.exists() else []
+args = sys.argv[1:]
+with open(state / "calls.log", "a") as log:
+    log.write(json.dumps([args, os.getcwd()]) + "\\n")
+if args == ["service", "join"]:
+    names = sorted(set(names) | {{"{PROJECT_ID}"}})
+    listed.write_text(json.dumps(names))
+elif args == ["service", "leave"]:
+    listed.write_text(json.dumps([n for n in names if n != "{PROJECT_ID}"]))
+elif args == ["service", "status", "--machine"]:
+    status = state / "status.json"
+    body = json.loads(status.read_text()) if status.exists() else {{"running": False}}
+    try:
+        os.kill(body.get("pid") or 0, 0) if body.get("pid") else None
+    except ProcessLookupError:
+        body = {{"running": False}}
+    print(json.dumps({{"mode": "machine", **body}}))
+elif args == ["service", "run", "--machine"]:
+    while True:
+        names = json.loads(listed.read_text()) if listed.exists() else []
+        (state / "status.json").write_text(json.dumps({{"running": True, "pid": os.getpid(),
+            "projects": [{{"project_id": n, "state": "served"}} for n in names]}}))
+        time.sleep(0.5)
+elif args == ["service", "doctor", "--machine"]:
+    print(json.dumps({{"ok": True}}))
+""")
+    (bin_dir / "coolify").chmod(0o755)
+    (registry / "manifest.json").write_text(json.dumps({"name": "coolify", "service": {
+        "name": "svc", "summary": "s", "verbs": [], "placement": "exclusive",
+        "machine": {"schema": "capabilities.service.machine.v1",
+                    "command": ["coolify", "service", "run", "--machine"],
+                    "doctor": ["coolify", "service", "doctor", "--machine"]}}}))
+    here = {"AGENT_NODE_ID": NODE}
+    _ok(_manager(lab, "node", "add", NODE, "--label", "lab-node", "--kind", "server",
+                 extra=here))
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("UPDATE lab.capabilities_agent_nodes SET folder = %s",
+                     (str(lab["project"]),))
+    env = {**lab["env"], **here, "SUPERVISOR_SERVER_URL": "unix:///tmp/test.sock",
+           "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+    (bin_dir / "supervisorctl").write_text("#!/bin/sh\n")
+    (bin_dir / "supervisorctl").chmod(0o755)
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+
+    # The node manager keeps one job for the node, which names no agent.
+    job = tmp_path / "jobs" / "coolify.machine.conf"
+    node_run = subprocess.Popen([str(MANAGER), "node", "run", "--supervisor",
+                                 str(tmp_path / "jobs")], cwd=lab["project"], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert _wait_for(job.exists, 15)
+        assert "node supervise coolify --machine\n" in job.read_text()
+    finally:
+        node_run.terminate()
+        node_run.communicate(timeout=60)
+
+    def row():
+        found = _rows(lab, "SELECT state, problem_code FROM capabilities_service_instances "
+                      "WHERE capability = 'coolify'")
+        return found[0] if found else None
+
+    def lease():
+        if _rows(lab, "SELECT to_regclass('deployment_service_leases')") == [(None,)]:
+            return []
+        return _rows(lab, "SELECT node FROM deployment_service_leases "
+                     "WHERE capability = 'coolify'")
+
+    def calls():
+        log = state / "calls.log"
+        return ([json.loads(line)[0] for line in log.read_text().splitlines()]
+                if log.exists() else [])
+
+    # A machine process it did not start already runs the service here.
+    foreign = subprocess.Popen(["sleep", "600"])
+    (state / "status.json").write_text(json.dumps({"running": True, "pid": foreign.pid}))
+    log = (tmp_path / "supervise.log").open("w")
+    supervise = subprocess.Popen([str(MANAGER), "node", "supervise", "coolify", "--machine",
+                                  "--every", "5"], cwd=lab["project"], env=env,
+                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        assert _wait_for(lambda: row() == ("waiting", "machine_process_elsewhere"), 30), \
+            (tmp_path / "supervise.log").read_text()
+        assert ["service", "join"] not in calls() and lease() == []
+        assert ["service", "run", "--machine"] not in calls()
+
+        # Gone, it takes the agent's lease, joins it, runs the machine process,
+        # and the row says what the service says of the agent.
+        foreign.kill()
+        foreign.wait()
+        assert _wait_for(lambda: row() == ("ready", None), 45), \
+            (tmp_path / "supervise.log").read_text()
+        assert lease() == [(NODE,)]
+        assert calls().count(["service", "join"]) == 1
+
+        # Unplaced, it takes the agent off the list, stops it and lets go.
+        _ok(_manager(lab, "unplace", "coolify", "--node", NODE, extra=here))
+        assert _wait_for(lambda: row() is None and lease() == [], 30), \
+            (tmp_path / "supervise.log").read_text()
+        assert ["service", "leave"] in calls()
+        assert json.loads((state / "list.json").read_text()) == []
+    finally:
+        if foreign.poll() is None:
+            foreign.kill()
+        os.killpg(supervise.pid, signal.SIGTERM)
+        supervise.wait(timeout=60)
+        log.close()
+    time.sleep(0.5)
+    machine = json.loads((state / "status.json").read_text()).get("pid")
+    try:
+        os.kill(machine, 0)
+        alive = True
+    except ProcessLookupError:
+        alive = False
+    assert not alive
 
 
 def _stand_in_launchctl(lab, tmp_path) -> tuple[Path, Path, Path]:

@@ -597,3 +597,45 @@ def test_handover_takes_down_the_service_agents_and_the_watchdog_only(
     assert (agents / "project.telegram.plist").is_file()
     again = handover(False)
     assert [a["action"] for a in again["agents"]] == ["absent", "absent"]
+
+
+def test_a_mac_handed_over_to_its_node_manager_is_not_told_to_load_its_agents(
+        tmp_path, monkeypatch, capsys) -> None:
+    root, env = _host_project(tmp_path, ("telegram",))
+    for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "CAPABILITIES_HOME"):
+        monkeypatch.setenv(key, env[key])
+    monkeypatch.chdir(root)
+    _sync(root, env)
+    module = _module()
+    loaded = set()
+
+    def status(label):
+        return {"label": label, "installed": label == "capabilities.node",
+                "loaded": label in loaded, "pid": None, "program": None}
+
+    monkeypatch.setattr(module, "_launchd_status", status)
+    # The node manager runs a project whose records are in the store.
+    monkeypatch.setattr(module, "_records_in_store", lambda: True)
+    assert module._handed_over()["label"] == "capabilities.node"
+    monkeypatch.setattr(module, "_records_in_store", lambda: False)
+    assert module._handed_over() is None
+    monkeypatch.setattr(module, "_handed_over", lambda: status("capabilities.node"))
+
+    def doctor():
+        # Other findings of this bare project (no settings, an in-process
+        # compile) are errors; what is asked here is what it says of launchd.
+        with pytest.raises(SystemExit):
+            module.cmd_doctor(type("Args", (), {"target": None})())
+        return json.loads(capsys.readouterr().out)
+
+    said = [f["message"] for f in doctor()["findings"]]
+    assert not [m for m in said if "not installed" in m or "not loaded" in m], said
+    payload = module._next_payload(root, None)
+    assert payload["host_agents"] == []
+    steps = " ".join(payload["provider_steps"])
+    assert "capabilities service start telegram" in steps and "bootstrap" not in steps
+    assert payload["manual_control"]["restart"] == ["capabilities service restart telegram"]
+    # One loaded again beside the node manager is the one thing said.
+    loaded.add("project.telegram")
+    finding = next(f for f in doctor()["findings"] if f["path"] == "project.telegram")
+    assert finding["severity"] == "warning" and "deployment handover" in finding["hint"]

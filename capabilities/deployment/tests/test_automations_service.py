@@ -89,7 +89,7 @@ class DeploymentAutomationsTests(unittest.TestCase):
         )
         supervisor = (self.root / BUNDLE / "supervisord.conf").read_text()
         # The service runs under its runner, which the gate on the node starts.
-        self.assertIn("command=" + "deployment runner automations --every 60 --restart unless-stopped -- automations service run", supervisor)
+        self.assertIn("command=" + "capabilities node supervise automations --every 60 --restart unless-stopped -- automations service run", supervisor)
         self.assertFalse((self.root / "deployment" / "capabilities.lock").exists())
         env = (self.root / BUNDLE / ".env.example").read_text()
         self.assertIn("AUTOMATIONS_ENVIRONMENT=production", env)

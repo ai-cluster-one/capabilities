@@ -916,6 +916,10 @@ PROJECT VERBS (run inside a consuming project)
         on this node (`place`), it keeps one Supervisor program in <dir>,
         named <capability>.<agent id>, running `node supervise` in the
         agent's folder; a service no longer placed here loses its program.
+        A service with no project command that declares a machine one
+        (service.machine) has one program for the node instead, named
+        <capability>.machine, running `node supervise <name> --machine` in
+        this folder while any agent here places it.
         --services limits it to those capabilities, the ones this
         Supervisor's box carries; a service placed here outside them is left
         to whatever runs it, such as a container of its own.
@@ -938,7 +942,8 @@ PROJECT VERBS (run inside a consuming project)
         scope), whose program is a launcher of the same name running `node
         supervise` in the agent's folder, with its logs beside the launcher in
         $XDG_STATE_HOME/capabilities/node/launchd/ and the node manager's
-        PATH, node id and home variables. Each job is loaded, replaced and
+        PATH, node id and home variables; a machine service's one job is
+        capabilities.node-machine.<capability>. Each job is loaded, replaced and
         taken down on its own (`launchctl bootstrap`, `bootout`), a job that
         is not loaded is loaded again on the next reconcile, and a restart is
         `launchctl kickstart -k`. The jobs are launchd's, so node run can stop
@@ -960,13 +965,84 @@ PROJECT VERBS (run inside a consuming project)
         launchd_unavailable, agent_not_on_node (run `capabilities init`
         here), node_agent_not_loaded, or handover_incomplete, with the answer
         as the error's detail; --apply exits 4 under the read-only switch.
-  node supervise <name> [--agent <id>]
-        What a node-run program runs: read <name>'s deploy command and
-        restart policy from its installed descriptor, then run it under
-        `deployment runner` (exec), which asks the gate and the lease on
-        each reconcile and writes this node's row of the service. Exit 6
-        agent_mismatch where the folder is bound to another agent than
-        --agent, 3 no_service or deployment_unavailable.
+  node supervise <name> [--agent <id>] [--every N] [--restart POLICY]
+                  [-- <command...>]
+        Run one capability service as the gate on this node says, until
+        stopped: what a node-run program runs, what a box's Supervisor
+        program and a service's own Compose container run, and what `deployment
+        runner` hands its service to. Without a command it runs <name>'s
+        deploy command and restart policy from its installed descriptor;
+        --every defaults to the project's service_policy.reconcile_seconds in
+        deployment/runtime.json (default 60, 5-3600), --restart to the
+        descriptor's or unless-stopped (no|on-failure|always|unless-stopped).
+        Every N seconds it reads the gate for <name> in this project on this
+        node: in store mode only the project's row naming this node places the
+        service, by its service flag (`place|unplace`), apart from whether
+        that row makes the CLI usable here; in files mode the project's own
+        enable does, and nothing inherited or global places it. Placed, an
+        exclusive service - the default, as its descriptor's
+        service.placement declares - takes or renews the service's lease
+        (deployment_service_leases, the table deployment's runner kept, made
+        where the store holds none yet), a row in the project's
+        store naming the holding node and expiring after three reconciles, so
+        it runs on one node at a time; a shared service takes no lease and
+        runs on every node it is placed on. Either way it starts the command
+        in a process group of its own and restarts it per the policy; a
+        service that exits 4, the contract's policy refusal, is not
+        restarted: the lease is released and the service held idle, reporting
+        the refusal (its error code and message when it printed one), until
+        the gate answer for this node changes or the supervisor restarts. A
+        service that exits with any other non-zero code, or cannot be started,
+        has its exit code, its last stderr lines (at most 2000 characters) and
+        the time written onto the lease it holds; another node taking the
+        lease clears them. Not placed, or the lease held live by another node,
+        it stops the group (TERM, KILL after 20 seconds) and releases its
+        lease; a refusal names the holder and expiry on stderr, and it keeps
+        checking, so it takes over once the lease expires or is released.
+        With no database resolvable no lease can be taken, and it runs as the
+        gate says. Each reconcile it also reports this node seen (`node
+        seen`); a report that fails is said once on stderr and changes nothing
+        else. While the service is placed here it keeps this node's row in
+        capabilities_service_instances: its state - starting, ready, unusable,
+        degraded, failing, held, waiting or stopping - with the problem and
+        its code, the payload, pid, host and start time of the running
+        process, the last failure's exit code, stderr tail and time, and the
+        settings skipped on this node. Whether a running service can do its
+        work is its declared doctor's answer (service.deploy.doctor), asked
+        10 seconds after it starts and then every reconcile, for at most 30
+        seconds: exit 0 is ready, or degraded when its body names
+        skipped_settings; any other answer is unusable, with the message and
+        code of the error envelope it printed, else the body's problem, else
+        its exit code's category. The row goes when the service is no longer
+        placed here or the supervisor stops; a project that declares no id
+        keeps none. It records its state as deployment always kept a runner's
+        (capabilities/deployment/state/runners/<name>.json, read by `deployment
+        services`), and a second supervisor of the same service in the same
+        project on this machine - a host agent loaded again, a runner of an
+        older release - starts nothing and waits for the first to stop. The
+        service gets each environment default the compiled service carries -
+        its descriptor's optional defaults, then the project runtime's
+        environment_defaults for it - where the supervisor's environment sets
+        none. Exit 6 agent_mismatch where the folder is bound to another agent
+        than --agent, 3 no_service; 4 under the read-only switch.
+  node supervise <name> --machine [--every N] [--restart POLICY]
+        What a node-run job runs for a service with no project command that
+        declares one per machine (service.machine.command): one process on
+        this node for every agent here that places it. Each reconcile it reads
+        those agents from the store, takes each one's lease where the service
+        is exclusive, puts each agent whose lease it holds on the service's own
+        list (`<name> service join` in its folder) and takes off those it put
+        there that it no longer holds (`service leave`), and runs the machine
+        command while any agent is on it, under the restart policy and exit-4
+        hold above, probing it with service.machine.doctor. It writes one row
+        per placed agent: from what `<name> service status --machine` says of
+        that agent (served ready, paused held, refused or error unusable),
+        waiting for an agent whose lease another node holds. Where a machine
+        process it did not start runs <name> here - an agent of `deployment
+        machine sync`, or one started by hand - it starts none beside it,
+        changes no list and writes each row waiting. Stopping, it stops the
+        process and takes off the list every agent it put there. Its record
+        is under $XDG_STATE_HOME/capabilities/node/machine/.
   service start <name> [--node <node>] [--wait S]
   service move <name> --node <node> [--wait S]
   service stop <name> [--node <node> | --all] [--wait S]
@@ -1475,6 +1551,7 @@ import secrets
 import select
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -9532,6 +9609,8 @@ NODE_JOB_STOP_SECONDS = 30
 NODE_LAUNCHD_MARK = "<!-- written by `capabilities node run`, which rewrites or removes it -->"
 NODE_AGENT_LABEL = "capabilities.node"
 NODE_LAUNCHD_FOREIGN_SLUG = "machine"
+# A machine service's one job on this Mac: capabilities.node-machine.<capability>.
+NODE_LAUNCHD_MACHINE_SLUG = "node-machine"
 NODE_AGENT_MARK = "<!-- written by `capabilities node install`, which rewrites it -->"
 # What a job carries over from the node manager's own environment: launchd
 # hands a job none, and these decide which node, home and tools it runs as.
@@ -9593,11 +9672,35 @@ def _node_service_command(name: str) -> tuple[list[str], str | None]:
     return list(command), None
 
 
+def _node_job_command(job: dict, manager: str) -> list[str]:
+    """What a job runs: `node supervise` for its agent's service, or for a
+    machine service, `node supervise --machine`, once for every agent here."""
+    if job.get("machine"):
+        return [manager, "node", "supervise", job["capability"], "--machine"]
+    return [manager, "node", "supervise", job["capability"], "--agent", job["agent_id"]]
+
+
+def _node_machine_command(name: str) -> list[str]:
+    """The machine command `name`'s installed service declares where it
+    declares no project command of its own (`service.machine.command`), else
+    []: such a service runs once per node, for every agent that places it."""
+    service = _installed_service(name) if name in _installed() else None
+    if not isinstance(service, dict):
+        return []
+    deploy = service.get("deploy")
+    if isinstance(deploy, dict) and deploy.get("command"):
+        return []
+    machine = service.get("machine")
+    command = machine.get("command") if isinstance(machine, dict) else None
+    return (list(command) if isinstance(command, list) and command
+            and all(isinstance(v, str) and v for v in command) else [])
+
+
 def _node_job_text(job: dict, manager: str) -> str:
     """A job's definition for the node's supervisor (Supervisor's program
     section). It names the agent, the capability and the manager, never the
     service's command line."""
-    command = [manager, "node", "supervise", job["capability"], "--agent", job["agent_id"]]
+    command = _node_job_command(job, manager)
     return (NODE_JOB_MARK
             + f"[program:{job['name']}]\n"
             + f"command={shlex.join(command)}\n"
@@ -9696,7 +9799,7 @@ def _node_launcher_text(job: dict, manager: str) -> str:
     """A launcher whose file name is the job's label: macOS lists a background
     item by the name of the program its job runs, never by its label, so each
     service shows under a name a person can tell apart."""
-    command = [manager, "node", "supervise", job["capability"], "--agent", job["agent_id"]]
+    command = _node_job_command(job, manager)
     return f"#!/bin/sh\n# {NODE_LAUNCHD_MARK}\nexec {shlex.join(command)}\n"
 
 
@@ -9820,6 +9923,9 @@ class _NodeManager:
                 continue
             key = f"service:{agent_id}/{capability}"
             _command, why = _node_service_command(capability)
+            machine = why is not None and bool(_node_machine_command(capability))
+            if machine:
+                why = None
             if why is None and _machine_state(capability) == "quarantined":
                 why = f"{capability} is quarantined on this machine"
             if why is not None:
@@ -9827,10 +9933,21 @@ class _NodeManager:
                                         f"does not run: {why}")
                 continue
             self.said.pop(key, None)
+            if machine:
+                # One process on this node serves every agent that places it.
+                name = self.machine_job_name(capability)
+                job = jobs.setdefault(name, {"name": name, "agent_id": None,
+                                             "capability": capability, "machine": True,
+                                             "folder": str(self.root), "agents": []})
+                job["agents"].append(agent_id)
+                continue
             name = self.job_name(agent_id, capability, slugs.get(agent_id))
             jobs[name] = {"name": name, "agent_id": agent_id, "capability": capability,
                           "folder": str(folders[agent_id])}
         return jobs
+
+    def machine_job_name(self, capability: str) -> str:
+        return f"{capability}.machine"
 
     def job_name(self, agent_id: str, capability: str, slug: str | None) -> str:
         del slug
@@ -9886,7 +10003,9 @@ class _NodeManager:
             self.write_job(job, path, text)
             self.changed.add(name)
             self.pending_apply = True
-            self.say(f"runs {job['capability']} for {job['agent_id']} here as job {name}")
+            self.say(f"runs {job['capability']} for "
+                     f"{', '.join(job['agents']) if job.get('machine') else job['agent_id']} "
+                     f"here as job {name}")
         for name, path in present.items():
             if name in desired:
                 continue
@@ -9925,8 +10044,9 @@ class _NodeManager:
         that was asked before this process looked is acted on."""
         keys = tuple(sorted(
             {(NODE_PLACEMENT_CHANNEL, agent_id) for agent_id in self.agents}
-            | {(NODE_RESTART_CHANNEL, f"{job['agent_id']}/{job['capability']}/{self.here}")
-               for job in self.jobs.values()}))
+            | {(NODE_RESTART_CHANNEL, f"{agent_id}/{job['capability']}/{self.here}")
+               for job in self.jobs.values()
+               for agent_id in (job.get("agents") or [job["agent_id"]])}))
         if keys == self.follow_keys or not keys:
             return
         db = self.db
@@ -9960,7 +10080,8 @@ class _NodeManager:
                 continue
             agent_id, capability, _node = scope.rsplit("/", 2)
             restarts += [name for name, job in self.jobs.items()
-                         if (job["agent_id"], job["capability"]) == (agent_id, capability)]
+                         if job["capability"] == capability
+                         and agent_id in (job.get("agents") or [job["agent_id"]])]
         return placement, restarts
 
     def restart(self, name: str) -> None:
@@ -10002,10 +10123,15 @@ class _LaunchdNodeManager(_NodeManager):
     def job_name(self, agent_id: str, capability: str, slug: str | None) -> str:
         # capabilities.machine.* is deployment's machine scope, so an agent
         # whose slug is `machine` is labelled by its id instead.
-        if slug == NODE_LAUNCHD_FOREIGN_SLUG:
+        if slug in (NODE_LAUNCHD_FOREIGN_SLUG, NODE_LAUNCHD_MACHINE_SLUG):
             slug = None
         who = re.sub(r"[^A-Za-z0-9_-]", "_", slug or agent_id)
         return f"capabilities.{who}.{capability}"
+
+    def machine_job_name(self, capability: str) -> str:
+        # capabilities.machine.<name> is deployment's machine scope, which an
+        # unmigrated Mac may still run beside this one.
+        return f"capabilities.{NODE_LAUNCHD_MACHINE_SLUG}.{capability}"
 
     def job_path(self, name: str) -> Path:
         return self.include / f"{name}.plist"
@@ -10297,35 +10423,1601 @@ def _node_install(args: list[str]) -> None:
     _emit(result)
 
 
+# ---------------------------------------------------------------- service supervision
+#
+# Every capability service a node runs is supervised here, one process per
+# service, `node supervise`: it asks the gate on this node what it answers for
+# the service, holds the service's lease in the project's store, and starts or
+# stops the service's command to match, once per reconcile. Turning a service
+# on or off for a node is therefore a gate write, never a recompile or a
+# redeploy, and the lease keeps one service on one machine. `deployment
+# runner`, which every compilation before the node manager runs, hands its
+# service to this process unchanged.
+#
+# The lease rows are the table deployment's runner kept (`deployment_service_
+# leases`), under deployment's name and ledger entry; the record of each
+# supervisor and the lock that
+# keeps it the only one in its project on this machine stay where `deployment
+# services` reads them, under deployment's state, so a runner still running an
+# older release and this process never both run one service here.
+
+SUPERVISE_RESTART_POLICIES = ("no", "on-failure", "always", "unless-stopped")
+SUPERVISE_EVERY_DEFAULT = 60
+SUPERVISE_EVERY_BOUNDS = (5, 3600)
+SUPERVISE_LEASE_TTL_RECONCILES = 3
+SUPERVISE_SEEN_TIMEOUT_SECONDS = 20
+SUPERVISE_STOP_GRACE_SECONDS = 20
+SUPERVISE_POLICY_EXIT = 4
+SUPERVISE_PROBE_GRACE_SECONDS = 10
+SUPERVISE_PROBE_TIMEOUT_SECONDS = 30
+SUPERVISE_PROBE_EXIT_CODES = {2: "auth", 3: "not_found", 4: "policy", 5: "unreachable",
+                              6: "input"}
+SUPERVISE_ERROR_CHARS = 2000
+SUPERVISE_SCHEMA = "capabilities.deployment.runner.v1"
+SUPERVISE_UNLOCKED = object()
+# The lease table keeps the name and the migration ledger entry deployment gave
+# it when its runner held the leases, so a store either side made reads alike:
+# these steps are deployment's LEASE_STEPS, byte for byte, which the ledger's
+# checksum holds to, until deployment's copy goes with its runner.
+SUPERVISE_LEASE_OWNER = "deployment"
+SUPERVISE_LEASE_VERSION = (1, 1)
+SUPERVISE_LEASE_STEPS = [
+    ("0001-service-leases",
+     "CREATE TABLE deployment_service_leases ("
+     " project text NOT NULL,"
+     " capability text NOT NULL,"
+     " node text NOT NULL CHECK (node <> ''),"
+     " acquired_at timestamptz NOT NULL DEFAULT now(),"
+     " renewed_at timestamptz NOT NULL DEFAULT now(),"
+     " expires_at timestamptz NOT NULL,"
+     " PRIMARY KEY (project, capability))"),
+    ("0002-service-lease-errors",
+     "ALTER TABLE deployment_service_leases"
+     " ADD COLUMN last_exit integer,"
+     " ADD COLUMN last_error text,"
+     " ADD COLUMN last_error_at timestamptz;"
+     " COMMENT ON COLUMN deployment_service_leases.last_exit IS"
+     " 'the exit code the service last failed with on the holding node; null when it"
+     " could not be started at all';"
+     " COMMENT ON COLUMN deployment_service_leases.last_error IS"
+     " 'the last lines the service printed to stderr when it last failed, or why it"
+     " could not be started; cleared when another node takes the lease';"
+     " COMMENT ON COLUMN deployment_service_leases.last_error_at IS"
+     " 'when the service last failed on the holding node'"),
+]
+SUPERVISE_STORE_SETTING_SLUGS = frozenset({
+    "store_not_configured", "store_not_postgres", "store_setting_unreadable",
+    "store_setting_too_new", "bad_store_setting", "sslmode_too_weak",
+    "bad_schema_name", "driver_missing"})
+
+
+def _supervise_now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _supervise_iso(moment) -> str | None:
+    return moment.isoformat(timespec="seconds") if hasattr(moment, "isoformat") else moment
+
+
+def _supervise_runtime(root: Path) -> dict:
+    """The project's deployment declaration, or {} where it has none."""
+    runtime = _read_json(root / "deployment" / "runtime.json")
+    return runtime if isinstance(runtime, dict) else {}
+
+
+def _supervise_every(root: Path) -> int:
+    """The project's reconcile cadence (service_policy.reconcile_seconds)."""
+    policy = _supervise_runtime(root).get("service_policy")
+    value = policy.get("reconcile_seconds") if isinstance(policy, dict) else None
+    low, high = SUPERVISE_EVERY_BOUNDS
+    if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
+        return value
+    return SUPERVISE_EVERY_DEFAULT
+
+
+def _supervise_state_dir(root: Path) -> Path:
+    """Where deployment keeps a project's state, as its own contract resolves
+    it: inside the envelope where the project has one, else the state home."""
+    envelope = _project_capabilities_dir(root)
+    if ((envelope / PROJECT_IDENTITY_REL).is_file()
+            or (envelope / "settings.json").is_file()
+            or (envelope.is_dir() and (_handed_off_project_id(root)
+                                       or _env_file_project_id(root)[0]))):
+        return envelope / "deployment" / "state" / "runners"
+    return _STATE_HOME / "deployment" / "runners"
+
+
+def _supervise_descriptor(name: str) -> dict:
+    """The service descriptor of `name`'s installed manifest, or {}."""
+    service = _installed_service(name)
+    return service if isinstance(service, dict) else {}
+
+
+def _supervise_placement(name: str) -> str:
+    return _service_placement(_supervise_descriptor(name))
+
+
+def _supervise_doctor(name: str) -> list[str]:
+    """The argv the installed service declares as its doctor, or none."""
+    deploy = _supervise_descriptor(name).get("deploy")
+    doctor = deploy.get("doctor") if isinstance(deploy, dict) else None
+    if isinstance(doctor, list) and doctor and all(isinstance(v, str) and v for v in doctor):
+        return list(doctor)
+    return []
+
+
+def _supervise_payload_sha256(name: str) -> str | None:
+    """The installed payload of `name`, as the manager recorded it."""
+    meta = _read_json(CAP_HOME / name / "meta.json")
+    value = meta.get("payload_sha256") if isinstance(meta, dict) else None
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) else None
+
+
+def _supervise_environment(root: Path, name: str) -> dict:
+    """The service's environment: the supervisor's own, with each default the
+    compiled service carries set where the supervisor's sets none - the
+    descriptor's optional environment defaults, then the project's
+    deployment declaration's environment_defaults for it - as a host agent's
+    file and a box's Compose file set them. A supervisor started from
+    neither, as the node's service manager starts it on a Mac, gives the
+    service the same values."""
+    defaults: dict[str, str] = {}
+    deploy = _supervise_descriptor(name).get("deploy")
+    environment = deploy.get("environment") if isinstance(deploy, dict) else None
+    optional = environment.get("optional") if isinstance(environment, dict) else None
+    for item in optional if isinstance(optional, list) else []:
+        if (isinstance(item, dict) and isinstance(item.get("key"), str)
+                and isinstance(item.get("default"), str)):
+            defaults[item["key"]] = item["default"]
+    services = _supervise_runtime(root).get("services")
+    entry = services.get(name) if isinstance(services, dict) else None
+    declared = entry.get("environment_defaults") if isinstance(entry, dict) else None
+    if isinstance(declared, dict):
+        defaults.update({key: value for key, value in declared.items()
+                         if isinstance(value, str)})
+    env = dict(os.environ)
+    # The project's envelope and id, handed down as a capability hands them to
+    # what it starts, so the service asks the manager for neither.
+    env[ENVELOPE_ENV] = str(_envelope_home(root))
+    env[ENVELOPE_ROOT_ENV] = str(root)
+    env.update(_project_id_handoff(root))
+    for key, value in defaults.items():
+        if re.fullmatch(r"[A-Z_][A-Z0-9_]*", key):
+            env.setdefault(key, value)
+    return env
+
+
+class _SuperviseProblem(Exception):
+    def __init__(self, state: str, code: str, message: str):
+        super().__init__(message)
+        self.state, self.code, self.message = state, code, message
+
+    def report(self) -> dict:
+        return {"state": self.state, "error": {"code": self.code, "message": self.message}}
+
+
+class _SuperviseStore:
+    """The project's store, one transaction at a time: each on a transaction
+    connection opened for it and closed after it, so a supervisor holds no
+    connection between reconciles, with the tables it writes made on the
+    first. With no database resolvable for the project nothing is written and
+    the answer is `unavailable`."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.conn = None
+        self._migrated = False
+
+    def _migrate(self, conn, db) -> None:
+        raise NotImplementedError
+
+    def _connect(self):
+        if self.conn is not None:
+            return self.conn
+        try:
+            from capabilities_contract import db
+        except ImportError:
+            raise _SuperviseProblem("unavailable", "driver_missing",
+                                    "the shared database library capabilities-contract "
+                                    "is not installed") from None
+        try:
+            setting = db.resolve_setting(self.root)
+        except db.DbError as exc:
+            state = ("unavailable" if exc.slug in SUPERVISE_STORE_SETTING_SLUGS
+                     else "unreachable")
+            raise _SuperviseProblem(state, exc.slug, exc.message) from None
+        try:
+            conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+                              transaction=True)
+        except db.DbError as exc:
+            raise _SuperviseProblem("unreachable", exc.slug, exc.message) from None
+        if not self._migrated:
+            try:
+                self._migrate(conn, db)
+            except db.DbError as exc:
+                conn.close()
+                raise _SuperviseProblem("unreachable", exc.slug, exc.message) from None
+            except _SuperviseProblem:
+                conn.close()
+                raise
+            self._migrated = True
+        self.conn = conn
+        return conn
+
+    def _run(self, work):
+        """`work(conn)` in one transaction on a connection opened for it and
+        closed after it."""
+        try:
+            conn = self._connect()
+        except _SuperviseProblem as problem:
+            return problem.report()
+        try:
+            with conn.transaction():
+                return work(conn)
+        except Exception as exc:  # psycopg.Error, or a connection that went away
+            return {"state": "unreachable", "error": {
+                "code": "store_unreachable",
+                "message": " ".join(f"{type(exc).__name__}: {exc}".split())[:300]}}
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+
+class _SuperviseLease(_SuperviseStore):
+    """One project's service leases in its store: a row per (project,
+    capability) naming the node that holds it and when that hold expires. The
+    holder renews it every reconcile; another node takes it only once it has
+    expired or been released. With no database resolvable for the project,
+    no lease can be taken and the lease is `unavailable`.
+
+    Each take, renewal, release or read is one store turn. `maybe_held` is
+    whether this node may hold the lease as far as this supervisor knows:
+    unknown at first, so the first release asks the store; a release is
+    skipped while it is known not to be held, so a supervisor whose service
+    is not placed here does not reach the store for its lease at all."""
+
+    def __init__(self, root: Path, project: str, node: str, ttl: int = 0):
+        super().__init__(root)
+        self.project, self.node, self.ttl = project, node, ttl
+        self.mine_until: float | None = None
+        self.maybe_held = True
+
+    def _migrate(self, conn, db) -> None:
+        db.migrate(conn, SUPERVISE_LEASE_OWNER, SUPERVISE_LEASE_STEPS,
+                   major=SUPERVISE_LEASE_VERSION[0], minor=SUPERVISE_LEASE_VERSION[1])
+
+    @staticmethod
+    def _holding(row, node: str) -> dict:
+        if row is None:
+            return {"state": "free", "holder": None}
+        holder, acquired, renewed, expires, live, code, error, failed = row
+        return {"state": ("held" if holder == node else
+                          "held_elsewhere" if live else "free"),
+                "holder": holder, "acquired_at": _supervise_iso(acquired),
+                "renewed_at": _supervise_iso(renewed), "expires_at": _supervise_iso(expires),
+                "live": bool(live),
+                "last_error": ({"exit": code, "error": error, "at": _supervise_iso(failed)}
+                               if failed is not None else None)}
+
+    def acquire(self, capability: str) -> dict:
+        """Take or renew this node's hold, unless another node's is live."""
+        def work(conn):
+            row = conn.execute(
+                "INSERT INTO deployment_service_leases AS l "
+                "(project, capability, node, expires_at) "
+                "VALUES (%s, %s, %s, now() + %s * interval '1 second') "
+                "ON CONFLICT (project, capability) DO UPDATE "
+                "SET node = EXCLUDED.node, expires_at = EXCLUDED.expires_at, "
+                "renewed_at = now(), acquired_at = CASE WHEN l.node = EXCLUDED.node "
+                "THEN l.acquired_at ELSE now() END, "
+                "last_exit = CASE WHEN l.node = EXCLUDED.node THEN l.last_exit END, "
+                "last_error = CASE WHEN l.node = EXCLUDED.node THEN l.last_error END, "
+                "last_error_at = CASE WHEN l.node = EXCLUDED.node "
+                "THEN l.last_error_at END "
+                "WHERE l.node = EXCLUDED.node OR l.expires_at <= now() "
+                "RETURNING node, acquired_at, renewed_at, expires_at, true, "
+                "last_exit, last_error, last_error_at",
+                (self.project, capability, self.node, self.ttl)).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
+                    "last_exit, last_error, last_error_at "
+                    "FROM deployment_service_leases WHERE project = %s AND capability = %s",
+                    (self.project, capability)).fetchone()
+            return self._holding(row, self.node)
+        found = self._run(work)
+        if found.get("state") == "held":
+            self.mine_until = time.monotonic() + self.ttl
+            self.maybe_held = True
+        elif found.get("state") == "unreachable":
+            self.maybe_held = True
+        else:
+            self.mine_until = None
+            self.maybe_held = found.get("state") not in ("held_elsewhere", "free")
+        return found
+
+    def release(self, capability: str) -> dict:
+        """Give up this node's hold, so another node may take it at once."""
+        def work(conn):
+            gone = conn.execute(
+                "DELETE FROM deployment_service_leases "
+                "WHERE project = %s AND capability = %s AND node = %s",
+                (self.project, capability, self.node)).rowcount
+            row = conn.execute(
+                "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
+                "last_exit, last_error, last_error_at "
+                "FROM deployment_service_leases WHERE project = %s AND capability = %s",
+                (self.project, capability)).fetchone()
+            found = self._holding(row, self.node)
+            found["released"] = bool(gone)
+            return found
+        found = self._run(work)
+        if found.get("state") != "unreachable":
+            self.mine_until = None
+            self.maybe_held = False
+        return found
+
+    def release_if_held(self, capability: str, known: dict) -> dict:
+        """`release`, unless this node is known not to hold the lease: then
+        `known`, the lease as last seen, and the store is not asked."""
+        if not self.maybe_held:
+            return known
+        return self.release(capability)
+
+    def record_error(self, capability: str, code, error: str) -> dict:
+        """Write why the service last failed onto this node's hold, so it can
+        be read from any machine that reads the store."""
+        def work(conn):
+            done = conn.execute(
+                "UPDATE deployment_service_leases SET last_exit = %s, last_error = %s, "
+                "last_error_at = now() "
+                "WHERE project = %s AND capability = %s AND node = %s",
+                (code, error[-SUPERVISE_ERROR_CHARS:], self.project, capability,
+                 self.node)).rowcount
+            return {"recorded": bool(done)}
+        return self._run(work)
+
+    def still_mine(self) -> bool:
+        """Whether the hold this node last renewed has not yet run out."""
+        return self.mine_until is not None and time.monotonic() < self.mine_until
+
+
+class _SuperviseInstance(_SuperviseStore):
+    """This node's row of what it runs of one service, in the store's
+    `capabilities_service_instances`, which the contract's ledger owns:
+    written on every start, reconcile and exit, and deleted once the
+    supervisor no longer supervises the service here. `maybe_written` is
+    whether a row may stand: unknown at first, since a supervisor killed
+    before it could delete its row left one, so the first delete asks the
+    store, and later ones only after a write."""
+
+    def __init__(self, root: Path, project: str, node: str):
+        super().__init__(root)
+        self.project, self.node = project, node
+        self.maybe_written = True
+
+    def _migrate(self, conn, db) -> None:
+        store = _store_module()
+        major, minor = store.STORE_TABLES_VERSION
+        db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
+                   major=major, minor=minor)
+
+    def put(self, capability: str, row: dict) -> dict:
+        def work(conn):
+            _store_module().service_instance_put(conn, self.project, capability, self.node,
+                                                 **row)
+            return {"written": True}
+        found = self._run(work)
+        if found.get("written"):
+            self.maybe_written = True
+        return found
+
+    def drop(self, capability: str) -> dict:
+        if not self.maybe_written:
+            return {"dropped": False}
+
+        def work(conn):
+            return {"dropped": _store_module().service_instance_drop(
+                conn, self.project, capability, self.node)}
+        found = self._run(work)
+        if "dropped" in found:
+            self.maybe_written = False
+        return found
+
+
+def _supervise_record_path(root: Path, name: str) -> Path:
+    return _supervise_state_dir(root) / f"{name}.json"
+
+
+def _supervise_read_record(root: Path, name: str) -> dict:
+    data = _read_json(_supervise_record_path(root, name))
+    return data if isinstance(data, dict) and data.get("schema") == SUPERVISE_SCHEMA else {}
+
+
+def _supervise_lock(root: Path, name: str, stopping: dict, say):
+    """The one supervisor of `name` in this project on this machine. A lease
+    is held by a node, so it cannot tell two supervisors on one node apart - a
+    host agent loaded again beside the node manager's job - and a second one
+    waits here, starting nothing, until the first stops. None once stopped
+    while waiting."""
+    path = _supervise_record_path(root, name).with_suffix(".lock")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a")
+    except OSError as exc:
+        # As with its record, a supervisor that cannot write here still runs
+        # its service; only the guard against a second copy is lost.
+        say(f"cannot take its lock {path}: {exc}; it runs without the guard against a "
+            "second runner here")
+        return SUPERVISE_UNLOCKED
+    said = False
+    while not stopping["now"]:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if not said:
+                holder = _supervise_read_record(root, name).get("runner_pid")
+                say(f"another runner of {name}"
+                    + (f", pid {holder}," if isinstance(holder, int) else "")
+                    + " runs in this project on this machine; this one starts nothing "
+                    "and waits for it to stop, so the service never runs twice here")
+                said = True
+            time.sleep(2)
+    handle.close()
+    return None
+
+
+def _supervise_child_preexec() -> None:
+    """The service leads a process group of its own, so stopping it reaches
+    every worker it started; on Linux it is also told when its supervisor
+    dies."""
+    os.setpgid(0, 0)
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+            import signal
+            ctypes.CDLL(None).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+        except (OSError, AttributeError):
+            pass
+
+
+def _supervise_relay_stderr(stream, tail: list) -> None:
+    """Pass the service's stderr through unchanged, keeping its last lines so
+    a refusal can be reported in the service's own words."""
+    for raw in iter(stream.readline, b""):
+        try:
+            sys.stderr.buffer.write(raw)
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+        tail.append(raw.decode("utf-8", "replace").rstrip("\n"))
+        del tail[:-20]
+    stream.close()
+
+
+def _supervise_refusal_of(lines: list) -> dict:
+    """The contract's error envelope among a service's last stderr lines, if
+    it printed one: its code and message."""
+    for line in reversed(lines):
+        try:
+            error = json.loads(line).get("error")
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(error, dict) and error.get("code"):
+            return {"slug": str(error["code"]),
+                    "message": str(error.get("message") or "")[:500]}
+    return {}
+
+
+def _supervise_readiness(command: list[str], root: Path, timeout: int) -> dict:
+    """Whether a running service can do its work here, in its declared
+    doctor's words: `ready`, `degraded` (ready, with settings it skipped on
+    this node) or `unusable`, with the problem and its code. The words are the
+    contract's: the exit code, the error envelope on stderr, and the body's
+    `ok`, `problem` and `skipped_settings`."""
+    if not command:
+        return {"state": "unusable", "code": "doctor_undeclared",
+                "problem": "the service declares no doctor, so whether it can do its "
+                           "work here is not known"}
+    shown = shlex.join(command)
+    try:
+        done = subprocess.run(command, cwd=str(root), stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"state": "unusable", "code": "doctor_timeout",
+                "problem": f"{shown} did not answer in {timeout}s"}
+    except OSError as exc:
+        return {"state": "unusable", "code": "doctor_unavailable",
+                "problem": f"{shown} cannot be run: {exc}"[:300]}
+    try:
+        body = json.loads(done.stdout)
+    except ValueError:
+        body = None
+    body = body if isinstance(body, dict) else {}
+    skipped = body.get("skipped_settings")
+    skipped = skipped if isinstance(skipped, list) else []
+    if done.returncode == 0 and body.get("ok") is not False:
+        return {"state": "degraded" if skipped else "ready", "skipped_settings": skipped}
+    said = _supervise_refusal_of(done.stderr.splitlines())
+    problem = (said.get("message")
+               or (body.get("problem") if isinstance(body.get("problem"), str) else None)
+               or (f"{shown} exited {done.returncode}" if done.returncode
+                   else f"{shown} answered ok: false"))
+    return {"state": "unusable", "problem": problem,
+            "code": said.get("slug") or SUPERVISE_PROBE_EXIT_CODES.get(done.returncode)
+            or "doctor_failed", "skipped_settings": skipped}
+
+
+def _supervise_gate_key(gate: dict) -> tuple:
+    """What a gate answer says, for telling whether it changed: placed or not,
+    and the row that answered."""
+    row = gate.get("row") or {}
+    return (bool(gate.get("placed")), row.get("scope"), row.get("node"), row.get("enabled"))
+
+
+def _supervise_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _supervise_stop_group(pgid: int, grace: float = SUPERVISE_STOP_GRACE_SECONDS,
+                          reap=None) -> None:
+    """TERM the group, and KILL what is left of it after `grace`. `reap` lets
+    the supervisor collect its own child as it exits, since a child that
+    exited but was not yet collected still counts as a member of its group."""
+    import signal
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if reap is not None:
+            reap()
+        if not _supervise_group_alive(pgid):
+            return
+        time.sleep(0.1)
+    if _supervise_group_alive(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+class _Supervisor:
+    """One service on this node, as the gate here says, until stopped."""
+
+    def __init__(self, root: Path, name: str, command: list[str], restart: str,
+                 every: int):
+        self.root, self.name, self.command = root, name, command
+        self.restart, self.every = restart, every
+        self.node = _this_node()["id"]
+        project_id = _folder_agent_id(root)
+        self.lease = _SuperviseLease(root, project_id or f"path:{root}", self.node,
+                                     every * SUPERVISE_LEASE_TTL_RECONCILES)
+        self.records = None
+        self.child: subprocess.Popen | None = None
+        self.child_started: float | None = None
+        self.child_started_at: str | None = None
+        self.want = False
+        self.placed = False
+        self.held_down = False
+        self.restart_at: float | None = None
+        self.quick_failures = 0
+        self.gate: dict = {}
+        self.lease_state: dict = {}
+        self.reason = "starting"
+        self.last_exit: dict | None = None
+        self.said: object = None
+        self.tick_at: str | None = None
+        self.stderr_tail: list = []
+        self.relay = None
+        self.error_unrecorded: str | None = None
+        # A service that refused with the policy exit is held idle until the
+        # gate answer it was refused under changes, or the supervisor restarts.
+        self.refusal: dict | None = None
+        self.gate_seen: tuple | None = None
+        self.seen_failing: str | None = None
+        # What runs here, as the store's instance row tells every machine: the
+        # running child's payload and readiness, and the last failure.
+        self.instance = (_SuperviseInstance(root, project_id, self.node) if project_id
+                         else None)
+        self.instance_failing: str | None = None
+        self.payload_sha256: str | None = None
+        self.probe: dict | None = None
+        self.probe_at: float | None = None
+        self.failure: dict | None = None
+
+    def say(self, message: str) -> None:
+        sys.stderr.write(f"[capabilities supervise {self.name}] {message}\n")
+        sys.stderr.flush()
+
+    def say_once(self, key: object, message: str) -> None:
+        if key != self.said:
+            self.said = key
+            self.say(message)
+
+    def running(self) -> bool:
+        return self.child is not None and self.child.poll() is None
+
+    def gate_answer(self) -> dict:
+        """What the gate answers for the service on this node, and whether
+        that places it here. In store mode only the project's row naming this
+        node places it, by its `service`, apart from whether it makes the CLI
+        usable here; in files mode, which carries no node, the project's own
+        enable does. Nothing inherited or global places a service."""
+        name, node = self.name, self.node
+        answer: dict = {"node": node, "records": None, "placed": False, "row": None}
+        store = _store_module()
+        try:
+            if self.records is None:
+                self.records = _open_project_records(self.root)
+            records = self.records
+            answer["records"] = records.mode_of("policy")
+            row = records.resolve("capabilities", "policy").get(name)
+        except store.StoreError as exc:
+            answer["error"] = {"code": exc.slug, "message": exc.message}
+            answer["reason"] = f"the gate cannot be read: {exc.message}"
+            return answer
+        value = (row or {}).get("value")
+        enabled = isinstance(value, dict) and value.get("enabled") is True
+        scope = (row or {}).get("scope")
+        named = (row or {}).get("node")
+        service = (row or {}).get("service") is True
+        if row is not None:
+            answer["row"] = {"scope": scope, "node": named,
+                             "enabled": value.get("enabled") if isinstance(value, dict)
+                             else None}
+            if answer["records"] == "store":
+                answer["row"]["service"] = service
+        if answer["records"] == "store":
+            answer["placed"] = enabled and scope == "project" and named == node and service
+            if row is None:
+                answer["reason"] = f"no policy row answers for {name} on {node}"
+            elif scope != "project":
+                answer["reason"] = (f"only a global row answers for {name} on {node}, and a "
+                                    "global row never places a service")
+            elif named is None:
+                answer["reason"] = (f"the project's row for every node answers; only a row "
+                                    f"naming {node} places the service here")
+            elif not enabled:
+                answer["reason"] = f"the project's row for {node} disables {name}"
+            elif not service:
+                answer["reason"] = (f"the project's row for {node} enables {name} without "
+                                    "placing its service here")
+            else:
+                answer["reason"] = f"the project's row for {node} places {name}'s service"
+        else:
+            answer["placed"] = enabled and scope == "project"
+            if answer["placed"]:
+                answer["reason"] = (f"the project enables {name} itself, which places it on "
+                                    "every machine reading these files")
+            elif scope == "project":
+                answer["reason"] = f"the project disables {name}"
+            else:
+                answer["reason"] = (f"the project does not enable {name} itself, and nothing "
+                                    "inherited or global places a service")
+        return answer
+
+    def adopt_orphan(self) -> None:
+        """A service a previous supervisor left behind - killed before it could
+        stop it - is stopped, so this one never starts a second copy."""
+        record = _supervise_read_record(self.root, self.name)
+        child = record.get("child") if isinstance(record.get("child"), dict) else {}
+        pgid = child.get("pgid")
+        previous = record.get("runner_pid")
+        if not isinstance(pgid, int) or pgid <= 1 or previous == os.getpid():
+            return
+        if isinstance(previous, int) and previous > 1:
+            try:
+                os.kill(previous, 0)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                return
+            else:
+                self.say(f"another runner, pid {previous}, still records this service "
+                         "here; its service is left to it")
+                return
+        if _supervise_group_alive(pgid):
+            self.say(f"stopping process group {pgid} a previous runner left running")
+            _supervise_stop_group(pgid)
+
+    def environment(self) -> dict:
+        return _supervise_environment(self.root, self.name)
+
+    def start(self) -> None:
+        try:
+            self.child = subprocess.Popen(self.command, cwd=str(self.root),
+                                          env=self.environment(),
+                                          preexec_fn=_supervise_child_preexec,
+                                          stderr=subprocess.PIPE)
+        except OSError as exc:
+            self.child = None
+            self.last_exit = {"code": None, "at": _supervise_now_iso(),
+                              "error": f"{type(exc).__name__}: {exc}"[:300]}
+            self.failure = dict(self.last_exit)
+            self.say(f"cannot start {shlex.join(self.command)}: {exc}")
+            self.restart_at = time.monotonic() + self.every
+            self.record_error()
+            self.write_instance()
+            return
+        import threading
+        self.stderr_tail = []
+        self.relay = threading.Thread(target=_supervise_relay_stderr,
+                                      args=(self.child.stderr, self.stderr_tail),
+                                      daemon=True)
+        self.relay.start()
+        self.child_started = time.monotonic()
+        self.child_started_at = _supervise_now_iso()
+        self.restart_at = None
+        self.payload_sha256 = _supervise_payload_sha256(self.name)
+        self.probe = None
+        self.probe_at = self.child_started + SUPERVISE_PROBE_GRACE_SECONDS
+        self.say(f"started {shlex.join(self.command)} as pid {self.child.pid} on {self.node}")
+        self.write_instance()
+        self.save()
+
+    def stop(self, why: str) -> None:
+        if self.child is None:
+            return
+        pid = self.child.pid
+        self.write_instance()
+        _supervise_stop_group(pid, reap=self.child.poll)
+        try:
+            self.child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        self.last_exit = {"code": self.child.returncode, "at": _supervise_now_iso(),
+                          "stopped": why}
+        self.child = None
+        self.say(f"stopped pid {pid}: {why}")
+        self.save()
+
+    def reap(self) -> None:
+        """A service that exited on its own: restart it as its policy says."""
+        if self.child is None or self.child.poll() is None:
+            return
+        code = self.child.returncode
+        ran = time.monotonic() - (self.child_started or time.monotonic())
+        self.last_exit = {"code": code, "at": _supervise_now_iso(), "ran_seconds": round(ran, 1)}
+        self.child = None
+        if code == SUPERVISE_POLICY_EXIT and self.want:
+            time.sleep(0.2)  # let the relay take the service's last words
+            self.failure = {"code": code, "at": self.last_exit["at"],
+                            "error": "\n".join(self.stderr_tail)[-SUPERVISE_ERROR_CHARS:]
+                            or f"exited with {code}"}
+            self.hold_refused()
+            return
+        if code != 0:
+            if self.relay is not None:
+                self.relay.join(timeout=0.5)  # the service's last words
+            self.last_exit["error"] = "\n".join(self.stderr_tail)[-SUPERVISE_ERROR_CHARS:]
+            self.failure = {"code": code, "at": self.last_exit["at"],
+                            "error": self.last_exit["error"] or f"exited with {code}"}
+            self.record_error()
+        again = (self.restart in ("always", "unless-stopped")
+                 or (self.restart == "on-failure" and code != 0))
+        if not self.want:
+            self.write_instance()
+            self.save()
+            return
+        if not again:
+            self.held_down = True
+            self.say(f"exited with {code}; restart policy {self.restart!r} keeps it "
+                     "stopped until the gate turns it off and on again or the runner "
+                     "restarts")
+        else:
+            self.quick_failures = self.quick_failures + 1 if ran < 10 else 0
+            delay = min(2 ** self.quick_failures, self.every)
+            self.restart_at = time.monotonic() + delay
+            self.say(f"exited with {code}; restarting in {delay}s")
+        self.write_instance()
+        self.save()
+
+    def record_error(self) -> None:
+        """Put the failure in `last_exit` on the lease this node holds, where
+        another machine can read it."""
+        if self.lease.mine_until is None:
+            return
+        found = self.lease.record_error(self.name, self.last_exit.get("code"),
+                                        self.last_exit.get("error") or "")
+        failing = (found.get("error") or {}).get("code")
+        if failing and failing != self.error_unrecorded:
+            self.say("cannot record the failure on the lease: "
+                     f"{found['error'].get('message')}")
+        self.error_unrecorded = failing
+
+    def hold_refused(self) -> None:
+        """The service refused to run here with the policy exit: hold it
+        idle, give up the lease, and say what it said."""
+        said = _supervise_refusal_of(self.stderr_tail)
+        self.refusal = {"exit": SUPERVISE_POLICY_EXIT, "at": _supervise_now_iso(), **said,
+                        "gate": self.gate_seen}
+        detail = (f"{said['slug']}: {said['message']}" if said
+                  else "it printed no error envelope")
+        self.want = False
+        self.reason = (f"held idle: {self.name} refused to run here with exit "
+                       f"{SUPERVISE_POLICY_EXIT} ({detail}); it is tried again when the "
+                       f"gate answer for {self.node} changes or the runner restarts")
+        self.say(self.reason)
+        self.lease_state = self.lease.release_if_held(self.name, self.lease_state)
+        if self.lease_state.get("released"):
+            self.say(f"released the lease for {self.name}")
+        self.write_instance()
+        self.save()
+
+    def instance_row(self) -> dict | None:
+        """The row of what this node runs of the service as the supervisor sees
+        it now, or None while it does not supervise the service here: neither
+        placed here nor still running."""
+        running = self.running()
+        if not self.placed and not running:
+            return None
+        failure = self.failure or {}
+        row = {"payload_sha256": self.payload_sha256 if running else None,
+               "pid": self.child.pid if running else None,
+               "host": socket.gethostname() if running else None,
+               "started_at": self.child_started_at if running else None,
+               "last_exit_code": failure.get("code"), "last_error": failure.get("error"),
+               "last_error_at": failure.get("at")}
+        holder = self.lease_state.get("holder")
+        # Whether the service's last exit was a failure: a start that failed or
+        # an exit other than 0, and not a stop the supervisor made.
+        last = self.last_exit or {}
+        failed = bool(last) and "stopped" not in last and last.get("code") != 0
+        if running and not self.want:
+            return {**row, "state": "stopping", "problem": self.reason}
+        if running:
+            if self.probe is None:
+                # Restarted after a quick failure and not yet asked: it is
+                # crashing, not starting.
+                state = "failing" if self.quick_failures and failed else "starting"
+                return {**row, "state": state}
+            return {**row, "state": self.probe["state"], "problem": self.probe.get("problem"),
+                    "problem_code": self.probe.get("code"),
+                    "skipped_settings": self.probe.get("skipped_settings") or []}
+        if self.refusal is not None:
+            return {**row, "state": "held", "problem": self.reason,
+                    "problem_code": self.refusal.get("slug") or "policy"}
+        if self.held_down:
+            return {**row, "state": "held", "problem_code": "restart_policy",
+                    "problem": (f"exited with {failure.get('code', 0)}; restart policy "
+                                f"{self.restart!r} keeps it stopped until the gate turns "
+                                "it off and on again or the runner restarts")}
+        if self.want:
+            return {**row, "state": "failing" if failed else "starting"}
+        return {**row, "state": "waiting", "problem": self.reason,
+                "problem_code": ("lease_held_elsewhere" if holder and holder != self.node
+                                 else "lease_unconfirmed")}
+
+    def write_instance(self) -> None:
+        """Put the row of what runs here in the store, or take it away once the
+        supervisor no longer supervises the service here. A failure to reach
+        the store is said once, and once more when the writes work again."""
+        if self.instance is None:
+            if self.instance_failing != "project_undeclared":
+                self.say("the project declares no id, so what runs here is not recorded "
+                         "in the store")
+            self.instance_failing = "project_undeclared"
+            return
+        row = self.instance_row()
+        found = (self.instance.drop(self.name) if row is None
+                 else self.instance.put(self.name, row))
+        failing = (found.get("error") or {}).get("code")
+        if failing != self.instance_failing:
+            self.say(f"cannot record what runs here in the store: "
+                     f"{found['error'].get('message')}" if failing
+                     else "records what runs here in the store again")
+        self.instance_failing = failing
+
+    def probe_if_due(self) -> bool:
+        """Ask the running service's declared doctor whether it can do its work,
+        once it has run SUPERVISE_PROBE_GRACE_SECONDS and then every
+        reconcile; whether it was asked."""
+        if not self.running() or self.probe_at is None or time.monotonic() < self.probe_at:
+            return False
+        self.probe = _supervise_readiness(_supervise_doctor(self.name), self.root,
+                                          min(SUPERVISE_PROBE_TIMEOUT_SECONDS, 2 * self.every))
+        self.probe_at = time.monotonic() + self.every
+        return True
+
+    def converge(self) -> None:
+        if self.want and not self.running() and not self.held_down:
+            if self.restart_at is None or time.monotonic() >= self.restart_at:
+                self.start()
+        elif not self.want and self.child is not None:
+            self.stop(self.reason)
+
+    def report_seen(self) -> None:
+        """Report this node up in the store (`node seen`), as its own process,
+        so a report that fails changes nothing here. A failure is said once,
+        and once more when the reports work again."""
+        failing = detail = None
+        own = Path(sys.argv[0]).resolve()
+        manager = str(own) if own.is_file() else (shutil.which("capabilities") or "capabilities")
+        try:
+            done = subprocess.run([manager, "node", "seen"], cwd=str(self.root),
+                                  stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  timeout=min(self.every, SUPERVISE_SEEN_TIMEOUT_SECONDS))
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            failing = type(exc).__name__
+            detail = f"the manager could not be run ({failing})"
+        else:
+            if done.returncode:
+                said = _supervise_refusal_of(done.stderr.splitlines())
+                failing = said.get("slug") or f"exit {done.returncode}"
+                detail = (f"{said['slug']}: {said['message']}" if said else
+                          f"capabilities node seen exited {done.returncode}")
+        if failing != self.seen_failing:
+            self.say(f"cannot report {self.node} seen: {detail}" if failing
+                     else f"reports {self.node} seen again")
+        self.seen_failing = failing
+
+    def tick(self) -> None:
+        self.tick_at = _supervise_now_iso()
+        self.report_seen()
+        gate = self.gate_answer()
+        self.gate = gate
+        if "error" in gate:
+            # A gate that cannot be read changes nothing this reconcile; the
+            # lease below still decides how long a running service may stay.
+            self.say_once(("gate_error", gate["error"]["code"]), gate["reason"])
+            placed = self.placed
+        else:
+            placed = bool(gate["placed"])
+            seen = _supervise_gate_key(gate)
+            if self.refusal is not None and seen != self.gate_seen:
+                self.say(f"the gate answer for {self.node} changed; the refusal "
+                         "hold is lifted")
+                self.refusal = None
+            self.gate_seen = seen
+        if placed and self.refusal is not None:
+            want, key = False, ("refused",)
+            reason = self.reason if self.reason.startswith("held idle") else "held idle"
+            lease = self.lease.release_if_held(self.name, self.lease_state)
+            self.placed, self.want, self.reason, self.lease_state = placed, want, reason, lease
+            self.converge()
+            self.write_instance()
+            self.save()
+            return
+        shared = placed and _supervise_placement(self.name) == "shared"
+        if shared:
+            # A shared service runs on every node it is placed on, so it takes
+            # no lease, and gives up one it held while it was exclusive.
+            lease = self.lease.release_if_held(self.name, self.lease_state)
+            want = True
+            reason = (f"{gate.get('reason') or 'placed'}; a shared service, so it runs on "
+                      "every node it is placed on")
+            key = ("shared",)
+        elif placed:
+            lease = self.lease.acquire(self.name)
+            state = lease.get("state")
+            if state == "held":
+                want = True
+                reason = f"{gate.get('reason') or 'placed'}; this node holds the lease"
+                key: object = ("held",)
+            elif state == "unavailable":
+                want = True
+                reason = (f"{gate.get('reason') or 'placed'}; the lease is unavailable "
+                          f"({(lease.get('error') or {}).get('code')}), so it runs as the "
+                          "gate says")
+                key = ("unavailable",)
+            elif state == "held_elsewhere":
+                want = False
+                reason = (f"refused: the lease for {self.name} is held by "
+                          f"{lease.get('holder')} until {lease.get('expires_at')}; "
+                          "checking again every reconcile")
+                key = ("held_elsewhere", lease.get("holder"))
+            else:
+                want = self.running() and self.lease.still_mine()
+                reason = ("the lease cannot be confirmed: "
+                          f"{(lease.get('error') or {}).get('message')}; "
+                          + ("keeping the service until this node's hold runs out" if want
+                             else "not starting the service until it can be"))
+                key = ("lease_unreachable", want)
+        else:
+            want = False
+            reason = f"not placed on {self.node}: {gate.get('reason')}"
+            key = ("idle", reason)
+            lease = self.lease_state
+        if not want:
+            self.held_down = False
+        if want and not self.want:
+            self.quick_failures = 0
+            self.restart_at = None
+        self.placed, self.want, self.reason, self.lease_state = placed, want, reason, lease
+        if "error" not in gate or placed:
+            self.say_once(key, reason)
+        self.converge()
+        if not placed:
+            # A node the gate turned off gives the service up once it has
+            # stopped it, so the node it was moved to need not wait for the
+            # hold to run out, and never starts it beside this one. Once it
+            # knows it holds none, it asks the store nothing more.
+            self.lease_state = self.lease.release_if_held(self.name, self.lease_state)
+            if self.lease_state.get("released"):
+                self.say(f"released the lease for {self.name}")
+        self.probe_if_due()
+        self.write_instance()
+        self.save()
+
+    def save(self) -> None:
+        child = None
+        if self.child is not None and self.child.poll() is None:
+            child = {"pid": self.child.pid, "pgid": self.child.pid,
+                     "started_at": self.child_started_at}
+        record = {"schema": SUPERVISE_SCHEMA, "service": self.name, "node": self.node,
+                  "runner_pid": os.getpid(), "every": self.every,
+                  "restart": self.restart, "command": self.command,
+                  "tick_at": self.tick_at, "want": self.want, "reason": self.reason,
+                  "running": child is not None, "child": child,
+                  "last_exit": self.last_exit, "gate": self.gate,
+                  "lease": self.lease_state, "refusal": self.refusal}
+        path = _supervise_record_path(self.root, self.name)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+            os.replace(tmp, path)
+        except OSError as exc:
+            self.say_once(("state_unwritable", str(path)),
+                          f"cannot record its state in {path}: {exc}")
+
+    def shutdown(self) -> None:
+        self.want = False
+        self.reason = "the runner is stopping"
+        self.stop("the runner is stopping")
+        if self.lease.mine_until is not None:
+            self.lease_state = self.lease.release(self.name)
+        self.lease.close()
+        if self.instance is not None:
+            self.instance.drop(self.name)
+            self.instance.close()
+        self.save()
+
+
+def _supervise_disconnect() -> None:
+    """Close this process's idle store connection, which the shared database
+    library keeps for its next operation."""
+    try:
+        from capabilities_contract import db
+    except ImportError:
+        return
+    db.disconnect()
+
+
+def _supervise(root: Path, name: str, command: list[str], restart: str, every: int) -> None:
+    """Run one capability service as the gate on this node says, until stopped."""
+    import signal
+    stopping = {"now": False}
+
+    def stop(_signum, _frame):
+        stopping["now"] = True
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, stop)
+    supervisor = _Supervisor(root, name, command, restart, every)
+    lock = _supervise_lock(root, name, stopping, supervisor.say)
+    if lock is None:
+        return
+    supervisor.adopt_orphan()
+    supervisor.say(f"runs {shlex.join(command)} on {supervisor.node} as the gate says, "
+                   f"reconciling every {every}s")
+    next_tick = 0.0
+    try:
+        while not stopping["now"]:
+            now = time.monotonic()
+            if now >= next_tick:
+                supervisor.tick()
+                next_tick = now + every
+                if not supervisor.running():
+                    # Its service not running here, the supervisor holds no
+                    # connection between reconciles.
+                    _supervise_disconnect()
+            else:
+                supervisor.reap()
+                supervisor.converge()
+                if supervisor.probe_if_due():
+                    supervisor.write_instance()
+            time.sleep(max(0.05, min(1.0, next_tick - time.monotonic())))
+    finally:
+        supervisor.shutdown()
+
+
+# A service that runs once per machine for every project that joins it (its
+# descriptor declares `service.machine` and no project command of its own) is
+# supervised once per node: one process, `node supervise <name> --machine`,
+# started by the node manager when any agent on this node places the service
+# here. It takes each placed agent's lease, puts each agent it holds on the
+# service's own list through the service's `service join` verb and takes it off
+# with `service leave`, runs the service's machine command while any agent is
+# on it, and writes one instance row per agent from what the service says of
+# that agent. A machine process it did not start - one an older machine-scope
+# agent runs, or one started by hand - keeps the service: this one then starts
+# nothing and changes no list.
+
+SUPERVISE_MACHINE_SCHEMA = "capabilities.node.machine-supervisor.v1"
+SUPERVISE_MACHINE_STATES = {"served": "ready", "paused": "held", "refused": "unusable",
+                            "error": "unusable"}
+
+
+def _supervise_machine_dir() -> Path:
+    return _STATE_HOME / "capabilities" / "node" / "machine"
+
+
+def _supervise_machine_command(name: str) -> tuple[list[str], list[str]]:
+    """The machine command and machine doctor `name`'s installed service
+    declares (`service.machine`), each [] where it declares none."""
+    machine = _supervise_descriptor(name).get("machine")
+    machine = machine if isinstance(machine, dict) else {}
+
+    def argv(value):
+        return (list(value) if isinstance(value, list) and value
+                and all(isinstance(v, str) and v for v in value) else [])
+    return argv(machine.get("command")), argv(machine.get("doctor"))
+
+
+class _SupervisePlacement(_SuperviseStore):
+    """The agents that live on this node and place one service here, as the
+    store holds them, read the way the node manager reads them."""
+
+    def __init__(self, root: Path, node: str):
+        super().__init__(root)
+        self.node = node
+
+    def _migrate(self, conn, db) -> None:
+        store = _store_module()
+        major, minor = store.STORE_TABLES_VERSION
+        db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
+                   major=major, minor=minor)
+
+    def placed(self, capability: str) -> dict:
+        def work(conn):
+            rows = conn.execute(
+                "SELECT l.agent_id, l.folder FROM capabilities_policy p "
+                "JOIN capabilities_agent_nodes l ON l.agent_id = p.agent_id "
+                "AND l.node = p.node WHERE p.node = %s AND p.capability = %s "
+                "AND p.enabled AND p.service ORDER BY l.agent_id",
+                (self.node, capability)).fetchall()
+            return {"agents": [(agent_id, folder) for agent_id, folder in rows]}
+        return self._run(work)
+
+
+class _MachineSupervisor(_Supervisor):
+    """One machine process of `name` on this node, for the agents here that
+    place it, each under its own lease where the service is exclusive."""
+
+    def __init__(self, root: Path, name: str, command: list[str], restart: str,
+                 every: int):
+        super().__init__(root, name, command, restart, every)
+        self.lease = _SuperviseLease(root, "", self.node, 0)  # unused: a lease per agent
+        self.instance = None
+        self.placement = _SupervisePlacement(root, self.node)
+        self.exclusive = _supervise_placement(name) == "exclusive"
+        self.agents: dict[str, Path] = {}
+        self.leases: dict[str, _SuperviseLease] = {}
+        self.lease_states: dict[str, dict] = {}
+        self.instances: dict[str, _SuperviseInstance] = {}
+        self.admitted: set[str] = set()
+        # The agents this supervisor put on the service's list, with the folder
+        # each was joined from, so it can take each off again after a restart.
+        joined = self.read_record().get("joined")
+        self.joined: dict[str, str] = ({k: v for k, v in joined.items()
+                                        if isinstance(k, str) and isinstance(v, str)}
+                                       if isinstance(joined, dict) else {})
+        self.list_failing: dict[str, str] = {}
+        self.foreign: dict | None = None
+        self.served: dict[str, dict] = {}
+
+    def say(self, message: str) -> None:
+        sys.stderr.write(f"[capabilities supervise {self.name} --machine] {message}\n")
+        sys.stderr.flush()
+
+    def environment(self) -> dict:
+        """A machine process belongs to no project: it is handed none."""
+        env = _snapshot_env()
+        env.pop(ENVELOPE_ENV, None)
+        env.pop(ENVELOPE_ROOT_ENV, None)
+        return env
+
+    def record_path(self) -> Path:
+        return _supervise_machine_dir() / f"{self.name}.json"
+
+    def read_record(self) -> dict:
+        data = _read_json(self.record_path())
+        return (data if isinstance(data, dict)
+                and data.get("schema") == SUPERVISE_MACHINE_SCHEMA else {})
+
+    def adopt_orphan(self) -> None:
+        record = self.read_record()
+        child = record.get("child") if isinstance(record.get("child"), dict) else {}
+        pgid = child.get("pgid")
+        previous = record.get("runner_pid")
+        if not isinstance(pgid, int) or pgid <= 1 or previous == os.getpid():
+            return
+        if isinstance(previous, int) and previous > 1:
+            try:
+                os.kill(previous, 0)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                return
+            else:
+                return
+        if _supervise_group_alive(pgid):
+            self.say(f"stopping process group {pgid} a previous supervisor left running")
+            _supervise_stop_group(pgid)
+
+    def status(self) -> dict | None:
+        """What the service says of its machine process (`service status
+        --machine`), or None where it does not answer."""
+        executable = shutil.which(self.name)
+        if not executable:
+            return None
+        rc, out, _err = _run_script(Path(executable), ["service", "status", "--machine"],
+                                    cwd=self.root, env=_snapshot_env(),
+                                    timeout=min(self.every, SUPERVISE_PROBE_TIMEOUT_SECONDS))
+        try:
+            body = json.loads(out) if rc == 0 else None
+        except ValueError:
+            body = None
+        return body if isinstance(body, dict) else None
+
+    def ours(self, pid) -> bool:
+        if not (isinstance(pid, int) and self.running()):
+            return False
+        try:
+            return os.getpgid(pid) == self.child.pid
+        except (ProcessLookupError, PermissionError):
+            return False
+
+    def list_verb(self, verb: str, agent_id: str) -> bool:
+        """`<name> service join|leave` in the agent's folder; whether it took."""
+        folder = self.agents.get(agent_id) or (Path(self.joined[agent_id])
+                                               if agent_id in self.joined else None)
+        executable = shutil.which(self.name)
+        if folder is None or not executable:
+            return False
+        rc, out, err = _run_script(Path(executable), ["service", verb], cwd=folder,
+                                   env=_snapshot_env(), timeout=120)
+        said = _supervise_refusal_of(err.splitlines())
+        failing = None if rc == 0 else (said.get("message") or (err or out).strip()[-300:]
+                                        or f"exit {rc}")
+        key = f"{verb}:{agent_id}"
+        if failing != self.list_failing.get(key):
+            self.say(f"`{self.name} service {verb}` for {agent_id} in {folder}: {failing}"
+                     if failing else f"{verb}s {agent_id} to the machine process here"
+                     if verb == "join" else f"takes {agent_id} off the machine process here")
+        if failing:
+            self.list_failing[key] = failing
+        else:
+            self.list_failing.pop(key, None)
+        return rc == 0
+
+    def tick(self) -> None:
+        self.tick_at = _supervise_now_iso()
+        self.report_seen()
+        found = self.placement.placed(self.name)
+        if "agents" in found:
+            own = _folder_agent_id(self.root)
+            agents = {}
+            for agent_id, folder in found["agents"]:
+                path = Path(folder) if folder else None
+                if (path is None or _folder_agent_id(path) != agent_id) and agent_id == own:
+                    path = self.root
+                if path is not None and _folder_agent_id(path) == agent_id:
+                    agents[agent_id] = path
+            self.agents = agents
+            self.placed = bool(agents)
+            self.gate = {"placed": self.placed, "agents": sorted(agents)}
+        else:
+            # A store that cannot be read changes nothing this reconcile; each
+            # lease below still decides how long its agent may stay served.
+            self.say_once(("placement_error", (found.get("error") or {}).get("code")),
+                          "cannot read where the service is placed: "
+                          f"{(found.get('error') or {}).get('message')}")
+        status = self.status()
+        pid = (status or {}).get("pid")
+        foreign = (status or {}).get("running") is True and not self.ours(pid)
+        if foreign and not self.running():
+            self.foreign = {"pid": pid}
+            self.want = False
+            self.reason = (f"a machine process of {self.name} this supervisor did not start "
+                           f"(pid {pid}) runs here, so it starts none beside it")
+            self.say_once(("foreign", pid), self.reason)
+            self.write_instance()
+            self.save()
+            return
+        self.foreign = None
+        admitted = set()
+        for agent_id in sorted(set(self.agents) | set(self.leases)):
+            lease = self.leases.get(agent_id)
+            if agent_id not in self.agents:
+                if lease is not None:
+                    self.lease_states[agent_id] = lease.release_if_held(
+                        self.name, self.lease_states.get(agent_id, {}))
+                continue
+            if not self.exclusive:
+                admitted.add(agent_id)
+                continue
+            if lease is None:
+                lease = self.leases[agent_id] = _SuperviseLease(
+                    self.root, agent_id, self.node, self.every * SUPERVISE_LEASE_TTL_RECONCILES)
+            state = lease.acquire(self.name)
+            self.lease_states[agent_id] = state
+            if state.get("state") == "held" or (
+                    state.get("state") not in ("free", "held_elsewhere")
+                    and agent_id in self.admitted and lease.still_mine()):
+                admitted.add(agent_id)
+        if self.refusal is not None and self.gate_seen != tuple(sorted(admitted)):
+            self.say("the agents it serves changed; the refusal hold is lifted")
+            self.refusal = None
+        self.gate_seen = tuple(sorted(admitted))
+        for agent_id in sorted(set(self.joined) - admitted):
+            if self.list_verb("leave", agent_id):
+                self.joined.pop(agent_id, None)
+        for agent_id in sorted(admitted - set(self.joined)):
+            if self.list_verb("join", agent_id):
+                self.joined[agent_id] = str(self.agents[agent_id])
+        self.admitted = admitted
+        want = bool(admitted) and self.refusal is None
+        if not want:
+            self.held_down = False
+        if want and not self.want:
+            self.quick_failures = 0
+            self.restart_at = None
+        self.want = want
+        self.reason = (f"serves {', '.join(sorted(admitted))} on {self.node}" if want else
+                       self.reason if self.refusal is not None else
+                       f"no agent on {self.node} places {self.name} here with its lease held")
+        self.say_once(("want", self.gate_seen, want), self.reason)
+        self.converge()
+        self.served = {row.get("project_id"): row for row in (status or {}).get("projects") or []
+                       if isinstance(row, dict)} if self.running() else {}
+        self.write_instance()
+        self.save()
+
+    def record_error(self) -> None:
+        """Put the failure on the lease of every agent this node holds."""
+        for agent_id, lease in self.leases.items():
+            if lease.mine_until is not None:
+                lease.record_error(self.name, self.last_exit.get("code"),
+                                   self.last_exit.get("error") or "")
+
+    def hold_refused(self) -> None:
+        said = _supervise_refusal_of(self.stderr_tail)
+        self.refusal = {"exit": SUPERVISE_POLICY_EXIT, "at": _supervise_now_iso(), **said}
+        detail = (f"{said['slug']}: {said['message']}" if said
+                  else "it printed no error envelope")
+        self.want = False
+        self.reason = (f"held idle: {self.name} refused to run here with exit "
+                       f"{SUPERVISE_POLICY_EXIT} ({detail}); it is tried again when the "
+                       "agents it serves change or the supervisor restarts")
+        self.say(self.reason)
+        self.write_instance()
+        self.save()
+
+    def agent_row(self, agent_id: str) -> dict | None:
+        """The instance row of one agent placing the service here."""
+        if agent_id not in self.agents:
+            return None
+        if self.foreign is not None:
+            return {"state": "waiting", "problem": self.reason,
+                    "problem_code": "machine_process_elsewhere"}
+        if agent_id not in self.admitted:
+            holder = self.lease_states.get(agent_id, {}).get("holder")
+            return {"state": "waiting",
+                    "problem": (f"the lease for {self.name} is held by {holder}"
+                                if holder and holder != self.node
+                                else "its lease cannot be confirmed"),
+                    "problem_code": ("lease_held_elsewhere" if holder and holder != self.node
+                                     else "lease_unconfirmed")}
+        row = self.instance_row()
+        if row is None:
+            return None
+        served = self.served.get(agent_id)
+        if row["state"] in ("ready", "degraded", "unusable") and served is not None:
+            mapped = SUPERVISE_MACHINE_STATES.get(served.get("state"))
+            if mapped is None:
+                return {**row, "state": "starting", "problem": served.get("reason")}
+            if mapped != "ready":
+                return {**row, "state": mapped, "problem": served.get("reason"),
+                        "problem_code": served.get("state")}
+        elif row["state"] in ("ready", "degraded") and served is None:
+            return {**row, "state": "starting", "problem": "not yet taken up"}
+        return row
+
+    def write_instance(self) -> None:
+        for agent_id in sorted(set(self.agents) | set(self.instances)):
+            instance = self.instances.get(agent_id)
+            if instance is None:
+                instance = self.instances[agent_id] = _SuperviseInstance(
+                    self.root, agent_id, self.node)
+            row = self.agent_row(agent_id)
+            found = instance.drop(self.name) if row is None else instance.put(self.name, row)
+            failing = (found.get("error") or {}).get("code")
+            if failing != self.instance_failing:
+                self.say(f"cannot record what runs here in the store: "
+                         f"{found['error'].get('message')}" if failing
+                         else "records what runs here in the store again")
+            self.instance_failing = failing
+            if row is None and "dropped" in found:
+                self.instances.pop(agent_id, None)
+
+    def probe_if_due(self) -> bool:
+        if not self.running() or self.probe_at is None or time.monotonic() < self.probe_at:
+            return False
+        self.probe = _supervise_readiness(_supervise_machine_command(self.name)[1], self.root,
+                                          min(SUPERVISE_PROBE_TIMEOUT_SECONDS, 2 * self.every))
+        self.probe_at = time.monotonic() + self.every
+        return True
+
+    def save(self) -> None:
+        child = None
+        if self.child is not None and self.child.poll() is None:
+            child = {"pid": self.child.pid, "pgid": self.child.pid,
+                     "started_at": self.child_started_at}
+        record = {"schema": SUPERVISE_MACHINE_SCHEMA, "service": self.name,
+                  "node": self.node, "runner_pid": os.getpid(), "every": self.every,
+                  "restart": self.restart, "command": self.command, "tick_at": self.tick_at,
+                  "want": self.want, "reason": self.reason, "running": child is not None,
+                  "child": child, "last_exit": self.last_exit,
+                  "agents": sorted(self.agents), "admitted": sorted(self.admitted),
+                  "joined": dict(sorted(self.joined.items())), "foreign": self.foreign,
+                  "leases": self.lease_states, "refusal": self.refusal}
+        path = self.record_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+            os.replace(tmp, path)
+        except OSError as exc:
+            self.say_once(("state_unwritable", str(path)),
+                          f"cannot record its state in {path}: {exc}")
+
+    def shutdown(self) -> None:
+        self.want = False
+        self.reason = "the supervisor is stopping"
+        self.stop("the supervisor is stopping")
+        for agent_id in sorted(self.joined):
+            if self.list_verb("leave", agent_id):
+                self.joined.pop(agent_id, None)
+        for agent_id, lease in self.leases.items():
+            if lease.mine_until is not None:
+                self.lease_states[agent_id] = lease.release(self.name)
+            lease.close()
+        self.agents = {}
+        self.write_instance()
+        for instance in self.instances.values():
+            instance.close()
+        self.placement.close()
+        self.save()
+
+
+def _supervise_machine(root: Path, name: str, restart: str | None, every: int) -> None:
+    """Run `name`'s machine process on this node for the agents that place it."""
+    import signal
+    command, _doctor = _supervise_machine_command(name)
+    if not command:
+        _die(3, "no_service", f"{name} is not installed here or declares no machine service")
+    if restart not in SUPERVISE_RESTART_POLICIES:
+        restart = "unless-stopped"
+    stopping = {"now": False}
+
+    def stop(_signum, _frame):
+        stopping["now"] = True
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, stop)
+    supervisor = _MachineSupervisor(root, name, command, restart, every)
+    path = supervisor.record_path().with_suffix(".lock")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock = path.open("a")
+    except OSError as exc:
+        _die(6, "state_unwritable", f"cannot take the machine supervisor's lock {path}: {exc}")
+    said = False
+    while not stopping["now"]:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if not said:
+                supervisor.say("another machine supervisor of this service runs on this "
+                               "machine; this one starts nothing and waits for it to stop")
+                said = True
+            time.sleep(2)
+    if stopping["now"]:
+        return
+    supervisor.adopt_orphan()
+    supervisor.say(f"runs {shlex.join(command)} on {supervisor.node} for the agents that "
+                   f"place it here, reconciling every {every}s")
+    next_tick = 0.0
+    try:
+        while not stopping["now"]:
+            now = time.monotonic()
+            if now >= next_tick:
+                supervisor.tick()
+                next_tick = now + every
+                if not supervisor.running():
+                    _supervise_disconnect()
+            else:
+                supervisor.reap()
+                supervisor.converge()
+                if supervisor.probe_if_due():
+                    supervisor.write_instance()
+            time.sleep(max(0.05, min(1.0, next_tick - time.monotonic())))
+    finally:
+        supervisor.shutdown()
+
+
 def _node_supervise(args: list[str]) -> None:
-    pos, opts = _kernel_options(args, {"--agent"}, set(), "node supervise")
+    command: list[str] = []
+    if "--" in args:
+        split = args.index("--")
+        args, command = args[:split], args[split + 1:]
+        if not command:
+            _die(6, "input", "node supervise needs the service command after `--`",
+                 "capabilities node supervise <name> [--every N] [--restart POLICY] "
+                 "[-- <command...>]")
+    pos, opts = _kernel_options(args, {"--agent", "--every", "--restart"}, {"--machine"},
+                                "node supervise")
     if len(pos) != 1:
         _die(6, "input", "node supervise takes the capability whose service it runs",
-             "capabilities node supervise <name> [--agent <id>]")
+             "capabilities node supervise <name> [--agent <id>] [--every N] "
+             "[--restart POLICY] [-- <command...>]")
     name = pos[0]
+    if not re.fullmatch(r"[a-z][a-z0-9_-]*", name):
+        _die(6, "input", f"node supervise needs a capability name, not {name!r}")
+    restart = opts.get("--restart")
+    if restart is not None and restart not in SUPERVISE_RESTART_POLICIES:
+        _die(6, "input", f"--restart takes one of {', '.join(SUPERVISE_RESTART_POLICIES)}")
+    every = opts.get("--every")
+    low, high = SUPERVISE_EVERY_BOUNDS
+    if every is not None and not (re.fullmatch(r"-?[0-9]+", every)
+                                  and low <= int(every) <= high):
+        _die(6, "input", f"--every must be from {low} to {high} seconds")
+    if "--machine" in opts and (command or opts.get("--agent")):
+        _die(6, "input", "node supervise --machine runs the service's own machine command "
+             "for every agent here that places it: it takes no --agent and no command")
+    _read_only_gate("node supervise")
     root = _require_project()
+    if "--machine" in opts:
+        _supervise_machine(root, name, restart,
+                           int(every) if every is not None else _supervise_every(root))
+        return
     agent = opts.get("--agent")
     bound = _folder_agent_id(root)
     if agent and bound != agent:
         _die(6, "agent_mismatch",
              f"{root} is bound to agent {bound or 'none'}, not {agent}; the job is stale "
              "and its node manager removes it")
-    command, why = _node_service_command(name)
-    if why is not None:
-        _die(3, "no_service", why)
-    service = _installed_service(name) or {}
-    restart = (service.get("deploy") or {}).get("restart")
-    deployment = shutil.which("deployment")
-    if not deployment:
-        _die(3, "deployment_unavailable",
-             "a service is supervised through `deployment runner`, and deployment is not "
-             "installed on this node", "run `capabilities install deployment`")
-    argv = [deployment, "runner", name]
-    if isinstance(restart, str) and restart:
-        argv += ["--restart", restart]
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os.execv(deployment, [*argv, "--", *command])
+    if not command:
+        command, why = _node_service_command(name)
+        if why is not None:
+            _die(3, "no_service", why)
+        if restart is None:
+            declared = (_supervise_descriptor(name).get("deploy") or {}).get("restart")
+            restart = declared if isinstance(declared, str) and declared else None
+    if restart not in SUPERVISE_RESTART_POLICIES:
+        restart = "unless-stopped"
+    _supervise(root, name, command, restart,
+               int(every) if every is not None else _supervise_every(root))
 
 
 # ---------------------------------------------------------------- service handles
