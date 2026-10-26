@@ -145,6 +145,14 @@ def test_every_change_is_announced_on_commit(store):
                        "entry": str(row["id"]), "event": payload["event"]}
 
 
+def test_every_change_raises_its_projects_version_as_it_commits(store):
+    from capabilities_contract import db
+    follower = db.Follower([E.CHANNEL], application_name="memory-test", setting=store.setting)
+    before = follower.read(store.conn).get((E.CHANNEL, P), 0)
+    add(store, "versioned")
+    assert follower.read(store.conn)[(E.CHANNEL, P)] == before + 1
+
+
 def test_a_pass_applies_under_one_id_and_undoes(store):
     a = add(store, "a", "alpha")
     b = add(store, "b", "beta")

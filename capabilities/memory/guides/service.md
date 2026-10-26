@@ -4,7 +4,7 @@ How the memory service keeps each project's block rendered and consolidated, whi
 
 ## Why a service
 
-The block a session reads is a file in the project's envelope, rendered from the store. Every write through the command line renders it again, but a write made on another machine reaches this machine only through the store, and the window moves with the clock. The service listens to the store and renders each project it serves when that project's memory changes, so the file stays current without anyone asking.
+The block a session reads is a file in the project's envelope, rendered from the store. Every write through the command line renders it again, but a write made on another machine reaches this machine only through the store, and the window moves with the clock. The service follows each project's change version in the store, about once a second, and renders each project it serves when that project's memory changes, so the file stays current without anyone asking.
 
 ## Choosing a mode
 

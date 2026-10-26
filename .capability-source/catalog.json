@@ -117,7 +117,7 @@
     },
     "memory": {
       "path": "capabilities/memory",
-      "payload_sha256": "a685e07e2103bd64ce9db8634ce17970f8f094120e036f1f95f95f91a07b5ab0",
+      "payload_sha256": "2113e94437659b192c3503787b4f7cdd8958bc604c72bda74e52e637e31246b7",
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a block in every session's context that says how to record and search them and how many there are, and a service that keeps the block current and consolidates the entries."
     },
     "notion": {

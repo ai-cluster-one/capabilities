@@ -61,7 +61,7 @@ def test_project_mode_renders_on_every_change_and_reloads(world):
     start(world, root)
     until(lambda: sidecar(root).get("rendered_by") == "the memory service")
     # A change the service did not make reaches the file through the store's
-    # notification: written straight into the store, as another machine would.
+    # change versions: written straight into the store, as another machine would.
     from _cli import engine, setting
     E = engine()
     with E.Store(setting(world.schema)).open() as store:
@@ -160,9 +160,9 @@ def test_the_service_grooms_a_window_that_no_longer_fits(world, tmp_path):
     assert groom["actor"].startswith("memory service on ")
 
 
-def test_between_steps_the_service_holds_its_listener_and_one_working_connection(world):
-    """The service listens on one session connection and puts each step's
-    questions on the process's one working connection, kept between steps."""
+def test_between_steps_the_service_holds_one_working_connection_and_no_listener(world):
+    """The service follows the store's change versions on the process's one
+    working connection, kept between steps, and holds no listening session."""
     import psycopg
     from _cli import DSN
     root = world.project("p")
@@ -187,4 +187,4 @@ def test_between_steps_the_service_holds_its_listener_and_one_working_connection
                 seen[pid] = (first, now, name)
             time.sleep(0.2)
     held = sorted(name for first, last, name in seen.values() if last - first >= 4.0)
-    assert held == ["memory", "memory-listen"], seen
+    assert held == ["memory"], seen

@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-10-26 — The service follows the store's change versions and holds no listening session
+
+Every event written to `memory_events` now also raises its project's version of the `memory_changed` channel in the store's change versions (`schema_channel`), through the trigger, in the writer's own transaction (ledger step `0005-changed-versions`, schema 1.1), so an event any release writes moves it. The same trigger keeps sending the `memory_changed` notification for a service of an earlier release that still listens. The service no longer opens its `memory-listen` session connection: it reads the versions once a second on its working connection with the library's `Follower` and renders a changed project after the half-second debounce, about a second after the write. A release at 1.0 reads the 1.1 tables as current. `service status` shows each store's `following`; `listening` stays in the row and is false.
+
 ## 2026-10-24 — Turns run on callva-harness-runner 0.10.1
 
 The runner is pinned at 0.10.1 in place of 0.9.0. Claude turns run through claude-agent-sdk 0.2.174, and a claude CLI up to 2.1.310 runs without the runner's out-of-range warning; codex is unchanged. The runner's 0.10.0 additions are new profile knobs only, so a turn runs as before.

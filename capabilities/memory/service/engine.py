@@ -15,8 +15,8 @@ machine's opt-in list, through the same code.
 Runtime state lives in the PostgreSQL the project resolves to, under the
 `memory_` prefix and the `memory` migration ledger: `memory_entries`, one row
 per entry, whose text never changes once written, and `memory_events`, the
-append-only trail of every change, which the store announces on the
-`memory_changed` channel as it commits.
+append-only trail of every change, which raises the project's version of the
+`memory_changed` channel in the store's change versions as it commits.
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ import hashlib
 import json
 import os
 import re
-import select
 import signal
 import socket
 import subprocess
@@ -41,7 +40,7 @@ from typing import Any, Callable, Iterable
 
 LEDGER_OWNER = "memory"
 LEDGER_MAJOR = 1
-LEDGER_MINOR = 0
+LEDGER_MINOR = 1
 CHANNEL = "memory_changed"
 
 LEDGER_STEPS = [
@@ -139,6 +138,26 @@ LEDGER_STEPS = [
     END $$;
     CREATE TRIGGER memory_notify AFTER INSERT ON memory_events
         FOR EACH ROW EXECUTE FUNCTION memory_notify();
+    """),
+    # Every event raises its project's version of `memory_changed` in the
+    # store's change versions, in the writer's own transaction, so an event any
+    # release writes moves the version the service follows. The notification
+    # stays beside it for a service of an earlier release that still listens.
+    ("0005-changed-versions", """
+    CREATE OR REPLACE FUNCTION memory_notify() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        PERFORM pg_notify('memory_changed', json_build_object(
+            'schema', tg_table_schema, 'project', new.project_id, 'kind', new.kind,
+            'entry', new.entry_id, 'event', new.seq)::text);
+        IF to_regclass(format('%I.schema_channel', tg_table_schema)) IS NOT NULL THEN
+            EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version) '
+                           'VALUES (%L, $1, 1) ON CONFLICT (channel, scope) '
+                           'DO UPDATE SET version = c.version + 1',
+                           tg_table_schema, 'memory_changed')
+                USING new.project_id;
+        END IF;
+        RETURN NULL;
+    END $$;
     """),
 ]
 
@@ -374,8 +393,8 @@ def event_out(row: dict) -> dict:
 class Store:
     """One connection to the store a project resolves, bound to its schema.
     Every write runs in one transaction, serialised per project, and leaves
-    an event; the store announces each event on `memory_changed` when the
-    transaction commits.
+    an event; each event raises the project's version of `memory_changed`,
+    committed with it.
 
     It is a transaction connection, at the store's transaction address where
     one is named and carrying no session state, unless `session` asks for a
@@ -1421,6 +1440,7 @@ RERENDER_SECONDS = 3600.0
 GROOM_CHECK_SECONDS = 300.0
 PUBLISH_SECONDS = 2.0
 DEBOUNCE_SECONDS = 0.5
+FOLLOW_SECONDS = 1.0
 RECONNECT_FIRST = 1.0
 RECONNECT_LONGEST = 30.0
 
@@ -1430,17 +1450,22 @@ def default_node() -> str:
 
 
 class StoreLink:
-    """The service's connections to one store, shared by every project on it:
-    the session connection that listens, held, and the transaction connection
-    its questions go on, opened when a step first asks one and closed when the
-    step ends (`release`), so between steps it holds only the listener. The
-    tables are migrated once, when the link first connects."""
+    """The service's connection to one store, shared by every project on it:
+    the transaction connection its questions go on, opened when a step first
+    asks one and closed when the step ends (`release`), so between steps it
+    holds no session. It learns what changed by following the projects'
+    versions of `memory_changed` on that connection, once a step. The tables
+    are migrated once, when the link first connects."""
 
     def __init__(self, setting):
         self.setting = setting
         self._store: Store | None = None
         self.migrated = False
-        self.listener = None
+        self.live = False
+        # Kept across a lost connection, so the first poll after it reports
+        # everything that moved meanwhile.
+        self.follower = None
+        self.follow_error: str | None = None
         self.error: str | None = None
         self.retry_at = 0.0
         self.delay = RECONNECT_FIRST
@@ -1462,7 +1487,7 @@ class StoreLink:
 
     @property
     def connected(self) -> bool:
-        return self.migrated and self.listener is not None
+        return self.migrated and self.live
 
     def ensure(self, log: Callable[[str], None]) -> bool:
         if self.connected:
@@ -1470,14 +1495,8 @@ class StoreLink:
         if time.monotonic() < self.retry_at:
             return False
         try:
-            if not self.migrated:
-                self.store  # noqa: B018 - opens it, migrating the tables once
-            if self.listener is None:
-                conn = database().connect(application_name="memory-listen",
-                                          setting=self.setting)
-                conn.autocommit = True
-                conn.execute(f"LISTEN {CHANNEL}")
-                self.listener = conn
+            self.store  # noqa: B018 - opens it, migrating the tables once
+            self.live = True
         except Exception as exc:
             why = getattr(exc, "message", None) or f"{type(exc).__name__}: {exc}"
             if why != self.error:
@@ -1502,25 +1521,24 @@ class StoreLink:
 
     def drop(self) -> None:
         self.release()
-        if self.listener is not None:
-            with contextlib.suppress(Exception):
-                self.listener.close()
-        self.listener = None
+        self.live = False
 
-    def notes(self) -> list[dict]:
-        """What the store announced since the last ask, without waiting."""
-        if self.listener is None:
-            return []
-        out = []
-        for note in self.listener.notifies(timeout=0):
-            with contextlib.suppress(ValueError):
-                out.append(json.loads(note.payload))
-        return out
+    def changes(self) -> set[str]:
+        """The projects whose version of `memory_changed` moved since the last
+        ask, read in one query on this step's connection; on the first ask,
+        every project the store holds a version for."""
+        if self.follower is None:
+            self.follower = database().Follower([CHANNEL], application_name="memory-service",
+                                                setting=self.setting)
+        moved = self.follower.poll(self.store.conn)
+        return {scope for (_, scope) in moved}
 
     def row(self) -> dict:
+        # `listening` stays in the row for a reader of the earlier shape; the
+        # link holds no listening session.
         return {"store": store_label(self.setting), "schema": self.setting.schema,
-                "connected": self.connected, "listening": self.listener is not None,
-                "error": self.error}
+                "connected": self.connected, "listening": False,
+                "following": self.follower is not None, "error": self.error}
 
 
 class Slot:
@@ -1677,7 +1695,7 @@ class Slot:
         self.engine.changed = True
 
     def poll(self) -> None:
-        """A notification lost with a connection is found here: the store's
+        """A change the versions did not show is found here: the store's
         newest event against the one the file is current to."""
         self.next_poll = time.monotonic() + POLL_SECONDS
         link = self.link
@@ -1903,21 +1921,26 @@ class Engine:
                              f"max_grooms {self.settings.get('max_grooms')})")
             while not self.stopping.is_set():
                 self.step()
-                self.wait(1.0)
+                self.wait(self.until_next())
         finally:
             self.shutdown()
             with contextlib.suppress(OSError):
                 (self.state_dir / PID_FILE).unlink()
             handle.close()
 
+    def until_next(self) -> float:
+        """How long until the next step: the follow interval, or sooner when a
+        changed project's debounce ends before it."""
+        seconds = FOLLOW_SECONDS
+        now = time.monotonic()
+        for slot in self.slots.values():
+            if slot.plan is not None and slot.dirty_at is not None:
+                seconds = min(seconds, slot.dirty_at + DEBOUNCE_SECONDS - now)
+        return max(0.05, seconds)
+
     def wait(self, seconds: float) -> None:
-        """Until a store announces something, or `seconds` pass."""
-        listeners = [link.listener for link in self.links.values() if link.listener is not None]
-        if not listeners:
-            self.stopping.wait(seconds)
-            return
-        with contextlib.suppress(OSError, ValueError, InterruptedError):
-            select.select(listeners, [], [], seconds)
+        """Until `seconds` pass or the process is asked to stop."""
+        self.stopping.wait(seconds)
 
     def step(self) -> None:
         if self.reload_requested.is_set():
@@ -1940,7 +1963,7 @@ class Engine:
                     slot.state, slot.reason = refusal
                     slot.release(f"no longer served: {refusal[0]}: {refusal[1]}")
                     slot.next_admit = time.monotonic() + ADMIT_SECONDS
-        self.listen()
+        self.follow()
         cap = int(self.settings.get("max_grooms") or 1)
         for slot in self.slots.values():
             if slot.reap_groom():
@@ -1959,22 +1982,30 @@ class Engine:
             link.release()
         self.publish(force=self.changed)
 
-    def listen(self) -> None:
-        """Take what every store announced, and mark the projects it names."""
+    def follow(self) -> None:
+        """Read which projects every store's versions say changed, and mark
+        them."""
         for link in list(self.links.values()):
             if not link.ensure(self.log_machine):
                 continue
             try:
-                notes = link.notes()
+                moved = link.changes()
             except Exception as exc:
-                link.lost(exc, self.log_machine)
-                continue
-            for note in notes:
-                if note.get("schema") != link.setting.schema:
+                if _connection_lost(exc):
+                    link.lost(exc, self.log_machine)
                     continue
-                for slot in self.slots.values():
-                    if slot.project_id == note.get("project") and slot.link is link:
-                        slot.dirty_at = slot.dirty_at or time.monotonic()
+                # A store whose versions do not read leaves its projects to
+                # the poll behind them.
+                why = getattr(exc, "message", None) or f"{type(exc).__name__}: {exc}"
+                if why != link.follow_error:
+                    self.log_machine(f"store {link.setting.schema}: versions do not read, "
+                                     f"polling: {why}")
+                link.follow_error = why
+                continue
+            link.follow_error = None
+            for slot in self.slots.values():
+                if slot.project_id in moved and slot.link is link:
+                    slot.dirty_at = slot.dirty_at or time.monotonic()
 
     def take_list(self) -> None:
         witness = self.host.list_witness()

@@ -166,9 +166,11 @@ MOVING IN AND OUT
       one JSON document; --out writes it to PATH instead.
 
 SERVICE  (memory service <verb> [--machine])
-  The service keeps every served project's block rendered: it listens on the
-  store's notification channel, renders a project again when its memory
-  changes, and renders hourly besides so the window moves with the clock. It
+  The service keeps every served project's block rendered: it follows each
+  project's version of the memory_changed channel in the store's change
+  versions about once a second on its working connection, holding no
+  listening session, renders a project again when its memory changes, and
+  renders hourly besides so the window moves with the clock. It
   runs a grooming pass for a project - `memory groom --apply` as a child in
   the project's root with the project's own environment - when the window no
   longer fits (SETTINGS), no pass ran for the project within
@@ -244,10 +246,13 @@ STORE
   store set` writes; the first level that answers is used whole. The store
   refuses an edit of an entry's text, a status move other than active to
   superseded or dropped and back, any change to the trail, and a delete other
-  than `drop --purge`. It announces every change on the channel
-  `memory_changed` as the change commits, with the payload
-  {"schema", "project", "kind", "entry", "event"} - ids only, never text - so
-  a reader listens rather than polls.
+  than `drop --purge`. Every change raises the project's version of the
+  channel `memory_changed` in the store's change versions (schema_channel,
+  scope the project id) in the writer's own transaction, so a reader follows
+  the version rather than listening. For a reader of an earlier release the
+  store also sends the notification `memory_changed` as the change commits,
+  with the payload {"schema", "project", "kind", "entry", "event"} - ids
+  only, never text.
 
 CONTRACT VERBS
   memory help                  this text
