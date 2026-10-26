@@ -918,28 +918,35 @@ SERVICE
   restart. Otherwise `state` is `paused` while the pause holds every lane, and
   `served`.
 
-  It wakes when the store notifies that a task of this project became
+  It wakes when the store's change versions say a task of this project became
   claimable - inserted in todo, moved to todo, or its pickup changed while in
   todo; a task handed to a worker in `waiting` is noticed at the poll - at every poll, at the earliest pickup or lease still ahead, and when
-  one of its turns claims or ends. The notification is a trigger among the
-  tables STORE describes, which the service brings up to this version once as
-  it starts; one channel serves the whole database, and its payload names the
-  schema and the project, so a daemon acts only on its own. A service whose
+  one of its turns claims or ends. A trigger among the tables STORE describes,
+  which the service brings up to this version once as it starts, raises the
+  project's version of `tasks_claimable` in the store's change versions
+  (schema_channel, scope the project id) in the writer's own transaction, and
+  the daemon reads those versions about once a second, holding no listening
+  session, so a daemon acts only on its own project. For a service of an
+  earlier release that still listens, the same trigger also sends the
+  `tasks_claimable` notification, whose payload names the schema and the
+  project. A service whose
   project resolves no database (STORE) refuses to run, exit 6
   `store_not_configured`, and `service doctor` says the same. A lapsed
   lease and an ended wait are put back by a claim and nothing else, so on the
   poll, with nothing else to start, a daemon that sees one due starts a turn
   whose claim puts it back.
 
-  The daemon holds one connection to the store for as long as it runs, the
-  session connection it listens on, at the store's address. The questions of
+  The daemon holds one connection to the store for as long as it runs, a
+  session connection at the store's address that carries the lock saying a
+  service serves the project, and on which it reads the change versions; it
+  listens for nothing. The questions of
   each pass - whether a lane would take something, whether a claim would put
   something back, the next pickup - go on one transaction connection opened
   for that pass, at the store's transaction address where one is named
-  (STORE), and closed at its end; idle, it holds only the listener. The store
+  (STORE), and closed at its end; idle, it holds only that held connection. The store
   cuts off any question that runs past 30s, and the daemon counts that
-  connection lost. Every 2 minutes the listener carries a `select 1`, so a
-  proxy in front of the store does not close it as idle. Its turns are `tasks
+  connection lost. Every 2 minutes the held connection carries a `select 1`
+  besides. Its turns are `tasks
   run` commands and open connections of their own.
 
   The daemon outlives the store being away. Its running turns are left to
@@ -955,7 +962,9 @@ SERVICE
   no turn.
   `service status` shows, under `stores`, each store the daemon reaches: how
   many connections it has opened to it since it started, when it last opened
-  one, whether it is listening, and the error that has it away, if any.
+  one, whether it holds the connection it reads the versions on (`listening`,
+  named as an earlier release named it), and the error that has it away, if
+  any.
   `service doctor` reports the store being away as a warning while the daemon
   runs, so a supervisor probing it does not restart the daemon for an outage.
 
@@ -999,9 +1008,10 @@ SERVICE
   profiles they name - is still compared, and a change there still fails it;
   what the store holds, the stored workers and the profiles they name, cannot
   be told then, and `service doctor` does not call the daemon stale for it.
-  A stored worker or hook saved or retired is announced by the store, on
-  the channel `tasks_declaration` beside the claimable one: a daemon that
-  hears it, or that opens its listener again after losing it, asks for the
+  A stored worker or hook saved or retired is announced by the store, as
+  the project's version of `tasks_declaration` beside the claimable one, with
+  its notification beside it for an earlier release: a daemon that reads it
+  move, or that opens its held connection again after losing it, asks for the
   declaration standing then and takes it up as a reload does when it moved,
   so `service doctor` and `service status` stay current with no reload.
   `service reload` validates them first and refuses
@@ -1046,7 +1056,7 @@ SERVICE
 
   `service pause` holds the conveyor without stopping the daemon: while it
   holds, the daemon starts no new turn on the lanes it names, or on every lane
-  when it names none, and goes on polling, listening and ending what finishes.
+  when it names none, and goes on polling, following and ending what finishes.
   Turns already running are not touched and finish on their own. `service
   resume` lifts it on the lanes it names, or everywhere; resuming one lane
   while every lane is paused leaves each other lane paused by name. A name
@@ -1100,10 +1110,10 @@ SERVICE
   working directory and holds its pid, its status `daemon.json` and its log.
   It loads no project's environment. Each project it serves is on the
   database resolved for that project's root (STORE), read once as the project
-  is admitted. It holds one listener for each distinct database, shared by
-  every project on it, puts each pass's questions to that database on one
-  connection opened for the pass, and hands each
-  notification to the project whose schema and id it names. A turn it starts
+  is admitted. It holds one connection for each distinct database, shared by
+  every project on it, reads the change versions on it, puts each pass's
+  questions to that database on one connection opened for the pass, and hands
+  each version that moved to the project whose id it names. A turn it starts
   is handed its project's database in the environment and uses exactly it
   (STORE).
 
@@ -1188,8 +1198,8 @@ SERVICE
   process it answers `running` false and every entry with `present` and
   `enabled_explicitly`. `doctor --machine` exits 0 while the process holds its
   lock, published its status within twice its publish interval, runs the
-  machine settings on disk and each store is listening or being asked for
-  again; a project in `error` or `refused` fails it not, since restarting
+  machine settings on disk and each store's held connection is up or being
+  asked for again; a project in `error` or `refused` fails it not, since restarting
   the process cannot repair a project. `doctor` in a joined project fails
   while that project is not `served` or `paused`. A stop of the machine
   process leaves every project's running turns running, and `stop --machine
@@ -1659,8 +1669,10 @@ RUNS
 WATCH
   tasks watch [--project ID | --all-projects] [--json]
 
-  A read that does not end. It holds one connection to the store, listens for
-  the store's change notification, and prints one JSON object per line on
+  A read that does not end. It holds one connection to the store, follows the
+  version of `tasks_watch` the store raises for the project (every project's
+  under --all-projects) about once a second, holding no listening session,
+  and prints one JSON object per line on
   stdout, flushing each line as it is written, until it is stopped. It writes
   nothing and needs no allow_write. Its scope is the project scope `list`
   takes - the project the command runs in, `--project ID`, or `--all-projects`
@@ -1670,7 +1682,7 @@ WATCH
   Each line is an object whose `event` names its shape:
 
     {"event": "ready", "store": S, "project": P, "all_projects": B}
-        first, once listening. `store` is the digest `list` carries, `project`
+        first, once following. `store` is the digest `list` carries, `project`
         the project read, null under --all-projects. Read whatever you hold
         after this line rather than before it, and no change falls between.
     {"event": K, "task": ROW}
@@ -1681,8 +1693,9 @@ WATCH
         row prints it, read when the change arrives, so it is the task as it
         is now: a claim announces `run_started` with the task shown
         `in_progress`, and the end of a raise `run_ended` with the status it
-        rests in, a move the work made announcing `task_changed` as well. Changes committed together arrive together, one line per kind
-        and task, so a burst that moves one task twice prints it once.
+        rests in, a move the work made announcing `task_changed` as well. Changes read together arrive together, one line per kind
+        and task, so a burst that moves one task twice within a read
+        prints it once.
     {"event": "counts", "counts": {STATUS: N, ...}, "total": N}
         after each burst of change lines and after each resync: what `counts`
         answers for the same scope.
@@ -1699,10 +1712,15 @@ WATCH
         after the catch-up: re-read the counts and anything you hold, because
         what happened while the watch was away is known only up to this line.
 
-  Tasks are never deleted, so no line removes one. Notifications come from
+  Tasks are never deleted, so no line removes one. The version is raised by
   triggers on the three tables STORE describes; they fire on
-  every write whichever path made it, and only when it commits, so work that
-  rolls back prints nothing.
+  every write whichever path made it, and are seen only when it commits, so
+  work that rolls back prints nothing. When it moves, the watch reads the
+  tasks in scope touched since its last read, less the catch-up's two-minute
+  margin, and tells each kind from what it held of the task at that read: its
+  last move, and how many trail entries, raises and ended raises it had. For
+  a watch of an earlier release the triggers also send the `tasks_watch`
+  notification.
 
   The connection is proven by a round trip every 30 seconds, and one not back
   within 15 is a connection lost; TCP keepalives are on as well. It shows in
@@ -1740,9 +1758,12 @@ STORE
   Where the setting also names a transaction address (AGENTKIT_DB_TRANSACTION_HOST
   and AGENTKIT_DB_TRANSACTION_PORT; `capabilities help` gives the store setting),
   every command, every turn and the service's questions connect there, on
-  connections that carry no session state, and only what holds LISTEN or a
-  session lock - the service's listener, `watch`, `workers import --apply` -
+  connections that carry no session state, and only what holds a session
+  connection - the service's held connection, `watch`, `workers import --apply` -
   connects to the store's address. Without one, everything uses the one address.
+  None of them listens: what changed is read from the store's change
+  versions (schema_channel), which the tables' triggers raise as each write
+  commits.
 
   A turn reaches the store its raise lives in, whatever the project's env
   files say by then. The service hands each turn it starts the store it
@@ -2273,6 +2294,18 @@ def _connect(entry: dict | None, *, raising: bool = False, waiting: bool | None 
         raise
     conn.row_factory = dict_row
     return conn
+
+
+def _follow(follower, conn) -> dict:
+    """What the contract's `follower` reports moved, polled on `conn`, one of this
+    capability's connections: those hand out rows as dicts, and the follower
+    reads its rows as tuples."""
+    from psycopg.rows import tuple_row
+    factory, conn.row_factory = conn.row_factory, tuple_row
+    try:
+        return follower.poll(conn)
+    finally:
+        conn.row_factory = factory
 
 
 def _sever_after(conn, seconds: float):
@@ -9916,6 +9949,8 @@ _WATCH_RETRY_LONGEST = 30.0
 # an earlier moment than the one it was missed after.
 _WATCH_CATCH_UP_GRACE = "2 minutes"
 _WATCH_KINDS = ("task_changed", "activity_added", "run_started", "run_ended")
+# How often the watch reads the version of the store's watch channel it follows.
+_WATCH_FOLLOW_SECONDS = 1.0
 
 
 class _WatchStop(BaseException):
@@ -9944,7 +9979,14 @@ def _tally(cur, where: str, params: list) -> dict:
 class _Watch:
     """One held connection and what it has printed. Everything it prints is read
     on that connection, through the scope `list` reads, so a line never names a
-    task the scope could not read."""
+    task the scope could not read.
+
+    It listens for nothing. It follows the version of `tasks_watch` the store
+    raises for the project, or for every project under --all-projects, and when
+    it moves reads the tasks in scope touched since its last read, less the
+    catch-up's grace, telling which kinds of change each had from what it held
+    of the task at its last read: its last move, and how many trail entries,
+    raises and ended raises it had."""
 
     def __init__(self, entry, opts: dict):
         self.entry = entry
@@ -9957,6 +9999,15 @@ class _Watch:
         self.live_at = None
         self.owed = None
         self.stdin = self._stdin()
+        # What follows the watch channel's version; kept across a lost
+        # connection. What each task touched within the window read last held,
+        # the server's clock that read began at, and whether a read is owed: set
+        # by a move and by a connection opened, cleared by a read that succeeds.
+        self.follower = None
+        self.marks: dict = {}
+        self.marked_from = None
+        self.read_at = None
+        self.due = False
 
     @staticmethod
     def _stdin() -> int | None:
@@ -9984,10 +10035,12 @@ class _Watch:
             return call()
 
     def open(self) -> str | None:
-        """Connect, with the store's tables and the triggers that announce what a
-        watch reports in place, and listen. Answers the store's digest."""
+        """Connect, with the store's tables and the triggers that raise the
+        version a watch follows in place, and take where the tasks and the
+        version stand. Answers the store's digest."""
         conn = _connect(self.entry, raising=True, application_name=_WATCH_APPLICATION,
                         session=True)
+        db = _db()
         try:
             conn.autocommit = True
             self.conn = conn
@@ -9997,8 +10050,20 @@ class _Watch:
                     return _store_identity(cur)
 
             store = self.bounded(check)
-            self.bounded(lambda: conn.execute(f"listen {WATCH_CHANNEL}"))
             self.prove()
+            # The tasks first and the version after, and a read owed once both
+            # are taken: a change committed between the two is read then, and
+            # one after them moves the version.
+            self.read()
+            if self.follower is None:
+                follow = [(WATCH_CHANNEL, self.project)] if self.project else [WATCH_CHANNEL]
+                self.follower = db.Follower(follow, application_name=_WATCH_APPLICATION,
+                                            setting=_store_setting(True))
+            self.bounded(lambda: _follow(self.follower, conn))
+            self.due = True
+        except db.DbError as exc:
+            self.close()
+            raise _store_refusal(exc) from exc
         except BaseException:
             self.close()
             raise
@@ -10032,25 +10097,90 @@ class _Watch:
                 return _tally(cur, self.where, self.params)
         self.line({"event": "counts", **self.bounded(read)})
 
-    def deliver(self, notes) -> None:
-        """One line per kind and task, in the order they arrived, each carrying
-        the task as it reads now. Notifications for another schema or another
-        project are not this watch's, and are dropped before the store is asked."""
+    def window(self, since) -> list[dict]:
+        """What each task in scope touched since `since`, less the grace, holds:
+        its last move, and how many trail entries, raises and ended raises it
+        has, with the newest moment of each. The grace covers a change whose
+        transaction began before `since` and committed after it."""
+        raises = (f"from {SCHEMA}.tasks_executions e where e.task_id = t.id "
+                  f"and {_a_raise()}")
+        return self.rows_plain(
+            f"""select * from (select t.id, t.updated_at,
+                       (select count(*) from {SCHEMA}.tasks_activities a
+                         where a.task_id = t.id) as activities,
+                       (select max(a.created_at) from {SCHEMA}.tasks_activities a
+                         where a.task_id = t.id) as activity_at,
+                       (select count(*) {raises}) as runs,
+                       (select max(e.started_at) {raises}) as started_at,
+                       (select count(*) {raises} and e.ended_at is not null) as ended,
+                       (select max(e.ended_at) {raises}) as ended_at,
+                       {_touched()} as last_touched_at
+                  from {SCHEMA}.tasks_tasks t{self.where}) s
+                 where last_touched_at >= %s::timestamptz - interval '{_WATCH_CATCH_UP_GRACE}'
+                 order by last_touched_at asc, id asc""",
+            self.params + [since])
+
+    def read(self) -> list[tuple[str, str]]:
+        """Read the window since the last read began, less the grace, and hold
+        what it found as the marks the next read is told against; answer each
+        kind of change and task it found since the last read, oldest first. A
+        task the last read did not find had nothing it could see within that
+        read's window, so every moment of the task from that window's start on
+        is new. The first read takes the marks and answers nothing."""
+        def clock():
+            with self.conn.cursor() as cur:
+                cur.execute("select clock_timestamp() as now, s.since, s.since - interval "
+                            f"'{_WATCH_CATCH_UP_GRACE}' as start from (select coalesce("
+                            "%s::timestamptz, clock_timestamp()) as since) s", [self.read_at])
+                return cur.fetchone()
+        now = self.bounded(clock)
+        found = self.window(now["since"])
         wanted: dict = {}
-        for note in notes:
-            if note.channel != WATCH_CHANNEL:
-                continue
-            try:
-                payload = json.loads(note.payload)
-            except ValueError:
-                continue
-            if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
-                continue
-            if self.project is not None and payload.get("project") != self.project:
-                continue
-            kind, task = payload.get("kind"), payload.get("task")
-            if kind in _WATCH_KINDS and task:
-                wanted.setdefault((kind, str(task)), None)
+        if self.read_at is not None:
+            for row in found:
+                for kind in self.kinds(row, self.marks.get(str(row["id"])), self.marked_from):
+                    wanted.setdefault((kind, str(row["id"])), None)
+        self.marks = {str(row["id"]): row for row in found}
+        self.marked_from = now["start"]
+        self.read_at = now["now"]
+        return list(wanted)
+
+    @staticmethod
+    def kinds(row: dict, mark: dict | None, start) -> list[str]:
+        """The kinds of change `row` had since `mark`, what the last read held of
+        it; with no mark, those whose newest moment falls in the window that
+        began at `start`."""
+        if mark is not None:
+            moved = {"task_changed": row["updated_at"] != mark["updated_at"],
+                     "activity_added": row["activities"] != mark["activities"],
+                     "run_started": row["runs"] != mark["runs"],
+                     "run_ended": row["ended"] != mark["ended"]}
+        else:
+            def since(moment):
+                return moment is not None and moment >= start
+            moved = {"task_changed": since(row["updated_at"]),
+                     "activity_added": since(row["activity_at"]),
+                     "run_started": since(row["started_at"]),
+                     "run_ended": since(row["ended_at"])}
+        return [kind for kind in _WATCH_KINDS if moved[kind]]
+
+    def rows_plain(self, sql: str, params: list) -> list[dict]:
+        def read():
+            with self.conn.cursor() as cur:
+                cur.execute(sql, params)
+                return cur.fetchall()
+        return self.bounded(read)
+
+    def changes(self) -> None:
+        """Read what changed since the last read and print it. The read stays
+        owed until it succeeds, so a move whose read failed is read again."""
+        self.deliver(self.read())
+        self.live_at = self.read_at
+        self.due = False
+
+    def deliver(self, wanted: list) -> None:
+        """One line per kind and task, in the order the tasks were last touched,
+        each carrying the task as it reads now."""
         if not wanted:
             return
         joiner = " and " if self.where else " where "
@@ -10097,20 +10227,17 @@ class _Watch:
             raise _WatchStop
 
     def follow(self) -> None:
-        """Print what the store announces until the connection fails, proving it
-        on the interval while nothing arrives."""
-        import select
+        """Print what changed whenever the followed version moves, reading it
+        once a second, until the connection fails, and prove the connection on
+        the interval besides."""
         import time
         due = time.monotonic() + _WATCH_PING_SECONDS
         while True:
-            notes = list(self.conn.notifies(timeout=0))
-            if notes:
-                self.deliver(notes)
-                continue
-            waiting = [self.conn.pgconn.socket] + ([self.stdin] if self.stdin is not None else [])
-            ready, _w, _x = select.select(waiting, [], [], max(0.0, due - time.monotonic()))
-            if self.stdin is not None and self.stdin in ready:
-                self.read_stdin()
+            if self.bounded(lambda: _follow(self.follower, self.conn)):
+                self.due = True
+            if self.due:
+                self.changes()
+            self.pause(_WATCH_FOLLOW_SECONDS)
             if time.monotonic() >= due:
                 self.prove()
                 due = time.monotonic() + _WATCH_PING_SECONDS
@@ -10958,18 +11085,33 @@ class _ServiceHost:
                 "schema": self.setting.schema}
 
     def listen(self):
-        """A connection listening on the channel. The daemon keeps asking while
+        """The connection the daemon holds: a session connection, for the lock
+        that says a service serves the project, on which it follows the store's
+        change versions. It listens for nothing. The daemon keeps asking while
         the store is away, so a store it cannot reach is raised to it rather
         than written to the log on every attempt."""
         conn = _connect(self.entry, raising=True, setting=self.setting, session=True)
         try:
             conn.autocommit = True
-            conn.execute(f"listen {CLAIMABLE_CHANNEL}")
-            conn.execute(f"listen {DECLARATION_CHANNEL}")
         except BaseException:
             conn.close()
             raise
         return conn
+
+    def follower(self):
+        """What follows the versions of the claimable and declaration channels
+        for every project of this store's schema: one row per project each, read
+        in one query."""
+        return _db().Follower([CLAIMABLE_CHANNEL, DECLARATION_CHANNEL],
+                              application_name=NAME, setting=self.setting)
+
+    def changes(self, follower, conn) -> list[dict]:
+        """What moved since the follower last read, polled on `conn`, as the
+        notifications an earlier release heard: the schema, the project and
+        which kind of change, so the daemon routes them as it routed those."""
+        kinds = {CLAIMABLE_CHANNEL: "claimable", DECLARATION_CHANNEL: "declaration"}
+        return [{"schema": self.schema, "project": scope, "kind": kinds[channel]}
+                for (channel, scope) in _follow(follower, conn) if channel in kinds]
 
     def open_query(self, timeout_seconds: float):
         """The connection the daemon's questions of one pass go on, a
@@ -10981,7 +11123,7 @@ class _ServiceHost:
                                         str(int(timeout_seconds * 1000))})
 
     def present(self, conn, on: bool = True) -> None:
-        """Say on `conn`, the connection the daemon listens on, that a service
+        """Say on `conn`, the connection the daemon holds, that a service
         serves this project, or no longer does: the advisory lock any project
         reads from `pg_locks` before it assigns a task here. Taken, never waited
         for, so a second service serving the same project elsewhere blocks
@@ -11010,10 +11152,12 @@ class _ServiceHost:
         return bool(conn.closed or conn.broken or isinstance(exc, psycopg.OperationalError))
 
     @staticmethod
-    def notification_installed(_conn) -> bool:
-        """The store notifies: the trigger is one of this capability's tables'
-        steps, which every connection a host opens has in place."""
-        return True
+    def notification_installed(conn) -> bool:
+        """The store announces: the triggers that raise the versions are one of
+        this capability's tables' steps, which every connection a host opens has
+        in place, and they raise them where the store holds its change versions."""
+        return conn.execute("select to_regclass(%s) is not null as present",
+                            (f"{SCHEMA}.schema_channel",)).fetchone()["present"]
 
     def lane_has_work(self, conn, worker: dict, exclude: tuple = ()) -> bool:
         # The store's answer alone: a worker's `before` hook is asked by the turn
@@ -11047,7 +11191,7 @@ class _ServiceHost:
         its project by its cwd. The turn reads the project's .env and .env.local
         over it itself, all but the store: the store this host resolved is
         handed to it as the environment level, every other AGENTKIT_DB_* key
-        removed, so the turn reaches the database its daemon listens on."""
+        removed, so the turn reaches the database its daemon follows."""
         env = dict(environment)
         for key in ("TASKS_EXECUTION", _RECEIPT_ENV, _EXCLUDE_ENV, "CLAUDE_PROJECT_DIR"):
             env.pop(key, None)
@@ -11880,7 +12024,7 @@ def cmd_service_status_machine(args: list[str]) -> None:
 def cmd_service_doctor_machine(args: list[str]) -> None:
     """The supervision probe: exit 0 while the machine process holds its lock,
     published its status lately, runs the machine settings on disk, and each
-    of its stores is listening or being asked for again. A project in `error`
+    of its stores is held or being asked for again. A project in `error`
     or `refused` is reported and fails nothing: restarting the process cannot
     repair a project."""
     import datetime as _dt
@@ -11912,7 +12056,7 @@ def cmd_service_doctor_machine(args: list[str]) -> None:
                             f"since; `{NAME} service reload --machine` hands it the file on disk")
         for store in status["stores"]:
             if not store.get("listening") and not store.get("retrying"):
-                problems.append(f"store {store.get('store')} is neither listened on nor "
+                problems.append(f"store {store.get('store')} is neither held nor "
                                 "being asked for again")
     if status.get("settings_error"):
         problems.append(status["settings_error"])
@@ -12371,7 +12515,7 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
         answer["notification"] = {"channel": CLAIMABLE_CHANNEL, "installed": None}
         answer["warning"] = ("the store is unreachable, so its tables and notification "
                              "are not checked; the running daemon keeps its turns and "
-                             "waits for the store, listening again as soon as it answers")
+                             "waits for the store, following it again as soon as it answers")
     elif isinstance(found, Refusal):
         _die(found.exit_code, found.code, found.message, found.hint)
     else:
@@ -12798,7 +12942,7 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 # callva-harness-runner owns and ships as steps of its own, applied under its own
 # ledger before these, everywhere these are: `_profile_tables` names them.
 STORE_MAJOR = 1
-STORE_MINOR = 6
+STORE_MINOR = 7
 
 _MOVE_FROM_SCHEMA_TASKS = r"""
 DO $move$
@@ -13365,6 +13509,146 @@ create trigger tasks_workers_notify_declaration after insert or update on tasks_
     for each row execute function tasks_workers_notify_declaration();
 """
 
+_CHANGE_VERSIONS = r"""
+-- Every change a notification announces also raises the project's version of
+-- that channel in the store's change versions (schema_channel, scope the project
+-- id), in the writer's own transaction, so a change any release writes moves
+-- the version the service and `watch` follow. Each notification stays beside it,
+-- unchanged, for a service or a watch of an earlier release that still listens.
+-- The triggers are deferred to the commit, so the version rows are locked last;
+-- and the claimable notice raises the project's watch version before its own,
+-- as every write to the three tables raises the watch version, so two writers
+-- of one project take its rows in the same order.
+create or replace function tasks_notify_claimable() returns trigger as $$
+begin
+    if new.status = 'todo' and (tg_op = 'INSERT'
+            or old.status is distinct from new.status
+            or old.pickup_at is distinct from new.pickup_at) then
+        perform pg_notify('tasks_claimable', json_build_object(
+            'schema', tg_table_schema, 'project', new.project_id,
+            'task', new.id, 'pickup_at', new.pickup_at)::text);
+        if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+            execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                           'values (%L, $1, 1) on conflict (channel, scope) '
+                           'do update set version = c.version + 1',
+                           tg_table_schema, 'tasks_watch')
+                using new.project_id;
+            execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                           'values (%L, $1, 1) on conflict (channel, scope) '
+                           'do update set version = c.version + 1',
+                           tg_table_schema, 'tasks_claimable')
+                using new.project_id;
+        end if;
+    end if;
+    return null;
+end;
+$$ language plpgsql;
+
+create or replace function tasks_notify_watch() returns trigger as $$
+declare
+    task    uuid;
+    project text;
+    kind    text;
+begin
+    if tg_table_name = 'tasks_tasks' then
+        task := new.id;
+        project := new.project_id;
+        kind := 'task_changed';
+    else
+        -- A hold episode's row is no raise: it records when a worker's before
+        -- hook first held the task back, and nothing a reader shows changed.
+        if tg_table_name = 'tasks_executions' then
+            if new.metrics ? 'hold' then
+                return null;
+            end if;
+        end if;
+        task := new.task_id;
+        execute format('select project_id from %I.tasks_tasks where id = $1', tg_table_schema)
+           into project using task;
+        if tg_table_name = 'tasks_activities' then
+            kind := 'activity_added';
+        elsif tg_op = 'INSERT' then
+            kind := 'run_started';
+        elsif old.ended_at is null and new.ended_at is not null then
+            kind := 'run_ended';
+        else
+            return null;
+        end if;
+    end if;
+    perform pg_notify('tasks_watch', json_build_object(
+        'schema', tg_table_schema, 'project', project,
+        'task', task, 'kind', kind)::text);
+    if project is not null then
+        if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+            execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                           'values (%L, $1, 1) on conflict (channel, scope) '
+                           'do update set version = c.version + 1',
+                           tg_table_schema, 'tasks_watch')
+                using project;
+        end if;
+    end if;
+    return null;
+end;
+$$ language plpgsql;
+
+create or replace function tasks_hooks_notify_declaration() returns trigger as $$
+begin
+    perform pg_notify('tasks_declaration', json_build_object(
+        'schema', tg_table_schema, 'project', new.project_id,
+        'kind', 'hook', 'hook', new.name)::text);
+    if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+        execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                       'values (%L, $1, 1) on conflict (channel, scope) '
+                       'do update set version = c.version + 1',
+                       tg_table_schema, 'tasks_declaration')
+            using new.project_id;
+    end if;
+    return null;
+end;
+$$ language plpgsql;
+
+create or replace function tasks_workers_notify_declaration() returns trigger as $$
+begin
+    perform pg_notify('tasks_declaration', json_build_object(
+        'schema', tg_table_schema, 'project', new.project_id,
+        'kind', 'worker', 'worker', new.name)::text);
+    if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+        execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                       'values (%L, $1, 1) on conflict (channel, scope) '
+                       'do update set version = c.version + 1',
+                       tg_table_schema, 'tasks_declaration')
+            using new.project_id;
+    end if;
+    return null;
+end;
+$$ language plpgsql;
+
+drop trigger tasks_notify_claimable on tasks_tasks;
+create constraint trigger tasks_notify_claimable after insert or update on tasks_tasks
+    deferrable initially deferred
+    for each row execute function tasks_notify_claimable();
+drop trigger tasks_notify_watch on tasks_tasks;
+create constraint trigger tasks_notify_watch after insert or update on tasks_tasks
+    deferrable initially deferred
+    for each row execute function tasks_notify_watch();
+drop trigger tasks_activities_notify_watch on tasks_activities;
+create constraint trigger tasks_activities_notify_watch after insert on tasks_activities
+    deferrable initially deferred
+    for each row execute function tasks_notify_watch();
+drop trigger tasks_executions_notify_watch on tasks_executions;
+create constraint trigger tasks_executions_notify_watch after insert or update on tasks_executions
+    deferrable initially deferred
+    for each row execute function tasks_notify_watch();
+drop trigger tasks_hooks_notify_declaration on tasks_hooks;
+create constraint trigger tasks_hooks_notify_declaration after insert or update on tasks_hooks
+    deferrable initially deferred
+    for each row execute function tasks_hooks_notify_declaration();
+drop trigger tasks_workers_notify_declaration on tasks_workers;
+create constraint trigger tasks_workers_notify_declaration after insert or update on tasks_workers
+    deferrable initially deferred
+    for each row execute function tasks_workers_notify_declaration();
+"""
+
 STORE_STEPS = [
     ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
     ("0002-tables", _TABLES_SHAPE),
@@ -13374,6 +13658,7 @@ STORE_STEPS = [
     ("0006-execution-node", _EXECUTION_NODE),
     ("0007-hooks", _HOOKS_TABLE),
     ("0008-workers-announce", _WORKERS_ANNOUNCE),
+    ("0009-change-versions", _CHANGE_VERSIONS),
 ]
 
 

@@ -363,7 +363,7 @@ def test_a_listener_the_store_refuses_is_asked_for_again_on_a_doubling_interval(
         assert daemon.status()["notification"]["listening"] is False
         log = (daemon.state_dir / "daemon.log").read_text()
         # Said once, however many times it was asked.
-        assert log.count("cannot listen for the store's notification") == 1
+        assert log.count("cannot hold a connection to the store to follow its versions") == 1
         host.away = False
         deadline = time.monotonic() + 3
         while daemon.listener is None and time.monotonic() < deadline:
@@ -373,7 +373,7 @@ def test_a_listener_the_store_refuses_is_asked_for_again_on_a_doubling_interval(
         assert daemon.status()["wake_by"] == "notification"
         assert daemon.store.relisten_at is None
         assert daemon.store.relisten_delay == service.RELISTEN_FIRST_SECONDS
-        assert "listening on tasks_claimable again" in (
+        assert "following tasks_claimable again" in (
             daemon.state_dir / "daemon.log").read_text()
     finally:
         dispatcher.close()
@@ -522,6 +522,9 @@ def test_the_store_notifies_and_the_daemon_wakes_for_its_own_project_only(
     with Harness(project, entry) as h:
         h.dispatcher.step()
         assert h.daemon.status()["wake_by"] == "notification"
+        # It follows the store's change versions and listens for nothing.
+        assert h.daemon.store.listener.execute(
+            "select count(*) as n from pg_listening_channels()").fetchone()["n"] == 0
         assert h.running() == 0
         reported = mod._inventory(False)["service"]
         assert reported["state"] == "running"
@@ -577,6 +580,78 @@ def test_a_task_moved_to_todo_or_given_a_new_pickup_is_announced(project, store,
     mod.cmd_set(entry, [tid, "--title", "renamed"])
     capsys.readouterr()
     assert heard() == []
+
+
+def versions(conn, schema: str) -> dict:
+    return {(row[0], row[1]): row[2] for row in conn.execute(
+        f"select channel, scope, version from {schema}.schema_channel").fetchall()}
+
+
+@needs_store
+def test_every_change_raises_its_projects_version_as_it_commits(project, store, capsys):
+    """The claimable and watch channels move with the writes they announce, in
+    the writer's own transaction, and a write rolled back moves nothing."""
+    entry, schema, conn = store
+    claimable, watch = (mod.CLAIMABLE_CHANNEL, HERE), (mod.WATCH_CHANNEL, HERE)
+    before = versions(conn, schema)
+    tid = add(entry, capsys, "alpha", status="draft")
+    after_add = versions(conn, schema)
+    assert after_add.get(claimable, 0) == before.get(claimable, 0)
+    assert after_add[watch] > before.get(watch, 0)
+    mod.cmd_set(entry, [tid, "--status", "todo"])
+    capsys.readouterr()
+    moved = versions(conn, schema)
+    assert moved[claimable] == after_add.get(claimable, 0) + 1
+    assert moved[watch] > after_add[watch]
+    with conn.transaction():
+        conn.execute(f"update {schema}.tasks_tasks set pickup_at = now() where id = %s", (tid,))
+        conn.execute(f"insert into {schema}.tasks_activities (task_id, description, actor) "
+                     "values (%s, 'kept', 'test')", (tid,))
+    kept = versions(conn, schema)
+    assert kept[claimable] == moved[claimable] + 1 and kept[watch] > moved[watch]
+    try:
+        with conn.transaction():
+            conn.execute(f"update {schema}.tasks_tasks set pickup_at = null where id = %s",
+                         (tid,))
+            raise RuntimeError("roll back")
+    except RuntimeError:
+        pass
+    assert versions(conn, schema) == kept
+
+
+@needs_store
+def test_two_writers_of_one_project_both_commit(project, store, capsys):
+    """Each writer takes the project's version rows at its commit, the watch row
+    before the claimable one, so a writer that first adds a trail entry and one
+    that first makes a task claimable never wait on each other in a cycle."""
+    import psycopg
+    entry, schema, _conn = store
+    one = add(entry, capsys, "alpha", status="draft")
+    two = add(entry, capsys, "alpha", status="draft")
+    a, b = (psycopg.connect(DSN) for _ in range(2))
+    try:
+        a.execute(f"insert into {schema}.tasks_activities (task_id, description, actor) "
+                  "values (%s, 'a', 'test')", (one,))
+        b.execute(f"update {schema}.tasks_tasks set status = 'todo' where id = %s", (two,))
+        a.execute(f"update {schema}.tasks_tasks set status = 'todo' where id = %s", (one,))
+        done: dict = {}
+
+        def commit(name, conn):
+            try:
+                conn.commit()
+                done[name] = "committed"
+            except Exception as exc:
+                done[name] = type(exc).__name__
+
+        threads = [threading.Thread(target=commit, args=pair) for pair in (("a", a), ("b", b))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        assert done == {"a": "committed", "b": "committed"}
+    finally:
+        a.close()
+        b.close()
 
 
 @needs_store
@@ -1029,8 +1104,8 @@ def test_the_daemon_outlives_the_store_going_away_and_listens_again(
         assert "notify" in h.daemon.last_wake["reasons"]
         assert "poll" not in h.daemon.last_wake["reasons"]
         log = (h.daemon.state_dir / "daemon.log").read_text()
-        assert "lost the store's notification" in log
-        assert "listening on tasks_claimable again" in log
+        assert "lost the connection the store's versions are followed on" in log
+        assert "following tasks_claimable again" in log
 
 
 # --- The connections it holds -----------------------------------------------
@@ -1174,7 +1249,7 @@ def test_connections_the_path_dropped_are_severed_and_asked_for_again(
         assert store_.connections_opened >= 3
         h.steps(lambda: store_.listener is not None, seconds=5)
         log = (h.daemon.state_dir / "daemon.log").read_text()
-        assert "lost the store's notification" in log
+        assert "lost the connection the store's versions are followed on" in log
 
 
 @needs_store
@@ -1274,9 +1349,11 @@ def test_the_listener_carries_a_round_trip_on_the_ping_interval(
         # No question connection is held between passes, so nothing else is pinged.
         assert store_.query is None
         assert {pid for pid, _at in pings} == {backend(store_.listener)}
+        # Its last statement is one of its own round trips: the ping, or the
+        # read of the change versions it makes at every wait.
         last = conn.execute("select query from pg_stat_activity where pid = %s",
                             (backend(store_.listener),)).fetchone()[0]
-        assert last == "select 1"
+        assert last == "select 1" or last.startswith("SELECT channel, scope, version FROM"), last
         assert store_.connections_opened == 2
 
 
@@ -1584,7 +1661,7 @@ def test_service_doctor_warns_while_the_daemon_waits_out_the_store(lab, relay):
     assert back["ok"] and back["store"] == {"reachable": True}
     assert back["service"]["pid"] == pid
     log = "\n".join(answer_of(tasks_cli(lab, "service", "logs", "--tail", "200"))["lines"])
-    assert "listening on tasks_claimable again" in log
+    assert "following tasks_claimable again" in log
     # A worker saved since the daemon loaded is announced by the store, and the
     # daemon takes it up with no reload.
     worker = _cli.worker_docs(project) / "alpha.md"

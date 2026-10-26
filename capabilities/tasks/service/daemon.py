@@ -26,28 +26,31 @@ store's shape. Before it asks the store anything for a project at a wake, and
 again before it starts a turn there, it asks the host whether the project may
 be served at all, and while it may not it asks and starts nothing for it.
 
-It wakes when the store notifies that a task became claimable, at every poll,
-at the earliest moment a pickup or a lease falls due, and when one of its own
-turns claims or ends. A store without the notification leaves it the poll.
+It wakes when the store's change versions say a task became claimable, which
+it reads about once a second, at every poll, at the earliest moment a pickup or
+a lease falls due, and when one of its own turns claims or ends. A store
+without the versions leaves it the poll. It listens for nothing.
 
-On the connection it listens on it holds, for each project it serves, the
-lock that says a service serves that project, which another project reads
-before it assigns a task there; it goes with the connection.
+On the connection it holds it keeps, for each project it serves, the lock that
+says a service serves that project, which another project reads before it
+assigns a task there; it goes with the connection.
 
-It holds one connection to the store, the session connection it listens on,
-and puts the questions of each pass on a transaction connection opened for that
+It holds one connection to the store, the session connection the lock is on and
+the versions are read on, and puts the questions of each pass on a transaction
+connection opened for that
 pass and closed at its end, each question cut off by the store when it runs
 past `QUESTION_TIMEOUT_SECONDS`. A question or a round trip whose answer is not
 back within `ROUND_TRIP_SECONDS` has its connection severed and counted lost,
 so a connection the path dropped under it holds the loop, and a stop, no longer
 than that. They are kept per store in a pool, so whoever asks of the same store
-shares the same ones. The listener carries a round trip of its own every
-`PING_SECONDS`, so a proxy in front of the store does not close it as idle.
+shares the same ones. The held connection carries a round trip of its own
+every `PING_SECONDS` besides, so a proxy in front of the store does not close it
+as idle.
 
 It outlives the store being away. A connection it loses, or cannot open, is
 asked for again on a doubling interval until the store answers, and the moment
 it has it again it asks the store for work, since what it missed was neither
-announced nor answered.
+read nor answered.
 
 It never starts a turn on a task one of its turns holds, or on one a worker's
 `before` hook held back until a moment still ahead, or until its next poll when
@@ -461,6 +464,11 @@ class Store:
         self.relisten_at: float | None = None
         self.relisten_delay = RELISTEN_FIRST_SECONDS
         self.listener_pinged = 0.0
+        # What follows the store's change versions, read on the listener: kept
+        # across a lost listener, so the first read after it reports what moved
+        # meanwhile. A store whose versions do not read says why, once.
+        self.follower = None
+        self.follow_error: str | None = None
         # The same for the connection questions go on, and when the last thing
         # went over it.
         self.query = None
@@ -911,12 +919,12 @@ class ProjectSlot:
             return
         if installed != self.notification_installed:
             if installed and self.listener is not None:
-                self.log(f"listening on {self.host.channel}; the poll every "
-                         f"{self.settings()['poll_seconds']}s is the fallback")
+                self.log(f"following {self.host.channel} in the store's change versions; "
+                         f"the poll every {self.settings()['poll_seconds']}s is the fallback")
             elif not installed:
-                self.log("the store has no claimable notification, so this daemon "
-                         f"wakes by the poll every {self.settings()['poll_seconds']}s; "
-                         "`tasks migrate` adds it")
+                self.log("the store has no change versions, so this daemon wakes by "
+                         f"the poll every {self.settings()['poll_seconds']}s; "
+                         "`tasks migrate` adds them")
         self.notification_installed = installed
 
     def heard(self, payload) -> bool:
@@ -925,7 +933,7 @@ class ProjectSlot:
                 and payload.get("schema") == self.host.schema)
 
     def notified(self, payload: dict) -> None:
-        if payload.get("kind") in ("hook", "worker"):
+        if payload.get("kind") in ("declaration", "hook", "worker"):
             # A stored worker or hook was saved or retired: the declaration is asked
             # again before the next pass, and taken up when it moved.
             self.declaration_check = True
@@ -1639,9 +1647,10 @@ class Dispatcher:
     # --- waking ----------------------------------------------------------------
 
     def _connect_listener(self, store: Store) -> None:
-        """Open the listener. A failure is said once, not on every attempt, and
-        the next attempt is planned; a listener opened after one was lost or
-        refused is a wake, since what the store announced meanwhile was lost.
+        """Open the listener, the held connection the presence lock is on and
+        the versions are read on. A failure is said once, not on every attempt,
+        and the next attempt is planned; a listener opened after one was lost or
+        refused is a wake, since a lease may have lapsed meanwhile.
         It is opened outside every scope, on the store the host resolved for
         its project."""
         self._drop_listener(store)
@@ -1652,11 +1661,11 @@ class Dispatcher:
             why = _why(exc)
             if why != store.listen_error:
                 self.store_log(
-                    store, f"cannot listen for the store's notification, waking by the "
-                           f"poll and asking again: {why}",
-                    lambda slot: f"cannot listen for the store's notification, waking by the "
-                                 f"poll every {slot.settings()['poll_seconds']}s and asking "
-                                 f"again: {why}")
+                    store, f"cannot hold a connection to the store to follow its versions, "
+                           f"waking by the poll and asking again: {why}",
+                    lambda slot: f"cannot hold a connection to the store to follow its "
+                                 f"versions, waking by the poll every "
+                                 f"{slot.settings()['poll_seconds']}s and asking again: {why}")
             store.listen_error = why
             self._relisten_later(store)
             return
@@ -1665,7 +1674,7 @@ class Dispatcher:
         for slot in self.on(store):
             self._present(store, slot)
         if store.listen_error is not None:
-            self.store_log(store, f"listening on {store.host.channel} again; asking the "
+            self.store_log(store, f"following {store.host.channel} again; asking the "
                                   "store for work")
             for slot in self.on(store):
                 slot.wakes.add("relisten")
@@ -1680,6 +1689,9 @@ class Dispatcher:
         for slot in self.on(store):
             if slot.served():
                 slot.check_notification()
+        if store.follower is None:
+            # The versions as they stand now: what moves after this is a wake.
+            self._follow(store)
 
     def _present(self, store: Store, slot: ProjectSlot, on: bool = True) -> None:
         """Say on the store's listener that this daemon serves the slot's
@@ -1698,8 +1710,8 @@ class Dispatcher:
         store.relisten_delay = min(store.relisten_delay * 2, RELISTEN_LONGEST_SECONDS)
 
     def _lose_listener(self, store: Store, exc: BaseException) -> None:
-        self.store_log(store, f"lost the store's notification, waking by the poll and "
-                              f"asking for it again: {_why(exc)}")
+        self.store_log(store, f"lost the connection the store's versions are followed on, "
+                              f"waking by the poll and asking for it again: {_why(exc)}")
         self._drop_listener(store)
         store.listen_error = _why(exc)
         self._relisten_later(store)
@@ -1711,54 +1723,52 @@ class Dispatcher:
         store.listener = None
 
     def wait(self, seconds: float) -> None:
-        """Sleep until a store notifies or `seconds` pass. A notification is
-        handed only to the slot whose project and schema it names; one for
-        another project or another schema on the same database is no wake."""
-        listening = [store for store in self.stores() if store.listener is not None]
-        if not listening:
-            time.sleep(seconds)
+        """Sleep `seconds`, then read every held store's change versions. What
+        moved is handed only to the slot whose project and schema it names; a
+        move for another project or another schema on the same database is no
+        wake."""
+        time.sleep(seconds)
+        for store in self.stores():
+            if store.listener is not None:
+                self._follow(store)
+
+    def _follow(self, store: Store) -> None:
+        """Read what moved in the store's change versions on its listener, and
+        route it. The first read after the follower is made only sets where it
+        stands. A lost connection is lost as any round trip on it is; versions
+        that do not read leave the slots to the poll, said once."""
+        follower = store.follower
+        changes = getattr(store.host, "changes", None)
+        if changes is None:
             return
-        if len(listening) == 1:
-            [store] = listening
-            try:
-                got = list(store.listener.notifies(timeout=seconds, stop_after=1))
-                if got:
-                    got += list(store.listener.notifies(timeout=0))
-            except Exception as exc:
+        conn = store.listener
+        try:
+            with store.host.bounded(conn, ROUND_TRIP_SECONDS):
+                if follower is None:
+                    follower = store.host.follower()
+                    changes(follower, conn)
+                    store.follower = follower
+                    moved = []
+                else:
+                    moved = changes(follower, conn)
+        except Exception as exc:
+            if store.host.lost(conn, exc):
                 self._lose_listener(store, exc)
                 return
-            self._route(store, got)
+            why = _why(exc)
+            if why != store.follow_error:
+                self.store_log(store, f"the store's change versions do not read, waking "
+                                      f"by the poll: {why}")
+            store.follow_error = why
             return
-        # Several stores: what any of them already holds is taken first, then
-        # the wait is on all of their sockets at once.
-        if self._drain(listening):
-            return
-        import select
-        with contextlib.suppress(Exception):
-            select.select([store.listener.fileno() for store in listening], [], [], seconds)
-        self._drain(listening)
+        if store.follow_error is not None:
+            self.store_log(store, "the store's change versions read again")
+        store.follow_error = None
+        self._route(store, moved)
 
-    def _drain(self, stores: list[Store]) -> bool:
-        heard = False
-        for store in stores:
-            if store.listener is None:
-                continue
-            try:
-                got = list(store.listener.notifies(timeout=0))
-            except Exception as exc:
-                self._lose_listener(store, exc)
-                continue
-            heard = heard or bool(got)
-            self._route(store, got)
-        return heard
-
-    def _route(self, store: Store, notes) -> None:
+    def _route(self, store: Store, payloads) -> None:
         slots = self.on(store)
-        for note in notes:
-            try:
-                payload = json.loads(note.payload)
-            except (ValueError, AttributeError):
-                continue
+        for payload in payloads:
             for slot in slots:
                 if slot.heard(payload):
                     slot.notified(payload)

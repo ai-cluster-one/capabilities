@@ -83,6 +83,25 @@ def test_the_tables_announce_each_kind_from_every_table_a_change_lands_in():
 
 # --- Against a store ---------------------------------------------------------
 
+@needs_store
+def test_the_watch_follows_the_version_and_listens_for_nothing(monkeypatch):
+    import psycopg
+    schema = "tasks_test_" + secrets.token_hex(4)
+    _cli.bind_store(mod, monkeypatch, schema)
+    monkeypatch.setattr(mod, "PROJECT", "prj_" + uuid.uuid4().hex[:12])
+    _cli.make_tables(mod, schema)
+    watch = mod._Watch({"allow_write": True}, {})
+    try:
+        watch.open()
+        assert watch.conn.execute(
+            "select count(*) as n from pg_listening_channels()").fetchone()["n"] == 0
+        assert watch.follower is not None and watch.due
+    finally:
+        watch.close()
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(f"drop schema {schema} cascade")
+
+
 @pytest.fixture()
 def lab(tmp_path):
     import psycopg
