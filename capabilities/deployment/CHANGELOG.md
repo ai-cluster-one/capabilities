@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-26 — `node exec` forwards piped standard input to the command on the node
+
+`deployment node exec <node> -- <command>` hands what is piped into it to the command run in the node's container, so `printf x | deployment node exec <node> -- cat` prints `x` and a value piped to `setup set --stdin` arrives. Every command the node verbs run before or beside their own - `capabilities`, `coolify`, `ssh` and the rest - now reads no standard input unless it is given some: before, the container lookup over SSH inherited the caller's pipe and drained it, so the command ran with an empty input and exited 0.
+
 ## 2026-10-26 — `node enrol` gives a node the agent's key instead of each secret its vault holds
 
 `deployment node enrol` writes the agent's `AGENT_ENCRYPTION_KEY`, as it resolves here, into the node's `~/.config/capabilities/shared.env` on its config volume, on standard input, so the node opens the agent's vault in the store (`capabilities secrets`) and no secret the vault holds is copied to it. A secret kept only in a file or the environment here is still written into the capability's `credentials.env` on the node, as before. The answer carries `key {placed, fingerprint}` and `secrets_in_vault`, the names per capability that were left to the vault, which `secrets_skipped` no longer lists. A key here that is not the one the agent's vault is kept under is refused (exit 6 `key_mismatch`) before anything is written to the node. Needs capabilities-contract 0.25.

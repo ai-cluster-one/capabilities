@@ -7464,9 +7464,12 @@ def _node_failure(argv, p, *, echo=True):
 
 
 def _node_run(argv, root, *, stdin=None, timeout=120, check=True, env=None):
+    # A child given no input reads nothing: inherited, ssh would forward the
+    # caller's pipe to the remote command and drain it before `node exec`.
+    given = {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
     try:
-        p = subprocess.run(argv, cwd=root, input=stdin, text=True,
-                           capture_output=True, timeout=timeout, env=env)
+        p = subprocess.run(argv, cwd=root, text=True, capture_output=True,
+                           timeout=timeout, env=env, **given)
     except (OSError, subprocess.TimeoutExpired):
         raise NodeFailure("node_command_failed", f"`{_node_command(argv)}` could not complete")
     if check and p.returncode:

@@ -226,6 +226,7 @@ def lab(tmp_path, monkeypatch):
     fake.module = m
     root = tmp_path / "agent"
     root.mkdir()
+    node_run = m._node_run
     monkeypatch.setattr(m, "_root", lambda: root)
     monkeypatch.setattr(m, "_node_run", fake)
     monkeypatch.setattr(m, "_store_placed", lambda root: True)
@@ -243,7 +244,7 @@ def lab(tmp_path, monkeypatch):
     monkeypatch.setattr(m.time, "sleep", lambda seconds: None)
     # The id `node create` mints for the node it makes.
     monkeypatch.setattr(m.secrets, "token_hex", lambda n: BOX1)
-    return SimpleNamespace(m=m, fake=fake, root=root, usable=usable)
+    return SimpleNamespace(m=m, fake=fake, root=root, usable=usable, node_run=node_run)
 
 
 def create_args(**extra):
@@ -701,6 +702,36 @@ def test_exec_runs_one_command_in_the_node_container_with_its_stdio_and_exit_cod
     assert argv[-2] == "root@203.0.113.7"
     assert shlex.split(argv[-1]) == ["docker", "exec", "-i", "abc123",
                                      "telegram", "login", "--events"]
+
+
+def test_exec_forwards_piped_stdin_past_the_lookups_it_runs_first(lab, monkeypatch, tmp_path):
+    lab.m.cmd_node_create(create_args())
+    # Each lookup goes through the real _node_run to a real child that reads
+    # its standard input, as ssh does, and is then answered by the fake.
+    real_run = lab.m.subprocess.run
+
+    def lookup(argv, **kw):
+        real_run(["sh", "-c", "cat >/dev/null"], **kw)
+        return lab.fake(argv, kw["cwd"], stdin=kw.get("input"))
+
+    received = tmp_path / "received"
+    monkeypatch.setattr(lab.m, "_node_run", lab.node_run)
+    monkeypatch.setattr(lab.m.subprocess, "run", lookup)
+    monkeypatch.setattr(lab.m.subprocess, "call", lambda argv, **kw: real_run(
+        ["sh", "-c", "cat > " + shlex.quote(str(received))]).returncode)
+    piped = tmp_path / "piped"
+    piped.write_text("x")
+    saved = lab.m.os.dup(0)
+    try:
+        with piped.open() as source:
+            lab.m.os.dup2(source.fileno(), 0)
+        with pytest.raises(SystemExit) as exited:
+            lab.m.cmd_node_exec(SimpleNamespace(node="box1", argv=["cat"]))
+    finally:
+        lab.m.os.dup2(saved, 0)
+        lab.m.os.close(saved)
+    assert exited.value.code == 0
+    assert received.read_text() == "x"
 
 
 def test_exec_refuses_an_unknown_node_and_a_missing_command(lab, monkeypatch):
