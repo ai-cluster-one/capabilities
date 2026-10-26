@@ -132,14 +132,14 @@ class Migration(td.DialogueCase):
     def test_the_job_steps_are_in_the_ledger_at_the_new_minor(self):
         steps = [r["step"] for r in self.db.execute(
             "SELECT step FROM schema_ledger WHERE owner = 'whatsapp' ORDER BY step")]
-        self.assertEqual(steps[13:], ["0014-jobs", "0015-jobs-queue", "0016-jobs-by-chat",
+        self.assertEqual(steps[13:21], ["0014-jobs", "0015-jobs-queue", "0016-jobs-by-chat",
                                       "0017-jobs-live-session", "0018-jobs-by-origin",
                                       "0019-job-amendments", "0020-job-amendments-pending",
                                       "0021-job-slots"])
         self.assertEqual(steps, [s.id for s in wa.STORE_STEPS])
         version = self.db.execute(
             "SELECT major, minor FROM schema_version WHERE owner = 'whatsapp'").fetchone()
-        self.assertEqual((version["major"], version["minor"]), (1, 3))
+        self.assertEqual((version["major"], version["minor"]), (1, wa.STORE_SCHEMA_MINOR))
         for table, wanted in (
                 ("whatsapp_jobs", {"project_id", "environment", "account", "chat_id",
                                    "host", "requested_by", "origin_message_id",

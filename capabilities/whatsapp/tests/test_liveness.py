@@ -101,9 +101,11 @@ def _request(text="hello") -> dict:
 @_cli.needs_store
 @needs_engine
 class Pickup(unittest.TestCase):
-    """The sender wakes the moment a row is queued, in this process through
-    its event and from any other through the store's notification. The poll
-    is set far out of reach here, so only the wake can explain a pickup."""
+    """The sender wakes when a row is queued: in this process at once through
+    its event, and from any other within about a second through the
+    account's outbox version, which the listener follows on its own store
+    connection. The poll is set far out of reach here, so only the wake can
+    explain a pickup."""
 
     def setUp(self):
         patcher = mock.patch.dict(os.environ, _cli.store_env())
@@ -160,10 +162,6 @@ class Pickup(unittest.TestCase):
 
     def test_a_row_queued_by_another_process_is_picked_up_through_the_store(self):
         daemon, held = self.listener()
-        outbox = threading.Thread(target=daemon.listen_outbox, daemon=True)
-        outbox.start()
-        self.addCleanup(daemon.leaving.set)
-        time.sleep(0.5)       # the listening connection is up
         child = (
             "import json, sys, time\n"
             f"sys.path.insert(0, {str(TESTS_DIR)!r})\n"
@@ -184,7 +182,9 @@ class Pickup(unittest.TestCase):
         times = [s - c for s, c in zip(sends, committed)]
         sys.stderr.write("\n  measured: other process commit -> send "
                          + ", ".join(f"{1000 * t:.1f} ms" for t in times) + "\n")
-        self.assertLess(max(times), 0.5)
+        self.assertLess(max(times), 1.5)
+        self.assertFalse([name for name in (t.name for t in threading.enumerate())
+                          if name == "service-outbox"])
 
 
 # ── Stall and stop, in a real process ───────────────────────────────────────
@@ -239,7 +239,6 @@ daemon = wa._ServiceDaemon(cfg, Path(spec["root"]), {"environment": "test"},
                            launch_nonce="child", session_factory=Held)
 daemon.stall_seconds = spec["stall"]
 daemon.term_grace = spec["grace"]
-daemon.listen_outbox = lambda: None
 sys.exit(daemon.run())
 '''
 
@@ -471,7 +470,6 @@ class Takeover(unittest.TestCase):
                                    launch_nonce="new",
                                    session_factory=lambda: Held())
         daemon.install_signals = lambda: None
-        daemon.listen_outbox = lambda: None
         daemon.backstop = False
         self.logs: list[str] = []
         daemon.log = self.logs.append

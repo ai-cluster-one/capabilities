@@ -140,9 +140,10 @@ Assistant service
   removed from the phone is final: the service stops reconnecting and says
   so in `service status` and `service doctor`. It sends the messages `send`
   queues for its account, oldest first and at most `defaults.send_rate` a
-  minute; a queued row wakes the sender at once (in-process, or through a
-  Postgres notification on channel whatsapp_outbox from any other process),
-  with a half-second poll behind it. A capture the store cannot take because the store is unreachable is
+  minute; a queued row wakes the sender (in-process at once, or within about
+  a second from any other process, through the account's whatsapp_outbox
+  version in the store's change versions, which the listener polls on its
+  own store connection), with a half-second poll behind it. A capture the store cannot take because the store is unreachable is
   appended to a spool file in the service's state directory and written into
   the store, in order and once, when it answers again (and at start);
   `service status` reports the spool depth and the store error. A send a
@@ -522,7 +523,8 @@ from pathlib import Path
 from typing import NoReturn
 
 import httpx
-from capabilities_contract.db import DbError, Step, connect, migrate, resolve_setting
+from capabilities_contract.db import (FOLLOW_INTERVAL_SECONDS, DbError, Follower, Step,
+                                      connect, migrate, resolve_setting)
 
 DEFAULT_SESSION = "default"
 
@@ -1590,9 +1592,30 @@ CREATE TABLE whatsapp_job_slots (
     PRIMARY KEY (project_id, environment, account, slot),
   CONSTRAINT whatsapp_job_slots_job_key
     UNIQUE (project_id, environment, account, job_id))"""),
+    # A queued message raises its account's version of `whatsapp_outbox` in
+    # the store's change versions, in the writer's own transaction, so a row
+    # any release writes moves the version a listener follows. The
+    # notification stays beside it for a listener of an earlier release that
+    # still listens on that channel.
+    Step("0022-outbox-versions", r"""
+CREATE FUNCTION whatsapp_outbox_announce() RETURNS trigger AS $$
+BEGIN
+  PERFORM pg_notify('whatsapp_outbox', new.account);
+  EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version) '
+                 'VALUES (%L, $1, 1) ON CONFLICT (channel, scope) '
+                 'DO UPDATE SET version = c.version + 1',
+                 tg_table_schema, 'whatsapp_outbox')
+      USING new.account;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER whatsapp_outbox_announce
+  AFTER INSERT ON whatsapp_messages
+  FOR EACH ROW WHEN (new.delivery = 'pending')
+  EXECUTE FUNCTION whatsapp_outbox_announce()"""),
 ]
 STORE_SCHEMA_MAJOR = 1
-STORE_SCHEMA_MINOR = 3
+STORE_SCHEMA_MINOR = 4
 
 
 def _tables():
@@ -5055,9 +5078,10 @@ TYPING_SECONDS = (1.5, 3.5)       # how long `--typing` shows composing, jittere
 DELIVERY_INTERRUPTED = "interrupted_delivery_unknown"
 
 
-# A queued message wakes the account's sender at once: in this process through
-# the event the running listener hands in, from any other process through a
-# notification on this channel, carrying the account, sent when the row commits.
+# A queued message wakes the account's sender: in this process at once through
+# the event the running listener hands in, from any other process through the
+# account's version of this channel in the store's change versions, which the
+# row's insert raises and the listener follows.
 OUTBOX_CHANNEL = "whatsapp_outbox"
 _OUTBOX_WAKE: threading.Event | None = None
 
@@ -5123,11 +5147,10 @@ def _queue_outgoing(db, request: dict) -> dict:
              kind, request["text"], request.get("reply_to"),
              request.get("mentions") or None, bool(request.get("typing")),
              OUTBOUND_SYNC, _iso_now()))
-        db.execute("SELECT pg_notify(%s, %s)", (OUTBOX_CHANNEL, db.account))
     wake = _OUTBOX_WAKE
     if wake is not None and not db.write_depth:
         # Committed: the sender can claim it now. Inside a caller's
-        # transaction the notification wakes it once that commits.
+        # transaction the version it raised wakes it once that commits.
         wake.set()
     return _outgoing_row(db, local_id)
 
@@ -6572,7 +6595,6 @@ SERVICE_WATCH_EVERY = 1.0         # how often the watchdog looks at progress
 SERVICE_TAKEOVER_GRACE = 15.0     # a stale holder's time to leave after SIGTERM, before SIGKILL
 SERVICE_STALE_CONFIRM = 2.0       # a holder found stale is read again after this, once
 SERVICE_STALL_SEAM_ENV = "WHATSAPP_SERVICE_STALL_SEAM"
-OUTBOX_LISTEN_WAIT = 5.0          # how long one wait for a notification lasts
 
 
 def _json_file(path: Path):
@@ -7751,6 +7773,11 @@ class _ServiceDaemon:
         self.sent = 0
         self.send_failures = 0
         self.recovered = False
+        # The account's outbox version, followed on the session's own store
+        # connection: what another process queued wakes the sender.
+        self.follower = None
+        self.followed_at: float | None = None
+        self.follow_reported = False
         self.next_store_attempt = 0.0
         # The dialogue, when the settings admit anyone; None leaves the
         # listener capturing and sending and answering nothing.
@@ -7940,35 +7967,6 @@ class _ServiceDaemon:
             os.write(2, (json.dumps(envelope, ensure_ascii=False) + "\n").encode())
         self.hard_exit(SERVICE_STALL_EXIT)
 
-    def listen_outbox(self) -> None:
-        """Wake the sender when another process queues a message for this
-        account. The poll in the loop remains the fallback."""
-        account = _store_account(self.cfg)
-        conn = None
-        reported = False
-        while not self.leaving.is_set():
-            try:
-                if conn is None:
-                    conn = connect(application_name=f"{NAME}-outbox",
-                                   setting=_store_setting(self.root))
-                    conn.autocommit = True
-                    conn.execute(f"LISTEN {OUTBOX_CHANNEL}")
-                    reported = False
-                for note in conn.notifies(timeout=OUTBOX_LISTEN_WAIT):
-                    if note.payload == account:
-                        self.wake.set()
-            except Exception as exc:
-                if not reported:
-                    self.log(f"outbox notifications unavailable "
-                             f"({_error_line(exc)}); the sender polls")
-                    reported = True
-                with contextlib.suppress(Exception):
-                    conn.close()
-                conn = None
-                self.leaving.wait(SPOOL_RETRY)
-        with contextlib.suppress(Exception):
-            conn.close()
-
     def owner_record(self) -> dict:
         return {"schema": SERVICE_OWNER_SCHEMA, "launch_nonce": self.nonce,
                 "pid": os.getpid(), "cli_path": str(Path(__file__).resolve()),
@@ -8151,6 +8149,36 @@ class _ServiceDaemon:
             self.publish()
         return delivered
 
+    def follow_outbox(self, db) -> float:
+        """Wake the sender when another process queued a message for this
+        account: poll the account's `whatsapp_outbox` version on the session's
+        own store connection, at most once every FOLLOW_INTERVAL_SECONDS, and
+        answer how long until the next poll is due. A poll that fails is taken
+        again at the next; the sender's tick stands behind it."""
+        now = time.monotonic()
+        if self.followed_at is not None \
+                and now - self.followed_at < FOLLOW_INTERVAL_SECONDS:
+            return FOLLOW_INTERVAL_SECONDS - (now - self.followed_at)
+        self.followed_at = now
+        if db.broken():
+            return FOLLOW_INTERVAL_SECONDS
+        try:
+            if self.follower is None:
+                self.follower = Follower([(OUTBOX_CHANNEL, db.account)],
+                                         application_name=NAME, setting=db.setting)
+            with db.write_lock:
+                moved = self.follower.poll(db.conn)
+        except Exception as exc:
+            if not self.follow_reported:
+                self.log(f"outbox versions unavailable ({_error_line(exc)}); "
+                         "the sender polls")
+                self.follow_reported = True
+            return FOLLOW_INTERVAL_SECONDS
+        self.follow_reported = False
+        if moved:
+            self.wake.set()
+        return FOLLOW_INTERVAL_SECONDS
+
     # -- the connection -----------------------------------------------------
 
     def track(self, session) -> dict:
@@ -8244,9 +8272,11 @@ class _ServiceDaemon:
                         self.dialogue.tick(session)
                     except Exception as exc:
                         self.log(f"dialogue: tick failed: {type(exc).__name__}: {exc}")
+                follow_in = SERVICE_TICK
                 if db is not None:
                     self.maintain_store(db)
                     self.deliver_pending(session, db)
+                    follow_in = self.follow_outbox(db)
                 if not drained_reported and session.offline_count is not None:
                     drained_reported = True
                     self.log(f"offline queue drained: {session.offline_count} "
@@ -8259,7 +8289,7 @@ class _ServiceDaemon:
                     with contextlib.suppress(Exception):
                         connected = bool(session._client.is_connected)
                     self.publish(connected=connected, **self.track(session))
-                if self.wake.wait(SERVICE_TICK):
+                if self.wake.wait(min(SERVICE_TICK, follow_in)):
                     self.wake.clear()
         except _Refusal as refusal:
             self.last_error = f"{refusal.code}: {refusal.message}"
@@ -8383,8 +8413,7 @@ class _ServiceDaemon:
                      f"account {self.cfg['account_key']}, project {self.root}")
             self.publish("starting", connected=False, last_error=None)
             for target, name in ((self.heartbeat, "service-heartbeat"),
-                                 (self.watch_progress, "service-watchdog"),
-                                 (self.listen_outbox, "service-outbox")):
+                                 (self.watch_progress, "service-watchdog")):
                 threading.Thread(target=target, name=name, daemon=True).start()
             self.start_jobs()
             code = self.loop()

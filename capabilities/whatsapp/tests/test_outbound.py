@@ -195,6 +195,54 @@ class Rows(StoreCase):
 
 
 @_cli.needs_store
+class OutboxVersion(StoreCase):
+    """A pending row raises its account's outbox version as it is written, by
+    whichever release writes it, and still sends the notification a listener
+    of an earlier release waits on."""
+
+    def version(self):
+        follower = wa.Follower([(wa.OUTBOX_CHANNEL, self.db.account)],
+                               application_name="test", setting=self.db.setting)
+        return follower.read(self.db.conn)[(wa.OUTBOX_CHANNEL, self.db.account)]
+
+    def test_a_queued_message_raises_its_accounts_version(self):
+        before = self.version()
+        wa._queue_outgoing(self.db, _request())
+        self.assertEqual(self.version(), before + 1)
+
+    def test_a_row_an_earlier_release_inserts_raises_it_too(self):
+        before = self.version()
+        # As the earlier writer did: its own insert, then its own notify.
+        with wa._writing(self.db):
+            self.db.execute(
+                """INSERT INTO whatsapp_messages
+                       (account, chat_id, id, local_id, from_me, ts, kind, text,
+                        delivery, requested_at, sync_type, captured_at)
+                   VALUES (%s, %s, 'out-old', 'out-old', true, now(),
+                           'conversation', 'x', 'pending', clock_timestamp(),
+                           %s, now())""",
+                (self.db.account, CHAT, wa.OUTBOUND_SYNC))
+            self.db.execute("SELECT pg_notify(%s, %s)",
+                            (wa.OUTBOX_CHANNEL, self.db.account))
+        self.assertEqual(self.version(), before + 1)
+
+    def test_a_captured_message_raises_nothing(self):
+        before = self.version()
+        self.captured("m1")
+        self.assertEqual(self.version(), before)
+
+    def test_a_listener_of_an_earlier_release_is_still_notified(self):
+        listener = wa.connect(application_name="test-listen",
+                              setting=self.db.setting)
+        self.addCleanup(listener.close)
+        listener.autocommit = True
+        listener.execute(f"LISTEN {wa.OUTBOX_CHANNEL}")
+        wa._queue_outgoing(self.db, _request())
+        payloads = [note.payload for note in listener.notifies(timeout=5, stop_after=1)]
+        self.assertEqual(payloads, [self.db.account])
+
+
+@_cli.needs_store
 @needs_engine
 class DirectSend(StoreCase):
     """Without a service the invocation sends the row itself."""

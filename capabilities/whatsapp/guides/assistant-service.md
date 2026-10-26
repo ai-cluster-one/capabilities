@@ -128,7 +128,7 @@ With `WHATSAPP_SERVICE_STALL_SEAM=1` in its environment, SIGUSR2 blocks the list
 
 ## Sending
 
-The service claims the pending rows of its account, the dialogue's answers among them, oldest first and sends each, at most `defaults.send_rate` a minute; the rest wait. A queued row wakes the sender at once - in-process directly, from another process through a Postgres notification - so a row goes out within milliseconds of being queued, with a half-second poll behind both. Each row ends `sent` with WhatsApp's id or `failed` with the reason. A row a previous run claimed and never answered for is failed at start as `interrupted_delivery_unknown` and never sent again. The sending guide holds the whole model.
+The service claims the pending rows of its account, the dialogue's answers among them, oldest first and sends each, at most `defaults.send_rate` a minute; the rest wait. A queued row wakes the sender - in-process at once, so a row goes out within milliseconds of being queued, and from another process within about a second, through the account's outbox version in the store - with a half-second poll behind both. Each row ends `sent` with WhatsApp's id or `failed` with the reason. A row a previous run claimed and never answered for is failed at start as `interrupted_delivery_unknown` and never sent again. The sending guide holds the whole model.
 
 ## When the store is unreachable
 

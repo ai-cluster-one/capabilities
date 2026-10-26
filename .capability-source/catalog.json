@@ -187,7 +187,7 @@
     },
     "whatsapp": {
       "path": "capabilities/whatsapp",
-      "payload_sha256": "8249c98443013bd1f4365a62cb2f85d7cd2fc8492c86dccab25a5eb70b8bbecd",
+      "payload_sha256": "778596cecc50803ee54d139eb873a40d878e18209852b123bb502147263089b6",
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON."
     },
     "windmill": {

@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-10-26 — The service follows queued messages by their version, and holds no listening connection
+
+A queued message raises its account's version of the `whatsapp_outbox` channel in the store's change versions, in the same transaction as its row (store step `0022-outbox-versions`, schema 1.4), through a trigger on `whatsapp_messages`, so a row written by any release moves it. The same trigger sends the `whatsapp_outbox` notification, so a listener of an earlier release on another machine still wakes as before; `send` no longer sends it itself. The assistant service no longer listens: it polls the account's version on its own store connection at most once a second and wakes the sender when it moved, so a row queued by another process goes out within about a second, with the half-second poll behind it, and the service holds no session connection for it. A row queued in the service's own process still wakes the sender at once.
+
 ## 2026-10-25 — The Deepgram key is kept once for the machine
 
 The setup field `DEEPGRAM_API_KEY` is declared `shared`, so `whatsapp setup` lists it under `shared`, apart from `fields`, and `whatsapp setup set` writes it to `~/.config/capabilities/shared.env`, where telegram reads the same value. `transcribe`, the assistant service's voice notes and the connections report ask that file before `~/.config/whatsapp/credentials.env`, so a key already kept there still works; a project's `.env.local`/`.env` still wins. `whatsapp setup unset DEEPGRAM_API_KEY` removes it from both files. The script declares `capabilities-contract>=0.22,<1`.
