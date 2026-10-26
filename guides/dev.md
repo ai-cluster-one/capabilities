@@ -11,6 +11,8 @@ capabilities dev start <name>
 From a source checkout pass `--project PATH` or `--no-project`; custom sources
 use `--source ID-OR-PATH`. Edit only the returned source worktree.
 
+Where a worktree lives is the machine's answer, not a habit: `capabilities path --json` names it as `worktree_root`, which is `~/work` on an agent node (its work volume, kept across a redeploy) and the data home elsewhere. A git worktree you open yourself, of any repository, goes at `<worktree_root>/<repo>-dev/<id>`; `dev start` places its own sessions there too, and `dev list` shows that place as `data_root`.
+
 `dev exec <session> -- <command>` is the hermetic lane with isolated
 HOME/registry/XDG roots. Refresh capability payloads with `dev install
 <session> <name>`. `dev run <session> <name> -- <args>` runs the exact session

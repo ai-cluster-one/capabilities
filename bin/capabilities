@@ -94,6 +94,10 @@ PROJECT PATH VERB
         it (context list, assets list, routine list --store), folder where its
         import and export default to. While the store does not answer, each
         layer is its folder.
+        worktree_root is where this machine keeps the git worktrees its agents
+        open, one at <worktree_root>/<repo>-dev/<id>: ~/work where that folder
+        exists (an agent node's work volume, kept across a redeploy), else
+        $XDG_DATA_HOME (~/.local/share).
         --identity adds project_identity: the project id
         (CAPABILITIES_PROJECT_ID) and its state - handed (the process
         environment's, for this root), declared (the project root's
@@ -416,7 +420,10 @@ DEVELOPMENT VERBS
   dev start <name> [--project PATH | --no-project] [--source ID-OR-PATH]
             [--session ID] [--allow-parallel]
         Create one isolated source worktree and attach the existing consumer
-        checkout when run from it. The project is recorded but never owned,
+        checkout when run from it. The worktree is <id>/source under
+        <worktree_root>/capabilities-dev on a machine with ~/work (see path),
+        else under $XDG_DATA_HOME/capabilities/dev; a session opened before
+        ~/work existed keeps its place. The project is recorded but never owned,
         branched, cleaned or removed by the manager.
   dev install <session> <name> [<name> ...]
         Structurally validate and install capabilities from the session source
@@ -1610,7 +1617,16 @@ def _httpx():
 DEV_SESSION_SCHEMA = "capabilities.dev.session.v2"
 LEGACY_DEV_SESSION_SCHEMA = "capabilities.dev.session.v1"
 DEV_STATE_ROOT = _STATE_HOME / "capabilities" / "dev"
-DEV_DATA_ROOT = _DATA_HOME / "capabilities" / "dev"
+# Where a machine keeps the git worktrees its agents open: ~/work where that
+# folder exists - an agent node's work volume, which outlives a redeploy - and
+# the data home otherwise. One worktree goes at <root>/<repo>-dev/<id>.
+WORK_HOME = Path.home() / "work"
+WORKTREE_ROOT = WORK_HOME if WORK_HOME.is_dir() else _DATA_HOME
+# The manager's own dev worktrees follow it; under the data home they keep the
+# place every session opened before the work volume was read.
+LEGACY_DEV_DATA_ROOT = _DATA_HOME / "capabilities" / "dev"
+DEV_DATA_ROOT = (WORKTREE_ROOT / "capabilities-dev" if WORKTREE_ROOT == WORK_HOME
+                 else LEGACY_DEV_DATA_ROOT)
 MANAGER_MUTATION_LOCK = _STATE_HOME / "capabilities" / "manager-mutation.lock"
 _MANAGER_MUTATION_DEPTH = 0
 DEV_MANAGED_ENV_KEYS = {
@@ -2648,6 +2664,7 @@ def cmd_path(json_output: bool, identity: bool = False) -> None:
         state["bound"] = bound
         state["contextkit_id"] = state["id"] if bound else None
         answer["project_identity"] = state
+    answer["worktree_root"] = str(WORKTREE_ROOT)
     _emit(answer)
 
 
@@ -5229,10 +5246,20 @@ def _dev_state_dir(session_id: str) -> Path:
     return DEV_STATE_ROOT / session_id
 
 
-def _dev_data_dir(session_id: str) -> Path:
+def _dev_data_root(session_id: str) -> Path:
+    """The data root a session's worktree lives under: the data home's for a
+    session opened there before this machine had a work folder, else the
+    machine's dev data root."""
     if not _dev_safe_id(session_id):
         _die(6, "bad_session", f"invalid dev session id: {session_id!r}")
-    return DEV_DATA_ROOT / session_id
+    if DEV_DATA_ROOT != LEGACY_DEV_DATA_ROOT \
+            and (LEGACY_DEV_DATA_ROOT / session_id).is_dir():
+        return LEGACY_DEV_DATA_ROOT
+    return DEV_DATA_ROOT
+
+
+def _dev_data_dir(session_id: str) -> Path:
+    return _dev_data_root(session_id) / session_id
 
 
 def _dev_session(session_id: str) -> dict:
@@ -7422,7 +7449,7 @@ def _dev_stop(session_id: str, emit_result: bool,
     state_dir = _dev_state_dir(session_id)
     data_dir = _dev_data_dir(session_id)
     _dev_assert_owned_path(state_dir, DEV_STATE_ROOT)
-    _dev_assert_owned_path(data_dir, DEV_DATA_ROOT)
+    _dev_assert_owned_path(data_dir, _dev_data_root(session_id))
     _dev_assert_owned_path(Path(session["source"]["worktree"]), data_dir)
     problems, discarded = _dev_cleanup_obstacles(session, discard_work)
     if problems:

@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-26 — `path --json` names where worktrees go, and dev worktrees on a node stay on its work volume
+
+`capabilities path --json` answers `worktree_root`, where this machine keeps the git worktrees its agents open, one at `<worktree_root>/<repo>-dev/<id>`: `~/work` where that folder exists, as an agent node's work volume does, else the data home (`~/.local/share`). On such a machine `dev start` opens its sessions under `~/work/capabilities-dev`, which `dev list` names as `data_root`, so a node's redeploy no longer loses an open session's worktree; elsewhere sessions stay under `~/.local/share/capabilities/dev`, and a session opened there before `~/work` existed keeps its place and is still listed, finished and stopped.
+
 ## 2026-10-26 — `node id` and `doctor` warn while AGENT_NODE_ID is set
 
 A node resolves its id itself, so `AGENT_NODE_ID` in the environment is needed only by a node still keyed by the name it had before ids. While it is set, `capabilities node id` answers `warnings` beside `overridden_by`, and `capabilities doctor` answers `warnings`, each `[{code: node_id_in_environment, variable, value, message, hint}]`, the hint naming `capabilities node id --set <id>` or `capabilities node rekey <name>`. It is a warning, not drift: doctor's exit code does not change, and the variable still overrides the id as before.

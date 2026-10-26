@@ -228,6 +228,8 @@ def test_path_json_reports_plain_project_provenance(tmp_path: Path) -> None:
         "body_root": ".",
         "layers": {name: str((project / name).resolve())
                    for name in ("context", "assets", "routines", "capabilities")},
+        "worktree_root": os.environ.get("XDG_DATA_HOME")
+        or str(tmp_path / "home" / ".local" / "share"),
     }
 
 

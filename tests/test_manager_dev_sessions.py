@@ -1568,3 +1568,31 @@ def test_dev_doctor_verifies_a_session_recorded_without_a_manager_key(tmp_path):
         link.symlink_to(candidate)
     finally:
         _run(env, "dev", "stop", "legacy-manager-key", check=False)
+
+
+def test_a_machine_with_a_work_folder_keeps_its_worktrees_there(tmp_path):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    data_home = Path(env["XDG_DATA_HOME"])
+    before = json.loads(_run(env, "path", "--json", cwd=consumer).stdout)
+    assert before["worktree_root"] == str(data_home)
+    earlier = _start(env, source, consumer, session="before-work")
+    assert Path(earlier["source_worktree"]) == (
+        data_home / "capabilities" / "dev" / "before-work" / "source")
+
+    work = Path(env["HOME"]) / "work"
+    work.mkdir(parents=True)
+    answer = json.loads(_run(env, "path", "--json", cwd=consumer).stdout)
+    assert answer["worktree_root"] == str(work)
+    started = _start(env, source, consumer, session="on-work")
+    assert Path(started["source_worktree"]) == (
+        work / "capabilities-dev" / "on-work" / "source")
+    listed = json.loads(_run(env, "dev", "list").stdout)
+    assert listed["data_root"] == str(work / "capabilities-dev")
+
+    for session in ("before-work", "on-work"):
+        stopped = json.loads(_run(env, "dev", "stop", session).stdout)
+        assert stopped["removed"] is True
+    assert not (data_home / "capabilities" / "dev" / "before-work").exists()
+    assert not (work / "capabilities-dev" / "on-work").exists()
