@@ -412,6 +412,47 @@ def test_a_store_mode_project_compiles_every_service_and_retires_the_switches(
     assert json.loads(deployment("sync", "--check").stdout)["retired"] == []
 
 
+def test_a_box_carries_a_machine_only_service_on_its_node_manager_whatever_the_shape(
+        tmp_path: Path, cluster) -> None:
+    database, _rows_of = _database(cluster)
+    env = _env(tmp_path / "home")
+    for name in ("slack", "agentrooms"):
+        path = Path(env["CAPABILITIES_HOME"]) / name / "manifest.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(_registry_manifest(name)))
+    assert "deploy" not in _registry_manifest("agentrooms")["service"]
+    root = _project(tmp_path / "project", {"id": PROJECT_ID, "slug": "project",
+                                           "records": "store"},
+                    dotenv=(f"AGENTKIT_DB_URL=postgresql://{ADMIN}@127.0.0.1:{cluster}/"
+                            f"{database}?sslmode=disable\nAGENTKIT_DB_SCHEMA=lab\n"))
+    _manager(root, env, "enable", "deployment", "--project")
+
+    def deployment(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run([str(DEPLOYMENT), *args], cwd=root, env=env,
+                              capture_output=True, text=True, timeout=120)
+
+    setup = deployment("setup", "--provider", "manual", "--force")
+    assert setup.returncode == 0, setup.stderr
+    assert json.loads(setup.stdout)["embedded_services"] == ["agentrooms", "slack"]
+    supervisor_path = root / "deployment/targets/production/supervisord.conf"
+    assert ("command=capabilities node run --supervisor /tmp/agent-box-services "
+            "--every 60 --services agentrooms,slack") in supervisor_path.read_text()
+
+    # With every deployable service a container of its own, the box still runs
+    # the machine-only one: it has no container form.
+    runtime_path = root / "deployment" / "runtime.json"
+    runtime = json.loads(runtime_path.read_text())
+    runtime["service_policy"] = {"shape": "container", "capabilities": {}}
+    runtime_path.write_text(json.dumps(runtime, indent=2) + "\n")
+    synced = deployment("sync")
+    assert synced.returncode == 0, synced.stdout + synced.stderr
+    result = json.loads(synced.stdout)
+    assert result["services"] == ["slack"]
+    assert result["embedded_services"] == ["agentrooms"]
+    assert ("command=capabilities node run --supervisor /tmp/agent-box-services "
+            "--every 60 --services agentrooms") in supervisor_path.read_text()
+
+
 def _backends(port: int, database: str) -> dict[int, str]:
     """Every connection to `database` other than this one: pid to state."""
     import psycopg

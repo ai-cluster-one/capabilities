@@ -104,7 +104,10 @@ USAGE
       one; embedded runs under the agent container's Supervisor, whose one
       program for them is the node's service manager (`capabilities node
       run`), which keeps a program per service placed on the node and none
-      for any other; container is a Compose service of its own. A store-mode
+      for any other; container is a Compose service of its own. A service
+      that declares only a machine form (service.machine, no service.deploy)
+      has no container of its own, so a box carries it embedded whatever the
+      shape, on that program's --services list. A store-mode
       runtime still carrying the retired switches (auto_include, default_mode,
       capabilities.<name> auto|enabled|disabled) or placement is reported as a
       warning naming each one, and sync rewrites it, keeping the shape it
@@ -1190,6 +1193,28 @@ def _store_service_descriptors(runtime: dict | None = None
     return descriptors, findings
 
 
+def _store_machine_services(runtime: dict | None = None) -> dict[str, dict]:
+    """Every service of the installed catalogue that declares no project
+    command and a machine one (service.machine.command), less the runtime's
+    exclusions: it has no container form, so a box runs it through its node
+    service manager, which keeps one program per node for it."""
+    excluded = _runtime_capability_excludes(runtime or {})
+    services: dict[str, dict] = {}
+    for name in _installed_service_names():
+        if name in excluded:
+            continue
+        manifest, err = _installed_manifest(name)
+        service = (manifest or {}).get("service") if not err else None
+        if not isinstance(service, dict) or "deploy" in service:
+            continue
+        machine = service.get("machine")
+        command = machine.get("command") if isinstance(machine, dict) else None
+        if (isinstance(command, list) and command
+                and all(isinstance(v, str) and v for v in command)):
+            services[name] = service
+    return services
+
+
 # What a runtime's service_policy says, once its retired on/off vocabulary is
 # read for the shape it implied. `enabled` always meant a Compose service of its
 # own; `auto` and `disabled` said only whether a service ran, which the gate now
@@ -1333,9 +1358,16 @@ def _active_descriptors(root: Path, runtime: dict) -> tuple[
             embedded[name] = service
         else:
             active[name] = service
+    # A service with only a machine form runs in the box whatever the shape,
+    # under the node's service manager; a host compiles none of them.
+    if str(runtime.get("profile") or "") in CONTAINER_PROFILES:
+        for name, service in _store_machine_services(runtime).items():
+            embedded.setdefault(name, service)
     mount_contracts: dict[str, tuple[str, str]] = {}
     for name, service in {**active, **embedded}.items():
-        deploy = service["deploy"]
+        deploy = service.get("deploy")
+        if not isinstance(deploy, dict):
+            continue
         for mount in deploy["mounts"]:
             contract = (mount["kind"], mount["target"])
             previous = mount_contracts.setdefault(mount["name"], contract)
@@ -3074,9 +3106,10 @@ def _compile_runtime(root: Path, runtime: dict,
         agent = services["agent"]
         embedded_names = []
         for name, service in sorted(embedded.items()):
-            deploy = service["deploy"]
-            agent = _merge_descriptor_requirements(agent, deploy)
-            _register_descriptor_volumes(volumes, deploy, compiler)
+            deploy = service.get("deploy")
+            if isinstance(deploy, dict):
+                agent = _merge_descriptor_requirements(agent, deploy)
+                _register_descriptor_volumes(volumes, deploy, compiler)
             embedded_names.append(name)
         agent["embedded_services"] = embedded_names
         services["agent"] = agent

@@ -993,8 +993,10 @@ PROJECT VERBS (run inside a consuming project)
         <capability>.machine, running `node supervise <name> --machine` in
         this folder while any agent here places it.
         --services limits it to those capabilities, the ones this
-        Supervisor's box carries; a service placed here outside them is left
-        to whatever runs it, such as a container of its own.
+        Supervisor's box carries; a service placed here outside them that
+        declares a project command is left to whatever runs it, such as a
+        container of its own, and named once on stderr, and a machine
+        service outside them runs nowhere here.
         It applies the difference with `supervisorctl update`, which leaves
         every unchanged program running, so node run can stop and start
         again while the services keep running. It reconciles every N
@@ -1003,9 +1005,13 @@ PROJECT VERBS (run inside a consuming project)
         `service restart` for one of its programs. It reports the node seen
         on each reconcile. While the store cannot be read it changes no job,
         and at its first start it writes none until it has read the store. A
-        placed service that cannot run here - not installed, no deploy
-        command, quarantined, or its agent's folder not bound to it - is
-        named once on stderr. Exit 6 supervisor_required,
+        placed service it will not run - not installed, no deploy or machine
+        command, quarantined, a machine service outside --services, or its
+        agent's folder not bound to it - is named once on stderr and keeps
+        this node's row in capabilities_service_instances, unusable, its
+        problem saying why and its code service_not_runnable, quarantined,
+        not_carried or agent_folder_unbound; the row goes once it runs or is
+        no longer placed here, and when node run stops. Exit 6 supervisor_required,
         supervisor_unreachable or node_run_running.
   node run --launchd [--every N] [--services <name,...>]
         The same on a Mac, where each job is a launchd agent of this OS user
@@ -10293,6 +10299,10 @@ class _NodeManager:
         self.follow_keys: tuple = ()
         self.said: dict[str, object] = {}
         self.changed: set[str] = set()
+        # The placed services this node will not run, by (agent, capability),
+        # whose rows in capabilities_service_instances this process wrote.
+        self.unrun: dict[tuple[str, str], tuple[str, str]] = {}
+        self.unrun_now: dict[tuple[str, str], tuple[str, str]] = {}
 
     def say(self, message: str) -> None:
         sys.stderr.write(f"[capabilities node {self.here}] {message}\n")
@@ -10380,23 +10390,39 @@ class _NodeManager:
             self.said.pop(f"agent:{agent_id}", None)
             folders[agent_id] = path
         jobs: dict[str, dict] = {}
+        unrun: dict[tuple[str, str], tuple[str, str]] = {}
         for agent_id, capability in placed:
             if agent_id not in folders:
-                continue
-            if self.only is not None and capability not in self.only:
-                # Placed here and run by something else on this node, such as
-                # a container of its own.
+                unrun[(agent_id, capability)] = (
+                    "agent_folder_unbound",
+                    f"agent {agent_id} records no folder on this node that is bound to it")
                 continue
             key = f"service:{agent_id}/{capability}"
             _command, why = _node_service_command(capability)
+            code = "service_not_runnable"
             machine = why is not None and bool(_node_machine_command(capability))
             if machine:
                 why = None
             if why is None and _machine_state(capability) == "quarantined":
-                why = f"{capability} is quarantined on this machine"
+                why, code = f"{capability} is quarantined on this machine", "quarantined"
+            if why is None and self.only is not None and capability not in self.only:
+                if not machine:
+                    # Placed here and run by something else on this node, such
+                    # as a container of its own, which keeps its own row.
+                    self.say_once(key, "elsewhere",
+                                  f"{capability} is placed here for {agent_id} and is not "
+                                  "among this box's services (--services), so it is left "
+                                  "to what runs it here, such as a container of its own")
+                    continue
+                # A machine service has no container of its own: nothing else
+                # on this node runs it.
+                why, code = (f"{capability} is not among the services this node run "
+                             f"keeps (--services {','.join(sorted(self.only))})",
+                             "not_carried")
             if why is not None:
                 self.say_once(key, why, f"{capability} is placed here for {agent_id} and "
                                         f"does not run: {why}")
+                unrun[(agent_id, capability)] = (code, why)
                 continue
             self.said.pop(key, None)
             if machine:
@@ -10410,7 +10436,41 @@ class _NodeManager:
             name = self.job_name(agent_id, capability, slugs.get(agent_id))
             jobs[name] = {"name": name, "agent_id": agent_id, "capability": capability,
                           "folder": str(folders[agent_id])}
+        self.unrun_now = unrun
         return jobs
+
+    def record_unrun(self, unrun: dict[tuple[str, str], tuple[str, str]]) -> None:
+        """Keep a row in capabilities_service_instances for each placed
+        service this node will not run, unusable with why, and drop the row
+        this process wrote for one it now runs or that is no longer placed
+        here, before its job starts and writes its own."""
+        gone = set(self.unrun) - set(unrun)
+        if not unrun and not gone:
+            return
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            self.say_once("unrun", type(exc).__name__,
+                          "cannot record the services it does not run: "
+                          f"{getattr(exc, 'message', exc)}")
+            return
+        try:
+            with conn.transaction():
+                for (agent_id, capability), (code, why) in sorted(unrun.items()):
+                    self.store.service_instance_put(
+                        conn, agent_id, capability, self.here, state="unusable",
+                        problem=why, problem_code=code)
+                for agent_id, capability in sorted(gone):
+                    self.store.service_instance_drop(conn, agent_id, capability, self.here)
+        except Exception as exc:
+            self.say_once("unrun", type(exc).__name__,
+                          "cannot record the services it does not run: "
+                          + " ".join(f"{type(exc).__name__}: {exc}".split())[:300])
+            return
+        finally:
+            conn.close()
+        self.said.pop("unrun", None)
+        self.unrun = dict(unrun)
 
     def machine_job_name(self, capability: str) -> str:
         return f"{capability}.machine"
@@ -10456,6 +10516,7 @@ class _NodeManager:
         agents, placed = answer
         self.agents = [row[0] for row in agents]
         desired = self.desired(agents, placed)
+        self.record_unrun(self.unrun_now)
         present = self.written()
         for name, job in desired.items():
             path = self.job_path(name)
@@ -10742,6 +10803,7 @@ def _node_run(args: list[str]) -> None:
     manager.say(f"keeps a job per service placed on this node in {where}, "
                 f"reconciling every {every}s and on each placement change")
     manager.run(stopping)
+    manager.record_unrun({})
     manager.say("stops; every job keeps running under the supervisor")
     lock.close()
 

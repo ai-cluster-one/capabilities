@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-26 — A box runs a service that has only a machine form
+
+In store mode a container box now carries every installed service that declares a machine command (`service.machine`) and no project one (`service.deploy`), less `capabilities.exclude`, embedded whatever the runtime's shape, since it has no container of its own: it is listed in `embedded_services` and on the node service manager's `capabilities node run --services` list, so a placement on the node starts its `<name>.machine` program there. Before, only services with `service.deploy` reached that list, and such a service placed on a box ran nowhere. A host profile compiles none of them.
+
 ## 2026-10-26 — `machine handover` hands the machine services' agents to the node manager
 
 `deployment machine handover [<name> ...] [--dry-run]` boots out each loaded `capabilities.machine.<name>` agent `machine sync` compiled - the named ones, or every compiled one when none is named - and takes its entry out of `~/Library/LaunchAgents`, as `deployment handover` does a project's agents, so the node manager's job for that service (`capabilities node install`, which runs it) is not left waiting on it; the machine watchdog goes with them once no other machine service agent stays loaded. The compiled files stay. It answers `{dry_run, ok, agents_dir, agents}` in `handover`'s shape and exits 6 when an agent could not be handed over; without --dry-run it is stopped by the read-only switch.

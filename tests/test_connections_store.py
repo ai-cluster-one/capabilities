@@ -1619,6 +1619,60 @@ def test_node_run_runs_its_own_agents_services_where_the_store_records_no_folder
     assert node_run.returncode == 0, err
 
 
+def test_node_run_records_a_placed_service_it_will_not_run_and_keeps_a_listed_machine_one(
+        lab, tmp_path):
+    """A machine service placed here runs under node run when its --services
+    list names it; left off the list it runs nowhere, and node run says so on
+    stderr and in the node's row, which goes once node run stops."""
+    here = _service_lab(lab)
+    (Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify" / "manifest.json").write_text(
+        json.dumps({"name": "coolify", "service": {
+            "name": "svc", "summary": "s", "verbs": [], "placement": "exclusive",
+            "machine": {"schema": "capabilities.service.machine.v1",
+                        "command": ["coolify", "service", "run", "--machine"]}}}))
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "supervisorctl").write_text("#!/bin/sh\n")
+    (bin_dir / "supervisorctl").chmod(0o755)
+    env = {**lab["env"], **here, "SUPERVISOR_SERVER_URL": "unix:///tmp/test.sock",
+           "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+
+    def row():
+        return _rows(lab, "SELECT state, problem_code, problem FROM "
+                          "capabilities_service_instances WHERE capability = 'coolify'")
+
+    jobs = tmp_path / "jobs"
+    node_run = subprocess.Popen([str(MANAGER), "node", "run", "--supervisor", str(jobs),
+                                 "--services", "slack"], cwd=lab["project"], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        found = _wait_for(row, 15)
+        assert found and found[0][:2] == ("unusable", "not_carried")
+        assert "--services slack" in found[0][2]
+        assert not list(jobs.glob("*.conf"))
+    finally:
+        node_run.terminate()
+        _out, err = node_run.communicate(timeout=60)
+    assert node_run.returncode == 0, err
+    assert "coolify is placed here for" in err and "does not run" in err
+    assert row() == []
+
+    node_run = subprocess.Popen([str(MANAGER), "node", "run", "--supervisor", str(jobs),
+                                 "--services", "coolify,slack"], cwd=lab["project"],
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True)
+    try:
+        job = jobs / "coolify.machine.conf"
+        assert _wait_for(job.exists, 15)
+        assert "node supervise coolify --machine\n" in job.read_text()
+        assert row() == []
+    finally:
+        node_run.terminate()
+        _out, err = node_run.communicate(timeout=60)
+    assert node_run.returncode == 0, err
+
+
 def test_a_machine_service_runs_once_per_node_for_the_agents_placing_it(lab, tmp_path):
     """A service with no project command of its own that declares a machine one
     is run once on the node, for each placing agent whose lease it holds, which
