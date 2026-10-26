@@ -1377,6 +1377,43 @@ def test_watch_follows_the_held_wakes_in_the_store(cli, project, stored, homeser
 
 
 @needs_store
+def test_watch_reads_a_held_change_again_after_a_failed_read(cli, project, stored, homeserver,
+                                                             capsys, monkeypatch):
+    import time as _time
+    connect(project, allow_write=False)
+    engine = cli._engine()
+    stranger = f"@s:{SERVER}"
+    real, calls = engine.Store.held_rooms, []
+
+    def lost_once(self, *a, **k):
+        # The first read after the held change is lost.
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("store read lost")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(engine.Store, "held_rooms", lost_once)
+
+    def hold_one():
+        store = engine.Store(engine.resolve_store(project)).open()
+        try:
+            store.acquire("prj_test", "alpha", "h1", "n1", 1)
+            store.save_sync("prj_test", "alpha", f"@alpha:{SERVER}", "h1", "b1", [
+                {"room_id": "!r", "key": "$1", "kind": "mention", "event_id": "$1",
+                 "sender": stranger, "held": True}])
+            _time.sleep(cli.WATCH_HELD_SECONDS * 4.5)
+        finally:
+            store.close()
+        return {"next_batch": "b2"}
+
+    homeserver.syncs += [{"next_batch": "b0"}, hold_one, cli._WatchStopped()]
+    code, lines, err = run_stream(cli, capsys, "watch")
+    assert code == 0, err
+    assert len(calls) >= 3
+    assert lines[1:] == [
+        {"event": "held", "room_id": "!r", "held": {"count": 1, "senders": [stranger]}}]
+
+@needs_store
 def test_watch_no_held_follows_matrix_holding_no_store_connection(cli, project, stored,
                                                                  homeserver, capsys):
     # The connection is resolved from the store, as in a project whose

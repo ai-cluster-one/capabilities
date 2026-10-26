@@ -206,7 +206,9 @@ LEDGER_STEPS = [
     # `agentrooms_held` in the store's change versions, in the writer's own
     # transaction, so a change any release writes moves the version `watch`
     # follows. The notification stays beside it for a `watch` of an earlier
-    # release that still listens on that channel.
+    # release that still listens on that channel. The trigger is deferred to
+    # the commit, so the version row is locked last and a writer never holds
+    # it while it waits for another writer's wake rows.
     ("0011-held-versions", r"""
     CREATE OR REPLACE FUNCTION agentrooms_wakes_held_notify() RETURNS trigger LANGUAGE plpgsql AS $$
     DECLARE
@@ -228,6 +230,10 @@ LEDGER_STEPS = [
             USING changed.project_id || '/' || changed.agent;
         RETURN NULL;
     END $$;
+    DROP TRIGGER agentrooms_wakes_held_notify ON agentrooms_wakes;
+    CREATE CONSTRAINT TRIGGER agentrooms_wakes_held_notify AFTER INSERT OR UPDATE OR DELETE
+        ON agentrooms_wakes DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION agentrooms_wakes_held_notify();
     """),
 ]
 # The channel a change to an agent's held wakes is announced on: its version

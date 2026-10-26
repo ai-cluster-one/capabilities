@@ -1825,12 +1825,17 @@ def _follow_held(cfg: dict, rooms: set | None):
 
     def run() -> None:
         # A poll that fails is taken again at the next; the first that
-        # answers reports whatever moved meanwhile.
+        # answers reports whatever moved meanwhile. A move whose reread failed
+        # is already past the follower, so the reread stays owed until one
+        # succeeds.
+        owed = False
         while True:
             time.sleep(WATCH_HELD_SECONDS)
             try:
-                if store.poll(follower):
+                if store.poll(follower) or owed:
+                    owed = True
                     reread()
+                    owed = False
             except _WatchStopped:
                 return
             except Exception:

@@ -220,6 +220,56 @@ def test_held_wakes_wait_for_the_operator_and_a_grant_releases_them(store):
     assert version == (10,) and len(said) <= 10
 
 
+
+def test_a_sync_releasing_a_room_and_a_dismiss_of_it_both_commit(store):
+    # save_sync's statements in its order - hold a wake in one room, then the
+    # grant's release of another - with the operator's dismiss of that other
+    # room between them. Neither waits on the version row while holding wake
+    # rows the other needs.
+    import threading
+
+    import psycopg
+
+    store.acquire("p", "alpha", "h1", "n1", 1)
+    store.save_sync("p", "alpha", "@alpha:x", "h1", "b1", [
+        {"room_id": "!r", "key": "$1", "kind": "mention", "event_id": "$1",
+         "sender": "@s:x", "held": True}])
+    dsn = f"{DSN}{'&' if '?' in DSN else '?'}options=-csearch_path%3D{store.setting.schema}"
+    sync, operator = psycopg.connect(dsn), psycopg.connect(dsn)
+    out = {}
+    try:
+        sync.execute("INSERT INTO agentrooms_wakes (project_id, agent, room_id, wake_key, kind, "
+                     "event_id, sender, held_at) VALUES ('p', 'alpha', '!q', '$2', 'mention', "
+                     "'$2', '@t:x', now())")
+
+        def dismiss():
+            try:
+                operator.execute("DELETE FROM agentrooms_wakes WHERE project_id = 'p' "
+                                 "AND agent = 'alpha' AND room_id = '!r' AND held_at IS NOT NULL")
+                operator.commit()
+                out["operator"] = "committed"
+            except Exception as exc:
+                operator.rollback()
+                out["operator"] = type(exc).__name__
+
+        thread = threading.Thread(target=dismiss)
+        thread.start()
+        thread.join(0.5)
+        try:
+            sync.execute("UPDATE agentrooms_wakes SET held_at = NULL WHERE project_id = 'p' "
+                         "AND agent = 'alpha' AND room_id = '!r' AND held_at IS NOT NULL")
+            sync.commit()
+            out["sync"] = "committed"
+        except Exception as exc:
+            sync.rollback()
+            out["sync"] = type(exc).__name__
+        thread.join()
+    finally:
+        sync.close()
+        operator.close()
+    assert out == {"sync": "committed", "operator": "committed"}
+    assert store.held_rooms("p", "alpha") == {"!q": {"count": 1, "senders": ["@t:x"]}}
+
 def test_catch_up_takes_the_admitted_wakes_and_a_later_one_is_known_taken(store):
     store.acquire("p", "alpha", "h1", "n1", 1)
     wake = {"room_id": "!r", "kind": "mention", "sender": "@b:x"}
