@@ -1032,7 +1032,11 @@ PROJECT VERBS (run inside a consuming project)
         an exclusive one placed on no node, a shared one not on this one - is
         first placed on this node (`capabilities place <name> --node <this
         node>` there), so the migration stops no service that was running;
-        where that fails the folder's agents are not handed over. Without
+        where that fails the folder's agents are not handed over. The machine
+        services it will run here - placed on this node by an agent it serves,
+        declaring a machine command and no project command - hand their old
+        machine agents over too (`deployment machine handover <name> ...`,
+        once, answered as machine_handover {services, agents, error?}). Without
         --apply it changes nothing and answers what it would do, which is how
         a machine's migration is announced before it runs. Answers {applied,
         project, agent_id, node, served [{agent_id, folder}], left [{agent_id,
@@ -1122,7 +1126,10 @@ PROJECT VERBS (run inside a consuming project)
         waiting for an agent whose lease another node holds. Where a machine
         process it did not start runs <name> here - an agent of `deployment
         machine sync`, or one started by hand - it starts none beside it,
-        changes no list and writes each row waiting. Stopping, it stops the
+        changes no list and writes each row waiting (machine_process_elsewhere),
+        its problem naming the command that ends it: `deployment machine
+        handover <name>` where launchd runs capabilities.machine.<name>, else
+        `<name> service stop --machine`. Stopping, it stops the
         process and takes off the list every agent it put there. Its record
         is under $XDG_STATE_HOME/capabilities/node/machine/.
   service start <name> [--node <node>] [--wait S]
@@ -10846,9 +10853,13 @@ def _node_install(args: list[str]) -> None:
     def read(conn, agent_id):
         return agent_id, conn.execute(
             "SELECT agent_id, folder FROM capabilities_agent_nodes WHERE node = %s "
-            "ORDER BY agent_id", (here,)).fetchall()
+            "ORDER BY agent_id", (here,)).fetchall(), conn.execute(
+            "SELECT p.agent_id, p.capability FROM capabilities_policy p "
+            "JOIN capabilities_agent_nodes l ON l.agent_id = p.agent_id "
+            "AND l.node = p.node WHERE p.node = %s AND p.enabled AND p.service "
+            "ORDER BY p.agent_id, p.capability", (here,)).fetchall()
 
-    (agent_id, links), setting = _kernel_run(root, read)
+    (agent_id, links, placed), setting = _kernel_run(root, read)
     if agent_id not in {linked for linked, _folder in links}:
         _die(6, "agent_not_on_node",
              f"agent {agent_id} does not live on node {here}, so a node manager here "
@@ -10903,6 +10914,29 @@ def _node_install(args: list[str]) -> None:
         if "error" in entry:
             failed.append(entry)
         handovers.append(entry)
+    # The machine services the node manager will run here, as `node run`
+    # chooses them, hand their old machine agents (`deployment machine sync`'s)
+    # over the same way, once for the machine.
+    served = {linked for linked, _path in folders}
+    machine = sorted({capability for linked, capability in placed if linked in served
+                      and _node_service_command(capability)[1] is not None
+                      and _node_machine_command(capability)
+                      and _machine_state(capability) != "quarantined"})
+    machine_handover: dict | None = None
+    if machine and deployment:
+        machine_handover = {"services": machine}
+        rc, out, err = _run_script(Path(deployment),
+                                   ["machine", "handover", *machine,
+                                    *([] if apply else ["--dry-run"])],
+                                   cwd=root, env=_snapshot_env(), timeout=300)
+        try:
+            answer = json.loads(out) if out.strip() else None
+        except ValueError:
+            answer = None
+        machine_handover["agents"] = (answer.get("agents") or []
+                                      if isinstance(answer, dict) else [])
+        if rc != 0 or not isinstance(answer, dict):
+            machine_handover["error"] = (err or out).strip()[-1000:] or f"exit {rc}"
     manager = shutil.which("capabilities") or str(Path(sys.argv[0]).resolve())
     logs = _node_launchd_dir()
     plist = _launch_agents_dir() / f"{NODE_AGENT_LABEL}.plist"
@@ -10918,6 +10952,8 @@ def _node_install(args: list[str]) -> None:
               "served": [{"agent_id": linked, "folder": str(path)} for linked, path in folders],
               "left": left, "handover": handovers, "node_agent": agent,
               "store": _kernel_store_report(setting)}
+    if machine_handover is not None:
+        result["machine_handover"] = machine_handover
     if not apply:
         result["next"] = "capabilities node install --apply"
         _emit(result)
@@ -10942,6 +10978,13 @@ def _node_install(args: list[str]) -> None:
                       + ", ".join(e["folder"] for e in failed) + " were not all handed over",
                       "run `deployment handover` in that folder; until it hands an agent "
                       "over, the node manager's job for that service waits for it", result)
+    if machine_handover is not None and "error" in machine_handover:
+        _service_fail("handover_incomplete",
+                      "the node manager is loaded, and the machine agents of "
+                      + ", ".join(machine) + " were not all handed over",
+                      f"run `deployment machine handover {' '.join(machine)}`; until it "
+                      "hands an agent over, the node manager's job for that service "
+                      "waits for it", result)
     _emit(result)
 
 
@@ -12259,8 +12302,12 @@ class _MachineSupervisor(_Supervisor):
         if foreign and not self.running():
             self.foreign = {"pid": pid}
             self.want = False
+            label = f"capabilities.machine.{self.name}"
+            retire = (f"`deployment machine handover {self.name}` retires {label}, which "
+                      "runs it" if _launchd_loaded(label)
+                      else f"`{self.name} service stop --machine` stops it")
             self.reason = (f"a machine process of {self.name} this supervisor did not start "
-                           f"(pid {pid}) runs here, so it starts none beside it")
+                           f"(pid {pid}) runs here, so it starts none beside it; {retire}")
             self.say_once(("foreign", pid), self.reason)
             self.write_instance()
             self.save()

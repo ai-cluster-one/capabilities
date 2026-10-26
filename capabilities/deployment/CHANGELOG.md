@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-26 — `machine handover` hands the machine services' agents to the node manager
+
+`deployment machine handover [<name> ...] [--dry-run]` boots out each loaded `capabilities.machine.<name>` agent `machine sync` compiled - the named ones, or every compiled one when none is named - and takes its entry out of `~/Library/LaunchAgents`, as `deployment handover` does a project's agents, so the node manager's job for that service (`capabilities node install`, which runs it) is not left waiting on it; the machine watchdog goes with them once no other machine service agent stays loaded. The compiled files stay. It answers `{dry_run, ok, agents_dir, agents}` in `handover`'s shape and exits 6 when an agent could not be handed over; without --dry-run it is stopped by the read-only switch.
+
 ## 2026-10-26 — `node exec` forwards piped standard input to the command on the node
 
 `deployment node exec <node> -- <command>` hands what is piped into it to the command run in the node's container, so `printf x | deployment node exec <node> -- cat` prints `x` and a value piped to `setup set --stdin` arrives. Every command the node verbs run before or beside their own - `capabilities`, `coolify`, `ssh` and the rest - now reads no standard input unless it is given some: before, the container lookup over SSH inherited the caller's pipe and drained it, so the command ran with an empty input and exited 0.

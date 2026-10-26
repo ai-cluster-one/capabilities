@@ -210,6 +210,7 @@ USAGE
       handed over.
 
   deployment machine sync|next [--text|--json]|status|watchdog [--dry-run]
+  deployment machine handover [<name> ...] [--dry-run]
       The machine scope, on macOS: supervision for the services that run once
       per machine rather than once per project. `sync` asks the capabilities
       manager for the installed set and reads each capability's manifest
@@ -242,7 +243,18 @@ USAGE
       compiled agent, whether it is linked and loaded, its compiled
       `process_type`, the `spawn_type` launchd runs it with, and
       `spawn_type_current`, false while launchd still runs an earlier
-      compilation, and writes nothing. Run `deployment guide profiles` for the model.
+      compilation, and writes nothing. `handover` hands the named machine
+      services' agents (every compiled one when none is named) over to the
+      node's service manager on a Mac (`capabilities node install`, which runs
+      it for the machine services the node manager will run there): it boots
+      out each loaded `capabilities.machine.<name>` and takes its entry out of
+      ~/Library/LaunchAgents, as `deployment handover` does a project's, and
+      the machine watchdog with them once no other machine service agent stays
+      loaded. The compiled files stay. Run again it changes nothing; --dry-run
+      changes nothing and answers the same. Answers {dry_run, ok, agents_dir,
+      agents [{label, kind (service|watchdog), service?, loaded, installed,
+      action, kept_at?}]}; exit 6 when an agent could not be handed over. Run
+      `deployment guide profiles` for the model.
 
   deployment deploy [--target <name>]
       Check compiler drift, sync the body through node-<target> over SSH,
@@ -5676,53 +5688,59 @@ def cmd_handover(args) -> None:
         report["skipped"] = "only the host-agents profile compiles launchd agents"
         _emit(report)
         return
-    library = Path.home() / "Library" / "LaunchAgents"
-    domain = f"gui/{os.getuid()}"
     failed = False
     for agent in found:
-        label = agent["label"]
-        installed = library / f"{label}.plist"
-        loaded = _launchctl("print", f"{domain}/{label}")[0] == 0
-        present = installed.is_symlink() or installed.exists()
-        entry = {**agent, "loaded": loaded, "installed": present}
-        if agent["kind"] == "other":
-            # Nothing the node manager runs takes its place, so it keeps running.
-            entry["action"] = "absent" if not loaded and not present else "kept"
-        elif not loaded and not present:
-            entry["action"] = "absent"
-        elif dry_run:
-            entry["action"] = "would_hand_over"
-        else:
-            if loaded:
-                code, detail = _launchctl("bootout", f"{domain}/{label}")
-                if code != 0 and _launchctl("print", f"{domain}/{label}")[0] == 0:
-                    entry.update(action="failed", step="bootout", detail=detail[:400])
-                    failed = True
-                    report["agents"].append(entry)
-                    continue
-            if present:
-                try:
-                    if installed.is_symlink():
-                        installed.unlink()
-                    else:
-                        # A file someone put there by hand stays, beside the
-                        # agents, rather than being lost.
-                        aside_dir = _host_agents_dir(root, runtime or {})
-                        aside_dir.mkdir(parents=True, exist_ok=True)
-                        aside = aside_dir / f"{label}.plist.handed-over"
-                        shutil.move(str(installed), str(aside))
-                        entry["kept_at"] = str(aside)
-                except OSError as exc:
-                    entry.update(action="failed", step="unlink", detail=str(exc)[:400])
-                    failed = True
-                    report["agents"].append(entry)
-                    continue
-            entry["action"] = "handed_over"
+        entry = _hand_over_agent(agent, _host_agents_dir(root, runtime or {}), dry_run)
+        failed = failed or entry["action"] == "failed"
         report["agents"].append(entry)
     report["ok"] = not failed
     _emit(report)
     if failed:
         sys.exit(6)
+
+
+def _hand_over_agent(agent: dict, aside_dir: Path, dry_run: bool) -> dict:
+    """Boot one launchd agent out and take its entry out of ~/Library/
+    LaunchAgents, so a login does not load it again; an agent of kind `other`
+    is only reported. A file put there by hand is kept in `aside_dir`."""
+    library = Path.home() / "Library" / "LaunchAgents"
+    domain = f"gui/{os.getuid()}"
+    label = agent["label"]
+    installed = library / f"{label}.plist"
+    loaded = _launchctl("print", f"{domain}/{label}")[0] == 0
+    present = installed.is_symlink() or installed.exists()
+    entry = {**agent, "loaded": loaded, "installed": present}
+    if agent["kind"] == "other":
+        # Nothing the node manager runs takes its place, so it keeps running.
+        entry["action"] = "absent" if not loaded and not present else "kept"
+        return entry
+    if not loaded and not present:
+        entry["action"] = "absent"
+        return entry
+    if dry_run:
+        entry["action"] = "would_hand_over"
+        return entry
+    if loaded:
+        code, detail = _launchctl("bootout", f"{domain}/{label}")
+        if code != 0 and _launchctl("print", f"{domain}/{label}")[0] == 0:
+            entry.update(action="failed", step="bootout", detail=detail[:400])
+            return entry
+    if present:
+        try:
+            if installed.is_symlink():
+                installed.unlink()
+            else:
+                # A file someone put there by hand stays, beside the
+                # agents, rather than being lost.
+                aside_dir.mkdir(parents=True, exist_ok=True)
+                aside = aside_dir / f"{label}.plist.handed-over"
+                shutil.move(str(installed), str(aside))
+                entry["kept_at"] = str(aside)
+        except OSError as exc:
+            entry.update(action="failed", step="unlink", detail=str(exc)[:400])
+            return entry
+    entry["action"] = "handed_over"
+    return entry
 
 
 def cmd_watchdog_command(args) -> None:
@@ -7369,6 +7387,39 @@ def cmd_machine_watchdog(dry_run: bool, now: float | None = None) -> dict:
 
 def cmd_machine_watchdog_command(args) -> None:
     _emit(cmd_machine_watchdog(bool(args.dry_run)))
+
+
+def cmd_machine_handover(args) -> None:
+    """Hand this machine's machine-service agents to the node's service manager."""
+    dry_run = bool(args.dry_run)
+    agents_dir = _machine_agents_dir()
+    library = Path.home() / "Library" / "LaunchAgents"
+    prefix = f"{MACHINE_LABEL_PREFIX}."
+    watchdog_label = _machine_label(MACHINE_WATCHDOG)
+    labels = {path.stem for directory in (agents_dir, library) if directory.is_dir()
+              for path in directory.glob(f"{prefix}*.plist")}
+    for name in args.names:
+        if not re.fullmatch(r"[a-z][a-z0-9_-]*", name) or name == MACHINE_WATCHDOG:
+            _die(6, "input", f"{name!r} is not a machine service's capability name")
+    names = set(args.names) or {label[len(prefix):] for label in labels} - {MACHINE_WATCHDOG}
+    report: dict = {"dry_run": dry_run, "agents_dir": str(agents_dir), "agents": []}
+    for name in sorted(names):
+        report["agents"].append(_hand_over_agent(
+            {"label": _machine_label(name), "kind": "service", "service": name},
+            agents_dir, dry_run))
+    # The watchdog goes with the last machine service agent it watches.
+    domain = f"gui/{os.getuid()}"
+    gone = {entry["label"] for entry in report["agents"]
+            if entry["action"] in ("handed_over", "would_hand_over", "absent")}
+    staying = [label for label in sorted(labels - gone - {watchdog_label})
+               if _launchctl("print", f"{domain}/{label}")[0] == 0]
+    if not staying:
+        report["agents"].append(_hand_over_agent(
+            {"label": watchdog_label, "kind": "watchdog"}, agents_dir, dry_run))
+    report["ok"] = all(entry["action"] != "failed" for entry in report["agents"])
+    _emit(report)
+    if not report["ok"]:
+        sys.exit(6)
 
 
 def cmd_runtime(args) -> None:
@@ -9526,6 +9577,10 @@ def main(argv: list[str] | None = None) -> None:
     p_machine_watchdog = machine.add_parser("watchdog", add_help=False)
     p_machine_watchdog.add_argument("--dry-run", action="store_true")
     p_machine_watchdog.set_defaults(fn=cmd_machine_watchdog_command)
+    p_machine_handover = machine.add_parser("handover", add_help=False)
+    p_machine_handover.add_argument("names", nargs="*")
+    p_machine_handover.add_argument("--dry-run", action="store_true")
+    p_machine_handover.set_defaults(fn=cmd_machine_handover)
 
     for verb, fn in (("deploy", cmd_deploy), ("rollback", cmd_rollback), ("logs", cmd_logs)):
         p = sub.add_parser(verb, add_help=False)
@@ -9594,7 +9649,7 @@ def main(argv: list[str] | None = None) -> None:
     if ((args.cmd in WRITE_VERBS or args.cmd in ("watchdog", "runner", "handover"))
             and not previews):
         _read_only_gate(f"`{NAME} {args.cmd}`")
-    if (args.cmd == "machine" and args.machine_cmd in ("sync", "watchdog")
+    if (args.cmd == "machine" and args.machine_cmd in ("sync", "watchdog", "handover")
             and not previews):
         _read_only_gate(f"`{NAME} machine {args.machine_cmd}`")
     if args.cmd == "node" and args.node_cmd in ("sync", "login", "create", "enrol",

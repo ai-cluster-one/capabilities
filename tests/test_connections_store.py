@@ -1712,7 +1712,11 @@ elif args == ["service", "doctor", "--machine"]:
         return ([json.loads(line)[0] for line in log.read_text().splitlines()]
                 if log.exists() else [])
 
-    # A machine process it did not start already runs the service here.
+    # A machine process it did not start already runs the service here, as
+    # deployment's machine agent for it, which launchd has loaded.
+    (bin_dir / "launchctl").write_text(
+        '#!/bin/sh\n[ "$1" = print ] && [ "${2##*/}" = capabilities.machine.coolify ]\n')
+    (bin_dir / "launchctl").chmod(0o755)
     foreign = subprocess.Popen(["sleep", "600"])
     (state / "status.json").write_text(json.dumps({"running": True, "pid": foreign.pid}))
     log = (tmp_path / "supervise.log").open("w")
@@ -1724,6 +1728,10 @@ elif args == ["service", "doctor", "--machine"]:
             (tmp_path / "supervise.log").read_text()
         assert ["service", "join"] not in calls() and lease() == []
         assert ["service", "run", "--machine"] not in calls()
+        # Its problem names the command that retires that agent.
+        assert "`deployment machine handover coolify`" in _rows(
+            lab, "SELECT problem FROM capabilities_service_instances "
+            "WHERE capability = 'coolify'")[0][0]
 
         # Gone, it takes the agent's lease, joins it, runs the machine process,
         # and the row says what the service says of the agent.
@@ -1922,6 +1930,51 @@ print(json.dumps({{"ok": True, "agents": [{{"label": "lab.coolify", "kind": "ser
     # Placed now, so a second run places nothing.
     again = _ok(_manager(lab, "node", "install", "--apply", extra=env))
     assert "placed" not in again["handover"][0]
+
+def test_node_install_hands_over_the_machine_agent_of_a_machine_service_placed_here(
+        lab, tmp_path):
+    here = _service_lab(lab)
+    registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify" / "manifest.json"
+    registry.write_text(json.dumps({"name": "coolify", "service": {
+        "name": "svc", "summary": "s", "verbs": [], "placement": "exclusive",
+        "machine": {"schema": "capabilities.service.machine.v1",
+                    "command": ["coolify", "service", "run", "--machine"],
+                    "doctor": ["coolify", "service", "doctor", "--machine"]}}}))
+    bin_dir, calls, _loaded = _stand_in_launchctl(lab, tmp_path)
+    handovers = tmp_path / "handover.log"
+    (bin_dir / "deployment").write_text(f"""#!{sys.executable}
+import json, os, sys
+with open({str(handovers)!r}, "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\\n")
+action = "would_hand_over" if "--dry-run" in sys.argv else "handed_over"
+label = "capabilities.machine.coolify" if sys.argv[1] == "machine" else "lab.coolify"
+print(json.dumps({{"ok": True, "agents": [{{"label": label, "action": action}}]}}))
+""")
+    (bin_dir / "deployment").chmod(0o755)
+    env = {**here, "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+
+    # Not placed here, the node manager would not run it, so its agent stays.
+    preview = _ok(_manager(lab, "node", "install", extra=env))
+    assert "machine_handover" not in preview
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+
+    preview = _ok(_manager(lab, "node", "install", extra=env))
+    assert preview["machine_handover"] == {"services": ["coolify"], "agents": [
+        {"label": "capabilities.machine.coolify", "action": "would_hand_over"}]}
+    done = _ok(_manager(lab, "node", "install", "--apply", extra=env))
+    assert done["machine_handover"]["agents"][0]["action"] == "handed_over"
+    assert [json.loads(line) for line in handovers.read_text().splitlines()][-2:] == [
+        ["handover"], ["machine", "handover", "coolify"]]
+    # Handed over before the node manager starts.
+    assert _logged(calls)[-1][0] == "bootstrap"
+
+    # One that cannot be handed over fails the install, naming the command.
+    (bin_dir / "deployment").write_text(
+        '#!/bin/sh\n[ "$1" = machine ] && { echo nope >&2; exit 2; }\necho \'{"ok": true}\'\n')
+    failed = _manager(lab, "node", "install", "--apply", extra=env)
+    assert failed.returncode == 6 and _error(failed)["code"] == "handover_incomplete"
+    assert "deployment machine handover coolify" in _error(failed)["hint"]
+
 
 def test_the_service_handles_place_and_answer_what_the_node_reports(lab):
     here = _service_lab(lab)

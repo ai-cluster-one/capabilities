@@ -386,7 +386,7 @@ def test_the_machine_verbs_pass_the_ordinary_gate(scratch):
     gate = base / "config" / "capabilities" / "settings.json"
     gate.write_text(json.dumps({"capabilities": {"deployment": {"enabled": False}}}))
     try:
-        for verb in ("sync", "next", "status", "watchdog"):
+        for verb in ("sync", "next", "status", "watchdog", "handover"):
             result = _deployment(env, base / "home", "machine", verb)
             assert result.returncode == 4, (verb, result.stdout, result.stderr)
     finally:
@@ -396,7 +396,7 @@ def test_the_machine_verbs_pass_the_ordinary_gate(scratch):
 def test_the_read_only_switch_stops_the_writing_verbs(scratch):
     base, env = scratch
     read_only = {**env, "CAPABILITIES_READ_ONLY": "1"}
-    for verb in ("sync", "watchdog"):
+    for verb in ("sync", "watchdog", "handover"):
         assert _deployment(read_only, base / "home", "machine", verb).returncode == 4
     assert not _agents_dir(base).is_dir() or not any(_agents_dir(base).iterdir())
     assert _deployment(read_only, base / "home", "machine", "status").returncode == 0
@@ -582,3 +582,53 @@ def test_a_machine_agent_that_failed_is_still_left_to_launchd_to_restart(
         "sick": ("none", "restarting"), "well": ("none", "restarting")}
     assert entries["sick"]["detail"] == "no pid; launchd is already restarting it"
     assert _kicks(module) == []
+
+
+def test_handover_takes_the_machine_agents_down_and_the_watchdog_with_the_last(
+        tmp_path, monkeypatch, capsys):
+    module = _load(DEPLOYMENT, "deployment_machine_handover_under_test")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    agents_dir = module._machine_agents_dir()
+    agents_dir.mkdir(parents=True)
+    library = tmp_path / "home" / "Library" / "LaunchAgents"
+    library.mkdir(parents=True)
+    labels = ["capabilities.machine.mfix", "capabilities.machine.other",
+              "capabilities.machine.watchdog"]
+    for label in labels:
+        (agents_dir / f"{label}.plist").write_bytes(plistlib.dumps({"Label": label}))
+        (library / f"{label}.plist").symlink_to(agents_dir / f"{label}.plist")
+    loaded = set(labels)
+
+    def launchctl(*argv):
+        label = argv[1].rsplit("/", 1)[-1]
+        if argv[0] == "print":
+            return (0, "") if label in loaded else (113, "not found")
+        if argv[0] == "bootout":
+            loaded.discard(label)
+        return 0, ""
+
+    monkeypatch.setattr(module, "_launchctl", launchctl)
+
+    def handover(*names, dry_run=False):
+        module.cmd_machine_handover(type("Args", (), {"names": list(names),
+                                                      "dry_run": dry_run})())
+        report = json.loads(capsys.readouterr().out)
+        return [(a["label"], a["kind"], a["action"]) for a in report["agents"]]
+
+    # Named, only that one goes; the watchdog stays while another agent runs.
+    assert handover("mfix", dry_run=True) == [
+        ("capabilities.machine.mfix", "service", "would_hand_over")]
+    assert loaded == set(labels)
+    assert handover("mfix") == [("capabilities.machine.mfix", "service", "handed_over")]
+    assert loaded == {"capabilities.machine.other", "capabilities.machine.watchdog"}
+    assert not (library / "capabilities.machine.mfix.plist").exists()
+    assert (agents_dir / "capabilities.machine.mfix.plist").is_file()
+
+    # Unnamed, every compiled one goes, and the watchdog with the last.
+    assert handover() == [
+        ("capabilities.machine.mfix", "service", "absent"),
+        ("capabilities.machine.other", "service", "handed_over"),
+        ("capabilities.machine.watchdog", "watchdog", "handed_over")]
+    assert loaded == set() and not any(library.iterdir())
+    assert [action for _l, _k, action in handover()] == ["absent"] * 3
