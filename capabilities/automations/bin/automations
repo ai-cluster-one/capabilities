@@ -9,7 +9,8 @@
 """automations — project-local scheduler and subprocess runner.
 
 Automations keeps each automation as a definition in the capabilities store,
-scheduled on the one node it names, runs the same way on a developer machine
+scheduled where the project's automations service is placed or on the one
+node it names, runs the same way on a developer machine
 and in an agent container, and records its runs in the same store.
 
 Configuration:
@@ -30,14 +31,26 @@ Definitions:
   root (`script_path`, a file on the node that runs it) or the script itself
   (`script_body`, which reads no file beside itself and starts with a #! line);
   arguments; a five-field numeric cron `schedule` read in its `timezone`
-  (default UTC), or none for manual only; the `node` that schedules it, or
-  none; `enabled`; `timeout_seconds` (default 300); and `retries` (default 0).
+  (default UTC), or none for manual only; the `node` it is pinned to, or
+  none to follow the service; `enabled`; `timeout_seconds` (default 300); and `retries` (default 0).
   One run of an automation is active at a time across every node, and a
   firing that finds one is recorded skipped.
 
   A node schedules the enabled definitions that name it, by the node id its
   service runs under (the id the machine resolves for itself, `capabilities
-  node id`; AGENT_NODE_ID overrides it). Every definition
+  node id`; AGENT_NODE_ID overrides it). A definition that names no node
+  follows the service: the nodes the project's automations service is placed
+  on (`capabilities place automations --node <node>`, `capabilities service
+  start|stop automations`), as the store's placement rows say, schedule it,
+  and every running daemon does where the store records no placement. A
+  definition naming a node the service is not placed on follows the service
+  too, since no daemon of the project runs there: moving the service carries
+  the automations of the node it left, and a pin holds only to a node the
+  service is on. A running daemon reads the placement again within 30
+  seconds; where several nodes schedule one automation, each firing is one
+  run, taken by whichever claims it first. The stored node is left as saved,
+  so a pin takes hold again once the service is placed back on its node.
+  Every definition
   saved is announced on the store, so a running daemon on any machine takes
   the change up within a second without a reload, and moving an automation to
   another node touches no file of either. A row the store holds that does
@@ -71,9 +84,11 @@ Commands:
       that does not validate, and with `missing_scripts` for a script path
       missing on this node. Fails with `config_stale` when the running daemon
       loaded a declaration that has changed since and it has not taken up.
-      Fails with `node_idle` when the running daemon's node is named by none
-      of the enabled automations, so a daemon that is alive and scheduling
-      nothing stops reading as healthy. `daemon_node` is the node that daemon
+      Fails with `node_idle` when the running daemon's node schedules none
+      of the enabled automations - none names it, and none follows the
+      service onto it - so a daemon that is alive and scheduling nothing stops
+      reading as healthy; `node_idle.placed_on` is where the service is
+      placed, null where the store records no placement. `daemon_node` is the node that daemon
       published, null when it published none; `node` is this invocation's.
       Exits 6 `store_not_configured` when the machine has no store to keep
       the definitions and runs in, and 5 when the store cannot be reached.
@@ -81,11 +96,14 @@ Commands:
       by their own migration.
   automations list
       The project's automations as their active versions say, each with
-      `id`, `version`, `description`, `enabled`, `node`, `scheduled_here`
-      (whether this invocation's node schedules it), `script` (its path, or
+      `id`, `version`, `description`, `enabled`, `node`, `follows_service`
+      (whether it runs where the service is placed rather than on `node`),
+      `scheduled_here` (whether this invocation's node schedules it),
+      `script` (its path, or
       null for a body), `body` (whether it is one), `arguments`, `schedule`,
       `timezone`, `timeout_seconds`, `retries`, `created_at` and `created_by`;
-      and `invalid_definitions` when a row is skipped.
+      `placed_on`, the nodes the service is placed on (null where the store
+      records no placement); and `invalid_definitions` when a row is skipped.
   automations set <automation> [--description TEXT] [--enabled true|false]
                   [--node NODE] [--schedule CRON] [--timezone ZONE]
                   [--timeout SEC] [--retries N] [--script PATH | --body FILE|-]
@@ -132,8 +150,10 @@ Commands:
       "script", "version"?}], "config_rewritten"?}. --apply is gated as `set`
       is.
   automations run <automation-id>
-      Enqueue one manual run, for the automation's node, or for this machine
-      when it names none. The daemon of that node dispatches it.
+      Enqueue one manual run, for the node the automation is pinned to, or,
+      for one that follows the service, for this machine where the service is
+      placed here or nowhere recorded, else the first node it is placed on.
+      The daemon of that node dispatches it.
   automations runs [--limit N] [--status STATUS]
       List recent run records from the run ledger.
   automations show <run-id>
@@ -414,8 +434,9 @@ Contract commands:
 
 Inventory:
   `automations inventory` reports one item per automation, by slug, read from
-  the store in one query. `name` is the slug; `state` is disabled | no node |
-  active | other node | enabled, judged by the running daemon's node, else
+  the store, with where the service is placed. `name` is the slug; `state`
+  is disabled | active | other node | enabled, judged by the running daemon's
+  node, else
   this invocation's, and `enabled` when a running daemon published none;
   `detail` is the schedule as display text, or `manual`. The facts a program
   reads are `attributes`, by these fixed labels, in this order:
@@ -425,7 +446,7 @@ Inventory:
     schedule_value  the cron expression; absent for manual
     timezone        the zone the cron is read in; absent for manual
     script          the script path, or `stored body`
-    node            the node that schedules it; absent when none
+    node            the node it is pinned to; absent when it names none
   Its `service` carries `ok` and, when false, `problem`: the findings
   `doctor` makes of the declaration and the daemon - missing_scripts,
   invalid_definitions, config_stale, node_idle - or why the definitions did
@@ -618,7 +639,8 @@ def _judging_node(runtime, state: Path, running: bool) -> str | None:
     return node_name()
 
 
-def _inventory_item(runtime, item: dict, node: str | None) -> dict:
+def _inventory_item(runtime, item: dict, node: str | None,
+                    placed: list[str] | None = None) -> dict:
     """One automation as an inventory item.
 
     The contract's item has no field for an id, a description or a schedule
@@ -641,11 +663,9 @@ def _inventory_item(runtime, item: dict, node: str | None) -> dict:
         attributes.append({"label": "node", "value": item["node"]})
     if not item["enabled"]:
         state_word = "disabled"
-    elif item["node"] is None:
-        state_word = "no node"
     elif node is None:
         state_word = "enabled"
-    elif runtime.scheduled_here(item, node):
+    elif runtime.scheduled_here(item, node, placed):
         state_word = "active"
     else:
         state_word = "other node"
@@ -662,7 +682,7 @@ def _inventory(_network: bool) -> dict:
     """The automations this project defines, and whether the daemon is up.
 
     The definitions are the store's, so the report reads them there, in one
-    query, and counts no run: a reader asking every capability at once must
+    query beside the one for where the service is placed, and counts no run: a reader asking every capability at once must
     not pay more than that for the asking. A store that does not answer is
     the report's problem rather than its failure.
 
@@ -712,7 +732,8 @@ def _inventory(_network: bool) -> dict:
     node = _judging_node(runtime, state, running)
     whose = "the running daemon's" if running else "no daemon running"
     declared = config["automations"]
-    items = [_inventory_item(runtime, item, node) for item in declared]
+    items = [_inventory_item(runtime, item, node, config.get("placed_on"))
+             for item in declared]
     active = sum(1 for item in items if item["state"] == "active")
     if node is None:
         active_metric = {"label": "enabled",
@@ -1395,7 +1416,8 @@ def _load(root: Path, definitions: bool = True):
     if definitions:
         try:
             with runtime.open_ledger(root, config, strict=False) as ledger:
-                runtime.apply_definitions(root, config, ledger.definitions())
+                runtime.apply_definitions(root, config, ledger.definitions(),
+                                          ledger.placed_nodes())
         except runtime.StoreUnavailable as exc:
             _store_refusal(exc)
     return runtime, config
@@ -1599,12 +1621,14 @@ def _service_findings(runtime, config: dict, state: Path, running: bool,
     anything. Nothing here reads the run ledger, so `doctor` and `inventory`
     judge these by the same code and only `doctor` adds the store's checks."""
     # A script path is a file on the node that runs it, so only the scripts of
-    # the automations this node runs - its own, and the ones of no node whose
-    # manual runs come to the machine that asks - are looked for here.
+    # the automations this node runs - its own, and the ones that follow the
+    # service, whose runs may come here - are looked for here.
     node = daemon_node if running and daemon_node else node_name()
+    placed = config.get("placed_on")
     missing_scripts = [
         item["script"] for item in config["automations"]
-        if item["script_path"] is not None and item["node"] in (None, node)
+        if item["script_path"] is not None
+        and (runtime.follows_service(item, placed) or item["node"] == node)
         and not item["script_path"].is_file()
     ]
     invalid_definitions = list(config.get("definition_problems") or [])
@@ -1632,8 +1656,9 @@ def _service_findings(runtime, config: dict, state: Path, running: bool,
             }
     # A daemon that is alive is not thereby working: it schedules the
     # automations whose node is the one it runs as, which is its own and not
-    # this invocation's, so a supervisor's node name can leave every enabled
-    # automation to other nodes. That daemon ticks, answers, and schedules
+    # this invocation's, and those that follow the service where the service
+    # is placed on that node, so a node name, or a service placed elsewhere,
+    # can leave every enabled automation to other nodes. That daemon ticks, answers, and schedules
     # nothing. An automation switched off is off on purpose, and a health
     # answer that failed over it would be wrong about a project that meant it,
     # so only enabled ones count. A daemon that published no node says nothing
@@ -1641,16 +1666,19 @@ def _service_findings(runtime, config: dict, state: Path, running: bool,
     node_idle = None
     enabled = [item for item in config["automations"] if item["enabled"]]
     if running and daemon_node and enabled and not any(
-            runtime.scheduled_here(item, daemon_node) for item in enabled):
+            runtime.scheduled_here(item, daemon_node, placed) for item in enabled):
         node_idle = {
             "daemon_node": daemon_node,
             "nodes": sorted({item["node"] for item in enabled if item["node"]}),
+            "placed_on": placed,
             "message": (
                 f"the running daemon schedules for node {daemon_node!r}, and none of the "
-                f"{len(enabled)} enabled automations here names it, so it is scheduling "
-                "nothing"
+                f"{len(enabled)} enabled automations here names it or follows the "
+                "service onto it, so it is scheduling nothing"
             ),
-            "hint": f"`{NAME} set <automation> --node {daemon_node}` places one on it",
+            "hint": (f"`capabilities place automations --node {daemon_node}` puts the "
+                     "service there, which the automations that name no node follow; "
+                     f"`{NAME} set <automation> --node {daemon_node}` pins one to it"),
         }
     return {"missing_scripts": missing_scripts, "invalid_definitions": invalid_definitions,
             "config_stale": config_stale, "node_idle": node_idle}
@@ -1695,7 +1723,8 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
     return result
 
 
-def _definition_view(runtime, item: dict, node: str) -> dict[str, Any]:
+def _definition_view(runtime, item: dict, node: str,
+                     placed: list[str] | None = None) -> dict[str, Any]:
     """One automation as `list` and `set` answer it."""
     return {
         "id": item["id"],
@@ -1703,7 +1732,8 @@ def _definition_view(runtime, item: dict, node: str) -> dict[str, Any]:
         "description": item["description"],
         "enabled": item["enabled"],
         "node": item["node"],
-        "scheduled_here": runtime.scheduled_here(item, node),
+        "follows_service": runtime.follows_service(item, placed),
+        "scheduled_here": runtime.scheduled_here(item, node, placed),
         "script": item["script"],
         "body": item["script_body"] is not None,
         "arguments": item["arguments"],
@@ -1720,8 +1750,9 @@ def cmd_list() -> dict[str, Any]:
     root = _root_required()
     runtime, config = _load(root)
     node = node_name()
-    answer = {"node": node,
-              "automations": [_definition_view(runtime, item, node)
+    placed = config.get("placed_on")
+    answer = {"node": node, "placed_on": placed,
+              "automations": [_definition_view(runtime, item, node, placed)
                               for item in config["automations"]]}
     if config["definition_problems"]:
         answer["invalid_definitions"] = config["definition_problems"]
@@ -1905,12 +1936,13 @@ def cmd_set(argv: list[str]) -> dict[str, Any]:
                                                       base=raw.get("base"))
             except runtime.ConfigError as exc:
                 _die(6, "conflict", str(exc), f"read it again with `{NAME} list`")
+            placed = ledger.placed_nodes()
     except runtime.StoreUnavailable as exc:
         _store_refusal(exc)
     item = runtime.definition_item(root, row)
     return {"automation": slug, "version": row["id"], "created": created,
             "changed": changed if created else [],
-            "item": _definition_view(runtime, item, node_name())}
+            "item": _definition_view(runtime, item, node_name(), placed)}
 
 
 def cmd_remove(slug: str, base: str | None) -> dict[str, Any]:
@@ -2696,7 +2728,8 @@ def cmd_service_reload(timeout: float) -> dict[str, Any]:
              "the daemon keeps the declaration it has; repair config.toml and retry")
     try:
         with runtime.open_ledger(root, config, strict=False) as ledger:
-            runtime.apply_definitions(root, config, ledger.definitions())
+            runtime.apply_definitions(root, config, ledger.definitions(),
+                                          ledger.placed_nodes())
     except runtime.StoreUnavailable as exc:
         _store_refusal(exc)
     try:

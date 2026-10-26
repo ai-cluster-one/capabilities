@@ -2,7 +2,7 @@
 
 Run `automations service init` once in the consuming project. It writes `config.toml`, which holds the scheduler's own `[engine]` settings and the `[agents]` profiles, and an example script; both are ordinary versioned project files.
 
-An automation is a definition in the store, not a line of that file: `automations set <slug> --script <path>` creates one, and every later `set` saves a new version with the fields it names. Give it a five-field cron `--schedule` and the `--timezone` it is read in, or no schedule for an automation that runs only when asked, and the `--node` that schedules it. A definition names one node, so the same automation never runs on two machines, and moving it to another node from any machine is one `set`: every daemon following the store takes the change up, and no file on either machine is touched. A daemon schedules the definitions whose node is the node id it runs under, the one the machine resolves for itself (`capabilities node id`). `automations history <slug>` shows every version and who saved it, and a run names the version it ran.
+An automation is a definition in the store, not a line of that file: `automations set <slug> --script <path>` creates one, and every later `set` saves a new version with the fields it names. Give it a five-field cron `--schedule` and the `--timezone` it is read in, or no schedule for an automation that runs only when asked. Leave `--node` empty and the automation follows the project's automations service: it runs on the node the service is placed on (`capabilities place automations --node <node>`), and moving the service carries it. `--node` pins it to one node instead, which holds while the service is placed there; a pin naming a node the service has left follows the service, since nothing of the project runs on that node any more. Each firing is one run, whichever node schedules it, and changing a definition from any machine is one `set`: every daemon following the store takes the change up, and no file on either machine is touched. A daemon schedules as the node id it runs under, the one the machine resolves for itself (`capabilities node id`). `automations history <slug>` shows every version and who saved it, and a run names the version it ran.
 
 Give a definition a `--description`. It changes nothing that runs: it carries why the automation exists into `automations list`, so reading the set does not mean opening every script.
 
@@ -45,7 +45,7 @@ The recurring shape of this choice is a monitor; `automations guide monitors` ow
 
 ## Self-contained bodies
 
-A body kept in the store runs on whichever node its definition names, from a file written for that one run, with nothing beside it. Everything it needs is therefore either inside the body or reached through something every node can reach: the store, through a capability.
+A body kept in the store runs on whichever node schedules its definition, from a file written for that one run, with nothing beside it. Everything it needs is therefore either inside the body or reached through something every node can reach: the store, through a capability.
 
 Keep the brief and the schema as text inside the script. A brief is a string the script fills with its evidence; a schema is a literal the script writes to a temporary file for the one turn, because `automations agent --schema` takes a path:
 

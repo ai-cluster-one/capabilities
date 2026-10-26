@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-26 — An automation without a node follows the service, and moving the service carries the automations of the node it left
+
+A definition that names no node runs where the project's automations service is placed, as the store's placement rows say (`capabilities place automations --node`, `capabilities service start|stop automations`), and on every running daemon where the store records no placement; before, it was scheduled nowhere. A definition naming a node the service is not placed on follows the service as well, so moving the service from one node to another carries every automation that named the node it left, and `doctor` no longer fails with `node_idle` on the new node. A pin holds while the service is placed on its node. No stored definition is rewritten: the node stays as saved, and a pin takes hold again if the service is placed back on it. A running daemon reads the placement again within 30 seconds. Where several nodes schedule one automation, each firing is still one run, by its dedupe key. A manual run of an automation that follows the service is queued for this machine where the service is placed here or nowhere recorded, else for the first node it is placed on. `list` adds `follows_service` per automation and `placed_on`; `doctor`'s `node_idle` adds `placed_on`; the inventory's `state` no longer says `no node`.
+
 ## 2026-10-24 — A definition's node is a node id
 
 A node schedules the definitions that name its node id, the one the machine resolves for itself (`capabilities node id`), as the contract now answers it; `AGENT_NODE_ID` overrides it in place of `AGENT_NODE_NAME`. The service runtime, loaded where no CLI handed it the node, asks the contract for that id rather than falling back to the host name. Help and guides say so. A definition saved under a node's name moves with that node's `capabilities node rekey`.

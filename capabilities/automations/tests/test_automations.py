@@ -149,6 +149,26 @@ environment = "test"
             row, _created = ledger.save_definition(slug, checked, by="fixture")
         return row
 
+    def place(self, *nodes: str) -> None:
+        """Place this project's automations service on exactly `nodes`, as the
+        manager's `capabilities place` writes it: a policy row naming each node
+        with its service placed, in the contract's own tables."""
+        from capabilities_contract import db
+        from capabilities_contract.capability.tiers import store
+        major, minor = store.STORE_TABLES_VERSION
+        with db.connect(application_name="automations-test",
+                        setting=RUNTIME.resolve_store(self.root)) as conn:
+            conn.autocommit = True
+            db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
+                       major=major, minor=minor)
+            with conn.transaction():
+                conn.execute("DELETE FROM capabilities_policy WHERE agent_id = %s "
+                             "AND capability = 'automations'", (self.project_id,))
+                for node in nodes:
+                    conn.execute("INSERT INTO capabilities_policy (agent_id, capability, "
+                                 "node, enabled, service) VALUES (%s, 'automations', %s, "
+                                 "true, true)", (self.project_id, node))
+
     def tearDown(self) -> None:
         with contextlib.suppress(Exception):
             self.cli("service", "stop", "--timeout", "2", "--force")
@@ -1050,6 +1070,68 @@ environments = ["production"]
         self.assertNotIn("node_idle", stopped)
 
     @needs_store
+    def test_moving_the_service_carries_the_automations_of_the_node_it_left(self) -> None:
+        # The failure this closes: the service moved to another node, every
+        # automation still named the node it left, and the new node's daemon
+        # scheduled nothing (node_idle) while the old node ran no daemon at all.
+        # An automation naming no node follows the service, and so does one
+        # naming a node the service is no longer placed on.
+        self.define("unpinned", script_path="capabilities/automations/scripts/job.py",
+                    schedule="0 3 * * *")
+        self.place(PRODUCTION)
+        daemon = self._supervised_daemon(PRODUCTION)
+        try:
+            probe = self.cli("doctor", check=False)
+            self.assertEqual(probe.returncode, 0, probe.stdout)
+            report = json.loads(probe.stdout)
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["daemon_node"], PRODUCTION)
+            self.assertNotIn("node_idle", report)
+            inventory = json.loads(self.cli("inventory").stdout)
+            self.assertIs(inventory["service"]["ok"], True)
+            states = {item["name"]: item["state"] for item in inventory["items"]}
+            self.assertEqual(states["job"], "active")
+            self.assertEqual(states["unpinned"], "active")
+        finally:
+            daemon.terminate()
+            daemon.wait(timeout=15)
+        listed = json.loads(subprocess.run(
+            [str(CLI), "list"], cwd=self.root, env={**self.env, "AGENT_NODE_ID": PRODUCTION},
+            capture_output=True, text=True, timeout=30).stdout)
+        self.assertEqual(listed["placed_on"], [PRODUCTION])
+        by_id = {item["id"]: item for item in listed["automations"]}
+        # The stored node stays as saved; it is the placement that decides.
+        self.assertEqual(by_id["job"]["node"], self.node)
+        self.assertTrue(by_id["job"]["follows_service"])
+        self.assertTrue(by_id["job"]["scheduled_here"])
+        self.assertIsNone(by_id["unpinned"]["node"])
+        self.assertTrue(by_id["unpinned"]["scheduled_here"])
+
+        # A pin to a node the service is still placed on holds, and that
+        # node alone schedules it.
+        self.place(PRODUCTION, self.node)
+        listed = json.loads(self.cli("list").stdout)
+        by_id = {item["id"]: item for item in listed["automations"]}
+        self.assertFalse(by_id["job"]["follows_service"])
+        self.assertTrue(by_id["job"]["scheduled_here"])
+        elsewhere = json.loads(subprocess.run(
+            [str(CLI), "list"], cwd=self.root, env={**self.env, "AGENT_NODE_ID": PRODUCTION},
+            capture_output=True, text=True, timeout=30).stdout)
+        by_id = {item["id"]: item for item in elsewhere["automations"]}
+        self.assertFalse(by_id["job"]["scheduled_here"])
+        self.assertTrue(by_id["unpinned"]["scheduled_here"])
+
+    @needs_store
+    def test_a_manual_run_of_an_automation_following_the_service_goes_to_its_node(self) -> None:
+        self.define("unpinned", script_path="capabilities/automations/scripts/job.py")
+        self.place(PRODUCTION)
+        queued = json.loads(self.cli("run", "unpinned").stdout)
+        self.assertEqual(queued["run"]["node"], PRODUCTION)
+        self.place()
+        queued = json.loads(self.cli("run", "unpinned").stdout)
+        self.assertEqual(queued["run"]["node"], self.node)
+
+    @needs_store
     def test_a_daemon_that_published_no_node_is_reported_without_failing(self) -> None:
         # A daemon started by an older payload published no node and keeps
         # running across an upgrade; the absence of the fact that would decide
@@ -1146,7 +1228,7 @@ environments = ["production"]
             ("script", "capabilities/automations/scripts/job.py"), ("node", self.node)])
 
         bodied, attrs = by_id["bodied"]
-        self.assertEqual((bodied["state"], bodied["detail"]), ("no node", "manual"))
+        self.assertEqual((bodied["state"], bodied["detail"]), ("active", "manual"))
         self.assertEqual(attrs, [("id", "bodied"), ("schedule_kind", "manual"),
                                  ("script", "stored body")])
 
@@ -1878,6 +1960,31 @@ def test_a_read_with_no_id_to_read_under_reads_as_empty(tmp_path, ledger_env, mo
         RUNTIME.open_ledger(root, {"engine": {"environment": "development"}})
 
 
+def test_an_automation_follows_the_service_unless_pinned_where_it_is_placed() -> None:
+    def item(node, enabled=True):
+        return {"node": node, "enabled": enabled}
+    # Unpinned: wherever the service is placed, and everywhere while no
+    # placement is recorded.
+    assert RUNTIME.scheduled_here(item(None), NODE_B, [NODE_B])
+    assert not RUNTIME.scheduled_here(item(None), HERE, [NODE_B])
+    assert RUNTIME.scheduled_here(item(None), HERE, None)
+    assert RUNTIME.scheduled_here(item(None), HERE, [])
+    # A pin holds where the service is placed, and where nothing is recorded.
+    assert RUNTIME.scheduled_here(item(HERE), HERE, [HERE, NODE_B])
+    assert not RUNTIME.scheduled_here(item(HERE), NODE_B, [HERE, NODE_B])
+    assert RUNTIME.scheduled_here(item(HERE), HERE, None)
+    assert not RUNTIME.scheduled_here(item(HERE), NODE_B, None)
+    # A pin to a node the service left follows the service.
+    assert RUNTIME.follows_service(item(HERE), [NODE_B])
+    assert RUNTIME.scheduled_here(item(HERE), NODE_B, [NODE_B])
+    assert not RUNTIME.scheduled_here(item(HERE), HERE, [NODE_B])
+    assert not RUNTIME.scheduled_here(item(None, enabled=False), NODE_B, [NODE_B])
+    assert RUNTIME.manual_run_node(item(None), HERE, [NODE_B]) == NODE_B
+    assert RUNTIME.manual_run_node(item(None), HERE, None) == HERE
+    assert RUNTIME.manual_run_node(item(HERE), NODE_B, [HERE]) == HERE
+    assert RUNTIME.manual_run_node(item(HERE), NODE_B, [NODE_B]) == NODE_B
+
+
 # --- supervising jobs while the store is gone ---------------------------------
 #
 # The daemon's own table of the processes it started is the truth about its
@@ -1986,6 +2093,9 @@ class DefinedLedger:
 
     def definitions(self):
         return self.rows
+
+    def placed_nodes(self):
+        return None
 
 
 def _start(daemon, run_id, slug="job"):

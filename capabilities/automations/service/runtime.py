@@ -26,6 +26,10 @@ ACTIVE_STATUSES = ("pending", "starting", "running")
 FINAL_STATUSES = ("succeeded", "failed", "canceled", "interrupted", "skipped")
 ID_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+# The capability whose placement rows say where this project's service runs,
+# and how often a running daemon reads them again.
+PLACEMENT_CAPABILITY = "automations"
+PLACEMENT_REFRESH_SECONDS = 30.0
 AGENT_ENGINES = ("claude", "codex")
 AGENT_MODES = ("read", "write", "act")
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -562,11 +566,16 @@ def definition_item(root: Path, row: dict[str, Any]) -> dict[str, Any]:
 
 
 def apply_definitions(root: Path, config: dict[str, Any],
-                      rows: Sequence[dict[str, Any]]) -> list[str]:
+                      rows: Sequence[dict[str, Any]],
+                      placed: Sequence[str] | None = None) -> list[str]:
     """Fill `config["automations"]` from the project's active definitions and
     say which rows were left out. A row that does not validate is skipped and
     named, never refusing the rest: one bad definition must not stop every
-    other automation of the project."""
+    other automation of the project. `placed` is where the project's
+    automations service is placed, kept as `config["placed_on"]` beside the
+    declaration and outside its fingerprint: it is the manager's fact, not a
+    person's declaration here."""
+    config["placed_on"] = list(placed) if placed is not None else None
     items: list[dict[str, Any]] = []
     problems: list[str] = []
     for row in sorted(rows, key=lambda r: r["slug"]):
@@ -583,16 +592,48 @@ def automation_map(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {item["id"]: item for item in config["automations"]}
 
 
-def scheduled_here(item: dict[str, Any], node: str) -> bool:
-    """Whether the node schedules this automation: it is enabled and names it."""
-    return item["enabled"] and item["node"] == node
+def follows_service(item: dict[str, Any], placed: Sequence[str] | None) -> bool:
+    """Whether the automation runs where the project's automations service is
+    placed rather than on a node of its own: it names no node, or names one the
+    service is not placed on, which no daemon of the project runs on once the
+    service has left it. `placed` is the nodes the service is placed on, as the
+    store records them (`RunLedger.placed_nodes`); while that is unknown or
+    empty, a node the automation names is held to."""
+    return item["node"] is None or (bool(placed) and item["node"] not in placed)
 
 
-def runs_here(item: dict[str, Any], node: str) -> bool:
+def scheduled_here(item: dict[str, Any], node: str,
+                   placed: Sequence[str] | None = None) -> bool:
+    """Whether the node schedules this automation: it is enabled, and names the
+    node, or follows the service and the service is placed on the node - or on
+    no node the store records, when every daemon of the project schedules it.
+    Two daemons firing the same minute take one run between them, by its
+    dedupe key."""
+    if not item["enabled"]:
+        return False
+    if not follows_service(item, placed):
+        return item["node"] == node
+    return not placed or node in placed
+
+
+def runs_here(item: dict[str, Any], node: str,
+              placed: Sequence[str] | None = None) -> bool:
     """Whether a run queued for the node may start there: the automation is
-    enabled and is the node's, or is no node's, whose manual runs go to the
-    machine that asked."""
-    return item["enabled"] and item["node"] in (None, node)
+    enabled and is the node's, or follows the service, whose runs go to the
+    node they were queued for."""
+    return item["enabled"] and (follows_service(item, placed) or item["node"] == node)
+
+
+def manual_run_node(item: dict[str, Any], here: str,
+                    placed: Sequence[str] | None = None) -> str:
+    """The node a manual run of the automation is queued for: the node it names
+    while that holds, else this machine where the service is placed here or
+    nowhere the store records, else the first node the service is placed on."""
+    if not follows_service(item, placed):
+        return item["node"]
+    if not placed or here in placed:
+        return here
+    return sorted(placed)[0]
 
 
 def every_seconds_as_cron(seconds: int) -> str:
@@ -1361,6 +1402,22 @@ class RunLedger:
         """The project's active definitions, one per slug."""
         return self._definition_rows("active", ())
 
+    def placed_nodes(self) -> list[str] | None:
+        """The nodes this project's automations service is placed on, as the
+        manager's placement rows in the store say (`capabilities place`,
+        `service start|stop`), sorted; None where the store keeps no placement
+        to read, as one the manager never migrated."""
+        import psycopg
+        try:
+            with self.conn.transaction():
+                rows = self._execute(
+                    "SELECT node FROM capabilities_policy WHERE agent_id = %s "
+                    "AND capability = %s AND service AND node IS NOT NULL ORDER BY node",
+                    (self.project_id, PLACEMENT_CAPABILITY)).fetchall()
+        except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
+            return None
+        return [row[0] for row in rows]
+
     def definition(self, slug: str, version: str | None = None) -> dict[str, Any] | None:
         """One definition: the active version, or the version named."""
         rows = (self._definition_rows("slug = %s AND id::text = %s", (slug, version))
@@ -1422,15 +1479,15 @@ class RunLedger:
 def enqueue_manual(
     root: Path, config: dict[str, Any], state_dir: Path, automation_id: str
 ) -> dict[str, Any]:
-    """Queue one run of the automation for its node, or for this machine when
-    it names none."""
+    """Queue one run of the automation for the node `manual_run_node` names."""
     item = automation_map(config).get(automation_id)
     if item is None:
         raise KeyError(automation_id)
     if not item["enabled"]:
         raise ConfigError(f"automation {automation_id!r} is disabled")
     with open_ledger(root, config) as ledger:
-        row = ledger.claim(automation_id, state_dir, trigger="manual", node=item["node"],
+        node = manual_run_node(item, ledger.node, config.get("placed_on"))
+        row = ledger.claim(automation_id, state_dir, trigger="manual", node=node,
                            definition_id=item["version"])
     assert row is not None
     return row
@@ -1717,6 +1774,7 @@ class Daemon:
         self.pause: dict | None = None
         self.definition_problems: list[str] = []
         self._generation = -1
+        self._placement_read_at = 0.0
         # A lost store is asked for again on a doubling interval, not on every tick.
         self._reopen_at = 0.0
         self._reopen_delay = RECONNECT_FIRST_SECONDS
@@ -1747,13 +1805,32 @@ class Daemon:
         config = file_config if file_config is not None else self._load_file()
         generation = self.runs.link.generation
         self.runs.link.take_changed(self.runs.project_id)
-        problems = apply_definitions(self.root, config, self.runs.definitions())
+        problems = apply_definitions(self.root, config, self.runs.definitions(),
+                                     self.runs.placed_nodes())
+        self._placement_read_at = time.monotonic()
         for problem in problems:
             if problem not in self.definition_problems:
                 self.log(problem)
         self.definition_problems = problems
         self._generation = generation
         return config
+
+    def follow_placement(self) -> None:
+        """Read where the service is placed again, at most once every
+        PLACEMENT_REFRESH_SECONDS: a move changes no definition, so the store
+        announces nothing this daemon follows, and the automations that follow
+        the service are taken up here within that interval."""
+        if time.monotonic() - self._placement_read_at < PLACEMENT_REFRESH_SECONDS:
+            return
+        self._placement_read_at = time.monotonic()
+        placed = self.runs.placed_nodes()
+        if placed == self.config.get("placed_on"):
+            return
+        self.config["placed_on"] = placed
+        here = sum(1 for item in self.config["automations"]
+                   if scheduled_here(item, self.node, placed))
+        self.log(f"the service is placed on {', '.join(placed) if placed else 'no node recorded'}"
+                 f", {here} automations scheduled on node {self.node}")
 
     def follow_definitions(self) -> None:
         """Take up the definitions again when the store announced a change to
@@ -1807,7 +1884,7 @@ class Daemon:
             if (
                 self.config["engine"]["recovery"] == "retry"
                 and item is not None
-                and runs_here(item, self.node)
+                and runs_here(item, self.node, self.config.get("placed_on"))
             ):
                 self._claim(slug, trigger="recovery", attempt=int(row["attempt"]) + 1,
                             parent_run_id=row["parent_run_id"] or row["id"],
@@ -1833,7 +1910,8 @@ class Daemon:
         node's run past its timeout and grace is closed for it."""
         grace = self.config["engine"]["shutdown_grace_seconds"]
         for item in self.config["automations"]:
-            if not scheduled_here(item, self.node) or not item["schedule"]:
+            if not scheduled_here(item, self.node, self.config.get("placed_on")) \
+                    or not item["schedule"]:
                 continue
             local = now.astimezone(ZoneInfo(item["timezone"]))
             if not cron_matches(item["schedule"], local):
@@ -1870,7 +1948,8 @@ class Daemon:
             for row in pending:
                 slug = row["automation_slug"]
                 item = self.by_id.get(slug)
-                if item is None or not runs_here(item, self.node):
+                if item is None or not runs_here(item, self.node,
+                                                 self.config.get("placed_on")):
                     # A run queued just after its definition changed is not
                     # skipped on a declaration the last poll left behind: it
                     # waits for the next tick, which reads the definitions first.
@@ -2191,7 +2270,8 @@ class Daemon:
         self.by_id = automation_map(config)
         self.reload_error = None
         fingerprint_path.write_text(daemon_record(config))
-        here = sum(1 for item in config["automations"] if scheduled_here(item, self.node))
+        here = sum(1 for item in config["automations"]
+                   if scheduled_here(item, self.node, config.get("placed_on")))
         self.log(f"reloaded, {len(self.by_id)} automations declared, {here} scheduled "
                  f"on node {self.node}")
         return True
@@ -2242,6 +2322,7 @@ class Daemon:
         jobs, which a store that is gone must not hold up."""
         self.reap()
         self.follow_definitions()
+        self.follow_placement()
         self.take_pause()
         if self.pause is None:
             self.schedule_due(utc_now())
@@ -2345,7 +2426,7 @@ class ProjectSlot:
         self.load_waits_on_store = False
         write_atomic(self.state_dir / DAEMON_FINGERPRINT_FILE, daemon_record(daemon.config))
         here = sum(1 for item in daemon.config["automations"]
-                   if scheduled_here(item, daemon.node))
+                   if scheduled_here(item, daemon.node, daemon.config.get("placed_on")))
         self.log(f"served: {len(daemon.by_id)} automations declared, {here} scheduled on "
                  f"node {daemon.node}, environment {daemon.config['engine']['environment']}")
         return True
