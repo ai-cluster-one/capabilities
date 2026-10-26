@@ -37,12 +37,27 @@ class Fake:
         self.fail_storage = False
         self.config = {"Image": "ghcr.io/agenium-dev/agent-node:0.0.1",
                        "Env": ["CAPABILITIES_PROJECT_ID=prj_00000000a1a1",
+                               "CAPABILITIES_PROJECT_ID_ROOT=/app",
                                "AGENT_NODE_NAME=box1", "PATH=/usr/bin"]}
         # The image the node's Coolify service names, which a deploy starts,
-        # the container's Docker health, and whether coolify has set-image.
+        # the container's Docker health, and whether coolify has set-compose.
         self.service_image = self.config["Image"]
         self.health = "healthy"
-        self.set_image = True
+        self.set_compose = True
+        # Coolify hides each service's Compose document, as it does from a
+        # token without read:sensitive: set-image cannot read it.
+        self.compose = None
+        # What the node's container mounts and its memory limit, and the
+        # environment and volumes of its image, as docker inspect reads them.
+        self.mounts = [{"Type": "volume", "Name": f"svc-new_{name}", "Destination": path}
+                       for name, path in (("config", "/home/agent/.config"),
+                                          ("state", "/home/agent/.local/state"),
+                                          ("claude", "/home/agent/.claude"),
+                                          ("codex", "/home/agent/.codex"),
+                                          ("work", "/home/agent/work"))]
+        self.memory = 2 << 30
+        self.image_config = {"Env": ["PATH=/usr/bin"], "Volumes": None}
+        self.containers = "abc123\n"
 
     def __call__(self, argv, root, *, stdin=None, timeout=120, check=True, env=None):
         self.calls.append({"argv": list(argv), "stdin": stdin})
@@ -83,12 +98,15 @@ class Fake:
                     return self.module.NodeFailure("validation_failed", "fixture", 6)
                 return json.dumps({"uuid": "storage-" + str(len(self.calls))})
             if args == ["help"]:
-                return "coolify help\n" + ("  service set-image <uuid>\n" if self.set_image else "")
+                return "coolify help\n  service set-image <uuid>\n" + (
+                    "  service set-compose <uuid>\n" if self.set_compose else "")
             if args[:2] == ["service", "set-image"]:
-                previous, self.service_image = self.service_image, args[args.index("--image") + 1]
-                return json.dumps({"uuid": args[2], "image": self.service_image,
-                                   "previous_image": previous,
-                                   "changed": previous != self.service_image})
+                return self.module.NodeFailure("compose_hidden", "fixture", 2)
+            if args[:2] == ["service", "set-compose"]:
+                assert args[3:] == ["--compose", "-"]
+                self.compose = stdin
+                self.service_image = json.loads(stdin.split("image: ", 1)[1].splitlines()[0])
+                return json.dumps({"uuid": args[2], "written": True})
             if args[:1] == ["deploy"]:
                 if args[1] not in self.apps:
                     self.config = {**self.config, "Image": self.service_image}
@@ -135,11 +153,17 @@ class Fake:
                 if any(w.endswith("project=" + app) for app in self.apps for w in remote) \
                         and "label=com.docker.compose.service=agent" in remote:
                     return ""
-                return "abc123\n"
+                return self.containers
+            if remote[:3] == ["docker", "image", "inspect"]:
+                return json.dumps(self.image_config) + "\n"
+            if remote[:2] == ["docker", "inspect"] and remote[3] == "{{json .}}":
+                return json.dumps({"Image": "sha256:" + "e" * 64, "Config": self.config,
+                                   "Mounts": self.mounts,
+                                   "HostConfig": {"Memory": self.memory}}) + "\n"
             if remote[:2] == ["docker", "inspect"] and remote[3].startswith("{{.Config.Image}}"):
                 return f"{self.config['Image']} {self.health}\n"
             if remote[:2] == ["docker", "inspect"]:
-                return json.dumps(self.config) + "\n"
+                return "".join(json.dumps(self.config) + "\n" for _id in remote[4:])
             assert remote[:2] == ["docker", "exec"], remote
             inner = [w for w in remote[2:] if w != "-i"][1:]
             if inner[:2] == ["sh", "-c"]:
@@ -640,9 +664,14 @@ def test_update_moves_a_standard_image_node_to_the_tag_and_waits_for_its_agent(l
 
     coolify = [c["argv"][3:] for c in lab.fake.of("coolify")
                if c["argv"][3:4] in (["service"], ["deploy"]) and "create" not in c["argv"]]
-    assert coolify == [["service", "set-image", "svc-new", "--image",
-                        "ghcr.io/agenium-dev/agent-node:0.0.10", "--compose-service", "agent"],
+    assert coolify == [["service", "set-compose", "svc-new", "--compose", "-"],
                        ["deploy", "svc-new"]]
+    # The whole document node create writes, with the new tag, and no read of
+    # the Compose Coolify hides from a token without read:sensitive.
+    created = next(c["stdin"] for c in lab.fake.of("coolify") if "create" in c["argv"])
+    assert lab.fake.compose == created.replace("agent-node:0.0.1", "agent-node:0.0.10")
+    assert lab.fake.compose == lab.m._agent_node_compose(
+        "prj_00000000a1a1", "ghcr.io/agenium-dev/agent-node:0.0.10", "2g")
     # Through the connection the row names, and nothing deleted.
     assert all(c["argv"][1:3] == ["--connection", "infra"] for c in lab.fake.of("coolify")
                if c["argv"][1:2] != ["help"])
@@ -654,6 +683,86 @@ def test_update_moves_a_standard_image_node_to_the_tag_and_waits_for_its_agent(l
     assert answer["previous_image"] == "ghcr.io/agenium-dev/agent-node:0.0.1"
     assert answer["health"] == "healthy" and answer["state"].startswith("running agent")
     assert answer["volumes"] == ["config", "state", "claude", "codex", "work"]
+    # The retired identity key is dropped and named, never its value.
+    assert answer["memory"] == "2g" and answer["env_dropped"] == ["AGENT_NODE_NAME"]
+    assert "box1" not in lab.fake.compose
+
+
+def test_update_keeps_the_memory_limit_the_node_runs_with(lab, capsys):
+    lab.m.cmd_node_create(create_args(memory="1536m"))
+    lab.fake.memory = 1536 << 20
+    capsys.readouterr()
+    lab.m.cmd_node_update(update_args())
+    assert 'mem_limit: "1536m"' in lab.fake.compose
+    assert json.loads(capsys.readouterr().out)["memory"] == "1536m"
+
+
+def _refused_before_any_change(lab, code):
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_update(update_args())
+    assert refused.value.code == code and refused.value.exit_code == 6
+    assert lab.fake.compose is None
+    assert not [c for c in lab.fake.of("coolify") if c["argv"][3:4] == ["deploy"]]
+    return refused.value.message
+
+
+@pytest.mark.parametrize("change,named", [
+    # A volume under another name would start the node empty.
+    (lambda mounts: mounts[0].update(Name="other_config"), "/home/agent/.config"),
+    (lambda mounts: mounts.pop(), "/home/agent/work"),
+    (lambda mounts: mounts[1].update(Type="bind", Name=""), "/home/agent/.local/state"),
+    # One the document does not mount would be dropped.
+    (lambda mounts: mounts.append({"Type": "volume", "Name": "svc-new_extra",
+                                   "Destination": "/data"}), "/data"),
+    (lambda mounts: mounts.append({"Type": "bind", "Source": "/srv",
+                                   "Destination": "/srv"}), "/srv"),
+])
+def test_update_refuses_volumes_that_are_not_node_creates(lab, change, named):
+    lab.m.cmd_node_create(create_args())
+    change(lab.fake.mounts)
+    assert named in _refused_before_any_change(lab, "node_volumes_unconfirmed")
+
+
+def test_update_keeps_an_anonymous_volume_the_image_declares(lab, capsys):
+    lab.m.cmd_node_create(create_args())
+    lab.fake.image_config["Volumes"] = {"/cache": {}}
+    lab.fake.mounts.append({"Type": "volume", "Name": "f" * 64, "Destination": "/cache"})
+    lab.m.cmd_node_update(update_args())
+    assert lab.fake.compose is not None
+
+
+@pytest.mark.parametrize("change,named", [
+    (lambda fake: setattr(fake, "containers", "abc123\ndef456\n"), "found 2"),
+    (lambda fake: setattr(fake, "memory", 0), "no memory limit"),
+    (lambda fake: fake.config["Env"].remove("CAPABILITIES_PROJECT_ID_ROOT=/app"),
+     "CAPABILITIES_PROJECT_ID_ROOT differ"),
+    (lambda fake: fake.config["Env"].append("EXTRA_SETTING=1"), "EXTRA_SETTING would be dropped"),
+    # A node still keyed by its name reads AGENT_NODE_NAME at boot to move to its id.
+    (lambda fake: fake.config["Env"].append("AGENT_NODE_ID=other"), "AGENT_NODE_ID"),
+])
+def test_update_refuses_what_it_cannot_establish_without_the_compose(lab, change, named):
+    lab.m.cmd_node_create(create_args())
+    change(lab.fake)
+    assert named in _refused_before_any_change(lab, "node_document_unconfirmed")
+
+
+def test_update_keeps_the_name_a_node_still_keyed_by_it_needs(lab):
+    lab.m.cmd_node_create(create_args())
+    lab.fake.config["Env"] = [e for e in lab.fake.config["Env"]
+                              if not e.startswith("AGENT_NODE_NAME=")] + [
+        "AGENT_NODE_NAME=" + BOX1]
+    assert "AGENT_NODE_NAME" in _refused_before_any_change(lab, "node_document_unconfirmed")
+
+
+def test_update_takes_coolifys_own_keys_and_the_images_environment(lab, capsys):
+    lab.m.cmd_node_create(create_args())
+    lab.fake.image_config["Env"] += ["LANG=C.UTF-8"]
+    lab.fake.config["Env"] += ["LANG=C.UTF-8", "COOLIFY_CONTAINER_NAME=agent-svc",
+                               "COOLIFY_RESOURCE_UUID=svc-new", "AGENT_NODE_ID=" + BOX1]
+    capsys.readouterr()
+    lab.m.cmd_node_update(update_args())
+    assert json.loads(capsys.readouterr().out)["env_dropped"] == ["AGENT_NODE_ID",
+                                                                 "AGENT_NODE_NAME"]
 
 
 def test_update_of_a_node_already_on_the_tag_does_not_redeploy_it(lab, capsys):
@@ -673,7 +782,7 @@ def test_update_refuses_a_node_built_from_a_repository_and_points_at_coolify_dep
     assert refused.value.exit_code == 6
     assert "coolify deploy app-new" in refused.value.message
     assert not [c for c in lab.fake.calls[before:]
-                if c["argv"][0] == "coolify" and ("set-image" in c["argv"] or "deploy" in c["argv"])]
+                if c["argv"][0] == "coolify" and ("set-compose" in c["argv"] or "deploy" in c["argv"])]
 
 
 @pytest.mark.parametrize("config", [
@@ -688,10 +797,10 @@ def test_update_refuses_a_resource_that_is_not_the_nodes_own(lab, config):
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_update(update_args())
     assert refused.value.code == "node_resource_not_own"
-    assert not [c for c in lab.fake.of("coolify") if "set-image" in c["argv"]]
+    assert lab.fake.compose is None
 
 
-def test_update_refuses_without_set_image_a_bad_tag_and_an_unknown_node(lab):
+def test_update_refuses_without_set_compose_a_bad_tag_and_an_unknown_node(lab):
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_update(update_args())
     assert refused.value.code == "node_unknown"
@@ -699,11 +808,11 @@ def test_update_refuses_without_set_image_a_bad_tag_and_an_unknown_node(lab):
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_update(update_args(version="../x"))
     assert refused.value.code == "input"
-    lab.fake.set_image = False
+    lab.fake.set_compose = False
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_update(update_args())
     assert refused.value.code == "provider_not_ready"
-    assert not [c for c in lab.fake.of("coolify") if "set-image" in c["argv"]]
+    assert lab.fake.compose is None
 
 
 @pytest.mark.parametrize("health,state", [("unhealthy", "running agent prj as node box1"),

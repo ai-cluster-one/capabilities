@@ -361,22 +361,34 @@ USAGE
       tag.
   deployment node update <node> --version <tag> [--wait 600]
       Move a node of the standard image to ghcr.io/agenium-dev/agent-node:<tag>
-      through the coolify connection its row names: replace the image of
-      the agent service in its Coolify service (`coolify service
-      set-image`), redeploy it (`coolify deploy`) with its volumes kept, so
-      its id, key, store setting, secrets, logins and work stay, and wait
-      up to --wait seconds for its container to run that image, report
-      healthy (when the image has a health check) and its agent state to
-      read running. A node already running the tag is not redeployed.
-      Answers {ok, node, label, resource, version, image, previous_image,
-      redeployed, volumes, container, running_image, health, state}. A node
-      built from a repository runs no tag and is refused (exit 6
-      node_built_from_repository; rebuild it with `coolify deploy
-      <uuid>`), as is a resource not running the standard image for this
-      agent (exit 6 node_resource_not_own) and a coolify without `service
-      set-image` (exit 6 provider_not_ready); nothing is changed then. A
-      node that is not back in time exits 5 node_not_raised after printing
-      the answer.
+      through the coolify connection its row names: write its Coolify
+      service the whole Compose document `node create` writes for it, with
+      the new tag (`coolify service set-compose`, which reads no field the
+      token needs read:sensitive for), and redeploy it (`coolify deploy`)
+      with its volumes kept, so its id, key, store setting, secrets, logins
+      and work stay; then wait up to --wait seconds for its container to run
+      that image, report healthy (when the image has a health check) and its
+      agent state to read running. The document's service name and volume
+      names are node create's; its environment is this agent's id and
+      CAPABILITIES_PROJECT_ID_ROOT; its memory limit is the one the node's
+      container runs with. Before writing, it reads the node's one agent
+      container over SSH (`docker inspect`) and refuses, changing nothing,
+      unless each volume the document mounts is the one mounted at that
+      path (<resource>_<name>) and nothing else is mounted but the image's
+      own anonymous volumes (exit 6 node_volumes_unconfirmed), and unless
+      the container has a memory limit and sets exactly those two keys
+      besides the image's environment, Coolify's own keys and a retired
+      AGENT_NODE_NAME other than the node's id or AGENT_NODE_ID equal to it,
+      which the new document drops (exit 6 node_document_unconfirmed). A node already running the tag is neither
+      written nor redeployed. Answers {ok, node, label, resource, version,
+      image, previous_image, redeployed, memory, env_dropped, volumes,
+      container, running_image, health, state}. A node built from a
+      repository runs no tag and is refused (exit 6
+      node_built_from_repository; rebuild it with `coolify deploy <uuid>`),
+      as is a resource not running the standard image for this agent (exit
+      6 node_resource_not_own) and a coolify without `service set-compose`
+      (exit 6 provider_not_ready); nothing is changed then. A node that is
+      not back in time exits 5 node_not_raised after printing the answer.
   deployment node remove <node> --yes
       Delete the node's Coolify resource with its volumes and configuration,
       then its node row. Only the resource the row names is touched; one
@@ -9094,6 +9106,104 @@ def _agent_node_running(root, host, row):
     return container, image, health.strip(), state
 
 
+# Keys a node's container may carry that its Compose document did not set:
+# Coolify's own, and the identity a node was handed before it resolved its id
+# from its config volume, which `node create` no longer writes.
+_AGENT_NODE_FOREIGN_ENV = re.compile(r"(?:COOLIFY|SERVICE)_[A-Za-z0-9_]*")
+_AGENT_NODE_RETIRED_ENV = ("AGENT_NODE_NAME", "AGENT_NODE_ID")
+
+
+def _agent_node_retired_env_droppable(key, value, node):
+    """Whether a retired identity key can leave the node's environment: an
+    AGENT_NODE_NAME that is not the node's id (a node still keyed by its name
+    reads it at boot to move to its own id), an AGENT_NODE_ID that is."""
+    return value != node if key == "AGENT_NODE_NAME" else value == node
+
+
+def _agent_node_memory(limit):
+    """A container's memory limit in bytes as Compose takes it: 2147483648 as 2g."""
+    for suffix, size in (("g", 1 << 30), ("m", 1 << 20), ("k", 1 << 10)):
+        if limit % size == 0:
+            return f"{limit // size}{suffix}"
+    return str(limit)
+
+
+def _agent_node_document(root, host, resource, project_id, node):
+    """What the node's Compose document holds besides its tag, read from its
+    one agent container (`docker inspect` over SSH, no Coolify field) and
+    checked against what `_agent_node_compose` writes for it: {image, memory,
+    env_dropped}. Each volume it would mount must be the one the container
+    mounts at that path, named <resource>_<name> as Coolify names a Compose
+    volume of the service, and the container mounts nothing else but the
+    image's own anonymous volumes; it must set exactly the two keys the
+    document names, to their values, besides the image's environment,
+    Coolify's own keys and a retired identity key the node no longer needs
+    (`_agent_node_retired_env_droppable`); and it must have a memory
+    limit. Anything that differs or cannot be read refuses before a change."""
+    owner = "com.docker.compose.project=" + resource
+    ids = _node_ssh(root, host, "docker ps -a --filter " + shlex.quote("label=" + owner)
+                    + " --filter " + shlex.quote("label=com.docker.compose.service="
+                                                 + AGENT_NODE_SERVICE)
+                    + " --format '{{.ID}}'").split()
+    if len(ids) != 1 or not re.fullmatch(r"[a-f0-9]+", ids[0]):
+        raise NodeFailure("node_document_unconfirmed", f"expected one agent container of "
+                          f"resource {resource} to read its volumes, memory limit and "
+                          f"environment from, found {len(ids)}; nothing was changed", 6)
+    try:
+        container = json.loads(_node_ssh(root, host, shlex.join(
+            ["docker", "inspect", "--format", "{{json .}}", ids[0]])))
+        built = json.loads(_node_ssh(root, host, shlex.join(
+            ["docker", "image", "inspect", "--format", "{{json .Config}}",
+             str(container["Image"])])))
+        config, mounts = container["Config"], container["Mounts"]
+        limit = int(container["HostConfig"]["Memory"])
+        env = [str(entry) for entry in config.get("Env") or []]
+        image_env = {str(entry) for entry in built.get("Env") or []}
+        image_volumes = set(built.get("Volumes") or {})
+        mounted = {str(m["Destination"]): (str(m.get("Type")), str(m.get("Name") or ""))
+                   for m in mounts}
+    except (ValueError, KeyError, TypeError, NodeFailure):
+        raise NodeFailure("node_document_unconfirmed", f"cannot read the agent container of "
+                          f"resource {resource} (docker inspect); nothing was changed", 6) from None
+    expected = {path: f"{resource}_{name}" for name, path in AGENT_NODE_VOLUMES}
+    differ = sorted(
+        [f"{path}: expects volume {name}, mounts "
+         + (f"{mounted[path][0]} {mounted[path][1]}" if path in mounted else "nothing")
+         for path, name in expected.items() if mounted.get(path) != ("volume", name)]
+        + [f"{path}: mounts {kind} {name}, which the document would drop"
+           for path, (kind, name) in mounted.items() if path not in expected
+           and not (kind == "volume" and path in image_volumes
+                    and re.fullmatch(r"[a-f0-9]{64}", name))])
+    if differ:
+        raise NodeFailure("node_volumes_unconfirmed", "the volumes node create's document "
+                          "mounts are not the ones the node's container mounts, so a new "
+                          "document could start it without its data: " + "; ".join(differ)
+                          + "; nothing was changed", 6)
+    if limit <= 0:
+        raise NodeFailure("node_document_unconfirmed", f"the agent container of resource "
+                          f"{resource} has no memory limit to keep; nothing was changed", 6)
+    wanted = _agent_node_environment(project_id)
+    keys = {}
+    for entry in env:
+        if entry not in image_env:
+            key, _sep, value = entry.partition("=")
+            keys[key] = value
+    wrong = sorted(key for key, value in wanted.items() if keys.get(key) != value)
+    dropped = sorted(key for key in keys if key in _AGENT_NODE_RETIRED_ENV
+                     and _agent_node_retired_env_droppable(key, keys[key], node))
+    extra = sorted(key for key in keys if key not in wanted and key not in dropped
+                   and not _AGENT_NODE_FOREIGN_ENV.fullmatch(key))
+    if wrong or extra:
+        raise NodeFailure("node_document_unconfirmed", "the node's environment is not the one "
+                          "node create's document sets"
+                          + (": " + ", ".join(wrong) + " differ" if wrong else "")
+                          + (("; " if wrong else ": ") + ", ".join(extra)
+                             + " would be dropped" if extra else "")
+                          + "; nothing was changed", 6)
+    return {"image": str(config.get("Image") or ""), "memory": _agent_node_memory(limit),
+            "env_dropped": dropped}
+
+
 def cmd_node_update(args):
     root = _root()
     node = _agent_node_name(args.node)
@@ -9127,17 +9237,21 @@ def cmd_node_update(args):
     if not _agent_node_is_own(root, host, resource, project_id):
         raise NodeFailure("node_resource_not_own", f"resource {resource} does not run "
                           f"{AGENT_NODE_IMAGE} for this agent; nothing was changed", 6)
-    if "service set-image" not in _node_run(["coolify", "help"], root).stdout:
+    if "service set-compose" not in _node_run(["coolify", "help"], root).stdout:
         raise NodeFailure("provider_not_ready", "the coolify capability here has no "
-                          "`service set-image`; update it (`capabilities update coolify`)", 6)
+                          "`service set-compose`; update it (`capabilities update coolify`)", 6)
     image = f"{AGENT_NODE_IMAGE}:{args.version}"
-    changed = _node_coolify(root, target, "service", "set-image", resource, "--image", image,
-                            "--compose-service", AGENT_NODE_SERVICE)
-    running = _agent_node_running(root, host, row)
-    # A node already running the tag is not started again; one whose service
-    # names it but whose container runs another is.
-    redeployed = bool(changed.get("changed")) or running is None or running[1] != image
+    # `node create` wrote the service's Compose document, so the whole of it is
+    # written again rather than read, which a token without read:sensitive
+    # cannot: what the document holds besides the tag is established from the
+    # node's container first, and nothing changes unless it agrees.
+    found = _agent_node_document(root, host, resource, project_id, node)
+    previous = found["image"]
+    # A node already running the tag is neither written nor started again.
+    redeployed = previous != image
     if redeployed:
+        _node_coolify(root, target, "service", "set-compose", resource, "--compose", "-",
+                      stdin=_agent_node_compose(project_id, image, found["memory"]))
         _node_coolify(root, target, "deploy", resource)
     deadline = time.monotonic() + args.wait
     while True:
@@ -9150,7 +9264,8 @@ def cmd_node_update(args):
     container, now_image, health, state = running or (None, None, None, "")
     answer = {"ok": up, "node": node, "label": row.get("label"), "resource": resource,
               "version": args.version, "image": image,
-              "previous_image": changed.get("previous_image"), "redeployed": redeployed,
+              "previous_image": previous, "redeployed": redeployed,
+              "memory": found["memory"], "env_dropped": found["env_dropped"],
               "volumes": [name for name, _path in AGENT_NODE_VOLUMES],
               "container": container, "running_image": now_image, "health": health,
               "state": state}
