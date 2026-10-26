@@ -28,7 +28,9 @@ class Fake:
         self.fail_add = False
         self.secret_file = tmp_path / ".env.local"
         self.secret_file.write_text("TELEGRAM_BOT_TOKEN=bot-secret\n"
-                                    "COOLIFY_INFRA_TOKEN=coolify-secret\n")
+                                    "COOLIFY_INFRA_TOKEN=coolify-secret\n"
+                                    "ASSETS_FILES_ACCESS_KEY_ID=files-secret\n"
+                                    "DRIVE_SA_JSON=drive-secret\n")
         self.state = "running agent prj_00000000a1a1 as node box1"
         self.gone: set[str] = set()
         self.apps: set[str] = set()
@@ -42,6 +44,8 @@ class Fake:
         out = self.answer(list(argv), stdin)
         if isinstance(out, Exception):
             raise out
+        if isinstance(out, SimpleNamespace):
+            return out
         return SimpleNamespace(returncode=0, stdout=out, stderr="")
 
     def answer(self, argv, stdin):
@@ -137,6 +141,23 @@ class Fake:
                  "tier": "project", "source": str(self.secret_file)},
                 {"key": "TELEGRAM_CHAT", "secret": False, "set": True,
                  "tier": "connection", "source": "store"}]}}})
+        if tool == "assets" and args == ["connections"]:
+            return json.dumps({"connections": {"files": {"keys": [
+                {"key": "bucket", "secret": False, "set": True,
+                 "tier": "connection", "source": "store"},
+                {"key": "ASSETS_FILES_ACCESS_KEY_ID", "secret": True, "set": True,
+                 "tier": "project", "source": str(self.secret_file)},
+                {"key": "ASSETS_FILES_SECRET_ACCESS_KEY", "secret": True, "set": False,
+                 "tier": None, "source": None}]}}})
+        if tool == "rclonec" and args == ["connections"]:
+            return json.dumps({"connections": {"drive": {"keys": [
+                {"key": "service_account_credentials (DRIVE_SA_JSON)", "secret": True,
+                 "set": True, "tier": "project", "source": str(self.secret_file)}]}}})
+        if tool == "slack" and args == ["connections"]:
+            # Its tokens are in the container's environment alone: it has no
+            # connection, and says so by exiting 6.
+            return SimpleNamespace(returncode=6, stdout="", stderr=json.dumps(
+                {"error": {"code": "connections_required", "message": "fixture"}}))
         if args == ["connections"]:
             return json.dumps({"connections": {}})
         raise AssertionError(argv)
@@ -160,7 +181,9 @@ def lab(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "_store_placed", lambda root: True)
     monkeypatch.setattr(m, "_project_id", lambda: "prj_00000000a1a1")
     monkeypatch.setattr(m, "_project_slug", lambda root: "lab-agent")
-    monkeypatch.setattr(m, "_enabled_capabilities", lambda root: ["telegram"])
+    usable = m._usable_capabilities
+    monkeypatch.setattr(m, "_usable_capabilities", lambda root: ["telegram"])
+    monkeypatch.setattr(m, "_installed_manifest", lambda name: (None, "not installed"))
     monkeypatch.setattr(m, "_records", lambda: SimpleNamespace(
         connections=lambda *a, **k: {"infra": {"enabled": True, "allow_write": True,
                                                "value": {"base_url": "https://coolify.invalid"}}}))
@@ -170,7 +193,7 @@ def lab(tmp_path, monkeypatch):
     monkeypatch.setattr(m.time, "sleep", lambda seconds: None)
     # The id `node create` mints for the node it makes.
     monkeypatch.setattr(m.secrets, "token_hex", lambda n: BOX1)
-    return SimpleNamespace(m=m, fake=fake, root=root)
+    return SimpleNamespace(m=m, fake=fake, root=root, usable=usable)
 
 
 def create_args(**extra):
@@ -286,7 +309,7 @@ def test_enrol_gives_the_node_its_key_secrets_placements_and_store(lab, capsys):
 
 def test_enrol_leaves_the_coolify_token_the_node_was_created_through_here(lab, monkeypatch,
                                                                          capsys):
-    monkeypatch.setattr(lab.m, "_enabled_capabilities", lambda root: ["coolify", "telegram"])
+    monkeypatch.setattr(lab.m, "_usable_capabilities", lambda root: ["coolify", "telegram"])
     lab.m.cmd_node_create(create_args())
     capsys.readouterr()
     lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
@@ -296,6 +319,99 @@ def test_enrol_leaves_the_coolify_token_the_node_was_created_through_here(lab, m
     assert json.loads(secrets["stdin"]) == {"telegram": {"TELEGRAM_BOT_TOKEN": "bot-secret"}}
     assert "coolify-secret" not in secrets["stdin"]
     assert json.loads(capsys.readouterr().out)["secrets"] == {"telegram": ["TELEGRAM_BOT_TOKEN"]}
+
+
+def test_a_capability_enabled_globally_is_usable_and_one_disabled_is_not(lab, monkeypatch):
+    rows = {"assets": {"scope": "global", "value": {"enabled": True}},
+            "telegram": {"scope": "project", "value": {"enabled": True}},
+            "slack": {"scope": "project", "value": {"enabled": False}}}
+    monkeypatch.setattr(lab.m, "_records", lambda: SimpleNamespace(
+        resolve=lambda kind, collection: rows))
+    assert lab.usable(lab.root) == ["assets", "telegram"]
+
+
+def test_enrol_carries_every_usable_capabilitys_connections_and_names_what_it_skips(
+        lab, monkeypatch, capsys):
+    # assets is enabled globally, not for the project: the agent uses it all
+    # the same, so its connection's keys go to the node.
+    monkeypatch.setattr(lab.m, "_usable_capabilities",
+                        lambda root: ["assets", "coolify", "rclonec", "telegram"])
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+
+    [secrets] = [c for c in lab.fake.of("ssh")
+                 if "docker exec" in c["argv"][-1] and "python3" in c["argv"][-1]]
+    assert json.loads(secrets["stdin"]) == {
+        "assets": {"ASSETS_FILES_ACCESS_KEY_ID": "files-secret"},
+        "rclonec": {"DRIVE_SA_JSON": "drive-secret"},
+        "telegram": {"TELEGRAM_BOT_TOKEN": "bot-secret"}}
+    out = capsys.readouterr().out
+    answer = json.loads(out)
+    assert {(row["capability"], row["key"]): row["reason"]
+            for row in answer["secrets_skipped"]} == {
+        ("assets", "ASSETS_FILES_SECRET_ACCESS_KEY"): "not set on this machine",
+        ("coolify", "COOLIFY_INFRA_TOKEN"):
+            "the connection the node was created through stays on this machine"}
+    for value in ("files-secret", "drive-secret", "bot-secret", "coolify-secret"):
+        assert value not in out
+
+
+def test_enrol_names_each_secret_a_capability_reads_from_the_environment_alone(
+        lab, monkeypatch, capsys):
+    from capabilities_contract import db
+    manifest = {"credentials": {"keys": [
+        {"key": "TELEGRAM_BOT_TOKEN", "secret": True},
+        {"key": "TELEGRAM_FLAT_TOKEN", "secret": True},
+        {"key": "TELEGRAM_VOICE", "secret": True}]},
+        "service": {"deploy": {"environment": {
+            "required": ["TELEGRAM_API_HASH", "TELEGRAM_BOT_TOKEN"],
+            "optional": [{"key": "TELEGRAM_SESSION"}, {"key": "TELEGRAM_VOICE"},
+                         {"key": next(k for k in db.KEYS if k.endswith("PASSWORD"))},
+                         {"key": "TELEGRAM_CHANNEL_ENABLED", "default": "true"}]}}}}
+    monkeypatch.setattr(lab.m, "_installed_manifest",
+                        lambda name: (manifest, None) if name == "telegram" else (None, "x"))
+    monkeypatch.setenv("TELEGRAM_SESSION", "session-secret")
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+    out = capsys.readouterr().out
+    answer = json.loads(out)
+    # Its service reads them from its environment and no connection reports
+    # them, so no node receives them: each is named, by its key alone, for it
+    # to be moved into a connection. A key its connection reports, a flat
+    # credential its service does not read and the database's are not.
+    assert answer["environment_only"] == {
+        "telegram": ["TELEGRAM_API_HASH", "TELEGRAM_SESSION", "TELEGRAM_VOICE"]}
+    assert "connection" in answer["environment_only_hint"]
+    assert "session-secret" not in out
+
+
+def test_enrol_names_the_secrets_of_a_capability_with_no_connection_to_report(
+        lab, monkeypatch, capsys):
+    manifest = {"credentials": {"keys": [{"key": "SLACK_BOT_TOKEN", "secret": True}]},
+                "service": {"deploy": {"environment": {
+                    "required": ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"], "optional": []}}}}
+    monkeypatch.setattr(lab.m, "_usable_capabilities", lambda root: ["slack", "telegram"])
+    monkeypatch.setattr(lab.m, "_installed_manifest",
+                        lambda name: (manifest, None) if name == "slack" else (None, "x"))
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["environment_only"] == {"slack": ["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"]}
+    assert [row["capability"] for row in answer["secrets_skipped"]] == ["slack"]
+    assert "gave no report (exit 6)" in answer["secrets_skipped"][0]["reason"]
+
+
+def test_a_gate_the_store_cannot_answer_refuses_enrol_as_input(lab, monkeypatch):
+    def unreachable():
+        raise lab.m.StoreError("store_unreachable", "fixture", None)
+    monkeypatch.setattr(lab.m, "_records", lambda: SimpleNamespace(
+        resolve=lambda kind, collection: unreachable()))
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.usable(lab.root)
+    assert (refused.value.code, refused.value.exit_code) == ("store_unreachable", 6)
 
 
 def test_enrol_reports_a_node_that_did_not_raise_its_agent(lab, capsys):

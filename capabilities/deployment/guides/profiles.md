@@ -116,8 +116,10 @@ by the agent; the agent CLIs keep their links in the image's `~/.local/bin`.
 
 A fresh volume is seeded from the image, so the first deploy starts from the
 tools the image installed. From then on the volumes are what runs, and every boot
-brings them to the catalogue the image names: the manager first, then each
-capability the registry lacks, installed from another catalogue or behind it.
+brings them up to date: the manager first, to the newest release on the official
+source's tracked branch rather than the catalogue `CAPABILITIES_REF` pins, and
+never to a release older than the one the node has; then each capability the
+registry lacks, installed from another catalogue or behind the one the image names.
 A capability installed from a local path or a registered source is left as it is. A capability service's own state mount under
 `~/.local/state/capabilities` - `~/.local/state/capabilities/projects` - sits
 inside `capabilities_state` as a volume of its own; Docker mounts the parent

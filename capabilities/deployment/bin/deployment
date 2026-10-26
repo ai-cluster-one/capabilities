@@ -255,7 +255,14 @@ USAGE
       follow the deployment until Coolify ends it (at most 3600 s), then wait for healthy.
       The database is never sent: the node takes AGENTKIT_DB_* from the
       server's environment, and a deploy leaves those values standing.
-      On failure request the previous release. Requires agent-box-checkout, a
+      On failure request the previous release; the message says
+      rollback=healthy, rollback=failed (<code>) or rollback=no previous
+      release. A check of a started deployment that cannot reach the store
+      (store_unreachable, store_busy) is tried again, up to 4 times; one that
+      still cannot is not a failed deploy: nothing is rolled back, the answer
+      on stdout says "deployment running, verification failed" with the
+      deployment and the `coolify wait` that checks it, and deploy exits 5
+      deployment_unverified. Requires agent-box-checkout, a
       committed branch and a granted connection. A target whose body_source
       is GitHub ({"kind": "github", "repository": "<owner>/<repo>"}, with
       deploy_key) prepares no server repository and pushes nothing: it
@@ -320,11 +327,20 @@ USAGE
       from from then on; make the node's X25519 key pair there (the private key stays in
       ~/.config/agent-node/node-key.pem, mode 0600) and record its public
       key on the node row; write the agent's secrets - every secret key of a
-      connection the agent's enabled capabilities resolve here, read where
-      each capability's `connections` says it is, except the coolify
-      connection the node was created through, whose token the node does
-      not hold - into each capability's credentials.env on the node's
-      config volume; place each named service
+      connection each capability the agent can use resolves here (enabled
+      for the project or globally), read where each capability's
+      `connections` says it is, except the coolify connection the node was
+      created through, whose token the node does not hold - into each
+      capability's credentials.env on the node's config volume. The answer's
+      secrets_skipped names each secret key it did not carry and why (not
+      set here, a value spanning lines, a key declared not secret, the
+      withheld coolify connection, a capability whose `connections` gave no
+      report), and environment_only names, per capability, each
+      secret-looking key its service reads from its environment
+      (service.deploy.environment, the database's aside) that no connection
+      reports: one it reads from the process environment alone - a target's
+      container environment, say - which no node receives until it is kept
+      in a connection. Keys only, never values. Place each named service
       on the node (`capabilities place <name> --node <node>`), which takes an
       exclusive service off the node it ran on before (unplaced) and leaves
       where the capability is usable as it is;
@@ -459,7 +475,9 @@ FILES
       compiler.container.persistent_manager true (container profiles) keeps the
       capabilities manager's whole home on named volumes, its launcher
       directory first on PATH: the node keeps the tools it installs, and each
-      boot brings the catalogue capabilities to the image's catalogue;
+      boot updates the manager to the newest release of the official
+      source's tracked branch, never an older one than it has, and brings
+      the catalogue capabilities to the image's catalogue;
       compiler.container.checkouts (agent-box-checkout) lists other
       repositories the box works on, each {path, url, branch, register}: each
       boot clones one whose path is absent or empty, never touches one already
@@ -1992,11 +2010,28 @@ def _body_sync_template(project_name: str, project_root: str) -> str:
 # On a manager home kept on volumes the manager is the one an earlier image
 # installed, and an older manager refuses newer payloads, so it is brought to the
 # release this image's catalogue carries before any capability is.
-_MANAGER_UPDATE = """# The manager's home persists, so it may be older than this image's catalogue.
-if capabilities self-update --check < /dev/null 2>/dev/null \\
-     | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("update_available") else 1)'; then
-  echo "[entrypoint] updating the capabilities manager to the release the catalogue this image names carries"
-  if ! capabilities self-update < /dev/null > /dev/null; then
+# The manager a box whose manager home persists follows: the official source's
+# tracked branch, never the catalogue CAPABILITIES_REF pins, which can be older
+# than the manager the node has already updated itself to.
+MANAGER_TRACK_SOURCE = "https://raw.githubusercontent.com/ai-cluster-one/capabilities/main"
+
+# Exit 0 only where `self-update --check` offers a release that is not older
+# than the one installed, by the dates its change-log headings carry.
+_MANAGER_NEWER = (
+    "import json,re,sys\n"
+    "d=json.load(sys.stdin)\n"
+    "date=lambda r: (re.match(r\"\\d{4}-\\d{2}-\\d{2}\",str((r or {}).get(\"version\") or \"\")) or [None])[0]\n"
+    "have,offer=date(d.get(\"installed\")),date(d.get(\"available\"))\n"
+    "sys.exit(0 if d.get(\"update_available\") and not (have and offer and offer<have) else 1)\n")
+
+_MANAGER_UPDATE = """# The manager's home persists and the node updates it, so it follows the
+# official source's tracked branch rather than the catalogue this image pins,
+# and is never replaced by a release older than the one it has.
+manager_source="__TRACK__"
+if CAPABILITIES_SOURCE="$manager_source" capabilities self-update --check < /dev/null 2>/dev/null \\
+     | python3 -c __NEWER__; then
+  echo "[entrypoint] updating the capabilities manager to the newer release its tracked branch carries"
+  if ! CAPABILITIES_SOURCE="$manager_source" capabilities self-update < /dev/null > /dev/null; then
     echo "[entrypoint] WARN: could not update the capabilities manager; the box runs the manager it has" >&2
   fi
 fi
@@ -2221,7 +2256,10 @@ def _entrypoint_template(project_name: str, supervisor_config: str | None = None
     # capabilities to the catalogue this image names - and, where the manager's
     # own home persists, the manager first, since only there can it be older.
     manager_block = (_CATALOGUE_BLOCK
-                     .replace("__MANAGER__", _MANAGER_UPDATE if persistent_manager else "")
+                     .replace("__MANAGER__", _MANAGER_UPDATE
+                              .replace("__TRACK__", MANAGER_TRACK_SOURCE)
+                              .replace("__NEWER__", shlex.quote(_MANAGER_NEWER))
+                              if persistent_manager else "")
                      .replace("__PLAN__", _catalogue_plan(catalogue_exclude))
                      .replace("__BEHIND__", shlex.quote(_CATALOGUE_BEHIND)))
     default_command = (
@@ -7712,6 +7750,26 @@ def _node_wait(root, target, app, deployment, timeout=600):
     raise NodeFailure("deployment_timeout", "deployment timed out: " + json.dumps(last))
 
 
+# A check of a started deployment that fails this way failed to reach the
+# store or the provider, not the deployment: it is tried again, and one that
+# keeps failing leaves the deployment running rather than rolled back.
+VERIFY_TRANSIENT = ("store_unreachable", "store_busy")
+VERIFY_ATTEMPTS = 4
+VERIFY_BACKOFF_SECONDS = 15
+
+
+def _node_verify(root, target, app, deployment):
+    """_node_wait on a started deployment, tried again while its check
+    fails to reach the store."""
+    for attempt in range(1, VERIFY_ATTEMPTS + 1):
+        try:
+            return _node_wait(root, target, app, deployment)
+        except NodeFailure as failure:
+            if failure.code not in VERIFY_TRANSIENT or attempt == VERIFY_ATTEMPTS:
+                raise
+            time.sleep(VERIFY_BACKOFF_SECONDS * attempt)
+
+
 def _node_deployment_uuid(result):
     if isinstance(result, dict):
         value = result.get("deployment_uuid")
@@ -7999,14 +8057,26 @@ def cmd_deploy(args):
     previous = _node_state(root, target).get("release") or {}
     environment = _node_environment(root, runtime, target, host, node_url, key, branch)
     _node_coolify(root, target, "env", "bulk", app, stdin=environment)
+    deployment = None
     try:
         if repository:
             started = _node_coolify(root, target, "app", "rollback", app, "--to", commit)
         else:
             started = _node_coolify(root, target, "deploy", app)
         deployment = _node_deployment_uuid(started)
-        _node_wait(root, target, app, deployment)
+        _node_verify(root, target, app, deployment)
     except NodeFailure as failure:
+        if deployment and failure.code in VERIFY_TRANSIENT:
+            # Coolify has the deployment and carries it on: the check of it
+            # failed, not the deployment, so nothing is rolled back.
+            _emit({"ok": False, "target": target["name"], "application": app,
+                   "deployment": deployment, "state": "deployment running, verification failed",
+                   "rolled_back": False, "error": {"code": failure.code,
+                                                   "message": failure.message},
+                   "next": f"coolify wait {app} --deployment {deployment}"})
+            raise NodeFailure("deployment_unverified", f"deployment {deployment} is running "
+                              f"on Coolify, but its check failed ({failure.code}) after "
+                              f"{VERIFY_ATTEMPTS} attempts; nothing was rolled back", 5)
         rolled_back = False
         rollback_error = None
         if previous.get("commit"):
@@ -8017,7 +8087,9 @@ def cmd_deploy(args):
             except NodeFailure as e:
                 rollback_error = e.code
         raise NodeFailure(failure.code, failure.message + "; rollback=" +
-                          ("healthy" if rolled_back else rollback_error or "no previous release"), failure.exit_code)
+                          ("healthy" if rolled_back else
+                           f"failed ({rollback_error})" if rollback_error else
+                           "no previous release"), failure.exit_code)
     state = _node_state(root, target)
     commit = _node_git(root, "rev-parse", "HEAD")
     state["release"] = {"commit": commit, "deployment": deployment, "deployed_at": _now_exact(),
@@ -8503,37 +8575,121 @@ def _agent_node_exec(root, host, container, argv, *, stdin=None, timeout=120):
                      stdin=stdin, timeout=timeout)
 
 
+def _usable_capabilities(root: Path) -> list[str]:
+    """Every capability the agent can use here: the gate's answer, from the
+    project's row or a global one, is enabled."""
+    del root
+    try:
+        rows = _records().resolve("capabilities", "policy")
+    except StoreError as exc:
+        raise NodeFailure(exc.slug, exc.message, 6) from None
+    return sorted(name for name, row in rows.items()
+                  if isinstance(row.get("value"), dict)
+                  and row["value"].get("enabled") is True)
+
+
+# Words of an environment key that say it holds a credential.
+_SECRET_WORDS = {"TOKEN", "SECRET", "KEY", "PASSWORD", "PASSWD", "PASS", "SESSION", "HASH",
+                 "COOKIE", "CREDENTIAL", "CREDENTIALS", "PRIVATE", "JSON", "DSN", "AUTH"}
+
+
+def _secret_looking(key: str) -> bool:
+    return bool(_SECRET_WORDS & set(key.upper().split("_")))
+
+
+def _reported_env_key(key: object) -> str | None:
+    """The environment key a `connections` row names: the row's key, or the
+    key in parentheses after an option a connection maps to one
+    (`option (ENV_KEY)`)."""
+    if _safe_env_key(key):
+        return key
+    named = re.fullmatch(r"\S+ \(([A-Z_][A-Z0-9_]*)\)", str(key or ""))
+    return named.group(1) if named else None
+
+
 def _agent_node_secrets(root, capabilities, withheld=None):
-    """{capability: {KEY: value}}: every secret key of a connection each of
-    these capabilities resolves for this agent, read where its own
-    `connections` answer says the value is, except the connections
-    `withheld` names per capability."""
+    """({capability: {KEY: value}}, skipped, environment_only): every secret
+    key of a connection each of these capabilities resolves for this agent,
+    read where its own `connections` answer says the value is, except the
+    connections `withheld` names per capability; every secret key it does
+    not carry, with the reason; and, per capability, every secret-looking
+    key its service reads from its environment that no connection reports,
+    which it resolves from the process environment alone and so cannot be
+    carried."""
     withheld = withheld or {}
-    out = {}
+    out, skipped, environment_only = {}, [], {}
+    database_keys = _database_keys()
     for name in capabilities:
         p = _node_run([name, "connections"], root, check=False, timeout=120)
         try:
-            listed = json.loads(p.stdout) if p.returncode == 0 else {}
+            listed = json.loads(p.stdout) if p.returncode == 0 else None
         except ValueError:
+            listed = None
+        if not isinstance(listed, dict):
+            # Its secrets may live in the process environment alone, which
+            # is why it has no connection to report: its service's keys are
+            # still named below, as reported by none.
+            skipped.append({"capability": name, "reason": f"`{name} connections` gave no "
+                            f"report (exit {p.returncode})"})
             listed = {}
-        keys = {}
+        keys, reported = {}, set()
         for cid, connection in (listed.get("connections") or {}).items():
-            if cid in withheld.get(name, ()):
-                continue
             for key in (connection or {}).get("keys") or []:
-                if not (isinstance(key, dict) and key.get("secret") and key.get("set")
-                        and _safe_env_key(str(key.get("key") or ""))):
+                if not isinstance(key, dict):
+                    continue
+                env_key = _reported_env_key(key.get("key"))
+                if env_key is None:
+                    continue
+                reported.add(env_key)
+                secret = key.get("secret") is True
+                if key.get("tier") == "connection" or not (secret or _secret_looking(env_key)):
+                    # A connection's own fields travel with the store.
+                    continue
+                row = {"capability": name, "connection": cid, "key": env_key}
+                if cid in withheld.get(name, ()):
+                    skipped.append({**row, "reason": "the connection the node was created "
+                                    "through stays on this machine"})
+                    continue
+                if not key.get("set"):
+                    skipped.append({**row, "reason": "not set on this machine"})
+                    continue
+                if not secret:
+                    skipped.append({**row, "reason": "the capability declares it not secret, "
+                                    "and enrol carries secret keys only"})
                     continue
                 value = None
                 if key.get("tier") in ("project", "user") and key.get("source"):
-                    value = _parse_env_file(Path(key["source"])).get(key["key"])
+                    value = _parse_env_file(Path(key["source"])).get(env_key)
                 elif key.get("tier") == "env":
-                    value = os.environ.get(key["key"])
-                if value and "\n" not in value and "\r" not in value:
-                    keys[key["key"]] = value
+                    value = os.environ.get(env_key)
+                if not value:
+                    skipped.append({**row, "reason": f"no value readable here from its "
+                                    f"{key.get('tier') or 'unknown'} tier"})
+                elif "\n" in value or "\r" in value:
+                    skipped.append({**row, "reason": "its value spans lines, which a "
+                                    "credentials file cannot hold"})
+                else:
+                    keys[env_key] = value
         if keys:
             out[name] = keys
-    return out
+        # The keys its service reads from its environment - what a compiled
+        # target's container environment carries - but the database's, which
+        # the store setting hands the node.
+        manifest, _err = _installed_manifest(name)
+        secret_keys = {entry.get("key") for entry in
+                       (((manifest or {}).get("credentials") or {}).get("keys") or [])
+                       if isinstance(entry, dict) and entry.get("secret") is True}
+        environment = ((((manifest or {}).get("service") or {}).get("deploy") or {})
+                       .get("environment") or {})
+        read = {key for key in [*(environment.get("required") or []),
+                                *[entry.get("key") for entry in environment.get("optional") or []
+                                  if isinstance(entry, dict)]]
+                if _safe_env_key(key)} - set(database_keys)
+        loose = sorted(key for key in read
+                       if key not in reported and (key in secret_keys or _secret_looking(key)))
+        if loose:
+            environment_only[name] = loose
+    return out, skipped, environment_only
 
 
 def _agent_node_store_args(root):
@@ -8769,8 +8925,9 @@ def cmd_node_enrol(args):
     # what the waiting node raises the agent on, so it finds them all there.
     # The coolify connection the node was created through stays here: the
     # row names it, and the node does not hold its token.
-    secrets = _agent_node_secrets(root, sorted({*_enabled_capabilities(root), *services}),
-                                  {"coolify": {row["coolify_connection"]}})
+    secrets, skipped, environment_only = _agent_node_secrets(
+        root, sorted({*_usable_capabilities(root), *services}),
+        {"coolify": {row["coolify_connection"]}})
     written = json.loads(_agent_node_exec(root, host, container, ["python3", "-c", _AGENT_NODE_SECRETS],
                                           stdin=json.dumps(secrets)) or "{}") if secrets else {}
     placed = []
@@ -8791,8 +8948,14 @@ def cmd_node_enrol(args):
     answer = {"ok": state.startswith("running agent"), "node": node, "label": row.get("label"),
               "public_key": public_key,
               "secrets": {name: sorted(keys) for name, keys in secrets.items()},
-              "secrets_written": written, "store": "written", "placed": placed,
+              "secrets_written": written, "secrets_skipped": skipped,
+              "environment_only": environment_only, "store": "written", "placed": placed,
               "unplaced": unplaced, "state": state}
+    if environment_only:
+        answer["environment_only_hint"] = (
+            "each key is read from the process environment alone - a target's container "
+            "environment, say - so no node receives it: keep its value in a connection of "
+            "the capability, then enrol again")
     if not answer["ok"]:
         _emit(answer)
         raise NodeFailure("node_not_raised", f"node {node} did not raise its agent within "

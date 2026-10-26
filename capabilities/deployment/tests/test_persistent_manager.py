@@ -309,6 +309,49 @@ if [ "$1 $2" = "update --check" ]; then cat {box}/check.json; exit 0; fi
     assert "updating" not in again.stdout
 
 
+@pytest.mark.parametrize("installed, available, updates", (
+    # The node updated its manager past the catalogue the image pins.
+    ("2026-10-26 — newer", "2026-10-20 — pinned", False),
+    ("2026-10-20 — older", "2026-10-26 — newer", True),
+    ("2026-10-26 — morning", "2026-10-26 — evening", True),
+    (None, "2026-10-26 — newer", True),
+))
+def test_a_boot_never_installs_a_manager_older_than_the_one_it_has(
+        tmp_path: Path, installed: str | None, available: str, updates: bool) -> None:
+    root, env = _project(tmp_path, ("telegram",))
+    _setup(root, env, "agent-box")
+    assert _opt_in(root, env).returncode == 0
+    entrypoint = (root / BUNDLE / "entrypoint.sh").read_text()
+    box = tmp_path / "box"
+    (box / "bin").mkdir(parents=True)
+    (box / "manager.json").write_text(json.dumps({
+        "installed": {"release": "a", "version": installed} if installed else None,
+        "available": {"release": "b", "version": available}, "update_available": True}))
+    (box / "catalog.json").write_text(json.dumps({"capabilities": {}}))
+    fake = box / "bin" / "capabilities"
+    fake.write_text(f"""#!/usr/bin/env bash
+echo "$* from $CAPABILITIES_SOURCE" >> {box}/calls
+if [ "$1 $2" = "self-update --check" ]; then cat {box}/manager.json; exit 0; fi
+""")
+    fake.chmod(0o755)
+    curl = box / "bin" / "curl"
+    curl.write_text(f"#!/usr/bin/env bash\ncat {box / 'catalog.json'}\n")
+    curl.chmod(0o755)
+    script = box / "boot.sh"
+    script.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + _boot_block(entrypoint))
+    pinned = "https://raw.githubusercontent.com/ai-cluster-one/capabilities/1111111"
+    run_env = {**os.environ, "PATH": f"{fake.parent}{os.pathsep}{os.environ['PATH']}",
+               "CAPABILITIES_HOME": str(box / "registry"), "CAPABILITIES_SOURCE": pinned}
+    booted = subprocess.run(["bash", str(script)], env=run_env, capture_output=True, text=True)
+    assert booted.returncode == 0, booted.stderr
+    # The manager follows the tracked branch, never the catalogue the image pins.
+    tracked = "https://raw.githubusercontent.com/ai-cluster-one/capabilities/main"
+    calls = (box / "calls").read_text().splitlines()
+    assert calls[0] == f"self-update --check from {tracked}"
+    assert (f"self-update from {tracked}" in calls) is updates
+    assert not [call for call in calls if call.startswith("self-update") and pinned in call]
+
+
 def test_a_service_state_mount_inside_the_manager_state_keeps_its_own_volume(tmp_path: Path) -> None:
     root, env = _project(tmp_path, ("automations",))
     _setup(root, env, "agent-box-checkout")

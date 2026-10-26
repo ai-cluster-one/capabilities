@@ -61,6 +61,10 @@ fixtures=json.loads(Path(os.environ['NODE_FIXTURE']).read_text())
 if args[:2] == ['ids','set'] or args[:2] == ['env','bulk']: print('{}'); sys.exit()
 if args[0] == 'wait' and 'deployment-fixture' in args and os.environ.get('NODE_WAIT_FAIL'):
  print(json.dumps({'error':{'code':'deployment_failed','message':'fixture build failed'}}),file=sys.stderr); sys.exit(5)
+if args[0] == 'wait' and os.environ.get('NODE_WAIT_STORE'):
+ blips=Path(os.environ['NODE_WAIT_STORE']); left=int(blips.read_text())
+ if left > 0:
+  blips.write_text(str(left-1)); print(json.dumps({'error':{'code':'store_unreachable','message':'fixture store timed out'}}),file=sys.stderr); sys.exit(5)
 if args[:3] == ['ids','get','node_app'] and os.environ.get('NODE_NEW_APP'):
  print(json.dumps({'error':{'code':'not_found','message':'fixture absent'}}),file=sys.stderr); sys.exit(3)
 key=' '.join(args)
@@ -189,6 +193,41 @@ def test_failed_deploy_rolls_back_and_keeps_release(node, monkeypatch):
     with pytest.raises(node.m.NodeFailure, match="rollback=healthy"):
         node.m.cmd_deploy(node.args)
     assert ["app", "rollback", "application-fixture", "--to", old["commit"]] in [r["argv"] for r in rows(node)]
+    assert node.m._node_state(node.root, node.target)["release"] == old
+
+
+def test_a_store_blip_while_checking_a_started_deploy_is_tried_again(node, monkeypatch, capsys):
+    blips = node.tmp / "blips"
+    blips.write_text("2")
+    monkeypatch.setenv("NODE_WAIT_STORE", str(blips))
+    monkeypatch.setattr(node.m.time, "sleep", lambda seconds: None)
+    node.m.cmd_deploy(node.args)
+    result = json.loads(capsys.readouterr().out)
+    assert result["release"]["deployment"] == "deployment-fixture"
+    calls = [r["argv"] for r in rows(node)]
+    assert [a[0] for a in calls].count("wait") == 3
+    assert not [a for a in calls if a[:2] == ["app", "rollback"]]
+
+
+def test_a_check_that_never_reaches_the_store_leaves_the_deployment_running(node, monkeypatch,
+                                                                            capsys):
+    old = {"commit": git(node.root, "rev-parse", "HEAD"), "deployment": "previous"}
+    node.m._node_save(node.root, node.target, {"release": old})
+    blips = node.tmp / "blips"
+    blips.write_text("99")
+    monkeypatch.setenv("NODE_WAIT_STORE", str(blips))
+    monkeypatch.setattr(node.m.time, "sleep", lambda seconds: None)
+    with pytest.raises(node.m.NodeFailure) as unverified:
+        node.m.cmd_deploy(node.args)
+    assert unverified.value.code == "deployment_unverified"
+    assert "rollback" not in unverified.value.message.replace("rolled back", "")
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["state"] == "deployment running, verification failed"
+    assert answer["rolled_back"] is False and answer["deployment"] == "deployment-fixture"
+    assert answer["error"]["code"] == "store_unreachable"
+    # Coolify carries the deployment on: nothing is rolled back, and the
+    # release on record is still the one before.
+    assert not [r for r in rows(node) if r["argv"][:2] == ["app", "rollback"]]
     assert node.m._node_state(node.root, node.target)["release"] == old
 
 
