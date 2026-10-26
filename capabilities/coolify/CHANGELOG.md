@@ -1,5 +1,9 @@
 # coolify — change log
 
+## 2026-10-26 — `service set-image`
+
+`service set-image <uuid> --image <registry/name:tag> [--compose-service <name>]` replaces the image of one service in a Coolify service's stored Compose document through `PATCH /services/<uuid>`: it reads the document (`GET /services/<uuid>`, which needs the token's read:sensitive ability, exit 2 `compose_hidden` without it), changes only that service's `image:` line and sends the document back, base64-encoded. `--compose-service` may be left out for a document of one service. Nothing restarts: `coolify deploy <uuid>` starts the service on the new image with its volumes kept. It answers uuid, compose_service, image, previous_image and changed, and sends nothing when the image is already that one. A write verb, refused with exit 4 on a read-only connection.
+
 ## 2026-10-24 — Resource and server reads carry their dashboard URL
 
 Every record from `resources`, `applications`, `services`, `databases` and `servers`, listed or read by uuid, carries `dashboard_url`: its page in the Coolify dashboard, the connection's `base_url` followed by `/project/<project-uuid>/environment/<environment-uuid>/application|service|database/<uuid>`, or `/server/<uuid>` for a server. A resource record names only its environment's id, so a read with resources in it also reads `GET /projects` and each project once to find the uuids; a server read makes no extra request. The field is absent when the page does not resolve. Every other field is unchanged.

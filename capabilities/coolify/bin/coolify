@@ -200,6 +200,19 @@ COMMANDS
       Create a service from a docker-compose file. The compose file is
       base64-encoded before sending. Returns the service uuid.
       Write verb - requires allow_write.
+  service set-image <uuid> --image <registry/name:tag>
+                    [--compose-service <name>]
+      Replace the image of one service in the service's Compose document
+      (PATCH /services/<uuid>), naming it by --compose-service, which a
+      document of one service may leave out. Only that `image:` line
+      changes; the rest of the document, its volumes included, stays as
+      Coolify holds it, and nothing restarts: `coolify deploy <uuid>` starts
+      the service on the new image, keeping its volumes. Answers uuid,
+      compose_service, image, previous_image and changed (false, and no
+      request sent, when the image is already that one). Reading the
+      document needs the token's read:sensitive ability (exit 2
+      compose_hidden without it); a service or image line it cannot find
+      exits 6. Write verb - requires allow_write.
 
   database create --engine <engine> --project <uuid> --server <uuid>
                   (--environment <name> | --environment-uuid <uuid>)
@@ -1289,6 +1302,94 @@ def cmd_service_create(c, args):
     return _request(c, "POST", "/services", json_body=payload)
 
 
+# An image reference as Compose takes it: registry, path, tag or digest.
+IMAGE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}")
+_COMPOSE_KEY = re.compile(r"""(\s*)(?:"([^"]+)"|'([^']+)'|([^\s:#'"][^:#]*?))\s*:\s*(?:#.*)?""")
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _significant(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped) and not stripped.startswith("#")
+
+
+def _compose_set_image(raw: str, image: str, name: str | None) -> tuple[str, str, str]:
+    """(the Compose document with one service's image replaced, that service's
+    name, its previous image). Only the `image:` line changes; every other
+    line, comments and order included, is kept as Coolify holds it."""
+    lines = raw.splitlines(keepends=True)
+    top = next((i for i, line in enumerate(lines)
+                if re.fullmatch(r"services\s*:\s*(?:#.*)?", line.rstrip("\r\n"))), None)
+    if top is None:
+        _die(6, "compose_unreadable", "the service's Compose document has no top-level services:")
+    end = next((i for i in range(top + 1, len(lines))
+                if _significant(lines[i]) and _indent(lines[i]) == 0), len(lines))
+    body = [i for i in range(top + 1, end) if _significant(lines[i])]
+    if not body:
+        _die(6, "compose_unreadable", "the service's Compose document declares no service")
+    level = _indent(lines[body[0]])
+    headers = {}
+    for i in body:
+        if _indent(lines[i]) == level:
+            match = _COMPOSE_KEY.fullmatch(lines[i].rstrip("\r\n"))
+            if not match:
+                _die(6, "compose_unreadable", f"cannot read the Compose service line {lines[i].strip()!r}")
+            headers[next(g for g in match.groups()[1:] if g)] = i
+    if name is None:
+        if len(headers) != 1:
+            _die(6, "input", "the Compose document has several services; name one with "
+                 "--compose-service: " + ", ".join(headers))
+        name = next(iter(headers))
+    if name not in headers:
+        _die(6, "input", f"the Compose document has no service {name!r}; it has: "
+             + ", ".join(headers))
+    start = headers[name]
+    stop = next((i for i in body if i > start and _indent(lines[i]) <= level), end)
+    children = [i for i in range(start + 1, stop) if _significant(lines[i])]
+    child = _indent(lines[children[0]]) if children else None
+    found = next((i for i in children if _indent(lines[i]) == child
+                  and re.match(r"\s*image\s*:", lines[i])), None)
+    if found is None:
+        _die(6, "input", f"Compose service {name!r} names no image: to replace")
+    line = lines[found]
+    ending = line[len(line.rstrip("\r\n")):]
+    previous = line.rstrip("\r\n").split(":", 1)[1].strip()
+    if previous[:1] in "\"'" and previous:
+        quote = previous[0]
+        previous = previous[1:previous.index(quote, 1)] if quote in previous[1:] else previous[1:]
+    else:
+        previous = re.sub(r"\s+#.*$", "", previous)
+    lines[found] = " " * child + "image: " + json.dumps(image) + ending
+    return "".join(lines), name, previous
+
+
+def cmd_service_set_image(c, args):
+    """Replace one Compose service's image in a service's stored Compose
+    document (PATCH /services/<uuid>); the change takes effect at the next
+    deploy."""
+    import base64
+
+    if not IMAGE_REF.fullmatch(args.image or "") or args.image.startswith("-"):
+        _die(6, "input", f"--image {args.image!r} is not an image reference such as "
+             "registry/name:tag")
+    detail = _request(c, "GET", f"/services/{args.uuid}")
+    raw = detail.get("docker_compose_raw") if isinstance(detail, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        _die(2, "compose_hidden", f"Coolify returned no Compose document for service {args.uuid}",
+             "the token needs the read:sensitive ability to read a service's Compose document")
+    updated, name, previous = _compose_set_image(raw, args.image, args.compose_service)
+    answer = {"uuid": args.uuid, "compose_service": name, "image": args.image,
+              "previous_image": previous, "changed": previous != args.image}
+    if answer["changed"]:
+        _request(c, "PATCH", f"/services/{args.uuid}",
+                 json_body={"docker_compose_raw": base64.b64encode(updated.encode()).decode()})
+    answer["next"] = f"coolify deploy {args.uuid}"
+    return answer
+
+
 # One create endpoint per engine, at /databases/<engine>. Coolify keeps the
 # envelope (project, server, environment, name, image, limits, tags) identical
 # across all eight and varies only the engine's own credential and conf fields,
@@ -1927,6 +2028,11 @@ def main() -> None:
     sp_create.add_argument("--name", help="service name")
     sp_create.add_argument("--instant-deploy", dest="instant_deploy", action="store_true")
     sp_create.add_argument("--destination", help="destination UUID")
+    sp_image = service_sub.add_parser("set-image", help="replace a Compose service's image")
+    sp_image.add_argument("uuid")
+    sp_image.add_argument("--image", required=True, help="image reference, tag included")
+    sp_image.add_argument("--compose-service", dest="compose_service", default=None,
+                          help="the Compose service whose image changes")
 
     # database create
     sp = sub.add_parser("database", help="create a database")
@@ -2091,6 +2197,8 @@ def main() -> None:
                 out(cmd_delete(c, "services", args.uuid, args))
             elif args.service_cmd == "create":
                 out(cmd_service_create(c, args))
+            elif args.service_cmd == "set-image":
+                out(cmd_service_set_image(c, args))
             else:
                 _die(6, "unknown_command", f"no handler for service {args.service_cmd!r}")
         elif args.cmd == "database":
