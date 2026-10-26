@@ -10403,17 +10403,17 @@ class _NodeManager:
             machine = why is not None and bool(_node_machine_command(capability))
             if machine:
                 why = None
+            if not machine and self.only is not None and capability not in self.only:
+                # Placed here and run by something else on this node, such as a
+                # container of its own, which keeps its own row.
+                self.say_once(key, "elsewhere",
+                              f"{capability} is placed here for {agent_id} and is not "
+                              "among this box's services (--services), so it is left "
+                              "to what runs it here, such as a container of its own")
+                continue
             if why is None and _machine_state(capability) == "quarantined":
                 why, code = f"{capability} is quarantined on this machine", "quarantined"
             if why is None and self.only is not None and capability not in self.only:
-                if not machine:
-                    # Placed here and run by something else on this node, such
-                    # as a container of its own, which keeps its own row.
-                    self.say_once(key, "elsewhere",
-                                  f"{capability} is placed here for {agent_id} and is not "
-                                  "among this box's services (--services), so it is left "
-                                  "to what runs it here, such as a container of its own")
-                    continue
                 # A machine service has no container of its own: nothing else
                 # on this node runs it.
                 why, code = (f"{capability} is not among the services this node run "
