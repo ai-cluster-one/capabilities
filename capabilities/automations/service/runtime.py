@@ -1731,14 +1731,14 @@ class Child:
     started_at: str = ""
     started: bool = False
     outcome: dict[str, Any] | None = None
-    # The definition version the job runs, and the temporary file a script
-    # body runs from, removed once the job has ended.
+    # The definition version the job runs, and the file a script body runs
+    # from, named by the body's digest.
     definition_id: str | None = None
     body_file: Path | None = None
 
 
-# Where a script kept in the store is written for the one run that runs it,
-# under the project's state root.
+# Where a script kept in the store is written, once per body by its digest
+# (capabilities_contract.bodies), under the project's state root.
 BODIES_DIR = "bodies"
 
 
@@ -1984,16 +1984,15 @@ class Daemon:
         return taken
 
     def _body_file(self, run_id: str, body: str) -> Path:
-        """The script body written where the run starts it from: a file of its
-        own in the project's state root, executable by this user alone."""
-        directory = self.state_dir / BODIES_DIR
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / run_id
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(body)
-        os.chmod(path, 0o700)
-        return path
+        """The script body written where the run starts it from: the file the
+        shared contract names by the body's digest in the project's state root,
+        executable by this user alone, written once and kept for every run of
+        that body."""
+        from capabilities_contract.bodies import materialise
+        try:
+            return materialise(body, self.state_dir / BODIES_DIR)
+        except ValueError as exc:
+            raise OSError(str(exc)) from exc
 
     def _start(self, row: dict[str, Any]) -> None:
         item = self.by_id[row["automation_slug"]]
@@ -2059,8 +2058,6 @@ class Daemon:
             )
         except OSError as exc:
             log_handle.close()
-            if body_file is not None:
-                body_file.unlink(missing_ok=True)
             self._finish_without_child(row, "failed", None, f"spawn failed: {exc}")
             return
         # Held before it is recorded: a job whose running write fails is still
@@ -2181,9 +2178,8 @@ class Daemon:
 
     @staticmethod
     def _discard_body(child: Child) -> None:
-        if child.body_file is not None:
-            with contextlib.suppress(OSError):
-                child.body_file.unlink()
+        """A body's file is named by its digest and shared by every run of
+        that body, so it stays when one run ends."""
 
     def _maybe_retry(self, run_id: str) -> None:
         row = self.runs.get(run_id)

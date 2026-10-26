@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-26 — A stored body runs from the shared contract's file named by its digest
+
+A `script_body` is written by `capabilities_contract.bodies.materialise`, the one piece the package uses to run a stored script body, to `<state root>/bodies/<sha256 of the body>`, mode 0700, written once and kept for every run of that body rather than written per run and removed after it. The script declares `capabilities-contract>=0.24`.
+
 ## 2026-10-26 — An automation without a node follows the service, and moving the service carries the automations of the node it left
 
 A definition that names no node runs where the project's automations service is placed, as the store's placement rows say (`capabilities place automations --node`, `capabilities service start|stop automations`), and on every running daemon where the store records no placement; before, it was scheduled nowhere. A definition naming a node the service is not placed on follows the service as well, so moving the service from one node to another carries every automation that named the node it left, and `doctor` no longer fails with `node_idle` on the new node. A pin holds while the service is placed on its node. No stored definition is rewritten: the node stays as saved, and a pin takes hold again if the service is placed back on it. A running daemon reads the placement again within 30 seconds. Where several nodes schedule one automation, each firing is still one run, by its dedupe key. A manual run of an automation that follows the service is queued for this machine where the service is placed here or nowhere recorded, else for the first node it is placed on. `list` adds `follows_service` per automation and `placed_on`; `doctor`'s `node_idle` adds `placed_on`; the inventory's `state` no longer says `no node`.

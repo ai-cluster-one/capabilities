@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.12,<1",
+#     "capabilities-contract>=0.24,<1",
 #     "callva-harness-runner==0.10.1",
 # ]
 # ///
@@ -63,9 +63,10 @@ Definitions:
 
 Scripts:
   A path script is a file in the project; Python files may be ordinary scripts
-  or executable PEP-723/shebang scripts. A body is written to a file of its own
-  under the state root for the one run and removed after it, and runs through
-  its #! line. Either runs in the project root, inherits the daemon
+  or executable PEP-723/shebang scripts. A body is written once under the
+  state root to a file named by its digest (the shared contract's
+  capabilities_contract.bodies), kept for every run of that body, and runs
+  through its #! line. Either runs in the project root, inherits the daemon
   environment and receives AUTOMATION_ID, AUTOMATION_RUN_ID,
   AUTOMATION_ATTEMPT, AUTOMATION_TRIGGER, AUTOMATION_ENVIRONMENT,
   AUTOMATION_NAMESPACE, AUTOMATION_PROJECT_ROOT, and AUTOMATION_STATE_DIR.

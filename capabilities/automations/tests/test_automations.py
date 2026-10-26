@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import hashlib
 import json
 import os
 import pytest
@@ -1594,7 +1595,8 @@ environments = ["production"]
     @needs_store
     def test_a_script_body_runs_from_the_store_as_a_file_script_runs(self) -> None:
         # The body is written to a file of its own for the one run, run through
-        # its #! line in the project with the same variables, and removed after.
+        # its #! line in the project with the same variables; the file is the
+        # shared contract's, named by the body's digest, and kept for its next run.
         self.define("bodied", script_body="#!/bin/sh\n"
                     "echo \"$AUTOMATION_ID $1 $AUTOMATION_ENVIRONMENT $(pwd)\"\n",
                     arguments=["first"], node=self.node)
@@ -1605,7 +1607,9 @@ environments = ["production"]
         self.assertEqual(row["summary"], f"bodied first test {self.root.resolve()}")
         self.assertEqual(row["definition_id"],
                          json.loads(self.cli("history", "bodied").stdout)["versions"][-1]["version"])
-        self.assertEqual(list((Path(started["state_dir"]) / "bodies").iterdir()), [])
+        body = "#!/bin/sh\necho \"$AUTOMATION_ID $1 $AUTOMATION_ENVIRONMENT $(pwd)\"\n"
+        self.assertEqual([p.name for p in (Path(started["state_dir"]) / "bodies").iterdir()],
+                         [hashlib.sha256(body.encode()).hexdigest()])
 
     @needs_store
     def test_a_run_receives_the_result_the_last_run_recorded(self) -> None:

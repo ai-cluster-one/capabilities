@@ -6,7 +6,7 @@ An automation is a definition in the store, not a line of that file: `automation
 
 Give a definition a `--description`. It changes nothing that runs: it carries why the automation exists into `automations list`, so reading the set does not mean opening every script.
 
-A script is either a file in the project, named by its path relative to the project root, or a body kept in the store (`--body <file>`). A body is written to a file of its own for each run and runs through its `#!` line, so it must be self-contained: it reads no file beside itself, because there is none. A script that reads a brief, a schema or a shared helper next to it stays a path until it is rewritten. A path is a file on the node that runs it, so that node's checkout has to carry it.
+A script is either a file in the project, named by its path relative to the project root, or a body kept in the store (`--body <file>`). A body is written once to a file named by its digest under the state root, kept for every run of it, and runs through its `#!` line, so it must be self-contained: it reads no file beside itself, because there is none. A script that reads a brief, a schema or a shared helper next to it stays a path until it is rewritten. A path is a file on the node that runs it, so that node's checkout has to carry it.
 
 A project whose `config.toml` still declares `[[automations]]` is moved with `automations import --apply`, which saves each as a definition whose script stays the path it was and takes them out of the file; until then the commands that read the declaration refuse and name the import.
 
@@ -45,7 +45,7 @@ The recurring shape of this choice is a monitor; `automations guide monitors` ow
 
 ## Self-contained bodies
 
-A body kept in the store runs on whichever node schedules its definition, from a file written for that one run, with nothing beside it. Everything it needs is therefore either inside the body or reached through something every node can reach: the store, through a capability.
+A body kept in the store runs on whichever node schedules its definition, from a file named by its digest, with nothing beside it. Everything it needs is therefore either inside the body or reached through something every node can reach: the store, through a capability.
 
 Keep the brief and the schema as text inside the script. A brief is a string the script fills with its evidence; a schema is a literal the script writes to a temporary file for the one turn, because `automations agent --schema` takes a path:
 
