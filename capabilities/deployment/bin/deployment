@@ -375,14 +375,23 @@ USAGE
       container over SSH (`docker inspect`) and refuses, changing nothing,
       unless each volume the document mounts is the one mounted at that
       path (<resource>_<name>) and nothing else is mounted but the image's
-      own anonymous volumes (exit 6 node_volumes_unconfirmed), and unless
+      own anonymous volumes (exit 6 node_volumes_unconfirmed); a path the
+      container mounts nothing at gains the document's volume, new and
+      empty (volumes_added), as on a node created before node create
+      declared it, and what the old container kept at that path outside a
+      volume is gone with it; and unless
       the container has a memory limit and sets exactly those two keys
       besides the image's environment, Coolify's own keys and a retired
       AGENT_NODE_NAME other than the node's id or AGENT_NODE_ID equal to it,
-      which the new document drops (exit 6 node_document_unconfirmed). A node already running the tag is neither
-      written nor redeployed. Answers {ok, node, label, resource, version,
-      image, previous_image, redeployed, memory, env_dropped, volumes,
-      container, running_image, health, state}. A node built from a
+      which the new document drops (exit 6 node_document_unconfirmed). A node
+      running the tag with no volume to gain is not written, and is
+      redeployed only when its container is not running, so running the
+      update again finishes one that left the node down; a node with no
+      agent container at all is refused (node_document_unconfirmed) and
+      brought back first with `coolify deploy <uuid>`. Answers {ok, node,
+      label, resource, version, image, previous_image, redeployed, memory,
+      env_dropped, volumes, volumes_added, container, running_image, health,
+      state}. A node built from a
       repository runs no tag and is refused (exit 6
       node_built_from_repository; rebuild it with `coolify deploy <uuid>`),
       as is a resource not running the standard image for this agent (exit
@@ -9128,23 +9137,29 @@ def _agent_node_memory(limit):
     return str(limit)
 
 
+def _agent_node_containers(root, host, resource):
+    """The ids of the Compose project `resource`'s agent containers on `host`,
+    stopped ones too."""
+    owner = "com.docker.compose.project=" + resource
+    return _node_ssh(root, host, "docker ps -a --filter " + shlex.quote("label=" + owner)
+                     + " --filter " + shlex.quote("label=com.docker.compose.service="
+                                                  + AGENT_NODE_SERVICE)
+                     + " --format '{{.ID}}'").split()
+
+
 def _agent_node_document(root, host, resource, project_id, node):
     """What the node's Compose document holds besides its tag, read from its
     one agent container (`docker inspect` over SSH, no Coolify field) and
     checked against what `_agent_node_compose` writes for it: {image, memory,
-    env_dropped}. Each volume it would mount must be the one the container
-    mounts at that path, named <resource>_<name> as Coolify names a Compose
+    env_dropped, volumes_added}. Each volume it would mount at a path the
+    container mounts anything at must be the one mounted there, named <resource>_<name> as Coolify names a Compose
     volume of the service, and the container mounts nothing else but the
     image's own anonymous volumes; it must set exactly the two keys the
     document names, to their values, besides the image's environment,
     Coolify's own keys and a retired identity key the node no longer needs
     (`_agent_node_retired_env_droppable`); and it must have a memory
     limit. Anything that differs or cannot be read refuses before a change."""
-    owner = "com.docker.compose.project=" + resource
-    ids = _node_ssh(root, host, "docker ps -a --filter " + shlex.quote("label=" + owner)
-                    + " --filter " + shlex.quote("label=com.docker.compose.service="
-                                                 + AGENT_NODE_SERVICE)
-                    + " --format '{{.ID}}'").split()
+    ids = _agent_node_containers(root, host, resource)
     if len(ids) != 1 or not re.fullmatch(r"[a-f0-9]+", ids[0]):
         raise NodeFailure("node_document_unconfirmed", f"expected one agent container of "
                           f"resource {resource} to read its volumes, memory limit and "
@@ -9166,10 +9181,14 @@ def _agent_node_document(root, host, resource, project_id, node):
         raise NodeFailure("node_document_unconfirmed", f"cannot read the agent container of "
                           f"resource {resource} (docker inspect); nothing was changed", 6) from None
     expected = {path: f"{resource}_{name}" for name, path in AGENT_NODE_VOLUMES}
+    # A path the container mounts nothing at holds no data a redeploy keeps,
+    # so the document's volume there is added new, empty, renaming nothing:
+    # a node created before node create declared that volume (work) gains it.
+    added = sorted(name for name, path in AGENT_NODE_VOLUMES if path not in mounted)
     differ = sorted(
-        [f"{path}: expects volume {name}, mounts "
-         + (f"{mounted[path][0]} {mounted[path][1]}" if path in mounted else "nothing")
-         for path, name in expected.items() if mounted.get(path) != ("volume", name)]
+        [f"{path}: expects volume {name}, mounts {mounted[path][0]} {mounted[path][1]}"
+         for path, name in expected.items()
+         if path in mounted and mounted[path] != ("volume", name)]
         + [f"{path}: mounts {kind} {name}, which the document would drop"
            for path, (kind, name) in mounted.items() if path not in expected
            and not (kind == "volume" and path in image_volumes
@@ -9201,7 +9220,7 @@ def _agent_node_document(root, host, resource, project_id, node):
                              + " would be dropped" if extra else "")
                           + "; nothing was changed", 6)
     return {"image": str(config.get("Image") or ""), "memory": _agent_node_memory(limit),
-            "env_dropped": dropped}
+            "env_dropped": dropped, "volumes_added": added}
 
 
 def cmd_node_update(args):
@@ -9234,6 +9253,14 @@ def cmd_node_update(args):
                           "is gone", 3)
     host = {**_node_server_host(root, target, entry, row["coolify_server"]),
             "connection": row["coolify_connection"]}
+    if not _agent_node_containers(root, host, resource):
+        # Without a container nothing confirms the volumes a new document
+        # would mount; the stored document still names them, and deploying
+        # it unchanged brings the node back to be updated.
+        raise NodeFailure("node_document_unconfirmed", f"resource {resource} has no agent "
+                          "container to confirm its volumes from: bring it back on its "
+                          f"current document with `coolify deploy {resource}` and run the "
+                          "update again; nothing was changed", 6)
     if not _agent_node_is_own(root, host, resource, project_id):
         raise NodeFailure("node_resource_not_own", f"resource {resource} does not run "
                           f"{AGENT_NODE_IMAGE} for this agent; nothing was changed", 6)
@@ -9247,11 +9274,16 @@ def cmd_node_update(args):
     # node's container first, and nothing changes unless it agrees.
     found = _agent_node_document(root, host, resource, project_id, node)
     previous = found["image"]
-    # A node already running the tag is neither written nor started again.
-    redeployed = previous != image
-    if redeployed:
+    # A node not on the tag, or one that has a volume to gain, has its
+    # document written again; one that is not running the tag (a container
+    # on another tag, or one on it that has stopped) is started again, so an
+    # update that left the node down is finished by running it once more.
+    rewrite = previous != image or bool(found["volumes_added"])
+    redeployed = rewrite or _agent_node_running(root, host, row) is None
+    if rewrite:
         _node_coolify(root, target, "service", "set-compose", resource, "--compose", "-",
                       stdin=_agent_node_compose(project_id, image, found["memory"]))
+    if redeployed:
         _node_coolify(root, target, "deploy", resource)
     deadline = time.monotonic() + args.wait
     while True:
@@ -9267,6 +9299,7 @@ def cmd_node_update(args):
               "previous_image": previous, "redeployed": redeployed,
               "memory": found["memory"], "env_dropped": found["env_dropped"],
               "volumes": [name for name, _path in AGENT_NODE_VOLUMES],
+              "volumes_added": found["volumes_added"],
               "container": container, "running_image": now_image, "health": health,
               "state": state}
     if not up:

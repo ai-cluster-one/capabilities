@@ -685,6 +685,7 @@ def test_update_moves_a_standard_image_node_to_the_tag_and_waits_for_its_agent(l
     assert answer["volumes"] == ["config", "state", "claude", "codex", "work"]
     # The retired identity key is dropped and named, never its value.
     assert answer["memory"] == "2g" and answer["env_dropped"] == ["AGENT_NODE_NAME"]
+    assert answer["volumes_added"] == []
     assert "box1" not in lab.fake.compose
 
 
@@ -709,7 +710,6 @@ def _refused_before_any_change(lab, code):
 @pytest.mark.parametrize("change,named", [
     # A volume under another name would start the node empty.
     (lambda mounts: mounts[0].update(Name="other_config"), "/home/agent/.config"),
-    (lambda mounts: mounts.pop(), "/home/agent/work"),
     (lambda mounts: mounts[1].update(Type="bind", Name=""), "/home/agent/.local/state"),
     # One the document does not mount would be dropped.
     (lambda mounts: mounts.append({"Type": "volume", "Name": "svc-new_extra",
@@ -723,6 +723,43 @@ def test_update_refuses_volumes_that_are_not_node_creates(lab, change, named):
     assert named in _refused_before_any_change(lab, "node_volumes_unconfirmed")
 
 
+def test_update_gives_a_node_created_before_its_work_volume_that_volume(lab, capsys):
+    # A node created before node create declared `work` mounts nothing there:
+    # the document's volume is added, new and empty, and none is renamed.
+    lab.m.cmd_node_create(create_args())
+    lab.fake.mounts[:] = [m for m in lab.fake.mounts if m["Destination"] != "/home/agent/work"]
+    capsys.readouterr()
+    lab.m.cmd_node_update(update_args())
+    assert lab.fake.compose == lab.m._agent_node_compose(
+        "prj_00000000a1a1", "ghcr.io/agenium-dev/agent-node:0.0.10", "2g")
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["volumes_added"] == ["work"] and answer["redeployed"] is True
+
+
+def test_update_on_the_tag_adds_a_missing_volume(lab, capsys):
+    lab.m.cmd_node_create(create_args())
+    lab.fake.mounts[:] = [m for m in lab.fake.mounts if m["Destination"] != "/home/agent/work"]
+    capsys.readouterr()
+    lab.m.cmd_node_update(update_args(version="0.0.1"))
+    assert lab.fake.compose is not None
+    assert [c for c in lab.fake.of("coolify") if c["argv"][3:4] == ["deploy"]]
+    assert json.loads(capsys.readouterr().out)["volumes_added"] == ["work"]
+
+
+def test_update_starts_again_a_node_on_the_tag_whose_container_stopped(lab, capsys, monkeypatch):
+    # An update that left the node down is finished by running it once more.
+    lab.m.cmd_node_create(create_args())
+    running = lab.m._agent_node_running
+    deployed = lambda: [c for c in lab.fake.of("coolify") if c["argv"][3:4] == ["deploy"]]
+    monkeypatch.setattr(lab.m, "_agent_node_running",
+                        lambda *a: running(*a) if deployed() else None)
+    capsys.readouterr()
+    lab.m.cmd_node_update(update_args(version="0.0.1"))
+    assert lab.fake.compose is None and len(deployed()) == 1
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["ok"] is True and answer["redeployed"] is True
+
+
 def test_update_keeps_an_anonymous_volume_the_image_declares(lab, capsys):
     lab.m.cmd_node_create(create_args())
     lab.fake.image_config["Volumes"] = {"/cache": {}}
@@ -733,6 +770,8 @@ def test_update_keeps_an_anonymous_volume_the_image_declares(lab, capsys):
 
 @pytest.mark.parametrize("change,named", [
     (lambda fake: setattr(fake, "containers", "abc123\ndef456\n"), "found 2"),
+    # A node whose container is gone has nothing to confirm its volumes from.
+    (lambda fake: setattr(fake, "containers", ""), "coolify deploy svc-new"),
     (lambda fake: setattr(fake, "memory", 0), "no memory limit"),
     (lambda fake: fake.config["Env"].remove("CAPABILITIES_PROJECT_ID_ROOT=/app"),
      "CAPABILITIES_PROJECT_ID_ROOT differ"),
