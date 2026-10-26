@@ -7,9 +7,9 @@ generation) and `capabilities_settings_changes` (the append-only trail). An
 agent whose `capabilities_agents.migrated_at` is set reads every record and its
 settings from those rows - its own over every agent's, and this node's over
 every node's - on a node it registered, the one whose id `node_id()` resolves
-(AGENT_NODE_ID in these tests); its files are not read. Its master writes the shared rows, a node the master lets write
-writes rows of its own, and while `migrating_since` is set only the migration
-on the master writes. An agent that never moved reads its files and its store
+(AGENT_NODE_ID in these tests); its files are not read. Its master, and every
+node its link lets write, writes the shared rows, and while `migrating_since` is
+set only the migration on the master writes. An agent that never moved reads its files and its store
 exactly as before.
 
 These tests drive the real manager and real capabilities (coolify, memory,
@@ -843,29 +843,74 @@ def test_off_the_master_shared_writes_are_refused(moved):
     assert lab.sql("SELECT count(*) FROM capabilities_identifiers") == [(0,)]
 
 
-def test_a_node_allowed_to_write_writes_rows_marked_with_its_node(moved):
+def test_a_node_allowed_to_write_writes_the_shared_rows_as_the_master_does(moved):
     lab = moved
     _register(lab, SERVER, "--may-write")
     lab.ok(MEMORY, "settings", "set", "window_days", "9")
     on_server = node_env(SERVER_LABEL)
     out = lab.ok(MEMORY, "settings", "set", "window_days", "3", **on_server)
-    assert out["node"] == SERVER
-    assert _document(lab) == {"window_days": 9}
-    assert _document(lab, node=SERVER) == {"window_days": 3}
-    assert _trail(lab)[-1][4:6] == (f"tester@{SERVER}", SERVER)
-    assert lab.ok(MEMORY, "settings", "get", "window_days", **on_server) == 3
-    assert lab.ok(MEMORY, "settings", "get", "window_days") == 9
-    lab.ok(COOLIFY, "ids", "set", "team", "node-team", **on_server)
+    assert "node" not in out
+    assert _document(lab) == {"window_days": 3}
+    assert _generation(lab, node=SERVER) is None
+    assert _trail(lab)[-1][4:6] == (f"tester@{SERVER}", None)
+    assert lab.ok(MEMORY, "settings", "get", "window_days") == 3
+    lab.ok(COOLIFY, "ids", "set", "team", "shared-team", **on_server)
     assert lab.sql("SELECT node, value FROM capabilities_identifiers") \
-        == [(SERVER, "node-team")]
+        == [(None, "shared-team")]
     lab.ok(MANAGER, "set", "coolify", "connection", "box",
            '{"base_url": "http://box.invalid", "secret_env": "COOLIFY_TOKEN"}')
-    code, error = lab.refused(MANAGER, "set", "coolify", "connection", "box",
-                              '{"base_url": "http://other.invalid"}', **on_server)
-    assert error["code"] == "node_read_only"
+    lab.ok(MANAGER, "set", "coolify", "connection", "box",
+           '{"base_url": "http://other.invalid", "secret_env": "COOLIFY_TOKEN"}',
+           **on_server)
+    assert lab.sql("SELECT spec->>'base_url' FROM capabilities_connections "
+                   "WHERE name = 'box'") == [("http://other.invalid",)]
     lab.ok(MANAGER, "set", "coolify", "grant", "box", '{"enabled": true}', **on_server)
     assert lab.sql("SELECT agent_id, node, enabled FROM capabilities_connection_grants") \
-        == [(PROJECT_ID, SERVER, True)]
+        == [(PROJECT_ID, None, True)]
+    # A row naming its own node it writes; a row naming another node is the master's.
+    lab.ok(MANAGER, "disable", "tasks", "--project", "--node", SERVER, **on_server)
+    assert lab.sql("SELECT node, enabled FROM capabilities_policy WHERE capability = 'tasks' "
+                   "AND node IS NOT NULL") == [(SERVER, False)]
+    code, error = lab.refused(MANAGER, "disable", "tasks", "--project", "--node", MASTER,
+                              **on_server)
+    assert error["code"] == "node_read_only" and MASTER in error["message"]
+    # The migration is still the master's alone.
+    lab.sql("UPDATE capabilities_agents SET migrating_since = now()")
+    code, error = lab.refused(MEMORY, "settings", "set", "window_days", "4", **on_server)
+    assert error["code"] == "agent_migrating"
+    assert _document(lab) == {"window_days": 3}
+
+
+def test_an_edit_another_node_wrote_under_is_refused_and_read_again_it_lands(moved, tmp_path):
+    lab = moved
+    _register(lab, SERVER, "--may-write")
+    lab.ok(MEMORY, "settings", "set", "window_days", "9")
+    # The editor changes its copy while the master changes the stored document.
+    meanwhile = tmp_path / "meanwhile.py"
+    meanwhile.write_text(
+        "import json, os, subprocess, sys\n"
+        "p = sys.argv[1]\n"
+        "d = json.load(open(p))\n"
+        "d['window_days'] = 12\n"
+        "json.dump(d, open(p, 'w'))\n"
+        f"env = dict(os.environ, AGENT_NODE_ID={MASTER!r}, AGENT_NODE_NAME={MASTER_LABEL!r})\n"
+        f"subprocess.run([{str(MEMORY)!r}, 'settings', 'set', 'block_chars', '4000'], "
+        "env=env, check=True, capture_output=True)\n")
+    on_server = node_env(SERVER_LABEL)
+    code, error = lab.refused(MEMORY, "settings", "edit", "--scope", "project", "--yes",
+                              EDITOR=f"{sys.executable} {meanwhile}", **on_server)
+    assert (code, error["code"]) == (6, "stale_edit"), error
+    assert _document(lab) == {"window_days": 9, "block_chars": 4000}
+    plain = tmp_path / "plain.py"
+    plain.write_text("import json, sys\n"
+                     "p = sys.argv[1]\n"
+                     "d = json.load(open(p))\n"
+                     "d['window_days'] = 12\n"
+                     "json.dump(d, open(p, 'w'))\n")
+    result = lab.run(MEMORY, "settings", "edit", "--scope", "project", "--yes",
+                     EDITOR=f"{sys.executable} {plain}", **on_server)
+    assert result.returncode == 0, result.stderr
+    assert _document(lab) == {"window_days": 12, "block_chars": 4000}
 
 
 def test_an_open_migration_freezes_every_write_but_the_migration_on_the_master(moved):

@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.25.0,<1",
+#     "capabilities-contract>=0.26.0,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -926,9 +926,12 @@ PROJECT VERBS (run inside a consuming project)
         agent's - is linked as it is, and --label and --kind are needed only
         for a new one (--label defaults to this machine's own where <id> is
         this machine). --address is its fixed host name or IP,
-        --target the deployment target that deploys it. A node that is a
-        Coolify resource names the coolify connection it was created
-        through, its server and the resource, all three or none (exit 6
+        --target the deployment target that deploys it. --may-write lets the
+        node write the agent's shared records and settings as the master
+        does, and rows naming itself; a row naming another node, and the
+        migration, stay the master's. A node that is a Coolify resource
+        names the coolify connection it was created through, its server and
+        the resource, all three or none (exit 6
         coolify_incomplete); the token stays in that connection.
         --public-key is the node's X25519 public key, its 32 bytes in base64
         (`deployment node enrol` records it). An agent has at most one

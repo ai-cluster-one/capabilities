@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-26 — A node the agent lets write changes its shared settings and records, as the master does
+
+With `capabilities-contract` 0.26.0, which the manager now requires (`>=0.26.0,<1`), a node registered with `capabilities node add <id> --may-write` or given it with `capabilities node set <node> --may-write` writes the agent's shared records and settings rows - `capabilities set`, `enable` and `disable` without `--node`, and every capability's `settings`, `ids` and `connection` verbs - as the master does, and the rows naming itself; before, its writes landed only on rows naming it. A row naming another node (`enable|disable --node <other>`, `place` there) and `capabilities migrate` stay the master's, and a node without `--may-write` is still refused `node_read_only`. `node list` shows `may_write` per node, as before. `node add` help says what the flag lets a node do; the executable standard (SHEBANG.md) and the migrate-to-database guide say it the same way.
+
 ## 2026-10-26 — Placing a service on another node warns about connections that point at loopback
 
 Placing a service on a node that is not this machine - `capabilities place <name> --node <node>`, `place <name> --all`, `enable <name> --project --node <node>`, and `service start|move <name> --node <node>` - answers a `warning`, said on stderr too, naming each connection the service uses and the address it holds wherever a connection field the capability declares of type `url` names localhost, 127.0.0.0/8 or ::1, since on that node the address reaches the node itself rather than this machine; credentials in the address are left out. The placement is written all the same. A routable address, a placement on this machine, a field of any other type, and unplacing say nothing new.

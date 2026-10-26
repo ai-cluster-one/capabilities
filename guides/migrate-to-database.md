@@ -9,7 +9,7 @@ Use this guide to walk a person through moving their agents' configuration from 
 You run the commands, read their JSON and fix what is mechanical. The person decides, and you ask them, about:
 
 - credentials and access: which database, its password, who may reach it;
-- which machine is each agent's **master** - the one machine that writes the agent's shared configuration; the first `migrate --apply` for an agent makes the machine it runs on the master;
+- which machine is each agent's **master** - the machine that migrates the agent and writes its shared configuration, as does any node later let write with `capabilities node set <node> --may-write`; the first `migrate --apply` for an agent makes the machine it runs on the master;
 - the name of each machine (its node name);
 - every dry-run question whose answer changes what the agent does or where it runs;
 - when each agent moves - the move is per agent and can be spread over days.
