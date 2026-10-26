@@ -2030,6 +2030,82 @@ print(json.dumps({{"ok": True, "agents": [{{"label": label, "action": action}}]}
     assert "deployment machine handover coolify" in _error(failed)["hint"]
 
 
+def test_a_start_or_place_without_a_node_on_a_mac_beside_a_server_says_where_it_lands(lab):
+    _import(lab)
+    registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"
+    registry.mkdir(parents=True)
+    (registry / "coolify").write_text("#!/bin/sh\n")
+
+    def declare(placement: str) -> None:
+        (registry / "manifest.json").write_text(json.dumps({"name": "coolify", "service": {
+            "name": "svc", "summary": "s", "verbs": [], "placement": placement}}))
+
+    def placed() -> list[tuple]:
+        return _rows(lab, "SELECT node FROM capabilities_policy WHERE capability = 'coolify' "
+                          "AND service ORDER BY node")
+
+    here = {"AGENT_NODE_ID": NODE}
+    declare("exclusive")
+    _ok(_manager(lab, "node", "add", NODE, "--label", "lab-node", "--kind", "mac", "--master",
+                 extra=here))
+    # An agent with no server node starts on this machine, as before.
+    _instance(lab, NODE, "ready")
+    alone = _manager(lab, "service", "start", "coolify", "--wait", "5", extra=here)
+    assert alone.returncode == 0 and "warning" not in json.loads(alone.stdout)
+    assert "warning" not in alone.stderr
+    _ok(_manager(lab, "unplace", "coolify", "--node", NODE, extra=here))
+
+    _ok(_manager(lab, "node", "add", BOX, "--label", "box-node", "--kind", "server",
+                 "--may-write", extra=here))
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("UPDATE lab.capabilities_agents SET migrated_at = now()")
+
+    # An exclusive service is not started on the Mac unasked: the refusal names
+    # every node and writes nothing.
+    refused = _manager(lab, "service", "start", "coolify", "--wait", "1", extra=here)
+    assert refused.returncode == 6
+    error = _error(refused)
+    assert error["code"] == "node_required"
+    assert "box-node" in error["message"] and "lab-node" in error["message"]
+    assert f"--node {BOX}" in error["hint"]
+    assert error["detail"] == {"this_node": NODE, "nodes": [
+        {"node": BOX, "label": "box-node", "kind": "server"},
+        {"node": NODE, "label": "lab-node", "kind": "mac"}]}
+    assert placed() == []
+    named = _ok(_manager(lab, "service", "start", "coolify", "--node", NODE, "--wait", "5",
+                         extra=here))
+    assert named["node"] == NODE and "warning" not in named
+
+    # The report still writes nothing, and says so beside the nodes.
+    report = _manager(lab, "place", "coolify", extra=here)
+    answer = json.loads(report.stdout)
+    assert answer["placed_on"] == [NODE]
+    assert "places nothing" in answer["warning"] and "box-node" in answer["warning"]
+    assert json.loads(report.stderr)["warning"] == answer["warning"]
+    assert placed() == [(NODE,)]
+
+    # A shared service is placed here, and the answer names where it landed.
+    _ok(_manager(lab, "unplace", "coolify", "--node", NODE, extra=here))
+    declare("shared")
+    started = _manager(lab, "service", "start", "coolify", "--wait", "5", extra=here)
+    assert started.returncode == 0
+    answer = json.loads(started.stdout)
+    assert answer["node"] == NODE and answer["placed_on"] == [NODE]
+    assert f"this machine, lab-node ({NODE}, mac)" in answer["warning"]
+    assert "box-node" in answer["warning"]
+    assert json.loads(started.stderr)["warning"] == answer["warning"]
+
+    # On the server nothing changes.
+    _ok(_manager(lab, "unplace", "coolify", "--node", NODE, extra=here))
+    declare("exclusive")
+    _instance(lab, BOX, "ready")
+    server = _ok(_manager(lab, "service", "start", "coolify", "--wait", "5",
+                          extra={"AGENT_NODE_ID": BOX}))
+    assert server["node"] == BOX and "warning" not in server
+    assert "warning" not in _ok(_manager(lab, "place", "coolify",
+                                         extra={"AGENT_NODE_ID": BOX}))
+
+
 def test_the_service_handles_place_and_answer_what_the_node_reports(lab):
     here = _service_lab(lab)
     assert _ok(_manager(lab, "service", "status", extra=here))["services"] == []

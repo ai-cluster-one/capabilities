@@ -622,7 +622,9 @@ POLICY VERBS
         holds it, so false while a move is under way until the lease names
         the new node. A
         shared service takes no lease: holder and lease are null and agrees
-        is null.
+        is null. Where this machine is not a server (its node's kind) and the
+        agent has a server node, the answer also carries a warning, said on
+        stderr too, that it placed nothing, naming the agent's nodes.
 
 PROJECT VERBS (run inside a consuming project)
   init [--claude] [--codex] [--with-layers | --with-template | --id <id>]
@@ -1152,7 +1154,12 @@ PROJECT VERBS (run inside a consuming project)
         instance, waited_seconds, unplaced_from?} once the row is ready or
         degraded, and exits 6 service_<state> (unusable, held, failing,
         waiting, starting, or absent for no row) with that answer as the
-        error's detail when it is not. move does the same for an exclusive
+        error's detail when it is not. Without --node, where this machine is
+        not a server (its node's kind) and the agent has a server node, start
+        refuses an exclusive service, writing nothing (exit 6 node_required,
+        detail {this_node, nodes [{node, label, kind}]}), and places a shared
+        one here with a warning, in the answer and on stderr, naming this
+        node and the agent's nodes. move does the same for an exclusive
         service (exit 6 placement_shared otherwise) and also waits for every
         other node's row to go. stop unplaces it from the node, or with
         --all from every node it is placed or running on, and waits until
@@ -12739,6 +12746,42 @@ def _service_settled(row: dict | None) -> str:
     return f"{state}: {row.get('problem') or ''}".rstrip(": ")
 
 
+def _nodes_beside_a_server(root: Path) -> tuple[dict, list[dict]] | None:
+    """(this node, every node of the agent), each {node, label, kind}, where this
+    machine is not a server and the agent has a server node, else None. There a
+    placement that names no node lands on this machine, which is not where a
+    person moving a service to the server meant it to go. A project whose gate
+    is in files carries no node, and a machine with no node id is no node."""
+    adapter = _records_for(root)
+    try:
+        if adapter.mode_of("policy") != "store":
+            return None
+    finally:
+        adapter.close()
+    here = _node_id_or(None)
+    if here is None:
+        return None
+
+    def read(conn, agent_id):
+        nodes = [{k: row[k] for k in ("node", "label", "kind")}
+                 for row in _node_rows(conn, agent_id)]
+        own = conn.execute("SELECT label, kind FROM capabilities_nodes WHERE id = %s",
+                           (here,)).fetchone()
+        return nodes, own
+
+    (nodes, own), _setting = _kernel_run(root, read)
+    this = {"node": here, "label": own[0] if own else here,
+            "kind": own[1] if own else ("mac" if sys.platform == "darwin" else "server")}
+    if this["kind"] == "server" or not any(n["kind"] == "server" for n in nodes):
+        return None
+    return this, nodes
+
+
+def _named_nodes(nodes: list[dict], here: str) -> str:
+    return ", ".join(f"{n['label']} ({n['node']}, {n['kind']}"
+                     + (", this machine)" if n["node"] == here else ")") for n in nodes)
+
+
 def _service_start(args: list[str], move: bool = False) -> None:
     verb = "move" if move else "start"
     name, opts = _service_options(args, verb, {"--node", "--wait"})
@@ -12752,6 +12795,18 @@ def _service_start(args: list[str], move: bool = False) -> None:
              f"{name}'s service is shared: it runs on every node it is placed on, so it "
              "moves by starting it on one node and stopping it on another",
              f"capabilities service start {name} --node {node}")
+    beside = (_nodes_beside_a_server(root)
+              if not opts.get("--node") and service is not None else None)
+    if beside and _service_placement(service) == "exclusive":
+        this, nodes = beside
+        servers = [n["node"] for n in nodes if n["kind"] == "server"]
+        _service_fail("node_required",
+                      f"{name}'s service is exclusive and this machine is not a server "
+                      f"while the agent has a server node, so service start names the "
+                      f"node it starts on, one of: {_named_nodes(nodes, this['node'])}",
+                      f"`capabilities service start {name} --node {servers[0]}` runs it "
+                      f"on the server; --node {this['node']} runs it on this machine",
+                      {"this_node": this["node"], "nodes": nodes})
     placed = _service_place(name, True, node)
     agent_id = _kernel_agent_id(root)
     _announce_placement(root)
@@ -12776,6 +12831,14 @@ def _service_start(args: list[str], move: bool = False) -> None:
         result["unplaced_from"] = placed["unplaced_from"]
     if others:
         result["still_on"] = others
+    if beside:
+        this, nodes = beside
+        result["warning"] = (
+            f"{name} is placed on this machine, {this['label']} ({this['node']}, "
+            f"{this['kind']}), and on no other node by this command; the agent's nodes "
+            f"are {_named_nodes(nodes, this['node'])}, and `capabilities service start "
+            f"{name} --node <node>` places it on another")
+        _warn(result["warning"])
     if row and row["ready"] and not (move and others):
         _emit(result)
         return
@@ -14136,8 +14199,23 @@ def _place_service(name: str, placed: bool, node: str | None,
         adapter = _records_for(root)
         try:
             _require_node_store(root, adapter)
-            _emit(_place_everywhere(name, root, adapter) if every
-                  else _placement_report(name, root, adapter, mode))
+            if every:
+                _emit(_place_everywhere(name, root, adapter))
+            else:
+                report = _placement_report(name, root, adapter, mode)
+                beside = _nodes_beside_a_server(root)
+                if beside:
+                    this, nodes = beside
+                    report["warning"] = (
+                        f"`place {name}` without --node places nothing: it reports that "
+                        f"{name}'s service is placed on "
+                        f"{', '.join(report['placed_on']) or 'no node'}. This machine is "
+                        f"not a server and the agent's nodes are "
+                        f"{_named_nodes(nodes, this['node'])}; `capabilities place {name} "
+                        f"--node <node>` places it on one"
+                        + (", --all on every one" if mode == "shared" else ""))
+                    _warn(report["warning"])
+                _emit(report)
             if every:
                 _announce_placement(root)
         except _store_module().StoreError as exc:
