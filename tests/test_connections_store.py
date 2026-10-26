@@ -264,7 +264,7 @@ def lab(tmp_path, instance, cluster):
         "CLAUDE_PROJECT_DIR": str(project),
     })
     for leaked in ("CAPABILITIES_READ_ONLY", "COOLIFY_BASE_URL", "COOLIFY_TOKEN",
-                   "VIRTUAL_ENV", "CAPABILITIES_PROJECT_ENVELOPE",
+                   "AGENT_ENCRYPTION_KEY", "VIRTUAL_ENV", "CAPABILITIES_PROJECT_ENVELOPE",
                    "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "CAPABILITIES_PROJECT_ID",
                    "CAPABILITIES_PROJECT_ID_ROOT", "AGENT_NODE_NAME", "AGENT_NODE_ID",
                    *DB_KEYS):
@@ -571,6 +571,66 @@ def test_a_store_mode_project_takes_up_a_config_home_connection_with_set(lab):
     _ok(_manager(lab, "set", "coolify", "grant", "hidden", '{"enabled": true}'))
     _ok(_coolify(lab, "--connection", "hidden", "resources"))
     assert ("GET", "/api/v1/resources") in lab["seen"]
+
+
+# --- the agent's vault, the cascade's last tier ----------------------------------------
+
+def _vault_token(lab, value: str = "vault-token-5678") -> None:
+    """The agent's key made, COOLIFY_TOKEN kept in its vault and taken out of
+    the project's .env, so the vault is the only tier that holds it."""
+    _ok(_manager(lab, "key", "generate"))
+    stored = subprocess.run([str(MANAGER), "secrets", "set", "COOLIFY_TOKEN"],
+                            cwd=lab["project"], env=lab["env"], input=value, text=True,
+                            capture_output=True, timeout=240)
+    _ok(stored)
+    env = lab["project"] / ".env"
+    env.write_text("".join(line for line in env.read_text().splitlines(True)
+                           if not line.startswith("COOLIFY_TOKEN=")))
+
+
+def _token_key(report: dict) -> dict:
+    return next(k for k in report["connections"]["box"]["keys"]
+                if k["key"] == "COOLIFY_TOKEN")
+
+
+def test_a_store_connection_finds_its_secret_in_the_agents_vault_last(lab):
+    _import(lab)
+    _ok(_manager(lab, "init"))
+    _vault_token(lab)
+    key = _token_key(_ok(_coolify(lab, "connections")))
+    assert key["set"] is True and key["tier"] == "vault"
+    assert key["source"] == f"vault:{PROJECT_ID}" and key["value"] == "…5678"
+    _ok(_coolify(lab, "resources"))
+    assert ("GET", "/api/v1/resources") in lab["seen"]
+    # Every tier above it still wins.
+    env = lab["project"] / ".env"
+    env.write_text(env.read_text() + "COOLIFY_TOKEN=file-token-1234\n")
+    key = _token_key(_ok(_coolify(lab, "connections")))
+    assert key["tier"] == "project" and key["value"] == "…1234"
+
+
+def test_a_files_mode_project_with_a_store_finds_its_secret_in_the_vault_too(lab):
+    _ok(_manager(lab, "init"))
+    _vault_token(lab)
+    key = _token_key(_ok(_coolify(lab, "connections")))
+    assert key["tier"] == "vault" and key["value"] == "…5678"
+
+
+def test_a_vault_that_cannot_be_read_says_so_and_a_secret_another_key_sealed_is_unset(lab):
+    _ok(_manager(lab, "init"))
+    _vault_token(lab)
+    _ok(_manager(lab, "key", "change"))
+    key = _token_key(_ok(_coolify(lab, "connections")))
+    assert key["set"] is False and "vault" not in key
+    env = lab["project"] / ".env"
+    env.write_text(env.read_text().replace(
+        f"AGENTKIT_DB_URL={lab['cluster'].url(lab['database'])}",
+        f"AGENTKIT_DB_URL={lab['cluster'].url(lab['database'], port=_free_port())}"))
+    key = _token_key(_ok(_coolify(lab, "connections")))
+    assert key["set"] is False and key["vault"].startswith("the vault could not be read")
+    doctor = _coolify(lab, "doctor")
+    assert doctor.returncode == 2
+    assert "the vault could not be read" in _error(doctor)["message"]
 
 
 # --- store mode, as a capability sees it --------------------------------------------

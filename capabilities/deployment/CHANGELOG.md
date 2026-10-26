@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-26 — `node enrol` gives a node the agent's key instead of each secret its vault holds
+
+`deployment node enrol` writes the agent's `AGENT_ENCRYPTION_KEY`, as it resolves here, into the node's `~/.config/capabilities/shared.env` on its config volume, on standard input, so the node opens the agent's vault in the store (`capabilities secrets`) and no secret the vault holds is copied to it. A secret kept only in a file or the environment here is still written into the capability's `credentials.env` on the node, as before. The answer carries `key {placed, fingerprint}` and `secrets_in_vault`, the names per capability that were left to the vault, which `secrets_skipped` no longer lists. A key here that is not the one the agent's vault is kept under is refused (exit 6 `key_mismatch`) before anything is written to the node. Needs capabilities-contract 0.25.
+
 ## 2026-10-26 — The agent-node guide says a node runs its scripts from the store
 
 The agent-node guide says a node raised from the store holds no checkout of the agent's repository, so a tasks worker's hooks are stored hooks and an automation's script a stored body.

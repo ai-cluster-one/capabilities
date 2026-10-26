@@ -35,6 +35,10 @@ class Fake:
         self.gone: set[str] = set()
         self.apps: set[str] = set()
         self.fail_storage = False
+        # The manager's `secrets list` for the agent: no key here, by default.
+        self.vault = {"key": {"set": False, "fingerprint": None, "matches": None},
+                      "secrets": []}
+        self.telegram_tier = "project"
         self.config = {"Image": "ghcr.io/agenium-dev/agent-node:0.0.1",
                        "Env": ["CAPABILITIES_PROJECT_ID=prj_00000000a1a1",
                                "CAPABILITIES_PROJECT_ID_ROOT=/app",
@@ -140,6 +144,8 @@ class Fake:
                 return json.dumps({"node": self.rows[args[2]]})
             if args[:2] == ["node", "remove"]:
                 return json.dumps({"removed": self.rows.pop(args[2])})
+            if args[:2] == ["secrets", "list"]:
+                return json.dumps(self.vault)
             if args[:1] == ["place"]:
                 return json.dumps({"placed": args[1], "node": args[3],
                                    "unplaced_from": ["mac"] if args[1] == "tasks" else []})
@@ -168,6 +174,8 @@ class Fake:
             inner = [w for w in remote[2:] if w != "-i"][1:]
             if inner[:2] == ["sh", "-c"]:
                 return KEY + "\n"
+            if inner[:2] == ["python3", "-c"] and "AGENT_ENCRYPTION_KEY" in inner[2]:
+                return ""
             if inner[:2] == ["python3", "-c"]:
                 return json.dumps({name: len(keys) for name, keys in json.loads(stdin).items()})
             if inner[:1] == ["capabilities"]:
@@ -176,9 +184,11 @@ class Fake:
                 return self.state
             raise AssertionError(inner)
         if tool == "telegram" and args == ["connections"]:
+            vault = self.telegram_tier == "vault"
             return json.dumps({"connections": {"default": {"keys": [
                 {"key": "TELEGRAM_BOT_TOKEN", "secret": True, "set": True,
-                 "tier": "project", "source": str(self.secret_file)},
+                 "tier": self.telegram_tier,
+                 "source": "vault:agt_fixture" if vault else str(self.secret_file)},
                 {"key": "TELEGRAM_CHAT", "secret": False, "set": True,
                  "tier": "connection", "source": "store"}]}}})
         if tool == "assets" and args == ["connections"]:
@@ -452,6 +462,57 @@ def test_a_gate_the_store_cannot_answer_refuses_enrol_as_input(lab, monkeypatch)
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.usable(lab.root)
     assert (refused.value.code, refused.value.exit_code) == ("store_unreachable", 6)
+
+
+AGENT_KEY = "k" * 43
+
+
+def _agent_key(lab, monkeypatch, matches=True):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(lab.root.parent / "config"))
+    monkeypatch.delenv("AGENT_ENCRYPTION_KEY", raising=False)
+    (lab.root / ".env.local").write_text(f"AGENT_ENCRYPTION_KEY={AGENT_KEY}\n")
+    lab.fake.vault = {"key": {"set": True, "fingerprint": "f" * 64, "matches": matches},
+                      "secrets": [{"name": "TELEGRAM_BOT_TOKEN", "readable": True},
+                                  {"name": "OLD_ONE", "readable": False}]}
+
+
+@pytest.mark.parametrize("tier", ["project", "vault"])
+def test_enrol_gives_the_node_the_agents_key_instead_of_a_secret_its_vault_holds(
+        lab, monkeypatch, capsys, tier):
+    # Kept in a file here as well, or resolved from the vault alone: either
+    # way the node reads it from the vault, and it is not reported skipped.
+    _agent_key(lab, monkeypatch)
+    lab.fake.telegram_tier = tier
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+
+    docker = [c for c in lab.fake.of("ssh") if "docker exec" in c["argv"][-1]]
+    [placed] = [c for c in docker if "AGENT_ENCRYPTION_KEY" in c["argv"][-1]]
+    assert placed["stdin"] == AGENT_KEY
+    for call in lab.fake.calls:
+        assert AGENT_KEY not in " ".join(call["argv"])
+    # The one file secret is in the vault, so no capability's file is written.
+    assert not [c for c in docker if "credentials.env" in c["argv"][-1]]
+    [store] = [c for c in docker if "capabilities store set" in c["argv"][-1]]
+    assert lab.fake.calls.index(placed) < lab.fake.calls.index(store)
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["key"] == {"placed": True, "fingerprint": "f" * 64}
+    assert answer["secrets"] == {} and answer["secrets_in_vault"] == {
+        "telegram": ["TELEGRAM_BOT_TOKEN"]}
+    assert not [row for row in answer["secrets_skipped"] if row["key"] == "TELEGRAM_BOT_TOKEN"]
+    assert AGENT_KEY not in json.dumps(answer)
+
+
+def test_enrol_refuses_a_key_that_does_not_open_the_vault_before_touching_the_node(
+        lab, monkeypatch, capsys):
+    _agent_key(lab, monkeypatch, matches=False)
+    lab.m.cmd_node_create(create_args())
+    before = len(lab.fake.of("ssh"))
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+    assert refused.value.code == "key_mismatch"
+    assert len(lab.fake.of("ssh")) == before
 
 
 def test_enrol_reports_a_node_that_did_not_raise_its_agent(lab, capsys):

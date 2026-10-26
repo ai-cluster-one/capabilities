@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.23,<1",
+#     "capabilities-contract>=0.25,<1",
 # ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
@@ -326,12 +326,20 @@ USAGE
       `capabilities node id --set <id>`, which the node resolves its id
       from from then on; make the node's X25519 key pair there (the private key stays in
       ~/.config/agent-node/node-key.pem, mode 0600) and record its public
-      key on the node row; write the agent's secrets - every secret key of a
+      key on the node row; write the agent's encryption key,
+      AGENT_ENCRYPTION_KEY as it resolves here, into the node's
+      ~/.config/capabilities/shared.env on its config volume, which opens the
+      agent's vault there (`capabilities secrets`; refused as key_mismatch
+      when the key here is not the one the vault is kept under; the answer's
+      key says whether it was placed and secrets_in_vault names, per
+      capability, each secret key the node reads from the vault instead of
+      a file); write the agent's other secrets - every secret key of a
       connection each capability the agent can use resolves here (enabled
       for the project or globally), read where each capability's
-      `connections` says it is, except the coolify connection the node was
-      created through, whose token the node does not hold - into each
-      capability's credentials.env on the node's config volume. The answer's
+      `connections` says it is, except a name the vault holds and the
+      coolify connection the node was created through, whose token the node
+      does not hold - into each capability's credentials.env on the node's
+      config volume. The answer's
       secrets_skipped names each secret key it did not carry and why (not
       set here, a value spanning lines, a key declared not secret, the
       withheld coolify connection, a capability whose `connections` gave no
@@ -8506,6 +8514,56 @@ print(json.dumps(written))
 """
 
 
+# Run in the node: set AGENT_ENCRYPTION_KEY, read from stdin, in the machine's
+# shared.env under the node's config home, mode 0600, every other line kept,
+# printing nothing. The node's root is not on a volume; its config home is.
+_AGENT_NODE_KEY = r"""
+import os, sys, tempfile
+from pathlib import Path
+key = sys.stdin.read().strip()
+if not key or "\n" in key:
+    sys.exit("no key came on stdin")
+path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "capabilities" / "shared.env"
+path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+lines = path.read_text().splitlines() if path.is_file() else []
+kept = [line for line in lines
+        if line.split("=", 1)[0].strip().removeprefix("export ").strip() != "AGENT_ENCRYPTION_KEY"]
+fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".shared.")
+with os.fdopen(fd, "w") as f:
+    f.write("\n".join(kept + ["AGENT_ENCRYPTION_KEY=" + key]) + "\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+"""
+
+
+def _agent_node_vault(root):
+    """(the agent's key as it resolves here, its fingerprint, the names its
+    vault holds that the key opens), or (None, None, set()) for an agent with
+    no key here. A key that is not the one the agent's vault is kept under is
+    refused: the node could read nothing with it."""
+    try:
+        listed = _manager(root, "secrets", "list")
+    except NodeFailure as failure:
+        if failure.code in ("key_missing", "agent_unregistered"):
+            return None, None, set()
+        raise
+    key = listed.get("key") or {}
+    if not key.get("set"):
+        return None, None, set()
+    if key.get("matches") is False:
+        raise NodeFailure("key_mismatch", "the AGENT_ENCRYPTION_KEY here is not the key this "
+                          "agent's vault is kept under, so the node could not read it", 6)
+    from capabilities_contract import vault
+    text, _where = vault.key_source(root)
+    try:
+        vault.parse_key(text or "")
+    except vault.VaultError as exc:
+        raise NodeFailure(exc.slug, exc.message, 6) from None
+    names = {entry["name"] for entry in listed.get("secrets") or []
+             if isinstance(entry, dict) and entry.get("readable")}
+    return text.strip(), key.get("fingerprint"), names
+
+
 def _manager(root, *args, stdin=None):
     """The manager's answer to `capabilities <args>` in this project."""
     p = _node_run(["capabilities", *args], root, stdin=stdin, check=False)
@@ -8956,6 +9014,9 @@ def cmd_node_enrol(args):
         raise NodeFailure("node_unknown", f"this agent has no node {node}", 6)
     node = row["node"]
     store_args, password = _agent_node_store_args(root)
+    # The agent's key is read, and refused when it is not the vault's, before
+    # anything is written to the node.
+    key, fingerprint, in_vault = _agent_node_vault(root)
     _target, host, container = _agent_node_reach(root, row, write=True)
     # The node's id goes onto its config volume first, with the node's own
     # manager: everything after it, the raised agent too, runs as that node.
@@ -8965,13 +9026,33 @@ def cmd_node_enrol(args):
     if not AGENT_NODE_PUBLIC_KEY.fullmatch(public_key):
         raise NodeFailure("node_key", "the node did not answer with an X25519 public key", 5)
     _manager(root, "node", "set", node, "--public-key", public_key)
-    # The agent's secrets go first and the store setting last: the setting is
-    # what the waiting node raises the agent on, so it finds them all there.
-    # The coolify connection the node was created through stays here: the
-    # row names it, and the node does not hold its token.
+    # The agent's key and secrets go first and the store setting last: the
+    # setting is what the waiting node raises the agent on, so it finds them
+    # all there. The key opens the agent's vault, so a secret the vault holds
+    # is neither carried nor reported skipped; a secret kept only in a file
+    # here still is carried. The coolify connection the node was created
+    # through stays here: the row names it, and the node does not hold its
+    # token.
+    if key is not None:
+        _agent_node_exec(root, host, container, ["python3", "-c", _AGENT_NODE_KEY], stdin=key)
+    withheld = {"coolify": {row["coolify_connection"]}}
     secrets, skipped, environment_only = _agent_node_secrets(
-        root, sorted({*_usable_capabilities(root), *services}),
-        {"coolify": {row["coolify_connection"]}})
+        root, sorted({*_usable_capabilities(root), *services}), withheld)
+    held = {}
+    for name in list(secrets):
+        held.setdefault(name, set()).update(k for k in secrets[name] if k in in_vault)
+        secrets[name] = {k: v for k, v in secrets[name].items() if k not in in_vault}
+        if not secrets[name]:
+            del secrets[name]
+    kept = []
+    for entry in skipped:
+        if (entry.get("key") in in_vault
+                and entry.get("connection") not in withheld.get(entry.get("capability"), ())):
+            held.setdefault(entry["capability"], set()).add(entry["key"])
+        else:
+            kept.append(entry)
+    skipped = kept
+    held = {name: sorted(keys) for name, keys in held.items() if keys}
     written = json.loads(_agent_node_exec(root, host, container, ["python3", "-c", _AGENT_NODE_SECRETS],
                                           stdin=json.dumps(secrets)) or "{}") if secrets else {}
     placed = []
@@ -8991,7 +9072,9 @@ def cmd_node_enrol(args):
         time.sleep(10)
     answer = {"ok": state.startswith("running agent"), "node": node, "label": row.get("label"),
               "public_key": public_key,
+              "key": {"placed": key is not None, "fingerprint": fingerprint},
               "secrets": {name: sorted(keys) for name, keys in secrets.items()},
+              "secrets_in_vault": held,
               "secrets_written": written, "secrets_skipped": skipped,
               "environment_only": environment_only, "store": "written", "placed": placed,
               "unplaced": unplaced, "state": state}

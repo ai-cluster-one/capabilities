@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.21.1,<1",
+#     "capabilities-contract>=0.25.0,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -66,11 +66,18 @@ ENVIRONMENT
                        reads but changes nothing (write verbs, project-record
                        writes and service activation exit 4), and this manager
                        refuses agent convert, agent set, allow, connections
-                       import, disable, enable, inherit, init, node add, node
-                       remove, node seen, node set, place (but its report),
-                       quarantine, relabel, set, store set, store unset and
-                       unplace.
+                       import, disable, enable, inherit, init, key generate,
+                       key set, key change, node add, node remove, node seen,
+                       node set, place (but its report), quarantine, relabel,
+                       secrets set, secrets rm, secrets raw --set, set, store
+                       set, store unset and unplace.
                        doctor reports it. Unset, `0` or `false` leaves it off.
+  AGENT_ENCRYPTION_KEY
+                       the agent's one encryption key, which opens its vault
+                       (see VAULT VERBS): the project's .env.local, else its
+                       .env, else this machine's
+                       $XDG_CONFIG_HOME/capabilities/shared.env, else the
+                       process environment. Never kept in the store.
   AGENTKIT_DB_URL, AGENTKIT_DB_HOST, AGENTKIT_DB_PORT, AGENTKIT_DB_NAME,
   AGENTKIT_DB_USER, AGENTKIT_DB_PASSWORD, AGENTKIT_DB_SCHEMA,
   AGENTKIT_DB_SSLMODE, AGENTKIT_DB_SSLROOTCERT, AGENTKIT_DB_TRANSACTION_HOST,
@@ -415,6 +422,62 @@ STORE VERBS
         (exit 6 store_setting_too_new). Exit 4 under the read-only switch.
         Answers as `store show` does, with changed; removing no setting is
         not an error.
+
+VAULT VERBS
+  Each agent has one encryption key, AGENT_ENCRYPTION_KEY (see ENVIRONMENT),
+  and a vault of named secrets in its store that only that key opens: each a
+  row of capabilities_vault, sealed with XChaCha20-Poly1305, the agent id and
+  the name bound to it. The store keeps the fingerprint of the agent's key on
+  its row of capabilities_agents, never the key; keeping the key is the
+  owner's. Every capability resolves a value its connections name through the
+  credential cascade and asks the vault last, after the project's .env files,
+  its credentials.env and the process environment. A secret several agents
+  use is a copy in each agent's vault. A row sealed under another key than
+  the agent's present one is unreadable: kept, reported, and read again only
+  once it is set again. Each verb stands in the current project and its
+  store, and answers JSON unless it says otherwise.
+  key generate
+        Make the agent's first key, record its fingerprint, and write it into
+        the project's .env.local. Exit 6 key_exists where a key resolves here,
+        key_recorded where the agent already keeps its vault under a key that
+        is not here (bring it with key set). Never prints the key.
+  key set
+        Take the agent's key on stdin - to bring it to another machine or
+        folder of the same agent - and write it into the project's .env.local;
+        recorded where the agent has none yet. Exit 6 bad_key for text that
+        is not a key, key_mismatch for a key that is not the agent's.
+  key change
+        Make a new key, record its fingerprint, and write it into the
+        project's .env.local. Everything sealed under the previous key becomes
+        unreadable; the answer names how many (unreadable) and the previous
+        fingerprint. Set those secrets again.
+  secrets list [--json]
+        The vault's names with readable, updated_at and updated_by, never a
+        value, and the key in force here {set, source, fingerprint, recorded,
+        matches}; unreadable lists the names no key here opens. Needs no key.
+  secrets show <NAME>
+        Print the one value on stdout, raw, with a trailing newline and
+        nothing else. Exit 3 not_set where the vault holds no NAME, 6
+        secret_unreadable where it was sealed under another key.
+  secrets set <NAME>
+        Seal the value read from stdin (one trailing newline dropped) and keep
+        it as NAME, replacing what was there. A value never comes on argv:
+        exit 6 stdin_required on a terminal. NAME is an environment variable
+        name.
+  secrets rm <NAME> [<NAME> ...]
+        Remove the named secrets, readable or not; needs no key. Answers
+        removed and absent.
+  secrets raw [--set]
+        The whole vault as KEY=value text: without --set printed on stdout
+        (a value a plain line would not carry back whole is a JSON string),
+        the names no key here opens named on stderr; with --set the text read
+        from stdin is saved as a whole - each name set where its value
+        changed, each readable name the text leaves out removed - and the
+        unreadable rows are kept and reported (unreadable_kept).
+  Without a key here, key-bound verbs exit 6 key_missing; with a key that is
+  not the one the agent's vault is kept under, 6 key_mismatch. A project with
+  no id exits 6 no_project_identity, an agent the store does not register 6
+  agent_unregistered, an unreachable store 5 store_unreachable.
 
 DEVELOPMENT VERBS
   dev start <name> [--project PATH | --no-project] [--source ID-OR-PATH]
@@ -1847,10 +1910,12 @@ def _store_module():
 # identity and its wiring — and the machine ceiling. Under the read-only switch the manager refuses them;
 # whether the switch is on is the store tier's answer, never the manager's own.
 READ_ONLY_REFUSED_VERBS = ("agent convert", "agent set", "allow", "connections import",
-                           "disable", "enable", "inherit", "init", "node add", "node remove",
+                           "disable", "enable", "inherit", "init", "key change",
+                           "key generate", "key set", "node add", "node remove",
                            "node set", "place", "quarantine", "references export",
                            "references import", "references retire", "references save",
-                           "relabel", "service move", "service restart", "service start",
+                           "relabel", "secrets raw --set", "secrets rm", "secrets set",
+                           "service move", "service restart", "service start",
                            "service stop",
                            "set", "store set", "store unset", "unplace")
 
@@ -8182,6 +8247,336 @@ def _kernel_run(root: Path, work):
 
 def _kernel_store_report(setting) -> dict:
     return {"level": setting.level, "schema": setting.schema}
+
+
+# ---------------------------------------------------------------- the agent's vault
+# Each agent's secrets are rows of the store, sealed with the agent's own key,
+# AGENT_ENCRYPTION_KEY, which lives in the agent's environment and never in the
+# store (capabilities_contract.vault). The manager carries the verbs that keep
+# the key and the secrets; every capability reads a secret as the last tier of
+# its credential cascade.
+
+VAULT_TEXT_SET_FLAG = "--set"
+
+
+def _vault_module():
+    try:
+        from capabilities_contract import vault
+    except ImportError as exc:
+        _die(5, "vault_missing",
+             f"the vault of {CONTRACT_LIBRARY} cannot be loaded: {exc}",
+             "update the capabilities manager, whose script header pins the library")
+    return vault
+
+
+def _vault_actor() -> str:
+    store = _store_module()
+    return f"{store._user_name()}@{store.node_name()}"
+
+
+def _vault_key_here(root: Path) -> tuple[bytes | None, str | None]:
+    """(the agent's key as this folder resolves it, where it was found)."""
+    vault = _vault_module()
+    text, where = vault.key_source(root)
+    if not text:
+        return None, None
+    try:
+        return vault.parse_key(text), where
+    except vault.VaultError as exc:
+        _die(6, exc.slug, f"{exc.message} (read from {where})", exc.hint)
+
+
+def _vault_require_key(root: Path) -> bytes:
+    key, _where = _vault_key_here(root)
+    if key is None:
+        vault = _vault_module()
+        _die(6, "key_missing",
+             f"this agent has no {vault.KEY_ENV} here: not in {root / '.env.local'}, "
+             f"{root / '.env'}, {vault.shared_env_path()} or the environment",
+             "bring the agent's key with `capabilities key set` (the key on stdin), or "
+             "make the agent's first one with `capabilities key generate`")
+    return key
+
+
+def _vault_registered(conn, agent_id: str) -> str | None:
+    """The fingerprint the agent's row records, refusing an agent the store
+    does not register."""
+    found, recorded = _vault_module().recorded_key(conn, agent_id)
+    if not found:
+        _die(6, "agent_unregistered",
+             f"the store registers no agent {agent_id}, whose row keeps the fingerprint "
+             "of its key",
+             "run `capabilities init` in the agent's folder")
+    return recorded
+
+
+def _vault_key_matches(conn, agent_id: str, key: bytes, record: bool = True) -> None:
+    """Refuse a key that is not the one the agent's vault is kept under; for a
+    write, record it where the agent has none yet."""
+    vault = _vault_module()
+    recorded = _vault_registered(conn, agent_id)
+    if recorded is None:
+        if record:
+            vault.record_key(conn, agent_id, vault.fingerprint(key))
+    elif recorded != vault.fingerprint(key):
+        _die(6, "key_mismatch",
+             f"the {vault.KEY_ENV} here is not the key agent {agent_id}'s vault is kept "
+             f"under (fingerprint {recorded[:16]}…)",
+             "bring the agent's key with `capabilities key set`, or replace it with "
+             "`capabilities key change`, which leaves what was sealed before unreadable")
+
+
+def _vault_stdin(what: str) -> str:
+    if sys.stdin is None or sys.stdin.isatty():
+        _die(6, "stdin_required", f"{what} is read from standard input, never from argv",
+             "pipe it in, for example from a password manager")
+    return sys.stdin.read()
+
+
+def _vault_write_key(root: Path, key: bytes) -> Path:
+    vault = _vault_module()
+    _write_env_local_keys(root, {vault.KEY_ENV: vault.encode_key(key)})
+    return root / ".env.local"
+
+
+def cmd_key(rest: list[str]) -> None:
+    vault = _vault_module()
+    sub = rest[0] if rest else None
+    if sub not in ("generate", "set", "change") or rest[1:]:
+        _die(6, "input", "key needs one subcommand and nothing else: generate, set or change",
+             "run `capabilities help`")
+    _read_only_gate(f"key {sub}")
+    root = _require_project()
+    if sub == "set":
+        text = _vault_stdin("the key").strip()
+        try:
+            key = vault.parse_key(text)
+        except vault.VaultError as exc:
+            _die(6, exc.slug, exc.message, exc.hint)
+    else:
+        if sub == "generate":
+            present, where = _vault_key_here(root)
+            if present is not None:
+                _die(6, "key_exists", f"this agent already has a {vault.KEY_ENV} ({where})",
+                     "`capabilities key change` replaces it")
+        key = vault.parse_key(vault.generate_key())
+    fingerprint = vault.fingerprint(key)
+
+    def write(conn, agent_id):
+        recorded = _vault_registered(conn, agent_id)
+        unreadable = 0
+        if sub == "generate" and recorded is not None:
+            _die(6, "key_recorded",
+                 f"agent {agent_id} already keeps its vault under a key (fingerprint "
+                 f"{recorded[:16]}…), which is not here",
+                 "bring that key with `capabilities key set`, or replace it with "
+                 "`capabilities key change`")
+        if sub == "set" and recorded not in (None, fingerprint):
+            _die(6, "key_mismatch",
+                 f"this is not the key agent {agent_id}'s vault is kept under "
+                 f"(fingerprint {recorded[:16]}…)",
+                 "`capabilities key change` replaces the agent's key, leaving what was "
+                 "sealed before unreadable")
+        if recorded != fingerprint:
+            vault.record_key(conn, agent_id, fingerprint)
+        if sub == "change":
+            unreadable = vault.sealed_under_other(conn, agent_id, fingerprint)
+        # Written inside the transaction, so a file that cannot be written
+        # leaves the store as it was.
+        changed_file = _write_env_local_keys(root, {vault.KEY_ENV: vault.encode_key(key)})
+        return recorded, unreadable, changed_file
+
+    (recorded, unreadable, changed_file), setting = _kernel_run(root, write)
+    answer = {"ok": True, "agent": _kernel_agent_id(root), "fingerprint": fingerprint,
+              "written": str(root / ".env.local"),
+              "changed": changed_file or recorded != fingerprint,
+              "store": _kernel_store_report(setting)}
+    if sub == "change":
+        answer["previous_fingerprint"] = recorded
+        answer["unreadable"] = unreadable
+        if unreadable:
+            answer["note"] = (f"{unreadable} secret(s) sealed under the previous key cannot be "
+                              "read any more; set each again with `capabilities secrets set`")
+    _emit(answer)
+
+
+def _vault_listing(conn, agent_id: str, key: bytes | None) -> tuple[list, str | None]:
+    vault = _vault_module()
+    recorded = _vault_registered(conn, agent_id)
+    current = vault.fingerprint(key) if key is not None else recorded
+    rows = vault.rows(conn, agent_id)
+    stamp = _store_module()._stamp
+    return [{"name": r["name"], "readable": current is not None
+             and r["key_fingerprint"] == current,
+             "updated_at": stamp(r["updated_at"]), "updated_by": r["updated_by"],
+             "_row": r} for r in rows], recorded
+
+
+def _vault_public(entries: list) -> list:
+    return [{k: v for k, v in e.items() if k != "_row"} for e in entries]
+
+
+def cmd_secrets(rest: list[str]) -> None:
+    vault = _vault_module()
+    sub = rest[0] if rest else None
+    args = rest[1:]
+    if sub not in ("list", "show", "set", "rm", "raw"):
+        _die(6, "input", "secrets needs a subcommand: list, show, set, rm or raw",
+             "run `capabilities help`")
+    root = _require_project()
+
+    def name_of(value: str) -> str:
+        try:
+            return vault.check_name(value)
+        except vault.VaultError as exc:
+            _die(6, exc.slug, exc.message, exc.hint)
+
+    if sub == "list":
+        if [a for a in args if a != "--json"]:
+            _die(6, "input", "secrets list takes only --json")
+        key, where = _vault_key_here(root)
+
+        def read(conn, agent_id):
+            return _vault_listing(conn, agent_id, key)
+
+        (entries, recorded), setting = _kernel_run(root, read)
+        fingerprint = vault.fingerprint(key) if key is not None else None
+        _emit({"ok": True, "agent": _kernel_agent_id(root),
+               "key": {"set": key is not None, "source": where, "fingerprint": fingerprint,
+                       "recorded": recorded,
+                       "matches": None if key is None or recorded is None
+                       else fingerprint == recorded},
+               "secrets": _vault_public(entries),
+               "unreadable": [e["name"] for e in entries if not e["readable"]],
+               "store": _kernel_store_report(setting)})
+        return
+
+    if sub == "rm":
+        names = [name_of(a) for a in args]
+        if not names or any(a.startswith("--") for a in args):
+            _die(6, "input", "secrets rm needs one or more names")
+        _read_only_gate("secrets rm")
+
+        def drop(conn, agent_id):
+            return vault.remove(conn, agent_id, names)
+
+        removed, setting = _kernel_run(root, drop)
+        _emit({"ok": True, "agent": _kernel_agent_id(root), "removed": removed,
+               "absent": sorted(set(names) - set(removed)),
+               "store": _kernel_store_report(setting)})
+        return
+
+    if sub == "show":
+        if len(args) != 1 or args[0].startswith("--"):
+            _die(6, "input", "secrets show needs exactly one name")
+        name = name_of(args[0])
+        key = _vault_require_key(root)
+
+        def read_one(conn, agent_id):
+            _vault_key_matches(conn, agent_id, key, record=False)
+            return [r for r in vault.rows(conn, agent_id) if r["name"] == name]
+
+        found, _setting = _kernel_run(root, read_one)
+        if not found:
+            _die(3, "not_set", f"the vault holds no {name}")
+        value = vault.unseal(key, _kernel_agent_id(root), name, found[0]["ciphertext"]) \
+            if found[0]["key_fingerprint"] == vault.fingerprint(key) else None
+        if value is None:
+            _die(6, "secret_unreadable",
+                 f"{name} was sealed under another key and cannot be read",
+                 f"set it again with `capabilities secrets set {name}`")
+        sys.stdout.write(value + "\n")
+        return
+
+    if sub == "set":
+        if len(args) != 1 or args[0].startswith("--"):
+            _die(6, "input", "secrets set needs exactly one name; the value comes on stdin")
+        name = name_of(args[0])
+        _read_only_gate("secrets set")
+        key = _vault_require_key(root)
+        value = _vault_stdin("a secret's value")
+        if value.endswith("\r\n"):
+            value = value[:-2]
+        elif value.endswith("\n"):
+            value = value[:-1]
+        if value == "":
+            _die(6, "input", f"no value came on stdin for {name}",
+                 f"`capabilities secrets rm {name}` removes a secret")
+
+        def put(conn, agent_id):
+            _vault_key_matches(conn, agent_id, key)
+            existed = any(r["name"] == name for r in vault.rows(conn, agent_id))
+            vault.put(conn, key, agent_id, name, value, updated_by=_vault_actor())
+            return existed
+
+        existed, setting = _kernel_run(root, put)
+        _emit({"ok": True, "agent": _kernel_agent_id(root), "name": name,
+               "changed": "replaced" if existed else "created",
+               "store": _kernel_store_report(setting)})
+        return
+
+    # raw: the whole vault as KEY=value text, printed, or saved whole from stdin.
+    saving = VAULT_TEXT_SET_FLAG in args
+    if [a for a in args if a != VAULT_TEXT_SET_FLAG]:
+        _die(6, "input", f"secrets raw takes only {VAULT_TEXT_SET_FLAG}")
+    if saving:
+        _read_only_gate("secrets raw --set")
+    key = _vault_require_key(root)
+    if not saving:
+        def read_all(conn, agent_id):
+            _vault_key_matches(conn, agent_id, key, record=False)
+            return _vault_listing(conn, agent_id, key)[0]
+
+        entries, _setting = _kernel_run(root, read_all)
+        agent_id = _kernel_agent_id(root)
+        values, unreadable = {}, []
+        for e in entries:
+            value = vault.unseal(key, agent_id, e["name"], e["_row"]["ciphertext"]) \
+                if e["readable"] else None
+            if value is None:
+                unreadable.append(e["name"])
+            else:
+                values[e["name"]] = value
+        sys.stdout.write(vault.render_text(values))
+        if unreadable:
+            sys.stderr.write(json.dumps({"unreadable": unreadable, "note": (
+                "sealed under another key, so left out; they stay in the vault until set "
+                "again or removed")}) + "\n")
+        return
+    try:
+        wanted = vault.parse_text(_vault_stdin("the vault's KEY=value text"))
+    except vault.VaultError as exc:
+        _die(6, exc.slug, exc.message, exc.hint)
+
+    def save(conn, agent_id):
+        _vault_key_matches(conn, agent_id, key)
+        entries = _vault_listing(conn, agent_id, key)[0]
+        held = {}
+        for e in entries:
+            held[e["name"]] = (vault.unseal(key, agent_id, e["name"], e["_row"]["ciphertext"])
+                               if e["readable"] else None, e["readable"])
+        actor = _vault_actor()
+        written, unchanged = [], []
+        for name, value in sorted(wanted.items()):
+            if name in held and held[name][1] and held[name][0] == value:
+                unchanged.append(name)
+                continue
+            vault.put(conn, key, agent_id, name, value, updated_by=actor)
+            written.append(name)
+        gone = [n for n, (_v, readable) in held.items() if n not in wanted and readable]
+        removed = vault.remove(conn, agent_id, gone) if gone else []
+        kept = sorted(n for n, (_v, readable) in held.items()
+                      if n not in wanted and not readable)
+        return written, unchanged, removed, kept
+
+    (written, unchanged, removed, kept), setting = _kernel_run(root, save)
+    answer = {"ok": True, "agent": _kernel_agent_id(root), "set": written,
+              "unchanged": unchanged, "removed": removed, "unreadable_kept": kept,
+              "store": _kernel_store_report(setting)}
+    if kept:
+        answer["note"] = ("sealed under another key, so kept as they are; set each again or "
+                          "remove it with `capabilities secrets rm`")
+    _emit(answer)
 
 
 def _agent_row(conn, agent_id: str) -> dict | None:
@@ -24364,6 +24759,10 @@ def main() -> None:
         cmd_bootstrap(rest)
     elif cmd == "agent":
         cmd_agent(rest)
+    elif cmd == "key":
+        cmd_key(rest)
+    elif cmd == "secrets":
+        cmd_secrets(rest)
     elif cmd == "node":
         cmd_node(rest)
     elif cmd == "service":

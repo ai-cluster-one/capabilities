@@ -1,8 +1,8 @@
 {
   "assets": {
-    "DOCTRINE.md": "c08bd4a5b2176e0f2654beb4c72aafcef23655239cc0c79b32a84b9da45154e5",
+    "DOCTRINE.md": "905189759463ecf2b8164ef0c1b37d1550a33353af567d900270fe586e9fee3b",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "d70efacf013a926f0b12b011cbfa865764fd97fb9b1c7eccace96ab22670c324",
+    "SHEBANG.md": "525eb4d46f788dde21612bb1e81bda9b713618cb3170519759229dce145a20b3",
     "SOURCES.md": "f130558217bd581ccff5ed8020d35c7e2e155b59894e6e2fc01dc63e5f1a4aaa",
     "TEMPLATE.md": "29f72a0c4dfeb08a8434fc89440e799bba6a42a933b5819bd6e897af6d15c73b",
     "contract/CHANGELOG.md": "a145c5476e697837b79e1b836f76618f75eef2317391e697ada75c3a16ed2c5c",
@@ -17,12 +17,12 @@
     "guides/repositories.md": "61c593b97dc699a8932892ceacbb86f8231222faa06a6915d0d97f25756d76b2",
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "a18b6159ef86a92c8e23e3220170861a45351bb598c2d8d2a9c910f4b0bafe72",
+    "manager/CHANGELOG.md": "3a21942ee3b789c80541393ec496d73845e3bedbf058af8af485293852937b9a",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "61c755425a185f9905d3cbfb58a328d4cb76c7f8ca81ccd9c668acea411d89c1"
+    "sha256": "13805639b5605cf7cd37681deb89bbc69622d749996298f7a6add2a0c15fdbb5"
   },
   "schema": "capabilities.manager-release.v1"
 }
