@@ -1596,3 +1596,32 @@ def test_a_machine_with_a_work_folder_keeps_its_worktrees_there(tmp_path):
         assert stopped["removed"] is True
     assert not (data_home / "capabilities" / "dev" / "before-work").exists()
     assert not (work / "capabilities-dev" / "on-work").exists()
+
+
+def test_gc_keeps_a_session_whose_worktree_a_redeploy_took_and_cleans_the_rest(
+    tmp_path,
+):
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    orphan = _start(env, source, consumer, session="lost-on-redeploy")
+    # A redeploy takes the data home's folder; the session record stays.
+    shutil.rmtree(Path(env["XDG_DATA_HOME"]) / "capabilities" / "dev" /
+                  "lost-on-redeploy")
+    (Path(env["HOME"]) / "work").mkdir(parents=True)
+    healthy = _start(env, source, consumer, session="on-work")
+
+    session_root = Path(env["XDG_STATE_HOME"]) / "capabilities" / "dev"
+    for session_id in ("lost-on-redeploy", "on-work"):
+        state_file = session_root / session_id / "session.json"
+        state = json.loads(state_file.read_text())
+        state["created_at"] = 0
+        state_file.write_text(json.dumps(state) + "\n")
+
+    collected = json.loads(_run(env, "dev", "gc", "--older-than", "1s").stdout)
+    assert collected["removed"] == [{"removed": True, "session": "on-work"}]
+    assert [entry["session"] for entry in collected["retained"]] == [
+        "lost-on-redeploy"]
+    assert "worktree is missing" in collected["retained"][0]["reason"]
+    assert not Path(healthy["source_worktree"]).exists()
+    assert not Path(orphan["source_worktree"]).exists()

@@ -5246,20 +5246,27 @@ def _dev_state_dir(session_id: str) -> Path:
     return DEV_STATE_ROOT / session_id
 
 
-def _dev_data_root(session_id: str) -> Path:
+def _dev_data_root(session_id: str, session: dict | None = None) -> Path:
     """The data root a session's worktree lives under: the data home's for a
     session opened there before this machine had a work folder, else the
-    machine's dev data root."""
+    machine's dev data root. A session's record decides it by the worktree it
+    names, which holds even once a redeploy has taken that folder; without a
+    record, the folder on disk does."""
     if not _dev_safe_id(session_id):
         _die(6, "bad_session", f"invalid dev session id: {session_id!r}")
-    if DEV_DATA_ROOT != LEGACY_DEV_DATA_ROOT \
-            and (LEGACY_DEV_DATA_ROOT / session_id).is_dir():
-        return LEGACY_DEV_DATA_ROOT
-    return DEV_DATA_ROOT
+    if DEV_DATA_ROOT == LEGACY_DEV_DATA_ROOT:
+        return DEV_DATA_ROOT
+    recorded = ((session or {}).get("source") or {}).get("worktree")
+    if recorded:
+        legacy = LEGACY_DEV_DATA_ROOT.resolve()
+        held = legacy in Path(str(recorded)).resolve().parents
+    else:
+        held = (LEGACY_DEV_DATA_ROOT / session_id).is_dir()
+    return LEGACY_DEV_DATA_ROOT if held else DEV_DATA_ROOT
 
 
-def _dev_data_dir(session_id: str) -> Path:
-    return _dev_data_root(session_id) / session_id
+def _dev_data_dir(session_id: str, session: dict | None = None) -> Path:
+    return _dev_data_root(session_id, session) / session_id
 
 
 def _dev_session(session_id: str) -> dict:
@@ -7447,9 +7454,9 @@ def _dev_stop(session_id: str, emit_result: bool,
                 "problems": ["active live takeover"]}
     session = _dev_session(session_id)
     state_dir = _dev_state_dir(session_id)
-    data_dir = _dev_data_dir(session_id)
+    data_dir = _dev_data_dir(session_id, session)
     _dev_assert_owned_path(state_dir, DEV_STATE_ROOT)
-    _dev_assert_owned_path(data_dir, _dev_data_root(session_id))
+    _dev_assert_owned_path(data_dir, _dev_data_root(session_id, session))
     _dev_assert_owned_path(Path(session["source"]["worktree"]), data_dir)
     problems, discarded = _dev_cleanup_obstacles(session, discard_work)
     if problems:
