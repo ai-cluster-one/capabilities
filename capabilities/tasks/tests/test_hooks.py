@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract>=0.8,<1",
+# dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract>=0.24,<1",
 #                 "callva-harness-runner==0.10.1",
 #                 "pyyaml>=6"]
 # ///
@@ -16,7 +16,7 @@ The store-backed checks read TASKS_TEST_DSN and skip when it is unset; every run
 works in a schema of its own and drops it.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
-        --with 'capabilities-contract>=0.8,<1' \\
+        --with 'capabilities-contract>=0.24,<1' \\
         --with 'callva-harness-runner==0.10.1' python -m pytest capabilities/tasks/tests -q
 """
 
@@ -147,12 +147,26 @@ def test_a_worker_without_hooks_declares_none(project):
     ("{before: a, during: b}", "its `hooks` names 'during', which nothing reads"),
     ("[a, b]", "its `hooks` is a mapping of before and after"),
     ("{before: ''}", "its `hooks.before` is one command line"),
-    ("{after: [a, b]}", "its `hooks.after` is one command line"),
+    ("{after: [a, 'b c']}", "its `hooks.after` is a list of stored hook names"),
+    ("{before: []}", "its `hooks.before` is a list of stored hook names"),
+    ("{before: [a, a]}", "its `hooks.before` names a hook more than once"),
+    ("{after: 3}", "its `hooks.after` is one command line"),
     ("{before: 'a \"b'}", "its `hooks.before` does not split into a command"),
 ])
 def test_hooks_that_cannot_be_read_are_refused(project, hooks, said):
     write_worker(project, "alpha", f"takes: [alpha]\nprofile: plain\nhooks: {hooks}")
     assert any(said in one for one in problems_of("alpha")), problems_of("alpha")
+
+
+def test_a_list_names_stored_hooks_and_a_string_stays_a_command_line(project, monkeypatch):
+    monkeypatch.setattr(mod, "_stored_hooks", lambda *a, **k: [])
+    write_worker(project, "alpha", "takes: [alpha]\nprofile: plain\nhooks:\n"
+                 "  before: [lane-check, quota]\n  after: scripts/follow.sh --x")
+    worker = mod._worker("alpha")
+    assert worker["hooks"] == {"before": ["lane-check", "quota"],
+                               "after": "scripts/follow.sh --x"}
+    assert mod._named_hooks(worker["hooks"]) == [("before", "lane-check"),
+                                                 ("before", "quota")]
 
 
 def test_the_fingerprint_moves_with_a_hook(project):
@@ -583,3 +597,182 @@ def test_the_service_logs_what_a_hook_held_back_and_does_not_spin(lab):
     shown = answer_of(tasks_cli(lab, "show", "t-held"))
     assert shown["task"]["status"] == "todo" and shown["task"]["pickup_at"] is None
     assert answer_of(tasks_cli(lab, "runs", "t-held"))["executions"] == []
+
+
+# --- Hooks kept in the store -------------------------------------------------
+
+def stored_hook(entry, capsys, project: Path, name: str, answer: int = 0,
+                said: str = "", description: str = "a test hook") -> str:
+    """Save hook `name`: a whole script that appends its name to `ran.log` in the
+    project root it is handed, prints `said`, and exits `answer`."""
+    body = (f"#!{sys.executable}\n"
+            "import os, sys\n"
+            "root = os.environ['TASKS_PROJECT_ROOT']\n"
+            "sys.stdin.read()\n"
+            f"open(os.path.join(root, 'ran.log'), 'a').write({name!r} + '\\n')\n"
+            f"print({said!r})\n"
+            f"sys.exit({answer})\n")
+    source = project / f"{name}.hook"
+    source.write_text(body)
+    mod.cmd_hooks(entry, ["save", name, str(source), "--description", description])
+    saved = json.loads(capsys.readouterr().out)
+    source.unlink()
+    return saved["version"]
+
+
+def ran_log(project: Path) -> list[str]:
+    path = project / "ran.log"
+    return path.read_text().split() if path.is_file() else []
+
+
+def stored_hooked(project: Path, *names: str) -> None:
+    write_worker(project, "alpha", "takes: [alpha]\nprofile: plain\nhooks:\n"
+                 f"  before: [{', '.join(names)}]")
+
+
+@needs_store
+def test_a_command_hook_naming_a_missing_file_holds(project, store, turns, capsys):
+    """The reported defect: a store-mode node has no checkout, so the file a
+    command hook names is absent, and every task is held."""
+    entry, _schema, _conn = store
+    write_worker(project, "alpha", "takes: [alpha]\nprofile: plain\nhooks:\n"
+                 f"  before: {sys.executable} capabilities/tasks/scripts/lane_check.py")
+    add(entry, capsys, "t-one")
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    report = answer(capsys)
+    assert report["claimed"] is None and turns == []
+    [held] = report["passed_over"]
+    assert held["verdict"] == "hold" and held["why"] == "exited 2"
+
+
+@needs_store
+def test_a_stored_hook_runs_with_no_file_beside_it(project, store, turns, capsys):
+    entry, _schema, _conn = store
+    version = stored_hook(entry, capsys, project, "lane-check")
+    assert not list(project.glob("*.hook"))
+    stored_hooked(project, "lane-check")
+    add(entry, capsys, "t-go")
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    report = answer(capsys)
+    assert report["claimed"] == "t-go" and turns == ["t-go"]
+    assert ran_log(project) == ["lane-check"]
+    # Materialised under the service's state directory, named by its body's hash.
+    mod.cmd_hooks(entry, ["show", "lane-check"])
+    shown_hook = answer(capsys)
+    assert shown_hook["version"] == version and shown_hook["description"] == "a test hook"
+    assert (mod._service_state_dir() / "hooks" / shown_hook["digest"]).is_file()
+    [row] = [r for r in mod._workers_report()[0] if r["worker"] == "alpha"]
+    assert row["ok"] and row["hooks"] == {"before": ["lane-check"]}
+
+
+@needs_store
+def test_stored_hooks_run_in_order_and_the_first_that_is_not_go_decides(
+        project, store, turns, capsys):
+    entry, _schema, _conn = store
+    stored_hook(entry, capsys, project, "first")
+    stored_hook(entry, capsys, project, "second", answer=75, said="2099-01-02")
+    stored_hook(entry, capsys, project, "third", answer=76, said="never asked")
+    stored_hooked(project, "first", "second", "third")
+    add(entry, capsys, "t-held")
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    report = answer(capsys)
+    assert report["claimed"] is None and turns == []
+    [held] = report["passed_over"]
+    assert held["verdict"] == "hold" and held["until"].startswith("2099-01-02")
+    assert ran_log(project) == ["first", "second"]
+
+
+@needs_store
+def test_saving_a_hook_moves_the_fingerprint_with_no_worker_save(project, store, turns,
+                                                                 capsys):
+    entry, _schema, _conn = store
+    stored_hook(entry, capsys, project, "lane-check")
+    stored_hooked(project, "lane-check")
+    before = mod._service_fingerprint()
+    assert before == mod._service_fingerprint()
+    stored_hook(entry, capsys, project, "lane-check", answer=75)
+    moved = mod._service_fingerprint()
+    assert moved not in (None, before)
+    # A hook no worker names moves nothing.
+    stored_hook(entry, capsys, project, "unnamed")
+    assert mod._service_fingerprint() == moved
+
+
+@needs_store
+@pytest.mark.parametrize("retired", [False, True])
+def test_a_missing_or_retired_stored_hook_is_a_doctor_error_and_holds(
+        project, store, turns, capsys, retired):
+    entry, _schema, _conn = store
+    if retired:
+        stored_hook(entry, capsys, project, "lane-check")
+        mod.cmd_hooks(entry, ["retire", "lane-check"])
+        assert answer(capsys)["hook"] == "lane-check"
+    stored_hooked(project, "lane-check")
+    [problem] = problems_of("alpha")
+    assert "names hook 'lane-check', which has no active version" in problem
+    add(entry, capsys, "t-held")
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    report = answer(capsys)
+    assert report["claimed"] is None and turns == []
+    [held] = report["passed_over"]
+    assert held["verdict"] == "hold" and "has no active version" in held["why"]
+
+
+@needs_store
+def test_a_hook_keeps_its_history_and_refuses_a_body_without_a_shebang(
+        project, store, capsys):
+    entry, _schema, _conn = store
+    first = stored_hook(entry, capsys, project, "lane-check")
+    second = stored_hook(entry, capsys, project, "lane-check", answer=75)
+    mod.cmd_hooks(entry, ["history", "lane-check"])
+    assert [v["version"] for v in answer(capsys)["versions"]] == [first, second]
+    stale = project / "stale.hook"
+    stale.write_text("#!/bin/sh\nexit 0\n")
+    with pytest.raises(SystemExit) as stopped:
+        mod.cmd_hooks(entry, ["save", "lane-check", str(stale), "--base", first])
+    assert stopped.value.code == 6 and "conflict" in capsys.readouterr().err
+    stale.write_text("exit 0\n")
+    with pytest.raises(SystemExit) as stopped:
+        mod.cmd_hooks(entry, ["save", "lane-check", str(stale)])
+    assert stopped.value.code == 6 and "hook_invalid" in capsys.readouterr().err
+
+
+@needs_store
+def test_a_running_service_takes_up_a_hook_save_with_no_reload(lab):
+    project = lab["project"]
+    assert answer_of(tasks_cli(lab, "service", "init"))["written"]
+    settings = project / "capabilities" / "tasks" / "service" / "config.toml"
+    settings.write_text(settings.read_text().replace("poll_seconds = 60", "poll_seconds = 3600")
+                        .replace("shutdown_grace_seconds = 60", "shutdown_grace_seconds = 5"))
+    script = project / "gate.hook"
+
+    def save(answer: int) -> str:
+        script.write_text(f"#!/bin/sh\nexit {answer}\n")
+        return answer_of(tasks_cli(lab, "hooks", "save", "lane-check", str(script),
+                                   "--description", "a gate"))["version"]
+
+    save(0)
+    stored_hooked(project, "lane-check")
+    assert answer_of(tasks_cli(lab, "service", "start"))["running"]
+    assert answer_of(tasks_cli(lab, "service", "doctor"))["ok"]
+    assert answer_of(tasks_cli(lab, "service", "status"))["current"] is True
+
+    def taken_up(times: int):
+        def check():
+            lines = answer_of(tasks_cli(lab, "service", "logs"))["lines"]
+            heard = sum("announced a change to the declaration" in line for line in lines)
+            status = answer_of(tasks_cli(lab, "service", "status"))
+            return status if heard == times and status["current"] is True else None
+        return check
+
+    # A new version, and no worker save and no reload: the daemon hears the
+    # store's announcement and takes the declaration up.
+    save(75)
+    poll_for(taken_up(1), 30)
+    assert answer_of(tasks_cli(lab, "service", "doctor"))["ok"]
+    # Retired: announced the same way.
+    answer_of(tasks_cli(lab, "hooks", "retire", "lane-check"))
+    poll_for(taken_up(2), 30)
+    # The retired hook is a worker problem doctor names; the daemon is not stale.
+    after = tasks_cli(lab, "service", "doctor")
+    assert "declaration_stale" not in after.stdout

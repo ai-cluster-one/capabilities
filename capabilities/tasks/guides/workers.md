@@ -23,7 +23,7 @@ A worker is written as a Markdown document. Its YAML front matter is the worker'
 - `routines` names the project's procedures, each found where the project keeps its routines: in its store when the store holds an active routine of the project, loaded with `routine show <name>`, otherwise at `routines/<name>.md`; the first is the procedure for the work and the rest apply at the moments they name. A worker naming none leaves the turn to choose one by the routines' descriptions, or to work from the project's doctrine, and to say on the trail what it chose.
 - `limits` bounds the worker: `attempts` raises that did work before a task is parked, `lease_seconds` the longest a claim is held (by default the profile's timeout plus ten minutes), within which a running turn holds its task by a short lease with one writer - the service for a turn it started, the `run` process itself for a run by hand - renewed while the turn lives, `cool_down_seconds` how long a task rests after a raise that left it where it was - failed, or abandoned - before any claim takes it again (60 by default; the older `hold_seconds_on_exhaustion` is read as it, and `doctor` names it), and `idle_failure_seconds`, under which a failed turn that wrote nothing counts as one that never started.
 - `park_hint` is one sentence the project adds to the handback when a task is parked at the `attempts` ceiling, and only then: it is what a person about to read a task the work kept failing on should check first.
-- `hooks` names the project's own commands that run around a turn, described below.
+- `hooks` names the project's own checks that run around a turn, stored hooks or command lines, described below.
 
 A string in the front matter may carry `${VAR}`, read from the environment and then from the project's `.env` and `.env.local`; a name nothing answers for is refused. Machine-local paths belong there rather than in a worker every machine reads: the store keeps the string as written, and each machine substitutes it where the worker runs.
 
@@ -45,7 +45,11 @@ The task and its trail reach the turn as quoted data, between markers drawn for 
 
 ### Hooks
 
-A hook lets a project gate or follow a worker's work with a check of its own, without `tasks` knowing what the check is. A worker declares at most two, one at each handler point of the conveyor - `before` a claim and `after` a raise - each one command line run from the project root without a shell, with the task as JSON on stdin and its id, key, type and assignee, the worker's name and the project root in the environment.
+A hook lets a project gate or follow a worker's work with a check of its own, without `tasks` knowing what the check is. A worker names its hooks at each handler point of the conveyor - `before` a claim and `after` a raise - and each runs from the project root without a shell, with the task as JSON on stdin and its id, key, type and assignee, the worker's name and the project root in the environment.
+
+A hook is kept in the store, as versions, the way a worker is: one executable script, starting with its `#!` line and reading no file beside itself, saved by its name with `tasks hooks save <name> <file> --description TEXT`. A worker names stored hooks as a list at a handler point, run in its order; the first that does not answer go decides, and the rest are not run. One hook serves every worker that names it, and saving a new version reaches each of them at its next claim with no worker save and no redeploy. The script is written to a file named by its content's hash under the service's state directory and run from there, so it needs no checkout: this is the way to hook a worker of an agent that runs from the store. A hook a worker names that has no active version - never saved, or retired - is an error `doctor` names, and holds every task it is asked about.
+
+A handler point given a string instead is one command line of the project's own, as before, and needs the file it names on the machine that runs the claim.
 
 Both answer in one vocabulary, by their exit: 0 is go; 75 is hold, until the moment on its last stdout line when it prints one; 76 is escalate, its last stdout line the reason. Anything else - another exit, a timeout, a command that cannot start - is a hold with no moment.
 
@@ -60,12 +64,12 @@ The capability ships after-raise handlers of its own for the harnesses' accounts
 takes: [change]
 profile: implementation
 hooks:
-  before: scripts/resource-free.py
+  before: [resource-free, quiet-hours]
   after: scripts/notify.sh
 ---
 ```
 
-Here `scripts/resource-free.py` reads the task from stdin, exits 0 when the resource the work needs is free, and otherwise prints the moment to try again, `2026-01-05T09:00:00+00:00`, and exits 75. `tasks help` HOOKS states the whole contract: the environment, the timeouts, the shipped handlers and where every held-back task and held lane is reported.
+Here `resource-free` and `quiet-hours` are stored hooks, asked in that order, and `after` is a command line. `resource-free` reads the task from stdin, exits 0 when the resource the work needs is free, and otherwise prints the moment to try again, `2026-01-05T09:00:00+00:00`, and exits 75. `tasks help` HOOKS states the whole contract: the environment, the timeouts, the shipped handlers and where every held-back task and held lane is reported.
 
 ## When a task cannot move: escalation
 

@@ -621,6 +621,9 @@ class ProjectSlot:
         self.next_renew = 0.0
         self.renew_error: str | None = None
         self.wakes: set[str] = {"start"}
+        # Set when the store announces a change to the declaration, or a lost
+        # listener is opened again and an announcement may have been missed.
+        self.declaration_check = False
         self.last_wake: dict | None = None
         self.held: set[str] = set()
         # Tasks a worker's `before` hook held back, and until when.
@@ -922,6 +925,11 @@ class ProjectSlot:
                 and payload.get("schema") == self.host.schema)
 
     def notified(self, payload: dict) -> None:
+        if payload.get("kind") == "hook":
+            # A stored hook was saved or retired: the declaration is asked
+            # again before the next pass, and taken up when it moved.
+            self.declaration_check = True
+            return
         self.wakes.add("notify")
         held = self.holds.get(str(payload.get("task")))
         if held is not None:
@@ -1279,6 +1287,19 @@ class ProjectSlot:
         self.wakes.add("reload")
         self.log(f"reloaded: lanes {', '.join(self._lane_words()) or 'none'}")
 
+    def take_up_declaration(self) -> None:
+        """Reload, as SIGHUP does, when the declaration standing now is not the
+        one loaded: what the store announced, or may have announced while no
+        listener heard it."""
+        try:
+            with self.scope():
+                current = self.host.fingerprint()
+        except (Exception, SystemExit):
+            return
+        if current is not None and current != self.declaration["fingerprint"]:
+            self.log("the store announced a change to the declaration; reloading")
+            self.reload()
+
     def cut_off(self, grace: float | None = None) -> None:
         """End every turn still running and settle each raise it held the way a
         lapsed lease is settled. An adopted turn is ended only while its pid is
@@ -1448,6 +1469,10 @@ class Dispatcher:
         if self.reload_requested:
             self.reload_requested = False
             self.reload()
+        for slot in self.slots:
+            if slot.declaration_check:
+                slot.declaration_check = False
+                slot.take_up_declaration()
         self.before_pass()
         ended = 0
         for slot in self.slots:
@@ -1644,6 +1669,7 @@ class Dispatcher:
                                   "store for work")
             for slot in self.on(store):
                 slot.wakes.add("relisten")
+                slot.declaration_check = True
         store.listen_error = None
         store.relisten_at = None
         store.relisten_delay = RELISTEN_FIRST_SECONDS

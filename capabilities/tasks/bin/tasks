@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.12,<1",
+#     "capabilities-contract>=0.24,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.10.1",
 #     "pyyaml>=6",
@@ -56,6 +56,11 @@ READING
                                   one worker whole - its settings, its body,
                                   and `text`, the document a save takes
   tasks workers history <name>    every version of it, oldest first
+  tasks hooks list                this project's stored hooks, each active one
+                                  with its description and its body's digest
+  tasks hooks show <name> [--version ID]
+                                  one hook whole, its body included
+  tasks hooks history <name>      every version of it, oldest first
   tasks profiles list             the harness profiles this project's workers
                                   can name, each as it resolves
   tasks profiles show <name> [--version ID] [--global]
@@ -86,6 +91,11 @@ WRITING  (needs allow_write on the connection; exit 4 otherwise)
                                                 see WORKERS
   tasks workers remove <name> [--base ID]       take a worker out of the project
   tasks workers import [--apply]                move worker files into the store
+  tasks hooks save <name> <file|-> [--description TEXT] [--base ID]
+                                                save a hook's new version; the
+                                                first needs --description. See
+                                                HOOKS
+  tasks hooks retire <name> [--base ID]         take a hook out of the project
   tasks profiles save <name> <file|-> [--base ID] [--global]
                                                 save a profile's new version;
                                                 see PROFILES
@@ -318,8 +328,9 @@ WORKERS
     park_hint: one sentence added to the handback, or the escalation, at the
                                   `attempts` ceiling
     hooks:                        # optional, either or both - see HOOKS
-      before: scripts/gate.py --strict    # asked about each task before a claim
-      after: scripts/follow.sh            # told how each settled raise ended
+      before: [lane-check, quota]         # stored hooks, asked before a claim
+      after: scripts/follow.sh            # a command line, told how each
+                                          # settled raise ended
     ---
 
     What this worker is and how it carries the work: its role, how it works,
@@ -576,14 +587,37 @@ PROFILES
   is saved over nothing and refuses the import, naming it.
 
 HOOKS
-  A worker's `hooks` names commands of the project's own that `run` starts
+  A worker's `hooks` names checks of the project's own that `run` starts
   around a turn: the two handler points of the conveyor, `before` a claim and
-  `after` a raise. Each is one command line, split as a shell splits it and run
-  without one, from the project root, with the task as `show` prints it under
-  "task" on stdin and these added to the environment: TASKS_TASK_ID,
+  `after` a raise. Each point is one of two things:
+
+    a list of names               stored hooks, run in that order; the first
+      before: [lane-check]        whose answer is not go decides, and the rest
+                                  are not run
+    a string                      one command line, split as a shell splits it
+      before: scripts/gate.py     and run without one
+
+  A stored hook is kept in the store, in the project it belongs to, as
+  versions the way a worker is: one executable script, starting with its #!
+  line and reading no file beside itself, saved by its name with `tasks hooks
+  save <name> <file> --description TEXT`, read with `show` and `history`,
+  saved over with `--base`, and taken out with `retire`. One hook serves every
+  worker that names it. Its body is written to a file named by its sha256
+  under the service's state directory, `hooks/`, and run from there, so it
+  needs no checkout: stored hooks are the way to hook a worker of an agent
+  that runs from the store, where a command line naming a file of the
+  project's repository finds none and holds every task. A name with no active
+  version - never saved, or retired - holds every task it is asked about, and
+  `doctor` names it as an error; it is never a go.
+
+  Every hook runs from the project root, with the task as `show` prints it
+  under "task" on stdin and these added to the environment: TASKS_TASK_ID,
   TASKS_TASK_KEY, TASKS_TASK_TYPE, TASKS_TASK_ASSIGNEE, TASKS_WORKER and
   TASKS_PROJECT_ROOT. `doctor` shows them, and the service fingerprints them
-  with the worker's version. Any other key under `hooks` is refused.
+  with the worker's version and the version of every stored hook a worker
+  names. A hook saved or retired is announced by the store, and a running
+  service takes it up as `service reload` would, with no reload asked: see
+  SERVICE. Any other key under `hooks` is refused.
 
   Both answer in one vocabulary, by their exit:
 
@@ -955,13 +989,19 @@ SERVICE
   `doctor` and `service doctor` name it.
 
   The daemon publishes a fingerprint of what it loaded - the settings, the
-  active version of every worker and the version every profile a worker names
-  resolves to - beside its pid, and `service doctor` fails while that differs from what the files
+  active version of every worker, the version every profile a worker names
+  resolves to and the active version of every stored hook a worker names -
+  beside its pid, and `service doctor` fails while that differs from what the files
   and the store hold now. While the store cannot be read, the part the files
   hold - the settings, the shipped and not yet imported worker files and the
   profiles they name - is still compared, and a change there still fails it;
   what the store holds, the stored workers and the profiles they name, cannot
   be told then, and `service doctor` does not call the daemon stale for it.
+  A stored hook saved or retired is the one change the store announces, on
+  the channel `tasks_declaration` beside the claimable one: a daemon that
+  hears it, or that opens its listener again after losing it, asks for the
+  declaration standing then and takes it up as a reload does when it moved,
+  so `service doctor` and `service status` stay current with no reload.
   `service reload` validates them first and refuses
   what does not load, then signals the daemon alone and waits until it
   publishes the new fingerprint; a daemon that rejects them keeps what it had
@@ -1869,7 +1909,7 @@ SETTINGS = {'homes': [{'scope': 'project',
            'scope': 'machine',
            'apply': 'reload'}]}
 WRITE_VERBS = {"add", "set", "tag", "untag", "meta", "activity", "claim",
-               "release", "run", "workers", "profiles"}
+               "release", "run", "workers", "profiles", "hooks"}
 WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/tasks/guides/")
@@ -6077,6 +6117,66 @@ def _forget_workers() -> None:
     _WORKER_ROWS.pop((SCHEMA, PROJECT), None)
 
 
+# The active hook rows this process read, per schema and project, read once by
+# a command and again by the service whenever it fingerprints its declaration.
+_HOOK_ROWS: dict = {}
+
+
+def _stored_hooks(fresh: bool = False, waiting: bool | None = None) -> list[dict]:
+    """Every active hook version of this project, by name, as `_stored_workers`
+    reads workers: none outside a project, and none in a store whose tables do
+    not hold hooks yet. Raises Refusal."""
+    import psycopg
+    project = PROJECT
+    if not project:
+        return []
+    key = (SCHEMA, project)
+    if fresh or key not in _HOOK_ROWS:
+        if waiting is None:
+            waiting = ProjectScope.current is None
+        with _connect(None, raising=True, waiting=waiting,
+                      migrating=False) as conn, conn.cursor() as cur:
+            try:
+                cur.execute(f"""select id, name, description, body, created_at, created_by
+                                  from {SCHEMA}.tasks_hooks
+                                 where project_id = %s and active
+                                 order by name""", (project,))
+                rows = [dict(row) for row in cur.fetchall()]
+            except psycopg.errors.UndefinedTable:
+                rows = []
+            conn.rollback()
+        _HOOK_ROWS[key] = rows
+    return _HOOK_ROWS[key]
+
+
+def _forget_hooks() -> None:
+    _HOOK_ROWS.pop((SCHEMA, PROJECT), None)
+
+
+def _named_hooks(hooks) -> list[tuple[str, str]]:
+    """Each stored hook a worker's `hooks` names, as (handler point, name), in
+    order; a command line names none."""
+    if not isinstance(hooks, dict):
+        return []
+    return [(which, name) for which in _HOOK_KEYS
+            if isinstance(hooks.get(which), list)
+            for name in hooks[which] if isinstance(name, str)]
+
+
+def _absent_hooks(hooks) -> list[str]:
+    """A sentence for each stored hook a worker names that has no active
+    version here. Raises Refusal when the store cannot be read."""
+    named = _named_hooks(hooks)
+    if not named:
+        return []
+    active = {row["name"] for row in _stored_hooks()}
+    return [f"its `hooks.{which}` names hook {name!r}, which has no active version "
+            f"here: it was never saved, or was retired, and every task it is asked "
+            f"about is held; `{NAME} hooks save {name} <file> --description TEXT` "
+            "saves it"
+            for which, name in named if name not in active]
+
+
 def _unimported_profile_files() -> list[Path]:
     """The profile files a project still carries in its envelope. Nothing reads
     them as profiles: a project's profiles live in the store, and these wait
@@ -6348,14 +6448,17 @@ def _read_writes(raw, wrong) -> dict | None:
 
 
 def _read_hooks(raw, wrong) -> dict:
-    """The worker's hooks, each one command line, or an empty mapping when it
-    declares none. A line is split as a shell would split it and run without
-    one, so a line that does not split is refused here rather than at the turn."""
+    """The worker's hooks, or an empty mapping when it declares none. Each
+    handler point is either one command line, a string, or a list of the names
+    of hooks this project keeps in the store, run in that order. A line is split
+    as a shell would split it and run without one, so a line that does not split
+    is refused here rather than at the turn."""
     import shlex
     if raw is None:
         return {}
     if not isinstance(raw, dict):
-        wrong("its `hooks` is a mapping of before and after, each one command line")
+        wrong("its `hooks` is a mapping of before and after, each one command line "
+              "or a list of stored hook names")
         return {}
     for unknown in sorted(set(map(str, raw)) - set(_HOOK_KEYS)):
         wrong(f"its `hooks` names {unknown!r}, which nothing reads: the hooks are "
@@ -6364,6 +6467,20 @@ def _read_hooks(raw, wrong) -> dict:
     for which in _HOOK_KEYS:
         command = raw.get(which)
         if command is None:
+            continue
+        if isinstance(command, list):
+            names = [one for one in command if isinstance(one, str)]
+            bad = [one for one in command
+                   if not isinstance(one, str) or not _WORKER_NAME.fullmatch(one)]
+            if not command or bad:
+                wrong(f"its `hooks.{which}` is a list of stored hook names, at least "
+                      "one, each lowercase letters, digits, `-` and `_`"
+                      + (f": {bad[0]!r} is none" if bad else ""))
+                continue
+            if len(set(names)) != len(names):
+                wrong(f"its `hooks.{which}` names a hook more than once")
+                continue
+            hooks[which] = names
             continue
         try:
             argv = shlex.split(command) if isinstance(command, str) else []
@@ -6879,6 +6996,13 @@ def _workers_report() -> tuple[list[dict], list[str]]:
                 row["deprecated"] = worker["deprecated"]
             if worker["hooks"]:
                 row["hooks"] = worker["hooks"]
+                # A stored hook it names that the store does not hold active
+                # holds every task it is asked about: never a silent go.
+                try:
+                    absent = _absent_hooks(worker["hooks"])
+                except Refusal as refused:
+                    absent = [f"its stored hooks could not be read: {refused.message}"]
+                problems = [*problems, *((3, "not_found", one) for one in absent)]
             row["profile_source"] = worker["profile_source"]
             if worker["profile"] is not None:
                 row["harness"] = worker["profile"].harness
@@ -7059,6 +7183,10 @@ def cmd_workers(entry, args: list[str]) -> None:
             row, created = _save_version(cur, project, name, spec, body, opts.get("base"))
             conn.commit()
         answer = {**_version_answer(row, whole=False), "created": created}
+        try:
+            missing = [*missing, *_absent_hooks(spec.get("hooks"))]
+        except Refusal:
+            pass
         if missing:
             answer["warning"] = "; ".join(missing)
         _emit(answer)
@@ -7355,6 +7483,152 @@ def _profile_refusal(exc: Exception, name: str) -> NoReturn:
     if isinstance(exc, runner.ProfileNotFound):
         _die(3, "not_found", str(exc), f"`{NAME} profiles list` shows this project's profiles")
     _die(6, "profile_invalid", str(exc), f"`{NAME} help` PROFILES states the shape")
+
+
+# --- Hooks in the store --------------------------------------------------------
+
+# A hook is an executable script the project keeps in the store, as versions the
+# way a worker is, and that any number of its workers name at a handler point.
+# Its body runs from a file named by its sha256, so nothing beside it is read.
+
+def _hook_answer(row: dict, *, whole: bool = True) -> dict:
+    from capabilities_contract.bodies import body_digest
+    answer = {"hook": row["name"], "version": str(row["id"]), "active": row["active"],
+              "description": row["description"], "digest": body_digest(row["body"]),
+              "created_at": _stamp(row["created_at"]), "created_by": row["created_by"]}
+    if whole:
+        answer["body"] = row["body"]
+    return answer
+
+
+def _active_hook(cur, project: str, name: str, lock: bool = False) -> dict | None:
+    cur.execute(f"""select * from {SCHEMA}.tasks_hooks
+                     where project_id = %s and name = %s and active
+                     {"for update" if lock else ""}""", (project, name))
+    rows = _rows(cur)
+    return rows[0] if rows else None
+
+
+def cmd_hooks(entry, args: list[str]) -> None:
+    """The project's stored hooks: read one, save a version, list a hook's
+    history, and retire it."""
+    import psycopg
+    from capabilities_contract.bodies import check_body
+    opts = _flags(args, **_FORM_ARGS["hooks"])
+    loose = opts["_loose"]
+    usage = (f"{NAME} hooks list | show <name> [--version ID] | history <name> | "
+             "save <name> <file|-> [--description TEXT] [--base ID] | "
+             "retire <name> [--base ID]")
+    if not loose or loose[0] not in ("list", "show", "history", "save", "retire"):
+        _die(6, "input", "hooks needs an action" if not loose
+             else f"unknown hooks action {loose[0]!r}", usage)
+    action, rest = loose[0], loose[1:]
+    wants = {"list": 0, "show": 1, "history": 1, "retire": 1, "save": 2}[action]
+    if len(rest) != wants:
+        _die(6, "input", f"hooks {action} takes {wants} argument(s)", usage)
+    if action in ("save", "retire") and _worker_execution():
+        _die(4, "policy",
+             f"`hooks {action}` is refused under a raise: a turn is fenced by what its "
+             "worker declares, and its hooks are part of that",
+             "a person saves hooks, outside any turn")
+    project = _writing_project()
+    with _connect(entry) as conn, conn.cursor() as cur:
+        if action == "list":
+            cur.execute(f"""select * from {SCHEMA}.tasks_hooks
+                             where project_id = %s and active order by name""", (project,))
+            rows = _rows(cur)
+            conn.commit()
+            _emit({"hooks": [_hook_answer(r, whole=False) for r in rows]})
+            return
+        name = rest[0]
+        if not _WORKER_NAME.fullmatch(name):
+            _die(6, "input", f"{name!r} is not a hook name: lowercase letters, digits, "
+                 "`-` and `_`, starting with a letter or digit")
+        if action == "save":
+            body = _read_input(rest[1])
+            try:
+                check_body(body)
+            except ValueError as exc:
+                _die(6, "hook_invalid", f"hook {name!r}: {exc}",
+                     "a hook is one executable script that reads no file beside itself")
+            active = _active_hook(cur, project, name, lock=True)
+            base = opts.get("base")
+            if base is not None and (active is None or str(active["id"]) != base):
+                conn.rollback()
+                _die(6, "conflict",
+                     f"hook {name!r} is no longer at version {base}: "
+                     + (f"{active['id']} is active" if active else "it has no active version"),
+                     f"read it again with `{NAME} hooks show {name}` and save over that")
+            description = (opts.get("description") or "").strip() or (
+                active["description"] if active else "")
+            if not description:
+                conn.rollback()
+                _die(6, "input", f"hook {name!r} is new and needs --description, one "
+                     "sentence saying what it checks", usage)
+            if active and active["body"] == body and active["description"] == description:
+                conn.commit()
+                _emit({**_hook_answer(active, whole=False), "created": False})
+                return
+            try:
+                if active:
+                    cur.execute(f"""update {SCHEMA}.tasks_hooks set active = false
+                                     where id = %s and active""", (str(active["id"]),))
+                    if cur.rowcount != 1:
+                        conn.rollback()
+                        _die(6, "conflict", f"hook {name!r} was saved by someone else first",
+                             f"read it again with `{NAME} hooks show {name}`")
+                cur.execute(f"""insert into {SCHEMA}.tasks_hooks
+                                  (project_id, name, description, body, active, created_by)
+                                values (%s, %s, %s, %s, true, %s) returning *""",
+                            (project, name, description, body, _actor()))
+            except psycopg.errors.UniqueViolation:
+                conn.rollback()
+                _die(6, "conflict", f"hook {name!r} was saved by someone else first",
+                     f"read it again with `{NAME} hooks show {name}`")
+            row = _rows(cur)[0]
+            conn.commit()
+            _forget_hooks()
+            _emit({**_hook_answer(row, whole=False), "created": True})
+            return
+        if action == "retire":
+            active = _active_hook(cur, project, name, lock=True)
+            if active is None or (opts.get("base") and str(active["id"]) != opts["base"]):
+                conn.rollback()
+                _die(3 if active is None else 6, "not_found" if active is None else "conflict",
+                     f"hook {name!r} has no active version" if active is None
+                     else f"hook {name!r} is no longer at version {opts['base']}",
+                     f"`{NAME} hooks list` shows this project's hooks")
+            cur.execute(f"""update {SCHEMA}.tasks_hooks set active = false
+                             where id = %s and active""", (str(active["id"]),))
+            conn.commit()
+            _forget_hooks()
+            _emit({"hook": name, "retired": str(active["id"])})
+            return
+        if action == "history":
+            cur.execute(f"""select * from {SCHEMA}.tasks_hooks
+                             where project_id = %s and name = %s
+                             order by created_at asc, id asc""", (project, name))
+            rows = _rows(cur)
+            conn.commit()
+            if not rows:
+                _die(3, "not_found", f"no hook named {name!r} was ever saved here",
+                     f"`{NAME} hooks list` shows this project's hooks")
+            _emit({"hook": name, "versions": [_hook_answer(r, whole=False) for r in rows]})
+            return
+        if opts.get("version"):
+            cur.execute(f"""select * from {SCHEMA}.tasks_hooks
+                             where project_id = %s and name = %s and id::text = %s""",
+                        (project, name, opts["version"]))
+            rows = _rows(cur)
+            row = rows[0] if rows else None
+        else:
+            row = _active_hook(cur, project, name)
+        conn.commit()
+    if row is None:
+        _die(3, "not_found", f"no hook named {name!r}"
+             + (f" at version {opts['version']}" if opts.get("version") else "") + " here",
+             f"`{NAME} hooks list` shows this project's hooks")
+    _emit(_hook_answer(row))
 
 
 def cmd_profiles(entry, args: list[str]) -> None:
@@ -8324,17 +8598,55 @@ def _last_line(text: str | None) -> str | None:
 
 
 def _run_hook(worker: dict, which: str, task: dict, extra: dict | None = None) -> dict:
-    """Run one of the worker's hooks on one task and say how it ended: its exit,
-    or why it has none, and the last line it printed.
+    """Run the worker's hooks at one handler point on one task and say how it
+    ended: its exit, or why it has none, and the last line it printed.
 
-    The command line is split as a shell would split it and run without one, in
-    the project root, with the task as `show` prints it on stdin and the task's
-    handles added to this process's environment. A hook that outlives its
-    seconds is ended with everything it started."""
+    A command line is split as a shell would split it and run without one. A
+    list names stored hooks, run in its order, each from the file its body is
+    materialised to under the service's state directory; the first that does
+    not answer go decides, and the rest are not run. A name with no active
+    version holds, as a hook that cannot start does."""
     import shlex
+    named = worker["hooks"][which]
+    if isinstance(named, str):
+        try:
+            argv = shlex.split(named)
+        except ValueError as exc:
+            return {"exit": None, "why": f"could not start: {exc}", "said": None}
+        return _run_hook_argv(argv, worker, which, task, extra)
+    from capabilities_contract.bodies import materialise
+    try:
+        stored = {row["name"]: row for row in _stored_hooks()}
+    except Refusal as refused:
+        return {"exit": None, "hook": named[0],
+                "why": f"its stored hooks could not be read: {refused.message}", "said": None}
+    ran: dict = {"exit": 0, "why": None, "said": None}
+    for name in named:
+        row = stored.get(name)
+        if row is None:
+            return {"exit": None, "hook": name, "said": None,
+                    "why": f"hook {name!r} has no active version here: it was never "
+                           "saved, or was retired"}
+        try:
+            path = materialise(row["body"], _service_state_dir() / "hooks")
+        except (OSError, ValueError) as exc:
+            return {"exit": None, "hook": name, "version": str(row["id"]), "said": None,
+                    "why": f"hook {name!r} could not be written to run: {exc}"}
+        ran = {**_run_hook_argv([str(path)], worker, which, task, extra),
+               "hook": name, "version": str(row["id"])}
+        if ran["exit"] != 0:
+            return ran
+    return ran
+
+
+def _run_hook_argv(argv: list[str], worker: dict, which: str, task: dict,
+                   extra: dict | None = None) -> dict:
+    """Run one hook on one task, in the project root, with the task as `show`
+    prints it on stdin and the task's handles added to this process's
+    environment. A hook that outlives its seconds is ended with everything it
+    started."""
     import signal
     import subprocess
-    command = worker["hooks"][which]
     seconds = _HOOK_TIMEOUTS[which]
     env = {**os.environ,
            "TASKS_TASK_ID": str(task["id"]),
@@ -8346,7 +8658,7 @@ def _run_hook(worker: dict, which: str, task: dict, extra: dict | None = None) -
            **(extra or {})}
     stdin = json.dumps(task, ensure_ascii=False, indent=2) + "\n"
     try:
-        child = subprocess.Popen(shlex.split(command), cwd=str(_project_here()), env=env,
+        child = subprocess.Popen(argv, cwd=str(_project_here()), env=env,
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True,
                                  start_new_session=True)
@@ -9894,6 +10206,10 @@ _LANE_DEFAULTS = {"max_parallel": 1}
 # channel for the whole database, so the payload says which schema and which
 # project the task belongs to, and a daemon acts only on its own.
 CLAIMABLE_CHANNEL = "tasks_claimable"
+# The store notifies this channel when a stored hook is saved or retired, on the
+# listener the claimable notice comes on, so a listener lost and opened again
+# listens to both.
+DECLARATION_CHANNEL = "tasks_declaration"
 
 # The store notifies this channel on every change `watch` reports, one trigger
 # per table a change can land in, and names the kind of change in the payload.
@@ -10232,11 +10548,20 @@ def _service_fingerprint_parts() -> tuple[str, str | None]:
     try:
         rows = _stored_workers(fresh=True, waiting=False)
         active = _stored_profiles(fresh=True, waiting=False)
+        named = sorted({name for _where, front in documents + [
+                            (None, row["spec"]) for row in rows]
+                        for _which, name in _named_hooks(
+                            front.get("hooks") if isinstance(front, dict) else None)})
+        hooks = ({row["name"]: str(row["id"]) for row in
+                  _stored_hooks(fresh=True, waiting=False)} if named else {})
     except Exception:
         return held, None
     store: list = [["worker", row["name"], "store", str(row["id"])] for row in rows]
     store += profiles(documents + [(f"worker {row['name']!r}", row["spec"]) for row in rows],
                       active)
+    # The version of every stored hook a worker names, so a hook saved or
+    # retired moves the declaration as a worker saved does.
+    store += [["hook", name, hooks.get(name, "absent")] for name in named]
     return held, hashlib.sha256(json.dumps(store).encode()).hexdigest()
 
 
@@ -10638,6 +10963,7 @@ class _ServiceHost:
         try:
             conn.autocommit = True
             conn.execute(f"listen {CLAIMABLE_CHANNEL}")
+            conn.execute(f"listen {DECLARATION_CHANNEL}")
         except BaseException:
             conn.close()
             raise
@@ -11984,7 +12310,7 @@ def _service_serving_problems(module, status: dict) -> tuple[list[str], dict | N
             stale = {"loaded": loaded,
                      "current": None if parts[1] is None else ".".join(parts)}
             problems.append("the running daemon loaded a declaration that has changed "
-                            "since: settings, a worker or a profile it names; "
+                            "since: settings, a worker, a profile or a stored hook it names; "
                             f"`{NAME} service reload` hands it the one standing now")
     machine = status.get("machine")
     if machine is not None:
@@ -12470,7 +12796,7 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 # callva-harness-runner owns and ships as steps of its own, applied under its own
 # ledger before these, everywhere these are: `_profile_tables` names them.
 STORE_MAJOR = 1
-STORE_MINOR = 4
+STORE_MINOR = 5
 
 _MOVE_FROM_SCHEMA_TASKS = r"""
 DO $move$
@@ -12954,6 +13280,72 @@ comment on column tasks_executions.node is
   'is no raise.';
 """
 
+_HOOKS_TABLE = r"""
+create table tasks_hooks (
+  id          uuid        not null default gen_random_uuid(),
+  project_id  text        not null constraint tasks_hooks_project_id_check check (project_id <> ''),
+  name        text        not null constraint tasks_hooks_name_check
+                            check (name ~ '^[a-z0-9][a-z0-9_-]{0,63}$'),
+  description text        not null constraint tasks_hooks_description_check
+                            check (description <> ''),
+  body        text        not null constraint tasks_hooks_body_check check (body like '#!%'),
+  active      boolean     not null default true,
+  created_at  timestamptz not null default now(),
+  created_by  text,
+  constraint tasks_hooks_pkey primary key (id)
+);
+
+comment on table tasks_hooks is
+  'One row is one version of a hook: an executable script a worker names by its name '
+  'at a handler point, run by tasks from a file named by its body''s sha256. A change '
+  'never edits a row: it inserts a new version and clears active on the version the '
+  'writer read, in one transaction. A name with no active version is no hook.';
+comment on column tasks_hooks.description is
+  'What the hook checks, in one sentence, shown beside it.';
+comment on column tasks_hooks.body is
+  'The whole script, starting with its #! line, reading no file beside itself.';
+comment on column tasks_hooks.created_by is
+  'Who saved this version, as the CLI resolved it.';
+
+-- One active version of a name per project, enforced by the store.
+create unique index tasks_hooks_one_active_idx
+  on tasks_hooks (project_id, name) where active;
+create index tasks_hooks_name_idx
+  on tasks_hooks (project_id, name, created_at);
+
+-- A hook version is history: only active may move, so a version id a worker's
+-- fingerprint or a run's answer named keeps meaning the script it was.
+create or replace function tasks_hooks_keep_history() returns trigger as $$
+begin
+  if tg_op = 'UPDATE' and (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') then
+    return new;
+  end if;
+  raise exception 'a hook version is never edited or deleted: % on tasks_hooks is refused, and only active may move; save a new version instead', lower(tg_op)
+    using errcode = 'restrict_violation', constraint = 'tasks_hooks_history';
+end;
+$$ language plpgsql;
+
+create trigger tasks_hooks_keep_history_row before update or delete on tasks_hooks
+    for each row execute function tasks_hooks_keep_history();
+create trigger tasks_hooks_keep_history_truncate before truncate on tasks_hooks
+    for each statement execute function tasks_hooks_keep_history();
+
+-- A hook saved or retired is announced on tasks_declaration, as the claimable
+-- notice names its schema and project, so a running service takes up the version
+-- its workers now run without a reload. Delivered when the write commits.
+create or replace function tasks_hooks_notify_declaration() returns trigger as $$
+begin
+    perform pg_notify('tasks_declaration', json_build_object(
+        'schema', tg_table_schema, 'project', new.project_id,
+        'kind', 'hook', 'hook', new.name)::text);
+    return null;
+end;
+$$ language plpgsql;
+
+create trigger tasks_hooks_notify_declaration after insert or update on tasks_hooks
+    for each row execute function tasks_hooks_notify_declaration();
+"""
+
 STORE_STEPS = [
     ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
     ("0002-tables", _TABLES_SHAPE),
@@ -12961,6 +13353,7 @@ STORE_STEPS = [
     ("0004-profiles", _PROFILE_COLUMN),
     ("0005-workers-history", _WORKERS_HISTORY_GUARD),
     ("0006-execution-node", _EXECUTION_NODE),
+    ("0007-hooks", _HOOKS_TABLE),
 ]
 
 
@@ -13111,6 +13504,7 @@ _FORM_ARGS = {
     "meta": {"names": ("actor",), "takes": 99},
     "run": {"names": ("key",), "bools": ("apply",), "takes": 1},
     "workers": {"names": ("version", "base"), "bools": ("apply",), "takes": 3},
+    "hooks": {"names": ("version", "base", "description"), "takes": 3},
     "profiles": {"names": ("version", "base"), "bools": ("apply", "global"), "takes": 3},
 }
 
@@ -13134,6 +13528,8 @@ def _reads_only(verb: str, rest: list[str]) -> bool:
         return False
     if verb == "meta":
         return opts["_loose"][:1] == ["show"]
+    if verb == "hooks":
+        return opts["_loose"][:1] in (["list"], ["show"], ["history"])
     if verb in ("workers", "profiles"):
         action = opts["_loose"][:1]
         return action in (["list"], ["show"], ["history"]) or (
@@ -13203,6 +13599,7 @@ def main() -> None:
         "claim": cmd_claim, "release": cmd_release, "run": cmd_run,
         "runs": cmd_runs, "history": cmd_history,
         "watch": cmd_watch, "workers": cmd_workers, "profiles": cmd_profiles,
+        "hooks": cmd_hooks,
         "accepts": cmd_accepts,
     }
     handler = handlers.get(verb)
