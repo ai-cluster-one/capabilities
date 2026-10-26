@@ -507,7 +507,9 @@ WORKERS
   was claimed under (`tasks runs <task>`); a raise of a shipped worker or a
   claim by hand records none. A project reads and writes only its own
   workers, and nothing working under a raise saves, removes or imports one,
-  exit 4 `policy`: what a turn may write is declared there.
+  exit 4 `policy`: what a turn may write is declared there. A save or a
+  remove is announced by the store, and a running service takes it up as
+  `service reload` would, with no reload asked: see SERVICE.
 
   `tasks workers show <name>` answers the version as `spec`, `body` and
   `text`, the whole document, so an edit is `show`, change `text`, `save
@@ -997,7 +999,7 @@ SERVICE
   profiles they name - is still compared, and a change there still fails it;
   what the store holds, the stored workers and the profiles they name, cannot
   be told then, and `service doctor` does not call the daemon stale for it.
-  A stored hook saved or retired is the one change the store announces, on
+  A stored worker or hook saved or retired is announced by the store, on
   the channel `tasks_declaration` beside the claimable one: a daemon that
   hears it, or that opens its listener again after losing it, asks for the
   declaration standing then and takes it up as a reload does when it moved,
@@ -12796,7 +12798,7 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 # callva-harness-runner owns and ships as steps of its own, applied under its own
 # ledger before these, everywhere these are: `_profile_tables` names them.
 STORE_MAJOR = 1
-STORE_MINOR = 5
+STORE_MINOR = 6
 
 _MOVE_FROM_SCHEMA_TASKS = r"""
 DO $move$
@@ -13346,6 +13348,23 @@ create trigger tasks_hooks_notify_declaration after insert or update on tasks_ho
     for each row execute function tasks_hooks_notify_declaration();
 """
 
+_WORKERS_ANNOUNCE = r"""
+-- A worker saved or retired is announced on tasks_declaration as a hook is, so a
+-- running service takes up the version it now runs without a reload. Delivered
+-- when the write commits.
+create function tasks_workers_notify_declaration() returns trigger as $$
+begin
+    perform pg_notify('tasks_declaration', json_build_object(
+        'schema', tg_table_schema, 'project', new.project_id,
+        'kind', 'worker', 'worker', new.name)::text);
+    return null;
+end;
+$$ language plpgsql;
+
+create trigger tasks_workers_notify_declaration after insert or update on tasks_workers
+    for each row execute function tasks_workers_notify_declaration();
+"""
+
 STORE_STEPS = [
     ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
     ("0002-tables", _TABLES_SHAPE),
@@ -13354,6 +13373,7 @@ STORE_STEPS = [
     ("0005-workers-history", _WORKERS_HISTORY_GUARD),
     ("0006-execution-node", _EXECUTION_NODE),
     ("0007-hooks", _HOOKS_TABLE),
+    ("0008-workers-announce", _WORKERS_ANNOUNCE),
 ]
 
 

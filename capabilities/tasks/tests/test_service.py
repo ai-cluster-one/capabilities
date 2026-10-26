@@ -1395,9 +1395,17 @@ def test_the_daemon_end_to_end_through_the_cli(lab):
     assert log and all(f" tasks service [{slug}]: " in line for line in log), log
     assert made["created"]
 
-    # A worker edited: doctor says the daemon is behind, reload catches it up.
+    # A worker saved: the store announces it, and the daemon takes it up with
+    # no reload.
     worker = _cli.worker_docs(project) / "alpha.md"
     worker.write_text(worker.read_text() + "\nedited.\n")
+    poll_for(lambda: answer_of(tasks_cli(lab, "service", "status"))["current"] is True, 30)
+    assert answer_of(tasks_cli(lab, "service", "doctor"))["ok"]
+    log = answer_of(tasks_cli(lab, "service", "logs"))["lines"]
+    assert any("the store announced a change to the declaration" in line for line in log)
+    # The settings edited: doctor says the daemon is behind, reload catches it up.
+    settings.write_text(settings.read_text().replace("shutdown_grace_seconds = 5",
+                                                     "shutdown_grace_seconds = 6"))
     stale = tasks_cli(lab, "service", "doctor")
     assert stale.returncode == 6 and "declaration_stale" in json.loads(stale.stdout)
     reloaded = answer_of(tasks_cli(lab, "service", "reload"))
@@ -1577,14 +1585,16 @@ def test_service_doctor_warns_while_the_daemon_waits_out_the_store(lab, relay):
     assert back["service"]["pid"] == pid
     log = "\n".join(answer_of(tasks_cli(lab, "service", "logs", "--tail", "200"))["lines"])
     assert "listening on tasks_claimable again" in log
-    # A worker saved since the daemon loaded fails the probe until it reloads.
+    # A worker saved since the daemon loaded is announced by the store, and the
+    # daemon takes it up with no reload.
     worker = _cli.worker_docs(project) / "alpha.md"
     worker.write_text(worker.read_text() + "\nedited.\n")
     _cli.save_declared_workers(mod, project, lab["schema"])
-    stale = tasks_cli(lab, "service", "doctor")
-    assert stale.returncode == 6 and "declaration_stale" in json.loads(stale.stdout)
-    assert answer_of(tasks_cli(lab, "service", "reload"))["reloaded"] is True
+    poll_for(lambda: answer_of(tasks_cli(lab, "service", "status"))["current"] is True, 30)
     assert answer_of(tasks_cli(lab, "service", "doctor"))["ok"]
+    log = "\n".join(answer_of(tasks_cli(lab, "service", "logs", "--tail", "200"))["lines"])
+    assert "the store announced a change to the declaration; reloading" in log
+    assert answer_of(tasks_cli(lab, "service", "reload"))["reloaded"] is False
     assert answer_of(tasks_cli(lab, "service", "stop"))["stopped"] is True
 
 

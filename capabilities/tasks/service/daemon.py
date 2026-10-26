@@ -925,8 +925,8 @@ class ProjectSlot:
                 and payload.get("schema") == self.host.schema)
 
     def notified(self, payload: dict) -> None:
-        if payload.get("kind") == "hook":
-            # A stored hook was saved or retired: the declaration is asked
+        if payload.get("kind") in ("hook", "worker"):
+            # A stored worker or hook was saved or retired: the declaration is asked
             # again before the next pass, and taken up when it moved.
             self.declaration_check = True
             return

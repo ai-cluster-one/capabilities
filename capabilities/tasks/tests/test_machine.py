@@ -728,9 +728,10 @@ def test_a_project_that_does_not_load_is_error_and_the_others_are_served(farm):
     doctor = json.loads(farm.cli("mill", "service", "doctor").stdout)
     assert any("does not serve this project: error" in p for p in doctor["problems"])
     assert farm.ok("orchard", "service", "doctor")["ok"] is True
-    # Repaired and reloaded from the project: served, and its work is taken.
+    # Repaired and saved: the store announces it, and the project is served
+    # with no reload, and its work is taken.
     miller.write_text(good)
-    assert farm.ok("mill", "service", "reload")["reloaded"] is True
+    farm.save()
     farm.until("mill", "served")
     farm.complete("mill", "t-mill")
 
