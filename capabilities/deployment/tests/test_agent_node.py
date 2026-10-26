@@ -38,6 +38,11 @@ class Fake:
         self.config = {"Image": "ghcr.io/agenium-dev/agent-node:0.0.1",
                        "Env": ["CAPABILITIES_PROJECT_ID=prj_00000000a1a1",
                                "AGENT_NODE_NAME=box1", "PATH=/usr/bin"]}
+        # The image the node's Coolify service names, which a deploy starts,
+        # the container's Docker health, and whether coolify has set-image.
+        self.service_image = self.config["Image"]
+        self.health = "healthy"
+        self.set_image = True
 
     def __call__(self, argv, root, *, stdin=None, timeout=120, check=True, env=None):
         self.calls.append({"argv": list(argv), "stdin": stdin})
@@ -77,7 +82,16 @@ class Fake:
                 if self.fail_storage:
                     return self.module.NodeFailure("validation_failed", "fixture", 6)
                 return json.dumps({"uuid": "storage-" + str(len(self.calls))})
+            if args == ["help"]:
+                return "coolify help\n" + ("  service set-image <uuid>\n" if self.set_image else "")
+            if args[:2] == ["service", "set-image"]:
+                previous, self.service_image = self.service_image, args[args.index("--image") + 1]
+                return json.dumps({"uuid": args[2], "image": self.service_image,
+                                   "previous_image": previous,
+                                   "changed": previous != self.service_image})
             if args[:1] == ["deploy"]:
+                if args[1] not in self.apps:
+                    self.config = {**self.config, "Image": self.service_image}
                 return json.dumps({"deployments": [{"resource_uuid": args[1],
                                                     "deployment_uuid": "dep-1"}]})
             if args[:1] == ["servers"]:
@@ -122,6 +136,8 @@ class Fake:
                         and "label=com.docker.compose.service=agent" in remote:
                     return ""
                 return "abc123\n"
+            if remote[:2] == ["docker", "inspect"] and remote[3].startswith("{{.Config.Image}}"):
+                return f"{self.config['Image']} {self.health}\n"
             if remote[:2] == ["docker", "inspect"]:
                 return json.dumps(self.config) + "\n"
             assert remote[:2] == ["docker", "exec"], remote
@@ -611,3 +627,92 @@ def test_exec_refuses_an_unknown_node_and_a_missing_command(lab, monkeypatch):
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_exec(SimpleNamespace(node="box1", argv=[]))
     assert refused.value.code == "input"
+
+
+def update_args(**extra):
+    return SimpleNamespace(**{"node": "box1", "version": "0.0.10", "wait": 30, **extra})
+
+
+def test_update_moves_a_standard_image_node_to_the_tag_and_waits_for_its_agent(lab, capsys):
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.m.cmd_node_update(update_args())
+
+    coolify = [c["argv"][3:] for c in lab.fake.of("coolify")
+               if c["argv"][3:4] in (["service"], ["deploy"]) and "create" not in c["argv"]]
+    assert coolify == [["service", "set-image", "svc-new", "--image",
+                        "ghcr.io/agenium-dev/agent-node:0.0.10", "--compose-service", "agent"],
+                       ["deploy", "svc-new"]]
+    # Through the connection the row names, and nothing deleted.
+    assert all(c["argv"][1:3] == ["--connection", "infra"] for c in lab.fake.of("coolify")
+               if c["argv"][1:2] != ["help"])
+    assert not [c for c in lab.fake.of("coolify") if "delete" in c["argv"]]
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["ok"] is True and answer["redeployed"] is True
+    assert answer["node"] == BOX1 and answer["resource"] == "svc-new"
+    assert answer["image"] == answer["running_image"] == "ghcr.io/agenium-dev/agent-node:0.0.10"
+    assert answer["previous_image"] == "ghcr.io/agenium-dev/agent-node:0.0.1"
+    assert answer["health"] == "healthy" and answer["state"].startswith("running agent")
+    assert answer["volumes"] == ["config", "state", "claude", "codex", "work"]
+
+
+def test_update_of_a_node_already_on_the_tag_does_not_redeploy_it(lab, capsys):
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.m.cmd_node_update(update_args(version="0.0.1"))
+    assert not [c for c in lab.fake.of("coolify") if c["argv"][3:4] == ["deploy"]]
+    assert json.loads(capsys.readouterr().out)["redeployed"] is False
+
+
+def test_update_refuses_a_node_built_from_a_repository_and_points_at_coolify_deploy(lab):
+    lab.m.cmd_node_create(build_args())
+    before = len(lab.fake.calls)
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_update(update_args())
+    assert refused.value.code == "node_built_from_repository"
+    assert refused.value.exit_code == 6
+    assert "coolify deploy app-new" in refused.value.message
+    assert not [c for c in lab.fake.calls[before:]
+                if c["argv"][0] == "coolify" and ("set-image" in c["argv"] or "deploy" in c["argv"])]
+
+
+@pytest.mark.parametrize("config", [
+    {"Image": "registry.invalid/other-service:1.0",
+     "Env": ["CAPABILITIES_PROJECT_ID=prj_00000000a1a1"]},
+    {"Image": "ghcr.io/agenium-dev/agent-node:0.0.1",
+     "Env": ["CAPABILITIES_PROJECT_ID=prj_00000000b2b2"]},
+])
+def test_update_refuses_a_resource_that_is_not_the_nodes_own(lab, config):
+    lab.m.cmd_node_create(create_args())
+    lab.fake.config = config
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_update(update_args())
+    assert refused.value.code == "node_resource_not_own"
+    assert not [c for c in lab.fake.of("coolify") if "set-image" in c["argv"]]
+
+
+def test_update_refuses_without_set_image_a_bad_tag_and_an_unknown_node(lab):
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_update(update_args())
+    assert refused.value.code == "node_unknown"
+    lab.m.cmd_node_create(create_args())
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_update(update_args(version="../x"))
+    assert refused.value.code == "input"
+    lab.fake.set_image = False
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_update(update_args())
+    assert refused.value.code == "provider_not_ready"
+    assert not [c for c in lab.fake.of("coolify") if "set-image" in c["argv"]]
+
+
+@pytest.mark.parametrize("health,state", [("unhealthy", "running agent prj as node box1"),
+                                          ("healthy", "idle: waiting for store-setting")])
+def test_update_reports_a_node_that_did_not_come_back(lab, capsys, health, state):
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.fake.health, lab.fake.state = health, state
+    with pytest.raises(lab.m.NodeFailure) as failed:
+        lab.m.cmd_node_update(update_args(wait=0))
+    assert failed.value.code == "node_not_raised" and failed.value.exit_code == 5
+    assert json.loads(capsys.readouterr().out)["ok"] is False

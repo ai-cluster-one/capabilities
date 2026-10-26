@@ -359,6 +359,24 @@ USAGE
       0.0.2 and later), through which git also reaches github.com over
       https. Each is kept on the node's volumes and outlives a new image
       tag.
+  deployment node update <node> --version <tag> [--wait 600]
+      Move a node of the standard image to ghcr.io/agenium-dev/agent-node:<tag>
+      through the coolify connection its row names: replace the image of
+      the agent service in its Coolify service (`coolify service
+      set-image`), redeploy it (`coolify deploy`) with its volumes kept, so
+      its id, key, store setting, secrets, logins and work stay, and wait
+      up to --wait seconds for its container to run that image, report
+      healthy (when the image has a health check) and its agent state to
+      read running. A node already running the tag is not redeployed.
+      Answers {ok, node, label, resource, version, image, previous_image,
+      redeployed, volumes, container, running_image, health, state}. A node
+      built from a repository runs no tag and is refused (exit 6
+      node_built_from_repository; rebuild it with `coolify deploy
+      <uuid>`), as is a resource not running the standard image for this
+      agent (exit 6 node_resource_not_own) and a coolify without `service
+      set-image` (exit 6 provider_not_ready); nothing is changed then. A
+      node that is not back in time exits 5 node_not_raised after printing
+      the answer.
   deployment node remove <node> --yes
       Delete the node's Coolify resource with its volumes and configuration,
       then its node row. Only the resource the row names is touched; one
@@ -8553,6 +8571,11 @@ def _agent_node_reach(root, row, write):
     entry = _node_connection(target, write)
     host = {**_node_server_host(root, target, entry, row["coolify_server"]),
             "connection": row["coolify_connection"]}
+    return target, host, _agent_node_container(root, host, row)
+
+
+def _agent_node_container(root, host, row):
+    """The one running container of the node `row` names, on `host`."""
     owner = "com.docker.compose.project=" + row["coolify_resource"]
     containers = _node_ssh(root, host, "docker ps --filter " + shlex.quote("label=" + owner)
                            + " --filter " + shlex.quote(
@@ -8566,7 +8589,7 @@ def _agent_node_reach(root, row, write):
     if len(containers) != 1 or not re.fullmatch(r"[a-f0-9]+", containers[0]):
         raise NodeFailure("node_container", "expected one running container for node "
                           f"{row.get('node')}", 3)
-    return target, host, containers[0]
+    return containers[0]
 
 
 def _agent_node_exec(root, host, container, argv, *, stdin=None, timeout=120):
@@ -9021,17 +9044,9 @@ def cmd_node_remove(args):
     target = {"connection": row["coolify_connection"]}
     entry = _node_connection(target, write=True)
     resource = row["coolify_resource"]
-    kind = None
     # A node of the standard image is a service, one built from a repository
     # an application; a resource that is neither any more leaves only its row.
-    for found, collection in (("service", "services"), ("application", "applications")):
-        try:
-            _node_coolify(root, target, collection, resource)
-            kind = found
-            break
-        except NodeFailure as failure:
-            if failure.exit_code != 3:
-                raise
+    kind = _agent_node_kind(root, target, resource)
     deleted = False
     if kind is not None:
         host = _node_server_host(root, target, entry, row["coolify_server"])
@@ -9047,6 +9062,104 @@ def cmd_node_remove(args):
     _manager(root, "node", "remove", node)
     _emit({"ok": True, "node": node, "resource": resource, "resource_deleted": deleted,
            "volumes_deleted": deleted, "row_removed": True})
+
+
+def _agent_node_kind(root, target, resource):
+    """What the node's Coolify resource is: a service for a node of the
+    standard image, an application for one built from a repository, None
+    for one that is gone."""
+    for found, collection in (("service", "services"), ("application", "applications")):
+        try:
+            _node_coolify(root, target, collection, resource)
+            return found
+        except NodeFailure as failure:
+            if failure.exit_code != 3:
+                raise
+    return None
+
+
+def _agent_node_running(root, host, row):
+    """(container, image, health, state) of the node's running container, or
+    None while none runs: the image it runs, its Docker health ('' without a
+    health check) and what its agent state file reads."""
+    try:
+        container = _agent_node_container(root, host, row)
+        image, _sep, health = _node_ssh(root, host, shlex.join(
+            ["docker", "inspect", "--format",
+             "{{.Config.Image}} {{if .State.Health}}{{.State.Health.Status}}{{end}}",
+             container])).strip().partition(" ")
+        state = _agent_node_exec(root, host, container, ["cat", AGENT_NODE_STATE], timeout=60)
+    except NodeFailure:
+        return None
+    return container, image, health.strip(), state
+
+
+def cmd_node_update(args):
+    root = _root()
+    node = _agent_node_name(args.node)
+    if not AGENT_NODE_VERSION.fullmatch(args.version or ""):
+        raise NodeFailure("input", "--version takes the standard image's tag", 6)
+    if args.wait < 0:
+        raise NodeFailure("input", "--wait takes a number of seconds", 6)
+    project_id, _slug = _agent_node_project(root)
+    row = _agent_node_row(root, node)
+    if row is None:
+        raise NodeFailure("node_unknown", f"this agent has no node {node}", 6)
+    node = row["node"]
+    if not row.get("coolify_resource"):
+        raise NodeFailure("node_not_coolify", f"node {node} is not a Coolify resource made by "
+                          "`deployment node create`", 6)
+    target = {"connection": row["coolify_connection"]}
+    entry = _node_connection(target, write=True)
+    resource = row["coolify_resource"]
+    # `node create` makes a node of the standard image a Compose service and
+    # one built from a repository an application; only the first runs a tag.
+    kind = _agent_node_kind(root, target, resource)
+    if kind == "application":
+        raise NodeFailure("node_built_from_repository", f"node {node} is built on its server "
+                          "from a repository, so it runs no tag of the standard image: "
+                          f"rebuild it with `coolify deploy {resource}`", 6)
+    if kind is None:
+        raise NodeFailure("node_resource_missing", f"node {node}'s Coolify resource {resource} "
+                          "is gone", 3)
+    host = {**_node_server_host(root, target, entry, row["coolify_server"]),
+            "connection": row["coolify_connection"]}
+    if not _agent_node_is_own(root, host, resource, project_id):
+        raise NodeFailure("node_resource_not_own", f"resource {resource} does not run "
+                          f"{AGENT_NODE_IMAGE} for this agent; nothing was changed", 6)
+    if "service set-image" not in _node_run(["coolify", "help"], root).stdout:
+        raise NodeFailure("provider_not_ready", "the coolify capability here has no "
+                          "`service set-image`; update it (`capabilities update coolify`)", 6)
+    image = f"{AGENT_NODE_IMAGE}:{args.version}"
+    changed = _node_coolify(root, target, "service", "set-image", resource, "--image", image,
+                            "--compose-service", AGENT_NODE_SERVICE)
+    running = _agent_node_running(root, host, row)
+    # A node already running the tag is not started again; one whose service
+    # names it but whose container runs another is.
+    redeployed = bool(changed.get("changed")) or running is None or running[1] != image
+    if redeployed:
+        _node_coolify(root, target, "deploy", resource)
+    deadline = time.monotonic() + args.wait
+    while True:
+        running = _agent_node_running(root, host, row)
+        up = (running is not None and running[1] == image and running[2] in ("", "healthy")
+              and running[3].startswith("running agent"))
+        if up or time.monotonic() >= deadline:
+            break
+        time.sleep(10)
+    container, now_image, health, state = running or (None, None, None, "")
+    answer = {"ok": up, "node": node, "label": row.get("label"), "resource": resource,
+              "version": args.version, "image": image,
+              "previous_image": changed.get("previous_image"), "redeployed": redeployed,
+              "volumes": [name for name, _path in AGENT_NODE_VOLUMES],
+              "container": container, "running_image": now_image, "health": health,
+              "state": state}
+    if not up:
+        _emit(answer)
+        raise NodeFailure("node_not_raised", f"node {node} did not come back on {image} with "
+                          f"its agent running within {args.wait} seconds; its state reads "
+                          f"{state!r}", 5)
+    _emit(answer)
 
 
 def _memory_attributes(root):
@@ -9212,6 +9325,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--services", default="")
     p.add_argument("--wait", type=int, default=300)
     p.set_defaults(fn=cmd_node_enrol)
+    p = node.add_parser("update", add_help=False)
+    p.add_argument("node")
+    p.add_argument("--version", required=True)
+    p.add_argument("--wait", type=int, default=600)
+    p.set_defaults(fn=cmd_node_update)
     p = node.add_parser("remove", add_help=False)
     p.add_argument("node")
     p.add_argument("--yes", action="store_true")
@@ -9245,7 +9363,8 @@ def main(argv: list[str] | None = None) -> None:
     if (args.cmd == "machine" and args.machine_cmd in ("sync", "watchdog")
             and not previews):
         _read_only_gate(f"`{NAME} machine {args.machine_cmd}`")
-    if args.cmd == "node" and args.node_cmd in ("sync", "login", "create", "enrol", "remove", "exec"):
+    if args.cmd == "node" and args.node_cmd in ("sync", "login", "create", "enrol",
+                                             "update", "remove", "exec"):
         _read_only_gate(f"`deployment node {args.node_cmd}`")
     try:
         args.fn(args)
