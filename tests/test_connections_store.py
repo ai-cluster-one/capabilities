@@ -1083,6 +1083,59 @@ def test_a_shared_service_is_placed_on_every_node_and_a_move_shows_until_the_lea
     assert _manager(lab, "place", "coolify", "--node", NODE, extra=read_only).returncode == 4
 
 
+def test_placing_a_service_on_another_node_warns_of_a_connection_at_loopback(lab):
+    # The defect: a service placed on another node kept a connection whose
+    # address is loopback, which on that node reaches the node itself.
+    _import(lab)
+    registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"
+    registry.mkdir(parents=True)
+    (registry / "coolify").write_text("#!/bin/sh\n")
+
+    def declare(kind: str) -> None:
+        (registry / "manifest.json").write_text(json.dumps({"name": "coolify", "connections": {
+            "fields": [{"key": "base_url", "type": kind},
+                       {"key": "secret_env", "type": "string"}]},
+            "service": {"name": "svc", "summary": "s", "verbs": []}}))
+
+    def warned(result: subprocess.CompletedProcess) -> str | None:
+        said = [json.loads(line)["warning"] for line in result.stderr.splitlines()
+                if line.startswith('{"warning"')]
+        answer = _ok(result).get("warning")
+        assert (answer is None) == (not said)
+        return answer
+
+    here = {"AGENT_NODE_ID": NODE}
+    declare("url")
+    away = warned(_manager(lab, "place", "coolify", "--node", BOX, extra=here))
+    assert f"connection box has base_url {lab['url']}" in away
+    assert f"connection spare has base_url {lab['url']}" in away
+    assert "connection off" not in away and BOX in away
+    assert _rows(lab, "SELECT node FROM capabilities_policy WHERE capability = 'coolify' "
+                      "AND service") == [(BOX,)]
+    assert "connection box" in warned(_manager(lab, "enable", "coolify", "--project",
+                                               "--node", BOX, extra=here))
+    assert warned(_manager(lab, "unplace", "coolify", "--node", BOX, extra=here)) is None
+    assert warned(_manager(lab, "place", "coolify", "--node", NODE, extra=here)) is None
+    # Credentials in the address are left out of the warning.
+    port = lab["url"].rsplit(":", 1)[1]
+    _rows(lab, "UPDATE capabilities_connections SET spec = jsonb_set(spec, '{base_url}', "
+               f"'\"http://user:pw@localhost:{port}/api\"') WHERE name = 'spare' "
+               "RETURNING name")
+    away = warned(_manager(lab, "place", "coolify", "--node", BOX, extra=here))
+    assert f"connection spare has base_url http://localhost:{port}/api" in away
+    assert "pw" not in away
+    # A routable address, and a field that is not an address, say nothing.
+    _rows(lab, "UPDATE capabilities_connections SET spec = jsonb_set(spec, '{base_url}', "
+               "'\"https://coolify.example.org\"') RETURNING name")
+    assert warned(_manager(lab, "place", "coolify", "--node", BOX, extra=here)) is None
+    _rows(lab, "UPDATE capabilities_connections SET spec = jsonb_set(spec, '{base_url}', "
+               "'\"http://[::1]:8008\"') RETURNING name")
+    assert "http://[::1]:8008" in warned(_manager(lab, "place", "coolify", "--node", NODE,
+                                                  extra={"AGENT_NODE_ID": BOX}))
+    declare("string")
+    assert warned(_manager(lab, "place", "coolify", "--node", BOX, extra=here)) is None
+
+
 def test_a_writer_that_predates_the_service_column_places_where_it_enables(lab):
     # A manager on an older library writes enabled alone, meaning what
     # enable --node and disable --node always meant: the service follows.

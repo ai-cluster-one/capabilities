@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-26 — Placing a service on another node warns about connections that point at loopback
+
+Placing a service on a node that is not this machine - `capabilities place <name> --node <node>`, `place <name> --all`, `enable <name> --project --node <node>`, and `service start|move <name> --node <node>` - answers a `warning`, said on stderr too, naming each connection the service uses and the address it holds wherever a connection field the capability declares of type `url` names localhost, 127.0.0.0/8 or ::1, since on that node the address reaches the node itself rather than this machine; credentials in the address are left out. The placement is written all the same. A routable address, a placement on this machine, a field of any other type, and unplacing say nothing new.
+
 ## 2026-10-26 — `service start` and `place` without --node say where the service lands
 
 On a machine that is not a server - its node's kind in the registry, else mac on a Mac - while the agent also has a server node, `capabilities service start <name>` without `--node` no longer places an exclusive service on this machine unasked: it refuses, writing nothing, with exit 6 `node_required`, naming every node of the agent in the message and in `detail {this_node, nodes [{node, label, kind}]}`, and the hint names `--node` for the server. A shared service is still placed on this machine, and the answer carries a `warning`, said on stderr too, naming this node and the agent's nodes. `capabilities place <name>` without `--node` or `--all` still writes nothing; in the same situation its report carries a `warning` that it placed nothing, naming the agent's nodes and `--node`. On a server, for an agent with no server node, with `--node`, or in a project whose gate is in files, nothing changes.

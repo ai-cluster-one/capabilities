@@ -597,9 +597,15 @@ POLICY VERBS
         (enabled_on_node), since a service runs only where its project
         enables it; placing where that row disables it is refused (exit 6
         disabled_on_node). Unplacing a node it is not on changes nothing.
+        Placing it on a node that is not this machine - here, with --all,
+        through enable --node or service start|move --node - carries a
+        warning, said on stderr too, naming each connection the service uses
+        whose address field (one its capability declares of type url) names
+        localhost, 127.0.0.0/8 or ::1, which on that node reaches the node
+        itself; the placement is written all the same.
         JSON {placed|unplaced, node, placement, changed, placed_on [nodes],
-        unplaced_from?, enabled_on_node?, gate}. Exit 3 when <name> is not
-        installed, 6 no_service when it bundles none.
+        unplaced_from?, enabled_on_node?, warning?, gate}. Exit 3 when <name>
+        is not installed, 6 no_service when it bundles none.
   place <name> --all
         Put a shared service on every node of this project's agent (`node
         list`); an exclusive one is refused (exit 6 placement_exclusive).
@@ -12829,6 +12835,8 @@ def _service_start(args: list[str], move: bool = False) -> None:
               "waited_seconds": waited}
     if placed.get("unplaced_from"):
         result["unplaced_from"] = placed["unplaced_from"]
+    if placed.get("warning"):
+        result["warning"] = placed["warning"]
     if others:
         result["still_on"] = others
     if beside:
@@ -14000,6 +14008,7 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False,
     root = _project_root()
     migrated: list[str] = []
     was_placed = False
+    loopback = None
     if scope == "project":
         root = _require_project()
         migrated = _ensure_envelope(root)
@@ -14018,6 +14027,9 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False,
             adapter.set("capabilities", "policy", name, {"enabled": enabled},
                         actor="capabilities", scope=scope, node=node)
             gate_source = _gate_source(adapter, root, scope)
+            if (enabled and scope == "project" and node is not None
+                    and name in _installed() and _installed_service(name)):
+                loopback = _loopback_warning(name, [node], adapter)
         except _store_module().StoreError as exc:
             _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
         finally:
@@ -14051,6 +14063,9 @@ def _set_gate(name: str, enabled: bool, scope: str, deny: bool = False,
             f"{name} is quarantined on this machine, so it stays disabled in "
             f"every project; ask the user whether to run `capabilities allow {name}`")
         _warn(result["warning"])
+    if loopback:
+        result["warning"] = "; ".join(filter(None, (result.get("warning"), loopback)))
+        _warn(loopback)
     _refresh_after_gate(root, result, enabled)
     _emit(result)
 
@@ -14250,6 +14265,7 @@ def _service_place(name: str, placed: bool, node: str) -> dict:
                                actor="capabilities")
         on = adapter.placed_nodes(name)
         gate_source = _gate_source(adapter, root, "project")
+        loopback = _loopback_warning(name, [node], adapter) if placed else None
     except _store_module().StoreError as exc:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     finally:
@@ -14261,6 +14277,9 @@ def _service_place(name: str, placed: bool, node: str) -> dict:
         result["unplaced_from"] = answer["unplaced"]
     if answer.get("enabled_on_node"):
         result["enabled_on_node"] = True
+    if loopback:
+        result["warning"] = loopback
+        _warn(loopback)
     return result
 
 
@@ -14329,6 +14348,10 @@ def _place_everywhere(name: str, root: Path, adapter) -> dict:
                     "gate": _gate_source(adapter, root, "project")}
     if enabled_on:
         result["enabled_on_nodes"] = enabled_on
+    loopback = _loopback_warning(name, nodes, adapter)
+    if loopback:
+        result["warning"] = loopback
+        _warn(loopback)
     return result
 
 
@@ -14359,6 +14382,71 @@ def _placement_report(name: str, root: Path, adapter, mode: str) -> dict:
     agrees = None if mode == "shared" else (holder in on if on else holder is None)
     return {"capability": name, "placement": mode, "placed_on": on, "holder": holder,
             "lease": lease, "agrees": agrees, "gate": gate_source}
+
+
+def _loopback_address(value) -> str | None:
+    """The address `value` names, its credentials left out, where its host is
+    loopback - localhost, 127.0.0.0/8 or ::1 - else None."""
+    import ipaddress
+    import urllib.parse
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        parts = urllib.parse.urlsplit(text if "//" in text else "//" + text)
+        host = parts.hostname
+    except ValueError:
+        return None
+    if host is None:
+        return None
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host == "localhost"
+    if not loopback:
+        return None
+    netloc = parts.netloc.rpartition("@")[2]
+    return urllib.parse.urlunsplit(parts._replace(netloc=netloc)).removeprefix("//")
+
+
+def _loopback_warning(name: str, nodes: list[str], adapter) -> str | None:
+    """The warning placing `name`'s service on `nodes` carries where a node is
+    not this machine and a connection the service uses names a loopback address
+    in a field its capability declares an address (type url): on that node the
+    address reaches the node itself, not the machine it was written on. None
+    where there is nothing to say; a read that fails says nothing, since the
+    placement it follows has already been written."""
+    store = _store_module()
+    try:
+        this = store.this_node()
+        here = {this.get("id"), this.get("label")}
+    except store.StoreError:
+        here = set()
+    away = [node for node in nodes if node not in here]
+    manifest = _read_json(CAP_HOME / name / "manifest.json")
+    declared = manifest.get("connections") if isinstance(manifest, dict) else None
+    fields = declared.get("fields") if isinstance(declared, dict) else None
+    keys = [f["key"] for f in fields or [] if isinstance(f, dict)
+            and f.get("type") == "url" and isinstance(f.get("key"), str)]
+    if not away or not keys:
+        return None
+    try:
+        used = adapter.connections(name)
+    except store.StoreError:
+        return None
+    found = []
+    for cid, row in sorted(used.items()):
+        value = row.get("value") if isinstance(row.get("value"), dict) else {}
+        for key in keys:
+            address = _loopback_address(value.get(key))
+            if address is not None:
+                found.append(f"connection {cid} has {key} {address}")
+    if not found:
+        return None
+    return (f"{name}'s service is placed on {', '.join(away)}, which is not this "
+            f"machine, and " + "; ".join(found) + ": a loopback address, which on "
+            f"that node reaches the node itself rather than this machine; point the "
+            f"connection at an address that node reaches")
 
 
 def _unplaced_warning(name: str, node: str, by: str) -> str:
