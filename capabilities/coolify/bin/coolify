@@ -213,6 +213,15 @@ COMMANDS
       document needs the token's read:sensitive ability (exit 2
       compose_hidden without it); a service or image line it cannot find
       exits 6. Write verb - requires allow_write.
+  service set-compose <uuid> --compose <file|->
+      Replace a service's whole Compose document with the one given (a
+      file, or '-' for stdin) through PATCH /services/<uuid>, base64-encoded,
+      without reading the stored one - so it needs no read:sensitive. The
+      caller owns the document: what it leaves out, a volume included, is
+      gone from the service. Nothing restarts: `coolify deploy <uuid>`
+      starts the service from the new document; named volumes keep their
+      data when the document keeps their names. Answers uuid, written and
+      next. An empty document exits 6. Write verb - requires allow_write.
 
   database create --engine <engine> --project <uuid> --server <uuid>
                   (--environment <name> | --environment-uuid <uuid>)
@@ -1390,6 +1399,20 @@ def cmd_service_set_image(c, args):
     return answer
 
 
+def cmd_service_set_compose(c, args):
+    """Replace a service's whole stored Compose document (PATCH
+    /services/<uuid>) without reading it; the change takes effect at the
+    next deploy."""
+    import base64
+
+    raw = sys.stdin.read() if args.compose == "-" else Path(args.compose).read_text()
+    if not raw.strip():
+        _die(6, "input", "the Compose document is empty")
+    _request(c, "PATCH", f"/services/{args.uuid}",
+             json_body={"docker_compose_raw": base64.b64encode(raw.encode()).decode()})
+    return {"uuid": args.uuid, "written": True, "next": f"coolify deploy {args.uuid}"}
+
+
 # One create endpoint per engine, at /databases/<engine>. Coolify keeps the
 # envelope (project, server, environment, name, image, limits, tags) identical
 # across all eight and varies only the engine's own credential and conf fields,
@@ -2033,6 +2056,9 @@ def main() -> None:
     sp_image.add_argument("--image", required=True, help="image reference, tag included")
     sp_image.add_argument("--compose-service", dest="compose_service", default=None,
                           help="the Compose service whose image changes")
+    sp_compose = service_sub.add_parser("set-compose", help="replace a service's Compose document")
+    sp_compose.add_argument("uuid")
+    sp_compose.add_argument("--compose", required=True, help="docker-compose file (path or - for stdin)")
 
     # database create
     sp = sub.add_parser("database", help="create a database")
@@ -2199,6 +2225,8 @@ def main() -> None:
                 out(cmd_service_create(c, args))
             elif args.service_cmd == "set-image":
                 out(cmd_service_set_image(c, args))
+            elif args.service_cmd == "set-compose":
+                out(cmd_service_set_compose(c, args))
             else:
                 _die(6, "unknown_command", f"no handler for service {args.service_cmd!r}")
         elif args.cmd == "database":

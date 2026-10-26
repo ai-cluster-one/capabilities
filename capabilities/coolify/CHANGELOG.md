@@ -1,5 +1,9 @@
 # coolify — change log
 
+## 2026-10-26 — `service set-compose`
+
+`service set-compose <uuid> --compose <file|->` replaces a Coolify service's whole stored Compose document with the one given, base64-encoded, through `PATCH /services/<uuid>`, without reading the stored one, so a token without read:sensitive can write it. The caller owns the document: what it leaves out, a volume included, is gone from the service. Nothing restarts until `coolify deploy <uuid>`. It answers uuid, written and next; an empty document exits 6. A write verb, refused with exit 4 on a read-only connection.
+
 ## 2026-10-26 — `service set-image`
 
 `service set-image <uuid> --image <registry/name:tag> [--compose-service <name>]` replaces the image of one service in a Coolify service's stored Compose document through `PATCH /services/<uuid>`: it reads the document (`GET /services/<uuid>`, which needs the token's read:sensitive ability, exit 2 `compose_hidden` without it), changes only that service's `image:` line and sends the document back, base64-encoded. `--compose-service` may be left out for a document of one service. Nothing restarts: `coolify deploy <uuid>` starts the service on the new image with its volumes kept. It answers uuid, compose_service, image, previous_image and changed, and sends nothing when the image is already that one. A write verb, refused with exit 4 on a read-only connection.
