@@ -1339,20 +1339,29 @@ def test_held_wakes_are_listed_answered_and_dismissed(cli, project, stored, home
 @needs_store
 def test_watch_follows_the_held_wakes_in_the_store(cli, project, stored, homeserver, capsys):
     import time as _time
+
+    import psycopg
     connect(project, allow_write=False)
     engine = cli._engine()
     stranger = f"@s:{SERVER}"
+    listening = []
 
     def hold_one():
+        # Following, the watch holds no session listening on the store.
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            listening.extend(conn.execute(
+                "SELECT pid FROM pg_stat_activity WHERE datname = current_database() "
+                "AND query ILIKE 'LISTEN%' AND pid <> pg_backend_pid()").fetchall())
         store = engine.Store(engine.resolve_store(project)).open()
+        wait = cli.WATCH_HELD_SECONDS * 2.5
         try:
             store.acquire("prj_test", "alpha", "h1", "n1", 1)
             store.save_sync("prj_test", "alpha", f"@alpha:{SERVER}", "h1", "b1", [
                 {"room_id": "!r", "key": "$1", "kind": "mention", "event_id": "$1",
                  "sender": stranger, "held": True}])
-            _time.sleep(1.0)
+            _time.sleep(wait)
             store.dismiss_held("prj_test", "alpha", "!r")
-            _time.sleep(1.0)
+            _time.sleep(wait)
         finally:
             store.close()
         return {"next_batch": "b2"}
@@ -1361,6 +1370,7 @@ def test_watch_follows_the_held_wakes_in_the_store(cli, project, stored, homeser
     code, lines, err = run_stream(cli, capsys, "watch")
     assert code == 0, err
     assert lines[0]["held"] is True
+    assert listening == []
     assert lines[1:] == [
         {"event": "held", "room_id": "!r", "held": {"count": 1, "senders": [stranger]}},
         {"event": "held", "room_id": "!r", "held": {"count": 0, "senders": []}}]

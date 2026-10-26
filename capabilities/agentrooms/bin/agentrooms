@@ -1625,8 +1625,8 @@ WATCH_START_FILTER = {
              "ephemeral": {"not_types": ["*"]}, "account_data": {"not_types": ["*"]}},
 }
 WATCH_POLL_MS = 30000
-# How long the held-wake follower waits on one notification read before asking again.
-WATCH_HELD_SECONDS = 30.0
+# How often the held-wake follower asks the store whether the agent's held wakes moved.
+WATCH_HELD_SECONDS = 1.0
 _WATCH_LOCK = threading.Lock()
 # A change to one of these in a joined room reprints the room's row.
 WATCH_ROOM_TYPES = {"m.room.name", "m.room.topic", "m.room.encryption", "m.room.power_levels"}
@@ -1780,27 +1780,26 @@ def _watch_lines(m: Matrix, cfg: dict, sync: dict, rooms: set | None,
 
 
 def _follow_held(cfg: dict, rooms: set | None):
-    """Follow the agent's held wakes in the project's store: LISTEN on the
-    channel the store announces a change on, and read the room's held wakes
-    again on each notice, printing a `held` line where they changed. Answers
-    (held_of, start) - held_of(room_id) is what is known now - or None where no
-    store is read here."""
+    """Follow the agent's held wakes in the project's store: poll the agent's
+    version of the channel the store raises on each change to them, once every
+    WATCH_HELD_SECONDS on the store's own connection, and read the held wakes
+    again when it moved, printing a `held` line for each room where they
+    changed. No session is held for it. Answers (held_of, start) - held_of(room_id)
+    is what is known now - or None where no store is read here."""
     store, project, _why = _held_store()
     if store is None:
         return None
     engine = _engine()
-    setting, cid = store.setting, cfg["id"]
+    cid = cfg["id"]
     known: dict[str, dict] = {}
     lock = threading.Lock()
 
-    def listen():
-        conn = engine.database().connect(application_name=f"{NAME}-watch", setting=setting)
-        conn.autocommit = True
-        conn.execute(f"LISTEN {engine.HELD_CHANNEL}")
-        return conn
-
     try:
-        listener = listen()
+        follower = engine.database().Follower(
+            [(engine.HELD_CHANNEL, engine.held_scope(project, cid))],
+            application_name=f"{NAME}-watch", setting=store.setting)
+        # The version first, then what it covers: a change after the read moves it.
+        store.poll(follower)
         known.update(store.held_rooms(project, cid))
     except Exception:
         store.close()
@@ -1810,10 +1809,10 @@ def _follow_held(cfg: dict, rooms: set | None):
         with lock:
             return dict(known.get(room_id, NO_HELD))
 
-    def reread(room_ids: set | None) -> None:
+    def reread() -> None:
         now = store.held_rooms(project, cid)
         with lock:
-            wanted = set(now) | set(known) if room_ids is None else room_ids
+            wanted = set(now) | set(known)
         for room_id in sorted(r for r in wanted if isinstance(r, str)):
             if rooms is not None and room_id not in rooms:
                 continue
@@ -1825,29 +1824,17 @@ def _follow_held(cfg: dict, rooms: set | None):
             _watch_line({"event": "held", "room_id": room_id, "held": fresh})
 
     def run() -> None:
-        conn, wait = listener, 1.0
+        # A poll that fails is taken again at the next; the first that
+        # answers reports whatever moved meanwhile.
         while True:
+            time.sleep(WATCH_HELD_SECONDS)
             try:
-                if conn is None:
-                    conn = listen()
-                    reread(None)
-                    wait = 1.0
-                for note in conn.notifies(timeout=WATCH_HELD_SECONDS):
-                    try:
-                        said = json.loads(note.payload)
-                    except ValueError:
-                        continue
-                    if (said.get("schema"), said.get("project"), said.get("agent")) == \
-                            (setting.schema, project, cid):
-                        reread({said.get("room")})
+                if store.poll(follower):
+                    reread()
             except _WatchStopped:
                 return
             except Exception:
-                with contextlib.suppress(Exception):
-                    conn.close()
-                conn = None
-                time.sleep(wait)
-                wait = min(wait * 2, 30.0)
+                continue
 
     def start() -> None:
         threading.Thread(target=run, name="watch-held", daemon=True).start()

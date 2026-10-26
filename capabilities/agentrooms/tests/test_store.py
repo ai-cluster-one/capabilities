@@ -206,11 +206,18 @@ def test_held_wakes_wait_for_the_operator_and_a_grant_releases_them(store):
     store.save_sync("p", "alpha", "@alpha:x", "h1", "b5", [], {"!r": None})
     assert [w["key"] for w in store.claim("p", "alpha", "!r", "t4")] == ["$6"]
     store.finish("p", "alpha", "!r", "t4")
-    # Every change to what is held was announced, with ids only.
+    # Every change to what is held was announced, with ids only, and raised
+    # the agent's version once for each of the ten held rows it changed; a
+    # transaction's identical notifications fold into one.
     said = [json.loads(n.payload) for n in listener.notifies(timeout=1.0)]
+    version = listener.execute(
+        f'SELECT version FROM "{store.setting.schema}".schema_channel '
+        "WHERE channel = %s AND scope = %s",
+        (engine.HELD_CHANNEL, engine.held_scope("p", "alpha"))).fetchone()
     listener.close()
     assert said and all(n == {"schema": store.setting.schema, "project": "p", "agent": "alpha",
                               "room": "!r"} for n in said)
+    assert version == (10,) and len(said) <= 10
 
 
 def test_catch_up_takes_the_admitted_wakes_and_a_later_one_is_known_taken(store):

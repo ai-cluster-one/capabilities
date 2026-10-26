@@ -54,7 +54,7 @@ from typing import Any, Callable
 
 LEDGER_OWNER = "agentrooms"
 LEDGER_MAJOR = 1
-LEDGER_MINOR = 4
+LEDGER_MINOR = 5
 LEDGER_STEPS = [
     ("0001-sync", """
     CREATE TABLE agentrooms_sync (
@@ -202,10 +202,44 @@ LEDGER_STEPS = [
     COMMENT ON COLUMN agentrooms_turns.taken IS
         'event ids of the room messages `catch-up` returned inside the turn; a wake recorded later for one of them, from a sender the worker admits, starts no turn of its own';
     """),
+    # A change to an agent's held wakes raises the agent's version of
+    # `agentrooms_held` in the store's change versions, in the writer's own
+    # transaction, so a change any release writes moves the version `watch`
+    # follows. The notification stays beside it for a `watch` of an earlier
+    # release that still listens on that channel.
+    ("0011-held-versions", r"""
+    CREATE OR REPLACE FUNCTION agentrooms_wakes_held_notify() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        changed record;
+    BEGIN
+        IF tg_op = 'INSERT' AND new.held_at IS NULL
+           OR tg_op = 'DELETE' AND old.held_at IS NULL
+           OR tg_op = 'UPDATE' AND old.held_at IS NOT DISTINCT FROM new.held_at THEN
+            RETURN NULL;
+        END IF;
+        IF tg_op = 'DELETE' THEN changed := old; ELSE changed := new; END IF;
+        PERFORM pg_notify('agentrooms_held', json_build_object(
+            'schema', tg_table_schema, 'project', changed.project_id, 'agent', changed.agent,
+            'room', changed.room_id)::text);
+        EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version) '
+                       'VALUES (%L, $1, 1) ON CONFLICT (channel, scope) '
+                       'DO UPDATE SET version = c.version + 1',
+                       tg_table_schema, 'agentrooms_held')
+            USING changed.project_id || '/' || changed.agent;
+        RETURN NULL;
+    END $$;
+    """),
 ]
-# The channel a change to an agent's held wakes is announced on, with the
-# schema, project, agent and room; a listener reads the rows again.
+# The channel a change to an agent's held wakes is announced on: its version
+# for the agent's held_scope in the store's change versions, which `watch`
+# follows, and a notification with the schema, project, agent and room, which
+# an earlier release listens for. Either way the follower reads the rows again.
 HELD_CHANNEL = "agentrooms_held"
+
+
+def held_scope(project: str, agent: str) -> str:
+    """The scope of an agent's version of HELD_CHANNEL, as the trigger names it."""
+    return f"{project}/{agent}"
 
 # How long a lease outlives its last renewal, and how often it is renewed. A
 # process that dies leaves its agents to another process once this runs out.
@@ -704,6 +738,12 @@ class Store:
     def transaction(self):
         with self._operation() as conn, conn.transaction(), conn.cursor() as cur:
             yield cur
+
+    def poll(self, follower) -> dict:
+        """What `follower` follows that moved since its last poll, read on the
+        store's own connection."""
+        with self._operation() as conn:
+            return follower.poll(conn)
 
     # -- leases ---------------------------------------------------------------
 
