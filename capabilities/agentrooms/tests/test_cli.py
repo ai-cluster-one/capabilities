@@ -766,6 +766,31 @@ def test_workers_are_saved_as_versions_and_bound_in_the_projects_settings(cli, p
 
 
 @needs_store
+def test_service_harness_answers_the_harness_of_every_profile_a_turn_runs_on(
+        cli, project, stored, capsys, tmp_path):
+    assert cli.SERVICE["sign_ins"] == {"harness": ["agentrooms", "service", "harness", "--json"]}
+    assert "harness" in cli.SERVICE["verbs"]
+    connect(project, allow_write=True)
+    for name, profile in (("coder", "agentrooms-codex"), ("lab", "agentrooms-claude"),
+                          ("ghost", "nowhere")):
+        doc = tmp_path / f"{name}.md"
+        doc.write_text(f"---\nprofile: {profile}\naccepts_from: [\"*\"]\n---\nA role.\n")
+        code, _out, err = run(cli, capsys, "workers", "save", name, str(doc))
+        assert code == 0, err
+    assert run(cli, capsys, "workers", "bind", "coder")[0] == 0
+    assert run(cli, capsys, "workers", "bind", "lab", "--room", "!lab:example.org")[0] == 0
+    assert run(cli, capsys, "workers", "bind", "ghost", "--room", "!ghost:example.org")[0] == 0
+    code, out, err = run(cli, capsys, "service", "harness", "--json")
+    assert code == 0, err
+    assert out["harness"] == ["claude", "codex"] and out["unresolved"] == ["nowhere"]
+    rows = {row["worker"]: row for row in out["agents"]["alpha"]}
+    assert set(rows) == {"coder", "lab", "ghost"}
+    assert (rows["coder"]["profile"], rows["coder"]["harness"]) == ("agentrooms-codex", "codex")
+    assert (rows["lab"]["profile"], rows["lab"]["harness"]) == ("agentrooms-claude", "claude")
+    assert rows["ghost"]["harness"] is None
+
+
+@needs_store
 def test_an_agents_map_moves_into_a_bound_worker_that_admits_everyone(cli, project, stored, capsys):
     connect(project, allow_write=True)
     service = project / "capabilities" / "agentrooms" / "service"

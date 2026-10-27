@@ -685,6 +685,12 @@ SERVICE
     service pause [--reason TEXT] / service resume
         Hold this project's agents: no new sync starts and no turn runs; what
         arrives waits on the homeserver or as a recorded wake / release them.
+    service harness [--json]
+        The harness tools (claude, codex) of every profile a turn of this
+        project's served agents could run on - each agent's room and agent
+        bindings, else the default worker - resolved as a turn resolves it,
+        for the sign-ins a node needs; `unresolved` names a profile that
+        does not resolve. Starts no turn and changes nothing.
 
 WORKERS
   A worker is a Markdown document: its YAML front matter is the settings, its
@@ -890,7 +896,10 @@ SERVICE = {
                 "resumed harness session per agent per room; once per machine for the "
                 "projects that join it."),
     "verbs": ["init", "doctor", "run", "reload", "stop", "status", "logs", "pause",
-              "resume", "join", "leave"],
+              "resume", "join", "leave", "harness"],
+    # The sign-ins a node needs for it: the harness of every profile a turn of
+    # this project's agents runs on, which `service harness` answers.
+    "sign_ins": {"harness": ["agentrooms", "service", "harness", "--json"]},
     "state": "$XDG_STATE_HOME/capabilities/projects/<project-slug>/agentrooms",
     "machine": {
         "schema": "capabilities.service.machine.v1",
@@ -4719,6 +4728,119 @@ def cmd_service_pause(reason: str | None, resume: bool) -> dict:
         store.close()
 
 
+# The harness tools a sign-in answers for: a profile on any other harness needs
+# no sign-in on the node.
+_SIGN_IN_HARNESSES = ("claude", "codex")
+
+
+def _turn_workers(store, project: str, binding: dict, pending: dict) -> list[tuple]:
+    """Every worker that can answer an agent bound by `binding`, as the engine's
+    `bound_worker` picks one per room: each room's binding, the agent's, else the
+    project's `default`, else the shipped one. Answers (name, worker or None,
+    why none); `pending` holds the workers an agents map not yet moved would
+    save, by name."""
+    engine = _engine()
+    rooms = binding.get("rooms") if isinstance(binding.get("rooms"), dict) else {}
+    named = [(name, True) for name in dict.fromkeys(rooms.values()) if name]
+    if binding.get("worker"):
+        named.append((binding["worker"], True))
+    else:
+        named.append((engine.DEFAULT_WORKER, False))
+    out: list[tuple] = []
+    for name, bound in dict.fromkeys(named):
+        try:
+            row = store.worker(project, name)
+        except Exception as exc:
+            if type(exc).__name__ != "UndefinedTable":
+                raise
+            row = None
+        if row is None and name in pending:
+            row = {"id": None, "spec": pending[name], "body": ""}
+        if row is None:
+            if bound:
+                out.append((name, None, "it has no active version"))
+            else:
+                out.append((name, engine.load_default(), ""))
+            continue
+        try:
+            worker = engine.read_worker(name, row["spec"], row["body"], f"worker {name!r}")
+        except engine.WorkerInvalid as exc:
+            out.append((name, None, f"it is refused: {exc}"))
+            continue
+        out.append((name, worker, "") if worker["enabled"]
+                   else (name, None, "it is switched off"))
+    return out
+
+
+def cmd_service_harness() -> dict:
+    """The harness tools every profile a turn of this project's served agents
+    could run on, for the sign-ins a node placing the service needs: each served
+    agent's workers, chosen as a turn chooses them, each profile resolved as a
+    turn resolves it. It reads the project's store and changes nothing: the
+    store is not migrated, and an agents map not yet moved is read as the move
+    would leave it. A project that serves no agent, or resolves no store, runs
+    no turn and needs none. A profile that does not resolve is `unresolved` and
+    needs nothing."""
+    engine = _engine()
+    root = _project_root()
+    if root is None:
+        raise _Refusal(6, "input", "the service serves a project, and this is not one",
+                       "run this in the project whose agents it serves")
+    try:
+        plan = _plan_here(root, None)
+    except _Refusal as exc:
+        if exc.code not in ("no_agent_served", "store_not_configured"):
+            raise
+        return {"harness": [], "agents": {}, "unresolved": [], "reason": exc.code}
+    project = plan["project_id"]
+    try:
+        settings = _binding_settings()
+    except StoreError as exc:
+        raise _Refusal(5 if exc.slug in STORE_ENVIRONMENT_SLUGS else 6,
+                       exc.slug, exc.message, exc.hint) from None
+    pending: dict = {}
+    moves: dict = {}
+    if not _records_in_store():
+        legacy = _legacy_agents(root) or {}
+        found = _import_agents_map(root, apply=False) or {}
+        for cid, name in (found.get("moved") or {}).items():
+            moves[cid] = name
+            pending.setdefault(name, {"profile": legacy[cid]["profile"]})
+    declared = _connections_composed().get("connections") or {}
+    store = engine.Store(plan["setting"])
+    agents: dict = {}
+    unresolved: list[str] = []
+    tools: set = set()
+    try:
+        for cid in sorted(plan["agents"]):
+            binding = _binding_of(cid, declared.get(cid) or {}, settings)
+            if not binding.get("worker") and cid in moves:
+                binding = {**binding, "worker": moves[cid]}
+            rows = []
+            for name, worker, why in _turn_workers(store, project, binding, pending):
+                row: dict = {"worker": name}
+                if worker is None:
+                    rows.append({**row, "answers": False, "why": why})
+                    continue
+                row["profile"] = worker["profile"]
+                try:
+                    _profile, harness, _origin = _resolve_profile(store, project,
+                                                                  worker["profile"])
+                except _Refusal as exc:
+                    if worker["profile"] not in unresolved:
+                        unresolved.append(worker["profile"])
+                    rows.append({**row, "harness": None, "unresolved": exc.message})
+                    continue
+                row["harness"] = harness
+                if harness in _SIGN_IN_HARNESSES:
+                    tools.add(harness)
+                rows.append(row)
+            agents[cid] = rows
+    finally:
+        store.close()
+    return {"harness": sorted(tools), "agents": agents, "unresolved": unresolved}
+
+
 def _doctor_store(root: Path | None) -> dict:
     engine = _engine()
     try:
@@ -5112,6 +5234,7 @@ def _parser() -> _Parser:
     pause = ssub.add_parser("pause")
     pause.add_argument("--reason")
     ssub.add_parser("resume")
+    ssub.add_parser("harness").add_argument("--json", action="store_true")
     return parser
 
 
@@ -5142,6 +5265,11 @@ def _service(args) -> None:
         cmd_service_doctor(machine)
     elif action in ("pause", "resume"):
         _emit(cmd_service_pause(getattr(args, "reason", None), action == "resume"))
+    elif action == "harness":
+        try:
+            _emit(cmd_service_harness())
+        except _Refusal as exc:
+            _refused(exc)
 
 
 def main() -> None:

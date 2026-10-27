@@ -866,6 +866,10 @@ SERVICE
                                   paused lane, `pause.waited`: its oldest due
                                   task and how long it has waited
   tasks service logs [--tail 100] the end of the service log
+  tasks service harness [--json]  the harness tools (claude, codex) of every
+                                  lane's profile, resolved as a turn resolves
+                                  it, for the sign-ins a node needs; starts no
+                                  turn and changes nothing
   tasks service join              put this project on the machine service's list
   tasks service leave             take this project off it
 
@@ -1950,7 +1954,10 @@ SERVICE = {
     "summary": ("Project-local daemon that runs one turn of the conveyor for each "
                 "worker lane with work, woken by the store."),
     "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs",
-              "pause", "resume", "join", "leave"],
+              "pause", "resume", "join", "leave", "harness"],
+    # The sign-ins a node needs for it: gh for the git work its turns do, and the
+    # harness of every lane's profile, which `service harness` answers.
+    "sign_ins": {"tools": ["gh"], "harness": ["tasks", "service", "harness", "--json"]},
     "config": "capabilities/tasks/service/config.toml",
     "state": "$XDG_STATE_HOME/capabilities/projects/<project-slug>/tasks",
     # The same service once per machine, for every project that joined it.
@@ -10343,7 +10350,7 @@ def cmd_watch(entry, args: list[str]) -> None:
 # uses, so a turn the service starts is the turn a person starts.
 
 _SERVICE_VERBS = ("init", "doctor", "run", "start", "reload", "stop", "status", "logs",
-                  "pause", "resume", "join", "leave")
+                  "pause", "resume", "join", "leave", "harness")
 
 # What the settings file may say, and what it leaves to this capability. Any
 # other key is refused: a key nothing reads is a declaration doing nothing.
@@ -10746,7 +10753,7 @@ def _fingerprint_current(loaded: str | None, parts: tuple[str, str | None] | Non
     return None
 
 
-def _service_declaration() -> dict:
+def _service_declaration(settings: dict | None = None) -> dict:
     """What the service runs by: its settings, its lanes, the workers that are
     not lanes and why, and the fingerprint of the files all of it was read from.
 
@@ -10754,10 +10761,12 @@ def _service_declaration() -> dict:
     this runs leaves the published answer older than what was loaded, never
     newer: a daemon can be told it is stale when it is current, and never the
     reverse. A worker this capability cannot read refuses the whole declaration,
-    the way `doctor` refuses it. Raises Refusal."""
+    the way `doctor` refuses it. `settings`, when given, stands for the settings
+    file. Raises Refusal."""
     fingerprint = _service_fingerprint()
     path = _service_settings_where()
-    settings = _read_service_settings()
+    if settings is None:
+        settings = _read_service_settings()
     retired = _retired_workers_file()
     if retired:
         raise Refusal(*_retired_refusal(retired))
@@ -12920,6 +12929,52 @@ def cmd_service_logs(args: list[str]) -> None:
     _emit({"log_file": str(path), "lines": lines[-max(0, tail):]})
 
 
+# The harness tools a sign-in answers for: a profile on any other harness, such
+# as the library's stub, needs no sign-in on the node.
+_SIGN_IN_HARNESSES = ("claude", "codex")
+
+
+def cmd_service_harness(wanted: str | None, args: list[str]) -> None:
+    """The harness tools every lane's profile runs on, for the sign-ins a node
+    placing this service needs. The lanes are those `service run` loads, each
+    worker's profile resolved as a turn resolves it; it reads the store and
+    starts nothing, imports nothing and writes nothing. A project that resolves
+    no store runs no turn, so it needs none; a project with no service settings
+    yet is answered by the shipped defaults, which name no lane a worker does
+    not. A lane whose profile is not there is `unresolved` and needs nothing."""
+    _flags(args, (), bools=("json",))
+    try:
+        _store_setting(True, root=_project_here())
+    except Refusal as refused:
+        if refused.code != "store_not_configured":
+            _die(refused.exit_code, refused.code, refused.message, refused.hint)
+        _emit({"harness": [], "lanes": [], "unresolved": [], "store": "not_configured"})
+        return
+    _service_connection(wanted)
+    try:
+        try:
+            settings = _read_service_settings()
+        except Refusal as refused:
+            if refused.code != "service_not_initialized":
+                raise
+            settings = _check_service_settings({"version": 1}, _service_settings_where())
+        declaration = _service_declaration(settings)
+    except Refusal as refused:
+        _die(refused.exit_code, refused.code, refused.message, refused.hint)
+    lanes, unresolved, tools = [], [], set()
+    for lane in declaration["lanes"]:
+        spec = lane["spec"]
+        name = spec["profile_source"].get("name")
+        harness = getattr(spec["profile"], "harness", None)
+        lanes.append({"worker": lane["worker"], "profile": name, "harness": harness})
+        if harness is None:
+            if name and name not in unresolved:
+                unresolved.append(name)
+        elif harness in _SIGN_IN_HARNESSES:
+            tools.add(harness)
+    _emit({"harness": sorted(tools), "lanes": lanes, "unresolved": unresolved})
+
+
 _MACHINE_VERBS = {"init": cmd_service_init_machine, "doctor": cmd_service_doctor_machine,
                   "run": cmd_service_run_machine, "start": cmd_service_start_machine,
                   "reload": cmd_service_reload_machine, "stop": cmd_service_stop_machine,
@@ -12968,6 +13023,8 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
         cmd_service_pause(rest)
     elif verb == "resume":
         cmd_service_resume(rest)
+    elif verb == "harness":
+        cmd_service_harness(wanted, rest)
     else:
         cmd_service_logs(rest)
 

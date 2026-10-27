@@ -742,6 +742,99 @@ def test_agents_of_two_os_users_on_one_machine_keep_their_own_sign_ins_and_sessi
     assert node["claude_account"] == "lab@example.test" and len(node["sessions"]) == 2
 
 
+def _placed_dialer(lab: Lab) -> None:
+    """A capability whose service needs gh whatever its configuration and
+    answers in the agent's folder that its turns run on Claude Code and
+    Codex."""
+    registry = lab.tmp / "registry" / "dialer"
+    registry.mkdir(parents=True)
+    (registry / "manifest.json").write_text(json.dumps({
+        "name": "dialer", "service": {"name": "dialer", "sign_ins": {
+            "tools": ["gh"], "harness": ["dialer", "service", "harness", "--json"]}}}))
+    (registry / "dialer").write_text(
+        "#!/bin/sh\n[ \"$*\" = 'service harness --json' ] || exit 2\n"
+        "[ -d capabilities ] || exit 3\n"
+        "printf '%s\\n' '{\"harness\": [\"codex\", \"claude\", \"stub\"]}'\n")
+    (registry / "dialer").chmod(0o755)
+
+
+def test_a_node_is_expected_to_have_what_its_placed_services_need_and_the_owner_says(lab):
+    lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "server")
+    lab.ok("node", "add", nid("box-two"), "--label", "box-two", "--kind", "server")
+    here = {**node_env("box-one"), **_state_tools(lab)}
+    _placed_dialer(lab)
+
+    # Nothing placed: gh signed out, Codex absent and a dead session raise nothing.
+    lab.ok("node", "state", "report", **here)
+    one = {n["node"]: n for n in lab.ok("node", "state")["nodes"]}[nid("box-one")]
+    assert (one["health"], one["attention"]) == ("green", [])
+    assert [one[f"{t}_expected"] for t in ("claude", "codex", "gh")] == [False] * 3
+    assert [s["expected"] for s in one["sessions"]] == [False, False]
+
+    # The agent places dialer's and phonelink's services on box-one.
+    for name in ("dialer", "phonelink"):
+        lab.sql(f"INSERT INTO {SCHEMA}.capabilities_policy (agent_id, capability, node, "
+                "enabled, service) VALUES (%s, %s, %s, true, true) RETURNING capability",
+                (PROJECT_ID, name, nid("box-one")))
+    lab.ok("node", "state", "report", **here)
+    nodes = {n["node"]: n for n in lab.ok("node", "state")["nodes"]}
+    one, two = nodes[nid("box-one")], nodes[nid("box-two")]
+    assert [(one[f"{t}_needed"], one[f"{t}_override"], one[f"{t}_expected"])
+            for t in ("claude", "codex", "gh")] == [(True, None, True)] * 3
+    assert [(s["connection"], s["needed"], s["expected"]) for s in one["sessions"]] == [
+        ("main", True, True), ("spare", True, True)]
+    assert one["health"] == "yellow"
+    assert one["attention"] == [
+        {"kind": "sign_in", "tool": "codex", "reason": "absent"},
+        {"kind": "sign_in", "tool": "gh", "reason": "signed_out"},
+        {"kind": "session", "capability": "phonelink", "connection": "spare",
+         "reason": "not_live"}]
+    assert (two["health"], two["attention"]) == ("red", [])
+
+    # The owner's word stands over what the services need, per node.
+    for args in (("sign-in", "codex", "off"), ("sign-in", "gh", "off"),
+                 ("session", "phonelink", "spare", "off")):
+        said = lab.ok("node", "expect", "box-one", *args)
+        assert (said["node"], said["override"], said["before"], said["changed"]) == (
+            nid("box-one"), False, None, True)
+    assert lab.ok("node", "expect", "box-one", "sign-in", "gh", "off")["changed"] is False
+    said = lab.ok("node", "expect", nid("box-two"), "session", "phonelink", "main", "on")
+    assert (said["kind"], said["capability"], said["connection"]) == (
+        "session", "phonelink", "main")
+    nodes = {n["node"]: n for n in lab.ok("node", "state")["nodes"]}
+    one, two = nodes[nid("box-one")], nodes[nid("box-two")]
+    assert (one["health"], one["attention"]) == ("green", [])
+    assert (one["gh_needed"], one["gh_override"], one["gh_expected"]) == (True, False, False)
+    assert two["attention"] == [{"kind": "session", "capability": "phonelink",
+                                 "connection": "main", "reason": "not_reported"}]
+    assert [(s["connection"], s["live"], s["expected"]) for s in two["sessions"]] == [
+        ("main", None, True)]
+    # default takes the word back.
+    said = lab.ok("node", "expect", "box-one", "sign-in", "gh", "default")
+    assert (said["override"], said["before"]) == (None, False)
+    one = {n["node"]: n for n in lab.ok("node", "state")["nodes"]}[nid("box-one")]
+    assert one["attention"] == [{"kind": "sign_in", "tool": "gh", "reason": "signed_out"}]
+
+    # A harness command that cannot answer keeps nothing it never said, and
+    # the declared tools stand.
+    (lab.tmp / "registry" / "dialer" / "dialer").write_text("#!/bin/sh\nexit 1\n")
+    lab.ok("node", "state", "report", **here)
+    one = {n["node"]: n for n in lab.ok("node", "state")["nodes"]}[nid("box-one")]
+    assert [one[f"{t}_needed"] for t in ("claude", "codex", "gh")] == [False, False, True]
+
+    for args, code in ((("box-one", "sign-in", "stub", "on"), "input"),
+                       (("box-one", "sign-in", "gh"), "input"),
+                       (("box-one", "session", "dialer", "main", "on"), "not_device_bound"),
+                       (("box-three", "sign-in", "gh", "on"), "node_unknown")):
+        assert lab.refused("node", "expect", *args)[1]["code"] == code
+    assert lab.refused("node", "expect", "box-one", "sign-in", "gh", "on",
+                       CAPABILITIES_READ_ONLY="1")[1]["code"] == "read_only_switch"
+    planned = lab.ok("node", "rekey", nid("box-one"), nid("box-six"), "--dry-run")
+    assert {(r["table"], r["rows"]) for r in planned["rows"]} >= {
+        ("capabilities_node_login_expectations", 1),
+        ("capabilities_node_session_expectations", 1)}
+
+
 def test_writes_are_refused_under_the_read_only_switch(lab):
     lab.ok("node", "add", nid("x"), "--label", "x", "--kind", "mac")
     for args in (("agent", "set", "--name", "X"),

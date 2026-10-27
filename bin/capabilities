@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.28.0,<1",
+#     "capabilities-contract>=0.29.0,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -972,10 +972,14 @@ PROJECT VERBS (run inside a consuming project)
         label, reachable, load_1, load_5, load_15, cpu_count,
         memory_used_bytes, memory_limit_bytes, disk_used_bytes,
         disk_total_bytes, booted_at, uptime_seconds, boot_line,
-        image_version, claude_login, claude_account, codex_login,
-        codex_account, gh_login, gh_account, logins_checked_at,
-        reported_at, fresh_until, sessions [{capability, connection, live,
-        account, checked_at}]}], store}. A row stands for its node for 90
+        image_version, claude_login, claude_account, claude_needed,
+        claude_override, claude_expected, codex_login, codex_account,
+        codex_needed, codex_override, codex_expected, gh_login, gh_account,
+        gh_needed, gh_override, gh_expected, logins_checked_at, reported_at,
+        fresh_until, sessions [{capability, connection, live, account,
+        checked_at, needed, override, expected}], attention [{kind, tool |
+        capability and connection, reason}], health}], store}. A row stands
+        for its node for 90
         seconds after it is written (fresh_until, the store's time):
         reachable is whether that has not yet passed, by the store's now,
         and a node that never wrote one reads unreachable with every field
@@ -999,10 +1003,42 @@ PROJECT VERBS (run inside a consuming project)
         capability whose manifest declares connections.device_bound, every
         connection whose `connections --json` answer in the agent's folder
         there carries a session {live, account}.
+        What a node is expected to have is derived from what the agent
+        places there. A tool's <tool>_needed is whether a service the agent
+        places on that node needs it signed in there, as that node's manager
+        last reported from the services' manifests (service.sign_ins: its
+        declared tools, and the harness its own command answers in the
+        agent's folder). A session's needed is whether the agent places that
+        capability's service on that node. <tool>_override and a session's
+        override are the owner's word (`node expect`): true, false, or null
+        where none is given. expected is the override where there is one,
+        else needed. A session the owner expects that the node has not
+        reported is listed with live null. attention names each expected
+        item that needs action: a sign-in that is signed_out, absent, or
+        not_reported (no row for the agent there), and a session that is
+        not_live or not_reported. A login that is unknown is not raised.
+        health is red where the node is not reachable, else yellow where
+        attention is not empty, else green. Nothing that is not expected
+        raises anything.
+  node expect <node> sign-in <claude|codex|gh> on|off|default
+  node expect <node> session <capability> <connection> on|off|default
+        Set the owner's word on whether a tool's sign-in, or a device-bound
+        connection's live session, is expected for this agent on one of its
+        nodes, by id or label: on and off stand over what the placed
+        services need, and default takes the word back. It is kept in the
+        store (capabilities_node_login_expectations and
+        capabilities_node_session_expectations), goes with the node, and no
+        node's report replaces it. Answers {ok, project, agent_id, node,
+        kind, tool | capability and connection, override, before, changed,
+        store}, override and before each true, false or null. Exit 6
+        node_unknown for a node the agent does not have, not_device_bound
+        for a session of an installed capability whose connections are not
+        device-bound.
   node state report
         Write this node's state once: the row `node state` reads, and the
         sign-ins and sessions of every agent the store links to this node
-        whose folder here is bound to it, each capability's set replaced
+        whose folder here is bound to it, with the tools the services it
+        places here need signed in, each capability's set replaced
         and those of a capability no longer asked here dropped. What the
         store holds of an agent no longer linked to the node is dropped
         too; an agent linked here whose folder is not bound for this
@@ -1011,8 +1047,9 @@ PROJECT VERBS (run inside a consuming project)
         id`); a node reports itself and no other. `node run` writes it
         every 15 seconds and right after a reconcile that changed a job.
         Answers {ok, project, agent_id, node, state, sessions, store},
-        state and sessions as `node state` gives them for this node. Exit
-        6 node_unknown for a node not registered.
+        state and sessions as written for this node, without what `node
+        state` derives from them. Exit 6 node_unknown for a node not
+        registered.
   node rekey <old id> [<new id>] [--dry-run]
         Move a node from the id it is known by - a node registered before
         ids keeps the name it had as its id - to its own: this machine's id
@@ -1038,7 +1075,7 @@ PROJECT VERBS (run inside a consuming project)
         The agent and node verbs but `node id` need the project's id (exit 6
         no_project_identity: run init) and a database that resolves for the
         project (exit 6 store_not_configured, 5 when it cannot be reached);
-        set, add, remove, seen, state report and rekey exit 4 under the
+        set, add, remove, seen, state report, expect and rekey exit 4 under the
         read-only switch, but for rekey --dry-run.
   node run --supervisor <dir> [--every N] [--services <name,...>]
         The node's service manager: one per node and OS user, run as a
@@ -1067,7 +1104,8 @@ PROJECT VERBS (run inside a consuming project)
         on each reconcile, and writes this node's state (`node state
         report`) every 15 seconds, apart from its reconcile interval, and
         right after a reconcile that changed a job, asking the tools'
-        sign-ins and the sessions again every 60 seconds; a write that fails
+        sign-ins, the sessions and the harness of the services placed here
+        again every 60 seconds; a write that fails
         is said once on stderr and changes nothing else. While the store cannot be read it changes no job,
         and at its first start it writes none until it has read the store. A
         placed service it will not run - not installed, no deploy or machine
@@ -3470,6 +3508,33 @@ def _validate_fields(where: str, fields, setting: bool = False) -> list[str]:
     return problems
 
 
+def _validate_service_sign_ins(name: str, declared) -> list[str]:
+    """service.sign_ins: the tools the service needs signed in on a node it is
+    placed on - `tools` whatever its configuration, and `harness`, the command
+    that answers in an agent's folder which harness its turns run on there."""
+    tools_known = NODE_STATE_SIGN_IN_TOOLS
+    if not isinstance(declared, dict) or not declared or set(declared) - {"tools", "harness"}:
+        return ["service.sign_ins is an object of tools and harness, at least one of them"]
+    problems: list[str] = []
+    if "tools" in declared:
+        tools = declared["tools"]
+        if (not isinstance(tools, list) or not tools
+                or not all(isinstance(t, str) and t in tools_known for t in tools)
+                or tools != sorted(set(tools))):
+            problems.append("service.sign_ins.tools must be sorted unique names from "
+                            + "|".join(tools_known))
+    if "harness" in declared:
+        command = declared["harness"]
+        if (not isinstance(command, list) or not command
+                or not all(isinstance(part, str) and part.strip() for part in command)):
+            problems.append("service.sign_ins.harness is not a command: a list of "
+                            "non-empty strings")
+        elif command[0] != name:
+            problems.append(f"service.sign_ins.harness must start with {name!r}, the "
+                            "capability's own name")
+    return problems
+
+
 def _validate_connections_declaration(declared) -> list[str]:
     if declared is None:
         return []
@@ -3679,6 +3744,8 @@ def _validate_manifest(name: str, manifest) -> list[str]:
                                 f"{'|'.join(SERVICE_PLACEMENTS)}")
             if "deploy" in service:
                 problems.extend(_validate_service_deploy(service["deploy"]))
+            if "sign_ins" in service:
+                problems.extend(_validate_service_sign_ins(name, service["sign_ins"]))
             if "machine" in service:
                 problems.extend(_validate_service_machine(
                     name, service["machine"], verbs))
@@ -10116,7 +10183,9 @@ NODE_REFERENCES = (
     ("automations_runs", "environment", "whole"),
     ("capabilities_connection_grants", "node", "whole"),
     ("capabilities_identifiers", "node", "whole"),
+    ("capabilities_node_login_expectations", "node", "foreign key"),
     ("capabilities_node_logins", "node", "foreign key"),
+    ("capabilities_node_session_expectations", "node", "foreign key"),
     ("capabilities_node_sessions", "node", "foreign key"),
     ("capabilities_node_states", "node", "foreign key"),
     ("capabilities_policy", "node", "whole"),
@@ -10376,6 +10445,10 @@ NODE_STATE_SESSION_TIMEOUT = 60
 # the file its boot path writes its one line of what it is doing to.
 NODE_IMAGE_VERSION_FILE_ENV = "AGENT_NODE_VERSION_FILE"
 NODE_BOOT_LINE_FILE_ENV = "AGENT_NODE_STATE_FILE"
+# The tools whose sign-in a node reports, and a service may need (its
+# manifest's service.sign_ins); a harness answer names only claude or codex.
+NODE_STATE_SIGN_IN_TOOLS = ("claude", "codex", "gh")
+NODE_STATE_HARNESS_TOOLS = ("claude", "codex")
 NODE_STATE_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
@@ -10625,6 +10698,56 @@ def _node_device_sessions(folders: dict[str, Path]) -> dict[tuple[str, str], lis
     return out
 
 
+def _service_sign_ins(capability: str) -> dict | None:
+    """The installed capability's service.sign_ins, or None where it declares
+    none."""
+    manifest = _read_json(CAP_HOME / capability / "manifest.json")
+    service = manifest.get("service") if isinstance(manifest, dict) else None
+    declared = service.get("sign_ins") if isinstance(service, dict) else None
+    return declared if isinstance(declared, dict) else None
+
+
+def _node_needed_sign_ins(folders: dict[str, Path], placed: list[tuple],
+                          last: dict | None = None) -> tuple[dict[str, list[str]], dict]:
+    """For each agent whose folder here is bound, the tools the services it
+    places on this node need signed in here: each service's declared tools,
+    and the harness its own command answers in the agent's folder. Answers
+    (needed {agent: [tool]}, harness {(agent, capability): [tool]}); a
+    harness command that cannot answer keeps what it said last, in `last`."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
+    last = last or {}
+    needed: dict[str, list[str]] = {}
+    answers: dict[tuple[str, str], list[str]] = {}
+    for agent_id, folder in sorted(folders.items()):
+        tools: set[str] = set()
+        for capability in sorted({c for a, c in placed if a == agent_id}):
+            declared = _service_sign_ins(capability)
+            if not declared:
+                continue
+            tools.update(t for t in declared.get("tools") or ()
+                         if t in NODE_STATE_SIGN_IN_TOOLS)
+            command = declared.get("harness")
+            if not (isinstance(command, list) and command and command[0] == capability):
+                continue
+            rc, stdout, _err = _run_script(_script_path(capability),
+                                           [str(part) for part in command[1:]], cwd=folder,
+                                           env=env, timeout=NODE_STATE_SESSION_TIMEOUT)
+            try:
+                report = json.loads(stdout) if rc == 0 else None
+            except ValueError:
+                report = None
+            said = report.get("harness") if isinstance(report, dict) else None
+            if isinstance(said, list):
+                answer = sorted({t for t in said if t in NODE_STATE_HARNESS_TOOLS})
+            else:
+                answer = last.get((agent_id, capability))
+            if answer is not None:
+                answers[(agent_id, capability)] = answer
+                tools.update(answer)
+        needed[agent_id] = sorted(tools)
+    return needed, answers
+
+
 def _node_agent_folder(root: Path, own: str | None, agent_id: str,
                        folder: str | None) -> Path | None:
     """The folder on this node bound to `agent_id`, as its link records it,
@@ -10640,19 +10763,21 @@ def _node_agent_folder(root: Path, own: str | None, agent_id: str,
 
 
 def _node_state_write(conn, here: str, facts: dict, logins: dict | None,
-                      sessions: dict | None, agents: list[str]) -> dict:
+                      sessions: dict | None, agents: list[str],
+                      needed: dict[str, list[str]] | None = None) -> dict:
     """Write this node's state row, the tools' sign-ins for each of `agents` -
-    the agents whose folder here is bound for this process - and, where
-    `sessions` holds them, the sessions their device-bound capabilities
-    answered, dropping those of a capability no longer asked. What the store
-    holds of an agent no longer linked here goes too; another manager's
-    agents on the same machine keep theirs. Answers {reported_at,
-    fresh_until}."""
+    the agents whose folder here is bound for this process - with the tools
+    its placed services need (`needed`), and, where `sessions` holds them,
+    the sessions their device-bound capabilities answered, dropping those of
+    a capability no longer asked. What the store holds of an agent no longer
+    linked here goes too; another manager's agents on the same machine keep
+    theirs. Answers {reported_at, fresh_until}."""
     store = _store_module()
     stamp = store.node_state_put(conn, here, **facts)
     if logins is not None:
         for agent_id in agents:
-            store.node_logins_put(conn, agent_id, here, logins)
+            store.node_logins_put(conn, agent_id, here, logins,
+                                  needed=None if needed is None else needed.get(agent_id, ()))
     if sessions is not None:
         for (agent_id, capability), rows in sorted(sessions.items()):
             if rows is not None:
@@ -10666,7 +10791,8 @@ def _node_state_logins(store, logins: list[dict], node: str) -> dict:
     """The login fields of `node` from an agent's sign-in rows: each null
     where the node has written none for it."""
     row = next((r for r in logins if r["node"] == node), None)
-    out = {column: (row or {}).get(column) for column in store.NODE_LOGIN_COLUMNS}
+    out = {column: (row or {}).get(column)
+           for column in (*store.NODE_LOGIN_COLUMNS, *store.NODE_LOGIN_NEED_COLUMNS)}
     out["logins_checked_at"] = row["checked_at"] if row else None
     return out
 
@@ -10708,6 +10834,11 @@ class _NodeManager:
         self.probe_due = 0.0
         self.logins: dict | None = None
         self.sessions: dict | None = None
+        # What each agent's placed services need signed in here, asked with
+        # the tools; a harness command that cannot answer keeps its last.
+        self.placed: list[tuple] = []
+        self.needed: dict[str, list[str]] | None = None
+        self.harness: dict[tuple[str, str], list[str]] = {}
 
     def say(self, message: str) -> None:
         sys.stderr.write(f"[capabilities node {self.here}] {message}\n")
@@ -10917,6 +11048,7 @@ class _NodeManager:
         agents, placed = answer
         self.moved = False
         self.agents = [row[0] for row in agents]
+        self.placed = list(placed)
         desired = self.desired(agents, placed)
         self.record_unrun(self.unrun_now)
         present = self.written()
@@ -11034,6 +11166,9 @@ class _NodeManager:
             self.probe_due = now + NODE_STATE_PROBE_SECONDS
             self.logins = _node_tool_logins()
             self.sessions = _node_device_sessions(self.folders) if self.read_once else None
+            if self.read_once:
+                self.needed, self.harness = _node_needed_sign_ins(self.folders, self.placed,
+                                                                  self.harness)
         try:
             conn = self._connect()
         except Exception as exc:
@@ -11043,7 +11178,7 @@ class _NodeManager:
         try:
             with conn.transaction():
                 _node_state_write(conn, self.here, _node_facts(), self.logins, self.sessions,
-                                  sorted(self.folders))
+                                  sorted(self.folders), self.needed)
         except Exception as exc:
             self.say_once("state", type(exc).__name__,
                           "cannot write this node's state: "
@@ -13423,6 +13558,47 @@ def cmd_service(args: list[str]) -> None:
     verbs[sub](args[1:])
 
 
+def _node_expected(entry: dict, node: str, words: dict, placed: set[str]) -> None:
+    """Fill a `node state` entry with what the node is expected to have and
+    whether it has it. A sign-in is expected where the owner's word says so,
+    else where a service the agent places on the node needs it; a device
+    session where the owner's word says so, else where the agent places its
+    capability's service there. An expected sign-in that is not signed in, or
+    an expected session that is not live or not reported, needs attention and
+    makes the node yellow; a node that is not reachable is red. Nothing that
+    is not expected is raised."""
+    attention: list[dict] = []
+    said = {w["tool"]: w["expected"] for w in words["sign_ins"] if w["node"] == node}
+    for tool in NODE_STATE_SIGN_IN_TOOLS:
+        needed = bool(entry.pop(f"{tool}_needed", None))
+        override = said.get(tool)
+        expected = needed if override is None else override
+        entry.update({f"{tool}_needed": needed, f"{tool}_override": override,
+                      f"{tool}_expected": expected})
+        login = entry.get(f"{tool}_login")
+        if expected and login in (None, "signed_out", "absent"):
+            attention.append({"kind": "sign_in", "tool": tool,
+                              "reason": login or "not_reported"})
+    said = {(w["capability"], w["connection"]): w["expected"]
+            for w in words["sessions"] if w["node"] == node}
+    reported = {(s["capability"], s["connection"]) for s in entry["sessions"]}
+    entry["sessions"] += [{"capability": capability, "connection": connection, "live": None,
+                           "account": None, "checked_at": None}
+                          for capability, connection in sorted(set(said) - reported)]
+    for session in entry["sessions"]:
+        key = (session["capability"], session["connection"])
+        needed = key in reported and session["capability"] in placed
+        override = said.get(key)
+        expected = needed if override is None else override
+        session.update({"needed": needed, "override": override, "expected": expected})
+        if expected and session["live"] is not True:
+            attention.append({"kind": "session", "capability": key[0], "connection": key[1],
+                              "reason": "not_reported" if key not in reported else "not_live"})
+    entry["attention"] = attention
+    entry["health"] = ("red" if not entry["reachable"] else
+                       "yellow" if attention else "green")
+
+
 def _node_state_answer(row: dict) -> dict:
     return {key: (_store_module()._stamp(value) if key.endswith("_at") or key == "fresh_until"
                   else value) for key, value in row.items()}
@@ -13448,9 +13624,11 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
                                      "--label <label> --kind mac|server`")
             return agent_id, conn.execute(
                 "SELECT agent_id, folder FROM capabilities_agent_nodes WHERE node = %s "
-                "ORDER BY agent_id", (here,)).fetchall()
+                "ORDER BY agent_id", (here,)).fetchall(), conn.execute(
+                "SELECT agent_id, capability FROM capabilities_policy WHERE node = %s "
+                "AND enabled AND service ORDER BY agent_id, capability", (here,)).fetchall()
         try:
-            (agent_id, linked), _setting = _kernel_run(root, links)
+            (agent_id, linked, placed), _setting = _kernel_run(root, links)
         except _KernelRefusal as exc:
             _die(6, exc.code, exc.message, exc.hint)
         own = _folder_agent_id(root)
@@ -13458,9 +13636,10 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
                    if (path := _node_agent_folder(root, own, linked_id, folder)) is not None}
         facts, logins = _node_facts(), _node_tool_logins()
         sessions = _node_device_sessions(folders)
+        needed, _harness = _node_needed_sign_ins(folders, placed)
 
         def write(conn, agent_id):
-            _node_state_write(conn, here, facts, logins, sessions, sorted(folders))
+            _node_state_write(conn, here, facts, logins, sessions, sorted(folders), needed)
             return ({**store.node_states(conn, [here])[0],
                      **_node_state_logins(store, store.node_logins(conn, agent_id, [here]), here)},
                     store.node_sessions(conn, agent_id, [here]))
@@ -13481,6 +13660,10 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
         states = {r["node"]: r for r in store.node_states(conn, ids)}
         logins = store.node_logins(conn, agent_id, ids)
         sessions = store.node_sessions(conn, agent_id, ids)
+        words = store.node_expectations(conn, agent_id, ids)
+        placed = conn.execute(
+            "SELECT node, capability FROM capabilities_policy WHERE agent_id = %s "
+            "AND node = ANY (%s) AND enabled AND service", (agent_id, ids)).fetchall()
         out = []
         for node in nodes:
             state = states.get(node["node"]) or dict.fromkeys(
@@ -13491,10 +13674,63 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
             entry.update({k: v for k, v in _node_state_answer(state).items() if k != "node"})
             entry["sessions"] = [_node_state_answer({k: v for k, v in s.items() if k != "node"})
                                  for s in sessions if s["node"] == node["node"]]
+            _node_expected(entry, node["node"], words,
+                           {c for n, c in placed if n == node["node"]})
             out.append(entry)
         return agent_id, out
     (agent_id, nodes), setting = _kernel_run(root, read)
     _emit({"ok": True, "project": str(root), "agent_id": agent_id, "nodes": nodes,
+           "store": _kernel_store_report(setting)})
+
+
+NODE_EXPECT_WORDS = {"on": True, "off": False, "default": None}
+
+
+def _node_expect_verb(root: Path, args: list[str]) -> None:
+    """`node expect`: the owner's word on whether a sign-in or a device session
+    is expected on one of this agent's nodes."""
+    usage = ("capabilities node expect <node> sign-in <claude|codex|gh> on|off|default\n"
+             "capabilities node expect <node> session <capability> <connection> "
+             "on|off|default")
+    pos, _opts = _kernel_options(args, set(), {"--json"}, "node expect")
+    kind = pos[1] if len(pos) > 1 else None
+    if not ((kind == "sign-in" and len(pos) == 4) or (kind == "session" and len(pos) == 5)) \
+            or pos[-1] not in NODE_EXPECT_WORDS or not all(p.strip() for p in pos):
+        _die(6, "input", "node expect takes a node, sign-in and a tool, or session, a "
+             "capability and a connection, then on, off or default", usage)
+    word = NODE_EXPECT_WORDS[pos[-1]]
+    if kind == "sign-in":
+        if pos[2] not in NODE_STATE_SIGN_IN_TOOLS:
+            _die(6, "input", f"{pos[2]!r} is not a tool whose sign-in a node reports: "
+                 + ", ".join(NODE_STATE_SIGN_IN_TOOLS), usage)
+        target = {"tool": pos[2]}
+    else:
+        capability, connection = pos[2].strip(), pos[3].strip()
+        if not re.fullmatch(r"[a-z][a-z0-9_-]*", capability):
+            _die(6, "input", f"{capability!r} is not a capability name", usage)
+        manifest = _read_json(CAP_HOME / capability / "manifest.json")
+        connections = manifest.get("connections") if isinstance(manifest, dict) else None
+        if manifest and not (isinstance(connections, dict)
+                             and connections.get("device_bound") is True):
+            _die(6, "not_device_bound", f"{capability}'s connections are not sessions bound "
+                 "to a device, so no node holds one",
+                 "a session is expected only of a capability whose manifest declares "
+                 "connections.device_bound")
+        target = {"capability": capability, "connection": connection}
+    _read_only_gate("node expect")
+    store = _store_module()
+
+    def work(conn, agent_id):
+        node = _node_ref(conn, agent_id, pos[0].strip())
+        return agent_id, node, store.node_expectation_set(
+            conn, agent_id, node, expected=word, by=_vault_actor(), **target)
+    try:
+        (agent_id, node, answer), setting = _kernel_run(root, work)
+    except _KernelRefusal as exc:
+        _die(6, exc.code, exc.message, exc.hint)
+    _emit({"ok": True, "project": str(root), "agent_id": agent_id, "node": node,
+           "kind": kind.replace("-", "_"), **target, "override": answer["after"],
+           "before": answer["before"], "changed": answer["changed"],
            "store": _kernel_store_report(setting)})
 
 
@@ -13539,9 +13775,12 @@ def cmd_node(args: list[str]) -> None:
     if sub == "state":
         _node_state_verb(root, args[1:])
         return
+    if sub == "expect":
+        _node_expect_verb(root, args[1:])
+        return
     if sub not in ("add", "set", "remove", "seen"):
-        _die(6, "input", "node needs a subcommand: add, set, list, remove, seen, state, id, "
-             "rekey, run or supervise",
+        _die(6, "input", "node needs a subcommand: add, set, list, remove, seen, state, "
+             "expect, id, rekey, run or supervise",
              "run `capabilities help`")
     _read_only_gate(f"node {sub}")
     if sub == "seen":

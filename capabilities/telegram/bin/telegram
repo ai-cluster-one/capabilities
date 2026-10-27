@@ -238,6 +238,18 @@ Commands:
                                                settings name with its document
                                                key: `telegram context show|edit|
                                                put <key>` reads and writes it.
+  telegram service harness [--json]            The harness tools (claude, codex)
+                                               of every profile a turn is
+                                               configured to run on now - each
+                                               name the settings reach, every
+                                               chat's `/set profile` and the
+                                               profile of every open job - each
+                                               resolved and fitted as a turn
+                                               resolves it, for the sign-ins a
+                                               node needs. Runs no turn and
+                                               writes nothing; `unresolved`
+                                               names a profile that does not
+                                               resolve or fit.
   telegram service doctor|run|start|reload|stop|status|logs
                                                Manage the bundled Telegram assistant
                                                service for this project. The engine
@@ -656,7 +668,10 @@ SERVICE = {
     "name": "assistant",
     "summary": "Project-local Telegram assistant daemon using the bundled service engine.",
     "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs",
-              "migrate-ownership", "migrate-profiles", "schema", "validate"],
+              "migrate-ownership", "migrate-profiles", "schema", "validate", "harness"],
+    # The sign-ins a node needs for it: the harness of every profile a turn is
+    # configured to run on, which `service harness` answers.
+    "sign_ins": {"harness": ["telegram", "service", "harness", "--json"]},
     "config": "capabilities/telegram/service",
     "state": "<connection-state>/service",
     "deploy": {
@@ -2840,6 +2855,118 @@ def cmd_service_validate(scope: str, key: str | None) -> dict:
     return {"ok": True, "scope": scope, "key": key, "changed": changed,
             "apply": "restart" if restart else "reload", "restart": restart,
             "documents": documents, "skipped_routes": _SKIPPED_ROUTES}
+
+
+# The harness tools a sign-in answers for: the stub runs in process and needs
+# none.
+_SIGN_IN_HARNESSES = ("claude", "codex")
+
+# A job still to run: written, waiting, running, or stopped on an outcome the
+# daemon resumes on its own (jobs.SELF_RESUMING).
+_HARNESS_OPEN_JOBS = """
+    SELECT id, profile, engine FROM telegram_jobs
+     WHERE project_id = %s AND surface = 'telegram' AND environment = %s
+       AND (state IN ('draft', 'waiting', 'running')
+            OR (state = 'stopped' AND outcome IN ('quota', 'interrupted')))
+     ORDER BY created_at, id"""
+_HARNESS_CHAT_PROFILES = """
+    SELECT channel_key, settings->>'profile' FROM telegram_channels
+     WHERE project_id = %s AND environment = %s AND settings->>'profile' IS NOT NULL
+     ORDER BY channel_key"""
+
+
+def _configured_in_store(setting, project_id: str, environment: str) -> tuple[list, list]:
+    """Every chat's `/set profile` and every open job of this project and
+    environment, as (channel key, profile) and (job id, profile) rows, read on
+    one read-only connection. A job registered before profiles names none and
+    runs on `telegram-<engine>`, as the daemon runs it. A table the store does
+    not hold yet holds none. Writes nothing and migrates nothing."""
+    from capabilities_contract.db import DbError, connect
+    try:
+        conn = connect(application_name=NAME, setting=setting, transaction=True)
+    except DbError as exc:
+        _die(6 if exc.slug in _STORE_SETTING_SLUGS else 5, exc.slug, exc.message, exc.hint)
+    found: list[list] = []
+    try:
+        conn.rollback()
+        conn.read_only = True
+        for sql in (_HARNESS_CHAT_PROFILES, _HARNESS_OPEN_JOBS):
+            try:
+                found.append(conn.execute(sql, (project_id, environment)).fetchall())
+            except Exception as exc:
+                if type(exc).__name__ != "UndefinedTable":
+                    raise
+                conn.rollback()
+                found.append([])
+    finally:
+        with contextlib.suppress(Exception):
+            conn.rollback()
+        conn.close()
+    chats = [(str(key), str(profile)) for key, profile in found[0]]
+    jobs = []
+    for job_id, profile, engine in found[1]:
+        if not profile:
+            profile = (f"{_profiles_module().PREFIX}{engine}"
+                       if engine in _SIGN_IN_HARNESSES else "stub")
+        jobs.append((str(job_id), str(profile)))
+    return chats, jobs
+
+
+def cmd_service_harness() -> dict:
+    """The harness tools of every profile a turn is configured to run on now,
+    for the sign-ins a node placing the service needs: each name the settings
+    reach, as `service doctor` reads them, every chat's `/set profile`, and the
+    profile of every open job, each resolved and fitted as a turn resolves it
+    with no turn run. Reads the store and writes nothing. A project that
+    resolves no store runs no turn and needs none; a name that does not
+    resolve or fit is `unresolved` and needs nothing."""
+    root = _service_project_root()
+    try:
+        setting = _jobs_module().store_setting(root)
+    except _jobs_module().JobError as exc:
+        if exc.slug != "store_not_configured":
+            _die(6, exc.slug, exc.message, exc.hint)
+        return {"harness": [], "profiles": [], "unresolved": [],
+                "store": "not_configured"}
+    project_id = _project_id(write=False)
+    if not project_id:
+        _die(6, "no_project_identity", "this project declares no id",
+             "run `capabilities init` in the project")
+    settings = _service_settings(root)
+    named: dict[str, dict] = {}
+
+    def name(profile: str) -> dict:
+        return named.setdefault(profile, {"profile": profile, "harness": None,
+                                          "settings": [], "chats": [], "jobs": []})
+
+    for entry in _declared_profiles(settings):
+        name(entry["profile"])["settings"] = entry["declared_at"]
+    chats, jobs = _configured_in_store(setting, str(project_id), _job_environment(root))
+    for key, profile in chats:
+        name(profile)["chats"].append(key)
+    for job_id, profile in jobs:
+        name(profile)["jobs"].append(job_id)
+    unresolved: list[str] = []
+    entries = [{"profile": one, "declared_at": []} for one in named]
+    if entries:
+        code, found = _profiles_call(
+            ["probe", "--project-root", str(root), "--project-id", str(project_id)],
+            json.dumps({"profiles": entries, "live": False}))
+        if code != 0:
+            _die(code, found["code"], found["message"], found.get("hint"))
+        if found.get("store_error"):
+            _die(5, "store_unreachable", f"the store's profiles could not be read: "
+                 f"{found['store_error']}")
+        for row in found.get("rows") or []:
+            one = named[row["profile"]]
+            if row.get("ok"):
+                one["harness"] = row.get("worker")
+            else:
+                unresolved.append(row["profile"])
+                one["unresolved"] = row.get("reason")
+    tools = {one["harness"] for one in named.values()} & set(_SIGN_IN_HARNESSES)
+    return {"harness": sorted(tools), "profiles": list(named.values()),
+            "unresolved": unresolved}
 
 
 def _declared_profiles(settings: dict) -> list[dict]:
@@ -5136,6 +5263,8 @@ def main() -> None:
         "validate", help="judge proposed settings on stdin as a reload would; writes nothing")
     validate.add_argument("--scope", choices=("project", "global"), default="project")
     validate.add_argument("--key", help="stdin is this key's value, not the whole document")
+    svc.add_parser("harness", help="the harness tools of every profile a turn is configured "
+                   "to run on; writes nothing").add_argument("--json", action="store_true")
 
     # `--connection <id>` selects a connection; `--session <PATH>` overrides the
     # session-file path. Both are global, accepted anywhere on the line (extracted
@@ -5271,6 +5400,8 @@ def main() -> None:
             _emit(_settings_schema_module().json_schema())
         elif args.service_cmd == "validate":
             _emit(cmd_service_validate(args.scope, args.key))
+        elif args.service_cmd == "harness":
+            _emit(cmd_service_harness())
         return
 
     with (_first_link(connection_flag, session_flag) if args.cmd == "login"

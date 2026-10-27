@@ -104,7 +104,8 @@ def refused(capsys=None) -> str:
 def test_the_manifest_declares_the_service_the_contract_expects():
     service = mod.SERVICE
     assert service["verbs"] == ["init", "doctor", "run", "start", "reload", "stop",
-                                "status", "logs", "pause", "resume", "join", "leave"]
+                                "status", "logs", "pause", "resume", "join", "leave",
+                                "harness"]
     assert service["config"] == "capabilities/tasks/service/config.toml"
     deploy = service["deploy"]
     assert deploy["schema"] == "capabilities.service.deploy.v1"
@@ -1548,6 +1549,24 @@ def test_the_daemon_end_to_end_through_the_cli(lab):
     assert stopped["stopped"] is True
     assert not mod._service_module().pid_alive(pid)
     assert answer_of(tasks_cli(lab, "service", "status"))["running"] is False
+
+
+@needs_store
+def test_service_harness_answers_the_harness_of_every_lanes_profile(lab):
+    assert mod.SERVICE["sign_ins"] == {"tools": ["gh"],
+                                       "harness": ["tasks", "service", "harness", "--json"]}
+    project = lab["project"]
+    (_cli.profile_docs(project) / "coder.toml").write_text(
+        'harness = "codex"\nmodel = "gpt-6-sol"\ntimeout_seconds = 600\n')
+    write_worker(project, "beta", "takes: [beta]\nprofile: coder")
+    write_worker(project, "gamma", "takes: [gamma]\nprofile: nowhere")
+    write_worker(project, "triage", "on_request: [triage]\nprofile: coder")
+    answer = answer_of(tasks_cli(lab, "service", "harness", "--json"))
+    assert answer == {"harness": ["claude", "codex"],
+                      "lanes": [{"worker": "alpha", "profile": "plain", "harness": "claude"},
+                                {"worker": "beta", "profile": "coder", "harness": "codex"},
+                                {"worker": "gamma", "profile": "nowhere", "harness": None}],
+                      "unresolved": ["nowhere"]}
 
 
 @needs_store

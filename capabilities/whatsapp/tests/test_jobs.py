@@ -753,5 +753,59 @@ class Control(JobsCase):
         self.assertEqual(self.command(d, "/stop"), "Nothing is running right now.")
 
 
+
+@_cli.needs_store
+@td.needs_runner
+class ServiceHarness(td.DialogueCase):
+    """`whatsapp service harness` answers the harness of every profile a turn is
+    configured to run on: the settings', each chat's `/set profile` and each
+    open job's, and writes nothing."""
+
+    def job(self, project, profile, state="waiting", outcome=None):
+        job_id = f"job-{uuid.uuid4().hex[:8]}"
+        self.db.execute(
+            "INSERT INTO whatsapp_jobs (id, project_id, environment, account, chat_id,"
+            " requested_by, description, profile, state, outcome, created_at, updated_at)"
+            " VALUES (%s, %s, 'test', %s, %s, %s, 'work', %s, %s, %s, now(), now())",
+            (job_id, project, self.db.account, ALICE_JID, ALICE, profile, state, outcome))
+        return job_id
+
+    def test_the_settings_chats_and_open_jobs_each_name_a_profile(self):
+        self.assertEqual(wa.SERVICE["sign_ins"],
+                         {"harness": ["whatsapp", "service", "harness", "--json"]})
+        self.assertIn("harness", wa.SERVICE["verbs"])
+        project = f"prj_{uuid.uuid4().hex[:12]}"
+        self.db.execute(
+            "INSERT INTO whatsapp_register (project_id, environment, account, chat_id,"
+            " overrides) VALUES (%s, 'test', %s, %s, '{\"profile\": \"whatsapp-codex\"}')",
+            (project, self.db.account, ALICE_JID))
+        legacy = self.job(project, None)
+        gone = self.job(project, "whatsapp-gone")
+        self.job(project, "whatsapp-job-codex", state="stopped", outcome="succeeded")
+        settings = td._settings()
+        with mock.patch.object(wa, "_service_project_root", lambda: self.root), \
+                mock.patch.object(wa, "_service_settings", lambda: settings), \
+                mock.patch.object(wa, "_service_project_id", lambda root: project):
+            answer = wa._cmd_service_harness()
+        rows = {row["profile"]: row for row in answer["profiles"]}
+        self.assertEqual(answer["harness"], ["claude", "codex"])
+        self.assertEqual(answer["unresolved"], ["whatsapp-gone"])
+        self.assertEqual(set(rows), {"whatsapp-claude", "whatsapp-job-claude",
+                                     "whatsapp-codex", "whatsapp-gone"})
+        self.assertEqual((rows["whatsapp-claude"]["harness"],
+                          rows["whatsapp-claude"]["settings"]),
+                         ("claude", ["defaults.profile"]))
+        self.assertEqual((rows["whatsapp-job-claude"]["harness"],
+                          rows["whatsapp-job-claude"]["jobs"]), ("claude", [legacy]))
+        self.assertEqual((rows["whatsapp-codex"]["harness"], rows["whatsapp-codex"]["chats"]),
+                         ("codex", [ALICE_JID]))
+        self.assertEqual((rows["whatsapp-gone"]["harness"], rows["whatsapp-gone"]["jobs"]),
+                         (None, [gone]))
+        with mock.patch.object(wa, "_service_project_root", lambda: self.root), \
+                mock.patch.object(wa, "_service_settings",
+                                  lambda: {**settings, "allowed_users": {},
+                                           "allowed_groups": {}}):
+            self.assertEqual(wa._cmd_service_harness()["harness"], [])
+
 if __name__ == "__main__":
     unittest.main()

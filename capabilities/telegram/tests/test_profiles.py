@@ -1003,5 +1003,80 @@ class WhoMaySave(unittest.TestCase):
         self.assertEqual(text, "harness = 'codex'\n")
 
 
+
+@needs_runner
+@needs_store
+class ServiceHarness(unittest.TestCase):
+    """`telegram service harness` answers the harness of every profile a turn is
+    configured to run on: the settings', each chat's `/set profile` and each
+    open job's, and writes nothing."""
+
+    def test_the_settings_chats_and_open_jobs_each_name_a_profile(self):
+        from capabilities_contract.db import connect
+        cli = import_cli()
+        self.assertEqual(cli.SERVICE["sign_ins"],
+                         {"harness": ["telegram", "service", "harness", "--json"]})
+        self.assertIn("harness", cli.SERVICE["verbs"])
+        setting, project = store_setting(), project_id()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "capabilities").mkdir()
+        jobs_module = cli._jobs_module()
+        store, reg = jobs_module.open_register(root / "capabilities", "production",
+                                               project_id=project, setting=setting)
+        self.addCleanup(store.close)
+        conn = connect(application_name="telegram", setting=setting)
+        self.addCleanup(conn.close)
+        lib.save_profile(conn, "telegram-fast", CODEX, scope="project",
+                         schema=setting.schema, scope_id=project)
+        conn.execute("INSERT INTO telegram_channels (project_id, environment, connection, "
+                     "channel_key, settings) VALUES (%s, 'production', 'probe', '11', "
+                     "'{\"profile\": \"telegram-fast\"}'::jsonb)", (project,))
+        conn.commit()
+        legacy = reg.submit(reg.register(channel_key="11", requested_by="11",
+                                         description="before profiles", engine="claude")["id"])
+        gone = reg.register(channel_key="12", requested_by="12", description="gone",
+                            engine="codex", profile="telegram-gone")
+        done = reg.register(channel_key="12", requested_by="12", description="finished",
+                            engine="codex", profile="telegram-done")
+        reg.update(done["id"], state="stopped", outcome="succeeded")
+        profiles_module = cli._profiles_module()
+
+        def profiles_call(argv, text=""):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(sys, "stdin", io.StringIO(text)), \
+                    mock.patch.object(profiles_module, "_connect", lambda root: (
+                        connect(application_name="telegram", setting=setting),
+                        setting.schema)), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = profiles_module.main(argv)
+            return code, json.loads(out.getvalue() if code == 0
+                                    else err.getvalue().splitlines()[-1])
+
+        settings = {"environment": "production",
+                    "defaults": {"profile": "telegram-claude"}}
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("TELEGRAM_SERVICE_PROFILE", "TELEGRAM_ENVIRONMENT")}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(cli, "_service_project_root", lambda: root), \
+                mock.patch.object(cli, "_jobs_module", return_value=mock.Mock(
+                    store_setting=lambda _root: setting, JobError=jobs.JobError)), \
+                mock.patch.object(cli, "_project_id", lambda write=False: project), \
+                mock.patch.object(cli, "_service_settings", lambda _root: settings), \
+                mock.patch.object(cli, "_profiles_call", profiles_call):
+            answer = cli.cmd_service_harness()
+        rows = {row["profile"]: row for row in answer["profiles"]}
+        self.assertEqual(answer["harness"], ["claude", "codex"])
+        self.assertEqual(answer["unresolved"], ["telegram-gone"])
+        self.assertEqual(set(rows), {"telegram-claude", "telegram-fast", "telegram-gone"})
+        self.assertEqual((rows["telegram-claude"]["harness"], rows["telegram-claude"]["settings"],
+                          rows["telegram-claude"]["jobs"]),
+                         ("claude", ["settings.defaults.profile"], [str(legacy["id"])]))
+        self.assertEqual((rows["telegram-fast"]["harness"], rows["telegram-fast"]["chats"]),
+                         ("codex", ["11"]))
+        self.assertEqual((rows["telegram-gone"]["harness"], rows["telegram-gone"]["jobs"]),
+                         (None, [str(gone["id"])]))
+
 if __name__ == "__main__":
     unittest.main()

@@ -270,6 +270,17 @@ Assistant service
       whatsapp service logs [--connection ID] [--tail N]
       whatsapp service doctor [--connection ID]
                                        Settings, store, link and ownership.
+      whatsapp service harness [--json]
+                                       The harness tools (claude, codex) of
+                                       every profile a turn is configured to
+                                       run on now - each the settings reach,
+                                       every chat's `/set profile` and each
+                                       open job's - resolved and fitted as a
+                                       turn resolves it, for the sign-ins a
+                                       node needs. With no dialogue admitted
+                                       none. Runs no turn and writes nothing;
+                                       `unresolved` names a profile that does
+                                       not resolve or fit.
       whatsapp jobs help               The job register's verbs: list, active,
                                        show, register, submit, amend, discard,
                                        stop, resume.
@@ -740,7 +751,11 @@ SERVICE = {
                 "answers the messages its settings admit with a dialogue turn "
                 "on the harness runner, runs the jobs those turns hand over, "
                 "and sends the messages queued for the account."),
-    "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs"],
+    "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs",
+              "harness"],
+    # The sign-ins a node needs for it: the harness of every profile a turn is
+    # configured to run on, which `service harness` answers.
+    "sign_ins": {"harness": ["whatsapp", "service", "harness", "--json"]},
     "config": "capabilities/whatsapp/service",
     "state": "<account-state>/service",
     "deploy": {
@@ -7471,6 +7486,110 @@ def _cmd_service_logs(connection_flag: str | None, tail: int) -> dict:
             "lines": lines[-max(0, tail):]}
 
 
+# The harness tools a sign-in answers for.
+_SIGN_IN_HARNESSES = ("claude", "codex")
+
+# A job still to run: written, waiting, running, or stopped by a spent quota,
+# which the runner resumes on its own.
+_HARNESS_OPEN_JOBS = """
+    SELECT id, profile FROM whatsapp_jobs
+     WHERE project_id = %s AND environment = %s AND surface = 'whatsapp'
+       AND (state IN ('draft', 'waiting', 'running')
+            OR (state = 'stopped' AND outcome = 'quota'))
+     ORDER BY created_at, id"""
+_HARNESS_CHAT_PROFILES = """
+    SELECT chat_id, overrides->>'profile' FROM whatsapp_register
+     WHERE project_id = %s AND environment = %s AND overrides->>'profile' IS NOT NULL
+     ORDER BY chat_id"""
+
+
+def _configured_in_store(setting, project_id: str, environment: str) -> tuple[list, list]:
+    """Every chat's `/set profile` and every open job of this project and
+    environment, as (chat, profile) and (job id, profile or None) rows, read on
+    one read-only connection. A table the store does not hold yet holds none.
+    Writes nothing and migrates nothing."""
+    try:
+        conn = connect(application_name=NAME, setting=setting, transaction=True)
+    except DbError as exc:
+        _store_refusal(exc)
+    found: list[list] = []
+    try:
+        conn.rollback()
+        conn.read_only = True
+        for sql in (_HARNESS_CHAT_PROFILES, _HARNESS_OPEN_JOBS):
+            try:
+                found.append(conn.execute(sql, (project_id, environment)).fetchall())
+            except Exception as exc:
+                if type(exc).__name__ != "UndefinedTable":
+                    raise
+                conn.rollback()
+                found.append([])
+    finally:
+        with contextlib.suppress(Exception):
+            conn.rollback()
+        conn.close()
+    return ([(str(row[0]), str(row[1])) for row in found[0]],
+            [(str(row[0]), row[1] or None) for row in found[1]])
+
+
+def _cmd_service_harness() -> dict:
+    """The harness tools of every profile a turn is configured to run on now,
+    for the sign-ins a node placing the service needs: each name the settings
+    reach, every chat's `/set profile`, and the profile of every open job - a
+    job naming none runs on the job default - each resolved and fitted as the
+    listener resolves it, with no turn run. Settings that admit nobody run no
+    dialogue and no job, so need none. Reads the store and writes nothing. A
+    project that resolves no store runs no turn and needs none; a name that
+    does not resolve or fit is `unresolved` and needs nothing."""
+    root = _service_project_root()
+    try:
+        setting = resolve_setting(root)
+    except DbError as exc:
+        if exc.slug != "store_not_configured":
+            _store_refusal(exc)
+        return {"harness": [], "profiles": [], "unresolved": [], "store": "not_configured"}
+    settings = _service_settings()
+    if not _service_schema().dialogue_configured(settings):
+        return {"harness": [], "profiles": [], "unresolved": [], "dialogue": False}
+    project_id = _service_project_id(root)
+    named: dict[str, dict] = {}
+
+    def name(profile: str) -> dict:
+        return named.setdefault(profile, {"profile": profile, "harness": None,
+                                          "settings": [], "chats": [], "jobs": []})
+
+    for profile, where in _settings_profiles(settings).items():
+        name(profile)["settings"] = list(where)
+    job_default = ((settings.get("defaults") or {}).get("job_profile")
+                   or _service_module("profiles").DEFAULT_JOB_PROFILE)
+    chats, jobs = _configured_in_store(setting, project_id,
+                                       settings.get("environment") or "production")
+    for chat, profile in chats:
+        name(profile)["chats"].append(chat)
+    for job_id, profile in jobs:
+        name(profile or job_default)["jobs"].append(job_id)
+    unresolved: list[str] = []
+    for row in _profile_check(root, list(named)):
+        one = named.get(row.get("name"))
+        if one is None:
+            continue
+        if row.get("ok"):
+            one["harness"] = row.get("harness")
+            continue
+        error = str(row.get("error") or "")
+        if row.get("code") == "profiles_not_imported":
+            _refuse(6, "profiles_not_imported", error,
+                    f"run `{NAME} profiles import` to see what it would save, then "
+                    "`--apply`")
+        if error.startswith("the profiles could not be checked"):
+            _refuse(5, "profiles_unreadable", error)
+        unresolved.append(one["profile"])
+        one["unresolved"] = error
+    tools = {one["harness"] for one in named.values()} & set(_SIGN_IN_HARNESSES)
+    return {"harness": sorted(tools), "profiles": list(named.values()),
+            "unresolved": unresolved}
+
+
 def _cmd_service_doctor(connection_flag: str | None,
                         local: bool = False) -> tuple[dict, int]:
     """The service's readiness without touching the account: settings, store,
@@ -8695,6 +8814,8 @@ def cmd_service(args):
         return _cmd_service_status(connection)
     if action == "logs":
         return _cmd_service_logs(connection, args.tail)
+    if action == "harness":
+        return _cmd_service_harness()
     report, fail = _cmd_service_doctor(connection)
     _emit(report)
     if fail:
@@ -8889,6 +9010,8 @@ def main():
     slogs = _svc("logs", help="Tail the listener's log")
     slogs.add_argument("--tail", type=int, default=50)
     _svc("doctor", help="Settings, store, link and ownership")
+    _svc("harness", help="The harness tools of every profile a turn is configured to "
+         "run on; writes nothing").add_argument("--json", action="store_true")
 
     pjobs = _sub("jobs", help="The register of work that outlives a conversation")
     jobs_sub = pjobs.add_subparsers(dest="jobs_command", required=True)
