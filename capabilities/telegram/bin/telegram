@@ -59,6 +59,18 @@ Every live connection declares the positive Telegram user/account ID in
 need not equal the registry label. Discovery login may run before this binding;
 doctor, service and live takeover refuse an absent or mismatched identity.
 
+One account is reached through one connection. The account's own folder,
+$XDG_STATE_HOME/telegram/<account>/linked-by.json, records the connection that
+holds it on this machine and the project whose own connection that is (null
+for one the machine shares); `login` writes it, and a successful `doctor`
+writes it where nothing holds the account yet. `connection add` naming that
+account's expected_account_id, and `login` of any other connection to it, are
+refused with exit 6 `number_linked`, the error carrying `account` and
+`holder` {connection, owner}: nothing is written, and a session the refused
+login had just signed in is signed out again. Another project is given the
+holding connection by a grant instead. The holder logging in again is not
+refused, nor is anyone once the holder was removed.
+
 The write gate: outbound sends and reactions leave the system, so they are off
 unless a connection grants them. Grant them with
 `"allow_write": true` on a connection's grant. A refused write exits
@@ -436,8 +448,9 @@ Exit codes:
      `warnings`, and the doctor stays ok
   6  input / validation — a malformed argument, a bad date, a machine with
      no store configured for the service or its jobs, a profile the
-     service settings name that does not resolve or fit, or a worker still
-     named where a profile is (run `telegram service migrate-profiles`)
+     service settings name that does not resolve or fit, a worker still
+     named where a profile is (run `telegram service migrate-profiles`), or
+     an account another connection already holds (`number_linked`)
 
 Quirks worth knowing:
   - This is a full-account MTProto session — a personal user account, so it
@@ -811,6 +824,214 @@ def _auth_connection_gate(connection_flag: str | None,
 
 
 _contract_bind(globals(), "connections")
+
+_contract_connection = _cmd_connection
+
+
+def _cmd_connection(argv: list[str]) -> None:
+    """The contract's `connection add|remove`, refusing first an add that names
+    an account another connection already holds on this machine
+    (deviations.md): one account is reached through one connection."""
+    if argv[:1] == ["add"]:
+        _refuse_added_account(argv[1:])
+    _contract_connection(argv)
+
+
+def _refuse_added_account(argv: list[str]) -> None:
+    """Refuse `connection add` the account id it gives, read from argv and from
+    the JSON object on stdin, which is handed on unread. What is malformed is
+    left to the contract's own refusals."""
+    given, words = {}, []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--field", "--env", "--identity", "--display-name"):
+            if arg == "--field" and i + 1 < len(argv) and "=" in argv[i + 1]:
+                key, value = argv[i + 1].split("=", 1)
+                given[key.strip()] = value
+            i += 2
+            continue
+        if arg.startswith("--field=") and "=" in arg[len("--field="):]:
+            key, value = arg[len("--field="):].split("=", 1)
+            given[key.strip()] = value
+        else:
+            words.append(arg)
+        i += 1
+    if "--stdin" in words:
+        text = sys.stdin.read()
+        sys.stdin = io.StringIO(text)
+        try:
+            document = json.loads(text) if text.strip() else {}
+        except ValueError:
+            document = None
+        if isinstance(document, dict):
+            given.update(document)
+    names = [w for w in words if not w.startswith("--")]
+    if len(names) != 1:
+        return
+    scope = "global" if {"--global", "--machine"} & set(words) else "project"
+    _refuse_account_held(given.get("expected_account_id"), names[0],
+                         lambda: _connection_owner(names[0], scope))
+
+
+# Which connection holds an account on this machine, the project whose own
+# connection it is (null for one the machine shares), and whether that
+# connection is a row in the store, kept in the account's own folder beside its
+# service control records, which no project's state moves.
+LINKED_BY = "linked-by.json"
+
+
+def _account_key(account) -> str | None:
+    """An account id as the folder it is kept under, or None for no id."""
+    if isinstance(account, bool):
+        return None
+    try:
+        value = int(str(account).strip())
+    except (TypeError, ValueError):
+        return None
+    return str(value) if value > 0 else None
+
+
+def _connection_owner(cid: str, scope: str | None = None) -> str | None:
+    """The project whose own connection `cid` is, as the records keep it, or
+    None for one the machine shares. `scope` is where a connection about to be
+    added is written; without it, where `cid` resolves."""
+    try:
+        adapter = _records()
+        entry = adapter.connections(NAME, include_disabled=True).get(cid)
+        if entry is not None and adapter.mode_of("connection") == "store":
+            return adapter.connection_owner(NAME, cid)
+        if scope is None:
+            scope = (entry or {}).get("scope", ("global",))[0]
+        return adapter.project_id if scope in ("project", "store") else None
+    except (StoreError, AttributeError):
+        return None
+
+
+def _linked_by(key: str) -> dict | None:
+    """The connection that holds account `key` on this machine, as its folder
+    records it."""
+    held = _json_file(_STATE_HOME / NAME / key / LINKED_BY)
+    if isinstance(held, dict) and isinstance(held.get("connection"), str):
+        found = {"connection": held["connection"], "owner": held.get("owner")}
+        if held.get("store") is True:
+            found["store"] = True
+        return found
+    return None
+
+
+def _connection_in_store(cid: str) -> bool:
+    """Whether connection `cid`, as it resolves here, is a row in the store."""
+    try:
+        adapter = _records()
+        return (adapter.mode_of("connection") == "store"
+                and cid in adapter.connections(NAME, include_disabled=True))
+    except (StoreError, AttributeError):
+        return False
+
+
+def _holder_gone(held: dict) -> bool:
+    """Whether the connection an account records as its holder is known to be
+    removed, so the record holds nobody. Another project's own connection is
+    seen only through the store, and only when it was a row there: one that
+    project keeps in files cannot be told gone, and neither can anything when
+    the records do not answer."""
+    try:
+        adapter = _records()
+        if held["owner"] is None:
+            return (held["connection"] not in adapter.resolve_scope(
+                        NAME, "connection", "global")
+                    and held["connection"] not in adapter.connections(
+                        NAME, include_disabled=True))
+        if held["owner"] == adapter.project_id:
+            return held["connection"] not in adapter.connections(
+                NAME, include_disabled=True)
+        if held.get("store") and adapter.mode_of("connection") == "store":
+            return adapter.connection_owner(NAME, held["connection"]) != held["owner"]
+        return False
+    except (StoreError, AttributeError):
+        return False
+
+
+def _record_linked_by(cid: str, account, *, adopt: bool = False) -> None:
+    """Record that connection `cid` holds `account` on this machine. With
+    `adopt`, only where the account records nobody: one signed in before the
+    record existed, or whose holder was removed (a rename), is taken by the
+    first connection that proves it."""
+    key = _account_key(account)
+    if key is None:
+        return
+    held = _linked_by(key)
+    if adopt and held is not None and not _holder_gone(held):
+        return
+    record = {"connection": cid, "owner": _connection_owner(cid)}
+    if _connection_in_store(cid):
+        record["store"] = True
+    with contextlib.suppress(OSError):
+        _atomic_json(_STATE_HOME / NAME / key / LINKED_BY, record)
+
+
+def _account_holder(account, cid: str, owner) -> tuple[str, dict] | None:
+    """The account and the other connection holding it on this machine, where
+    connection `cid` may not have it; else None.
+
+    One account is reached through one connection; another project is given
+    that connection by a grant rather than adding its own for the same account.
+    `owner` is the project whose own connection `cid` is, or a callable
+    answering it, asked only when the connection names match. An account no
+    connection was recorded for is not held, nor is one whose recorded
+    connection was removed: a rename leaves one connection for it."""
+    key = _account_key(account)
+    if key is None:
+        return None
+    held = _linked_by(key)
+    if held is None:
+        return None
+    if held["connection"] == cid:
+        if (owner() if callable(owner) else owner) == held["owner"]:
+            return None
+    if _holder_gone(held):
+        return None
+    return key, held
+
+
+def _die_account_held(key: str, held: dict) -> NoReturn:
+    whose = (f"project {held['owner']}'s connection" if held["owner"]
+             else "the machine's shared connection")
+    _die_with_fields(
+        6, "number_linked",
+        f"Telegram account {key} is already held on this machine by {whose} "
+        f"{held['connection']!r}, and one account is reached through one "
+        f"connection",
+        f"ask whoever holds connection {held['connection']!r} to give this "
+        f"project access to it, and use that connection instead of adding "
+        f"another one for the same account",
+        {"account": key, "holder": {"connection": held["connection"],
+                                    "owner": held["owner"]}})
+
+
+def _refuse_account_held(account, cid: str, owner) -> None:
+    """Refuse connection `cid` the account `account` where another connection
+    already holds it on this machine, before anything is written."""
+    found = _account_holder(account, cid, owner)
+    if found:
+        _die_account_held(*found)
+
+
+def _die_with_fields(exit_code: int, code: str, message: str, hint: str | None,
+                     fields: dict) -> NoReturn:
+    """`_die` for a refusal that carries fields beside its code, written into
+    the same envelope (deviations.md)."""
+    err: dict = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    err.update(fields)
+    if _EVENTS_ON[0]:
+        sys.stdout.write(json.dumps({"event": "error", "exit": exit_code,
+                                     "error": err}, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(exit_code)
 
 
 # --- Connections / credentials ----------------------------------------------
@@ -1314,6 +1535,7 @@ def cmd_doctor(wanted: str | None) -> None:
                 res = asyncio.run(_check_connection(cfg))
                 if res.get("ok"):
                     _record_identity(cid, res["actual_account_id"], res["account"])
+                    _record_linked_by(cid, res["actual_account_id"], adopt=True)
         if not res.get("ok") and not fail_exit:
             fail_exit = res.get("category") or 5
         res.pop("category", None)
@@ -1431,14 +1653,38 @@ def _login_result(cfg: dict, me, **extra) -> dict:
              f"Telegram session account mismatch: expected {cfg['expected_account_id']}, got {me.id}",
              "use the session owned by the configured account or correct expected_account_id")
     _record_identity(cfg["id"], int(me.id), entity_label(me))
+    _record_linked_by(cfg["id"], int(me.id))
     return out
+
+
+async def _refuse_held_login(client, cfg: dict, me, *, fresh: bool) -> None:
+    """Refuse a login that discovered an account another connection already
+    holds on this machine. A session this run signed in is signed out again
+    first, so the refused connection keeps no login of the account; one that
+    was signed in before the run is left as it was. A connection that names
+    its account was refused before the login began."""
+    if cfg.get("expected_account_id") is not None:
+        return
+    found = _account_holder(int(me.id), cfg["id"],
+                            lambda: _connection_owner(cfg["id"]))
+    if not found:
+        return
+    with contextlib.suppress(RPCError, ConnectionError, OSError, sqlite3.Error):
+        if fresh:
+            await client.log_out()
+        else:
+            await client.disconnect()
+    _die_account_held(*found)
 
 
 async def cmd_login(cfg: dict, phone: str | None = None) -> dict:
     client = make_client(cfg)
+    await client.connect()
+    fresh = not await client.is_user_authorized()
     # interactive: phone (unless given) + code (+ 2FA password if set)
     await client.start(**({"phone": phone} if phone else {}))
     me = await client.get_me()
+    await _refuse_held_login(client, cfg, me, fresh=fresh)
     await client.disconnect()
     return _login_result(cfg, me)
 
@@ -1496,6 +1742,7 @@ async def cmd_login_qr(cfg: dict) -> dict:
         await client.connect()
         if await client.is_user_authorized():
             me = await client.get_me()
+            await _refuse_held_login(client, cfg, me, fresh=False)
             return _login_result(cfg, me, already_authorized=True)
 
         qr_login = await client.qr_login()
@@ -1524,6 +1771,7 @@ async def cmd_login_qr(cfg: dict) -> dict:
                 await qr_login.recreate()
                 _event("qr", payload=qr_login.url, expires=qr_login.expires.isoformat(),
                        refreshed=True)
+        await _refuse_held_login(client, cfg, me, fresh=True)
         return _login_result(cfg, me)
     finally:
         await client.disconnect()
@@ -1538,6 +1786,7 @@ async def cmd_login_phone_events(cfg: dict, phone: str | None = None) -> dict:
         await client.connect()
         if await client.is_user_authorized():
             me = await client.get_me()
+            await _refuse_held_login(client, cfg, me, fresh=False)
             return _login_result(cfg, me, already_authorized=True)
         phone = (phone or _event_answer("phone_needed")).strip()
         if not phone:
@@ -1564,6 +1813,7 @@ async def cmd_login_phone_events(cfg: dict, phone: str | None = None) -> dict:
             _die(2, "code_invalid", "Telegram refused the login code",
                  "run `telegram login --phone --events` again for a fresh code")
         me = await client.get_me()
+        await _refuse_held_login(client, cfg, me, fresh=True)
         return _login_result(cfg, me)
     finally:
         await client.disconnect()
@@ -5438,6 +5688,9 @@ def _connection_command(args, connection_flag: str | None,
     """A verb that acts through one connection's session."""
     cfg = _load_config(
         connection_flag, session_flag, allow_discovery=args.cmd == "login")
+    if args.cmd == "login":
+        _refuse_account_held(cfg["expected_account_id"], cfg["id"],
+                             lambda: _connection_owner(cfg["id"]))
     _write_gate(cfg["id"], cfg["allow_write"], args.cmd)
     temporary = None
     # A normal CLI call may be launched by a model-host process rather than the
