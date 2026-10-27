@@ -264,6 +264,26 @@ class NumberLinked(unittest.TestCase):
         self.assertEqual(self.wa._linked_by(self.state / ACCOUNT),
                          {"connection": "renamed", "owner": None})
 
+    def test_a_store_project_does_not_take_a_files_projects_holder(self):
+        home = self.state / ACCOUNT
+        self.wa._write_json(home / self.wa.LINKED_BY,
+                            {"connection": "test", "owner": "filesproject"})
+
+        class StoreRecords:
+            project_id = "storeproject"
+            mode_of = staticmethod(lambda collection: "store")
+            connections = staticmethod(lambda *a, **k: {"other": {}})
+            connection_owner = staticmethod(lambda *a: None)
+
+        with mock.patch.object(self.wa, "_records", lambda: StoreRecords):
+            refusal = self.refusal(
+                lambda: self.wa._refuse_number_linked(ACCOUNT, "other", "storeproject"))
+            self.wa._record_linked_by({"id": "other", "home": str(home)}, adopt=True)
+        self.assertEqual(refusal.fields["holder"],
+                         {"connection": "test", "owner": "filesproject"})
+        self.assertEqual(self.wa._linked_by(home),
+                         {"connection": "test", "owner": "filesproject"})
+
     def test_an_unrecorded_home_is_not_refused(self):
         (self.state / ACCOUNT / self.wa.LINKED_BY).unlink()
         with contextlib.redirect_stdout(io.StringIO()):

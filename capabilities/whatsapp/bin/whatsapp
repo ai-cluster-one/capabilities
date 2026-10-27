@@ -2028,8 +2028,9 @@ def _account_home(key: str, cid: str) -> Path:
     return home
 
 
-# Which connection linked the device in an account's home, and the project whose
-# own connection it is (null for one the machine shares), kept in the home.
+# Which connection linked the device in an account's home, the project whose
+# own connection it is (null for one the machine shares), and whether that
+# connection is a row in the store, kept in the home.
 LINKED_BY = "linked-by.json"
 
 
@@ -2053,15 +2054,29 @@ def _linked_by(home: Path) -> dict | None:
     """The connection a home's device was linked for, as the home records it."""
     held = _json_file(home / LINKED_BY)
     if isinstance(held, dict) and isinstance(held.get("connection"), str):
-        return {"connection": held["connection"], "owner": held.get("owner")}
+        found = {"connection": held["connection"], "owner": held.get("owner")}
+        if held.get("store") is True:
+            found["store"] = True
+        return found
     return None
+
+
+def _connection_in_store(cid: str) -> bool:
+    """Whether connection `cid`, as it resolves here, is a row in the store."""
+    try:
+        adapter = _records()
+        return (adapter.mode_of("connection") == "store"
+                and cid in adapter.connections(NAME, include_disabled=True))
+    except (StoreError, AttributeError):
+        return False
 
 
 def _holder_gone(held: dict) -> bool:
     """Whether the connection a home records as its holder is known to be
     removed, so the record holds nobody. Another project's own connection is
-    seen only through the store; in files it cannot be told gone, and neither
-    can anything when the records do not answer."""
+    seen only through the store, and only when it was a row there: one that
+    project keeps in files cannot be told gone, and neither can anything when
+    the records do not answer."""
     try:
         adapter = _records()
         if held["owner"] is None:
@@ -2069,13 +2084,12 @@ def _holder_gone(held: dict) -> bool:
                         NAME, "connection", "global")
                     and held["connection"] not in adapter.connections(
                         NAME, include_disabled=True))
-        if held["owner"] == adapter.project_id \
-                and held["connection"] in adapter.connections(
-                    NAME, include_disabled=True):
-            return False
-        if adapter.mode_of("connection") == "store":
+        if held["owner"] == adapter.project_id:
+            return held["connection"] not in adapter.connections(
+                NAME, include_disabled=True)
+        if held.get("store") and adapter.mode_of("connection") == "store":
             return adapter.connection_owner(NAME, held["connection"]) != held["owner"]
-        return held["owner"] == adapter.project_id
+        return False
     except (StoreError, AttributeError):
         return False
 
@@ -2089,9 +2103,11 @@ def _record_linked_by(cfg: dict, *, adopt: bool = False) -> None:
     held = _linked_by(home)
     if adopt and held is not None and not _holder_gone(held):
         return
+    record = {"connection": cfg["id"], "owner": _connection_owner(cfg["id"])}
+    if _connection_in_store(cfg["id"]):
+        record["store"] = True
     with contextlib.suppress(OSError):
-        _write_json(home / LINKED_BY, {"connection": cfg["id"],
-                                       "owner": _connection_owner(cfg["id"])})
+        _write_json(home / LINKED_BY, record)
 
 
 def _refuse_number_linked(number, cid: str, owner) -> None:
@@ -2127,7 +2143,8 @@ def _refuse_number_linked(number, cid: str, owner) -> None:
         f"ask whoever holds connection {held['connection']!r} to give this "
         f"project access to it, and use that connection instead of adding "
         f"another one for the same number",
-        fields={"account": key, "holder": held})
+        fields={"account": key, "holder": {"connection": held["connection"],
+                                           "owner": held["owner"]}})
 
 
 def _connection_home(cfg: dict) -> Path:
