@@ -246,6 +246,36 @@ def test_an_id_that_cannot_be_a_remote_name_is_refused(project):
     assert cfg is None and problem["code"] == "bad_connection_id"
 
 
+def _doctor_argv(entry: dict) -> tuple[list, dict]:
+    cfg, problem = module._build_cfg("r2", entry)
+    assert problem is None
+    seen = {}
+    def fake_run(argv, *a, env=None, **kw):
+        seen["argv"], seen["env"] = argv, env
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    with patch.object(module.subprocess, "run", fake_run):
+        assert module._check_connection(cfg) == {"ok": True}
+    return seen["argv"], seen["env"]
+
+
+def test_doctor_lists_the_path_a_connection_names_for_its_check(project):
+    """A bucket-scoped key may not list buckets; doctor lists the bucket it is for."""
+    argv, env = _doctor_argv({"type": "s3", "options": {"provider": "Cloudflare"},
+                              "check_path": "own-bucket"})
+    assert argv[:3] == ["rclone", "lsd", "r2:own-bucket"]
+    assert not any("CHECK_PATH" in key for key in env)
+
+
+def test_doctor_lists_the_remote_root_without_a_check_path(project):
+    argv, _ = _doctor_argv({"type": "s3", "options": {"provider": "Cloudflare"}})
+    assert argv[:3] == ["rclone", "lsd", "r2:"]
+
+
+def test_a_check_path_that_is_not_a_string_is_refused(project):
+    cfg, problem = module._build_cfg("r2", {"type": "s3", "check_path": ["b"]})
+    assert cfg is None and problem["code"] == "bad_check_path"
+
+
 def test_connections_report_masks_every_secret(project):
     report = module._connections_report()
     assert set(report["connections"]) == {"gd", "r2"}

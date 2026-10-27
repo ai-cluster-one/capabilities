@@ -4,7 +4,7 @@ This file's sole purpose is to hold `rclonec`'s deliberate, justified departures
 
 ## Transport is a subprocess passthrough to `rclone`, not an HTTP/JSON API
 
-rclonec's forwarded verbs make no network call of their own: rclonec resolves a connection into an rclone remote definition, places it in the child environment, and `subprocess`-execs `rclone` (the [railwayc](../railwayc/) precedent of putting credentials in front of an official CLI). The *resilient-HTTP* intent — backoff, retry, status mapping — is realized by `rclone` itself, which owns retries, chunking and rate-limit handling for every backend it speaks. rclonec makes no HTTP call anywhere, including in `doctor`: its readiness probe is `rclone lsd <remote>:` under the connection's own configuration, so readiness is proven over exactly the path the work verbs use rather than a parallel one.
+rclonec's forwarded verbs make no network call of their own: rclonec resolves a connection into an rclone remote definition, places it in the child environment, and `subprocess`-execs `rclone` (the [railwayc](../railwayc/) precedent of putting credentials in front of an official CLI). The *resilient-HTTP* intent — backoff, retry, status mapping — is realized by `rclone` itself, which owns retries, chunking and rate-limit handling for every backend it speaks. rclonec makes no HTTP call anywhere, including in `doctor`: its readiness probe is `rclone lsd <remote>:` under the connection's own configuration, or `rclone lsd <remote>:<check_path>` when the connection names the path it is for, so readiness is proven over exactly the path the work verbs use rather than a parallel one.
 
 ## Forwarding is transparent — rclone owns the forwarded command's contract
 

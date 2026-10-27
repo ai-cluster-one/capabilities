@@ -89,6 +89,12 @@ CONNECTIONS
   4, and so does a forwarded transfer whose DESTINATION is this remote; reading from it
   stays available. Nothing in the cascade lifts the gate.
 
+  `check_path` names the path under the remote that `doctor` lists to prove the
+  connection, in place of the remote's top level - a bucket, or `bucket/prefix`, for a
+  key scoped to one bucket that may not list them all. It is rclonec's own field, sits
+  beside `options` rather than in it, and never reaches rclone's configuration; without
+  it doctor lists `<id>:`.
+
   Outside any project, connections and doctor are machine reads: they use the
   machine's own connections read-only, unless a grant switched one off; every
   other verb that needs a connection is refused there.
@@ -132,6 +138,12 @@ CONN_FIELDS = [{'key': 'type',
   'help': 'Maps each secret rclone option to the env key that holds its value, e.g. '
           'token.',
   'type': 'object',
+  'required': False},
+ {'key': 'check_path',
+  'label': 'Doctor check path',
+  'help': 'The path under the remote doctor lists instead of its top level, e.g. the '
+          'one bucket a scoped key may reach.',
+  'type': 'string',
   'required': False}]
 WRITE_DEFAULT = True    # a connection points at a store the consumer owns
 MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
@@ -255,6 +267,13 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
             "message": f"connection {cid!r} is missing 'type'",
             "hint": "name the rclone backend, e.g. \"drive\" or \"s3\"; "
                     "`rclone help backends` lists them"}
+    check_path = entry.get("check_path")
+    if check_path is not None and not isinstance(check_path, str):
+        return None, {
+            "exit": 6, "code": "bad_check_path",
+            "message": f"connection {cid!r} has a 'check_path' that is not a string",
+            "hint": "name the path doctor lists under the remote, e.g. \"bucket\" or "
+                    "\"bucket/prefix\""}
     secrets: dict = {}
     for opt, env_key in _secret_map(entry).items():
         value = _resolve_env_key(env_key)[0]
@@ -266,7 +285,7 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
                         f"environment"}
         secrets[opt] = value
     return {"id": cid, "type": backend, "options": _options_of(entry),
-            "secrets": secrets,
+            "secrets": secrets, "check_path": check_path or "",
             "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT))}, None
 
 
@@ -450,15 +469,17 @@ def _summarize_failure(text: str) -> str | None:
 
 
 def _check_connection(cfg: dict) -> dict:
-    """One connection's round-trip: list the remote's top level under its own
-    configuration. Reported rather than died, so doctor covers every connection."""
+    """One connection's round-trip: list the path the connection declares for the check,
+    or the remote's top level, under its own configuration. Reported rather than died,
+    so doctor covers every connection."""
+    target = f"{cfg['id']}:{cfg.get('check_path') or ''}"
     try:
-        proc = subprocess.run([RCLONE, "lsd", f"{cfg['id']}:", "--retries", "1"],
+        proc = subprocess.run([RCLONE, "lsd", target, "--retries", "1"],
                               env=_child_env(cfg), capture_output=True, text=True,
                               timeout=DOCTOR_TIMEOUT)
     except subprocess.TimeoutExpired:
         return {"ok": False, "category": 5,
-                "error": f"rclone was unresponsive (lsd {cfg['id']}: timed out)"}
+                "error": f"rclone was unresponsive (lsd {target} timed out)"}
     except OSError as e:
         return {"ok": False, "category": 5, "error": f"could not run {RCLONE}: {e}"}
     if proc.returncode == 0:
