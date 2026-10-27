@@ -746,7 +746,8 @@ def test_exec_refuses_an_unknown_node_and_a_missing_command(lab, monkeypatch):
 
 
 def update_args(**extra):
-    return SimpleNamespace(**{"node": "box1", "version": "0.0.10", "wait": 30, **extra})
+    return SimpleNamespace(**{"node": "box1", "version": "0.0.10", "memory": None, "wait": 30,
+                              **extra})
 
 
 def test_update_moves_a_standard_image_node_to_the_tag_and_waits_for_its_agent(lab, capsys):
@@ -788,6 +789,28 @@ def test_update_keeps_the_memory_limit_the_node_runs_with(lab, capsys):
     lab.m.cmd_node_update(update_args())
     assert 'mem_limit: "1536m"' in lab.fake.compose
     assert json.loads(capsys.readouterr().out)["memory"] == "1536m"
+
+
+@pytest.mark.parametrize("version", ["0.0.10", "0.0.1"])
+def test_update_writes_the_memory_limit_it_is_given(lab, capsys, version):
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.m.cmd_node_update(update_args(version=version, memory="5g"))
+    # On the tag or off it, a new limit writes the document and redeploys it.
+    assert lab.fake.compose == lab.m._agent_node_compose(
+        "prj_00000000a1a1", f"ghcr.io/agenium-dev/agent-node:{version}", "5g")
+    assert [c["argv"][3:] for c in lab.fake.of("coolify")
+            if c["argv"][3:4] == ["deploy"]] == [["deploy", "svc-new"]]
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["memory"] == "5g" and answer["redeployed"] is True
+
+
+def test_update_with_the_memory_limit_the_node_runs_with_does_not_redeploy_it(lab, capsys):
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.m.cmd_node_update(update_args(version="0.0.1", memory="2048m"))
+    assert lab.fake.compose is None
+    assert json.loads(capsys.readouterr().out)["redeployed"] is False
 
 
 def _refused_before_any_change(lab, code):
@@ -939,6 +962,11 @@ def test_update_refuses_without_set_compose_a_bad_tag_and_an_unknown_node(lab):
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_update(update_args(version="../x"))
     assert refused.value.code == "input"
+    for memory in ("", "5 g", "0g", "5t"):
+        with pytest.raises(lab.m.NodeFailure) as refused:
+            lab.m.cmd_node_update(update_args(memory=memory))
+        assert refused.value.code == "input" and refused.value.exit_code == 6
+        assert refused.value.message == "--memory takes a size such as 2g or 1536m"
     lab.fake.set_compose = False
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_update(update_args())

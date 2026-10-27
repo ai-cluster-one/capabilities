@@ -382,7 +382,7 @@ USAGE
       0.0.2 and later), through which git also reaches github.com over
       https. Each is kept on the node's volumes and outlives a new image
       tag.
-  deployment node update <node> --version <tag> [--wait 600]
+  deployment node update <node> --version <tag> [--memory <size>] [--wait 600]
       Move a node of the standard image to ghcr.io/agenium-dev/agent-node:<tag>
       through the coolify connection its row names: write its Coolify
       service the whole Compose document `node create` writes for it, with
@@ -393,9 +393,11 @@ USAGE
       that image, report healthy (when the image has a health check) and its
       agent state to read running. The document's service name and volume
       names are node create's; its environment is this agent's id and
-      CAPABILITIES_PROJECT_ID_ROOT; its memory limit is the one the node's
-      container runs with. Before writing, it reads the node's one agent
-      container over SSH (`docker inspect`) and refuses, changing nothing,
+      CAPABILITIES_PROJECT_ID_ROOT; its memory limit is --memory, a size as
+      node create takes it (exit 6 input otherwise), or without it the one
+      the node's container runs with. Before writing, it reads the node's
+      one agent container over SSH (`docker inspect`) and refuses, changing
+      nothing,
       unless each volume the document mounts is the one mounted at that
       path (<resource>_<name>) and nothing else is mounted but the image's
       own anonymous volumes (exit 6 node_volumes_unconfirmed); a path the
@@ -407,8 +409,8 @@ USAGE
       besides the image's environment, Coolify's own keys and a retired
       AGENT_NODE_NAME other than the node's id or AGENT_NODE_ID equal to it,
       which the new document drops (exit 6 node_document_unconfirmed). A node
-      running the tag with no volume to gain is not written, and is
-      redeployed only when its container is not running, so running the
+      running the tag with no volume to gain and no new memory limit is not
+      written, and is redeployed only when its container is not running, so running the
       update again finishes one that left the node down; a node with no
       agent container at all is refused (node_document_unconfirmed) and
       brought back first with `coolify deploy <uuid>`. Answers {ok, node,
@@ -9307,6 +9309,12 @@ def _agent_node_memory(limit):
     return str(limit)
 
 
+def _agent_node_memory_bytes(size):
+    """A Compose memory size in bytes: 2g as 2147483648, a bare number as bytes."""
+    unit = {"b": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30}.get(size[-1].lower())
+    return int(size[:-1]) * unit if unit else int(size)
+
+
 def _agent_node_containers(root, host, resource):
     """The ids of the Compose project `resource`'s agent containers on `host`,
     stopped ones too."""
@@ -9400,6 +9408,8 @@ def cmd_node_update(args):
         raise NodeFailure("input", "--version takes the standard image's tag", 6)
     if args.wait < 0:
         raise NodeFailure("input", "--wait takes a number of seconds", 6)
+    if args.memory is not None and not AGENT_NODE_MEMORY_LIMIT.fullmatch(args.memory):
+        raise NodeFailure("input", "--memory takes a size such as 2g or 1536m", 6)
     project_id, _slug = _agent_node_project(root)
     row = _agent_node_row(root, node)
     if row is None:
@@ -9444,15 +9454,20 @@ def cmd_node_update(args):
     # node's container first, and nothing changes unless it agrees.
     found = _agent_node_document(root, host, resource, project_id, node)
     previous = found["image"]
-    # A node not on the tag, or one that has a volume to gain, has its
-    # document written again; one that is not running the tag (a container
-    # on another tag, or one on it that has stopped) is started again, so an
-    # update that left the node down is finished by running it once more.
-    rewrite = previous != image or bool(found["volumes_added"])
+    # --memory replaces the limit the container runs with; without it that
+    # limit is kept.
+    memory = (found["memory"] if args.memory is None
+              else _agent_node_memory(_agent_node_memory_bytes(args.memory)))
+    # A node not on the tag, one that has a volume to gain, or one whose
+    # memory limit changes has its document written again; one that is not
+    # running the tag (a container on another tag, or one on it that has
+    # stopped) is started again, so an update that left the node down is
+    # finished by running it once more.
+    rewrite = previous != image or bool(found["volumes_added"]) or memory != found["memory"]
     redeployed = rewrite or _agent_node_running(root, host, row) is None
     if rewrite:
         _node_coolify(root, target, "service", "set-compose", resource, "--compose", "-",
-                      stdin=_agent_node_compose(project_id, image, found["memory"]))
+                      stdin=_agent_node_compose(project_id, image, memory))
     if redeployed:
         _node_coolify(root, target, "deploy", resource)
     deadline = time.monotonic() + args.wait
@@ -9467,7 +9482,7 @@ def cmd_node_update(args):
     answer = {"ok": up, "node": node, "label": row.get("label"), "resource": resource,
               "version": args.version, "image": image,
               "previous_image": previous, "redeployed": redeployed,
-              "memory": found["memory"], "env_dropped": found["env_dropped"],
+              "memory": memory, "env_dropped": found["env_dropped"],
               "volumes": [name for name, _path in AGENT_NODE_VOLUMES],
               "volumes_added": found["volumes_added"],
               "container": container, "running_image": now_image, "health": health,
@@ -9650,6 +9665,7 @@ def main(argv: list[str] | None = None) -> None:
     p = node.add_parser("update", add_help=False)
     p.add_argument("node")
     p.add_argument("--version", required=True)
+    p.add_argument("--memory")
     p.add_argument("--wait", type=int, default=600)
     p.set_defaults(fn=cmd_node_update)
     p = node.add_parser("remove", add_help=False)

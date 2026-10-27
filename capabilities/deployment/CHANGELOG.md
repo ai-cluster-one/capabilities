@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-27 — `node update --memory` changes a node's memory limit
+
+`deployment node update <node> --version <tag> --memory <size>` writes the node's Compose document with that memory limit instead of the one its container runs with, and redeploys the node, also when it already runs the tag; before, a node kept the limit `node create` gave it unless its Compose was edited by hand. The size is taken as `node create` takes it, and a malformed one is refused with exit 6 `input` before anything changes. A size equal to the running limit changes nothing, and without `--memory` the running limit is kept as before. The answer's `memory` is the limit written.
+
 ## 2026-10-26 — A box runs a service that has only a machine form
 
 In store mode a container box now carries every installed service that declares a machine command (`service.machine`) and no project one (`service.deploy`), less `capabilities.exclude`, embedded whatever the runtime's shape, since it has no container of its own: it is listed in `embedded_services` and on the node service manager's `capabilities node run --services` list, so a placement on the node starts its `<name>.machine` program there. Before, only services with `service.deploy` reached that list, and such a service placed on a box ran nowhere. A host profile compiles none of them.
