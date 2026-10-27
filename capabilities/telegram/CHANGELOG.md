@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-27 — The service finds a key in the agent's vault, as the CLI does
+
+The daemon and the call recorder resolve every credential they read - the Telegram app's id and hash, a connection's own hash, the voice keys, the Deepgram key and `TELEGRAM_SESSION` - through the CLI's own credential cascade, the shared library's, instead of a lookup of their own that read only the project's `.env.local`/`.env`, `credentials.env`, `shared.env` and the process environment. A key `telegram connections` reports as `vault:<agent>` is now found by the service as well, where the daemon used to exit with `TELEGRAM_API_HASH not resolved`. The order is unchanged: the project's files, then the machine's files, then the process environment, then the vault. The not-resolved message names the vault. `service/daemon.py` and `service/call_recorder.py` declare `capabilities-contract>=0.25,<1`, the first release that reads the vault.
+
 ## 2026-10-25 — `service doctor` names why the service cannot work
 
 A failing `telegram service doctor` still prints its report and exits 5, and now also prints the contract's error envelope naming the first thing it found: `service_unhealthy` with the running daemon's health and last error (for a session that is not signed in, `session not authorized — exec in and run: telegram login ...`), `worker_unavailable` with the profile that cannot run a turn, or the job register's own store code. A supervisor that runs the doctor, such as `deployment runner`, records that as why the service is unusable. A route skipped on this node is listed under `skipped_settings`, as `{setting, project, reason}`, beside the `warnings` that already named it, and the doctor stays ok.

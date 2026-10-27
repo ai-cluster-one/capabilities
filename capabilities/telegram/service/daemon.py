@@ -8,7 +8,7 @@
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract>=0.12,<1",
+#     "capabilities-contract>=0.25,<1",
 #     "callva-harness-runner==0.10.1",
 # ]
 # ///
@@ -296,10 +296,6 @@ RECOVERY_IDLE_POLL = 5.0
 RECOVERY_MAX_GAP = 600.0
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
-CRED_FILE = CONFIG_HOME / "telegram" / "credentials.env"
-# The machine's one home for a value several capabilities share, keyed by its
-# shared name, asked before CRED_FILE (SHEBANG.md, "The credential cascade").
-SHARED_CRED_FILE = CONFIG_HOME / "capabilities" / "shared.env"
 DEFAULT_SESSION = STATE_HOME / "telegram" / "session"
 if (not DEFAULT_SESSION.with_suffix(".session").exists()
         and (CONFIG_HOME / "telegram" / "session.session").exists()):
@@ -919,19 +915,10 @@ def _project_env_value(key):
     return os.environ.get(key)
 
 
-def _env_value(key, shared=None):
-    for path in (PROJECT_ROOT / ".env.local", PROJECT_ROOT / ".env"):
-        value = _parse_env_file(path).get(key)
-        if value:
-            return value
-    if shared:
-        value = _parse_env_file(SHARED_CRED_FILE).get(shared)
-        if value:
-            return value
-    value = _parse_env_file(CRED_FILE).get(key)
-    if value:
-        return value
-    return os.environ.get(key)
+def _env_value(key):
+    """A credential as the CLI resolves it (SHEBANG.md, "The credential
+    cascade"), the agent's vault included."""
+    return records.credential(PROJECT_ROOT, key)
 
 
 def _project_path(value):
@@ -2278,11 +2265,11 @@ def resolve_creds():
         api_id_raw = _env_value("TELEGRAM_API_ID")
         secret_env = "TELEGRAM_API_HASH"
     if not api_id_raw:
-        sys.exit("TELEGRAM_API_ID not resolved (project .env.local, credentials.env, or env)")
+        sys.exit("TELEGRAM_API_ID not resolved (project .env.local, credentials.env, env, or the agent's vault)")
     api_id = int(api_id_raw)
     api_hash = _env_value(secret_env)
     if not api_hash:
-        sys.exit(f"{secret_env} not resolved (project .env.local, credentials.env, or env)")
+        sys.exit(f"{secret_env} not resolved (project .env.local, credentials.env, env, or the agent's vault)")
     return api_id, api_hash
 
 
@@ -4154,7 +4141,7 @@ def deepgram_transcribe(audio, mime="audio/ogg"):
     """Transcribe voice-note bytes via Deepgram's prerecorded API. Blocking (urllib) —
     call from an executor. Returns the transcript, or None on any failure (no key,
     network, empty). Telegram voice notes are OGG/Opus."""
-    key = _env_value("DEEPGRAM_API_KEY", shared="DEEPGRAM_API_KEY")
+    key = _env_value("DEEPGRAM_API_KEY")
     if not key:
         return None
     url = ("https://api.deepgram.com/v1/listen"

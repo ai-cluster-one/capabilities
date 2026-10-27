@@ -5,7 +5,7 @@
 #     "py-tgcalls==3.0.1b1",
 #     "ntgcalls==3.0.3",
 #     "telethon==1.45.0",
-#     "capabilities-contract>=0.12,<1",
+#     "capabilities-contract>=0.25,<1",
 # ]
 # ///
 # The 3.x line is what carries conference calls: joining one needs
@@ -85,7 +85,6 @@ import records
 
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
-USER_CREDENTIALS = CONFIG_HOME / "telegram" / "credentials.env"
 JOIN_ATTEMPTS = 3
 JOIN_TIMEOUT_SECONDS = 20
 JOIN_RETRY_COOLDOWN_SECONDS = 15
@@ -199,30 +198,9 @@ def project_capabilities_dir(root: Path) -> Path:
     return legacy
 
 
-def parse_env_file(path: Path) -> dict[str, str]:
-    try:
-        lines = path.read_text().splitlines()
-    except OSError:
-        return {}
-    values: dict[str, str] = {}
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        if key.startswith("export "):
-            key = key[len("export "):].strip()
-        values[key] = value.strip().strip('"').strip("'")
-    return values
-
-
 def env_value(root: Path, key: str) -> str | None:
-    for path in (root / ".env.local", root / ".env", USER_CREDENTIALS):
-        value = parse_env_file(path).get(key)
-        if value:
-            return value
-    return os.environ.get(key) or None
+    """A credential as the CLI resolves it, the agent's vault included."""
+    return records.credential(root, key)
 
 
 def connections_registry(root: Path) -> tuple[dict | None, str | None]:
