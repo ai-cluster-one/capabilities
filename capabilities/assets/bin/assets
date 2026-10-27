@@ -163,8 +163,10 @@ FILES  (reading; `files list` reads the store only)
       included: each `created` or `replaced` (files add, import), `linked` or
       `unlinked` (files link) or `removed` (files rm), with the record it
       wrote or retired - its name, size, sha256 and document - and who did it
-      and when. An `unchanged` answer writes nothing and logs nothing; the
-      log starts when the store's assets tables reached schema 1.2.
+      and when. An `unchanged` answer writes nothing and logs nothing. The
+      log starts when the store's assets tables reached schema 1.2, and holds
+      only the writes of an `assets` that has this verb: an older `assets`
+      still writes to a store at 1.2, and its writes are not in the log.
   assets files get <name> --out PATH|- [--connection ID]
       Fetch the file from the bucket, check its size and sha256 against its
       record, and write it to PATH (`-` writes the bytes alone to stdout, with
@@ -673,7 +675,8 @@ class _Bucket:
 # The log references the file record by its key, as a file does its document,
 # and like every other table here it is never edited or deleted. It starts when
 # the step is applied: what happened to a file before then is not known, so
-# nothing is backfilled.
+# nothing is backfilled. The executable writes it, not the store, so an older
+# assets writing to a migrated store leaves no record; the help says so.
 TABLES_MAJOR, TABLES_MINOR = 1, 2
 TABLE_STEPS = [
     ("0001-documents", """
