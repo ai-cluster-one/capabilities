@@ -1,5 +1,7 @@
 #!/bin/sh
-# capabilities bootstrap — installs ONE thing: the `capabilities` manager.
+# capabilities bootstrap — installs the `capabilities` manager, and the `uv`
+# it runs on: Astral's official installer when uv is missing, `uv self update`
+# when it is present.
 #
 #   curl -fsSL https://raw.githubusercontent.com/ai-cluster-one/capabilities/main/install.sh | sh
 #
@@ -28,7 +30,21 @@ MANAGER="$MANAGER_DIR/capabilities"
 err() { printf '%s\n' "$*" >&2; exit 1; }
 
 command -v curl >/dev/null 2>&1 || err "curl is required"
-command -v uv >/dev/null 2>&1 || printf 'NOTE: `uv` is not on PATH — the manager needs it to run.\n      Install it first: https://docs.astral.sh/uv/getting-started/installation/\n' >&2
+CALLER_PATH="$PATH"
+
+# uv runs the manager and every capability (`uv run --script`). Astral's
+# installer puts it in the first of these; a non-login shell may not have that
+# directory on PATH yet, so look there before deciding it is missing.
+find_uv() {
+    command -v uv >/dev/null 2>&1 && return 0
+    for dir in "${UV_INSTALL_DIR:-}" "${XDG_BIN_HOME:-}" "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+        [ -n "$dir" ] && [ -x "$dir/uv" ] || continue
+        PATH="$dir:$PATH"; export PATH
+        return 0
+    done
+    return 1
+}
+if find_uv; then UV_PLAN="update   uv (uv self update)"; else UV_PLAN="install  uv (https://astral.sh/uv/install.sh)"; fi
 
 # bin dir: explicit > first of ~/.local/bin, ~/bin already on PATH > ~/.local/bin
 if [ -n "${CAPABILITIES_BIN:-}" ]; then
@@ -37,11 +53,12 @@ else
     BIN_DIR="$HOME/.local/bin"
     for cand in "$HOME/.local/bin" "$HOME/bin"; do
         [ -d "$cand" ] || continue
-        case ":$PATH:" in *":$cand:"*) BIN_DIR="$cand"; break;; esac
+        case ":$CALLER_PATH:" in *":$cand:"*) BIN_DIR="$cand"; break;; esac
     done
 fi
 
 printf 'capabilities bootstrap — the plan:\n'
+printf '  %s\n' "$UV_PLAN"
 printf '  fetch    %s/bin/capabilities\n' "$REPO"
 if [ -n "$SHA256" ]; then printf '  verify   sha256 %s\n' "$SHA256"; else printf '  verify   (no checksum pinned for ref %s)\n' "$TAG"; fi
 printf '  place    %s\n' "$MANAGER"
@@ -51,6 +68,15 @@ if (exec < /dev/tty) 2>/dev/null; then
     printf 'Proceed? [Y/n] '
     read -r answer < /dev/tty || answer=""
     case "$answer" in n*|N*) err "aborted";; esac
+fi
+
+if find_uv; then
+    # uv installed by another route (a package manager, a root-owned image
+    # layer) cannot update itself; it still runs the manager, so carry on.
+    uv self update >/dev/null 2>&1 || printf 'NOTE: `uv self update` did not run; keeping %s (%s).\n' "$(command -v uv)" "$(uv --version 2>/dev/null)" >&2
+else
+    curl -LsSf https://astral.sh/uv/install.sh | sh || err "uv install failed: https://astral.sh/uv/install.sh"
+    find_uv || err "uv was installed but cannot be found; open a new shell and re-run this installer"
 fi
 
 tmp="$(mktemp)"
@@ -144,7 +170,7 @@ fi
 # bootstrap owns it: nothing else runs on a machine that has only the manager.
 "$BIN_DIR/capabilities" skill >/dev/null || printf 'NOTE: could not generate the agent skill — run `capabilities skill`.\n' >&2
 
-case ":$PATH:" in
+case ":$CALLER_PATH:" in
     *":$BIN_DIR:"*) ;;
     *) printf 'NOTE: %s is not on PATH — add it so `capabilities` resolves by name.\n' "$BIN_DIR" >&2;;
 esac

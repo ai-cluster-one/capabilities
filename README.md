@@ -86,7 +86,7 @@ These are the alignment signal — the standard `capabilities audit` walks rule 
 
 ## Try it
 
-Bootstrap installs **one** thing — the `capabilities` manager:
+Bootstrap installs the `capabilities` manager, and the [`uv`](https://docs.astral.sh/uv/) it runs on — by Astral's official installer when it is missing, `uv self update` when it is present:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ai-cluster-one/capabilities/main/install.sh | sh
