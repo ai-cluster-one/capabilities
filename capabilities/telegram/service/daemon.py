@@ -142,6 +142,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from call_recording_helpers import (
     concat_captures,
     display_duration,
+    ensure_ffmpeg,
     finalize_mp3_capture,
     iso_utc,
     report_recording_failure,
@@ -6028,6 +6029,9 @@ def call_recording_lifecycle(*, calls, client, recording_output,
             "mode": mode,
         })
 
+        # PyTgCalls writes the capture through `ffmpeg` on PATH, so it is
+        # fetched before the call is joined where the machine has none.
+        await ensure_ffmpeg()
         try:
             if mode == "conference":
                 await join_conference_on_a_current_chain(
@@ -10108,6 +10112,9 @@ async def run_session(client):
             # Attempt to join (with retries)
             from pytgcalls.types import GroupCallConfig
             from pytgcalls.exceptions import NoActiveGroupCall
+            # PyTgCalls writes the capture through `ffmpeg` on PATH, so it is
+            # fetched before the call is joined where the machine has none.
+            await ensure_ffmpeg()
             joined = False
             JOIN_ATTEMPTS = 3
             for attempt in range(1, JOIN_ATTEMPTS + 1):

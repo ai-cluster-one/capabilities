@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-27 — A call recording fetches ffmpeg before it joins the call, so the first one on a machine without ffmpeg is captured
+
+PyTgCalls writes a recording's capture through `ffmpeg` on PATH from the moment the call is joined, so where the machine had no ffmpeg the first recording failed at the join, before anything had fetched it. Every recording - the service's incoming calls and group calls, and `call_recorder` on a chat, with `--watch-groups` and with `--listen` - now fetches ffmpeg into `$XDG_STATE_HOME/telegram/programs/ffmpeg` before it joins, where none is on PATH, and the capture runs on that copy. The first such recording waits for the fetch; later ones find the copy. Where ffmpeg is on PATH nothing changes.
+
 ## 2026-10-27 — Call recording fetches its own ffmpeg on first use where none is on PATH, and `telegram manifest` declares it
 
 Where `ffmpeg` is not on PATH, the first recording that needs it - its encode, the join of a recording a restart split, its duration, its waveform, a voice-agent call's stereo track - fetches ffmpeg through uv from the `imageio-ffmpeg` 0.6.0 wheel, a static build with libopus for linux and macOS on amd64 and arm64, and keeps it at `$XDG_STATE_HOME/telegram/programs/ffmpeg`, as the user and without root or a package manager. The service puts that folder on the end of its PATH, so an ffmpeg on the machine is still the one that runs and every later recording uses the fetched one where there is none. A fetch that fails leaves the recording failed with `ffmpeg_unavailable` naming what failed, as a missing ffmpeg did before. A recording's duration is now read from the `Duration:` ffmpeg prints rather than from `ffprobe`, which the wheel does not carry, so a recording no longer needs ffprobe. `telegram manifest` now carries `programs`, naming ffmpeg and what stops without it, so `capabilities doctor` can say it is missing.

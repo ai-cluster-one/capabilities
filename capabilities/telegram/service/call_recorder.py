@@ -73,6 +73,7 @@ from telethon.tl.types import (
 from call_recording_helpers import (
     build_voice_waveform,
     display_duration,
+    ensure_ffmpeg,
     finalize_mp3_capture,
     iso_utc,
     recording_caption,
@@ -511,6 +512,9 @@ async def run(args: argparse.Namespace, config: dict, runtime_session: Path) -> 
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, stop_event.set)
 
+        # PyTgCalls writes the capture through `ffmpeg` on PATH, so it is
+        # fetched before the call is joined where the machine has none.
+        await ensure_ffmpeg()
         await calls.record(
             chat_id,
             built_in_record_stream(capture),
@@ -852,6 +856,9 @@ async def watch_groups(
         }
         write_metadata(metadata_path, metadata)
 
+        # PyTgCalls writes the capture through `ffmpeg` on PATH, so it is
+        # fetched before the call is joined where the machine has none.
+        await ensure_ffmpeg()
         joined = False
         for attempt in range(1, JOIN_ATTEMPTS + 1):
             metadata["join"].update({"attempts": attempt, "status": "joining"})
@@ -1267,6 +1274,9 @@ async def listen(args: argparse.Namespace, config: dict, runtime_session: Path) 
             mode=mode,
             source_message_id=source_message_id,
         )
+        # PyTgCalls writes the capture through `ffmpeg` on PATH, so it is
+        # fetched before the call is joined where the machine has none.
+        await ensure_ffmpeg()
         try:
             if mode == "conference":
                 call_config = CallConfig(conference=source_message_id)
