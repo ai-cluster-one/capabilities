@@ -967,41 +967,52 @@ PROJECT VERBS (run inside a consuming project)
   node state
         What each of this agent's nodes last said of itself, as its row of
         capabilities_node_states holds it, one row per machine shared by
-        every agent on it: {ok, project, agent_id, nodes [{node, label,
-        reachable, load_1, load_5, load_15, cpu_count, memory_used_bytes,
-        memory_limit_bytes, disk_used_bytes, disk_total_bytes, booted_at,
-        uptime_seconds, boot_line, image_version, claude_login,
-        claude_account, codex_login, codex_account, gh_login, gh_account,
+        every agent on it, with this agent's own sign-ins there from
+        capabilities_node_logins: {ok, project, agent_id, nodes [{node,
+        label, reachable, load_1, load_5, load_15, cpu_count,
+        memory_used_bytes, memory_limit_bytes, disk_used_bytes,
+        disk_total_bytes, booted_at, uptime_seconds, boot_line,
+        image_version, claude_login, claude_account, codex_login,
+        codex_account, gh_login, gh_account, logins_checked_at,
         reported_at, fresh_until, sessions [{capability, connection, live,
         account, checked_at}]}], store}. A row stands for its node for 90
         seconds after it is written (fresh_until, the store's time):
         reachable is whether that has not yet passed, by the store's now,
         and a node that never wrote one reads unreachable with every field
-        null. Memory is the container's under a memory limit, its usage less
-        the file cache it can give back, else the machine's; disk is the
-        filesystem holding the home; booted_at is the container's start on a
-        container node, the machine's boot otherwise. boot_line and
-        image_version are what an agent-node image says of itself, through
-        the files AGENT_NODE_STATE_FILE and AGENT_NODE_VERSION_FILE name;
-        null off the image. Each tool's login is signed_in, signed_out,
-        absent (not on PATH) or unknown (its answer could not be read), from
-        its own status answer - `claude auth status --json`, `codex login
-        status`, `gh auth status --json hosts` for github.com - with the
-        account it states only while signed in; no token is read or kept.
+        null. Memory is the container's under a memory limit, its usage
+        less the file cache it can give back, else the machine's; disk is
+        the filesystem holding the home; booted_at is the container's
+        start on a container node, the machine's boot otherwise. boot_line
+        and image_version are what an agent-node image says of itself,
+        through the files AGENT_NODE_STATE_FILE and
+        AGENT_NODE_VERSION_FILE name; null off the image. Each tool's
+        login is signed_in, signed_out, absent (not on PATH) or unknown
+        (its answer could not be read), from its own status answer -
+        `claude auth status --json`, `codex login status`, `gh auth status
+        --json hosts` for github.com - with the account it states only
+        while signed in; no token is read or kept. A sign-in is this
+        agent's on that node, not the machine's: a tool keeps it in the
+        home of the OS user it runs as, so on a Mac with an agent under
+        each of several OS users each agent reads its own. Every login
+        field is null while the node has written none for this agent.
         sessions are this agent's on that node: for each installed
         capability whose manifest declares connections.device_bound, every
         connection whose `connections --json` answer in the agent's folder
         there carries a session {live, account}.
   node state report
         Write this node's state once: the row `node state` reads, and the
-        sessions of every agent the store links to this node whose folder
-        here is bound to it, each capability's set replaced and those of an
-        agent or capability no longer asked here dropped. The node is the
-        one this process runs on (`node id`); a node reports itself and no
-        other. `node run` writes it every 15 seconds and right after a
-        reconcile that changed a job. Answers {ok, project, agent_id, node,
-        state, sessions, store}, state and sessions as `node state` gives
-        them for this node. Exit 6 node_unknown for a node not registered.
+        sign-ins and sessions of every agent the store links to this node
+        whose folder here is bound to it, each capability's set replaced
+        and those of a capability no longer asked here dropped. What the
+        store holds of an agent no longer linked to the node is dropped
+        too; an agent linked here whose folder is not bound for this
+        process, as one of another OS user on the same Mac, keeps what its
+        own manager wrote. The node is the one this process runs on (`node
+        id`); a node reports itself and no other. `node run` writes it
+        every 15 seconds and right after a reconcile that changed a job.
+        Answers {ok, project, agent_id, node, state, sessions, store},
+        state and sessions as `node state` gives them for this node. Exit
+        6 node_unknown for a node not registered.
   node rekey <old id> [<new id>] [--dry-run]
         Move a node from the id it is known by - a node registered before
         ids keeps the name it had as its id - to its own: this machine's id
@@ -10105,6 +10116,7 @@ NODE_REFERENCES = (
     ("automations_runs", "environment", "whole"),
     ("capabilities_connection_grants", "node", "whole"),
     ("capabilities_identifiers", "node", "whole"),
+    ("capabilities_node_logins", "node", "foreign key"),
     ("capabilities_node_sessions", "node", "foreign key"),
     ("capabilities_node_states", "node", "foreign key"),
     ("capabilities_policy", "node", "whole"),
@@ -10348,8 +10360,9 @@ def _node_launcher_text(job: dict, manager: str) -> str:
 # ---------------------------------------------------------------- node state
 #
 # Each node writes what it says of itself into the store, one row per machine
-# (capabilities_node_states), and per agent whether each device-bound
-# connection holds a live session here (capabilities_node_sessions): `node
+# (capabilities_node_states), and per agent whether its tools are signed in
+# here (capabilities_node_logins) and whether each device-bound connection
+# holds a live session here (capabilities_node_sessions): `node
 # state report` once, `node run` on its own beat. The row stands for the node
 # for the contract's NODE_STATE_FRESH_SECONDS; after that it reads unreachable.
 # The tools' sign-ins and the sessions are each tool's and capability's own
@@ -10627,19 +10640,35 @@ def _node_agent_folder(root: Path, own: str | None, agent_id: str,
 
 
 def _node_state_write(conn, here: str, facts: dict, logins: dict | None,
-                      sessions: dict | None) -> dict:
-    """Write this node's state row and, where `sessions` holds them, the
-    sessions each agent's device-bound capabilities answered, dropping those
-    of an agent or capability no longer asked here. Answers {reported_at,
+                      sessions: dict | None, agents: list[str]) -> dict:
+    """Write this node's state row, the tools' sign-ins for each of `agents` -
+    the agents whose folder here is bound for this process - and, where
+    `sessions` holds them, the sessions their device-bound capabilities
+    answered, dropping those of a capability no longer asked. What the store
+    holds of an agent no longer linked here goes too; another manager's
+    agents on the same machine keep theirs. Answers {reported_at,
     fresh_until}."""
     store = _store_module()
-    stamp = store.node_state_put(conn, here, **facts, logins=logins)
+    stamp = store.node_state_put(conn, here, **facts)
+    if logins is not None:
+        for agent_id in agents:
+            store.node_logins_put(conn, agent_id, here, logins)
     if sessions is not None:
         for (agent_id, capability), rows in sorted(sessions.items()):
             if rows is not None:
                 store.node_sessions_put(conn, agent_id, here, capability, rows)
-        store.node_sessions_prune(conn, here, sorted(sessions))
+    store.node_agents_prune(conn, here, agents if sessions is not None else [],
+                            sorted(sessions or {}))
     return stamp
+
+
+def _node_state_logins(store, logins: list[dict], node: str) -> dict:
+    """The login fields of `node` from an agent's sign-in rows: each null
+    where the node has written none for it."""
+    row = next((r for r in logins if r["node"] == node), None)
+    out = {column: (row or {}).get(column) for column in store.NODE_LOGIN_COLUMNS}
+    out["logins_checked_at"] = row["checked_at"] if row else None
+    return out
 
 
 class _NodeManager:
@@ -11013,7 +11042,8 @@ class _NodeManager:
             return
         try:
             with conn.transaction():
-                _node_state_write(conn, self.here, _node_facts(), self.logins, self.sessions)
+                _node_state_write(conn, self.here, _node_facts(), self.logins, self.sessions,
+                                  sorted(self.folders))
         except Exception as exc:
             self.say_once("state", type(exc).__name__,
                           "cannot write this node's state: "
@@ -13430,8 +13460,9 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
         sessions = _node_device_sessions(folders)
 
         def write(conn, agent_id):
-            _node_state_write(conn, here, facts, logins, sessions)
-            return (store.node_states(conn, [here])[0],
+            _node_state_write(conn, here, facts, logins, sessions, sorted(folders))
+            return ({**store.node_states(conn, [here])[0],
+                     **_node_state_logins(store, store.node_logins(conn, agent_id, [here]), here)},
                     store.node_sessions(conn, agent_id, [here]))
         (row, own_sessions), setting = _kernel_run(root, write)
         _emit({"ok": True, "project": str(root), "agent_id": agent_id, "node": here,
@@ -13448,11 +13479,13 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
         nodes = _node_rows(conn, agent_id)
         ids = [n["node"] for n in nodes]
         states = {r["node"]: r for r in store.node_states(conn, ids)}
+        logins = store.node_logins(conn, agent_id, ids)
         sessions = store.node_sessions(conn, agent_id, ids)
         out = []
         for node in nodes:
             state = states.get(node["node"]) or dict.fromkeys(
                 ("node", *store.NODE_STATE_COLUMNS, "uptime_seconds"))
+            state = {**state, **_node_state_logins(store, logins, node["node"])}
             entry = {"node": node["node"], "label": node["label"],
                      "reachable": bool(state.pop("reachable", False))}
             entry.update({k: v for k, v in _node_state_answer(state).items() if k != "node"})

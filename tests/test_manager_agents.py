@@ -588,15 +588,15 @@ def test_a_node_reports_itself_seen_and_no_other(lab):
     assert lab.refused("node", "seen", nid("box-two"), **node_env("box-one"))[0] == 6
 
 
-def _state_tools(lab: Lab) -> dict:
+def _state_tools(lab: Lab, account: str = "lab@example.test") -> dict:
     """The environment of a node whose tools answer as the test says - Claude
-    Code signed in, the GitHub CLI signed out, Codex not installed - whose
-    image names its version and boot line, and whose registry holds one
-    capability whose connections are device-bound."""
+    Code signed in as `account`, the GitHub CLI signed out, Codex not
+    installed - whose image names its version and boot line, and whose
+    registry holds one capability whose connections are device-bound."""
     tools = lab.tmp / "tools"
     tools.mkdir()
     for name, body in (
-            ("claude", "printf '%s\\n' '{\"loggedIn\": true, \"email\": \"lab@example.test\"}'"),
+            ("claude", f"printf '%s\\n' '{{\"loggedIn\": true, \"email\": \"{account}\"}}'"),
             ("gh", "printf '%s\\n' '{\"hosts\": {}}'; exit 1")):
         (tools / name).write_text(f"#!/bin/sh\n{body}\n")
         (tools / name).chmod(0o755)
@@ -685,6 +685,7 @@ def test_a_nodes_state_follows_it_through_a_rekey(lab):
     planned = lab.ok("node", "rekey", "box-one", nid("box-one"), "--dry-run")
     assert {(r["table"], r["rows"], r["how"]) for r in planned["rows"]} >= {
         ("capabilities_node_states", 1, "foreign key"),
+        ("capabilities_node_logins", 1, "foreign key"),
         ("capabilities_node_sessions", 2, "foreign key")}
     lab.ok("node", "rekey", "box-one", nid("box-one"))
     assert lab.sql(f"SELECT node FROM {SCHEMA}.capabilities_node_states") == [(nid("box-one"),)]
@@ -692,6 +693,53 @@ def test_a_nodes_state_follows_it_through_a_rekey(lab):
         (nid("box-one"),)]
     [node] = lab.ok("node", "state")["nodes"]
     assert node["node"] == nid("box-one") and node["reachable"] is True
+
+
+def _other_agent(lab: Lab, agent_id: str) -> Lab:
+    """Another agent in the same store, in a folder, home and registry of its
+    own: an agent of another OS user on the same machine."""
+    other = Lab.__new__(Lab)
+    other.tmp, other.cluster, other.database = lab.tmp / "other", lab.cluster, lab.database
+    other.project = other.tmp / "project"
+    (other.project / ".git").mkdir(parents=True)
+    (other.project / "capabilities").mkdir()
+    (other.project / "capabilities" / "project.json").write_text(json.dumps(
+        {"schema": "capabilities.project.v1", "slug": "other", "id": agent_id}))
+    (other.project / ".env.local").write_text((lab.project / ".env.local").read_text())
+    return other
+
+
+def test_agents_of_two_os_users_on_one_machine_keep_their_own_sign_ins_and_sessions(lab):
+    # A Mac's id is its hardware's, so the manager of each OS user on it
+    # reports under the one node id; neither drops nor overwrites what the
+    # other's agents hold there.
+    other_id = "prj_" + "0f1e2d3c4b5a"
+    other = _other_agent(lab, other_id)
+    lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "mac")
+    other.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "mac")
+    mine = {**node_env("box-one"), **_state_tools(lab)}
+    theirs = {**node_env("box-one"), **_state_tools(other, "other@example.test")}
+
+    other.ok("node", "state", "report", **theirs)
+    lab.ok("node", "state", "report", **mine)
+    for agent, account in ((lab, "lab@example.test"), (other, "other@example.test")):
+        [node] = agent.ok("node", "state")["nodes"]
+        assert (node["reachable"], node["claude_login"], node["claude_account"]) == (
+            True, "signed_in", account)
+        assert [(s["connection"], s["live"]) for s in node["sessions"]] == [
+            ("main", True), ("spare", False)]
+
+    # An agent no longer linked to the node loses what it held there at the
+    # next report of any manager on it.
+    lab.sql(f"DELETE FROM {SCHEMA}.capabilities_agent_nodes WHERE agent_id = %s "
+            "RETURNING agent_id", (other_id,))
+    lab.ok("node", "state", "report", **mine)
+    assert lab.sql(f"SELECT (SELECT count(*) FROM {SCHEMA}.capabilities_node_sessions "
+                   f"WHERE project_id = %s) + (SELECT count(*) FROM "
+                   f"{SCHEMA}.capabilities_node_logins WHERE project_id = %s)",
+                   (other_id, other_id)) == [(0,)]
+    [node] = lab.ok("node", "state")["nodes"]
+    assert node["claude_account"] == "lab@example.test" and len(node["sessions"]) == 2
 
 
 def test_writes_are_refused_under_the_read_only_switch(lab):
