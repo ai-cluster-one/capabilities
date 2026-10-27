@@ -52,10 +52,12 @@ MODEL
   credential it was given. Nothing is written to disk, so the same connection runs
   identically on a laptop and on a server.
 
-  rclone is not vendored. It is an ordinary tool on PATH, installed and updated on its
-  own (`rclone selfupdate`) and usable by anything else on the machine. `rclonec doctor`
-  reports the path it resolved and the version it found, so a missing or shadowed binary
-  is diagnosed in one run rather than inferred.
+  rclone is not vendored. rclonec runs the `rclone` on PATH when there is one. Otherwise
+  the first verb that needs rclone fetches rclone's own standalone build for this
+  platform, checked against the release's SHA256SUMS, into
+  $XDG_STATE_HOME/rclonec/programs/rclone, as the user and without root, and every later
+  run uses it. `rclonec doctor` reports the path it resolved and the version it found, so
+  a missing or shadowed binary is diagnosed in one run rather than inferred.
 
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one connection. An
@@ -159,6 +161,14 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 
 RCLONE = "rclone"
 DOCTOR_TIMEOUT = 60.0
+# The programs rclonec needs that the operating system does not carry (SHEBANG.md,
+# `programs`): one on PATH is used, otherwise rclonec fetches its own into PROGRAMS_DIR.
+PROGRAMS = [{"name": RCLONE,
+             "feature": "every command rclonec forwards to rclone, and doctor's proof "
+                        "of each connection"}]
+PROGRAMS_DIR = _STATE_HOME / NAME / "programs"
+RCLONE_DOWNLOADS = "https://downloads.rclone.org/"
+FETCH_TIMEOUT = 300.0
 # The id becomes an rclone remote name and an environment variable fragment, so it is
 # held to the intersection of what both accept.
 REMOTE_ID = re.compile(r"^[A-Za-z0-9_]+$")
@@ -307,23 +317,87 @@ def _child_env(cfg: dict) -> dict:
 
 
 def _rclone_path() -> str | None:
-    return shutil.which(RCLONE)
+    """The rclone on PATH, else the one rclonec fetched, else None."""
+    own = PROGRAMS_DIR / RCLONE
+    return shutil.which(RCLONE) or (str(own) if os.access(own, os.X_OK) else None)
+
+
+def _fetch_rclone() -> str:
+    """Fetch rclone's own standalone build for this platform into PROGRAMS_DIR and
+    return its path. The archive is checked against the release's SHA256SUMS before
+    the binary is unpacked; nothing runs as root and no package manager is asked.
+    Raises RuntimeError naming what failed."""
+    import hashlib
+    import io
+    import platform
+    import urllib.request
+    import zipfile
+    system = {"linux": "linux", "darwin": "osx"}.get(sys.platform)
+    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64",
+            "arm64": "arm64"}.get(platform.machine().lower())
+    if not system or not arch:
+        raise RuntimeError(f"rclone publishes no build rclonec fetches for "
+                           f"{sys.platform}/{platform.machine()}")
+
+    def get(url: str) -> bytes:
+        # downloads.rclone.org refuses urllib's own User-Agent with 403.
+        request = urllib.request.Request(url, headers={"User-Agent": NAME})
+        try:
+            with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT) as response:
+                return response.read()
+        except OSError as e:
+            raise RuntimeError(f"could not fetch {url}: {e}") from None
+
+    version = get(RCLONE_DOWNLOADS + "version.txt").decode().split()[-1]
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", version):
+        raise RuntimeError(f"{RCLONE_DOWNLOADS}version.txt names no version: {version!r}")
+    stem = f"rclone-{version}-{system}-{arch}"
+    sums = get(f"{RCLONE_DOWNLOADS}{version}/SHA256SUMS").decode(errors="replace")
+    wanted = next((line.split()[0] for line in sums.splitlines()
+                   if line.strip().endswith(f"  {stem}.zip")), None)
+    if not wanted:
+        raise RuntimeError(f"{version}/SHA256SUMS lists no {stem}.zip")
+    archive = get(f"{RCLONE_DOWNLOADS}{version}/{stem}.zip")
+    if hashlib.sha256(archive).hexdigest() != wanted:
+        raise RuntimeError(f"{stem}.zip does not match its SHA256SUMS line")
+    try:
+        binary = zipfile.ZipFile(io.BytesIO(archive)).read(f"{stem}/{RCLONE}")
+    except (KeyError, zipfile.BadZipFile) as e:
+        raise RuntimeError(f"{stem}.zip holds no {stem}/{RCLONE}: {e}") from None
+    PROGRAMS_DIR.mkdir(parents=True, exist_ok=True)
+    target = PROGRAMS_DIR / RCLONE
+    partial = PROGRAMS_DIR / f".{RCLONE}.{os.getpid()}.partial"
+    partial.write_bytes(binary)
+    partial.chmod(0o755)
+    os.replace(partial, target)
+    return str(target)
+
+
+def _ensure_rclone() -> tuple[str | None, str | None]:
+    """The rclone to run, fetched on first use: (path, None), or (None, why not)."""
+    found = _rclone_path()
+    if found:
+        return found, None
+    try:
+        return _fetch_rclone(), None
+    except RuntimeError as e:
+        return None, str(e)
 
 
 def _require_rclone() -> str:
-    found = _rclone_path()
+    found, problem = _ensure_rclone()
     if not found:
         _die(5, "rclone_not_found",
-             f"the `{RCLONE}` binary is not on PATH",
-             "install it from https://rclone.org/install/ — `curl https://rclone.org/"
-             "install.sh | sudo bash`, or unpack the release archive onto PATH; "
+             f"the `{RCLONE}` binary is not on PATH and could not be fetched: {problem}",
+             f"put rclone on PATH (https://rclone.org/install/), or let rclonec fetch it "
+             f"into {PROGRAMS_DIR} once the network reaches {RCLONE_DOWNLOADS}; "
              f"`{NAME} doctor` reports the path once it resolves")
     return found
 
 
-def _rclone_version() -> str | None:
+def _rclone_version(rclone: str = RCLONE) -> str | None:
     try:
-        proc = subprocess.run([RCLONE, "version"], capture_output=True, text=True,
+        proc = subprocess.run([rclone, "version"], capture_output=True, text=True,
                               timeout=DOCTOR_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -342,8 +416,12 @@ def _value_taking_flags() -> set:
     global _VALUE_FLAGS_CACHE
     if _VALUE_FLAGS_CACHE is not None:
         return _VALUE_FLAGS_CACHE
+    rclone, _ = _ensure_rclone()
+    if not rclone:
+        _VALUE_FLAGS_CACHE = set()
+        return _VALUE_FLAGS_CACHE
     try:
-        proc = subprocess.run([RCLONE, "help", "flags"], capture_output=True, text=True,
+        proc = subprocess.run([rclone, "help", "flags"], capture_output=True, text=True,
                               timeout=DOCTOR_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired):
         _VALUE_FLAGS_CACHE = set()
@@ -468,13 +546,13 @@ def _summarize_failure(text: str) -> str | None:
     return head
 
 
-def _check_connection(cfg: dict) -> dict:
+def _check_connection(cfg: dict, rclone: str = RCLONE) -> dict:
     """One connection's round-trip: list the path the connection declares for the check,
     or the remote's top level, under its own configuration. Reported rather than died,
     so doctor covers every connection."""
     target = f"{cfg['id']}:{cfg.get('check_path') or ''}"
     try:
-        proc = subprocess.run([RCLONE, "lsd", target, "--retries", "1"],
+        proc = subprocess.run([rclone, "lsd", target, "--retries", "1"],
                               env=_child_env(cfg), capture_output=True, text=True,
                               timeout=DOCTOR_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -499,12 +577,14 @@ def _check_connection(cfg: dict) -> dict:
 def cmd_doctor(reg: dict | None, wanted: str | None) -> None:
     report = _connections_report()
     _doctor_gate(report, wanted)
-    found = _rclone_path()
-    tool = {"found": bool(found), "path": found, "version": _rclone_version()
+    found, unfetched = _ensure_rclone()
+    tool = {"found": bool(found), "path": found, "version": _rclone_version(found)
             if found else None}
     if not found:
-        tool["hint"] = ("install rclone from https://rclone.org/install/ and put it on "
-                        "PATH; rclonec resolves it by name and never vendors a copy")
+        tool["error"] = unfetched
+        tool["hint"] = (f"put rclone on PATH (https://rclone.org/install/), or let "
+                        f"rclonec fetch it into {PROGRAMS_DIR} once the network reaches "
+                        f"{RCLONE_DOWNLOADS}")
     results: dict = {}
     worst = 0
     for cid, row in report["connections"].items():
@@ -518,10 +598,11 @@ def cmd_doctor(reg: dict | None, wanted: str | None) -> None:
             worst = max(worst, problem["exit"])
             continue
         if not found:
-            results[cid] = {"ok": False, "error": f"the `{RCLONE}` binary is not on PATH"}
+            results[cid] = {"ok": False, "error": f"the `{RCLONE}` binary is not on PATH "
+                                                  f"and could not be fetched: {unfetched}"}
             worst = max(worst, 5)
             continue
-        outcome = _check_connection(cfg)
+        outcome = _check_connection(cfg, found)
         results[cid] = {"ok": outcome["ok"], "remote": f"{cid}:",
                         "type": cfg["type"], "allow_write": cfg["allow_write"]}
         if not outcome["ok"]:
@@ -539,11 +620,11 @@ def cmd_doctor(reg: dict | None, wanted: str | None) -> None:
 
 # ── forwarding ──────────────────────────────────────────────────────────────
 
-def _forward(argv: list[str], cfg: dict) -> NoReturn:
+def _forward(argv: list[str], cfg: dict, rclone: str = RCLONE) -> NoReturn:
     # Inherit stdio so streaming, progress, --json and colors pass straight through;
     # rclone's own exit code is the result.
     try:
-        proc = subprocess.run([RCLONE, *argv], env=_child_env(cfg))
+        proc = subprocess.run([rclone, *argv], env=_child_env(cfg))
     except OSError as e:
         _die(5, "rclone_exec_failed", f"could not run {RCLONE}: {e}")
     sys.exit(proc.returncode)
@@ -568,6 +649,9 @@ def main() -> None:
             wanted = a.split("=", 1)[1]; i += 1; continue
         cleaned.append(a); i += 1
 
+    if cleaned[:1] == ["manifest"]:
+        _emit({**_manifest_core(), "programs": PROGRAMS})
+        return
     _contract(cleaned)           # contract verbs; everything else forwards
     if not cleaned or (len(cleaned) == 1 and cleaned[0] in ("help", "-h", "--help")):
         sys.stdout.write((__doc__ or "").lstrip("\n"))
@@ -597,8 +681,7 @@ def main() -> None:
     if problem:
         _die(problem["exit"], problem["code"], problem["message"], problem.get("hint"))
 
-    _require_rclone()
-    _forward(cleaned, cfg)
+    _forward(cleaned, cfg, _require_rclone())
 
 
 if __name__ == "__main__":

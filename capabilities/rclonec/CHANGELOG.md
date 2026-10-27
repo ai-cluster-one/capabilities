@@ -1,5 +1,9 @@
 # rclonec — change log
 
+## 2026-10-27 — `rclonec` fetches rclone itself on first use where none is on PATH, and declares it in its manifest
+
+Where `rclone` is not on PATH, the first command that needs it - a forwarded command, `doctor`, or the write gate asking `rclone help flags` - fetches rclone's own standalone build for this platform (linux or macOS, amd64 or arm64) from the latest release on `downloads.rclone.org`, checks it against that release's `SHA256SUMS`, and keeps it at `$XDG_STATE_HOME/rclonec/programs/rclone`, as the user and without root or a package manager; every later run uses it. An `rclone` on PATH is still used first and nothing is fetched then. A fetch that fails exits 5 `rclone_not_found` as before, naming what failed, and `doctor` reports it under `rclone.error`. `rclonec manifest` now carries `programs`, naming rclone and what stops without it, so `capabilities doctor` can say it is missing.
+
 ## 2026-10-27 — `rclonec doctor` lists the path a connection names in `check_path`, so a bucket-scoped key is reported ready
 
 A connection entry may name `check_path`, a path under its remote such as the one bucket an S3 or R2 key is scoped to. `rclonec doctor` then proves the connection with `rclone lsd <id>:<check_path>` instead of `rclone lsd <id>:`, which on S3 is ListBuckets and is refused to a bucket-scoped key, so doctor reported a working connection as `not_ready`. A connection without `check_path` is checked as before, the doctor output is unchanged, and the field never reaches rclone's configuration. `check_path` is declared among the connection's fields, so `rclonec connection add <id> --field check_path=<bucket>` writes it.

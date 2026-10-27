@@ -53,12 +53,13 @@ def isolate_records_adapter():
 
 @pytest.fixture()
 def flags():
-    """`rclone help flags` answered without running rclone."""
+    """`rclone help flags` answered without running rclone, or fetching it."""
     def fake_run(argv, *a, **kw):
         assert argv[:3] == ["rclone", "help", "flags"], \
             f"the gate ran something other than the flag query: {argv}"
         return subprocess.CompletedProcess(argv, 0, stdout=FAKE_FLAGS, stderr="")
-    with patch.object(module.subprocess, "run", fake_run):
+    with patch.object(module.subprocess, "run", fake_run), \
+            patch.object(module, "_rclone_path", lambda: "rclone"):
         yield
 
 
@@ -185,7 +186,8 @@ def test_a_directional_verb_is_refused_when_rclone_cannot_answer():
     """No flag table means no way to find the destination; refuse, never guess."""
     def unanswerable(argv, *a, **kw):
         raise OSError("rclone is not installed")
-    with patch.object(module.subprocess, "run", unanswerable):
+    with patch.object(module.subprocess, "run", unanswerable), \
+            patch.object(module, "_rclone_path", lambda: "rclone"):
         _refused(["copy", "/tmp/x", "gd:dest"])
 
 

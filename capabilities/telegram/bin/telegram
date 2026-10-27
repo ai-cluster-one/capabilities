@@ -674,6 +674,12 @@ TABLES = True      # telegram_* tables in the project's database, built by _tabl
 INVENTORY = {"network": "none"}   # the daemon's state is pid and health files on this machine
 SERVICE_STATE_VERSION = 1
 POST_INSTALL: list = []
+# The programs telegram needs that the operating system does not carry (SHEBANG.md,
+# `programs`). The service fetches ffmpeg the first time a recording needs it where
+# none is on PATH, into $XDG_STATE_HOME/telegram/programs (service/call_recording_helpers.py).
+PROGRAMS = [{"name": "ffmpeg",
+             "feature": "call recording: encoding a call's audio, its duration and "
+                        "waveform, and joining a recording a restart split"}]
 SERVICE = {
     # How many nodes run it at once (service.placement). One Telegram account is one
     # MTProto session: one node runs it at a time.
@@ -2785,7 +2791,8 @@ def cmd_transcribe(json_path: str, force: bool, model: str) -> dict:
 # --- Bundled assistant service ----------------------------------------------
 
 def _manifest_payload() -> dict:
-    payload = {**_manifest_core(), "service_state_version": SERVICE_STATE_VERSION}
+    payload = {**_manifest_core(), "service_state_version": SERVICE_STATE_VERSION,
+               "programs": PROGRAMS}
     # A connection is a session a login minted on one device, not a value that
     # can be carried to another machine.
     payload["connections"] = {**payload["connections"], "device_bound": True}

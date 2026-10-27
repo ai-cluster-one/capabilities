@@ -34,7 +34,7 @@ from zoneinfo import ZoneInfo
 from pytgcalls.exceptions import NotInCallError
 from pytgcalls.types import Device, Frame
 
-from call_recording_helpers import iso_utc, probe_audio_duration
+from call_recording_helpers import ensure_ffmpeg, iso_utc, probe_audio_duration
 
 DEFAULT_MODEL = "gemini-3.1-flash-live-preview"
 DEFAULT_VOICE = "Aoede"
@@ -1555,6 +1555,7 @@ async def join_tracks_to_stereo(caller_pcm, agent_pcm, output, *,
     temporary = output.with_name(f".{output.stem}.{os.getpid()}.tmp.ogg")
     with contextlib.suppress(OSError):
         temporary.unlink()
+    unfetched = await ensure_ffmpeg()
     try:
         process = await asyncio.create_subprocess_exec(
             "ffmpeg",
@@ -1575,7 +1576,7 @@ async def join_tracks_to_stereo(caller_pcm, agent_pcm, output, *,
         )
         _, stderr = await process.communicate()
     except OSError as exc:
-        result["error"] = f"ffmpeg_unavailable: {exc}"[:500]
+        result["error"] = f"ffmpeg_unavailable: {unfetched or exc}"[:500]
         return result
 
     if process.returncode != 0:

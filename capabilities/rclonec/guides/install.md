@@ -1,6 +1,8 @@
 # Installing rclone
 
-rclonec does not vendor rclone. It resolves `rclone` on PATH, so the binary is installed once on the machine and shared by everything on it, updated on its own schedule.
+rclonec does not vendor rclone. It runs the `rclone` on PATH when there is one, so a binary installed on the machine is shared by everything on it and updated on its own schedule.
+
+Where none is on PATH, the first rclonec command that needs rclone fetches it: rclone's own standalone build for this platform, from the latest release on `downloads.rclone.org`, checked against that release's `SHA256SUMS`, into `$XDG_STATE_HOME/rclonec/programs/rclone` (`~/.local/state/rclonec/programs/rclone` by default). It runs as you, needs no root and no package manager, and every later run uses that copy. On an agent node `~/.local/state` is a volume, so the copy outlives a redeploy. `capabilities doctor` names rclone as missing until either is there. The steps below are for putting rclone on PATH yourself.
 
 rclone is a single statically linked binary that depends on nothing but the operating system. A package manager adds no value here and takes one away: `rclone selfupdate` maintains a binary installed directly, but should not be used against one a package manager owns.
 

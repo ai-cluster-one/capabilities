@@ -11,6 +11,9 @@ import contextlib
 import json
 import math
 import os
+import re
+import shutil
+import subprocess
 import sys
 from array import array
 from datetime import datetime, timezone
@@ -24,6 +27,67 @@ from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeFilename
 # than by the one that opened it, and is delivered on the same terms; its
 # stop_reason goes on saying which of the two happened.
 DELIVERABLE_STATUSES = ("complete", "recovered")
+
+# Where telegram keeps the programs it fetched itself (SHEBANG.md, `programs`).
+# The folder goes on the end of PATH, so an ffmpeg already on the machine is the
+# one that runs and this one only stands in where there is none. A node keeps
+# ~/.local/state on a volume, so what is fetched once outlives a redeploy.
+PROGRAMS_DIR = (Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+                / "telegram" / "programs")
+# The wheel ffmpeg is fetched from: a static build with libopus for linux and
+# macOS, amd64 and arm64, reached through uv as the user and without root.
+FFMPEG_WHEEL = "imageio-ffmpeg==0.6.0"
+FFMPEG_FETCH_TIMEOUT = 900
+_ffmpeg_fetching: asyncio.Lock | None = None
+if str(PROGRAMS_DIR) not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = os.pathsep.join(
+        part for part in (os.environ.get("PATH"), str(PROGRAMS_DIR)) if part)
+
+
+def _fetch_ffmpeg() -> None:
+    """Copy the ffmpeg the FFMPEG_WHEEL wheel carries into PROGRAMS_DIR. Raises
+    RuntimeError naming what failed."""
+    uv = os.environ.get("UV") or shutil.which("uv")
+    if not uv:
+        raise RuntimeError("uv is not on PATH, so ffmpeg cannot be fetched")
+    try:
+        process = subprocess.run(
+            [uv, "run", "--no-project", "--quiet", "--with", FFMPEG_WHEEL, "python", "-I",
+             "-c", "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"],
+            capture_output=True, text=True, timeout=FFMPEG_FETCH_TIMEOUT,
+            env={key: value for key, value in os.environ.items()
+                 if key != "IMAGEIO_FFMPEG_EXE"})
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"fetching {FFMPEG_WHEEL} through uv failed: {exc}") from None
+    lines = process.stdout.strip().splitlines()
+    source = Path(lines[-1]) if lines else None
+    if process.returncode != 0 or source is None or not source.is_file():
+        detail = (process.stderr or process.stdout).strip()[-300:]
+        raise RuntimeError(f"fetching {FFMPEG_WHEEL} through uv failed: {detail}")
+    PROGRAMS_DIR.mkdir(parents=True, exist_ok=True)
+    partial = PROGRAMS_DIR / f".ffmpeg.{os.getpid()}.partial"
+    shutil.copyfile(source, partial)
+    partial.chmod(0o755)
+    os.replace(partial, PROGRAMS_DIR / "ffmpeg")
+
+
+async def ensure_ffmpeg() -> str | None:
+    """Make `ffmpeg` resolve, fetching it the first time a recording needs it
+    where the machine has none. Returns None when it resolves, else why not, for
+    the error the caller reports when running it fails."""
+    global _ffmpeg_fetching
+    if shutil.which("ffmpeg"):
+        return None
+    if _ffmpeg_fetching is None:
+        _ffmpeg_fetching = asyncio.Lock()
+    async with _ffmpeg_fetching:
+        if shutil.which("ffmpeg"):
+            return None
+        try:
+            await asyncio.to_thread(_fetch_ffmpeg)
+        except RuntimeError as exc:
+            return str(exc)
+    return None
 
 # How a finished recording is encoded, wherever it was captured. Speech at 24
 # kbit/s mono is a quarter of the file a stereo 96 kbit/s encode makes of the
@@ -41,26 +105,30 @@ _OPUS_MONO_ARGS = (
 
 
 async def probe_audio_duration(path: Path) -> float | None:
-    """Return the finalized media duration without making delivery depend on probing."""
+    """Return the finalized media duration without making delivery depend on probing.
+
+    Read from the `Duration:` ffmpeg prints for its input, the container's own
+    figure, so the ffmpeg telegram fetches is all a recording needs. With no
+    output named ffmpeg exits non-zero after printing it, so the exit status
+    says nothing here and the line is what is read."""
+    await ensure_ffmpeg()
     try:
         process = await asyncio.create_subprocess_exec(
-            "ffprobe",
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            "ffmpeg",
+            "-hide_banner",
+            "-i", str(path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await process.communicate()
+        _, stderr = await process.communicate()
     except OSError:
         return None
-    if process.returncode != 0:
+    found = re.search(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)",
+                      stderr.decode(errors="replace"))
+    if not found:
         return None
-    try:
-        duration = float(stdout.decode().strip())
-    except (TypeError, ValueError):
-        return None
+    hours, minutes, seconds = found.groups()
+    duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
     return duration if duration > 0 else None
 
 
@@ -80,6 +148,7 @@ async def trailing_silence_start(path: Path, floor: str = "-45dB",
     at EOF like any other, so an unclosed one never appears and every silence
     would otherwise look like a pause in the middle.
     """
+    await ensure_ffmpeg()
     try:
         process = await asyncio.create_subprocess_exec(
             "ffmpeg",
@@ -172,6 +241,7 @@ async def concat_captures(parts: list[dict], output: Path) -> dict:
     with contextlib.suppress(OSError):
         temporary.unlink()
     filtergraph = f"{''.join(labels)}concat=n={count}:v=0:a=1[out]"
+    unfetched = await ensure_ffmpeg()
     try:
         process = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-loglevel", "error",
@@ -185,7 +255,7 @@ async def concat_captures(parts: list[dict], output: Path) -> dict:
         )
         _, stderr = await process.communicate()
     except OSError as exc:
-        result["error"] = f"ffmpeg_unavailable: {exc}"[:500]
+        result["error"] = f"ffmpeg_unavailable: {unfetched or exc}"[:500]
         return result
     if process.returncode != 0:
         result["error"] = (f"ffmpeg_exit_{process.returncode}: "
@@ -235,6 +305,7 @@ async def finalize_mp3_capture(capture: Path, output: Path,
     temporary = output.with_name(f".{output.stem}.{os.getpid()}.tmp.ogg")
     with contextlib.suppress(OSError):
         temporary.unlink()
+    unfetched = await ensure_ffmpeg()
     try:
         process = await asyncio.create_subprocess_exec(
             "ffmpeg",
@@ -251,7 +322,7 @@ async def finalize_mp3_capture(capture: Path, output: Path,
         )
         _, stderr = await process.communicate()
     except OSError as exc:
-        result["error"] = f"ffmpeg_unavailable: {exc}"[:500]
+        result["error"] = f"ffmpeg_unavailable: {unfetched or exc}"[:500]
         return result
 
     if process.returncode != 0:
@@ -444,6 +515,7 @@ def voice_waveform_from_pcm(pcm: bytes, bars: int = 100) -> bytes | None:
 
 async def build_voice_waveform(path: Path) -> bytes | None:
     """Decode a low-rate mono envelope for Telegram's voice-note waveform."""
+    await ensure_ffmpeg()
     try:
         process = await asyncio.create_subprocess_exec(
             "ffmpeg",

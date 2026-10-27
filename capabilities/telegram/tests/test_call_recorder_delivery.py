@@ -237,14 +237,16 @@ class CallRecorderDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(waveform)
         self.assertEqual(len(waveform), 2)
 
-    async def test_probe_audio_duration_reads_ffprobe_value(self):
+    async def test_probe_audio_duration_reads_ffmpeg_duration(self):
         helpers = import_call_recording_helpers()
 
         class Process:
-            returncode = 0
+            returncode = 1
 
             async def communicate(self):
-                return b"638.299479\n", b""
+                return b"", (b"Input #0, ogg, from 'recording.ogg':\n"
+                             b"  Duration: 00:10:38.30, start: 0.000000, bitrate: 24 kb/s\n"
+                             b"At least one output file must be specified\n")
 
         original = helpers.asyncio.create_subprocess_exec
 
@@ -257,7 +259,7 @@ class CallRecorderDeliveryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             helpers.asyncio.create_subprocess_exec = original
 
-        self.assertAlmostEqual(duration, 638.299479)
+        self.assertAlmostEqual(duration, 638.3)
 
 
 class TrailingSilenceTests(unittest.IsolatedAsyncioTestCase):

@@ -1803,6 +1803,11 @@ VERIFICATION VERBS
         as drift, each agent_id holding grants in the store that ContextKit's
         registry (contextkit_agents) does not know (grant_agent_unknown), or
         that the registry is not in the store (agents_registry_absent).
+        It also lists, never as drift, each program an installed capability
+        declares in its manifest's `programs` that is neither on PATH nor in
+        $XDG_STATE_HOME/<name>/programs/ (program_missing: capability,
+        program, feature, fetched_to, and a one-line message saying what
+        stops working until the capability fetches it on first use).
         Exit 0 clean, 7 drift found.
   audit <name> [--from <path>]
         Contract conformance: call the contract verbs, validate output
@@ -3555,6 +3560,64 @@ def _validate_contribution(contribution: object) -> list[str]:
     return problems
 
 
+PROGRAM_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
+
+
+def _validate_programs(programs: object) -> list[str]:
+    """`programs`: the programs a capability needs that the operating system
+    does not carry, each `{name, feature}`. An unknown key is refused, as in
+    `contribution`, so a key nothing reads cannot ride in."""
+    if not isinstance(programs, list):
+        return ["programs is not a list"]
+    problems: list[str] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(programs):
+        where = f"programs[{index}]"
+        if not isinstance(entry, dict):
+            problems.append(f"{where} is not an object")
+            continue
+        unknown = sorted(set(entry) - {"name", "feature"})
+        if unknown:
+            problems.append(f"{where} has unknown key(s): {', '.join(unknown)}")
+        name = entry.get("name")
+        if not isinstance(name, str) or not PROGRAM_NAME.fullmatch(name):
+            problems.append(f"{where}.name must be an executable's file name")
+        elif name in seen:
+            problems.append(f"{where}.name {name} is declared twice")
+        else:
+            seen.add(name)
+        feature = entry.get("feature")
+        if not isinstance(feature, str) or not feature.strip():
+            problems.append(f"{where}.feature must say what stops working without it")
+    return problems
+
+
+def _programs_missing() -> list[dict]:
+    """Each program an installed capability declares that this machine has
+    neither on PATH nor where the capability keeps the one it fetched,
+    `$XDG_STATE_HOME/<name>/programs/<program>`. Not drift: a capability fetches
+    such a program the first time a feature needs it, so until then it is
+    missing by design."""
+    missing: list[dict] = []
+    for name in sorted(_installed()):
+        _stub, manifest = _load_snapshots(name)
+        programs = (manifest or {}).get("programs")
+        if not isinstance(programs, list) or _validate_programs(programs):
+            continue
+        for entry in programs:
+            program = entry["name"]
+            own = _STATE_HOME / name / "programs" / program
+            if shutil.which(program) or os.access(own, os.X_OK):
+                continue
+            missing.append({
+                "code": "program_missing", "capability": name, "program": program,
+                "feature": entry["feature"], "fetched_to": str(own),
+                "message": (f"{name}: {program} is neither on PATH nor in {own.parent}; "
+                            f"until {name} fetches it there on first use, this stops "
+                            f"working: {entry['feature']}")})
+    return missing
+
+
 INVENTORY_NETWORK_MODES = ("none", "optional", "required")
 
 
@@ -3853,6 +3916,8 @@ def _validate_manifest(name: str, manifest) -> list[str]:
                     name, service["machine"], verbs))
     if "contribution" in manifest:
         problems.extend(_validate_contribution(manifest["contribution"]))
+    if "programs" in manifest:
+        problems.extend(_validate_programs(manifest["programs"]))
     if "connections" in manifest:
         problems.extend(_validate_connections_declaration(manifest["connections"]))
     if "settings" in manifest:
@@ -23892,6 +23957,7 @@ def cmd_doctor() -> None:
                         "context --codex` to repair")
                 for blocker in _codex_delivery_blockers(root):
                     findings.append(f"project: Codex capability context does not load — {blocker}")
+    information = information + _programs_missing()
     report = {"ok": not findings, "findings": findings}
     if information:
         report["information"] = information
