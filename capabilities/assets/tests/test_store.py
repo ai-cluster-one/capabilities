@@ -27,7 +27,8 @@ def test_the_tables_have_the_planned_shape(world):  # noqa: F811
                 "FROM information_schema.columns WHERE table_schema = current_schema() "
                 "AND table_name LIKE 'assets\\_%' ORDER BY table_name, ordinal_position"):
             columns.setdefault(table, []).append((column, kind, nullable, generated))
-        assert set(columns) == {"assets_documents", "assets_versions", "assets_files"}
+        assert set(columns) == {"assets_documents", "assets_versions", "assets_files",
+                                "assets_file_operations"}
         assert [c[0] for c in columns["assets_documents"]] == [
             "project_id", "id", "kind", "name", "created_at", "created_by", "retired_at"]
         assert [c[0] for c in columns["assets_versions"]] == [
@@ -58,7 +59,7 @@ def test_the_tables_have_the_planned_shape(world):  # noqa: F811
         ledger = [row[0] for row in conn.execute(
             "SELECT step FROM schema_ledger WHERE owner = 'assets' ORDER BY applied_at, step")]
         assert ledger == ["0001-documents", "0002-versions", "0003-guards", "0004-files",
-                          "0005-files-guard"]
+                          "0005-files-guard", "0006-file-operations"]
 
 
 def test_the_store_refuses_what_a_column_does_not_mean(world):  # noqa: F811
@@ -185,7 +186,7 @@ def test_a_file_row_changes_only_by_being_retired_once(world):  # noqa: F811
             with pytest.raises(psycopg.errors.CheckViolation):
                 conn.execute(statement, (row,))
         with pytest.raises(psycopg.errors.CheckViolation):
-            conn.execute("TRUNCATE assets_files")
+            conn.execute("TRUNCATE assets_files CASCADE")
         conn.execute("UPDATE assets_files SET retired_at = now() WHERE id = %s", (row,))
         with pytest.raises(psycopg.errors.CheckViolation):
             conn.execute("UPDATE assets_files SET retired_at = NULL WHERE id = %s", (row,))

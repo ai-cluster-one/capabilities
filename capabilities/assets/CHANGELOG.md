@@ -1,5 +1,9 @@
 # assets — change log
 
+## 2026-10-27 — Every write to a kept file is logged
+
+Every write to a file's records is logged in the same transaction as the write: a row of the new append-only table `assets_file_operations` names the record written or retired, the outcome the verb answered - `created` or `replaced` by `files add` and `import`, `linked` or `unlinked` by `files link`, `removed` by `files rm` - who did it and when. `files log [<name>] [--limit N]` reads it newest first, at most N records (default 100), each with the file's name, size, sha256 and document, and with a name it lists that file's records, a removed file's included, so a deleted file leaves a trace of who deleted it and when. It reads the store only. An `unchanged` answer logs nothing. The store refuses an edit or a delete of a log record. The assets tables move to schema 1.2 by the one new step `0006-file-operations`, applied on an existing store by the first command that opens it; the log starts there, and writes made before it are not backfilled. A `TRUNCATE assets_files` without `CASCADE` is now refused by the log's reference to it before the guard trigger is reached; it is refused either way.
+
 ## 2026-10-27 — A kept file can be deleted
 
 `files rm <name>` deletes a file the project kept: the object of every record the name has had - the current one and every one it replaced - is deleted from the bucket, then the current record is retired, so the name leaves `files list`, `export` and its document's `files`, and is free for a new file. Records are still never deleted; a retired record of a removed file names bytes the bucket no longer holds. It asks on the terminal before deleting and is refused without one (exit 6 `confirmation_required`) unless `--yes`; a name with no unretired file is refused with exit 3 `not_found`. It answers `removed` with the record it `retired` and the storage keys it `deleted`. It is a write, under the write gate and the read-only switch.

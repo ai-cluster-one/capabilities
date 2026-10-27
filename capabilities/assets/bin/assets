@@ -157,6 +157,14 @@ FILES  (reading; `files list` reads the store only)
   assets files list
       Every unretired file of this project, by name: media type, size,
       sha256, storage key, the document it belongs to, who kept it and when.
+  assets files log [<name>] [--limit N]
+      The log of writes to this project's file records, newest first (at most
+      N, default 100), or only those of the file <name>, a removed one's
+      included: each `created` or `replaced` (files add, import), `linked` or
+      `unlinked` (files link) or `removed` (files rm), with the record it
+      wrote or retired - its name, size, sha256 and document - and who did it
+      and when. An `unchanged` answer writes nothing and logs nothing; the
+      log starts when the store's assets tables reached schema 1.2.
   assets files get <name> --out PATH|- [--connection ID]
       Fetch the file from the bucket, check its size and sha256 against its
       record, and write it to PATH (`-` writes the bytes alone to stdout, with
@@ -253,7 +261,7 @@ WRITE_VERBS = {"save", "retire", "import", "files add", "files link", "files rm"
 WRITE_DEFAULT = True    # the bucket, like the store, is the consumer's own
 DOCS_BASE = ""
 STATE = False
-TABLES = True       # assets_documents, assets_versions and assets_files, built by _tables()
+TABLES = True       # the four assets_* tables, built by _tables()
 INVENTORY = None    # what assets holds is in the store; reading it is `assets list`
 POST_INSTALL: list[dict] = []
 
@@ -659,7 +667,14 @@ class _Bucket:
 # bytes are - `files rm` deletes the object of every record of the name - and
 # its record is retired, not deleted: the store keeps refusing a delete, as for
 # documents, so the record of what was kept and when outlives the bytes.
-TABLES_MAJOR, TABLES_MINOR = 1, 1
+# Every write to a file's records is logged in the same transaction: one row of
+# assets_file_operations naming the record it wrote or retired, the outcome the
+# verb answered, who and when, so a removed file's trail says who removed it.
+# The log references the file record by its key, as a file does its document,
+# and like every other table here it is never edited or deleted. It starts when
+# the step is applied: what happened to a file before then is not known, so
+# nothing is backfilled.
+TABLES_MAJOR, TABLES_MINOR = 1, 2
 TABLE_STEPS = [
     ("0001-documents", """
     CREATE TABLE assets_documents (
@@ -811,6 +826,36 @@ TABLE_STEPS = [
         FOR EACH ROW EXECUTE FUNCTION assets_files_guard();
     CREATE TRIGGER assets_files_truncate BEFORE TRUNCATE ON assets_files
         FOR EACH STATEMENT EXECUTE FUNCTION assets_files_guard();
+    """),
+    ("0006-file-operations", """
+    CREATE TABLE assets_file_operations (
+        project_id  text NOT NULL CHECK (project_id <> ''),
+        id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        file_id     uuid NOT NULL REFERENCES assets_files (id),
+        operation   text NOT NULL CHECK (operation IN ('created', 'replaced', 'linked',
+                                                       'unlinked', 'removed')),
+        created_at  timestamptz NOT NULL DEFAULT now(),
+        created_by  text NOT NULL CHECK (created_by <> '')
+    );
+    CREATE INDEX assets_file_operations_project ON assets_file_operations (project_id, created_at);
+    CREATE INDEX assets_file_operations_file ON assets_file_operations (file_id);
+    COMMENT ON TABLE assets_file_operations IS
+        'Every write to a project''s file records, one row each, written in the transaction of the write. Append-only: never edited or deleted.';
+    COMMENT ON COLUMN assets_file_operations.file_id IS
+        'The file record the operation wrote (created, replaced, linked, unlinked) or retired (removed).';
+    COMMENT ON COLUMN assets_file_operations.operation IS
+        'The outcome the verb answered: created and replaced by files add and import, linked and unlinked by files link, removed by files rm.';
+
+    CREATE FUNCTION assets_file_operations_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        RAISE EXCEPTION 'the file operations log is append-only: it is never edited or deleted'
+            USING ERRCODE = 'check_violation';
+    END $$;
+    CREATE TRIGGER assets_file_operations_guard BEFORE UPDATE OR DELETE
+        ON assets_file_operations
+        FOR EACH ROW EXECUTE FUNCTION assets_file_operations_guard();
+    CREATE TRIGGER assets_file_operations_truncate BEFORE TRUNCATE ON assets_file_operations
+        FOR EACH STATEMENT EXECUTE FUNCTION assets_file_operations_guard();
     """),
 ]
 
@@ -1217,7 +1262,15 @@ def _write_file_row(conn, project: str, name: str, sha: str, size: int, put: dic
     if (current["id"] if current else None) != (seen["id"] if seen else None) or put is None:
         raise _StaleFile(name)
     row = _replace_file_row(conn, project, name, sha, size, put, document_id, actor, current)
-    return ("replaced" if current is not None else "created"), row, current
+    outcome = "replaced" if current is not None else "created"
+    _log_file(conn, project, row["id"], outcome, actor)
+    return outcome, row, current
+
+
+def _log_file(conn, project: str, file_id, operation: str, actor: str) -> None:
+    """Log a write to a file's records, inside the caller's transaction."""
+    _rows(conn, "INSERT INTO assets_file_operations (project_id, file_id, operation, "
+                "created_by) VALUES (%s, %s, %s, %s)", (project, file_id, operation, actor))
 
 
 def _replace_file_row(conn, project: str, name: str, sha: str, size: int, put: dict,
@@ -1741,8 +1794,10 @@ def cmd_files_link(args) -> None:
             current = _current_file(conn, project, name, lock=True)
             if current is None or current["id"] != seen["id"]:
                 raise _StaleFile(name)
+            actor = _actor()
             row = _replace_file_row(conn, project, name, seen["sha256"], seen["bytes"], put,
-                                    wanted, _actor(), current)
+                                    wanted, actor, current)
+            _log_file(conn, project, row["id"], "linked" if owner else "unlinked", actor)
     except (_StaleFile, psycopg.errors.UniqueViolation):
         _stale_file_refusal(name)
     except psycopg.errors.CheckViolation as exc:
@@ -1795,6 +1850,7 @@ def cmd_files_rm(args) -> None:
                 raise _StaleFile(name)
             row = _one(conn, "UPDATE assets_files SET retired_at = now() WHERE id = %s "
                              f"RETURNING {FILE_COLUMNS}", (seen["id"],))
+            _log_file(conn, project, row["id"], "removed", _actor())
     except _StaleFile:
         _stale_file_refusal(name)
     except psycopg.errors.CheckViolation as exc:
@@ -1812,6 +1868,25 @@ def cmd_files_list(_args) -> None:
                        "AND f.retired_at IS NULL ORDER BY f.name", (project,))
     _emit({"project": project, "count": len(rows),
            "files": [_file_out(row, row["document"]) for row in rows]})
+
+
+def cmd_files_log(args) -> None:
+    project = _project(write=False)
+    name = _checked_file_name(args.name, project) if args.name is not None else None
+    conn = _open(_root())
+    rows = _rows(conn, "SELECT o.id, o.operation, o.created_at, o.created_by, o.file_id, "
+                       "f.name, f.bytes, f.sha256, d.name AS document "
+                       "FROM assets_file_operations o JOIN assets_files f ON f.id = o.file_id "
+                       "LEFT JOIN assets_documents d ON d.id = f.document_id "
+                       "WHERE o.project_id = %s AND (%s::text IS NULL OR f.name = %s) "
+                       "ORDER BY o.created_at DESC, o.id DESC LIMIT %s",
+                 (project, name, name, args.limit))
+    _emit({"project": project, "name": name, "count": len(rows),
+           "operations": [{"id": str(r["id"]), "operation": r["operation"], "name": r["name"],
+                           "file": str(r["file_id"]), "bytes": r["bytes"],
+                           "sha256": r["sha256"], "document": r["document"],
+                           "at": _iso(r["created_at"]), "by": r["created_by"]}
+                          for r in rows]})
 
 
 def cmd_files_get(args) -> None:
@@ -2011,6 +2086,9 @@ def _parser() -> _Parser:
     one.add_argument("--out", required=True)
     one.add_argument("--connection")
     files.add_parser("list")
+    one = files.add_parser("log")
+    one.add_argument("name", nargs="?")
+    one.add_argument("--limit", type=_limit, default=100)
     return parser
 
 
@@ -2029,7 +2107,8 @@ def main() -> None:
      "history": cmd_history, "diff": cmd_diff, "search": cmd_search, "save": cmd_save,
      "retire": cmd_retire, "import": cmd_import, "export": cmd_export,
      "files add": cmd_files_add, "files link": cmd_files_link, "files get": cmd_files_get,
-     "files rm": cmd_files_rm, "files list": cmd_files_list}[verb](args)
+     "files rm": cmd_files_rm, "files list": cmd_files_list,
+     "files log": cmd_files_log}[verb](args)
 
 
 if __name__ == "__main__":

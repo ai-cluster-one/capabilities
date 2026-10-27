@@ -22,7 +22,7 @@
     },
     "assets": {
       "path": "capabilities/assets",
-      "payload_sha256": "500fc8bdef52b650a6a33c19286b4eb573d50d638605454fd3dc122fc49f625a",
+      "payload_sha256": "d89948e19c058b8d1e899ac032db2238a2c4b15138fb12d2f73c2b8f573a6da6",
       "summary": "A project's assets: markdown as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text and diffed between versions - and every other file kept byte for byte in an S3-compatible bucket, sha256-checked, both imported from and exported to an agent's assets folder."
     },
     "automations": {

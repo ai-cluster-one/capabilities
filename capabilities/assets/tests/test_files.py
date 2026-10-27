@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import psycopg
 import pytest
 
 from _cli import connect, error, needs_store, world  # noqa: F401
@@ -328,3 +329,39 @@ def test_a_kept_file_is_deleted_from_the_bucket(world, gateway, tmp_path):  # no
     assert switched.returncode == 4 and error(switched)["code"] == "read_only_switch"
     readded = world.ok(root, "files", "add", "research/x/me.png", "--from", "-", stdin=b"new")
     assert readded["outcome"] == "created"
+
+
+@needs_gateway
+def test_every_write_to_a_file_is_logged(world, gateway, tmp_path):  # noqa: F811
+    root = connected(world.project(), gateway)
+    world.ok(root, "save", "research/x", "--from", "-", stdin=b"# X\n")
+    added = world.ok(root, "files", "add", "research/x/me.png", "--from", "-", stdin=PNG)
+    world.ok(root, "files", "add", "research/x/me.png", "--from", "-", stdin=PNG)
+    replaced = world.ok(root, "files", "add", "research/x/me.png", "--from", "-",
+                        stdin=PNG + b"!")
+    linked = world.ok(root, "files", "link", "research/x/me.png", "--document", "research/x")
+    unlinked = world.ok(root, "files", "link", "research/x/me.png", "--none")
+    (root / "assets" / "research").mkdir(parents=True)
+    (root / "assets" / "research" / "y.bin").write_bytes(b"y")
+    world.ok(root, "import")
+    removed = world.ok(root, "files", "rm", "research/x/me.png", "--yes")
+    log = world.ok(root, "files", "log", "research/x/me.png")
+    assert [(o["operation"], o["file"]) for o in log["operations"]] == [
+        ("removed", removed["retired"]), ("unlinked", unlinked["file"]["id"]),
+        ("linked", linked["file"]["id"]), ("replaced", replaced["file"]["id"]),
+        ("created", added["file"]["id"])]
+    assert log["operations"][2]["document"] == "research/x"
+    assert log["operations"][3]["sha256"] == sha(PNG + b"!")
+    assert all(o["name"] == "research/x/me.png" and o["by"] and o["at"]
+               for o in log["operations"])
+    assert world.ok(root, "files", "list")["files"][0]["name"] == "research/y.bin"
+    every = world.ok(root, "files", "log")
+    assert every["count"] == 6 and every["operations"][1]["name"] == "research/y.bin"
+    assert every["operations"][1]["operation"] == "created"
+    assert world.ok(root, "files", "log", "--limit", "1")["count"] == 1
+    assert world.ok(root, "files", "log", "research/none.bin")["operations"] == []
+    with connect(world.schema) as conn:
+        for statement in ("UPDATE assets_file_operations SET operation = 'created'",
+                          "DELETE FROM assets_file_operations", "TRUNCATE assets_file_operations"):
+            with pytest.raises(psycopg.errors.CheckViolation):
+                conn.execute(statement)
